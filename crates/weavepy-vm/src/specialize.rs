@@ -493,7 +493,7 @@ pub fn attempt_specialize_call(callable: &Object, argc: usize) -> InlineCache {
         Object::Builtin(b) => {
             if crate::native_call_ic_safe(b.name) {
                 InlineCache::CallNative {
-                    func_id: rc_id(b),
+                    func_id: native_fn_id(b),
                     argc: u32::try_from(argc).unwrap_or(u32::MAX),
                 }
             } else {
@@ -509,7 +509,7 @@ pub fn attempt_specialize_call(callable: &Object, argc: usize) -> InlineCache {
             if let Object::Builtin(b) = &bm.function {
                 if crate::native_call_ic_safe(b.name) {
                     return InlineCache::CallNativeMethod {
-                        func_id: rc_id(b),
+                        func_id: native_fn_id(b),
                         argc: u32::try_from(argc).unwrap_or(u32::MAX),
                     };
                 }
@@ -617,6 +617,20 @@ pub fn attempt_specialize_call_bound_py(
 #[inline]
 pub fn rc_id<T>(rc: &Rc<T>) -> u64 {
     Rc::as_ptr(rc) as usize as u64
+}
+
+/// Fingerprint for a native builtin behind a `CallNative` /
+/// `CallNativeMethod` cache: the allocation address folded with the
+/// address of its `'static` name. The name pointer is what makes the
+/// ABA case safe — a `BuiltinFn` freed and another allocated at the same
+/// address is only mistaken for the original if it also carries the very
+/// same name literal, in which case it passed the same
+/// [`crate::native_call_ic_safe`] gate. That lets the hit path skip the
+/// per-call name gate (a `starts_with` plus a ~60-arm string `matches!`,
+/// RFC 0077 WS3) and compare one `u64`.
+#[inline]
+pub fn native_fn_id(b: &Rc<crate::object::BuiltinFn>) -> u64 {
+    rc_id(b) ^ (b.name.as_ptr() as usize as u64).rotate_left(29)
 }
 
 /// Whether a type's MRO defines an attribute-access override that

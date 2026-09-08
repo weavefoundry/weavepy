@@ -1060,6 +1060,13 @@ if _HAVE_NATIVE and hasattr(_n, "chain_from_iterable"):
     # `builtin_function_or_method`, matching CPython's METH_CLASS slot
     # (see chain_from_iterable in itertools_mod.rs — RFC 0076 WS5).
     chain.from_iterable = classmethod(_n.chain_from_iterable)
+    # Tag the native as a descriptor owned by `chain` (the `_operator`
+    # `_register_call_descriptors` pattern): that registration is what
+    # keeps the bound attribute's type `builtin_function_or_method`
+    # rather than `method`, and gives it `__qualname__ ==
+    # 'chain.from_iterable'` (RFC 0077 Phase II).
+    if hasattr(_n, "_register_classmethod_descriptor"):
+        _n._register_classmethod_descriptor(chain, "from_iterable")
 
 
 # ---------------------------------------------------------------------------

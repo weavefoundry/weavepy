@@ -3,7 +3,9 @@
  * Real autoconf output for this platform, taken from
  * python-build-standalone cpython-3.13.15+20260807 apple-darwin (PSF-2.0), with the
  * per-architecture deltas merged under __x86_64__/__aarch64__
- * guards so one file serves both arches.
+ * guards so one file serves both arches. The macros configure.ac added
+ * in 3.14 are appended at the end (RFC 0077 WS12); the 3.13-era output
+ * is otherwise unchanged between the two releases.
  */
 /* pyconfig.h.  Generated from pyconfig.h.in by configure.  */
 /* pyconfig.h.in.  Generated from configure.ac by autoheader.  */
@@ -723,8 +725,6 @@
 /* Define to 1 if you have the `lchown' function. */
 #define HAVE_LCHOWN 1
 
-/* Define to 1 if you want to build _blake2 module with libb2 */
-/* #undef HAVE_LIBB2 */
 
 /* Define to 1 if you have the `db' library (-ldb). */
 /* #undef HAVE_LIBDB */
@@ -741,8 +741,6 @@
 /* Define to 1 if you have the <libintl.h> header file. */
 /* #undef HAVE_LIBINTL_H */
 
-/* Define to 1 if you have the `resolv' library (-lresolv). */
-/* #undef HAVE_LIBRESOLV */
 
 /* Define to 1 if you have the `sendfile' library (-lsendfile). */
 /* #undef HAVE_LIBSENDFILE */
@@ -1972,8 +1970,6 @@
 /* Define to build the readline module against libedit. */
 /* #undef WITH_EDITLINE */
 
-/* Define if you want to compile in object freelists optimization */
-#define WITH_FREELISTS 1
 
 /* Define to 1 if libintl is needed for locale functions. */
 /* #undef WITH_LIBINTL */
@@ -2096,6 +2092,82 @@
 #if defined(__USLC__) && defined(__SCO_VERSION__)
 #define STRICT_SYSV_CURSES /* Don't use ncurses extensions */
 #endif
+
+/* --- 3.14 additions (RFC 0077 WS12) ----------------------------------
+ * configure.ac macros new in 3.14, with the values a 3.14.7 macOS build
+ * produces. Build-environment differences between python-build-standalone
+ * and other distributions (readline/editline, zlib headers, ...) are not
+ * adopted: the base above stays the PBS output. */
+
+/* Define to 1 if you have the 'backtrace' function. */
+#define HAVE_BACKTRACE 1
+
+/* Define to 1 if you have the <execinfo.h> header file. */
+#define HAVE_EXECINFO_H 1
+
+/* Define to 1 if you have the 'dladdr1' function. */
+/* #undef HAVE_DLADDR1 */
+
+/* Define to 1 if you have the 'dl_iterate_phdr' function. */
+/* #undef HAVE_DL_ITERATE_PHDR */
+
+/* Define to 1 if you have the <link.h> header file. */
+/* #undef HAVE_LINK_H */
+
+/* Define to 1 if you have the <linux/netfilter_ipv4.h> header file. */
+/* #undef HAVE_LINUX_NETFILTER_IPV4_H */
+
+/* Define to 1 if you have the <linux/sched.h> header file. */
+/* #undef HAVE_LINUX_SCHED_H */
+
+/* Define to 1 if you have the 'pthread_getattr_np' function. */
+/* #undef HAVE_PTHREAD_GETATTR_NP */
+
+/* Define to 1 if you have the 'pthread_getname_np' function. */
+#define HAVE_PTHREAD_GETNAME_NP 1
+
+/* Define to 1 if you have the 'pthread_get_name_np' function. */
+/* #undef HAVE_PTHREAD_GET_NAME_NP */
+
+/* Define to 1 if you have the 'pthread_setname_np' function. */
+#define HAVE_PTHREAD_SETNAME_NP 1
+
+/* Define to 1 if you have the 'pthread_set_name_np' function. */
+/* #undef HAVE_PTHREAD_SET_NAME_NP */
+
+/* Define to 1 if you have the <zdict.h> header file. */
+/* #undef HAVE_ZDICT_H */
+
+/* Define to 1 if you have the <zstd.h> header file. */
+/* #undef HAVE_ZSTD_H */
+
+/* Define if you want to enable remote debugging support (PEP 768).
+ * WeavePy ships the without-remote-debug posture. */
+/* #undef Py_REMOTE_DEBUG */
+
+/* Define if you want to use tail-calling interpreters in CPython. */
+/* #undef Py_TAIL_CALL_INTERP */
+
+/* Maximum length in bytes of a thread name */
+#define _PYTHREAD_NAME_MAXLEN 63
+
+/* Defined if _Complex C type can be used with libffi. */
+#define _Py_FFI_SUPPORT_C_COMPLEX 1
+
+/* HACL* library can compile SIMD128 implementations */
+/* #undef _Py_HACL_CAN_COMPILE_VEC128 */
+
+/* HACL* library can compile SIMD256 implementations */
+/* #undef _Py_HACL_CAN_COMPILE_VEC256 */
+
+/* Define to 1 if the linker sets a thread stack size. */
+/* #undef _Py_LINKER_THREAD_STACK_SIZE */
+
+/* Define if the C stack grows down */
+#define _Py_STACK_GROWS_DOWN 1
+
+/* Define to activate features from IEC 60559:2020 in libm. */
+#define __STDC_WANT_IEC_60559_EXT__ 1
 
 #endif /*Py_PYCONFIG_H*/
 

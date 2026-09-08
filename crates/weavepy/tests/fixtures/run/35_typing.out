@@ -1,5 +1,5 @@
-typing.Optional[int]
-typing.Union[int, str]
+int | None
+int | str
 typing.List[int]
 typing.Dict[str, int]
 typing.Tuple[int, str, float]

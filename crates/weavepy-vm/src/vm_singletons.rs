@@ -131,6 +131,16 @@ pub fn push_pending_weakref_callback(callback: Object, weakref_obj: Object) {
     });
 }
 
+/// Is anything parked in this thread's weakref-callback queue? Cheap
+/// (one TLS borrow, no drain) so the reaper's per-node finalizer drain
+/// can skip publishing the interpreter pointer when there is nothing to
+/// run. Teardown-safe: reports `false` once TLS is gone.
+pub fn has_pending_weakref_callbacks() -> bool {
+    PENDING_WEAKREF_CALLBACKS
+        .try_with(|cell| cell.try_borrow().map(|q| !q.is_empty()).unwrap_or(false))
+        .unwrap_or(false)
+}
+
 /// Drain the pending weakref-callback queue.
 pub fn drain_pending_weakref_callbacks() -> Vec<(Object, Object)> {
     PENDING_WEAKREF_CALLBACKS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
@@ -274,6 +284,29 @@ pub fn publish_interpreter_seed(interp: &crate::Interpreter) {
     *slot = Some(interp.fork_for_thread());
     drop(slot);
     *seed_types_slot().lock() = Some(crate::builtin_types::builtin_types());
+}
+
+/// Run `f` (typically a `Interpreter::new()` for a *sub*-interpreter)
+/// without letting it replace the published seed. `Interpreter::default`
+/// unconditionally publishes itself as the seed, so without this a
+/// sub-interpreter would (a) become the fork source for the main
+/// interpreter's later `start_new_thread` fallback and (b) stay alive
+/// in the slot after `interpreters.destroy()` — every closed
+/// sub-interpreter's builtins dict, `_frozen_importlib`, and module
+/// graph would be pinned by the seed copy (~120 tracked objects per
+/// interpreter, growing `gc.collect()` linearly across
+/// `InterpreterPoolExecutor` runs).
+pub fn with_seed_preserved<T>(f: impl FnOnce() -> T) -> T {
+    let saved = seed_slot().lock().take();
+    let saved_types = seed_types_slot().lock().take();
+    let out = f();
+    if saved.is_some() {
+        *seed_slot().lock() = saved;
+    }
+    if saved_types.is_some() {
+        *seed_types_slot().lock() = saved_types;
+    }
+    out
 }
 
 /// Hand out a fresh worker [`crate::Interpreter`] cloned from the
@@ -981,6 +1014,22 @@ pub fn cext_call_active() -> bool {
 /// set (already-imported modules keep working), and
 /// `sys.is_finalizing()` reads it.
 static FINALIZING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `True` once shutdown reached CPython's `finalize_modules` stage:
+/// `sys.modules` emptied and `sys.meta_path` set to None, so a
+/// Python-level `import` fails even for a loaded module. The earlier
+/// stage — the collection of cyclic garbage after daemon threads are
+/// stopped — still imports normally, so this is set only once the
+/// sweep over module-global objects begins.
+static MODULES_TORN_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_modules_torn_down(value: bool) {
+    MODULES_TORN_DOWN.store(value, std::sync::atomic::Ordering::Release);
+}
+
+pub fn modules_torn_down() -> bool {
+    MODULES_TORN_DOWN.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// CPython clears the `sys` module dict *after* the std streams are
 /// finalized, so a `__del__` raising during that final sweep has nowhere

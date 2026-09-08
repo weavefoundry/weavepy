@@ -245,6 +245,9 @@ def bytearray_concat(left, right):
 
 def bytearray_resize(obj, size):
     # PyByteArray_Resize(); resizes in place, returns 0.
+    if size < 0:
+        raise ValueError(
+            "Can only resize to positive sizes, got %d" % size)
     if size > _ALLOC_LIMIT:
         raise MemoryError
     cur = len(obj)
@@ -498,13 +501,15 @@ def bytes_decodeescape(s, errors=None, size=None):
 
         if first_invalid > 0xFF:
             warnings.warn(
-                "invalid octal escape sequence '\\%o'" % first_invalid,
+                'b"\\%o" is an invalid octal escape sequence. '
+                'Such sequences will not work in the future. ' % first_invalid,
                 DeprecationWarning,
                 stacklevel=2,
             )
         else:
             warnings.warn(
-                "invalid escape sequence '\\%s'" % chr(first_invalid),
+                'b"\\%s" is an invalid escape sequence. '
+                'Such sequences will not work in the future. ' % chr(first_invalid),
                 DeprecationWarning,
                 stacklevel=2,
             )

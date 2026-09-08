@@ -1,6 +1,6 @@
 //! The `cmath` built-in module.
 //!
-//! Faithful port of CPython 3.13's `Modules/cmathmodule.c`: every
+//! Faithful port of CPython 3.14's `Modules/cmathmodule.c`: every
 //! function carries over the C source's algorithm, the 7x7
 //! special-value tables (indexed over {-inf, -finite, -0, +0,
 //! +finite, +inf, nan} for the real and imaginary parts), the
@@ -134,8 +134,8 @@ const ACOS_SPECIAL_VALUES: [[Cx; 7]; 7] = [
 const ACOSH_SPECIAL_VALUES: [[Cx; 7]; 7] = [
     [(INF, -P34), (INF, -P),  (INF, -P),  (INF, P),  (INF, P),  (INF, P34), (INF, N)],
     [(INF, -P12), (U, U),     (U, U),     (U, U),    (U, U),    (INF, P12), (N, N)],
-    [(INF, -P12), (U, U),     (0., -P12), (0., P12), (U, U),    (INF, P12), (N, N)],
-    [(INF, -P12), (U, U),     (0., -P12), (0., P12), (U, U),    (INF, P12), (N, N)],
+    [(INF, -P12), (U, U),     (0., -P12), (0., P12), (U, U),    (INF, P12), (N, P12)],
+    [(INF, -P12), (U, U),     (0., -P12), (0., P12), (U, U),    (INF, P12), (N, P12)],
     [(INF, -P12), (U, U),     (U, U),     (U, U),    (U, U),    (INF, P12), (N, N)],
     [(INF, -P14), (INF, -0.), (INF, -0.), (INF, 0.), (INF, 0.), (INF, P14), (INF, N)],
     [(INF, N),    (N, N),     (N, N),     (N, N),    (N, N),    (INF, N),   (N, N)],
@@ -222,8 +222,8 @@ const SQRT_SPECIAL_VALUES: [[Cx; 7]; 7] = [
 const TANH_SPECIAL_VALUES: [[Cx; 7]; 7] = [
     [(-1., 0.), (U, U), (-1., -0.), (-1., 0.), (U, U), (-1., 0.), (-1., 0.)],
     [(N, N),    (U, U), (U, U),     (U, U),    (U, U), (N, N),    (N, N)],
-    [(N, N),    (U, U), (-0., -0.), (-0., 0.), (U, U), (N, N),    (N, N)],
-    [(N, N),    (U, U), (0., -0.),  (0., 0.),  (U, U), (N, N),    (N, N)],
+    [(-0., N),  (U, U), (-0., -0.), (-0., 0.), (U, U), (-0., N),  (-0., N)],
+    [(0., N),   (U, U), (0., -0.),  (0., 0.),  (U, U), (0., N),   (0., N)],
     [(N, N),    (U, U), (U, U),     (U, U),    (U, U), (N, N),    (N, N)],
     [(1., 0.),  (U, U), (1., -0.),  (1., 0.),  (U, U), (1., 0.),  (1., 0.)],
     [(N, N),    (N, N), (N, -0.),   (N, 0.),   (N, N), (N, N),    (N, N)],
@@ -705,7 +705,7 @@ fn to_complex(o: &Object, func: &str) -> Result<Cx, RuntimeError> {
             // still live on this thread; the GIL keeps the access exclusive.
             let interp = unsafe { &mut *ptr };
             let globals = interp.builtins_dict();
-            let r = interp.coerce_complex_arg(o, true, &globals)?;
+            let r = interp.coerce_complex_arg(o, true, 1, &globals)?;
             if let Object::Complex(c) = &r {
                 return Ok((c.real, c.imag));
             }

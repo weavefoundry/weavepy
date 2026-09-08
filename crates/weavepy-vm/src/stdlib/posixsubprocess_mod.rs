@@ -205,13 +205,14 @@ fn errno() -> i32 {
 /// `fork_exec(args, executable_list, close_fds, fds_to_keep, cwd,
 /// env_list, p2cread, p2cwrite, c2pread, c2pwrite, errread, errwrite,
 /// errpipe_read, errpipe_write, restore_signals, call_setsid,
-/// pgid_to_set, gid, extra_groups, uid, child_umask, preexec_fn,
-/// allow_vfork)` — CPython 3.13's `_posixsubprocess.fork_exec`.
+/// pgid_to_set, gid, extra_groups, uid, child_umask, preexec_fn)` —
+/// CPython 3.14's `_posixsubprocess.fork_exec` (3.13's trailing
+/// `allow_vfork` is gone: 3.14 dropped the vfork path).
 #[cfg(unix)]
 fn fork_exec(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.len() < 23 {
+    if args.len() != 22 {
         return Err(type_error(format!(
-            "fork_exec expected 23 arguments, got {}",
+            "fork_exec() takes exactly 22 arguments ({} given)",
             args.len()
         )));
     }
@@ -237,6 +238,14 @@ fn fork_exec(args: &[Object]) -> Result<Object, RuntimeError> {
     let uid = opt_int(Some(&args[19]));
     let child_umask = opt_int(Some(&args[20])).unwrap_or(-1);
     let preexec_fn = &args[21];
+
+    // `subprocess_fork_exec_impl`: PySys_Audit("_posixsubprocess.fork_exec",
+    // "OOO", executable_list, process_args, env_list-or-None)
+    // (audit-tests test_posixsubprocess).
+    crate::stdlib::sys::audit_event(
+        "_posixsubprocess.fork_exec",
+        &[exec_list.clone(), process_args.clone(), env_list.clone()],
+    )?;
 
     // ---- Parent: build all C data BEFORE forking (no alloc in child). ----
     let exec_items = match crate::stdlib::os::sequence_items(exec_list) {

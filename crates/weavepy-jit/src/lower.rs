@@ -747,9 +747,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::Pop => {
                 self.pop();
             }
-            TOp::Dup => {
-                let top = *self.vstack.last().expect("dup on empty");
-                self.vstack.push(top);
+            TOp::Dup { depth } => {
+                let len = self.vstack.len();
+                let entry = self.vstack[len - depth as usize];
+                self.vstack.push(entry);
             }
             TOp::Swap2 => {
                 let len = self.vstack.len();
@@ -835,8 +836,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 elem,
                 none_fill,
                 mixed,
+                konst,
             } => {
-                self.emit_build_list(n, elem, none_fill, mixed, stmt.pc);
+                self.emit_build_list(n, elem, none_fill, mixed, konst, stmt.pc);
             }
             TOp::BuildTuple { n } => self.emit_build_tuple(n, stmt.pc),
             TOp::BuildMap { n } => self.emit_build_map(n, stmt.pc),
@@ -845,7 +847,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::StrGetItem => self.emit_str_get(stmt.pc),
             TOp::BuildString { n } => self.emit_build_string(n, stmt.pc),
             TOp::ListRepeat => self.emit_list_repeat(stmt.pc),
-            TOp::ListSlice { start, stop } => self.emit_list_slice(start, stop, stmt.pc),
+            TOp::ListSlice { start, stop, konst } => {
+                self.emit_list_slice(start, stop, konst, stmt.pc)
+            }
             TOp::PushGlobalObj { token, lane } => self.emit_push_global_obj(token, lane, stmt.pc),
             TOp::CallDyn { argc, kwc, names } => self.emit_call_dyn(argc, kwc, names, stmt.pc),
             TOp::DynAttrGet { name } => self.emit_dyn_attr_get(name, stmt.pc),
@@ -854,7 +858,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::ContainsDyn { negate } => self.emit_contains_dyn(negate, stmt.pc),
             TOp::BuildSet { n } => self.emit_build_set(n, stmt.pc),
             TOp::StrMod => self.emit_str_mod(stmt.pc),
-            TOp::StrSlice { start, stop } => self.emit_str_slice(start, stop, stmt.pc),
+            TOp::StrSlice { start, stop, konst } => {
+                self.emit_str_slice(start, stop, konst, stmt.pc)
+            }
         }
     }
 
@@ -1311,7 +1317,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// `BUILD_SLICE`'s* pc with the bound operands spilled (absent
     /// ones as materialized `None`s) so the interpreter rebuilds the
     /// slice object and executes the subscript generically.
-    fn emit_str_slice(&mut self, start: bool, stop: bool, pc: u32) {
+    fn emit_str_slice(&mut self, start: bool, stop: bool, konst: bool, pc: u32) {
         let missing = i64::MIN;
         let stop_v = if stop {
             self.pop().0
@@ -1325,21 +1331,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         };
         let (pin, _) = self.pop();
         // Spill shape at the erased BUILD_SLICE: [.., str, start,
-        // stop, step=None], `None` bounds as object-lane `-1`.
+        // stop, step=None], `None` bounds as object-lane `-1`. The
+        // folded `LOAD_CONST slice(...)` shape deopts at the
+        // `LOAD_CONST` with just [.., str].
         let mut snapshot = self.vstack.clone();
         snapshot.push((pin, JitType::Str));
-        let none = self.b.ins().iconst(types::I64, -1);
-        snapshot.push(if start {
-            (start_v, JitType::Int)
-        } else {
-            (none, JitType::Obj)
-        });
-        snapshot.push(if stop {
-            (stop_v, JitType::Int)
-        } else {
-            (none, JitType::Obj)
-        });
-        snapshot.push((none, JitType::Obj));
+        if !konst {
+            let none = self.b.ins().iconst(types::I64, -1);
+            snapshot.push(if start {
+                (start_v, JitType::Int)
+            } else {
+                (none, JitType::Obj)
+            });
+            snapshot.push(if stop {
+                (stop_v, JitType::Int)
+            } else {
+                (none, JitType::Obj)
+            });
+            snapshot.push((none, JitType::Obj));
+        }
         let sig = self.quad_helper_sig();
         let helper = self
             .b
@@ -1415,12 +1425,24 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// element by its own tag. The helper answers the fresh pin
     /// index, negative on cap pressure (deopt: the interpreter
     /// re-executes the `BUILD_LIST`).
-    fn emit_build_list(&mut self, n: u32, elem: JitType, none_fill: bool, mixed: bool, pc: u32) {
+    fn emit_build_list(
+        &mut self,
+        n: u32,
+        elem: JitType,
+        none_fill: bool,
+        mixed: bool,
+        konst: bool,
+        pc: u32,
+    ) {
         // The deopt re-executes the `BUILD_LIST`, so the spill must
         // hold all `n` elements: the natives still on the stack, or —
         // for `none_fill` — materialized `None` markers (`-1` on the
-        // object lane), which never occupied native slots.
+        // object lane), which never occupied native slots. The folded
+        // constant literal re-executes `BUILD_LIST 0`: nothing to hold.
         let mut snapshot = self.vstack.clone();
+        if konst {
+            snapshot.truncate(snapshot.len() - n as usize);
+        }
         if none_fill {
             for _ in 0..n {
                 let none = self.b.ins().iconst(types::I64, -1);
@@ -1670,7 +1692,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// operands spilled — absent ones as materialized `None`s — so
     /// the interpreter rebuilds the slice object and executes the
     /// subscript generically.
-    fn emit_list_slice(&mut self, start: bool, stop: bool, pc: u32) {
+    fn emit_list_slice(&mut self, start: bool, stop: bool, konst: bool, pc: u32) {
         let missing = i64::MIN;
         let stop_v = if stop {
             self.pop().0
@@ -1684,21 +1706,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         };
         let (pin, lane) = self.pop();
         // Spill shape at the erased BUILD_SLICE: [.., list, start,
-        // stop, step=None], `None` bounds as object-lane `-1`.
+        // stop, step=None], `None` bounds as object-lane `-1`. The
+        // folded `LOAD_CONST slice(...)` shape deopts at the
+        // `LOAD_CONST` with just [.., list].
         let mut snapshot = self.vstack.clone();
         snapshot.push((pin, lane));
-        let none = self.b.ins().iconst(types::I64, -1);
-        snapshot.push(if start {
-            (start_v, JitType::Int)
-        } else {
-            (none, JitType::Obj)
-        });
-        snapshot.push(if stop {
-            (stop_v, JitType::Int)
-        } else {
-            (none, JitType::Obj)
-        });
-        snapshot.push((none, JitType::Obj));
+        if !konst {
+            let none = self.b.ins().iconst(types::I64, -1);
+            snapshot.push(if start {
+                (start_v, JitType::Int)
+            } else {
+                (none, JitType::Obj)
+            });
+            snapshot.push(if stop {
+                (stop_v, JitType::Int)
+            } else {
+                (none, JitType::Obj)
+            });
+            snapshot.push((none, JitType::Obj));
+        }
         let sig = self.quad_helper_sig();
         let helper = self
             .b

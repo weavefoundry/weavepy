@@ -50,6 +50,17 @@
 # measured" (pre-RFC-0063 behaviour). Windows rows seeded in this wave
 # are limited to files that are POSIX-only by construction (CPython
 # itself skips them on NT); everything else gets measured by CI first.
+#
+# RFC 0077 Phase II (the CPython 3.14 switch) re-measured the whole
+# suite against the 3.14.7 `Lib/test` tree (`vendor/cpython314/`, the
+# oracle `--all-cpython` schedules; the `cpython/Lib/test/<file>` label
+# spelling is unchanged). Every row below is a 3.14 measurement:
+# `--mode subprocess --jobs 6`, unexpected 0, no `fail`, `error`, or
+# `timeout` rows; the three `divergence` rows (test_capi, test_embed,
+# test_marshal) and the one `skip` enumerate their 3.14 reasons. Where
+# a 3.14 file grew (test_capi's subinterpreter legs, test_asyncio's
+# free-threading file, the xml.etree files) the per-test budget was
+# raised for parallel-sweep load, not to hide a hang.
 
 measured_os = ["macos", "linux"]
 
@@ -136,6 +147,14 @@ timeout_seconds = 180
 
 [tests."cpython/Lib/test/test_asyncio/test_eager_task_factory.py"]
 status = "pass"
+timeout_seconds = 180
+
+[tests."cpython/Lib/test/test_asyncio/test_free_threading.py"]
+status = "pass"
+# New in the 3.14 tree (RFC 0077 Phase II): 24 run, OK, ~16s solo. The
+# tests spin N threads racing `all_tasks()`/`current_task()` against
+# task creation under the GIL hand-off; a saturated -j6 sweep pushed
+# one run past the 60s default, so it carries the sibling budget.
 timeout_seconds = 180
 
 [tests."cpython/Lib/test/test_asyncio/test_events.py"]
@@ -235,9 +254,17 @@ status = "pass"
 reason = "measured (RFC 0060 WS1): 184 run, OK (50 skips) — the _testcapi vectorcall fixture surface (PEP 590 conventions, Py_TPFLAGS_METHOD_DESCRIPTOR/HAVE_VECTORCALL) landed; the skips are C-only stress legs CPython also gates."
 
 [tests."cpython/Lib/test/test_capi.py"]
-status = "pass"
+status = "divergence"
 timeout_seconds = 180
-reason = "measured (RFC 0068 WS3): the 40+-submodule fixture fractal is green — watcher dispatch, debug-allocator emulation, heap-ctype refcounts, PEP 523 frame-eval recording, real sub-interpreters (PEP 684 config/ID lifecycle, cross-interpreter pending_identify), and the sq_repeat overflow-vs-MemoryError split all landed. 760 run / ~1740 C-only skips, matching CPython's gating."
+# SubinterpreterTest.test_py_config_isoloated_per_interpreter asserts
+# `PyConfig_Get('int_max_str_digits')` returns a *new* int object on
+# each call (`assertIsNot(4300, 4300)`). WeavePy's ints are unboxed
+# values, so two equal ints are one identity: the RFC 0036 object-model
+# divergence docs/CONFORMANCE.md records for test_marshal, graded the
+# same way. The config isolation the test is really about holds (the
+# subinterpreter's 55555 does not leak; before == after).
+divergence_tests = ["test.test_capi.test_misc.SubinterpreterTest.test_py_config_isoloated_per_interpreter"]
+reason = "measured (RFC 0077 Phase II, CPython 3.14.7): 945 run, 1 enumerated divergence (unboxed-int identity in test_py_config_isoloated_per_interpreter), the rest OK — the 3.14 C-API delta lands in `abi314.rs` and the `_testcapi`/`_testlimitedcapi` twins (PyUnicodeWriter, fixed-width PyLong, PyLong export/import, Py_tp_token/PyType_GetBaseByToken, PyType_Freeze, PyUnstable_Object_IsUniqueReferencedTemporary over the LOAD_FAST_BORROW-aware sys.getrefcount, PyConfig_Get/Set, the 3.14 _PyArg_UnpackKeywords varpos slot, PyDict_GetItem's unhashable-key wording, PyByteArray_Resize's negative-size ValueError, the 3.14 TypeError for custom-tp_new metaclasses and mutable-base immutable types). measured (RFC 0068 WS3): the 40+-submodule fixture fractal is green — watcher dispatch, debug-allocator emulation, heap-ctype refcounts, PEP 523 frame-eval recording, real sub-interpreters (PEP 684 config/ID lifecycle, cross-interpreter pending_identify), and the sq_repeat overflow-vs-MemoryError split all landed. 760 run / ~1740 C-only skips, matching CPython's gating."
 
 [tests."cpython/Lib/test/test_class.py"]
 status = "pass"
@@ -340,7 +367,10 @@ reason = "RFC 0037 WS3: passes end-to-end (35 tests). The complex() constructor 
 status = "pass"
 # ~120-250s under -j8; observed >300s on a loaded/thermally-throttled host
 # (RFC 0052 re-measure) — verdict is stable, so raise headroom only.
-timeout_seconds = 600
+# RFC 0077 Phase II (3.14 file): 160s solo, 560s under one saturated
+# -j6 sweep and killed at 600s under the next; same verdict every solo
+# run, so headroom again.
+timeout_seconds = 900
 reason = "RFC 0040 WS6: passes as a graded unit — 267 run, 0 fail, 0 err, 20 skip (release build). The whole `concurrent.futures` matrix is green: ThreadPool + ProcessPool (fork/forkserver/spawn) across test_init/test_future/test_as_completed/test_wait/test_thread_pool/test_process_pool/test_shutdown/test_deadlock. Two fixes landed this wave. (1) A VM deterministic-finalization bug: a comprehension's anonymous `<listcomp>`/`<setcomp>`/`<dictcomp>`/`<genexpr>` is GC-tracked when it captures cells, so when emitted by `MakeFunction` and consumed by the very next `Call` a plain `Rc` drop left it pinned by its own GC handle — leaking the captured locals until the next cycle collection. `ThreadPoolExecutor.map`'s `result_iterator` closes over the listcomp's `self`, so every `map` leaked one ref to the executor; `del executor` then never hit refcount 0, the idle-worker wakeup weakref-callback never fired, and `test_shutdown`/`test_del_shutdown` hung. `reap_call_receiver` now routes a uniquely-held call-temporary `Function` through the same prompt-reap cascade as closure-function locals (the leak also resolved the test_future 18→20 and test_as_completed 19→20 residuals). (2) Added the native `faulthandler` module: `test_deadlock` fires `faulthandler._sigsegv()` inside a pool worker to force a hard crash and assert `BrokenProcessPool` recovery; without the module `import faulthandler` raised in the worker, so the crash never happened and every recovery case errored or hung to `LONG_TIMEOUT`. The crash primitives genuinely `raise(3)` the signal, and ProcessPool broken-worker detection (verified independently for SIGSEGV/SIGABRT/os._exit) recovers promptly."
 
 [tests."cpython/Lib/test/test_configparser.py"]
@@ -466,32 +496,29 @@ reason = "RFC 0068 WS6: 1782 run, 0F/0E (1 skip). Last residual was test__encode
 
 [tests."cpython/Lib/test/test_embed.py"]
 status = "divergence"
-# InitConfigTests (35): the `test_init_*` config-dump family — each
+# InitConfigTests (30): the `test_init_*` config-dump family — each
 # test runs a `_testembed` command that prints the live PyConfig/
 # PyPreConfig as JSON via `_testinternalcapi.get_configs` and diffs
 # it against CPython's build-specific defaults (frozen-module blobs,
-# allocator domains, pybuilddir landmarks). The WS6 twin does not
+# allocator domains, pybuilddir landmarks). The twin does not
 # implement the dump family (GraalPy's posture); each exits 1 with
-# an "unimplemented command" note.
-# SetConfigTests (1): `_PyInterpreterState_SetConfig` via
-# `_testinternalcapi.set_config` — a CPython-internal mutation
-# surface with no PEP 587 analogue. `test_set_config` shells out to
-# `test._test_embed_set_config`; the inner run's per-method failures
-# echo on stdout and grade through this one outer id.
+# an "unimplemented command" note. Four dump legs (default_config,
+# compat_env, python_env, initconfig_api) skip in 3.14 exactly as
+# they do on CPython: the file's `skipIf(support.check_bolt_optimized,
+# ...)` passes the *function*, which is always truthy.
 # AuditingTests (7): the audit-hook command family
 # (`PySys_AddAuditHook` from C before init, open-code hooks,
 # incomplete-frame probes) — unimplemented twin commands.
-# EmbeddingTests residuals (5): four unimplemented twin commands
-# (finalize_structseq, getargs static-parser reset, and the two
-# inittab-submodule legs exercise `_testcapi`-internal C fixtures)
-# plus test_static_types_inherited_slots — a slot-wrapper identity
-# residual (`range.__ge__` is its own wrapper object where CPython
-# shares `object.__ge__`'s), the test_marshal-shaped object-model
-# divergence.
+# EmbeddingTests residuals (3): unimplemented twin commands (getargs
+# static-parser reset and the two inittab-submodule legs exercise
+# `_testcapi`-internal C fixtures). test_finalize_structseq passes
+# now that `sys.get_asyncgen_hooks()` returns the struct sequence,
+# and the RFC 0075 slot-wrapper identity residual
+# (test_static_types_inherited_slots) passes on 3.14.
 # MiscTests (1): Py_FrozenMain over a frozen-module blob — a
 # CPython-build artifact (bpo-44133 already skips it on Windows).
-divergence_tests = ["test.test_embed.InitConfigTests.test_global_pathconfig", "test.test_embed.InitConfigTests.test_init_compat_config", "test.test_embed.InitConfigTests.test_init_compat_env", "test.test_embed.InitConfigTests.test_init_default_config", "test.test_embed.InitConfigTests.test_init_dev_mode", "test.test_embed.InitConfigTests.test_init_dont_configure_locale", "test.test_embed.InitConfigTests.test_init_dont_parse_argv", "test.test_embed.InitConfigTests.test_init_env_dev_mode", "test.test_embed.InitConfigTests.test_init_env_dev_mode_alloc", "test.test_embed.InitConfigTests.test_init_from_config", "test.test_embed.InitConfigTests.test_init_global_config", "test.test_embed.InitConfigTests.test_init_is_python_build_with_home", "test.test_embed.InitConfigTests.test_init_isolated_config", "test.test_embed.InitConfigTests.test_init_isolated_flag", "test.test_embed.InitConfigTests.test_init_main", "test.test_embed.InitConfigTests.test_init_parse_argv", "test.test_embed.InitConfigTests.test_init_pybuilddir", "test.test_embed.InitConfigTests.test_init_python_config", "test.test_embed.InitConfigTests.test_init_python_env", "test.test_embed.InitConfigTests.test_init_pyvenv_cfg", "test.test_embed.InitConfigTests.test_init_run_main", "test.test_embed.InitConfigTests.test_init_set_config", "test.test_embed.InitConfigTests.test_init_setpath", "test.test_embed.InitConfigTests.test_init_setpath_config", "test.test_embed.InitConfigTests.test_init_setpythonhome", "test.test_embed.InitConfigTests.test_init_sys_add", "test.test_embed.InitConfigTests.test_init_use_frozen_modules", "test.test_embed.InitConfigTests.test_init_warnoptions", "test.test_embed.InitConfigTests.test_preinit_compat_config", "test.test_embed.InitConfigTests.test_preinit_dont_parse_argv", "test.test_embed.InitConfigTests.test_preinit_isolated1", "test.test_embed.InitConfigTests.test_preinit_isolated2", "test.test_embed.InitConfigTests.test_preinit_isolated_config", "test.test_embed.InitConfigTests.test_preinit_parse_argv", "test.test_embed.InitConfigTests.test_preinit_python_config", "test.test_embed.SetConfigTests.test_set_config", "test.test_embed.AuditingTests.test_audit", "test.test_embed.AuditingTests.test_audit_run_interactivehook", "test.test_embed.AuditingTests.test_audit_run_startup", "test.test_embed.AuditingTests.test_audit_subinterpreter", "test.test_embed.AuditingTests.test_audit_tuple", "test.test_embed.AuditingTests.test_get_incomplete_frame", "test.test_embed.AuditingTests.test_open_code_hook", "test.test_embed.EmbeddingTests.test_finalize_structseq", "test.test_embed.EmbeddingTests.test_getargs_reset_static_parser", "test.test_embed.EmbeddingTests.test_inittab_submodule_multiphase", "test.test_embed.EmbeddingTests.test_inittab_submodule_singlephase", "test.test_embed.EmbeddingTests.test_static_types_inherited_slots", "test.test_embed.MiscTests.test_frozenmain"]
-reason = "measured (RFC 0075 WS6): the skip retires — 77 run, 21 pass, 6 skip, 49 enumerated divergences (56 failing methods; SetConfigTests' inner subprocess ids grade through its one outer id) via the `_testembed` twin (`crates/weavepy-cli/src/bin/_testembed.rs`, staged at `{bindir}/Programs/_testembed`). The lifecycle heart passes measured: test_repeated_init_exec, test_repeated_simple_init, test_repeated_init_and_subinterpreters, test_repeated_init_and_inittab, test_forced_io_encoding (PYTHONIOENCODING halves fill unset EmbedConfig stdio fields per config_init_stdio_encoding), test_unicode_id_init, test_init_in_background_thread, test_bpo20891, test_initialize_twice, test_run_main(_loop), test_get_argc_argv, test_init_main_interpreter_settings, plus the audit-free EmbeddingTests legs (subinterps ids/distinct-state, ucnhash reset). The divergences cluster: the InitConfigTests config-dump matrix (35 — `_testinternalcapi.get_configs` JSON vs CPython build defaults; the twin does not implement the dump family, GraalPy's posture), SetConfigTests (8 — `_PyInterpreterState_SetConfig`, internal), the audit-hook command family (7), four `_testcapi`-fixture commands + one slot-wrapper identity residual (5), and Py_FrozenMain (1)."
+divergence_tests = ["test.test_embed.AuditingTests.test_audit", "test.test_embed.AuditingTests.test_audit_run_interactivehook", "test.test_embed.AuditingTests.test_audit_run_startup", "test.test_embed.AuditingTests.test_audit_subinterpreter", "test.test_embed.AuditingTests.test_audit_tuple", "test.test_embed.AuditingTests.test_get_incomplete_frame", "test.test_embed.AuditingTests.test_open_code_hook", "test.test_embed.EmbeddingTests.test_getargs_reset_static_parser", "test.test_embed.EmbeddingTests.test_inittab_submodule_multiphase", "test.test_embed.EmbeddingTests.test_inittab_submodule_singlephase", "test.test_embed.InitConfigTests.test_global_pathconfig", "test.test_embed.InitConfigTests.test_init_compat_config", "test.test_embed.InitConfigTests.test_init_dev_mode", "test.test_embed.InitConfigTests.test_init_dont_configure_locale", "test.test_embed.InitConfigTests.test_init_dont_parse_argv", "test.test_embed.InitConfigTests.test_init_env_dev_mode", "test.test_embed.InitConfigTests.test_init_env_dev_mode_alloc", "test.test_embed.InitConfigTests.test_init_from_config", "test.test_embed.InitConfigTests.test_init_global_config", "test.test_embed.InitConfigTests.test_init_is_python_build_with_home", "test.test_embed.InitConfigTests.test_init_isolated_config", "test.test_embed.InitConfigTests.test_init_isolated_flag", "test.test_embed.InitConfigTests.test_init_parse_argv", "test.test_embed.InitConfigTests.test_init_pybuilddir", "test.test_embed.InitConfigTests.test_init_python_config", "test.test_embed.InitConfigTests.test_init_pyvenv_cfg", "test.test_embed.InitConfigTests.test_init_run_main", "test.test_embed.InitConfigTests.test_init_setpath", "test.test_embed.InitConfigTests.test_init_setpath_config", "test.test_embed.InitConfigTests.test_init_setpythonhome", "test.test_embed.InitConfigTests.test_init_sys_add", "test.test_embed.InitConfigTests.test_init_use_frozen_modules", "test.test_embed.InitConfigTests.test_init_warnoptions", "test.test_embed.InitConfigTests.test_preinit_compat_config", "test.test_embed.InitConfigTests.test_preinit_dont_parse_argv", "test.test_embed.InitConfigTests.test_preinit_isolated1", "test.test_embed.InitConfigTests.test_preinit_isolated2", "test.test_embed.InitConfigTests.test_preinit_isolated_config", "test.test_embed.InitConfigTests.test_preinit_parse_argv", "test.test_embed.InitConfigTests.test_preinit_python_config", "test.test_embed.MiscTests.test_frozenmain"]
+reason = "measured (RFC 0077 Phase II, CPython 3.14.7): 83 run, 32 pass, 10 skip, 41 enumerated divergences via the `_testembed` twin (`crates/weavepy-cli/src/bin/_testembed.rs`, staged at `{bindir}/Programs/_testembed`). The RFC 0075 list shrinks from 49: test_finalize_structseq (sys.asyncgen_hooks is a real struct sequence) and test_static_types_inherited_slots (slot-wrapper sharing) pass; SetConfigTests.test_set_config, test_init_set_config and test_init_main left test_embed in 3.14; test_init_default_config, test_init_compat_env and test_init_python_env skip on CPython too (the BOLT skipIf bug). The lifecycle heart passes measured: test_repeated_init_exec, test_repeated_simple_init, test_repeated_init_and_subinterpreters, test_repeated_init_and_inittab, test_forced_io_encoding, test_unicode_id_init, test_init_in_background_thread, test_bpo20891, test_initialize_twice, test_run_main(_loop), test_get_argc_argv, test_init_main_interpreter_settings, plus the audit-free EmbeddingTests legs (subinterps ids/distinct-state, ucnhash reset)."
 
 [tests."cpython/Lib/test/test_ensurepip.py"]
 status = "pass"
@@ -579,7 +606,11 @@ reason = "RFC 0037 WS3/WS8: passes end-to-end. cmath is ported (pure-Python over
 
 [tests."cpython/Lib/test/test_frame.py"]
 status = "pass"
-reason = "measured (RFC 0060 WS1): 61 run, OK (11 skips) — frame introspection (f_lineno across trace events, PEP 667 FrameLocalsProxy hidden-comprehension semantics, _testcapi frame fixtures) conforms; skips are C-only frame-object stress legs."
+# ~19s solo; the 3.14 file's PEP 667 FrameLocalsProxy and
+# sneaky-teardown legs are GC-heavy and a saturated -j6 sweep (RFC 0077
+# Phase II) pushed one run past the 60s default. Headroom only.
+timeout_seconds = 120
+reason = "measured (RFC 0077 Phase II): 59 run, OK (11 skips) on the 3.14 file. RFC 0060 WS1: 61 run, OK (11 skips) — frame introspection (f_lineno across trace events, PEP 667 FrameLocalsProxy hidden-comprehension semantics, _testcapi frame fixtures) conforms; skips are C-only frame-object stress legs."
 
 [tests."cpython/Lib/test/test_frozen.py"]
 status = "pass"
@@ -820,8 +851,8 @@ reason = "measured (RFC 0054 sweep): now passes end-to-end (~8s; 3 skips). The p
 
 [tests."cpython/Lib/test/test_marshal.py"]
 status = "divergence"
-divergence_tests = ["test.test_marshal.InstancingTestCase.testInt", "test.test_marshal.InstancingTestCase.testFloat"]
-reason = "measured (RFC 0060 WS9): 66 run, 2F (14 skips) — version arg, buffer inputs, code round-trips, interning, and the unmarshallable-object taxonomy (incl. inside co_consts, gh-106287) all conform. The two residuals are InstancingTestCase.testInt/testFloat: they assert version-2 loads create *more* instances (n2 > n0 by id()), unsatisfiable while WeavePy's unboxed int/float model derives id() from the value — a principled object-model residual, not a marshal gap."
+divergence_tests = ["test.test_marshal.InstancingTestCase.testInt", "test.test_marshal.InstancingTestCase.testFloat", "test.test_marshal.BugsTestCase.test_reference_loop_tuple", "test.test_marshal.BugsTestCase.test_loads_abnormal_reference_loops"]
+reason = "measured (RFC 0077 Phase II, 3.14 suite): 75 run, 2F/2E (14 skips) — version arg (now 5, with TYPE_SLICE), buffer inputs, code round-trips, interning, the unmarshallable-object taxonomy (incl. inside co_consts, gh-106287) and the 3.14 w_complete recursion guard ('cannot marshal recursion slice/code objects') all conform. Residuals: InstancingTestCase.testInt/testFloat assert version-2 loads create *more* instances (n2 > n0 by id()), unsatisfiable while WeavePy's unboxed int/float model derives id() from the value; BugsTestCase.test_reference_loop_tuple/test_loads_abnormal_reference_loops need a tuple whose items are filled *after* it is registered in the ref table (CPython's PyTuple_New + SET_ITEM), impossible with WeavePy's immutable Rc<[Object]> tuple — both are object-model residuals, not marshal gaps."
 
 [tests."cpython/Lib/test/test_math.py"]
 status = "pass"
@@ -1360,6 +1391,10 @@ reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the obje
 status = "pass"
 reason = "measured (RFC 0055 WS6): frozen CPython tty.py over the native termios builtin — setraw/setcbreak mode surgery verified against tcgetattr round-trips."
 
+[tests."cpython/Lib/test/test_tstring.py"]
+status = "pass"
+reason = "measured (RFC 0077 Phase II): 12 run, OK. PEP 750 t-strings on by default (-X lang=3.13 opts out); string.templatelib Template/Interpolation carry the CPython tp_name ('string.templatelib.Template') so concatenation TypeErrors match, and every replacement-field diagnostic names the kind ('t-string: expecting ...') through the lexer/parser error path."
+
 [tests."cpython/Lib/test/test_tuple.py"]
 status = "pass"
 reason = "RFC 0039 WS5: the gc.collect() reachable-hang is gone (the cycle collector no longer rescans the whole generation). All 38 tests pass (4 skips for CPython-only sizeof/refcount probes). Required CPython-faithful tuple fidelity: xxPrime-based tuple hashing (`tuplehash`), `PyObject_RichCompareBool` semantics for `count`/`index`/`in` (identity-first, then Python `__eq__`), `t * 1 is t` identity, and recursive-repr cycle detection (`(...)`)."
@@ -1491,12 +1526,16 @@ reason = "measured (RFC 0037): passes end-to-end — parenthesized context manag
 
 [tests."cpython/Lib/test/test_xml_etree.py"]
 status = "pass"
-timeout_seconds = 120
+# ~48s solo on the 3.14 file (86s under the first -j6 sweep, past 120s
+# under a saturated one): headroom only, verdict stable at every solo
+# re-measure (RFC 0077 Phase II).
+timeout_seconds = 300
 reason = "measured (RFC 0056 WS3): passes over the native pyexpat (5 skips). The _elementtree C accelerator itself is not shipped; ElementTree runs pure-Python, so accelerator-only legs skip like a CPython --without-c-locale-coercion build would."
 
 [tests."cpython/Lib/test/test_xml_etree_c.py"]
 status = "pass"
-reason = "measured (RFC 0056 WS3): passes with 24 skips — every leg that needs the _elementtree C accelerator skips cleanly; the shared behavior tests run over the pure-Python ElementTree + native pyexpat."
+timeout_seconds = 300
+reason = "measured (RFC 0077 Phase II): the 3.14 file runs the shared ElementTree matrix twice as deep (~32s alone, past the 60s default under a -j6 sweep), so it takes test_xml_etree's budget. RFC 0056 WS3: passes with 24 skips — every leg that needs the _elementtree C accelerator skips cleanly; the shared behavior tests run over the pure-Python ElementTree + native pyexpat."
 
 [tests."cpython/Lib/test/test_xmlrpc.py"]
 status = "pass"

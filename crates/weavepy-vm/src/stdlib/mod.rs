@@ -108,7 +108,6 @@ pub mod zstd_mod;
 // RFC 0023 — drop-in stdlib parity.
 pub mod abc_mod;
 pub mod atexit_mod;
-pub mod contextvars_mod;
 pub mod ctypes_native;
 pub mod greenlet_native;
 pub mod https_mod;
@@ -120,6 +119,7 @@ pub mod ssl_real;
 pub mod string_mod;
 pub mod warnings_mod;
 
+pub mod collections_native;
 pub mod gc_real;
 pub mod multiprocessing_mod;
 pub mod queue_native;
@@ -258,6 +258,10 @@ pub fn register_all(cache: &ModuleCache) {
     // bound form must be a `builtin_function_or_method` —
     // test_types.test_method_descriptor_crash).
     cache.register_builtin("_weave_queue", queue_native::build);
+    // Atomic `deque` end operations behind the `_collections` Python
+    // stand-in (CPython documents append/pop from either side as
+    // thread-safe; `SimpleQueue` and asyncio's ready queue rely on it).
+    cache.register_builtin("_weave_collections", collections_native::build);
     cache.register_builtin("gc", gc_real::build);
     cache.register_builtin("_multiprocessing", multiprocessing_mod::build);
     // RFC 0040 WS5 — native XML parser behind `xml.parsers.expat`; drives the
@@ -287,7 +291,10 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("mmap", mmap_mod::build);
     cache.register_builtin("_locale", locale_mod::build);
     cache.register_builtin("_abc", abc_mod::build);
-    cache.register_builtin("_contextvars", contextvars_mod::build);
+    // `_contextvars` is the frozen alias of the pure-Python `contextvars`
+    // (see `python/_contextvars.py`): 3.14's `threading` and
+    // `_py_warnings` import the accelerator name directly and must see
+    // the same `Context`/`ContextVar` types `contextvars` hands out.
     // RFC 0066 WS4: native greenlets over real stack switching.
     cache.register_builtin("_greenlet", greenlet_native::build);
     // RFC 0046 (wave 5): native primitive layer behind the frozen `_ctypes`
@@ -449,6 +456,11 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             is_package: false,
         },
         FrozenSource {
+            name: "ctypes._layout",
+            source: include_str!("python/ctypes/_layout.py"),
+            is_package: false,
+        },
+        FrozenSource {
             name: "ctypes.util",
             source: include_str!("python/ctypes/util.py"),
             is_package: false,
@@ -525,6 +537,14 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "_weave_codegen",
             source: include_str!("python/_weave_codegen.py"),
+            is_package: false,
+        },
+        // RFC 0077 WS14 — code-object introspection behind 3.14's
+        // `_testinternalcapi.get_code_var_counts` / `verify_stateless_code`
+        // / `get_co_localskinds` / `code_returns_only_none` (test_code).
+        FrozenSource {
+            name: "_weave_codeinfo",
+            source: include_str!("python/_weave_codeinfo.py"),
             is_package: false,
         },
         // RFC 0040 WS7 — CPython's pure-Python `io` reference implementation.
@@ -812,11 +832,6 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             name: "pathlib",
             source: include_str!("python/pathlib.py"),
             is_package: true,
-        },
-        FrozenSource {
-            name: "pathlib._abc",
-            source: include_str!("python/pathlib_abc.py"),
-            is_package: false,
         },
         FrozenSource {
             name: "pathlib._local",
@@ -1629,6 +1644,214 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/encodings/cp737.py"),
             is_package: false,
         },
+        // RFC 0077: the rest of CPython 3.14's `encodings` package, vendored
+        // verbatim so every `encodings.aliases` target is an importable module
+        // (test_codecs.test_alias_modules_exist) with CPython's class surface.
+        // The UTF/escape/transform modules run directly on `_codecs`; the CJK
+        // modules build on `_multibytecodec` + the `_codecs_{cn,hk,iso2022,
+        // jp,kr,tw}.getcodec` shims below, which hand them handles onto the
+        // frozen Python codec implementations. `codecs.lookup` keeps serving
+        // its own CodecInfos for the names it special-cases.
+        FrozenSource {
+            name: "encodings.big5",
+            source: include_str!("python/encodings/big5.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.big5hkscs",
+            source: include_str!("python/encodings/big5hkscs.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.bz2_codec",
+            source: include_str!("python/encodings/bz2_codec.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp932",
+            source: include_str!("python/encodings/cp932.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp949",
+            source: include_str!("python/encodings/cp949.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp950",
+            source: include_str!("python/encodings/cp950.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.euc_jis_2004",
+            source: include_str!("python/encodings/euc_jis_2004.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.euc_jisx0213",
+            source: include_str!("python/encodings/euc_jisx0213.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.euc_jp",
+            source: include_str!("python/encodings/euc_jp.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.euc_kr",
+            source: include_str!("python/encodings/euc_kr.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.gb18030",
+            source: include_str!("python/encodings/gb18030.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.gb2312",
+            source: include_str!("python/encodings/gb2312.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.gbk",
+            source: include_str!("python/encodings/gbk.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.hex_codec",
+            source: include_str!("python/encodings/hex_codec.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.hz",
+            source: include_str!("python/encodings/hz.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso2022_jp",
+            source: include_str!("python/encodings/iso2022_jp.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso2022_jp_1",
+            source: include_str!("python/encodings/iso2022_jp_1.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso2022_jp_2",
+            source: include_str!("python/encodings/iso2022_jp_2.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso2022_jp_2004",
+            source: include_str!("python/encodings/iso2022_jp_2004.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso2022_jp_3",
+            source: include_str!("python/encodings/iso2022_jp_3.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso2022_jp_ext",
+            source: include_str!("python/encodings/iso2022_jp_ext.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso2022_kr",
+            source: include_str!("python/encodings/iso2022_kr.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.johab",
+            source: include_str!("python/encodings/johab.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.quopri_codec",
+            source: include_str!("python/encodings/quopri_codec.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.raw_unicode_escape",
+            source: include_str!("python/encodings/raw_unicode_escape.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.shift_jis",
+            source: include_str!("python/encodings/shift_jis.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.shift_jis_2004",
+            source: include_str!("python/encodings/shift_jis_2004.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.shift_jisx0213",
+            source: include_str!("python/encodings/shift_jisx0213.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.unicode_escape",
+            source: include_str!("python/encodings/unicode_escape.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.utf_16",
+            source: include_str!("python/encodings/utf_16.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.utf_16_be",
+            source: include_str!("python/encodings/utf_16_be.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.utf_16_le",
+            source: include_str!("python/encodings/utf_16_le.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.utf_32",
+            source: include_str!("python/encodings/utf_32.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.utf_32_be",
+            source: include_str!("python/encodings/utf_32_be.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.utf_32_le",
+            source: include_str!("python/encodings/utf_32_le.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.utf_7",
+            source: include_str!("python/encodings/utf_7.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.utf_8_sig",
+            source: include_str!("python/encodings/utf_8_sig.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.uu_codec",
+            source: include_str!("python/encodings/uu_codec.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.zlib_codec",
+            source: include_str!("python/encodings/zlib_codec.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings._win_cp_codecs",
+            source: include_str!("python/encodings/_win_cp_codecs.py"),
+            is_package: false,
+        },
         // Vendored verbatim from CPython 3.13 for code that reaches into the
         // `encodings` package directly (`encodings.ascii.StreamReader`,
         // `from encodings.rot_13 import rot13`, the always-raising
@@ -2255,6 +2478,38 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/_multibytecodec.py"),
             is_package: false,
         },
+        // CPython's `Modules/cjkcodecs/_codecs_*.c` `getcodec` entry points,
+        // as handles onto the frozen codecs (for the vendored `encodings.*`).
+        FrozenSource {
+            name: "_codecs_cn",
+            source: include_str!("python/_codecs_cn.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_codecs_hk",
+            source: include_str!("python/_codecs_hk.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_codecs_iso2022",
+            source: include_str!("python/_codecs_iso2022.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_codecs_jp",
+            source: include_str!("python/_codecs_jp.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_codecs_kr",
+            source: include_str!("python/_codecs_kr.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_codecs_tw",
+            source: include_str!("python/_codecs_tw.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "weakref",
             source: include_str!("python/weakref.py"),
@@ -2279,6 +2534,35 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "_datetime",
             source: include_str!("python/_datetime.py"),
+            is_package: false,
+        },
+        // Target-side half of 3.14's `_interpreters.call()` (see the
+        // module docstring for the queue protocol).
+        FrozenSource {
+            name: "_weave_xidata",
+            source: include_str!("python/_weave_xidata.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_weave_xicall",
+            source: include_str!("python/_weave_xicall.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_contextvars",
+            source: include_str!("python/_contextvars.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_weave_capsule",
+            source: include_str!("python/_weave_capsule.py"),
+            is_package: false,
+        },
+        // 3.14's C `_types` module (test_types.test_names imports `types`
+        // with and without it).
+        FrozenSource {
+            name: "_types",
+            source: include_str!("python/_types.py"),
             is_package: false,
         },
         FrozenSource {
@@ -2428,12 +2712,37 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/pickletools.py"),
             is_package: false,
         },
-        // `_opcode` — the 3.13 accelerator surface `test.support` and `dis`
-        // import (specialization gate, opcode predicates). Pure-Python over
-        // the frozen `opcode` tables.
+        // `_opcode` — the 3.14 accelerator surface `opcode`, `dis` and
+        // `test.support` import (specialization gate, opcode predicates,
+        // stack effects). Generated by `tools/gen_opcode_shim.py` from
+        // CPython's opcode metadata over the verbatim `_opcode_metadata`
+        // tables (RFC 0077 WS9).
         FrozenSource {
             name: "_opcode",
             source: include_str!("python/_opcode.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_opcode_metadata",
+            source: include_str!("python/_opcode_metadata.py"),
+            is_package: false,
+        },
+        // `_suggestions` — `Modules/_suggestions.c`'s `_generate_suggestions`
+        // (bounded Levenshtein), which `traceback` prefers for "Did you
+        // mean" hints and the 3.14 SyntaxError keyword-typo probe.
+        FrozenSource {
+            name: "_suggestions",
+            source: include_str!("python/_suggestions.py"),
+            is_package: false,
+        },
+        // `_remote_debugging` — 3.14's remote stack unwinder. The result
+        // struct sequences are real (`asyncio.tools` imports `FrameInfo`
+        // at load time, so `python -m asyncio` needs them); attaching to
+        // another process isn't available, so `RemoteUnwinder(pid)`
+        // raises like the C module does without attach permission.
+        FrozenSource {
+            name: "_remote_debugging",
+            source: include_str!("python/_remote_debugging.py"),
             is_package: false,
         },
         // RFC 0034 — the `test` package: CPython's regression-test
@@ -2622,8 +2931,9 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/test_regrtest.py"),
             is_package: false,
         },
-        // RFC 0060 — CPython 3.13's *verbatim* `test.libregrtest` package
-        // (from `vendor/cpython/Lib/test/libregrtest/`), replacing the
+        // RFC 0060 — CPython's *verbatim* `test.libregrtest` package
+        // (3.14, from `vendor/cpython314/Lib/test/libregrtest/`; RFC 0077
+        // re-vendored it and added `parallel_case`), replacing the
         // RFC 0036 shim whose partial `result.py` shadowed the real one
         // (`test_regrtest` imports `TestStats` at module scope).
         FrozenSource {
@@ -2654,6 +2964,11 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "test.libregrtest.main",
             source: include_str!("python/test_libregrtest/main.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.parallel_case",
+            source: include_str!("python/test_libregrtest/parallel_case.py"),
             is_package: false,
         },
         FrozenSource {
@@ -2761,11 +3076,6 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         // Compression wrappers (RFC 0019).
         // Shared buffered/decompress reader used by gzip/bz2/lzma (CPython
         // `Lib/_compression.py`, ported verbatim).
-        FrozenSource {
-            name: "_compression",
-            source: include_str!("python/_compression.py"),
-            is_package: false,
-        },
         FrozenSource {
             name: "gzip",
             source: include_str!("python/gzip.py"),
@@ -3204,6 +3514,118 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "_pyrepl.main",
             source: include_str!("python/_pyrepl_main.py"),
+            is_package: false,
+        },
+        // RFC 0077 WS11 — 3.14's `pdb` imports `_pyrepl.utils` for
+        // syntax-colored listings (`gen_colors`); verbatim with its two
+        // leaf dependencies.
+        FrozenSource {
+            name: "_pyrepl.utils",
+            source: include_str!("python/_pyrepl_utils.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.types",
+            source: include_str!("python/_pyrepl_types.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.trace",
+            source: include_str!("python/_pyrepl_trace.py"),
+            is_package: false,
+        },
+        // RFC 0077 — the rest of 3.14.7's `_pyrepl` package, verbatim, so
+        // `test_pyrepl` (`from _pyrepl import terminfo`, `unix_console`,
+        // `readline`, …) resolves against the staged stdlib. The
+        // interactive REPL itself stays Rust-native.
+        FrozenSource {
+            name: "_pyrepl.__main__",
+            source: include_str!("python/_pyrepl___main__.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl._module_completer",
+            source: include_str!("python/_pyrepl__module_completer.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl._threading_handler",
+            source: include_str!("python/_pyrepl__threading_handler.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.base_eventqueue",
+            source: include_str!("python/_pyrepl_base_eventqueue.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.commands",
+            source: include_str!("python/_pyrepl_commands.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.completing_reader",
+            source: include_str!("python/_pyrepl_completing_reader.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.fancy_termios",
+            source: include_str!("python/_pyrepl_fancy_termios.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.historical_reader",
+            source: include_str!("python/_pyrepl_historical_reader.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.input",
+            source: include_str!("python/_pyrepl_input.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.keymap",
+            source: include_str!("python/_pyrepl_keymap.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.reader",
+            source: include_str!("python/_pyrepl_reader.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.readline",
+            source: include_str!("python/_pyrepl_readline.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.simple_interact",
+            source: include_str!("python/_pyrepl_simple_interact.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.terminfo",
+            source: include_str!("python/_pyrepl_terminfo.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.unix_console",
+            source: include_str!("python/_pyrepl_unix_console.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.unix_eventqueue",
+            source: include_str!("python/_pyrepl_unix_eventqueue.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.windows_console",
+            source: include_str!("python/_pyrepl_windows_console.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.windows_eventqueue",
+            source: include_str!("python/_pyrepl_windows_eventqueue.py"),
             is_package: false,
         },
         // RFC 0055 WS2 — verbatim CPython `venv` + `ensurepip`
@@ -3824,6 +4246,152 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "__hello_only__",
             source: "initialized = True\n",
+            is_package: false,
+        },
+        // RFC 0077 WS8: modules new in (or newly bundled from) CPython 3.14.
+        FrozenSource {
+            name: "_ast_unparse",
+            source: include_str!("python/_ast_unparse.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_py_warnings",
+            source: include_str!("python/_py_warnings.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "annotationlib",
+            source: include_str!("python/annotationlib.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.graph",
+            source: include_str!("python/asyncio/graph.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.tools",
+            source: include_str!("python/asyncio/tools.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "concurrent.futures.interpreter",
+            source: include_str!("python/concurrent_futures_interpreter.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "concurrent.interpreters",
+            source: include_str!("python/concurrent/interpreters/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "concurrent.interpreters._crossinterp",
+            source: include_str!("python/concurrent/interpreters/_crossinterp.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "concurrent.interpreters._queues",
+            source: include_str!("python/concurrent/interpreters/_queues.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "pathlib._os",
+            source: include_str!("python/pathlib__os.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "pathlib.types",
+            source: include_str!("python/pathlib_types.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "sched",
+            source: include_str!("python/sched.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "tabnanny",
+            source: include_str!("python/tabnanny.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "wave",
+            source: include_str!("python/wave.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "pyclbr",
+            source: include_str!("python/pyclbr.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "modulefinder",
+            source: include_str!("python/modulefinder.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "json.__main__",
+            source: include_str!("python/json/__main__.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib.simple",
+            source: include_str!("python/importlib_simple.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "this",
+            source: include_str!("python/this.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "antigravity",
+            source: include_str!("python/antigravity.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_apple_support",
+            source: include_str!("python/_apple_support.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_android_support",
+            source: include_str!("python/_android_support.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_ios_support",
+            source: include_str!("python/_ios_support.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_aix_support",
+            source: include_str!("python/_aix_support.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "xml.etree.cElementTree",
+            source: include_str!("python/xml/etree/cElementTree.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pylong",
+            source: include_str!("python/_pylong.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "pydoc_data",
+            source: include_str!("python/pydoc_data/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "pydoc_data.module_docs",
+            source: include_str!("python/pydoc_data/module_docs.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "pydoc_data.topics",
+            source: include_str!("python/pydoc_data/topics.py"),
             is_package: false,
         },
         // Explicit `<pkg>.__init__` rows (importable spellings of the

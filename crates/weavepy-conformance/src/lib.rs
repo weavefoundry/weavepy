@@ -34,7 +34,7 @@ pub use runner::{run_file, FileReport, PhaseOutcome};
 ///
 /// Bumping this should be a deliberate change with the delta reviewed; see
 /// `docs/ARCHITECTURE.md` ("Compatibility strategy").
-pub const CPYTHON_TARGET_VERSION: &str = "3.13";
+pub const CPYTHON_TARGET_VERSION: &str = "3.14";
 
 /// Environment variable that overrides the python interpreter used as the
 /// oracle (defaults to `python3`).

@@ -51,7 +51,7 @@ jobs:
       # `cargo test` compiles weavepy-pylib's source into a unit-test
       # harness but never emits the cdylib artifact, so build it
       # explicitly: the windows_dll integration battery (RFC 0064 WS5)
-      # needs target/debug/python313.dll next to the shim exe.
+      # needs target/debug/python314.dll next to the shim exe.
       - run: cargo build -p weavepy-pylib
       - run: cargo test --workspace --all-targets --all-features
       - run: cargo test --workspace --doc
@@ -96,7 +96,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build weavepy CLI + runtime library
-        # weavepy-pylib builds python313.dll — on Windows the exe is a
+        # weavepy-pylib builds python314.dll — on Windows the exe is a
         # thin shim over it (RFC 0064 WS1), so the DLL must sit next to
         # the exe. Building it on all three OSes keeps the cdylib
         # honest everywhere.
@@ -203,9 +203,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.14"
       - name: Build weavepy CLI + runtime library + bench harness
-        # weavepy-pylib: python313.dll, the runtime the Windows shim
+        # weavepy-pylib: python314.dll, the runtime the Windows shim
         # exe loads (RFC 0064 WS1).
         run: cargo build --release -p weavepy-cli -p weavepy-pylib -p weavepy-bench
       - name: Build merge-base weavepy (A/B reference)
@@ -283,19 +283,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.14"
       - name: Cache ecosystem wheels
         uses: actions/cache@v4
         with:
           path: target/ecosystem-wheels
           key: ecosystem-wheels-${{ runner.os }}-${{ hashFiles('tests/ecosystem/manifest.toml') }}
       - name: Build weavepy CLI + runtime library
-        # weavepy-pylib: python313.dll, the runtime the Windows shim
+        # weavepy-pylib: python314.dll, the runtime the Windows shim
         # exe loads (RFC 0064 WS1).
         run: cargo build --release -p weavepy-cli -p weavepy-pylib
       - name: Fetch ecosystem wheels (no-op on cache hit)
         # `python`, not `python3`: setup-python exposes both on
-        # ubuntu/macos (same 3.13 interpreter) but only `python` on
+        # ubuntu/macos (same 3.14 interpreter) but only `python` on
         # windows runners.
         run: python tools/ecosystem_fetch.py --dest target/ecosystem-wheels
       - name: Install libpq for the psycopg2 sdist row (macOS)
@@ -352,20 +352,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.14"
       - name: Cache ecosystem wheels
         uses: actions/cache@v4
         with:
           path: target/ecosystem-wheels
           key: ecosystem-wheels-${{ runner.os }}-${{ hashFiles('tests/ecosystem/manifest.toml') }}
       - name: Build weavepy CLI + runtime library
-        # weavepy-pylib: python313.dll — the Windows artifact ships it
-        # at the prefix root with libs\python313.lib (RFC 0064 WS3),
+        # weavepy-pylib: python314.dll — the Windows artifact ships it
+        # at the prefix root with libs\python314.lib (RFC 0064 WS3),
         # and the builder refuses to package a shim exe without it.
         run: cargo build --release -p weavepy-cli -p weavepy-pylib
       - name: Fetch ecosystem wheels (no-op on cache hit)
         # `python`, not `python3`: setup-python exposes both on
-        # ubuntu/macos (same 3.13 interpreter) but only `python` on
+        # ubuntu/macos (same 3.14 interpreter) but only `python` on
         # windows runners.
         run: python tools/ecosystem_fetch.py --dest target/ecosystem-wheels
       - name: Run dist check
@@ -390,7 +390,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.14"
       - name: Verify python oracle
         run: python3 -V
       - name: Run conformance harness

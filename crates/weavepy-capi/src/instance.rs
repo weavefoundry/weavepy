@@ -183,10 +183,7 @@ pub fn container_body_out(inst: &Rc<PyInstance>, ty: *mut PyTypeObject) -> Optio
             Some(weavepy_vm::object::Object::Tuple(t)) => t.len(),
             _ => 0,
         };
-        basicsize.max(
-            std::mem::size_of::<crate::layout::PyVarObject>()
-                + n * std::mem::size_of::<*mut PyObject>(),
-        )
+        basicsize.max(crate::layout::TUPLE_HEAD_BYTES + n * std::mem::size_of::<*mut PyObject>())
     };
     let body = attach_body(inst, ty, body_bytes);
     if is_list {
@@ -219,7 +216,7 @@ pub fn make_inline_instance(ty: *mut PyTypeObject, nitems: PySsizeT) -> *mut PyO
         if flags & tpflags::LIST_SUBCLASS != 0 {
             min_body = std::mem::size_of::<crate::layout::PyListObject>();
         } else {
-            min_body = std::mem::size_of::<crate::layout::PyVarObject>();
+            min_body = crate::layout::TUPLE_HEAD_BYTES;
             itemsize = itemsize.max(std::mem::size_of::<*mut PyObject>());
         }
     }
@@ -260,6 +257,16 @@ pub fn make_inline_instance(ty: *mut PyTypeObject, nitems: PySsizeT) -> *mut PyO
     if !body.is_null() && unsafe { (*ty).tp_itemsize } != 0 {
         let vo = body as *mut crate::layout::PyVarObject;
         unsafe { (*vo).ob_size = nitems.max(0) };
+    }
+    // A tuple-shaped body (tuple subclass, struct sequence) carries the
+    // 3.14 `ob_hash` cache ahead of `ob_item`; CPython's `tuple_alloc`
+    // stamps it unset.
+    if !body.is_null()
+        && unsafe { (*ty).tp_flags } & crate::layout::tpflags::TUPLE_SUBCLASS != 0
+        && body_bytes >= crate::layout::TUPLE_HEAD_BYTES
+    {
+        let to = body as *mut crate::layout::PyTupleObject;
+        unsafe { (*to).ob_hash = -1 };
     }
     body
 }

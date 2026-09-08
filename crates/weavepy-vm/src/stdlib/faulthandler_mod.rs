@@ -211,13 +211,33 @@ fn dump_frames(out: &mut String, frame_stack: &crate::object::FrameStack) {
         out.push_str("  <no Python frame>\n");
         return;
     }
-    for (depth, frame) in stack.iter().rev().enumerate() {
+    let mut depth = 0usize;
+    for frame in stack.iter().rev() {
+        if frame_is_native_stand_in(frame) {
+            continue;
+        }
         if depth >= MAX_FRAME_DEPTH {
             out.push_str("  ...\n");
             break;
         }
         dump_frame_line(out, frame);
+        depth += 1;
     }
+}
+
+/// Frames of frozen Python stand-ins for machinery CPython implements
+/// in C: `_seqtools` (`map`/`zip`/...), the `_weave_*` internals, and
+/// `contextvars.Context.run` (3.14's `Thread._bootstrap_inner` runs the
+/// target through `self._context.run`, which is a C call in CPython, so
+/// `test_faulthandler.test_dump_traceback_threads` expects exactly
+/// `run` -> `_bootstrap_inner` -> `_bootstrap`). A crash dump must not
+/// show them, just as CPython shows no frame for C code.
+fn frame_is_native_stand_in(frame: &crate::object::FrameShell) -> bool {
+    let filename = frame.code.filename.as_str();
+    let base = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
+    base == "_seqtools.py"
+        || base.starts_with("_weave_")
+        || (base == "contextvars.py" && frame.code.name.as_str() == "run")
 }
 
 /// CPython `write_thread_id`: `0x` + the thread id zero-padded to
@@ -643,6 +663,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             builtin_kw("dump_traceback", fh_dump_traceback),
         );
         d.insert(
+            DictKey(Object::from_static("dump_c_stack")),
+            builtin_kw("dump_c_stack", fh_dump_c_stack),
+        );
+        d.insert(
             DictKey(Object::from_static("dump_traceback_later")),
             builtin_kw("dump_traceback_later", fh_dump_traceback_later),
         );
@@ -784,6 +808,70 @@ fn fh_dump_traceback(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obj
     }
     write_fd(fd, out.as_bytes());
     Ok(Object::None)
+}
+
+/// `faulthandler.dump_c_stack(file=sys.stderr)` — 3.14 (gh-127604).
+/// Mirrors `_Py_DumpStack`'s libunwind-less path: `backtrace(3)` for the
+/// return addresses and `dladdr(3)` for `Binary file "<image>", at
+/// <symbol>+0x<off> [0x<addr>]` lines (`test_faulthandler.test_dump_c_stack`).
+fn fh_dump_c_stack(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let interp = current_interp("faulthandler.dump_c_stack()")?;
+    let file = args.first().or_else(|| kwarg(kwargs, "file")).cloned();
+    let fd = resolve_fd(interp, file)?;
+    let mut out = String::from("Current thread's C stack trace (most recent call first):\n");
+    dump_c_stack(&mut out);
+    write_fd(fd, out.as_bytes());
+    Ok(Object::None)
+}
+
+#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+fn dump_c_stack(out: &mut String) {
+    use std::fmt::Write as _;
+    const MAX_FRAMES: usize = 100;
+    let mut frames: [*mut libc::c_void; MAX_FRAMES] = [std::ptr::null_mut(); MAX_FRAMES];
+    // SAFETY: `frames` is a valid buffer of `MAX_FRAMES` pointers.
+    let n = unsafe { libc::backtrace(frames.as_mut_ptr(), MAX_FRAMES as libc::c_int) };
+    for &addr in frames.iter().take(usize::try_from(n).unwrap_or(0)) {
+        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a valid out-pointer; `dladdr` only reads `addr`.
+        let ok = unsafe { libc::dladdr(addr, &raw mut info) } != 0;
+        let cstr = |p: *const libc::c_char| -> Option<String> {
+            if p.is_null() {
+                None
+            } else {
+                // SAFETY: `dladdr` hands back NUL-terminated strings owned by
+                // the loader that stay valid for the life of the image.
+                Some(
+                    unsafe { std::ffi::CStr::from_ptr(p) }
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            }
+        };
+        let addr_u = addr as usize;
+        match (ok, cstr(info.dli_fname)) {
+            (true, Some(fname)) => {
+                let _ = write!(out, "  Binary file \"{fname}\"");
+                if let Some(sym) = cstr(info.dli_sname) {
+                    let off = addr_u.wrapping_sub(info.dli_saddr as usize);
+                    let _ = write!(out, ", at {sym}+{off:#x}");
+                }
+                let _ = writeln!(out, " [{addr_u:#x}]");
+            }
+            _ => {
+                let _ = writeln!(out, "  <unknown> [{addr_u:#x}]");
+            }
+        }
+    }
+    if n == 0 {
+        out.push_str("  <unable to read C stack>\n");
+    }
+}
+
+#[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+fn dump_c_stack(out: &mut String) {
+    // CPython without libunwind/backtrace support prints this marker.
+    out.push_str("  <cannot get C stack on this system>\n");
 }
 
 // ---------------------------------------------------------------------

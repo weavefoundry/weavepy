@@ -51,6 +51,8 @@ __all__ = [
     # --- Modules/_testcapi/immortal.c (test_capi.test_immortal) ---
     # (test_immortal_small_ints is provided by _weave_capi_num)
     "test_immortal_builtins",
+    "is_immortal",
+    "_is_static_immortal",
     # --- Modules/_testcapi/watchers.c (test_capi.test_watchers) ---
     "add_dict_watcher",
     "clear_dict_watcher",
@@ -68,6 +70,11 @@ __all__ = [
     "get_code_watcher_num_destroyed_events",
     "allocate_too_many_code_watchers",
     "code_newempty",
+    "add_context_watcher",
+    "clear_context_watcher",
+    "clear_context_stack",
+    "get_context_switches",
+    "allocate_too_many_context_watchers",
     "add_func_watcher",
     "clear_func_watcher",
     "allocate_too_many_func_watchers",
@@ -135,11 +142,16 @@ __all__ = [
     "HeapCTypeWithBasesSlot",
     "create_heapctype_with_none_bases_slot",
     "HeapCTypeWithDict",
+    "HeapCTypeWithRelativeDict",
     "HeapCTypeWithNegativeDict",
     "HeapCTypeWithManagedDict",
     "HeapCTypeWithWeakref",
+    "HeapCTypeWithRelativeWeakref",
     "HeapCTypeWithManagedWeakref",
     "HeapCTypeSetattr",
+    "HeapCTypeVectorcall",
+    "ManualHeapType",
+    "ManagedDictType",
     "HeapCTypeWithBuffer",
     "py_buildvalue",
     "py_buildvalue_ints",
@@ -154,7 +166,498 @@ __all__ = [
     "docstring_with_signature_but_no_doc",
     "docstring_with_signature_and_extra_newlines",
     "DocStringUnrepresentableSignatureTest",
+    # --- Modules/_testlimitedcapi/weakref.c and Modules/_testcapi/
+    #     weakref.c (test_capi.test_weakref, new in 3.14) ---
+    "pyweakref_check",
+    "pyweakref_checkref",
+    "pyweakref_checkrefexact",
+    "pyweakref_checkproxy",
+    "pyweakref_newref",
+    "pyweakref_newproxy",
+    "pyweakref_getref",
+    "pyweakref_isdead",
+    # --- Modules/_testlimitedcapi/capsule.c (test_capi.test_capsule) ---
+    "capsule_new",
+    "PyCapsule_Import",
+    # --- Modules/_testcapi/codec.c + _testlimitedcapi/codec.c
+    #     (test_capi.test_codecs CAPICodecs / CAPICodecErrors) ---
+    "codec_register",
+    "codec_unregister",
+    "codec_known_encoding",
+    "codec_encode",
+    "codec_decode",
+    "codec_encoder",
+    "codec_decoder",
+    "codec_incremental_encoder",
+    "codec_incremental_decoder",
+    "codec_stream_reader",
+    "codec_stream_writer",
+    "codec_register_error",
+    "codec_lookup_error",
+    "codec_strict_errors",
+    "codec_ignore_errors",
+    "codec_replace_errors",
+    "codec_xmlcharrefreplace_errors",
+    "codec_backslashreplace_errors",
+    "codec_namereplace_errors",
+    # --- Modules/_testcapi/exceptions.c: PyUnicode*Error_{Get,Set}{Start,End}
+    #     (test_capi.test_exceptions.TestUnicodeError) ---
+    "unicode_encode_get_start",
+    "unicode_decode_get_start",
+    "unicode_translate_get_start",
+    "unicode_encode_set_start",
+    "unicode_decode_set_start",
+    "unicode_translate_set_start",
+    "unicode_encode_get_end",
+    "unicode_decode_get_end",
+    "unicode_translate_get_end",
+    "unicode_encode_set_end",
+    "unicode_decode_set_end",
+    "unicode_translate_set_end",
 ]
+
+
+# =====================================================================
+# PyCapsule_Import (Modules/_testlimitedcapi/capsule.c)
+# =====================================================================
+
+def _charp(name):
+    # The "z#" convention: str is passed through, bytes are the raw
+    # char* (decoded as UTF-8 by the API that consumes them), None is
+    # NULL.
+    if name is None or isinstance(name, str):
+        return name
+    if isinstance(name, (bytes, bytearray)):
+        return bytes(name)
+    raise TypeError(
+        "argument must be str, bytes or None, not %s" % type(name).__name__
+    )
+
+
+def capsule_new(name):
+    """`capsule_new(name)`: a capsule whose pointer is a copy of its own
+    name (so a successful PyCapsule_Import round-trips the name); a
+    None name is a NULL name with a non-NULL dummy pointer."""
+    import _weave_capsule
+    name = _charp(name)
+    cap = _weave_capsule.new_capsule(name)
+    object.__setattr__(cap, "_capsule_pointer",
+                       name if name is not None else b"")
+    return cap
+
+
+def _capsule_fields(obj):
+    import _weave_capsule
+    if type(obj) is not _weave_capsule.PyCapsule:
+        return None
+    try:
+        name = object.__getattribute__(obj, "_capsule_name")
+    except AttributeError:
+        name = None
+    try:
+        pointer = object.__getattribute__(obj, "_capsule_pointer")
+    except AttributeError:
+        pointer = None
+    return name, pointer
+
+
+def _capsule_name_bytes(name):
+    if name is None:
+        return None
+    if isinstance(name, str):
+        return name.encode("utf-8", "surrogateescape")
+    return bytes(name)
+
+
+def PyCapsule_Import(name, no_block=0):
+    """Port of PyCapsule_Import (Objects/capsule.c): the first
+    dotted component is imported, the rest are attribute lookups, and
+    the resulting object must be a capsule whose name matches the
+    whole dotted path. `no_block` is ignored, as in CPython."""
+    name = _charp(name)
+    if name is None:
+        raise SystemError("bad argument to internal function")
+    raw = _capsule_name_bytes(name)
+    # strchr()-style split on the raw bytes, one component at a time.
+    obj = None
+    parts = raw.split(b".")
+    for i, part in enumerate(parts):
+        if i == 0:
+            try:
+                modname = part.decode("utf-8")
+            except UnicodeDecodeError:
+                modname = None
+            mod = None
+            if modname is not None:
+                try:
+                    mod = __import__(modname)
+                    # __import__ returns the top-level package; walk to
+                    # the dotted target like PyImport_ImportModule does.
+                    for sub in modname.split(".")[1:]:
+                        mod = getattr(mod, sub)
+                except BaseException as e:
+                    if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                        raise
+                    mod = None
+            if mod is None:
+                shown = part.decode("utf-8", "backslashreplace")
+                raise ImportError(
+                    'PyCapsule_Import could not import module "%s"' % shown
+                )
+            obj = mod
+        else:
+            # PyObject_GetAttrString: the C string must be UTF-8.
+            attr = part.decode("utf-8")
+            obj = getattr(obj, attr)
+    fields = _capsule_fields(obj)
+    if fields is not None:
+        cap_name, pointer = fields
+        cap_raw = _capsule_name_bytes(cap_name)
+        if pointer is not None and cap_raw is not None and cap_raw == raw:
+            if isinstance(pointer, bytes):
+                return pointer.decode("utf-8")
+            return pointer
+    shown = raw.decode("utf-8", "backslashreplace")
+    raise AttributeError('PyCapsule_Import "%s" is not valid' % shown)
+
+
+# =====================================================================
+# PyCodec_* wrappers (Modules/_testcapi/codec.c, _testlimitedcapi/codec.c)
+# =====================================================================
+
+def _bad_argument():
+    raise TypeError("bad argument type for built-in operation")
+
+
+def _codec_lookup(encoding):
+    # _PyCodec_Lookup: a NULL encoding is PyErr_BadArgument().
+    import codecs
+    if encoding is None:
+        _bad_argument()
+    return codecs.lookup(encoding)
+
+
+def codec_register(search_function):
+    import codecs
+    codecs.register(search_function)
+    return None
+
+
+def codec_unregister(search_function):
+    import codecs
+    codecs.unregister(search_function)
+    return None
+
+
+def codec_known_encoding(encoding):
+    # PyCodec_KnownEncoding: a failed lookup is False, never an error.
+    import codecs
+    if encoding is None:
+        return False
+    try:
+        codecs.lookup(encoding)
+    except LookupError:
+        return False
+    return True
+
+
+def codec_encode(input, encoding=None, errors=None):
+    # PyCodec_Encode(input, encoding, errors)
+    import codecs
+    if input is None:
+        raise TypeError("bad argument type for built-in operation")
+    info = _codec_lookup(encoding)
+    result = info.encode(input, errors if errors is not None else "strict")
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise TypeError("encoder must return a tuple (object, integer)")
+    return result[0]
+
+
+def codec_decode(input, encoding=None, errors=None):
+    # PyCodec_Decode(input, encoding, errors)
+    if input is None:
+        raise TypeError("bad argument type for built-in operation")
+    info = _codec_lookup(encoding)
+    result = info.decode(input, errors if errors is not None else "strict")
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise TypeError("decoder must return a tuple (object,integer)")
+    return result[0]
+
+
+def codec_encoder(encoding):
+    return _codec_lookup(encoding).encode
+
+
+def codec_decoder(encoding):
+    return _codec_lookup(encoding).decode
+
+
+def _codec_getincrementalcodec(encoding, errors, attr):
+    factory = getattr(_codec_lookup(encoding), attr)
+    if errors is not None:
+        return factory(errors)
+    return factory()
+
+
+def codec_incremental_encoder(encoding, errors):
+    return _codec_getincrementalcodec(encoding, errors, "incrementalencoder")
+
+
+def codec_incremental_decoder(encoding, errors):
+    return _codec_getincrementalcodec(encoding, errors, "incrementaldecoder")
+
+
+def _codec_getstreamcodec(encoding, stream, errors, attr):
+    factory = getattr(_codec_lookup(encoding), attr)
+    if errors is not None:
+        return factory(stream, errors)
+    return factory(stream)
+
+
+def codec_stream_reader(encoding, stream, errors):
+    return _codec_getstreamcodec(encoding, stream, errors, "streamreader")
+
+
+def codec_stream_writer(encoding, stream, errors):
+    return _codec_getstreamcodec(encoding, stream, errors, "streamwriter")
+
+
+def codec_register_error(encoding, error):
+    import codecs
+    if not isinstance(encoding, str):
+        raise TypeError(
+            "argument 1 must be str, not %s" % type(encoding).__name__
+        )
+    codecs.register_error(encoding, error)
+    return None
+
+
+def codec_lookup_error(name):
+    # PyCodec_LookupError(NULL) is the strict handler.
+    import codecs
+    if name is None:
+        name = "strict"
+    return codecs.lookup_error(name)
+
+
+def codec_strict_errors(exc):
+    import codecs
+    return codecs.strict_errors(exc)
+
+
+def codec_ignore_errors(exc):
+    import codecs
+    return codecs.ignore_errors(exc)
+
+
+def codec_replace_errors(exc):
+    import codecs
+    return codecs.replace_errors(exc)
+
+
+def codec_xmlcharrefreplace_errors(exc):
+    import codecs
+    return codecs.xmlcharrefreplace_errors(exc)
+
+
+def codec_backslashreplace_errors(exc):
+    import codecs
+    return codecs.backslashreplace_errors(exc)
+
+
+def codec_namereplace_errors(exc):
+    import codecs
+    return codecs.namereplace_errors(exc)
+
+
+# =====================================================================
+# PyUnicode{Encode,Decode,Translate}Error_{Get,Set}{Start,End}
+# (Objects/exceptions.c via Modules/_testcapi/exceptions.c)
+# =====================================================================
+
+def _unicode_error_check(exc, exc_type):
+    if exc is None:
+        raise SystemError("bad argument to internal function")
+    if not isinstance(exc, exc_type):
+        raise TypeError(
+            "expected %s, got %s" % (exc_type.__name__, type(exc).__name__)
+        )
+
+
+def _unicode_error_object(exc, exc_type):
+    obj = exc.object
+    if exc_type is UnicodeDecodeError:
+        if not isinstance(obj, (bytes, bytearray)):
+            raise TypeError("object attribute must be bytes")
+    elif not isinstance(obj, str):
+        raise TypeError("object attribute must be unicode")
+    return obj
+
+
+def _unicode_error_get_start(exc, exc_type):
+    # start is clamped to [0, max(0, len - 1)].
+    _unicode_error_check(exc, exc_type)
+    obj = _unicode_error_object(exc, exc_type)
+    start = exc.start
+    if not isinstance(start, int):
+        raise TypeError("start attribute must be int")
+    n = len(obj)
+    if start < 0:
+        return 0
+    if n == 0:
+        return 0
+    return min(start, n - 1)
+
+
+def _unicode_error_get_end(exc, exc_type):
+    # end is clamped to [min(1, len), max(min(1, len), len)].
+    _unicode_error_check(exc, exc_type)
+    obj = _unicode_error_object(exc, exc_type)
+    end = exc.end
+    if not isinstance(end, int):
+        raise TypeError("end attribute must be int")
+    n = len(obj)
+    lo = min(1, n)
+    if end < lo:
+        return lo
+    return min(end, max(lo, n))
+
+
+def _unicode_error_set(exc, exc_type, attr, value):
+    _unicode_error_check(exc, exc_type)
+    if not isinstance(value, int):
+        raise TypeError("an integer is required")
+    setattr(exc, attr, int(value))
+    return None
+
+
+def unicode_encode_get_start(exc):
+    return _unicode_error_get_start(exc, UnicodeEncodeError)
+
+
+def unicode_decode_get_start(exc):
+    return _unicode_error_get_start(exc, UnicodeDecodeError)
+
+
+def unicode_translate_get_start(exc):
+    return _unicode_error_get_start(exc, UnicodeTranslateError)
+
+
+def unicode_encode_set_start(exc, start):
+    return _unicode_error_set(exc, UnicodeEncodeError, "start", start)
+
+
+def unicode_decode_set_start(exc, start):
+    return _unicode_error_set(exc, UnicodeDecodeError, "start", start)
+
+
+def unicode_translate_set_start(exc, start):
+    return _unicode_error_set(exc, UnicodeTranslateError, "start", start)
+
+
+def unicode_encode_get_end(exc):
+    return _unicode_error_get_end(exc, UnicodeEncodeError)
+
+
+def unicode_decode_get_end(exc):
+    return _unicode_error_get_end(exc, UnicodeDecodeError)
+
+
+def unicode_translate_get_end(exc):
+    return _unicode_error_get_end(exc, UnicodeTranslateError)
+
+
+def unicode_encode_set_end(exc, end):
+    return _unicode_error_set(exc, UnicodeEncodeError, "end", end)
+
+
+def unicode_decode_set_end(exc, end):
+    return _unicode_error_set(exc, UnicodeDecodeError, "end", end)
+
+
+def unicode_translate_set_end(exc, end):
+    return _unicode_error_set(exc, UnicodeTranslateError, "end", end)
+
+
+# =====================================================================
+# PyWeakref_* wrappers (Modules/_testlimitedcapi/weakref.c,
+# Modules/_testcapi/weakref.c)
+# =====================================================================
+
+def _weakref_types():
+    import weakref
+    return (weakref.ReferenceType, weakref.ProxyType,
+            weakref.CallableProxyType)
+
+
+def pyweakref_check(obj):
+    # PyWeakref_Check(): any of the three weakref types (subclasses too).
+    return 1 if isinstance(obj, _weakref_types()) else 0
+
+
+def pyweakref_checkref(obj):
+    # PyWeakref_CheckRef()
+    import weakref
+    return 1 if isinstance(obj, weakref.ReferenceType) else 0
+
+
+def pyweakref_checkrefexact(obj):
+    # PyWeakref_CheckRefExact()
+    import weakref
+    return 1 if type(obj) is weakref.ReferenceType else 0
+
+
+def pyweakref_checkproxy(obj):
+    # PyWeakref_CheckProxy()
+    import weakref
+    return 1 if isinstance(obj, (weakref.ProxyType,
+                                 weakref.CallableProxyType)) else 0
+
+
+def pyweakref_newref(obj, callback=None):
+    # PyWeakref_NewRef(); a None callback is the NULL callback.
+    import weakref
+    if callback is None:
+        return weakref.ref(obj)
+    return weakref.ref(obj, callback)
+
+
+def pyweakref_newproxy(obj, callback=None):
+    # PyWeakref_NewProxy()
+    import weakref
+    if callback is None:
+        return weakref.proxy(obj)
+    return weakref.proxy(obj, callback)
+
+
+def _weakref_referent(ref):
+    # Shared by PyWeakref_GetRef / PyWeakref_IsDead: NULL is a
+    # SystemError, a non-weakref a TypeError; proxies are unwrapped
+    # through the underlying reference.
+    import weakref
+    if ref is None:
+        raise SystemError("bad argument to internal function")
+    # `type(ref)` rather than isinstance(): a dead proxy forwards
+    # `__class__` to its referent and would raise ReferenceError.
+    if not issubclass(type(ref), _weakref_types()):
+        raise TypeError("expected a weakref")
+    # Every weakref flavour (ref or proxy) carries the same per-target
+    # deref slot; the ReferenceType-level `__call__` reads it without
+    # going through the proxy's attribute forwarding.
+    return weakref.ReferenceType.__call__(ref)
+
+
+def pyweakref_getref(ref):
+    # PyWeakref_GetRef(): 0 when dead, (1, obj) when alive.
+    obj = _weakref_referent(ref)
+    if obj is None:
+        return 0
+    return (1, obj)
+
+
+def pyweakref_isdead(ref):
+    # PyWeakref_IsDead()
+    return 0 if _weakref_referent(ref) is not None else 1
 
 
 # =====================================================================
@@ -619,7 +1122,19 @@ def function_set_warning():
     # C fixture attributes the warning to the *caller* of the Python
     # function invoking it; this shim adds one extra frame, so use
     # stacklevel 3.
-    import warnings
+    try:
+        import warnings
+    except ImportError:
+        # Interpreter finalization: CPython's C warning machinery can't
+        # import `warnings` either and falls back to the bare
+        # "<file>:<line>: <Category>: <msg>" line (no source line) on
+        # stderr — test_exceptions.test_warn_during_finalization.
+        frame = sys._getframe(2)
+        sys.stderr.write(
+            "%s:%d: RuntimeWarning: Testing PyErr_WarnEx\n"
+            % (frame.f_code.co_filename, frame.f_lineno)
+        )
+        return
 
     warnings.warn("Testing PyErr_WarnEx", RuntimeWarning, 3)
 
@@ -717,6 +1232,38 @@ class _CFuncMisc:
 
 
 @_CFuncMisc
+def _statically_immortal(obj):
+    # The objects CPython allocates in the static data segment (and so
+    # marks immortal, `_Py_IsStaticImmortal`): the singletons, the small
+    # ints, the empty tuple/bytes/str, the latin-1 single characters, and
+    # every static builtin type.
+    if obj is None or obj is True or obj is False:
+        return True
+    if obj is Ellipsis or obj is NotImplemented:
+        return True
+    t = type(obj)
+    if t is int:
+        return -5 <= obj <= 256
+    if t is tuple or t is bytes:
+        return len(obj) == 0 or (t is bytes and len(obj) == 1)
+    if t is str:
+        return len(obj) == 0 or (len(obj) == 1 and ord(obj) < 256)
+    if t is type:
+        return getattr(obj, "__module__", None) == "builtins"
+    return False
+
+
+def is_immortal(obj):
+    """`PyUnstable_IsImmortal(obj)` (test_capi.test_immortal)."""
+    return _statically_immortal(obj)
+
+
+def _is_static_immortal(obj):
+    """`_Py_IsStaticImmortal(obj)`, behind `_testinternalcapi`."""
+    return _statically_immortal(obj)
+
+
+@_CFuncMisc
 def test_immortal_builtins():
     # verify_immortality(): an immortal object's refcount must not
     # respond to new references being created and destroyed.
@@ -752,6 +1299,11 @@ _dict_watch_events = None
 _dict_watchers_installed = 0
 
 _type_watchers = [None] * _TYPE_MAX_WATCHERS
+# 3.14 reserves type watcher slot 0 for the interpreter's own
+# specialization cache (`TYPE_WATCHER_FOR_...` in pycore_typeobject.h),
+# so fixture watchers start at ID 1 (test_watchers.TestTypeWatchers
+# test_error pins "#1").
+_type_watchers[0] = "interp"
 _type_modified_events = None
 _type_watchers_installed = 0
 
@@ -871,7 +1423,7 @@ def _dispatch_type_watch_event(mask, tp):
         if not (mask >> wid) & 1:
             continue
         kind = _type_watchers[wid]
-        if kind is None:
+        if kind is None or kind == "interp":
             continue
         if kind == 1:  # ERROR
             _fire_unraisable(
@@ -1022,6 +1574,95 @@ def allocate_too_many_code_watchers():
         exc = e
     for wid in allocated:
         _code_watchers[wid] = None
+    if exc is not None:
+        raise exc
+
+
+# --- context watchers (3.14) -------------------------------------------
+
+_CONTEXT_MAX_WATCHERS = 8
+_NUM_CONTEXT_WATCHERS = 2
+# slot value: 0/1 = recording fixture watcher, 2 = error watcher,
+# "noop" = allocate_too_many filler.
+_context_watchers = [None] * _CONTEXT_MAX_WATCHERS
+_context_watcher_ids = [-1, -1]
+_context_switches = [None, None]
+
+
+def _dispatch_context_switch(ctx):
+    for wid, which in enumerate(_context_watchers):
+        if which is None or which == "noop":
+            continue
+        if which == 2:
+            _fire_unraisable(
+                RuntimeError("boom!"),
+                "Exception ignored in Py_CONTEXT_SWITCHED watcher callback "
+                "for %r" % (ctx,),
+                None,
+                None,
+            )
+        elif _context_switches[which] is not None:
+            _context_switches[which].append(ctx)
+
+
+def _sync_context_hook():
+    import contextvars
+
+    active = any(w is not None and w != "noop" for w in _context_watchers)
+    contextvars._set_switch_hook(_dispatch_context_switch if active else None)
+
+
+def add_context_watcher(which_watcher):
+    which = int(which_watcher)
+    if which < 0 or which > 2:
+        raise ValueError("invalid watcher %d" % which)
+    wid = _allocate_watcher_slot(_context_watchers, which,
+                                 "no more context watcher IDs available")
+    if which < _NUM_CONTEXT_WATCHERS:
+        _context_watcher_ids[which] = wid
+        _context_switches[which] = []
+    _sync_context_hook()
+    return wid
+
+
+def clear_context_watcher(watcher_id):
+    wid = _validate_watcher_id(_context_watchers, watcher_id, "context")
+    _context_watchers[wid] = None
+    for i in range(_NUM_CONTEXT_WATCHERS):
+        if _context_watcher_ids[i] == wid:
+            _context_watcher_ids[i] = -1
+            _context_switches[i] = None
+    _sync_context_hook()
+
+
+def clear_context_stack():
+    import contextvars
+
+    contextvars._clear_context_stack()
+
+
+def get_context_switches(watcher_id):
+    which = int(watcher_id)
+    if which < 0 or which >= _NUM_CONTEXT_WATCHERS:
+        raise ValueError("invalid watcher %d" % which)
+    if _context_switches[which] is None:
+        return []
+    return _context_switches[which]
+
+
+def allocate_too_many_context_watchers():
+    allocated = []
+    exc = None
+    try:
+        for _ in range(_CONTEXT_MAX_WATCHERS + 1):
+            allocated.append(
+                _allocate_watcher_slot(
+                    _context_watchers, "noop",
+                    "no more context watcher IDs available"))
+    except RuntimeError as e:
+        exc = e
+    for wid in allocated:
+        _context_watchers[wid] = None
     if exc is not None:
         raise exc
 
@@ -1362,14 +2003,13 @@ class _ImmutableMeta(type):
 
 
 def make_immutable_type_with_base(base):
-    import warnings
-
-    warnings.warn(
-        "Creating immutable type ImmutableSubclass from mutable base "
-        "is deprecated, and slated to be disallowed in Python 3.14.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
+    # 3.14: an immutable heap type may not derive from a mutable base
+    # (the 3.12/3.13 DeprecationWarning became the TypeError).
+    if not (base.__flags__ & (1 << 8)):  # Py_TPFLAGS_IMMUTABLETYPE
+        raise TypeError(
+            "Creating immutable type ImmutableSubclass from mutable base %s"
+            % base.__name__
+        )
     return _ImmutableMeta("ImmutableSubclass", (base,), {})
 
 
@@ -1407,18 +2047,11 @@ def pytype_fromspec_meta(meta):
 
 
 def make_type_with_base(base):
-    # PyType_FromSpecWithBases with a custom-tp_new metaclass warns but
-    # still creates "_testcapi.Subclass" (allowed pre-3.14).
+    # PyType_FromSpecWithBases with a custom-tp_new metaclass: deprecated
+    # in 3.12/3.13, a TypeError since 3.14 (typeobject.c
+    # `PyType_FromMetaclass`).
     if getattr(type(base), "_weave_custom_tp_new_", False):
-        import warnings
-
-        warnings.warn(
-            "Type _testcapi.Subclass uses PyType_Spec with a metaclass "
-            "that has custom tp_new. This is deprecated and will no "
-            "longer be allowed in Python 3.14.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
+        raise TypeError("Metaclasses with custom tp_new are not supported.")
     return type(base)("Subclass", (base,), {"__module__": "_testcapi"})
 
 
@@ -1460,7 +2093,38 @@ def subclass_heaptype(base, basicsize, itemsize):
     _skip_needs_native("PyType_FromMetaclass with relative basicsize")
 
 
-def make_heaptype_with_member(extra_base_size, basicsize, offset, relative):
+# `structmember.h` / `typeslots` constants the 3.14 heap-type legs pass.
+Py_TP_USE_SPEC = 0
+Py_T_PYSSIZET = 19
+Py_READONLY = 1
+Py_RELATIVE_OFFSET = 8
+
+def make_heaptype_with_member(extra_base_size=0, basicsize=0, offset=0,
+                              relative=False, *, add_relative_flag=None,
+                              member_name="memb", member_offset=None,
+                              member_type=Py_T_PYSSIZET,
+                              member_flags=Py_READONLY):
+    # The 3.14 special-member leg passes keywords; run CPython's
+    # `type_ready`/`PyType_FromMetaclass` validation for the relative
+    # special offsets (`__dictoffset__` & co.) before deferring the
+    # real struct-member type to native support.
+    if add_relative_flag is not None:
+        relative = add_relative_flag
+    if member_offset is not None:
+        offset = member_offset
+    if relative and basicsize > 0:
+        raise SystemError(
+            "With Py_RELATIVE_OFFSET, basicsize must be negative.")
+    if relative and (offset < 0 or offset >= -basicsize):
+        raise SystemError("Member offset out of range (0..-basicsize)")
+    if member_name in ("__vectorcalloffset__", "__dictoffset__",
+                       "__weaklistoffset__"):
+        if member_type != Py_T_PYSSIZET:
+            raise SystemError(
+                "type of %s must be Py_T_PYSSIZET" % member_name)
+        if member_flags != Py_READONLY:
+            raise SystemError(
+                "flags for %s must be Py_READONLY" % member_name)
     _skip_needs_native("Py_RELATIVE_OFFSET struct members")
 
 
@@ -1609,6 +2273,22 @@ class HeapCTypeWithDict:
         return self.__dict__
 
 
+class HeapCTypeWithRelativeDict:
+    """3.14 _testlimitedcapi twin of HeapCTypeWithDict: the dict slot is
+    declared with Py_RELATIVE_OFFSET (`Py_T_OBJECT_EX` member at a
+    basicsize-relative offset), still a solid layout."""
+
+    _weave_solid_layout_ = "dict"
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        _check_solid_layout_conflict(cls)
+
+    @property
+    def dictobj(self):
+        return self.__dict__
+
+
 class HeapCTypeWithNegativeDict:
     _weave_solid_layout_ = "negative_dict"
 
@@ -1637,8 +2317,52 @@ class HeapCTypeWithWeakref:
         return getattr(self, "__weakref__", None)
 
 
+class HeapCTypeWithRelativeWeakref:
+    """3.14 _testlimitedcapi twin of HeapCTypeWithWeakref (the weaklist
+    slot declared with Py_RELATIVE_OFFSET)."""
+
+    _weave_solid_layout_ = "weakref"
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        _check_solid_layout_conflict(cls)
+
+    @property
+    def weakreflist(self):
+        return getattr(self, "__weakref__", None)
+
+
 class HeapCTypeWithManagedWeakref:
     """Py_TPFLAGS_MANAGED_WEAKREF: plain Python class semantics."""
+
+
+class _VectorcallMeta(type):
+    # `tp()` goes through tp_vectorcall (value = 1); the explicit
+    # `tp.__new__(tp)` + `__init__()` path is tp_new/tp_init (value = 2).
+    def __call__(cls, *args, **kwargs):
+        if cls is HeapCTypeVectorcall and not args and not kwargs:
+            self = cls.__new__(cls)
+            self.value = 1
+            return self
+        return super().__call__(*args, **kwargs)
+
+
+class HeapCTypeVectorcall(metaclass=_VectorcallMeta):
+    """Heap type with a Py_tp_vectorcall slot (3.14
+    heaptype_with_tp_vectorcall)."""
+
+    def __init__(self):
+        self.value = 2
+
+
+class ManualHeapType:
+    """gh-128923: a heap type allocated and initialised by hand
+    (PyType_GenericAlloc + PyType_Ready) rather than PyType_FromSpec."""
+
+
+class ManagedDictType:
+    """Py_TPFLAGS_MANAGED_DICT type built from a spec: `__dict__` is
+    readable and assignable (PyObject_GenericGetDict/SetDict)."""
 
 
 class HeapCTypeSetattr:
@@ -1854,6 +2578,342 @@ class DocStringUnrepresentableSignatureTest:
         "--\n"
         "\n"
         "This docstring has a signature with a default value.")
+
+
+# =====================================================================
+# RFC 0077 WS12 — the CPython 3.14 fixture growth
+# =====================================================================
+#
+# Wrappers for the 3.14 C-API additions (`Modules/_testcapi/*.c` and
+# `_testlimitedcapi/*.c` legs). Where the surface is a real exported
+# symbol (abi314.rs) the wrapper drives it through `ctypes.pythonapi`,
+# so the test exercises the C entry point; pure object-protocol
+# wrappers are written directly.
+
+__all__ += [
+    "PyIter_Next",
+    "PyIter_NextItem",
+    "sequence_fast",
+    "sequence_fast_get_size",
+    "sequence_fast_get_item",
+    "bytes_join",
+    "py_fopen",
+    "py_universalnewlinefgets",
+    "function_get_annotations",
+    "hash_buffer",
+    "PyImport_ImportModuleAttr",
+    "PyImport_ImportModuleAttrString",
+    "pack_full_version",
+    "pack_version",
+    "pyobject_is_unique_temporary",
+    "pyobject_is_unique_temporary_new_object",
+    "pyobject_enable_deferred_refcount",
+    "is_uniquely_referenced",
+    "type_freeze",
+    "create_type_with_token",
+    "get_tp_token",
+    "pytype_getbasebytoken",
+    "pytype_getmodulebydef",
+    "Py_TP_USE_SPEC",
+    "Py_T_PYSSIZET",
+    "Py_READONLY",
+    "Py_RELATIVE_OFFSET",
+]
+
+_pythonapi_cache = {}
+
+
+def _pythonapi(name, restype, *argtypes):
+    """A `ctypes.pythonapi` binding for one exported C-API symbol
+    (memoised); PyDLL semantics raise the pending C exception."""
+    fn = _pythonapi_cache.get(name)
+    if fn is None:
+        import ctypes
+
+        fn = getattr(ctypes.pythonapi, name)
+        fn.restype = restype
+        fn.argtypes = argtypes
+        _pythonapi_cache[name] = fn
+    return fn
+
+
+def PyIter_Next(it):
+    """PyIter_Next(it): the next item, or None (NULL, no error) when
+    the iterator is exhausted; other errors propagate."""
+    try:
+        return type(it).__next__(it)
+    except StopIteration:
+        return None
+
+
+def PyIter_NextItem(it):
+    """PyIter_NextItem(it, &item) (3.14): like PyIter_Next but a
+    non-iterator is a TypeError rather than a crash."""
+    nxt = getattr(type(it), "__next__", None)
+    if nxt is None:
+        raise TypeError(
+            "expected an iterator, got '%s'" % type(it).__name__
+        )
+    try:
+        return nxt(it)
+    except StopIteration:
+        return None
+
+
+def sequence_fast(seq, msg):
+    """PySequence_Fast(seq, msg): a list or tuple passes through, any
+    other iterable becomes a list; `msg` is the TypeError text."""
+    if seq is None:
+        raise SystemError("bad argument to internal function")
+    if isinstance(seq, (list, tuple)):
+        return seq
+    try:
+        return list(seq)
+    except TypeError:
+        raise TypeError(msg) from None
+
+
+def sequence_fast_get_size(fast):
+    """PySequence_Fast_GET_SIZE(o)."""
+    return len(fast)
+
+
+def sequence_fast_get_item(fast, index):
+    """PySequence_Fast_GET_ITEM(o, i)."""
+    return fast[index]
+
+
+def bytes_join(sep, iterable):
+    """PyBytes_Join(sep, iterable) (3.14): `sep` must be exact-or-sub
+    bytes; NULLs are SystemErrors."""
+    if sep is None or iterable is None:
+        raise SystemError("bad argument to internal function")
+    if not isinstance(sep, bytes):
+        raise TypeError(
+            "sep: expected bytes, got %s" % type(sep).__name__
+        )
+    return bytes.join(sep, iterable)
+
+
+def py_fopen(path, mode):
+    """Py_fopen(path, mode) + Py_fclose(): open through the real C entry
+    point and return the first 256 bytes."""
+    import ctypes
+
+    fopen = _pythonapi("Py_fopen", ctypes.c_void_p, ctypes.py_object,
+                       ctypes.c_char_p)
+    fclose = _pythonapi("Py_fclose", ctypes.c_int, ctypes.c_void_p)
+    if isinstance(mode, str):
+        mode = mode.encode("utf-8")
+    fp = fopen(path, mode)
+    if not fp:
+        raise SystemError("Py_fopen returned NULL without an exception")
+    try:
+        libc = ctypes.CDLL(None)
+        fread = libc.fread
+        fread.restype = ctypes.c_size_t
+        fread.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
+                          ctypes.c_void_p)
+        buf = ctypes.create_string_buffer(256)
+        n = fread(buf, 1, 256, fp)
+        return buf.raw[:n]
+    finally:
+        fclose(fp)
+
+
+def py_universalnewlinefgets(filename, size):
+    """Py_UniversalNewlineFgets(buf, size, fp, NULL) on a freshly opened
+    file: the first line with universal-newline translation."""
+    import ctypes
+
+    fopen = _pythonapi("Py_fopen", ctypes.c_void_p, ctypes.py_object,
+                       ctypes.c_char_p)
+    fclose = _pythonapi("Py_fclose", ctypes.c_int, ctypes.c_void_p)
+    fgets = _pythonapi("Py_UniversalNewlineFgets", ctypes.c_void_p,
+                       ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p,
+                       ctypes.c_void_p)
+    fp = fopen(filename, b"rb")
+    try:
+        buf = ctypes.create_string_buffer(int(size))
+        res = fgets(buf, int(size), fp, None)
+        if not res:
+            raise ValueError("Py_UniversalNewlineFgets returned NULL")
+        return buf.value
+    finally:
+        fclose(fp)
+
+
+def function_get_annotations(func):
+    """PyFunction_GetAnnotations(func): the (materialised) annotations
+    dict, or None when the function has none."""
+    if func is None:
+        raise SystemError("bad argument to internal function")
+    if not isinstance(func, types.FunctionType):
+        raise SystemError("bad argument to internal function")
+    annotations = func.__annotations__
+    return annotations if annotations else None
+
+
+def hash_buffer(data):
+    """Py_HashBuffer(ptr, len) (3.14)."""
+    import ctypes
+
+    data = bytes(data)
+    fn = _pythonapi("Py_HashBuffer", ctypes.c_ssize_t, ctypes.c_char_p,
+                    ctypes.c_ssize_t)
+    return fn(data, len(data))
+
+
+def PyImport_ImportModuleAttr(mod_name, attr_name):
+    """PyImport_ImportModuleAttr(mod_name, attr_name) (3.14)."""
+    if mod_name is None or attr_name is None:
+        raise SystemError("bad argument to internal function")
+    if not isinstance(mod_name, str):
+        raise TypeError("module name must be a string")
+    if not isinstance(attr_name, str):
+        raise TypeError("attribute name must be a string")
+    import importlib
+
+    module = importlib.import_module(mod_name)
+    return getattr(module, attr_name)
+
+
+def PyImport_ImportModuleAttrString(mod_name, attr_name):
+    """PyImport_ImportModuleAttrString(mod_name, attr_name) (3.14): the
+    `char*` spelling; bytes are decoded as UTF-8."""
+    if isinstance(mod_name, (bytes, bytearray)):
+        mod_name = bytes(mod_name).decode("utf-8")
+    if isinstance(attr_name, (bytes, bytearray)):
+        attr_name = bytes(attr_name).decode("utf-8")
+    return PyImport_ImportModuleAttr(mod_name, attr_name)
+
+
+def pack_full_version(major, minor, micro, level, serial):
+    """Py_PACK_FULL_VERSION(major, minor, micro, level, serial) (3.14):
+    every field is masked to its width."""
+    return (((major & 0xFF) << 24) | ((minor & 0xFF) << 16)
+            | ((micro & 0xFF) << 8) | ((level & 0xF) << 4) | (serial & 0xF))
+
+
+def pack_version(major, minor):
+    """Py_PACK_VERSION(major, minor) (3.14)."""
+    return pack_full_version(major, minor, 0, 0, 0)
+
+
+def _interned_constant(obj):
+    # 3.14 immortalises the interned string constants of code objects;
+    # `sys.intern` returning the very same object is the observable
+    # signature of that.
+    return type(obj) is str and sys.intern(obj) is obj
+
+
+def pyobject_is_unique_temporary(obj):
+    """PyUnstable_Object_IsUniqueReferencedTemporary(obj) (3.14): the
+    caller's reference is the only one. This wrapper's own parameter
+    binding is the single reference a stack temporary has left;
+    `sys.getrefcount` reads it through a LOAD_FAST_BORROW, so the count
+    is 1 for a temporary and 2+ when a caller's local still binds it."""
+    if _statically_immortal(obj) or _interned_constant(obj):
+        return False
+    return sys.getrefcount(obj) <= 1
+
+
+def pyobject_is_unique_temporary_new_object():
+    """A freshly created C object is never a *stack* temporary."""
+    return False
+
+
+def pyobject_enable_deferred_refcount(obj):
+    """PyUnstable_Object_EnableDeferredRefcount(obj) (3.14): only a
+    free-threaded build enables anything; 0 here."""
+    return 0
+
+
+def is_uniquely_referenced(obj):
+    """PyUnstable_Object_IsUniquelyReferenced(obj) (3.14); same
+    accounting as pyobject_is_unique_temporary."""
+    if _statically_immortal(obj) or _interned_constant(obj):
+        return False
+    return sys.getrefcount(obj) <= 1
+
+
+def type_freeze(tp):
+    """PyType_Freeze(type) (3.14) through the exported entry point: the
+    class becomes immutable once every base is."""
+    import ctypes
+
+    fn = _pythonapi("PyType_Freeze", ctypes.c_int, ctypes.py_object)
+    if fn(tp) < 0:
+        raise SystemError("PyType_Freeze failed without an exception")
+    return None
+
+
+_TP_TOKEN = "__weave_tp_token__"
+_TP_MODULE_DEF = "__weave_tp_module_def__"
+
+
+def create_type_with_token(name, token):
+    """`create_type_with_token(name, token)`: a heap type carrying a
+    `Py_tp_token`; `Py_TP_USE_SPEC` (0) means "the spec's own address",
+    modelled by a fresh unique integer."""
+    module, _, qualname = name.rpartition(".")
+    if token == Py_TP_USE_SPEC:
+        token = id(object.__new__(object)) | 1  # unique, never 0
+        # keep the sentinel alive so its address is never reused
+        _spec_tokens.append(token)
+    ns = {
+        "__module__": module or "_testcapi",
+        _TP_TOKEN: int(token),
+        _TP_MODULE_DEF: "_testcapi",
+    }
+    return type(qualname, (object,), ns)
+
+
+_spec_tokens = []
+
+
+def get_tp_token(tp):
+    """The type's own `Py_tp_token` (0 for static types and pure Python
+    subclasses, which do not inherit it)."""
+    return type.__dict__["__dict__"].__get__(tp).get(_TP_TOKEN, 0)
+
+
+def pytype_getbasebytoken(tp, token, use_mro, want_result):
+    """PyType_GetBaseByToken(type, token, &result): (rc, result)."""
+    if not isinstance(tp, type):
+        raise TypeError(
+            "expected a type, got a '%s' object" % type(tp).__name__
+        )
+    if not token:
+        raise SystemError("PyType_GetBaseByToken called with token=NULL")
+    if use_mro:
+        candidates = tp.__mro__
+    else:
+        candidates = []
+        stack = [tp]
+        while stack:
+            cur = stack.pop(0)
+            if cur in candidates:
+                continue
+            candidates.append(cur)
+            stack.extend(cur.__bases__)
+    for base in candidates:
+        if get_tp_token(base) == token:
+            return (1, base if want_result else None)
+    return (0, None)
+
+
+def pytype_getmodulebydef(tp):
+    """PyType_GetModuleByDef(type, def): the module owning the first
+    heap type in the MRO created from `_testcapi`'s module def."""
+    for base in tp.__mro__:
+        owner = type.__dict__["__dict__"].__get__(base).get(_TP_MODULE_DEF)
+        if owner is not None:
+            return sys.modules[owner]
+    raise TypeError(
+        "PyType_GetModuleByDef: No superclass of '%s' has the given module"
+        % tp.__name__
+    )
 
 
 # =====================================================================

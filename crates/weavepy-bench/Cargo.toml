@@ -18,6 +18,7 @@ path = "src/main.rs"
 # link the interpreter crates at all. The `--jit` column requires the
 # `weavepy` binary itself to be built with `--features weavepy-cli/jit`.
 [dependencies]
+rustc-demangle = "0.1.28"
 serde = { workspace = true }
 serde_json = { workspace = true }
 

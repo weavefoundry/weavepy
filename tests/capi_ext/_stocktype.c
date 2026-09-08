@@ -3,7 +3,7 @@
  * proof.
  *
  * Like `_stockabi.c`, this module is compiled against the host's **stock
- * CPython 3.13 headers** with the *full* (non-limited) API, so it sees
+ * CPython 3.14 headers** with the *full* (non-limited) API, so it sees
  * the genuine 416-byte `PyTypeObject`, the real method-suite structs
  * (`PyNumberMethods`, `PySequenceMethods`, `PyMappingMethods`), and the
  * inlined head macros. Where `_stockabi` proved WeavePy's object
@@ -735,7 +735,7 @@ static PyMethodDef st_methods[] = {
 static struct PyModuleDef st_module = {
     PyModuleDef_HEAD_INIT,
     "_stocktype",
-    "RFC 0044 wave-2 stock-CPython-3.13 static-type-suite proof.",
+    "RFC 0044 wave-2 stock-CPython-3.14 static-type-suite proof.",
     -1,
     st_methods,
     NULL,
@@ -769,6 +769,6 @@ PyMODINIT_FUNC PyInit__stocktype(void) {
         Py_DECREF(m);
         return NULL;
     }
-    PyModule_AddStringConstant(m, "ABI", "cp313");
+    PyModule_AddStringConstant(m, "ABI", "cp314");
     return m;
 }

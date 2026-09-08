@@ -31,7 +31,7 @@ pub use weavepy_vm as vm;
 ///
 /// RFC 0075 moved the loader body into `weavepy-capi`
 /// ([`capi::loader::install_vm_extension_loader`]) so a pure-capi
-/// embedder — a C program linking `libpython313` — imports
+/// embedder — a C program linking `libpython314` — imports
 /// extensions without this umbrella crate in the picture. The
 /// umbrella keeps this entry point for its Rust consumers.
 pub fn install_capi_loader() {
@@ -312,18 +312,53 @@ fn run_source_with_options_impl(
     // `\N{NAME}` escapes resolve through the VM's UCD tables even for this
     // pre-interpreter parse of the main module.
     vm::install_parser_unicode_hook();
-    // RFC 0076 WS15: the `-X lang=next` language preview (PEP 750
-    // t-strings, PEP 758 unparenthesized except lists) must gate this
-    // pre-interpreter parse too, not just the runtime `compile()`/import
-    // paths configured in `apply_run_options`.
-    parser::set_lang_preview(opts.flags.xoptions.iter().any(|x| x == "lang=next"));
+    // RFC 0077 WS11: the 3.14 grammar (PEP 750 t-strings, PEP 758
+    // unparenthesized except lists) is the default. `-X lang=next` is
+    // accepted as a no-op; `-X lang=3.13` pins the previous grammar for
+    // this pre-interpreter parse as well as the runtime paths configured
+    // in `apply_run_options`.
+    parser::set_lang_preview(!opts.flags.xoptions.iter().any(|x| x == "lang=3.13"));
     // Tokenizer-collected invalid-escape diagnostics (CPython's
     // `SyntaxWarning`s) are replayed through the `warnings` machinery
     // once the interpreter is up, just before the module body runs.
     let (module_res, escape_warnings) = parser::parse_module_with_warnings(source_ref);
     let module = match module_res {
         Ok(m) => m,
-        Err(e) => return (None, Err(e.into())),
+        Err(e) => {
+            // CPython parses the main module inside the initialized
+            // interpreter and reports a SyntaxError through
+            // `sys.excepthook` / `traceback` — which is where the 3.14
+            // keyword-typo hints ("Did you mean 'if'?") come from. Bring
+            // an interpreter up (site included, as at CPython init) and
+            // let it rebuild and print the exception.
+            if opts.print_uncaught {
+                let mut interpreter = vm::Interpreter::default();
+                interpreter.apply_run_options(&opts.flags);
+                for p in &opts.extra_path {
+                    interpreter.append_path(p.clone());
+                }
+                let argv: Vec<String> = if opts.argv.is_empty() {
+                    vec![opts.filename.clone()]
+                } else {
+                    opts.argv.clone()
+                };
+                interpreter.set_argv(argv);
+                if !opts.flags.no_site {
+                    let _ = interpreter.run_site();
+                }
+                if let Some(exc) = interpreter.main_module_syntax_error(source_ref, &opts.filename)
+                {
+                    if interpreter.print_uncaught_exception(&exc) {
+                        let _ = interpreter.flush_streams();
+                        return (
+                            None,
+                            Err(Error::RuntimePrinted(vm::RuntimeError::PyException(exc))),
+                        );
+                    }
+                }
+            }
+            return (None, Err(e.into()));
+        }
     };
     // `-O`/`-OO` applies to the main module too (assert/docstring
     // stripping, `__debug__` folding) — RFC 0052.
@@ -388,9 +423,16 @@ fn run_source_with_options_impl(
         let code_rc = vm::sync::Rc::new(code.clone());
         interpreter.register_source_with_linecache(&code_rc, source_ref, "<string>");
     }
-    let result = interpreter
-        .emit_escape_warnings(source_ref, &opts.filename, &escape_warnings)
-        .and_then(|()| interpreter.run_module_as(&code, "__main__", file_for_main));
+    // RFC 0077 WS11: `-X lang=next` is a no-op now that the 3.14 grammar
+    // is the default; say so once per process, before user code runs.
+    let lang_next_requested = opts.flags.xoptions.iter().any(|x| x == "lang=next");
+    let result = (if lang_next_requested {
+        interpreter.emit_lang_next_deprecation()
+    } else {
+        Ok(())
+    })
+    .and_then(|()| interpreter.emit_escape_warnings(source_ref, &opts.filename, &escape_warnings))
+    .and_then(|()| interpreter.run_module_as(&code, "__main__", file_for_main));
     // CPython prints the uncaught exception (via `sys.excepthook` /
     // the traceback module) *before* `Py_FinalizeEx` runs shutdown
     // finalizers — `__del__` output interleaves after the traceback.

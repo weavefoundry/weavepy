@@ -275,7 +275,8 @@ pub struct RegrtestFile {
 ///
 /// Returns the bundled tests in `tests/regrtest/` plus, when present,
 /// the CPython `Lib/test/` files. CPython tests come from one of:
-/// `vendor/cpython/Lib/test/`, `vendor/cpython-tests/`, or — when the
+/// `vendor/cpython314/Lib/test/`, `vendor/cpython/Lib/test/`,
+/// `vendor/cpython-tests/`, or — when the
 /// caller passes [`DiscoveryOptions::cpython_dir`] — an explicit
 /// directory. Only the files mentioned in `expectations.toml` (or the
 /// curated [`CPYTHON_REGRTEST_INCLUDE`] list) are scheduled, unless
@@ -299,9 +300,20 @@ pub fn discover_with(
         collect_bundled(&bundled, &mut out);
     }
 
+    // RFC 0077 WS14: the 3.14 tree (`vendor/cpython314/`) is the oracle;
+    // the 3.13 checkout (`vendor/cpython/`) remains a fallback for the
+    // `weavepy-3.13` maintenance line.
     let cpython_test = opts
         .cpython_dir
         .clone()
+        .or_else(|| {
+            let candidate = workspace_root
+                .join("vendor")
+                .join("cpython314")
+                .join("Lib")
+                .join("test");
+            candidate.is_dir().then_some(candidate)
+        })
         .or_else(|| {
             let candidate = workspace_root
                 .join("vendor")
@@ -1025,6 +1037,17 @@ fn capi_fixtures_dir() -> Option<String> {
     use std::hash::{Hash, Hasher};
     let mut h = std::hash::DefaultHasher::new();
     built_list.hash(&mut h);
+    // A rebuilt fixture (same `OUT_DIR` path, new bytes) must land in a
+    // fresh stage, or every worker keeps loading the previous build:
+    // fold each dylib's size and mtime into the key.
+    for p in &built {
+        if let Ok(meta) = std::fs::metadata(p) {
+            meta.len().hash(&mut h);
+            if let Ok(modified) = meta.modified() {
+                modified.hash(&mut h);
+            }
+        }
+    }
     let shim = std::env::temp_dir().join(format!("weavepy-capi-fixtures-{:016x}", h.finish()));
     if !built
         .iter()
@@ -1057,6 +1080,11 @@ fn libregrtest_bootstrap(file: &RegrtestFile) -> Option<String> {
         .replace('/', ".");
     let lib_dir = cpython_lib_dir(file)?;
     let path = file.path.display().to_string();
+    let main_file = Path::new(&lib_dir)
+        .join("test")
+        .join("__main__.py")
+        .display()
+        .to_string();
     // Compiled C-API fixtures (`_testbuffer`, RFC 0066 WS1): appended to
     // the tail of `sys.path` so they can never shadow the stdlib.
     // (Also on the default path via WEAVEPY_CPYTHON_LIB — the guard keeps
@@ -1096,6 +1124,21 @@ if {name:?}.split(".")[0] == "test_importlib":
 del _lib
 {fixtures}
 sys.argv = [{path:?}]
+# Under `python -m test` the `__main__` module is `Lib/test/__main__.py`:
+# it carries a `__file__` and a `__spec__` named `test.__main__`. This
+# `-c` bootstrap stands in for it, so give `__main__` both.
+# test_capi.test_run's PyRun_*File legs read and temporarily delete
+# `sys.modules['__main__'].__file__` around every subtest, and the spec
+# is what keeps `multiprocessing`'s spawn preparation on the
+# `init_main_from_name` route (which skips `*.__main__` modules) instead
+# of `init_main_from_path` — without it every spawned worker would
+# *execute* `test/__main__.py`, i.e. run the whole suite (RFC 0077
+# Phase II).
+import importlib.util as _ilu
+_main = sys.modules["__main__"]
+_main.__file__ = {main_file:?}
+_main.__spec__ = _ilu.spec_from_file_location("test.__main__", {main_file:?})
+del _ilu, _main
 import unittest
 # Run inside a fresh scratch working directory, like libregrtest's per-worker
 # `temp_cwd`. CPython's suite assumes a disposable cwd: `test.support.os_helper`

@@ -255,11 +255,13 @@ def _args_from_interpreter_flags():
 
     if dev_mode:
         args.extend(("-X", "dev"))
-    for opt in ("faulthandler", "tracemalloc", "importtime", "showrefcount", "utf8"):
-        if opt in xoptions:
-            value = xoptions[opt]
-            arg = opt if value is True else "%s=%s" % (opt, value)
-            args.extend(("-X", arg))
+    for opt in sorted(xoptions):
+        if opt == "dev":
+            # handled above via sys.flags.dev_mode
+            continue
+        value = xoptions[opt]
+        arg = opt if value is True else "%s=%s" % (opt, value)
+        args.extend(("-X", arg))
 
     return args
 
@@ -852,7 +854,7 @@ class Popen:
                     errpipe_read, errpipe_write,
                     bool(restore_signals), bool(start_new_session),
                     int(process_group), gid, gids, uid, int(umask),
-                    preexec_fn, False,
+                    preexec_fn,
                 )
                 # A child now exists (even if it fails to exec, fork_exec
                 # returned its pid and we must reap it). Only mark it created
@@ -1421,9 +1423,9 @@ class Popen:
                     except TimeoutExpired:
                         pass
                 self._sigint_wait_secs = 0  # Note that this has been done.
-                return  # resume the KeyboardInterrupt
-            # Wait for the process to terminate, to avoid zombies.
-            self.wait()
+            else:
+                # Wait for the process to terminate, to avoid zombies.
+                self.wait()
 
     def __del__(self, _maxsize=sys.maxsize, _warn=warnings.warn):
         if not self._child_created:

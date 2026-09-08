@@ -535,18 +535,22 @@ fn bind_sequence(
     }
     for i in 0..supplied {
         let idx = (i + 1) as i32;
-        // gh-101698: binding a *named* parameter positionally is
-        // deprecated ("?N" indexed placeholders are exempt).
+        // gh-101698: binding a *named* parameter positionally was
+        // deprecated in 3.12 and is a ProgrammingError since 3.14 ("?N"
+        // indexed placeholders are exempt).
         // SAFETY: live statement, in-range index.
         let name_ptr = unsafe { ffi::sqlite3_bind_parameter_name(stmt.stmt(), idx) };
         if !name_ptr.is_null() {
             // SAFETY: non-null parameter name is NUL-terminated.
             let name = unsafe { super::cstr_to_string(name_ptr) };
             if !name.starts_with('?') {
-                ip.warn_deprecation_from_builtin(format!(
-                    "Binding {idx} ('{name}') is a named parameter. Starting with Python 3.14, \
-                     named parameters must not be bound positionally; use a dict instead."
-                ))?;
+                return Err(super::raise(
+                    super::programming_error_class(),
+                    format!(
+                        "Binding {idx} ('{name}') is a named parameter, but you supplied a \
+                         sequence which requires nameless (qmark) placeholders."
+                    ),
+                ));
             }
         }
         let value = get(ip, i)?;

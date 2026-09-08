@@ -1,11 +1,11 @@
 //! The WeavePy runtime as a CPython-ABI shared library (RFC 0064 WS1).
 //!
-//! On Windows this crate builds `python313.dll` — the module name
-//! every CPython-3.13 extension's PE import table references. The
+//! On Windows this crate builds `python314.dll` — the module name
+//! every CPython-3.14 extension's PE import table references. The
 //! whole interpreter lives here: the `weavepy.exe` shim
 //! (`weavepy-cli/src/main.rs`) loads this DLL and calls
 //! [`weavepy_main`], and a `.pyd` loaded later binds its
-//! `python313.dll` imports to this already-loaded module, so there is
+//! `python314.dll` imports to this already-loaded module, so there is
 //! exactly one runtime in the process.
 //!
 //! The C-API itself needs no code in this crate: the ~682
@@ -17,7 +17,7 @@
 //! [`weavepy_main`] for the shim, and the CPython embedding twins
 //! [`Py_Main`] / [`Py_BytesMain`] that stock `pylifecycle.h` declares.
 //!
-//! On POSIX the same crate builds `libpython313.{so,dylib}`; it is
+//! On POSIX the same crate builds `libpython314.{so,dylib}`; it is
 //! compiled everywhere (keeping the export surface honest on every
 //! `cargo test --workspace`) but only the Windows artifact ships —
 //! the POSIX distribution keeps its fully-static binary (RFC 0064

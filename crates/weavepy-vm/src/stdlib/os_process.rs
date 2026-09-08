@@ -25,8 +25,6 @@ use crate::object::{DictData, DictKey, Object};
 // `-D warnings` on other targets.
 #[cfg(any(unix, windows))]
 use crate::sync::{Rc, RefCell};
-#[cfg(unix)]
-use parking_lot::Mutex;
 
 #[cfg(unix)]
 use std::ffi::CString;
@@ -546,6 +544,9 @@ fn os_fork(_args: &[Object]) -> Result<Object, RuntimeError> {
         // `_PyImport_ReInitLock`: drop the fork-time acquisition and hand
         // any remaining user-held levels to this (sole surviving) thread.
         crate::stdlib::imp_mod::import_lock_reinit_in_child();
+        // 3.14: the `_asyncio` current task is thread-state-bound and does
+        // not survive into the child (`TestFork.test_fork_not_share_current_task`).
+        crate::stdlib::asyncio_mod::clear_current_tasks_after_fork_in_child();
         run_atfork(AtForkPhase::Child);
     } else {
         // `PyOS_AfterFork_Parent`: release the fork-time import-lock level.
@@ -1837,15 +1838,24 @@ enum AtForkPhase {
     Child,
 }
 
+/// CPython `interp->before_forkers` / `after_forkers_parent` /
+/// `after_forkers_child`. Per *interpreter* — every thread of an
+/// interpreter shares the handle (`Interpreter::fork_for_thread`) and a
+/// sub-interpreter starts with an empty one — never process-global: a
+/// closed sub-interpreter's `threading._after_fork` and
+/// `logging._afterFork` left in a global list rooted, through their
+/// `__globals__`, that interpreter's entire module graph for the life
+/// of the process.
 #[cfg(unix)]
-struct AtForkHandlers {
+#[derive(Default)]
+pub(crate) struct AtForkHandlers {
     before: Vec<Object>,
     after_in_parent: Vec<Object>,
     after_in_child: Vec<Object>,
 }
 
 #[cfg(unix)]
-static ATFORK: Mutex<Option<AtForkHandlers>> = Mutex::new(None);
+pub(crate) type AtForkRegistry = Rc<RefCell<AtForkHandlers>>;
 
 /// `os.register_at_fork(*, before=None, after_in_parent=None,
 /// after_in_child=None)` — record callables fired around `os.fork()` and
@@ -1892,12 +1902,15 @@ pub(super) fn register_at_fork_kw(
     if !has_handler {
         return Err(type_error("At least one argument is required."));
     }
-    let mut guard = ATFORK.lock();
-    let h = guard.get_or_insert_with(|| AtForkHandlers {
-        before: Vec::new(),
-        after_in_parent: Vec::new(),
-        after_in_child: Vec::new(),
-    });
+    let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
+        return Err(crate::error::runtime_error(
+            "register_at_fork(): no running interpreter",
+        ));
+    };
+    // SAFETY: published by the active builtin call on this thread; the
+    // GIL keeps the access exclusive.
+    let interp = unsafe { &*ptr };
+    let mut h = interp.atfork_handlers.borrow_mut();
     for (k, v) in kwargs {
         match k.as_str() {
             "before" => h.before.push(v.clone()),
@@ -1911,25 +1924,24 @@ pub(super) fn register_at_fork_kw(
 
 #[cfg(unix)]
 fn run_atfork(phase: AtForkPhase) {
-    let handlers: Vec<Object> = {
-        let guard = ATFORK.lock();
-        match guard.as_ref() {
-            None => return,
-            Some(h) => match phase {
-                // `before` handlers run in reverse registration order.
-                AtForkPhase::Before => h.before.iter().rev().cloned().collect(),
-                AtForkPhase::Parent => h.after_in_parent.clone(),
-                AtForkPhase::Child => h.after_in_child.clone(),
-            },
-        }
-    };
-    if handlers.is_empty() {
-        return;
-    }
+    // `PyOS_BeforeFork`/`PyOS_AfterFork_*` run the *current*
+    // interpreter's hooks.
     if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
         // SAFETY: published by the active builtin call on this thread; the
         // interpreter outlives this synchronous re-entrant call.
         let interp = unsafe { &mut *ptr };
+        let handlers: Vec<Object> = {
+            let h = interp.atfork_handlers.borrow();
+            match phase {
+                // `before` handlers run in reverse registration order.
+                AtForkPhase::Before => h.before.iter().rev().cloned().collect(),
+                AtForkPhase::Parent => h.after_in_parent.clone(),
+                AtForkPhase::Child => h.after_in_child.clone(),
+            }
+        };
+        if handlers.is_empty() {
+            return;
+        }
         for h in handlers {
             let _ = interp.call_object(h, &[], &[]);
         }

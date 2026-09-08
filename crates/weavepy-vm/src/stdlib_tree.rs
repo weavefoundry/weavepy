@@ -24,10 +24,10 @@
 //!    keep their `<frozen name>` pseudo-filenames — the pre-RFC-0053
 //!    behavior, and the graceful degradation mode for read-only
 //!    filesystems).
-//! 2. `WEAVEPYHOME` (or `PYTHONHOME`): `{home}/lib/weavepy3.13` is
+//! 2. `WEAVEPYHOME` (or `PYTHONHOME`): `{home}/lib/weavepy3.14` is
 //!    accepted if the `os.py` landmark exists — an installed layout.
 //! 3. Landmark search relative to the executable: any ancestor `d`
-//!    of the binary with `d/lib/weavepy3.13/os.py`.
+//!    of the binary with `d/lib/weavepy3.14/os.py`.
 //! 4. Fallback: a per-build cache prefix under the user cache
 //!    directory, extracted on demand (idempotent, concurrency-safe:
 //!    write to a temp dir, `rename` into place, `COMPLETE` marker).
@@ -36,10 +36,10 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Implementation-specific lib directory name. Deliberately
-/// `weavepy3.13`, not `python3.13`, so a WeavePy tree and a CPython
+/// `weavepy3.14`, not `python3.14`, so a WeavePy tree and a CPython
 /// install can never shadow each other (same trade as the
-/// `weavepy-313` bytecode cache tag from RFC 0033).
-pub const LIB_DIR_NAME: &str = "weavepy3.13";
+/// `weavepy-314` bytecode cache tag from RFC 0033).
+pub const LIB_DIR_NAME: &str = weavepy_version::LIB_DIR_NAME;
 
 const COMPLETE_MARKER: &str = ".weavepy-complete";
 
@@ -133,7 +133,7 @@ const DATA_FILES: &[(&str, &str)] = &[
 /// `_PIP_VERSION` and refuses to uninstall a mismatched install.
 pub const PIP_WHEEL_NAME: &str = "pip-24.0.0+weavepy-py3-none-any.whl";
 
-/// The materialized stdlib directory (`…/lib/weavepy3.13`) for this
+/// The materialized stdlib directory (`…/lib/weavepy3.14`) for this
 /// process, or `None` when disabled or unavailable. Resolved once;
 /// the warm path after first call is a pointer read.
 pub fn stdlib_dir() -> Option<&'static Path> {
@@ -142,17 +142,17 @@ pub fn stdlib_dir() -> Option<&'static Path> {
 }
 
 /// The installation prefix implied by the stdlib dir
-/// (`{prefix}/lib/weavepy3.13`).
+/// (`{prefix}/lib/weavepy3.14`).
 pub fn prefix() -> Option<&'static Path> {
     stdlib_dir().and_then(|d| d.parent()).and_then(Path::parent)
 }
 
 /// Whether `prefix` carries an installed WeavePy home — a complete
-/// `{prefix}/lib/weavepy3.13` tree. RFC 0075 (embedding): CPython's
+/// `{prefix}/lib/weavepy3.14` tree. RFC 0075 (embedding): CPython's
 /// getpath falls back to computing the prefix from the *shared
 /// library's* location when the program itself is a foreign embedder
 /// binary; `Py_InitializeFromConfig` uses this predicate to run the
-/// same probe over the `libpython3.13` on-disk path (dladdr).
+/// same probe over the `libpython3.14` on-disk path (dladdr).
 pub fn is_home_prefix(prefix: &Path) -> bool {
     prefix
         .join("lib")
@@ -215,7 +215,7 @@ fn rel_path(name: &str, is_package: bool) -> PathBuf {
 /// aliases, markers — anything `materialize` writes that is not an
 /// embedded source). Bump when the shape changes so existing caches
 /// keyed on unchanged sources are not mistaken for the new layout.
-const TREE_FORMAT: &str = "tree-format-3";
+const TREE_FORMAT: &str = "tree-format-4";
 
 /// FNV-1a over every frozen module's name and source, mixed with the
 /// crate version. Any change to any embedded byte lands in a new
@@ -380,7 +380,7 @@ pub fn set_program_name_override(name: Option<PathBuf>) {
 /// and `pyvenv.cfg` is never found (macOS returns the exec'd path and
 /// dodges this). Falls back to `current_exe()` when argv[0] is absent
 /// or doesn't name a real file (misleading custom argv0).
-pub(crate) fn program_exe() -> Option<PathBuf> {
+pub fn program_exe() -> Option<PathBuf> {
     if let Some(name) = PROGRAM_NAME_OVERRIDE.lock().unwrap().clone() {
         // getpath's program_full_path: relative-with-separator paths
         // are cwd-anchored; bare names are PATH-searched, and an
@@ -497,19 +497,44 @@ fn resolve() -> Option<PathBuf> {
     let prefix = root.join(format!("{:016x}", build_id()));
     let lib = prefix.join("lib").join(LIB_DIR_NAME);
     if lib.join(COMPLETE_MARKER).is_file() {
+        // The cache tree is keyed on the build, not the binary's location,
+        // so another copy of this same build (a probe under /tmp, a
+        // renamed artifact) may have written the exe-derived metadata
+        // (`BINDIR`, `base_interpreter`). Re-key it to *this* executable
+        // when it disagrees (`test_build_details.test_base_interpreter`).
+        #[cfg(unix)]
+        refresh_install_metadata(&prefix, &lib);
         return Some(lib);
     }
     materialize(&prefix).then_some(lib)
 }
 
+/// Rewrite the two exe-dependent metadata files under `lib` when
+/// `build-details.json` names a different interpreter than the running one.
+#[cfg(unix)]
+fn refresh_install_metadata(prefix: &Path, lib: &Path) {
+    let Some(exe) = program_exe() else { return };
+    let current = std::fs::read_to_string(lib.join("build-details.json")).unwrap_or_default();
+    let recorded = serde_json::from_str::<serde_json::Value>(&current)
+        .ok()
+        .and_then(|v| {
+            v.get("base_interpreter")
+                .and_then(|b| b.as_str().map(str::to_owned))
+        });
+    if recorded.as_deref() == Some(exe.to_string_lossy().as_ref()) {
+        return;
+    }
+    let _ = write_install_json(lib, prefix);
+}
+
 /// Walk `exe`'s ancestors for the installed-layout landmark
-/// (`{d}/lib/weavepy3.13/.weavepy-complete`).
+/// (`{d}/lib/weavepy3.14/.weavepy-complete`).
 ///
 /// The walk starts at the exe's own directory, which covers both
 /// artifact shapes without a special case: the POSIX layout
 /// (`{prefix}/bin/weavepy`) finds the landmark one level up, and the
 /// RFC 0063 WS6 NT layout — `python.exe` at the prefix root, no
-/// `bin\` — finds `{prefix}/lib/weavepy3.13` on the very first probe.
+/// `bin\` — finds `{prefix}/lib/weavepy3.14` on the very first probe.
 fn landmark_walk(exe: &Path) -> Option<PathBuf> {
     let mut dir = exe.parent();
     while let Some(d) = dir {
@@ -586,7 +611,7 @@ fn cache_root() -> Option<PathBuf> {
     Some(std::env::temp_dir().join(per_user))
 }
 
-/// Extract the embedded stdlib into `{prefix}/lib/weavepy3.13`.
+/// Extract the embedded stdlib into `{prefix}/lib/weavepy3.14`.
 /// Concurrency-safe against sibling WeavePy processes (the regrtest
 /// harness spawns many at once on a cold cache): each writer builds a
 /// private `{prefix}.tmp-{pid}` tree and renames it into place; the
@@ -613,13 +638,13 @@ fn materialize(prefix: &Path) -> bool {
             std::fs::write(&path, src.source)?;
         }
         // `sysconfig`'s posix_prefix scheme derives `stdlib`/`purelib`
-        // as `{prefix}/lib/python3.13[/site-packages]`. Make those
-        // paths real inside our private prefix: a `python3.13` symlink
+        // as `{prefix}/lib/python3.14[/site-packages]`. Make those
+        // paths real inside our private prefix: a `python3.14` symlink
         // onto the tree (POSIX only) and an empty `site-packages`.
         // Nothing outside this hash-keyed prefix ever resolves the
         // alias, so it cannot shadow a CPython install. On Windows the
         // symlink is skipped outright — the `nt` scheme names
-        // `lib/weavepy3.13` directly (RFC 0063 WS6), so there is no
+        // `lib/weavepy3.14` directly (RFC 0063 WS6), so there is no
         // alias to make real (and NTFS symlinks need privileges).
         std::fs::create_dir_all(tmp_lib.join("site-packages"))?;
         #[cfg(unix)]
@@ -631,9 +656,9 @@ fn materialize(prefix: &Path) -> bool {
         }
         // RFC 0055 WS1 — the installation artifacts `sysconfig`
         // points at must exist for the surface to be truthful:
-        // `get_makefile_filename()` → `{stdlib}/config-3.13-{multiarch}/
+        // `get_makefile_filename()` → `{stdlib}/config-3.14-{multiarch}/
         // Makefile` (also `srcdir`), and `get_config_h_filename()` →
-        // `{prefix}/include/python3.13/pyconfig.h`. Both carry the
+        // `{prefix}/include/python3.14/pyconfig.h`. Both carry the
         // same variables the frozen `_weave_sysconfigdata` reports, in
         // CPython's on-disk formats (`_parse_makefile`/`parse_config_h`
         // can read them back).
@@ -683,7 +708,7 @@ fn materialize(prefix: &Path) -> bool {
             )?;
             // RFC 0062 WS2 — the installable header surface. A real
             // CPython install ships the full `Include/` tree plus the
-            // generated `pyconfig.h` under `{prefix}/include/python3.13/`
+            // generated `pyconfig.h` under `{prefix}/include/python3.14/`
             // on POSIX and directly under `{prefix}\Include` on Windows
             // (RFC 0063 WS6 — sysconfig's `nt` scheme and therefore
             // `INCLUDEPY` resolve there, with no versioned subdir).
@@ -736,6 +761,12 @@ fn materialize(prefix: &Path) -> bool {
             std::fs::create_dir_all(&bundled)?;
             std::fs::write(bundled.join(PIP_WHEEL_NAME), pip_wheel_bytes())?;
         }
+        // CPython 3.14's installed metadata (POSIX): the
+        // `_sysconfig_vars__*.json` snapshot of `sysconfig.get_config_vars()`
+        // and PEP 739's `build-details.json`, both keyed on the *final*
+        // prefix the tree is renamed into.
+        #[cfg(unix)]
+        write_install_metadata(&tmp_prefix, &tmp_lib, prefix)?;
         std::fs::write(
             tmp_lib.join(COMPLETE_MARKER),
             format!("{:016x}\n", build_id()),
@@ -761,6 +792,301 @@ fn materialize(prefix: &Path) -> bool {
                 .is_file()
         }
     }
+}
+
+/// `os.uname()` fields `(sysname, release, machine)`.
+#[cfg(unix)]
+fn uname_fields() -> (String, String, String) {
+    fn field(raw: &[libc::c_char]) -> String {
+        let bytes: Vec<u8> = raw
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+    // SAFETY: `uname` fills the zeroed struct; the fields are read back
+    // as NUL-terminated C strings.
+    let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&raw mut u) } != 0 {
+        return (String::new(), String::new(), String::new());
+    }
+    (field(&u.sysname), field(&u.release), field(&u.machine))
+}
+
+/// `sysconfig.get_platform()` for this host, computed the way the
+/// verbatim `sysconfig`/`_osx_support` do so `build-details.json`'s
+/// `platform` agrees with the running interpreter
+/// (`test_build_details.test_platform`).
+#[cfg(unix)]
+fn sysconfig_platform() -> String {
+    let (osname, release, machine) = uname_fields();
+    let osname = osname.to_lowercase().replace('/', "");
+    let machine = machine.replace(' ', "_").replace('/', "-");
+    if osname.starts_with("linux") {
+        return format!("{osname}-{machine}");
+    }
+    if osname == "darwin" {
+        // `_osx_support._get_system_version()`: the first two components
+        // of `ProductUserVisibleVersion` from SystemVersion.plist.
+        let plist = std::fs::read_to_string("/System/Library/CoreServices/SystemVersion.plist")
+            .unwrap_or_default();
+        let macver = plist
+            .split("<key>ProductUserVisibleVersion</key>")
+            .nth(1)
+            .and_then(|rest| rest.split("<string>").nth(1))
+            .and_then(|rest| rest.split("</string>").next())
+            .map(|v| v.trim().split('.').take(2).collect::<Vec<_>>().join("."))
+            .filter(|v| !v.is_empty());
+        return match macver {
+            Some(ver) => format!("macosx-{ver}-{machine}"),
+            None => format!("{osname}-{release}-{machine}"),
+        };
+    }
+    format!("{osname}-{release}-{machine}")
+}
+
+/// Write the 3.14 install-time metadata into the tree being built:
+///
+/// * `{stdlib}/_sysconfig_vars_{abiflags}_{platform}_{multiarch}.json`
+///   — gh-127178's JSON twin of `_sysconfigdata`, holding exactly what
+///   `sysconfig.get_config_vars()` reports for this prefix (the frozen
+///   `_weave_sysconfigdata` plus the keys `sysconfig._init_config_vars`
+///   layers on; `test_sysconfig.test_sysconfigdata_json` diffs the two).
+/// * `{stdlib}/build-details.json` — PEP 739 (`test_build_details`).
+/// * `{prefix}/lib/pkgconfig/python-3.14.pc` — the relocatable pc file
+///   `build-details.json`'s `c_api.pkgconfig_path` points at (the dist
+///   tool rewrites it and adds the `python3.pc` aliases).
+#[cfg(unix)]
+fn write_install_metadata(
+    tmp_prefix: &Path,
+    tmp_lib: &Path,
+    final_prefix: &Path,
+) -> std::io::Result<()> {
+    write_install_json(tmp_lib, final_prefix)?;
+    let version_short = weavepy_version::SHORT;
+    let pc_dir = tmp_prefix.join("lib").join("pkgconfig");
+    std::fs::create_dir_all(&pc_dir)?;
+    std::fs::write(
+        pc_dir.join(format!("python-{version_short}.pc")),
+        format!(
+            "# WeavePy (RFC 0075 WS5) — relocatable via ${{pcfiledir}}.\n\
+             prefix=${{pcfiledir}}/../..\n\
+             exec_prefix=${{prefix}}\n\
+             libdir=${{prefix}}/lib\n\
+             includedir=${{prefix}}/include\n\
+             \n\
+             Name: Python\n\
+             Description: Embed WeavePy (CPython {version_short}-compatible) into an application\n\
+             Requires:\n\
+             Version: {version_short}\n\
+             Libs.private: -lm\n\
+             Libs: \n\
+             Cflags: -I${{includedir}}/python{version_short}\n"
+        ),
+    )
+}
+
+/// Atomically place `contents` at `path` (write-then-rename), so a
+/// concurrent reader never sees a truncated JSON file.
+#[cfg(unix)]
+fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// The two exe-dependent JSON files in the stdlib dir:
+/// `_sysconfig_vars__*.json` and PEP 739's `build-details.json`, keyed on
+/// `final_prefix` and the running executable.
+#[cfg(unix)]
+fn write_install_json(tmp_lib: &Path, final_prefix: &Path) -> std::io::Result<()> {
+    use serde_json::{json, Map, Value};
+
+    let version_short = weavepy_version::SHORT;
+    let multiarch = crate::stdlib::sysconfig_native::MULTIARCH;
+    let prefix = final_prefix.to_string_lossy().into_owned();
+    let join = |parts: &[&str]| -> String {
+        let mut p = final_prefix.to_path_buf();
+        for part in parts {
+            p.push(part);
+        }
+        p.to_string_lossy().into_owned()
+    };
+    let python_lib = format!("python{version_short}");
+    let libdest = join(&["lib", &python_lib]);
+    let includepy = join(&["include", &python_lib]);
+    let config_dir_name = if multiarch.is_empty() {
+        format!("config-{version_short}")
+    } else {
+        format!("config-{version_short}-{multiarch}")
+    };
+    // `srcdir` is `os.path.realpath(dirname(get_makefile_filename()))`;
+    // the final prefix doesn't exist yet, so canonicalize its parent.
+    let srcdir = final_prefix
+        .parent()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .and_then(|real| final_prefix.file_name().map(|n| real.join(n)))
+        .unwrap_or_else(|| final_prefix.to_path_buf())
+        .join("lib")
+        .join(LIB_DIR_NAME)
+        .join(&config_dir_name)
+        .to_string_lossy()
+        .into_owned();
+    let exe = program_exe();
+    let bindir = exe
+        .as_deref()
+        .and_then(Path::parent)
+        .map_or_else(|| join(&["bin"]), |d| d.to_string_lossy().into_owned());
+    let sys_platform = if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "freebsd") {
+        "freebsd"
+    } else {
+        "unknown"
+    };
+    let (ccshared, ldshared, ldcxxshared) = (
+        crate::stdlib::sysconfig_native::CCSHARED,
+        crate::stdlib::sysconfig_native::LDSHARED,
+        crate::stdlib::sysconfig_native::LDCXXSHARED,
+    );
+
+    // Mirrors `_weave_sysconfigdata.build_time_vars` (keep in sync) …
+    let mut vars: Map<String, Value> = Map::new();
+    let mut put = |k: &str, v: Value| {
+        vars.insert(k.to_owned(), v);
+    };
+    put("ABIFLAGS", json!(""));
+    put("AR", json!("ar"));
+    put("ARFLAGS", json!("rcs"));
+    put("BINDIR", json!(bindir));
+    put("BINLIBDEST", json!(libdest));
+    put("CC", json!(crate::stdlib::sysconfig_native::CC));
+    put("CCSHARED", json!(ccshared));
+    put("CFLAGS", json!(crate::stdlib::sysconfig_native::CFLAGS));
+    put("CONFINCLUDEPY", json!(includepy));
+    put("CXX", json!(crate::stdlib::sysconfig_native::CXX));
+    put("EXE", json!(""));
+    put(
+        "EXT_SUFFIX",
+        json!(crate::stdlib::sysconfig_native::EXT_SUFFIX),
+    );
+    put("HOST_GNU_TYPE", json!(""));
+    put("INCLUDEPY", json!(includepy));
+    put("LDCXXSHARED", json!(ldcxxshared));
+    put("LDFLAGS", json!(""));
+    put("LDLIBRARY", json!(format!("libpython{version_short}.a")));
+    put("LIBPYTHON", json!(""));
+    put("LDSHARED", json!(ldshared));
+    put("BLDSHARED", json!(ldshared));
+    put("LDVERSION", json!(version_short));
+    put("OPT", json!(crate::stdlib::sysconfig_native::OPT));
+    put("LIBDEST", json!(libdest));
+    put("LIBDIR", json!(join(&["lib"])));
+    put("LIBRARY", json!(format!("libpython{version_short}.a")));
+    put("MULTIARCH", json!(multiarch));
+    put("Py_DEBUG", json!(0));
+    put("Py_ENABLE_SHARED", json!(0));
+    put("Py_GIL_DISABLED", json!(0));
+    put("SHLIB_SUFFIX", json!(".so"));
+    put("SIZEOF_VOID_P", json!(8));
+    put("SOABI", json!(crate::stdlib::sysconfig_native::SOABI));
+    put("srcdir", json!(srcdir));
+    put(
+        "TZPATH",
+        json!("/usr/share/zoneinfo:/usr/lib/zoneinfo:/usr/share/lib/zoneinfo:/etc/zoneinfo"),
+    );
+    put("VERSION", json!(version_short));
+    put("WITH_DOC_STRINGS", json!(1));
+    put("WITH_PYMALLOC", json!(0));
+    put("exec_prefix", json!(prefix));
+    put("platlibdir", json!("lib"));
+    put("prefix", json!(prefix));
+    if cfg!(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )) {
+        put("HAVE_GETENTROPY", json!(1));
+    } else if cfg!(target_os = "linux") {
+        put("HAVE_GETRANDOM_SYSCALL", json!(1));
+        put("HAVE_GETRANDOM", json!(1));
+        put("HAVE_GETENTROPY", json!(1));
+    }
+    // … plus what `sysconfig._init_config_vars` adds (`userbase` is
+    // environment-dependent and excluded by the test on both sides).
+    put("py_version", json!(weavepy_version::FULL));
+    put("py_version_short", json!(version_short));
+    put("py_version_nodot", json!(weavepy_version::NODOT));
+    put("installed_base", json!(prefix));
+    put("base", json!(prefix));
+    put("installed_platbase", json!(prefix));
+    put("platbase", json!(prefix));
+    put("projectbase", json!(bindir));
+    put("implementation", json!("Python"));
+    put("implementation_lower", json!("python"));
+    put("stdlib_impl_lower", json!("weavepy"));
+    put("abiflags", json!(""));
+    put("py_version_nodot_plat", json!(""));
+    put("abi_thread", json!(""));
+    let json_name = format!("_sysconfig_vars__{sys_platform}_{multiarch}.json");
+    write_atomic(
+        &tmp_lib.join(json_name),
+        &serde_json::to_string_pretty(&Value::Object(vars)).unwrap_or_default(),
+    )?;
+
+    // PEP 739 build details.
+    let version_info = json!({
+        "major": weavepy_version::MAJOR,
+        "minor": weavepy_version::MINOR,
+        "micro": weavepy_version::MICRO,
+        "releaselevel": "final",
+        "serial": 0,
+    });
+    let mut implementation = json!({
+        "name": "weavepy",
+        "cache_tag": crate::pycache::CACHE_TAG,
+        "version": version_info.clone(),
+        "hexversion": weavepy_version::HEX,
+        "supports_isolated_interpreters": true,
+    });
+    if !multiarch.is_empty() {
+        implementation["_multiarch"] = json!(multiarch);
+    }
+    let mut details = json!({
+        "schema_version": "1.0",
+        "base_prefix": prefix,
+        "platform": sysconfig_platform(),
+        "language": {
+            "version": version_short,
+            "version_info": version_info,
+        },
+        "implementation": implementation,
+        "abi": {
+            "flags": [],
+            "extension_suffix": crate::stdlib::sysconfig_native::EXT_SUFFIX,
+            "stable_abi_suffix": ".abi3.so",
+        },
+        "suffixes": {
+            "source": [".py"],
+            "bytecode": [".pyc"],
+            "extensions": [crate::stdlib::sysconfig_native::EXT_SUFFIX, ".abi3.so", ".so"],
+        },
+        "c_api": {
+            "headers": includepy,
+            "pkgconfig_path": join(&["lib", "pkgconfig"]),
+        },
+    });
+    if let Some(exe) = exe {
+        details["base_interpreter"] = json!(exe.to_string_lossy());
+    }
+    write_atomic(
+        &tmp_lib.join("build-details.json"),
+        &serde_json::to_string_pretty(&details).unwrap_or_default(),
+    )
 }
 
 #[cfg(test)]

@@ -1546,6 +1546,35 @@ static void wpy_append(char *buf, size_t bufsize, size_t *pos, const char *s, si
  * (honouring width/precision); standard specs are reconstructed verbatim
  * and handed to `snprintf` one directive at a time with the correctly
  * typed argument peeled off the `va_list`. */
+
+/* CPython 3.14 unicode_fromformat_write_utf8: a `%.Ns` precision counts
+ * *bytes*; when it cuts the input short (len == precision) and the tail
+ * is an incomplete UTF-8 sequence, that tail is dropped rather than
+ * decoded to U+FFFD ("%.6s" of "abc[\xe2\x82\xac]" is "abc[" while
+ * "%.5s" of "abc[\xff]" keeps the replacement char, test_from_format).
+ * Returns the byte length to splice. */
+static size_t wpy_utf8_precision_len(const char *s, int limit) {
+    if (limit < 0) limit = 0;
+    size_t len = 0;
+    while (len < (size_t)limit && s[len]) len++;
+    if (len == (size_t)limit && len > 0) {
+        size_t lead = len;
+        while (lead > 0 && ((unsigned char)s[lead - 1] & 0xC0) == 0x80) {
+            lead--;
+        }
+        if (lead > 0) {
+            unsigned char b = (unsigned char)s[lead - 1];
+            size_t need = (b & 0xE0) == 0xC0 ? 2
+                        : (b & 0xF0) == 0xE0 ? 3
+                        : (b & 0xF8) == 0xF0 ? 4 : 1;
+            if (need > 1 && len - (lead - 1) < need) {
+                len = lead - 1;
+            }
+        }
+    }
+    return len;
+}
+
 static int weavepy_format_into(char *buf, size_t bufsize, const char *fmt, va_list ap) {
     if (bufsize == 0) {
         return 0;
@@ -1762,7 +1791,7 @@ static int weavepy_format_into(char *buf, size_t bufsize, const char *fmt, va_li
                     int limit = prec_star ? pv : atoi(prec);
                     if (limit < 0) limit = 0;
                     if (cs_is_cstr) {
-                        if ((size_t)limit < cs_len) cs_len = (size_t)limit;
+                        cs_len = wpy_utf8_precision_len(cs, limit);
                     } else {
                         size_t i = 0;
                         int count = 0;
@@ -1950,6 +1979,31 @@ static int weavepy_format_into(char *buf, size_t bufsize, const char *fmt, va_li
                             wpy_append(buf, bufsize, &pos, " ", 1);
                     }
                     wpy_append(buf, bufsize, &pos, tmp, tn);
+                    if (left_align) {
+                        for (int k = 0; k < padn; k++)
+                            wpy_append(buf, bufsize, &pos, " ", 1);
+                    }
+                    n = 0; /* already appended */
+                } else if (has_prec) {
+                    /* Byte-counted precision with the 3.14 incomplete-tail
+                     * rule (wpy_utf8_precision_len); width pads by code
+                     * point. */
+                    const char *s = va_arg(ap, const char *);
+                    if (s == NULL) s = "(null)";
+                    int limit = prec_star ? pv : atoi(prec);
+                    size_t len = wpy_utf8_precision_len(s, limit);
+                    int nchars = 0;
+                    for (size_t i = 0; i < len; i++) {
+                        if (((unsigned char)s[i] & 0xC0) != 0x80) nchars++;
+                    }
+                    int want = width_star ? wv : (nw ? atoi(width) : 0);
+                    int padn = want > nchars ? want - nchars : 0;
+                    int left_align = (strchr(flags, '-') != NULL);
+                    if (!left_align) {
+                        for (int k = 0; k < padn; k++)
+                            wpy_append(buf, bufsize, &pos, " ", 1);
+                    }
+                    wpy_append(buf, bufsize, &pos, s, len);
                     if (left_align) {
                         for (int k = 0; k < padn; k++)
                             wpy_append(buf, bufsize, &pos, " ", 1);
@@ -2189,6 +2243,59 @@ PyObject *_PyErr_FormatFromCause(PyObject *ty, const char *fmt, ...) {
     va_end(ap);
     _WeavePy_ApplyCause(cause);
     return NULL;
+}
+
+/* --------------------------------------------------------------
+ * 3.14 variadic entry points (RFC 0077 WS12).
+ * -------------------------------------------------------------- */
+
+/* PyUnicodeWriter_Format(writer, format, ...) — format through
+ * PyUnicode_FromFormatV and append the result with the Rust writer
+ * (abi314.rs); an error leaves the writer untouched so the caller can
+ * retry (test_capi.test_unicode test_recover_error). */
+typedef struct PyUnicodeWriter PyUnicodeWriter;
+extern int PyUnicodeWriter_WriteStr(PyUnicodeWriter *writer, PyObject *obj);
+
+int PyUnicodeWriter_Format(PyUnicodeWriter *writer, const char *format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    PyObject *s = PyUnicode_FromFormatV(format, ap);
+    va_end(ap);
+    if (!s) {
+        return -1;
+    }
+    int rc = PyUnicodeWriter_WriteStr(writer, s);
+    Py_DECREF(s);
+    return rc;
+}
+
+/* PySys_Audit(event, format, ...) — build the argument tuple with
+ * Py_VaBuildValue (a NULL format audits with no arguments; a single
+ * non-tuple value is wrapped) and hand it to PySys_AuditTuple. */
+extern int PySys_AuditTuple(const char *event, PyObject *args);
+
+int PySys_Audit(const char *event, const char *format, ...) {
+    PyObject *args = NULL;
+    if (format && *format) {
+        va_list ap;
+        va_start(ap, format);
+        args = Py_VaBuildValue(format, ap);
+        va_end(ap);
+        if (!args) {
+            return -1;
+        }
+        if (!PyTuple_Check(args)) {
+            PyObject *one = PyTuple_Pack(1, args);
+            Py_DECREF(args);
+            if (!one) {
+                return -1;
+            }
+            args = one;
+        }
+    }
+    int rc = PySys_AuditTuple(event, args);
+    Py_XDECREF(args);
+    return rc;
 }
 
 /* --------------------------------------------------------------

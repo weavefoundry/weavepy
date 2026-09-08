@@ -7,7 +7,7 @@
 //! registration, forced stdio encodings, `Py_RunMain`, pre-init
 //! configuration. This binary is the WeavePy twin: the same command
 //! surface, implemented directly against the `weavepy-capi` embedding
-//! layer (the same code paths a C embedder linking `libpython3.13`
+//! layer (the same code paths a C embedder linking `libpython3.14`
 //! hits — the capi entry points here *are* the exported symbols).
 //!
 //! The regrtest harness stages it at `{bindir}/Programs/_testembed`,
@@ -17,11 +17,12 @@
 //! 1 with a note on stderr; those tests are enumerated as divergences
 //! in `tests/regrtest/expectations.toml`.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io::Write;
+use std::os::raw::c_char;
 
 use weavepy::capi::initconfig::EmbedConfig;
-use weavepy::capi::{embed, initconfig, pythonrun};
+use weavepy::capi::{embed, initconfig, pep741, pythonrun};
 
 /// `test_embed.INIT_LOOPS`.
 const INIT_LOOPS: usize = 4;
@@ -45,6 +46,13 @@ fn main() {
         "test_initialize_pymain" => test_initialize_pymain(),
         "test_run_main" => test_run_main(1),
         "test_run_main_loop" => test_run_main(5),
+        "test_init_run_main_code_exitcode" => test_init_run_main_code_exitcode(&args[2..]),
+        "test_init_run_main_script_exitcode" => test_init_run_main_script_exitcode(&args[2..]),
+        "test_init_run_main_module_exitcode" => test_init_run_main_module_exitcode(&args[2..]),
+        "test_init_run_main_interactive_exitcode" => test_init_run_main_interactive_exitcode(),
+        "test_initconfig_get_api" => test_initconfig_get_api(),
+        "test_initconfig_exit" => test_initconfig_exit(),
+        "test_initconfig_module" => test_initconfig_module(),
         "test_get_argc_argv" => test_get_argc_argv(),
         "test_init_main_interpreter_settings" => test_init_main_interpreter_settings(),
         "test_unicode_id_init" => test_unicode_id_init(),
@@ -106,12 +114,22 @@ fn flush_stdout() {
 // ---------------------------------------------------------------------------
 
 fn test_repeated_init_exec(args: &[String]) -> i32 {
-    let Some(code) = args.first() else {
+    let Some(first) = args.first() else {
         eprintln!("test_repeated_init_exec: missing code argument");
         return 1;
     };
-    for i in 1..=INIT_LOOPS {
+    // 3.14's `_testembed.c`: with several CODE arguments there is one loop
+    // per argument, each running its own snippet (test_embed's
+    // test_static_types_inherited_slots passes two and expects exactly
+    // two `--- Loop #N ---` blocks); a single CODE runs INIT_LOOPS times.
+    let loops = if args.len() > 1 {
+        args.len()
+    } else {
+        INIT_LOOPS
+    };
+    for i in 1..=loops {
         eprintln!("--- Loop #{i} ---");
+        let code = if args.len() > 1 { &args[i - 1] } else { first };
         init(Some(python_config()));
         let rc = run(code);
         let f = fini();
@@ -342,6 +360,342 @@ fn test_run_main(loops: usize) -> i32 {
         }
         flush_stdout();
     }
+    0
+}
+
+/// 3.14 `test_init_run_main_exitcode`: `Py_RunMain()` over a parsed
+/// command line whose program raises `SystemExit(123)` must *return*
+/// 123 (not `Py_Exit()` the process), so the trailer line reaches
+/// stdout.
+fn test_init_run_main_exitcode(config: EmbedConfig) -> i32 {
+    init(Some(config));
+    let exitcode = unsafe { embed::Py_RunMain() };
+    if exitcode != 123 {
+        eprintln!("Py_RunMain() returned {exitcode}, expected 123");
+        return 1;
+    }
+    println!("ok! Py_RunMain() returned 123");
+    0
+}
+
+fn test_init_run_main_code_exitcode(args: &[String]) -> i32 {
+    let Some(code) = args.first() else {
+        eprintln!("test_init_run_main_code_exitcode: missing CODE argument");
+        return 1;
+    };
+    test_init_run_main_exitcode(EmbedConfig {
+        argv: vec!["-c".to_owned()],
+        run_command: Some(format!("{code}\n")),
+        program_name: Some("./python3".to_owned()),
+        ..python_config()
+    })
+}
+
+fn test_init_run_main_script_exitcode(args: &[String]) -> i32 {
+    let Some(filename) = args.first() else {
+        eprintln!("test_init_run_main_script_exitcode: missing FILENAME argument");
+        return 1;
+    };
+    test_init_run_main_exitcode(EmbedConfig {
+        argv: vec![filename.clone()],
+        run_filename: Some(filename.clone()),
+        program_name: Some("./python3".to_owned()),
+        ..python_config()
+    })
+}
+
+fn test_init_run_main_module_exitcode(args: &[String]) -> i32 {
+    let Some(module) = args.first() else {
+        eprintln!("test_init_run_main_module_exitcode: missing MODULE argument");
+        return 1;
+    };
+    test_init_run_main_exitcode(EmbedConfig {
+        argv: vec!["-m".to_owned()],
+        run_module: Some(module.clone()),
+        program_name: Some("./python3".to_owned()),
+        ..python_config()
+    })
+}
+
+fn test_init_run_main_interactive_exitcode() -> i32 {
+    // `python3 -i` over piped stdin (and `$PYTHONSTARTUP`, for
+    // test_init_run_main_startup_exitcode).
+    test_init_run_main_exitcode(EmbedConfig {
+        argv: vec![String::new()],
+        inspect: true,
+        program_name: Some("./python3".to_owned()),
+        ..python_config()
+    })
+}
+
+// ---------------------------------------------------------------------------
+// PEP 741 `PyInitConfig` (3.14 `test_initconfig_*`)
+// ---------------------------------------------------------------------------
+
+const PROGRAM_NAME_UTF8: &CStr = c"./_testembed";
+
+fn initconfig_getint(config: *mut pep741::PyInitConfig, name: &CStr) -> i64 {
+    let mut value: i64 = 0;
+    let rc = unsafe { pep741::PyInitConfig_GetInt(config, name.as_ptr(), &raw mut value) };
+    assert_eq!(rc, 0, "PyInitConfig_GetInt({name:?})");
+    value
+}
+
+/// The C twin's `assert(...)` body: every probe is a hard check.
+fn test_initconfig_get_api() -> i32 {
+    let config = pep741::PyInitConfig_Create();
+    if config.is_null() {
+        println!("Init allocation error");
+        return 1;
+    }
+    unsafe {
+        // PyInitConfig_HasOption()
+        assert_eq!(
+            pep741::PyInitConfig_HasOption(config, c"verbose".as_ptr()),
+            1
+        );
+        assert_eq!(
+            pep741::PyInitConfig_HasOption(config, c"utf8_mode".as_ptr()),
+            1
+        );
+        assert_eq!(
+            pep741::PyInitConfig_HasOption(config, c"non-existent".as_ptr()),
+            0
+        );
+
+        // PyInitConfig_GetInt()
+        assert_eq!(initconfig_getint(config, c"dev_mode"), 0);
+        assert_eq!(
+            pep741::PyInitConfig_SetInt(config, c"dev_mode".as_ptr(), 1),
+            0
+        );
+        assert_eq!(initconfig_getint(config, c"dev_mode"), 1);
+
+        // PyInitConfig_GetInt() on a PyPreConfig option
+        assert_eq!(initconfig_getint(config, c"utf8_mode"), 0);
+        assert_eq!(
+            pep741::PyInitConfig_SetInt(config, c"utf8_mode".as_ptr(), 1),
+            0
+        );
+        assert_eq!(initconfig_getint(config, c"utf8_mode"), 1);
+
+        // PyInitConfig_GetStr()
+        let mut s: *mut c_char = std::ptr::null_mut();
+        assert_eq!(
+            pep741::PyInitConfig_GetStr(config, c"program_name".as_ptr(), &raw mut s),
+            0
+        );
+        assert!(s.is_null());
+        assert_eq!(
+            pep741::PyInitConfig_SetStr(
+                config,
+                c"program_name".as_ptr(),
+                PROGRAM_NAME_UTF8.as_ptr()
+            ),
+            0
+        );
+        assert_eq!(
+            pep741::PyInitConfig_GetStr(config, c"program_name".as_ptr(), &raw mut s),
+            0
+        );
+        assert_eq!(CStr::from_ptr(s), PROGRAM_NAME_UTF8);
+        libc::free(s.cast());
+
+        // PyInitConfig_GetStrList() and PyInitConfig_FreeStrList()
+        let mut length: usize = 0;
+        let mut items: *mut *mut c_char = std::ptr::null_mut();
+        assert_eq!(
+            pep741::PyInitConfig_GetStrList(
+                config,
+                c"xoptions".as_ptr(),
+                &raw mut length,
+                &raw mut items
+            ),
+            0
+        );
+        assert_eq!(length, 0);
+
+        let xoptions: [*const c_char; 1] = [c"faulthandler".as_ptr()];
+        assert_eq!(
+            pep741::PyInitConfig_SetStrList(
+                config,
+                c"xoptions".as_ptr(),
+                xoptions.len(),
+                xoptions.as_ptr()
+            ),
+            0
+        );
+        assert_eq!(
+            pep741::PyInitConfig_GetStrList(
+                config,
+                c"xoptions".as_ptr(),
+                &raw mut length,
+                &raw mut items
+            ),
+            0
+        );
+        assert_eq!(length, 1);
+        assert_eq!(CStr::from_ptr(*items), c"faulthandler");
+        pep741::PyInitConfig_FreeStrList(length, items);
+
+        // Setting hash_seed sets use_hash_seed
+        assert_eq!(initconfig_getint(config, c"use_hash_seed"), 0);
+        assert_eq!(
+            pep741::PyInitConfig_SetInt(config, c"hash_seed".as_ptr(), 123),
+            0
+        );
+        assert_eq!(initconfig_getint(config, c"use_hash_seed"), 1);
+
+        // Setting module_search_paths sets module_search_paths_set
+        assert_eq!(initconfig_getint(config, c"module_search_paths_set"), 0);
+        let paths: [*const c_char; 2] = [c"search".as_ptr(), c"path".as_ptr()];
+        assert_eq!(
+            pep741::PyInitConfig_SetStrList(
+                config,
+                c"module_search_paths".as_ptr(),
+                paths.len(),
+                paths.as_ptr()
+            ),
+            0
+        );
+        assert_eq!(initconfig_getint(config, c"module_search_paths_set"), 1);
+        pep741::PyInitConfig_Free(config);
+    }
+    0
+}
+
+fn test_initconfig_exit() -> i32 {
+    let config = pep741::PyInitConfig_Create();
+    if config.is_null() {
+        println!("Init allocation error");
+        return 1;
+    }
+    unsafe {
+        let argv: [*const c_char; 2] = [PROGRAM_NAME_UTF8.as_ptr(), c"--help".as_ptr()];
+        assert_eq!(
+            pep741::PyInitConfig_SetStrList(config, c"argv".as_ptr(), argv.len(), argv.as_ptr()),
+            0
+        );
+        assert_eq!(
+            pep741::PyInitConfig_SetInt(config, c"parse_argv".as_ptr(), 1),
+            0
+        );
+
+        assert!(pep741::Py_InitializeFromInitConfig(config) < 0);
+
+        let mut exitcode: std::os::raw::c_int = -1;
+        assert_eq!(
+            pep741::PyInitConfig_GetExitCode(config, &raw mut exitcode),
+            1
+        );
+        assert_eq!(exitcode, 0);
+
+        let mut err_msg: *const c_char = std::ptr::null();
+        assert_eq!(pep741::PyInitConfig_GetError(config, &raw mut err_msg), 1);
+        assert_eq!(CStr::from_ptr(err_msg), c"exit code 0");
+
+        pep741::PyInitConfig_Free(config);
+    }
+    0
+}
+
+/// `my_test_extension`: a multi-phase (PEP 489) definition with the
+/// `Py_mod_gil` slot, like the C original.
+unsafe extern "C" fn init_my_test_extension() -> *mut weavepy::capi::object::PyObject {
+    use weavepy::capi::module::{PyModuleDef, PyModuleDef_Base, PyModuleDef_Slot, PY_MOD_GIL};
+    use weavepy::capi::object::PyObject;
+    struct Statics {
+        slots: std::cell::UnsafeCell<[PyModuleDef_Slot; 2]>,
+        def: std::cell::UnsafeCell<Option<PyModuleDef>>,
+    }
+    // SAFETY: only touched from the initializing thread, once.
+    unsafe impl Sync for Statics {}
+    static STATICS: Statics = Statics {
+        slots: std::cell::UnsafeCell::new([
+            PyModuleDef_Slot {
+                slot: PY_MOD_GIL,
+                // Py_MOD_GIL_NOT_USED is the integer 1 smuggled through
+                // the slot's `void *`; `dangling_mut` is the const-safe
+                // way to spell that non-address.
+                value: std::ptr::dangling_mut::<std::ffi::c_void>(),
+            },
+            PyModuleDef_Slot {
+                slot: 0,
+                value: std::ptr::null_mut(),
+            },
+        ]),
+        def: std::cell::UnsafeCell::new(None),
+    };
+    unsafe {
+        let def = STATICS.def.get();
+        if (*def).is_none() {
+            *def = Some(PyModuleDef {
+                m_base: PyModuleDef_Base {
+                    ob_base: PyObject {
+                        ob_refcnt: 1,
+                        ob_type: std::ptr::null_mut(),
+                    },
+                    m_init: None,
+                    m_index: 0,
+                    m_copy: std::ptr::null_mut(),
+                },
+                m_name: c"my_test_extension".as_ptr(),
+                m_doc: std::ptr::null(),
+                m_size: 0,
+                m_methods: std::ptr::null_mut(),
+                m_slots: STATICS.slots.get().cast::<PyModuleDef_Slot>(),
+                m_traverse: std::ptr::null_mut(),
+                m_clear: std::ptr::null_mut(),
+                m_free: std::ptr::null_mut(),
+            });
+        }
+        weavepy::capi::module::PyModuleDef_Init((*def).as_mut().expect("set above"))
+    }
+}
+
+fn test_initconfig_module() -> i32 {
+    let config = pep741::PyInitConfig_Create();
+    if config.is_null() {
+        println!("Init allocation error");
+        return 1;
+    }
+    let fail = |config: *mut pep741::PyInitConfig| -> i32 {
+        let mut err_msg: *const c_char = std::ptr::null();
+        unsafe {
+            let _ = pep741::PyInitConfig_GetError(config, &raw mut err_msg);
+            let msg = if err_msg.is_null() {
+                "<unknown>".to_owned()
+            } else {
+                CStr::from_ptr(err_msg).to_string_lossy().into_owned()
+            };
+            println!("Python init failed: {msg}");
+        }
+        1
+    };
+    unsafe {
+        if pep741::PyInitConfig_SetStr(config, c"program_name".as_ptr(), PROGRAM_NAME_UTF8.as_ptr())
+            < 0
+        {
+            return fail(config);
+        }
+        if pep741::PyInitConfig_AddModule(
+            config,
+            c"my_test_extension".as_ptr(),
+            Some(init_my_test_extension),
+        ) < 0
+        {
+            return fail(config);
+        }
+        if pep741::Py_InitializeFromInitConfig(config) < 0 {
+            return fail(config);
+        }
+        pep741::PyInitConfig_Free(config);
+    }
+    if run("import my_test_extension") < 0 {
+        eprintln!("unable to import my_test_extension");
+        return 1;
+    }
+    fini();
     0
 }
 

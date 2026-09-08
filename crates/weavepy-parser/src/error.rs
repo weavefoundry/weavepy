@@ -46,7 +46,7 @@ impl ParseError {
     /// `SyntaxError.end_offset` (the `^^^^` underline width).
     pub fn byte_end_offset(&self) -> u32 {
         match self {
-            ParseError::Lex(e) => e.byte_offset(),
+            ParseError::Lex(e) => e.byte_end_offset(),
             ParseError::Unexpected { span, .. }
             | ParseError::Indentation { span, .. }
             | ParseError::NotImplemented { span, .. }

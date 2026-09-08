@@ -52,14 +52,20 @@ pub struct Row {
     pub weavepy: RunSet,
     #[serde(default)]
     pub cpython: Option<RunSet>,
-    /// Optional `WEAVEPY_JIT=0` column (RFC 0067 WS4; reported,
-    /// never gated). The gated `weavepy` column measures the default
-    /// binary — which ships with the tier-2 JIT — so this column is
-    /// how interpreter-only progress stays a measured number.
-    /// (Pre-v5 baselines carried a `jit` column instead; v5
-    /// re-recorded them, so old files simply lack this field.)
+    /// The `WEAVEPY_JIT=0` column (RFC 0067 WS4, made default-on and
+    /// gated by RFC 0077 WS1). The `weavepy` column measures the
+    /// default binary — which ships with the tier-2 JIT — and this
+    /// column measures the tier-1 floor every non-compiled frame,
+    /// deopt, and generic call runs on. (Pre-v5 baselines carried a
+    /// `jit` column instead; v5 re-recorded them, so old files simply
+    /// lack this field; pre-v6 files carry it as `null`.)
     #[serde(default)]
     pub interp: Option<RunSet>,
+    /// `interp.median_ns / cpython.median_ns` (RFC 0077 WS1). Gated
+    /// like [`Self::ratio`] whenever both the new and the baseline
+    /// row carry one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interp_ratio: Option<f64>,
     /// The merge-base binary's timings, when `gate --base-weavepy`
     /// ran an A/B comparison (never persisted into baselines — the
     /// base binary is meaningful only within the run that measured
@@ -93,6 +99,12 @@ impl Row {
             .as_ref()
             .filter(|c| c.median_ns > 0.0 && weavepy.median_ns > 0.0)
             .map(|c| weavepy.median_ns / c.median_ns);
+        let interp_ratio = match (&interp, &cpython) {
+            (Some(i), Some(c)) if i.median_ns > 0.0 && c.median_ns > 0.0 => {
+                Some(i.median_ns / c.median_ns)
+            }
+            _ => None,
+        };
         let memory_ratio = match (
             weavepy.max_rss_bytes,
             cpython.as_ref().and_then(|c| c.max_rss_bytes),
@@ -106,6 +118,7 @@ impl Row {
             weavepy,
             cpython,
             interp,
+            interp_ratio,
             base: None,
             base_ratio: None,
             ratio,
@@ -141,19 +154,40 @@ pub struct Report {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
     /// Geometric mean of the per-fixture WeavePy/CPython ratios
-    /// (fixtures without a CPython column are excluded).
+    /// (fixtures without a CPython column, and the accelerator census
+    /// rows in `fixtures::CENSUS_FIXTURES`, are excluded).
     #[serde(default)]
     pub geomean_ratio: Option<f64>,
+    /// Geometric mean of the per-fixture interpreter-only/CPython
+    /// ratios (RFC 0077 WS1; rows without an `interp` leg are
+    /// excluded). Gated alongside [`Self::geomean_ratio`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interp_geomean_ratio: Option<f64>,
     pub rows: Vec<Row>,
 }
 
 impl Report {
     pub fn new(rows: Vec<Row>) -> Self {
-        let ratios: Vec<f64> = rows.iter().filter_map(|r| r.ratio).collect();
+        let in_geomean = |r: &&Row| !crate::fixtures::CENSUS_FIXTURES.contains(&r.name.as_str());
+        let ratios: Vec<f64> = rows
+            .iter()
+            .filter(in_geomean)
+            .filter_map(|r| r.ratio)
+            .collect();
         let geomean_ratio = if ratios.is_empty() {
             None
         } else {
             Some(stats::geometric_mean(&ratios))
+        };
+        let interp_ratios: Vec<f64> = rows
+            .iter()
+            .filter(in_geomean)
+            .filter_map(|r| r.interp_ratio)
+            .collect();
+        let interp_geomean_ratio = if interp_ratios.is_empty() {
+            None
+        } else {
+            Some(stats::geometric_mean(&interp_ratios))
         };
         Self {
             // v3 (RFC 0059 WS5b): rows carry `max_rss_bytes` +
@@ -162,14 +196,18 @@ impl Report {
             // v5 (RFC 0067 WS4): `weavepy` measures the default
             // binary (JIT on); the optional extra column is `interp`
             // (`WEAVEPY_JIT=0`), replacing v4's `jit` column.
+            // v6 (RFC 0077 WS1): `interp` is default-on, rows carry
+            // `interp_ratio`, and the top level carries
+            // `interp_geomean_ratio`; both are gated.
             // Older files still deserialize (new fields are `Option`
             // with serde defaults) but `gate` refuses baselines
             // without a platform stamp — see [`Self::check_platform`].
-            version: 5,
+            version: 6,
             host: hostname_or_unknown(),
             created_at: now_rfc3339(),
             platform: Some(crate::fixtures::platform_key()),
             geomean_ratio,
+            interp_geomean_ratio,
             rows,
         }
     }
@@ -224,9 +262,9 @@ impl Report {
         if has_interp {
             let _ = writeln!(
                 out,
-                "| fixture | work | WeavePy |{base_head} WeavePy (interp) | CPython | ×CPython (lower is better) |{rss_head}"
+                "| fixture | work | WeavePy |{base_head} WeavePy (interp) | CPython | ×CPython (lower is better) | ×CPython (interp) |{rss_head}"
             );
-            let _ = writeln!(out, "|---|---|---|{base_bars}---|---|---|{rss_bars}");
+            let _ = writeln!(out, "|---|---|---|{base_bars}---|---|---|---|{rss_bars}");
         } else {
             let _ = writeln!(
                 out,
@@ -275,10 +313,14 @@ impl Report {
                     Some(j) => format_ns(j.median_ns),
                     None => "-".to_owned(),
                 };
+                let iratio = match r.interp_ratio {
+                    Some(x) => format!("{x:.2}×"),
+                    None => "-".to_owned(),
+                };
                 let _ = writeln!(
                     out,
-                    "| {} | {} | {} |{base_cells} {} | {} | {} |{rss_cells}",
-                    r.name, r.work, wp, interp, cp, ratio
+                    "| {} | {} | {} |{base_cells} {} | {} | {} | {} |{rss_cells}",
+                    r.name, r.work, wp, interp, cp, ratio, iratio
                 );
             } else {
                 let _ = writeln!(
@@ -291,6 +333,13 @@ impl Report {
         if let Some(g) = self.geomean_ratio {
             let _ = writeln!(out);
             let _ = writeln!(out, "Geometric mean: **{g:.2}× CPython**");
+        }
+        if let Some(g) = self.interp_geomean_ratio {
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
+                "Geometric mean (interpreter only, `WEAVEPY_JIT=0`): **{g:.2}× CPython**"
+            );
         }
         if let Some(g) = self.base_geomean() {
             let _ = writeln!(out);
@@ -387,6 +436,16 @@ impl Report {
                 ));
             }
         }
+        if let (Some(ng), Some(og)) = (self.interp_geomean_ratio, baseline.interp_geomean_ratio) {
+            if og > 0.0 && ng > og * factor {
+                out.push(format!(
+                    "geomean (interp): {:.2}× -> {:.2}× vs CPython ({:+.1}%)",
+                    og,
+                    ng,
+                    100.0 * (ng - og) / og,
+                ));
+            }
+        }
         out
     }
 
@@ -415,6 +474,20 @@ impl Report {
 /// both rows carry one (host-independent); otherwise the absolute
 /// WeavePy median is the fallback.
 fn row_regression(new: &Row, old: &Row, factor: f64) -> Option<String> {
+    // RFC 0077 WS1: the interpreter-only leg is gated too, whenever
+    // both rows measured it (baselines predating the column simply
+    // don't gate it yet).
+    if let (Some(nr), Some(or)) = (new.interp_ratio, old.interp_ratio) {
+        if or > 0.0 && nr > or * factor {
+            return Some(format!(
+                "{}: interp ratio {:.2}× -> {:.2}× vs CPython ({:+.1}%)",
+                new.name,
+                or,
+                nr,
+                100.0 * (nr - or) / or,
+            ));
+        }
+    }
     match (new.ratio, old.ratio) {
         (Some(nr), Some(or)) if or > 0.0 => (nr > or * factor).then(|| {
             format!(
@@ -536,7 +609,33 @@ mod tests {
             report.platform.as_deref(),
             Some(crate::fixtures::platform_key().as_str())
         );
-        assert_eq!(report.version, 5);
+        assert_eq!(report.version, 6);
+    }
+
+    /// RFC 0077 WS1: the interpreter-only leg is gated when both rows
+    /// carry it, and ignored (not failed) against a baseline that
+    /// predates the column.
+    #[test]
+    fn interp_ratio_is_gated_when_both_rows_carry_it() {
+        let mk = |interp_ns: Option<f64>| {
+            Row::new(
+                "a".into(),
+                1,
+                RunSet::from_samples_ns(&[100.0]),
+                Some(RunSet::from_samples_ns(&[100.0])),
+                interp_ns.map(|ns| RunSet::from_samples_ns(&[ns])),
+            )
+        };
+        let baseline = Report::new(vec![mk(Some(300.0))]);
+        assert_eq!(baseline.rows[0].interp_ratio, Some(3.0));
+        assert!((baseline.interp_geomean_ratio.unwrap() - 3.0).abs() < 1e-9);
+        let regressed = Report::new(vec![mk(Some(400.0))]);
+        let regs = regressed.regressions(&baseline, 10.0);
+        assert_eq!(regs.len(), 2, "{regs:?}");
+        assert!(regs[0].contains("interp ratio 3.00× -> 4.00×"), "{regs:?}");
+        assert!(regs[1].contains("geomean (interp)"), "{regs:?}");
+        let old_baseline = Report::new(vec![mk(None)]);
+        assert!(regressed.regressions(&old_baseline, 10.0).is_empty());
     }
 
     #[test]

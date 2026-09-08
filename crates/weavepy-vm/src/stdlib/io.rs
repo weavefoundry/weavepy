@@ -30,7 +30,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("DEFAULT_BUFFER_SIZE")),
-            Object::Int(8192),
+            Object::Int(crate::object::DEFAULT_BUFFER_SIZE as i64),
         );
         d.insert(DictKey(Object::from_static("SEEK_SET")), Object::Int(0));
         d.insert(DictKey(Object::from_static("SEEK_CUR")), Object::Int(1));
@@ -1231,7 +1231,7 @@ fn make_memory_stream(
         );
     };
     method("read", crate::builtins::file_read);
-    method("read1", crate::builtins::file_read);
+    method("read1", crate::builtins::file_read1);
     method("readline", crate::builtins::file_readline);
     method("readlines", crate::builtins::file_readlines);
     method("readinto", crate::builtins::file_readinto);
@@ -3692,13 +3692,32 @@ fn tw_sync_for_write(inst: &crate::types::PyInstance) -> Result<(), RuntimeError
 
 fn tw_write(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = tw_self(args)?;
+    // A surrogate-bearing `str` (`WStr`, RFC 0040) keeps its raw code points
+    // for the encoder so `errors='replace'`/`surrogateescape` see the lone
+    // surrogates; `text` then carries U+FFFD stand-ins for the newline
+    // scan and the returned character count.
+    let mut wcps: Option<Vec<u32>> = None;
     let text = match args.get(1) {
         Some(Object::Str(s)) => s.to_string(),
+        Some(Object::WStr(cps)) => {
+            wcps = Some(cps.to_vec());
+            cps.iter()
+                .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
+                .collect()
+        }
         // A `str` subclass instance contributes its wrapped native payload
         // (CPython's check is `isinstance`-based).
-        Some(Object::Instance(inst)) if matches!(inst.native.get(), Some(Object::Str(_))) => {
+        Some(Object::Instance(inst))
+            if matches!(inst.native.get(), Some(Object::Str(_) | Object::WStr(_))) =>
+        {
             match inst.native.get() {
                 Some(Object::Str(s)) => s.to_string(),
+                Some(Object::WStr(cps)) => {
+                    wcps = Some(cps.to_vec());
+                    cps.iter()
+                        .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
+                        .collect()
+                }
                 _ => unreachable!("checked above"),
             }
         }
@@ -3744,7 +3763,37 @@ fn tw_write(args: &[Object]) -> Result<Object, RuntimeError> {
     // codec calls must not repeat it (`test_io.test_illegal_encoder`).
     let bytes = {
         let _exempt = crate::stdlib::codecs_mod::io_text_exempt_guard();
-        crate::stdlib::codecs_mod::encode_str(&translated, &effective_encoding, &errors)?
+        match &wcps {
+            Some(cps) => {
+                let tr: Vec<u32> = match tw_newline_mode(&inst) {
+                    NewlineMode::Cr => cps
+                        .iter()
+                        .map(|&c| {
+                            if c == u32::from('\n') {
+                                u32::from('\r')
+                            } else {
+                                c
+                            }
+                        })
+                        .collect(),
+                    NewlineMode::CrLf => cps
+                        .iter()
+                        .flat_map(|&c| {
+                            if c == u32::from('\n') {
+                                vec![u32::from('\r'), c]
+                            } else {
+                                vec![c]
+                            }
+                        })
+                        .collect(),
+                    _ => cps.clone(),
+                };
+                crate::stdlib::codecs_mod::encode_codepoints(&tr, &effective_encoding, &errors)?
+            }
+            None => {
+                crate::stdlib::codecs_mod::encode_str(&translated, &effective_encoding, &errors)?
+            }
+        }
     };
     // Any successful write leaves the stream past its start.
     tw_set(&inst, "_start_of_stream", Object::Bool(false));
@@ -4629,7 +4678,7 @@ fn bw_check_open(inst: &crate::types::PyInstance) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-const BW_CHUNK: usize = 8192;
+const BW_CHUNK: usize = crate::object::DEFAULT_BUFFER_SIZE;
 
 // ---------------------------------------------------------------------------
 // Per-instance buffered lock (CPython's `self->lock` / `_pyio`'s
@@ -5652,6 +5701,15 @@ fn bw_seek(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(value_error(format!(
             "Invalid whence ({whence}, should be 0, 1 or 2)"
         )));
+    }
+    // `_io__Buffered_seek_impl`: probe the raw stream's `seekable()` up
+    // front (`_PyIOBase_check_seekable(raw)`), so a non-seekable raw
+    // reports "File or stream is not seekable." rather than whatever its
+    // bare `seek` would raise (test_zstd test_seek_not_seekable).
+    if let Ok(RawTarget::Py(raw)) = bw_target(&inst) {
+        if !py_call(&raw, "seekable", &[])?.is_truthy() {
+            return Err(unsupported_op("File or stream is not seekable."));
+        }
     }
     // Flush pending writes before repositioning.
     if bw_is_writer(&clsname) {

@@ -317,6 +317,11 @@ fn parser_name(parser: &PyArgParser) -> String {
 /// positional `args` and the `kwnames`-keyed keyword values into `buf`
 /// slot-by-slot (parser.keywords order), leaving optional slots NULL.
 /// Returns `buf` on success, NULL with an exception set on error.
+///
+/// 3.14 signature (RFC 0077 WS12): the `varpos` flag says the function
+/// takes `*args`, so positionals beyond `maxpos` are legal — the first
+/// `maxpos` land in `buf` and the caller slices the rest off `args`
+/// itself.
 #[no_mangle]
 pub unsafe extern "C" fn _PyArg_UnpackKeywords(
     args: *const *mut PyObject,
@@ -327,6 +332,7 @@ pub unsafe extern "C" fn _PyArg_UnpackKeywords(
     minpos: c_int,
     maxpos: c_int,
     minkw: c_int,
+    varpos: c_int,
     buf: *mut *mut PyObject,
 ) -> *const *mut PyObject {
     crate::interp::ensure_initialised();
@@ -352,7 +358,7 @@ pub unsafe extern "C" fn _PyArg_UnpackKeywords(
     let total = keywords.len().max(maxpos as usize);
 
     // Fast-path shape check on positionals.
-    if nargs > maxpos as PySsizeT {
+    if nargs > maxpos as PySsizeT && varpos == 0 {
         crate::errors::set_type_error(format!(
             "{fname}() takes at most {maxpos} positional argument{} ({nargs} given)",
             if maxpos == 1 { "" } else { "s" }
@@ -371,7 +377,7 @@ pub unsafe extern "C" fn _PyArg_UnpackKeywords(
         for i in 0..total {
             *buf.add(i) = core::ptr::null_mut();
         }
-        for i in 0..nargs as usize {
+        for i in 0..(nargs as usize).min(maxpos.max(0) as usize) {
             *buf.add(i) = *args.add(i);
         }
     }

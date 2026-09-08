@@ -26,6 +26,22 @@
 # a CI-measured Windows baseline is transplanted into status_windows
 # rows and "windows" joins the stamp, flipping the lane to blocking. A
 # missing stamp means "all OSes measured" (pre-RFC-0063 behaviour).
+#
+# Re-measured on the CPython 3.14 target (RFC 0077 Phase II, macOS
+# aarch64, offline from the cp314 wheel cache `tools/ecosystem_fetch.py`
+# builds): 48 rows, 48 pass, 0 unexpected. No probe row changed status.
+# The `--selftests` tier on the same run: 8 pass / 2 fail, every row at
+# its RFC 0076 verdict (numpy budget-bound at 2400s, lxml at its
+# upstream-collection `fail`); no selftest row changed status either.
+# Engine fixes the re-measure forced before it went green: a method
+# call with 2 positionals and 22 keywords (fastapi's `api_route`
+# decorator; also the polars and uvicorn rows through fastapi) was
+# compiled as a method-flagged LOAD_ATTR paired with CALL_FUNCTION_EX,
+# which CPython 3.14 never emits (canary:
+# tests/regrtest/test_rfc0077_wide_method_call.py); and
+# `itertools.chain.from_iterable` is registered as a class-level
+# descriptor so `type()` reports `builtin_function_or_method` (torch's
+# `_dynamo` polyfill signature check).
 
 measured_os = ["macos", "linux"]
 

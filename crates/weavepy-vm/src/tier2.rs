@@ -1298,8 +1298,10 @@ fn ctor_field_plan(icode: &CodeObject) -> Option<Vec<(String, CtorFieldSrc)>> {
             }
             // `self.<name> = <param or const>`: value load, self load,
             // STORE_ATTR.
-            OpCode::LoadFast | OpCode::LoadConst => {
+            OpCode::LoadFast | OpCode::LoadConst | OpCode::LoadSmallInt => {
                 let src = match ins[i].op {
+                    // CPython 3.14 LOAD_SMALL_INT (`self.x = 0`).
+                    OpCode::LoadSmallInt => CtorFieldSrc::Lane(JitType::Int),
                     OpCode::LoadFast => {
                         let slot = ins[i].arg;
                         if slot == 0 {
@@ -3303,19 +3305,21 @@ fn finish_deopted_callee(
         shell_cache: None,
         parked_native: None,
     };
+    // A deopt-after-call carries the parked, already-computed result;
+    // `rebuild_stack` places it at the exiting op's native depth.
+    let parked = if raised.is_some() {
+        None
+    } else {
+        nctx.parked.take()
+    };
     rebuild_stack(
-        interp, &mut frame, &entry, locals_buf, spill, tags, njf, &nctx.pins,
+        interp, &mut frame, &entry, locals_buf, spill, tags, njf, &nctx.pins, parked,
     );
     if raised.is_some() {
         // As though the raising CALL just executed: pc points past it
         // (`handle_exception` uses `pc - 1` as the raise site).
         frame.pc = njf.deopt_pc + 1;
     } else {
-        // A deopt-after-call carries the parked, already-computed
-        // result on top of the rebuilt stack.
-        if let Some(v) = nctx.parked.take() {
-            frame.stack.push(v);
-        }
         frame.pc = njf.deopt_pc;
     }
     interp.run_deopted_frame(&mut frame, raised)
@@ -3889,14 +3893,14 @@ extern "C" fn wpjit_math_cos(x: f64) -> f64 {
 /// interpreter re-executes and raises the exact `ZeroDivisionError`),
 /// so the error arm is unreachable-defensive.
 extern "C" fn wpjit_float_floordiv(a: f64, b: f64) -> f64 {
-    crate::py_float_divmod(a, b, "float floor division").map_or(f64::NAN, |(div, _)| div)
+    crate::py_float_divmod(a, b, "division by zero").map_or(f64::NAN, |(div, _)| div)
 }
 
 /// Python-semantics `float` modulo (RFC 0069 WS2): the remainder takes
 /// the divisor's sign. Zero divisors deopt before the call, as with
 /// [`wpjit_float_floordiv`].
 extern "C" fn wpjit_float_mod(a: f64, b: f64) -> f64 {
-    crate::py_float_divmod(a, b, "float modulo").map_or(f64::NAN, |(_, m)| m)
+    crate::py_float_divmod(a, b, "division by zero").map_or(f64::NAN, |(_, m)| m)
 }
 
 /// The `wpjit_list_get` helper (RFC 0061 WS5): read one element of a
@@ -7225,8 +7229,16 @@ fn native_exit_writeback(
             }
         }
     }
-    rebuild_stack(interp, frame, entry, locals_buf, spill, tags, jf, &ctx.pins);
-    if matches!(status, JitStatus::Raised) {
+    let raised = matches!(status, JitStatus::Raised);
+    // A deopt-after-call carries the parked, already-computed result:
+    // `rebuild_stack` slots it in at the exiting op's native depth
+    // (below any open self-or-null marker) and the interpreter resumes
+    // after the call.
+    let parked = if raised { None } else { ctx.parked.take() };
+    rebuild_stack(
+        interp, frame, entry, locals_buf, spill, tags, jf, &ctx.pins, parked,
+    );
+    if raised {
         // As though the CALL instruction just executed and
         // raised: pc points past it (`handle_exception` uses
         // `pc - 1` as the raise site).
@@ -7236,12 +7248,6 @@ fn native_exit_writeback(
         });
         JitEntry::Raised(err)
     } else {
-        // A deopt-after-call carries the parked, already-
-        // computed result: it goes on top of the rebuilt stack
-        // and the interpreter resumes after the call.
-        if let Some(v) = ctx.parked.take() {
-            frame.stack.push(v);
-        }
         frame.pc = jf.deopt_pc;
         JitEntry::Deopt
     }
@@ -7265,6 +7271,7 @@ fn rebuild_stack(
     tags: &[u32],
     jf: &JitFrame,
     pins: &PinTable,
+    parked: Option<Object>,
 ) {
     let cf = &entry.cf;
     // Erased objects to re-insert, by ascending interpreter depth.
@@ -7458,6 +7465,23 @@ fn rebuild_stack(
             // self-or-null `Unbound` marker above the bound method.
             frame.stack.push(Object::Unbound);
         }
+    }
+    // A deopt-after-call's parked, already-computed result is the
+    // value the exiting op would have pushed: it occupies the next
+    // *native* slot, so interpreter-side inserts recorded above that
+    // depth (notably the `Unbound` self-or-null marker of a
+    // method-form `DynAttrGet` whose null span is open at `deopt_pc`)
+    // must land *above* it, not below. Pushing it after the trailing
+    // inserts inverted `[method, Unbound]` into `[Unbound, method]`,
+    // and the consuming CALL then invoked `Unbound` ("'NoneType'
+    // object is not callable" once the pin table hit its cap in a
+    // hot allocating loop; test_dictviews test_deeply_nested_repr).
+    if let Some(v) = parked {
+        while next < inserts.len() && inserts[next].0 as usize == frame.stack.len() {
+            frame.stack.push(inserts[next].1.clone());
+            next += 1;
+        }
+        frame.stack.push(v);
     }
     while next < inserts.len() {
         frame.stack.push(inserts[next].1.clone());

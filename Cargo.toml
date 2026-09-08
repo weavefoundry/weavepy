@@ -12,6 +12,7 @@ members = [
     "crates/weavepy-lexer",
     "crates/weavepy-parser",
     "crates/weavepy-pylib",
+    "crates/weavepy-version",
     "crates/weavepy-vm",
     "vendor/expat-sys",
 ]
@@ -28,6 +29,7 @@ default-members = [
     "crates/weavepy-lexer",
     "crates/weavepy-parser",
     "crates/weavepy-pylib",
+    "crates/weavepy-version",
     "crates/weavepy-vm",
 ]
 
@@ -56,6 +58,7 @@ weavepy-conformance = { path = "crates/weavepy-conformance", version = "0.0.0" }
 weavepy-jit         = { path = "crates/weavepy-jit",         version = "0.0.0" }
 weavepy-lexer       = { path = "crates/weavepy-lexer",       version = "0.0.0" }
 weavepy-parser      = { path = "crates/weavepy-parser",      version = "0.0.0" }
+weavepy-version     = { path = "crates/weavepy-version",     version = "0.0.0" }
 weavepy-vm          = { path = "crates/weavepy-vm",          version = "0.0.0" }
 
 # Third-party.
@@ -309,9 +312,15 @@ debug         = "line-tables-only"
 strip         = "debuginfo"
 panic         = "unwind"
 
+# Profiling build: release codegen with full, unstripped debuginfo so
+# `sample`/`perf` and `atos`/`addr2line` attribute samples to source lines
+# (`weavepy-bench profile`, RFC 0077 WS1). Note cargo routes this profile's
+# output to `target/release/` too, so build it with a separate
+# `CARGO_TARGET_DIR` to keep a release binary intact alongside.
 [profile.bench]
 inherits = "release"
 debug    = true
+strip    = "none"
 
 # A profile for shipping a maximally-optimized interpreter binary.
 [profile.dist]

@@ -378,10 +378,19 @@ fn write_fstring_body(out: &mut String, e: &Expr, is_format_spec: bool) -> Optio
             ..
         } => {
             out.push('{');
-            let mut inner = String::new();
-            // `PR_TEST + 1` in CPython's `append_formattedvalue`:
-            // lambdas / conditionals / walruses get wrapped in parens.
-            write_expr(&mut inner, value, Level::Or)?;
+            // An interpolation carries its expression's source text and
+            // CPython's `append_interpolation` emits that verbatim
+            // (`t'{a    +  b}'` round-trips), where a formatted value is
+            // re-unparsed at `PR_TEST + 1`: lambdas / conditionals /
+            // walruses get wrapped in parens.
+            let inner = match &e.kind {
+                ExprKind::Interpolation { text, .. } => text.clone(),
+                _ => {
+                    let mut inner = String::new();
+                    write_expr(&mut inner, value, Level::Or)?;
+                    inner
+                }
+            };
             // `{{` would read as an escaped literal brace: CPython
             // inserts a space (`{ {…}`).
             if inner.starts_with('{') {

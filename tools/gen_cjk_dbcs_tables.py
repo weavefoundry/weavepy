@@ -1,7 +1,7 @@
-#!/usr/bin/env python3.13
+#!/usr/bin/env python3.14
 """Generate `_cjk_tables.py` — packed mapping tables for the CJK DBCS codecs.
 
-Run with a real CPython 3.13 (`python3.13 tools/gen_cjk_dbcs_tables.py`); the
+Run with a real CPython 3.14 (`python3.14 tools/gen_cjk_dbcs_tables.py`); the
 tables are *probed* from CPython's own cjkcodecs so WeavePy's pure-Python
 ports (`_codec_cjk_dbcs.py`) reproduce the reference behaviour bit-for-bit,
 including every NEC/IBM duplicate-row preference and decode-only cell.

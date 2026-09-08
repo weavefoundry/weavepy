@@ -22,6 +22,7 @@ default = []
 [dependencies]
 weavepy-vm      = { workspace = true }
 weavepy-compiler = { workspace = true }
+weavepy-version = { workspace = true }
 libc            = { workspace = true }
 # RFC 0069 WS5 — C-stack headroom probe for the C-API recursion guard.
 stacker         = "0.1.24"
@@ -38,6 +39,7 @@ windows-sys = { workspace = true }
 
 [build-dependencies]
 cc = "1.0"
+weavepy-version = { workspace = true }
 
 [dev-dependencies]
 weavepy   = { workspace = true }

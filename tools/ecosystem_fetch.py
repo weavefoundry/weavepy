@@ -35,6 +35,8 @@ BOOTSTRAP = ["pip", "setuptools", "wheel"]
 
 # The expectations spelling of this host (the harness's own mapping).
 HOST_OS = {"win32": "windows", "darwin": "macos"}.get(sys.platform, "linux")
+# The CPython minor WeavePy presents to wheel resolution (`cp314` tags).
+TARGET_PYTHON_VERSION = "3.14"
 
 
 def skipped_rows(manifest_path: Path):
@@ -188,8 +190,9 @@ def main() -> int:
     wheel_groups = [BOOTSTRAP] + wheel_groups
 
     args.dest.mkdir(parents=True, exist_ok=True)
-    # Target WeavePy's compatibility surface (cp313), not the host
-    # interpreter — otherwise a cp39 host fetches cp39 binary wheels
+    # Target WeavePy's compatibility surface (cp314 since RFC 0077; keep
+    # in step with `crates/weavepy-version`), not the host interpreter —
+    # otherwise a cp39 host fetches cp39 binary wheels
     # (charset_normalizer, markupsafe) that WeavePy's pip then rejects.
     # Cross-version download requires --only-binary, which is what the
     # offline lane wants anyway.
@@ -248,7 +251,7 @@ def main() -> int:
             "--implementation",
             "cp",
             "--python-version",
-            "3.13",
+            TARGET_PYTHON_VERSION,
             *[a for p in plats for a in ("--platform", p)],
             "--platform",
             "any",

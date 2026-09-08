@@ -479,7 +479,25 @@ fn fwd_get_buffer_obj(obj: &Object) -> Result<Object, RuntimeError> {
 /// consuming the reference. NULL surfaces the pending C exception
 /// (e.g. `PyBytes_FromFormat(b'%c', c_int(-1))` → OverflowError).
 fn fwd_steal_object(p: usize) -> Result<Object, RuntimeError> {
+    if p == 0 {
+        // cfield.c `O_get`: a NULL result with no exception pending is a
+        // ValueError, not a generic "operation failed" RuntimeError
+        // (test_refcounts.test_restype_py_object_with_null_return).
+        return Err(match crate::errors::take_pending() {
+            Some(pending) => crate::errors::to_runtime_error(pending),
+            None => weavepy_vm::error::value_error("PyObject is NULL"),
+        });
+    }
     unwrap(p as *mut PyObject)
+}
+
+/// ctypes `py_object` callback argument: the C caller keeps ownership of
+/// the pointer, so clone the VM object without consuming a reference.
+fn fwd_borrow_object(p: usize) -> Result<Object, RuntimeError> {
+    if p == 0 {
+        return Err(weavepy_vm::error::value_error("PyObject is NULL"));
+    }
+    Ok(unsafe { crate::object::clone_object(p as *mut PyObject) })
 }
 
 /// ctypes `py_object` argument: mint a new owned `PyObject*` for the VM
@@ -560,10 +578,12 @@ pub fn install() {
         get_buffer: fwd_get_buffer,
         get_buffer_obj: fwd_get_buffer_obj,
         steal_object: fwd_steal_object,
+        borrow_object: fwd_borrow_object,
         object_to_owned_ptr: fwd_object_to_owned_ptr,
         release_object_ptr: fwd_release_object_ptr,
         descr_get: fwd_descr_get,
         handled_exception: fwd_handled_exception,
+        take_pending_error: crate::errors::take_pending_error_runtime,
     });
     weavepy_vm::types::TypeObject::install_metaclass_drift_hook(
         crate::types::metaclass_drift_probe,

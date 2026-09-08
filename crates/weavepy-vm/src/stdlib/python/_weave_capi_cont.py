@@ -163,6 +163,10 @@ def dict_getitem(mapping, key):
     if not isinstance(mapping, dict):
         return KeyError
     try:
+        # PyObject_Hash() first: the C code hashes the key itself, so an
+        # unhashable key reports the plain "unhashable type" message, not
+        # dict.get()'s 3.14 "cannot use ... as a dict key" wrapper.
+        hash(key)
         value = dict.get(mapping, key, _NULL)
     except BaseException as exc:
         _write_unraisable(
@@ -310,9 +314,11 @@ def dict_mergefromseq2(mapping, seq2, override):
             try:
                 fast = list(item)
             except TypeError:
-                raise TypeError(
-                    "cannot convert dictionary update sequence element #%d "
-                    "to a sequence" % i) from None
+                exc = TypeError("object is not iterable")
+                exc.add_note(
+                    "Cannot convert dictionary update sequence element #%d "
+                    "to a sequence" % i)
+                raise exc from None
         n = len(fast)
         if n != 2:
             raise ValueError(

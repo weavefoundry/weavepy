@@ -988,9 +988,14 @@ fn compressor_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
         ));
     }
 
+    // 3.14: `preset` is a clinic `uint32_t` (`_PyLong_UInt32_Converter`):
+    // a negative value is ValueError, one past 2**32 OverflowError
+    // (test_lzma test_init_bad_preset).
     let preset_u = match preset_val {
-        Some(p) if p < 0 => return Err(overflow_error("can't convert negative int to unsigned")),
-        Some(p) => p as u32,
+        Some(p) if p < 0 => return Err(value_error("Cannot convert negative int")),
+        Some(p) => {
+            u32::try_from(p).map_err(|_| overflow_error("Python int too large for C uint32_t"))?
+        }
         None => 6,
     };
 

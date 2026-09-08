@@ -666,13 +666,13 @@ pub fn init_static_types() {
     // tp_basicsize` and raises `ValueError("X size changed, may indicate
     // binary incompatibility. Expected N from C header, got M from
     // PyObject")` when the live value is smaller than the `sizeof(...)` its
-    // stock CPython 3.13 headers baked in (numpy.random's `bit_generator`
-    // checks `builtins.type` == `sizeof(PyHeapTypeObject)` = 928, and a
+    // stock CPython 3.14 headers baked in (numpy.random's `bit_generator`
+    // checks `builtins.type` == `sizeof(PyHeapTypeObject)` = 936, and a
     // zero tripped it). WeavePy stores these objects as managed
     // `PyObjectBox` mirrors, so the field is **reporting-only**: it never
     // diverts allocation, which is gated by the separate `INLINE_TYPES`
     // registry these are never entered into. The values mirror stock
-    // CPython 3.13 (`<type>.__basicsize__` / `.__itemsize__`) byte-for-byte.
+    // CPython 3.14 (`<type>.__basicsize__` / `.__itemsize__`) byte-for-byte.
     unsafe fn set_size(slot: &StaticType, basicsize: PySsizeT, itemsize: PySsizeT) {
         unsafe {
             let ty = &mut *slot.as_ptr();
@@ -716,7 +716,7 @@ pub fn init_static_types() {
     }
 
     unsafe {
-        set_size(&PyType_Type, 928, 40);
+        set_size(&PyType_Type, 936, 40);
         set_size(&PyBaseObject_Type, 16, 0);
         set_size(&PyLong_Type, 24, 4);
         set_size(&PyFloat_Type, 24, 0);
@@ -725,7 +725,13 @@ pub fn init_static_types() {
         set_size(&PyUnicode_Type, 64, 0);
         set_size(&PyBytes_Type, 33, 1);
         set_size(&PyByteArray_Type, 56, 0);
-        set_size(&PyTuple_Type, 24, 8);
+        // 3.14: `sizeof(PyTupleObject) - sizeof(PyObject*)` — the var head
+        // plus the `ob_hash` cache (gh-131525).
+        set_size(
+            &PyTuple_Type,
+            crate::layout::TUPLE_HEAD_BYTES as PySsizeT,
+            8,
+        );
         set_size(&PyList_Type, 40, 0);
         set_size(&PyDict_Type, 48, 0);
         set_size(&PySet_Type, 200, 0);
@@ -3453,6 +3459,18 @@ pub unsafe extern "C" fn PyType_FromMetaclass(
                 }
                 x if x == crate::slottable::Py_tp_base || x == crate::slottable::Py_tp_bases => {
                     // Already consumed in the bases pass.
+                }
+                x if x == crate::slottable::Py_tp_token => {
+                    // 3.14 (gh-124153): `Py_TP_USE_SPEC` (NULL) means the
+                    // spec's own address is the token, so a module can
+                    // recognise its heap types via `PyType_GetBaseByToken`
+                    // without a static.
+                    let token = if slot.pfunc.is_null() {
+                        spec as *mut c_void
+                    } else {
+                        slot.pfunc
+                    };
+                    slot_table.install(slot.slot, token);
                 }
                 _ => {
                     slot_table.install(slot.slot, slot.pfunc);

@@ -420,7 +420,7 @@ pub unsafe extern "C" fn PyDictProxy_New(mapping: *mut PyObject) -> *mut PyObjec
 // ---------------------------------------------------------------------------
 
 /// Build a Python tuple owning new references to `items`.
-unsafe fn pack_tuple(items: &[*mut PyObject]) -> *mut PyObject {
+pub(crate) unsafe fn pack_tuple(items: &[*mut PyObject]) -> *mut PyObject {
     let t = unsafe { crate::containers::PyTuple_New(items.len() as isize) };
     if t.is_null() {
         return ptr::null_mut();
@@ -433,7 +433,7 @@ unsafe fn pack_tuple(items: &[*mut PyObject]) -> *mut PyObject {
 }
 
 /// `getattr(import(modname), attr)(*args)`.
-unsafe fn call_module_attr(
+pub(crate) unsafe fn call_module_attr(
     modname: *const c_char,
     attr: *const c_char,
     args: &[*mut PyObject],

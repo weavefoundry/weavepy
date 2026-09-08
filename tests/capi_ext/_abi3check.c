@@ -1,7 +1,7 @@
 /*
  * _abi3check — the RFC 0056 WS5 limited-API (abi3) proof.
  *
- * Compiled against the host's stock CPython 3.13 headers with
+ * Compiled against the host's stock CPython 3.14 headers with
  * `Py_LIMITED_API = 0x030D0000`, so — unlike the `_stock*` fixtures —
  * every object access goes through *exported functions*, never inlined
  * macros. This is exactly the surface a PyO3 `abi3-py313` wheel binds

@@ -81,9 +81,9 @@ enum Cmd {
         no_check: bool,
 
         /// Explicit CPython `Lib/test/` directory. Overrides the
-        /// `vendor/cpython/Lib/test/` (then `vendor/cpython-tests/`)
-        /// auto-discovery — this is how CI points the harness at a real
-        /// CPython 3.13 checkout.
+        /// `vendor/cpython314/Lib/test/` (then `vendor/cpython/Lib/test/`,
+        /// then `vendor/cpython-tests/`) auto-discovery — this is how CI
+        /// points the harness at a real CPython 3.14 checkout.
         #[arg(long, value_name = "DIR")]
         cpython_dir: Option<PathBuf>,
 

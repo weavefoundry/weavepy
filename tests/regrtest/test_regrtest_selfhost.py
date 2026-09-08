@@ -184,6 +184,8 @@ class RunSingleTestTests(unittest.TestCase):
             python_cmd=None,
             randomize=False,
             random_seed=0,
+            # 3.14's libregrtest (`--parallel-threads`, gh-127500).
+            parallel_threads=None,
         )
 
     def _write(self, path, name, src):

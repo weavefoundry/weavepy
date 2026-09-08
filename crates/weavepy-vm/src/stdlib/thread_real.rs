@@ -339,9 +339,7 @@ fn resolve_acquire_args(
         // Beyond `TIMEOUT_MAX` the nanosecond deadline overflows; CPython
         // raises OverflowError.
         if tv.is_nan() || tv > TIMEOUT_MAX_SECS {
-            return Err(overflow_error(
-                "timestamp too large to convert to C _PyTime_t",
-            ));
+            return Err(overflow_error("timestamp out of range for C PyTime_t"));
         }
     }
     Ok((blocking, timeout_obj))
@@ -569,28 +567,34 @@ fn rlock_type() -> Rc<TypeObject> {
     })
 }
 
-/// `type(RLock).__repr__` — `<unlocked _thread.RLock object at 0x...>`
-/// (or `locked`), derived from the instance's own `locked()` method.
+/// `type(RLock).__repr__` — 3.14's
+/// `<unlocked _thread.RLock object owner=0 count=0 at 0x...>` (or
+/// `locked`, with the owning thread id and recursion depth; gh-134322,
+/// `lock_tests.RLockTests.test_repr_count`), read from the instance's
+/// `_weave_repr_state()` snapshot.
 fn rlock_repr(args: &[Object]) -> Result<Object, RuntimeError> {
     let Some(Object::Instance(inst)) = args.first() else {
         return Err(type_error("__repr__ requires an RLock instance"));
     };
-    let locked_fn = inst
+    let state_fn = inst
         .dict
         .borrow()
-        .get(&DictKey(Object::from_static("locked")))
+        .get(&DictKey(Object::from_static("_weave_repr_state")))
         .cloned();
-    let is_locked = matches!(
-        locked_fn.and_then(|f| match f {
-            Object::Builtin(b) => (b.call)(&[]).ok(),
-            _ => None,
-        }),
-        Some(Object::Bool(true))
-    );
-    let st = if is_locked { "locked" } else { "unlocked" };
+    let (owner, count) = match state_fn.and_then(|f| match f {
+        Object::Builtin(b) => (b.call)(&[]).ok(),
+        _ => None,
+    }) {
+        Some(Object::Tuple(t)) => match (t.first(), t.get(1)) {
+            (Some(Object::Int(o)), Some(Object::Int(c))) => (*o, *c),
+            _ => (0, 0),
+        },
+        _ => (0, 0),
+    };
+    let st = if count > 0 { "locked" } else { "unlocked" };
     let addr = Rc::as_ptr(inst) as usize;
     Ok(Object::from_str(format!(
-        "<{st} _thread.RLock object at 0x{addr:x}>"
+        "<{st} _thread.RLock object owner={owner} count={count} at 0x{addr:x}>"
     )))
 }
 
@@ -761,6 +765,16 @@ fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
     let locked = move |_args: &[Object]| -> Result<Object, RuntimeError> {
         Ok(Object::Bool(locked_lock.depth() > 0))
     };
+    // `(owner, count)` snapshot for `__repr__` (3.14 prints both,
+    // gh-134322); not part of CPython's public surface.
+    let repr_state_lock = rlock.clone();
+    let repr_state = move |_args: &[Object]| -> Result<Object, RuntimeError> {
+        let (owner, depth) = repr_state_lock.owner_and_depth();
+        Ok(Object::new_tuple(vec![
+            Object::Int(i64::try_from(owner).unwrap_or(i64::MAX)),
+            Object::Int(depth as i64),
+        ]))
+    };
     // CPython's RLock exposes `_release_save` / `_acquire_restore` so
     // `Condition.wait()` can drop the *entire* reentrant hold and later
     // restore it. The opaque "state" is just the saved recursion count.
@@ -861,6 +875,10 @@ fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
         d.insert(
             DictKey(Object::from_static("locked")),
             b_dyn("locked", locked),
+        );
+        d.insert(
+            DictKey(Object::from_static("_weave_repr_state")),
+            b_dyn("_weave_repr_state", repr_state),
         );
         d.insert(
             DictKey(Object::from_static("__enter__")),
@@ -1454,8 +1472,17 @@ fn spawn_python_worker(
             // releasing the lock so a thread waking from `join()`
             // immediately observes `is_done()`.
             let _ = crate::gil::pop_gil_guard();
+            // A daemon thread that reaches this point during interpreter
+            // finalization was forced out by the dispatch loop (CPython's
+            // `tstate_must_exit`: it would hang forever in `take_gil` and
+            // never run its handle's `set_done`). Keep the handle "running"
+            // so `Thread.is_alive()` stays true and `join()` raises
+            // `PythonFinalizationError`, as CPython 3.14 reports
+            // (test_threading.test_join_daemon_thread_in_finalization).
             if let Some(hs) = &worker_handle {
-                hs.done.store(true, Ordering::Release);
+                if !(daemon && crate::vm_singletons::is_finalizing()) {
+                    hs.done.store(true, Ordering::Release);
+                }
             }
             entry.mark_finished();
             let _ = worker_lock.release();
@@ -1714,6 +1741,19 @@ fn make_thread_handle_object(state: Arc<ThreadHandleState>, ident: Object) -> Ob
         // what `current_worker_thread_id()` reports.
         if ident == crate::vm_singletons::current_worker_thread_id() {
             return Err(runtime_error("Cannot join current thread"));
+        }
+        // gh-123940 (CPython 3.14): a thread still running once
+        // finalization has begun was forced to exit and will never signal
+        // its handle; joining it would block forever.
+        if crate::vm_singletons::is_finalizing() {
+            return Err(RuntimeError::PyException(crate::error::PyException::new(
+                crate::builtin_types::make_exception_with_class(
+                    crate::builtin_types::builtin_types()
+                        .python_finalization_error
+                        .clone(),
+                    "cannot join thread at interpreter shutdown",
+                ),
+            )));
         }
         let me = crate::gil::current_thread_id();
         // `threading.Thread.join` clamps the timeout to >= 0 before it

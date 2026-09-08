@@ -127,7 +127,7 @@ unsafe fn inherit_struct(t: *mut PyTypeObject, base: *mut PyTypeObject) {
 
     // Instance size is inherited when the subtype declares none —
     // CPython's `inherit_special`. pybind11's `make_default_metaclass`
-    // leaves `tp_basicsize` at 0 and relies on readying to pull 928
+    // leaves `tp_basicsize` at 0 and relies on readying to pull 936
     // (`sizeof(PyHeapTypeObject)`) down from `PyType_Type`; its
     // `tp_alloc` calls then size type-object allocations off the field
     // (RFC 0066 WS3 — a 0 here truncated pybind11's `pybind11_object`

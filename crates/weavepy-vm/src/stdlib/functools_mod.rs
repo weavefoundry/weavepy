@@ -48,8 +48,8 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "reduce",
                 binds_instance: false,
-                call: Box::new(reduce),
-                call_kw: None,
+                call: Box::new(|args| reduce(args, &[])),
+                call_kw: Some(Box::new(reduce)),
             })),
         );
         // The *class* itself, as in CPython's C module — torch._dynamo
@@ -83,6 +83,17 @@ fn partial_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     let slf = args.first().ok_or_else(|| {
         type_error("descriptor '__call__' of 'functools.partial' object needs an argument")
     })?;
+    // 3.14 `functools.Placeholder`: a partial with placeholders merges
+    // call-site positionals into the stored tuple. That path stays in
+    // the frozen `functools.py` (`_partial_call_py`); the native fast
+    // path covers the common placeholder-free case.
+    if let Ok(phcount) = interp.load_attr_public(slf, "_phcount") {
+        if !matches!(phcount, Object::Int(0)) {
+            let py_call = interp.load_attr_public(slf, "_partial_call_py")?;
+            let globals = interp.builtins_dict();
+            return interp.call(&py_call, &args[1..], kwargs, &globals);
+        }
+    }
     let func = interp.load_attr_public(slf, "func")?;
     let stored_args = interp.load_attr_public(slf, "args")?;
     let stored_kw = interp.load_attr_public(slf, "keywords")?;
@@ -282,7 +293,14 @@ fn lru_cache_wrapper_new(args: &[Object]) -> Result<Object, RuntimeError> {
     lru_set(&inst, "_lru_hits", Object::Int(0));
     lru_set(&inst, "_lru_misses", Object::Int(0));
     lru_set(&inst, "_lru_cache_info_cls", cache_info_cls.clone());
-    Ok(Object::Instance(inst))
+    // CPython's `lru_cache_new` GC-tracks the wrapper: its `__wrapped__`
+    // edge closes the `module dict -> wrapper -> function -> __globals__`
+    // cycle of every `@lru_cache` at module level, and an untracked
+    // wrapper counted as an external root that made that namespace
+    // immortal.
+    let wrapper = Object::Instance(inst);
+    crate::gc_trace::track(wrapper.clone());
+    Ok(wrapper)
 }
 
 /// Build the cache key for one call (CPython's `lru_cache_make_key`): a
@@ -523,10 +541,28 @@ fn lru_descr_get(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object
 
 /// `reduce(function, iterable[, initial])` — native loop, no Python
 /// frame per step (CPython's `_functools.reduce`).
-fn reduce(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.len() < 2 || args.len() > 3 {
+fn reduce(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    // 3.14 (gh-125916): `initial` may be passed by keyword; `function`
+    // and `iterable` remain positional-only.
+    if args.len() < 2 {
         return Err(type_error(format!(
-            "reduce expected at most 3 arguments, got {}",
+            "reduce() takes at least 2 positional arguments ({} given)",
+            args.len()
+        )));
+    }
+    let mut args: Vec<Object> = args.to_vec();
+    for (k, v) in kwargs {
+        if k == "initial" {
+            args.push(v.clone());
+        } else {
+            return Err(type_error(format!(
+                "reduce() got an unexpected keyword argument '{k}'"
+            )));
+        }
+    }
+    if args.len() > 3 {
+        return Err(type_error(format!(
+            "reduce() takes at most 3 arguments ({} given)",
             args.len()
         )));
     }

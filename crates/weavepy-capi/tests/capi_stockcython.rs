@@ -24,7 +24,7 @@
 //!     inherited dunders are still reached through the bridged MRO).
 //!
 //! Skipped (passes) when the env var is unset — that happens when
-//! CPython 3.13 dev headers (or `cc`) aren't available on the build
+//! CPython 3.14 dev headers (or `cc`) aren't available on the build
 //! host, so CI on a bare machine still passes.
 
 use std::path::PathBuf;
@@ -181,7 +181,7 @@ fn stockcython_module_loads_with_types() {
         }
     }
     match lookup(&module, "ABI") {
-        Some(Object::Str(s)) => assert_eq!(&*s, "cp313"),
+        Some(Object::Str(s)) => assert_eq!(&*s, "cp314"),
         other => panic!("ABI wrong: {other:?}"),
     }
 }

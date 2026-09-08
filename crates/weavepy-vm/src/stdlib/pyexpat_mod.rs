@@ -906,6 +906,22 @@ fn error_string_for(code: c_int) -> Option<String> {
 
 /// Raise `ExpatError` for the parser's current error state (`set_error`).
 fn set_error(st: &StateRef, code: c_int) -> RuntimeError {
+    set_error_with(st, code, None)
+}
+
+/// `XML_ERROR_INVALID_ARGUMENT` (expat.h `enum XML_Error`).
+const XML_ERROR_INVALID_ARGUMENT: c_int = 41;
+
+/// `set_invalid_arg`: an `ExpatError` whose message is `errmsg` verbatim
+/// (no "line/column" suffix) but which still carries the parser's current
+/// position in `lineno`/`offset` and `XML_ERROR_INVALID_ARGUMENT` in `code`.
+fn set_invalid_arg(st: &StateRef, errmsg: &str) -> RuntimeError {
+    set_error_with(st, XML_ERROR_INVALID_ARGUMENT, Some(errmsg))
+}
+
+/// pyexpat.c `set_xml_error`: build the exception for `code`, using
+/// `errmsg` verbatim as the message when given.
+fn set_error_with(st: &StateRef, code: c_int, errmsg: Option<&str>) -> RuntimeError {
     let parser = st.borrow().parser();
     // SAFETY: live parser handle. `XML_Size` is u64 on unix builds but u32 on
     // windows-gnu, so a lossless `From` conversion isn't portable here.
@@ -916,12 +932,15 @@ fn set_error(st: &StateRef, code: c_int) -> RuntimeError {
             ex::XML_GetCurrentColumnNumber(parser) as i64,
         )
     };
-    let msg = format!(
-        "{}: line {}, column {}",
-        error_string_for(code).unwrap_or_else(|| "unknown error".to_owned()),
-        lineno,
-        column
-    );
+    let msg = match errmsg {
+        Some(m) => m.to_owned(),
+        None => format!(
+            "{}: line {}, column {}",
+            error_string_for(code).unwrap_or_else(|| "unknown error".to_owned()),
+            lineno,
+            column
+        ),
+    };
     let cls = expat_error_type();
     let einst = PyInstance::new(cls);
     einst.slot_set("args", Object::new_tuple(vec![Object::from_str(msg)]));
@@ -1144,6 +1163,18 @@ fn parser_type() -> Rc<TypeObject> {
             "SetReparseDeferralEnabled",
             set_reparse_deferral_method,
         );
+        if expat_at_least(2, 4) {
+            method(
+                &mut d,
+                "SetBillionLaughsAttackProtectionActivationThreshold",
+                set_bl_activation_threshold_method,
+            );
+            method(
+                &mut d,
+                "SetBillionLaughsAttackProtectionMaximumAmplification",
+                set_bl_maximum_amplification_method,
+            );
+        }
         method(&mut d, "__setattr__", setattr_method);
         method(&mut d, "__del__", del_method);
         let cls = TypeObject::new_with_flags(
@@ -1578,7 +1609,17 @@ fn external_entity_parser_create(args: &[Object]) -> Result<Object, RuntimeError
     let ctx_ptr = ctx_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
     let enc_ptr = enc_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
 
-    let (parent_parser, handlers, intern, buffer_text, buffer_size, ordered, specified, nsp) = {
+    let (
+        parent_parser,
+        handlers,
+        intern,
+        buffer_text,
+        buffer_size,
+        ordered,
+        specified,
+        nsp,
+        reparse,
+    ) = {
         let s = st.borrow();
         (
             s.parser(),
@@ -1589,6 +1630,7 @@ fn external_entity_parser_create(args: &[Object]) -> Result<Object, RuntimeError
             s.ordered_attributes,
             s.specified_attributes,
             s.ns_prefixes,
+            s.reparse_deferral,
         )
     };
     // SAFETY: live parent parser; context/encoding pointers valid or null.
@@ -1618,6 +1660,15 @@ fn external_entity_parser_create(args: &[Object]) -> Result<Object, RuntimeError
                     s.ordered_attributes = ordered;
                     s.specified_attributes = specified;
                     s.handlers = handlers;
+                    // The sub-parser inherits the parent's reparse
+                    // deferral setting (pyexpat.c, Expat >= 2.6).
+                    s.reparse_deferral = reparse;
+                    if expat_at_least(2, 6) {
+                        // SAFETY: live child parser.
+                        unsafe {
+                            ex::XML_SetReparseDeferralEnabled(child, ex::XML_Bool::from(reparse));
+                        }
+                    }
                 }
                 let s = child_st.borrow();
                 for (slot, h) in s.handlers.iter().enumerate() {
@@ -1887,6 +1938,84 @@ fn set_reparse_deferral_method(args: &[Object]) -> Result<Object, RuntimeError> 
         }
     }
     Ok(Object::None)
+}
+
+/// Argument Clinic `unsigned_long_long` converter
+/// (`_PyLong_UnsignedLongLong_Converter`): an int, non-negative, that fits
+/// in 64 bits.
+fn unsigned_long_long_arg(v: Option<&Object>) -> Result<u64, RuntimeError> {
+    let v = v.ok_or_else(|| type_error("function takes exactly 1 argument (0 given)"))?;
+    match v {
+        Object::Int(i) => {
+            if *i < 0 {
+                return Err(value_error("value must be positive"));
+            }
+            Ok(*i as u64)
+        }
+        Object::Bool(b) => Ok(u64::from(*b)),
+        Object::Long(_) => {
+            let big = v
+                .as_bigint()
+                .ok_or_else(|| type_error("an integer is required"))?;
+            if big.sign() == num_bigint::Sign::Minus {
+                return Err(value_error("value must be positive"));
+            }
+            u64::try_from(big).map_err(|_| overflow_error("int too big to convert"))
+        }
+        _ => Err(type_error("an integer is required")),
+    }
+}
+
+/// Argument Clinic `float` converter: `PyFloat_AsDouble` narrowed to C
+/// `float`.
+fn float_arg(v: Option<&Object>) -> Result<f32, RuntimeError> {
+    let v = v.ok_or_else(|| type_error("function takes exactly 1 argument (0 given)"))?;
+    match v {
+        Object::Float(f) => Ok(*f as f32),
+        Object::Int(i) => Ok(*i as f32),
+        Object::Bool(b) => Ok(f32::from(u8::from(*b))),
+        Object::Long(_) => Ok(v.as_f64().unwrap_or(f32::INFINITY.into()) as f32),
+        other => Err(type_error(format!(
+            "must be real number, not {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// `xmlparser.SetBillionLaughsAttackProtectionActivationThreshold(threshold)`.
+fn set_bl_activation_threshold_method(args: &[Object]) -> Result<Object, RuntimeError> {
+    let st = state_of_args(args)?;
+    let threshold = unsigned_long_long_arg(args.get(1))?;
+    let parser = st.borrow().parser();
+    // SAFETY: live parser.
+    let ok =
+        unsafe { ex::XML_SetBillionLaughsAttackProtectionActivationThreshold(parser, threshold) };
+    if ok == ex::XML_TRUE {
+        return Ok(Object::None);
+    }
+    // Only fails for a non-root parser (ExternalEntityParserCreate).
+    Err(set_invalid_arg(&st, "parser must be a root parser"))
+}
+
+/// `xmlparser.SetBillionLaughsAttackProtectionMaximumAmplification(max_factor)`.
+fn set_bl_maximum_amplification_method(args: &[Object]) -> Result<Object, RuntimeError> {
+    let st = state_of_args(args)?;
+    let max_factor = float_arg(args.get(1))?;
+    let parser = st.borrow().parser();
+    // SAFETY: live parser.
+    let ok =
+        unsafe { ex::XML_SetBillionLaughsAttackProtectionMaximumAmplification(parser, max_factor) };
+    if ok == ex::XML_TRUE {
+        return Ok(Object::None);
+    }
+    // Expat does not say which check failed (gh-90949): report the
+    // out-of-range factor when that is the cause, else the parser kind.
+    let message = if max_factor.is_nan() || max_factor < 1.0 {
+        "'max_factor' must be at least 1.0"
+    } else {
+        "parser must be a root parser"
+    };
+    Err(set_invalid_arg(&st, message))
 }
 
 // ---------------------------------------------------------------------------

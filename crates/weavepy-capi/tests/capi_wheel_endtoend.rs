@@ -42,7 +42,7 @@ fn py_quote(s: &str) -> String {
 /// compiled `_numpylike.so` payload. The wheel structure is:
 ///
 /// ```text
-/// _numpylike.cpython-313-<plat>.so   ← the extension
+/// _numpylike.cpython-314-<plat>.so   ← the extension
 /// numpylike-1.0.0.dist-info/METADATA
 /// numpylike-1.0.0.dist-info/WHEEL
 /// numpylike-1.0.0.dist-info/RECORD
@@ -51,7 +51,7 @@ fn build_wheel(out_dir: &Path, ext_path: &Path) -> PathBuf {
     // The wheel format is a regular zip; we hand-roll a minimal one
     // here so the test doesn't depend on the host `zip` binary or
     // an extra crate.
-    let wheel_path = out_dir.join("numpylike-1.0.0-cp313-cp313-any.whl");
+    let wheel_path = out_dir.join("numpylike-1.0.0-cp314-cp314-any.whl");
     let mut wheel = zip_minimal::Writer::new(File::create(&wheel_path).unwrap());
 
     let so_name = if cfg!(target_os = "windows") {
@@ -73,7 +73,7 @@ fn build_wheel(out_dir: &Path, ext_path: &Path) -> PathBuf {
     );
     wheel.add_file(
         "numpylike-1.0.0.dist-info/WHEEL",
-        b"Wheel-Version: 1.0\nGenerator: weavepy-test/0.1\nRoot-Is-Purelib: false\nTag: cp313-cp313-any\n",
+        b"Wheel-Version: 1.0\nGenerator: weavepy-test/0.1\nRoot-Is-Purelib: false\nTag: cp314-cp314-any\n",
     );
     wheel.add_file("numpylike-1.0.0.dist-info/RECORD", b"");
 
@@ -81,8 +81,22 @@ fn build_wheel(out_dir: &Path, ext_path: &Path) -> PathBuf {
     wheel_path
 }
 
+/// Every interpreter entry point runs on a main-thread-sized stack (the
+/// CLI reserves 1 GiB; the fixture harness spawns 16 MiB threads). Rust's
+/// 2 MiB test thread is not enough for `site` initialization plus the
+/// `_minipip` wheel install in an unoptimized build, so mirror the
+/// fixture harness here.
 #[test]
 fn wheel_install_and_import_round_trip() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(wheel_install_and_import_round_trip_impl)
+        .expect("spawn test thread")
+        .join()
+        .expect("test thread panicked");
+}
+
+fn wheel_install_and_import_round_trip_impl() {
     let Some(ext) = numpylike_path() else {
         eprintln!("WEAVEPY_CAPI_NUMPYLIKE_EXTENSION not set; skipping");
         return;
@@ -95,11 +109,11 @@ fn wheel_install_and_import_round_trip() {
     // Lay out a private venv-style prefix:
     //   <tmp>/
     //     bin/
-    //     lib/python3.13/site-packages/
-    //     wheels/numpylike-1.0.0-cp313-cp313-any.whl
+    //     lib/python3.14/site-packages/
+    //     wheels/numpylike-1.0.0-cp314-cp314-any.whl
     let tmp = tempfile::tempdir().expect("mktemp");
     let prefix = tmp.path();
-    let site_packages = prefix.join("lib/python3.13/site-packages");
+    let site_packages = prefix.join("lib/python3.14/site-packages");
     std::fs::create_dir_all(&site_packages).unwrap();
     std::fs::create_dir_all(prefix.join("bin")).unwrap();
     let wheel_dir = prefix.join("wheels");

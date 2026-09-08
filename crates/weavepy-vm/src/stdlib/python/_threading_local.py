@@ -61,9 +61,13 @@ _all_impls = {}
 def _register_impl(impl):
     key = id(impl)
 
-    def _drop(_ref, key=key):
-        with _locals_lock:
-            _all_impls.pop(key, None)
+    def _drop(_ref, key=key, lock=_locals_lock, impls=_all_impls):
+        # Default-bound so the callback still works while this module's
+        # globals are being blanked at interpreter teardown (the
+        # ``_PyModule_ClearDict`` step of a sub-interpreter's ``close()``),
+        # when ``_locals_lock`` and ``_all_impls`` already read as None.
+        with lock:
+            impls.pop(key, None)
 
     try:
         ref = _weakref.ref(impl, _drop)

@@ -103,10 +103,47 @@ impl Repl {
         if !self.quiet {
             self.print_banner();
         }
+        self.warn_dumb_terminal();
         if let Some(p) = startup {
             self.run_startup(p);
         }
+        self.install_prompts();
         self.run_loop()
+    }
+
+    /// CPython's `PyRun_InteractiveLoop` defines `sys.ps1` / `sys.ps2`
+    /// (when the startup file hasn't) on entering the loop; their
+    /// presence is how pdb / `code.interact` detect an interactive
+    /// session. Scripts run outside the REPL never see them.
+    fn install_prompts(&mut self) {
+        let Ok(Object::Module(sys)) = self.interpreter.import_path("sys") else {
+            return;
+        };
+        let mut d = sys.dict.borrow_mut();
+        for (name, value) in [("ps1", ps1()), ("ps2", ps2())] {
+            let key = DictKey(Object::from_static(name));
+            if !d.contains_key(&key) {
+                d.insert(key, Object::Str(Rc::from(value.as_str())));
+            }
+        }
+    }
+
+    /// 3.14's `_pyrepl.main.interactive_console`: on a tty whose
+    /// terminfo lacks the capabilities pyrepl needs (`TERM=dumb`), it
+    /// warns once on stderr and falls back to the basic REPL, unless
+    /// `PYTHON_BASIC_REPL` asked for that explicitly. Our line editor is
+    /// native, but the fallback notice is part of the observable contract
+    /// (test_pyrepl `TestDumbTerminal`).
+    fn warn_dumb_terminal(&self) {
+        if !self.stdin_tty || std::env::var_os("PYTHON_BASIC_REPL").is_some() {
+            return;
+        }
+        if std::env::var("TERM").map(|t| t == "dumb").unwrap_or(false) {
+            let _ = writeln!(
+                io::stderr(),
+                "warning: can't use pyrepl: (5, \"terminal doesn't have the required clear capability\"); TERM=dumb"
+            );
+        }
     }
 
     fn print_banner(&self) {
@@ -115,9 +152,14 @@ impl Repl {
         // stderr until the first `>>> ` while stdout must carry only
         // program output.
         let mut stderr = io::stderr().lock();
+        // CPython's `Python {sys.version} on {sys.platform}` shape (the
+        // version string already carries the "(WeavePy)" implementation
+        // tag), so tooling that sniffs the banner sees the interpreter
+        // version WeavePy identifies as (RFC 0077).
+        let (maj, min, mic) = weavepy_vm::stdlib::sys::PY_VERSION;
         let _ = writeln!(
             stderr,
-            "WeavePy {VERSION} (Python 3.13 compatible) on {}",
+            "Python {maj}.{min}.{mic} (WeavePy {VERSION}) on {}",
             host_platform()
         );
         let _ = writeln!(
@@ -175,6 +217,7 @@ impl Repl {
                     if let Some(p) = self.history_path.as_ref() {
                         let _ = self.editor.save_history(p);
                     }
+                    self.finalize_interpreter();
                     return Ok(());
                 }
                 Err(e) => {
@@ -309,10 +352,22 @@ impl Repl {
                 if let Some(p) = self.history_path.clone() {
                     let _ = self.editor.save_history(&p);
                 }
-                let _ = self.interpreter.flush_streams();
+                self.finalize_interpreter();
                 crate::exit_with_system_exit(code);
             }
         }
+    }
+
+    /// `Py_FinalizeEx` for the interactive session: join non-daemon
+    /// threads and run `atexit` callbacks, sweep leftover
+    /// sub-interpreters (GH-135729's "close them with
+    /// Interpreter.close()" warning), run finalizers, flush. Both exits
+    /// from the loop (EOF and `SystemExit`) come through here, as in
+    /// CPython's `pymain_run_python` → `Py_RunMain`.
+    fn finalize_interpreter(&mut self) {
+        self.interpreter.run_interpreter_shutdown();
+        self.interpreter.run_shutdown_finalizers();
+        let _ = self.interpreter.flush_streams();
     }
 
     fn flufl_active(&self) -> bool {

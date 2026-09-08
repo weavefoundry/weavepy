@@ -265,6 +265,8 @@ pub const Py_am_anext: c_int = 79;
 pub const Py_nb_matrix_multiply: c_int = 80;
 pub const Py_nb_inplace_matrix_multiply: c_int = 81;
 pub const Py_am_send: c_int = 82;
+/// 3.14: the type token slot (`PyType_GetBaseByToken`).
+pub const Py_tp_token: c_int = 83;
 
 /// All number-protocol slot IDs, used by [`SlotTable::has_number_protocol`].
 pub const PY_NB_SLOTS: &[c_int] = &[

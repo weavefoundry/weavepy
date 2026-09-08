@@ -1,33 +1,27 @@
-//! CPython 3.13's AST optimizer (`Python/ast_opt.c`) — RFC 0068 WS1.
+//! CPython 3.14's AST preprocessor (`Python/ast_preprocess.c`) plus the
+//! constant evaluators its flowgraph folds use (RFC 0068 WS1, RFC 0077
+//! WS9).
 //!
-//! Runs after validation and before code generation, rewriting the
-//! parse AST in place:
+//! 3.14 moved constant folding out of the AST pass and into the
+//! flowgraph optimizer (`fold_const_binop`, `fold_const_unaryop`,
+//! `fold_tuple_of_constants`, `optimize_lists_and_sets`, ...). What is
+//! left at the AST level is the `%`-format rewrite (`"%s" % (x,)` into
+//! a JoinedStr) and the walk itself; `crate::flowgraph` calls the
+//! evaluators below on `LOAD_CONST` operands instead.
 //!
-//! - constant folding of unary ops, binary ops (with CPython's
-//!   `safe_multiply`/`safe_power`/`safe_lshift`/`safe_mod` size
-//!   guards), constant subscripts, and all-constant tuples,
-//! - `not (x is y)` / `not (x in y)` inverted into `is not` / `not in`,
-//! - literal `list`/`set` operands of `in`/`not in` and of `for` /
-//!   comprehension iteration converted to `tuple`/`frozenset`
-//!   constants (a literal list of non-constants still becomes a
-//!   tuple display),
-//!
-//! so the production bytecode carries CPython's optimized shapes
-//! (`test_peepholer`'s `TestTranforms`, `test_compile`, `test_ast`).
-//!
-//! Folding is *exact*: a fold only happens when the compile-time value
-//! is bit-identical to what the VM would compute at run time (IEEE-754
-//! arithmetic for floats, CPython's Smith-scaled complex division,
-//! floor-division/modulo sign rules for ints). Anything else — errors,
-//! overflow-prone conversions, out-of-range subscripts — is left to
-//! run time, like `ast_opt.c` clearing the error and skipping the fold.
+//! Evaluation is *exact*: a fold only happens when the compile-time
+//! value is bit-identical to what the VM would compute at run time
+//! (IEEE-754 arithmetic for floats, CPython's Smith-scaled complex
+//! division, floor-division/modulo sign rules for ints). Anything else
+//! — errors, overflow-prone conversions, out-of-range subscripts — is
+//! left to run time, like CPython clearing the error and skipping the
+//! fold.
 
 use num_bigint::BigInt;
 use num_integer::Integer;
 use num_traits::{FromPrimitive, Pow, Signed, ToPrimitive, Zero};
 use weavepy_parser::ast::{
-    BinOp, CmpOp, Comprehension, Constant, Expr, ExprKind, Module, Stmt, StmtKind, TypeParamKind,
-    UnaryOp,
+    BinOp, Comprehension, Constant, Expr, ExprKind, Module, Stmt, StmtKind, TypeParamKind, UnaryOp,
 };
 
 /// `ast_opt.c` guards: don't create constants above these sizes.
@@ -175,7 +169,6 @@ fn fold_stmt(stmt: &mut Stmt, pep563: bool) {
         } => {
             fold_expr(target, false);
             fold_expr(iter, true);
-            fold_iter(iter);
             fold_body(body, pep563);
             fold_body(orelse, pep563);
         }
@@ -215,8 +208,7 @@ fn fold_stmt(stmt: &mut Stmt, pep563: bool) {
         StmtKind::Match { subject, cases } => {
             fold_expr(subject, true);
             for case in cases {
-                // Patterns keep their literal shapes (codegen folds
-                // pattern literals itself); guard and body fold.
+                fold_pattern(&mut case.pattern);
                 if let Some(g) = &mut case.guard {
                     fold_expr(g, true);
                 }
@@ -245,20 +237,88 @@ fn fold_stmt(stmt: &mut Stmt, pep563: bool) {
     }
 }
 
+/// `astfold_pattern`: the one AST-level constant fold 3.14 kept is the
+/// formation of negative and complex literals in `MatchValue` values
+/// and `MatchMapping` keys (`case -0.0:`, `case 1 - 2j:`), so those
+/// land in `co_consts` as single constants in pattern order.
+fn fold_pattern(pat: &mut weavepy_parser::ast::Pattern) {
+    use weavepy_parser::ast::PatternKind;
+    match &mut pat.kind {
+        PatternKind::Value(e) => fold_const_match_pattern(e),
+        PatternKind::Singleton(_) | PatternKind::Capture(_) | PatternKind::Star(_) => {}
+        PatternKind::Sequence(items) | PatternKind::Or(items) => {
+            for p in items {
+                fold_pattern(p);
+            }
+        }
+        PatternKind::Mapping { keys, patterns, .. } => {
+            for k in keys {
+                fold_const_match_pattern(k);
+            }
+            for p in patterns {
+                fold_pattern(p);
+            }
+        }
+        PatternKind::Class {
+            cls,
+            positionals,
+            keywords,
+        } => {
+            fold_expr(cls, true);
+            for p in positionals {
+                fold_pattern(p);
+            }
+            for (_, p) in keywords {
+                fold_pattern(p);
+            }
+        }
+        PatternKind::As { pattern, .. } => fold_pattern(pattern),
+    }
+}
+
+/// `fold_const_match_patterns`: `-<const>` and `<const> +/- <const>`.
+fn fold_const_match_pattern(e: &mut Expr) {
+    let folded = match &mut e.kind {
+        ExprKind::UnaryOp {
+            op: UnaryOp::USub,
+            operand,
+        } => match &operand.kind {
+            ExprKind::Constant(c) => eval_unaryop_const(UnaryOp::USub, c),
+            _ => None,
+        },
+        ExprKind::BinOp {
+            left,
+            op: op @ (BinOp::Add | BinOp::Sub),
+            right,
+        } => match &right.kind {
+            ExprKind::Constant(rc) => {
+                fold_const_match_pattern(left);
+                match &left.kind {
+                    ExprKind::Constant(lc) => eval_binop_const(lc, *op, rc),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(c) = folded {
+        e.kind = ExprKind::Constant(c);
+    }
+}
+
 fn fold_comprehensions(generators: &mut [Comprehension]) {
     for gen in generators {
         fold_expr(&mut gen.target, false);
         fold_expr(&mut gen.iter, true);
-        fold_iter(&mut gen.iter);
         for cond in &mut gen.ifs {
             fold_expr(cond, true);
         }
     }
 }
 
-/// Post-order fold. `load` is false in assignment/delete target
-/// position, where `fold_tuple`/`fold_subscr` must not apply (CPython
-/// guards on `ctx == Load`).
+/// Post-order walk. `load` is false in assignment/delete target
+/// position (kept for the `ctx == Load` guards CPython's walk has).
 fn fold_expr(e: &mut Expr, load: bool) {
     match &mut e.kind {
         ExprKind::Constant(_) | ExprKind::Name(_) => {}
@@ -266,9 +326,6 @@ fn fold_expr(e: &mut Expr, load: bool) {
         ExprKind::Subscript { value, slice } => {
             fold_expr(value, true);
             fold_expr(slice, true);
-            if load {
-                fold_subscr(e);
-            }
         }
         ExprKind::Slice { lower, upper, step } => {
             for part in [lower, upper, step].into_iter().flatten() {
@@ -278,7 +335,7 @@ fn fold_expr(e: &mut Expr, load: bool) {
         ExprKind::BinOp { left, right, .. } => {
             fold_expr(left, true);
             fold_expr(right, true);
-            fold_binop(e);
+            fold_format(e);
         }
         ExprKind::BoolOp { values, .. } => {
             for v in values {
@@ -287,22 +344,13 @@ fn fold_expr(e: &mut Expr, load: bool) {
         }
         ExprKind::UnaryOp { operand, .. } => {
             fold_expr(operand, true);
-            fold_unaryop(e);
         }
         ExprKind::Compare {
-            left,
-            ops,
-            comparators,
+            left, comparators, ..
         } => {
             fold_expr(left, true);
             for c in comparators.iter_mut() {
                 fold_expr(c, true);
-            }
-            // fold_compare: `in`/`not in` against a literal list/set.
-            if let (Some(op), Some(last)) = (ops.last(), comparators.last_mut()) {
-                if matches!(op, CmpOp::In | CmpOp::NotIn) {
-                    fold_iter(last);
-                }
             }
         }
         ExprKind::IfExp { test, body, orelse } => {
@@ -339,9 +387,6 @@ fn fold_expr(e: &mut Expr, load: bool) {
         ExprKind::Tuple(elts) => {
             for el in elts.iter_mut() {
                 fold_expr(el, load);
-            }
-            if load {
-                fold_tuple(e);
             }
         }
         ExprKind::List(elts) => {
@@ -404,84 +449,200 @@ fn fold_expr(e: &mut Expr, load: bool) {
 
 // ---------- individual folds ----------
 
-fn fold_tuple(e: &mut Expr) {
-    let ExprKind::Tuple(elts) = &e.kind else {
+/// `fold_binop` + `optimize_format`: `"literal %s %r" % (a, b)` with a
+/// `str` constant on the left and a starless tuple display on the
+/// right becomes the equivalent f-string (a JoinedStr of literal
+/// pieces and FormattedValues). Only the `%s` / `%r` / `%a`
+/// conversions with at most a width and precision qualify; anything
+/// else leaves the expression alone.
+fn fold_format(e: &mut Expr) {
+    let ExprKind::BinOp { left, op, right } = &e.kind else {
         return;
     };
-    if let Some(c) = make_const_tuple(elts) {
-        e.kind = ExprKind::Constant(c);
+    if *op != BinOp::Mod {
+        return;
     }
-}
-
-fn make_const_tuple(elts: &[Expr]) -> Option<Constant> {
-    let mut out = Vec::with_capacity(elts.len());
-    for el in elts {
-        match &el.kind {
-            ExprKind::Constant(c) => out.push(c.clone()),
-            _ => return None,
-        }
-    }
-    Some(Constant::Tuple(out))
-}
-
-/// `fold_iter`: a literal list iterated or tested for membership
-/// becomes a tuple (constant if possible); a literal set of constants
-/// becomes a frozenset constant.
-fn fold_iter(e: &mut Expr) {
-    match &e.kind {
-        ExprKind::List(elts) => {
-            if elts
-                .iter()
-                .any(|el| matches!(el.kind, ExprKind::Starred(_)))
-            {
-                return;
-            }
-            if let Some(c) = make_const_tuple(elts) {
-                e.kind = ExprKind::Constant(c);
-            } else if let ExprKind::List(elts) = &mut e.kind {
-                let elts = std::mem::take(elts);
-                e.kind = ExprKind::Tuple(elts);
-            }
-        }
-        ExprKind::Set(elts) => {
-            if let Some(Constant::Tuple(items)) = make_const_tuple(elts) {
-                e.kind = ExprKind::Constant(Constant::FrozenSet(dedup_py(items)));
-            }
-        }
-        _ => {}
-    }
-}
-
-fn fold_unaryop(e: &mut Expr) {
-    let ExprKind::UnaryOp { op, operand } = &mut e.kind else {
+    let ExprKind::Constant(Constant::Str(fmt)) = &left.kind else {
         return;
     };
-    let op = *op;
-    if let ExprKind::Compare { ops, .. } = &mut operand.kind {
-        // `not (x is/in y)` → `x is not/not in y` (Eq/Lt/… are left
-        // alone: rich comparisons don't satisfy `not` folding laws).
-        if op == UnaryOp::Not && ops.len() == 1 {
-            let inverted = match ops[0] {
-                CmpOp::Is => Some(CmpOp::IsNot),
-                CmpOp::IsNot => Some(CmpOp::Is),
-                CmpOp::In => Some(CmpOp::NotIn),
-                CmpOp::NotIn => Some(CmpOp::In),
-                _ => None,
-            };
-            if let Some(newop) = inverted {
-                ops[0] = newop;
-                let inner =
-                    std::mem::replace(&mut operand.kind, ExprKind::Constant(Constant::None));
-                e.kind = inner;
-                return;
-            }
-        }
-        return;
-    }
-    let ExprKind::Constant(c) = &operand.kind else {
+    let ExprKind::Tuple(elts) = &right.kind else {
         return;
     };
-    let folded = match op {
+    if elts
+        .iter()
+        .any(|el| matches!(el.kind, ExprKind::Starred(_)))
+    {
+        return;
+    }
+    let Some(seq) = optimize_format(fmt, elts) else {
+        return;
+    };
+    e.kind = ExprKind::JoinedStr(seq);
+}
+
+fn optimize_format(fmt: &str, elts: &[Expr]) -> Option<Vec<Expr>> {
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut pos = 0usize;
+    let mut cnt = 0usize;
+    let mut seq: Vec<Expr> = Vec::with_capacity(elts.len() * 2 + 1);
+    loop {
+        if let Some(lit) = parse_literal(&chars, &mut pos) {
+            seq.push(lit);
+        }
+        if pos >= chars.len() {
+            break;
+        }
+        if cnt >= elts.len() {
+            // More format units than items.
+            return None;
+        }
+        debug_assert_eq!(chars[pos], '%');
+        pos += 1;
+        let expr = parse_format(&chars, &mut pos, &elts[cnt])?;
+        cnt += 1;
+        seq.push(expr);
+    }
+    if cnt < elts.len() {
+        // More items than format units.
+        return None;
+    }
+    Some(seq)
+}
+
+/// `parse_literal`: the run of non-`%` text (with `%%` collapsed) from
+/// `*pos`, as a `Constant` node carrying no location (CPython builds
+/// it with `-1` positions); `None` when empty.
+fn parse_literal(chars: &[char], pos: &mut usize) -> Option<Expr> {
+    let start = *pos;
+    let mut p = start;
+    let mut has_percents = false;
+    while p < chars.len() {
+        if chars[p] != '%' {
+            p += 1;
+        } else if p + 1 < chars.len() && chars[p + 1] == '%' {
+            has_percents = true;
+            p += 2;
+        } else {
+            break;
+        }
+    }
+    *pos = p;
+    if p == start {
+        return None;
+    }
+    let mut text: String = chars[start..p].iter().collect();
+    if has_percents {
+        text = text.replace("%%", "%");
+    }
+    Some(Expr {
+        kind: ExprKind::Constant(Constant::Str(text)),
+        span: weavepy_lexer::Span::NO_LOCATION,
+    })
+}
+
+const MAXDIGITS: usize = 3;
+
+/// `simple_format_arg_parse`: flags, width, precision and the
+/// conversion character of one format unit.
+fn simple_format_arg_parse(
+    chars: &[char],
+    pos: &mut usize,
+) -> Option<(char, bool, Option<u32>, Option<u32>)> {
+    let mut p = *pos;
+    let mut ljust = false;
+    let mut ch;
+    loop {
+        ch = *chars.get(p)?;
+        p += 1;
+        match ch {
+            '-' => {
+                ljust = true;
+                continue;
+            }
+            '+' | ' ' | '#' | '0' => continue,
+            _ => break,
+        }
+    }
+    let mut width = None;
+    if ch.is_ascii_digit() {
+        let mut w = 0u32;
+        let mut digits = 0usize;
+        while ch.is_ascii_digit() {
+            w = w * 10 + ch.to_digit(10).unwrap();
+            ch = *chars.get(p)?;
+            p += 1;
+            digits += 1;
+            if digits >= MAXDIGITS {
+                return None;
+            }
+        }
+        width = Some(w);
+    }
+    let mut prec = None;
+    if ch == '.' {
+        ch = *chars.get(p)?;
+        p += 1;
+        let mut pr = 0u32;
+        if ch.is_ascii_digit() {
+            let mut digits = 0usize;
+            while ch.is_ascii_digit() {
+                pr = pr * 10 + ch.to_digit(10).unwrap();
+                ch = *chars.get(p)?;
+                p += 1;
+                digits += 1;
+                if digits >= MAXDIGITS {
+                    return None;
+                }
+            }
+        }
+        prec = Some(pr);
+    }
+    *pos = p;
+    Some((ch, ljust, width, prec))
+}
+
+/// `parse_format`: one `%s` / `%r` / `%a` unit as a FormattedValue.
+fn parse_format(chars: &[char], pos: &mut usize, arg: &Expr) -> Option<Expr> {
+    let (spec, ljust, width, prec) = simple_format_arg_parse(chars, pos)?;
+    if !matches!(spec, 's' | 'r' | 'a') {
+        return None;
+    }
+    let mut buf = String::new();
+    if !ljust && width.is_some_and(|w| w > 0) {
+        buf.push('>');
+    }
+    if let Some(w) = width {
+        buf.push_str(&w.to_string());
+    }
+    if let Some(p) = prec {
+        buf.push('.');
+        buf.push_str(&p.to_string());
+    }
+    // CPython hands the spec over as a bare `Constant` with `-1`
+    // positions (no `JoinedStr` wrapper, no location).
+    let format_spec = if buf.is_empty() {
+        None
+    } else {
+        Some(Box::new(Expr {
+            kind: ExprKind::Constant(Constant::Str(buf)),
+            span: weavepy_lexer::Span::NO_LOCATION,
+        }))
+    };
+    Some(Expr {
+        kind: ExprKind::FormattedValue {
+            value: Box::new(arg.clone()),
+            conversion: spec as i32,
+            format_spec,
+        },
+        span: arg.span,
+    })
+}
+
+/// CPython's `eval_const_unaryop` (flowgraph): the result of `op` on a
+/// constant operand, or `None` when the runtime would raise (or when
+/// the fold is deliberately skipped).
+pub(crate) fn eval_unaryop_const(op: UnaryOp, c: &Constant) -> Option<Constant> {
+    match op {
         UnaryOp::Not => Some(Constant::Bool(!truthy(c))),
         // `~bool` is deprecated (gh-103487); leave it unfolded so the
         // runtime DeprecationWarning fires (test_bool.test_math asserts
@@ -505,35 +666,19 @@ fn fold_unaryop(e: &mut Expr) {
             Constant::Complex(r, i) => Some(Constant::Complex(-r, -i)),
             _ => None,
         },
-    };
-    if let Some(c) = folded {
-        e.kind = ExprKind::Constant(c);
     }
 }
 
-fn fold_binop(e: &mut Expr) {
-    let ExprKind::BinOp { left, op, right } = &e.kind else {
-        return;
-    };
-    let (ExprKind::Constant(lv), ExprKind::Constant(rv)) = (&left.kind, &right.kind) else {
-        return;
-    };
-    if let Some(c) = eval_binop(lv, *op, rv) {
-        e.kind = ExprKind::Constant(c);
-    }
+/// CPython's `eval_const_binop` (flowgraph).
+pub(crate) fn eval_binop_const(lv: &Constant, op: BinOp, rv: &Constant) -> Option<Constant> {
+    eval_binop(lv, op, rv)
 }
 
-fn fold_subscr(e: &mut Expr) {
-    let ExprKind::Subscript { value, slice } = &e.kind else {
-        return;
-    };
-    let (ExprKind::Constant(container), ExprKind::Constant(index)) = (&value.kind, &slice.kind)
-    else {
-        return;
-    };
-    let Some(idx) = int_of(index) else {
-        return;
-    };
+/// `PyObject_GetItem` on constants for an integer index (sequence
+/// indexing of `str` / `bytes` / `tuple`); `None` when the runtime
+/// would raise.
+pub(crate) fn eval_subscr_const(container: &Constant, index: &Constant) -> Option<Constant> {
+    let idx = int_of(index)?;
     let get = |len: i64| -> Option<usize> {
         let mut i = idx.to_i64()?;
         if i < 0 {
@@ -541,7 +686,7 @@ fn fold_subscr(e: &mut Expr) {
         }
         usize::try_from(i).ok().filter(|&i| (i as i64) < len)
     };
-    let folded = match container {
+    match container {
         Constant::Str(s) => {
             let chars: Vec<char> = s.chars().collect();
             get(chars.len() as i64).map(|i| Constant::Str(chars[i].to_string()))
@@ -550,9 +695,6 @@ fn fold_subscr(e: &mut Expr) {
         Constant::Bytes(b) => get(b.len() as i64).map(|i| Constant::Int(i64::from(b[i]))),
         Constant::Tuple(items) => get(items.len() as i64).map(|i| items[i].clone()),
         _ => None,
-    };
-    if let Some(c) = folded {
-        e.kind = ExprKind::Constant(c);
     }
 }
 
@@ -730,21 +872,40 @@ fn eval_binop(lv: &Constant, op: BinOp, rv: &Constant) -> Option<Constant> {
     }
 }
 
+/// Which operands of a complex operation are complex (3.14's mixed-mode
+/// arithmetic, gh-69639: a real operand touches only the real part, so
+/// `1 - 0j` folds to `(1-0j)` and `(1+2j) - 1` to `2j`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ComplexSides {
+    Both,
+    LeftOnly,
+    RightOnly,
+}
+
+fn complex_sides(lv: &Constant, rv: &Constant) -> ComplexSides {
+    match (is_complex_kind(lv), is_complex_kind(rv)) {
+        (true, false) => ComplexSides::LeftOnly,
+        (false, true) => ComplexSides::RightOnly,
+        _ => ComplexSides::Both,
+    }
+}
+
 /// Numeric-only op with per-domain implementations (int exact, float
-/// IEEE, complex componentwise). Mixed operands promote upward.
+/// IEEE, complex following `complexobject.c`). Mixed operands promote
+/// upward.
 fn eval_numeric(
     lv: &Constant,
     rv: &Constant,
     int_op: impl Fn(BigInt, BigInt) -> BigInt,
     float_op: impl Fn(f64, f64) -> Option<f64>,
-    complex_op: impl Fn((f64, f64), (f64, f64)) -> Option<(f64, f64)>,
+    complex_op: impl Fn((f64, f64), (f64, f64), ComplexSides) -> Option<(f64, f64)>,
 ) -> Option<Constant> {
     if !is_numeric(lv) || !is_numeric(rv) {
         return None;
     }
     if is_complex_kind(lv) || is_complex_kind(rv) {
         let (a, b) = (complex_of(lv)?, complex_of(rv)?);
-        return complex_op(a, b).map(|(r, i)| Constant::Complex(r, i));
+        return complex_op(a, b, complex_sides(lv, rv)).map(|(r, i)| Constant::Complex(r, i));
     }
     if is_float_kind(lv) || is_float_kind(rv) {
         let (a, b) = (float_of(lv)?, float_of(rv)?);
@@ -753,8 +914,12 @@ fn eval_numeric(
     Some(int_const(int_op(int_of(lv)?, int_of(rv)?)))
 }
 
-fn c_sub(a: (f64, f64), b: (f64, f64)) -> Option<(f64, f64)> {
-    Some((a.0 - b.0, a.1 - b.1))
+fn c_sub(a: (f64, f64), b: (f64, f64), sides: ComplexSides) -> Option<(f64, f64)> {
+    Some(match sides {
+        ComplexSides::Both => (a.0 - b.0, a.1 - b.1),
+        ComplexSides::LeftOnly => (a.0 - b.0, a.1),
+        ComplexSides::RightOnly => (a.0 - b.0, -b.1),
+    })
 }
 
 fn eval_add(lv: &Constant, rv: &Constant) -> Option<Constant> {
@@ -764,7 +929,13 @@ fn eval_add(lv: &Constant, rv: &Constant) -> Option<Constant> {
             rv,
             |a, b| a + b,
             |a, b| Some(a + b),
-            |a, b| Some((a.0 + b.0, a.1 + b.1)),
+            |a, b, sides| {
+                Some(match sides {
+                    ComplexSides::Both => (a.0 + b.0, a.1 + b.1),
+                    ComplexSides::LeftOnly => (a.0 + b.0, a.1),
+                    ComplexSides::RightOnly => (b.0 + a.0, b.1),
+                })
+            },
         );
     }
     if let (Some(a), Some(b)) = (str_points(lv), str_points(rv)) {
@@ -801,7 +972,13 @@ fn eval_mult(lv: &Constant, rv: &Constant) -> Option<Constant> {
             rv,
             |a, b| a * b,
             |a, b| Some(a * b),
-            |a, b| Some(c_mul(a, b)),
+            |a, b, sides| {
+                Some(match sides {
+                    ComplexSides::Both => c_mul(a, b),
+                    ComplexSides::LeftOnly => (a.0 * b.0, a.1 * b.0),
+                    ComplexSides::RightOnly => (b.0 * a.0, b.1 * a.0),
+                })
+            },
         );
     }
     // int * str/bytes/tuple with the ast_opt size caps.
@@ -851,8 +1028,45 @@ fn eval_mult(lv: &Constant, rv: &Constant) -> Option<Constant> {
     }
 }
 
-fn c_mul(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
-    (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+/// `_Py_c_prod`, including C11 Annex G.5.1's recovery of infinities
+/// that computed as `nan+nanj`.
+fn c_mul(z: (f64, f64), w: (f64, f64)) -> (f64, f64) {
+    let (a, b, c, d) = (z.0, z.1, w.0, w.1);
+    let (ac, bd, ad, bc) = (a * c, b * d, a * d, b * c);
+    let (mut re, mut im) = (ac - bd, ad + bc);
+    if re.is_nan() && im.is_nan() {
+        let (mut a, mut b, mut c, mut d) = (a, b, c, d);
+        let box_inf = |x: f64| (if x.is_infinite() { 1.0f64 } else { 0.0 }).copysign(x);
+        let zero_nan = |x: f64| if x.is_nan() { 0.0f64.copysign(x) } else { x };
+        let mut recalc = false;
+        if a.is_infinite() || b.is_infinite() {
+            a = box_inf(a);
+            b = box_inf(b);
+            c = zero_nan(c);
+            d = zero_nan(d);
+            recalc = true;
+        }
+        if c.is_infinite() || d.is_infinite() {
+            c = box_inf(c);
+            d = box_inf(d);
+            a = zero_nan(a);
+            b = zero_nan(b);
+            recalc = true;
+        }
+        if !recalc && (ac.is_infinite() || bd.is_infinite() || ad.is_infinite() || bc.is_infinite())
+        {
+            a = zero_nan(a);
+            b = zero_nan(b);
+            c = zero_nan(c);
+            d = zero_nan(d);
+            recalc = true;
+        }
+        if recalc {
+            re = f64::INFINITY * (a * c - b * d);
+            im = f64::INFINITY * (a * d + b * c);
+        }
+    }
+    (re, im)
 }
 
 /// CPython's `_Py_c_quot` (Smith's scaled algorithm) — bit-exact with
@@ -882,6 +1096,67 @@ fn c_quot(a: (f64, f64), b: (f64, f64)) -> Option<(f64, f64)> {
     } else {
         Some((f64::NAN, f64::NAN))
     }
+    .map(|(mut re, mut im): (f64, f64)| {
+        // C11 Annex G.5.2: recover infinities and zeros from `nan+nanj`.
+        if re.is_nan() && im.is_nan() {
+            if (areal.is_infinite() || aimag.is_infinite())
+                && breal.is_finite()
+                && bimag.is_finite()
+            {
+                let x = (if areal.is_infinite() { 1.0f64 } else { 0.0 }).copysign(areal);
+                let y = (if aimag.is_infinite() { 1.0f64 } else { 0.0 }).copysign(aimag);
+                re = f64::INFINITY * (x * breal + y * bimag);
+                im = f64::INFINITY * (y * breal - x * bimag);
+            } else if (abs_breal.is_infinite() || abs_bimag.is_infinite())
+                && areal.is_finite()
+                && aimag.is_finite()
+            {
+                let x = (if breal.is_infinite() { 1.0f64 } else { 0.0 }).copysign(breal);
+                let y = (if bimag.is_infinite() { 1.0f64 } else { 0.0 }).copysign(bimag);
+                re = 0.0 * (areal * x + aimag * y);
+                im = 0.0 * (aimag * x - areal * y);
+            }
+        }
+        (re, im)
+    })
+}
+
+/// `_Py_cr_quot`: a complex over a real divides both parts.
+fn cr_quot(a: (f64, f64), b: f64) -> Option<(f64, f64)> {
+    (b != 0.0).then(|| (a.0 / b, a.1 / b))
+}
+
+/// `_Py_rc_quot`: a real over a complex (Smith's algorithm with a zero
+/// imaginary numerator, keeping zero signs exact).
+fn rc_quot(a: f64, b: (f64, f64)) -> Option<(f64, f64)> {
+    let (breal, bimag) = b;
+    let abs_breal = breal.abs();
+    let abs_bimag = bimag.abs();
+    let (mut re, mut im) = if abs_breal >= abs_bimag {
+        if abs_breal == 0.0 {
+            return None;
+        }
+        let ratio = bimag / breal;
+        let denom = breal + bimag * ratio;
+        (a / denom, (-a * ratio) / denom)
+    } else if abs_bimag >= abs_breal {
+        let ratio = breal / bimag;
+        let denom = breal * ratio + bimag;
+        ((a * ratio) / denom, (-a) / denom)
+    } else {
+        (f64::NAN, f64::NAN)
+    };
+    if re.is_nan()
+        && im.is_nan()
+        && a.is_finite()
+        && (abs_breal.is_infinite() || abs_bimag.is_infinite())
+    {
+        let x = (if breal.is_infinite() { 1.0f64 } else { 0.0 }).copysign(breal);
+        let y = (if bimag.is_infinite() { 1.0f64 } else { 0.0 }).copysign(bimag);
+        re = 0.0 * (a * x);
+        im = 0.0 * (-a * y);
+    }
+    Some((re, im))
 }
 
 fn eval_div(lv: &Constant, rv: &Constant) -> Option<Constant> {
@@ -889,7 +1164,13 @@ fn eval_div(lv: &Constant, rv: &Constant) -> Option<Constant> {
         return None;
     }
     if is_complex_kind(lv) || is_complex_kind(rv) {
-        return c_quot(complex_of(lv)?, complex_of(rv)?).map(|(r, i)| Constant::Complex(r, i));
+        let (a, b) = (complex_of(lv)?, complex_of(rv)?);
+        return match complex_sides(lv, rv) {
+            ComplexSides::Both => c_quot(a, b),
+            ComplexSides::LeftOnly => cr_quot(a, b.0),
+            ComplexSides::RightOnly => rc_quot(a.0, b),
+        }
+        .map(|(r, i)| Constant::Complex(r, i));
     }
     if is_float_kind(lv) || is_float_kind(rv) {
         let (a, b) = (float_of(lv)?, float_of(rv)?);
@@ -1036,8 +1317,70 @@ fn eval_pow(lv: &Constant, rv: &Constant) -> Option<Constant> {
         }
         return Some(Constant::Float(a.powf(b)));
     }
-    // complex pow uses CPython's c_powi/c_pow rounding; leave to the VM.
+    if (is_complex_kind(lv) || is_complex_kind(rv)) && is_numeric(lv) && is_numeric(rv) {
+        let (a, b) = (complex_of(lv)?, complex_of(rv)?);
+        // `complex_pow`: a small integral exponent takes the exact
+        // repeated-squaring path (`c_powi`), anything else the polar
+        // form (`_Py_c_pow`). An infinite component in the result is
+        // `_Py_ADJUST_ERANGE2`'s OverflowError; a NaN never sets errno
+        // but is left to the VM regardless (no folded NaN constants).
+        let p = if b.1 == 0.0 && b.0 == b.0.floor() && b.0.abs() <= 100.0 {
+            c_powi(a, b.0 as i64)?
+        } else {
+            c_pow(a, b)?
+        };
+        if !p.0.is_finite() || !p.1.is_finite() {
+            return None;
+        }
+        return Some(Constant::Complex(p.0, p.1));
+    }
     None
+}
+
+/// `c_powu` / `c_powi`: binary exponentiation by `_Py_c_prod`, the
+/// negative exponent as `1 / x**-n` (`None` on a zero divisor).
+fn c_powi(x: (f64, f64), n: i64) -> Option<(f64, f64)> {
+    let powu = |x: (f64, f64), n: i64| -> (f64, f64) {
+        let mut r = (1.0, 0.0);
+        let mut p = x;
+        let mut mask: i64 = 1;
+        while mask > 0 && n >= mask {
+            if n & mask != 0 {
+                r = c_mul(r, p);
+            }
+            mask <<= 1;
+            p = c_mul(p, p);
+        }
+        r
+    };
+    if n > 0 {
+        Some(powu(x, n))
+    } else {
+        c_quot((1.0, 0.0), powu(x, -n))
+    }
+}
+
+/// `_Py_c_pow`: the general polar-form power; `None` where CPython
+/// sets EDOM (zero to a negative or complex power).
+fn c_pow(a: (f64, f64), b: (f64, f64)) -> Option<(f64, f64)> {
+    if b.0 == 0.0 && b.1 == 0.0 {
+        return Some((1.0, 0.0));
+    }
+    if a.0 == 0.0 && a.1 == 0.0 {
+        if b.1 != 0.0 || b.0 < 0.0 {
+            return None;
+        }
+        return Some((0.0, 0.0));
+    }
+    let vabs = a.0.hypot(a.1);
+    let mut len = vabs.powf(b.0);
+    let at = a.1.atan2(a.0);
+    let mut phase = at * b.0;
+    if b.1 != 0.0 {
+        len *= (-at * b.1).exp();
+        phase += b.1 * vabs.ln();
+    }
+    Some((len * phase.cos(), len * phase.sin()))
 }
 
 // ---------- Python-equality dedup for frozenset folds ----------
@@ -1090,7 +1433,7 @@ fn py_eq(a: &Constant, b: &Constant) -> bool {
 
 /// Set-literal dedup with Python equality (first occurrence wins,
 /// matching `PyFrozenSet_New` insertion order semantics).
-fn dedup_py(items: Vec<Constant>) -> Vec<Constant> {
+pub(crate) fn dedup_py(items: Vec<Constant>) -> Vec<Constant> {
     let mut out: Vec<Constant> = Vec::with_capacity(items.len());
     for item in items {
         if !out.iter().any(|existing| py_eq(existing, &item)) {

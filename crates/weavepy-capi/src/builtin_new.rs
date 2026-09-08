@@ -576,6 +576,7 @@ pub unsafe extern "C" fn tuple_new(
         let vo = obj as *mut crate::layout::PyVarObject;
         (*vo).ob_size = n;
         let to = obj as *mut crate::layout::PyTupleObject;
+        (*to).ob_hash = -1;
         let base = std::ptr::addr_of_mut!((*to).ob_item) as *mut *mut PyObject;
         for (i, item) in items.into_iter().enumerate() {
             *base.add(i) = crate::object::into_owned(item);

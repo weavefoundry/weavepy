@@ -31,6 +31,9 @@ for _name in dir(_os):
 # `os.py` re-imports `_exit` explicitly (`from posix import _exit`);
 # the underscore loop above skipped it.
 _exit = _os._exit
+# 3.14: `_pyrepl`'s console polls `posix._is_inputhook_installed()` /
+# `nt._is_inputhook_installed()` for `PyOS_InputHook`.
+_is_inputhook_installed = _os._is_inputhook_installed
 
 if hasattr(_os, "_fcopyfile"):
     _fcopyfile = _os._fcopyfile

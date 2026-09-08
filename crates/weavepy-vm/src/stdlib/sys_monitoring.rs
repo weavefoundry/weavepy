@@ -18,23 +18,25 @@ use crate::trace::with_monitoring;
 /// `(name, bit)` for every PEP 669 event, in bit order. Shared by the
 /// `events` namespace and `_all_events()`.
 const EVENT_NAMES: &[(&str, usize)] = &[
-    ("BRANCH", crate::trace::EVENT_BRANCH),
-    ("CALL", crate::trace::EVENT_CALL),
-    ("C_RAISE", crate::trace::EVENT_C_RAISE),
-    ("C_RETURN", crate::trace::EVENT_C_RETURN),
-    ("EXCEPTION_HANDLED", crate::trace::EVENT_EXCEPTION_HANDLED),
-    ("INSTRUCTION", crate::trace::EVENT_INSTRUCTION),
-    ("JUMP", crate::trace::EVENT_JUMP),
-    ("LINE", crate::trace::EVENT_LINE),
+    ("PY_START", crate::trace::EVENT_PY_START),
     ("PY_RESUME", crate::trace::EVENT_PY_RESUME),
     ("PY_RETURN", crate::trace::EVENT_PY_RETURN),
-    ("PY_START", crate::trace::EVENT_PY_START),
-    ("PY_THROW", crate::trace::EVENT_PY_THROW),
-    ("PY_UNWIND", crate::trace::EVENT_PY_UNWIND),
     ("PY_YIELD", crate::trace::EVENT_PY_YIELD),
-    ("RAISE", crate::trace::EVENT_RAISE),
-    ("RERAISE", crate::trace::EVENT_RERAISE),
+    ("CALL", crate::trace::EVENT_CALL),
+    ("LINE", crate::trace::EVENT_LINE),
+    ("INSTRUCTION", crate::trace::EVENT_INSTRUCTION),
+    ("JUMP", crate::trace::EVENT_JUMP),
+    ("BRANCH_LEFT", crate::trace::EVENT_BRANCH_LEFT),
+    ("BRANCH_RIGHT", crate::trace::EVENT_BRANCH_RIGHT),
     ("STOP_ITERATION", crate::trace::EVENT_STOP_ITERATION),
+    ("RAISE", crate::trace::EVENT_RAISE),
+    ("EXCEPTION_HANDLED", crate::trace::EVENT_EXCEPTION_HANDLED),
+    ("PY_UNWIND", crate::trace::EVENT_PY_UNWIND),
+    ("PY_THROW", crate::trace::EVENT_PY_THROW),
+    ("RERAISE", crate::trace::EVENT_RERAISE),
+    ("C_RETURN", crate::trace::EVENT_C_RETURN),
+    ("C_RAISE", crate::trace::EVENT_C_RAISE),
+    ("BRANCH", crate::trace::EVENT_BRANCH),
 ];
 
 pub fn build() -> Object {
@@ -258,7 +260,7 @@ fn mon_set_events(args: &[Object]) -> Result<Object, RuntimeError> {
         if m.tools[id].is_none() {
             return Err(value_error(format!("tool {id} is not in use")));
         }
-        m.events[id] = mask;
+        m.events[id] = crate::trace::expand_branch_mask(mask);
         Ok(Object::None)
     })
 }
@@ -288,6 +290,7 @@ fn mon_set_local_events(args: &[Object]) -> Result<Object, RuntimeError> {
     if mask & !crate::trace::LOCAL_EVENTS_MASK != 0 {
         return Err(value_error(format!("invalid local event set 0x{mask:x}")));
     }
+    let mask = crate::trace::expand_branch_mask(mask);
     with_monitoring(|m| {
         if m.tools[id].is_none() {
             return Err(value_error(format!("tool {id} is not in use")));
@@ -338,12 +341,31 @@ fn mon_register_callback(args: &[Object]) -> Result<Object, RuntimeError> {
         ));
     }
     let event_index = (event as u64).trailing_zeros() as usize;
+    let new_cb = match callback {
+        Object::None => None,
+        other => Some(other),
+    };
     with_monitoring(|m| {
+        if event_index == crate::trace::EVENT_BRANCH {
+            // Deprecated composite: install the callback for both
+            // halves (`_PyMonitoring_RegisterCallback`); the prior
+            // value reported is the LEFT slot's.
+            let prior = m.callbacks[id][crate::trace::EVENT_BRANCH_LEFT]
+                .clone()
+                .unwrap_or(Object::None);
+            m.callbacks[id][crate::trace::EVENT_BRANCH_LEFT] = new_cb.clone();
+            m.callbacks[id][crate::trace::EVENT_BRANCH_RIGHT] = new_cb;
+            m.legacy_branch[id] = true;
+            return Ok(prior);
+        }
+        if matches!(
+            event_index,
+            crate::trace::EVENT_BRANCH_LEFT | crate::trace::EVENT_BRANCH_RIGHT
+        ) {
+            m.legacy_branch[id] = false;
+        }
         let prior = m.callbacks[id][event_index].clone().unwrap_or(Object::None);
-        m.callbacks[id][event_index] = match callback {
-            Object::None => None,
-            other => Some(other),
-        };
+        m.callbacks[id][event_index] = new_cb;
         Ok(prior)
     })
 }

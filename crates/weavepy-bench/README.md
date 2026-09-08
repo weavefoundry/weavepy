@@ -91,7 +91,7 @@ cargo xbench gate --base-weavepy=/path/to/merge-base/weavepy --pct=15
 cargo xbench run --update-baseline
 
 # Point at explicit interpreters.
-cargo xbench run --weavepy=target/release/weavepy --python=python3.13
+cargo xbench run --weavepy=target/release/weavepy --python=python3.14
 
 # Add a WEAVEPY_JIT=0 interpreter-only column (reported, never gated).
 # The default binary ships with the tier-2 JIT on (RFC 0067), so the

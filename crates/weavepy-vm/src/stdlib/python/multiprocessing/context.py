@@ -173,7 +173,7 @@ class BaseContext(object):
         '''
         # This is undocumented.  In previous versions of multiprocessing
         # its only effect was to make socket objects inheritable on Windows.
-        from . import connection
+        from . import connection  # noqa: F401
 
     def set_executable(self, executable):
         '''Sets the path to a python.exe or pythonw.exe binary used to run
@@ -265,15 +265,12 @@ class DefaultContext(BaseContext):
 
     def get_all_start_methods(self):
         """Returns a list of the supported start methods, default first."""
-        if sys.platform == 'win32':
-            return ['spawn']
-        else:
-            # WeavePy: spawn is the default on every POSIX platform (see
-            # the _default_context selection below), so it sorts first.
-            methods = ['spawn', 'fork']
-            if reduction.HAVE_SEND_HANDLE:
-                methods.append('forkserver')
-            return methods
+        default = self._default_context.get_start_method()
+        start_method_names = [default]
+        start_method_names.extend(
+            name for name in _concrete_contexts if name != default
+        )
+        return start_method_names
 
 
 #
@@ -345,7 +342,7 @@ if sys.platform != 'win32':
     # off fork-by-default: gh-84559 changed the Linux default in 3.14.)
     _default_context = DefaultContext(_concrete_contexts['spawn'])
 
-else:
+else:  # Windows
 
     class SpawnProcess(process.BaseProcess):
         _start_method = 'spawn'

@@ -38,6 +38,12 @@ pub const FIXTURES: &[&str] = &[
     "attr_access",
     "call_overhead",
     "generators",
+    // RFC 0077 WS6 — the accelerator census: pure-Python stand-ins for
+    // CPython C modules (`_collections`, `_datetime`, `_pickle`) get a
+    // measured ratio each instead of an anecdote.
+    "deque_ops",
+    "datetime_ops",
+    "pickle_bench",
     "startup",
 ];
 
@@ -45,6 +51,14 @@ pub const FIXTURES: &[&str] = &[
 /// self-timed `WEAVEPY_BENCH_NS` region. Startup cost *is* the
 /// workload for these.
 pub const WALL_CLOCK_FIXTURES: &[&str] = &["startup"];
+
+/// RFC 0077 (WS6): the accelerator census. These time pure-Python
+/// stand-ins for CPython C modules, so their ratios are two orders of
+/// magnitude above the suite's and would swamp the headline geomean
+/// (2.9x became 4.6x with them in). They are measured, reported, and
+/// gated per row like every other fixture, but excluded from both
+/// geometric means; the ratio itself is the deliverable.
+pub const CENSUS_FIXTURES: &[&str] = &["deque_ops", "datetime_ops", "pickle_bench"];
 
 /// Default per-fixture work parameter passed as `bench(n)`.
 /// Picked to make a single iteration take ~50-300ms on CPython —
@@ -72,6 +86,9 @@ pub fn default_work(name: &str) -> u32 {
         "attr_access" => 200_000,
         "call_overhead" => 150_000,
         "generators" => 300_000,
+        "deque_ops" => 200_000,
+        "datetime_ops" => 60_000,
+        "pickle_bench" => 40,
         "startup" => 1,
         _ => 1,
     }

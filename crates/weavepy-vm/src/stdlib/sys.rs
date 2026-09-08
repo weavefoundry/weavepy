@@ -20,7 +20,11 @@ use crate::object::{BuiltinFn, DictData, DictKey, FileBackend, Object, PyFile, P
 /// `weavepy-cli/src/main.rs`); user code that inspects
 /// `sys.version_info` is checking *Python language* compatibility, not
 /// the WeavePy build identity.
-pub const PY_VERSION: (i64, i64, i64) = (3, 13, 0);
+pub const PY_VERSION: (i64, i64, i64) = (
+    weavepy_version::MAJOR as i64,
+    weavepy_version::MINOR as i64,
+    weavepy_version::MICRO as i64,
+);
 
 /// Build the `sys` module against the given interpreter handles.
 /// Most state lives on the [`ModuleCache`]; `frame_stack`,
@@ -185,6 +189,23 @@ pub fn build_with_state(
             DictKey(Object::from_static("monitoring")),
             crate::stdlib::sys_monitoring::build(),
         );
+        d.insert(DictKey(Object::from_static("_jit")), build_jit_module());
+        // PEP 768 (3.14): the remote-debugging posture is "built without
+        // remote debug support" -- `is_remote_debug_enabled()` is False
+        // and `remote_exec` raises, exactly like a `--without-remote-debug`
+        // CPython (test.support's `support_remote_exec_only` then skips).
+        d.insert(
+            DictKey(Object::from_static("is_remote_debug_enabled")),
+            builtin("is_remote_debug_enabled", |_args| Ok(Object::Bool(false))),
+        );
+        d.insert(
+            DictKey(Object::from_static("remote_exec")),
+            builtin("remote_exec", |_args| {
+                Err(crate::error::runtime_error(
+                    "Remote debugging is not enabled in this build of Python",
+                ))
+            }),
+        );
         d.insert(
             DictKey(Object::from_static("setprofile")),
             builtin("setprofile", sys_setprofile),
@@ -237,14 +258,12 @@ pub fn build_with_state(
             DictKey(Object::from_static("dont_write_bytecode")),
             Object::Bool(false),
         );
-        d.insert(
-            DictKey(Object::from_static("ps1")),
-            Object::from_static(">>> "),
-        );
-        d.insert(
-            DictKey(Object::from_static("ps2")),
-            Object::from_static("... "),
-        );
+        // `sys.ps1` / `sys.ps2` are *not* preset: CPython only defines
+        // them on entering the interactive loop (`PyRun_InteractiveLoop`),
+        // and `hasattr(sys, 'ps1')` is how pdb / code.interact tell a
+        // script run from a REPL (pdb's inline `quit` only asks "Quit
+        // anyway?" when the attribute is absent — test_pdb
+        // `PdbTestInline.test_quit`). The CLI REPL installs them.
         d.insert(
             DictKey(Object::from_static("warnoptions")),
             Object::new_list(Vec::new()),
@@ -277,17 +296,27 @@ pub fn build_with_state(
         // with real importer objects; until then they hold empty
         // collections so `importlib.util.find_spec("name")` doesn't
         // crash trying to walk a missing attribute.
+        // GC-tracked like every CPython list/dict: these hold the
+        // importer classes, path hooks, and `FileFinder`s of *this*
+        // interpreter, and an untracked container makes each of them
+        // look externally rooted — for a destroyed sub-interpreter that
+        // pinned its whole importlib graph (and everything reachable from
+        // it) for the life of the process.
+        let tracked = |o: Object| {
+            crate::gc_trace::track(o.clone());
+            o
+        };
         d.insert(
             DictKey(Object::from_static("meta_path")),
-            Object::new_list(Vec::new()),
+            tracked(Object::new_list(Vec::new())),
         );
         d.insert(
             DictKey(Object::from_static("path_hooks")),
-            Object::new_list(Vec::new()),
+            tracked(Object::new_list(Vec::new())),
         );
         d.insert(
             DictKey(Object::from_static("path_importer_cache")),
-            Object::new_dict(),
+            tracked(Object::new_dict()),
         );
         d.insert(DictKey(Object::from_static("pycache_prefix")), Object::None);
         d.insert(
@@ -567,10 +596,10 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             // MS_DLL_ID); `sysconfig`/`venv`/pip read it on Windows.
             d.insert(
                 DictKey(Object::from_static("winver")),
-                Object::from_static("3.13"),
+                Object::from_static(weavepy_version::SHORT),
             );
             // CPython publishes the HMODULE of python3xx.dll here. Since
-            // RFC 0064 the runtime ships as a real `python313.dll` loaded
+            // RFC 0064 the runtime ships as a real `python314.dll` loaded
             // by the `weavepy.exe` shim, so the handle is the module's:
             // nonzero whenever this interpreter is running out of the DLL
             // (the shipped configuration), 0 in a statically-linked
@@ -632,9 +661,21 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         let executable = crate::stdlib_tree::program_exe().map_or(Object::from_static(""), |p| {
             Object::from_str(p.to_string_lossy().into_owned())
         });
+        // getpath: `PYTHONEXECUTABLE` (macOS only) or `__PYVENV_LAUNCHER__`
+        // override `sys.executable` (a venv launcher / framework stub
+        // reporting the path the user invoked) while `_base_executable`
+        // keeps following argv[0].
+        let launcher_override = [
+            ("PYTHONEXECUTABLE", cfg!(target_os = "macos")),
+            ("__PYVENV_LAUNCHER__", true),
+        ]
+        .iter()
+        .filter(|(_, enabled)| *enabled)
+        .find_map(|(var, _)| std::env::var_os(var).filter(|v| !v.is_empty()))
+        .map(|v| Object::from_str(v.to_string_lossy().into_owned()));
         d.insert(
             DictKey(Object::from_static("executable")),
-            executable.clone(),
+            launcher_override.unwrap_or_else(|| executable.clone()),
         );
         // `sys._base_executable` mirrors `sys.executable` outside a venv
         // (CPython sets it to the real interpreter; `test_os.PidTests` and
@@ -671,7 +712,19 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
                 .map_or(Object::from_static(""), |p| {
                     Object::from_str(p.to_string_lossy().into_owned())
                 });
-            for name in ["prefix", "exec_prefix", "base_prefix", "base_exec_prefix"] {
+            // Inside a venv, getpath sets `prefix`/`exec_prefix` to the
+            // directory holding pyvenv.cfg while the `base_*` pair keeps
+            // the installation (3.14's `site.venv()` only checks this;
+            // it no longer assigns it — test_venv, test_sysconfig
+            // test_makefile_overwrites_config_vars).
+            let venv_prefix = venv_prefix_dir().map_or_else(
+                || prefix.clone(),
+                |p| Object::from_str(p.to_string_lossy().into_owned()),
+            );
+            for name in ["prefix", "exec_prefix"] {
+                d.insert(DictKey(Object::from_static(name)), venv_prefix.clone());
+            }
+            for name in ["base_prefix", "base_exec_prefix"] {
                 d.insert(DictKey(Object::from_static(name)), prefix.clone());
             }
         }
@@ -791,6 +844,10 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("intern")),
             builtin("intern", sys_intern),
+        );
+        d.insert(
+            DictKey(Object::from_static("_clear_type_descriptors")),
+            builtin("_clear_type_descriptors", sys_clear_type_descriptors),
         );
         d.insert(
             DictKey(Object::from_static("is_finalizing")),
@@ -939,23 +996,49 @@ fn implementation_value() -> Object {
             Object::from_static(crate::stdlib::sysconfig_native::MULTIARCH),
         );
     }
+    // 3.14 / PEP 734: WeavePy ships a working `_interpreters` (multiple
+    // isolated interpreters with their own GIL), so this is `True` like a
+    // non-WASM CPython build (`test_sys.test_implementation`).
+    d.insert(
+        DictKey(Object::from_static("supports_isolated_interpreters")),
+        Object::Bool(true),
+    );
     Object::SimpleNamespace(Rc::new(RefCell::new(d)))
 }
 
 /// Contents of the governing `pyvenv.cfg` (next to the executable's
 /// directory or one level up), or `None` outside a virtual environment.
 fn venv_cfg_contents() -> Option<String> {
+    std::fs::read_to_string(venv_cfg_path()?).ok()
+}
+
+/// Path of the governing `pyvenv.cfg`, or `None` outside a venv.
+fn venv_cfg_path() -> Option<std::path::PathBuf> {
     // argv[0]-derived: the venv executable is a symlink whose identity
     // `current_exe()` destroys on Linux (see stdlib_tree::program_exe).
     let exe = crate::stdlib_tree::program_exe()?;
     let exe_dir = exe.parent()?;
-    let cfg = [
+    [
         exe_dir.join("pyvenv.cfg"),
         exe_dir.parent()?.join("pyvenv.cfg"),
     ]
     .into_iter()
-    .find(|p| p.is_file())?;
-    std::fs::read_to_string(cfg).ok()
+    .find(|p| p.is_file())
+}
+
+/// CPython getpath's `venv_prefix`: the directory holding `pyvenv.cfg`.
+/// Since 3.14 `site.venv()` no longer rewrites `sys.prefix` itself (it
+/// only warns when getpath disagrees), so the interpreter must report
+/// the venv directory as `sys.prefix`/`sys.exec_prefix` natively.
+/// `None` outside a venv (or under `PYTHONHOME`, which getpath honours
+/// first).
+fn venv_prefix_dir() -> Option<std::path::PathBuf> {
+    for var in ["WEAVEPYHOME", "PYTHONHOME"] {
+        if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
+            return None;
+        }
+    }
+    venv_cfg_path()?.parent().map(std::path::Path::to_path_buf)
 }
 
 /// Case-insensitive `key = value` lookup in pyvenv.cfg contents.
@@ -1078,6 +1161,10 @@ fn builtin_module_names_value() -> Object {
         "_xxsubinterpreters",
         "atexit",
         "binascii",
+        // `builtins` is native in CPython too; `_pyrepl._module_completer`
+        // completes top-level imports from this tuple
+        // (`test_pyrepl.test_builtin_completion_top_level`).
+        "builtins",
         "cmath",
         "errno",
         "faulthandler",
@@ -1348,6 +1435,20 @@ pub(crate) fn intern_name(name: &str) -> Object {
     })
 }
 
+/// CPython's `intern_string_constants` rule (codeobject.c): a str
+/// constant is interned when it is ASCII and every character is a name
+/// character (`Py_ISALNUM` or `_`); the empty string and every
+/// one-character latin-1 string are static singletons, interned too.
+pub(crate) fn cpython_interns_constant(s: &str) -> bool {
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (None, _) => return true,
+        (Some(c), None) if (c as u32) < 256 => return true,
+        _ => {}
+    }
+    s.is_ascii() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 /// Is `o` the pooled (`sys.intern`) instance for its value? `marshal`
 /// writes such strings with the `*_INTERNED` type codes so a round-trip
 /// preserves the interned identity (RFC 0060, test_marshal.testIntern).
@@ -1358,6 +1459,43 @@ pub(crate) fn str_is_interned(o: &Object) -> bool {
             .get(&o.to_str())
             .is_some_and(|pooled| pooled.is_same(o))
     })
+}
+
+/// `sys._clear_type_descriptors(type)` (3.14, gh-135228): drop the
+/// `__dict__` / `__weakref__` getset descriptors from a heap type's dict
+/// so `dataclasses._add_slots` can rebuild the class with `__slots__`
+/// without the original class being kept alive by its descriptors.
+fn sys_clear_type_descriptors(args: &[Object]) -> Result<Object, RuntimeError> {
+    let ty = match args {
+        [Object::Type(ty)] => ty,
+        [_] => {
+            return Err(type_error(
+                "_clear_type_descriptors() argument must be a type",
+            ))
+        }
+        _ => {
+            return Err(type_error(format!(
+                "_clear_type_descriptors() takes exactly one argument ({} given)",
+                args.len()
+            )))
+        }
+    };
+    if ty.flags.is_builtin || ty.immutable.get() {
+        return Err(type_error(format!(
+            "cannot clear descriptors of immutable type '{}'",
+            ty.qualified_display_name()
+        )));
+    }
+    {
+        let mut d = ty.dict.borrow_mut();
+        d.shift_remove(&DictKey(Object::from_static("__dict__")));
+        d.shift_remove(&DictKey(Object::from_static("__weakref__")));
+    }
+    ty.bump_attr_version();
+    if crate::capi_watchers::types_active() {
+        crate::capi_watchers::type_modified(ty);
+    }
+    Ok(Object::None)
 }
 
 fn sys_intern(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1726,6 +1864,44 @@ fn sys_setprofileallthreads(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
+/// `sys._jit` (CPython 3.14): the observation surface for CPython's
+/// experimental copy-and-patch JIT. WeavePy's own tier-2 JIT is not that
+/// machinery and does not tag frames the way `sys._jit.is_active` reports,
+/// so all three predicates answer `False`, like a CPython built without
+/// `--enable-experimental-jit` (`test.support` derives
+/// `requires_jit_enabled` / `requires_jit_disabled` from `is_enabled`).
+fn build_jit_module() -> Object {
+    let dict = Rc::new(RefCell::new(DictData::default()));
+    {
+        let mut d = dict.borrow_mut();
+        d.insert(
+            DictKey(Object::from_static("__name__")),
+            Object::from_static("sys._jit"),
+        );
+        d.insert(
+            DictKey(Object::from_static("__doc__")),
+            Object::from_static("Utilities for observing just-in-time compilation."),
+        );
+        d.insert(
+            DictKey(Object::from_static("is_available")),
+            builtin("is_available", |_args| Ok(Object::Bool(false))),
+        );
+        d.insert(
+            DictKey(Object::from_static("is_enabled")),
+            builtin("is_enabled", |_args| Ok(Object::Bool(false))),
+        );
+        d.insert(
+            DictKey(Object::from_static("is_active")),
+            builtin("is_active", |_args| Ok(Object::Bool(false))),
+        );
+    }
+    Object::Module(Rc::new(PyModule {
+        name: "sys._jit".to_owned(),
+        filename: None,
+        dict,
+    }))
+}
+
 fn sys_gettrace(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(crate::trace::trace_hook_raw().unwrap_or(Object::None))
 }
@@ -1819,7 +1995,7 @@ fn obj_call_no_args(m: &Object) -> Result<Object, RuntimeError> {
     interp.call(m, &[], &[], &g)
 }
 
-/// CPython 3.13 `sys.flags` struct-sequence field order. `tuple(sys.flags)`
+/// CPython 3.14 `sys.flags` struct-sequence field order. `tuple(sys.flags)`
 /// must yield these in exactly this order (`test_multiprocessing` /
 /// `test_sys` compare `sys.flags` across a spawned child via the tuple form).
 pub(crate) const SYS_FLAGS_FIELDS: &[&str] = &[
@@ -1843,6 +2019,11 @@ pub(crate) const SYS_FLAGS_FIELDS: &[&str] = &[
     "int_max_str_digits",
 ];
 
+/// The attribute-only tail of 3.14's `sys.flags` (`n_in_sequence` stops
+/// at `int_max_str_digits`, so these never appear in `tuple(sys.flags)`).
+pub(crate) const SYS_FLAGS_HIDDEN: &[&str] =
+    &["gil", "thread_inherit_context", "context_aware_warnings"];
+
 /// `sys.version_info` (and `sys.implementation.version`) — CPython's
 /// `PyStructSequence` with named fields; `sys.version_info.major` is
 /// one of the most common introspection idioms in the ecosystem
@@ -1856,33 +2037,25 @@ const VERSION_INFO_FIELDS: &[&str] = &["major", "minor", "micro", "releaselevel"
 #[cfg(windows)]
 const WINDOWS_VERSION_VISIBLE: [&str; 5] = ["major", "minor", "build", "platform", "service_pack"];
 
-/// The `HMODULE` of `python313.dll` when this interpreter is running
-/// out of the runtime DLL (RFC 0064 WS1: the shipped exe is a shim
-/// that loads it), 0 when statically linked (embedder test harnesses).
-/// `GetModuleHandleW` peeks at the process's loaded-module list
-/// without loading anything and without taking a reference.
+/// The `HMODULE` of the runtime DLL (`python314.dll`, following
+/// `weavepy_version::PYLIB_STEM`) when this interpreter is running out
+/// of it (RFC 0064 WS1: the shipped exe is a shim that loads it), 0 when
+/// statically linked (embedder test harnesses). `GetModuleHandleW`
+/// peeks at the process's loaded-module list without loading anything
+/// and without taking a reference.
 #[cfg(windows)]
 fn python_dll_handle() -> i64 {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    // "python313.dll" as static UTF-16, NUL-terminated.
-    const NAME: &[u16] = &[
-        b'p' as u16,
-        b'y' as u16,
-        b't' as u16,
-        b'h' as u16,
-        b'o' as u16,
-        b'n' as u16,
-        b'3' as u16,
-        b'1' as u16,
-        b'3' as u16,
-        b'.' as u16,
-        b'd' as u16,
-        b'l' as u16,
-        b'l' as u16,
-        0,
-    ];
-    // SAFETY: NAME is a valid NUL-terminated UTF-16 string.
-    let handle = unsafe { GetModuleHandleW(NAME.as_ptr()) };
+    // The DLL name as NUL-terminated UTF-16. Derived from the version
+    // crate so a CPython switch (3.13 -> 3.14 hardcoded "python313.dll"
+    // here and `sys.dllhandle` silently reported 0 under the shim) can't
+    // leave it behind.
+    const DLL_NAME: &str = weavepy_version::vconcat!(weavepy_version::PYLIB_STEM, ".dll");
+    let mut name: Vec<u16> = DLL_NAME.encode_utf16().collect();
+    name.push(0);
+    // SAFETY: `name` is a valid NUL-terminated UTF-16 string that
+    // outlives the call.
+    let handle = unsafe { GetModuleHandleW(name.as_ptr()) };
     handle as usize as i64
 }
 
@@ -2012,14 +2185,16 @@ fn sys_flags_value() -> Object {
     // index, with `len()`/iteration over the field values. `tuple(sys.flags)`
     // is used by `test_multiprocessing` to round-trip flags through a spawned
     // child, so a plain namespace (not iterable) is insufficient.
-    // 3.13's `flags` carries `gil` as a *hidden* named field: reachable
-    // as `sys.flags.gil` but excluded from `len()`/indexing/iteration
+    // 3.14's `flags` carries `gil`, `thread_inherit_context`, and
+    // `context_aware_warnings` as *hidden* named fields: reachable by
+    // attribute but excluded from `len()`/indexing/iteration
     // (`len(sys.flags) == 18` in test_sys.test_sys_flags while
-    // test_cmd_line.test_python_gil reads `sys.flags.gil`).
+    // test_cmd_line.test_python_gil reads `sys.flags.gil` and
+    // `_py_warnings`/`threading` read the two context flags).
     let slots: Vec<Option<&'static str>> = SYS_FLAGS_FIELDS
         .iter()
+        .chain(SYS_FLAGS_HIDDEN.iter())
         .map(|f| Some(*f))
-        .chain(std::iter::once(Some("gil")))
         .collect();
     let ty =
         crate::stdlib::os::struct_seq_type_layout("flags", "sys", slots, SYS_FLAGS_FIELDS.len());
@@ -2040,10 +2215,20 @@ fn sys_flags_value() -> Object {
         .collect();
     let flags = crate::stdlib::os::struct_seq_instance(ty, SYS_FLAGS_FIELDS, values);
     if let Object::Instance(inst) = &flags {
-        // This build always runs with the GIL (no free-threading).
-        inst.dict
-            .borrow_mut()
-            .insert(DictKey(Object::from_static("gil")), Object::Int(1));
+        let mut dict = inst.dict.borrow_mut();
+        // This build always runs with the GIL (no free-threading), and
+        // the two PEP 649-era context flags take their 3.14 GIL-build
+        // defaults (both off; `-X thread_inherit_context=1` /
+        // `-X context_aware_warnings=1` flip them in apply_run_options).
+        dict.insert(DictKey(Object::from_static("gil")), Object::Int(1));
+        dict.insert(
+            DictKey(Object::from_static("thread_inherit_context")),
+            Object::Int(0),
+        );
+        dict.insert(
+            DictKey(Object::from_static("context_aware_warnings")),
+            Object::Int(0),
+        );
     }
     flags
 }
@@ -2148,14 +2333,18 @@ pub fn is_stdlib_module_name(name: &str) -> bool {
 }
 
 /// `sys.stdlib_module_names` — the documented set of standard-
-/// library module names. CPython 3.13 ships a frozenset; we
+/// library module names. CPython 3.14 ships a frozenset; we
 /// mirror that with a [`Object::FrozenSet`].
 fn stdlib_module_names_value() -> Object {
     use crate::object::SetData;
     let names: &[&'static str] = &[
+        "__future__",
         "_abc",
         "_aix_support",
+        "_android_support",
+        "_apple_support",
         "_ast",
+        "_ast_unparse",
         "_asyncio",
         "_bisect",
         "_blake2",
@@ -2169,23 +2358,30 @@ fn stdlib_module_names_value() -> Object {
         "_codecs_tw",
         "_collections",
         "_collections_abc",
+        "_colorize",
         "_compat_pickle",
-        "_compression",
         "_contextvars",
         "_csv",
         "_ctypes",
         "_curses",
         "_curses_panel",
         "_datetime",
+        "_dbm",
         "_decimal",
         "_elementtree",
         "_frozen_importlib",
         "_frozen_importlib_external",
         "_functools",
+        "_gdbm",
         "_hashlib",
         "_heapq",
+        "_hmac",
         "_imp",
+        "_interpchannels",
+        "_interpqueues",
+        "_interpreters",
         "_io",
+        "_ios_support",
         "_json",
         "_locale",
         "_lsprof",
@@ -2195,16 +2391,24 @@ fn stdlib_module_names_value() -> Object {
         "_multibytecodec",
         "_multiprocessing",
         "_opcode",
+        "_opcode_metadata",
         "_operator",
         "_osx_support",
+        "_overlapped",
         "_pickle",
         "_posixshmem",
         "_posixsubprocess",
         "_py_abc",
+        "_py_warnings",
+        "_pydatetime",
         "_pydecimal",
         "_pyio",
+        "_pylong",
+        "_pyrepl",
         "_queue",
         "_random",
+        "_remote_debugging",
+        "_scproxy",
         "_sha1",
         "_sha2",
         "_sha3",
@@ -2215,9 +2419,11 @@ fn stdlib_module_names_value() -> Object {
         "_sre",
         "_ssl",
         "_stat",
+        "_statistics",
         "_string",
         "_strptime",
         "_struct",
+        "_suggestions",
         "_symtable",
         "_sysconfig",
         "_thread",
@@ -2225,21 +2431,24 @@ fn stdlib_module_names_value() -> Object {
         "_tkinter",
         "_tokenize",
         "_tracemalloc",
+        "_types",
+        "_typing",
         "_uuid",
         "_warnings",
         "_weakref",
         "_weakrefset",
+        "_winapi",
+        "_wmi",
         "_zoneinfo",
+        "_zstd",
         "abc",
+        "annotationlib",
         "antigravity",
         "argparse",
         "array",
         "ast",
-        "asynchat",
         "asyncio",
-        "asyncore",
         "atexit",
-        "audioop",
         "base64",
         "bdb",
         "binascii",
@@ -2248,9 +2457,6 @@ fn stdlib_module_names_value() -> Object {
         "bz2",
         "cProfile",
         "calendar",
-        "cgi",
-        "cgitb",
-        "chunk",
         "cmath",
         "cmd",
         "code",
@@ -2259,13 +2465,13 @@ fn stdlib_module_names_value() -> Object {
         "collections",
         "colorsys",
         "compileall",
+        "compression",
         "concurrent",
         "configparser",
         "contextlib",
         "contextvars",
         "copy",
         "copyreg",
-        "crypt",
         "csv",
         "ctypes",
         "curses",
@@ -2305,8 +2511,6 @@ fn stdlib_module_names_value() -> Object {
         "http",
         "idlelib",
         "imaplib",
-        "imghdr",
-        "imp",
         "importlib",
         "inspect",
         "io",
@@ -2319,30 +2523,26 @@ fn stdlib_module_names_value() -> Object {
         "logging",
         "lzma",
         "mailbox",
-        "mailcap",
         "marshal",
         "math",
         "mimetypes",
         "mmap",
         "modulefinder",
-        "msilib",
         "msvcrt",
         "multiprocessing",
         "netrc",
-        "nis",
-        "nntplib",
+        "nt",
         "ntpath",
+        "nturl2path",
         "numbers",
         "opcode",
         "operator",
         "optparse",
         "os",
-        "ossaudiodev",
         "pathlib",
         "pdb",
         "pickle",
         "pickletools",
-        "pipes",
         "pkgutil",
         "platform",
         "plistlib",
@@ -2363,6 +2563,78 @@ fn stdlib_module_names_value() -> Object {
         "quopri",
         "random",
         "re",
+        "readline",
+        "reprlib",
+        "resource",
+        "rlcompleter",
+        "runpy",
+        "sched",
+        "secrets",
+        "select",
+        "selectors",
+        "shelve",
+        "shlex",
+        "shutil",
+        "signal",
+        "site",
+        "smtplib",
+        "socket",
+        "socketserver",
+        "sqlite3",
+        "sre_compile",
+        "sre_constants",
+        "sre_parse",
+        "ssl",
+        "stat",
+        "statistics",
+        "string",
+        "stringprep",
+        "struct",
+        "subprocess",
+        "symtable",
+        "sys",
+        "sysconfig",
+        "syslog",
+        "tabnanny",
+        "tarfile",
+        "tempfile",
+        "termios",
+        "textwrap",
+        "this",
+        "threading",
+        "time",
+        "timeit",
+        "tkinter",
+        "token",
+        "tokenize",
+        "tomllib",
+        "trace",
+        "traceback",
+        "tracemalloc",
+        "tty",
+        "turtle",
+        "turtledemo",
+        "types",
+        "typing",
+        "unicodedata",
+        "unittest",
+        "urllib",
+        "uuid",
+        "venv",
+        "warnings",
+        "wave",
+        "weakref",
+        "webbrowser",
+        "winreg",
+        "winsound",
+        "wsgiref",
+        "xml",
+        "xmlrpc",
+        "zipapp",
+        "zipfile",
+        "zipimport",
+        "zlib",
+        "zoneinfo",
     ];
     let mut set = SetData::default();
     for n in names {
@@ -2384,12 +2656,9 @@ fn stdlib_module_names_value() -> Object {
         "shutil",
         "signal",
         "site",
-        "smtpd",
         "smtplib",
-        "sndhdr",
         "socket",
         "socketserver",
-        "spwd",
         "sqlite3",
         "sre_compile",
         "sre_constants",
@@ -2401,17 +2670,14 @@ fn stdlib_module_names_value() -> Object {
         "stringprep",
         "struct",
         "subprocess",
-        "sunau",
         "symtable",
         "sys",
         "sysconfig",
         "syslog",
         "tabnanny",
         "tarfile",
-        "telnetlib",
         "tempfile",
         "termios",
-        "test",
         "textwrap",
         "threading",
         "time",
@@ -2431,7 +2697,6 @@ fn stdlib_module_names_value() -> Object {
         "unicodedata",
         "unittest",
         "urllib",
-        "uu",
         "uuid",
         "venv",
         "warnings",
@@ -2441,7 +2706,6 @@ fn stdlib_module_names_value() -> Object {
         "winreg",
         "winsound",
         "wsgiref",
-        "xdrlib",
         "xml",
         "xmlrpc",
         "zipapp",
@@ -2482,14 +2746,62 @@ fn sys_getrefcount(args: &[Object]) -> Result<Object, RuntimeError> {
     // (test_nditer test_iter_refcount — RFC 0076 WS1).
     let extra_c = crate::gc_trace::extra_c_refs(obj);
     // The clone in our `args` slice plays the role of CPython's
-    // "+1 for the argument reference" — no extra increment needed.
+    // "+1 for the argument reference" — no extra increment needed...
+    // unless CPython wouldn't have taken one at all (a borrowed load).
+    let borrowed = borrowed_argument_discount(obj);
     let visible = strong
         .saturating_sub(registry)
         .saturating_sub(weak_clones)
         .saturating_sub(zombie_refs)
         .saturating_sub(pinned)
+        .saturating_sub(borrowed)
         .saturating_add(extra_c);
     Ok(Object::Int(visible.max(1) as i64))
+}
+
+/// CPython 3.14's `LOAD_FAST_BORROW` (gh-130704) pushes a *borrowed*
+/// reference: `sys.getrefcount(x)` on a local that the compiler's
+/// liveness pass proved safe to borrow reads 1 lower than 3.13 did,
+/// because the argument slot never took its own `Py_INCREF`. WeavePy
+/// executes every fast load as a plain clone (the borrow is a wire-form
+/// mark, `CodeObject::wire_marks`), so recover the CPython number by
+/// looking at the caller's instruction just before the `CALL`: when it
+/// is a borrow-marked fast load of a slot still bound to `obj`, the
+/// argument clone corresponds to a reference CPython never counted.
+fn borrowed_argument_discount(obj: &Object) -> usize {
+    use weavepy_compiler::bytecode::{wire, OpCode};
+    let Some(handles) = crate::vm_singletons::current_thread_handles() else {
+        return 0;
+    };
+    let shell = handles.frame_stack.borrow().last().cloned();
+    let Some(shell) = shell else {
+        return 0;
+    };
+    // `lasti` mirrors the pc of the executing `CALL`; the last argument
+    // was pushed by the instruction before it.
+    let call_pc = shell.lasti.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    let Some(load_pc) = call_pc.checked_sub(1) else {
+        return 0;
+    };
+    let code = &shell.code;
+    let Some(ins) = code.instructions.get(load_pc) else {
+        return 0;
+    };
+    let is_borrow = code
+        .wire_marks
+        .get(load_pc)
+        .is_some_and(|m| m & wire::BORROW != 0);
+    if !is_borrow {
+        return 0;
+    }
+    let slot = match ins.op {
+        OpCode::LoadFast => ins.arg,
+        // Fused pair: the second (top-of-stack) load is the argument.
+        OpCode::LoadFastLoadFast => ins.arg & 15,
+        _ => return 0,
+    } as usize;
+    let locals = shell.locals.borrow();
+    usize::from(locals.get(slot).is_some_and(|v| v.is_same(obj)))
 }
 
 thread_local! {
@@ -2588,9 +2900,21 @@ fn sys_set_asyncgen_hooks(
     Ok(Object::None)
 }
 
+const ASYNCGEN_HOOKS_FIELDS: &[&str] = &["firstiter", "finalizer"];
+
 fn sys_get_asyncgen_hooks(_args: &[Object]) -> Result<Object, RuntimeError> {
+    // CPython returns the `sys.asyncgen_hooks` struct sequence
+    // (`AsyncGenHooksType`, a tuple subclass with named fields), not a
+    // bare tuple — test_embed's finalize_structseq leg checks
+    // `__bases__ == (tuple,)` on it (bpo-46417).
     let (firstiter, finalizer) = asyncgen_hooks();
-    Ok(Object::new_tuple(vec![firstiter, finalizer]))
+    let ty = crate::stdlib::os::struct_seq_type("asyncgen_hooks", "sys", ASYNCGEN_HOOKS_FIELDS);
+    disallow_instantiation(&ty, "sys.asyncgen_hooks");
+    Ok(crate::stdlib::os::struct_seq_instance(
+        ty,
+        ASYNCGEN_HOOKS_FIELDS,
+        vec![firstiter, finalizer],
+    ))
 }
 
 /// Default `sys.displayhook`: if the value is None do nothing,

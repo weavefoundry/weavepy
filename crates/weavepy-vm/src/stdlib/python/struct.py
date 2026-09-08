@@ -17,13 +17,15 @@ class error(Exception):
 
 _INT_CODES = frozenset("bBhHiIlLqQnNP")
 _FLOAT_CODES = frozenset("fde")
+# 3.14: C `float complex` / `double complex`.
+_COMPLEX_CODES = frozenset("FD")
 
 # Values the Rust core handles directly (including its own native
 # `__index__`/`__float__` coercions for numeric scalars). Only exotic
 # objects — e.g. something whose `__bool__` raises for a `?` code —
 # need the Python-level pre-coercion loop. Skipping it for all-
 # primitive calls keeps `struct.pack` off `zipfile`'s hot path.
-_PRIMITIVES = (int, float, bytes, bytearray, str, memoryview)
+_PRIMITIVES = (int, float, complex, bytes, bytearray, str, memoryview)
 
 
 def _needs_coercion(values):
@@ -69,6 +71,16 @@ def _coerce_values(fmt, values):
                     out.append(float(v))
                 except (TypeError, ValueError):
                     raise error("required argument is not a float") from None
+        elif code in _COMPLEX_CODES:
+            if isinstance(v, (complex, float, int)):
+                out.append(v)
+            else:
+                # `PyComplex_AsCComplex`: __complex__, then the float
+                # protocol (__float__ / __index__).
+                try:
+                    out.append(complex(v))
+                except (TypeError, ValueError):
+                    raise error("required argument is not a complex") from None
         elif code == "?":
             out.append(bool(v))
         else:

@@ -76,6 +76,7 @@ CHANNEL_BINDING_TYPES = []
 HAS_NEVER_CHECK_COMMON_NAME = True
 HAS_PSK = False                      # external PSK key exchange not exposed
 HAS_PSK_TLS13 = False
+HAS_PHA = False                      # TLS 1.3 post-handshake auth not exposed
 
 OPENSSL_VERSION = _ssl.OPENSSL_VERSION
 OPENSSL_VERSION_NUMBER = _ssl.OPENSSL_VERSION_NUMBER
@@ -716,11 +717,14 @@ class SSLContext:
 
     @options.setter
     def options(self, value):
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise TypeError(f"argument must be int, not {type(value).__name__}")
-        # OpenSSL options are a uint64 bitmask.
-        if value < 0 or value >= (1 << 64):
-            raise OverflowError("Python int too large to convert to C unsigned long long")
+        if not isinstance(value, int):
+            raise TypeError(f"'{type(value).__name__}' object cannot be interpreted as an integer")
+        # 3.14 converts with PyLong_AsUnsignedLongLong: a negative value is
+        # a ValueError, one past uint64 an OverflowError (test_ssl.test_options).
+        if value < 0:
+            raise ValueError("Cannot convert negative int")
+        if value >= (1 << 64):
+            raise OverflowError("Python int too large for C unsigned long long")
         if value & int(_DEPRECATED_OPTION_BITS) & ~self._options:
             _warnings.warn(
                 'ssl.OP_NO_SSL*/ssl.OP_NO_TLS* options are deprecated',

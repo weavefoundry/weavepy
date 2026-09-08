@@ -418,6 +418,12 @@ class _ZoneInfoBase(tzinfo):
 
         return obj
 
+    def _c_tz_str_error(self, tz_str, exc):
+        """Hook for the accelerator-shaped class: return a replacement
+        ``ValueError`` (the C module reports the raw footer *bytes*), or
+        ``None`` to keep the pure-Python message."""
+        return None
+
     @classmethod
     def _new_instance(cls, key):
         obj = super().__new__(cls)
@@ -613,7 +619,13 @@ class _ZoneInfoBase(tzinfo):
 
         # Set the "fallback" time zone
         if tz_str is not None and tz_str != b"":
-            self._tz_after = _parse_tz_str(tz_str.decode())
+            try:
+                self._tz_after = _parse_tz_str(tz_str.decode())
+            except ValueError as e:
+                reworded = self._c_tz_str_error(tz_str, e)
+                if reworded is None:
+                    raise
+                raise reworded from None
         else:
             if not self._ttinfos and not _ttinfo_list:
                 raise ValueError("No time zone information found.")

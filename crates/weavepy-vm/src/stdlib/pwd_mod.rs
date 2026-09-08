@@ -63,15 +63,19 @@ unsafe fn passwd_to_object(p: *const libc::passwd) -> Object {
     super::os::struct_seq_instance(struct_passwd_type(), &PASSWD_FIELDS, values)
 }
 
-fn uid_from_obj(obj: &Object) -> Result<i64, RuntimeError> {
+/// `pwd.getpwuid(uid)` argument handling (`test_pwd.test_errors`): exactly
+/// one `int` argument; CPython's `pwd_getpwuid` turns an out-of-`uid_t`-range
+/// value into `KeyError('getpwuid(): uid not found')` rather than an
+/// `OverflowError`. Returns `None` for the out-of-range case.
+#[cfg(unix)]
+fn uid_from_obj(obj: &Object) -> Result<Option<libc::uid_t>, RuntimeError> {
     match obj {
-        Object::Int(n) => Ok(*n),
-        Object::Bool(b) => Ok(i64::from(*b)),
-        // CPython accepts anything `_Py_Uid_Converter` can digest; a huge
-        // int is simply "not found" rather than an OverflowError here.
-        Object::Long(_) => Ok(-1),
+        Object::Int(-1) => Ok(Some(libc::uid_t::MAX)),
+        Object::Int(n) => Ok(libc::uid_t::try_from(*n).ok()),
+        Object::Bool(b) => Ok(Some(libc::uid_t::from(*b))),
+        Object::Long(_) => Ok(None),
         _ => Err(type_error(format!(
-            "getpwuid(): uid must be a number, not {}",
+            "uid should be integer, not {}",
             obj.type_name()
         ))),
     }
@@ -79,31 +83,37 @@ fn uid_from_obj(obj: &Object) -> Result<i64, RuntimeError> {
 
 #[cfg(unix)]
 fn pwd_getpwuid(args: &[Object]) -> Result<Object, RuntimeError> {
-    let arg = args
-        .first()
-        .ok_or_else(|| type_error("getpwuid() takes exactly 1 argument (0 given)"))?;
-    let uid = uid_from_obj(arg)?;
-    let p = unsafe { libc::getpwuid(uid as libc::uid_t) };
+    if args.len() != 1 {
+        return Err(type_error(format!(
+            "pwd.getpwuid() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+    let arg = &args[0];
+    let Some(uid) = uid_from_obj(arg)? else {
+        return Err(key_error("getpwuid(): uid not found"));
+    };
+    let p = unsafe { libc::getpwuid(uid) };
     if p.is_null() {
-        return Err(key_error(format!("getpwuid(): uid not found: {uid}")));
+        let shown = match arg {
+            Object::Int(n) => *n,
+            Object::Bool(b) => i64::from(*b),
+            _ => i64::from(uid),
+        };
+        return Err(key_error(format!("getpwuid(): uid not found: {shown}")));
     }
     Ok(unsafe { passwd_to_object(p) })
 }
 
 #[cfg(unix)]
 fn pwd_getpwnam(args: &[Object]) -> Result<Object, RuntimeError> {
-    let name = match args.first() {
-        Some(Object::Str(s)) => s.to_string(),
-        Some(other) => {
-            return Err(type_error(format!(
-                "getpwnam(): argument must be a str, not {}",
-                other.type_name()
-            )))
-        }
-        None => return Err(type_error("getpwnam() takes exactly 1 argument (0 given)")),
-    };
-    let cname = std::ffi::CString::new(name.as_str())
-        .map_err(|_| type_error("getpwnam(): embedded null character"))?;
+    if args.len() != 1 {
+        return Err(type_error(format!(
+            "pwd.getpwnam() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+    let (name, cname) = super::grp_mod::name_arg_to_cstring(args, "getpwnam")?;
     let p = unsafe { libc::getpwnam(cname.as_ptr()) };
     if p.is_null() {
         return Err(key_error(format!("getpwnam(): name not found: '{name}'")));
@@ -112,7 +122,13 @@ fn pwd_getpwnam(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 #[cfg(unix)]
-fn pwd_getpwall(_args: &[Object]) -> Result<Object, RuntimeError> {
+fn pwd_getpwall(args: &[Object]) -> Result<Object, RuntimeError> {
+    if !args.is_empty() {
+        return Err(type_error(format!(
+            "pwd.getpwall() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
     let mut entries = Vec::new();
     unsafe {
         libc::setpwent();

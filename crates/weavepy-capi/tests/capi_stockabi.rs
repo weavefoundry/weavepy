@@ -10,7 +10,7 @@
 //! — runs correctly against WeavePy's layout-faithful mirrors.
 //!
 //! Skipped (passes) when the env var is unset — that happens when
-//! CPython 3.13 dev headers (or `cc`) aren't available on the build
+//! CPython 3.14 dev headers (or `cc`) aren't available on the build
 //! host, so CI on a bare machine still passes.
 
 use std::path::PathBuf;
@@ -98,7 +98,7 @@ fn stockabi_module_loads_with_constants() {
         other => panic!("ANSWER wrong: {other:?}"),
     }
     match lookup(&module, "ABI") {
-        Some(Object::Str(s)) => assert_eq!(&*s, "cp313"),
+        Some(Object::Str(s)) => assert_eq!(&*s, "cp314"),
         other => panic!("ABI wrong: {other:?}"),
     }
 }
@@ -239,6 +239,60 @@ fn stockabi_function_api() {
     match call(&mut interp, &module, "list_sum", &[lst]) {
         Object::Int(n) => assert_eq!(n, 6),
         other => panic!("list_sum: {other:?}"),
+    }
+}
+
+/// 3.14 exports `PyUnicode_KIND`/`PyUnicode_DATA` as real functions next
+/// to the header macros (PyO3 binds them as `extern`; pydantic-core's
+/// `-z now` manylinux wheel failed to dlopen with `undefined symbol:
+/// PyUnicode_DATA` before they existed). The fixture calls the
+/// *functions*; the buffer they expose must decode back to the string
+/// at the reported width for each PEP 393 kind.
+#[test]
+fn stockabi_exported_unicode_kind_and_data_functions() {
+    let Some((_lock, mut interp, module)) = load() else {
+        return;
+    };
+    let cases: [(&str, i64, fn(&[u8]) -> String); 4] = [
+        ("abc", 1, |b| b.iter().map(|&c| c as char).collect()),
+        ("caf\u{e9}", 1, |b| b.iter().map(|&c| c as char).collect()),
+        ("\u{20ac}1", 2, |b| {
+            let units: Vec<u16> = b
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
+                .collect();
+            String::from_utf16(&units).unwrap()
+        }),
+        ("a\u{1F600}", 4, |b| {
+            b.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| char::from_u32(u32::from_le_bytes(*c)).unwrap())
+                .collect()
+        }),
+    ];
+    for (s, want_kind, decode) in cases {
+        match call(
+            &mut interp,
+            &module,
+            "str_kind_data",
+            &[Object::Str(s.into())],
+        ) {
+            Object::Tuple(t) => {
+                assert_eq!(t.len(), 2, "{s:?}");
+                let Object::Int(kind) = &t[0] else {
+                    panic!("str_kind_data({s:?}) kind: {:?}", t[0]);
+                };
+                assert_eq!(*kind, want_kind, "{s:?}");
+                let Object::Bytes(raw) = &t[1] else {
+                    panic!("str_kind_data({s:?}) data: {:?}", t[1]);
+                };
+                assert_eq!(decode(raw), s);
+            }
+            other => panic!("str_kind_data({s:?}): {other:?}"),
+        }
     }
 }
 

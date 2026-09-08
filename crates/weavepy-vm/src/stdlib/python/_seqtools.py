@@ -185,6 +185,11 @@ class _FilterIter:
 
     __slots__ = ("_func", "_it")
 
+    # Present CPython's identity: instances repr as `<filter object at …>`
+    # and pickle through `builtins.filter` (see `__reduce__`).
+    __module__ = "builtins"
+    __qualname__ = "filter"
+
     def __new__(cls, func, iterable, **kwargs):
         _reject_subclass_kwargs(cls, _FilterIter, "filter", kwargs)
         self = object.__new__(cls)
@@ -207,7 +212,16 @@ class _FilterIter:
                 return item
 
     def __reduce__(self):
-        return (filter, (self._func, self._it))
+        # CPython's `filter_reduce` returns `Py_TYPE(lz)`; for the exact
+        # type that is `builtins.filter` (the pickler resolves it by
+        # name, so it must be the very object bound in `builtins`).
+        cls = type(self)
+        if cls is _FilterIter:
+            cls = filter
+        return (cls, (self._func, self._it))
+
+
+_FilterIter.__name__ = "filter"
 
 
 class _MapIter:
@@ -218,26 +232,73 @@ class _MapIter:
     and exceptions from ``func`` surface mid-stream, as in CPython.
     """
 
-    __slots__ = ("_func", "_iters")
+    __slots__ = ("_func", "_iters", "_strict")
+
+    # CPython identity (`<map object at …>`, `type(m).__module__ ==
+    # 'builtins'`); pickling goes through `builtins.map` so protocol < 3
+    # emits the `itertools.imap` compat global (pickletester
+    # test_compat_pickle).
+    __module__ = "builtins"
+    __qualname__ = "map"
 
     def __new__(cls, func, *iterables, **kwargs):
+        # 3.14: `map(..., strict=True)` (gh-119793) mirrors zip's strict
+        # mode; any other keyword follows the bpo-43413 subclass rule.
+        strict = kwargs.pop("strict", False)
         _reject_subclass_kwargs(cls, _MapIter, "map", kwargs)
+        if not iterables:
+            raise TypeError("map() must have at least two arguments.")
         self = object.__new__(cls)
         self._func = func
         self._iters = tuple(_hold_iter(it) for it in iterables)
+        self._strict = bool(strict)
         return self
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        iters = self._iters
         args = []
-        for it in self._iters:
-            args.append(next(it))
+        for i, it in enumerate(iters):
+            try:
+                args.append(next(it))
+            except StopIteration:
+                if not self._strict:
+                    raise
+                if i > 0:
+                    raise ValueError(
+                        f"map() argument {i+1} is shorter than {_zip_arg_range(i)}"
+                    ) from None
+                # First iterator exhausted: with strict the rest must be
+                # exhausted too (a non-StopIteration error propagates).
+                for j, jt in enumerate(iters[1:], 1):
+                    try:
+                        next(jt)
+                    except StopIteration:
+                        continue
+                    raise ValueError(
+                        f"map() argument {j+1} is longer than {_zip_arg_range(j)}"
+                    ) from None
+                raise
         return self._func(*args)
 
     def __reduce__(self):
-        return (map, (self._func,) + self._iters)
+        # CPython's `map_reduce`/`map_setstate`: strict rides in the
+        # state slot (test_builtin test_map_pickle_strict_fail). The
+        # exact type reduces to `builtins.map` itself (see `_FilterIter`).
+        cls = type(self)
+        if cls is _MapIter:
+            cls = map
+        if self._strict:
+            return (cls, (self._func,) + self._iters, True)
+        return (cls, (self._func,) + self._iters)
+
+    def __setstate__(self, state):
+        self._strict = bool(state)
+
+
+_MapIter.__name__ = "map"
 
 
 class _EnumerateIter:

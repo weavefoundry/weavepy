@@ -2,12 +2,12 @@
  *
  * CPython ships a hand-maintained `PC/pyconfig.h` on Windows (there
  * is no autoconf step); this is WeavePy's equivalent, shaped after
- * CPython 3.13's file: the same platform macros, LLP64 type sizes,
+ * CPython 3.14's file: the same platform macros, LLP64 type sizes,
  * shared-core markers, and — critically — the MSVC autolink pragma
- * that makes `cl /LD ext.c /I{Include}` pull `python313.lib` off the
+ * that makes `cl /LD ext.c /I{Include}` pull `python314.lib` off the
  * `/LIBPATH` without the build script naming it. setuptools points
  * `/LIBPATH:` at `{sys.base_exec_prefix}\libs`, where the WeavePy
- * artifact ships the import library for `python313.dll`.
+ * artifact ships the import library for `python314.dll`.
  */
 
 #ifndef Py_CONFIG_H
@@ -40,8 +40,8 @@
 #endif /* MS_WIN64 */
 
 /* Debug builds: MSVC's _DEBUG selects CPython's debug ABI. WeavePy
- * does not ship python313_d.dll, so a Debug extension build fails at
- * link with a clear missing-python313_d.lib error — the same failure
+ * does not ship python314_d.dll, so a Debug extension build fails at
+ * link with a clear missing-python314_d.lib error — the same failure
  * a release-only CPython install produces. */
 #ifdef _DEBUG
 #define Py_DEBUG 1
@@ -49,7 +49,7 @@
 
 /* --- shared core + autolink ---------------------------------------- */
 
-/* The Python runtime is a DLL (python313.dll — RFC 0064 WS1). */
+/* The Python runtime is a DLL (python314.dll — RFC 0064 WS1). */
 #define MS_COREDLL 1
 #define Py_ENABLE_SHARED 1
 
@@ -62,16 +62,16 @@
  * MSVC pull the import library automatically. */
 #if defined(_MSC_VER)
 #if defined(_DEBUG)
-#pragma comment(lib, "python313_d.lib")
+#pragma comment(lib, "python314_d.lib")
 #elif defined(Py_LIMITED_API)
 /* CPython points the limited API at python3.lib (the stable-ABI
  * forwarder DLL's import library). WeavePy does not ship the
  * forwarder yet (RFC 0064 Future work), so limited-API builds link
  * the full runtime library — the resulting .pyd imports
- * python313.dll and works on WeavePy 3.13. */
-#pragma comment(lib, "python313.lib")
+ * python314.dll and works on WeavePy 3.14. */
+#pragma comment(lib, "python314.lib")
 #else
-#pragma comment(lib, "python313.lib")
+#pragma comment(lib, "python314.lib")
 #endif /* _DEBUG */
 #endif /* _MSC_VER */
 #endif /* Py_BUILD_CORE */
@@ -153,5 +153,16 @@ typedef _W64 int ssize_t;
 /* #undef Py_GIL_DISABLED */
 /* #undef Py_TRACE_REFS */
 /* #undef Py_REF_DEBUG */
+
+/* --- 3.14 additions (RFC 0077 WS12) --------------------------------- */
+
+/* PEP 768 remote debugging is compiled out (`sys.is_remote_debug_enabled()`
+ * is False; `sys.remote_exec` raises RuntimeError). */
+/* #undef Py_REMOTE_DEBUG */
+/* The tail-calling interpreter is a CPython build option, not an ABI. */
+/* #undef Py_TAIL_CALL_INTERP */
+#define _Py_STACK_GROWS_DOWN 1
+/* MSVC has no C99 `_Complex`, so ctypes' complex support is off. */
+/* #undef _Py_FFI_SUPPORT_C_COMPLEX */
 
 #endif /* !Py_CONFIG_H */

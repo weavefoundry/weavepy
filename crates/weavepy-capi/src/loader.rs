@@ -26,6 +26,7 @@
 
 use std::ffi::CString;
 use std::path::Path;
+use weavepy_version::{vconcat, CP_TAG, SOABI_PREFIX};
 use weavepy_vm::sync::Rc;
 
 use libloading::{Library, Symbol};
@@ -472,8 +473,11 @@ pub fn load_extension_module(
 
 /// Load the shared library with the platform's CPython semantics.
 ///
-/// POSIX: plain dlopen (`RTLD_NOW | RTLD_LOCAL`, libloading's
-/// default, matching CPython's `dlopenflags` default).
+/// POSIX: plain dlopen with libloading's default `RTLD_LAZY | RTLD_LOCAL`.
+/// CPython's `dlopenflags` default is `RTLD_NOW`; the lazy binding here
+/// means a missing function symbol surfaces at first call rather than
+/// at import, except for a library linked `-z now` (`DF_BIND_NOW`, the
+/// maturin/PyO3 default), which the loader resolves eagerly regardless.
 #[cfg(not(windows))]
 fn open_extension_library(path: &Path, _leaf: &str) -> Result<Library, LoadError> {
     unsafe { Library::new(path) }.map_err(|e| LoadError::Dlopen(format!("{path:?}: {e}")))
@@ -559,25 +563,33 @@ pub fn find_extension_on_path(
 
 /// Extension-file suffixes the loader recognises, in priority order.
 pub fn extension_suffixes() -> &'static [&'static str] {
+    const MACOS: &[&str] = &[
+        vconcat!(".", SOABI_PREFIX, "-darwin.so"),
+        ".abi3.so",
+        ".so",
+        ".dylib",
+    ];
+    // glibc (manylinux) and musl (musllinux, RFC 0047 wave 5) carry
+    // distinct SOABI suffixes; the loader probes both so a wheel from
+    // either Linux ABI resolves to its `.so`.
+    const LINUX: &[&str] = &[
+        vconcat!(".", SOABI_PREFIX, "-x86_64-linux-gnu.so"),
+        vconcat!(".", SOABI_PREFIX, "-aarch64-linux-gnu.so"),
+        vconcat!(".", SOABI_PREFIX, "-x86_64-linux-musl.so"),
+        vconcat!(".", SOABI_PREFIX, "-aarch64-linux-musl.so"),
+        ".abi3.so",
+        ".so",
+    ];
+    // The tagged name is what wheels actually install
+    // (`EXT_SUFFIX` = `.cp313-win_amd64.pyd`); bare `.pyd` and
+    // `.dll` are the CPython fallbacks (RFC 0064 WS2).
+    const WINDOWS: &[&str] = &[vconcat!(".", CP_TAG, "-win_amd64.pyd"), ".pyd", ".dll"];
     if cfg!(target_os = "macos") {
-        &[".cpython-313-darwin.so", ".abi3.so", ".so", ".dylib"]
+        MACOS
     } else if cfg!(target_os = "linux") {
-        // glibc (manylinux) and musl (musllinux, RFC 0047 wave 5) carry
-        // distinct SOABI suffixes; the loader probes both so a wheel from
-        // either Linux ABI resolves to its `.so`.
-        &[
-            ".cpython-313-x86_64-linux-gnu.so",
-            ".cpython-313-aarch64-linux-gnu.so",
-            ".cpython-313-x86_64-linux-musl.so",
-            ".cpython-313-aarch64-linux-musl.so",
-            ".abi3.so",
-            ".so",
-        ]
+        LINUX
     } else if cfg!(target_os = "windows") {
-        // The tagged name is what wheels actually install
-        // (`EXT_SUFFIX` = `.cp313-win_amd64.pyd`); bare `.pyd` and
-        // `.dll` are the CPython fallbacks (RFC 0064 WS2).
-        &[".cp313-win_amd64.pyd", ".pyd", ".dll"]
+        WINDOWS
     } else {
         &[".so"]
     }

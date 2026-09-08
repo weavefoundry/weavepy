@@ -1,7 +1,8 @@
 //! `marshal` — internal byte serialisation for Python objects (RFC 0019).
 //!
-//! Implements the version-4 marshal format used by CPython 3.4+ for
-//! `.pyc` files. The on-disk format is *not* compatible with
+//! Implements the version-5 marshal format used by CPython 3.14 for
+//! `.pyc` files (version 5 adds `TYPE_SLICE`; versions 0..=4 are still
+//! written on request). The on-disk format is *not* compatible with
 //! CPython's because the embedded code objects use WeavePy's own
 //! bytecode, but the surface and the value-encoding map line up so
 //! `marshal.dumps(...)` followed by `marshal.loads(...)` round-trips
@@ -20,7 +21,7 @@
 //! Surface:
 //! * `dump(value, file[, version])` / `dumps(value[, version])`.
 //! * `load(file)` / `loads(bytes)`.
-//! * `version` — the protocol version; always 4 for now.
+//! * `version` — the protocol version; 5 (RFC 0077 WS9).
 
 use crate::sync::Rc;
 use crate::sync::RefCell;
@@ -39,13 +40,17 @@ use crate::object::{
 // bits whose meaning WeavePy tracks on its own `CodeObject` are consumed on
 // read; the rest are informational (e.g. `dis`/`inspect` flag display).
 const CO_OPTIMIZED: u32 = 0x0001;
-const CO_NEWLOCALS: u32 = 0x0002;
 const CO_VARARGS: u32 = 0x0004;
 const CO_VARKEYWORDS: u32 = 0x0008;
+const CO_NESTED: u32 = 0x0010;
 const CO_GENERATOR: u32 = 0x0020;
 const CO_COROUTINE: u32 = 0x0080;
 const CO_ITERABLE_COROUTINE: u32 = 0x0100;
 const CO_ASYNC_GENERATOR: u32 = 0x0200;
+// CPython 3.14: `co_consts[0]` is the docstring / function-like scope
+// defined directly in a class body.
+const CO_HAS_DOCSTRING: u32 = 0x0400_0000;
+const CO_METHOD: u32 = 0x0800_0000;
 
 const TYPE_NULL: u8 = b'0';
 const TYPE_NONE: u8 = b'N';
@@ -79,11 +84,15 @@ const TYPE_ASCII_INTERNED: u8 = b'A';
 const TYPE_SMALL_TUPLE: u8 = b')';
 const TYPE_SHORT_ASCII: u8 = b'z';
 const TYPE_SHORT_ASCII_INTERNED: u8 = b'Z';
+/// CPython 3.14 (marshal version 5): a `slice` constant, three nested
+/// values `start`, `stop`, `step`. Needed because 3.14's compiler folds
+/// `a[1:2]` into a slice constant in `co_consts`.
+const TYPE_SLICE: u8 = b':';
 
 const FLAG_REF: u8 = 0x80;
 
-/// The version WeavePy writes by default (CPython 3.4+).
-const MARSHAL_VERSION: i64 = 4;
+/// The version WeavePy writes by default (CPython 3.14's `Py_MARSHAL_VERSION`).
+const MARSHAL_VERSION: i64 = 5;
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::default()));
@@ -228,7 +237,7 @@ fn load_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
 }
 
 /// Args-only entry kept for internal callers (`pycache`, frozen-code
-/// cache). Writes the default version-4 form.
+/// cache). Writes the default version-5 form.
 pub fn b_dumps(args: &[Object]) -> Result<Object, RuntimeError> {
     dumps_kw(args, &[])
 }
@@ -258,12 +267,40 @@ struct MarshalWriter {
     /// recursive containers marshallable and preserves aliasing
     /// (test_marshal.InstancingTestCase).
     refs: std::collections::HashMap<u64, u32>,
+    /// Identities of the code and slice objects whose bodies are still
+    /// being written. CPython 3.14 (`w_ref`/`w_complete`) tags these two
+    /// kinds as incomplete until their children are out: the reader
+    /// builds them only after their parts, so a back-reference from
+    /// inside would land on an unfilled slot — `dumps` raises "cannot
+    /// marshal recursion slice objects" instead.
+    in_progress: std::collections::HashSet<u64>,
     /// Strong clones of every ref-registered object. Identity is the
     /// allocation address, so a registered temporary (e.g. the tuples
     /// `write_code` synthesizes) must stay alive for the whole dump or
     /// a later allocation could reuse its address and produce a bogus
     /// `TYPE_REF`.
     keepalive: Vec<Object>,
+    /// Set while a code object is the root of the dump: the CPython
+    /// reference-flag model (see [`CodePlan`]) replaces identity-based
+    /// sharing so the bytes match `marshal.dumps(compile(...))`.
+    plan: Option<CodePlan>,
+    /// Number of reference slots handed out so far (the reader's
+    /// `refs` vector length) — the index the next `FLAG_REF` gets.
+    next_ref: u32,
+    /// Strings written while this is set are ones CPython interns in
+    /// place (`co_names`, `co_localsplusnames`, `co_filename`,
+    /// `co_name`, `co_qualname`).
+    force_interned: bool,
+    /// Whether a one-byte `bytes` is CPython's cached singleton (true
+    /// for constants, false for the freshly built tables).
+    bytes_singletons: bool,
+    /// The next value written has a CPython reference count above one
+    /// for reasons outside the constant-merge model (a set element held
+    /// by marshal's own sort pair).
+    force_flag_next: bool,
+    /// The next value written is a fresh, unmerged object (an
+    /// `__annotate__` code object's rebuilt `co_localsplusnames`).
+    force_unshared_next: bool,
 }
 
 impl MarshalWriter {
@@ -274,7 +311,23 @@ impl MarshalWriter {
             version,
             allow_code,
             refs: std::collections::HashMap::new(),
+            in_progress: std::collections::HashSet::new(),
             keepalive: Vec::new(),
+            plan: None,
+            next_ref: 0,
+            force_interned: false,
+            bytes_singletons: true,
+            force_flag_next: false,
+            force_unshared_next: false,
+        }
+    }
+
+    /// Whether a string in a constant role is interned on the CPython
+    /// side (see [`StringRules::const_is_interned`]).
+    fn interned_constant(&self, bytes: &[u8]) -> bool {
+        match &self.plan {
+            Some(p) => p.strings.const_is_interned(bytes),
+            None => cpython_interns_constant(bytes),
         }
     }
 
@@ -291,6 +344,11 @@ impl MarshalWriter {
     }
 
     fn write_value(&mut self, value: &Object) -> Result<(), RuntimeError> {
+        if self.depth == 0 && self.version >= 3 && self.plan.is_none() {
+            if let Object::Code(co) = value {
+                self.plan = Some(CodePlan::for_code(co));
+            }
+        }
         // CPython `w_object`: depth-guard every value, containers included.
         self.depth += 1;
         if self.depth > MAX_MARSHAL_STACK_DEPTH {
@@ -304,23 +362,19 @@ impl MarshalWriter {
 
     fn write_dispatch(&mut self, value: &Object) -> Result<(), RuntimeError> {
         // Singletons sit outside the ref machinery (CPython `w_object`).
-        match value {
-            Object::None => {
-                self.write_byte(TYPE_NONE);
-                return Ok(());
-            }
-            Object::Bool(b) => {
-                self.write_byte(if *b { TYPE_TRUE } else { TYPE_FALSE });
-                return Ok(());
-            }
+        // A one-shot flag/unshared request still belongs to *this*
+        // value (a `True` set element consumes its forced flag) and
+        // must not leak onto the value written next.
+        let singleton: Option<u8> = match value {
+            Object::None => Some(TYPE_NONE),
+            Object::Bool(b) => Some(if *b { TYPE_TRUE } else { TYPE_FALSE }),
             // The `StopIteration` *type* has its own wire code (CPython
             // uses it for the StopIteration ⇄ generator protocol;
             // test_marshal.ExceptionTestCase).
             Object::Type(t)
                 if Rc::ptr_eq(t, &crate::builtin_types::builtin_types().stop_iteration) =>
             {
-                self.write_byte(TYPE_STOPITER);
-                return Ok(());
+                Some(TYPE_STOPITER)
             }
             // `Ellipsis` (the value of `...`) is a singleton instance of
             // the registry `ellipsis` type.
@@ -330,27 +384,191 @@ impl MarshalWriter {
                     &crate::builtin_types::builtin_types().ellipsis_,
                 ) =>
             {
-                self.write_byte(TYPE_ELLIPSIS);
-                return Ok(());
+                Some(TYPE_ELLIPSIS)
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some(code) = singleton {
+            self.force_flag_next = false;
+            self.force_unshared_next = false;
+            self.write_byte(code);
+            return Ok(());
+        }
+        if self.plan.is_some() {
+            return self.write_planned(value);
         }
         let mut flag = 0u8;
+        let deferred = matches!(value, Object::Code(_) | Object::Slice(_));
+        let mut id = 0u64;
         if self.version >= 3 {
-            let id = crate::weakref_registry::id_of(value);
+            id = crate::weakref_registry::id_of(value);
             if let Some(&idx) = self.refs.get(&id) {
+                if self.in_progress.contains(&id) {
+                    return Err(value_error(format!(
+                        "cannot marshal recursion {} objects",
+                        value.type_name()
+                    )));
+                }
                 self.write_byte(TYPE_REF);
                 self.write_int(idx as i32);
                 return Ok(());
             }
             // Register *before* the children are written so a recursive
             // container resolves to itself (CPython `w_ref`).
-            let idx = self.refs.len() as u32;
+            let idx = self.next_ref;
+            self.next_ref += 1;
             self.refs.insert(id, idx);
+            if deferred {
+                self.in_progress.insert(id);
+            }
             self.keepalive.push(value.clone());
             flag = FLAG_REF;
         }
+        let r = self.write_body(value, flag);
+        if deferred && self.version >= 3 {
+            // `w_complete`
+            self.in_progress.remove(&id);
+        }
+        r
+    }
+
+    /// `w_ref` under the CPython reference-count model of a freshly
+    /// compiled code object (see [`CodePlan`]): a value gets `FLAG_REF`
+    /// when CPython's copy would have a reference count other than one
+    /// — interned strings, cached singletons (small ints, `()`, `b''`,
+    /// one-byte `bytes`), and constants the compiler merged into one
+    /// object because they occur more than once. A flagged value that
+    /// was already written comes out as `TYPE_REF`.
+    fn write_planned(&mut self, value: &Object) -> Result<(), RuntimeError> {
+        let forced = std::mem::take(&mut self.force_flag_next);
+        let unshared = std::mem::take(&mut self.force_unshared_next);
+        let key = ConstKey::of_ctx(
+            value,
+            self.force_interned,
+            self.plan.as_ref().map(|p| &*p.strings),
+        );
+        let shared = !unshared
+            && key
+                .as_ref()
+                .is_some_and(|k| self.plan.as_ref().is_some_and(|p| p.shared.contains(k)));
+        let flagged = forced
+            || match value {
+                Object::Str(s) => {
+                    self.force_interned || shared || self.interned_constant(s.as_bytes())
+                }
+                Object::WStr(_) => shared,
+                Object::Int(i) => shared || (-5..=256).contains(i),
+                Object::Bytes(b) => {
+                    b.is_empty() || (b.len() == 1 && self.bytes_singletons) || shared
+                }
+                Object::Tuple(t) => t.is_empty() || shared,
+                Object::FrozenSet(fs) => {
+                    shared && !self.plan.as_ref().is_some_and(|p| p.frozenset_rebuilt(fs))
+                }
+                Object::Long(_) | Object::Float(_) | Object::Complex(_) | Object::Slice(_) => {
+                    shared
+                }
+                // Nested code objects are held only by their `co_consts`
+                // tuple (and the root by the caller's local).
+                Object::Code(_) => false,
+                // Anything else (a `code.replace(co_consts=([],))` oddity):
+                // written unshared.
+                _ => false,
+            };
+        let mut flag = 0u8;
+        if flagged {
+            if let Some(k) = key {
+                if let Some(&idx) = self.plan.as_ref().and_then(|p| p.refs.get(&k)) {
+                    self.write_byte(TYPE_REF);
+                    self.write_int(idx as i32);
+                    return Ok(());
+                }
+                let idx = self.next_ref;
+                self.next_ref += 1;
+                if let Some(p) = self.plan.as_mut() {
+                    p.refs.insert(k, idx);
+                }
+                flag = FLAG_REF;
+            }
+        }
         self.write_body(value, flag)
+    }
+
+    /// Set elements. CPython (bpo-37596) serialises them in the order of
+    /// `sorted(v, key=marshal.dumps)` — each element's standalone dump,
+    /// taken while marshal holds an extra reference to it, so every
+    /// element is flagged both in its sort key and in the real stream.
+    /// Without a code plan the runtime's own iteration order is kept.
+    fn write_set_items(&mut self, items: Vec<Object>) -> Result<(), RuntimeError> {
+        if self.plan.is_none() {
+            for item in &items {
+                self.write_value(item)?;
+            }
+            return Ok(());
+        }
+        let mut pairs: Vec<(Vec<u8>, Object)> = Vec::with_capacity(items.len());
+        for item in items {
+            let mut sub = MarshalWriter::new(self.version, self.allow_code);
+            sub.plan = self.plan.as_ref().map(|p| CodePlan {
+                shared: Rc::clone(&p.shared),
+                refs: std::collections::HashMap::new(),
+                strings: Rc::clone(&p.strings),
+            });
+            sub.force_flag_next = true;
+            sub.write_value(&item)?;
+            pairs.push((sub.into_bytes(), item));
+        }
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_, item) in pairs {
+            self.force_flag_next = true;
+            self.write_value(&item)?;
+        }
+        Ok(())
+    }
+
+    /// Write a string CPython interns in place (`co_names`, `co_filename`,
+    /// `co_name`, `co_qualname`, `co_localsplusnames`).
+    fn write_interned_str(&mut self, value: &Object) -> Result<(), RuntimeError> {
+        let prev = std::mem::replace(&mut self.force_interned, true);
+        let r = self.write_value(value);
+        self.force_interned = prev;
+        r
+    }
+
+    /// Write one of a code object's freshly built byte tables (never a
+    /// cached one-byte singleton).
+    fn write_table_bytes(&mut self, value: &Object) -> Result<(), RuntimeError> {
+        let prev = std::mem::replace(&mut self.bytes_singletons, false);
+        let r = self.write_value(value);
+        self.bytes_singletons = prev;
+        r
+    }
+
+    /// `co_localspluskinds` is built outside the constant cache
+    /// (`PyBytes_FromStringAndSize(NULL, n)`): a fresh object unless it
+    /// is the empty-bytes singleton.
+    fn write_kinds_bytes(&mut self, kinds: &[u8]) -> Result<(), RuntimeError> {
+        if self.plan.is_none() || kinds.is_empty() {
+            return self.write_table_bytes(&Object::new_bytes(kinds.to_vec()));
+        }
+        self.write_byte(TYPE_STRING);
+        self.write_int(kinds.len() as i32);
+        self.buf.extend_from_slice(kinds);
+        Ok(())
+    }
+
+    /// `co_code` is a fresh `bytes` CPython caches on the code object
+    /// (`_PyCode_GetCode`): always flagged, never a reference to (or
+    /// from) anything else.
+    fn write_co_code(&mut self, co_code: &[u8]) {
+        if self.version >= 3 {
+            self.next_ref += 1;
+            self.write_byte(TYPE_STRING | FLAG_REF);
+        } else {
+            self.write_byte(TYPE_STRING);
+        }
+        self.write_int(co_code.len() as i32);
+        self.buf.extend_from_slice(co_code);
     }
 
     fn write_body(&mut self, value: &Object, flag: u8) -> Result<(), RuntimeError> {
@@ -383,8 +601,13 @@ impl MarshalWriter {
                 // the round-trip via the `*_INTERNED` codes — version ≥ 3
                 // only, like CPython (testNoIntern dumps with version 2
                 // and expects a fresh instance back).
-                let interned = self.version >= 3 && crate::stdlib::sys::str_is_interned(value);
                 let bytes = s.as_bytes();
+                let interned = self.version >= 3
+                    && if self.plan.is_some() {
+                        self.force_interned || self.interned_constant(bytes)
+                    } else {
+                        crate::stdlib::sys::str_is_interned(value)
+                    };
                 if bytes.is_ascii() && bytes.len() <= 255 {
                     self.write_byte(
                         if interned {
@@ -477,25 +700,37 @@ impl MarshalWriter {
                 self.write_byte(TYPE_NULL);
             }
             Object::Set(s) => {
-                let s = s.borrow();
+                let items: Vec<Object> = s.borrow().iter().map(|k| k.0.clone()).collect();
                 self.write_byte(TYPE_SET | flag);
-                self.write_int(s.len() as i32);
-                for k in s.iter() {
-                    self.write_value(&k.0)?;
-                }
+                self.write_int(items.len() as i32);
+                self.write_set_items(items)?;
             }
             Object::FrozenSet(s) => {
+                let items: Vec<Object> = s.iter().map(|k| k.0.clone()).collect();
                 self.write_byte(TYPE_FROZENSET | flag);
-                self.write_int(s.len() as i32);
-                for k in s.iter() {
-                    self.write_value(&k.0)?;
-                }
+                self.write_int(items.len() as i32);
+                self.write_set_items(items)?;
             }
             Object::Code(co) => {
                 if !self.allow_code {
                     return Err(value_error("unmarshallable object"));
                 }
                 self.write_code(co, flag)?;
+            }
+            // Slices are only representable from version 5 (CPython 3.14);
+            // older versions reject them like any other unknown object.
+            Object::Slice(s) if self.version >= 5 => {
+                self.write_byte(TYPE_SLICE | flag);
+                // `const_cache_insert` only recurses into tuples and
+                // frozensets: a folded slice's bounds are never merged
+                // with other constants (only the immortal small-int
+                // singletons are shared with them).
+                for bound in [&s.start, &s.stop, &s.step] {
+                    self.force_unshared_next = self.plan.is_some();
+                    let r = self.write_value(bound);
+                    self.force_unshared_next = false;
+                    r?;
+                }
             }
             other => {
                 // Last resort: an instance exporting the buffer protocol
@@ -555,13 +790,26 @@ impl MarshalWriter {
             return Err(value_error("unmarshallable object"));
         }
         let cp = co.to_cpython();
+        self.write_code_fields(co, &cp, flag)
+    }
+
+    fn write_code_fields(
+        &mut self,
+        co: &CodeObject,
+        cp: &cpython_code::CpythonCode,
+        flag: u8,
+    ) -> Result<(), RuntimeError> {
         self.write_byte(TYPE_CODE | flag);
         self.write_int(co.arg_count as i32);
         self.write_int(co.posonly_count as i32);
         self.write_int(co.kwonly_count as i32);
         self.write_int(cp.stacksize as i32);
         self.write_int(code_flags(co) as i32);
-        self.write_value(&Object::new_bytes(cp.co_code.clone()))?;
+        if self.plan.is_some() {
+            self.write_co_code(&cp.co_code);
+        } else {
+            self.write_value(&Object::new_bytes(cp.co_code.clone()))?;
+        }
         let consts: Vec<Object> = co
             .constants
             .iter()
@@ -569,19 +817,392 @@ impl MarshalWriter {
             .map(crate::constant_to_object_public)
             .collect();
         self.write_value(&Object::new_tuple(consts))?;
-        self.write_value(&strs_to_tuple(&co.names))?;
-        self.write_value(&strs_to_tuple(&cp.localsplusnames))?;
-        self.write_value(&Object::new_bytes(cp.localspluskinds.clone()))?;
-        self.write_value(&Object::from_str(co.filename.clone()))?;
-        self.write_value(&Object::from_str(co.name.clone()))?;
+        self.write_interned_str(&strs_to_tuple(&co.names))?;
+        // `codegen_leave_annotations_scope` rebuilds an `__annotate__`
+        // code object's `co_localsplusnames` (`.format` -> `format`) as a
+        // fresh tuple outside the constant cache.
+        self.force_unshared_next = CodePlan::is_annotate(co);
+        self.write_interned_str(&strs_to_tuple(&cp.localsplusnames))?;
+        self.write_kinds_bytes(&cp.localspluskinds)?;
+        self.write_interned_str(&Object::from_str(co.filename.clone()))?;
+        self.write_interned_str(&Object::from_str(co.name.clone()))?;
         // PEP 3155 qualified name, computed at compile time from lexical
         // nesting (`outer.<locals>.inner`, `C.method`). Round-trips so an
         // unmarshalled function/class keeps a faithful `__qualname__`.
-        self.write_value(&Object::from_str(co.qualname.clone()))?;
+        self.write_interned_str(&Object::from_str(co.qualname.clone()))?;
         self.write_int(cp.firstlineno as i32);
-        self.write_value(&Object::new_bytes(cp.co_linetable.clone()))?;
-        self.write_value(&Object::new_bytes(cp.co_exceptiontable.clone()))?;
+        self.write_table_bytes(&Object::new_bytes(cp.co_linetable.clone()))?;
+        self.write_table_bytes(&Object::new_bytes(cp.co_exceptiontable.clone()))?;
         Ok(())
+    }
+}
+
+/// CPython's `intern_string_constants` rule: a string constant is
+/// interned in place when it is ASCII and every character is a name
+/// character (`Py_ISALNUM` or `_`). Separately, every one-character
+/// latin-1 string is a statically interned singleton.
+fn cpython_interns_constant(bytes: &[u8]) -> bool {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        let mut chars = s.chars();
+        match (chars.next(), chars.next()) {
+            (None, _) => return true,
+            (Some(c), None) if (c as u32) < 256 => return true,
+            _ => {}
+        }
+    }
+    bytes.is_ascii()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
+/// `_PyCode_ConstantKey`: the identity under which the compiler merges
+/// equal constants into one object (`1` and `1.0` and `True` stay
+/// distinct, `0.0` and `-0.0` stay distinct, frozensets compare as
+/// sets). Code objects are unique.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum ConstKey {
+    None,
+    Bool(bool),
+    Ellipsis,
+    /// A string CPython does not intern: distinct from any equal
+    /// interned string (a `co_names` entry, or a name-character
+    /// constant), which is one shared object per value.
+    Str(Vec<u8>),
+    Interned(Vec<u8>),
+    Int(i64),
+    Long(String),
+    Float(u64),
+    Complex(u64, u64),
+    Bytes(Vec<u8>),
+    Tuple(Vec<ConstKey>),
+    FrozenSet(Vec<ConstKey>),
+    Slice(Box<ConstKey>, Box<ConstKey>, Box<ConstKey>),
+    Code(usize),
+}
+
+impl ConstKey {
+    fn of(value: &Object) -> Option<ConstKey> {
+        Self::of_ctx(value, false, None)
+    }
+
+    /// `interned`: the value sits in an interned-in-place role
+    /// (`co_names`, `co_localsplusnames`, `co_filename`, `co_name`,
+    /// `co_qualname`), so its strings are interned whatever their
+    /// characters. `rules`: the compilation's string facts, deciding
+    /// which constant strings CPython ends up interning.
+    fn of_ctx(value: &Object, interned: bool, rules: Option<&StringRules>) -> Option<ConstKey> {
+        Some(match value {
+            Object::None => ConstKey::None,
+            Object::Bool(b) => ConstKey::Bool(*b),
+            Object::Str(s) => {
+                let bytes = s.as_bytes();
+                if interned
+                    || rules.map_or_else(
+                        || cpython_interns_constant(bytes),
+                        |r| r.const_is_interned(bytes),
+                    )
+                {
+                    ConstKey::Interned(bytes.to_vec())
+                } else {
+                    ConstKey::Str(bytes.to_vec())
+                }
+            }
+            Object::WStr(cps) => ConstKey::Str(
+                crate::stdlib::codecs_mod::encode_codepoints(cps, "utf-8", "surrogatepass").ok()?,
+            ),
+            Object::Int(i) => ConstKey::Int(*i),
+            Object::Long(b) => ConstKey::Long(b.to_string()),
+            // A NaN never compares equal to another, so CPython's
+            // const-merging never shares one: every NaN constant is its
+            // own object (and its own marshal entry).
+            Object::Float(f) if f.is_nan() => return None,
+            Object::Complex(c) if c.real.is_nan() || c.imag.is_nan() => return None,
+            Object::Float(f) => ConstKey::Float(f.to_bits()),
+            Object::Complex(c) => ConstKey::Complex(c.real.to_bits(), c.imag.to_bits()),
+            Object::Bytes(b) => ConstKey::Bytes(b.to_vec()),
+            Object::Tuple(items) => ConstKey::Tuple(
+                items
+                    .iter()
+                    .map(|x| ConstKey::of_ctx(x, interned, rules))
+                    .collect::<Option<_>>()?,
+            ),
+            Object::FrozenSet(s) => {
+                let mut keys = s
+                    .iter()
+                    .map(|k| ConstKey::of_ctx(&k.0, interned, rules))
+                    .collect::<Option<Vec<_>>>()?;
+                keys.sort();
+                ConstKey::FrozenSet(keys)
+            }
+            Object::Slice(s) => ConstKey::Slice(
+                Box::new(ConstKey::of(&s.start)?),
+                Box::new(ConstKey::of(&s.stop)?),
+                Box::new(ConstKey::of(&s.step)?),
+            ),
+            Object::Code(c) => ConstKey::Code(Rc::as_ptr(c) as usize),
+            Object::Instance(inst)
+                if Rc::ptr_eq(
+                    &inst.cls(),
+                    &crate::builtin_types::builtin_types().ellipsis_,
+                ) =>
+            {
+                ConstKey::Ellipsis
+            }
+            _ => return None,
+        })
+    }
+
+    /// The immediate constituents the compiler's `merge_consts_recursive`
+    /// descends into (tuple and frozenset elements).
+    fn children(&self) -> &[ConstKey] {
+        match self {
+            ConstKey::Tuple(xs) | ConstKey::FrozenSet(xs) => xs,
+            _ => &[],
+        }
+    }
+}
+
+/// The sharing structure CPython's compiler gives a code object tree:
+/// every constant, `co_consts`/`co_names`/`co_localsplusnames` tuple, and
+/// line/exception table is merged through one per-compilation cache
+/// (`_PyCompile_ConstCacheMergeOne`), so an equal value occurring in
+/// two places is one object — with a reference count above one, which
+/// is what `w_ref` keys `FLAG_REF` on. `shared` holds the keys that
+/// occur more than once; `refs` the slot each flagged value was written
+/// at.
+struct CodePlan {
+    shared: Rc<std::collections::HashSet<ConstKey>>,
+    refs: std::collections::HashMap<ConstKey, u32>,
+    strings: Rc<StringRules>,
+}
+
+/// Which strings of a compilation CPython ends up interning, and which
+/// have an interned twin — the facts `FLAG_REF` placement depends on.
+///
+/// A string constant's fate is set by the *first* object registered for
+/// its value in the compiler's constant cache (registration follows
+/// codegen order: a unit's constants in order, nested code compiled at
+/// the point it appears, then the unit's `co_names` and
+/// `co_localsplusnames` at assembly). Later occurrences are merged into
+/// that object. If it is an interned object — a name, a class-body
+/// `__qualname__` (interned in place by `init_code` when no twin exists),
+/// a class name pushed for `__build_class__` — every occurrence is
+/// interned; if it is a plain literal, the constants stay plain and only
+/// the name slots are swapped for the interned twin afterwards.
+struct StringRules {
+    /// Every identifier of the tree (parser-interned before any code
+    /// object existed).
+    identifiers: std::collections::HashSet<String>,
+    /// Non-name-character string values whose canonical object is
+    /// interned.
+    interned_consts: std::collections::HashSet<String>,
+}
+
+impl StringRules {
+    /// `intern_string_constants` interns name-character strings; latin-1
+    /// characters are singletons; the rest follows the canonical object.
+    fn const_is_interned(&self, bytes: &[u8]) -> bool {
+        cpython_interns_constant(bytes)
+            || std::str::from_utf8(bytes).is_ok_and(|s| self.interned_consts.contains(s))
+    }
+
+    /// Whether interning `s` (a name-character string of two or more
+    /// characters) would *replace* it with an existing twin: an
+    /// identifier of this tree or of the interpreter's startup set.
+    fn has_interned_twin(&self, s: &str) -> bool {
+        s.chars().nth(1).is_some()
+            && cpython_interns_constant(s.as_bytes())
+            && (self.identifiers.contains(s) || startup_interned(s))
+    }
+}
+
+/// Identifiers CPython 3.14 interns while starting up (`_Py_ID` table,
+/// `builtins`/`sys`/core type attribute names, the frozen modules).
+static STARTUP_INTERNED: &str = include_str!("cpython314_startup_interned.txt");
+
+fn startup_interned(name: &str) -> bool {
+    STARTUP_INTERNED
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .any(|l| l == name)
+}
+
+impl CodePlan {
+    fn for_code(co: &Rc<CodeObject>) -> Self {
+        let mut scan = Scan::default();
+        scan.unit(co);
+        let strings = StringRules {
+            identifiers: scan.identifiers,
+            interned_consts: scan
+                .canonical
+                .into_iter()
+                .filter_map(|(v, interned)| interned.then_some(v))
+                .collect(),
+        };
+        let mut counts: std::collections::HashMap<ConstKey, u32> = std::collections::HashMap::new();
+        Self::count_code(co, &strings, &mut counts);
+        Self {
+            shared: Rc::new(
+                counts
+                    .into_iter()
+                    .filter_map(|(k, n)| (n > 1).then_some(k))
+                    .collect(),
+            ),
+            refs: std::collections::HashMap::new(),
+            strings: Rc::new(strings),
+        }
+    }
+
+    /// `intern_string_constants` rebuilds a frozenset constant as a fresh
+    /// object whenever interning one of its string elements *replaces*
+    /// it with an already-interned twin. Such a frozenset is never
+    /// shared, even when the compiler merged equal ones.
+    fn frozenset_rebuilt(&self, fs: &crate::object::FrozenSetObj) -> bool {
+        fs.iter().any(|k| match &k.0 {
+            Object::Str(s) => self.strings.has_interned_twin(s),
+            _ => false,
+        })
+    }
+
+    /// A compiler-generated `__annotate__` code object (PEP 649): its
+    /// `co_localsplusnames` is rebuilt after assembly and never enters
+    /// the constant cache. (A user's `def __annotate__(format)` is an
+    /// ordinary function whose tuple is cached like any other.)
+    fn is_annotate(co: &CodeObject) -> bool {
+        co.annotate_scope
+    }
+
+    /// `merge_consts_recursive`: a container already in the cache is
+    /// replaced wholesale, so its elements are only merged (counted) the
+    /// first time the container is seen.
+    fn count(key: ConstKey, counts: &mut std::collections::HashMap<ConstKey, u32>) {
+        let n = counts.entry(key.clone()).or_insert(0);
+        *n += 1;
+        if *n == 1 {
+            for child in key.children() {
+                Self::count(child.clone(), counts);
+            }
+        }
+    }
+
+    fn count_code(
+        co: &Rc<CodeObject>,
+        strings: &StringRules,
+        counts: &mut std::collections::HashMap<ConstKey, u32>,
+    ) {
+        let cp = co.to_cpython();
+        let consts: Vec<Object> = co
+            .constants
+            .iter()
+            .cloned()
+            .map(crate::constant_to_object_public)
+            .collect();
+        if let Some(k) = ConstKey::of_ctx(&Object::new_tuple(consts.clone()), false, Some(strings))
+        {
+            Self::count(k, counts);
+        }
+        if let Some(k) = ConstKey::of_ctx(&strs_to_tuple(&co.names), true, None) {
+            Self::count(k, counts);
+        }
+        if !Self::is_annotate(co) {
+            if let Some(k) = ConstKey::of_ctx(&strs_to_tuple(&cp.localsplusnames), true, None) {
+                Self::count(k, counts);
+            }
+        }
+        Self::count(ConstKey::Bytes(cp.co_linetable.clone()), counts);
+        Self::count(ConstKey::Bytes(cp.co_exceptiontable.clone()), counts);
+        for c in &consts {
+            if let Object::Code(inner) = c {
+                Self::count_code(inner, strings, counts);
+            }
+        }
+    }
+}
+
+/// The registration-order walk behind [`StringRules`].
+#[derive(Default)]
+struct Scan {
+    identifiers: std::collections::HashSet<String>,
+    /// Value -> whether the first object registered for it is interned.
+    /// Only non-name-character strings are tracked (the others are
+    /// interned regardless).
+    canonical: std::collections::HashMap<String, bool>,
+    /// `co_qualname` of every code object created so far (units finish,
+    /// and `init_code` interns their qualname, in post-order).
+    qualnames_done: std::collections::HashSet<String>,
+}
+
+impl Scan {
+    fn register(&mut self, value: &str, interned: bool) {
+        if cpython_interns_constant(value.as_bytes()) {
+            return;
+        }
+        self.canonical.entry(value.to_owned()).or_insert(interned);
+    }
+
+    fn unit(&mut self, co: &Rc<CodeObject>) {
+        let cp = co.to_cpython();
+        let consts: Vec<Object> = co
+            .constants
+            .iter()
+            .cloned()
+            .map(crate::constant_to_object_public)
+            .collect();
+        // Class names pushed for `__build_class__` are the parser's
+        // (interned) identifier objects.
+        let class_names: Vec<&str> = consts
+            .iter()
+            .filter_map(|c| match c {
+                Object::Code(b) if b.is_class_body => Some(b.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        for c in &consts {
+            match c {
+                Object::Str(s) => {
+                    let text: &str = s;
+                    // A class body's `__qualname__` constant is the very
+                    // object `init_code` interns as `co_qualname`: interned
+                    // in place when no twin exists, but left a plain object
+                    // (the slot swapped for the twin) when an earlier code
+                    // object of the same qualname already interned it.
+                    let is_own_qualname = co.is_class_body && text == co.qualname;
+                    let interned = (is_own_qualname
+                        && !startup_interned(text)
+                        && !self.qualnames_done.contains(text))
+                        || class_names.contains(&text)
+                        || co.const_identifiers.iter().any(|n| n == text);
+                    self.register(text, interned);
+                }
+                Object::Code(inner) => self.unit(inner),
+                other => self.literals(other, &co.const_identifiers),
+            }
+        }
+        self.identifiers
+            .extend(co.const_identifiers.iter().cloned());
+        // Names never pass through the compiler's constant cache, so an
+        // equal string *constant* keeps its own object: the canonical
+        // constant is not decided here, only the identifier set.
+        for name in co.names.iter().chain(cp.localsplusnames.iter()) {
+            self.identifiers.insert(name.clone());
+        }
+        self.identifiers.insert(co.name.clone());
+        self.qualnames_done.insert(co.qualname.clone());
+    }
+
+    /// Strings nested in tuple/frozenset constants: plain literals,
+    /// except the parser-interned identifiers of a keyword-names tuple.
+    fn literals(&mut self, value: &Object, identifiers: &[String]) {
+        match value {
+            Object::Str(s) => {
+                let text: &str = s;
+                self.register(text, identifiers.iter().any(|n| n == text));
+            }
+            Object::Tuple(items) => items.iter().for_each(|x| self.literals(x, identifiers)),
+            Object::FrozenSet(fs) => fs.iter().for_each(|k| self.literals(&k.0, identifiers)),
+            _ => {}
+        }
     }
 }
 
@@ -601,37 +1222,9 @@ fn instance_buffer_bytes(value: &Object) -> Option<Vec<u8>> {
     }
 }
 
-/// CPython `co_flags` for a WeavePy code object. Module/class bodies are
-/// not "optimized" (they use name-based locals); functions are.
+/// CPython `co_flags` for a WeavePy code object (`CodeObject::co_flags`).
 fn code_flags(co: &CodeObject) -> u32 {
-    // Only function scopes: CPython's compute_code_flags sets
-    // CO_OPTIMIZED|CO_NEWLOCALS for FunctionBlock alone — module *and*
-    // class bodies report 0 (plus feature bits below).
-    let mut f = 0u32;
-    if !co.is_class_body && co.name != "<module>" {
-        f |= CO_OPTIMIZED | CO_NEWLOCALS;
-    }
-    if co.has_varargs {
-        f |= CO_VARARGS;
-    }
-    if co.has_varkeywords {
-        f |= CO_VARKEYWORDS;
-    }
-    if co.is_generator {
-        f |= CO_GENERATOR;
-    }
-    if co.is_coroutine {
-        f |= CO_COROUTINE;
-    }
-    if co.is_iterable_coroutine {
-        f |= CO_ITERABLE_COROUTINE;
-    }
-    if co.is_async_generator {
-        f |= CO_ASYNC_GENERATOR;
-    }
-    // Persist active `__future__` bits so an unmarshalled code object
-    // still reports them on `co_flags` (RFC 0052).
-    f | co.future_flags
+    co.co_flags()
 }
 
 /// Pack a `BigInt` into CPython's marshal digit form: a signed count of
@@ -1024,6 +1617,15 @@ impl<'a> MarshalReader<'a> {
                 self.fill_ref(idx, &t);
                 return Ok(Some(t));
             }
+            TYPE_SLICE => {
+                let idx = self.reserve_ref(flag);
+                let start = self.read_value()?;
+                let stop = self.read_value()?;
+                let step = self.read_value()?;
+                let s = Object::Slice(Rc::new(crate::object::PySlice { start, stop, step }));
+                self.fill_ref(idx, &s);
+                return Ok(Some(s));
+            }
             TYPE_LIST => {
                 let len = self.read_int()? as usize;
                 let list = Object::new_list(Vec::new());
@@ -1088,7 +1690,7 @@ impl<'a> MarshalReader<'a> {
         let arg_count = self.read_int()? as u32;
         let posonly_count = self.read_int()? as u32;
         let kwonly_count = self.read_int()? as u32;
-        let _stacksize = self.read_int()?;
+        let stacksize = self.read_int()?;
         let flags = self.read_int()? as u32;
         let co_code = self.read_value()?;
         let consts = self.read_value()?;
@@ -1159,10 +1761,18 @@ impl<'a> MarshalReader<'a> {
             is_coroutine: flags & CO_COROUTINE != 0,
             is_async_generator: flags & CO_ASYNC_GENERATOR != 0,
             is_iterable_coroutine: flags & CO_ITERABLE_COROUTINE != 0,
+            has_docstring: flags & CO_HAS_DOCSTRING != 0,
+            is_method: flags & CO_METHOD != 0,
+            is_nested: flags & CO_NESTED != 0,
             future_flags: flags & weavepy_compiler::flags::PYCF_MASK,
             cp_cache: cpython_code::CpCache::default(),
             wire: None,
+            stacksize: u32::try_from(stacksize).ok(),
             no_interrupt_jumps: decoded.no_interrupt_jumps,
+            wire_marks: decoded.wire_marks,
+            hidden_locals: decoded.hidden_locals,
+            const_identifiers: Vec::new(),
+            annotate_scope: false,
         };
         Ok(Object::Code(Rc::new(co)))
     }

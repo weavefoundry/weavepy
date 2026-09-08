@@ -41,8 +41,9 @@ struct RawCall {
     stack: *const u64,    // +24  -> overflow stack words (may be null if 0)
     stack_words: u64,     // +32
     nfpr: u64,            // +40  -> # FP regs used (SysV variadic `al`; Win64 ignores it)
-    ret_gpr: *mut u64,    // +48  -> receives x0 / rax
-    ret_fpr: *mut u64,    // +56  -> receives d0 / xmm0
+    ret_gpr: *mut u64,    // +48  -> receives [x0, x1] / [rax, rdx] (2 words)
+    ret_fpr: *mut u64,    // +56  -> receives [d0..d3] / [xmm0, xmm1] (4 words)
+    indirect: u64,        // +64  -> aarch64 x8 (indirect result location)
 }
 
 /// A snapshot of the argument registers as seen by a closure trampoline,
@@ -132,11 +133,13 @@ core::arch::global_asm!(
     "  ldp x2, x3, [x16, #16]",
     "  ldp x4, x5, [x16, #32]",
     "  ldp x6, x7, [x16, #48]",
+    "  ldr x8, [x19, #64]",  // indirect result location (x8)
     "  blr x20",
-    "  ldr x9, [x19, #48]",  // ret_gpr
-    "  str x0, [x9]",
-    "  ldr x9, [x19, #56]",  // ret_fpr
-    "  str d0, [x9]",
+    "  ldr x9, [x19, #48]",  // ret_gpr: x0, x1 (composites <= 16 bytes)
+    "  stp x0, x1, [x9]",
+    "  ldr x9, [x19, #56]",  // ret_fpr: d0..d3 (HFA results)
+    "  stp d0, d1, [x9]",
+    "  stp d2, d3, [x9, #16]",
     "  mov sp, x29",
     "  ldp x19, x20, [sp, #16]",
     "  ldp x29, x30, [sp], #32",
@@ -243,10 +246,12 @@ core::arch::global_asm!(
     "  mov rax, [rbx+40]", // nfpr -> al (variadic)
     "  mov r11, [rbx+0]",  // fnptr
     "  call r11",
-    "  mov r10, [rbx+48]", // ret_gpr
+    "  mov r10, [rbx+48]", // ret_gpr: rax, rdx (INTEGER eightbytes)
     "  mov [r10], rax",
-    "  mov r10, [rbx+56]", // ret_fpr
+    "  mov [r10+8], rdx",
+    "  mov r10, [rbx+56]", // ret_fpr: xmm0, xmm1 (SSE eightbytes)
     "  movsd [r10], xmm0",
+    "  movsd [r10+8], xmm1",
     "  lea rsp, [rbp-16]",
     "  pop r12",
     "  pop rbx",
@@ -487,10 +492,23 @@ extern "C" {
     fn wp_cl_pool();
 }
 
+/// The result register image captured after a call: the two integer
+/// result registers (`x0,x1` / `rax,rdx`) and the first four FP result
+/// registers (`d0..d3` / `xmm0,xmm1`, the rest zero). Scalar results live
+/// in `gpr[0]` / `fpr[0]`; the extra words carry small by-value aggregates.
+#[derive(Clone, Copy, Default)]
+pub(super) struct RawRet {
+    pub(super) gpr: [u64; 2],
+    pub(super) fpr: [u64; 4],
+}
+
 /// Execute a real C ABI call. `gpr`/`fpr` hold the integer and FP register
 /// files (only the ABI-relevant prefix is consumed); `stack` holds any
 /// overflow words; `nfpr` is the FP-register count for SysV x86-64 variadic
-/// calls (the Win64 gate ignores it). Returns `(x0/rax, d0/xmm0)`.
+/// calls (the Win64 gate ignores it); `indirect` is the address of the
+/// caller-allocated buffer for a large by-value aggregate result (loaded
+/// into `x8` on AArch64; the x86-64 ABIs pass it as an ordinary first
+/// integer argument instead, so the gates there ignore it).
 ///
 /// # Safety
 /// `fnptr` must be a valid function whose real C signature matches the
@@ -506,9 +524,9 @@ pub(super) unsafe fn raw_call(
     fpr: &[u64; 8],
     stack: &[u64],
     nfpr: u64,
-) -> (u64, u64) {
-    let mut ret_gpr = 0u64;
-    let mut ret_fpr = 0u64;
+    indirect: u64,
+) -> RawRet {
+    let mut ret = RawRet::default();
     let call = RawCall {
         fnptr: fnptr as *const c_void,
         gpr: gpr.as_ptr(),
@@ -520,11 +538,12 @@ pub(super) unsafe fn raw_call(
         },
         stack_words: stack.len() as u64,
         nfpr,
-        ret_gpr: &raw mut ret_gpr,
-        ret_fpr: &raw mut ret_fpr,
+        ret_gpr: ret.gpr.as_mut_ptr(),
+        ret_fpr: ret.fpr.as_mut_ptr(),
+        indirect,
     };
     unsafe { wp_ffi_call_gate(&raw const call) };
-    (ret_gpr, ret_fpr)
+    ret
 }
 
 /// Per-slot user-data pointers (leaked `ClosureData`), read lock-free by the
@@ -676,8 +695,20 @@ pub(super) unsafe fn raw_call(
     _fpr: &[u64; 8],
     _stack: &[u64],
     _nfpr: u64,
-) -> (u64, u64) {
-    (0, 0)
+    _indirect: u64,
+) -> RawRet {
+    RawRet::default()
+}
+
+/// See the supported-architecture definition.
+#[cfg(not(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+)))]
+#[derive(Clone, Copy, Default)]
+pub(super) struct RawRet {
+    pub(super) gpr: [u64; 2],
+    pub(super) fpr: [u64; 4],
 }
 
 #[cfg(not(any(

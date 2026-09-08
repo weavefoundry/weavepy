@@ -40,6 +40,7 @@ __all__ = [
     "unicode_asunicodeescapestring",
     "unicode_decoderawunicodeescape",
     "unicode_asrawunicodeescapestring",
+    "unicode_equal",
     # test_capi.test_eval
     "eval_get_func_name",
     "eval_get_func_desc",
@@ -609,3 +610,200 @@ def sys_getxoptions():
         xoptions = {}
         _sys._xoptions = xoptions
     return xoptions
+
+
+def unicode_equal(a, b):
+    """PyUnicode_Equal(a, b) — 1/0 for two str (subclasses included), a
+    TypeError naming the offending argument otherwise (3.14)."""
+    if not isinstance(a, str):
+        raise TypeError(
+            "first argument must be str, not %s" % type(a).__name__
+        )
+    if not isinstance(b, str):
+        raise TypeError(
+            "second argument must be str, not %s" % type(b).__name__
+        )
+    return int(str.__eq__(a, b))
+
+
+# ---------------------------------------------------------------------------
+# test_capi.test_unicode.PyUnicodeWriterTest — the `_testcapi.PyUnicodeWriter`
+# fixture type (Modules/_testcapi/unicode.c), driven over the real exported
+# `PyUnicodeWriter_*` symbols through `ctypes.pythonapi` (RFC 0077 WS12).
+# ---------------------------------------------------------------------------
+
+__all__.append("PyUnicodeWriter")
+
+_writer_api = None
+
+
+def _writer_functions():
+    """Bind the `PyUnicodeWriter_*` entry points once; `PyDLL` semantics
+    raise the C-side exception whenever a call leaves one pending."""
+    global _writer_api
+    if _writer_api is not None:
+        return _writer_api
+    import ctypes
+
+    api = ctypes.pythonapi
+    void_p, ssize_t, c_int = ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_int
+    char_p, u32 = ctypes.c_char_p, ctypes.c_uint32
+
+    def bind(name, restype, *argtypes):
+        fn = getattr(api, name)
+        fn.restype = restype
+        fn.argtypes = argtypes
+        return fn
+
+    _writer_api = _types.SimpleNamespace(
+        ctypes=ctypes,
+        create=bind("PyUnicodeWriter_Create", void_p, ssize_t),
+        discard=bind("PyUnicodeWriter_Discard", None, void_p),
+        finish=bind("PyUnicodeWriter_Finish", ctypes.py_object, void_p),
+        write_char=bind("PyUnicodeWriter_WriteChar", c_int, void_p, u32),
+        write_utf8=bind("PyUnicodeWriter_WriteUTF8", c_int, void_p, char_p, ssize_t),
+        write_ascii=bind("PyUnicodeWriter_WriteASCII", c_int, void_p, char_p, ssize_t),
+        write_widechar=bind(
+            "PyUnicodeWriter_WriteWideChar", c_int, void_p, void_p, ssize_t
+        ),
+        write_ucs4=bind("PyUnicodeWriter_WriteUCS4", c_int, void_p, void_p, ssize_t),
+        write_str=bind("PyUnicodeWriter_WriteStr", c_int, void_p, ctypes.py_object),
+        write_repr=bind("PyUnicodeWriter_WriteRepr", c_int, void_p, ctypes.py_object),
+        write_substring=bind(
+            "PyUnicodeWriter_WriteSubstring",
+            c_int, void_p, ctypes.py_object, ssize_t, ssize_t,
+        ),
+        decode_utf8_stateful=bind(
+            "PyUnicodeWriter_DecodeUTF8Stateful",
+            c_int, void_p, char_p, ssize_t, char_p, void_p,
+        ),
+    )
+    return _writer_api
+
+
+_MISSING = object()
+# `wchar_t` is 32-bit on every non-Windows target WeavePy builds for
+# (`_testcapi.SIZEOF_WCHAR_T` reports the same).
+_SIZEOF_WCHAR_T = 2 if _sys.platform == "win32" else 4
+
+
+def _writer_bytes_arg(data, what="argument"):
+    # PyArg_ParseTuple "z#": bytes-like or None (-> NULL).
+    if data is None:
+        return None
+    if isinstance(data, str):
+        raise TypeError(
+            "%s must be bytes or None, not str" % (what,)
+        )
+    return _as_bytes_buffer(data)
+
+
+class PyUnicodeWriter:
+    """`_testcapi.PyUnicodeWriter(size)` — a thin object wrapper over a C
+    `PyUnicodeWriter*`: each method is the matching `PyUnicodeWriter_*`
+    call, `finish()` consumes the writer, and `get_pointer()` exposes the
+    raw pointer so tests can hand it to the variadic
+    `PyUnicodeWriter_Format` through ctypes."""
+
+    __slots__ = ("_ptr",)
+
+    def __init__(self, size):
+        api = _writer_functions()
+        ptr = api.create(int(size))
+        if not ptr:
+            raise MemoryError
+        self._ptr = ptr
+
+    def __del__(self):
+        ptr = getattr(self, "_ptr", None)
+        if ptr:
+            self._ptr = None
+            _writer_functions().discard(ptr)
+
+    def _writer(self):
+        if not self._ptr:
+            raise ValueError("operation forbidden, writer is finished")
+        return self._ptr
+
+    def get_pointer(self):
+        return self._writer()
+
+    def finish(self):
+        ptr = self._writer()
+        self._ptr = None
+        return _writer_functions().finish(ptr)
+
+    def write_char(self, ch):
+        ch = int(ch)
+        if ch < 0 or ch > 0xFFFF_FFFF:
+            raise OverflowError("unsigned int is out of range")
+        _writer_functions().write_char(self._writer(), ch)
+
+    def write_utf8(self, data, size):
+        _writer_functions().write_utf8(
+            self._writer(), _writer_bytes_arg(data, "str"), int(size)
+        )
+
+    def write_ascii(self, data, size):
+        _writer_functions().write_ascii(
+            self._writer(), _writer_bytes_arg(data, "str"), int(size)
+        )
+
+    def _units(self, data, unit, size):
+        """Marshal `data` (bytes of `unit`-byte code units, or None) into a
+        zero-padded C buffer so a `size < 0` scan for the terminator in
+        the callee stays in bounds; a missing `size` means "the whole
+        buffer"."""
+        api = _writer_functions()
+        raw = _writer_bytes_arg(data, "str")
+        if size is _MISSING:
+            size = (len(raw) // unit) if raw is not None else 0
+        if raw is None:
+            return None, int(size), None
+        buf = api.ctypes.create_string_buffer(raw, len(raw) + unit)
+        return api.ctypes.addressof(buf), int(size), buf
+
+    def write_widechar(self, data, size=_MISSING):
+        api = _writer_functions()
+        addr, size, _keepalive = self._units(data, _SIZEOF_WCHAR_T, size)
+        api.write_widechar(self._writer(), addr, size)
+
+    def write_ucs4(self, data, size=_MISSING):
+        api = _writer_functions()
+        addr, size, _keepalive = self._units(data, 4, size)
+        api.write_ucs4(self._writer(), addr, size)
+
+    def write_str(self, obj):
+        # A NULL object is a documented crash in CPython; refuse cleanly.
+        if obj is None:
+            raise _bad_internal_call()
+        _writer_functions().write_str(self._writer(), obj)
+
+    def write_repr(self, obj):
+        api = _writer_functions()
+        if obj is None:
+            # PyUnicodeWriter_WriteRepr(NULL) writes "<NULL>" like %R.
+            api.write_utf8(self._writer(), b"<NULL>", -1)
+            return
+        api.write_repr(self._writer(), obj)
+
+    def write_substring(self, string, start, end):
+        if not isinstance(string, str):
+            raise TypeError("expected str")
+        _writer_functions().write_substring(
+            self._writer(), string, int(start), int(end)
+        )
+
+    def decodeutf8stateful(self, data, size, errors, use_consumed=False):
+        api = _writer_functions()
+        raw = _writer_bytes_arg(data, "str")
+        errs = _writer_bytes_arg(errors, "errors")
+        consumed = api.ctypes.c_ssize_t(0) if use_consumed else None
+        api.decode_utf8_stateful(
+            self._writer(), raw, int(size), errs,
+            api.ctypes.addressof(consumed) if use_consumed else None,
+        )
+        if use_consumed:
+            return consumed.value
+        return None
+

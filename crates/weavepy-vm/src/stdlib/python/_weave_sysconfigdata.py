@@ -31,7 +31,7 @@ _base_executable = getattr(sys, "_base_executable", "") or getattr(
 )
 _bindir = os.path.dirname(_base_executable) or os.path.join(_prefix, "bin")
 # RFC 0055 WS1 — ABI identity. WeavePy's binary ABI loads stock
-# CPython 3.13 extensions, so EXT_SUFFIX/SOABI carry CPython's tags
+# CPython 3.14 extensions, so EXT_SUFFIX/SOABI carry CPython's tags
 # (they must equal `_imp.extension_suffixes()[0]` — asserted by
 # test_sysconfig — and they are what setuptools/packaging use to name
 # and match built extensions).
@@ -41,7 +41,7 @@ if _multiarch:
 else:
     _soabi = "cpython-%d%d" % sys.version_info[:2]
 _ext_suffix = "." + _soabi + ".so"
-# `{stdlib}/config-3.13-{multiarch}` — materialized by the stdlib
+# `{stdlib}/config-3.14-{multiarch}` — materialized by the stdlib
 # tree (RFC 0055) so `get_makefile_filename()`/`srcdir` point at real
 # files.
 _config_dir = os.path.join(
@@ -54,14 +54,14 @@ _config_dir = os.path.join(
 )
 
 # RFC 0062 WS2 — compiler variables for building C-extension sdists
-# against the installed `{prefix}/include/python3.13/` header tree.
+# against the installed `{prefix}/include/python3.14/` header tree.
 # setuptools' `customize_compiler()` reads CC/CXX/CFLAGS/CCSHARED/
 # LDSHARED/LDCXXSHARED/AR/ARFLAGS from here. Extensions never link a
 # libpython (same model as a static-libpython CPython): on macOS the
 # `-undefined dynamic_lookup` link defers `Py*` resolution to load
 # time, on Linux the weavepy binary exports its C-API via
 # `--export-dynamic`. Keep in sync with the Rust constants in
-# `sysconfig_native.rs` (mirrored into `config-3.13*/Makefile`).
+# `sysconfig_native.rs` (mirrored into `config-3.14*/Makefile`).
 _is_macos = sys.platform == "darwin"
 _cflags = "-fno-strict-overflow -Wsign-compare -DNDEBUG -g -O3 -Wall"
 if _is_macos:
@@ -97,7 +97,7 @@ build_time_vars = {
     # link — symbols resolve from the host binary at load time). CPython's
     # static/framework builds publish the empty string here and meson's
     # `links_against_libpython()` keys off it; leaving it unset makes
-    # meson add `-lpython3.13` and fail its sysconfig dependency check
+    # meson add `-lpython3.14` and fail its sysconfig dependency check
     # (numpy test_mem_policy builds a test extension with meson —
     # RFC 0076 WS1).
     "LIBPYTHON": "",

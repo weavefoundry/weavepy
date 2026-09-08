@@ -1,9 +1,10 @@
 //! The `unicodedata` built-in module — RFC 0023, rebuilt on generated
-//! UCD 15.1.0 tables in RFC 0050 WS4.
+//! UCD tables in RFC 0050 WS4 (UCD 16.0.0 since RFC 0077, matching
+//! CPython 3.14).
 //!
-//! Mirrors CPython 3.13's `Modules/unicodedata.c` surface, backed by
+//! Mirrors CPython 3.14's `Modules/unicodedata.c` surface, backed by
 //! `stdlib/ucd` — packed tables produced by `tools/gen_ucd_tables.py`
-//! probing host CPython 3.13 (whose database *is* UCD 15.1.0), including
+//! probing host CPython 3.14 (whose database *is* UCD 16.0.0), including
 //! the real `ucd_3_2_0` snapshot. Every property answer, name, and
 //! normalization comes from the same data CPython ships:
 //!
@@ -16,7 +17,7 @@
 //! - `decomposition(chr)` — raw UCD decomposition text (with `<tag>`).
 //! - `normalize`/`is_normalized` — NFC/NFD/NFKC/NFKD from the same tables
 //!   (canonical composition pairs probed with exclusions applied).
-//! - `unidata_version = "15.1.0"`, `ucd_3_2_0` — the genuine 3.2.0 delta.
+//! - `unidata_version = "16.0.0"`, `ucd_3_2_0` — the genuine 3.2.0 delta.
 
 use crate::sync::Rc;
 use crate::sync::RefCell;
@@ -43,7 +44,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("unidata_version")),
-            Object::from_static("15.1.0"),
+            Object::from_static("16.0.0"),
         );
         d.insert(
             DictKey(Object::from_static("ucd_3_2_0")),
@@ -360,7 +361,31 @@ fn key_error(msg: impl Into<String>) -> RuntimeError {
 // crate-internal name helpers (codecs `namereplace` + `\N{...}` decode)
 // ---------------------------------------------------------------------------
 
-/// Canonical UCD 15.1.0 name for `ch` (CPython raises for controls and
+/// CPython's `_PyUnicode_Name_CAPI` / `_PyUnicode_GetNameCAPI`: the
+/// tokenizer's `\N{...}` decoder and the `namereplace` error handler reach
+/// the name database by *importing* `unicodedata` through the live runtime,
+/// so the module lands in `sys.modules` as a side effect
+/// (test_unicodedata.test_unicodedata_unload_reload) and a poisoned
+/// `sys.modules['unicodedata'] = None` makes both unavailable
+/// (test_failed_import_during_compiling). The tables themselves are
+/// compiled in, so this only performs the import; `false` means CPython
+/// would fail to load the module.
+pub(crate) fn ensure_unicodedata_loaded() -> bool {
+    let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
+        // No interpreter (embedding entry points parsing before one
+        // exists): nothing to poison, nothing to register.
+        return true;
+    };
+    // SAFETY: published by an enclosing VM frame on this thread.
+    let interp = unsafe { &mut *ptr };
+    match interp.cache.get("unicodedata") {
+        Some(Object::None) => false,
+        Some(_) => true,
+        None => interp.import_path_internal("unicodedata").is_ok(),
+    }
+}
+
+/// Canonical UCD 16.0.0 name for `ch` (CPython raises for controls and
 /// unassigned code points; those return `None` here).
 pub(crate) fn char_name(ch: char) -> Option<String> {
     ucd::name(ch as u32)

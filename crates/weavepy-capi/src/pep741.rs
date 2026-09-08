@@ -77,7 +77,7 @@ pub extern "C" fn PyInitConfig_Create() -> *mut PyInitConfig {
         configure_locale: 0,
         coerce_c_locale: 0,
         coerce_c_locale_warn: 0,
-        utf8_mode: 1,
+        utf8_mode: 0, // `PyPreConfig_InitIsolatedConfig`
         allocator: 0,
         gil: None,
         modules: Vec::new(),
@@ -149,6 +149,7 @@ fn int_slot<'a>(c: &'a mut PyConfig, name: &str) -> Option<&'a mut c_int> {
         "faulthandler" => &mut c.faulthandler,
         "tracemalloc" => &mut c.tracemalloc,
         "perf_profiling" => &mut c.perf_profiling,
+        "remote_debug" => &mut c.remote_debug,
         "import_time" => &mut c.import_time,
         "code_debug_ranges" => &mut c.code_debug_ranges,
         "show_ref_count" => &mut c.show_ref_count,
@@ -171,6 +172,10 @@ fn int_slot<'a>(c: &'a mut PyConfig, name: &str) -> Option<&'a mut c_int> {
         "use_frozen_modules" => &mut c.use_frozen_modules,
         "safe_path" => &mut c.safe_path,
         "int_max_str_digits" => &mut c.int_max_str_digits,
+        "thread_inherit_context" => &mut c.thread_inherit_context,
+        "context_aware_warnings" => &mut c.context_aware_warnings,
+        #[cfg(target_vendor = "apple")]
+        "use_system_logger" => &mut c.use_system_logger,
         "cpu_count" => &mut c.cpu_count,
         "pathconfig_warnings" => &mut c.pathconfig_warnings,
         "skip_source_first_line" => &mut c.skip_source_first_line,
@@ -232,6 +237,7 @@ const INT_NAMES: &[&str] = &[
     "faulthandler",
     "tracemalloc",
     "perf_profiling",
+    "remote_debug",
     "import_time",
     "code_debug_ranges",
     "show_ref_count",
@@ -254,6 +260,10 @@ const INT_NAMES: &[&str] = &[
     "use_frozen_modules",
     "safe_path",
     "int_max_str_digits",
+    "thread_inherit_context",
+    "context_aware_warnings",
+    #[cfg(target_vendor = "apple")]
+    "use_system_logger",
     "cpu_count",
     "pathconfig_warnings",
     "skip_source_first_line",
@@ -686,8 +696,9 @@ pub unsafe extern "C" fn Py_InitializeFromInitConfig(config: *mut PyInitConfig) 
 
 unsafe fn store_status(c: &mut PyInitConfig, status: PyStatus) -> c_int {
     if status._type == _PyStatus_TYPE_EXIT {
+        // CPython's `initconfig_set_status`: "exit code %i".
         c.exitcode = Some(status.exitcode);
-        return c.set_error("Python exit");
+        return c.set_error(&format!("exit code {}", status.exitcode));
     }
     if status._type == _PyStatus_TYPE_ERROR {
         let msg = if status.err_msg.is_null() {
@@ -855,6 +866,11 @@ fn default_int(option: &str) -> Option<i64> {
         "use_environment" | "site_import" | "user_site_directory" | "write_bytecode" => 1,
         "int_max_str_digits" => 4300,
         "cpu_count" => -1,
+        // 3.14: remote debugging is on unless disabled; the two context
+        // knobs default off on a GIL build; the Apple system logger is
+        // off on macOS.
+        "remote_debug" => 1,
+        "thread_inherit_context" | "context_aware_warnings" | "use_system_logger" => 0,
         "gil" => i64::from(!weavepy_vm::gil::free_threading_enabled()),
         _ => return None,
     })

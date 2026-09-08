@@ -63,7 +63,7 @@ pub fn install(bt: &BuiltinTypes) {
 /// synthesize but that no earlier install pass put in the type dict.
 /// CPython stores all of these in `tp_dict`; doctest's builtins traversal
 /// (`DocTestFinder.find(builtins)` — test_doctest `non_Python_modules`
-/// asserts 830 < n < 860 discovered docstrings) and `help()` both
+/// asserts 750 < n < 800 discovered docstrings on 3.14) and `help()` both
 /// enumerate `vars(cls)` directly, so presence matters, not just
 /// gettability. Names that would *change dispatch semantics* by
 /// appearing in a dict that lacks them today (attribute-access hooks,
@@ -817,6 +817,43 @@ fn install_introspection_getsets(bt: &BuiltinTypes) {
         }),
         _ => Err(type_error("descriptor requires a 'memoryview' object")),
     });
+    // The remaining `memoryview` buffer-metadata getsets (CPython
+    // `memory_getsetlist`): `type(mv).shape` must be a `getset_descriptor`
+    // so `rlcompleter` can list them on a released view without running
+    // the getters (test_rlcompleter
+    // test_released_memoryview_completion_works). Each getter defers to
+    // the instance attribute path, which owns the released-view check.
+    fn mv_getset(args: &[Object], name: &str) -> Result<Object, RuntimeError> {
+        let Some(mv @ Object::MemoryView(_)) = args.first() else {
+            return Err(type_error("descriptor requires a 'memoryview' object"));
+        };
+        let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
+            return Err(type_error(
+                "memoryview getset requires a running interpreter",
+            ));
+        };
+        // SAFETY: published by the enclosing VM frame on this thread.
+        let interp = unsafe { &mut *ptr };
+        interp.load_attr_public(mv, name)
+    }
+    macro_rules! mv_getsets {
+        ($($name:literal),* $(,)?) => {
+            $(getset(&bt.memoryview_, $name, GetSet, None, |a| mv_getset(a, $name));)*
+        };
+    }
+    mv_getsets!(
+        "nbytes",
+        "itemsize",
+        "ndim",
+        "readonly",
+        "format",
+        "shape",
+        "strides",
+        "suboffsets",
+        "c_contiguous",
+        "contiguous",
+        "f_contiguous",
+    );
     // `inspect.isdatadescriptor` keys on the descriptor *type* carrying
     // `__set__`/`__delete__`; CPython's getset/member descriptor types
     // both do (writes route to the setter — always absent for the
@@ -1036,6 +1073,19 @@ fn install_value_richcmp(bt: &BuiltinTypes) {
             &bt.range_,
             name,
             richcmp_builtin(name, *op, fam_range, &bt.range_),
+        );
+    }
+    // code: `code_richcompare` is a slot of its own, so
+    // `types.CodeType.__eq__ is not object.__eq__`
+    // (test_crossinterp's assert_equal_or_equalish dispatches on that).
+    fn fam_code(o: &Object) -> bool {
+        matches!(o, Object::Code(_))
+    }
+    for (name, op) in &[("__eq__", CompareKind::Eq), ("__ne__", CompareKind::NotEq)] {
+        insert_if_absent(
+            &bt.code_,
+            name,
+            richcmp_builtin(name, *op, fam_code, &bt.code_),
         );
     }
 }
@@ -1916,6 +1966,11 @@ fn install_class_getitem(bt: &BuiltinTypes) {
         &bt.exception_group,
         // PEP 585 also covers `enumerate[int]` (RFC 0056 WS4).
         &bt.enumerate_,
+        // 3.14: `memoryview[int]` (PEP 688 follow-up, gh-126012) and the
+        // `staticmethod`/`classmethod` wrappers (gh-96461) are generic.
+        &bt.memoryview_,
+        &bt.staticmethod_,
+        &bt.classmethod_,
     ] {
         insert_if_absent(
             ty,
@@ -2379,6 +2434,8 @@ fn install_method_tables(bt: &BuiltinTypes) {
     install_named_methods(
         &bt.bytearray_,
         "bytearray",
-        &["append", "extend", "clear", "pop", "reverse", "insert"],
+        &[
+            "append", "extend", "clear", "pop", "reverse", "insert", "resize",
+        ],
     );
 }

@@ -45,10 +45,15 @@ const DEF_ANNOT: i64 = 256;
 /// CPython `DEF_TYPE_PARAM` (`2<<9`): the name is a PEP 695 type
 /// parameter.
 const DEF_TYPE_PARAM: i64 = 2 << 9;
+/// CPython `DEF_COMP_ITER` (`2<<8`): the name is a comprehension
+/// iteration variable.
+const DEF_COMP_ITER: i64 = 2 << 8;
+/// CPython `DEF_COMP_CELL` (`2<<10`): a comprehension iteration variable
+/// that became a cell in an inlined (PEP 709) comprehension.
+const DEF_COMP_CELL: i64 = 2 << 10;
 const DEF_BOUND: i64 = DEF_LOCAL | DEF_PARAM | DEF_IMPORT; // 134
 
 const SCOPE_OFF: i64 = 12;
-#[allow(dead_code)]
 const SCOPE_MASK: i64 = 15;
 
 // ---- scopes ----
@@ -72,6 +77,10 @@ enum BlockType {
     Function,
     Class,
     Module,
+    /// PEP 649 `__annotate__` scope holding a `def`'s parameter/return
+    /// annotations or a block's annotated assignments (CPython
+    /// `AnnotationBlock`).
+    Annotation,
     /// PEP 695 `type X = …` value scope (CPython `TypeAliasBlock`).
     TypeAlias,
     /// PEP 695 hidden `[T, …]` scope wrapping a generic
@@ -89,6 +98,7 @@ impl BlockType {
         matches!(
             self,
             BlockType::Function
+                | BlockType::Annotation
                 | BlockType::TypeAlias
                 | BlockType::TypeParameters
                 | BlockType::TypeVariable
@@ -99,6 +109,7 @@ impl BlockType {
             BlockType::Function => TYPE_FUNCTION,
             BlockType::Class => TYPE_CLASS,
             BlockType::Module => TYPE_MODULE,
+            BlockType::Annotation => TYPE_ANNOTATION,
             BlockType::TypeAlias => TYPE_TYPE_ALIAS,
             BlockType::TypeParameters => TYPE_TYPE_PARAMETERS,
             BlockType::TypeVariable => TYPE_TYPE_VARIABLE,
@@ -121,6 +132,23 @@ struct Block {
     varnames: Vec<String>,
     children: Vec<usize>,
     id: i64,
+    /// CPython `ste_comprehension`: a list/set/dict/generator
+    /// comprehension scope.
+    comprehension: bool,
+    /// CPython `ste_generator`: set for generator expressions, which
+    /// stay their own scope (PEP 709 inlines the other kinds).
+    generator: bool,
+    /// Set by the analyzer once this comprehension was merged into its
+    /// parent (`ste_comp_inlined`).
+    comp_inlined: bool,
+    /// The block's `__annotate__` child for annotated assignments
+    /// (`ste_annotation_block`), created on the first one and re-entered
+    /// by the rest.
+    annotation_block: Option<usize>,
+    /// CPython `ste_in_conditional_block`, transient during the build.
+    in_conditional: bool,
+    /// CPython `ste_has_conditional_annotations`.
+    has_conditional_annotations: bool,
 }
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
@@ -145,6 +173,9 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             ("DEF_BOUND", DEF_BOUND),
             ("DEF_ANNOT", DEF_ANNOT),
             ("DEF_FREE_CLASS", DEF_FREE_CLASS),
+            ("DEF_TYPE_PARAM", DEF_TYPE_PARAM),
+            ("DEF_COMP_ITER", DEF_COMP_ITER),
+            ("DEF_COMP_CELL", DEF_COMP_CELL),
             ("SCOPE_OFF", SCOPE_OFF),
             ("SCOPE_MASK", SCOPE_MASK),
             ("LOCAL", LOCAL),
@@ -254,6 +285,14 @@ struct Builder {
     stack: Vec<usize>,
     newlines: Vec<usize>,
     next_id: i64,
+    /// `from __future__ import annotations` is in effect.
+    future_annotations: bool,
+    /// CPython `ste_comp_iter_target`: visiting a comprehension's
+    /// iteration target, whose names get `DEF_COMP_ITER`.
+    comp_iter_target: bool,
+    /// CPython `ste_in_unevaluated_annotation`: names in a function-local
+    /// annotation aren't recorded.
+    in_unevaluated_annotation: bool,
 }
 
 impl Builder {
@@ -268,6 +307,9 @@ impl Builder {
             stack: Vec::new(),
             newlines,
             next_id: 0,
+            future_annotations: false,
+            comp_iter_target: false,
+            in_unevaluated_annotation: false,
         }
     }
 
@@ -277,6 +319,10 @@ impl Builder {
     }
 
     fn run(&mut self, m: &past::Module) -> usize {
+        self.future_annotations = m.body.iter().any(|s| {
+            matches!(&s.kind, past::StmtKind::ImportFrom { module: Some(m), names, .. }
+                if m == "__future__" && names.iter().any(|a| a.name == "annotations"))
+        });
         let root = self.enter(BlockType::Module, "top", 0);
         for s in &m.body {
             self.visit_stmt(s);
@@ -307,12 +353,34 @@ impl Builder {
             varnames: Vec::new(),
             children: Vec::new(),
             id: self.next_id,
+            comprehension: false,
+            generator: false,
+            comp_inlined: false,
+            annotation_block: None,
+            in_conditional: false,
+            has_conditional_annotations: false,
         });
         if let Some(&parent) = self.stack.last() {
-            self.arena[parent].children.push(idx);
+            // `symtable_enter_existing_block`: under `from __future__
+            // import annotations` an annotation block is never recorded
+            // as a child (the compiler turns the annotations into
+            // strings).
+            if !(self.future_annotations && ty == BlockType::Annotation) {
+                self.arena[parent].children.push(idx);
+            }
         }
         self.stack.push(idx);
         idx
+    }
+
+    /// Run `f` with the statement bodies marked conditional
+    /// (`ENTER_CONDITIONAL_BLOCK`).
+    fn conditional<F: FnOnce(&mut Self)>(&mut self, f: F) {
+        let cur = self.cur();
+        let saved = self.arena[cur].in_conditional;
+        self.arena[cur].in_conditional = true;
+        f(self);
+        self.arena[cur].in_conditional = saved;
     }
 
     fn exit(&mut self) {
@@ -321,7 +389,19 @@ impl Builder {
 
     fn add_def(&mut self, name: &str, flag: i64) {
         let cur = self.cur();
-        let entry = self.arena[cur].symbols.entry(name.to_owned()).or_insert(0);
+        self.add_def_in(cur, name, flag);
+    }
+
+    /// `symtable_add_def_helper` against an explicit block.
+    fn add_def_in(&mut self, block: usize, name: &str, flag: i64) {
+        let mut flag = flag;
+        if self.comp_iter_target && block == self.cur() {
+            flag |= DEF_COMP_ITER;
+        }
+        let entry = self.arena[block]
+            .symbols
+            .entry(name.to_owned())
+            .or_insert(0);
         *entry |= flag;
     }
 
@@ -377,7 +457,24 @@ impl Builder {
     /// the caller enters the hidden type-parameters block first, so
     /// these resolve in that annotation scope (CPython
     /// `symtable_visit_annotations`).
-    fn visit_annotations(&mut self, args: &past::Arguments, returns: Option<&past::Expr>) {
+    fn visit_annotations(
+        &mut self,
+        args: &past::Arguments,
+        returns: Option<&past::Expr>,
+        lineno: i64,
+    ) {
+        // Every `def` gets an `__annotate__` block, annotated or not.
+        let parent = self.cur();
+        let in_class =
+            self.arena[parent].can_see_class_scope || self.arena[parent].ty == BlockType::Class;
+        self.enter(BlockType::Annotation, "__annotate__", lineno);
+        self.add_param(".format");
+        self.add_def(".format", USE);
+        if in_class {
+            let cur = self.cur();
+            self.arena[cur].can_see_class_scope = true;
+            self.add_def("__classdict__", USE);
+        }
         let all = args
             .posonlyargs
             .iter()
@@ -393,6 +490,49 @@ impl Builder {
         if let Some(r) = returns {
             self.visit_expr(r);
         }
+        self.exit();
+    }
+
+    /// CPython `symtable_visit_annotation`: an annotated assignment's
+    /// annotation lives in the block's shared `__annotate__` child.
+    fn visit_annotation(&mut self, annotation: &past::Expr) {
+        let parent = self.cur();
+        let parent_ty = self.arena[parent].ty;
+        let is_unevaluated = parent_ty == BlockType::Function;
+        // Module-level annotations are always conditional (the module
+        // may be partially executed); class-level ones inside a
+        // conditional statement are too.
+        if ((parent_ty == BlockType::Class && self.arena[parent].in_conditional)
+            || parent_ty == BlockType::Module)
+            && !self.arena[parent].has_conditional_annotations
+        {
+            self.arena[parent].has_conditional_annotations = true;
+            self.add_def("__conditional_annotations__", USE);
+        }
+        match self.arena[parent].annotation_block {
+            None => {
+                let idx = self.enter(
+                    BlockType::Annotation,
+                    "__annotate__",
+                    self.lineno(annotation.span),
+                );
+                self.arena[parent].annotation_block = Some(idx);
+                self.add_param(".format");
+                self.add_def(".format", USE);
+                if parent_ty == BlockType::Class && !self.future_annotations {
+                    self.arena[idx].can_see_class_scope = true;
+                    self.add_def("__classdict__", USE);
+                }
+            }
+            Some(idx) => self.stack.push(idx),
+        }
+        let saved = self.in_unevaluated_annotation;
+        if is_unevaluated {
+            self.in_unevaluated_annotation = true;
+        }
+        self.visit_expr(annotation);
+        self.in_unevaluated_annotation = saved;
+        self.exit();
     }
 
     /// CPython `symtable_enter_type_param_block`: open the hidden
@@ -494,7 +634,7 @@ impl Builder {
                 }
                 // Annotations resolve inside the hidden type-parameters
                 // block when the `def` is generic.
-                self.visit_annotations(args, returns.as_deref());
+                self.visit_annotations(args, returns.as_deref(), lineno);
                 self.enter(BlockType::Function, name, lineno);
                 self.add_params(args);
                 for st in body {
@@ -598,7 +738,7 @@ impl Builder {
                 } else {
                     self.bind_target(target);
                 }
-                self.visit_expr(annotation);
+                self.visit_annotation(annotation);
                 if let Some(v) = value {
                     self.visit_expr(v);
                 }
@@ -608,8 +748,10 @@ impl Builder {
                 test, body, orelse, ..
             } => {
                 self.visit_expr(test);
-                self.visit_block(body);
-                self.visit_block(orelse);
+                self.conditional(|b| {
+                    b.visit_block(body);
+                    b.visit_block(orelse);
+                });
             }
             S::For {
                 target,
@@ -625,28 +767,30 @@ impl Builder {
             } => {
                 self.bind_target(target);
                 self.visit_expr(iter);
-                self.visit_block(body);
-                self.visit_block(orelse);
+                self.conditional(|b| {
+                    b.visit_block(body);
+                    b.visit_block(orelse);
+                });
             }
             S::Try {
                 body,
                 handlers,
                 orelse,
                 finalbody,
-            } => {
-                self.visit_block(body);
+            } => self.conditional(|b| {
+                b.visit_block(body);
                 for h in handlers {
                     if let Some(t) = &h.type_ {
-                        self.visit_expr(t);
+                        b.visit_expr(t);
                     }
                     if let Some(n) = &h.name {
-                        self.add_def(n, DEF_LOCAL);
+                        b.add_def(n, DEF_LOCAL);
                     }
-                    self.visit_block(&h.body);
+                    b.visit_block(&h.body);
                 }
-                self.visit_block(orelse);
-                self.visit_block(finalbody);
-            }
+                b.visit_block(orelse);
+                b.visit_block(finalbody);
+            }),
             S::Raise { exc, cause } => {
                 if let Some(e) = exc {
                     self.visit_expr(e);
@@ -655,15 +799,15 @@ impl Builder {
                     self.visit_expr(c);
                 }
             }
-            S::With { items, body } | S::AsyncWith { items, body } => {
+            S::With { items, body } | S::AsyncWith { items, body } => self.conditional(|b| {
                 for it in items {
-                    self.visit_expr(&it.context_expr);
+                    b.visit_expr(&it.context_expr);
                     if let Some(v) = &it.optional_vars {
-                        self.bind_target(v);
+                        b.bind_target(v);
                     }
                 }
-                self.visit_block(body);
-            }
+                b.visit_block(body);
+            }),
             S::Import(aliases) => {
                 for a in aliases {
                     // `import a.b.c` binds `a`; `import a.b as c` binds `c`.
@@ -696,13 +840,15 @@ impl Builder {
             }
             S::Match { subject, cases } => {
                 self.visit_expr(subject);
-                for c in cases {
-                    self.visit_pattern(&c.pattern);
-                    if let Some(g) = &c.guard {
-                        self.visit_expr(g);
+                self.conditional(|b| {
+                    for c in cases {
+                        b.visit_pattern(&c.pattern);
+                        if let Some(g) = &c.guard {
+                            b.visit_expr(g);
+                        }
+                        b.visit_block(&c.body);
                     }
-                    self.visit_block(&c.body);
-                }
+                });
             }
             S::Expr(e) => self.visit_expr(e),
             S::Pass | S::Break | S::Continue => {}
@@ -726,7 +872,6 @@ impl Builder {
         }
     }
 
-    /// Record a name appearing in store/del position.
     fn bind_target(&mut self, e: &past::Expr) {
         use past::ExprKind as E;
         match &e.kind {
@@ -752,6 +897,9 @@ impl Builder {
         match &e.kind {
             E::Constant(_) => {}
             E::Name(n) => {
+                if self.in_unevaluated_annotation {
+                    return;
+                }
                 self.add_def(n, USE);
                 // Zero-argument `super()` implicitly closes over `__class__`;
                 // CPython models a `super` load as a use of `__class__`.
@@ -793,8 +941,14 @@ impl Builder {
                 self.visit_expr(orelse);
             }
             E::NamedExpr { target, value } => {
-                // Walrus binds in the current scope (the comprehension-leak
-                // special case is intentionally not modelled).
+                // `symtable_handle_namedexpr`: inside a comprehension the
+                // target binds in the nearest enclosing function or
+                // module block (`symtable_extend_namedexpr_scope`).
+                if self.arena[self.cur()].comprehension {
+                    if let past::ExprKind::Name(n) = &target.kind {
+                        self.extend_namedexpr_scope(n);
+                    }
+                }
                 self.visit_expr(value);
                 if let past::ExprKind::Name(n) = &target.kind {
                     self.add_def(n, DEF_LOCAL);
@@ -837,19 +991,27 @@ impl Builder {
             }
             // PEP 709: list/set/dict comprehensions are inlined into the
             // enclosing block — visit their parts here, no child scope.
-            E::ListComp { elt, generators } | E::SetComp { elt, generators } => {
-                self.visit_inline_comp(generators, &[elt]);
+            E::ListComp { elt, generators } => {
+                self.visit_comprehension("listcomp", generators, &[elt], self.lineno(span), false);
+            }
+            E::SetComp { elt, generators } => {
+                self.visit_comprehension("setcomp", generators, &[elt], self.lineno(span), false);
             }
             E::DictComp {
                 key,
                 value,
                 generators,
             } => {
-                self.visit_inline_comp(generators, &[key, value]);
+                self.visit_comprehension(
+                    "dictcomp",
+                    generators,
+                    &[key, value],
+                    self.lineno(span),
+                    false,
+                );
             }
-            // Generator expressions keep their own `genexpr` block.
             E::GeneratorExp { elt, generators } => {
-                self.visit_genexpr(generators, &[elt], self.lineno(span));
+                self.visit_comprehension("genexpr", generators, &[elt], self.lineno(span), true);
             }
             E::Starred(value) => self.visit_expr(value),
             E::Yield(value) => {
@@ -877,46 +1039,33 @@ impl Builder {
         }
     }
 
-    /// Inlined comprehension (list/set/dict): everything is analyzed in the
-    /// current block.
-    fn visit_inline_comp(&mut self, generators: &[past::Comprehension], elts: &[&past::Expr]) {
-        for (i, g) in generators.iter().enumerate() {
-            self.visit_expr(&g.iter);
-            // Inlined comprehension targets become locals of the enclosing
-            // block, matching CPython 3.13's symbol table.
-            self.bind_target(&g.target);
-            let _ = i;
-            for cond in &g.ifs {
-                self.visit_expr(cond);
-            }
-        }
-        for e in elts {
-            self.visit_expr(e);
-        }
-    }
-
-    /// Generator expression: its own `genexpr` block with a `.0` argument;
-    /// the outermost iterable is evaluated in the enclosing block.
-    fn visit_genexpr(
+    /// `symtable_handle_comprehension`: every comprehension gets its
+    /// own function-like block with a `.0` argument; the outermost
+    /// iterable is evaluated in the enclosing block. The analyzer
+    /// later merges the non-generator ones into their parent (PEP 709).
+    fn visit_comprehension(
         &mut self,
+        name: &str,
         generators: &[past::Comprehension],
         elts: &[&past::Expr],
         lineno: i64,
+        is_generator: bool,
     ) {
-        if let Some(first) = generators.first() {
-            self.visit_expr(&first.iter);
-        }
-        self.enter(BlockType::Function, "genexpr", lineno);
+        let Some(first) = generators.first() else {
+            return;
+        };
+        self.visit_expr(&first.iter);
+        let idx = self.enter(BlockType::Function, name, lineno);
+        self.arena[idx].comprehension = true;
+        self.arena[idx].generator = is_generator;
         self.add_param(".0");
-        if let Some(first) = generators.first() {
-            self.bind_target(&first.target);
-            for cond in &first.ifs {
-                self.visit_expr(cond);
-            }
+        self.visit_comp_target(&first.target);
+        for cond in &first.ifs {
+            self.visit_expr(cond);
         }
         for g in generators.iter().skip(1) {
+            self.visit_comp_target(&g.target);
             self.visit_expr(&g.iter);
-            self.bind_target(&g.target);
             for cond in &g.ifs {
                 self.visit_expr(cond);
             }
@@ -925,6 +1074,47 @@ impl Builder {
             self.visit_expr(e);
         }
         self.exit();
+    }
+
+    /// A comprehension's iteration target: every name it visits (bound
+    /// or not) is flagged `DEF_COMP_ITER`.
+    fn visit_comp_target(&mut self, target: &past::Expr) {
+        let saved = self.comp_iter_target;
+        self.comp_iter_target = true;
+        self.bind_target(target);
+        self.comp_iter_target = saved;
+    }
+
+    /// `symtable_extend_namedexpr_scope`: a walrus inside a
+    /// comprehension binds in the nearest enclosing non-comprehension
+    /// block — nonlocal-style through a function, global at module
+    /// level — recorded on both the comprehension and that block.
+    fn extend_namedexpr_scope(&mut self, name: &str) {
+        let cur = self.cur();
+        for &ste in self.stack.clone().iter().rev() {
+            if self.arena[ste].comprehension {
+                continue;
+            }
+            match self.arena[ste].ty {
+                BlockType::Function => {
+                    let in_scope = self.arena[ste].symbols.get(name).copied().unwrap_or(0);
+                    if in_scope & DEF_GLOBAL != 0 {
+                        self.add_def_in(cur, name, DEF_GLOBAL);
+                    } else {
+                        self.add_def_in(cur, name, DEF_NONLOCAL);
+                    }
+                    self.add_def_in(ste, name, DEF_LOCAL);
+                }
+                BlockType::Module => {
+                    self.add_def_in(cur, name, DEF_GLOBAL);
+                    self.add_def_in(ste, name, DEF_GLOBAL);
+                }
+                // Class and type-parameter scopes are rejected by the
+                // compiler's validation pass before we get here.
+                _ => {}
+            }
+            return;
+        }
     }
 
     fn visit_pattern(&mut self, p: &past::Pattern) {
@@ -1040,33 +1230,119 @@ impl Analyzer<'_> {
         }
 
         let children = self.arena[idx].children.clone();
-        let mut allfree: HashSet<String> = HashSet::new();
+        let mut inlined_cells: HashSet<String> = HashSet::new();
+        let can_see_class_scope = self.arena[idx].can_see_class_scope;
         for c in children {
             let mut cb = newbound.clone();
             let mut cf: HashSet<String> = HashSet::new();
             let mut cg = newglobal.clone();
             self.analyze_block(c, &mut cb, &mut cf, &mut cg);
-            allfree.extend(cf);
+            // PEP 709: every non-generator comprehension is inlined,
+            // except inside annotation scopes nested in classes.
+            let inline_comp =
+                self.arena[c].comprehension && !self.arena[c].generator && !can_see_class_scope;
+            if inline_comp {
+                self.inline_comprehension(idx, c, &mut scopes, &mut cf, &mut inlined_cells);
+                self.arena[c].comp_inlined = true;
+            }
+            newfree.extend(cf);
         }
-        newfree.extend(allfree);
+        // Splice the children of inlined comprehensions into ours.
+        let mut spliced = Vec::new();
+        for c in self.arena[idx].children.clone() {
+            if self.arena[c].comp_inlined {
+                spliced.extend(self.arena[c].children.iter().copied());
+            } else {
+                spliced.push(c);
+            }
+        }
+        self.arena[idx].children = spliced;
 
         if func_like {
-            analyze_cells(&mut scopes, &mut newfree);
+            analyze_cells(&mut scopes, &mut newfree, &inlined_cells);
         } else if is_class {
             newfree.remove("__class__");
             newfree.remove("__classdict__");
         }
 
-        let classflag = is_class || self.arena[idx].can_see_class_scope;
+        let classflag = is_class || can_see_class_scope;
         update_symbols(
             &mut self.arena[idx].symbols,
             &scopes,
             bound,
             &newfree,
+            &inlined_cells,
             classflag,
         );
 
         free.extend(newfree);
+    }
+
+    /// CPython `inline_comprehension`: merge an inlined comprehension's
+    /// symbols into its parent. A name the parent has no entry for is
+    /// copied with the comprehension's scope; an existing entry keeps
+    /// its own scope, and a comprehension free variable the parent
+    /// binds simply becomes the parent's local (unless a child of the
+    /// comprehension still closes over it, or the parent is a class).
+    fn inline_comprehension(
+        &mut self,
+        parent: usize,
+        comp: usize,
+        scopes: &mut HashMap<String, i64>,
+        comp_free: &mut HashSet<String>,
+        inlined_cells: &mut HashSet<String>,
+    ) {
+        let parent_is_class = self.arena[parent].ty == BlockType::Class;
+        let syms: Vec<(String, i64)> = self.arena[comp]
+            .symbols
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let mut remove_dunder_class = false;
+        for (name, comp_flags) in syms {
+            // The `.0` iterator parameter stays behind.
+            if comp_flags & DEF_PARAM != 0 {
+                continue;
+            }
+            let mut scope = (comp_flags >> SCOPE_OFF) & SCOPE_MASK;
+            let only_flags = comp_flags & ((1 << SCOPE_OFF) - 1);
+            if scope == CELL || only_flags & DEF_COMP_CELL != 0 {
+                inlined_cells.insert(name.clone());
+            }
+            // `__class__` is never free through a class scope
+            // (`drop_class_free`).
+            if scope == FREE && parent_is_class && name == "__class__" {
+                scope = GLOBAL_IMPLICIT;
+                comp_free.remove(&name);
+                remove_dunder_class = true;
+            }
+            match self.arena[parent].symbols.get(&name).copied() {
+                None => {
+                    self.arena[parent].symbols.insert(name.clone(), only_flags);
+                    scopes.insert(name, scope);
+                }
+                Some(flags) => {
+                    if flags & DEF_BOUND != 0
+                        && !parent_is_class
+                        && !self.is_free_in_any_child(comp, &name)
+                    {
+                        comp_free.remove(&name);
+                    }
+                }
+            }
+        }
+        if remove_dunder_class {
+            self.arena[comp].symbols.shift_remove("__class__");
+        }
+    }
+
+    fn is_free_in_any_child(&self, block: usize, name: &str) -> bool {
+        self.arena[block].children.iter().any(|&c| {
+            self.arena[c]
+                .symbols
+                .get(name)
+                .is_some_and(|&f| (f >> SCOPE_OFF) & SCOPE_MASK == FREE)
+        })
     }
 }
 
@@ -1108,15 +1384,20 @@ fn analyze_name(
     scopes.insert(name.to_owned(), GLOBAL_IMPLICIT);
 }
 
-/// Promote locals referenced by nested scopes to cell variables.
-fn analyze_cells(scopes: &mut HashMap<String, i64>, free: &mut HashSet<String>) {
+/// Promote locals referenced by nested scopes (or made cells by an
+/// inlined comprehension) to cell variables.
+fn analyze_cells(
+    scopes: &mut HashMap<String, i64>,
+    free: &mut HashSet<String>,
+    inlined_cells: &HashSet<String>,
+) {
     let locals: Vec<String> = scopes
         .iter()
         .filter(|(_, &s)| s == LOCAL)
         .map(|(n, _)| n.clone())
         .collect();
     for n in locals {
-        if free.contains(&n) {
+        if free.contains(&n) || inlined_cells.contains(&n) {
             scopes.insert(n.clone(), CELL);
             free.remove(&n);
         }
@@ -1128,11 +1409,17 @@ fn update_symbols(
     scopes: &HashMap<String, i64>,
     bound: &HashSet<String>,
     free: &HashSet<String>,
+    inlined_cells: &HashSet<String>,
     classflag: bool,
 ) {
     for (name, flags) in symbols.iter_mut() {
         if let Some(&scope) = scopes.get(name) {
             *flags |= scope << SCOPE_OFF;
+        }
+        // A name an inlined comprehension turned into a cell
+        // (`Symbol.is_comp_cell`).
+        if inlined_cells.contains(name) {
+            *flags |= DEF_COMP_CELL;
         }
     }
     for name in free {

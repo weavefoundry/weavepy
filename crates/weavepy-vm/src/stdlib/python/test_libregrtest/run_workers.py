@@ -22,7 +22,7 @@ from .runtests import RunTests, WorkerRunTests, JsonFile, JsonFileType
 from .single import PROGRESS_MIN_TIME
 from .utils import (
     StrPath, TestName,
-    format_duration, print_warning, count, plural, get_signal_name)
+    format_duration, print_warning, count, plural)
 from .worker import create_worker_process, USE_PROCESS_GROUP
 
 if MS_WINDOWS:
@@ -145,14 +145,23 @@ class WorkerThread(threading.Thread):
             return
         self._killed = True
 
-        if USE_PROCESS_GROUP:
+        use_killpg = USE_PROCESS_GROUP
+        if use_killpg:
+            try:
+                use_killpg = (os.getsid(popen.pid) != os.getsid(0))
+            except PermissionError:
+                # On OpenBSD getsid() is only allowed for a process in the
+                # same session, so the failure means that it is not.
+                use_killpg = True
+
+        if use_killpg:
             what = f"{self} process group"
         else:
             what = f"{self} process"
 
         print(f"Kill {what}", file=sys.stderr, flush=True)
         try:
-            if USE_PROCESS_GROUP:
+            if use_killpg:
                 os.killpg(popen.pid, signal.SIGKILL)
             else:
                 popen.kill()
@@ -364,7 +373,7 @@ class WorkerThread(threading.Thread):
                                   err_msg=None,
                                   state=State.TIMEOUT)
             if retcode != 0:
-                name = get_signal_name(retcode)
+                name = support.get_signal_name(retcode)
                 if name:
                     retcode = f"{retcode} ({name})"
                 raise WorkerError(self.test_name, f"Exit code {retcode}", stdout,

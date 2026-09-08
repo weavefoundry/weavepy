@@ -771,9 +771,14 @@ single target, on a fixed trigger rather than a fixed date:
    multi-version support is rejected permanently: a dual 3.13/3.14
    runtime would mean dual magics, dual verbatim stdlibs, and a
    forked conformance baseline, a standing tax with no drop-in
-   audience. Users who need a frozen older surface get a
-   **maintenance branch cut at each switch commit** (the CPython
-   release-branch model), which receives fixes by cherry-pick only.
+   audience. There is no maintenance line either: WeavePy fixes
+   forward only, and the way to get a fix is to take the current
+   release, which matches the current CPython. The last commit that
+   reported the previous version stays reachable in history for
+   anyone who needs to read it, but it gets no branch, no
+   cherry-picks, and no CI. (Amended by RFC 0077's landing; the
+   original text cut a `weavepy-3.13` maintenance branch at the
+   switch commit.)
 2. **The switch trigger.** Trunk switches to version N when (a)
    CPython N.1 — the first bugfix release — has shipped, and (b) the
    ecosystem matrix's packages publish cp31N wheels. Historically
@@ -1015,8 +1020,7 @@ policy); `cargo fmt` / `clippy -D warnings` / `cargo test
   `docs/PY314-GAP.md` — deferred annotations (PEP 649/749), the
   bytecode/magic delta, `annotationlib`, `python314.dll` /
   `libpython3.14` / cp314-tag identity, defaulting t-strings/PEP 758
-  and deleting `-X lang=next`, cutting the `weavepy-3.13`
-  maintenance branch, and the dual-baseline retirement.
+  and deleting `-X lang=next`, and the dual-baseline retirement.
 - **JIT under free-threading**: re-enabling tier-2 native entry with
   epoch-guarded caches under `gil=0` — its own RFC, chartered by the
   WS12 lane's measurements.

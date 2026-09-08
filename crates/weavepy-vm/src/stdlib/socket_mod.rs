@@ -1187,7 +1187,7 @@ fn wait_fd_until(
         if remain.is_zero() {
             return Err(timeout_error("timed out"));
         }
-        let ms = remain.as_millis().min(i32::MAX as u128) as i32;
+        let ms = poll_timeout_ms_ceil(remain);
         let mut pfd = libc::pollfd {
             fd,
             events,
@@ -1209,6 +1209,22 @@ fn wait_fd_until(
             }
         }
     }
+}
+
+/// The `poll(2)` budget for the time left until a socket deadline,
+/// rounded *up* to whole milliseconds like CPython's
+/// `_PyTime_AsMilliseconds(.., _PyTime_ROUND_CEILING)` in
+/// `sock_call_ex`. Truncating instead turns any sub-millisecond
+/// remainder into `poll(.., 0)`, an instant `TimeoutError` before the
+/// configured wait has been honoured; `test_httpservers`'
+/// `test_large_content_length_truncated` sets a 1 ms handler timeout
+/// and the request line arriving a few hundred microseconds after the
+/// server thread reached `readline` was reported as "Request timed out"
+/// under parallel sweep load.
+#[cfg(unix)]
+fn poll_timeout_ms_ceil(remain: Duration) -> libc::c_int {
+    let ms = remain.as_millis() + u128::from(!remain.subsec_nanos().is_multiple_of(1_000_000));
+    ms.min(libc::c_int::MAX as u128) as libc::c_int
 }
 
 /// Readiness masks for [`blocking_socket_io`]. On unix these are the real
@@ -2064,34 +2080,7 @@ fn wait_ready_for_timeout(
         return Ok(());
     }
     let fd = snapshot_raw_fd(state)?;
-    let deadline = std::time::Instant::now() + t;
-    loop {
-        let remain = deadline.saturating_duration_since(std::time::Instant::now());
-        if remain.is_zero() {
-            return Err(timeout_error("timed out"));
-        }
-        let ms = remain.as_millis().min(i32::MAX as u128) as i32;
-        let mut pfd = libc::pollfd {
-            fd,
-            events,
-            revents: 0,
-        };
-        let r = crate::gil::allow_threads_then(|| unsafe {
-            libc::poll(std::ptr::addr_of_mut!(pfd), 1, ms)
-        });
-        match r {
-            0 => return Err(timeout_error("timed out")),
-            n if n > 0 => return Ok(()),
-            _ => {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EINTR) {
-                    run_pending_signals_after_eintr()?;
-                    continue;
-                }
-                return Err(io_error_to_py(&err));
-            }
-        }
-    }
+    wait_fd_until(fd, events, std::time::Instant::now() + t)
 }
 
 /// `socket.sendmsg(buffers[, ancdata[, flags[, address]]])` — send normal
@@ -2531,11 +2520,16 @@ fn buffer_protocol_bytes(obj: &Object) -> Option<Vec<u8>> {
     // SAFETY: published by the active builtin call on this thread; the
     // interpreter outlives this call.
     let interp = unsafe { &mut *ptr };
-    let method = interp.load_attr_public(obj, "tobytes").ok()?;
-    match interp.call_object(method, &[], &[]).ok()? {
-        Object::Bytes(b) => Some(b.to_vec()),
-        _ => None,
+    if let Ok(method) = interp.load_attr_public(obj, "tobytes") {
+        if let Ok(Object::Bytes(b)) = interp.call_object(method, &[], &[]) {
+            return Some(b.to_vec());
+        }
     }
+    // A PEP 688 exporter (`__buffer__`), which sendmsg's "y*" converter
+    // accepts (test_socket.ReentrantMutationTests: the export may even
+    // mutate the caller's sequence — the items were snapshotted above).
+    let view = crate::builtins::buffer_exported_view(obj, 0)?;
+    Some(view.to_bytes())
 }
 
 /// Extract `sendmsg` ancillary data: an iterable of `(cmsg_level, cmsg_type,
@@ -3767,24 +3761,33 @@ fn mod_if_nametoindex(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `socket.if_indextoname(index)`.
 #[cfg(unix)]
 fn mod_if_indextoname(args: &[Object]) -> Result<Object, RuntimeError> {
-    // The index converts as a C unsigned int: a negative value or one that
-    // doesn't fit 32 bits is an OverflowError, while a non-int is a
-    // TypeError (testInvalidInterfaceIndexToName probes -1, 2**1000, and
-    // '_DEADBEEF' separately).
+    // 3.14 converts the index with `PyLong_AsUnsignedLong` (NET_IFINDEX): a
+    // negative value is a ValueError, one that doesn't fit a C unsigned int
+    // is an OverflowError, and a non-int is a TypeError
+    // (testInvalidInterfaceIndexToName probes -1, 2**1000, '_DEADBEEF').
     let arg = args.first();
     let idx = match arg.and_then(Object::as_i64) {
         Some(n) if (0..=i64::from(u32::MAX)).contains(&n) => n,
+        Some(n) if n < 0 => return Err(crate::error::value_error("Cannot convert negative int")),
         Some(_) => {
             return Err(crate::error::overflow_error(
-                "if_indextoname() argument out of range",
+                "Python int too large for C unsigned int",
             ))
+        }
+        None if matches!(arg, Some(Object::Long(big)) if big.sign() == num_bigint::Sign::Minus) => {
+            return Err(crate::error::value_error("Cannot convert negative int"))
         }
         None if matches!(arg, Some(Object::Long(_))) => {
             return Err(crate::error::overflow_error(
-                "if_indextoname() argument out of range",
+                "Python int too large for C unsigned int",
             ))
         }
-        None => return Err(type_error("if_indextoname() argument must be int")),
+        None => {
+            return Err(type_error(format!(
+                "'{}' object cannot be interpreted as an integer",
+                arg.map_or("NoneType", |o| o.type_name())
+            )))
+        }
     };
     let mut buf = [0u8; libc::IF_NAMESIZE];
     let r = unsafe { libc::if_indextoname(idx as libc::c_uint, buf.as_mut_ptr().cast()) };
@@ -3868,20 +3871,78 @@ fn mod_gethostname(_args: &[Object]) -> Result<Object, RuntimeError> {
 /// `gethostbyname(name)` → IPv4 dotted-quad. CPython's implementation
 /// resolves with `AF_INET` hints, so IPv6-only answers (`localhost` →
 /// `::1` first on macOS) must be filtered out, not returned.
+/// Forward-resolve `name` to its IPv4 addresses the way CPython's
+/// `setipaddr` does (`getaddrinfo(AF_INET)`), so a lookup failure is a
+/// `socket.gaierror` — `urllib.request._is_local_authority` catches
+/// exactly that to turn `file://not-a-local-host.com/...` into a
+/// `URLError` (`test_urllib2.HandlerTests.test_file`).
+#[cfg(unix)]
+fn resolve_ipv4(name: &str, who: &str) -> Result<Vec<String>, RuntimeError> {
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|_| value_error(format!("{who}: embedded null character")))?;
+    let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+    hints.ai_family = libc::AF_INET;
+    let mut res: *mut libc::addrinfo = std::ptr::null_mut();
+    let res_ptr = std::ptr::addr_of_mut!(res);
+    let name_ptr = c_name.as_ptr();
+    let rc = crate::gil::allow_threads_then(|| unsafe {
+        libc::getaddrinfo(name_ptr, std::ptr::null(), &raw const hints, res_ptr)
+    });
+    if rc != 0 {
+        let msg = unsafe {
+            let p = libc::gai_strerror(rc);
+            if p.is_null() {
+                "getaddrinfo failed".to_owned()
+            } else {
+                CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        };
+        return Err(gaierror(rc, msg));
+    }
+    let mut ips = Vec::new();
+    let mut cur = res;
+    while !cur.is_null() {
+        // SAFETY: rc == 0 guarantees a valid chain until `freeaddrinfo`.
+        let ai = unsafe { &*cur };
+        if ai.ai_family == libc::AF_INET && !ai.ai_addr.is_null() {
+            let sin = unsafe { &*ai.ai_addr.cast::<libc::sockaddr_in>() };
+            let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)).to_string();
+            if !ips.contains(&ip) {
+                ips.push(ip);
+            }
+        }
+        cur = ai.ai_next;
+    }
+    unsafe { libc::freeaddrinfo(res) };
+    Ok(ips)
+}
+
+#[cfg(not(unix))]
+fn resolve_ipv4(name: &str, _who: &str) -> Result<Vec<String>, RuntimeError> {
+    let addrs = (name, 0_u16)
+        .to_socket_addrs()
+        .map_err(|e| io_error_to_py(&e))?;
+    let mut ips = Vec::new();
+    for addr in addrs {
+        if let SocketAddr::V4(v4) = addr {
+            let ip = v4.ip().to_string();
+            if !ips.contains(&ip) {
+                ips.push(ip);
+            }
+        }
+    }
+    Ok(ips)
+}
+
 fn mod_gethostbyname(args: &[Object]) -> Result<Object, RuntimeError> {
     let name = match args.first() {
         Some(Object::Str(s)) => s.to_string(),
         _ => return Err(type_error("gethostbyname: arg must be str")),
     };
-    let addrs = (name.as_str(), 0_u16)
-        .to_socket_addrs()
-        .map_err(|e| io_error_to_py(&e))?;
-    for addr in addrs {
-        if let SocketAddr::V4(v4) = addr {
-            return Ok(Object::from_str(v4.ip().to_string()));
-        }
+    match resolve_ipv4(&name, "gethostbyname")?.into_iter().next() {
+        Some(ip) => Ok(Object::from_str(ip)),
+        None => Err(os_error("name resolution failed")),
     }
-    Err(os_error("name resolution failed"))
 }
 
 /// Optional `proto` argument shared by `getservbyname`/`getservbyport`
@@ -4057,21 +4118,10 @@ fn mod_gethostbyname_ex(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Str(s)) => s.to_string(),
         _ => return Err(type_error("gethostbyname_ex: arg must be str")),
     };
-    let addrs = (name.as_str(), 0_u16)
-        .to_socket_addrs()
-        .map_err(|e| io_error_to_py(&e))?;
-    let mut ips = Vec::new();
-    for sa in addrs {
-        if let SocketAddr::V4(v4) = sa {
-            let ip = Object::from_str(v4.ip().to_string());
-            if !ips
-                .iter()
-                .any(|existing: &Object| existing.repr() == ip.repr())
-            {
-                ips.push(ip);
-            }
-        }
-    }
+    let ips: Vec<Object> = resolve_ipv4(&name, "gethostbyname_ex")?
+        .into_iter()
+        .map(Object::from_str)
+        .collect();
     if ips.is_empty() {
         return Err(os_error("name resolution failed"));
     }
@@ -4920,18 +4970,29 @@ fn mod_inet_ntop(args: &[Object]) -> Result<Object, RuntimeError> {
 /// value must fit the C type exactly — negatives and larger ints raise
 /// OverflowError (testNtoH feeds `1<<34` to every one of the four).
 fn byteswap_arg(arg: Option<&Object>, bits: u32, name: &str) -> Result<u64, RuntimeError> {
+    // 3.14: `_PyLong_UnsignedShort_Converter` / `_PyLong_UnsignedInt_Converter`
+    // reject a negative value with ValueError and an out-of-range one with
+    // OverflowError (test_socket.testNtoHErrors).
     let n = match arg.and_then(Object::as_i64) {
         Some(n) => n,
+        None if matches!(arg, Some(Object::Long(b)) if b.sign() == num_bigint::Sign::Minus) => {
+            return Err(crate::error::value_error("value must be positive"))
+        }
         None if matches!(arg, Some(Object::Long(_))) => {
             return Err(crate::error::overflow_error(format!(
-                "{name}: Python int too large to convert to C unsigned"
+                "Python int too large for C unsigned {}",
+                if bits == 16 { "short" } else { "int" }
             )))
         }
         None => return Err(type_error(format!("{name}: arg must be int"))),
     };
-    if n < 0 || n >= 1i64 << bits {
+    if n < 0 {
+        return Err(crate::error::value_error("value must be positive"));
+    }
+    if n >= 1i64 << bits {
         return Err(crate::error::overflow_error(format!(
-            "{name}: Python int too large to convert to C unsigned"
+            "Python int too large for C unsigned {}",
+            if bits == 16 { "short" } else { "int" }
         )));
     }
     Ok(n as u64)

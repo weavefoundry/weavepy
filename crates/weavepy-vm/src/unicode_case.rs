@@ -2,7 +2,7 @@
 //!
 //! Mirrors CPython's `do_upper`/`do_lower`/`do_title`/`do_capitalize`/
 //! `do_swapcase`/`do_casefold` (Objects/unicodeobject.c) over the generated
-//! UCD 15.1.0 case tables, including the Final_Sigma rule and the full
+//! UCD 16.0.0 case tables, including the Final_Sigma rule and the full
 //! (multi-code-point) SpecialCasing expansions.
 
 use crate::stdlib::ucd;

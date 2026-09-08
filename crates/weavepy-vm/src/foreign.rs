@@ -180,6 +180,11 @@ pub struct ForeignHooks {
     /// the pending C exception. Backs ctypes' `py_object` restype
     /// (`pythonapi.PyBytes_FromFormat(...)` in `test_bytes.test_from_format`).
     pub steal_object: fn(usize) -> Result<Object, RuntimeError>,
+    /// Convert a *borrowed* `PyObject*` into a VM object without touching
+    /// its reference count — the ctypes `py_object` *callback argument*
+    /// direction (callbacks.c `getfunc` on a `PyObject*` the C caller
+    /// still owns). NULL raises `ValueError("PyObject is NULL")`.
+    pub borrow_object: fn(usize) -> Result<Object, RuntimeError>,
     /// Marshal a VM object to a *new owned* `PyObject*` reference — the
     /// ctypes `py_object` argument direction. Pair every call with a
     /// [`Self::release_object_ptr`] once the C call has returned.
@@ -208,6 +213,14 @@ pub struct ForeignHooks {
     /// `issubclass() arg 1 must be a class` from `handle_error(None, None,
     /// None)` (RFC 0072 WS2).
     pub handled_exception: fn() -> Option<Object>,
+    /// Take the C-API layer's *pending* exception (the `PyErr_Occurred`
+    /// slot), if any, as a VM error. ctypes consults this after every
+    /// `FUNCFLAG_PYTHONAPI` call (`PyDLL` / `ctypes.pythonapi`): CPython's
+    /// `_call_function_pointer` raises whatever the callee left pending
+    /// regardless of the return value, which is how a `-1` from
+    /// `PyUnicodeWriter_WriteChar(w, 0x110000)` reaches Python as the
+    /// `ValueError` it set (RFC 0077 WS12).
+    pub take_pending_error: fn() -> Option<RuntimeError>,
 }
 
 static HOOKS: OnceLock<ForeignHooks> = OnceLock::new();
@@ -253,6 +266,19 @@ pub fn wrap(ptr: usize, type_name: Rc<str>, tp_name: Rc<str>) -> Rc<PyForeignSou
 /// pending C exception.
 pub fn steal_object(ptr: usize) -> Result<Object, RuntimeError> {
     (hooks()?.steal_object)(ptr)
+}
+
+/// The pending C-API exception, if one is set, taken as a VM error (see
+/// [`ForeignHooks::take_pending_error`]). `None` when no cpyext bridge is
+/// installed or nothing is pending.
+pub fn take_pending_error() -> Option<RuntimeError> {
+    hooks().ok().and_then(|h| (h.take_pending_error)())
+}
+
+/// Convert a *borrowed* `PyObject*` (ctypes `py_object` callback argument)
+/// into a VM object; the reference stays with the C caller.
+pub fn borrow_object(ptr: usize) -> Result<Object, RuntimeError> {
+    (hooks()?.borrow_object)(ptr)
 }
 
 /// Mint a new owned `PyObject*` for `obj` (ctypes `py_object` argument).

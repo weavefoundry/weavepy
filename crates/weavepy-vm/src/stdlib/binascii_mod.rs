@@ -501,10 +501,10 @@ fn crc_hqx(args: &[Object]) -> Result<Object, RuntimeError> {
 /// "Trailing garbage".
 fn a2b_uu(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = input_bytes(args.first())?;
-    // An empty line decodes to empty output (the vendored `test_empty_string`
-    // feeds `a2b_uu(b'')` and asserts it does not raise).
+    // 3.14 (gh-129349): an empty input has no length byte and is an error
+    // (3.13 decoded it to `b''`).
     if data.is_empty() {
-        return Ok(Object::new_bytes(Vec::new()));
+        return Err(value_error("Missing length byte"));
     }
     let bin_len = i64::from(data[0].wrapping_sub(b' ') & 0o77);
     let rest = &data[1..];

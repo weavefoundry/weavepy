@@ -36,11 +36,18 @@ pickle(complex, pickle_complex, complex)
 
 
 def pickle_union(obj):
-    import functools, operator
-    return functools.reduce, (operator.or_, obj.__args__)
+    import typing, operator
+    return operator.getitem, (typing.Union, obj.__args__)
 
 
 pickle(type(int | str), pickle_union)
+
+
+def pickle_super(obj):
+    return super, (obj.__thisclass__, obj.__self__)
+
+
+pickle(super, pickle_super)
 
 
 def _reconstructor(cls, base, state):
@@ -213,6 +220,13 @@ def _reduce_newobj(obj, protocol):
                                 "not '%s'" % type(args).__name__)
         else:
             args = ()
+            # CPython's `object_getstate_default` with "required" state:
+            # a `property` carries C-level state (fget/fset/fdel/doc) but
+            # has no `__dict__`, slots, or `__getnewargs__`, so its
+            # basicsize check fails ("cannot pickle 'property' object";
+            # test_crossinterp lists it among the unpickleable wrappers).
+            if isinstance(obj, property):
+                raise TypeError(f"cannot pickle {cls.__name__!r} object")
         kwargs = {}
 
     if kwargs:

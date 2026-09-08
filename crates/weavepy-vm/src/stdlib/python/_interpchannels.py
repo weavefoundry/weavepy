@@ -1,4 +1,4 @@
-"""CPython 3.13's `_interpchannels` — cross-interpreter channels.
+"""CPython 3.14's `_interpchannels` — cross-interpreter channels.
 
 CPython implements this as the C extension
 `Modules/_interpchannelsmodule.c`. WeavePy's channel registry lives in
@@ -10,9 +10,14 @@ sending interpreter was destroyed. This frozen shim adapts the calling
 conventions (ChannelID objects, typed exceptions, keyword surfaces)
 onto those primitives.
 
-Graded consumers: test__interpchannels, and
-`test.support.interpreters.channels` (test_interpreters.test_channels,
-test_types SubinterpreterTests).
+Graded consumers: test__interpchannels, and `test.support.channels`
+(test_interpreters.test_channels, test_types SubinterpreterTests).
+
+3.14 added a per-channel / per-send `fallback` (`_PyXIDATA_XIDATA_ONLY`
+= 0 / `_PyXIDATA_FULL_FALLBACK` = 1) next to `unboundop`: a shareable
+object crosses as itself, anything else is pickled when the fallback
+allows it (`_weave_xidata`). The backend only ships shareable values,
+so a converted item rides as a tagged tuple that `recv` unwraps.
 """
 
 import _xxsubinterpreters as _channels_backend
@@ -193,11 +198,14 @@ class ChannelInfo:
                 f'closing={self.closing}, count={self.count})')
 
 
-def create(unboundop):
+def create(unboundop=-1, fallback=-1):
+    unboundop = _resolve_unboundop(unboundop, _UNBOUND_REPLACE)
+    fallback = _resolve_fallback(fallback, _FULL_FALLBACK)
     try:
         cid = _channels_backend.channel_create(unboundop)
     except (RuntimeError, ValueError) as exc:
         raise _map_error(exc) from None
+    _default_fallback[cid] = fallback
     return ChannelID(cid)
 
 
@@ -206,13 +214,15 @@ def destroy(cid):
         _channels_backend.channel_destroy(int(cid))
     except (RuntimeError, ValueError) as exc:
         raise _map_error(exc) from None
+    _default_fallback.pop(int(cid), None)
 
 
 def list_all():
     try:
         cids = _channels_backend.channel_list_all()
         return [(ChannelID(cid),
-                 (_channels_backend.channel_get_defaults(cid),))
+                 _channels_backend.channel_get_defaults(cid),
+                 _default_fallback.get(cid, _FULL_FALLBACK))
                 for cid in cids]
     except (RuntimeError, ValueError) as exc:
         raise _map_error(exc) from None
@@ -228,16 +238,51 @@ def list_interpreters(cid, *, send):
 
 _NO_DEFAULT = object()
 
+# Modules/_interpreters_common.h
+_UNBOUND_REMOVE = 1
+_UNBOUND_ERROR = 2
+_UNBOUND_REPLACE = 3
+_XIDATA_ONLY = 0
+_FULL_FALLBACK = 1
 
-def send(cid, obj, unboundop=None, *, timeout=None, blocking=True):
+
+def _resolve_unboundop(arg, default):
+    if arg is None or arg < 0:
+        return default
+    if arg in (_UNBOUND_REMOVE, _UNBOUND_ERROR, _UNBOUND_REPLACE):
+        return arg
+    raise ValueError(f'unsupported unboundop {arg}')
+
+
+def _resolve_fallback(arg, default):
+    if arg is None or arg < 0:
+        return default
+    if arg in (_XIDATA_ONLY, _FULL_FALLBACK):
+        return arg
+    raise ValueError(f'unsupported fallback {arg}')
+
+
+# Per-channel default fallback (the backend records only the default
+# unbound op; `create`'s fallback lives here, keyed by cid).
+_default_fallback = {}
+
+
+def send(cid, obj, unboundop=-1, fallback=-1, *, timeout=None,
+         blocking=True):
     if timeout is not None:
         if timeout < 0:
             raise ValueError('timeout value must be non-negative')
         if not blocking:
             raise ValueError('timeout is not supported for non-blocking sends')
+    cid = int(cid)
+    unboundop = _resolve_unboundop(unboundop, get_channel_defaults(cid)[0])
+    fallback = _resolve_fallback(
+        fallback, _default_fallback.get(cid, _FULL_FALLBACK))
+    import _weave_xidata
+    payload = _weave_xidata.get_xidata(obj, fallback)
     try:
         _channels_backend.channel_send(
-            int(cid), obj, unboundop, blocking, timeout)
+            cid, payload, unboundop, blocking, timeout)
     except (RuntimeError, ValueError) as exc:
         if 'not shareable' in str(exc):
             raise
@@ -245,23 +290,28 @@ def send(cid, obj, unboundop=None, *, timeout=None, blocking=True):
     return None if blocking else False
 
 
-def send_buffer(cid, obj, unboundop=None, *, timeout=None, blocking=True):
+def send_buffer(cid, obj, unboundop=-1, fallback=-1, *, timeout=None,
+                blocking=True):
     # CPython ships the *buffer* (mutations are visible on both
     # sides). Our interpreters share one object heap, so a memoryview
     # over the sender's object gives exactly that (gh-110246;
     # test__interpchannels test_send_buffer mutates both ways).
-    return send(cid, memoryview(obj), unboundop,
+    return send(cid, memoryview(obj), unboundop, fallback,
                 timeout=timeout, blocking=blocking)
 
 
 def recv(cid, default=_NO_DEFAULT):
     try:
         if default is _NO_DEFAULT:
-            return _channels_backend.channel_recv(int(cid))
+            obj, unboundop = _channels_backend.channel_recv(int(cid))
         else:
-            return _channels_backend.channel_recv(int(cid), default)
+            obj, unboundop = _channels_backend.channel_recv(int(cid), default)
     except (RuntimeError, ValueError) as exc:
         raise _map_error(exc) from None
+    if unboundop is None and obj is not default:
+        import _weave_xidata
+        obj = _weave_xidata.from_xidata(obj)
+    return (obj, unboundop)
 
 
 def close(cid, *, send=False, recv=False, force=False):
@@ -289,9 +339,10 @@ def get_info(cid):
 
 def get_channel_defaults(cid):
     try:
-        return _channels_backend.channel_get_defaults(int(cid))
+        unboundop = _channels_backend.channel_get_defaults(int(cid))
     except (RuntimeError, ValueError) as exc:
         raise _map_error(exc) from None
+    return (unboundop, _default_fallback.get(int(cid), _FULL_FALLBACK))
 
 
 def get_count(cid):

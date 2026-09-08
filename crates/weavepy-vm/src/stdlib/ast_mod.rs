@@ -128,7 +128,14 @@ pub fn parse(args: &[Object]) -> Result<Object, RuntimeError> {
             .map_err(|e| crate::parse_error_to_syntax_error(&e, &source, &filename))?;
         (m, Some(t))
     } else {
-        let m = weavepy_parser::parse_module(&source)
+        // Optional 5th arg: PEP 401 `CO_FUTURE_BARRY_AS_BDFL` carried in
+        // from `compile(..., PyCF_ONLY_AST | flags)`; `codeop.Compile`
+        // feeds recorded `__future__` flags back this way, so the REPL's
+        // `print("black" <> 'blue')` must parse (3.14 test_pyrepl
+        // test_future_barry_as_flufl).
+        let flufl = matches!(args.get(4), Some(Object::Bool(true)));
+        let m = weavepy_parser::parse_module_with_warnings_flags(&source, flufl)
+            .0
             .map_err(|e| crate::parse_error_to_syntax_error(&e, &source, &filename))?;
         (m, None)
     };
@@ -370,13 +377,15 @@ fn singleton(ty: &str) -> Object {
     node_noloc(ty, vec![])
 }
 
+/// An ASDL `identifier`: pegen's `_PyPegen_new_identifier` interns it,
+/// so `ast.parse('x').body[0].value.id is 'x'` (test_ast CopyTests).
 fn ident(s: &str) -> Object {
-    Object::from_str(s)
+    crate::stdlib::sys::intern_name(s)
 }
 
 fn opt_ident(s: Option<&str>) -> Object {
     match s {
-        Some(v) => Object::from_str(v),
+        Some(v) => ident(v),
         None => Object::None,
     }
 }
@@ -1235,10 +1244,7 @@ impl Builder<'_> {
             ),
             P::As { pattern, name } => node(
                 "MatchAs",
-                vec![
-                    ("pattern", self.pattern(pattern)),
-                    ("name", Object::from_str(name.clone())),
-                ],
+                vec![("pattern", self.pattern(pattern)), ("name", ident(name))],
                 sp,
                 self.lm,
             ),

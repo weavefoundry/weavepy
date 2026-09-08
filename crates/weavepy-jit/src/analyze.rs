@@ -22,6 +22,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use weavepy_compiler::{
     BinOpKind, CodeObject, CompareKind, Constant, OpCode, UnaryKind, BINARY_OP_INPLACE_FLAG,
+    COMPARE_OP_TO_BOOL_FLAG,
 };
 
 use crate::ir::{
@@ -326,6 +327,12 @@ struct Plan {
     /// the synthetic slot carrying the accumulator's element lane
     /// through the inference fixpoint.
     comp_acc: HashMap<usize, u32>,
+    /// CPython 3.14 folds a literal list of three or more constants
+    /// into `BUILD_LIST 0; LOAD_CONST (c0, ..); LIST_EXTEND 1`. The
+    /// `BUILD_LIST` pc → the tuple constant's index; the two trailing
+    /// instructions erase (`nop`) and the build arm reads the elements
+    /// straight from the constant pool.
+    const_list: HashMap<usize, u32>,
     /// RFC 0073 WS5 — recognized `CALL_KW` pcs → the names-tuple
     /// constant index. The preceding `LOAD_CONST` (the names tuple) is
     /// erased from the trace (`nop`); the call arm reads the names
@@ -1050,6 +1057,8 @@ fn plan_rewrite(
         match item.op {
             OpCode::PopJumpIfFalse
             | OpCode::PopJumpIfTrue
+            | OpCode::PopJumpIfNone
+            | OpCode::PopJumpIfNotNone
             | OpCode::JumpForward
             | OpCode::ForIter => {
                 targets.insert(forward_target(i, item.arg));
@@ -1107,7 +1116,7 @@ fn plan_rewrite(
             plan.nop.insert(i + 2);
             plan.nop.insert(i + 3);
             plan.nop.insert(exit);
-            if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopTop) {
+            if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopIter | OpCode::PopTop) {
                 plan.nop.insert(exit + 1);
             }
             plan.iter_headers
@@ -1175,7 +1184,7 @@ fn plan_rewrite(
             plan.nop.insert(exit);
             // The POP_TOP paired with END_FOR (CPython 3.13 loop-exit
             // shape) is equally dead in the compiled trace.
-            if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopTop) {
+            if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopIter | OpCode::PopTop) {
                 plan.nop.insert(exit + 1);
             }
             plan.calls.insert(i - 2, (pops, cur_slot, stop_slot));
@@ -1209,7 +1218,7 @@ fn plan_rewrite(
             plan.n_synth += 2;
             plan.get_iter.insert(i - 1, (seq_slot, idx_slot));
             plan.nop.insert(exit);
-            if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopTop) {
+            if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopIter | OpCode::PopTop) {
                 plan.nop.insert(exit + 1);
             }
             plan.iter_headers.insert(i, (seq_slot, idx_slot, var_slot));
@@ -1226,7 +1235,7 @@ fn plan_rewrite(
         // RFC 0073 WS1 — the PEP-709 inlined single-target listcomp:
         //   GET_ITER; LOAD_FAST_AND_CLEAR t; SWAP 2; BUILD_LIST 0;
         //   SWAP 2; FOR_ITER; STORE_FAST t; <body>; JUMP_BACKWARD;
-        //   END_FOR; POP_TOP; SWAP 2; STORE_FAST t; JUMP_FORWARD
+        //   END_FOR; POP_ITER; SWAP 2; STORE_FAST t; JUMP_FORWARD
         // The saved target and the iterator erase from the model
         // (deopt spans re-insert them); the accumulator stays a real
         // stack value across the loop. Set/dict comprehensions wait
@@ -1242,14 +1251,25 @@ fn plan_rewrite(
             && matches!(ins[i - 5].op, OpCode::GetIter)
             && ins[i - 4].arg == var_slot
         {
-            // Epilogue: END_FOR; POP_TOP; SWAP 2; STORE_FAST t.
+            // Epilogue: END_FOR; POP_ITER; SWAP 2; STORE_FAST t — or,
+            // when the comprehension's value is stored straight into a
+            // local, CPython 3.14's swap-folded `END_FOR; POP_ITER;
+            // STORE_FAST r; STORE_FAST t` (the flowgraph's static-swap
+            // pass rewrote `SWAP 2; STORE_FAST t; STORE_FAST r`). In the
+            // folded shape the accumulator store stays a real
+            // instruction; only the restore erases.
             if exit + 3 >= n
-                || !matches!(ins[exit + 1].op, OpCode::PopTop)
-                || !matches!(ins[exit + 2].op, OpCode::Swap)
-                || ins[exit + 2].arg != 2
+                || !matches!(ins[exit + 1].op, OpCode::PopIter | OpCode::PopTop)
                 || !matches!(ins[exit + 3].op, OpCode::StoreFast)
                 || ins[exit + 3].arg != var_slot
             {
+                return Err(bail());
+            }
+            let swapped_epilogue =
+                matches!(ins[exit + 2].op, OpCode::Swap) && ins[exit + 2].arg == 2;
+            let folded_epilogue =
+                matches!(ins[exit + 2].op, OpCode::StoreFast) && ins[exit + 2].arg != var_slot;
+            if !swapped_epilogue && !folded_epilogue {
                 return Err(bail());
             }
             // The header is the only allowed landing point inside the
@@ -1272,7 +1292,9 @@ fn plan_rewrite(
             plan.nop.insert(i - 1); // SWAP burying the accumulator
             plan.nop.insert(exit); // END_FOR
             plan.nop.insert(exit + 1); // POP_TOP
-            plan.nop.insert(exit + 2); // SWAP (epilogue)
+            if swapped_epilogue {
+                plan.nop.insert(exit + 2); // SWAP (epilogue)
+            }
             plan.nop.insert(exit + 3); // STORE_FAST (restores Unbound)
             plan.iter_headers.insert(i, (seq_slot, idx_slot, var_slot));
             plan.fused_store_iter.insert(i + 1, var_slot);
@@ -1405,6 +1427,34 @@ fn plan_rewrite(
         }
     }
 
+    // The folded constant-list literal (see `Plan::const_list`): the
+    // three instructions must be straight-line (no landing pc inside
+    // the erased tail) and every element a scalar constant the lanes
+    // represent; anything else leaves `LIST_EXTEND` to reject.
+    for i in 0..n {
+        if !matches!(ins[i].op, OpCode::BuildList)
+            || ins[i].arg != 0
+            || plan.comp_acc.contains_key(&i)
+            || i + 2 >= n
+            || !matches!(ins[i + 1].op, OpCode::LoadConst)
+            || !matches!(ins[i + 2].op, OpCode::ListExtend)
+            || ins[i + 2].arg != 1
+            || targets.contains(&(i + 1))
+            || targets.contains(&(i + 2))
+        {
+            continue;
+        }
+        let Some(Constant::Tuple(items)) = code.constants.get(ins[i + 1].arg as usize) else {
+            continue;
+        };
+        if items.is_empty() || !items.iter().all(|c| const_type(c).is_some()) {
+            continue;
+        }
+        plan.const_list.insert(i, ins[i + 1].arg);
+        plan.nop.insert(i + 1);
+        plan.nop.insert(i + 2);
+    }
+
     // Burnable globals: every LOAD_GLOBAL that is not a recognized range
     // callee must resolve to a scalar constant or a callable Python
     // function (RFC 0059 WS3), and needs an identity guard either way.
@@ -1521,7 +1571,7 @@ fn range_prefix(
     let args_start = i - 2 - k;
     for arg_ins in &ins[args_start..(i - 2)] {
         match arg_ins.op {
-            OpCode::LoadFast => {}
+            OpCode::LoadFast | OpCode::LoadSmallInt => {}
             OpCode::LoadConst
                 if matches!(
                     code.constants.get(arg_ins.arg as usize),
@@ -1536,12 +1586,15 @@ fn range_prefix(
     let mut step_nop = None;
     if k == 3 {
         let step_pc = i - 3;
-        if !matches!(ins[step_pc].op, OpCode::LoadConst)
-            || !matches!(
+        let step_is_one = match ins[step_pc].op {
+            OpCode::LoadSmallInt => ins[step_pc].arg == 1,
+            OpCode::LoadConst => matches!(
                 code.constants.get(ins[step_pc].arg as usize),
                 Some(Constant::Int(1))
-            )
-        {
+            ),
+            _ => false,
+        };
+        if !step_is_one {
             return None;
         }
         step_nop = Some(step_pc);
@@ -1691,7 +1744,10 @@ fn build_blocks(code: &CodeObject) -> Result<Vec<RawBlock>, JitVerdict> {
     leaders.insert(0);
     for (i, ins) in code.instructions.iter().enumerate() {
         match ins.op {
-            OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => {
+            OpCode::PopJumpIfFalse
+            | OpCode::PopJumpIfTrue
+            | OpCode::PopJumpIfNone
+            | OpCode::PopJumpIfNotNone => {
                 let t = forward_target(i, ins.arg);
                 if t > n {
                     return Err(JitVerdict::BadJumpTarget);
@@ -1777,7 +1833,10 @@ fn build_blocks(code: &CodeObject) -> Result<Vec<RawBlock>, JitVerdict> {
             OpCode::JumpBackward => {
                 vec![index_of[&backward_target(last, ins.arg).ok_or(JitVerdict::BadJumpTarget)?]]
             }
-            OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => {
+            OpCode::PopJumpIfFalse
+            | OpCode::PopJumpIfTrue
+            | OpCode::PopJumpIfNone
+            | OpCode::PopJumpIfNotNone => {
                 let t = index_of[&forward_target(last, ins.arg)];
                 let f = index_of
                     .get(&(last + 1))
@@ -2466,6 +2525,29 @@ fn resolve_kw_perm(
 }
 
 /// Map a representable [`Constant`] to its lane, or `None`.
+/// CPython 3.14 folds `x[a:b]` with constant bounds into `LOAD_CONST
+/// slice(a, b, None)` + `BINARY_OP NB_SUBSCR`. Returns the erased
+/// marker shape `(has_start, has_stop)` when the constant is such a
+/// unit-step slice with `int`/`None` bounds, plus the bounds
+/// themselves.
+fn const_slice_shape(c: &Constant) -> Option<(Option<i64>, Option<i64>)> {
+    let Constant::Slice(parts) = c else {
+        return None;
+    };
+    let (start, stop, step) = &**parts;
+    if !matches!(step, Constant::None) {
+        return None;
+    }
+    let bound = |b: &Constant| -> Option<Option<i64>> {
+        match b {
+            Constant::None => Some(None),
+            Constant::Int(v) => Some(Some(*v)),
+            _ => None,
+        }
+    };
+    Some((bound(start)?, bound(stop)?))
+}
+
 fn const_type(c: &Constant) -> Option<JitType> {
     match c {
         Constant::Int(_) => Some(JitType::Int),
@@ -2646,6 +2728,27 @@ fn infer_block(
             }
             if !c.ty.is_representable() && c.src.is_none() {
                 return Err(JitVerdict::TypeUnknown);
+            }
+            let out = boundary_stack(stack)?;
+            vec![(b.succs[0], out.clone()), (b.succs[1], out)]
+        }
+        // CPython 3.14's flowgraph fuses `LOAD_CONST None; IS_OP;
+        // POP_JUMP_IF_*` into `POP_JUMP_IF_[NOT_]NONE`: the same
+        // nullable object-lane fence as `IS_OP` (RFC 0070 WS1),
+        // consumed directly by the branch.
+        OpCode::PopJumpIfNone | OpCode::PopJumpIfNotNone => {
+            let c = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if !c.is_plain() {
+                return Err(escape_verdict(code, &[&c], "CALL (callee escapes)"));
+            }
+            match c.ty {
+                JitType::Obj => {}
+                JitType::Unknown => {
+                    if let Some(slot) = c.src {
+                        set_local(local_types, slot, JitType::Obj, changed)?;
+                    }
+                }
+                _ => return Err(JitVerdict::UnsupportedOpcode("IS_OP operand lane")),
             }
             let out = boundary_stack(stack)?;
             vec![(b.succs[0], out.clone()), (b.succs[1], out)]
@@ -2923,13 +3026,24 @@ fn step_abstract(
         return Ok(());
     }
     match ins.op {
-        OpCode::Nop | OpCode::Resume => {}
+        OpCode::Nop | OpCode::Resume | OpCode::NotTaken => {}
         // RFC 0076 WS6 — cell-array setup is a no-op in the VM (cells
         // are prebuilt at frame creation; `MAKE_CELL` is a bounds
         // check, `COPY_FREE_VARS` does nothing), so both admit as
         // nops. `LOAD_CLOSURE`/`MAKE_FUNCTION` still reject, so a
         // closure-*defining* body only compiles once its function
-        // construction does.
+        // construction does. A `MAKE_CELL` past the prologue is a
+        // PEP 709 comprehension minting a fresh cell (RFC 0077 WS9):
+        // that one does real work, so it rejects.
+        OpCode::MakeCell
+            if code.instructions[..i]
+                .iter()
+                .any(|x| x.op == OpCode::Resume) =>
+        {
+            return Err(JitVerdict::UnsupportedOpcode(
+                "MAKE_CELL (comprehension cell)",
+            ));
+        }
         OpCode::MakeCell | OpCode::CopyFreeVars => {}
         // RFC 0071 WS4 — a recognized list-loop `GET_ITER`: pop the
         // iterable (it must be, or probe as, a pinned list) into the
@@ -3175,8 +3289,22 @@ fn step_abstract(
                 });
                 return Ok(());
             }
+            // CPython 3.14's folded `slice(a, b, None)` constant: the
+            // same erased-slice marker `BUILD_SLICE` produces (RFC 0071
+            // WS4), consumable solely by the next `BINARY_SUBSCR`.
+            if let Some((start, stop)) = const_slice_shape(c) {
+                stack.push(SE {
+                    slice: Some((start.is_some(), stop.is_some())),
+                    ..SE::known(JitType::Unknown)
+                });
+                return Ok(());
+            }
             let ty = const_type(c).ok_or(JitVerdict::UnsupportedConst)?;
             stack.push(SE::known(ty));
+        }
+        // CPython 3.14 LOAD_SMALL_INT: the constant rides in the oparg.
+        OpCode::LoadSmallInt => {
+            stack.push(SE::known(JitType::Int));
         }
         OpCode::LoadFast => {
             // `src` is kept even for typed loads: RFC 0065 WS5 attribute
@@ -3793,7 +3921,7 @@ fn step_abstract(
             let ret = if mark.is_self { ret_lane } else { mark.ret };
             stack.push(SE::known(ret.unwrap_or(JitType::Unknown)));
         }
-        OpCode::PopTop => {
+        OpCode::PopTop | OpCode::PopIter => {
             // `break` inside a rewritten range loop pops the *iterator*,
             // which the rewrite never pushed — erase the pop. (When the
             // rewritten stack is empty inside a loop span, the
@@ -3812,7 +3940,10 @@ fn step_abstract(
             }
         }
         OpCode::CopyTop => {
-            let v = *stack.last().ok_or(JitVerdict::StackUnderflow)?;
+            // `COPY n` pushes the n-th entry from the top (CPython
+            // 3.14's chained comparison is `SWAP 2; COPY 2; COMPARE_OP`).
+            let depth = copy_depth(ins.arg, stack.len())?;
+            let v = stack[stack.len() - depth];
             if !v.is_plain() {
                 return Err(escape_verdict(code, &[&v], "CALL (callee escapes)"));
             }
@@ -3958,7 +4089,19 @@ fn step_abstract(
                 stack.push(SE::known(ty));
                 return Ok(());
             }
-            let k = ins.arg as usize;
+            let mut k = ins.arg as usize;
+            // The folded constant literal: its elements come from the
+            // constant pool, typed like any pushed constant.
+            if let Some(&cidx) = plan.const_list.get(&i) {
+                let Some(Constant::Tuple(items)) = code.constants.get(cidx as usize) else {
+                    return Err(JitVerdict::UnsupportedConst);
+                };
+                for c in items {
+                    let ty = const_type(c).ok_or(JitVerdict::UnsupportedConst)?;
+                    stack.push(SE::known(ty));
+                }
+                k = items.len();
+            }
             if k == 0 {
                 // RFC 0076 WS8 — the `[]` literal: an empty list on the
                 // object-element lane (`self.xs = []` prologues, list
@@ -4796,8 +4939,20 @@ fn bin_kind(arg: u32) -> Result<ArithKind, JitVerdict> {
     Ok(k)
 }
 
+/// The stack depth a `COPY n` reads (1 = TOS), checked against the
+/// modeled stack. The interpreter treats `COPY 0` like `COPY 1`.
+fn copy_depth(arg: u32, stack_len: usize) -> Result<usize, JitVerdict> {
+    let depth = (arg.max(1)) as usize;
+    if depth > stack_len {
+        return Err(JitVerdict::StackUnderflow);
+    }
+    Ok(depth)
+}
+
 fn cmp_kind(arg: u32) -> Result<CmpKind, JitVerdict> {
-    let k = match arg {
+    // Bit 4 asks for a `bool` result; the typed comparisons the JIT
+    // emits already produce one.
+    let k = match arg & !COMPARE_OP_TO_BOOL_FLAG {
         x if x == CompareKind::Lt as u32 => CmpKind::Lt,
         x if x == CompareKind::LtE as u32 => CmpKind::Le,
         x if x == CompareKind::Eq as u32 => CmpKind::Eq,
@@ -4859,6 +5014,10 @@ struct ESlot {
     /// RFC 0071 WS4 — an erased `BUILD_SLICE` result (see
     /// [`SE::slice`]).
     slice: Option<(bool, bool)>,
+    /// The slice marker came from CPython 3.14's folded `LOAD_CONST
+    /// slice(...)` rather than a `BUILD_SLICE`: the deopt spill at
+    /// the consumer carries no bounds (see [`TOp::ListSlice`]).
+    const_slice: bool,
     /// RFC 0073 WS3 — a pinned `str` receiver carrying a burned-in
     /// native method (see [`SE::str_method`]).
     str_method: Option<StrMethodMark>,
@@ -4878,6 +5037,7 @@ impl ESlot {
             null: None,
             none_const: false,
             slice: None,
+            const_slice: false,
             str_method: None,
         }
     }
@@ -5051,6 +5211,33 @@ fn emit_block(
                 }
             } else {
                 TTerm::BranchTrue {
+                    fallthrough: compact[&block_succ(b, 0)],
+                    target: compact[&block_succ(b, 1)],
+                }
+            }
+        }
+        // CPython 3.14's fused `POP_JUMP_IF_[NOT_]NONE`: the `IsNone`
+        // fence (RFC 0070 WS1) feeding the branch directly. The fence
+        // statement lands in this block; the terminator consumes its
+        // native `Bool`.
+        OpCode::PopJumpIfNone | OpCode::PopJumpIfNotNone => {
+            let c = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if !c.is_plain() || c.ty != JitType::Obj {
+                return Err(JitVerdict::UnsupportedOpcode("IS_OP operand lane"));
+            }
+            stmts.push(TStmt {
+                pc: last as u32,
+                op: TOp::IsNone { negate: false },
+            });
+            seed_entry(emit_entries, block_succ(b, 0), &stack);
+            seed_entry(emit_entries, block_succ(b, 1), &stack);
+            if matches!(ins.op, OpCode::PopJumpIfNone) {
+                TTerm::BranchTrue {
+                    fallthrough: compact[&block_succ(b, 0)],
+                    target: compact[&block_succ(b, 1)],
+                }
+            } else {
+                TTerm::BranchFalse {
                     fallthrough: compact[&block_succ(b, 0)],
                     target: compact[&block_succ(b, 1)],
                 }
@@ -5367,8 +5554,9 @@ fn emit_instr(
         return Ok(());
     }
     match ins.op {
-        OpCode::Nop | OpCode::Resume => {}
-        // RFC 0076 WS6 — no-op cell-array setup (see inference pass).
+        OpCode::Nop | OpCode::Resume | OpCode::NotTaken => {}
+        // RFC 0076 WS6 — no-op cell-array setup (see inference pass,
+        // which already rejected a post-prologue `MAKE_CELL`).
         OpCode::MakeCell | OpCode::CopyFreeVars => {}
         // RFC 0071 WS4 — a recognized list-loop `GET_ITER`: capture
         // the pinned list into the seq synthetic slot and zero the
@@ -5503,6 +5691,25 @@ fn emit_instr(
                 });
                 return Ok(());
             }
+            // CPython 3.14's folded `slice(a, b, None)`: the present
+            // bounds take native slots below the marker (start-then-
+            // stop, what the `ListSlice`/`StrSlice` lowering pops),
+            // exactly as the erased `BUILD_SLICE` leaves them.
+            if let Some((start, stop)) = const_slice_shape(c) {
+                if let Some(v) = start {
+                    push(TOp::PushConstInt(v), Some(JitType::Int), stack, stmts);
+                }
+                if let Some(v) = stop {
+                    push(TOp::PushConstInt(v), Some(JitType::Int), stack, stmts);
+                }
+                stack.push(ESlot {
+                    slice: Some((start.is_some(), stop.is_some())),
+                    const_slice: true,
+                    ..ESlot::val(JitType::Unknown)
+                });
+                *max_stack = (*max_stack).max(stack.len() as u32);
+                return Ok(());
+            }
             let (op, ty) = match c {
                 Constant::Int(v) => (TOp::PushConstInt(*v), JitType::Int),
                 Constant::Bool(v) => (TOp::PushConstBool(*v), JitType::Bool),
@@ -5514,6 +5721,14 @@ fn emit_instr(
                 _ => return Err(JitVerdict::UnsupportedConst),
             };
             push(op, Some(ty), stack, stmts);
+        }
+        OpCode::LoadSmallInt => {
+            push(
+                TOp::PushConstInt(i64::from(ins.arg)),
+                Some(JitType::Int),
+                stack,
+                stmts,
+            );
         }
         OpCode::LoadFast => {
             let ty = local_types
@@ -6633,7 +6848,7 @@ fn emit_instr(
                 stmts,
             );
         }
-        OpCode::PopTop => {
+        OpCode::PopTop | OpCode::PopIter => {
             // RFC 0065 WS5 — `append`'s poison result never existed on
             // the native stack; consume it silently.
             if stack.last().is_some_and(|s| s.poison) {
@@ -6656,14 +6871,20 @@ fn emit_instr(
             push(TOp::PushNone, Some(JitType::Obj), stack, stmts);
         }
         OpCode::CopyTop => {
-            let t = *stack.last().ok_or(JitVerdict::StackUnderflow)?;
+            let depth = copy_depth(ins.arg, stack.len())?;
+            let t = stack[stack.len() - depth];
             if !t.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             // Manual push: the copy keeps the slot provenance so an
             // augmented attribute assignment (`p.a += 1`, which dups
             // the receiver) still knows its receiver slot.
-            stmts.push(TStmt { pc, op: TOp::Dup });
+            stmts.push(TStmt {
+                pc,
+                op: TOp::Dup {
+                    depth: depth as u32,
+                },
+            });
             stack.push(t);
             *max_stack = (*max_stack).max(stack.len() as u32);
         }
@@ -6700,6 +6921,7 @@ fn emit_instr(
                         elem,
                         none_fill: false,
                         mixed: false,
+                        konst: false,
                     },
                     Some(list),
                     stack,
@@ -6707,7 +6929,27 @@ fn emit_instr(
                 );
                 return Ok(());
             }
-            let k = ins.arg as usize;
+            let mut k = ins.arg as usize;
+            // The folded constant literal (see `Plan::const_list`): push
+            // the elements as constants, then build as `BUILD_LIST k`;
+            // the deopt re-executes `BUILD_LIST 0`, so the spill must
+            // not carry them (`konst`).
+            let konst = plan.const_list.contains_key(&i);
+            if let Some(&cidx) = plan.const_list.get(&i) {
+                let Some(Constant::Tuple(items)) = code.constants.get(cidx as usize) else {
+                    return Err(JitVerdict::UnsupportedConst);
+                };
+                for c in items {
+                    let (op, ty) = match c {
+                        Constant::Int(v) => (TOp::PushConstInt(*v), JitType::Int),
+                        Constant::Bool(v) => (TOp::PushConstBool(*v), JitType::Bool),
+                        Constant::Float(v) => (TOp::PushConstFloat(v.to_bits()), JitType::Float),
+                        _ => return Err(JitVerdict::UnsupportedConst),
+                    };
+                    push(op, Some(ty), stack, stmts);
+                }
+                k = items.len();
+            }
             if k == 0 {
                 // RFC 0076 WS8 — the `[]` literal (see inference).
                 push(
@@ -6716,6 +6958,7 @@ fn emit_instr(
                         elem: JitType::Obj,
                         none_fill: false,
                         mixed: false,
+                        konst: false,
                     },
                     Some(JitType::ListObj),
                     stack,
@@ -6772,6 +7015,7 @@ fn emit_instr(
                     elem,
                     none_fill,
                     mixed,
+                    konst,
                 },
                 Some(list),
                 stack,
@@ -6975,9 +7219,15 @@ fn emit_instr(
             // immediately preceding instruction).
             if let Some(&marker) = stack.last() {
                 if let Some((has_start, has_stop)) = marker.slice {
-                    if i == 0 || !matches!(code.instructions[i - 1].op, OpCode::BuildSlice) {
+                    let producer = if marker.const_slice {
+                        OpCode::LoadConst
+                    } else {
+                        OpCode::BuildSlice
+                    };
+                    if i == 0 || code.instructions[i - 1].op != producer {
                         return Err(JitVerdict::UnsupportedOpcode("slice (non-adjacent)"));
                     }
+                    let konst = marker.const_slice;
                     stack.pop();
                     if has_stop {
                         pop_val(stack)?;
@@ -6995,6 +7245,7 @@ fn emit_instr(
                             op: TOp::StrSlice {
                                 start: has_start,
                                 stop: has_stop,
+                                konst,
                             },
                         });
                         stack.push(ESlot::val(JitType::Str));
@@ -7009,6 +7260,7 @@ fn emit_instr(
                         op: TOp::ListSlice {
                             start: has_start,
                             stop: has_stop,
+                            konst,
                         },
                     });
                     stack.push(ESlot::val(cont));

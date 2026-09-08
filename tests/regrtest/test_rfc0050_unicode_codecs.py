@@ -1,7 +1,7 @@
 """RFC 0050 WS6 — Unicode/codec machinery invariants.
 
 Pins the WS2–WS5 surface in-process (no CPython checkout needed):
-the error-handler callback protocol, UCD 15.1.0 name/lookup/property
+the error-handler callback protocol, UCD 16.0.0 name/lookup/property
 spot checks, CPython-parity str case mappings and predicates, and the
 CJK codec round-trip semantics the frozen `_codec_cjk_*` engines
 implement.
@@ -50,11 +50,11 @@ else:
     raise AssertionError("strict utf-8 decode of 0xff must raise")
 
 # ---------------------------------------------------------------------------
-# unicodedata: UCD 15.1.0 with aliases, named sequences, and algorithmic
+# unicodedata: UCD 16.0.0 (CPython 3.14; RFC 0077) with aliases, named sequences, and algorithmic
 # names (WS4).
 # ---------------------------------------------------------------------------
 
-assert unicodedata.unidata_version == "15.1.0", unicodedata.unidata_version
+assert unicodedata.unidata_version == "16.0.0", unicodedata.unidata_version
 assert unicodedata.name("\u20ac") == "EURO SIGN"
 assert unicodedata.lookup("EURO SIGN") == "\u20ac"
 # Alias (NameAliases.txt) and a lookup-only algorithmic range (Tangut).

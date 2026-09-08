@@ -21,22 +21,75 @@ use crate::ast::{
 };
 use crate::error::ParseError;
 
-pub(crate) fn parse(source: &str, tokens: Vec<Token>) -> Result<Module, ParseError> {
-    parse_with_flufl(source, tokens, false)
-}
-
-/// [`parse`] with PEP 401 `barry_as_FLUFL` pre-activated (the
-/// `CO_FUTURE_BARRY_AS_BDFL` compile flag). The parser also flips the
-/// flag itself when it sees `from __future__ import barry_as_FLUFL`.
-pub(crate) fn parse_with_flufl(
+/// Parse a module with PEP 401 `barry_as_FLUFL` optionally pre-activated
+/// (the `CO_FUTURE_BARRY_AS_BDFL` compile flag; the parser also flips
+/// the flag itself on `from __future__ import barry_as_FLUFL`).
+///
+/// Also reports pegen's `last_stmt_location`: the `(lineno, col_offset)`
+/// of the last statement parsed before the error (or the end of input),
+/// `(0, 0)` when none was.
+pub(crate) fn parse_with_flufl_tracking(
     source: &str,
     tokens: Vec<Token>,
     flufl: bool,
-) -> Result<Module, ParseError> {
+) -> (Result<Module, ParseError>, crate::ParseMeta) {
     let mut p = Parser::new(source, tokens);
     p.flufl = flufl;
-    let module = p.parse_module()?;
-    Ok(module)
+    let module = p.parse_module();
+    let module = p.apply_poison(module);
+    let meta = p.meta(module.is_err());
+    (module, meta)
+}
+
+/// [`parse_eval_with_flufl`] that also reports where the parser stopped
+/// (see [`crate::ParseMeta`]).
+pub(crate) fn parse_eval_tracking(
+    source: &str,
+    tokens: Vec<Token>,
+    flufl: bool,
+) -> (Result<Module, ParseError>, crate::ParseMeta) {
+    let mut p = Parser::new(source, tokens);
+    p.flufl = flufl;
+    let module = p.parse_eval_module();
+    let module = p.apply_poison(module);
+    let meta = p.meta(module.is_err());
+    (module, meta)
+}
+
+/// Describe a token for [`crate::ParseMeta`].
+pub(crate) fn stop_token(t: &Token) -> crate::StopToken {
+    crate::StopToken {
+        kind: match t.kind {
+            TokenKind::Newline => crate::StopKind::Newline,
+            TokenKind::Dedent => crate::StopKind::Dedent,
+            TokenKind::Endmarker => crate::StopKind::Endmarker,
+            _ => crate::StopKind::Other,
+        },
+        start: t.span.start.0,
+        end: t.span.end.0,
+        expr_start: matches!(
+            t.kind,
+            TokenKind::Name
+                | TokenKind::Number
+                | TokenKind::String
+                | TokenKind::LPar
+                | TokenKind::LSqb
+                | TokenKind::LBrace
+                | TokenKind::Minus
+                | TokenKind::Plus
+                | TokenKind::Tilde
+                | TokenKind::Star
+                | TokenKind::Ellipsis
+                | TokenKind::Keyword(
+                    Keyword::Not
+                        | Keyword::Lambda
+                        | Keyword::Await
+                        | Keyword::None
+                        | Keyword::True
+                        | Keyword::False
+                )
+        ),
+    }
 }
 
 /// Parse with CPython's `eval` start rule: `expressions NEWLINE* ENDMARKER`.
@@ -141,6 +194,36 @@ struct Parser<'src> {
     /// `None` on the default path, where `# type:` comments stay plain
     /// comments.
     type_comments: Option<TypeCommentState>,
+    /// `(lineno, col_offset)` of the most recent successfully parsed
+    /// statement (pegen's `last_stmt_location`); see
+    /// [`Parser::parse_statement`].
+    last_stmt: Option<(u32, u32)>,
+    /// Index of the token the grammar first rejected, recorded by the
+    /// range-anchored diagnostics that go on to consume more tokens
+    /// before raising (pegen's first pass stops there; see
+    /// [`Parser::meta`]).
+    first_fail: Option<usize>,
+    /// Index of the token where the innermost pegen `expression` rule
+    /// began ([`Parser::parse_ternary`]); rules keyed on a token *at*
+    /// an expression start (the 3.14 `invalid_expression` STRING
+    /// alternative) test against it.
+    expr_entry: usize,
+    /// Index of the token where pegen would attempt `star_targets`
+    /// (statement start, and after each `=` of an assignment); the
+    /// target grammar runs with `invalid_*` rules on before any
+    /// `expression` there gets a chance to poison the memo.
+    target_entry: usize,
+    /// Index of the token where a `STRING expression+ STRING` probe
+    /// failed ([`Parser::check_string_expr_string`]); a later failure of
+    /// the ordinary grammar at that same token is reported as pegen
+    /// would with its memo poisoned (see [`Parser::apply_poison`]).
+    poison: Option<usize>,
+    /// Set once [`Parser::apply_poison`] downgraded the error: pegen's
+    /// error pass fetched no token past the stop token in that case.
+    poisoned: bool,
+    /// Furthest token index a diagnostic's lookahead fetched beyond the
+    /// failure point (see [`Parser::meta`]).
+    peeked: Option<usize>,
 }
 
 /// Collected `# type:` comments (CPython's TYPE_COMMENT / TYPE_IGNORE
@@ -244,6 +327,13 @@ impl<'src> Parser<'src> {
             lambda_body: false,
             walrus_value: false,
             type_comments: tc,
+            last_stmt: None,
+            first_fail: None,
+            expr_entry: usize::MAX,
+            target_entry: usize::MAX,
+            poison: None,
+            poisoned: false,
+            peeked: None,
         }
     }
 
@@ -277,6 +367,76 @@ impl<'src> Parser<'src> {
 
     fn peek_token(&self) -> &Token {
         &self.tokens[self.pos]
+    }
+
+    /// Post-parse metadata: pegen's `last_stmt_location` plus, after a
+    /// failure, the token the parser was looking at when it gave up
+    /// (errors propagate with `?` without rewinding, so `self.pos` is
+    /// the offending token in practice).
+    /// Finish a parse: when the ordinary grammar failed at the very
+    /// token a `STRING expression+ STRING` probe had already failed on,
+    /// pegen's memo holds that failure with the `invalid_*` rules
+    /// switched off, and the specific diagnostic never fires; what's
+    /// left is the generic "invalid syntax" at the first pass's last
+    /// token.
+    fn apply_poison(&mut self, result: Result<Module, ParseError>) -> Result<Module, ParseError> {
+        let Err(err) = result else { return result };
+        let Some(fail) = self.poison else {
+            return Err(err);
+        };
+        let stop = self.first_fail.unwrap_or(self.pos);
+        if stop != fail || !matches!(err, ParseError::Unexpected { .. }) {
+            return Err(err);
+        }
+        self.poisoned = true;
+        self.first_fail = Some(fail);
+        let span = self.tokens[fail.min(self.tokens.len() - 1)].span;
+        Err(ParseError::Unexpected {
+            span,
+            message: "invalid syntax".to_owned(),
+        })
+    }
+
+    fn meta(&self, failed: bool) -> crate::ParseMeta {
+        let (stop, furthest) = if failed {
+            let pos = self.first_fail.unwrap_or(self.pos);
+            // pegen's error pass re-parses a rejected token that can
+            // start an expression as one (`invalid_expression`,
+            // `invalid_class_argument_pattern`, ...), fetching the token
+            // after it — and, through a `','.x+` loop, each further
+            // comma-separated element's follower.
+            let mut i = pos;
+            let starts_expr =
+                |i: usize| self.tokens.get(i).is_some_and(|t| stop_token(t).expr_start);
+            // A memo-poisoned failure ran no `invalid_*` rule that would
+            // have looked past the stop token.
+            if !self.poisoned && starts_expr(i) {
+                i += 1;
+                while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Comma)) {
+                    // The loop fetches the comma's follower to see
+                    // whether another element starts there.
+                    i += 1;
+                    if !starts_expr(i) {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            if let (Some(peeked), false) = (self.peeked, self.poisoned) {
+                i = i.max(peeked);
+            }
+            (
+                self.tokens.get(pos).map(stop_token),
+                self.tokens.get(i).map(stop_token),
+            )
+        } else {
+            (None, None)
+        };
+        crate::ParseMeta {
+            last_stmt: self.last_stmt.unwrap_or((0, 0)),
+            stop,
+            furthest,
+        }
     }
 
     fn peek_at(&self, k: usize) -> Option<&TokenKind> {
@@ -317,11 +477,16 @@ impl<'src> Parser<'src> {
             // simply stopped short (NEWLINE / EOF): `try` ⏎ says
             // "expected ':'". Anywhere else the generic parse failure is
             // a bare "invalid syntax" pointing at the offending token.
-            let message = if matches!(self.peek(), TokenKind::Newline | TokenKind::Endmarker) {
-                format!("expected {}", what.replace('`', "'"))
-            } else {
-                "invalid syntax".to_owned()
-            };
+            // Only the punctuation pegen has dedicated `invalid_*` rules
+            // for is named (`expected ':'`, `expected '('`); a missing
+            // NAME or other token is the bare generic error.
+            let named = matches!(what, "`:`" | "`(`" | "'('");
+            let message =
+                if named && matches!(self.peek(), TokenKind::Newline | TokenKind::Endmarker) {
+                    format!("expected {}", what.replace('`', "'"))
+                } else {
+                    "invalid syntax".to_owned()
+                };
             Err(ParseError::Unexpected {
                 span: self.peek_token().span,
                 message,
@@ -419,6 +584,46 @@ impl<'src> Parser<'src> {
         }
     }
 
+    /// pegen's 3.14 `'as' target` diagnostics (`invalid_dotted_as_name`,
+    /// `invalid_import_from_as_name`, `invalid_except_stmt`,
+    /// `invalid_as_pattern`): when the token after `as` doesn't start a
+    /// plain NAME target, the grammar re-parses the target as a full
+    /// `expression` and names its kind ("cannot use attribute as import
+    /// target"). Returns `Ok(())` when nothing specific applies, leaving
+    /// the caller's ordinary NAME handling to report the generic error.
+    ///
+    /// `name_ok(next)` says whether a *bare* NAME target followed by
+    /// `next` is fine for the enclosing rule; `require_next` gates the
+    /// diagnostic on the token after the expression (the except rule
+    /// needs the `:`). The position is left untouched.
+    fn as_target_diagnostic(
+        &mut self,
+        require_next: Option<&TokenKind>,
+        name_ok: impl Fn(&TokenKind) -> bool,
+        message: impl Fn(&str) -> String,
+    ) -> Result<(), ParseError> {
+        let save = self.pos;
+        let bare_name_token = matches!(self.peek(), TokenKind::Name);
+        let parsed = self.parse_expression(false);
+        let next = self.peek().clone();
+        self.pos = save;
+        let Ok(target) = parsed else {
+            return Ok(());
+        };
+        if bare_name_token && matches!(target.kind, ExprKind::Name(_)) && name_ok(&next) {
+            return Ok(());
+        }
+        if let Some(req) = require_next {
+            if next != *req {
+                return Ok(());
+            }
+        }
+        Err(ParseError::Unexpected {
+            span: target.span,
+            message: message(crate::ast::expr_name(&target)),
+        })
+    }
+
     /// Expect the `:` between a dict key and value. A `=` here gets
     /// CPython's "cannot assign to X here. Maybe you meant '==' instead
     /// of '='?", anchored at the key.
@@ -470,6 +675,7 @@ impl<'src> Parser<'src> {
                 let start = prev.span;
                 // Parse (and discard) the stray expression to find its
                 // extent; any nested parse error wins.
+                self.first_fail.get_or_insert(self.pos);
                 let stray = self.parse_ternary()?;
                 return Err(ParseError::Unexpected {
                     span: start.merge(stray.span),
@@ -485,6 +691,31 @@ impl<'src> Parser<'src> {
         while matches!(self.peek(), TokenKind::Nl | TokenKind::Comment) {
             self.pos += 1;
         }
+    }
+
+    /// The end of a compound statement's block, as pegen's `EXTRA` sees
+    /// it: the last non-whitespace token consumed. That is the final
+    /// statement's last token, except when the suite ended with a
+    /// trailing `;` (`def f(): x = 1;`), which the enclosing statement's
+    /// span includes even though the simple statement's does not.
+    fn block_end(&self, last_stmt: weavepy_lexer::Span) -> weavepy_lexer::Span {
+        let mut i = self.pos;
+        while i > 0 {
+            i -= 1;
+            match self.tokens[i].kind {
+                TokenKind::Newline
+                | TokenKind::Nl
+                | TokenKind::Comment
+                | TokenKind::Indent
+                | TokenKind::Dedent
+                | TokenKind::Endmarker => continue,
+                TokenKind::Semi if self.tokens[i].span.end.0 > last_stmt.end.0 => {
+                    return last_stmt.merge(self.tokens[i].span);
+                }
+                _ => break,
+            }
+        }
+        last_stmt
     }
 
     fn skip_trivia_and_newlines(&mut self) {
@@ -521,8 +752,8 @@ impl<'src> Parser<'src> {
                 message: "unexpected indent".to_owned(),
             });
         }
+        let start_span = self.peek_token().span;
         let first = self.parse_eval_element()?;
-        let start_span = first.span;
         let expr = if self.check(&TokenKind::Comma) {
             let mut items = vec![first];
             while self.eat(&TokenKind::Comma) {
@@ -531,7 +762,9 @@ impl<'src> Parser<'src> {
                 }
                 items.push(self.parse_eval_element()?);
             }
-            let end_span = items.last().expect("nonempty").span;
+            // `expressions` ends at the last consumed token (a closing
+            // paren or trailing comma included), like the other tuples.
+            let end_span = self.prev_token_span();
             Expr {
                 kind: ExprKind::Tuple(items),
                 span: start_span.merge(end_span),
@@ -640,7 +873,41 @@ impl<'src> Parser<'src> {
         Ok((argtypes, returns))
     }
 
+    /// pegen's `statement` rule: parse one statement and register it as
+    /// the most recent successfully parsed statement
+    /// (`_PyPegen_register_stmts`), which the 3.14 parser publishes
+    /// through `SyntaxError._metadata` for `traceback`'s keyword-typo
+    /// suggestions. Like CPython, an earlier-line statement finishing
+    /// later (an enclosing compound statement) doesn't move it backwards.
     fn parse_statement(&mut self) -> Result<Stmt, ParseError> {
+        let stmt = self.parse_statement_inner()?;
+        // Only `compound_stmt` alternatives go through `register_stmts`.
+        let compound = matches!(
+            stmt.kind,
+            StmtKind::FunctionDef { .. }
+                | StmtKind::AsyncFunctionDef { .. }
+                | StmtKind::ClassDef { .. }
+                | StmtKind::If { .. }
+                | StmtKind::While { .. }
+                | StmtKind::For { .. }
+                | StmtKind::AsyncFor { .. }
+                | StmtKind::With { .. }
+                | StmtKind::AsyncWith { .. }
+                | StmtKind::Try { .. }
+                | StmtKind::Match { .. }
+        );
+        let line = self.line_of(stmt.span);
+        if compound && self.last_stmt.is_none_or(|(l, _)| l <= line) {
+            let start = stmt.span.start.0 as usize;
+            let line_start = self.source[..start].rfind('\n').map_or(0, |i| i + 1);
+            // AST `col_offset` is a UTF-8 byte offset.
+            let col = (start - line_start) as u32;
+            self.last_stmt = Some((line, col));
+        }
+        Ok(stmt)
+    }
+
+    fn parse_statement_inner(&mut self) -> Result<Stmt, ParseError> {
         self.skip_trivia();
         // An INDENT token where a statement should start means the line
         // is indented deeper than its block — CPython's tokenizer
@@ -766,10 +1033,7 @@ impl<'src> Parser<'src> {
     }
 
     /// Parse a PEP 695 type-alias statement into the first-class
-    /// [`StmtKind::TypeAlias`] node. The compiler lowers it to the
-    /// lazy `__weavepy_type_alias__` assignment via
-    /// [`lower_type_alias_stmt`] just before compilation, so
-    /// `ast.parse` and `symtable` observe the real node.
+    /// [`StmtKind::TypeAlias`] node.
     fn parse_type_alias_stmt(&mut self) -> Result<Stmt, ParseError> {
         let type_tok = self.bump(); // `type`
         let name_tok = self.expect(&TokenKind::Name, "type alias name")?;
@@ -1044,12 +1308,59 @@ impl<'src> Parser<'src> {
     }
 
     fn simple_keyword_stmt(&mut self, kind: StmtKind) -> Result<Stmt, ParseError> {
+        self.check_stmt_as_ifexp_body()?;
         let tok = self.bump();
         self.consume_stmt_end()?;
         Ok(Stmt {
             kind,
             span: tok.span,
         })
+    }
+
+    /// `'else' ':' block` for `if`/`while`/`for`, plus pegen
+    /// `invalid_else_stmt` (3.14): an `elif` right after the else block
+    /// is "'elif' block follows an 'else' block" (anchored at the `elif`).
+    fn parse_else_block(&mut self) -> Result<Vec<Stmt>, ParseError> {
+        let else_tok = self.bump();
+        self.expect(&TokenKind::Colon, "`:`")?;
+        let block = self.parse_block("'else' statement", else_tok.span)?;
+        let save = self.pos;
+        self.skip_trivia_and_newlines();
+        if self.at_keyword(Keyword::Elif) {
+            return Err(ParseError::Unexpected {
+                span: self.peek_token().span,
+                message: "'elif' block follows an 'else' block".to_owned(),
+            });
+        }
+        self.pos = save;
+        Ok(block)
+    }
+
+    /// pegen `invalid_expression` (3.14): `(pass_stmt | break_stmt |
+    /// continue_stmt) 'if' disjunction 'else' simple_stmt` — a statement
+    /// keyword used as a conditional expression's body is "expected
+    /// expression before 'if', but statement is given", anchored at the
+    /// keyword. Position is left untouched when the shape doesn't match.
+    fn check_stmt_as_ifexp_body(&mut self) -> Result<(), ParseError> {
+        if !matches!(
+            self.peek(),
+            TokenKind::Keyword(Keyword::Pass | Keyword::Break | Keyword::Continue)
+        ) || !matches!(self.peek_at(1), Some(TokenKind::Keyword(Keyword::If)))
+        {
+            return Ok(());
+        }
+        let save = self.pos;
+        let kw_span = self.peek_token().span;
+        self.pos += 2; // keyword, `if`
+        let matched = self.parse_or().is_ok() && self.at_keyword(Keyword::Else);
+        self.pos = save;
+        if matched {
+            return Err(ParseError::Unexpected {
+                span: kw_span,
+                message: "expected expression before 'if', but statement is given".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Claim the first unclaimed type comment whose start offset lies in
@@ -1232,6 +1543,7 @@ impl<'src> Parser<'src> {
 
         // Try to parse an expression first; assignment / aug-assignment
         // / ann-assignment are disambiguated by lookahead.
+        self.target_entry = self.pos;
         let first = self.parse_expression(true)?;
 
         // Augmented assignment.
@@ -1323,6 +1635,7 @@ impl<'src> Parser<'src> {
                 }
                 // Peek-parse the right-hand side as expression list;
                 // re-classify if another `=` follows.
+                self.target_entry = self.pos;
                 let next = self.parse_assign_rhs()?;
                 if self.check(&TokenKind::Equal) {
                     targets.push(next);
@@ -1459,7 +1772,7 @@ impl<'src> Parser<'src> {
         }
         let def_tc = colon_tc.or(body_tc);
         let body = self.parse_block("function definition", def_tok.span)?;
-        let span_end = body.last().map_or(def_tok.span, |s| s.span);
+        let span_end = body.last().map_or(def_tok.span, |s| self.block_end(s.span));
         let span = def_tok.span.merge(span_end);
         if let Some(text) = def_tc {
             self.record_stmt_type_comment(span.start.0, text);
@@ -1608,7 +1921,9 @@ impl<'src> Parser<'src> {
         }
         self.expect(&TokenKind::Colon, "`:`")?;
         let body = self.parse_block("class definition", class_tok.span)?;
-        let span_end = body.last().map_or(class_tok.span, |s| s.span);
+        let span_end = body
+            .last()
+            .map_or(class_tok.span, |s| self.block_end(s.span));
         let span = class_tok.span.merge(span_end);
         Ok(Stmt {
             kind: StmtKind::ClassDef {
@@ -1667,6 +1982,7 @@ impl<'src> Parser<'src> {
                         message: "expected ':'".to_owned(),
                     });
                 }
+                let first_tok_span = self.peek_token().span;
                 let t = self.parse_expression(false)?;
                 // `except A, B:` — pegen `invalid_except_stmt` on 3.13;
                 // under `-X lang=next` (PEP 758, 3.14) an unparenthesized
@@ -1696,11 +2012,7 @@ impl<'src> Parser<'src> {
                                     .to_owned(),
                         });
                     }
-                    let tup_span = elts
-                        .first()
-                        .map(|e| e.span)
-                        .unwrap_or(kw_span)
-                        .merge(elts.last().map(|e| e.span).unwrap_or(kw_span));
+                    let tup_span = first_tok_span.merge(self.prev_token_span());
                     Expr {
                         kind: ExprKind::Tuple(elts),
                         span: tup_span,
@@ -1710,6 +2022,12 @@ impl<'src> Parser<'src> {
                 };
                 let n = if self.at_keyword(Keyword::As) {
                     self.bump();
+                    let stmt = if is_star { "except*" } else { "except" };
+                    self.as_target_diagnostic(
+                        Some(&TokenKind::Colon),
+                        |next| *next == TokenKind::Colon,
+                        |name| format!("cannot use {stmt} statement with {name}"),
+                    )?;
                     let nt = self.expect(&TokenKind::Name, "name after `as`")?;
                     Some(self.ident(nt.span))
                 } else {
@@ -1726,7 +2044,9 @@ impl<'src> Parser<'src> {
                 },
                 exc_tok.span,
             )?;
-            let span_end = handler_body.last().map_or(exc_tok.span, |s| s.span);
+            let span_end = handler_body
+                .last()
+                .map_or(exc_tok.span, |s| self.block_end(s.span));
             handlers.push(ExceptHandler {
                 type_,
                 name,
@@ -1758,7 +2078,7 @@ impl<'src> Parser<'src> {
             .or_else(|| orelse.last())
             .or_else(|| handlers.last().map(|h| &h.body).and_then(|b| b.last()))
             .or_else(|| body.last())
-            .map_or(try_tok.span, |s| s.span);
+            .map_or(try_tok.span, |s| self.block_end(s.span));
         Ok(Stmt {
             kind: StmtKind::Try {
                 body,
@@ -1827,7 +2147,7 @@ impl<'src> Parser<'src> {
             self.record_stmt_type_comment(kw.span.start.0, text);
         }
         let body = self.parse_block("'with' statement", kw.span)?;
-        let span_end = body.last().map_or(kw.span, |s| s.span);
+        let span_end = body.last().map_or(kw.span, |s| self.block_end(s.span));
         Ok(Stmt {
             kind: StmtKind::With { items, body },
             span: kw.span.merge(span_end),
@@ -2199,16 +2519,14 @@ impl<'src> Parser<'src> {
             let nested = self.parse_if()?;
             vec![nested]
         } else if self.at_keyword(Keyword::Else) {
-            let else_tok = self.bump();
-            self.expect(&TokenKind::Colon, "`:`")?;
-            self.parse_block("'else' statement", else_tok.span)?
+            self.parse_else_block()?
         } else {
             Vec::new()
         };
         let span_end = orelse
             .last()
             .or_else(|| body.last())
-            .map_or(if_tok.span, |s| s.span);
+            .map_or(if_tok.span, |s| self.block_end(s.span));
         Ok(Stmt {
             kind: StmtKind::If { test, body, orelse },
             span: if_tok.span.merge(span_end),
@@ -2227,16 +2545,14 @@ impl<'src> Parser<'src> {
         self.expect(&TokenKind::Colon, "`:`")?;
         let body = self.parse_block("'while' statement", kw.span)?;
         let orelse = if self.at_keyword(Keyword::Else) {
-            let else_tok = self.bump();
-            self.expect(&TokenKind::Colon, "`:`")?;
-            self.parse_block("'else' statement", else_tok.span)?
+            self.parse_else_block()?
         } else {
             Vec::new()
         };
         let span_end = orelse
             .last()
             .or_else(|| body.last())
-            .map_or(kw.span, |s| s.span);
+            .map_or(kw.span, |s| self.block_end(s.span));
         Ok(Stmt {
             kind: StmtKind::While { test, body, orelse },
             span: kw.span.merge(span_end),
@@ -2272,16 +2588,14 @@ impl<'src> Parser<'src> {
         }
         let body = self.parse_block("'for' statement", kw.span)?;
         let orelse = if self.at_keyword(Keyword::Else) {
-            let else_tok = self.bump();
-            self.expect(&TokenKind::Colon, "`:`")?;
-            self.parse_block("'else' statement", else_tok.span)?
+            self.parse_else_block()?
         } else {
             Vec::new()
         };
         let span_end = orelse
             .last()
             .or_else(|| body.last())
-            .map_or(kw.span, |s| s.span);
+            .map_or(kw.span, |s| self.block_end(s.span));
         Ok(Stmt {
             kind: StmtKind::For {
                 target,
@@ -2326,16 +2640,20 @@ impl<'src> Parser<'src> {
             let dotted = self.parse_dotted_name()?;
             let asname = if self.at_keyword(Keyword::As) {
                 self.bump();
+                // pegen `invalid_dotted_as_name` (3.14).
+                self.import_as_target_diagnostic()?;
                 let n = self.expect(&TokenKind::Name, "name after `as`")?;
                 Some(self.ident(n.span))
             } else {
                 None
             };
-            names.push(Alias {
+            let alias = Alias {
                 name: dotted,
                 asname,
                 span: start.merge(self.prev_token_span()),
-            });
+            };
+            Self::check_import_alias_debug(&alias)?;
+            names.push(alias);
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
@@ -2353,6 +2671,44 @@ impl<'src> Parser<'src> {
             kind: StmtKind::Import(names),
             span: kw.span.merge(end),
         })
+    }
+
+    /// pegen `invalid_dotted_as_name` / `invalid_import_from_as_name`:
+    /// `'as' !(NAME (',' | ')' | ';' | NEWLINE)) a=expression` →
+    /// "cannot use X as import target".
+    fn import_as_target_diagnostic(&mut self) -> Result<(), ParseError> {
+        self.as_target_diagnostic(
+            None,
+            |next| {
+                matches!(
+                    next,
+                    TokenKind::Comma
+                        | TokenKind::RPar
+                        | TokenKind::Semi
+                        | TokenKind::Newline
+                        | TokenKind::Endmarker
+                )
+            },
+            |name| format!("cannot use {name} as import target"),
+        )
+    }
+
+    /// CPython 3.14 (`_PyPegen_checked_alias`… via `alias` actions):
+    /// an import that would bind `__debug__` — `import __debug__`,
+    /// `import __debug__.x`, `import a as __debug__`, `from a import
+    /// __debug__` — is "cannot assign to __debug__" over the alias.
+    fn check_import_alias_debug(alias: &Alias) -> Result<(), ParseError> {
+        let bound = alias
+            .asname
+            .as_deref()
+            .unwrap_or_else(|| alias.name.split('.').next().unwrap_or(""));
+        if bound == "__debug__" {
+            return Err(ParseError::Unexpected {
+                span: alias.span,
+                message: "cannot assign to __debug__".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     fn parse_dotted_name(&mut self) -> Result<String, ParseError> {
@@ -2428,16 +2784,20 @@ impl<'src> Parser<'src> {
                 let name = self.ident(n.span);
                 let asname = if self.at_keyword(Keyword::As) {
                     self.bump();
+                    // pegen `invalid_import_from_as_name` (3.14).
+                    self.import_as_target_diagnostic()?;
                     let n2 = self.expect(&TokenKind::Name, "name after `as`")?;
                     Some(self.ident(n2.span))
                 } else {
                     None
                 };
-                names.push(Alias {
+                let alias = Alias {
                     name,
                     asname,
                     span: n.span.merge(self.prev_token_span()),
-                });
+                };
+                Self::check_import_alias_debug(&alias)?;
+                names.push(alias);
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -2648,11 +3008,11 @@ impl<'src> Parser<'src> {
     fn parse_match_subject(&mut self) -> Result<Expr, ParseError> {
         // `subject_expr` admits named expressions (`match y := f():`).
         self.walrus_ok = true;
+        let start_span = self.peek_token().span;
         let first = self.parse_ternary()?;
         if !self.check(&TokenKind::Comma) {
             return Ok(first);
         }
-        let start_span = first.span;
         let mut items = vec![first];
         while self.eat(&TokenKind::Comma) {
             if self.check(&TokenKind::Colon) {
@@ -2661,7 +3021,7 @@ impl<'src> Parser<'src> {
             self.walrus_ok = true;
             items.push(self.parse_ternary()?);
         }
-        let end_span = items.last().expect("nonempty").span;
+        let end_span = self.prev_token_span();
         Ok(Expr {
             kind: ExprKind::Tuple(items),
             span: start_span.merge(end_span),
@@ -2689,7 +3049,9 @@ impl<'src> Parser<'src> {
         };
         self.expect(&TokenKind::Colon, "`:`")?;
         let body = self.parse_block("'case' statement", case_tok.span)?;
-        let span_end = body.last().map_or(case_tok.span, |s| s.span);
+        let span_end = body
+            .last()
+            .map_or(case_tok.span, |s| self.block_end(s.span));
         Ok(MatchCase {
             pattern,
             guard,
@@ -2727,14 +3089,25 @@ impl<'src> Parser<'src> {
 
     /// Top-level pattern: `or_pattern ('as' NAME)?`.
     fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {
+        // pegen `EXTRA`: the `as`/`|` node spans every token it consumed,
+        // parentheses around a grouped alternative included (`(0 as z) |
+        // (1 as z)` starts at the first `(`), unlike the group pattern
+        // itself, which passes its inner pattern's own span through.
+        let start = self.peek_token().span;
         let pat = self.parse_or_pattern()?;
         if self.at_keyword(Keyword::As) {
             self.bump();
+            // pegen `invalid_as_pattern` (3.14): `or_pattern 'as'
+            // a=expression` names the offending target kind.
+            self.as_target_diagnostic(
+                None,
+                |_| true,
+                |name| format!("cannot use {name} as pattern target"),
+            )?;
             if !self.check(&TokenKind::Name) {
-                // pegen `invalid_as_pattern`.
                 return Err(ParseError::Unexpected {
                     span: self.peek_token().span,
-                    message: "invalid pattern target".to_owned(),
+                    message: "invalid syntax".to_owned(),
                 });
             }
             let n = self.bump();
@@ -2746,7 +3119,7 @@ impl<'src> Parser<'src> {
                 });
             }
             return Ok(Pattern {
-                span: pat.span.merge(n.span),
+                span: start.merge(n.span),
                 kind: PatternKind::As {
                     pattern: Box::new(pat),
                     name,
@@ -2758,18 +3131,17 @@ impl<'src> Parser<'src> {
 
     /// `or_pattern: closed_pattern ('|' closed_pattern)*`.
     fn parse_or_pattern(&mut self) -> Result<Pattern, ParseError> {
+        let start = self.peek_token().span;
         let first = self.parse_closed_pattern()?;
         if !self.check(&TokenKind::Vbar) {
             return Ok(first);
         }
-        let start = first.span;
         let mut alts = vec![first];
         while self.eat(&TokenKind::Vbar) {
             alts.push(self.parse_closed_pattern()?);
         }
-        let end = alts.last().expect("nonempty").span;
         Ok(Pattern {
-            span: start.merge(end),
+            span: start.merge(self.prev_token_span()),
             kind: PatternKind::Or(alts),
         })
     }
@@ -3346,12 +3718,15 @@ impl<'src> Parser<'src> {
     /// general iterable-unpacking case in collection literals fall
     /// out of a single parse.
     fn parse_expression_list(&mut self, _allow_trailing_comma: bool) -> Result<Expr, ParseError> {
+        // An unparenthesized tuple starts at its first *token*, which
+        // is the opening paren when the first element is parenthesized
+        // (`(a), b` spans from the `(`; the element itself does not).
+        let start_span = self.peek_token().span;
         let first = self.parse_ternary_or_starred()?;
         if !self.check(&TokenKind::Comma) {
             return Ok(first);
         }
         let mut items = vec![first];
-        let start_span = items[0].span;
         while self.eat(&TokenKind::Comma) {
             if matches!(
                 self.peek(),
@@ -3409,9 +3784,12 @@ impl<'src> Parser<'src> {
         let walrus_ok = std::mem::take(&mut self.walrus_ok);
         let in_lambda_body = std::mem::take(&mut self.lambda_body);
         let in_walrus_value = std::mem::take(&mut self.walrus_value);
+        self.expr_entry = self.pos;
         if self.at_keyword(Keyword::Lambda) {
             return self.parse_lambda(in_walrus_value);
         }
+        // `x = pass if c else 1` (pegen `invalid_expression`, 3.14).
+        self.check_stmt_as_ifexp_body()?;
         // `yield` is *not* a general expression in CPython's grammar: a
         // `yield_expr` is only admitted as a whole statement, as the
         // sole RHS of an (aug/ann) assignment, or parenthesized. Those
@@ -3494,6 +3872,15 @@ impl<'src> Parser<'src> {
                 });
             }
             self.bump();
+            // pegen `invalid_expression` (3.14): `a 'if' b 'else'
+            // !expression` — a statement keyword (or nothing) after
+            // `else` is diagnosed at the next token.
+            if !self.at_expression_start() {
+                return Err(ParseError::Unexpected {
+                    span: self.peek_token().span,
+                    message: "expected expression after 'else', but statement is given".to_owned(),
+                });
+            }
             let orelse = self.parse_ternary()?;
             let span = start.merge(self.prev_token_span());
             return Ok(Expr {
@@ -3970,7 +4357,10 @@ impl<'src> Parser<'src> {
                 TokenKind::LSqb => {
                     self.bump();
                     let slice = self.parse_subscript()?;
-                    let rb = self.expect(&TokenKind::RSqb, "`]`")?;
+                    // `x[a b]`, `x[a:b c]`: the hint spans from the last
+                    // expression parsed inside the brackets.
+                    let last = std::slice::from_ref(Self::last_subscript_expr(&slice));
+                    let rb = self.expect_or_forgot_comma(&TokenKind::RSqb, "`]`", last)?;
                     let span = start.merge(rb.span);
                     base = Expr {
                         kind: ExprKind::Subscript {
@@ -4068,13 +4458,6 @@ impl<'src> Parser<'src> {
                 {
                     let nt = self.bump();
                     let name = self.ident(nt.span);
-                    // `f(__debug__=1)` — CPython `forbidden_name`.
-                    if name == "__debug__" {
-                        return Err(ParseError::Unexpected {
-                            span: nt.span,
-                            message: "cannot assign to __debug__".to_owned(),
-                        });
-                    }
                     if kw_names.contains(&name) {
                         return Err(ParseError::Unexpected {
                             span: nt.span,
@@ -4093,6 +4476,14 @@ impl<'src> Parser<'src> {
                         });
                     }
                     let val = self.parse_ternary()?;
+                    // `f(__debug__=1)` — CPython `forbidden_name`; 3.14
+                    // reports the whole `name=value` keyword's range.
+                    if name == "__debug__" {
+                        return Err(ParseError::Unexpected {
+                            span: nt.span.merge(val.span),
+                            message: "cannot assign to __debug__".to_owned(),
+                        });
+                    }
                     // `f(a = i for i in xs)` — pegen `invalid_arguments`:
                     // a generator expression can't be a keyword value
                     // without parentheses; CPython points at `a = i` with
@@ -4126,20 +4517,26 @@ impl<'src> Parser<'src> {
                         message: format!("cannot assign to {}", self.lexeme(nt.span)),
                     });
                 } else {
+                    let positional_tok = self.peek_token().clone();
                     if seen_keyword {
-                        return Err(ParseError::Unexpected {
-                            span: self.peek_token().span,
-                            message: if seen_kw_unpack {
-                                "positional argument follows keyword argument unpacking".to_owned()
-                            } else {
-                                "positional argument follows keyword argument".to_owned()
-                            },
-                        });
+                        // The plain grammar (`kwargs`) stops here; the
+                        // "positional follows keyword" diagnostic waits
+                        // until a genexp has been ruled out (pegen tries
+                        // `args ',' expression for_if_clauses` first).
+                        self.first_fail.get_or_insert(self.pos);
                     }
                     // Positional arguments admit named expressions
                     // (`f(x := 1)`, `sum(y := i for i in xs)`).
                     self.walrus_ok = true;
-                    let e = self.parse_ternary()?;
+                    let e = match self.parse_ternary() {
+                        Ok(e) => e,
+                        Err(_) if seen_keyword => {
+                            return Err(
+                                self.positional_after_keyword(positional_tok.span, seen_kw_unpack)
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    };
                     // `f(1=2)` — a non-name expression followed by `=`.
                     if self.check(&TokenKind::Equal) {
                         return Err(ParseError::Unexpected {
@@ -4152,7 +4549,14 @@ impl<'src> Parser<'src> {
                     // Generator expression as single argument: `f(x for x in xs)`.
                     if self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async) {
                         let elt = e;
+                        if !(args.is_empty() && keywords.is_empty()) {
+                            // The plain grammar stops at the `for`.
+                            self.first_fail.get_or_insert(self.pos);
+                        }
                         let generators = self.parse_comp_for()?;
+                        // `for_if_clauses` looks at the token after the
+                        // last clause for another one.
+                        self.peeked = self.peeked.max(Some(self.pos));
                         // CPython's genexp node (and the
                         // must-be-parenthesized error) spans the whole
                         // `elt for … in …`, not just the element.
@@ -4180,11 +4584,27 @@ impl<'src> Parser<'src> {
                             span: node_span,
                         });
                         if self.check(&TokenKind::Comma) {
+                            // pegen (`invalid_arguments`): `expression
+                            // for_if_clauses ',' [args | expression
+                            // for_if_clauses]` — the optional tail is
+                            // parsed (with its own diagnostics) before
+                            // the genexp error is raised.
+                            self.bump();
+                            self.peeked = self.peeked.max(Some(self.pos));
+                            if !self.check(&TokenKind::RPar) {
+                                let save = self.pos;
+                                let _ = self.parse_call_args(lpar_span)?;
+                                self.pos = save;
+                            }
                             return Err(ParseError::Unexpected {
                                 span,
                                 message: "Generator expression must be parenthesized".to_owned(),
                             });
                         }
+                    } else if seen_keyword {
+                        return Err(
+                            self.positional_after_keyword(positional_tok.span, seen_kw_unpack)
+                        );
                     } else {
                         args.push(e);
                     }
@@ -4200,8 +4620,14 @@ impl<'src> Parser<'src> {
                 // *previous* element and suggests the missing comma.
                 if !self.check(&TokenKind::RPar) && self.at_expression_start() {
                     if let Some(prev) = last_arg_span {
+                        // The range runs through the stray expression
+                        // (`invalid_expression: a=disjunction
+                        // b=expression_without_invalid`); a nested parse
+                        // error inside it wins.
+                        self.first_fail.get_or_insert(self.pos);
+                        let stray = self.parse_ternary()?;
                         return Err(ParseError::Unexpected {
-                            span: prev,
+                            span: prev.merge(stray.span),
                             message: "invalid syntax. Perhaps you forgot a comma?".to_owned(),
                         });
                     }
@@ -4213,6 +4639,17 @@ impl<'src> Parser<'src> {
             }
         }
         Ok((args, keywords))
+    }
+
+    fn positional_after_keyword(&self, span: Span, after_unpack: bool) -> ParseError {
+        ParseError::Unexpected {
+            span,
+            message: if after_unpack {
+                "positional argument follows keyword argument unpacking".to_owned()
+            } else {
+                "positional argument follows keyword argument".to_owned()
+            },
+        }
     }
 
     /// Could the current token begin an expression? Drives the
@@ -4242,10 +4679,28 @@ impl<'src> Parser<'src> {
         }
     }
 
+    /// The innermost last expression of a parsed subscript (pegen's
+    /// `invalid_expression` fires on the `expression` that precedes a
+    /// stray one, not on the enclosing slice or tuple).
+    fn last_subscript_expr(e: &Expr) -> &Expr {
+        match &e.kind {
+            ExprKind::Tuple(elts) if !elts.is_empty() => {
+                Self::last_subscript_expr(elts.last().unwrap())
+            }
+            ExprKind::Slice { lower, upper, step } => step
+                .as_deref()
+                .or(upper.as_deref())
+                .or(lower.as_deref())
+                .map_or(e, Self::last_subscript_expr),
+            _ => e,
+        }
+    }
+
     fn parse_subscript(&mut self) -> Result<Expr, ParseError> {
         // Parse a single (sub)slice (`a`, `a:b`, `a:b:c`, etc.) — the
         // comma-separated form (`x[a, b, c]`) is handled by the outer
         // loop after this call returns.
+        let start_tok_span = self.peek_token().span;
         let first = self.parse_subscript_single()?;
         if !self.check(&TokenKind::Comma) {
             // PEP 646: a lone starred element still forms a one-element tuple
@@ -4271,10 +4726,7 @@ impl<'src> Parser<'src> {
             }
             elts.push(self.parse_subscript_single()?);
         }
-        let span = match (elts.first(), elts.last()) {
-            (Some(f), Some(l)) => f.span.merge(l.span),
-            _ => self.peek_token().span,
-        };
+        let span = start_tok_span.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::Tuple(elts),
             span,
@@ -4340,6 +4792,10 @@ impl<'src> Parser<'src> {
                 Some(TokenKind::ColonEqual)
             );
         self.walrus_ok = true;
+        // pegen's `slice` rule spans from its first *token*, so a
+        // parenthesized lower bound (`x[(a+1):]`) starts the Slice at
+        // the `(`, not at the inner expression.
+        let first_tok_span = self.peek_token().span;
         let first = self.parse_ternary()?;
         if !self.check(&TokenKind::Colon) {
             return Ok(first);
@@ -4371,7 +4827,7 @@ impl<'src> Parser<'src> {
         } else {
             None
         };
-        let span = first.span.merge(self.prev_token_span());
+        let span = first_tok_span.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::Slice {
                 lower: Some(Box::new(first)),
@@ -4832,6 +5288,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_target_list_no_tuple(&mut self) -> Result<Expr, ParseError> {
+        let start_tok_span = self.peek_token().span;
         let first = self.parse_target_or_star()?;
         if !self.check(&TokenKind::Comma) {
             return Ok(first);
@@ -4843,7 +5300,7 @@ impl<'src> Parser<'src> {
             }
             items.push(self.parse_target_or_star()?);
         }
-        let span = items[0].span.merge(items.last().unwrap().span);
+        let span = start_tok_span.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::Tuple(items),
             span,
@@ -4877,6 +5334,78 @@ impl<'src> Parser<'src> {
     /// byte strings, and f-strings. The CPython AST flattens these:
     /// `"a" "b"` → `Constant("ab")`, `f"a" "b"` → `JoinedStr(["ab"])`,
     /// `f"a{x}" "b"` → `JoinedStr(["a", FormattedValue(x), "b"])`.
+    /// pegen `invalid_expression` (3.14), first alternative:
+    /// `STRING (!STRING expression_without_invalid)+ STRING` — a lone
+    /// (non f/t) string token, one or more expressions, then another
+    /// plain string token is "invalid syntax. Is this intended to be
+    /// part of the string?" spanning the expressions (`"a "b" c"`).
+    /// Called with the position just past the leading string; leaves it
+    /// untouched when the shape doesn't match.
+    ///
+    /// The rule only applies where pegen invokes `expression` (the
+    /// caller checks [`Parser::expr_entry`]). Its `expression_without_invalid`
+    /// probe has a side effect worth mirroring: it runs the ordinary
+    /// grammar over the expressions after the string with the
+    /// `invalid_*` rules switched off, and every memoized rule that
+    /// fails there stays failed for the rest of the error pass. So when
+    /// one of those expressions is malformed, CPython reports a plain
+    /// "invalid syntax" at the token the first pass stopped on instead
+    /// of the specific diagnostic (`"a" + f(4, x for x in y)` points at
+    /// `for`; test_exceptions `test_encodings`).
+    ///
+    /// `target_first`: the string sits where `star_targets` is attempted
+    /// and a subscript/call follows, so the target grammar (with the
+    /// specific diagnostics on) already ran over those tokens; a failure
+    /// there isn't downgraded.
+    fn check_string_expr_string(&mut self, target_first: bool) -> Result<(), ParseError> {
+        if !self.at_expression_start() {
+            return Ok(());
+        }
+        let save = self.pos;
+        let (save_first_fail, save_peeked) = (self.first_fail, self.peeked);
+        let mut range: Option<Span> = None;
+        let result = loop {
+            match self.parse_expression(false) {
+                Ok(e) => range = Some(range.map_or(e.span, |r| r.merge(e.span))),
+                Err(_) if target_first => break None,
+                // Errors raised from actions (string decoding) abort
+                // the parse outright in pegen too.
+                Err(e) if e.syntax_message().starts_with('(') => return Err(e),
+                Err(ParseError::Unexpected { .. }) => {
+                    let fail = self.first_fail.unwrap_or(self.pos);
+                    if self.poison.is_none() {
+                        self.poison = Some(fail);
+                    }
+                    // The probe's own lookahead bookkeeping doesn't
+                    // outlive it.
+                    self.first_fail = save_first_fail;
+                    self.peeked = save_peeked;
+                    break None;
+                }
+                Err(e) => return Err(e),
+            }
+            if matches!(self.peek(), TokenKind::String) {
+                let tok = self.peek_token().clone();
+                let plain = self
+                    .string_prefix(&tok)
+                    .map(|p| !p.interpolated())
+                    .unwrap_or(false);
+                break if plain { range } else { None };
+            }
+            if !self.at_expression_start() {
+                break None;
+            }
+        };
+        self.pos = save;
+        match result {
+            Some(span) => Err(ParseError::Unexpected {
+                span,
+                message: "invalid syntax. Is this intended to be part of the string?".to_owned(),
+            }),
+            None => Ok(()),
+        }
+    }
+
     fn parse_string_concat(&mut self, first: Token) -> Result<Expr, ParseError> {
         let mut span = first.span;
         let first_prefix = self.string_prefix(&first)?;
@@ -4892,10 +5421,21 @@ impl<'src> Parser<'src> {
         } else {
             AccumString::Plain(constant_str_cps(self.decode_string(&first)?))
         };
+        let at_expr_entry = self.pos == self.expr_entry;
+        let at_target_entry = self.pos == self.target_entry;
         self.bump();
+        if at_expr_entry
+            && !first_prefix.interpolated()
+            && !matches!(self.peek(), TokenKind::String)
+        {
+            let target_first =
+                at_target_entry && matches!(self.peek(), TokenKind::LPar | TokenKind::LSqb);
+            self.check_string_expr_string(target_first)?;
+        }
         while matches!(self.peek(), TokenKind::String) {
             let next_tok = self.peek_token().clone();
             let next_prefix = self.string_prefix(&next_tok)?;
+            let prev_span = span;
             span = span.merge(next_tok.span);
             self.bump();
             // PEP 750: t-strings only concatenate with other t-strings.
@@ -4950,10 +5490,21 @@ impl<'src> Parser<'src> {
                     if !a.is_empty() {
                         parts.push(Expr {
                             kind: ExprKind::Constant(cps_to_constant(a)),
-                            span: first.span,
+                            // All plain fragments accumulated so far.
+                            span: prev_span,
                         });
                     }
-                    parts.extend(self.fstring_parts_for(&next_tok)?);
+                    // The f-string's leading literal fuses with the plain
+                    // prefix (`"a, " f"not {x}"` is one Constant part).
+                    for p in self.fstring_parts_for(&next_tok)? {
+                        if let ExprKind::Constant(c @ (Constant::Str(_) | Constant::WStr(_))) =
+                            p.kind
+                        {
+                            join_str_into_parts(&mut parts, c, p.span);
+                        } else {
+                            parts.push(p);
+                        }
+                    }
                     AccumString::Joined(parts)
                 }
                 (AccumString::Joined(mut parts), false, false) => {
@@ -5104,13 +5655,15 @@ impl<'src> Parser<'src> {
         body_abs: u32,
         template: bool,
     ) -> Result<Vec<Expr>, ParseError> {
-        self.parse_fstring_body_inner(body, raw, anchor, body_abs, false, template)
+        let kind = if template { 't' } else { 'f' };
+        self.parse_fstring_body_inner(body, raw, anchor, body_abs, false, template, kind)
     }
 
     /// `spec_mode` parses a format spec, where `{{`/`}}` are *not*
     /// doubled-brace escapes: in a spec every `{` opens a nested
     /// replacement field (CPython rejects `f'{3:{{>10}'` with "expecting
     /// a valid expression after '{'").
+    #[allow(clippy::too_many_arguments)]
     fn parse_fstring_body_inner(
         &self,
         body: &str,
@@ -5119,6 +5672,11 @@ impl<'src> Parser<'src> {
         body_abs: u32,
         spec_mode: bool,
         template: bool,
+        // CPython's `TOK_GET_STRING_PREFIX`: diagnostics name the kind
+        // of the innermost enclosing *literal* ("t-string: expecting
+        // '}'") — which a t-string's format spec shares even though its
+        // own nested fields build `FormattedValue`s (`template` false).
+        kind: char,
     ) -> Result<Vec<Expr>, ParseError> {
         let mut parts = Vec::new();
         let mut literal = String::new();
@@ -5181,13 +5739,17 @@ impl<'src> Parser<'src> {
                             span: anchor,
                             message: m,
                         })?;
-                    parts.push(Expr {
-                        kind: ExprKind::Constant(decoded),
-                        span: Span::new(body_abs + lit_start as u32, body_abs + i as u32),
-                    });
+                    // `_PyPegen_joined_str` drops literal parts that
+                    // decode to `''` (a lone `\<newline>` continuation).
+                    if !is_empty_str_constant(&decoded) {
+                        parts.push(Expr {
+                            kind: ExprKind::Constant(decoded),
+                            span: Span::new(body_abs + lit_start as u32, body_abs + i as u32),
+                        });
+                    }
                     literal.clear();
                 }
-                let (field, end) = match self.scan_fstring_field(body, i + 1, anchor) {
+                let (field, end) = match self.scan_fstring_field(body, i + 1, anchor, kind) {
                     Ok(ok) => ok,
                     // Unterminated field ("f-string: expecting '}'"):
                     // CPython's pegen parses the partial expression
@@ -5195,7 +5757,7 @@ impl<'src> Parser<'src> {
                     // forgot a comma?") wins over the missing brace.
                     Err(scan_err) => {
                         if matches!(&scan_err, ParseError::Unexpected { message, .. }
-                            if message == "f-string: expecting '}'")
+                            if message.ends_with("-string: expecting '}'"))
                         {
                             let partial = &body[i + 1..];
                             self.parse_fstring_field(
@@ -5205,6 +5767,7 @@ impl<'src> Parser<'src> {
                                 raw,
                                 true,
                                 template,
+                                kind,
                             )?;
                         }
                         return Err(scan_err);
@@ -5217,6 +5780,7 @@ impl<'src> Parser<'src> {
                     raw,
                     false,
                     template,
+                    kind,
                 )?;
                 // The debug form `{x=}` comes back as a synthetic
                 // JoinedStr([Constant("x="), FormattedValue]); CPython
@@ -5224,8 +5788,22 @@ impl<'src> Parser<'src> {
                 // values list (crucially also *inside a format spec* —
                 // `f"{2:{y=}}"` has Constant/FormattedValue as siblings,
                 // never a nested JoinedStr).
+                // The debug text fuses with a preceding literal run
+                // (`_PyPegen_concatenate_strings` merges every run of
+                // adjacent Constant parts: `f"abc {m=}"` is
+                // `[Constant("abc m="), FormattedValue]`).
                 match parsed.kind {
-                    ExprKind::JoinedStr(debug_parts) => parts.extend(debug_parts),
+                    ExprKind::JoinedStr(debug_parts) => {
+                        for p in debug_parts {
+                            if let ExprKind::Constant(c @ (Constant::Str(_) | Constant::WStr(_))) =
+                                p.kind
+                            {
+                                join_str_into_parts(&mut parts, c, p.span);
+                            } else {
+                                parts.push(p);
+                            }
+                        }
+                    }
                     _ => parts.push(parsed),
                 }
                 i = end + 1; // skip past the closing `}`
@@ -5239,7 +5817,7 @@ impl<'src> Parser<'src> {
                 }
                 return Err(ParseError::Unexpected {
                     span: anchor,
-                    message: "f-string: single '}' is not allowed".to_owned(),
+                    message: format!("{kind}-string: single '}}' is not allowed"),
                 });
             }
             // Append the next UTF-8 character (one or more bytes).
@@ -5256,10 +5834,12 @@ impl<'src> Parser<'src> {
                 span: anchor,
                 message: m,
             })?;
-            parts.push(Expr {
-                kind: ExprKind::Constant(decoded),
-                span: Span::new(body_abs + lit_start as u32, body_abs + i as u32),
-            });
+            if !is_empty_str_constant(&decoded) {
+                parts.push(Expr {
+                    kind: ExprKind::Constant(decoded),
+                    span: Span::new(body_abs + lit_start as u32, body_abs + i as u32),
+                });
+            }
         }
         Ok(parts)
     }
@@ -5279,6 +5859,7 @@ impl<'src> Parser<'src> {
         body: &str,
         start: usize,
         anchor: Span,
+        kind: char,
     ) -> Result<(String, usize), ParseError> {
         let bytes = body.as_bytes();
         // Openers seen *inside* the field (the field's own `{` is implicit
@@ -5319,7 +5900,7 @@ impl<'src> Parser<'src> {
                     None => {
                         return Err(ParseError::Unexpected {
                             span: anchor,
-                            message: "f-string: unmatched ')'".to_owned(),
+                            message: format!("{kind}-string: unmatched ')'"),
                         })
                     }
                 },
@@ -5332,7 +5913,7 @@ impl<'src> Parser<'src> {
                     None => {
                         return Err(ParseError::Unexpected {
                             span: anchor,
-                            message: "f-string: unmatched ']'".to_owned(),
+                            message: format!("{kind}-string: unmatched ']'"),
                         })
                     }
                 },
@@ -5360,13 +5941,14 @@ impl<'src> Parser<'src> {
         }
         Err(ParseError::Unexpected {
             span: anchor,
-            message: "f-string: expecting '}'".to_owned(),
+            message: format!("{kind}-string: expecting '}}'"),
         })
     }
 
     /// Parse one `expr[!conv][:spec]` field and return a
     /// `FormattedValue` (possibly preceded by a synthetic literal
     /// for `{x = }` debug form).
+    #[allow(clippy::too_many_arguments)]
     fn parse_fstring_field(
         &self,
         field: &str,
@@ -5375,6 +5957,7 @@ impl<'src> Parser<'src> {
         raw: bool,
         partial: bool,
         template: bool,
+        kind: char,
     ) -> Result<Expr, ParseError> {
         // PEP 701 (3.12+): backslashes *are* allowed inside replacement
         // fields (e.g. `f"{d["a\tb"]}"`). The expression is re-tokenized
@@ -5452,11 +6035,16 @@ impl<'src> Parser<'src> {
         // it must not hide the debug `=`. Strip comments first, then both
         // the detection and the echoed literal work on the cleaned text.
         let clean = strip_fstring_field_comments(expr_slice);
+        // The parse itself runs on a copy where comments are blanked
+        // rather than removed, so every byte offset maps straight back
+        // onto `field` (and so onto real source positions).
+        let blanked = blank_fstring_field_comments(expr_slice);
+        debug_assert_eq!(blanked.len(), expr_slice.len());
         // Only ASCII whitespace is insignificant around the expression
         // (space, tab, formfeed, CR/LF, VT). Notably *not* U+00A0 etc. —
         // CPython rejects those as "invalid non-printable character".
         let ws = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c');
-        let trimmed_end = clean.trim_end_matches(ws);
+        let trimmed_end = blanked.trim_end_matches(ws);
         let is_debug = trimmed_end.ends_with('=')
             && !trimmed_end.ends_with("==")
             && !trimmed_end.ends_with("!=")
@@ -5468,8 +6056,19 @@ impl<'src> Parser<'src> {
             // any surrounding spaces, comments removed) is echoed.
             (value_src, Some(clean.clone()))
         } else {
-            (clean.trim_matches(ws), None)
+            (blanked.trim_matches(ws), None)
         };
+        // A field that *opens* with a lone `=` (`f'{=x}'`): pegen's first
+        // token after `{` is `=`, so it reports the missing expression
+        // before it rather than the trailing junk.
+        let lead = blanked.trim_start_matches(ws);
+        if lead.starts_with('=') && !lead.starts_with("==") && !expr_text.is_empty() {
+            let at = field_abs + (blanked.len() - lead.len()) as u32;
+            return Err(ParseError::Unexpected {
+                span: Span::new(at, at + 1),
+                message: format!("{kind}-string: valid expression required before '='"),
+            });
+        }
         if expr_text.is_empty() {
             // Name the terminator that followed the (empty) expression,
             // mirroring CPython: "f-string: valid expression required
@@ -5489,7 +6088,7 @@ impl<'src> Parser<'src> {
             if partial && before == '}' {
                 return Err(ParseError::Unexpected {
                     span: anchor,
-                    message: "f-string: expecting '}'".to_owned(),
+                    message: format!("{kind}-string: expecting '}}'"),
                 });
             }
             // CPython's caret sits on the *terminator character itself*
@@ -5504,7 +6103,7 @@ impl<'src> Parser<'src> {
                 } as u32;
             return Err(ParseError::Unexpected {
                 span: Span::new(term_pos, term_pos + 1),
-                message: format!("f-string: valid expression required before '{before}'"),
+                message: format!("{kind}-string: valid expression required before '{before}'"),
             });
         }
         // Recursively tokenize+parse the expression. Inside an f-string
@@ -5527,9 +6126,9 @@ impl<'src> Parser<'src> {
         // location (CPython's pegen reports interior errors verbatim —
         // e.g. "invalid decimal literal" inside `f'{(123_a)}'` points
         // at line 3 of a multi-line f-string, not at the `f`).
-        // `expr_text` borrows `clean`; when no comments were stripped,
-        // offsets in `clean` equal offsets in `field`.
-        let expr_off_in_field = expr_text.as_ptr() as usize - clean.as_ptr() as usize;
+        // `expr_text` borrows `blanked`, whose offsets equal offsets in
+        // `field`.
+        let expr_off_in_field = expr_text.as_ptr() as usize - blanked.as_ptr() as usize;
         let expr_abs = field_abs + expr_off_in_field as u32;
         // Map a byte offset in `wrapped` (below) back to the source:
         // subtract the synthetic `(`, clamp to the expression's extent.
@@ -5567,7 +6166,7 @@ impl<'src> Parser<'src> {
                     message: if junk_is_expr {
                         "invalid syntax. Perhaps you forgot a comma?".to_owned()
                     } else {
-                        "f-string: expecting '=', or '!', or ':', or '}'".to_owned()
+                        format!("{kind}-string: expecting '=', or '!', or ':', or '}}'")
                     },
                 });
             }
@@ -5582,6 +6181,7 @@ impl<'src> Parser<'src> {
                 expr_abs,
                 expr_start_span,
                 &map_back,
+                kind,
             )
         })?;
         // Re-anchor the sub-parsed tree from `wrapped` coordinates onto
@@ -5606,7 +6206,7 @@ impl<'src> Parser<'src> {
             Some(idx) if !partial => {
                 let conv_end = spec_start.map(|s| s - 1).unwrap_or(field.len());
                 let text = &field[idx..conv_end];
-                validate_fstring_conversion(text, idx, field, field_abs)?
+                validate_fstring_conversion(text, idx, field, field_abs, kind)?
             }
             // Partial (unterminated) field whose conversion clause *was*
             // terminated by a `:` — the clause is complete enough to
@@ -5615,7 +6215,7 @@ impl<'src> Parser<'src> {
             Some(idx) if spec_start.is_some() => {
                 let conv_end = spec_start.map(|s| s - 1).unwrap_or(field.len());
                 let text = &field[idx..conv_end];
-                validate_fstring_conversion(text, idx, field, field_abs)?
+                validate_fstring_conversion(text, idx, field, field_abs, kind)?
             }
             // Partial field with the conversion clause itself cut off:
             // defer to the lexer's diagnostics.
@@ -5639,6 +6239,7 @@ impl<'src> Parser<'src> {
                     field_abs + s as u32,
                     true,
                     false,
+                    kind,
                 )?;
                 // CPython spans the format-spec JoinedStr from its `:`
                 // through the end of the spec text (before the `}`).
@@ -5660,11 +6261,15 @@ impl<'src> Parser<'src> {
         );
         let fv = Expr {
             kind: if template {
-                // PEP 750: keep the verbatim expression text for
-                // `Interpolation.expression`.
+                // PEP 750: `Interpolation.expression` is the source text
+                // between the `{` and the terminator with only trailing
+                // whitespace and `=` removed (`_strip_interpolation_expr`),
+                // so `t"{ a }"` reports `' a'` and `t"{a = }"` reports `'a'`.
                 ExprKind::Interpolation {
                     value: Box::new(value),
-                    text: expr_text.to_owned(),
+                    text: clean
+                        .trim_end_matches(|c: char| ws(c) || c == '=')
+                        .to_owned(),
                     conversion,
                     format_spec,
                 }
@@ -5683,11 +6288,22 @@ impl<'src> Parser<'src> {
             // parse_fstring_field appends parts directly, so we
             // package both into a synthetic JoinedStr that will
             // get flattened by the outer JoinedStr later.
+            //
+            // `_PyPegen_formatted_value` locates the debug text from
+            // just after the `{` to just before the terminator: the
+            // `!` of a conversion, the `:` of a format spec, or the
+            // `}`.
+            let debug_end = field_abs
+                + match (conv_start, spec_start) {
+                    (Some(c), _) => c - 1,
+                    (None, Some(s)) => s - 1,
+                    (None, None) => field.len(),
+                } as u32;
             return Ok(Expr {
                 kind: ExprKind::JoinedStr(vec![
                     Expr {
                         kind: ExprKind::Constant(Constant::Str(lit)),
-                        span: anchor,
+                        span: Span::new(field_abs, debug_end),
                     },
                     fv,
                 ]),
@@ -5893,10 +6509,11 @@ fn map_fstring_subparse_error(
     expr_abs: u32,
     expr_start_span: Span,
     map_back: &dyn Fn(u32) -> u32,
+    kind: char,
 ) -> ParseError {
     let valid_expr_err = || ParseError::Unexpected {
         span: expr_start_span,
-        message: "f-string: expecting a valid expression after '{'".to_owned(),
+        message: format!("{kind}-string: expecting a valid expression after '{{'"),
     };
     // Does a non-empty leading slice of the expression parse as a complete
     // expression list? Returns the junk position (in `wrapped`
@@ -5927,7 +6544,7 @@ fn map_fstring_subparse_error(
             if !prefix.is_empty() && leading_parse(prefix).is_some() {
                 ParseError::Unexpected {
                     span: Span::new(at, at + 1),
-                    message: "f-string: expecting '=', or '!', or ':', or '}'".to_owned(),
+                    message: format!("{kind}-string: expecting '=', or '!', or ':', or '}}'"),
                 }
             } else {
                 valid_expr_err()
@@ -5969,17 +6586,31 @@ fn map_fstring_subparse_error(
                 // it (the junk may itself be a `(`-less continuation the
                 // paren-wrapped parse choked on).
                 Some((junk_pos, junk_is_expr)) => {
+                    // pegen takes a lone `=` after the expression as the
+                    // debug marker and complains about the *next* token
+                    // (`f'{x=y}'`: "expecting '!', or ':', or '}'").
+                    let junk_off = (junk_pos as usize).saturating_sub(1).min(expr_text.len());
+                    let junk = &expr_text[junk_off..];
+                    if junk.starts_with('=') && !junk.starts_with("==") {
+                        let rest = &junk[1..];
+                        let skip = rest.len() - rest.trim_start().len();
+                        let at = map_back(junk_pos + 1 + skip as u32);
+                        return ParseError::Unexpected {
+                            span: Span::new(at, at + 1),
+                            message: format!("{kind}-string: expecting '!', or ':', or '}}'"),
+                        };
+                    }
                     let at = map_back(junk_pos);
                     ParseError::Unexpected {
                         span: Span::new(at, at + 1),
                         message: if junk_is_expr {
                             "invalid syntax. Perhaps you forgot a comma?".to_owned()
                         } else {
-                            "f-string: expecting '=', or '!', or ':', or '}'".to_owned()
+                            format!("{kind}-string: expecting '=', or '!', or ':', or '}}'")
                         },
                     }
                 }
-                None => fstring_lambda_error(expr_text, spec_start, field_abs, expr_abs)
+                None => fstring_lambda_error(expr_text, spec_start, field_abs, expr_abs, kind)
                     .unwrap_or_else(valid_expr_err),
             }
         }
@@ -6002,6 +6633,7 @@ fn fstring_lambda_error(
     spec_start: Option<usize>,
     field_abs: u32,
     expr_abs: u32,
+    kind: char,
 ) -> Option<ParseError> {
     let spec_start = spec_start?;
     if !expr_text.contains("lambda") {
@@ -6020,7 +6652,7 @@ fn fstring_lambda_error(
     Some(ParseError::Unexpected {
         // CPython spans from the `lambda` keyword through the spec colon.
         span: Span::new(expr_abs + lam_off as u32, field_abs + spec_start as u32),
-        message: "f-string: lambda expressions are not allowed without parentheses".to_owned(),
+        message: format!("{kind}-string: lambda expressions are not allowed without parentheses"),
     })
 }
 
@@ -6182,12 +6814,13 @@ fn validate_fstring_conversion(
     idx: usize,
     field: &str,
     field_abs: u32,
+    kind: char,
 ) -> Result<i32, ParseError> {
     let abs = |off: usize| field_abs + (idx + off) as u32;
     if text.is_empty() {
         return Err(ParseError::Unexpected {
             span: Span::new(abs(0), abs(0) + 1),
-            message: "f-string: missing conversion character".to_owned(),
+            message: format!("{kind}-string: missing conversion character"),
         });
     }
     let first = text.chars().next().expect("non-empty");
@@ -6195,14 +6828,15 @@ fn validate_fstring_conversion(
         // CPython spans from the `!` through the end of the field.
         return Err(ParseError::Unexpected {
             span: Span::new(field_abs + (idx - 1) as u32, field_abs + field.len() as u32),
-            message: "f-string: conversion type must come right after the exclamation mark"
-                .to_owned(),
+            message: format!(
+                "{kind}-string: conversion type must come right after the exclamation mark"
+            ),
         });
     }
     if !(unicode_ident::is_xid_start(first) || first == '_') {
         return Err(ParseError::Unexpected {
             span: Span::new(abs(0), abs(first.len_utf8())),
-            message: "f-string: invalid conversion character".to_owned(),
+            message: format!("{kind}-string: invalid conversion character"),
         });
     }
     let ident_end = text
@@ -6218,14 +6852,14 @@ fn validate_fstring_conversion(
         let at = ident_end + j;
         return Err(ParseError::Unexpected {
             span: Span::new(abs(at), abs(at + c.len_utf8())),
-            message: "f-string: expecting ':' or '}'".to_owned(),
+            message: format!("{kind}-string: expecting ':' or '}}'"),
         });
     }
     if !matches!(ident, "s" | "r" | "a") {
         return Err(ParseError::Unexpected {
             span: Span::new(abs(0), abs(ident_end)),
             message: format!(
-                "f-string: invalid conversion character '{ident}': expected 's', 'r', or 'a'"
+                "{kind}-string: invalid conversion character '{ident}': expected 's', 'r', or 'a'"
             ),
         });
     }
@@ -6240,6 +6874,18 @@ fn validate_fstring_conversion(
 /// mangling a `#` that lives inside a string. A comment runs to the next
 /// newline (the newline itself is preserved).
 fn strip_fstring_field_comments(s: &str) -> String {
+    scrub_fstring_field_comments(s, false)
+}
+
+/// Like [`strip_fstring_field_comments`], but each comment byte becomes a
+/// space, so byte offsets into the result equal offsets into `s` (the
+/// expression's source span must start at its first real character,
+/// even when a comment sits between `{` and the expression).
+fn blank_fstring_field_comments(s: &str) -> String {
+    scrub_fstring_field_comments(s, true)
+}
+
+fn scrub_fstring_field_comments(s: &str, blank: bool) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0usize;
@@ -6288,6 +6934,9 @@ fn strip_fstring_field_comments(s: &str) -> String {
             b'#' => {
                 // Drop the comment up to (but not including) the newline.
                 while i < bytes.len() && bytes[i] != b'\n' {
+                    if blank {
+                        out.push(' ');
+                    }
                     i += 1;
                 }
             }
@@ -6382,6 +7031,7 @@ pub(crate) fn partial_fstring_field_error(
     source: &str,
     field_start: u32,
     limit: u32,
+    kind: char,
 ) -> Option<ParseError> {
     let end = (limit as usize).min(source.len());
     let start = (field_start as usize).min(end);
@@ -6392,23 +7042,28 @@ pub(crate) fn partial_fstring_field_error(
     let tokens = weavepy_lexer::tokenize("").ok()?;
     let p = Parser::new("", tokens);
     let anchor = Span::new(field_start, limit);
-    match p.parse_fstring_field(field, anchor, field_start, false, true, false) {
+    match p.parse_fstring_field(field, anchor, field_start, false, true, kind == 't', kind) {
         Err(e) => {
             // Errors CPython's pegen reports from the tokens it has
             // already seen win over the tokenizer's unterminated-field
             // diagnostic; anything else keeps the lexer error.
             let wins = match &e {
                 ParseError::Unexpected { message, .. }
-                | ParseError::Indentation { message, .. } => message.starts_with("invalid syntax.")
-                    || message.starts_with("f-string: valid expression required before")
-                    || message == "f-string: expecting a valid expression after '{'"
-                    || message == "f-string: expecting '=', or '!', or ':', or '}'"
-                    || message == "f-string: missing conversion character"
-                    || message.starts_with("f-string: invalid conversion character")
-                    || message
-                        == "f-string: conversion type must come right after the exclamation mark"
-                    || message
-                        == "f-string: lambda expressions are not allowed without parentheses",
+                | ParseError::Indentation { message, .. } => {
+                    // Strip the "f-string: " / "t-string: " tag.
+                    let body = message
+                        .strip_prefix("f-string: ")
+                        .or_else(|| message.strip_prefix("t-string: "))
+                        .unwrap_or(message);
+                    message.starts_with("invalid syntax.")
+                        || body.starts_with("valid expression required before")
+                        || body == "expecting a valid expression after '{'"
+                        || body == "expecting '=', or '!', or ':', or '}'"
+                        || body == "missing conversion character"
+                        || body.starts_with("invalid conversion character")
+                        || body == "conversion type must come right after the exclamation mark"
+                        || body == "lambda expressions are not allowed without parentheses"
+                }
                 _ => false,
             };
             wins.then_some(e)
@@ -6426,6 +7081,13 @@ fn split_string_prefix(lex: &str) -> (&str, &str) {
         }
     }
     lex.split_at(idx)
+}
+
+/// `_PyPegen_joined_str` / `_PyPegen_setup_full_format_spec` skip
+/// literal f-string parts whose decoded value is the empty string (the
+/// tokenizer still emits a part for `\<newline>` continuations).
+fn is_empty_str_constant(c: &Constant) -> bool {
+    matches!(c, Constant::Str(s) if s.is_empty())
 }
 
 fn strip_quotes(s: &str) -> &str {
@@ -6849,166 +7511,6 @@ fn big_to_i64(b: &num_bigint::BigInt) -> Option<i64> {
     }
 }
 
-/// PEP 695 helper — lower a `type` alias to a **lazy** `TypeAliasType`
-/// constructor call so the alias body is *not* evaluated at definition
-/// time (matching CPython 3.12+ `typing.TypeAliasType`):
-///
-/// ```python
-/// type Name[T, U] = body
-/// # lowers to
-/// Name = __weavepy_type_alias__('Name', ('T', 'U'), lambda T, U: body)
-///
-/// type Name = body
-/// # lowers to
-/// Name = __weavepy_type_alias__('Name', (), lambda: body)
-/// ```
-///
-/// The `__weavepy_type_alias__` intrinsic hands the tuple of real
-/// `_typing` type-parameter objects (built by each `TypeParam`'s
-/// constructor expression, RFC 0051) plus a zero-argument thunk to
-/// `_typing.TypeAliasType`, which only invokes the thunk the first
-/// time `Name.__value__` is read. Deferring the body is what lets
-/// numpy's `_typing` aliases — e.g. `type ArrayLike = Buffer |
-/// _DualArrayLike[np.dtype, …]` — be defined without eagerly building
-/// unions / subscripting other aliases.
-///
-/// A generic alias nests one immediately-invoked lambda per type
-/// parameter (CPython's hidden PEP 695 scope): a later parameter's
-/// lazy bound/default and the value thunk each *close over* the
-/// earlier parameters, so `type A[T, U: T] = X[T, U]` resolves `T` in
-/// `U`'s bound and both names in the body without leaking either into
-/// the enclosing scope:
-///
-/// ```python
-/// A = (lambda T:
-///         (lambda U:
-///             __weavepy_type_alias__('A', (T, U), lambda: X[T, U])
-///         )(<ctor U>)
-///     )(<ctor T>)
-/// ```
-/// Lower a first-class [`StmtKind::TypeAlias`] statement to the
-/// runtime assignment form the compiler executes:
-/// `Name = __weavepy_type_alias__('Name', (…), <thunk>)` (see
-/// [`build_lazy_type_alias`]). Called by the compiler front-end so
-/// every later pass (mangling, scope analysis, codegen) sees the
-/// same shape the parser used to emit directly.
-///
-/// # Panics
-///
-/// Panics if `stmt` is not a [`StmtKind::TypeAlias`].
-pub fn lower_type_alias_stmt(stmt: &Stmt) -> Stmt {
-    let StmtKind::TypeAlias {
-        name,
-        name_span,
-        type_params,
-        value,
-    } = &stmt.kind
-    else {
-        panic!("lower_type_alias_stmt on non-TypeAlias statement");
-    };
-    let target = Expr {
-        kind: ExprKind::Name(name.clone()),
-        span: *name_span,
-    };
-    let rhs = build_lazy_type_alias(name, (**value).clone(), type_params, *name_span);
-    Stmt {
-        kind: StmtKind::Assign {
-            targets: vec![target],
-            value: rhs,
-        },
-        span: stmt.span,
-    }
-}
-
-pub fn build_lazy_type_alias(name: &str, body: Expr, params: &[TypeParam], span: Span) -> Expr {
-    let thunk = Expr {
-        kind: ExprKind::TypeParamFn {
-            args: Arguments::default(),
-            body: Box::new(body),
-        },
-        span,
-    };
-    let name_str = Expr {
-        kind: ExprKind::Constant(Constant::Str(name.to_owned())),
-        span,
-    };
-    let params_tuple = Expr {
-        kind: ExprKind::Tuple(
-            params
-                .iter()
-                .map(|p| Expr {
-                    kind: ExprKind::Name(p.name.clone()),
-                    span,
-                })
-                .collect(),
-        ),
-        span,
-    };
-    let mut acc = Expr {
-        kind: ExprKind::Call {
-            func: Box::new(Expr {
-                kind: ExprKind::Name("__weavepy_type_alias__".to_owned()),
-                span,
-            }),
-            args: vec![name_str, params_tuple, thunk],
-            keywords: Vec::new(),
-        },
-        span,
-    };
-    // Wrap innermost-last: each parameter's constructor runs in the
-    // scope of every parameter declared before it. PEP 696 defaults
-    // attach *inside* the binder (after the name is bound) so a
-    // default can reference the parameter itself
-    // (`type X[T = [T for T in [T]]] = T`); the `(<set default>,
-    // <rest>)[1]` tuple sequences the mutation before the inner body.
-    for p in params.iter().rev() {
-        let inner_body = if p.default.is_some() {
-            let set_default = p.apply_default_expr(Expr {
-                kind: ExprKind::Name(p.name.clone()),
-                span,
-            });
-            Expr {
-                kind: ExprKind::Subscript {
-                    value: Box::new(Expr {
-                        kind: ExprKind::Tuple(vec![set_default, acc]),
-                        span,
-                    }),
-                    slice: Box::new(Expr {
-                        kind: ExprKind::Constant(Constant::Int(1)),
-                        span,
-                    }),
-                },
-                span,
-            }
-        } else {
-            acc
-        };
-        let binder = Expr {
-            kind: ExprKind::TypeParamFn {
-                args: Arguments {
-                    args: vec![Arg {
-                        name: p.name.clone(),
-                        annotation: None,
-                        span,
-                    }],
-                    ..Arguments::default()
-                },
-                body: Box::new(inner_body),
-            },
-            span,
-        };
-        acc = Expr {
-            kind: ExprKind::Call {
-                func: Box::new(binder),
-                args: vec![p.constructor_expr()],
-                keywords: Vec::new(),
-            },
-            span,
-        };
-    }
-    acc
-}
-
 /// PEP 695 annotation scopes (type-parameter bounds/constraints/
 /// defaults, `type` alias values, and the header of a generic
 /// `def`/`class`) reject `yield`, `yield from`, `await`, and the
@@ -7045,7 +7547,7 @@ pub(crate) fn check_type_param_expr(e: &Expr, ctx: &str) -> Result<(), ParseErro
 }
 
 /// Immediate sub-expressions of `e`, for read-only traversal.
-fn expr_children(e: &Expr) -> Vec<&Expr> {
+pub fn expr_children(e: &Expr) -> Vec<&Expr> {
     let mut out: Vec<&Expr> = Vec::new();
     match &e.kind {
         ExprKind::Constant(_) | ExprKind::Name(_) => {}

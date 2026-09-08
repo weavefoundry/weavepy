@@ -2012,14 +2012,14 @@ impl MethodWrapper {
                 let doc = pinned("__doc__", &|| {
                     crate::builtins::code_docstring(&code).unwrap_or(Object::None)
                 });
-                let annotations = pinned("__annotations__", &|| {
-                    Object::Dict(Rc::new(RefCell::new(DictData::default())))
-                });
+                // 3.14 (PEP 749, gh-125017): `__annotations__` and
+                // `__annotate__` are no longer copied eagerly; they are
+                // getsets that lazily pull from the wrapped callable and
+                // cache the result in the wrapper's dict (see `load_attr`).
                 [
                     ("__module__", module),
                     ("__name__", name),
                     ("__qualname__", qualname),
-                    ("__annotations__", annotations),
                     ("__doc__", doc),
                 ]
                 .into_iter()
@@ -2090,6 +2090,13 @@ pub struct PyProperty {
     /// `property_copy`: a getter-derived doc is *not* carried over to
     /// the copy, so the new getter's own docstring wins.
     pub getter_doc: Cell<bool>,
+}
+
+impl Drop for PyProperty {
+    fn drop(&mut self) {
+        // See `BuiltinFn::drop`.
+        crate::descr_registry::forget(std::ptr::from_ref(self).cast::<()>() as usize);
+    }
 }
 
 impl PyProperty {
@@ -2782,6 +2789,33 @@ impl indexmap::Equivalent<DictKey> for StrKey<'_> {
     }
 }
 
+/// [`StrKey`] with its Python hash precomputed (RFC 0077 WS4). The
+/// interpreter's attribute-name probes hash the same `co_names` entry on
+/// every execution of a site — a siphash per probe — so the VM memoises
+/// `py_str_hash` per code object (see `code_name_key` in the eval loop)
+/// and probes with this key instead. Hash and equality are bit-for-bit
+/// those of `StrKey`; the caller is responsible for `hash ==
+/// py_str_hash(s)`.
+#[derive(Debug, Clone, Copy)]
+pub struct StrKeyHashed<'a> {
+    pub s: &'a str,
+    pub hash: i64,
+}
+
+impl Hash for StrKeyHashed<'_> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+    }
+}
+
+impl indexmap::Equivalent<DictKey> for StrKeyHashed<'_> {
+    #[inline]
+    fn equivalent(&self, key: &DictKey) -> bool {
+        indexmap::Equivalent::equivalent(&StrKey(self.s), key)
+    }
+}
+
 /// Count of "exotic" keys ever inserted into a *class* dict: any key
 /// that is not a plain `Object::Str`. While zero (every real-world
 /// program), `TypeObject::lookup`'s native [`StrKey`] walk is
@@ -3129,6 +3163,19 @@ thread_local! {
 /// Park `err` as the pending key-comparison error (first one wins, matching
 /// CPython aborting on the first failed compare). Called from the reentrant
 /// `__hash__`/`__eq__` bridges when the callback raises.
+/// `indexmap` skips hashing when probing a table of 0 or 1 entries (it
+/// compares the lone entry directly). CPython always calls `__hash__`
+/// first, so a raising `__hash__` must still surface for `x in {'a'}`
+/// (test_set.test_unhashable_element's `HashError`). Only a user
+/// instance with a Python `__hash__` is affected; the call runs inside a
+/// `key_cmp_scope`, so a raised exception is stashed and re-raised there.
+#[inline]
+pub(crate) fn force_hash_for_tiny_table(len: usize, key: &Object) {
+    if len <= 1 && dict_key_is_reentrant(key) {
+        let _ = py_hash_value(key);
+    }
+}
+
 pub(crate) fn stash_key_cmp_error(err: RuntimeError) {
     KEY_CMP_ERROR.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -3690,6 +3737,7 @@ pub fn is_function_slot(name: &str) -> bool {
             | "__doc__"
             | "__module__"
             | "__annotations__"
+            | "__annotate__"
             | "__type_params__"
             | "__defaults__"
             | "__kwdefaults__"
@@ -3750,6 +3798,15 @@ pub struct BoundMethod {
     /// wrapped `partial` with the class prepended rather than re-invoking
     /// `partial.__get__`.
     pub redispatch_descriptor: bool,
+    /// A genuine CPython `PyMethod_Type` object over a *builtin*
+    /// callable: `classmethod(repr).__get__(None, C)`,
+    /// `types.MethodType(len, obj)`. Attribute lookup on a builtin
+    /// type's method (`[].append`, `object().__repr__`) instead yields a
+    /// C-level bound object (`builtin_function_or_method` /
+    /// `method-wrapper`), which CPython's instrumentation never expands
+    /// (`_MAYBE_EXPAND_METHOD` checks `PyMethod_Type`). Irrelevant when
+    /// `function` is a Python function (always `method`).
+    pub py_method: bool,
 }
 
 impl BoundMethod {
@@ -3760,6 +3817,33 @@ impl BoundMethod {
             receiver,
             function,
             redispatch_descriptor: false,
+            py_method: false,
+        }
+    }
+
+    /// A `PyMethod_Type` object built by `classmethod.__get__` /
+    /// `types.MethodType`, so a builtin `function` still reports as
+    /// `method` and expands under instrumentation (see [`Self::py_method`]).
+    pub fn py_method(receiver: Object, function: Object) -> Self {
+        BoundMethod {
+            receiver,
+            function,
+            redispatch_descriptor: false,
+            py_method: true,
+        }
+    }
+
+    /// Would CPython represent this as a `PyMethod_Type` object? Always
+    /// for a Python function; for a builtin only when built by
+    /// `classmethod.__get__` / `types.MethodType` over a *non-native*
+    /// callable (a C `classmethod_descriptor` such as `int.from_bytes`
+    /// binds to a `builtin_function_or_method`).
+    pub fn is_pymethod_type(&self) -> bool {
+        match &self.function {
+            Object::Builtin(_) => {
+                self.py_method && crate::descr_registry::lookup(&self.function).is_none()
+            }
+            _ => true,
         }
     }
 
@@ -3772,6 +3856,7 @@ impl BoundMethod {
             receiver,
             function,
             redispatch_descriptor: true,
+            py_method: false,
         }
     }
 }
@@ -3804,6 +3889,14 @@ pub struct BuiltinFn {
     pub call_kw: Option<
         Box<dyn Fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError> + Send + Sync>,
     >,
+}
+
+impl Drop for BuiltinFn {
+    fn drop(&mut self) {
+        // The descriptor side tables key on this allocation's address;
+        // a reused address must not inherit its tags.
+        crate::descr_registry::forget(std::ptr::from_ref(self).cast::<()>() as usize);
+    }
 }
 
 impl BuiltinFn {
@@ -4136,8 +4229,12 @@ impl fmt::Debug for AsyncGenAwait {
 /// (`io.StringIO`/`io.BytesIO`), or the interpreter's stdout/stderr
 /// sinks.
 /// Default Python-level buffer size for a buffered file stream
-/// (`io.DEFAULT_BUFFER_SIZE`).
-pub const DEFAULT_BUFFER_SIZE: usize = 8192;
+/// (`io.DEFAULT_BUFFER_SIZE`): 128 KiB since CPython 3.14 (gh-117151).
+pub const DEFAULT_BUFFER_SIZE: usize = 128 * 1024;
+
+/// `TextIOWrapper._CHUNK_SIZE`, which stayed at 8 KiB when
+/// `DEFAULT_BUFFER_SIZE` grew in 3.14.
+pub const TEXT_CHUNK_SIZE: usize = 8192;
 
 /// The CPython io-stack layer a [`PyFile`] presents to Python: its
 /// `type()` identity and which `io` ABC it answers `isinstance` for.
@@ -5260,7 +5357,7 @@ impl PyFile {
                 }
             }
         }
-        DEFAULT_BUFFER_SIZE
+        TEXT_CHUNK_SIZE
     }
 
     /// Decide — once, lazily, and cached — whether this text stream must use
@@ -7189,6 +7286,13 @@ pub enum PyIterator {
         /// `__del__`) must be pinned here for the iterator's lifetime
         /// (test_dict test_free_after_iterating).
         owner: Option<Object>,
+        /// `reversed(d)` / `reversed(d.items())` …: `index` then counts
+        /// *down* (it holds the number of entries still to yield). The
+        /// watch is taken eagerly so a `clear()` + refill before the
+        /// first step exhausts the cursor silently, like CPython's
+        /// `di_pos >= dk_nentries` bail-out
+        /// (test_dict.test_reversed_dict_after_clear_and_restore).
+        reverse: bool,
     },
     Bytes {
         data: Rc<[u8]>,
@@ -7378,16 +7482,30 @@ impl PyIterator {
                 index,
                 dict,
                 owner,
+                reverse,
                 ..
             } => {
                 let d = dict.as_ref()?;
-                let entry = d
-                    .borrow()
-                    .get_index(*index)
-                    .map(|(k, v)| (k.0.clone(), v.clone()));
+                let entry = if *reverse {
+                    if *index == 0 {
+                        None
+                    } else {
+                        d.borrow()
+                            .get_index(*index - 1)
+                            .map(|(k, v)| (k.0.clone(), v.clone()))
+                    }
+                } else {
+                    d.borrow()
+                        .get_index(*index)
+                        .map(|(k, v)| (k.0.clone(), v.clone()))
+                };
                 match entry {
                     Some((k, v)) => {
-                        *index += 1;
+                        if *reverse {
+                            *index -= 1;
+                        } else {
+                            *index += 1;
+                        }
                         Some(match kind {
                             DictViewKind::Keys => k,
                             DictViewKind::Values => v,
@@ -7644,6 +7762,7 @@ impl PyIterator {
             len,
             watch,
             index,
+            reverse,
             ..
         } = self
         {
@@ -7654,7 +7773,7 @@ impl PyIterator {
                 // Sticky (`di_used = -1`): further `next()` calls keep
                 // raising and `__length_hint__` reports 0.
                 *len = usize::MAX;
-                *index = usize::MAX;
+                *index = if *reverse { 0 } else { usize::MAX };
                 return Err(runtime_error("dictionary changed size during iteration"));
             }
             // Same size but keys churned (`del d[k]; d[k] = v` between
@@ -7664,6 +7783,13 @@ impl PyIterator {
             // bump it, so `d[k] = new` over an existing key stays legal).
             match watch {
                 Some(w) if w.changed() => {
+                    if *reverse {
+                        // `dictreviter_iter_lock_held`: a rebuilt entry
+                        // array leaves `di_pos` past `dk_nentries`, which
+                        // is a silent StopIteration, not an error.
+                        *index = 0;
+                        return Ok(None);
+                    }
                     return Err(runtime_error("dictionary keys changed during iteration"));
                 }
                 None => *watch = Some(DictWatch::new(d)),
@@ -7710,10 +7836,18 @@ impl PyIterator {
             }
             PyIterator::Tuple { items, index } => Some(items.len().saturating_sub(*index)),
             PyIterator::Str { s, index } => Some(s[(*index).min(s.len())..].chars().count()),
-            PyIterator::DictKeys { dict, index, .. } => Some(
-                dict.as_ref()
-                    .map_or(0, |d| d.borrow().len().saturating_sub(*index)),
-            ),
+            PyIterator::DictKeys {
+                dict,
+                index,
+                reverse,
+                ..
+            } => Some(dict.as_ref().map_or(0, |d| {
+                if *reverse {
+                    (*index).min(d.borrow().len())
+                } else {
+                    d.borrow().len().saturating_sub(*index)
+                }
+            })),
             PyIterator::Bytes { data, index } => Some(data.len().saturating_sub(*index)),
             PyIterator::ByteArray { data, index } => {
                 Some(data.borrow().len().saturating_sub(*index))
@@ -7811,12 +7945,20 @@ impl PyIterator {
                     .collect()
             }
             PyIterator::DictKeys {
-                kind, index, dict, ..
+                kind,
+                index,
+                dict,
+                reverse,
+                ..
             } => match dict {
                 Some(d) => {
                     let d = d.borrow();
-                    let start = (*index).min(d.len());
-                    (start..d.len())
+                    let range: Box<dyn Iterator<Item = usize>> = if *reverse {
+                        Box::new((0..(*index).min(d.len())).rev())
+                    } else {
+                        Box::new((*index).min(d.len())..d.len())
+                    };
+                    range
                         .filter_map(|i| d.get_index(i))
                         .map(|(k, v)| match kind {
                             DictViewKind::Keys => k.0.clone(),
@@ -8506,7 +8648,7 @@ impl Object {
                 seq_cmp(&a, &b)
             }
             _ => {
-                if std::env::var_os("WEAVEPY_CMP_BT").is_some() {
+                if crate::hot_gates::env_flags::cmp_bt() {
                     eprintln!(
                         "[CMP_BT vm-lt] '{}' vs '{}'\n{:?}",
                         self.type_name_owned(),
@@ -8574,7 +8716,7 @@ impl Object {
             Object::Dict(d) => {
                 // `unhashable in {…}` raises TypeError, exactly like a
                 // direct `d[unhashable]` lookup (CPython `PyDict_Contains`).
-                crate::builtins::ensure_hashable(item)?;
+                crate::builtins::ensure_dict_key(item)?;
                 if dict_key_is_reentrant(item) {
                     // A key with user `__eq__` compares through Python (which
                     // may raise, or mutate `d` mid-probe — gh-140551).
@@ -8601,11 +8743,17 @@ impl Object {
                 let key = crate::builtins::set_membership_key(item)?;
                 // A custom `__eq__` raising during a hash collision aborts the
                 // lookup in CPython (test_badcmp `s.__contains__(BadCmp())`).
-                key_cmp_scope(|| s.borrow().contains(&key))
+                key_cmp_scope(|| {
+                    force_hash_for_tiny_table(s.borrow().len(), &key.0);
+                    s.borrow().contains(&key)
+                })
             }
             Object::FrozenSet(s) => {
                 let key = crate::builtins::set_membership_key(item)?;
-                key_cmp_scope(|| s.contains(&key))
+                key_cmp_scope(|| {
+                    force_hash_for_tiny_table(s.len(), &key.0);
+                    s.contains(&key)
+                })
             }
             Object::Bytes(haystack) => bytes_membership(haystack, item),
             Object::ByteArray(haystack) => {
@@ -8730,12 +8878,12 @@ impl Object {
             Object::Instance(inst) => match inst.native.get() {
                 Some(native) => native.contains(item),
                 None => Err(type_error(format!(
-                    "argument of type '{}' is not iterable",
+                    "argument of type '{}' is not a container or iterable",
                     self.type_name()
                 ))),
             },
             _ => Err(type_error(format!(
-                "argument of type '{}' is not iterable",
+                "argument of type '{}' is not a container or iterable",
                 self.type_name()
             ))),
         }
@@ -8810,6 +8958,7 @@ impl Object {
                     dict: Some(d.clone()),
                     len,
                     watch: None,
+                    reverse: false,
                     owner: None,
                 })
             }
@@ -8874,6 +9023,7 @@ impl Object {
                     dict: Some(v.dict.clone()),
                     len,
                     watch: None,
+                    reverse: false,
                     owner: v.owner.clone(),
                 })
             }
@@ -8885,6 +9035,7 @@ impl Object {
                     dict: Some(d.clone()),
                     len,
                     watch: None,
+                    reverse: false,
                     owner: None,
                 })
             }
@@ -9021,6 +9172,20 @@ impl Object {
 
     /// Like [`type_name`], but returns the user-class name for
     /// `Object::Instance` instead of the static placeholder.
+    /// CPython's `%T` format unit: `type(obj).__module__.__qualname__`
+    /// with the `builtins` prefix dropped (`test.test_str.PseudoFloat`,
+    /// `float`). Built-in and bridged types fall back to
+    /// [`Self::type_name_owned`].
+    pub fn type_name_fq(&self) -> String {
+        if let Object::Instance(inst) = self {
+            let cls = inst.cls();
+            if cls.c_tp_name.get().is_none() {
+                return cls.qualified_display_name();
+            }
+        }
+        self.type_name_owned()
+    }
+
     pub fn type_name_owned(&self) -> String {
         match self {
             // A bridged extension class renders its C `tp_name`
@@ -9632,6 +9797,47 @@ impl Object {
                             }
                             format!("[{}]", parts.join(", "))
                         }
+                        // CPython `_Py_typing_type_repr`: anything with a
+                        // `__qualname__` and a `__module__` renders as
+                        // `module.qualname` (bare `qualname` for builtins),
+                        // so `repr(Union[fun, int])` is
+                        // `"__main__.fun | int"` (test_typing
+                        // test_function_repr_union), and `list[len]` is
+                        // `"list[len]"`.
+                        Object::Function(f) => {
+                            let qual = f
+                                .slot("__qualname__")
+                                .as_ref()
+                                .map(Object::to_str)
+                                .unwrap_or_else(|| f.code().qualname.clone());
+                            let module = f
+                                .slot("__module__")
+                                .or_else(|| {
+                                    f.globals
+                                        .borrow()
+                                        .get(&DictKey(Object::from_static("__name__")))
+                                        .cloned()
+                                })
+                                .unwrap_or(Object::None);
+                            match module {
+                                Object::None => o.repr(),
+                                m => {
+                                    let m = m.to_str();
+                                    if m == "builtins" {
+                                        qual
+                                    } else {
+                                        format!("{m}.{qual}")
+                                    }
+                                }
+                            }
+                        }
+                        Object::Builtin(b) => {
+                            let qual = crate::builtin_display_name(b.name);
+                            match crate::descr_registry::module_of(o) {
+                                Some(m) if m != "builtins" => format!("{m}.{qual}"),
+                                _ => qual.to_owned(),
+                            }
+                        }
                         other => other.repr(),
                     }
                 }
@@ -9815,7 +10021,7 @@ impl Object {
             Object::Instance(inst) => match inst.native.get() {
                 Some(native) => native.len(),
                 None => {
-                    if std::env::var_os("WEAVEPY_LEN_DBG").is_some() {
+                    if crate::hot_gates::env_flags::len_dbg() {
                         eprintln!(
                             "[LEN_DBG] Instance cls={} c_body={:#x} native=None",
                             inst.cls().name,
@@ -10102,9 +10308,10 @@ pub(crate) fn i64_cmp_f64(a: i64, b: f64) -> Result<Ordering, RuntimeError> {
 //
 // Identity is restored by *tagging*: every seam where CPython would allocate
 // a fresh float object for a NaN (literal parse, `PyFloat_FromDouble`,
-// arithmetic producing NaN) stamps a unique counter into the low mantissa
-// bits. Bit 51 (quiet) stays set, bit 50 marks "WeavePy tag", bits 0..50
-// carry the counter, and the sign bit is preserved. `is_same` (bit
+// arithmetic producing NaN) stamps a unique counter into the mantissa.
+// Bit 51 (quiet) stays set, bit 50 marks "WeavePy tag", bits 29..50 carry
+// the counter, bits 0..29 hold a fixed magic (see `NAN_TAG_MAGIC`), and
+// the sign bit is preserved. `is_same` (bit
 // comparison) then separates distinct NaNs exactly like CPython pointer
 // identity, and `py_hash_double` hashes the bits — stable per object,
 // different across objects.
@@ -10114,15 +10321,33 @@ pub(crate) fn i64_cmp_f64(a: i64, b: f64) -> Result<Ordering, RuntimeError> {
 // it; `pandas.util.hash_pandas_object` hashes the raw buffer), pickle /
 // marshal payloads, and mirror float bodies (`ob_fval` is read by the
 // `PyFloat_AS_DOUBLE` macro). Those seams call [`untag_nan`], which strips
-// only the marker-bearing tags and leaves genuine (bit-50-clear) payloads —
-// e.g. from `struct.unpack` of exotic bytes — untouched, so byte-level
+// only marker-and-magic-bearing tags and leaves genuine payloads — e.g.
+// from `struct.unpack` of exotic bytes — untouched, so byte-level
 // round-trips stay faithful.
 
 /// Marker bit distinguishing WeavePy identity tags from genuine NaN
 /// payloads that entered through byte-level APIs.
 const NAN_TAG_MARKER: u64 = 1 << 50;
-/// Mask of the counter field within the tag (bits 0..50).
-const NAN_TAG_COUNTER_MASK: u64 = NAN_TAG_MARKER - 1;
+/// The tag's low field is a fixed magic, not counter bits. A NaN widened
+/// from a 2- or 4-byte encoding (`PyFloat_Unpack2/4`, `struct.unpack('e'
+/// / 'f')`) carries its payload in the top of the mantissa and has bits
+/// 0..29 clear, so requiring this nonzero magic there means no such
+/// payload can ever be mistaken for a tag and canonicalized on the way
+/// back out (test_capi.test_float's random-payload round trips at every
+/// size). An 8-byte payload collides only with probability 2^-29.
+const NAN_TAG_MAGIC_MASK: u64 = (1 << 29) - 1;
+const NAN_TAG_MAGIC: u64 = 0x0A5C_3D71;
+/// The identity counter lives in bits 29..50.
+const NAN_TAG_COUNTER_SHIFT: u32 = 29;
+const NAN_TAG_COUNTER_MASK: u64 = (1 << (50 - NAN_TAG_COUNTER_SHIFT)) - 1;
+
+/// Whether `v` carries a WeavePy identity tag (as opposed to a genuine
+/// payload that entered through a byte-level API).
+#[inline]
+fn is_tagged_nan(v: f64) -> bool {
+    let bits = v.to_bits();
+    v.is_nan() && bits & NAN_TAG_MARKER != 0 && bits & NAN_TAG_MAGIC_MASK == NAN_TAG_MAGIC
+}
 
 /// Stamp a fresh identity tag into a NaN, preserving its sign. Non-NaN
 /// values pass through unchanged. Each call yields a distinct bit pattern,
@@ -10142,7 +10367,12 @@ fn fresh_nan_bits(v: f64) -> f64 {
     let counter = NEXT_NAN_TAG.fetch_add(1, Ordering::Relaxed) & NAN_TAG_COUNTER_MASK;
     let sign = v.to_bits() & (1u64 << 63);
     // Exponent all-ones + quiet bit keeps it a quiet NaN on every platform.
-    f64::from_bits(sign | 0x7ff8_0000_0000_0000 | NAN_TAG_MARKER | counter)
+    f64::from_bits(
+        sign | 0x7ff8_0000_0000_0000
+            | NAN_TAG_MARKER
+            | (counter << NAN_TAG_COUNTER_SHIFT)
+            | NAN_TAG_MAGIC,
+    )
 }
 
 /// Construct an `Object::Float`, giving a NaN result a fresh identity —
@@ -10157,7 +10387,7 @@ pub fn fresh_float(v: f64) -> Object {
 /// non-NaN values pass through unchanged.
 #[inline]
 pub fn untag_nan(v: f64) -> f64 {
-    if v.is_nan() && v.to_bits() & NAN_TAG_MARKER != 0 {
+    if is_tagged_nan(v) {
         let sign = v.to_bits() & (1u64 << 63);
         return f64::from_bits(sign | 0x7ff8_0000_0000_0000);
     }
@@ -10430,9 +10660,28 @@ fn siphash13(k0: u64, k1: u64, data: &[u8]) -> u64 {
         round(&mut v0, &mut v1, &mut v2, &mut v3);
         v0 ^= mi;
     }
-    let mut tail = [0u8; 8];
-    tail[..rem.len()].copy_from_slice(rem);
-    let b = ((data.len() as u64) << 56) | u64::from_le_bytes(tail);
+    // Little-endian assemble of the 0..7 tail bytes with fixed-width
+    // loads: byte `i` of the tail lands at bits `8*i`, exactly as
+    // `u64::from_le_bytes` of a zero-padded buffer would place it, but
+    // without the variable-length `copy_from_slice` (a `memcpy` call that
+    // the RFC 0077 census showed under every short-string hash).
+    let mut tail: u64 = 0;
+    let mut rest = rem;
+    let mut shift = 0u32;
+    if rest.len() >= 4 {
+        tail |= u64::from(u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]));
+        rest = &rest[4..];
+        shift = 32;
+    }
+    if rest.len() >= 2 {
+        tail |= u64::from(u16::from_le_bytes([rest[0], rest[1]])) << shift;
+        rest = &rest[2..];
+        shift += 16;
+    }
+    if let Some(&byte) = rest.first() {
+        tail |= u64::from(byte) << shift;
+    }
+    let b = ((data.len() as u64) << 56) | tail;
     v3 ^= b;
     round(&mut v0, &mut v1, &mut v2, &mut v3);
     v0 ^= b;
@@ -11093,7 +11342,7 @@ fn bytes_membership(haystack: &[u8], item: &Object) -> Result<bool, RuntimeError
 /// except those in the "Other" (Cc, Cf, Cs, Co, Cn) and "Separator"
 /// (Zl, Zp, Zs) general categories, with U+0020 (space) treated as
 /// printable. Used by `repr(str)` (and `str.isprintable`).
-/// `Py_UNICODE_ISPRINTABLE`, from the generated UCD 15.1.0 tables (the
+/// `Py_UNICODE_ISPRINTABLE`, from the generated UCD 16.0.0 tables (the
 /// `unicode_properties` crate tracks a newer UCD and drifts on newly
 /// assigned code points).
 pub(crate) fn char_is_printable(c: char) -> bool {
@@ -11482,6 +11731,28 @@ impl Object {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `hash(b"...")` under `PYTHONHASHSEED=0` on CPython 3.13 (an all-zero
+    /// siphash13 key), one value per tail length 0..=7 plus two multi-chunk
+    /// inputs, so every branch of the fixed-width tail assembly is pinned
+    /// bit-for-bit against the reference implementation.
+    #[test]
+    fn siphash13_tail_lengths_match_cpython() {
+        let pinned: [(&[u8], u64); 9] = [
+            (b"a", 4_644_417_185_603_328_019),
+            (b"ab", 6_148_830_537_548_944_441),
+            (b"abc", 13_851_880_170_939_887_858),
+            (b"abcd", 16_416_137_402_921_954_953),
+            (b"abcde", 2_674_923_165_546_153_122),
+            (b"abcdef", 7_070_790_388_344_807_208),
+            (b"abcdefg", 7_904_145_750_247_929_094),
+            (b"abcdefgh", 4_574_395_652_268_504_554),
+            (b"abcdefghijk", 1_450_545_860_578_130_900),
+        ];
+        for (data, want) in pinned.iter() {
+            assert_eq!(siphash13(0, 0, data), *want, "{data:?}");
+        }
+    }
 
     #[test]
     fn truthiness_matches_python_basics() {

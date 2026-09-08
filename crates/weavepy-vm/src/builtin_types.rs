@@ -494,6 +494,12 @@ impl BuiltinTypes {
                             return Ok(inst);
                         }
                     }
+                    // A plain namespace is a container like any other:
+                    // `ns.caught = args` with `args.thread` reaching back
+                    // through a closure cell is a cycle the collector must
+                    // see (test_interpreters' captured_thread_exception
+                    // left its Thread in `threading._dangling`).
+                    crate::gc_trace::track(ns.clone());
                     Ok(ns)
                 };
             let mut ns_dict = simple_namespace_.dict.borrow_mut();
@@ -552,17 +558,29 @@ impl BuiltinTypes {
         // `isinstance(typ, GenericAlias)` and
         // `__class_getitem__ = classmethod(GenericAlias)`.
         let generic_alias_ = mk("GenericAlias", vec![object_.clone()]);
-        let union_type_ = mk("UnionType", vec![object_.clone()]);
-        for ty in [&generic_alias_, &union_type_] {
-            // Not in `as_globals` (they live in `types`, not `builtins`),
-            // so the bulk metaclass pass below won't reach them.
+        // 3.14: `types.UnionType` *is* `typing.Union` — one class, named
+        // `Union` in module `typing`, subscriptable (`Union[int, str]`)
+        // and the class of every `X | Y` union.
+        let union_type_ = mk("Union", vec![object_.clone()]);
+        for (ty, module) in [(&generic_alias_, "types"), (&union_type_, "typing")] {
+            // Not in `as_globals` (they live in `types`/`typing`, not
+            // `builtins`), so the bulk metaclass pass below won't reach them.
             ty.set_metaclass(type_.clone());
             let mut d = ty.dict.borrow_mut();
             d.insert(
                 crate::object::DictKey(Object::from_static("__module__")),
-                Object::from_static("types"),
+                Object::from_static(module),
             );
         }
+        union_type_.dict.borrow_mut().insert(
+            crate::object::DictKey(Object::from_static("__class_getitem__")),
+            Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                name: "__class_getitem__",
+                binds_instance: false,
+                call: Box::new(crate::union_class_getitem),
+                call_kw: None,
+            })),
+        );
         // (Their C tp_doc strings live in `builtin_type_doc` — the
         // `type.__doc__` getset path; test_pydoc test_union_type.)
         // CPython's `ga_new`: `GenericAlias(origin, args)` — also reached
@@ -910,6 +928,9 @@ impl BuiltinTypes {
                 "end_lineno",
                 "end_offset",
                 "print_file_and_line",
+                // 3.14: `(last_stmt_lineno, last_stmt_col, source)` set
+                // by the parser; `traceback._find_keyword_typos` reads it.
+                "_metadata",
             ],
         );
         install_field_defaults(
@@ -2591,16 +2612,10 @@ fn install_module_methods(module_: &Rc<TypeObject>) {
             crate::error::type_error("descriptor requires a 'module' object".to_owned())
         })?;
         let dict = dict_of(this)?;
-        if let Some(v) = dict.borrow().get(&crate::object::StrKey("__annotations__")) {
-            return Ok(v.clone());
-        }
-        let fresh = Object::new_dict();
-        dict.borrow_mut().insert(
-            DictKey(Object::from_static("__annotations__")),
-            fresh.clone(),
-        );
-        Ok(fresh)
+        crate::builtins::module_annotations_get_dict(&dict)
     }
+    // `module_set_annotations`: the store lands in the namespace and
+    // drops any deferred `__annotate__`.
     fn module_annotations_set(args: &[Object]) -> Result<Object, RuntimeError> {
         let (this, value) = match args {
             [this, value] => (this, value.clone()),
@@ -2610,22 +2625,51 @@ fn install_module_methods(module_: &Rc<TypeObject>) {
                 ))
             }
         };
-        dict_of(this)?
-            .borrow_mut()
-            .insert(DictKey(Object::from_static("__annotations__")), value);
+        let dict = dict_of(this)?;
+        let mut d = dict.borrow_mut();
+        d.insert(DictKey(Object::from_static("__annotations__")), value);
+        d.shift_remove(&DictKey(Object::from_static("__annotate__")));
         Ok(Object::None)
     }
     fn module_annotations_del(args: &[Object]) -> Result<Object, RuntimeError> {
         let this = args.first().ok_or_else(|| {
             crate::error::type_error("descriptor requires a 'module' object".to_owned())
         })?;
-        let removed = dict_of(this)?
-            .borrow_mut()
-            .shift_remove(&DictKey(Object::from_static("__annotations__")));
+        let dict = dict_of(this)?;
+        let mut d = dict.borrow_mut();
+        let removed = d.shift_remove(&DictKey(Object::from_static("__annotations__")));
         if removed.is_none() {
             return Err(crate::error::attribute_error("__annotations__".to_owned()));
         }
+        d.shift_remove(&DictKey(Object::from_static("__annotate__")));
         Ok(Object::None)
+    }
+    // `module.__annotate__` — CPython `module_get_annotate` /
+    // `module_set_annotate` (PEP 649).
+    fn module_annotate_get(args: &[Object]) -> Result<Object, RuntimeError> {
+        let this = args.first().ok_or_else(|| {
+            crate::error::type_error("descriptor requires a 'module' object".to_owned())
+        })?;
+        let dict = dict_of(this)?;
+        Ok(crate::builtins::module_annotate_get_dict(&dict))
+    }
+    fn module_annotate_set(args: &[Object]) -> Result<Object, RuntimeError> {
+        let (this, value) = match args {
+            [this, value] => (this, value.clone()),
+            _ => {
+                return Err(crate::error::type_error(
+                    "__annotate__ setter requires (module, value)".to_owned(),
+                ))
+            }
+        };
+        let dict = dict_of(this)?;
+        crate::builtins::module_annotate_set_dict(&dict, value)?;
+        Ok(Object::None)
+    }
+    fn module_annotate_del(_args: &[Object]) -> Result<Object, RuntimeError> {
+        Err(crate::error::type_error(
+            "cannot delete __annotate__ attribute".to_owned(),
+        ))
     }
 
     fn builtin(name: &'static str, f: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
@@ -2662,6 +2706,15 @@ fn install_module_methods(module_: &Rc<TypeObject>) {
             builtin("__annotations__", module_annotations_get),
             builtin("__annotations__", module_annotations_set),
             builtin("__annotations__", module_annotations_del),
+            Object::None,
+        ))),
+    );
+    d.insert(
+        DictKey(Object::from_static("__annotate__")),
+        Object::Property(Rc::new(PyProperty::new(
+            builtin("__annotate__", module_annotate_get),
+            builtin("__annotate__", module_annotate_set),
+            builtin("__annotate__", module_annotate_del),
             Object::None,
         ))),
     );
@@ -3375,6 +3428,141 @@ pub fn install_type_dunders(type_: &Rc<TypeObject>) {
     fn type_dunder_dict_set(_args: &[Object]) -> Result<Object, RuntimeError> {
         Err(crate::error::attribute_error("readonly attribute"))
     }
+    // PEP 649 / 749 (RFC 0077 WS10) — CPython `type_get_annotations` /
+    // `type_set_annotations` / `type_get_annotate` / `type_set_annotate`.
+    // Class annotations live in the class dict under three keys:
+    // `__annotations__` (an eager dict — `from __future__ import
+    // annotations` bodies, or an explicit assignment), `__annotate_func__`
+    // (the compiler's deferred function, stored by the class body), and
+    // `__annotations_cache__` (the memoized result of calling it). Only
+    // the class's *own* dict is consulted: a subclass never sees its
+    // base's annotations.
+    fn type_annotations_get(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Type(ty)) = args.first() else {
+            return Err(crate::error::type_error(
+                "descriptor '__annotations__' for 'type' objects doesn't apply to other objects",
+            ));
+        };
+        if ty.flags.is_builtin {
+            return Err(crate::error::attribute_error(format!(
+                "type object '{}' has no attribute '__annotations__'",
+                ty.name
+            )));
+        }
+        let stored = {
+            let d = ty.dict.borrow();
+            d.get(&crate::object::StrKey("__annotations__"))
+                .or_else(|| d.get(&crate::object::StrKey("__annotations_cache__")))
+                .cloned()
+        };
+        let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+            crate::error::runtime_error("type.__annotations__ requires an active interpreter")
+        })?;
+        // SAFETY: published by an enclosing VM frame live on this thread.
+        let interp = unsafe { &mut *ptr };
+        if let Some(v) = stored {
+            // A descriptor stored under the key binds to the class
+            // (`get(annotations, NULL, tp)`).
+            return interp.descriptor_get(&v, &Object::None, &Object::Type(ty.clone()));
+        }
+        let annotate = interp.load_attr_public(&Object::Type(ty.clone()), "__annotate__")?;
+        let annotations = crate::builtins::call_annotate_value(Some(&annotate))?;
+        ty.dict.borrow_mut().insert(
+            DictKey(Object::from_static("__annotations_cache__")),
+            annotations.clone(),
+        );
+        ty.bump_attr_version();
+        Ok(annotations)
+    }
+    fn type_annotations_set(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Type(ty)) = args.first() else {
+            return Err(crate::error::type_error(
+                "descriptor '__annotations__' for 'type' objects doesn't apply to other objects",
+            ));
+        };
+        let value = args.get(1).cloned().unwrap_or(Object::None);
+        let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+            crate::error::runtime_error(
+                "type.__annotations__ setter requires an active interpreter",
+            )
+        })?;
+        // SAFETY: published by an enclosing VM frame live on this thread.
+        let interp = unsafe { &mut *ptr };
+        interp.set_type_attr_direct(ty, "__annotations__", value)?;
+        Ok(Object::None)
+    }
+    fn type_annotations_del(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Type(ty)) = args.first() else {
+            return Err(crate::error::type_error(
+                "descriptor '__annotations__' for 'type' objects doesn't apply to other objects",
+            ));
+        };
+        let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+            crate::error::runtime_error(
+                "type.__annotations__ deleter requires an active interpreter",
+            )
+        })?;
+        // SAFETY: published by an enclosing VM frame live on this thread.
+        let interp = unsafe { &mut *ptr };
+        interp.del_type_attr_direct(ty, "__annotations__")?;
+        Ok(Object::None)
+    }
+    fn type_annotate_get(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Type(ty)) = args.first() else {
+            return Err(crate::error::type_error(
+                "descriptor '__annotate__' for 'type' objects doesn't apply to other objects",
+            ));
+        };
+        if ty.flags.is_builtin {
+            return Err(crate::error::attribute_error(format!(
+                "type object '{}' has no attribute '__annotate__'",
+                ty.name
+            )));
+        }
+        let stored = {
+            let d = ty.dict.borrow();
+            d.get(&crate::object::StrKey("__annotate__"))
+                .or_else(|| d.get(&crate::object::StrKey("__annotate_func__")))
+                .cloned()
+        };
+        match stored {
+            Some(v) => {
+                let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+                    crate::error::runtime_error("type.__annotate__ requires an active interpreter")
+                })?;
+                // SAFETY: published by an enclosing VM frame live on this thread.
+                let interp = unsafe { &mut *ptr };
+                interp.descriptor_get(&v, &Object::None, &Object::Type(ty.clone()))
+            }
+            None => {
+                ty.dict.borrow_mut().insert(
+                    DictKey(Object::from_static("__annotate_func__")),
+                    Object::None,
+                );
+                Ok(Object::None)
+            }
+        }
+    }
+    fn type_annotate_set(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Type(ty)) = args.first() else {
+            return Err(crate::error::type_error(
+                "descriptor '__annotate__' for 'type' objects doesn't apply to other objects",
+            ));
+        };
+        let value = args.get(1).cloned().unwrap_or(Object::None);
+        let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+            crate::error::runtime_error("type.__annotate__ setter requires an active interpreter")
+        })?;
+        // SAFETY: published by an enclosing VM frame live on this thread.
+        let interp = unsafe { &mut *ptr };
+        interp.set_type_attr_direct(ty, "__annotate__", value)?;
+        Ok(Object::None)
+    }
+    fn type_annotate_del(_args: &[Object]) -> Result<Object, RuntimeError> {
+        Err(crate::error::type_error(
+            "cannot delete __annotate__ attribute",
+        ))
+    }
     type GetSetFn = fn(&[Object]) -> Result<Object, RuntimeError>;
     fn mk_getset(name: &'static str, get: GetSetFn, set: GetSetFn, del: GetSetFn) -> Object {
         Object::Property(Rc::new(crate::object::PyProperty::new(
@@ -3432,6 +3620,24 @@ pub fn install_type_dunders(type_: &Rc<TypeObject>) {
                 type_dunder_dict_get,
                 type_dunder_dict_set,
                 type_dunder_dict_set,
+            ),
+        ),
+        (
+            "__annotations__",
+            mk_getset(
+                "__annotations__",
+                type_annotations_get,
+                type_annotations_set,
+                type_annotations_del,
+            ),
+        ),
+        (
+            "__annotate__",
+            mk_getset(
+                "__annotate__",
+                type_annotate_get,
+                type_annotate_set,
+                type_annotate_del,
             ),
         ),
     ] {
@@ -3869,13 +4075,6 @@ fn install_unicode_error_dunders(ty: &Rc<TypeObject>, kind: UnicodeErrorKind) {
                 _ => 0,
             }
         };
-        // `encoding` / `reason` render via str() whatever their type —
-        // attributes are reassignable after construction (issue 7309).
-        let encoding = get("encoding").map(|o| o.to_str()).unwrap_or_default();
-        let reason = get("reason").map(|o| o.to_str()).unwrap_or_default();
-        let start = get("start").as_ref().map(as_i).unwrap_or(0);
-        let end = get("end").as_ref().map(as_i).unwrap_or(0);
-
         // CPython: a half-built instance (`__new__` without `__init__`)
         // falls back to `BaseException.__str__` — "" for empty args,
         // str(arg) for one, repr(args) otherwise.
@@ -3890,7 +4089,60 @@ fn install_unicode_error_dunders(ty: &Rc<TypeObject>, kind: UnicodeErrorKind) {
                 _ => Object::from_static(""),
             });
         }
-        let obj = get("object").unwrap_or(Object::None);
+        // `encoding` / `reason` render via str() whatever their type —
+        // attributes are reassignable after construction (issue 7309) —
+        // through the full `__str__` protocol, which may run Python code.
+        let py_str = |o: Object| -> Result<String, RuntimeError> {
+            match &o {
+                Object::Str(_) | Object::None | Object::Int(_) | Object::Bool(_) => Ok(o.to_str()),
+                _ => match crate::vm_singletons::current_interpreter_ptr() {
+                    // SAFETY: published by an enclosing VM frame still
+                    // live on this thread; the GIL keeps the access
+                    // exclusive.
+                    Some(ptr) => unsafe { &mut *ptr }.str_object(&o),
+                    None => Ok(o.to_str()),
+                },
+            }
+        };
+        let reason = py_str(get("reason").unwrap_or(Object::None))?;
+        let encoding = match kind {
+            UnicodeErrorKind::Translate => String::new(),
+            _ => py_str(get("encoding").unwrap_or(Object::None))?,
+        };
+        // Those str() calls may have mutated `object`
+        // (`check_unicode_error_attribute`, gh-128974).
+        let obj = match get("object") {
+            None => {
+                return Err(crate::error::type_error(
+                    "UnicodeError 'object' attribute is not set".to_owned(),
+                ));
+            }
+            Some(o) => {
+                let subclass_of = |o: &Object, base: &str| {
+                    matches!(o, Object::Instance(i)
+                        if i.cls().mro.borrow().iter().any(|t| t.name == base))
+                };
+                let ok = match kind {
+                    UnicodeErrorKind::Decode => {
+                        matches!(o, Object::Bytes(_)) || subclass_of(&o, "bytes")
+                    }
+                    _ => matches!(o, Object::Str(_) | Object::WStr(_)) || subclass_of(&o, "str"),
+                };
+                if !ok {
+                    return Err(crate::error::type_error(format!(
+                        "UnicodeError 'object' attribute must be a {}",
+                        if kind == UnicodeErrorKind::Decode {
+                            "bytes"
+                        } else {
+                            "string"
+                        }
+                    )));
+                }
+                o
+            }
+        };
+        let start = get("start").as_ref().map(as_i).unwrap_or(0);
+        let end = get("end").as_ref().map(as_i).unwrap_or(0);
 
         // Escape a single offending scalar exactly as CPython does.
         let escape = |c: u32| -> String {
@@ -4056,9 +4308,10 @@ fn install_syntax_error_dunders(syntax_error: &Rc<TypeObject>) {
                     items.len()
                 )));
             }
-            if items.len() > 6 {
+            // 3.14 accepts a seventh `_metadata` item.
+            if items.len() > 7 {
                 return Err(crate::error::type_error(format!(
-                    "function takes at most 6 arguments ({} given)",
+                    "function takes at most 7 arguments ({} given)",
                     items.len()
                 )));
             }
@@ -4072,9 +4325,12 @@ fn install_syntax_error_dunders(syntax_error: &Rc<TypeObject>) {
             inst_rc.slot_set("lineno", pick(1));
             inst_rc.slot_set("offset", pick(2));
             inst_rc.slot_set("text", pick(3));
-            if items.len() == 6 {
+            if items.len() >= 6 {
                 inst_rc.slot_set("end_lineno", pick(4));
                 inst_rc.slot_set("end_offset", pick(5));
+            }
+            if items.len() == 7 {
+                inst_rc.slot_set("_metadata", pick(6));
             }
         }
         Ok(Object::None)
@@ -5760,6 +6016,18 @@ fn install_numeric_class_methods(bt: &BuiltinTypes) {
         crate::builtins::b_bytearray_fromhex_cls,
     );
     install(&bt.float_, "fromhex", crate::builtins::b_float_fromhex_cls);
+    // 3.14: `float.from_number(number)` (gh-84978).
+    install(
+        &bt.float_,
+        "from_number",
+        crate::builtins::b_float_from_number_cls,
+    );
+    // 3.14: `complex.from_number(number)`.
+    install(
+        &bt.complex_,
+        "from_number",
+        crate::builtins::b_complex_from_number_cls,
+    );
     // `float.__getformat__` — CPython keeps this (undocumented) classmethod
     // for `test.support` (`HAVE_IEEE_754`) and struct/float tests. Rust f64
     // is IEEE 754 binary64 on every supported target, so the answer is

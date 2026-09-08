@@ -13,6 +13,7 @@
 
 use crate::sync::Rc;
 use crate::sync::RefCell;
+use weavepy_version::{vconcat, CP_TAG, SOABI_PREFIX};
 
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
@@ -37,13 +38,13 @@ pub const MULTIARCH: &str = if cfg!(target_os = "macos") {
 /// `_imp.extension_suffixes()[0]` (`test_sysconfig` asserts the
 /// identity, and setuptools names built extensions with it).
 pub const EXT_SUFFIX: &str = if cfg!(target_os = "macos") {
-    ".cpython-313-darwin.so"
+    vconcat!(".", SOABI_PREFIX, "-darwin.so")
 } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-    ".cpython-313-x86_64-linux-gnu.so"
+    vconcat!(".", SOABI_PREFIX, "-x86_64-linux-gnu.so")
 } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-    ".cpython-313-aarch64-linux-gnu.so"
+    vconcat!(".", SOABI_PREFIX, "-aarch64-linux-gnu.so")
 } else if cfg!(windows) {
-    ".cp313-win_amd64.pyd"
+    vconcat!(".", CP_TAG, "-win_amd64.pyd")
 } else {
     ".so"
 };
@@ -51,13 +52,13 @@ pub const EXT_SUFFIX: &str = if cfg!(target_os = "macos") {
 /// The shared-object ABI tag (`EXT_SUFFIX` minus the dot and the
 /// trailing `.so`/`.pyd`).
 pub const SOABI: &str = if cfg!(target_os = "macos") {
-    "cpython-313-darwin"
+    vconcat!(SOABI_PREFIX, "-darwin")
 } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-    "cpython-313-x86_64-linux-gnu"
+    vconcat!(SOABI_PREFIX, "-x86_64-linux-gnu")
 } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-    "cpython-313-aarch64-linux-gnu"
+    vconcat!(SOABI_PREFIX, "-aarch64-linux-gnu")
 } else if cfg!(windows) {
-    "cp313-win_amd64"
+    vconcat!(CP_TAG, "-win_amd64")
 } else {
     ""
 };

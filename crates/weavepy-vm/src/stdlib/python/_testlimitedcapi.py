@@ -83,6 +83,12 @@ class LimitedVectorCallClass:
         return "vectorcall called"
 
 
+class LimitedRelativeVectorCallClass(LimitedVectorCallClass):
+    """3.14: the same probe built with `Py_RELATIVE_OFFSET` for
+    `Py_tp_vectorcall_offset` (test_call.test_vectorcall_limited_incoming);
+    the offset encoding is invisible at the Python level."""
+
+
 def call_vectorcall(callable):
     # PyObject_Vectorcall(callable, ["foo"], 1 args + kwname "baz"="bar")
     return callable("foo", baz="bar")
@@ -138,6 +144,13 @@ def _test_widechar_impl():
 
 
 test_widechar = _CFuncLtd(_test_widechar_impl)
+
+
+def run_compilestring(source, filename, start):
+    """`Py_CompileString()` (test_capi.test_run.test_compilestring)."""
+    import _testcapi
+
+    return _testcapi.run_compilestringflags(source, filename, start, 0)
 
 
 from _weave_capi_bin import *  # noqa: E402,F401,F403

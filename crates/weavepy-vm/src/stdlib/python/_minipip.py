@@ -1307,6 +1307,41 @@ def cmd_search(args):
     return 0
 
 
+def cmd_debug(args):
+    """``pip debug [--verbose]`` — real pip's shape: interpreter identity
+    and, under ``--verbose``, the compatible wheel tags (RFC 0077's
+    identity gate reads ``cp314`` out of this)."""
+    location = os.path.dirname(os.path.abspath(
+        globals().get('__file__') or '.'))
+    print('pip version: pip {} from {} (python {}.{})'.format(
+        VERSION, location, *sys.version_info[:2]))
+    print('sys.version: {}'.format(sys.version))
+    print('sys.executable: {}'.format(sys.executable))
+    print('sys.getdefaultencoding: {}'.format(sys.getdefaultencoding()))
+    print('sys.getfilesystemencoding: {}'.format(sys.getfilesystemencoding()))
+    print('sys.platform: {}'.format(sys.platform))
+    print('sys.implementation:')
+    print('  name: {}'.format(sys.implementation.name))
+    if not getattr(args, 'verbose', 0):
+        return 0
+    # Every (python, abi, platform) triple `_is_compatible_wheel` accepts,
+    # most specific first — the interpreter's own `cpXY-cpXY-<plat>` leads.
+    pys = _compatible_python_tags()
+    abis = _compatible_abi_tags()
+    plats = _compatible_platform_tags()
+    major, minor = sys.version_info[:2]
+    own = 'cp%d%d' % (major, minor)
+    pys = [own] + [t for t in pys if t != own]
+    abis = [own] + [t for t in abis if t != own]
+    plats = [t for t in plats if t != 'any'] + ['any']
+    triples = ['{}-{}-{}'.format(py, abi, plat)
+               for py in pys for abi in abis for plat in plats]
+    print('Compatible tags: {}'.format(len(triples)))
+    for t in triples:
+        print('  ' + t)
+    return 0
+
+
 def main(argv=None):
     """``python -m pip``."""
     if argv is None:
@@ -1407,6 +1442,10 @@ def main(argv=None):
     search = subs.add_parser('search', help='deprecated; returns nothing')
     search.add_argument('terms', nargs='*')
     search.set_defaults(func=cmd_search)
+
+    debug = subs.add_parser('debug', help='show interpreter and tag info')
+    debug.add_argument('-v', '--verbose', action='count', default=0)
+    debug.set_defaults(func=cmd_debug)
 
     opts = parser.parse_args(argv)
     if opts.version:

@@ -3,7 +3,7 @@
  * array C-API surface, wave 3) hermetic proof.
  *
  * Like `_stockabi.c` / `_stocktype.c`, this module is compiled against
- * the host's **stock CPython 3.13 headers** with the *full* (non-limited)
+ * the host's **stock CPython 3.14 headers** with the *full* (non-limited)
  * API, so it sees the genuine 416-byte `PyTypeObject`, the real
  * `PyMemberDef` layout + `T_*` codes (`<structmember.h>`), the inlined
  * head macros, and the real `PyCapsule_*` surface. Where `_stockabi`
@@ -354,7 +354,7 @@ static PyMethodDef sa_methods[] = {
 static struct PyModuleDef sa_module = {
     PyModuleDef_HEAD_INIT,
     "_stockarray",
-    "RFC 0045 wave-3 stock-CPython-3.13 inline-storage + array C-API proof.",
+    "RFC 0045 wave-3 stock-CPython-3.14 inline-storage + array C-API proof.",
     -1,
     sa_methods,
     NULL,
@@ -394,6 +394,6 @@ PyMODINIT_FUNC PyInit__stockarray(void) {
         return NULL;
     }
 
-    PyModule_AddStringConstant(m, "ABI", "cp313");
+    PyModule_AddStringConstant(m, "ABI", "cp314");
     return m;
 }

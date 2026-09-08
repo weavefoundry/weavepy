@@ -29,6 +29,21 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, LexError> {
 /// `SyntaxError` for the stray `$`). Collecting them on the scanner and
 /// handing them back regardless of the result preserves that ordering.
 pub fn tokenize_with_escapes(source: &str) -> (Result<Vec<Token>, LexError>, Vec<EscapeWarning>) {
+    let (result, warnings) = tokenize_partial(source);
+    (result.map_err(|(_, e)| e), warnings)
+}
+
+/// [`tokenize_with_escapes`] that, on failure, also hands back the
+/// tokens scanned *before* the error. CPython's tokenizer is lazy, so
+/// its parser sees exactly this prefix before the tokenizer error
+/// surfaces; callers replay that ordering (a parse error in the prefix
+/// can win over, or be overridden by, the tokenizer's diagnostic).
+pub fn tokenize_partial(
+    source: &str,
+) -> (
+    Result<Vec<Token>, (Vec<Token>, LexError)>,
+    Vec<EscapeWarning>,
+) {
     let mut scanner = Scanner::new(source);
     let mut out = Vec::new();
     let mut seen_content = false;
@@ -68,7 +83,7 @@ pub fn tokenize_with_escapes(source: &str) -> (Result<Vec<Token>, LexError>, Vec
                         // character of the indent run).
                         let start = tok.span.start.0;
                         let pos = if start > indent_pos { start - 1 } else { start };
-                        break Err(LexError::UnexpectedIndent { pos });
+                        break Err((out, LexError::UnexpectedIndent { pos }));
                     }
                     seen_content = true;
                 }
@@ -78,7 +93,7 @@ pub fn tokenize_with_escapes(source: &str) -> (Result<Vec<Token>, LexError>, Vec
                 }
             }
             Ok(None) => continue,
-            Err(e) => break Err(e),
+            Err(e) => break Err((out, e)),
         }
     };
     (result, scanner.escape_warnings)
@@ -125,6 +140,10 @@ struct Scanner<'src> {
     /// Current lexical f-string nesting depth (CPython caps this at
     /// MAXFSTRINGLEVEL = 150 with "too many nested f-strings").
     fstring_level: u32,
+    /// The string kind (`'f'` / `'t'`) of each lexically enclosing
+    /// f-/t-string, innermost last — CPython's per-mode `string_kind`,
+    /// which `TOK_GET_STRING_PREFIX` reads for "%c-string: ..." errors.
+    fstring_kinds: Vec<char>,
     /// Start (just past the `{`) of the outermost replacement field of
     /// the outermost f-string currently being scanned. Lets a deeply
     /// nested "too many nested f-strings" carry enough context for the
@@ -148,8 +167,15 @@ impl<'src> Scanner<'src> {
             last_was_content: false,
             escape_warnings: Vec::new(),
             fstring_level: 0,
+            fstring_kinds: Vec::new(),
             outer_field_start: None,
         }
+    }
+
+    /// `'t'` inside a t-string, else `'f'` (CPython's
+    /// `TOK_GET_STRING_PREFIX`).
+    fn fstring_kind(&self) -> char {
+        self.fstring_kinds.last().copied().unwrap_or('f')
     }
 
     /// Inspect the escape that begins at the backslash at absolute offset
@@ -186,7 +212,12 @@ impl<'src> Scanner<'src> {
             if val > 0o377 {
                 self.escape_warnings.push(EscapeWarning {
                     offset: bs as u32,
-                    message: format!("invalid octal escape sequence '\\{digits}'"),
+                    // 3.14 (gh-129559 wording): the warning names the fix.
+                    message: format!(
+                        "\"\\{digits}\" is an invalid octal escape sequence. \
+                         Such sequences will not work in the future. \
+                         Did you mean \"\\\\{digits}\"? A raw string is also an option."
+                    ),
                 });
                 return true;
             }
@@ -222,7 +253,11 @@ impl<'src> Scanner<'src> {
             .unwrap_or(esc as char);
         self.escape_warnings.push(EscapeWarning {
             offset: bs as u32,
-            message: format!("invalid escape sequence '\\{esc_char}'"),
+            message: format!(
+                "\"\\{esc_char}\" is an invalid escape sequence. \
+                 Such sequences will not work in the future. \
+                 Did you mean \"\\\\{esc_char}\"? A raw string is also an option."
+            ),
         });
         true
     }
@@ -283,9 +318,9 @@ impl<'src> Scanner<'src> {
                 return Ok(Some(self.token(TokenKind::Newline, self.pos, self.pos)));
             }
             // EOF with an unclosed bracket: CPython's tokenizer reports
-            // the *outermost* unclosed bracket (`parenstack[0]`),
+            // the *innermost* unclosed bracket (`parenstack[level-1]`),
             // anchored at its opening position (`'(' was never closed`).
-            if let Some(&(bracket, pos)) = self.open_brackets.first() {
+            if let Some(&(bracket, pos)) = self.open_brackets.last() {
                 return Err(LexError::BracketNeverClosed {
                     open: bracket as char,
                     pos: pos as u32,
@@ -334,15 +369,17 @@ impl<'src> Scanner<'src> {
                 // right after the swallowed newline): CPython reports
                 // an EOF error rather than silently completing the
                 // statement — unless a bracket is open, which wins.
+                // Anchored one column past the backslash on *its* line
+                // (`compile('x = 1 \\\n')` reports line 1, offset 8).
                 if self.peek().is_none() {
-                    if let Some(&(bracket, pos)) = self.open_brackets.first() {
+                    if let Some(&(bracket, pos)) = self.open_brackets.last() {
                         return Err(LexError::BracketNeverClosed {
                             open: bracket as char,
                             pos: pos as u32,
                         });
                     }
                     return Err(LexError::UnexpectedEofParsing {
-                        pos: self.pos as u32,
+                        pos: (bs_pos + 1) as u32,
                         line_had_tokens: self.last_was_content,
                     });
                 }
@@ -353,7 +390,7 @@ impl<'src> Scanner<'src> {
             // unclosed bracket (anchored at its opener), not the stray
             // backslash.
             if self.peek().is_none() {
-                if let Some(&(bracket, pos)) = self.open_brackets.first() {
+                if let Some(&(bracket, pos)) = self.open_brackets.last() {
                     return Err(LexError::BracketNeverClosed {
                         open: bracket as char,
                         pos: pos as u32,
@@ -462,12 +499,35 @@ impl<'src> Scanner<'src> {
         // indent handling (the continuation is consumed by the main
         // loop as part of the logical line).
         if b == b'\\' {
+            // A continuation chain that runs off the end of the input
+            // is bpo-2180's "unexpected EOF while parsing", anchored one
+            // column past the last backslash (`compile('  \\')` reports
+            // offset 4; `'\\\n'` offset 2). It is *not* an indentation
+            // error, and unlike a chain that lands on a blank line it is
+            // not blank either.
+            let eof_after = |bs: usize| -> Option<u32> {
+                let mut q = bs + 1;
+                if self.src.get(q) == Some(&b'\r') {
+                    q += 1;
+                }
+                if self.src.get(q) == Some(&b'\n') {
+                    q += 1;
+                }
+                (q >= self.src.len()).then_some((bs + 1) as u32)
+            };
             let mut probe = self.pos;
             let blank_joined = loop {
                 if self.src.get(probe) != Some(&b'\\') {
                     break false;
                 }
-                let mut q = probe + 1;
+                if let Some(pos) = eof_after(probe) {
+                    return Err(LexError::UnexpectedEofParsing {
+                        pos,
+                        line_had_tokens: self.last_was_content,
+                    });
+                }
+                let bs = probe;
+                let mut q = bs + 1;
                 if self.src.get(q) == Some(&b'\r') {
                     q += 1;
                 }
@@ -479,8 +539,16 @@ impl<'src> Scanner<'src> {
                     probe += 1;
                 }
                 match self.src.get(probe) {
-                    None | Some(b'\n' | b'\r' | b'#') => break true,
+                    Some(b'\n' | b'\r' | b'#') => break true,
                     Some(b'\\') => continue,
+                    // Whitespace, then EOF: the joined line never got
+                    // its content.
+                    None => {
+                        return Err(LexError::UnexpectedEofParsing {
+                            pos: (bs + 1) as u32,
+                            line_had_tokens: self.last_was_content,
+                        });
+                    }
                     _ => break false,
                 }
             };
@@ -617,6 +685,18 @@ impl<'src> Scanner<'src> {
                 let prefix_str = std::str::from_utf8(lexeme).unwrap_or("");
                 if let Some(prefix) = StringPrefix::parse(prefix_str) {
                     return self.scan_string(start, prefix);
+                }
+                // CPython's tokenizer scans a run of distinct prefix
+                // letters up to the quote and names the clashing pair
+                // (`ub''` → "'u' and 'b' prefixes are incompatible");
+                // anything else (`kf''`, `bb''`) is a NAME then a STRING.
+                if let Some((first, second)) = incompatible_prefix_pair(prefix_str) {
+                    return Err(LexError::IncompatibleStringPrefixes {
+                        pos: start as u32,
+                        end: self.pos as u32,
+                        first,
+                        second,
+                    });
                 }
                 // Otherwise fall through to treat as identifier.
             }
@@ -890,7 +970,7 @@ impl<'src> Scanner<'src> {
                 self.pos += 1;
             }
             let mut warned = false;
-            self.scan_fstring_extent(start, quote, triple, prefix.raw, &mut warned)?;
+            self.scan_fstring_extent(start, quote, triple, prefix, &mut warned)?;
             return Ok(self.token(TokenKind::String, start, self.pos));
         }
         if triple {
@@ -911,7 +991,7 @@ impl<'src> Scanner<'src> {
         start: usize,
         quote: u8,
         triple: bool,
-        raw: bool,
+        prefix: StringPrefix,
         warned: &mut bool,
     ) -> Result<(), LexError> {
         // CPython's tokenizer caps lexically nested f-strings at
@@ -922,9 +1002,13 @@ impl<'src> Scanner<'src> {
             return Err(LexError::FstringTooManyNested {
                 pos: start as u32,
                 field_start: self.outer_field_start.unwrap_or(start as u32),
+                kind: self.fstring_kinds.first().copied().unwrap_or('f'),
             });
         }
-        let r = self.scan_fstring_extent_inner(start, quote, triple, raw, warned);
+        self.fstring_kinds
+            .push(if prefix.template { 't' } else { 'f' });
+        let r = self.scan_fstring_extent_inner(start, quote, triple, prefix, warned);
+        self.fstring_kinds.pop();
         self.fstring_level -= 1;
         r
     }
@@ -934,9 +1018,11 @@ impl<'src> Scanner<'src> {
         start: usize,
         quote: u8,
         triple: bool,
-        raw: bool,
+        prefix: StringPrefix,
         warned: &mut bool,
     ) -> Result<(), LexError> {
+        let raw = prefix.raw;
+        let kind = if prefix.template { 't' } else { 'f' };
         // Start of the literal body (just past the opening quotes) —
         // used to report `\N` escape errors with CPython's
         // segment-relative byte positions.
@@ -946,10 +1032,19 @@ impl<'src> Scanner<'src> {
                 // Ran off the end with the literal still open: CPython
                 // names the quote style ("unterminated f-string literal"
                 // vs "...triple-quoted f-string literal").
+                let detected_line = self.eof_line();
                 return Err(if triple {
-                    LexError::UnterminatedTripleFstring { pos: start as u32 }
+                    LexError::UnterminatedTripleFstring {
+                        pos: start as u32,
+                        kind,
+                        detected_line,
+                    }
                 } else {
-                    LexError::UnterminatedFstring { pos: start as u32 }
+                    LexError::UnterminatedFstring {
+                        pos: start as u32,
+                        kind,
+                        detected_line,
+                    }
                 });
             };
             if b == quote {
@@ -968,7 +1063,11 @@ impl<'src> Scanner<'src> {
                 // A single-line f-string's *literal* text can't span
                 // lines; newlines are only legal inside `{ }`.
                 b'\n' | b'\r' if !triple => {
-                    return Err(LexError::UnterminatedFstring { pos: start as u32 });
+                    return Err(LexError::UnterminatedFstring {
+                        pos: start as u32,
+                        kind,
+                        detected_line: self.line_of(self.pos),
+                    });
                 }
                 // Escape in the literal part — consume the backslash and
                 // the byte it escapes (full validation happens at decode
@@ -1126,6 +1225,7 @@ impl<'src> Scanner<'src> {
                     if depth >= 3 {
                         return Err(LexError::FstringNestedTooDeeply {
                             pos: self.pos as u32,
+                            kind: self.fstring_kind(),
                         });
                     }
                     self.pos += 1;
@@ -1193,6 +1293,7 @@ impl<'src> Scanner<'src> {
                             return Err(LexError::FstringUnmatchedParen {
                                 close: b as char,
                                 pos: self.pos as u32,
+                                kind: self.fstring_kind(),
                             })
                         }
                     }
@@ -1240,6 +1341,7 @@ impl<'src> Scanner<'src> {
                 return Err(LexError::FstringExpectingBraceOrSpec {
                     pos: start as u32,
                     field_start,
+                    kind: self.fstring_kind(),
                 });
             };
             match b {
@@ -1284,6 +1386,7 @@ impl<'src> Scanner<'src> {
                     return Err(LexError::FstringExpectingBraceOrSpec {
                         pos: self.pos as u32,
                         field_start,
+                        kind: self.fstring_kind(),
                     });
                 }
                 // A literal newline in the spec is only legal inside a
@@ -1294,6 +1397,7 @@ impl<'src> Scanner<'src> {
                 b'\n' | b'\r' if !outer_triple => {
                     return Err(LexError::FstringNewlineInSpec {
                         pos: self.pos as u32,
+                        kind: self.fstring_kind(),
                     });
                 }
                 _ => self.pos += 1,
@@ -1321,11 +1425,13 @@ impl<'src> Scanner<'src> {
         // "expecting '}'" at) is the *opening* quote — the field's
         // expression text ends just before it.
         let quote_pos = self.pos as u32;
+        let kind = self.fstring_kind();
         let unterminated = |pos: u32, detected_line: u32| {
             if quote == outer_quote {
                 LexError::FstringExpectingBrace {
                     pos: quote_pos,
                     field_start,
+                    kind,
                 }
             } else {
                 LexError::UnterminatedString { pos, detected_line }
@@ -1354,12 +1460,12 @@ impl<'src> Scanner<'src> {
         }
         if prefix.interpolated() {
             let mut warned = false;
-            return self.scan_fstring_extent(self.pos, quote, triple, prefix.raw, &mut warned);
+            return self.scan_fstring_extent(self.pos, quote, triple, prefix, &mut warned);
         }
         let _ = prefix.raw;
         loop {
             let Some(b) = self.peek() else {
-                return Err(unterminated(self.pos as u32, self.line_of(self.pos)));
+                return Err(unterminated(self.pos as u32, self.eof_line()));
             };
             if b == b'\\' {
                 // A backslash escapes the next byte for tokenizing in raw
@@ -1477,7 +1583,7 @@ impl<'src> Scanner<'src> {
             let Some(b) = self.peek() else {
                 return Err(LexError::UnterminatedTripleString {
                     pos: start as u32,
-                    detected_line: self.line_of(self.pos),
+                    detected_line: self.eof_line(),
                 });
             };
             if b == b'\\' {
@@ -1570,8 +1676,7 @@ impl<'src> Scanner<'src> {
         // Single-character punctuation.
         let kind = match b {
             b'(' => {
-                self.paren_depth += 1;
-                self.open_brackets.push((b'(', start));
+                self.push_bracket(b'(', start)?;
                 TokenKind::LPar
             }
             b')' => {
@@ -1579,8 +1684,7 @@ impl<'src> Scanner<'src> {
                 TokenKind::RPar
             }
             b'[' => {
-                self.paren_depth += 1;
-                self.open_brackets.push((b'[', start));
+                self.push_bracket(b'[', start)?;
                 TokenKind::LSqb
             }
             b']' => {
@@ -1588,8 +1692,7 @@ impl<'src> Scanner<'src> {
                 TokenKind::RSqb
             }
             b'{' => {
-                self.paren_depth += 1;
-                self.open_brackets.push((b'{', start));
+                self.push_bracket(b'{', start)?;
                 TokenKind::LBrace
             }
             b'}' => {
@@ -1655,6 +1758,18 @@ impl<'src> Scanner<'src> {
 
     // ---------- helpers ----------
 
+    /// Push an opener, enforcing CPython's `MAXLEVEL` (200) nesting
+    /// limit ("too many nested parentheses" at the 201st).
+    fn push_bracket(&mut self, open: u8, start: usize) -> Result<(), LexError> {
+        const MAXLEVEL: usize = 200;
+        if self.open_brackets.len() >= MAXLEVEL {
+            return Err(LexError::TooManyNestedParens { pos: start as u32 });
+        }
+        self.paren_depth += 1;
+        self.open_brackets.push((open, start));
+        Ok(())
+    }
+
     /// Pop the bracket stack for a closer, producing CPython's
     /// "unmatched ')'" (nothing open) or "closing parenthesis ')' does
     /// not match opening parenthesis '['" (wrong opener) diagnostics.
@@ -1691,6 +1806,13 @@ impl<'src> Scanner<'src> {
         self.src[..end].iter().filter(|b| **b == b'\n').count() as u32 + 1
     }
 
+    /// CPython's `tok->lineno` when the tokenizer hits EOF: the line of
+    /// the last byte read, so a trailing newline doesn't count as having
+    /// started another line.
+    fn eof_line(&self) -> u32 {
+        self.line_of(self.src.len().saturating_sub(1))
+    }
+
     fn token(&self, kind: TokenKind, start: usize, end: usize) -> Token {
         Token {
             kind,
@@ -1711,6 +1833,38 @@ impl<'src> Scanner<'src> {
 
 fn is_ident_start(b: u8) -> bool {
     b == b'_' || b.is_ascii_alphabetic()
+}
+
+/// CPython 3.14 `maybe_raise_syntax_error_for_string_prefixes`: for a
+/// quote-adjacent identifier made only of distinct prefix letters
+/// (`b`/`r`/`u`/`f`/`t`, any case), the first clashing pair in CPython's
+/// check order — `(u,b)`, `(u,r)`, `(u,f)`, `(u,t)`, `(b,f)`, `(b,t)`,
+/// `(f,t)` — or `None` when the run is not a pure prefix run (a repeated
+/// letter or a non-prefix letter ends CPython's scan before the quote).
+fn incompatible_prefix_pair(prefix: &str) -> Option<(char, char)> {
+    let (mut b, mut r, mut u, mut f, mut t) = (false, false, false, false, false);
+    for c in prefix.chars() {
+        match c.to_ascii_lowercase() {
+            'b' if !b => b = true,
+            'u' if !u => u = true,
+            'r' if !r => r = true,
+            'f' if !f => f = true,
+            't' if !t => t = true,
+            _ => return None,
+        }
+    }
+    let pairs = [
+        (u && b, ('u', 'b')),
+        (u && r, ('u', 'r')),
+        (u && f, ('u', 'f')),
+        (u && t, ('u', 't')),
+        (b && f, ('b', 'f')),
+        (b && t, ('b', 't')),
+        (f && t, ('f', 't')),
+    ];
+    pairs
+        .into_iter()
+        .find_map(|(hit, pair)| hit.then_some(pair))
 }
 
 /// Decode one UTF-8 code point at the start of `bytes`. Returns the

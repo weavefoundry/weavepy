@@ -30,11 +30,11 @@ struct ExtensionBuild<'a> {
     env_var: &'a str,
 }
 
-/// The stock CPython 3.13 include directories the binary-ABI proof
+/// The stock CPython 3.14 include directories the binary-ABI proof
 /// fixtures compile against.
 ///
 /// RFC 0062 WS2 vendored the stock `Include/` tree into
-/// `include/cpython313/` (plus per-OS generated `pyconfig.h`
+/// `include/cpython314/` (plus per-OS generated `pyconfig.h`
 /// variants), so the default is fully hermetic: stage the right
 /// `pyconfig.h` under `OUT_DIR` and compile against
 /// `[staged, tree]`. `WEAVEPY_STOCK_PYTHON` still overrides with a
@@ -57,7 +57,9 @@ fn stock_python_include(manifest_dir: &Path, out_dir: &Path) -> Option<Vec<PathB
         }
         return None;
     }
-    let tree = manifest_dir.join("include").join("cpython313");
+    let tree = manifest_dir
+        .join("include")
+        .join(weavepy_version::HEADER_TREE);
     if !tree.join("Python.h").is_file() {
         return None;
     }
@@ -202,7 +204,7 @@ fn main() {
 
     // ----------------------------------------------------------------
     // 2b) RFC 0043 binary-ABI hermetic proofs: compile the proof
-    //     fixtures against the host's *stock* CPython 3.13 headers
+    //     fixtures against the host's *stock* CPython 3.14 headers
     //     (full, non-limited API → real inlined macros and the genuine
     //     416-byte `PyTypeObject`), NOT WeavePy's `include/Python.h`.
     //
@@ -218,7 +220,7 @@ fn main() {
     //         interchange protocols, and the `import_array()` array-C-API
     //         capsule pattern.
     //
-    //     Skipped (with a note) when CPython 3.13 dev headers aren't
+    //     Skipped (with a note) when CPython 3.14 dev headers aren't
     //     present, so a bare CI host still builds and the stock proofs
     //     self-skip.
     // ----------------------------------------------------------------
@@ -354,7 +356,7 @@ fn main() {
         }
         None => {
             println!(
-                "cargo:warning=stock CPython 3.13 headers not found; \
+                "cargo:warning=stock CPython 3.14 headers not found; \
                  skipping the _stockabi/_stocktype/_stockarray/_stockcython \
                  binary-ABI proof fixtures"
             );

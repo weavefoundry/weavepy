@@ -87,6 +87,21 @@ class ZoneInfo(_zoneinfo_module._ZoneInfoBase):
 
         return instance
 
+    def _c_tz_str_error(self, tz_str, exc):
+        # `_zoneinfo.c` parses the TZif footer as bytes and formats the
+        # failing string with %R, so its ValueErrors carry the bytes
+        # repr (test_invalid_tzstr_non_ascii_*).
+        msg = str(exc)
+        if msg.startswith("Invalid TZ string"):
+            return ValueError(
+                f"Malformed transition rule in TZ string: {tz_str!r}"
+            )
+        if msg.startswith("Missing transition rules"):
+            return ValueError(
+                f"Missing transition rules in TZ string: {tz_str!r}"
+            )
+        return ValueError(f"Invalid STD format in {tz_str!r}")
+
     @classmethod
     def clear_cache(cls, *, only_keys=None):
         if cls is ZoneInfo:

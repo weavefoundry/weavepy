@@ -672,4 +672,4 @@ pub unsafe extern "C" fn PyObject_CallFinalizerFromDealloc(_obj: *mut PyObject) 
 /// compares it against the compile-time hex; WeavePy targets CPython
 /// 3.13.0, so we publish `0x030d00f0` (3.13.0 final).
 #[no_mangle]
-pub static Py_Version: c_ulong = 0x030d_00f0;
+pub static Py_Version: c_ulong = weavepy_version::HEX as c_ulong;

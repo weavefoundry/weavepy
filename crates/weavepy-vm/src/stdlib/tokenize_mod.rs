@@ -90,9 +90,12 @@ const OP: i32 = 55;
 const FSTRING_START: i32 = 59;
 const FSTRING_MIDDLE: i32 = 60;
 const FSTRING_END: i32 = 61;
-const COMMENT: i32 = 62;
-const NL: i32 = 63;
-const ERRORTOKEN: i32 = 64;
+const TSTRING_START: i32 = 62;
+const TSTRING_MIDDLE: i32 = 63;
+const TSTRING_END: i32 = 64;
+const COMMENT: i32 = 65;
+const NL: i32 = 66;
+const ERRORTOKEN: i32 = 67;
 
 const EOF: i32 = -1;
 
@@ -249,6 +252,9 @@ struct Mode {
     quote: i32,
     quote_size: i32,
     raw: bool,
+    /// `string_kind == TSTRING`: a PEP 750 template string, whose parts
+    /// are `TSTRING_START` / `TSTRING_MIDDLE` / `TSTRING_END`.
+    tstring: bool,
     /// buffer index of the f-string opening prefix (`f_string_start`).
     start: usize,
     /// buffer index of the line the f-string started on.
@@ -270,6 +276,7 @@ impl Mode {
             quote: 0,
             quote_size: 0,
             raw: false,
+            tstring: false,
             start: 0,
             multi_line_start: 0,
             line_start: 0,
@@ -401,6 +408,34 @@ impl Tok {
 
     fn syntaxerror(&mut self, msg: impl Into<String>) -> i32 {
         self.syntaxerror_range(msg.into(), -1, -1)
+    }
+
+    /// `FTSTRING_MIDDLE(tok_mode)`: the middle-part token type of the
+    /// innermost f/t-string.
+    fn ftstring_middle(&self) -> i32 {
+        if self.modes.last().is_some_and(|m| m.tstring) {
+            TSTRING_MIDDLE
+        } else {
+            FSTRING_MIDDLE
+        }
+    }
+
+    /// `TOK_GET_STRING_PREFIX(tok)`: `'t'` inside a t-string, else `'f'`.
+    fn string_prefix(&self) -> char {
+        if self.modes.last().is_some_and(|m| m.tstring) {
+            't'
+        } else {
+            'f'
+        }
+    }
+
+    /// `FTSTRING_END(tok_mode)`.
+    fn ftstring_end(&self) -> i32 {
+        if self.modes.last().is_some_and(|m| m.tstring) {
+            TSTRING_END
+        } else {
+            FSTRING_END
+        }
     }
 
     /// `_PyTokenizer_indenterror`.
@@ -844,26 +879,51 @@ impl Tok {
                 // Identifier (most frequent token!).
                 let mut nonascii = false;
                 if is_potential_identifier_start(c) {
-                    // Process the legal combinations of b"", r"", u"", f"".
-                    let (mut saw_b, mut saw_r, mut saw_u, mut saw_f) = (false, false, false, false);
+                    // Process the legal combinations of b"", r"", u"",
+                    // f"", t"" (3.14 `lexer.c`: each letter is accepted
+                    // at most once; incompatible pairs are rejected
+                    // when the quote arrives).
+                    let (mut saw_b, mut saw_r, mut saw_u, mut saw_f, mut saw_t) =
+                        (false, false, false, false, false);
                     loop {
-                        if !(saw_b || saw_u || saw_f) && (c == 'b' as i32 || c == 'B' as i32) {
+                        if !saw_b && (c == 'b' as i32 || c == 'B' as i32) {
                             saw_b = true;
-                        } else if !(saw_b || saw_u || saw_r || saw_f)
-                            && (c == 'u' as i32 || c == 'U' as i32)
-                        {
+                        } else if !saw_u && (c == 'u' as i32 || c == 'U' as i32) {
                             saw_u = true;
-                        } else if !(saw_r || saw_u) && (c == 'r' as i32 || c == 'R' as i32) {
+                        } else if !saw_r && (c == 'r' as i32 || c == 'R' as i32) {
                             saw_r = true;
-                        } else if !(saw_f || saw_b || saw_u) && (c == 'f' as i32 || c == 'F' as i32)
-                        {
+                        } else if !saw_f && (c == 'f' as i32 || c == 'F' as i32) {
                             saw_f = true;
+                        } else if !saw_t && (c == 't' as i32 || c == 'T' as i32) {
+                            saw_t = true;
                         } else {
                             break;
                         }
                         c = self.nextc();
                         if c == '"' as i32 || c == '\'' as i32 {
-                            if saw_f {
+                            // Supported: rb, rf, rt (in any order).
+                            // Unsupported: ub, ur, uf, ut, bf, bt, ft.
+                            let bad = [
+                                (saw_u && saw_b, "u", "b"),
+                                (saw_u && saw_r, "u", "r"),
+                                (saw_u && saw_f, "u", "f"),
+                                (saw_u && saw_t, "u", "t"),
+                                (saw_b && saw_f, "b", "f"),
+                                (saw_b && saw_t, "b", "t"),
+                                (saw_f && saw_t, "f", "t"),
+                            ]
+                            .into_iter()
+                            .find(|(hit, _, _)| *hit);
+                            if let Some((_, p1, p2)) = bad {
+                                let start = self.start.unwrap_or(self.cur);
+                                let t = self.syntaxerror_range(
+                                    format!("'{p1}' and '{p2}' prefixes are incompatible"),
+                                    (start + 1) as i64 - self.line_start as i64,
+                                    self.cur as i64 - self.line_start as i64,
+                                );
+                                return self.make(t, self.start, Some(self.cur));
+                            }
+                            if saw_f || saw_t {
                                 return self.f_string_quote(c);
                             }
                             return self.letter_quote(c);
@@ -1013,7 +1073,10 @@ impl Tok {
                         && self.modes.last().unwrap().curly_bracket_depth == 0
                         && c == '}' as i32
                     {
-                        let t = self.syntaxerror("f-string: single '}' is not allowed");
+                        let t = self.syntaxerror(format!(
+                            "{}-string: single '}}' is not allowed",
+                            self.string_prefix()
+                        ));
                         return self.make(t, self.start, Some(self.cur));
                     }
                     if !self.extra_tokens && self.level == 0 {
@@ -1034,7 +1097,8 @@ impl Tok {
                                 let previous_bracket = m.curly_bracket_depth - 1;
                                 if previous_bracket == m.curly_bracket_expr_start_depth {
                                     let t = self.syntaxerror(format!(
-                                        "f-string: unmatched '{}'",
+                                        "{}-string: unmatched '{}'",
+                                        self.string_prefix(),
                                         c as u8 as char
                                     ));
                                     return self.make(t, self.start, Some(self.cur));
@@ -1058,8 +1122,11 @@ impl Tok {
                         let m = self.modes.last_mut().unwrap();
                         m.curly_bracket_depth -= 1;
                         if m.curly_bracket_depth < 0 {
-                            let t = self
-                                .syntaxerror(format!("f-string: unmatched '{}'", c as u8 as char));
+                            let t = self.syntaxerror(format!(
+                                "{}-string: unmatched '{}'",
+                                self.string_prefix(),
+                                c as u8 as char
+                            ));
                             return self.make(t, self.start, Some(self.cur));
                         }
                         if c == '}' as i32
@@ -1097,7 +1164,9 @@ impl Tok {
     fn f_string_quote(&mut self, c: i32) -> RawToken {
         let start = self.start.unwrap();
         let first = (self.buf[start] as char).to_ascii_lowercase();
-        if !((first == 'f' || first == 'r') && (c == '\'' as i32 || c == '"' as i32)) {
+        if !((first == 'f' || first == 'r' || first == 't')
+            && (c == '\'' as i32 || c == '"' as i32))
+        {
             return self.letter_quote(c);
         }
         let quote = c;
@@ -1122,12 +1191,14 @@ impl Tok {
         }
 
         if self.modes.len() + 1 >= MAXFSTRINGLEVEL {
-            let t = self.syntaxerror("too many nested f-strings");
+            let t = self.syntaxerror("too many nested f-strings or t-strings");
             return self.make(t, self.start, Some(self.cur));
         }
-        let raw = match first {
-            'f' => self.buf[start + 1].eq_ignore_ascii_case(&b'r'),
-            'r' => true,
+        let second = self.buf[start + 1].to_ascii_lowercase();
+        let (raw, tstring) = match first {
+            'f' => (second == b'r', false),
+            't' => (second == b'r', true),
+            'r' => (true, second == b't'),
             _ => unreachable!(),
         };
         self.modes.push(Mode {
@@ -1137,13 +1208,19 @@ impl Tok {
             quote,
             quote_size,
             raw,
+            tstring,
             start,
             multi_line_start: self.line_start,
             line_start: self.lineno,
             in_format_spec: false,
             debug: false,
         });
-        self.make(FSTRING_START, self.start, Some(self.cur))
+        let ty = if tstring {
+            TSTRING_START
+        } else {
+            FSTRING_START
+        };
+        self.make(ty, self.start, Some(self.cur))
     }
 
     /// The `letter_quote:` label — an ordinary string literal.
@@ -1192,7 +1269,10 @@ impl Tok {
                 if self.inside_fstring() {
                     let m = self.modes.last().unwrap();
                     if m.quote == quote && m.quote_size == quote_size {
-                        let t = self.syntaxerror("f-string: expecting '}'");
+                        let t = self.syntaxerror(format!(
+                            "{}-string: expecting '}}'",
+                            self.string_prefix()
+                        ));
                         return self.make(t, self.start, Some(self.cur));
                     }
                 }
@@ -1512,7 +1592,10 @@ impl Tok {
                     let m = self.modes.last_mut().unwrap();
                     m.curly_bracket_expr_start_depth += 1;
                     if m.curly_bracket_expr_start_depth >= MAX_EXPR_NESTING {
-                        let t = self.syntaxerror("f-string: expressions nested too deeply");
+                        let t = self.syntaxerror(format!(
+                            "{}-string: expressions nested too deeply",
+                            self.string_prefix()
+                        ));
                         return self.make(t, self.start, Some(self.cur));
                     }
                     m.kind = ModeKind::Regular;
@@ -1536,8 +1619,9 @@ impl Tok {
             }
         }
         if at_end {
+            let ty = self.ftstring_end();
             self.modes.pop();
-            return self.make(FSTRING_END, self.start, Some(self.cur));
+            return self.make(ty, self.start, Some(self.cur));
         }
 
         self.multi_line_start = self.line_start;
@@ -1558,7 +1642,10 @@ impl Tok {
                 if in_format_spec && c == '\n' as i32 {
                     if quote_size == 1 {
                         let t = self.syntaxerror(
-                            "f-string: newlines are not allowed in format specifiers for single quoted f-strings",
+                            format!(
+                                "{p}-string: newlines are not allowed in format specifiers for single quoted {p}-strings",
+                                p = self.string_prefix()
+                            ),
                         );
                         return self.make(t, self.start, Some(self.cur));
                     }
@@ -1566,7 +1653,7 @@ impl Tok {
                     let m = self.modes.last_mut().unwrap();
                     m.kind = ModeKind::Regular;
                     m.in_format_spec = false;
-                    return self.make(FSTRING_MIDDLE, self.start, Some(self.cur));
+                    return self.make(self.ftstring_middle(), self.start, Some(self.cur));
                 }
 
                 // Report the error from the initial quote character.
@@ -1581,7 +1668,8 @@ impl Tok {
 
                 if quote_size == 3 {
                     self.syntaxerror(format!(
-                        "unterminated triple-quoted f-string literal (detected at line {start_line})"
+                        "unterminated triple-quoted {}-string literal (detected at line {start_line})",
+                        self.string_prefix()
                     ));
                     if c != '\n' as i32 {
                         self.done = Done::Eofs;
@@ -1589,7 +1677,8 @@ impl Tok {
                     return self.make(ERRORTOKEN, self.start, Some(self.cur));
                 }
                 let t = self.syntaxerror(format!(
-                    "unterminated f-string literal (detected at line {start_line})"
+                    "unterminated {}-string literal (detected at line {start_line})",
+                    self.string_prefix()
                 ));
                 return self.make(t, self.start, Some(self.cur));
             }
@@ -1609,25 +1698,28 @@ impl Tok {
                         let m = self.modes.last_mut().unwrap();
                         m.curly_bracket_expr_start_depth += 1;
                         if m.curly_bracket_expr_start_depth >= MAX_EXPR_NESTING {
-                            let t = self.syntaxerror("f-string: expressions nested too deeply");
+                            let t = self.syntaxerror(format!(
+                                "{}-string: expressions nested too deeply",
+                                self.string_prefix()
+                            ));
                             return self.make(t, self.start, Some(self.cur));
                         }
                         m.kind = ModeKind::Regular;
                         m.in_format_spec = false;
                     }
-                    return self.make(FSTRING_MIDDLE, self.start, Some(self.cur));
+                    return self.make(self.ftstring_middle(), self.start, Some(self.cur));
                 }
-                return self.make(FSTRING_MIDDLE, self.start, Some(self.cur - 1));
+                return self.make(self.ftstring_middle(), self.start, Some(self.cur - 1));
             } else if c == '}' as i32 {
                 if unicode_escape {
-                    return self.make(FSTRING_MIDDLE, self.start, Some(self.cur));
+                    return self.make(self.ftstring_middle(), self.start, Some(self.cur));
                 }
                 let peek = self.nextc();
                 // Format specs can't legally use double brackets, so `}}`
                 // at bracket-depth 0 outside a spec is a literal brace.
                 let cursor = self.modes.last().unwrap().curly_bracket_depth;
                 if peek == '}' as i32 && !in_format_spec && cursor == 0 {
-                    return self.make(FSTRING_MIDDLE, self.start, Some(self.cur - 1));
+                    return self.make(self.ftstring_middle(), self.start, Some(self.cur - 1));
                 }
                 self.backup(peek);
                 self.backup(c);
@@ -1636,7 +1728,7 @@ impl Tok {
                     m.kind = ModeKind::Regular;
                     m.in_format_spec = false;
                 }
-                return self.make(FSTRING_MIDDLE, self.start, Some(self.cur));
+                return self.make(self.ftstring_middle(), self.start, Some(self.cur));
             } else if c == '\\' as i32 {
                 let mut peek = self.nextc();
                 #[allow(unused_assignments)]
@@ -1671,12 +1763,12 @@ impl Tok {
         for _ in 0..quote_size {
             self.backup(quote);
         }
-        self.make(FSTRING_MIDDLE, self.start, Some(self.cur))
+        self.make(self.ftstring_middle(), self.start, Some(self.cur))
     }
 }
 
 fn is_string_lit(ty: i32) -> bool {
-    ty == STRING || ty == FSTRING_MIDDLE
+    ty == STRING || ty == FSTRING_MIDDLE || ty == TSTRING_MIDDLE
 }
 
 fn chars_of(bytes: &[u8]) -> i64 {

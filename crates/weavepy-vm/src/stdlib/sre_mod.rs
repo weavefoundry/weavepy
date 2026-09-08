@@ -732,13 +732,14 @@ impl<'a> Matcher<'a> {
             AT_END_LINE => ptr == self.end || is_linebreak(s[ptr]),
             AT_END_STRING => ptr == self.end,
             AT_BOUNDARY => self.word_boundary(ptr, ascii_word),
-            // `\B` never matches an empty string (gh-80300, changed in
-            // CPython 3.12): both boundary forms fail there.
-            AT_NON_BOUNDARY => self.beginning != self.end && !self.word_boundary(ptr, ascii_word),
+            // 3.14 (gh-124130): `\B` matches the empty string again (the
+            // 3.12 gh-80300 exclusion applies only to `\b`), so it is the
+            // plain complement of the boundary test.
+            AT_NON_BOUNDARY => !self.word_boundary_raw(ptr, ascii_word),
             AT_LOC_BOUNDARY => self.word_boundary(ptr, loc_word),
-            AT_LOC_NON_BOUNDARY => self.beginning != self.end && !self.word_boundary(ptr, loc_word),
+            AT_LOC_NON_BOUNDARY => !self.word_boundary_raw(ptr, loc_word),
             AT_UNI_BOUNDARY => self.word_boundary(ptr, uni_word),
-            AT_UNI_NON_BOUNDARY => self.beginning != self.end && !self.word_boundary(ptr, uni_word),
+            AT_UNI_NON_BOUNDARY => !self.word_boundary_raw(ptr, uni_word),
             _ => false,
         }
     }
@@ -748,6 +749,13 @@ impl<'a> Matcher<'a> {
         if self.beginning == self.end {
             return false;
         }
+        self.word_boundary_raw(ptr, is_word)
+    }
+
+    /// The boundary test without `\b`'s empty-string exclusion; `\B` is
+    /// its exact complement (CPython `SRE_AT_NON_BOUNDARY`).
+    #[inline]
+    fn word_boundary_raw(&self, ptr: usize, is_word: fn(u32) -> bool) -> bool {
         let thatp = ptr > self.beginning && is_word(self.s[ptr - 1]);
         let thisp = ptr < self.end && is_word(self.s[ptr]);
         thisp != thatp

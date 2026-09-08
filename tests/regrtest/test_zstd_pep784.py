@@ -127,7 +127,13 @@ class CompressorTests(unittest.TestCase):
         }
         frame = compress(DATA, options=options)
         self.assertEqual(decompress(frame), DATA)
-        with self.assertRaises(ZstdError):
+        # CPython 3.14.7 (`_zstd_set_c_parameters` -> `set_parameter_error`)
+        # reports an out-of-range parameter as ValueError, not ZstdError.
+        with self.assertRaisesRegex(
+            ValueError,
+            "compression parameter 'window_log' received an illegal value 9999; "
+            "the valid range is \\[10, 31\\]",
+        ):
             compress(DATA, options={CompressionParameter.window_log: 9999})
 
 

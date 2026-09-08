@@ -3,7 +3,7 @@
  *
  * Unlike every other in-tree fixture (`_smalltest`, `_ndarray`,
  * `_numpylike`), this module is compiled against the **stock CPython
- * 3.13 headers** (`#include <Python.h>` resolved via the host's real
+ * 3.14 headers** (`#include <Python.h>` resolved via the host's real
  * include directory) with the *full* (non-limited) API. That means the
  * compiler inlines CPython's hot-path macros directly into this object
  * file:
@@ -187,6 +187,31 @@ static PyObject *sa_alloc_free_cycle(PyObject *self, PyObject *args) {
     return PyLong_FromLong(sum);
 }
 
+/* ----- 3.14 exported PEP 393 accessors ----- */
+
+/* `PyUnicode_KIND` / `PyUnicode_DATA` are header macros *and*, since
+ * 3.14, exported functions (`PyAPI_FUNC` in cpython/unicodeobject.h) so
+ * non-C bindings can call them; PyO3 does, and a `-z now` wheel fails
+ * to dlopen without them. Parenthesising the name suppresses the macro
+ * so these are the function calls, resolved through the host's export
+ * table. Returns `(kind, raw_bytes)` so the caller can decode the
+ * buffer at the reported width and compare. */
+static PyObject *sa_str_kind_data(PyObject *self, PyObject *o) {
+    (void)self;
+    if (!PyUnicode_Check(o)) {
+        PyErr_SetString(PyExc_TypeError, "str expected");
+        return NULL;
+    }
+    int kind = (PyUnicode_KIND)(o);
+    const void *data = (PyUnicode_DATA)(o);
+    Py_ssize_t n = PyUnicode_GET_LENGTH(o);
+    PyObject *raw = PyBytes_FromStringAndSize((const char *)data, n * kind);
+    if (!raw) {
+        return NULL;
+    }
+    return Py_BuildValue("(iN)", kind, raw);
+}
+
 /* ----- module definition (static, single-phase) ----- */
 
 static PyMethodDef sa_methods[] = {
@@ -201,6 +226,7 @@ static PyMethodDef sa_methods[] = {
     {"add", sa_add, METH_VARARGS, "a + b (long)"},
     {"add_doubles", sa_add_doubles, METH_VARARGS, "a + b (double)"},
     {"echo_str", sa_echo_str, METH_VARARGS, "echo a str"},
+    {"str_kind_data", sa_str_kind_data, METH_O, "(PyUnicode_KIND)(o), (PyUnicode_DATA)(o) as functions"},
     {"make_pair", sa_make_pair, METH_VARARGS, "Py_BuildValue (OO)"},
     {"list_sum", sa_list_sum, METH_O, "sum a list via function API"},
     {"alloc_free_cycle", sa_alloc_free_cycle, METH_NOARGS, "C-side alloc + Py_DECREF to zero"},
@@ -210,7 +236,7 @@ static PyMethodDef sa_methods[] = {
 static struct PyModuleDef sa_module = {
     PyModuleDef_HEAD_INIT,
     "_stockabi",
-    "RFC 0043 wave-1 stock-CPython-3.13-ABI proof extension.",
+    "RFC 0043 wave-1 stock-CPython-3.14-ABI proof extension.",
     -1,
     sa_methods,
     NULL,
@@ -225,6 +251,6 @@ PyMODINIT_FUNC PyInit__stockabi(void) {
         return NULL;
     }
     PyModule_AddIntConstant(m, "ANSWER", 42);
-    PyModule_AddStringConstant(m, "ABI", "cp313");
+    PyModule_AddStringConstant(m, "ABI", "cp314");
     return m;
 }

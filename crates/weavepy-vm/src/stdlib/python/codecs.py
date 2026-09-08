@@ -383,7 +383,9 @@ def escape_decode(data, errors="strict"):
                 else:
                     break
             if v > 0o377 and first_invalid is None:
-                first_invalid = "invalid octal escape sequence '\\%o'" % v
+                first_invalid = (
+                    'b"\\%o" is an invalid octal escape sequence. '
+                    'Such sequences will not work in the future. ' % v)
             out.append(v & 0xFF)
         elif c == 0x78:  # \xHH
             hexdig = b"0123456789abcdefABCDEF"
@@ -408,7 +410,9 @@ def escape_decode(data, errors="strict"):
             # DeprecationWarning for the first one (CPython
             # `_PyBytes_DecodeEscape2`).
             if first_invalid is None:
-                first_invalid = "invalid escape sequence '\\%s'" % chr(c)
+                first_invalid = (
+                    'b"\\%s" is an invalid escape sequence. '
+                    'Such sequences will not work in the future. ' % chr(c))
             out.append(0x5C)
             out.append(c)
     if first_invalid is not None:
@@ -2269,6 +2273,27 @@ def lookup_error(name):
     raise LookupError(f"unknown error handler name '{name}'")
 
 
+def _unregister_error(errors):
+    """`_codecs._unregister_error` (3.14, gh-133167): drop a handler
+    registered with `register_error`. Returns whether one was removed;
+    the built-in handlers cannot be un-registered."""
+    if not isinstance(errors, str):
+        raise TypeError("_unregister_error() argument must be str, not %s"
+                        % type(errors).__name__)
+    if errors in _BUILTIN_ERROR_HANDLERS:
+        raise ValueError(
+            f"cannot un-register built-in error handler '{errors}'")
+    return _ERROR_HANDLERS.pop(errors, None) is not None
+
+
+# On CPython these live in `_codecs` (`from _codecs import *`); the
+# registry is this module's, so publish the same callables there.
+for _fn in (register_error, lookup_error, _unregister_error):
+    _fn.__module__ = '_codecs'
+    setattr(_codecs, _fn.__name__, _fn)
+del _fn
+
+
 def getencoder(encoding):
     """The stateless ``encode`` callable for *encoding*."""
     return lookup(encoding).encode
@@ -2398,6 +2423,10 @@ class _StatefulFuncIncrementalDecoder(BufferedIncrementalDecoder):
 def open(filename, mode='r', encoding=None, errors='strict', buffering=-1):
     """CPython ``codecs.open`` (vendored verbatim): open an encoded file
     and wrap it in a :class:`StreamReaderWriter`."""
+    import warnings
+    warnings.warn("codecs.open() is deprecated. Use open() instead.",
+                  DeprecationWarning, stacklevel=2)
+
     if encoding is not None and \
        'b' not in mode:
         # Force opening of the file in binary mode

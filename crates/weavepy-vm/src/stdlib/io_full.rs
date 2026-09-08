@@ -123,7 +123,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // `_io.DEFAULT_BUFFER_SIZE`.
         d.insert(
             DictKey(Object::from_static("DEFAULT_BUFFER_SIZE")),
-            Object::Int(8192),
+            Object::Int(crate::object::DEFAULT_BUFFER_SIZE as i64),
         );
         d.insert(
             DictKey(Object::from_static("text_encoding")),
@@ -615,6 +615,15 @@ pub(crate) fn apply_buffering(
         if let Object::File(f) = file {
             f.buf_size.set(buffering as usize);
         }
+    } else if buffering < 0 {
+        // 3.14's default policy (gh-117151): `max(min(st_blksize, 8 MiB),
+        // DEFAULT_BUFFER_SIZE)` — what `read1()` returns per raw read
+        // (`test_file.testDefaultBufferSize`).
+        if let Object::File(f) = file {
+            let blksize = usize::try_from(f.blksize.get()).unwrap_or(0);
+            f.buf_size
+                .set(blksize.clamp(crate::object::DEFAULT_BUFFER_SIZE, 8192 * 1024));
+        }
     }
     Ok(())
 }
@@ -774,8 +783,9 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
         .truncate(truncate && !exclusive)
         .create(!exclusive && (writable || appending))
         .create_new(exclusive);
-    let f = opts
-        .open(&path)
+    // Blocking `open(2)` (a FIFO with no peer yet) releases the GIL, as
+    // CPython's `_io.FileIO` does.
+    let f = crate::gil::allow_threads_then(|| opts.open(&path))
         .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&path)))?;
     // CPython raises `IsADirectoryError` when `open()` targets a directory
     // (the kernel happily hands out a read-only dir fd; CPython's `FileIO`

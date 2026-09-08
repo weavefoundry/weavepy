@@ -75,12 +75,21 @@ In-tree fixtures live in `conformance/corpus/` and follow the convention
 When you want the wider CPython test corpus locally, run:
 
 ```bash
-git submodule add -b v3.13.1 https://github.com/python/cpython.git vendor/cpython
+git submodule add -b v3.14.7 https://github.com/python/cpython.git vendor/cpython
 git submodule update --init --depth=1 vendor/cpython
 ```
 
-The harness picks up `vendor/cpython/Lib/test/` automatically on the next
-run. CI deliberately does **not** clone the submodule — the in-tree
+Or, without a submodule, fetch the 3.14.7 `Lib/` tarball into the
+(gitignored) `vendor/cpython314/Lib` tree the RFC 0077 sweeps use:
+
+```bash
+mkdir -p vendor/cpython314
+curl -L https://github.com/python/cpython/archive/refs/tags/v3.14.7.tar.gz \
+  | tar -xz --strip-components=1 -C vendor/cpython314 cpython-3.14.7/Lib
+```
+
+The harness picks up `vendor/cpython314/Lib/test/` (then
+`vendor/cpython/Lib/test/`) automatically on the next run. CI deliberately does **not** clone the submodule — the in-tree
 corpus is enough to track the front-of-pipeline metric without growing
 the clone size on every PR.
 
@@ -90,13 +99,14 @@ By default the harness invokes `python3` on `$PATH`. Override it for one
 run with `$WEAVEPY_PYTHON`:
 
 ```bash
-WEAVEPY_PYTHON=/opt/cpython/3.13/bin/python3 \
+WEAVEPY_PYTHON=/opt/cpython/3.14/bin/python3 \
   cargo run -p weavepy-conformance -- run
 ```
 
-WeavePy currently tracks CPython 3.13. The harness uses whatever oracle
-it's pointed at — using e.g. 3.12 will produce mismatches that aren't
-about WeavePy. CI pins to 3.13.
+WeavePy tracks CPython 3.14 (RFC 0077 made the switch; RFC 0076's
+version policy governs the cadence). The harness uses whatever oracle
+it's pointed at — using e.g. 3.13 will produce mismatches that aren't
+about WeavePy. CI pins to 3.14.
 
 ## Where we are today
 
@@ -159,10 +169,10 @@ value, so two equal unboxed ints *are* the same object identity-wise;
 abandoning unboxing to satisfy two identity asserts is rejected.
 
 ```bash
-# Run the curated allowlist against a vendored CPython 3.13 Lib/test/,
+# Run the curated allowlist against a vendored CPython 3.14 Lib/test/,
 # one crash-isolated subprocess per test, 8 in parallel:
 cargo run -p weavepy-conformance -- regrtest \
-    --cpython-dir vendor/cpython/Lib/test \
+    --cpython-dir vendor/cpython314/Lib/test \
     --mode subprocess --jobs 8 --timeout 45
 
 # Refresh the baseline after an intentional change (grade without gating):
@@ -173,7 +183,8 @@ Key flags (the discovery/execution library has supported these since
 RFC 0026; RFC 0036 exposes them on the CLI):
 
 - `--cpython-dir DIR` — point at any CPython `Lib/test/` tree, overriding
-  the `vendor/cpython/Lib/test/` → `vendor/cpython-tests/` autodiscovery.
+  the `vendor/cpython314/Lib/test/` → `vendor/cpython/Lib/test/` →
+  `vendor/cpython-tests/` autodiscovery.
 - `--mode subprocess` — run each test in a fresh `weavepy` child with a
   SIGKILL wall timer, so a stack overflow / `abort()` is captured as a
   single failure instead of taking the runner down. (`--mode in-process`
@@ -204,7 +215,7 @@ row stays a measured fail per RFC 0066.
 
 A `conformance` job runs on every push and pull request. It:
 
-1. Installs Python 3.13 via `actions/setup-python`.
+1. Installs Python 3.14 via `actions/setup-python`.
 2. Builds and runs `weavepy-conformance run`.
 3. Appends the Markdown report to the GitHub Actions job summary.
 4. Uploads `target/conformance/` as an artifact named

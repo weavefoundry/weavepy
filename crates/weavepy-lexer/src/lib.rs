@@ -29,7 +29,7 @@ pub mod scanner;
 pub mod token;
 
 pub use error::LexError;
-pub use scanner::{tokenize, tokenize_with_escapes};
+pub use scanner::{tokenize, tokenize_partial, tokenize_with_escapes};
 pub use token::{
     lang_preview, set_lang_preview, BytePos, EscapeWarning, Keyword, Span, StringPrefix, Token,
     TokenKind,
@@ -193,11 +193,25 @@ mod tests {
     // verbatim; `test_fstring.py` asserts on these exact strings.
     #[test]
     fn fstring_unterminated_literal_messages() {
-        // test_not_closing_quotes: bare `f"` / `f'`.
-        assert_eq!(lex_err_msg("f\""), "unterminated f-string literal");
-        assert_eq!(lex_err_msg("f'"), "unterminated f-string literal");
+        // test_not_closing_quotes: bare `f"` / `f'` (3.14 appends the
+        // detection line, and a t-string names its own kind).
+        assert_eq!(
+            lex_err_msg("f\""),
+            "unterminated f-string literal (detected at line 1)"
+        );
+        assert_eq!(
+            lex_err_msg("f'"),
+            "unterminated f-string literal (detected at line 1)"
+        );
         // A single-line f-string may not span a newline in its literal part.
-        assert_eq!(lex_err_msg("f'abc\n"), "unterminated f-string literal");
+        assert_eq!(
+            lex_err_msg("f'abc\n"),
+            "unterminated f-string literal (detected at line 1)"
+        );
+        assert_eq!(
+            lex_err_msg("t'"),
+            "unterminated t-string literal (detected at line 1)"
+        );
     }
 
     #[test]
@@ -205,12 +219,34 @@ mod tests {
         // test_not_closing_quotes: `f"""` / `f'''`.
         assert_eq!(
             lex_err_msg("f\"\"\""),
-            "unterminated triple-quoted f-string literal"
+            "unterminated triple-quoted f-string literal (detected at line 1)"
         );
         assert_eq!(
             lex_err_msg("f'''"),
-            "unterminated triple-quoted f-string literal"
+            "unterminated triple-quoted f-string literal (detected at line 1)"
         );
+        assert_eq!(
+            lex_err_msg("t'''"),
+            "unterminated triple-quoted t-string literal (detected at line 1)"
+        );
+    }
+
+    #[test]
+    fn tstring_field_diagnostics_name_the_kind() {
+        // CPython's `TOK_GET_STRING_PREFIX`: the innermost enclosing
+        // string's kind heads the message (test_tstring test_syntax_errors).
+        assert_eq!(lex_err_msg("t'{'"), "t-string: expecting '}'");
+        assert_eq!(lex_err_msg("t'{a'"), "t-string: expecting '}'");
+        assert_eq!(
+            lex_err_msg("t'{x!s:'"),
+            "t-string: expecting '}', or format specs"
+        );
+        assert_eq!(
+            lex_err_msg("t'{1:d\n}'"),
+            "t-string: newlines are not allowed in format specifiers for single quoted t-strings"
+        );
+        // A nested f-string keeps its own kind.
+        assert_eq!(lex_err_msg("t'{f\"{\"}'"), "f-string: expecting '}'");
     }
 
     #[test]
@@ -333,15 +369,18 @@ mod lang_preview_tests {
 
     #[test]
     fn t_prefix_gated() {
-        assert!(StringPrefix::parse("t").is_none());
-        set_lang_preview(true);
-        let p = StringPrefix::parse("t").expect("t accepted under gate");
+        // RFC 0077 WS11: the 3.14 grammar is the default; `-X lang=3.13`
+        // (preview off) pins the previous one, where `t` is no prefix.
+        let p = StringPrefix::parse("t").expect("t accepted by default");
         assert!(p.template && !p.fstring);
         assert!(StringPrefix::parse("rt").is_some());
         assert!(StringPrefix::parse("tb").is_none());
         assert!(StringPrefix::parse("ft").is_none());
         let toks = tokenize("x = t'a{1}b'\n").expect("t-string tokenizes");
         assert!(toks.iter().any(|t| t.kind == TokenKind::String));
-        set_lang_preview(false);
+        // The opt-out itself is process-global, so it's exercised from
+        // Python (tests/regrtest/test_lang_next_pep750_pep758.py) rather
+        // than toggled here under the parallel test runner.
+        assert!(lang_preview());
     }
 }

@@ -748,6 +748,20 @@ std::thread_local! {
     static GIL_HELD_SINCE: std::cell::Cell<Option<std::time::Instant>> =
         const { std::cell::Cell::new(None) };
 
+    /// When this holder first *noticed* a waiter at a checkpoint (RFC
+    /// 0077 Phase II). CPython's `take_gil` measures the switch interval
+    /// from the waiter's side: a waiter parks for `switchinterval`, and
+    /// only then raises `gil_drop_request`. Measuring from the holder's
+    /// acquisition instead let a long-running holder yield the moment a
+    /// waiter appeared — a `Future.result()` waiter woken by
+    /// `set_result` could slip in before the worker reached
+    /// `_idle_semaphore.release()` and `work_queue.get()`, spinning a
+    /// second thread (test_concurrent_futures' InterpreterPoolExecutor
+    /// `test_idle_thread_reuse`). Cleared when the waiter count drops to
+    /// zero and on every (re)acquire.
+    static WAITER_SEEN_SINCE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+
     /// Depth of nested "no cooperative GIL hand-off" critical sections
     /// on this thread. While `> 0`, [`maybe_yield_gil`] refuses to drop
     /// the GIL at a periodic checkpoint.
@@ -794,6 +808,22 @@ fn no_yield_active() -> bool {
 #[inline]
 pub fn note_gil_acquired() {
     GIL_HELD_SINCE.with(|c| c.set(Some(std::time::Instant::now())));
+    WAITER_SEEN_SINCE.with(|c| c.set(None));
+}
+
+/// Whether a waiter has been waiting on this holder for at least the
+/// switch interval (CPython's waiter-side `gil_drop_request` timing).
+/// The first checkpoint that sees a waiter starts the clock and keeps
+/// the GIL; a later checkpoint past the interval reports due.
+#[inline]
+fn waiter_interval_elapsed() -> bool {
+    WAITER_SEEN_SINCE.with(|c| match c.get() {
+        Some(since) => since.elapsed() >= global_gil().breaker.switch_interval(),
+        None => {
+            c.set(Some(std::time::Instant::now()));
+            false
+        }
+    })
 }
 
 /// Whether this thread has held the GIL long enough (≥ the configured
@@ -874,6 +904,7 @@ fn maybe_yield_gil() {
     }
     let gil = global_gil();
     if gil.breaker.waiter_count() == 0 {
+        WAITER_SEEN_SINCE.with(|c| c.set(None));
         return;
     }
     // CPython hands the GIL off on a wall-clock interval, not an opcode
@@ -882,10 +913,11 @@ fn maybe_yield_gil() {
     // a short burst of bytecode between checkpoints — e.g. a finalizer's
     // `n_instances -= 1` or an unpickle's `__new__` increment — completes
     // without another thread slipping in mid-`LOAD`/`STORE` and clobbering a
-    // shared counter (the `test_release_task_refs` race). A thread that has
-    // held the GIL for less than the interval keeps running; the next
-    // checkpoint after the interval elapses performs the hand-off.
-    if !switch_interval_elapsed() {
+    // shared counter (the `test_release_task_refs` race). Both clocks must
+    // have run out: the holder has held for the interval *and* the waiter
+    // has waited for it (`WAITER_SEEN_SINCE`), which is what CPython's
+    // waiter-timed drop request amounts to.
+    if !switch_interval_elapsed() || !waiter_interval_elapsed() {
         return;
     }
     let popped: Vec<GilGuard> =
@@ -925,40 +957,34 @@ fn maybe_yield_gil() {
     note_gil_acquired();
 }
 
-std::thread_local! {
-    /// Per-thread cache of [`current_thread_id`] (RFC 0059 WS1a). A
-    /// thread's native id is stable for its lifetime, but deriving it
-    /// via `libc::pthread_self` is a dyld-stub call — and `GilCell`
-    /// consults the id on **every** borrow, several times per bytecode
-    /// instruction. `const`-initialized to 0 (never a valid id: pthread
-    /// ids are pointers, Windows ids are non-zero for live threads, and
-    /// the hash fallback re-derives on the impossible collision) so the
-    /// fast path is one TLS load + branch with no lazy-init bookkeeping.
-    static THREAD_ID_CACHE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
 /// Best-effort current-thread native id. Returns the OS thread
 /// id on Linux/macOS via `libc::pthread_self`; uses
 /// `GetCurrentThreadId` on Windows. The exact representation
 /// is opaque; the only invariant is uniqueness within the
-/// running process. Cached per thread (RFC 0059): the derivation
-/// call runs once, every later lookup is a TLS load.
+/// running process. Cached per thread (RFC 0059): a thread's native
+/// id is stable for its lifetime, but deriving it is a dyld-stub call
+/// and `GilCell` consults the id on **every** borrow, several times
+/// per bytecode instruction. The cache lives in the cell layer's
+/// thread-local block ([`crate::sync::CELL_TLS`], RFC 0077 WS3) so a
+/// borrow reads it and the live-guard count through one TLS access.
 #[inline]
 pub fn current_thread_id() -> u64 {
-    let cached = THREAD_ID_CACHE.try_with(std::cell::Cell::get).unwrap_or(0);
+    let cached = crate::sync::CELL_TLS
+        .try_with(|t| t.thread_id.get())
+        .unwrap_or(0);
     if cached != 0 {
         return cached;
     }
     let id = derive_thread_id();
     // Cache best-effort: during TLS teardown the cell may be gone, in
     // which case every call re-derives — correct, just slower.
-    let _ = THREAD_ID_CACHE.try_with(|c| c.set(id));
+    let _ = crate::sync::CELL_TLS.try_with(|t| t.thread_id.set(id));
     id
 }
 
 /// Uncached [`current_thread_id`] body — the OS derivation call.
 #[cold]
-fn derive_thread_id() -> u64 {
+pub(crate) fn derive_thread_id() -> u64 {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
     unsafe {
         let h = libc::pthread_self();

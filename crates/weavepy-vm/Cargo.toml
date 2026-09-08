@@ -15,6 +15,7 @@ categories.workspace   = true
 weavepy-compiler = { workspace = true }
 weavepy-lexer    = { workspace = true }
 weavepy-parser   = { workspace = true }
+weavepy-version  = { workspace = true }
 chrono           = { workspace = true }
 indexmap         = { workspace = true }
 regex            = { workspace = true }
@@ -95,3 +96,7 @@ jit = ["dep:weavepy-jit"]
 
 [lints]
 workspace = true
+
+[build-dependencies]
+weavepy-version = { workspace = true }
+
