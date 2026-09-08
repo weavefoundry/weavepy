@@ -70,7 +70,12 @@ requirements = "pytest==8.4.2 hypothesis==6.155.7"
 # Budget: 17:20 measured locally; GitHub runners pace ~2x slower
 # (CI measured ~10% of the suite in 256s), so 2400s leaves no
 # headroom — 4800s does.
-command = "tests"
+# attrs' conftest selects a 400 ms Hypothesis deadline even in CI.
+# Linux CI hit 634.75 ms once and 2.61 ms on replay, a timing-only
+# FlakyFailure. Explicitly select Hypothesis's built-in CI profile:
+# no per-example deadline, with the same example count and phases.
+# The full-suite wall budget and separate benchmark gates still apply.
+command = "tests --hypothesis-profile=ci"
 timeout_seconds = 4800
 
 [packages.click]

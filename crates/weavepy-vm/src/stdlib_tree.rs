@@ -43,89 +43,7 @@ pub const LIB_DIR_NAME: &str = weavepy_version::LIB_DIR_NAME;
 
 const COMPLETE_MARKER: &str = ".weavepy-complete";
 
-/// Non-`.py` files materialized into the stdlib tree (RFC 0055 WS2):
-/// the verbatim `venv` activation scripts, found by
-/// `venv.EnvBuilder.setup_scripts` relative to `venv.__file__`.
-/// Paths are relative to the stdlib dir, `/`-separated.
-const DATA_FILES: &[(&str, &str)] = &[
-    // (`os.py` is projected by its frozen-source registration now —
-    // the startup import stays native, but a fresh `import os`
-    // executes the source like CPython post-startup.)
-    // RFC 0068 WS4 — `importlib._bootstrap[_external]` are NOT frozen
-    // under their dotted names (importlib/__init__ aliases the frozen
-    // `_frozen_importlib*` modules into sys.modules; a second frozen
-    // execution would mint duplicate classes with the wrong
-    // `__module__`). The source files still must exist on disk for
-    // `importlib/__init__`'s ImportError fallback and test_importlib's
-    // "Source" variant, which blocks the frozen names and re-imports
-    // importlib from disk.
-    (
-        "importlib/_bootstrap.py",
-        include_str!("stdlib/python/importlib_bootstrap.py"),
-    ),
-    (
-        "importlib/_bootstrap_external.py",
-        include_str!("stdlib/python/importlib_bootstrap_external.py"),
-    ),
-    (
-        "venv/scripts/common/activate",
-        include_str!("stdlib/python/venv/scripts/common/activate"),
-    ),
-    (
-        "venv/scripts/common/Activate.ps1",
-        include_str!("stdlib/python/venv/scripts/common/Activate.ps1"),
-    ),
-    (
-        "venv/scripts/common/activate.fish",
-        include_str!("stdlib/python/venv/scripts/common/activate.fish"),
-    ),
-    (
-        "venv/scripts/posix/activate.csh",
-        include_str!("stdlib/python/venv/scripts/posix/activate.csh"),
-    ),
-    // The NT activation pair (RFC 0063 WS6), adopted verbatim from
-    // CPython 3.13's `Lib/venv/scripts/nt/` — including the chcp
-    // code-page save/restore dance and `VIRTUAL_ENV_PROMPT`. CRLF line
-    // endings are load-bearing for cmd.exe and preserved end to end
-    // (a directory-local .gitattributes exempts them from the repo's
-    // LF normalization). `Activate.ps1` already lives in `common`.
-    (
-        "venv/scripts/nt/activate.bat",
-        include_str!("stdlib/python/venv/scripts/nt/activate.bat"),
-    ),
-    (
-        "venv/scripts/nt/deactivate.bat",
-        include_str!("stdlib/python/venv/scripts/nt/deactivate.bat"),
-    ),
-    // pydoc's stylesheet, served by `pydoc` and `xmlrpc.server`'s
-    // DocXMLRPCServer (`_get_css` opens it relative to `__file__`).
-    (
-        "pydoc_data/_pydoc.css",
-        include_str!("stdlib/python/pydoc_data/_pydoc.css"),
-    ),
-    // RFC 0066 WS4: the bundled greenlet's dist-info. The stdlib tree
-    // is a `sys.path` entry, so importlib.metadata (and pip listing)
-    // sees the bundled native greenlet as an installed distribution —
-    // dependents like SQLAlchemy's asyncio extension probe exactly
-    // this. The version must agree with `_greenlet.GREENLET_VERSION`
-    // and the directory name below.
-    (
-        "greenlet-3.2.0.dist-info/METADATA",
-        include_str!("stdlib/python/greenlet_dist_info/METADATA"),
-    ),
-    (
-        "greenlet-3.2.0.dist-info/INSTALLER",
-        include_str!("stdlib/python/greenlet_dist_info/INSTALLER"),
-    ),
-    (
-        "greenlet-3.2.0.dist-info/top_level.txt",
-        include_str!("stdlib/python/greenlet_dist_info/top_level.txt"),
-    ),
-    (
-        "greenlet-3.2.0.dist-info/RECORD",
-        include_str!("stdlib/python/greenlet_dist_info/RECORD"),
-    ),
-];
+use crate::stdlib::tree_manifest::DATA_FILES;
 
 /// The bundled pip wheel's filename. The version must agree with
 /// `ensurepip._PIP_VERSION` and the frozen pip facade's
@@ -211,37 +129,10 @@ fn rel_path(name: &str, is_package: bool) -> PathBuf {
     p
 }
 
-/// Layout version of the materialized tree itself (directory shape,
-/// aliases, markers — anything `materialize` writes that is not an
-/// embedded source). Bump when the shape changes so existing caches
-/// keyed on unchanged sources are not mistaken for the new layout.
-const TREE_FORMAT: &str = "tree-format-4";
-
-/// FNV-1a over every frozen module's name and source, mixed with the
-/// crate version. Any change to any embedded byte lands in a new
-/// cache directory.
+/// Computed from the embedded sources at build time. Reading the constant
+/// avoids hashing and paging in the whole stdlib on every process startup.
 fn build_id() -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h = FNV_OFFSET;
-    let mut eat = |bytes: &[u8]| {
-        for &b in bytes {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-    };
-    eat(env!("CARGO_PKG_VERSION").as_bytes());
-    eat(TREE_FORMAT.as_bytes());
-    for src in crate::stdlib::frozen_sources() {
-        eat(src.name.as_bytes());
-        eat(&[u8::from(src.is_package)]);
-        eat(src.source.as_bytes());
-    }
-    for (path, contents) in DATA_FILES {
-        eat(path.as_bytes());
-        eat(contents.as_bytes());
-    }
-    h
+    include!(concat!(env!("OUT_DIR"), "/stdlib_build_id.rs"))
 }
 
 /// Build the bundled pip wheel (RFC 0055 WS2) from the frozen pip
@@ -1107,7 +998,13 @@ mod tests {
     }
 
     #[test]
-    fn build_id_is_stable_within_process() {
-        assert_eq!(build_id(), build_id());
+    fn build_id_matches_embedded_manifest() {
+        assert_eq!(
+            build_id(),
+            crate::stdlib::tree_manifest::fingerprint(
+                env!("CARGO_PKG_VERSION"),
+                crate::stdlib::frozen_sources(),
+            ),
+        );
     }
 }

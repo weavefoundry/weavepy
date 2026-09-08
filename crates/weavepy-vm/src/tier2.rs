@@ -3360,11 +3360,11 @@ fn call_with_activation_shell<T>(
         return f(interp);
     };
     let shell = Rc::new(crate::object::FrameShell {
-        code: code.clone(),
-        locals: Rc::new(GilRefCell::new(Vec::new())),
-        cells: ctx.cells.clone(),
-        globals: ctx.globals.clone(),
-        builtins: ctx.builtins.clone(),
+        code: crate::object::FrameSlot::new(code.clone()),
+        locals: crate::object::FrameSlot::new(Rc::new(GilRefCell::new(Vec::new()))),
+        cells: crate::object::FrameSlot::new(ctx.cells.clone()),
+        globals: crate::object::FrameSlot::new(ctx.globals.clone()),
+        builtins: crate::object::FrameSlot::new(ctx.builtins.clone()),
         builtins_obj: None,
         class_namespace: None,
         class_namespace_obj: None,

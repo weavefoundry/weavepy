@@ -6482,11 +6482,11 @@ impl Interpreter {
         // correct fallback.
         if let Some(mut pooled) = self.frame_shell_pool.borrow_mut().pop() {
             if let Some(m) = Rc::get_mut(&mut pooled) {
-                m.code = frame.code.clone();
-                m.locals = frame.locals.clone();
-                m.cells = frame.cells.clone();
-                m.globals = frame.globals.clone();
-                m.builtins = frame.builtins.clone();
+                m.code = crate::object::FrameSlot::new(frame.code.clone());
+                m.locals = crate::object::FrameSlot::new(frame.locals.clone());
+                m.cells = crate::object::FrameSlot::new(frame.cells.clone());
+                m.globals = crate::object::FrameSlot::new(frame.globals.clone());
+                m.builtins = crate::object::FrameSlot::new(frame.builtins.clone());
                 m.builtins_obj = frame.builtins_obj.clone();
                 m.class_namespace = frame.class_namespace.clone();
                 m.class_namespace_obj = frame.class_namespace_obj.clone();
@@ -6500,11 +6500,11 @@ impl Interpreter {
             }
         }
         let shell = Rc::new(crate::object::FrameShell {
-            code: frame.code.clone(),
-            locals: frame.locals.clone(),
-            cells: frame.cells.clone(),
-            globals: frame.globals.clone(),
-            builtins: frame.builtins.clone(),
+            code: crate::object::FrameSlot::new(frame.code.clone()),
+            locals: crate::object::FrameSlot::new(frame.locals.clone()),
+            cells: crate::object::FrameSlot::new(frame.cells.clone()),
+            globals: crate::object::FrameSlot::new(frame.globals.clone()),
+            builtins: crate::object::FrameSlot::new(frame.builtins.clone()),
             builtins_obj: frame.builtins_obj.clone(),
             class_namespace: frame.class_namespace.clone(),
             class_namespace_obj: frame.class_namespace_obj.clone(),
@@ -6522,9 +6522,9 @@ impl Interpreter {
     /// Only shells nothing else can observe qualify: not a generator's
     /// (the generator object re-pushes it across suspensions), never
     /// materialised (a `PyFrame`/traceback may hold it), and sole-owned
-    /// now that the spine popped its clone. Parked shells are scrubbed
-    /// to shared placeholders immediately — CPython frees the frame at
-    /// return, so nothing may stay pinned until reuse.
+    /// now that the spine popped its clone. Parked shells release their
+    /// metadata immediately: CPython frees the frame at return, so
+    /// nothing may stay pinned until reuse.
     fn recycle_frame_shell(&self, mut shell: Rc<crate::object::FrameShell>) {
         const FRAME_SHELL_POOL_CAP: usize = 64;
         if shell.is_gen
@@ -6536,11 +6536,11 @@ impl Interpreter {
             return;
         }
         if let Some(m) = Rc::get_mut(&mut shell) {
-            m.code = empty_code_placeholder();
-            m.locals = empty_locals_placeholder();
-            m.cells = crate::object::empty_cells();
-            m.globals = empty_dict_placeholder();
-            m.builtins = empty_dict_placeholder();
+            m.code.clear();
+            m.locals.clear();
+            m.cells.clear();
+            m.globals.clear();
+            m.builtins.clear();
             m.builtins_obj = None;
             m.class_namespace = None;
             m.class_namespace_obj = None;
@@ -6927,11 +6927,19 @@ impl Interpreter {
     #[inline]
     fn load_fast_value(frame: &Frame, arg: u32) -> Result<Object, RuntimeError> {
         let v = if Self::locals_fast_off() {
-            frame.locals.borrow().get(arg as usize).cloned()
+            frame
+                .locals
+                .borrow()
+                .get(arg as usize)
+                .map(Self::clone_operand)
         } else {
             // SAFETY: see the method docs — GIL-serialized, non-
             // escaping, non-re-entrant, bounds-checked.
-            unsafe { (&*frame.locals.as_ptr()).get(arg as usize).cloned() }
+            unsafe {
+                (&*frame.locals.as_ptr())
+                    .get(arg as usize)
+                    .map(Self::clone_operand)
+            }
         };
         let v = v.ok_or_else(|| {
             RuntimeError::Internal(format!(
@@ -6952,6 +6960,20 @@ impl Interpreter {
             return Err(Self::unbound_local(&name));
         }
         Ok(v)
+    }
+
+    /// Copy common bytecode operands inline without enlarging every general
+    /// object clone in the JIT, builtins, and collection implementations.
+    #[inline(always)]
+    fn clone_operand(value: &Object) -> Object {
+        match value {
+            Object::None => Object::None,
+            Object::Unbound => Object::Unbound,
+            Object::Bool(value) => Object::Bool(*value),
+            Object::Int(value) => Object::Int(*value),
+            Object::Float(value) => Object::Float(*value),
+            other => other.clone(),
+        }
     }
 
     /// Error for reading/deleting an empty cell. Cellvars are still
@@ -8405,7 +8427,7 @@ impl Interpreter {
                         frame.pc += 1;
                         let table = code_const_objects(&frame.code);
                         let v = match table.get(c_idx as usize) {
-                            Some(v) => v.clone(),
+                            Some(v) => Self::clone_operand(v),
                             None => {
                                 return Err(RuntimeError::Internal("bad const index".to_owned()))
                             }
@@ -8425,7 +8447,7 @@ impl Interpreter {
                 let Some(v) = table.get(ins.arg as usize) else {
                     return self.step(frame);
                 };
-                let v = v.clone();
+                let v = Self::clone_operand(v);
                 specialize::record_dispatch();
                 frame.pc = pc + 1;
                 frame.push(v);
@@ -8788,7 +8810,7 @@ impl Interpreter {
                 // conversion, no string re-allocation per execution.
                 let table = code_const_objects(&frame.code);
                 let v = match table.get(ins.arg as usize) {
-                    Some(v) => v.clone(),
+                    Some(v) => Self::clone_operand(v),
                     None => {
                         // Generic-slot fallback (see `code_const_objects`).
                         let c = frame
@@ -8879,7 +8901,7 @@ impl Interpreter {
                         frame.pc += 1;
                         let table = code_const_objects(&frame.code);
                         let v = match table.get(c_idx as usize) {
-                            Some(v) => v.clone(),
+                            Some(v) => Self::clone_operand(v),
                             None => {
                                 return Err(RuntimeError::Internal("bad const index".to_owned()))
                             }
@@ -8926,7 +8948,7 @@ impl Interpreter {
                                                         k,
                                                     ) =>
                                                 {
-                                                    Some(v.clone())
+                                                    Some(Self::clone_operand(v))
                                                 }
                                                 _ => None,
                                             }
@@ -26299,7 +26321,7 @@ impl Interpreter {
                                 Some((k, v))
                                     if self.cached_slot_name_matches(&frame.code, name_idx, k) =>
                                 {
-                                    Some(v.clone())
+                                    Some(Self::clone_operand(v))
                                 }
                                 _ => None,
                             }
@@ -26321,7 +26343,7 @@ impl Interpreter {
                                 Some((k, v))
                                     if self.cached_slot_name_matches(&frame.code, name_idx, k) =>
                                 {
-                                    Some(v.clone())
+                                    Some(Self::clone_operand(v))
                                 }
                                 _ => None,
                             }
@@ -26450,7 +26472,7 @@ impl Interpreter {
                                 Some((k, v))
                                     if self.cached_slot_name_matches(&frame.code, name_idx, k) =>
                                 {
-                                    Some(v.clone())
+                                    Some(Self::clone_operand(v))
                                 }
                                 _ => None,
                             }
@@ -30844,6 +30866,7 @@ impl Interpreter {
                         // thread's tier cache is the sole owner of, so
                         // `weakref`s on dead `__code__` objects die like
                         // they do under CPython's collector.
+                        #[cfg(feature = "jit")]
                         crate::tier2::gc_sweep();
                         // Release `__missing__`-globals owners nothing can
                         // reach any more (`annotationlib`'s
@@ -34191,6 +34214,7 @@ impl Interpreter {
     /// `None` under the `_testcapi.set_nomemory` injection window,
     /// where the caller must take the interpreter path for the
     /// faithful `MemoryError`.
+    #[cfg(feature = "jit")]
     pub(crate) fn alloc_plain_instance(&mut self, cls: &Rc<TypeObject>) -> Option<(Object, bool)> {
         if crate::stdlib::testinternalcapi_mod::nomem_alloc_fails() {
             return None;
@@ -47655,28 +47679,6 @@ pub fn constant_to_object_public(c: Constant) -> Object {
 fn fusion_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("WEAVEPY_NO_FUSE").is_none())
-}
-
-/// RFC 0061 (WS3a): shared placeholder fields for parked
-/// [`FrameShell`](crate::object::FrameShell)s. A pooled shell is
-/// unreachable by construction (the pool owns its only `Rc`), so the
-/// placeholders are never read or mutated through it — they exist only
-/// so parking pins no user objects and allocates nothing.
-fn empty_code_placeholder() -> Rc<CodeObject> {
-    static P: std::sync::OnceLock<Rc<CodeObject>> = std::sync::OnceLock::new();
-    P.get_or_init(|| Rc::new(CodeObject::default())).clone()
-}
-
-fn empty_locals_placeholder() -> Rc<RefCell<Vec<Object>>> {
-    static P: std::sync::OnceLock<Rc<RefCell<Vec<Object>>>> = std::sync::OnceLock::new();
-    P.get_or_init(|| Rc::new(RefCell::new(Vec::new()))).clone()
-}
-
-fn empty_dict_placeholder() -> Rc<RefCell<crate::object::DictData>> {
-    static P: std::sync::OnceLock<Rc<RefCell<crate::object::DictData>>> =
-        std::sync::OnceLock::new();
-    P.get_or_init(|| Rc::new(RefCell::new(crate::object::DictData::default())))
-        .clone()
 }
 
 /// RFC 0061 (WS2a): the per-code-object materialized constant table,

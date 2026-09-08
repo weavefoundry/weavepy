@@ -18,6 +18,12 @@ use std::env;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+#[allow(unreachable_pub)] // The VM publicly re-exports the shared source type.
+#[path = "src/stdlib/frozen_sources.rs"]
+mod frozen_sources;
+#[path = "src/stdlib/tree_manifest.rs"]
+mod tree_manifest;
+
 fn collect_headers(dir: &Path, root: &Path, out: &mut Vec<(String, PathBuf)>) {
     let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
         panic!(
@@ -124,5 +130,29 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    // Track both the manifest and all included sources, including additions
+    // and deletions. The runtime and build script share the same Rust table.
+    for path in [
+        "src/stdlib/frozen_sources.rs",
+        "src/stdlib/tree_manifest.rs",
+        "src/stdlib/python",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    let build_id = tree_manifest::fingerprint(
+        &env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION"),
+        frozen_sources::frozen_sources(),
+    );
+    std::fs::write(
+        out_dir.join("stdlib_build_id.rs"),
+        format!(
+            "0x{:04x}_{:04x}_{:04x}_{:04x}u64\n",
+            build_id >> 48,
+            (build_id >> 32) & 0xffff,
+            (build_id >> 16) & 0xffff,
+            build_id & 0xffff,
+        ),
+    )
+    .expect("write stdlib_build_id.rs");
     std::fs::write(out_dir.join("cpython_headers.rs"), src).expect("write cpython_headers.rs");
 }
