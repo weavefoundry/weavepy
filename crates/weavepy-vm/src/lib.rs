@@ -2681,6 +2681,29 @@ impl Interpreter {
                 continue;
             };
             let id = crate::weakref_registry::id_of(&obj);
+            // RFC 0077 (WS2): a dead exact `list`/`dict`/`set` holding only
+            // scalar leaves is CPython's `list_dealloc` of a list of ints:
+            // untrack and free, nothing else. Every step of the cascade
+            // body below is a no-op for it — no `__del__` (only instances
+            // and unfinished generators finalize), no weakrefs (the
+            // registry filter says so), no child that could be tracked or
+            // anchor one (scalars never are), and no C crossing to guard
+            // with the cascade marker — yet the body still paid a
+            // cascade-set insert, a weakref clear, two finalizer drains
+            // and a per-element `id_of`/`handle_for` traversal. Since
+            // every list is GC-tracked, that overhead was the dominant
+            // cost of *dying* for the commonest containers in the language
+            // (`list(range(n))` / `[...]` temporaries measured at ~35% of
+            // the fannkuch fixture once `list(it)` results were tracked).
+            // `try_borrow` failing (a re-entrant mutation in flight) just
+            // takes the general path.
+            if Self::is_scalar_leaf_container(&obj) && crate::weakref_registry::count_for(id) == 0 {
+                if gc_trace::is_tracked(id) {
+                    gc_trace::with_state(|s| s.untrack_id(id));
+                }
+                drop(obj);
+                continue;
+            }
             // Mark `obj` as mid-cascade for the rest of this iteration: the
             // teardown below crosses it back into C (the GC bridge's
             // `tp_traverse` mints and releases a transient self box), and
@@ -3402,6 +3425,33 @@ impl Interpreter {
         }
     }
 
+    /// An exact builtin `list`/`dict`/`set` whose every element (and key)
+    /// is a scalar leaf ([`gc_trace::is_atomic`]): a container that can
+    /// neither finalize nor anchor anything the prompt reaper would have
+    /// to cascade into. Subclass instances are `Object::Instance` and never
+    /// match. A container that is currently borrowed reports `false` so
+    /// the caller takes the general path.
+    fn is_scalar_leaf_container(obj: &Object) -> bool {
+        match obj {
+            Object::List(l) => l
+                .try_borrow()
+                .map(|v| v.iter().all(gc_trace::is_atomic))
+                .unwrap_or(false),
+            Object::Set(s) => s
+                .try_borrow()
+                .map(|m| m.iter().all(|k| gc_trace::is_atomic(&k.0)))
+                .unwrap_or(false),
+            Object::Dict(d) => d
+                .try_borrow()
+                .map(|m| {
+                    m.iter()
+                        .all(|(k, v)| gc_trace::is_atomic(&k.0) && gc_trace::is_atomic(v))
+                })
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
     /// Cheap, allocation-free pre-check for the `POP_EXCEPT` reap: does the
     /// acyclic subgraph rooted at `obj` contain a finalizable object
     /// (`__del__` / an unfinished generator) reachable through value
@@ -3726,6 +3776,19 @@ impl Interpreter {
     }
 
     pub fn run_pending_finalizers(&mut self) -> usize {
+        // RFC 0077 (WS2): the prompt reaper drains after every node it
+        // tears down, and for the overwhelming majority nothing was
+        // queued. Answer that without publishing the interpreter pointer
+        // or touching the drain's hot-gate handshake: three relaxed reads
+        // instead of a guard, two TLS takes and a gate clear/re-set. The
+        // gate check keeps the handshake's invariant (a raised gate is
+        // always lowered by a real drain) intact.
+        if !crate::vm_singletons::has_pending_finalizers()
+            && !crate::vm_singletons::has_pending_weakref_callbacks()
+            && crate::hot_gates::load() & crate::hot_gates::PENDING_FINALIZERS == 0
+        {
+            return 0;
+        }
         // Finalizers run arbitrary Python (`__del__` → traceback →
         // native islice, …), so the interpreter pointer must be
         // published here just like the public call entry points: the

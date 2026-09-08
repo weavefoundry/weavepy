@@ -131,6 +131,16 @@ pub fn push_pending_weakref_callback(callback: Object, weakref_obj: Object) {
     });
 }
 
+/// Is anything parked in this thread's weakref-callback queue? Cheap
+/// (one TLS borrow, no drain) so the reaper's per-node finalizer drain
+/// can skip publishing the interpreter pointer when there is nothing to
+/// run. Teardown-safe: reports `false` once TLS is gone.
+pub fn has_pending_weakref_callbacks() -> bool {
+    PENDING_WEAKREF_CALLBACKS
+        .try_with(|cell| cell.try_borrow().map(|q| !q.is_empty()).unwrap_or(false))
+        .unwrap_or(false)
+}
+
 /// Drain the pending weakref-callback queue.
 pub fn drain_pending_weakref_callbacks() -> Vec<(Object, Object)> {
     PENDING_WEAKREF_CALLBACKS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
