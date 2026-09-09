@@ -10602,31 +10602,24 @@ fn str_split_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
         return s
             .split(is_space)
             .filter(|f| !f.is_empty())
-            .map(Object::from_str)
+            .map(|s| Object::Str(Rc::from(s)))
             .collect();
     }
-    let chars: Vec<(usize, char)> = s.char_indices().collect();
-    let n = chars.len();
     let mut out = Vec::new();
-    let mut i = 0;
+    let mut rest = s;
     let mut splits = 0;
-    while i < n {
-        while i < n && is_space(chars[i].1) {
-            i += 1;
-        }
-        if i >= n {
+    loop {
+        rest = rest.trim_start_matches(is_space);
+        if rest.is_empty() {
             break;
         }
         if splits >= maxsplit {
-            out.push(Object::from_str(s[chars[i].0..].to_string()));
-            return out;
+            out.push(Object::Str(Rc::from(rest)));
+            break;
         }
-        let start = chars[i].0;
-        while i < n && !is_space(chars[i].1) {
-            i += 1;
-        }
-        let end = if i < n { chars[i].0 } else { s.len() };
-        out.push(Object::from_str(s[start..end].to_string()));
+        let end = rest.find(is_space).unwrap_or(rest.len());
+        out.push(Object::Str(Rc::from(&rest[..end])));
+        rest = &rest[end..];
         splits += 1;
     }
     out
@@ -10661,10 +10654,10 @@ fn str_split(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
                 return Err(value_error("empty separator"));
             }
             if maxsplit < 0 {
-                s.split(&*sep).map(Object::from_str).collect()
+                s.split(&*sep).map(|s| Object::Str(Rc::from(s))).collect()
             } else {
                 s.splitn((maxsplit as usize).saturating_add(1), &*sep)
-                    .map(Object::from_str)
+                    .map(|s| Object::Str(Rc::from(s)))
                     .collect()
             }
         }
@@ -10673,9 +10666,24 @@ fn str_split(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
 }
 
 fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
-    let sep = str_self(args)?.into_owned();
+    use std::borrow::Cow;
+
+    let sep = str_self(args)?;
     if args.len() != 2 {
         return Err(type_error("join() expected 1 argument"));
+    }
+    // Exact built-in sequences of exact strings need no iteration hooks,
+    // reference clones, or intermediate copies. Hold a list's read guard
+    // across both passes so concurrent mutation cannot change its size.
+    if matches!(args.first(), Some(Object::Str(_))) {
+        let joined = match &args[1] {
+            Object::List(items) => join_exact_strings(&items.borrow(), &sep),
+            Object::Tuple(items) => join_exact_strings(items, &sep),
+            _ => None,
+        };
+        if let Some(joined) = joined {
+            return Ok(joined);
+        }
     }
     let mut it = args[1].make_iter()?;
     let mut items = Vec::new();
@@ -10688,23 +10696,23 @@ fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
     if items.len() == 1 && matches!(&items[0], Object::Str(_) | Object::WStr(_)) {
         return Ok(items[0].clone());
     }
-    let mut parts = Vec::new();
+    let mut parts: Vec<Cow<'_, str>> = Vec::with_capacity(items.len());
     let mut saw_surrogate = matches!(args.first(), Some(Object::WStr(_)));
     for v in &items {
         match v {
-            Object::Str(s) => parts.push(s.to_string()),
+            Object::Str(s) => parts.push(Cow::Borrowed(s)),
             Object::WStr(cps) => {
                 saw_surrogate = true;
-                parts.push(bridge_encode_cps(cps));
+                parts.push(Cow::Owned(bridge_encode_cps(cps)));
             }
             // Accept `str` subclass instances (e.g. email's `ValueTerminal`):
             // CPython's `str.join` treats any `PyUnicode` — subclasses
             // included — as a string item. Unwrap the native payload.
             other => match other.native_value() {
-                Some(Object::Str(s)) => parts.push(s.to_string()),
+                Some(Object::Str(s)) => parts.push(Cow::Owned(s.to_string())),
                 Some(Object::WStr(cps)) => {
                     saw_surrogate = true;
-                    parts.push(bridge_encode_cps(&cps));
+                    parts.push(Cow::Owned(bridge_encode_cps(&cps)));
                 }
                 _ => {
                     return Err(type_error(format!(
@@ -10721,6 +10729,30 @@ fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
     } else {
         Object::from_str(joined)
     })
+}
+
+/// Return `None` for shapes that need the general Unicode/iterator path.
+fn join_exact_strings(items: &[Object], sep: &str) -> Option<Object> {
+    let mut size = sep.len().checked_mul(items.len().saturating_sub(1))?;
+    for item in items {
+        let Object::Str(s) = item else {
+            return None;
+        };
+        size = size.checked_add(s.len())?;
+    }
+    if items.len() == 1 {
+        return Some(items[0].clone());
+    }
+    let mut joined = String::with_capacity(size);
+    for (i, item) in items.iter().enumerate() {
+        if i != 0 {
+            joined.push_str(sep);
+        }
+        if let Object::Str(s) = item {
+            joined.push_str(s);
+        }
+    }
+    Some(Object::from_str(joined))
 }
 
 fn str_startswith(args: &[Object]) -> Result<Object, RuntimeError> {

@@ -439,12 +439,15 @@ impl<T: ?Sized> GilCell<T> {
     /// reentrant lock let us in), unwind, release, and report failure.
     #[inline]
     fn borrow_shared(&self) -> bool {
-        let prev = self.borrow.fetch_add(1, Ordering::Acquire);
-        if prev < 0 {
-            self.borrow.fetch_sub(1, Ordering::Release);
+        // The owner lock already serializes access across threads. The
+        // counter only checks same-thread reentry, so it needs no atomic
+        // read-modify-write or second acquire/release barrier.
+        let prev = self.borrow.load(Ordering::Relaxed);
+        if prev < 0 || prev == isize::MAX {
             self.lock_release();
             return false;
         }
+        self.borrow.store(prev + 1, Ordering::Relaxed);
         true
     }
 
@@ -453,14 +456,11 @@ impl<T: ?Sized> GilCell<T> {
     /// mutable borrow); releases the lock and reports failure otherwise.
     #[inline]
     fn borrow_exclusive(&self) -> bool {
-        if self
-            .borrow
-            .compare_exchange(0, -1, Ordering::Acquire, Ordering::Acquire)
-            .is_err()
-        {
+        if self.borrow.load(Ordering::Relaxed) != 0 {
             self.lock_release();
             return false;
         }
+        self.borrow.store(-1, Ordering::Relaxed);
         true
     }
 
@@ -691,7 +691,8 @@ impl<T: ?Sized + fmt::Display> fmt::Display for Ref<'_, T> {
 
 impl<T: ?Sized> Drop for Ref<'_, T> {
     fn drop(&mut self) {
-        self.cell.borrow.fetch_sub(1, Ordering::Release);
+        let count = self.cell.borrow.load(Ordering::Relaxed);
+        self.cell.borrow.store(count - 1, Ordering::Relaxed);
         self.cell.lock_release();
         note_cell_guard_released();
     }
@@ -729,7 +730,7 @@ impl<T: ?Sized> Drop for RefMut<'_, T> {
     fn drop(&mut self) {
         // From -1 back to 0 — there's only ever one outstanding
         // mutable borrow at a time.
-        self.cell.borrow.store(0, Ordering::Release);
+        self.cell.borrow.store(0, Ordering::Relaxed);
         self.cell.lock_release();
         note_cell_guard_released();
     }
@@ -1453,6 +1454,38 @@ mod tests {
         });
         handle.join().unwrap();
         assert_eq!(*shared.borrow(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn gilcell_contended_borrows_publish_consistent_state() {
+        let shared = Rc::new(GilCell::new((0_u64, 0_u64)));
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let shared = shared.clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    for _ in 0..2_000 {
+                        {
+                            let a = shared.borrow();
+                            let b = shared.borrow();
+                            assert_eq!(a.0, b.1);
+                            assert!(shared.try_borrow_mut().is_err());
+                        }
+                        let mut pair = shared.borrow_mut();
+                        assert!(shared.try_borrow().is_err());
+                        assert!(shared.try_borrow_mut().is_err());
+                        pair.0 += 1;
+                        pair.1 += 1;
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(*shared.borrow(), (16_000, 16_000));
     }
 
     #[test]

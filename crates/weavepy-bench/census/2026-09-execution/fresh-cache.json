@@ -1,0 +1,101 @@
+{
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "jit": false,
+  "binaries": {
+    "base": {
+      "path": "target/release/weavepy-perf-971d752",
+      "sha256": "70cbfdda4bbdbdb65f410ba47a1ff97321334a5bbc83258238656352e2a12e6e",
+      "bytes": 44120992
+    },
+    "new": {
+      "path": "target/release/weavepy",
+      "sha256": "2b1329038d4ce27eb493f77e8c945b235b49f914da54c2e9c021087bb08cc698",
+      "bytes": 44121520
+    }
+  },
+  "rows": {
+    "startup_fresh_cache": {
+      "samples": {
+        "base": [
+          {
+            "wall_ns": 193050500,
+            "cpu_ns": 179736000,
+            "rss_bytes": 41287680
+          },
+          {
+            "wall_ns": 189455541,
+            "cpu_ns": 173756000,
+            "rss_bytes": 41254912
+          },
+          {
+            "wall_ns": 156323042,
+            "cpu_ns": 148456000,
+            "rss_bytes": 41385984
+          },
+          {
+            "wall_ns": 162310792,
+            "cpu_ns": 152377000,
+            "rss_bytes": 41222144
+          },
+          {
+            "wall_ns": 162057375,
+            "cpu_ns": 129710000,
+            "rss_bytes": 41369600
+          },
+          {
+            "wall_ns": 137692333,
+            "cpu_ns": 134576000,
+            "rss_bytes": 41385984
+          },
+          {
+            "wall_ns": 151019875,
+            "cpu_ns": 144905000,
+            "rss_bytes": 41353216
+          }
+        ],
+        "new": [
+          {
+            "wall_ns": 188494959,
+            "cpu_ns": 180177000,
+            "rss_bytes": 41320448
+          },
+          {
+            "wall_ns": 203161875,
+            "cpu_ns": 161567000,
+            "rss_bytes": 41123840
+          },
+          {
+            "wall_ns": 161070750,
+            "cpu_ns": 157689000,
+            "rss_bytes": 41123840
+          },
+          {
+            "wall_ns": 221094875,
+            "cpu_ns": 158624000,
+            "rss_bytes": 41304064
+          },
+          {
+            "wall_ns": 202301209,
+            "cpu_ns": 140813000,
+            "rss_bytes": 41238528
+          },
+          {
+            "wall_ns": 142881125,
+            "cpu_ns": 140097000,
+            "rss_bytes": 41189376
+          },
+          {
+            "wall_ns": 146420833,
+            "cpu_ns": 134097000,
+            "rss_bytes": 41238528
+          }
+        ]
+      },
+      "comparisons": {
+        "wall_ns": 1.0376839573195409,
+        "cpu_ns": 1.0409970008597098,
+        "rss_bytes": 0.9968316831683168
+      }
+    }
+  }
+}

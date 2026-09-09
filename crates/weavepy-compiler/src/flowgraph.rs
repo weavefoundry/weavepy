@@ -424,6 +424,7 @@ struct Cfg {
     entry: BlockId,
     handlers: Vec<HandlerInfo>,
     consts: Vec<Constant>,
+    constant_index: crate::intern::InternIndex,
     /// Whether the prefix stage must insert `RETURN_GENERATOR; POP_TOP`.
     generator_prefix: bool,
     /// `co_firstlineno`, for the prefix locations.
@@ -520,11 +521,8 @@ impl Cfg {
 
     /// `add_const`: find or append, returning the pool index.
     fn add_const(&mut self, c: Constant) -> u32 {
-        if let Some(i) = self.consts.iter().position(|x| *x == c) {
-            return i as u32;
-        }
-        self.consts.push(c);
-        (self.consts.len() - 1) as u32
+        self.constant_index
+            .intern(&mut self.consts, c, crate::intern::constant_hash)
     }
 
     /// `maybe_instr_make_load_smallint`.
@@ -721,6 +719,7 @@ fn build(co: &mut CodeObject, input: &BuildInput<'_>) -> Cfg {
         entry: 0,
         handlers: Vec::new(),
         consts: std::mem::take(&mut co.constants),
+        constant_index: crate::intern::InternIndex::default(),
         generator_prefix,
         firstlineno,
     };
@@ -2066,6 +2065,7 @@ impl Cfg {
             }
         }
         self.consts = new_consts;
+        self.constant_index = crate::intern::InternIndex::default();
         for b in self.chain() {
             for instr in self.blocks[b].instrs_mut() {
                 if instr.op == OpCode::LoadConst {

@@ -60,6 +60,9 @@ fn lower_at(cps: &[char], i: usize) -> ucd::CaseMap {
 }
 
 pub fn lower(s: &str) -> String {
+    if s.is_ascii() {
+        return s.to_ascii_lowercase();
+    }
     let cps: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
     for i in 0..cps.len() {
@@ -69,6 +72,9 @@ pub fn lower(s: &str) -> String {
 }
 
 pub fn upper(s: &str) -> String {
+    if s.is_ascii() {
+        return s.to_ascii_uppercase();
+    }
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         push_cps(&mut out, ucd::to_upper_full(c as u32));
@@ -78,6 +84,9 @@ pub fn upper(s: &str) -> String {
 
 /// `str.casefold()` — context-free full fold (no Final_Sigma).
 pub fn casefold(s: &str) -> String {
+    if s.is_ascii() {
+        return s.to_ascii_lowercase();
+    }
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         push_cps(&mut out, ucd::to_fold_full(c as u32));
@@ -86,6 +95,18 @@ pub fn casefold(s: &str) -> String {
 }
 
 pub fn title(s: &str) -> String {
+    if s.is_ascii() {
+        let mut previous_is_cased = false;
+        return ascii_case_map(s, |b| {
+            let mapped = if previous_is_cased {
+                b.to_ascii_lowercase()
+            } else {
+                b.to_ascii_uppercase()
+            };
+            previous_is_cased = b.is_ascii_alphabetic();
+            mapped
+        });
+    }
     let cps: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
     let mut previous_is_cased = false;
@@ -103,6 +124,13 @@ pub fn title(s: &str) -> String {
 /// `str.capitalize()` — first char titlecased (3.8+ semantics), rest
 /// lowered with the sigma rule.
 pub fn capitalize(s: &str) -> String {
+    if s.is_ascii() {
+        let mut out = s.to_ascii_lowercase();
+        if let Some(first) = out.get_mut(..1) {
+            first.make_ascii_uppercase();
+        }
+        return out;
+    }
     let cps: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
     if let Some(&first) = cps.first() {
@@ -115,6 +143,15 @@ pub fn capitalize(s: &str) -> String {
 }
 
 pub fn swapcase(s: &str) -> String {
+    if s.is_ascii() {
+        return ascii_case_map(s, |b| {
+            if b.is_ascii_lowercase() {
+                b.to_ascii_uppercase()
+            } else {
+                b.to_ascii_lowercase()
+            }
+        });
+    }
     let cps: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
     for i in 0..cps.len() {
@@ -131,9 +168,18 @@ pub fn swapcase(s: &str) -> String {
     out
 }
 
+/// ASCII case mappings preserve both length and UTF-8 validity. Keep this
+/// safe even if a future caller passes a non-ASCII byte through the mapper.
+fn ascii_case_map(s: &str, map: impl FnMut(u8) -> u8) -> String {
+    String::from_utf8(s.bytes().map(map).collect()).expect("ASCII case mapping")
+}
+
 /// `Py_UNICODE_ISSPACE` — differs from Rust's `char::is_whitespace` (e.g.
 /// U+001C..U+001F are Python whitespace).
 pub fn is_space(c: char) -> bool {
+    if c.is_ascii() {
+        return matches!(c, '\t'..='\r' | '\x1c'..=' ');
+    }
     ucd::case_flags(c as u32) & ucd::FLAG_SPACE != 0
 }
 
