@@ -2,6 +2,8 @@
 
 For the subsequent compiler and string optimizations measured against this
 release, see [Execution and compilation performance](PERFORMANCE-EXECUTION.md).
+For the later JSON and string work, including comparisons with CPython,
+see [JSON and string performance](PERFORMANCE-JSON.md).
 
 The September 8, 2026, optimization pass reduces warm-cache process startup
 from 50.7 ms to 32.3 ms on the measured macOS ARM64 host. Across all 24 existing

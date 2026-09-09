@@ -70,6 +70,48 @@ class StringFastPaths(unittest.TestCase):
         self.assertEqual("".split(None, 0), [])
         self.assertEqual("a,,b,".split(",", 2), ["a", "", "b,"])
 
+    def test_bounded_whitespace_rsplit(self):
+        for whitespace in (" ", "\t", "\n", "\x1c", "\x1f", "\u0085", "\u2003"):
+            text = whitespace + "a" + whitespace + "β" + whitespace
+            self.assertEqual(text.rsplit(), ["a", "β"])
+            self.assertEqual(text.rsplit(None, 0), [whitespace + "a" + whitespace + "β"])
+            self.assertEqual(text.rsplit(None, 1), [whitespace + "a", "β"])
+            self.assertEqual(text.rsplit(None, 2), ["a", "β"])
+            self.assertEqual(whitespace.rsplit(None, 0), [])
+        self.assertEqual(" a\ud800 b ".rsplit(None, 1), [" a\ud800", "b"])
+        self.assertEqual(" a ".rsplit(maxsplit=1), ["a"])
+        self.assertEqual("".rsplit(None, 0), [])
+        self.assertEqual("aaa".rsplit("aa", 1), ["a", ""])
+
+    def test_prefix_suffix_bounds(self):
+        for text in ("", "abc", "aéΣ😀z", "a\ud800z"):
+            for needle in ("", "a", "z", "éΣ", "😀", text):
+                self.assertEqual(text.startswith(needle), text[:len(needle)] == needle)
+                self.assertEqual(text.endswith(needle), not needle or text[-len(needle):] == needle)
+                for start in (-100, -2, -1, 0, 1, len(text), len(text) + 1, 100):
+                    for end in (-100, -1, 0, 1, len(text), 100):
+                        adjusted_start = max(0, start + len(text)) if start < 0 else start
+                        adjusted_end = min(len(text), max(0, end + len(text) if end < 0 else end))
+                        valid = adjusted_start <= adjusted_end
+                        part = text[start:end]
+                        self.assertEqual(text.startswith(needle, start, end),
+                                         valid and part.startswith(needle))
+                        self.assertEqual(text.endswith(needle, start, end),
+                                         valid and part.endswith(needle))
+            self.assertTrue(text.startswith((text,)))
+            self.assertTrue(text.endswith((text,)))
+            self.assertTrue(text.startswith(text, None, None))
+            self.assertTrue(text.endswith(text, 0, 2**63 - 1))
+            self.assertFalse(text.startswith("", 2**63 - 1))
+            self.assertTrue(text.startswith(text, -2**63))
+            self.assertTrue(text.endswith("", None, -2**63))
+        self.assertTrue("aéΣ😀z".startswith("éΣ", 1, None))
+        self.assertTrue("aéΣ😀z".endswith("😀", None, -1))
+        with self.assertRaises(TypeError):
+            "abc".startswith("a", "bad")
+        with self.assertRaises(TypeError):
+            "abc".endswith("c", 0, "bad")
+
 
 if __name__ == "__main__":
     unittest.main()

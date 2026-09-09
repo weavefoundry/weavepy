@@ -1,0 +1,54 @@
+{
+  "baseline_commit": "33c211b716dc54606841e5911d7298f762c5d2ce",
+  "baseline_binary_sha256": "3af8dad889285a0d49136029dc672b12c4052a44784561b3a308c7bcb0c5c0f0",
+  "platform": "macOS 26.6.2 arm64",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "cpython": "Python 3.14.7",
+  "cpython_jit_available": "False",
+  "release_build": "cargo build --offline --locked --release -p weavepy-cli --bin weavepy -j 1",
+  "metrics": {
+    "suite": "Original work sizes, both WeavePy execution modes, all 24 fixtures. One discarded cycle, alternating interpreter order; retain all measured samples.",
+    "ratios": "Median of ratios within paired cycles; values below 1 improve the metric.",
+    "cpu_and_rss": "Full-process CPU time and peak resident memory; supplemental probes additionally time workload CPU. JSON/string probes disable the JIT and time one bench() invocation per process; one complete process cycle is discarded.",
+    "profiling": "Flat sampling identifies candidate bottlenecks; profiles were collected during compilation and are not throughput measurements.",
+    "not_measured": "Energy, controlled build time, allocation counts, service tail latency, and other hardware platforms.",
+    "json_probe_files": "Twelve valid baseline/candidate/CPython probes in probes.json. Two additional surrogate probes in surrogates.json; the baseline encoder fails its workload assertion and has no performance ratio. See probe-baseline-error.txt.",
+    "scaling": "Initial mixed-mode run, an explicit CPython reference, and a seven-cycle follow-up isolating each GIL mode are all retained. Mixed-mode results show order sensitivity after the heavier free-threaded processes. The isolated GIL-enabled comparison is within 0.2% for serial and parallel workload time."
+  },
+  "modified_binary_sha256": "df59e69396bb60ae27f60aa141f5fef272a64742a4d3ea207a457c85198cd76c",
+  "modified_binary_bytes": 44166432,
+  "baseline_binary_bytes": 44129472,
+  "validation": {
+    "fixture_runner": "87 existing Python fixtures executed through the final CLI and compared byte for byte with their .out files. Localhost socket and subprocess access enabled.",
+    "cpython_gates": [
+      "test_json",
+      "test_scope",
+      "test_frame",
+      "test_exceptions",
+      "test_generators",
+      "test_sys_settrace",
+      "test_sys_setprofile",
+      "test_gc",
+      "test_str",
+      "test_userstring"
+    ],
+    "json_oracles": "250 encodings, 281 decodings, 219 malformed-input positions per mode; JIT, interpreter, gil=0. Generated with CPython 3.14.7 using verify.py.",
+    "clippy": "cargo clippy --locked -p weavepy-vm --all-features -- -D warnings",
+    "no_jit_build": "cargo check -p weavepy-vm --no-default-features",
+    "report_tests": "Six tools/tests/test_bench_compare.py tests passed.",
+    "initial_candidate": "validation.json was measured before removing the operand experiment; final JSON checks are recorded separately.",
+    "final": "All 104 checks passed on the final JSON and string release, including directional bounds; see validation-final.json."
+  },
+  "operand_experiment": {
+    "sha256": "4469ea9285106165d94f6e9ebcf7754147b76783c528f8ec5b7ea75bbca0096d",
+    "bytes": 44182432,
+    "path": "target/release/weavepy-operands-experiment",
+    "result": "Removed: 0.5% aggregate improvement, 2.5%-2.8% list_ops regression."
+  },
+  "before_prefix": "before-prefix/ retains measurements for the UTF-8 JSON candidate before removing whole-string indexes in prefix/suffix checks and bounded rsplit. These are intermediate results, not the final release.",
+  "before_bounds": "before-bounds/ retains the full suite before optimizing positive and negative string bounds. Its JSON and unbounded prefix/suffix optimizations are the same as the final release.",
+  "source_sha256": {
+    "crates/weavepy-vm/src/builtins.rs": "c1d52a2f0ceaf80e69efb9242bcdae8973114d5edd7a05bf811e7ac531d4c855",
+    "crates/weavepy-vm/src/stdlib/json_accel.rs": "29e4168bfd3bc5ae3ee08a6a8b67594ebda552fb1678a075ca524b4e5634a55a"
+  }
+}

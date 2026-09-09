@@ -13,16 +13,15 @@
 //! - `make_encoder(markers, default, encoder, indent, key_separator,
 //!   item_separator, sort_keys, skipkeys, allow_nan) -> encoder_callable`
 //!
-//! Behaviour mirrors `Modules/_json.c`. Because `test_json` runs the *same*
-//! assertions against the C and pure-Python implementations, matching the
-//! pure-Python reference (`json/decoder.py`, `json/scanner.py`,
-//! `json/encoder.py`) is sufficient — the two never disagree on observable
-//! output or error positions. The few C-specific behaviours `test_speedups`
+//! Behaviour mirrors `Modules/_json.c`, using the pure-Python reference
+//! (`json/decoder.py`, `json/scanner.py`, `json/encoder.py`) for shared
+//! semantics. Native details, including the position of invalid escapes,
+//! follow the C implementation. The C-specific behaviours `test_speedups`
 //! pins (eager encoding, `encoder()` must return a `str`, `make_encoder`
 //! argument validation, `make_scanner` reading attributes eagerly) are
 //! reproduced explicitly.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::builtin_types::builtin_types;
 use crate::builtins::class_of;
@@ -48,7 +47,18 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let eb = b("encode_basestring", json_encode_basestring);
     let eba = b("encode_basestring_ascii", json_encode_basestring_ascii);
     let mk_scanner = b("make_scanner", json_make_scanner);
-    let mk_encoder = bkw("make_encoder", json_make_encoder);
+    // Keep the original function identities even if Python replaces the
+    // module attributes. Only these two encoders can bypass a Python call.
+    let encoders = [eb.clone(), eba.clone()];
+    let kw_encoders = encoders.clone();
+    let mk_encoder = Object::Builtin(Rc::new(BuiltinFn {
+        name: "make_encoder",
+        binds_instance: false,
+        call: Box::new(move |a| json_make_encoder(a, &[], &encoders)),
+        call_kw: Some(Box::new(move |a, kw| {
+            json_make_encoder(a, kw, &kw_encoders)
+        })),
+    }));
 
     // `__module__ == "_json"` for each public function — `test_json`'s
     // `TestCTest.test_cjson` and `test_speedups` assert exactly this.
@@ -113,6 +123,61 @@ where
 // ---------------------------------------------------------------------------
 // String helpers (code-point addressed, matching Python str semantics)
 // ---------------------------------------------------------------------------
+
+/// Parse borrowed UTF-8 bytes or surrogate-bearing Unicode code points.
+/// Translate byte offsets only at the public boundary and on errors.
+trait JsonChar: Copy + Into<u32> {
+    fn string(s: &[Self]) -> Object;
+    fn text(s: &[Self]) -> std::borrow::Cow<'_, str>;
+    fn position(s: &[Self], offset: usize) -> usize;
+    fn append(s: &[Self], out: &mut Vec<u32>);
+    fn first(s: &[Self]) -> u32;
+}
+
+impl JsonChar for u8 {
+    fn string(s: &[Self]) -> Object {
+        Object::Str(Rc::from(std::str::from_utf8(s).expect("UTF-8 JSON span")))
+    }
+
+    fn text(s: &[Self]) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(std::str::from_utf8(s).expect("UTF-8 JSON span"))
+    }
+
+    fn position(s: &[Self], offset: usize) -> usize {
+        let end = offset.min(s.len());
+        s[..end].iter().filter(|&&c| c & 0xc0 != 0x80).count() + (offset - end)
+    }
+
+    fn append(s: &[Self], out: &mut Vec<u32>) {
+        out.extend(Self::text(s).chars().map(u32::from));
+    }
+
+    fn first(s: &[Self]) -> u32 {
+        Self::text(s).chars().next().map_or(0, u32::from)
+    }
+}
+
+impl JsonChar for u32 {
+    fn string(s: &[Self]) -> Object {
+        Object::str_from_codepoints(s.to_vec())
+    }
+
+    fn text(s: &[Self]) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(s.iter().filter_map(|&c| char::from_u32(c)).collect())
+    }
+
+    fn position(_s: &[Self], offset: usize) -> usize {
+        offset
+    }
+
+    fn append(s: &[Self], out: &mut Vec<u32>) {
+        out.extend_from_slice(s);
+    }
+
+    fn first(s: &[Self]) -> u32 {
+        s.first().copied().unwrap_or(0)
+    }
+}
 
 /// Code points of a `str`/`WStr` (or a `str` *subclass* instance), or a
 /// `TypeError` naming the bad argument like CPython's `_json`.
@@ -197,7 +262,14 @@ fn hex_val(c: u32) -> Option<u32> {
 
 /// Build a `json.decoder.JSONDecodeError(msg, doc, pos)` and wrap it as a
 /// `RuntimeError`, mirroring `_json.c`'s `raise_errmsg`.
-fn decode_error(interp: &mut Interpreter, msg: &str, doc: &Object, pos: usize) -> RuntimeError {
+fn decode_error<C: JsonChar>(
+    interp: &mut Interpreter,
+    msg: &str,
+    doc: &Object,
+    cps: &[C],
+    pos: usize,
+) -> RuntimeError {
+    let pos = C::position(cps, pos);
     let module = match interp.import_path("json.decoder") {
         Ok(m) => m,
         Err(e) => return e,
@@ -270,10 +342,10 @@ fn json_scanstring(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
 /// Core string scan (shared by `scanstring` and the scanner). `end` is the
 /// index of the first character after the opening quote; returns the decoded
 /// string and the index after the closing quote.
-fn scan_string(
+fn scan_string<C: JsonChar>(
     interp: &mut Interpreter,
     doc: &Object,
-    cps: &[u32],
+    cps: &[C],
     mut end: usize,
     strict: bool,
 ) -> Result<(Object, usize), RuntimeError> {
@@ -289,17 +361,21 @@ fn scan_string(
                     interp,
                     "Unterminated string starting at",
                     doc,
+                    cps,
                     begin,
                 ));
             }
-            let c = cps[i];
+            let c = cps[i].into();
             if c == 0x22 || c == 0x5c || c < 0x20 {
                 break;
             }
             i += 1;
         }
-        out.extend_from_slice(&cps[chunk_start..i]);
-        let terminator = cps[i];
+        if cps[i].into() == 0x22 && out.is_empty() && chunk_start == begin.wrapping_add(1) {
+            return Ok((C::string(&cps[chunk_start..i]), i + 1));
+        }
+        C::append(&cps[chunk_start..i], &mut out);
+        let terminator = cps[i].into();
         end = i + 1;
         if terminator == 0x22 {
             // closing quote
@@ -309,7 +385,7 @@ fn scan_string(
             if strict {
                 let ch = char::from_u32(terminator).unwrap_or('\u{fffd}');
                 let msg = format!("Invalid control character {:?} at", ch);
-                return Err(decode_error(interp, &msg, doc, end - 1));
+                return Err(decode_error(interp, &msg, doc, cps, end - 1));
             }
             out.push(terminator);
             continue;
@@ -320,10 +396,11 @@ fn scan_string(
                 interp,
                 "Unterminated string starting at",
                 doc,
+                cps,
                 begin,
             ));
         }
-        let esc = cps[end];
+        let esc = cps[end].into();
         if esc != 0x75 {
             // not '\u': a one-char escape from the lookup table
             let ch = match esc {
@@ -336,9 +413,9 @@ fn scan_string(
                 0x72 => 0x0d, // \r
                 0x74 => 0x09, // \t
                 _ => {
-                    let c = char::from_u32(esc).unwrap_or('\u{fffd}');
+                    let c = char::from_u32(C::first(&cps[end..])).unwrap_or('\u{fffd}');
                     let msg = format!("Invalid \\escape: {:?}", c);
-                    return Err(decode_error(interp, &msg, doc, end));
+                    return Err(decode_error(interp, &msg, doc, cps, end - 1));
                 }
             };
             end += 1;
@@ -349,8 +426,8 @@ fn scan_string(
             end += 5;
             if (0xd800..=0xdbff).contains(&uni)
                 && end + 1 < cps.len()
-                && cps[end] == 0x5c
-                && cps[end + 1] == 0x75
+                && cps[end].into() == 0x5c
+                && cps[end + 1].into() == 0x75
             {
                 let uni2 = decode_uxxxx(interp, doc, cps, end + 1)?;
                 if (0xdc00..=0xdfff).contains(&uni2) {
@@ -366,17 +443,17 @@ fn scan_string(
 
 /// `_decode_uXXXX(s, pos)` — `pos` is the index of the `'u'`; reads four hex
 /// digits at `pos+1`.
-fn decode_uxxxx(
+fn decode_uxxxx<C: JsonChar>(
     interp: &mut Interpreter,
     doc: &Object,
-    cps: &[u32],
+    cps: &[C],
     pos: usize,
 ) -> Result<u32, RuntimeError> {
     if pos + 4 < cps.len() {
         let mut val = 0u32;
         let mut ok = true;
         for k in 1..=4 {
-            match hex_val(cps[pos + k]) {
+            match hex_val(cps[pos + k].into()) {
                 Some(d) => val = (val << 4) | d,
                 None => {
                     ok = false;
@@ -388,7 +465,13 @@ fn decode_uxxxx(
             return Ok(val);
         }
     }
-    Err(decode_error(interp, "Invalid \\uXXXX escape", doc, pos))
+    Err(decode_error(
+        interp,
+        "Invalid \\uXXXX escape",
+        doc,
+        cps,
+        pos,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +518,11 @@ fn json_encode_basestring(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = args
         .first()
         .ok_or_else(|| type_error("encode_basestring() missing argument"))?;
+    if let Object::Str(s) = s {
+        let mut out = JsonWriter::default();
+        out.quoted_utf8(s, false);
+        return Ok(out.finish());
+    }
     with_interp(|interp| {
         let cps = arg_codepoints(interp, s, "first argument")?;
         let mut out: Vec<u32> = Vec::with_capacity(cps.len() + 2);
@@ -453,6 +541,11 @@ fn json_encode_basestring_ascii(args: &[Object]) -> Result<Object, RuntimeError>
     let s = args
         .first()
         .ok_or_else(|| type_error("encode_basestring_ascii() missing argument"))?;
+    if let Object::Str(s) = s {
+        let mut out = JsonWriter::default();
+        out.quoted_utf8(s, true);
+        return Ok(out.finish());
+    }
     with_interp(|interp| {
         let cps = arg_codepoints(interp, s, "first argument")?;
         let mut out = String::with_capacity(cps.len() + 2);
@@ -500,6 +593,8 @@ struct ScannerCfg {
     object_pairs_hook: Object,
     parse_float: Object,
     parse_int: Object,
+    native_float: bool,
+    native_int: bool,
     parse_constant: Object,
 }
 
@@ -540,13 +635,25 @@ fn json_make_scanner(args: &[Object]) -> Result<Object, RuntimeError> {
         // so a `strict=BadBool()` decoder propagates the exception —
         // `test_speedups.TestDecode.test_bad_bool_args`.
         let strict_obj = interp.load_attr_public(&ctx, "strict")?;
+        let strict = interp.op_truth(&strict_obj)?;
+        let object_hook = interp.load_attr_public(&ctx, "object_hook")?;
+        let object_pairs_hook = interp.load_attr_public(&ctx, "object_pairs_hook")?;
+        let parse_float = interp.load_attr_public(&ctx, "parse_float")?;
+        let parse_int = interp.load_attr_public(&ctx, "parse_int")?;
+        let parse_constant = interp.load_attr_public(&ctx, "parse_constant")?;
+        let native_float =
+            matches!(&parse_float, Object::Type(t) if Rc::ptr_eq(t, &builtin_types().float_));
+        let native_int =
+            matches!(&parse_int, Object::Type(t) if Rc::ptr_eq(t, &builtin_types().int_));
         let cfg = Rc::new(ScannerCfg {
-            strict: interp.op_truth(&strict_obj)?,
-            object_hook: interp.load_attr_public(&ctx, "object_hook")?,
-            object_pairs_hook: interp.load_attr_public(&ctx, "object_pairs_hook")?,
-            parse_float: interp.load_attr_public(&ctx, "parse_float")?,
-            parse_int: interp.load_attr_public(&ctx, "parse_int")?,
-            parse_constant: interp.load_attr_public(&ctx, "parse_constant")?,
+            strict,
+            object_hook,
+            object_pairs_hook,
+            parse_float,
+            parse_int,
+            native_float,
+            native_int,
+            parse_constant,
         });
         Ok(Object::Builtin(Rc::new(BuiltinFn {
             name: "scanner",
@@ -569,9 +676,46 @@ fn scanner_call(cfg: &ScannerCfg, args: &[Object]) -> Result<Object, RuntimeErro
         _ => return Err(type_error("second argument must be an integer")),
     };
     with_interp(|interp| {
-        let cps = arg_codepoints(interp, &s, "first argument")?;
-        let mut memo: HashMap<Vec<u32>, Object> = HashMap::new();
-        match scan_once(interp, cfg, &s, &cps, idx.max(0) as usize, &mut memo) {
+        let mut memo = HashSet::new();
+        let idx = idx.max(0) as usize;
+        let result = match &s {
+            Object::Str(text) => {
+                let ascii = text.is_ascii();
+                let byte_idx = if ascii || idx == 0 {
+                    idx
+                } else {
+                    // Include the end boundary: raw_decode at len(s) must
+                    // report that character offset, including after UTF-8.
+                    let Some(offset) = text
+                        .char_indices()
+                        .map(|(i, _)| i)
+                        .chain(std::iter::once(text.len()))
+                        .nth(idx)
+                    else {
+                        return Err(stop_iteration_value(interp, idx));
+                    };
+                    offset
+                };
+                let result = scan_once(interp, cfg, &s, text.as_bytes(), byte_idx, &mut memo);
+                if ascii {
+                    result
+                } else {
+                    match result {
+                        Ok((obj, end)) => Ok((obj, u8::position(text.as_bytes(), end))),
+                        Err(ScanErr::NoValue(i)) => {
+                            Err(ScanErr::NoValue(u8::position(text.as_bytes(), i)))
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+            Object::WStr(cps) => scan_once(interp, cfg, &s, cps, idx, &mut memo),
+            _ => {
+                let cps = arg_codepoints(interp, &s, "first argument")?;
+                scan_once(interp, cfg, &s, &cps, idx, &mut memo)
+            }
+        };
+        match result {
             Ok((obj, end)) => Ok(Object::new_tuple(vec![obj, Object::Int(end as i64)])),
             Err(ScanErr::NoValue(i)) => Err(stop_iteration_value(interp, i)),
             Err(ScanErr::Err(e)) => Err(e),
@@ -593,18 +737,18 @@ fn is_set(o: &Object) -> bool {
     !matches!(o, Object::None)
 }
 
-fn scan_once(
+fn scan_once<C: JsonChar>(
     interp: &mut Interpreter,
     cfg: &ScannerCfg,
     doc: &Object,
-    cps: &[u32],
+    cps: &[C],
     idx: usize,
-    memo: &mut HashMap<Vec<u32>, Object>,
+    memo: &mut HashSet<StringKey>,
 ) -> Result<(Object, usize), ScanErr> {
     if idx >= cps.len() {
         return Err(ScanErr::NoValue(idx));
     }
-    let c = cps[idx];
+    let c = cps[idx].into();
     match c {
         0x22 => {
             // '"'
@@ -628,16 +772,22 @@ fn scan_once(
         0x66 if matches_kw(cps, idx, "false") => Ok((Object::Bool(false), idx + 5)),
         _ => {
             if let Some((end, is_float)) = match_number(cps, idx) {
-                let numstr: String = cps[idx..end]
-                    .iter()
-                    .filter_map(|&c| char::from_u32(c))
-                    .collect();
+                let numstr = C::text(&cps[idx..end]);
+                if is_float && cfg.native_float {
+                    if let Ok(value) = numstr.parse::<f64>() {
+                        return Ok((Object::Float(value), end));
+                    }
+                } else if !is_float && cfg.native_int {
+                    if let Ok(value) = numstr.parse::<i64>() {
+                        return Ok((Object::Int(value), end));
+                    }
+                }
                 let parser = if is_float {
                     cfg.parse_float.clone()
                 } else {
                     cfg.parse_int.clone()
                 };
-                let res = interp.call_object(parser, &[Object::from_str(numstr)], &[])?;
+                let res = interp.call_object(parser, &[Object::from_str(numstr.as_ref())], &[])?;
                 return Ok((res, end));
             }
             if matches_kw(cps, idx, "NaN") {
@@ -661,13 +811,13 @@ fn parse_constant(
     interp.call_object(cfg.parse_constant.clone(), &[Object::from_str(name)], &[])
 }
 
-fn matches_kw(cps: &[u32], idx: usize, kw: &str) -> bool {
+fn matches_kw<C: JsonChar>(cps: &[C], idx: usize, kw: &str) -> bool {
     let kb = kw.as_bytes();
     if idx + kb.len() > cps.len() {
         return false;
     }
     for (k, &byte) in kb.iter().enumerate() {
-        if cps[idx + k] != u32::from(byte) {
+        if cps[idx + k].into() != u32::from(byte) {
             return false;
         }
     }
@@ -680,20 +830,20 @@ fn is_digit(c: u32) -> bool {
 
 /// Match `NUMBER_RE = (-?(?:0|[1-9][0-9]*))(\.[0-9]+)?([eE][-+]?[0-9]+)?`.
 /// Returns `(end_index, is_float)` or `None` if no integer part matches.
-fn match_number(cps: &[u32], idx: usize) -> Option<(usize, bool)> {
+fn match_number<C: JsonChar>(cps: &[C], idx: usize) -> Option<(usize, bool)> {
     let n = cps.len();
     let mut i = idx;
-    if i < n && cps[i] == 0x2d {
+    if i < n && cps[i].into() == 0x2d {
         i += 1; // '-'
     }
     if i >= n {
         return None;
     }
-    if cps[i] == 0x30 {
+    if cps[i].into() == 0x30 {
         i += 1; // '0'
-    } else if (0x31..=0x39).contains(&cps[i]) {
+    } else if (0x31..=0x39).contains(&cps[i].into()) {
         i += 1;
-        while i < n && is_digit(cps[i]) {
+        while i < n && is_digit(cps[i].into()) {
             i += 1;
         }
     } else {
@@ -701,11 +851,11 @@ fn match_number(cps: &[u32], idx: usize) -> Option<(usize, bool)> {
     }
     let mut is_float = false;
     // fraction
-    if i < n && cps[i] == 0x2e {
+    if i < n && cps[i].into() == 0x2e {
         let mut j = i + 1;
-        if j < n && is_digit(cps[j]) {
+        if j < n && is_digit(cps[j].into()) {
             j += 1;
-            while j < n && is_digit(cps[j]) {
+            while j < n && is_digit(cps[j].into()) {
                 j += 1;
             }
             i = j;
@@ -713,14 +863,14 @@ fn match_number(cps: &[u32], idx: usize) -> Option<(usize, bool)> {
         }
     }
     // exponent
-    if i < n && (cps[i] == 0x65 || cps[i] == 0x45) {
+    if i < n && (cps[i].into() == 0x65 || cps[i].into() == 0x45) {
         let mut j = i + 1;
-        if j < n && (cps[j] == 0x2b || cps[j] == 0x2d) {
+        if j < n && (cps[j].into() == 0x2b || cps[j].into() == 0x2d) {
             j += 1;
         }
-        if j < n && is_digit(cps[j]) {
+        if j < n && is_digit(cps[j].into()) {
             j += 1;
-            while j < n && is_digit(cps[j]) {
+            while j < n && is_digit(cps[j].into()) {
                 j += 1;
             }
             i = j;
@@ -736,34 +886,34 @@ fn is_ws(c: u32) -> bool {
     WS.contains(&c)
 }
 
-fn skip_ws(cps: &[u32], mut i: usize) -> usize {
-    while i < cps.len() && is_ws(cps[i]) {
+fn skip_ws<C: JsonChar>(cps: &[C], mut i: usize) -> usize {
+    while i < cps.len() && is_ws(cps[i].into()) {
         i += 1;
     }
     i
 }
 
 /// `JSONObject` — `idx` points just past the opening `{`.
-fn parse_object(
+fn parse_object<C: JsonChar>(
     interp: &mut Interpreter,
     cfg: &ScannerCfg,
     doc: &Object,
-    cps: &[u32],
+    cps: &[C],
     mut end: usize,
-    memo: &mut HashMap<Vec<u32>, Object>,
+    memo: &mut HashSet<StringKey>,
 ) -> Result<(Object, usize), ScanErr> {
     let _depth_guard = match crate::recursion::enter() {
         crate::recursion::Enter::Ok(g) => g,
         crate::recursion::Enter::Overflow => return Err(ScanErr::Err(recursion_overflow())),
     };
     let mut pairs: Vec<(Object, Object)> = Vec::new();
-    let mut nextchar = cps.get(end).copied();
+    let mut nextchar = cps.get(end).copied().map(Into::into);
 
     if nextchar != Some(0x22) {
         if let Some(c) = nextchar {
             if is_ws(c) {
                 end = skip_ws(cps, end);
-                nextchar = cps.get(end).copied();
+                nextchar = cps.get(end).copied().map(Into::into);
             }
         }
         if nextchar == Some(0x7d) {
@@ -775,6 +925,7 @@ fn parse_object(
                 interp,
                 "Expecting property name enclosed in double quotes",
                 doc,
+                cps,
                 end,
             )));
         }
@@ -787,13 +938,14 @@ fn parse_object(
         let key_obj = intern_key(memo, key_obj);
 
         // ':'
-        if cps.get(end).copied() != Some(0x3a) {
+        if cps.get(end).copied().map(Into::into) != Some(0x3a) {
             end = skip_ws(cps, end);
-            if cps.get(end).copied() != Some(0x3a) {
+            if cps.get(end).copied().map(Into::into) != Some(0x3a) {
                 return Err(ScanErr::Err(decode_error(
                     interp,
                     "Expecting ':' delimiter",
                     doc,
+                    cps,
                     end,
                 )));
             }
@@ -801,10 +953,10 @@ fn parse_object(
         end += 1;
 
         // optional whitespace before value
-        if let Some(c) = cps.get(end).copied() {
+        if let Some(c) = cps.get(end).copied().map(Into::into) {
             if is_ws(c) {
                 end += 1;
-                if let Some(c2) = cps.get(end).copied() {
+                if let Some(c2) = cps.get(end).copied().map(Into::into) {
                     if is_ws(c2) {
                         end = skip_ws(cps, end + 1);
                     }
@@ -820,6 +972,7 @@ fn parse_object(
                     interp,
                     "Expecting value",
                     doc,
+                    cps,
                     i,
                 )))
             }
@@ -829,11 +982,11 @@ fn parse_object(
         pairs.push((key_obj, value));
 
         // delimiter
-        let mut nc = cps.get(end).copied();
+        let mut nc = cps.get(end).copied().map(Into::into);
         if let Some(c) = nc {
             if is_ws(c) {
                 end = skip_ws(cps, end + 1);
-                nc = cps.get(end).copied();
+                nc = cps.get(end).copied().map(Into::into);
             }
         }
         end += 1;
@@ -846,13 +999,14 @@ fn parse_object(
                     interp,
                     "Expecting ',' delimiter",
                     doc,
+                    cps,
                     end - 1,
                 )))
             }
         }
         let comma_idx = end - 1;
         end = skip_ws(cps, end);
-        nextchar = cps.get(end).copied();
+        nextchar = cps.get(end).copied().map(Into::into);
         end += 1;
         if nextchar != Some(0x22) {
             if nextchar == Some(0x7d) {
@@ -860,6 +1014,7 @@ fn parse_object(
                     interp,
                     "Illegal trailing comma before end of object",
                     doc,
+                    cps,
                     comma_idx,
                 )));
             }
@@ -867,6 +1022,7 @@ fn parse_object(
                 interp,
                 "Expecting property name enclosed in double quotes",
                 doc,
+                cps,
                 end - 1,
             )));
         }
@@ -875,14 +1031,36 @@ fn parse_object(
     Ok((result, end))
 }
 
-fn intern_key(memo: &mut HashMap<Vec<u32>, Object>, key_obj: Object) -> Object {
-    if let Some(cps) = key_obj.str_codepoints() {
-        if let Some(existing) = memo.get(&cps) {
-            return existing.clone();
+/// Only immutable string storage can enter the decoder's key memo.
+/// Keeping that invariant in the type avoids both code-point copies and
+/// the interior-mutable variants of a general Python dictionary key.
+#[derive(PartialEq, Eq, Hash)]
+enum StringKey {
+    Utf8(Rc<str>),
+    Wide(Rc<[u32]>),
+}
+
+impl StringKey {
+    fn object(&self) -> Object {
+        match self {
+            Self::Utf8(s) => Object::Str(s.clone()),
+            Self::Wide(cps) => Object::WStr(cps.clone()),
         }
-        memo.insert(cps, key_obj.clone());
     }
-    key_obj
+}
+
+fn intern_key(memo: &mut HashSet<StringKey>, key_obj: Object) -> Object {
+    let key = match key_obj {
+        Object::Str(s) => StringKey::Utf8(s),
+        Object::WStr(cps) => StringKey::Wide(cps),
+        other => return other,
+    };
+    if let Some(existing) = memo.get(&key) {
+        return existing.object();
+    }
+    let value = key.object();
+    memo.insert(key);
+    value
 }
 
 /// Apply `object_pairs_hook` / `object_hook` to the parsed key/value pairs.
@@ -911,24 +1089,24 @@ fn finish_object(
 }
 
 /// `JSONArray` — `idx` points just past the opening `[`.
-fn parse_array(
+fn parse_array<C: JsonChar>(
     interp: &mut Interpreter,
     cfg: &ScannerCfg,
     doc: &Object,
-    cps: &[u32],
+    cps: &[C],
     mut end: usize,
-    memo: &mut HashMap<Vec<u32>, Object>,
+    memo: &mut HashSet<StringKey>,
 ) -> Result<(Object, usize), ScanErr> {
     let _depth_guard = match crate::recursion::enter() {
         crate::recursion::Enter::Ok(g) => g,
         crate::recursion::Enter::Overflow => return Err(ScanErr::Err(recursion_overflow())),
     };
     let mut values: Vec<Object> = Vec::new();
-    let mut nextchar = cps.get(end).copied();
+    let mut nextchar = cps.get(end).copied().map(Into::into);
     if let Some(c) = nextchar {
         if is_ws(c) {
             end = skip_ws(cps, end + 1);
-            nextchar = cps.get(end).copied();
+            nextchar = cps.get(end).copied().map(Into::into);
         }
     }
     if nextchar == Some(0x5d) {
@@ -943,6 +1121,7 @@ fn parse_array(
                     interp,
                     "Expecting value",
                     doc,
+                    cps,
                     i,
                 )))
             }
@@ -951,11 +1130,11 @@ fn parse_array(
         end = new_end;
         values.push(value);
 
-        let mut nc = cps.get(end).copied();
+        let mut nc = cps.get(end).copied().map(Into::into);
         if let Some(c) = nc {
             if is_ws(c) {
                 end = skip_ws(cps, end + 1);
-                nc = cps.get(end).copied();
+                nc = cps.get(end).copied().map(Into::into);
             }
         }
         end += 1;
@@ -967,6 +1146,7 @@ fn parse_array(
                     interp,
                     "Expecting ',' delimiter",
                     doc,
+                    cps,
                     end - 1,
                 )))
             }
@@ -974,21 +1154,22 @@ fn parse_array(
         let comma_idx = end - 1;
         // Skip whitespace before the next value (advances `end`), matching
         // `JSONArray`'s 1–2-char fast path.
-        if let Some(c) = cps.get(end).copied() {
+        if let Some(c) = cps.get(end).copied().map(Into::into) {
             if is_ws(c) {
                 end += 1;
-                if let Some(c2) = cps.get(end).copied() {
+                if let Some(c2) = cps.get(end).copied().map(Into::into) {
                     if is_ws(c2) {
                         end = skip_ws(cps, end + 1);
                     }
                 }
             }
         }
-        if cps.get(end).copied() == Some(0x5d) {
+        if cps.get(end).copied().map(Into::into) == Some(0x5d) {
             return Err(ScanErr::Err(decode_error(
                 interp,
                 "Illegal trailing comma before end of array",
                 doc,
+                cps,
                 comma_idx,
             )));
         }
@@ -1000,21 +1181,168 @@ fn parse_array(
 // make_encoder
 // ---------------------------------------------------------------------------
 
+/// Accumulate directly into UTF-8, widening only if an unescaped surrogate
+/// occurs. This also preserves lone surrogates returned by custom encoders.
+#[derive(Default)]
+struct JsonWriter {
+    text: String,
+    wide: Option<Vec<u32>>,
+}
+
+impl JsonWriter {
+    fn push_str(&mut self, s: &str) {
+        if let Some(wide) = &mut self.wide {
+            wide.extend(s.chars().map(u32::from));
+        } else {
+            self.text.push_str(s);
+        }
+    }
+
+    fn push_codepoints(&mut self, cps: &[u32]) {
+        let wide = self.wide.get_or_insert_with(|| {
+            let cps = self.text.chars().map(u32::from).collect();
+            self.text = String::new();
+            cps
+        });
+        wide.extend_from_slice(cps);
+    }
+
+    fn push_object(&mut self, o: &Object) -> Result<(), RuntimeError> {
+        match o {
+            Object::Str(s) => self.push_str(s),
+            Object::WStr(cps) => self.push_codepoints(cps),
+            Object::Instance(inst) => match inst.native.get() {
+                Some(s @ (Object::Str(_) | Object::WStr(_))) => self.push_object(s)?,
+                _ => return Err(type_error("encoder produced a non-str chunk")),
+            },
+            _ => return Err(type_error("encoder produced a non-str chunk")),
+        }
+        Ok(())
+    }
+
+    fn unicode_escape(&mut self, c: u32) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let bytes = [
+            b'\\',
+            b'u',
+            HEX[((c >> 12) & 15) as usize],
+            HEX[((c >> 8) & 15) as usize],
+            HEX[((c >> 4) & 15) as usize],
+            HEX[(c & 15) as usize],
+        ];
+        self.push_str(std::str::from_utf8(&bytes).expect("ASCII escape"));
+    }
+
+    fn escape(&mut self, c: u32) {
+        match c {
+            0x22 => self.push_str("\\\""),
+            0x5c => self.push_str("\\\\"),
+            0x08 => self.push_str("\\b"),
+            0x0c => self.push_str("\\f"),
+            0x0a => self.push_str("\\n"),
+            0x0d => self.push_str("\\r"),
+            0x09 => self.push_str("\\t"),
+            0..=0xffff => self.unicode_escape(c),
+            _ => {
+                let n = c - 0x10000;
+                self.unicode_escape(0xd800 | (n >> 10));
+                self.unicode_escape(0xdc00 | (n & 0x3ff));
+            }
+        }
+    }
+
+    fn quoted_utf8(&mut self, s: &str, ascii: bool) {
+        self.push_str("\"");
+        let mut start = 0;
+        if ascii {
+            for (i, c) in s.char_indices() {
+                if c == '"' || c == '\\' || !(0x20..=0x7e).contains(&u32::from(c)) {
+                    self.push_str(&s[start..i]);
+                    self.escape(u32::from(c));
+                    start = i + c.len_utf8();
+                }
+            }
+        } else {
+            // Non-ASCII UTF-8 bytes cannot be quotes, slashes, or controls.
+            for (i, &c) in s.as_bytes().iter().enumerate() {
+                if c == b'"' || c == b'\\' || c < 0x20 {
+                    self.push_str(&s[start..i]);
+                    self.escape(u32::from(c));
+                    start = i + 1;
+                }
+            }
+        }
+        self.push_str(&s[start..]);
+        self.push_str("\"");
+    }
+
+    fn quoted_wide(&mut self, cps: &[u32], ascii: bool) {
+        self.push_str("\"");
+        let mut start = 0;
+        for (i, &c) in cps.iter().enumerate() {
+            if c == 0x22 || c == 0x5c || c < 0x20 || (ascii && c > 0x7e) {
+                if start < i {
+                    if ascii {
+                        for &c in &cps[start..i] {
+                            self.push_str(char::from_u32(c).unwrap().encode_utf8(&mut [0; 4]));
+                        }
+                    } else {
+                        self.push_codepoints(&cps[start..i]);
+                    }
+                }
+                self.escape(c);
+                start = i + 1;
+            }
+        }
+        if ascii {
+            for &c in &cps[start..] {
+                self.push_str(char::from_u32(c).unwrap().encode_utf8(&mut [0; 4]));
+            }
+        } else {
+            self.push_codepoints(&cps[start..]);
+        }
+        self.push_str("\"");
+    }
+
+    fn finish(self) -> Object {
+        match self.wide {
+            Some(cps) => Object::str_from_codepoints(cps),
+            None => Object::from_str(self.text),
+        }
+    }
+}
+
 struct EncoderCfg {
     markers: Object, // dict or None
     default: Object,
     encoder: Object,
-    indent: Option<String>,
-    key_separator: String,
-    item_separator: String,
+    /// Some(ensure_ascii) only for the original native string encoders.
+    native_encoder: Option<bool>,
+    indent: Option<Object>,
+    key_separator: Object,
+    item_separator: Object,
     sort_keys: bool,
     skipkeys: bool,
     allow_nan: bool,
 }
 
-fn obj_to_string(o: &Object) -> Option<String> {
-    o.str_codepoints()
-        .map(|cps| cps.iter().filter_map(|&c| char::from_u32(c)).collect())
+fn string_value(o: &Object) -> Option<Object> {
+    match o {
+        Object::Str(_) | Object::WStr(_) => Some(o.clone()),
+        Object::Instance(inst) => match inst.native.get() {
+            Some(s @ (Object::Str(_) | Object::WStr(_))) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn write_indent(out: &mut JsonWriter, indent: &Object, level: usize) -> Result<(), RuntimeError> {
+    out.push_str("\n");
+    for _ in 0..level {
+        out.push_object(indent)?;
+    }
+    Ok(())
 }
 
 /// Parameter names of `_json.make_encoder`, in clinic order — it is
@@ -1035,6 +1363,7 @@ const MAKE_ENCODER_PARAMS: [&str; 9] = [
 fn json_make_encoder(
     positional: &[Object],
     kwargs: &[(String, Object)],
+    encoders: &[Object; 2],
 ) -> Result<Object, RuntimeError> {
     if positional.len() > 9 {
         return Err(type_error(format!(
@@ -1084,11 +1413,11 @@ fn json_make_encoder(
     }
     let indent = match &args[3] {
         Object::None => None,
-        s => Some(obj_to_string(s).ok_or_else(|| type_error("indent must be a string or None"))?),
+        s => Some(string_value(s).ok_or_else(|| type_error("indent must be a string or None"))?),
     };
-    let key_separator = obj_to_string(&args[4])
+    let key_separator = string_value(&args[4])
         .ok_or_else(|| type_error("make_encoder() argument 5 must be str"))?;
-    let item_separator = obj_to_string(&args[5])
+    let item_separator = string_value(&args[5])
         .ok_or_else(|| type_error("make_encoder() argument 6 must be str"))?;
     // `bool(...)` honours `__bool__` for the flag arguments (CPython's
     // `PyObject_IsTrue` in `encoder_init`), so a `JSONEncoder(sort_keys=…)`
@@ -1105,6 +1434,13 @@ fn json_make_encoder(
         markers,
         default: args[1].clone(),
         encoder: args[2].clone(),
+        native_encoder: encoders
+            .iter()
+            .position(|encoder| match (encoder, &args[2]) {
+                (Object::Builtin(a), Object::Builtin(b)) => Rc::ptr_eq(a, b),
+                _ => false,
+            })
+            .map(|i| i == 1),
         indent,
         key_separator,
         item_separator,
@@ -1151,7 +1487,7 @@ fn encoder_call(cfg: &EncoderCfg, args: &[Object]) -> Result<Object, RuntimeErro
         }
     };
     with_interp(|interp| {
-        let mut out: Vec<Object> = Vec::new();
+        let mut out = JsonWriter::default();
         let mut cycle: HashSet<usize> = HashSet::new();
         let track = !matches!(cfg.markers, Object::None);
         encode_value(
@@ -1165,19 +1501,7 @@ fn encoder_call(cfg: &EncoderCfg, args: &[Object]) -> Result<Object, RuntimeErro
         )?;
         // `_json.c` writes into one `PyUnicodeWriter` and returns
         // `(result,)`: a single joined chunk, as a tuple.
-        let mut joined = String::new();
-        for chunk in &out {
-            match obj_to_string(chunk) {
-                Some(s) => joined.push_str(&s),
-                None => {
-                    return Err(type_error(format!(
-                        "encoder produced a non-str chunk: {}",
-                        chunk.type_name_owned()
-                    )))
-                }
-            }
-        }
-        Ok(Object::new_tuple(vec![Object::from_str(joined)]))
+        Ok(Object::new_tuple(vec![out.finish()]))
     })
 }
 
@@ -1257,6 +1581,20 @@ fn call_encoder(
             r.type_name_owned()
         ))),
     }
+}
+
+fn write_encoded_string(
+    interp: &mut Interpreter,
+    cfg: &EncoderCfg,
+    s: &Object,
+    out: &mut JsonWriter,
+) -> Result<(), RuntimeError> {
+    match (cfg.native_encoder, s) {
+        (Some(ascii), Object::Str(s)) => out.quoted_utf8(s, ascii),
+        (Some(ascii), Object::WStr(cps)) => out.quoted_wide(cps, ascii),
+        _ => out.push_object(&call_encoder(interp, cfg, s)?)?,
+    }
+    Ok(())
 }
 
 fn intstr(interp: &mut Interpreter, o: &Object) -> Result<Object, RuntimeError> {
@@ -1384,7 +1722,7 @@ fn encode_value(
     cfg: &EncoderCfg,
     o: &Object,
     level: usize,
-    out: &mut Vec<Object>,
+    out: &mut JsonWriter,
     track: bool,
     cycle: &mut HashSet<usize>,
 ) -> Result<(), RuntimeError> {
@@ -1410,17 +1748,17 @@ fn encode_value_impl(
     cfg: &EncoderCfg,
     o: &Object,
     level: usize,
-    out: &mut Vec<Object>,
+    out: &mut JsonWriter,
     track: bool,
     cycle: &mut HashSet<usize>,
 ) -> Result<(), RuntimeError> {
     match json_kind(o) {
-        Kind::Str => out.push(call_encoder(interp, cfg, o)?),
-        Kind::Null => out.push(Object::from_static("null")),
-        Kind::True => out.push(Object::from_static("true")),
-        Kind::False => out.push(Object::from_static("false")),
-        Kind::Int => out.push(intstr(interp, o)?),
-        Kind::Float => out.push(floatstr(interp, o, cfg.allow_nan)?),
+        Kind::Str => write_encoded_string(interp, cfg, o, out)?,
+        Kind::Null => out.push_str("null"),
+        Kind::True => out.push_str("true"),
+        Kind::False => out.push_str("false"),
+        Kind::Int => out.push_object(&intstr(interp, o)?)?,
+        Kind::Float => out.push_object(&floatstr(interp, o, cfg.allow_nan)?)?,
         Kind::List => {
             encode_list(interp, cfg, o, level, out, track, cycle)?;
         }
@@ -1466,7 +1804,7 @@ fn encode_list(
     cfg: &EncoderCfg,
     container: &Object,
     level: usize,
-    out: &mut Vec<Object>,
+    out: &mut JsonWriter,
     track: bool,
     cycle: &mut HashSet<usize>,
 ) -> Result<(), RuntimeError> {
@@ -1491,7 +1829,7 @@ fn encode_list(
     };
 
     if current_len(0).is_none() {
-        out.push(Object::from_static("[]"));
+        out.push_str("[]");
         return Ok(());
     }
     let id = obj_id(container);
@@ -1499,17 +1837,12 @@ fn encode_list(
         return Err(value_error("Circular reference detected"));
     }
     let mut level = level;
-    let (newline_indent, separator) = if let Some(ind) = &cfg.indent {
+    if cfg.indent.is_some() {
         level += 1;
-        let nl = format!("\n{}", ind.repeat(level));
-        let sep = format!("{}{}", cfg.item_separator, nl);
-        (Some(nl), sep)
-    } else {
-        (None, cfg.item_separator.clone())
-    };
-    out.push(Object::from_static("["));
-    if let Some(nl) = &newline_indent {
-        out.push(Object::from_str(nl.clone()));
+    }
+    out.push_str("[");
+    if let Some(ind) = &cfg.indent {
+        write_indent(out, ind, level)?;
     }
     let mut first = true;
     let mut i = 0;
@@ -1517,7 +1850,10 @@ fn encode_list(
         if first {
             first = false;
         } else {
-            out.push(Object::from_str(separator.clone()));
+            out.push_object(&cfg.item_separator)?;
+            if let Some(ind) = &cfg.indent {
+                write_indent(out, ind, level)?;
+            }
         }
         encode_value(interp, cfg, &value, level, out, track, cycle).map_err(|e| {
             serializing_note(e, || {
@@ -1528,9 +1864,9 @@ fn encode_list(
     }
     if let Some(ind) = &cfg.indent {
         level -= 1;
-        out.push(Object::from_str(format!("\n{}", ind.repeat(level))));
+        write_indent(out, ind, level)?;
     }
-    out.push(Object::from_static("]"));
+    out.push_str("]");
     if track {
         cycle.remove(&id);
     }
@@ -1544,28 +1880,23 @@ fn encode_dict(
     container: &Object,
     mut items: Vec<(Object, Object)>,
     level: usize,
-    out: &mut Vec<Object>,
+    out: &mut JsonWriter,
     track: bool,
     cycle: &mut HashSet<usize>,
 ) -> Result<(), RuntimeError> {
     if items.is_empty() {
-        out.push(Object::from_static("{}"));
+        out.push_str("{}");
         return Ok(());
     }
     let id = obj_id(container);
     if track && !cycle.insert(id) {
         return Err(value_error("Circular reference detected"));
     }
-    out.push(Object::from_static("{"));
+    out.push_str("{");
     let mut level = level;
-    let (newline_indent, item_separator) = if let Some(ind) = &cfg.indent {
+    if cfg.indent.is_some() {
         level += 1;
-        let nl = format!("\n{}", ind.repeat(level));
-        let sep = format!("{}{}", cfg.item_separator, nl);
-        (Some(nl), sep)
-    } else {
-        (None, cfg.item_separator.clone())
-    };
+    }
 
     if cfg.sort_keys {
         items = sort_items(interp, items)?;
@@ -1593,14 +1924,14 @@ fn encode_dict(
         };
         if first {
             first = false;
-            if let Some(nl) = &newline_indent {
-                out.push(Object::from_str(nl.clone()));
-            }
         } else {
-            out.push(Object::from_str(item_separator.clone()));
+            out.push_object(&cfg.item_separator)?;
         }
-        out.push(call_encoder(interp, cfg, &key_str)?);
-        out.push(Object::from_str(cfg.key_separator.clone()));
+        if let Some(ind) = &cfg.indent {
+            write_indent(out, ind, level)?;
+        }
+        write_encoded_string(interp, cfg, &key_str, out)?;
+        out.push_object(&cfg.key_separator)?;
         // The note names the *original* key (`dict item 1`, not `'1'`).
         encode_value(interp, cfg, &v, level, out, track, cycle).map_err(|e| {
             serializing_note(e, || {
@@ -1615,10 +1946,10 @@ fn encode_dict(
     if !first {
         if let Some(ind) = &cfg.indent {
             level -= 1;
-            out.push(Object::from_str(format!("\n{}", ind.repeat(level))));
+            write_indent(out, ind, level)?;
         }
     }
-    out.push(Object::from_static("}"));
+    out.push_str("}");
     if track {
         cycle.remove(&id);
     }

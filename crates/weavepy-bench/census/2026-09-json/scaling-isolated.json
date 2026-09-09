@@ -1,0 +1,270 @@
+{
+  "work": 3000000,
+  "notes": "Modes run separately; each mode discards one process pair and reverses binary order on alternate cycles. This checks the order effect seen after heavy free-threaded processes in scaling.json. Higher scaling is better; lower time and memory are better.",
+  "binaries": {
+    "base": {
+      "path": "target/release/weavepy-perf-33c211b",
+      "sha256": "3af8dad889285a0d49136029dc672b12c4052a44784561b3a308c7bcb0c5c0f0"
+    },
+    "new": {
+      "path": "target/release/weavepy",
+      "sha256": "df59e69396bb60ae27f60aa141f5fef272a64742a4d3ea207a457c85198cd76c"
+    }
+  },
+  "samples": {
+    "1": {
+      "base": [
+        {
+          "serial_ns": 98028792,
+          "parallel_ns": 106019875,
+          "scaling": 0.9246265570488552,
+          "wall_ns": 329082791,
+          "cpu_ns": 326654000,
+          "rss_bytes": 63455232
+        },
+        {
+          "serial_ns": 97567208,
+          "parallel_ns": 106107375,
+          "scaling": 0.9195139169167081,
+          "wall_ns": 322614708,
+          "cpu_ns": 320239000,
+          "rss_bytes": 63602688
+        },
+        {
+          "serial_ns": 98112542,
+          "parallel_ns": 106977583,
+          "scaling": 0.9171317882551151,
+          "wall_ns": 325452792,
+          "cpu_ns": 323066000,
+          "rss_bytes": 63242240
+        },
+        {
+          "serial_ns": 97851250,
+          "parallel_ns": 106718541,
+          "scaling": 0.916909555575727,
+          "wall_ns": 327314083,
+          "cpu_ns": 324789000,
+          "rss_bytes": 63438848
+        },
+        {
+          "serial_ns": 97885500,
+          "parallel_ns": 105976083,
+          "scaling": 0.9236565197451202,
+          "wall_ns": 325703667,
+          "cpu_ns": 323247000,
+          "rss_bytes": 63373312
+        },
+        {
+          "serial_ns": 98075375,
+          "parallel_ns": 106794833,
+          "scaling": 0.918353184746307,
+          "wall_ns": 324322250,
+          "cpu_ns": 321966000,
+          "rss_bytes": 63438848
+        },
+        {
+          "serial_ns": 97654041,
+          "parallel_ns": 107086667,
+          "scaling": 0.9119159624232211,
+          "wall_ns": 325715042,
+          "cpu_ns": 323346000,
+          "rss_bytes": 63160320
+        }
+      ],
+      "new": [
+        {
+          "serial_ns": 97838416,
+          "parallel_ns": 108365875,
+          "scaling": 0.9028526369578984,
+          "wall_ns": 326436541,
+          "cpu_ns": 323862000,
+          "rss_bytes": 63553536
+        },
+        {
+          "serial_ns": 97443542,
+          "parallel_ns": 105778167,
+          "scaling": 0.9212065661905448,
+          "wall_ns": 323294166,
+          "cpu_ns": 320901000,
+          "rss_bytes": 63668224
+        },
+        {
+          "serial_ns": 97885875,
+          "parallel_ns": 106511292,
+          "scaling": 0.9190187553071838,
+          "wall_ns": 324219666,
+          "cpu_ns": 322260000,
+          "rss_bytes": 63766528
+        },
+        {
+          "serial_ns": 98312000,
+          "parallel_ns": 106530750,
+          "scaling": 0.9228509139379945,
+          "wall_ns": 326486042,
+          "cpu_ns": 323939000,
+          "rss_bytes": 63668224
+        },
+        {
+          "serial_ns": 98044875,
+          "parallel_ns": 106727416,
+          "scaling": 0.9186475104016385,
+          "wall_ns": 325772333,
+          "cpu_ns": 323231000,
+          "rss_bytes": 63602688
+        },
+        {
+          "serial_ns": 97809333,
+          "parallel_ns": 107025125,
+          "scaling": 0.9138913222479301,
+          "wall_ns": 324071000,
+          "cpu_ns": 321717000,
+          "rss_bytes": 63848448
+        },
+        {
+          "serial_ns": 98091542,
+          "parallel_ns": 106439500,
+          "scaling": 0.9215708641998506,
+          "wall_ns": 325062166,
+          "cpu_ns": 322612000,
+          "rss_bytes": 63651840
+        }
+      ]
+    },
+    "0": {
+      "base": [
+        {
+          "serial_ns": 3644759208,
+          "parallel_ns": 849079625,
+          "scaling": 4.292600011453579,
+          "wall_ns": 4910982250,
+          "cpu_ns": 9866750000,
+          "rss_bytes": 58540032
+        },
+        {
+          "serial_ns": 3601793500,
+          "parallel_ns": 801735541,
+          "scaling": 4.492495736820528,
+          "wall_ns": 4828127959,
+          "cpu_ns": 9903804000,
+          "rss_bytes": 58687488
+        },
+        {
+          "serial_ns": 3639908125,
+          "parallel_ns": 883143750,
+          "scaling": 4.12153528233654,
+          "wall_ns": 4951326709,
+          "cpu_ns": 10052547000,
+          "rss_bytes": 58572800
+        },
+        {
+          "serial_ns": 3609227250,
+          "parallel_ns": 896114000,
+          "scaling": 4.027642967301035,
+          "wall_ns": 4949537500,
+          "cpu_ns": 10483387000,
+          "rss_bytes": 58720256
+        },
+        {
+          "serial_ns": 3369476667,
+          "parallel_ns": 838867541,
+          "scaling": 4.016696918542471,
+          "wall_ns": 4648152791,
+          "cpu_ns": 9907973000,
+          "rss_bytes": 58359808
+        },
+        {
+          "serial_ns": 3669731417,
+          "parallel_ns": 864448000,
+          "scaling": 4.2451731243521875,
+          "wall_ns": 4979642666,
+          "cpu_ns": 10232878000,
+          "rss_bytes": 58523648
+        },
+        {
+          "serial_ns": 3660399417,
+          "parallel_ns": 864287042,
+          "scaling": 4.235166373117972,
+          "wall_ns": 4965645417,
+          "cpu_ns": 10162557000,
+          "rss_bytes": 58638336
+        }
+      ],
+      "new": [
+        {
+          "serial_ns": 3452048834,
+          "parallel_ns": 778437667,
+          "scaling": 4.43458606943284,
+          "wall_ns": 4655317459,
+          "cpu_ns": 9425409000,
+          "rss_bytes": 58474496
+        },
+        {
+          "serial_ns": 3607663375,
+          "parallel_ns": 871175208,
+          "scaling": 4.141145594905405,
+          "wall_ns": 4915501792,
+          "cpu_ns": 9764386000,
+          "rss_bytes": 58359808
+        },
+        {
+          "serial_ns": 3482218542,
+          "parallel_ns": 807656250,
+          "scaling": 4.311510673012188,
+          "wall_ns": 4732379542,
+          "cpu_ns": 9752314000,
+          "rss_bytes": 58753024
+        },
+        {
+          "serial_ns": 3538551708,
+          "parallel_ns": 855982417,
+          "scaling": 4.133907002905178,
+          "wall_ns": 4854356000,
+          "cpu_ns": 9982293000,
+          "rss_bytes": 58671104
+        },
+        {
+          "serial_ns": 3531315792,
+          "parallel_ns": 828406542,
+          "scaling": 4.262781150272471,
+          "wall_ns": 4801771375,
+          "cpu_ns": 9902595000,
+          "rss_bytes": 58490880
+        },
+        {
+          "serial_ns": 3545758459,
+          "parallel_ns": 826400041,
+          "scaling": 4.290607796569555,
+          "wall_ns": 4816783208,
+          "cpu_ns": 10039854000,
+          "rss_bytes": 58753024
+        },
+        {
+          "serial_ns": 3555486042,
+          "parallel_ns": 925187708,
+          "scaling": 3.842988845675412,
+          "wall_ns": 4920080792,
+          "cpu_ns": 10052893000,
+          "rss_bytes": 58638336
+        }
+      ]
+    }
+  },
+  "comparisons": {
+    "1": {
+      "serial_ns": 0.9987325044701494,
+      "parallel_ns": 0.9982403151482365,
+      "scaling": 1.00184080876069,
+      "wall_ns": 0.997995560794518,
+      "cpu_ns": 0.9977299858356065,
+      "rss_bytes": 1.0036194415718718
+    },
+    "0": {
+      "serial_ns": 0.9713382713064725,
+      "parallel_ns": 0.9559858325775524,
+      "scaling": 1.0263836781131948,
+      "wall_ns": 0.9807696173632385,
+      "cpu_ns": 0.9811368805530565,
+      "rss_bytes": 1.0
+    }
+  }
+}

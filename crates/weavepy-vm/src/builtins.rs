@@ -10794,31 +10794,66 @@ fn str_apply_start_end<'a>(
     start: Option<&Object>,
     end: Option<&Object>,
 ) -> Result<Option<&'a str>, RuntimeError> {
-    let chars: Vec<(usize, char)> = s.char_indices().collect();
-    let n = chars.len() as i64;
-    let resolve = |raw: Option<&Object>, default: i64| -> Result<i64, RuntimeError> {
+    // The common unbounded check only needs to inspect the needle. In
+    // particular, json.loads checks for a BOM this way on the whole input.
+    if matches!(start, None | Some(Object::None | Object::Int(0)))
+        && matches!(end, None | Some(Object::None))
+    {
+        return Ok(Some(s));
+    }
+    let resolve = |raw: Option<&Object>| -> Result<Option<i64>, RuntimeError> {
         match raw {
-            None | Some(Object::None) => Ok(default),
-            Some(Object::Int(i)) => Ok(*i),
+            None | Some(Object::None) => Ok(None),
+            Some(Object::Int(i)) => Ok(Some(*i)),
             Some(_) => Err(type_error("slice indices must be int or None")),
         }
     };
-    let mut start_idx = resolve(start, 0)?;
-    let mut end_idx = resolve(end, n)?;
-    if start_idx < 0 {
-        start_idx = (start_idx + n).max(0);
-    }
-    if end_idx < 0 {
-        end_idx += n;
-    }
-    let end_idx = end_idx.clamp(0, n);
-    if start_idx > end_idx {
+    let start_idx = resolve(start)?.unwrap_or(0);
+    let end_idx = resolve(end)?;
+    if start_idx >= 0 && end_idx.is_some_and(|i| i >= 0 && start_idx > i) {
         return Ok(None);
     }
-    let start_idx = start_idx as usize;
-    let end_idx = end_idx as usize;
-    let start_byte = chars.get(start_idx).map(|(i, _)| *i).unwrap_or(s.len());
-    let end_byte = chars.get(end_idx).map(|(i, _)| *i).unwrap_or(s.len());
+    // Find positive bounds from the front and negative bounds from the
+    // back. Neither needs the full character count or an allocated index.
+    // Include len(s) as a valid boundary, but reject a start beyond it even
+    // for an empty needle. The end boundary may clamp to the end of s.
+    let offset = |text: &str, index: i64| -> Option<usize> {
+        if index < 0 {
+            let count = index.unsigned_abs();
+            if count > text.len() as u64 {
+                return Some(0);
+            }
+            return Some(
+                text.char_indices()
+                    .rev()
+                    .nth((count - 1) as usize)
+                    .map_or(0, |(i, _)| i),
+            );
+        }
+        let index = usize::try_from(index).ok()?;
+        let prefix = text.as_bytes().get(..index)?;
+        if prefix.is_ascii() {
+            Some(index)
+        } else {
+            text.char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(text.len()))
+                .nth(index)
+        }
+    };
+    let Some(start_byte) = offset(s, start_idx) else {
+        return Ok(None);
+    };
+    let end_byte = match end_idx {
+        Some(end) if start_idx >= 0 && end >= start_idx => {
+            offset(&s[start_byte..], end - start_idx).map_or(s.len(), |i| start_byte + i)
+        }
+        Some(end) => offset(s, end).unwrap_or(s.len()),
+        None => s.len(),
+    };
+    if start_byte > end_byte {
+        return Ok(None);
+    }
     Ok(Some(&s[start_byte..end_byte]))
 }
 
@@ -11085,32 +11120,27 @@ fn str_rsplit_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
             .map(Object::from_str)
             .collect();
     }
-    let chars: Vec<(usize, char)> = s.char_indices().collect();
-    let n = chars.len();
-    let mut out_rev: Vec<String> = Vec::new();
-    let mut i = n;
-    let mut splits = 0;
-    while i > 0 {
-        while i > 0 && is_space(chars[i - 1].1) {
-            i -= 1;
-        }
-        if i == 0 {
+    let mut out_rev = Vec::new();
+    let mut rest = s;
+    loop {
+        rest = rest.trim_end_matches(is_space);
+        if rest.is_empty() {
             break;
         }
-        let end_byte = if i < n { chars[i].0 } else { s.len() };
-        if splits >= maxsplit {
-            out_rev.push(s[..end_byte].to_string());
+        if out_rev.len() as i64 == maxsplit {
+            out_rev.push(Object::Str(Rc::from(rest)));
             break;
         }
-        while i > 0 && !is_space(chars[i - 1].1) {
-            i -= 1;
-        }
-        let start_byte = chars[i].0;
-        out_rev.push(s[start_byte..end_byte].to_string());
-        splits += 1;
+        let start = rest
+            .char_indices()
+            .rev()
+            .find(|(_, c)| is_space(*c))
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        out_rev.push(Object::Str(Rc::from(&rest[start..])));
+        rest = &rest[..start];
     }
     out_rev.reverse();
-    out_rev.into_iter().map(Object::from_str).collect()
+    out_rev
 }
 
 fn str_rsplit(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {

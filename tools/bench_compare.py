@@ -38,6 +38,15 @@ def paired_ratio(after: list[dict], before: list[dict], metric: str) -> float:
     )
 
 
+def relative_metrics(after: list[dict], before: list[dict]) -> dict:
+    """Report every measured metric, including CPU time and process memory."""
+    if not after or not before:
+        raise ValueError("Relative metrics require measured samples")
+    if any(sample.keys() != after[0].keys() for sample in after + before):
+        raise ValueError("Relative metrics require identical measurement fields")
+    return {metric: paired_ratio(after, before, metric) for metric in after[0]}
+
+
 def measure(binary: str, jit: str | None, name: str, work: int, warm: bool) -> dict:
     env = os.environ.copy()
     env["WEAVEPY_BENCH_WORK"] = str(work)
@@ -180,23 +189,29 @@ def main() -> None:
             for label, values in samples.items()
         }
         comparisons = {
-            mode: {
-                metric: paired_ratio(samples[new], samples[base], metric)
-                for metric in samples[new][0]
-            }
+            mode: relative_metrics(samples[new], samples[base])
             for mode, new, base in [
                 ("jit", "new", "base"),
                 ("interp", "new_interp", "base_interp"),
             ]
         }
-        report["rows"][name] = {"work": n, **row, "comparisons": comparisons}
+        cpython_comparisons = {
+            mode: relative_metrics(samples[label], samples["cpython"])
+            for mode, label in [("jit", "new"), ("interp", "new_interp")]
+        }
+        report["rows"][name] = {
+            "work": n, **row, "comparisons": comparisons,
+            "cpython_comparisons": cpython_comparisons,
+        }
         # Preserve completed fixtures if a subsequent workload fails.
         args.out.write_text(json.dumps(report, indent=2) + "\n")
         print(
             f"{name:16s} "
             f"JIT {comparisons['jit']['ns']:.3f}x  "
             f"interp {comparisons['interp']['ns']:.3f}x  "
-            f"RSS {comparisons['jit']['rss_bytes']:.3f}x",
+            f"RSS {comparisons['jit']['rss_bytes']:.3f}x  "
+            f"CPython {cpython_comparisons['jit']['ns']:.3f}x time / "
+            f"{cpython_comparisons['jit']['rss_bytes']:.3f}x RSS",
             flush=True,
         )
 

@@ -1,0 +1,47 @@
+{
+  "baseline_commit": "33c211b716dc54606841e5911d7298f762c5d2ce",
+  "baseline_binary_sha256": "3af8dad889285a0d49136029dc672b12c4052a44784561b3a308c7bcb0c5c0f0",
+  "platform": "macOS 26.6.2 arm64",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "cpython": "Python 3.14.7",
+  "cpython_jit_available": "False",
+  "release_build": "cargo build --offline --locked --release -p weavepy-cli --bin weavepy -j 1",
+  "metrics": {
+    "suite": "Original work sizes, both WeavePy execution modes, all 24 fixtures. One discarded cycle, alternating interpreter order; retain all measured samples.",
+    "ratios": "Median of ratios within paired cycles; values below 1 improve the metric.",
+    "cpu_and_rss": "Full-process CPU time and peak resident memory; warm probes additionally time workload CPU.",
+    "profiling": "Flat sampling identifies candidate bottlenecks; profiles were collected during compilation and are not throughput measurements.",
+    "not_measured": "Energy, controlled build time, allocation counts, service tail latency, and other hardware platforms."
+  },
+  "modified_binary_sha256": "66b9e4d35108419093d0d96764fc0a66e9ac76a902f8c178f77f02c6145c6258",
+  "modified_binary_bytes": 44166336,
+  "baseline_binary_bytes": 44129472,
+  "validation": {
+    "fixture_runner": "87 existing Python fixtures executed through the final CLI and compared byte for byte with their .out files. Localhost socket and subprocess access enabled.",
+    "cpython_gates": [
+      "test_json",
+      "test_scope",
+      "test_frame",
+      "test_exceptions",
+      "test_generators",
+      "test_sys_settrace",
+      "test_sys_setprofile",
+      "test_gc",
+      "test_str",
+      "test_userstring"
+    ],
+    "json_oracles": "250 encodings, 281 decodings, 219 malformed-input positions per mode; JIT, interpreter, gil=0. Generated with CPython 3.14.7 using verify.py.",
+    "clippy": "cargo clippy --locked -p weavepy-vm --all-features -- -D warnings",
+    "no_jit_build": "cargo check -p weavepy-vm --no-default-features",
+    "report_tests": "Six tools/tests/test_bench_compare.py tests passed.",
+    "initial_candidate": "validation.json was measured before removing the operand experiment; final JSON checks are recorded separately.",
+    "final": "All 104 checks passed on the final JSON and string release; see validation-final.json."
+  },
+  "operand_experiment": {
+    "sha256": "4469ea9285106165d94f6e9ebcf7754147b76783c528f8ec5b7ea75bbca0096d",
+    "bytes": 44182432,
+    "path": "target/release/weavepy-operands-experiment",
+    "result": "Removed: 0.5% aggregate improvement, 2.5%-2.8% list_ops regression."
+  },
+  "before_prefix": "before-prefix/ retains measurements for the UTF-8 JSON candidate before removing whole-string indexes in prefix/suffix checks and bounded rsplit. These are intermediate results, not the final release."
+}
