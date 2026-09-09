@@ -1,0 +1,15 @@
+{
+  "baseline_commit": "971d75214077c07935710798b705ec50d5831860",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "cpython": "Python 3.14.7",
+  "release_build": "cargo build --release -p weavepy-cli --bin weavepy",
+  "metric_notes": {
+    "suite": "Paired alternating-order subprocesses, one discarded cycle, original work sizes, both JIT and interpreter.",
+    "probes": "Interpreter only; seven measured cycles for kernels and 31 for startup, one discarded cycle.",
+    "rss": "Per-child peak resident memory; includes process startup.",
+    "time": "Workload timers exclude startup; startup probes use full-process wall time.",
+    "warm": "Seven measured cycles after one discarded cycle. Each subprocess invokes bench(n) once before timing a second invocation and records workload CPU time.",
+    "scaling": "Existing eight-thread fixture, five measured cycles and one discarded cycle, both binaries and both GIL modes. Work values are 1,000,000 and 3,000,000 per worker."
+  }
+}

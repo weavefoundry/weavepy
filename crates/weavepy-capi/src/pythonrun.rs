@@ -38,6 +38,22 @@ pub struct PyCompilerFlags {
 // Shared plumbing
 // ---------------------------------------------------------------------------
 
+/// Compilation and exception reporting can consume native stack before
+/// execution reaches the VM's per-frame growth check. C embedders may call
+/// us on a small OS thread stack, so reserve headroom for the whole run.
+fn with_run_stack<R>(body: impl FnOnce() -> R) -> R {
+    // A greenlet may suspend and destroy its stack out of band. Match the
+    // VM's policy: its dedicated stack must not acquire stacker segments.
+    if weavepy_vm::stdlib::greenlet_native::on_greenlet_stack() {
+        return body();
+    }
+    stacker::maybe_grow(8 * 1024 * 1024, 64 * 1024 * 1024, body)
+}
+
+fn with_run_interp<R>(body: impl FnOnce(&mut Interpreter) -> R) -> Option<R> {
+    with_run_stack(|| crate::interp::with_interp_mut(body))
+}
+
 /// The `__main__` module's dict, creating the module (CPython's
 /// `PyImport_AddModule("__main__")`) if this is the first touch.
 pub fn main_module_dict(interp: &mut Interpreter) -> Result<Rc<RefCell<DictData>>, RuntimeError> {
@@ -212,8 +228,8 @@ fn run_in_embed_subinterp(id: i64, source: &str) -> Option<c_int> {
         match crate::embed::owned_interpreter() {
             // SAFETY: live between `Py_Initialize*` and `Py_FinalizeEx`;
             // the GIL keeps the access exclusive.
-            Some(p) => Some(f(unsafe { &mut *p })),
-            None => crate::interp::with_interp_mut(f),
+            Some(p) => Some(with_run_stack(|| f(unsafe { &mut *p }))),
+            None => with_run_interp(f),
         }
     }
     let module = with_host(|interp| interp.import_path("_xxsubinterpreters"))?;
@@ -256,15 +272,16 @@ pub unsafe extern "C" fn PyRun_SimpleStringFlags(
             return rc;
         }
     }
-    let outcome = crate::interp::with_interp_mut(|interp| {
-        match crate::embed::exec_in_main(interp, &source, None) {
-            Ok(_) => 0,
-            Err(err) => {
-                print_or_exit(interp, err);
-                -1
-            }
-        }
-    });
+    let outcome =
+        with_run_interp(
+            |interp| match crate::embed::exec_in_main(interp, &source, None) {
+                Ok(_) => 0,
+                Err(err) => {
+                    print_or_exit(interp, err);
+                    -1
+                }
+            },
+        );
     outcome.unwrap_or_else(|| {
         crate::errors::set_runtime_error(
             "PyRun_SimpleString: interpreter not initialized".to_owned(),
@@ -310,7 +327,7 @@ unsafe fn run_string_impl(
     };
     let filename = filename.to_owned();
     let source = source.to_owned();
-    let result = crate::interp::with_interp_mut(move |interp| {
+    let result = with_run_interp(move |interp| {
         let code = compile_source(interp, &source, &filename, mode, flags, -1)?;
         eval_code_object(interp, code, globals_obj, locals_obj)
     });
@@ -385,9 +402,8 @@ pub unsafe extern "C" fn Py_CompileStringExFlags(
     } else {
         unsafe { (*flags).cf_flags }
     };
-    let result = crate::interp::with_interp_mut(|interp| {
-        compile_source(interp, &source, &filename, mode, cf, optimize)
-    });
+    let result =
+        with_run_interp(|interp| compile_source(interp, &source, &filename, mode, cf, optimize));
     match result {
         Some(Ok(code)) => crate::object::into_owned(code),
         Some(Err(err)) => {
@@ -443,9 +459,8 @@ pub unsafe extern "C" fn PyEval_EvalCode(
     } else {
         unsafe { crate::object::clone_object(locals) }
     };
-    let result = crate::interp::with_interp_mut(|interp| {
-        eval_code_object(interp, code_obj, globals_obj, locals_obj)
-    });
+    let result =
+        with_run_interp(|interp| eval_code_object(interp, code_obj, globals_obj, locals_obj));
     match result {
         Some(Ok(obj)) => crate::object::into_owned(obj),
         Some(Err(err)) => {
@@ -572,7 +587,7 @@ pub unsafe extern "C" fn PyRun_SimpleFileExFlags(
             .to_string_lossy()
             .into_owned()
     };
-    let outcome = crate::interp::with_interp_mut(|interp| {
+    let outcome = with_run_interp(|interp| {
         match crate::embed::exec_in_main(interp, &source, Some(&filename)) {
             Ok(_) => 0,
             Err(err) => {
@@ -698,7 +713,7 @@ pub unsafe extern "C" fn PyRun_InteractiveOneFlags(
             .to_string_lossy()
             .into_owned()
     };
-    let outcome = crate::interp::with_interp_mut(|interp| {
+    let outcome = with_run_interp(|interp| {
         let ps1 = prompt(interp, "ps1", ">>> ");
         let ps2 = prompt(interp, "ps2", "... ");
         eprint!("{ps1}");

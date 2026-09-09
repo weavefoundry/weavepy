@@ -36,6 +36,7 @@ mod ast_opt;
 pub mod bytecode;
 pub mod cpython_code;
 mod flowgraph;
+mod intern;
 mod mangle;
 mod validate;
 
@@ -518,27 +519,6 @@ impl CodeObject {
             && self.coltable == other.coltable
             && self.exception_table == other.exception_table
             && self.no_interrupt_jumps == other.no_interrupt_jumps
-    }
-
-    /// Find or insert a constant; returns its index.
-    fn intern_constant(&mut self, c: Constant) -> u32 {
-        for (i, existing) in self.constants.iter().enumerate() {
-            if existing == &c {
-                return i as u32;
-            }
-        }
-        self.constants.push(c);
-        (self.constants.len() - 1) as u32
-    }
-
-    fn intern_name(&mut self, n: &str) -> u32 {
-        for (i, existing) in self.names.iter().enumerate() {
-            if existing == n {
-                return i as u32;
-            }
-        }
-        self.names.push(n.to_owned());
-        (self.names.len() - 1) as u32
     }
 
     /// Render this code object as a `dis`-style listing.
@@ -1535,6 +1515,8 @@ enum Binding {
 
 struct Compiler {
     co: CodeObject,
+    constant_index: intern::InternIndex,
+    name_index: intern::InternIndex,
     kind: CodeKind,
     /// Which comprehension form this scope lowers (`None` outside
     /// comprehensions). Drives CPython's "'yield' inside list
@@ -1988,6 +1970,8 @@ impl Compiler {
         co.future_flags = params.future_flags;
         Self {
             co,
+            constant_index: intern::InternIndex::default(),
+            name_index: intern::InternIndex::default(),
             kind,
             comp_kind: None,
             bindings: IndexMap::new(),
@@ -2039,6 +2023,15 @@ impl Compiler {
             next_cond_annotation_index: 0,
             in_conditional_block: 0,
         }
+    }
+
+    fn intern_name(&mut self, name: &str) -> u32 {
+        self.name_index.intern_name(&mut self.co.names, name)
+    }
+
+    fn intern_constant(&mut self, c: Constant) -> u32 {
+        self.constant_index
+            .intern(&mut self.co.constants, c, intern::constant_hash)
     }
 
     /// CPython `ste_new`: a child scope is nested when this scope is
@@ -2232,7 +2225,7 @@ impl Compiler {
         let wrap = self.stopiteration_wrap
             && (self.co.is_generator || self.co.is_coroutine || self.co.is_async_generator);
         if wrap {
-            let none_idx = self.co.intern_constant(Constant::None);
+            let none_idx = self.intern_constant(Constant::None);
             self.emit_no_line(OpCode::LoadConst, none_idx);
             self.emit_no_line(OpCode::ReturnValue, 0);
             let handler = self.next_offset();
@@ -2254,7 +2247,7 @@ impl Compiler {
         }
         // `_PyCodegen_AddReturnAtEnd`: every stream falling off its end
         // returns None (and no jump target is out of bounds).
-        let none_idx = self.co.intern_constant(Constant::None);
+        let none_idx = self.intern_constant(Constant::None);
         self.emit_no_line(OpCode::LoadConst, none_idx);
         self.emit_no_line(OpCode::ReturnValue, 0);
 
@@ -2652,9 +2645,7 @@ impl Compiler {
         let mut end_jumps = Vec::with_capacity(2);
         if !is_tuple {
             // Early exit: the opposite of the builtin's initial result.
-            let idx = self
-                .co
-                .intern_constant(Constant::Bool(const_oparg != COMMON_CONSTANT_ALL));
+            let idx = self.intern_constant(Constant::Bool(const_oparg != COMMON_CONSTANT_ALL));
             self.emit(OpCode::LoadConst, idx);
         }
         let j = self.emit(OpCode::JumpForward, 0);
@@ -2668,9 +2659,7 @@ impl Compiler {
         if is_tuple {
             self.emit(OpCode::ListToTuple, 0);
         } else {
-            let idx = self
-                .co
-                .intern_constant(Constant::Bool(const_oparg == COMMON_CONSTANT_ALL));
+            let idx = self.intern_constant(Constant::Bool(const_oparg == COMMON_CONSTANT_ALL));
             self.emit(OpCode::LoadConst, idx);
         }
         let j = self.emit(OpCode::JumpForward, 0);
@@ -2756,7 +2745,7 @@ impl Compiler {
             self.emit_load_name(&first_param);
             self.current_span = saved;
         }
-        let namei = self.co.intern_name(attr);
+        let namei = self.intern_name(attr);
         let arg = (namei << 2) | u32::from(method) | (u32::from(two_arg) << 1);
         self.emit(OpCode::LoadSuperAttr, arg);
         self.with_attr_location(attr_expr.span.end.0, attr.len() as u32, |c| {
@@ -2860,7 +2849,7 @@ impl Compiler {
                 self.apply_annotate_loc(loc);
             }
             self.emit(OpCode::BuildSet, 0);
-            let idx = self.co.intern_name("__conditional_annotations__");
+            let idx = self.intern_name("__conditional_annotations__");
             self.emit(OpCode::StoreName, idx);
         }
         // Under PEP 563 (`codegen_body`): SETUP_ANNOTATIONS as the first
@@ -2883,8 +2872,8 @@ impl Compiler {
         if !self.interactive && !self.eval_mode {
             if let Some(doc) = first_stmt_docstring(&module.body) {
                 if self.params.optimize < 2 {
-                    let doc_const = self.co.intern_constant(Constant::Str(clean_docstring(doc)));
-                    let doc_name = self.co.intern_name("__doc__");
+                    let doc_const = self.intern_constant(Constant::Str(clean_docstring(doc)));
+                    let doc_name = self.intern_name("__doc__");
                     self.set_line_from(module.body[0].span.start.0);
                     self.set_span(module.body[0].span);
                     self.emit(OpCode::LoadConst, doc_const);
@@ -2904,11 +2893,9 @@ impl Compiler {
                 .compile_deferred_annotations(loc)?
                 .expect("placeholder implies deferred annotations");
             debug_assert!(code.freevars.is_empty());
-            let code_idx = self
-                .co
-                .intern_constant(Constant::Code(std::sync::Arc::new(code)));
+            let code_idx = self.intern_constant(Constant::Code(std::sync::Arc::new(code)));
             self.co.instructions[load as usize].arg = code_idx;
-            let name_idx = self.co.intern_name("__annotate__");
+            let name_idx = self.intern_name("__annotate__");
             self.co.instructions[store as usize].arg = name_idx;
         }
         Ok(())
@@ -3388,7 +3375,7 @@ impl Compiler {
                         let saved = self.current_span;
                         self.set_span(target.span);
                         self.emit(OpCode::CopyTop, 1);
-                        let idx = self.co.intern_name(attr);
+                        let idx = self.intern_name(attr);
                         self.with_attr_location(target.span.end.0, attr.len() as u32, |c| {
                             c.emit(OpCode::LoadAttr, idx);
                         });
@@ -3517,10 +3504,10 @@ impl Compiler {
                                         self.cell_or_free_index("__conditional_annotations__");
                                     self.emit(OpCode::LoadDeref, idx);
                                 } else {
-                                    let idx = self.co.intern_name("__conditional_annotations__");
+                                    let idx = self.intern_name("__conditional_annotations__");
                                     self.emit(OpCode::LoadName, idx);
                                 }
-                                let c = self.co.intern_constant(Constant::Int(i64::from(i)));
+                                let c = self.intern_constant(Constant::Int(i64::from(i)));
                                 self.emit(OpCode::LoadConst, c);
                                 self.emit(OpCode::SetAdd, 1);
                                 self.emit(OpCode::PopTop, 0);
@@ -3892,7 +3879,7 @@ impl Compiler {
                 let (ploc, holes) =
                     self.unwind_for_return(Some((ret_span.start.0, ret_span.end.0)), !const_ret)?;
                 if let Some(c) = const_value {
-                    let idx = self.co.intern_constant(c);
+                    let idx = self.intern_constant(c);
                     self.emit_at(ploc, OpCode::LoadConst, idx);
                 }
                 self.emit_at(ploc, OpCode::ReturnValue, 0);
@@ -3978,11 +3965,11 @@ impl Compiler {
         aliases: &[weavepy_parser::ast::Alias],
     ) -> Result<(), CompileError> {
         for alias in aliases {
-            let level_idx = self.co.intern_constant(Constant::Int(0));
+            let level_idx = self.intern_constant(Constant::Int(0));
             self.emit(OpCode::LoadConst, level_idx);
-            let none_idx = self.co.intern_constant(Constant::None);
+            let none_idx = self.intern_constant(Constant::None);
             self.emit(OpCode::LoadConst, none_idx);
-            let name_idx = self.co.intern_name(&self.import_name_mangled(&alias.name));
+            let name_idx = self.intern_name(&self.import_name_mangled(&alias.name));
             self.emit(OpCode::ImportName, name_idx);
             match &alias.asname {
                 None => {
@@ -4009,7 +3996,7 @@ impl Compiler {
                         self.emit_store_name(asname);
                     } else {
                         for (i, part) in attrs.iter().enumerate() {
-                            let idx = self.co.intern_name(&self.import_name_mangled(part));
+                            let idx = self.intern_name(&self.import_name_mangled(part));
                             self.emit(OpCode::ImportFrom, idx);
                             if i + 1 < attrs.len() {
                                 self.emit(OpCode::Swap, 2);
@@ -4044,16 +4031,16 @@ impl Compiler {
         names: &[weavepy_parser::ast::Alias],
         level: u32,
     ) -> Result<(), CompileError> {
-        let level_idx = self.co.intern_constant(Constant::Int(i64::from(level)));
+        let level_idx = self.intern_constant(Constant::Int(i64::from(level)));
         self.emit(OpCode::LoadConst, level_idx);
         let from_tuple: Vec<Constant> = names
             .iter()
             .map(|a| Constant::Str(a.name.clone()))
             .collect();
-        let from_idx = self.co.intern_constant(Constant::Tuple(from_tuple));
+        let from_idx = self.intern_constant(Constant::Tuple(from_tuple));
         self.emit(OpCode::LoadConst, from_idx);
         let module_name = module.unwrap_or("");
-        let name_idx = self.co.intern_name(&self.import_name_mangled(module_name));
+        let name_idx = self.intern_name(&self.import_name_mangled(module_name));
         self.emit(OpCode::ImportName, name_idx);
 
         // `from m import *` is its own opcode and binds every public name.
@@ -4067,7 +4054,7 @@ impl Compiler {
         }
 
         for alias in names {
-            let from_idx = self.co.intern_name(&self.import_name_mangled(&alias.name));
+            let from_idx = self.intern_name(&self.import_name_mangled(&alias.name));
             self.emit(OpCode::ImportFrom, from_idx);
             let target = alias.asname.as_deref().unwrap_or(&alias.name);
             self.emit_store_name(target);
@@ -4284,7 +4271,7 @@ impl Compiler {
                 self.patma_jump_to_fail_pop(pc, OpCode::PopJumpIfFalse);
             }
             PatternKind::Singleton(c) => {
-                let idx = self.co.intern_constant(c.clone().into());
+                let idx = self.intern_constant(c.clone().into());
                 self.emit(OpCode::LoadConst, idx);
                 self.emit(OpCode::IsOp, 0);
                 self.patma_jump_to_fail_pop(pc, OpCode::PopJumpIfFalse);
@@ -4356,7 +4343,7 @@ impl Compiler {
             None => {
                 // No star: len(subject) == size
                 self.emit(OpCode::GetLen, 0);
-                let idx = self.co.intern_constant(Constant::Int(size as i64));
+                let idx = self.intern_constant(Constant::Int(size as i64));
                 self.emit(OpCode::LoadConst, idx);
                 self.emit(OpCode::CompareOp, CompareKind::Eq as u32);
                 self.patma_jump_to_fail_pop(pc, OpCode::PopJumpIfFalse);
@@ -4364,7 +4351,7 @@ impl Compiler {
             Some(_) if size > 1 => {
                 // Star: len(subject) >= size - 1
                 self.emit(OpCode::GetLen, 0);
-                let idx = self.co.intern_constant(Constant::Int((size - 1) as i64));
+                let idx = self.intern_constant(Constant::Int((size - 1) as i64));
                 self.emit(OpCode::LoadConst, idx);
                 self.emit(OpCode::CompareOp, CompareKind::GtE as u32);
                 self.patma_jump_to_fail_pop(pc, OpCode::PopJumpIfFalse);
@@ -4447,13 +4434,13 @@ impl Compiler {
             self.set_span(pat.span);
             self.emit(OpCode::CopyTop, 0);
             if i < star {
-                let idx = self.co.intern_constant(Constant::Int(i as i64));
+                let idx = self.intern_constant(Constant::Int(i as i64));
                 self.emit(OpCode::LoadConst, idx);
             } else {
                 // The subject may not support negative indexing! Compute
                 // a nonnegative index:
                 self.emit(OpCode::GetLen, 0);
-                let idx = self.co.intern_constant(Constant::Int((size - i) as i64));
+                let idx = self.intern_constant(Constant::Int((size - i) as i64));
                 self.emit(OpCode::LoadConst, idx);
                 self.emit(OpCode::BinaryOp, BinOpKind::Sub as u32);
             }
@@ -4492,7 +4479,7 @@ impl Compiler {
         if size > 0 {
             // If the pattern has any keys in it, perform a length check:
             self.emit(OpCode::GetLen, 0);
-            let idx = self.co.intern_constant(Constant::Int(size as i64));
+            let idx = self.intern_constant(Constant::Int(size as i64));
             self.emit(OpCode::LoadConst, idx);
             self.emit(OpCode::CompareOp, CompareKind::GtE as u32);
             self.patma_jump_to_fail_pop(pc, OpCode::PopJumpIfFalse);
@@ -4511,7 +4498,7 @@ impl Compiler {
         self.emit(OpCode::MatchKeys, 0);
         pc.on_top += 2;
         self.emit(OpCode::CopyTop, 0);
-        let none_idx = self.co.intern_constant(Constant::None);
+        let none_idx = self.intern_constant(Constant::None);
         self.emit(OpCode::LoadConst, none_idx);
         self.emit(OpCode::IsOp, 1);
         self.patma_jump_to_fail_pop(pc, OpCode::PopJumpIfFalse);
@@ -4575,11 +4562,11 @@ impl Compiler {
                 Constant::Str(n.clone())
             })
             .collect();
-        let kw_idx = self.co.intern_constant(Constant::Tuple(kw_names));
+        let kw_idx = self.intern_constant(Constant::Tuple(kw_names));
         self.emit(OpCode::LoadConst, kw_idx);
         self.emit(OpCode::MatchClass, nargs as u32);
         self.emit(OpCode::CopyTop, 0);
-        let none_idx = self.co.intern_constant(Constant::None);
+        let none_idx = self.intern_constant(Constant::None);
         self.emit(OpCode::LoadConst, none_idx);
         self.emit(OpCode::IsOp, 1);
         // TOS is now a tuple of (nargs + nattrs) attributes (or None):
@@ -5123,9 +5110,7 @@ impl Compiler {
                 c.set_span(tp.span);
             };
             at_param(self);
-            let name_idx = self
-                .co
-                .intern_constant(Constant::Str(tp.source_name.clone()));
+            let name_idx = self.intern_constant(Constant::Str(tp.source_name.clone()));
             self.emit(OpCode::LoadConst, name_idx);
             match &tp.kind {
                 TypeParamKind::TypeVar { bound: None } => {
@@ -5185,9 +5170,7 @@ impl Compiler {
             span: Some(e.span),
         };
         self.apply_annotate_loc(loc);
-        let defaults = self
-            .co
-            .intern_constant(Constant::Tuple(vec![Constant::Int(1)]));
+        let defaults = self.intern_constant(Constant::Tuple(vec![Constant::Int(1)]));
         self.emit(OpCode::LoadConst, defaults);
         let value: &Expr = match (&e.kind, allow_starred) {
             (ExprKind::Starred(inner), true) => inner,
@@ -5218,9 +5201,7 @@ impl Compiler {
             self.emit(OpCode::BuildTuple, code.freevars.len() as u32);
             flags |= 0x08;
         }
-        let code_idx = self
-            .co
-            .intern_constant(Constant::Code(std::sync::Arc::new(code)));
+        let code_idx = self.intern_constant(Constant::Code(std::sync::Arc::new(code)));
         self.emit(OpCode::LoadConst, code_idx);
         self.emit_make_function(flags);
         Ok(())
@@ -5252,9 +5233,9 @@ impl Compiler {
             span: e.span,
         };
         if type_params.is_empty() {
-            let name_idx = self.co.intern_constant(Constant::Str(display.clone()));
+            let name_idx = self.intern_constant(Constant::Str(display.clone()));
             self.emit(OpCode::LoadConst, name_idx);
-            let none_idx = self.co.intern_constant(Constant::None);
+            let none_idx = self.intern_constant(Constant::None);
             self.emit(OpCode::LoadConst, none_idx);
             self.emit_type_alias_body(&display, value, span)?;
         } else {
@@ -5302,7 +5283,7 @@ impl Compiler {
                 |inner| {
                     inner.current_line = stmt_line;
                     inner.set_span(span);
-                    let name_idx = inner.co.intern_constant(Constant::Str(display.clone()));
+                    let name_idx = inner.intern_constant(Constant::Str(display.clone()));
                     inner.emit(OpCode::LoadConst, name_idx);
                     inner.emit_type_params(type_params)?;
                     inner.current_line = stmt_line;
@@ -5337,9 +5318,7 @@ impl Compiler {
             line: self.current_line,
             span: Some(span),
         };
-        let defaults = self
-            .co
-            .intern_constant(Constant::Tuple(vec![Constant::Int(1)]));
+        let defaults = self.intern_constant(Constant::Tuple(vec![Constant::Int(1)]));
         self.emit(OpCode::LoadConst, defaults);
         let analysis = [Stmt {
             kind: StmtKind::Return(Some(value.clone())),
@@ -5357,9 +5336,7 @@ impl Compiler {
             self.emit(OpCode::BuildTuple, code.freevars.len() as u32);
             flags |= 0x08;
         }
-        let code_idx = self
-            .co
-            .intern_constant(Constant::Code(std::sync::Arc::new(code)));
+        let code_idx = self.intern_constant(Constant::Code(std::sync::Arc::new(code)));
         self.emit(OpCode::LoadConst, code_idx);
         self.emit_make_function(flags);
         self.emit(OpCode::BuildTuple, 3);
@@ -5391,7 +5368,7 @@ impl Compiler {
             .collect();
         if !kw_default_pairs.is_empty() {
             for (name, default) in &kw_default_pairs {
-                let idx = self.co.intern_constant(Constant::Str((*name).into()));
+                let idx = self.intern_constant(Constant::Str((*name).into()));
                 self.emit(OpCode::LoadConst, idx);
                 self.compile_expr(default)?;
             }
@@ -5672,9 +5649,7 @@ impl Compiler {
         // the AST preprocessor has already removed the docstring, so
         // neither the constant nor the flag appears.
         if let Some(doc) = first_stmt_docstring(body).filter(|_| self.params.optimize < 2) {
-            inner
-                .co
-                .intern_constant(Constant::Str(clean_docstring(doc)));
+            inner.intern_constant(Constant::Str(clean_docstring(doc)));
             inner.co.has_docstring = true;
         }
         // The docstring statement itself generates *no* code in a
@@ -5738,9 +5713,7 @@ impl Compiler {
             self.emit(OpCode::BuildTuple, inner_freevars.len() as u32);
             flags |= 0x08;
         }
-        let code_idx = self
-            .co
-            .intern_constant(Constant::Code(std::sync::Arc::new(inner_code)));
+        let code_idx = self.intern_constant(Constant::Code(std::sync::Arc::new(inner_code)));
         self.emit(OpCode::LoadConst, code_idx);
         self.emit_make_function(flags);
         Ok(())
@@ -5843,7 +5816,7 @@ impl Compiler {
         // LOAD_SMALL_INT — `remove_unused_consts` never drops slot 0).
         inner.apply_annotate_loc(loc);
         inner.emit(OpCode::LoadFast, 0);
-        let fake_globals = inner.co.intern_constant(Constant::Int(i64::from(
+        let fake_globals = inner.intern_constant(Constant::Int(i64::from(
             ANNOTATE_FORMAT_VALUE_WITH_FAKE_GLOBALS,
         )));
         inner.emit(OpCode::LoadConst, fake_globals);
@@ -5883,9 +5856,7 @@ impl Compiler {
             self.emit(OpCode::BuildTuple, code.freevars.len() as u32);
             flags |= 0x08;
         }
-        let code_idx = self
-            .co
-            .intern_constant(Constant::Code(std::sync::Arc::new(code)));
+        let code_idx = self.intern_constant(Constant::Code(std::sync::Arc::new(code)));
         self.emit(OpCode::LoadConst, code_idx);
         self.emit_make_function(flags);
     }
@@ -5967,7 +5938,7 @@ impl Compiler {
         let code = self.compile_annotate_code(loc, &analysis_body, |inner| {
             for (pname, ann) in &annotated {
                 inner.apply_annotate_loc(loc);
-                let idx = inner.co.intern_constant(Constant::Str(pname.clone()));
+                let idx = inner.intern_constant(Constant::Str(pname.clone()));
                 inner.emit(OpCode::LoadConst, idx);
                 inner.emit_annotation_value(ann, loc)?;
             }
@@ -6051,13 +6022,13 @@ impl Compiler {
                 let mut skip: Option<u32> = None;
                 if let Some(i) = d.cond_index {
                     at_stmt(inner);
-                    let c = inner.co.intern_constant(Constant::Int(i64::from(i)));
+                    let c = inner.intern_constant(Constant::Int(i64::from(i)));
                     inner.emit(OpCode::LoadConst, c);
                     if is_class {
                         let idx = inner.cell_or_free_index("__conditional_annotations__");
                         inner.emit(OpCode::LoadDeref, idx);
                     } else {
-                        let idx = inner.co.intern_name("__conditional_annotations__");
+                        let idx = inner.intern_name("__conditional_annotations__");
                         inner.emit(OpCode::LoadGlobal, idx);
                     }
                     inner.emit(OpCode::ContainsOp, 0);
@@ -6067,7 +6038,7 @@ impl Compiler {
                 inner.compile_expr(&d.annotation)?;
                 at_stmt(inner);
                 inner.emit(OpCode::CopyTop, 2);
-                let key = inner.co.intern_constant(Constant::Str(d.name.clone()));
+                let key = inner.intern_constant(Constant::Str(d.name.clone()));
                 inner.emit(OpCode::LoadConst, key);
                 inner.apply_annotate_loc(loc);
                 inner.emit(OpCode::StoreSubscr, 0);
@@ -6199,7 +6170,7 @@ impl Compiler {
             // the `ex_call` route: the two already-pushed operands
             // (body, name) seed the positional list.
             self.build_class_body(name, body, entry_line)?;
-            let name_idx = self.co.intern_constant(Constant::Str(display.clone()));
+            let name_idx = self.intern_constant(Constant::Str(display.clone()));
             self.emit(OpCode::LoadConst, name_idx);
             if generic {
                 self.emit_generic_base();
@@ -6213,7 +6184,7 @@ impl Compiler {
             self.emit(OpCode::CallEx, 0);
         } else {
             self.build_class_body(name, body, entry_line)?;
-            let name_idx = self.co.intern_constant(Constant::Str(display));
+            let name_idx = self.intern_constant(Constant::Str(display));
             self.emit(OpCode::LoadConst, name_idx);
             if generic {
                 self.emit_generic_base();
@@ -6234,7 +6205,7 @@ impl Compiler {
                     names.push(Constant::Str(n));
                     self.compile_expr(&k.value)?;
                 }
-                let tup_idx = self.co.intern_constant(Constant::Tuple(names));
+                let tup_idx = self.intern_constant(Constant::Tuple(names));
                 self.emit(OpCode::LoadConst, tup_idx);
                 self.emit(OpCode::CallKw, (bases.len() + 2) as u32);
             }
@@ -6571,7 +6542,7 @@ impl Compiler {
             inner.emit_load_name("__name__");
             inner.emit_store_name("__module__");
             let qualname_str = inner.co.qualname.clone();
-            let qualname_const = inner.co.intern_constant(Constant::Str(qualname_str));
+            let qualname_const = inner.intern_constant(Constant::Str(qualname_str));
             inner.emit(OpCode::LoadConst, qualname_const);
             inner.emit_store_name("__qualname__");
             // A `nonlocal __firstlineno__` declaration in the class body
@@ -6581,9 +6552,7 @@ impl Compiler {
             // (test_inspect test_getsource_on_class_without_firstlineno).
             // `emit_store_name` routes Free/Nonlocal bindings through
             // STORE_DEREF, exactly like `codegen_nameop`.
-            let line_const = inner
-                .co
-                .intern_constant(Constant::Int(i64::from(firstlineno)));
+            let line_const = inner.intern_constant(Constant::Int(i64::from(firstlineno)));
             inner.emit(OpCode::LoadConst, line_const);
             inner.emit_store_name("__firstlineno__");
             // `codegen_class_body`: a generic class stores
@@ -6647,9 +6616,7 @@ impl Compiler {
         if let Some(doc) = first_stmt_docstring(body) {
             // `-OO` (optimize >= 2) strips class docstrings too.
             if self.params.optimize < 2 {
-                let doc_const = inner
-                    .co
-                    .intern_constant(Constant::Str(clean_docstring(doc)));
+                let doc_const = inner.intern_constant(Constant::Str(clean_docstring(doc)));
                 // `codegen_body`: the LOAD_CONST sits at the docstring
                 // *expression*, so tracing a class body fires a `'line'`
                 // event on the docstring line
@@ -6722,8 +6689,8 @@ impl Compiler {
             let mut attrs: Vec<String> = attrs.into_iter().collect();
             attrs.sort();
             let tup = Constant::Tuple(attrs.into_iter().map(Constant::Str).collect());
-            let tup_const = inner.co.intern_constant(tup);
-            let tup_name = inner.co.intern_name("__static_attributes__");
+            let tup_const = inner.intern_constant(tup);
+            let tup_name = inner.intern_name("__static_attributes__");
             inner.emit(OpCode::LoadConst, tup_const);
             inner.emit(OpCode::StoreName, tup_name);
         }
@@ -6767,9 +6734,7 @@ impl Compiler {
             self.emit(OpCode::BuildTuple, inner_freevars.len() as u32);
             flags |= 0x08;
         }
-        let code_idx = self
-            .co
-            .intern_constant(Constant::Code(std::sync::Arc::new(inner_code)));
+        let code_idx = self.intern_constant(Constant::Code(std::sync::Arc::new(inner_code)));
         self.emit(OpCode::LoadConst, code_idx);
         self.emit_make_function(flags);
         Ok(())
@@ -7969,7 +7934,7 @@ impl Compiler {
                 None => {
                     // `codegen_slice_two_parts`: `ADDOP_LOAD_CONST(c,
                     // LOC(s), Py_None)` with the Slice node's location.
-                    let idx = self.co.intern_constant(Constant::None);
+                    let idx = self.intern_constant(Constant::None);
                     let saved_line = self.current_line;
                     let saved_span = self.current_span;
                     self.set_line_from(slice.span.start.0);
@@ -7986,7 +7951,7 @@ impl Compiler {
     /// CPython's `codegen_call_exit_with_nones`: with the exit pair at
     /// the top of the stack, `__exit__(None, None, None)`.
     fn emit_call_exit_with_nones(&mut self) {
-        let none_idx = self.co.intern_constant(Constant::None);
+        let none_idx = self.intern_constant(Constant::None);
         self.emit(OpCode::LoadConst, none_idx);
         self.emit(OpCode::LoadConst, none_idx);
         self.emit(OpCode::LoadConst, none_idx);
@@ -8236,7 +8201,7 @@ impl Compiler {
                 }
             }
             if let Some(text) = text {
-                let idx = self.co.intern_constant(Constant::Str(text));
+                let idx = self.intern_constant(Constant::Str(text));
                 self.emit(OpCode::LoadConst, idx);
                 return Ok(());
             }
@@ -8322,7 +8287,7 @@ impl Compiler {
         let dict_name = "__annotations__";
         if !self.annotations_initialized {
             self.emit(OpCode::BuildMap, 0);
-            let idx = self.co.intern_name(dict_name);
+            let idx = self.intern_name(dict_name);
             self.emit(OpCode::StoreName, idx);
             self.annotations_initialized = true;
         }
@@ -8333,9 +8298,9 @@ impl Compiler {
         self.emit_annotation(annotation)?;
         self.current_line = saved_line;
         self.current_span = saved_span;
-        let dict_idx = self.co.intern_name(dict_name);
+        let dict_idx = self.intern_name(dict_name);
         self.emit(OpCode::LoadName, dict_idx);
-        let key_idx = self.co.intern_constant(Constant::Str(name.to_owned()));
+        let key_idx = self.intern_constant(Constant::Str(name.to_owned()));
         self.emit(OpCode::LoadConst, key_idx);
         self.emit(OpCode::StoreSubscr, 0);
         Ok(())
@@ -8372,7 +8337,7 @@ impl Compiler {
             )),
             ExprKind::Attribute { value, attr } => {
                 self.compile_expr(value)?;
-                let idx = self.co.intern_name(attr);
+                let idx = self.intern_name(attr);
                 let saved = self.current_span;
                 self.set_span(target.span);
                 self.with_attr_location(target.span.end.0, attr.len() as u32, |c| {
@@ -8679,7 +8644,7 @@ impl Compiler {
         for kw in keywords {
             let name = kw.arg.clone().expect("named keyword run");
             self.note_identifier_const(&name);
-            let idx = self.co.intern_constant(Constant::Str(name));
+            let idx = self.intern_constant(Constant::Str(name));
             self.emit(OpCode::LoadConst, idx);
             self.compile_expr(&kw.value)?;
             if big {
@@ -8755,7 +8720,7 @@ impl Compiler {
             }
             ExprKind::Attribute { value, attr } => {
                 self.compile_expr(value)?;
-                let idx = self.co.intern_name(attr);
+                let idx = self.intern_name(attr);
                 let saved_line = self.current_line;
                 let saved = self.current_span;
                 self.set_line_from(target.span.start.0);
@@ -8809,7 +8774,7 @@ impl Compiler {
                 self.emit(OpCode::DeleteDeref, idx);
             }
             Binding::Global | Binding::ClassPassthrough => {
-                let idx = self.co.intern_name(name);
+                let idx = self.intern_name(name);
                 // GLOBAL_EXPLICIT: `global x` in a class body — or in any
                 // scope nested under this module block — bypasses the
                 // local namespace entirely.
@@ -8849,7 +8814,7 @@ impl Compiler {
                 self.emit(OpCode::StoreDeref, idx);
             }
             Binding::Global | Binding::ClassPassthrough => {
-                let idx = self.co.intern_name(name);
+                let idx = self.intern_name(name);
                 // GLOBAL_EXPLICIT → STORE_GLOBAL: an explicit `global x`
                 // in a class body bypasses the class namespace; at module
                 // level, a `global x` declared in *any* nested scope makes
@@ -8903,9 +8868,7 @@ impl Compiler {
         // `__debug__` is a compile-time constant in CPython: `True`
         // at optimize 0, `False` under `-O`/`-OO` (RFC 0052).
         if name == "__debug__" {
-            let idx = self
-                .co
-                .intern_constant(Constant::Bool(self.params.optimize == 0));
+            let idx = self.intern_constant(Constant::Bool(self.params.optimize == 0));
             self.emit(OpCode::LoadConst, idx);
             return;
         }
@@ -8934,7 +8897,7 @@ impl Compiler {
                 // it binds load from the class dict then *globals*,
                 // never an enclosing function's cell.
                 if ctx.globals.contains(name) {
-                    let idx = self.co.intern_name(name);
+                    let idx = self.intern_name(name);
                     self.emit(OpCode::LoadGlobal, idx);
                 } else if !ctx.assigned.contains(name)
                     && matches!(binding, Some(Binding::Free | Binding::Nonlocal))
@@ -8946,7 +8909,7 @@ impl Compiler {
                 } else {
                     let dict_idx = self.cell_or_free_index("__classdict__");
                     self.emit(OpCode::LoadDeref, dict_idx);
-                    let idx = self.co.intern_name(name);
+                    let idx = self.intern_name(name);
                     self.emit(OpCode::LoadClassdictOrGlobal, idx);
                 }
                 return;
@@ -8964,14 +8927,14 @@ impl Compiler {
             // `inline_comprehension`: `__class__` free in a comprehension
             // inlined into a class body is demoted to `GLOBAL_IMPLICIT`.
             if self.inline_comp > 0 {
-                let idx = self.co.intern_name(name);
+                let idx = self.intern_name(name);
                 self.emit(OpCode::LoadGlobal, idx);
             } else if let Some(pos) = self.free_order.iter().position(|n| n == "__class__") {
                 let idx = (self.co.cellvars.len() + pos) as u32;
                 self.emit(OpCode::LoadLocals, 0);
                 self.emit(OpCode::LoadClassdictOrDeref, idx);
             } else {
-                let idx = self.co.intern_name(name);
+                let idx = self.intern_name(name);
                 self.emit(OpCode::LoadName, idx);
             }
             return;
@@ -8987,7 +8950,7 @@ impl Compiler {
             // `inline_comprehension`: the implicit class-scope names,
             // free in the comprehension, are demoted to `GLOBAL_IMPLICIT`.
             if CLASS_DUNDERS.contains(&name) {
-                let idx = self.co.intern_name(name);
+                let idx = self.intern_name(name);
                 self.emit(OpCode::LoadGlobal, idx);
                 return;
             }
@@ -9016,7 +8979,7 @@ impl Compiler {
                     self.emit(OpCode::LoadDeref, idx);
                 }
                 Some(Binding::Global | Binding::ClassPassthrough) | None => {
-                    let idx = self.co.intern_name(name);
+                    let idx = self.intern_name(name);
                     self.emit(OpCode::LoadGlobal, idx);
                 }
             }
@@ -9046,7 +9009,7 @@ impl Compiler {
                 }
             }
             Some(Binding::Global) | Some(Binding::ClassPassthrough) | None => {
-                let idx = self.co.intern_name(name);
+                let idx = self.intern_name(name);
                 // GLOBAL_EXPLICIT: `global x` in a class body — or in any
                 // scope nested under this module block — loads straight
                 // from globals, skipping the local namespace.
@@ -9079,7 +9042,7 @@ impl Compiler {
     fn compile_expr_inner(&mut self, e: &Expr) -> Result<(), CompileError> {
         match &e.kind {
             ExprKind::Constant(c) => {
-                let idx = self.co.intern_constant(c.clone().into());
+                let idx = self.intern_constant(c.clone().into());
                 self.emit(OpCode::LoadConst, idx);
             }
             ExprKind::Name(n) => self.emit_load_name(n),
@@ -9290,7 +9253,7 @@ impl Compiler {
                         self.current_span = saved_span;
                     } else {
                         self.compile_expr(value)?;
-                        let idx = self.co.intern_name(attr);
+                        let idx = self.intern_name(attr);
                         // The method load carries the *attribute expression's*
                         // span (not the whole call's), exactly like a plain
                         // `ExprKind::Attribute` visit.
@@ -9377,7 +9340,7 @@ impl Compiler {
                         names.push(Constant::Str(n));
                         self.compile_expr(&k.value)?;
                     }
-                    let tup_idx = self.co.intern_constant(Constant::Tuple(names));
+                    let tup_idx = self.intern_constant(Constant::Tuple(names));
                     if let Some((attr_end, attr_len)) = meth {
                         // `maybe_optimize_method_call` threads the
                         // method attribute's location (`LOC(meth)`,
@@ -9410,7 +9373,7 @@ impl Compiler {
                     self.emit_super_attr(e, false)?;
                 } else {
                     self.compile_expr(value)?;
-                    let idx = self.co.intern_name(attr);
+                    let idx = self.intern_name(attr);
                     self.with_attr_location(e.span.end.0, attr.len() as u32, |c| {
                         c.emit(OpCode::LoadAttr, idx);
                     });
@@ -9439,7 +9402,7 @@ impl Compiler {
                 if let Some(folded) =
                     constant_slice(lower.as_deref(), upper.as_deref(), step.as_deref())
                 {
-                    let idx = self.co.intern_constant(folded);
+                    let idx = self.intern_constant(folded);
                     self.emit(OpCode::LoadConst, idx);
                 } else {
                     self.compile_slice_two_parts(e)?;
@@ -9551,7 +9514,7 @@ impl Compiler {
                 if let Some(v) = value {
                     self.compile_expr(v)?;
                 } else {
-                    let idx = self.co.intern_constant(Constant::None);
+                    let idx = self.intern_constant(Constant::None);
                     self.emit(OpCode::LoadConst, idx);
                 }
                 // CPython 3.13 own-yield shape. An async generator's *own*
@@ -9658,7 +9621,7 @@ impl Compiler {
     /// block to the stream tail with an explicit rejoin jump, exactly
     /// like CPython's `push_cold_blocks_to_end`.
     fn emit_send_dance(&mut self, resume_arg: u32) {
-        let none_idx = self.co.intern_constant(Constant::None);
+        let none_idx = self.intern_constant(Constant::None);
         self.emit(OpCode::LoadConst, none_idx);
         let loop_start = self.use_label();
         let send = self.emit(OpCode::Send, 0);
@@ -9992,7 +9955,7 @@ impl Compiler {
     /// machinery.
     fn compile_joined_str(&mut self, parts: &[Expr]) -> Result<(), CompileError> {
         if parts.is_empty() {
-            let idx = self.co.intern_constant(Constant::Str(String::new()));
+            let idx = self.intern_constant(Constant::Str(String::new()));
             self.emit(OpCode::LoadConst, idx);
             return Ok(());
         }
@@ -10004,9 +9967,9 @@ impl Compiler {
             // `''.join([p0, p1, ...])` so the operand stack stays shallow.
             // Every synthesized instruction carries the f-string's own
             // location.
-            let empty = self.co.intern_constant(Constant::Str(String::new()));
+            let empty = self.intern_constant(Constant::Str(String::new()));
             self.emit(OpCode::LoadConst, empty);
-            let join = self.co.intern_name("join");
+            let join = self.intern_name("join");
             self.emit(OpCode::LoadMethodAttr, join);
             self.emit(OpCode::BuildList, 0);
             for p in parts {
@@ -10077,7 +10040,7 @@ impl Compiler {
         }
         strings.push(cps_to_const(cur));
         for s in strings.iter().cloned() {
-            let idx = self.co.intern_constant(s);
+            let idx = self.intern_constant(s);
             self.emit(OpCode::LoadConst, idx);
         }
         self.emit(OpCode::BuildTuple, strings.len() as u32);
@@ -10100,7 +10063,7 @@ impl Compiler {
             self.compile_expr(value)?;
             self.set_line_from(p.span.start.0);
             self.set_span(p.span);
-            let idx = self.co.intern_constant(Constant::Str(text.clone()));
+            let idx = self.intern_constant(Constant::Str(text.clone()));
             self.emit(OpCode::LoadConst, idx);
             let conv: u32 = match *conversion {
                 -1 => 0,
@@ -11251,7 +11214,7 @@ impl Compiler {
             // iterator's for a `for` (END_FOR/POP_ITER), the whole
             // expression's for an `async for` (END_ASYNC_FOR carries
             // `LOC(e)`; test_multiline_async_generator_expression).
-            let none_idx = inner.co.intern_constant(Constant::None);
+            let none_idx = inner.intern_constant(Constant::None);
             inner.emit_no_line(OpCode::LoadConst, none_idx);
             inner.emit_no_line(OpCode::ReturnValue, 0);
         } else {
@@ -11284,9 +11247,7 @@ impl Compiler {
             self.emit(OpCode::BuildTuple, inner_freevars.len() as u32);
             flags |= 0x08;
         }
-        let code_idx = self
-            .co
-            .intern_constant(Constant::Code(std::sync::Arc::new(inner_code)));
+        let code_idx = self.intern_constant(Constant::Code(std::sync::Arc::new(inner_code)));
         self.emit(OpCode::LoadConst, code_idx);
         self.emit_make_function(flags);
         // Push the outermost generator's iterator as `.0`: CPython
