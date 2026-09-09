@@ -16,7 +16,10 @@ use weavepy_capi::initconfig::{
     Py_InitializeFromConfig,
 };
 use weavepy_capi::lifecycle::{Py_Finalize, Py_FinalizeEx, Py_Initialize, Py_IsInitialized};
-use weavepy_capi::pythonrun::{PyRun_SimpleString, PyRun_String, Py_eval_input};
+use weavepy_capi::pythonrun::{
+    PyEval_EvalCode, PyRun_SimpleString, PyRun_String, Py_CompileString, Py_eval_input,
+    Py_file_input,
+};
 
 static ATEXIT_FIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -51,12 +54,62 @@ fn eval_int(expr: &str) -> Option<i64> {
 
 #[test]
 fn embedding_lifecycle_end_to_end() {
+    // Embedders can enter from small native stacks, including the default
+    // Windows thread stack. Compilation and execution must grow their own.
+    std::thread::Builder::new()
+        .name("small-stack-embedder".to_owned())
+        .stack_size(1024 * 1024)
+        .spawn(embedding_lifecycle)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn embedding_lifecycle() {
     // --- Round 1: plain Py_Initialize ------------------------------
     unsafe { Py_Initialize() };
     assert_eq!(unsafe { Py_IsInitialized() }, 1, "initialized after init");
 
     assert_eq!(run_simple("x = 20 + 22"), 0, "simple exec succeeds");
     assert_eq!(eval_int("x"), Some(42), "state visible across PyRun calls");
+
+    // Nested definitions exercise the compiler before the VM's per-frame
+    // stack growth can run. Keep the depth well below Python's limits.
+    let mut source = String::new();
+    for depth in 0..40 {
+        source.push_str(&format!("{}def f{depth}():\n", "    ".repeat(depth)));
+    }
+    source.push_str(&format!("{}return 42\n", "    ".repeat(40)));
+    for depth in (0..39).rev() {
+        source.push_str(&format!(
+            "{}return f{}()\n",
+            "    ".repeat(depth + 1),
+            depth + 1
+        ));
+    }
+    source.push_str("x = f0()\n");
+    assert_eq!(run_simple(&source), 0, "nested compilation succeeds");
+    assert_eq!(eval_int("x"), Some(42));
+
+    // The separate compile/evaluate entry points need the same headroom.
+    unsafe {
+        let source = CString::new(source).unwrap();
+        let code = Py_CompileString(source.as_ptr(), c"<embed>".as_ptr(), Py_file_input);
+        assert!(
+            !code.is_null(),
+            "Py_CompileString succeeds on a small stack"
+        );
+        let main = weavepy_capi::module::PyImport_AddModule(c"__main__".as_ptr());
+        let dict = weavepy_capi::module::PyModule_GetDict(main);
+        let result = PyEval_EvalCode(code, dict, dict);
+        assert!(
+            !result.is_null(),
+            "PyEval_EvalCode succeeds on a small stack"
+        );
+        weavepy_capi::object::Py_DecRef(result);
+        weavepy_capi::object::Py_DecRef(code);
+    }
+    assert_eq!(eval_int("x"), Some(42));
 
     // A failing PyRun_SimpleString reports -1 (and prints a traceback).
     assert_eq!(run_simple("raise ValueError('embedding')"), -1);
