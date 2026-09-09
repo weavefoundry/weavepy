@@ -1,0 +1,20 @@
+{
+  "deque_ops": {
+    "work": 200000,
+    "values": {
+      "cpython": "65011872809",
+      "baseline": "65011872809",
+      "candidate": "65011872809",
+      "candidate_interp": "65011872809"
+    }
+  },
+  "datetime_ops": {
+    "work": 60000,
+    "values": {
+      "cpython": "369347",
+      "baseline": "369347",
+      "candidate": "369347",
+      "candidate_interp": "369347"
+    }
+  }
+}

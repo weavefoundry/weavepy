@@ -22,6 +22,7 @@ __all__ = ["deque", "defaultdict", "OrderedDict", "_count_elements"]
 # subscription (`deque[int]`) yields a `types.GenericAlias`. `types` only
 # imports `sys`, so this is import-cycle safe from this low-level module.
 from types import GenericAlias as _GenericAlias
+from _weave_collections import iterator_index as _deque_iterator_index
 
 
 # Per-`repr` recursion guard for `defaultdict.__repr__` (the moral
@@ -220,7 +221,10 @@ class deque:
     # head index. The unbound form keeps gh-92063's foreign-receiver
     # TypeError. Being builtins also makes `d.append` a
     # `builtin_function_or_method`, like the C accelerator's.
-    from _weave_collections import append, appendleft, pop, popleft
+    from _weave_collections import (
+        append, appendleft, pop, popleft, rotate,
+        __len__, __bool__, __getitem__,
+    )
 
     def extend(self, iterable):
         # `d.extend(d)` iterates a snapshot (CPython special-cases
@@ -235,17 +239,6 @@ class deque:
             iterable = list(self._flat())
         for item in iterable:
             self.appendleft(item)
-
-    def rotate(self, n=1):
-        data = self._flat()
-        if not data:
-            return
-        size = len(data)
-        n = n % size
-        if n == 0:
-            return
-        self._state += 1
-        self._data = data[-n:] + data[:-n]
 
     def clear(self):
         self._state += 1
@@ -321,12 +314,6 @@ class deque:
         self._state += 1
         self._flat().reverse()
 
-    def __len__(self):
-        return len(self._data) - self._head
-
-    def __bool__(self):
-        return len(self._data) > self._head
-
     def __iter__(self):
         return _deque_iterator(self)
 
@@ -366,9 +353,6 @@ class deque:
         if i < 0 or i >= n:
             raise IndexError("deque index out of range")
         return self._head + i
-
-    def __getitem__(self, idx):
-        return self._data[self._slot(idx)]
 
     def __setitem__(self, idx, value):
         # In-place replacement does NOT invalidate live iterators (CPython's
@@ -507,29 +491,19 @@ class _deque_iterator:
     (sticky — the iterator is dead afterwards, `__length_hint__` reports 0).
     """
 
+    __slots__ = ("_deq", "_index", "_deq_state")
+
     def __init__(self, deq, index=0):
         if not isinstance(deq, deque):
             raise TypeError("deque expected")
         self._deq = deq
-        self._index = index
+        self._index = _deque_iterator_index(deq, index)
         self._deq_state = deq._state
 
     def __iter__(self):
         return self
 
-    def __next__(self):
-        deq = self._deq
-        if deq is None:
-            raise StopIteration
-        if deq._state != self._deq_state:
-            self._deq = None
-            raise RuntimeError("deque mutated during iteration")
-        i = self._index
-        if i >= len(deq._data) - deq._head:
-            self._deq = None
-            raise StopIteration
-        self._index = i + 1
-        return deq._data[deq._head + i]
+    from _weave_collections import iterator_next as __next__
 
     def __length_hint__(self):
         deq = self._deq
@@ -940,31 +914,21 @@ class _deque_reverse_iterator:
     """Reverse iterator over a live deque
     (CPython's `_collections._deque_reverse_iterator`)."""
 
+    __slots__ = ("_deq", "_index", "_deq_state")
+
     def __init__(self, deq, index=0):
         if not isinstance(deq, deque):
             raise TypeError("deque expected")
         self._deq = deq
         # `index` counts consumed items, mirroring the forward iterator's
         # constructor/`__reduce__` contract.
-        self._index = index
+        self._index = _deque_iterator_index(deq, index)
         self._deq_state = deq._state
 
     def __iter__(self):
         return self
 
-    def __next__(self):
-        deq = self._deq
-        if deq is None:
-            raise StopIteration
-        if deq._state != self._deq_state:
-            self._deq = None
-            raise RuntimeError("deque mutated during iteration")
-        i = len(deq._data) - 1 - self._index
-        if i < deq._head:
-            self._deq = None
-            raise StopIteration
-        self._index += 1
-        return deq._data[i]
+    from _weave_collections import reverse_iterator_next as __next__
 
     def __length_hint__(self):
         deq = self._deq

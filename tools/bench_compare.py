@@ -26,6 +26,19 @@ ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "crates/weavepy-bench/fixtures"
 
 
+def verify_runtime(binary: str) -> None:
+    """Refuse WeavePy's reduced fallback runtime in standard-library comparisons."""
+    source = '''
+import sys, os
+if sys.implementation.name == "weavepy":
+    assert sys._stdlib_dir and os.path.isdir(sys._stdlib_dir), (
+        "Standard library was not staged; set WEAVEPY_STDLIB_CACHE to a writable directory")
+    assert getattr(os, "__file__", None), "os must come from the staged standard library"
+'''
+    subprocess.run([binary, "-c", source], check=True, capture_output=True,
+                   text=True, timeout=60)
+
+
 def paired_ratio(after: list[dict], before: list[dict], metric: str) -> float:
     """Keep interleaved samples paired when summarizing relative performance.
 
@@ -130,6 +143,8 @@ def main() -> None:
     )
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
+    verify_runtime(args.base)
+    verify_runtime(args.new)
     if args.samples < 1:
         parser.error("--samples must be positive")
     if not hasattr(os, "wait4"):

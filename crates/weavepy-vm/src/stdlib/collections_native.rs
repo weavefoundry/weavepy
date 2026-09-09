@@ -1,4 +1,4 @@
-//! `_weave_collections` — native end operations for the Python
+//! `_weave_collections`: native sequence operations for the Python
 //! `_collections.deque` stand-in.
 //!
 //! CPython documents `deque.append`/`appendleft`/`pop`/`popleft` as
@@ -15,7 +15,7 @@
 //! `test_rfc0076_gil0`'s `ThreadPoolExecutor.map` hung on the missing
 //! future).
 //!
-//! These four builtins run the whole operation while holding the
+//! The end operations run the whole operation while holding the
 //! backing list's `GilCell` borrow. A builtin call has no eval-breaker
 //! checkpoint, so the operation is atomic under the GIL; under `gil=0`
 //! the cell's reentrant mutex serialises concurrent callers. They are
@@ -32,7 +32,7 @@
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
-use crate::error::{index_error, type_error, RuntimeError};
+use crate::error::{index_error, runtime_error, stop_iteration, type_error, RuntimeError};
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 use crate::types::PyInstance;
@@ -210,6 +210,161 @@ fn deque_popleft(args: &[Object]) -> Result<Object, RuntimeError> {
     popleft_locked(inst, &mut d)
 }
 
+fn deque_len(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (inst, data) = receiver(args, "__len__")?;
+    if args.len() != 1 {
+        return Err(type_error("deque.__len__() takes no arguments"));
+    }
+    let d = data.borrow();
+    Ok(Object::Int(d.len().saturating_sub(head(inst)) as i64))
+}
+
+fn deque_bool(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (inst, data) = receiver(args, "__bool__")?;
+    if args.len() != 1 {
+        return Err(type_error("deque.__bool__() takes no arguments"));
+    }
+    let d = data.borrow();
+    Ok(Object::Bool(d.len() > head(inst)))
+}
+
+fn deque_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    receiver(args, "__getitem__")?;
+    let [_, index] = args else {
+        return Err(type_error("deque.__getitem__() takes one argument"));
+    };
+    let mut index = crate::builtins::coerce_index_object(index)?
+        .as_i64()
+        .ok_or_else(|| index_error("deque index out of range"))?;
+    // __index__ can reinitialize the deque. Fetch its current storage after
+    // that callback, and don't keep a list borrow across arbitrary Python.
+    let (inst, data) = receiver(args, "__getitem__")?;
+    let d = data.borrow();
+    let h = head(inst);
+    let n = d.len().saturating_sub(h) as i64;
+    if index < 0 {
+        index += n;
+    }
+    if index < 0 || index >= n {
+        return Err(index_error("deque index out of range"));
+    }
+    Ok(d[h + index as usize].clone())
+}
+
+fn deque_rotate(args: &[Object]) -> Result<Object, RuntimeError> {
+    receiver(args, "rotate")?;
+    let n = match args {
+        [_] => 1,
+        [_, n] => crate::builtins::coerce_index_i64(n)?,
+        _ => return Err(type_error("deque.rotate() takes at most one argument")),
+    };
+    let (inst, data) = receiver(args, "rotate")?;
+    let mut d = data.borrow_mut();
+    let mut h = head(inst).min(d.len());
+    let len = d.len() - h;
+    if len <= 1 {
+        return Ok(Object::None);
+    }
+    // CPython invalidates iterators even for rotate(0) or a whole turn.
+    bump_state(inst);
+    let right = n.rem_euclid(len as i64) as usize;
+    if right == 0 {
+        return Ok(Object::None);
+    }
+    // Transfer the shorter end, reusing prefix slack. Growing or compacting
+    // that slack is amortized across rotations, as with appendleft/popleft;
+    // rotating one item doesn't repeatedly copy the entire live window.
+    if right <= len / 2 {
+        if h < right {
+            let slack = right.max(len / 2).max(8);
+            d.splice(0..0, std::iter::repeat_n(Object::None, slack));
+            h += slack;
+        }
+        let end = d.len();
+        for i in 0..right {
+            d.swap(h - right + i, end - right + i);
+        }
+        d.truncate(end - right);
+        set_head(inst, h - right);
+    } else {
+        let left = len - right;
+        d.reserve(left);
+        for i in 0..left {
+            let value = std::mem::replace(&mut d[h + i], Object::None);
+            d.push(value);
+        }
+        h += left;
+        if h >= 32 && h * 2 >= d.len() {
+            d.drain(..h);
+            h = 0;
+        }
+        set_head(inst, h);
+    }
+    Ok(Object::None)
+}
+
+fn deque_iterator_index(args: &[Object]) -> Result<Object, RuntimeError> {
+    receiver(args, "__iter__")?;
+    let [_, index] = args else {
+        return Err(type_error("deque iterator requires a deque and an index"));
+    };
+    let index = crate::builtins::coerce_index_i64(index)?.max(0) as usize;
+    let (inst, data) = receiver(args, "__iter__")?;
+    let d = data.borrow();
+    Ok(Object::Int(
+        index.min(d.len().saturating_sub(head(inst))) as i64
+    ))
+}
+
+fn deque_iterator_next(args: &[Object]) -> Result<Object, RuntimeError> {
+    deque_next(args, false)
+}
+
+fn deque_reverse_iterator_next(args: &[Object]) -> Result<Object, RuntimeError> {
+    deque_next(args, true)
+}
+
+fn deque_next(args: &[Object], reverse: bool) -> Result<Object, RuntimeError> {
+    let [Object::Instance(iterator)] = args else {
+        return Err(type_error("deque iterator __next__ requires one iterator"));
+    };
+    let deque = match iterator.slot_get("_deq") {
+        Some(Object::Instance(deque)) => deque,
+        Some(Object::None) => return Err(stop_iteration()),
+        _ => return Err(type_error("deque iterator expected")),
+    };
+    let Some(Object::List(data)) = deque.slot_get("_data") else {
+        return Err(type_error("deque expected"));
+    };
+    // Serialize the state check, cursor advance, and item read with deque
+    // end operations, including simultaneous next() calls under gil=0.
+    // The local deque reference outlives the guard, so clearing _deq can't
+    // finalize its items while the backing list is borrowed.
+    let d = data.borrow();
+    if deque.slot_get("_state").and_then(|s| s.as_i64())
+        != iterator.slot_get("_deq_state").and_then(|s| s.as_i64())
+    {
+        iterator.slot_set("_deq", Object::None);
+        return Err(runtime_error("deque mutated during iteration"));
+    }
+    let h = head(&deque).min(d.len());
+    let index = iterator
+        .slot_get("_index")
+        .and_then(|i| i.as_i64())
+        .ok_or_else(|| type_error("invalid deque iterator index"))?;
+    if index < 0 || index as usize >= d.len() - h {
+        iterator.slot_set("_deq", Object::None);
+        return Err(stop_iteration());
+    }
+    iterator.slot_set("_index", Object::Int(index + 1));
+    let slot = if reverse {
+        d.len() - 1 - index as usize
+    } else {
+        h + index as usize
+    };
+    Ok(d[slot].clone())
+}
+
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::default()));
     {
@@ -218,9 +373,11 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("__name__")),
             Object::from_static("_weave_collections"),
         );
-        let mut reg = |name: &'static str, f: fn(&[Object]) -> Result<Object, RuntimeError>| {
+        let mut reg = |export: &'static str,
+                       name: &'static str,
+                       f: fn(&[Object]) -> Result<Object, RuntimeError>| {
             d.insert(
-                DictKey(Object::from_static(name)),
+                DictKey(Object::from_static(export)),
                 Object::Builtin(Rc::new(BuiltinFn {
                     name,
                     binds_instance: true,
@@ -229,10 +386,21 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 })),
             );
         };
-        reg("append", deque_append);
-        reg("appendleft", deque_appendleft);
-        reg("pop", deque_pop);
-        reg("popleft", deque_popleft);
+        reg("append", "append", deque_append);
+        reg("appendleft", "appendleft", deque_appendleft);
+        reg("pop", "pop", deque_pop);
+        reg("popleft", "popleft", deque_popleft);
+        reg("__len__", "__len__", deque_len);
+        reg("__bool__", "__bool__", deque_bool);
+        reg("__getitem__", "__getitem__", deque_getitem);
+        reg("rotate", "rotate", deque_rotate);
+        reg("iterator_index", "iterator_index", deque_iterator_index);
+        reg("iterator_next", "__next__", deque_iterator_next);
+        reg(
+            "reverse_iterator_next",
+            "__next__",
+            deque_reverse_iterator_next,
+        );
     }
     Rc::new(PyModule {
         name: "_weave_collections".to_owned(),
