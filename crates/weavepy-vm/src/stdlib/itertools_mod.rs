@@ -336,7 +336,7 @@ fn as_bool(o: &Object) -> bool {
 
 /// Materialised pool argument: a tuple (the Python wrappers always
 /// pass tuples).
-fn pool_of(o: &Object, what: &str) -> Result<Rc<[Object]>, RuntimeError> {
+fn pool_of(o: &Object, what: &str) -> Result<Rc<crate::object::TupleStorage>, RuntimeError> {
     match o {
         Object::Tuple(items) => Ok(items.clone()),
         _ => Err(type_error(format!("{what} must be a tuple"))),
@@ -538,7 +538,7 @@ fn product_core(args: &[Object]) -> Result<Object, RuntimeError> {
     let [pools, indices, started, stopped] = args else {
         return Err(type_error("product_core expected 4 arguments"));
     };
-    let pools: Vec<Rc<[Object]>> = match pools {
+    let pools: Vec<Rc<crate::object::TupleStorage>> = match pools {
         Object::Tuple(items) => items
             .iter()
             .map(|p| pool_of(p, "pool"))
@@ -714,7 +714,7 @@ fn lazy_state(args: &[Object]) -> Result<Object, RuntimeError> {
             vec![
                 fillvalue.clone(),
                 Object::Int(*numactive as i64),
-                Object::Tuple(slots.into()),
+                Object::new_tuple(slots),
             ]
         }
         LazyIterKind::Accumulate {
@@ -738,8 +738,8 @@ fn lazy_state(args: &[Object]) -> Result<Object, RuntimeError> {
             let pools: Vec<Object> = pools.iter().map(|p| Object::Tuple(p.clone())).collect();
             let ix: Vec<Object> = indices.iter().map(|&i| Object::Int(i as i64)).collect();
             vec![
-                Object::Tuple(pools.into()),
-                Object::Tuple(ix.into()),
+                Object::new_tuple(pools),
+                Object::new_tuple(ix),
                 Object::Bool(*started),
                 Object::Bool(*stopped),
             ]
@@ -757,8 +757,8 @@ fn lazy_state(args: &[Object]) -> Result<Object, RuntimeError> {
             vec![
                 Object::Tuple(pool.clone()),
                 Object::Int(*r as i64),
-                Object::Tuple(ix.into()),
-                Object::Tuple(cy.into()),
+                Object::new_tuple(ix),
+                Object::new_tuple(cy),
                 Object::Bool(*started),
                 Object::Bool(*stopped),
             ]
@@ -781,7 +781,7 @@ fn lazy_state(args: &[Object]) -> Result<Object, RuntimeError> {
             vec![
                 Object::Tuple(pool.clone()),
                 Object::Int(*r as i64),
-                Object::Tuple(ix.into()),
+                Object::new_tuple(ix),
                 Object::Bool(*started),
                 Object::Bool(*stopped),
             ]
@@ -792,5 +792,5 @@ fn lazy_state(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Bool(*strict),
         ],
     };
-    Ok(Object::Tuple(items.into()))
+    Ok(Object::new_tuple(items))
 }

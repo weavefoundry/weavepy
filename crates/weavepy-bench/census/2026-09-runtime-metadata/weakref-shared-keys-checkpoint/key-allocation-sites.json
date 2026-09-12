@@ -1,0 +1,125 @@
+{
+  "binary_sha256": "36989234372e807ab95dc79686d9e5dd3bb51b458a9f7a1d92992357c30373a0",
+  "symbol": "__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class",
+  "rows": [
+    {
+      "key": "__call__",
+      "return_offset": 776,
+      "requested_bytes": 24,
+      "evidence": {
+        "immediate_u16_parts": [
+          24415,
+          24931,
+          27756,
+          24415
+        ],
+        "literal_hex": "5f5f63616c6c5f5f",
+        "post_allocation_instructions": [
+          "100a9d680:     \tcmp\tx0, #0x0",
+          "100a9d684:     \tcset\tw8, eq",
+          "100a9d688:     \tstr\tw8, [sp, #0x4]",
+          "100a9d68c:     \tcbz\tx0, 0x100a9e1d8 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xe60>",
+          "100a9d690:     \tmov\tw8, #0x1                ; =1",
+          "100a9d694:     \tdup.2d\tv0, x8",
+          "100a9d698:     \tstr\tq0, [x0]",
+          "100a9d69c:     \tmov\tx8, #0x5f5f             ; =24415",
+          "100a9d6a0:     \tmovk\tx8, #0x6163, lsl #16",
+          "100a9d6a4:     \tmovk\tx8, #0x6c6c, lsl #32",
+          "100a9d6a8:     \tmovk\tx8, #0x5f5f, lsl #48",
+          "100a9d6ac:     \tstr\tx8, [x0, #0x10]",
+          "100a9d6b0:     \tmov\tw8, #0x7                ; =7",
+          "100a9d6b4:     \tstrb\tw8, [sp, #0xf8]",
+          "100a9d6b8:     \tmov\tw8, #0x8                ; =8",
+          "100a9d6bc:     \tstp\tx0, x8, [sp, #0x100]"
+        ]
+      }
+    },
+    {
+      "key": "__weakref_get__",
+      "return_offset": 1124,
+      "requested_bytes": 32,
+      "evidence": {
+        "literal_virtual_address": "0x1014216f5",
+        "literal_hex": "5f5f7765616b7265665f6765745f5f"
+      }
+    },
+    {
+      "key": "__clear__",
+      "return_offset": 1448,
+      "requested_bytes": 32,
+      "evidence": {
+        "literal_virtual_address": "0x10142185f",
+        "literal_hex": "5f5f636c6561725f5f"
+      }
+    },
+    {
+      "key": "__alive__",
+      "return_offset": 1772,
+      "requested_bytes": 32,
+      "evidence": {
+        "literal_virtual_address": "0x101421868",
+        "literal_hex": "5f5f616c6976655f5f"
+      }
+    },
+    {
+      "key": "__repr__",
+      "return_offset": 2096,
+      "requested_bytes": 24,
+      "evidence": {
+        "immediate_u16_parts": [
+          24415,
+          25970,
+          29296,
+          24415
+        ],
+        "literal_hex": "5f5f726570725f5f",
+        "post_allocation_instructions": [
+          "100a9dba8:     \tcbz\tx0, 0x100a9e410 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x1098>",
+          "100a9dbac:     \tmov\tw8, #0x1                ; =1",
+          "100a9dbb0:     \tdup.2d\tv0, x8",
+          "100a9dbb4:     \tstr\tq0, [x0]",
+          "100a9dbb8:     \tmov\tx8, #0x5f5f             ; =24415",
+          "100a9dbbc:     \tmovk\tx8, #0x6572, lsl #16",
+          "100a9dbc0:     \tmovk\tx8, #0x7270, lsl #32",
+          "100a9dbc4:     \tmovk\tx8, #0x5f5f, lsl #48",
+          "100a9dbc8:     \tstr\tx8, [x0, #0x10]",
+          "100a9dbcc:     \tmov\tw8, #0x7                ; =7",
+          "100a9dbd0:     \tstrb\tw8, [sp, #0xf8]",
+          "100a9dbd4:     \tmov\tw8, #0x8                ; =8",
+          "100a9dbd8:     \tstp\tx0, x8, [sp, #0x100]",
+          "100a9dbdc:     \tstr\tx22, [sp, #0x130]",
+          "100a9dbe0:     \tmov\tw0, #0x8                ; =8",
+          "100a9dbe4:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>"
+        ]
+      }
+    },
+    {
+      "key": "__callback__",
+      "return_offset": 2448,
+      "requested_bytes": 32,
+      "evidence": {
+        "literal_virtual_address": "0x1012064b5",
+        "literal_hex": "5f5f63616c6c6261636b5f5f"
+      }
+    },
+    {
+      "key": "__callback__",
+      "return_offset": 2660,
+      "requested_bytes": 32,
+      "evidence": {
+        "literal_virtual_address": "0x1012064b5",
+        "literal_hex": "5f5f63616c6c6261636b5f5f"
+      }
+    },
+    {
+      "key": "__weakref_kind__",
+      "return_offset": 2868,
+      "requested_bytes": 32,
+      "evidence": {
+        "literal_virtual_address": "0x1011daf80",
+        "literal_hex": "5f5f7765616b7265665f6b696e645f5f"
+      }
+    }
+  ],
+  "limits": "Exact static sites and requested bytes, not live counts or RSS. The two callback sites are alternative branches; one runs per wrapper. Seven keys request208bytes per wrapper before allocator rounding. Candidate normal operation shares these names; its teardown fallback still allocates."
+}

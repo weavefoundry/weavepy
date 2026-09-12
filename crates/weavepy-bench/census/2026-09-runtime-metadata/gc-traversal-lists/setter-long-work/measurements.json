@@ -1,0 +1,1086 @@
+{
+  "purpose": "Measure verified datetime components with separate stable per-binary frozen caches.",
+  "execution_context": {
+    "declared_launch_context": "outside-tool-filesystem-sandbox (require_escalated)",
+    "environment": {
+      "TZ": null,
+      "LANG": "C.UTF-8",
+      "LC_ALL": "C.UTF-8",
+      "LC_TIME": null,
+      "PYTHON_JIT": null,
+      "PYTHON_GIL": null
+    }
+  },
+  "samples": 7,
+  "work": 200000,
+  "binaries": {
+    "previous_jit": {
+      "path": "/Users/owencarey/Documents/weavefoundry/weavepy/target/release/weavepy-runtime-gc-candidate-index",
+      "sha256": "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce"
+    },
+    "previous_interp": {
+      "path": "/Users/owencarey/Documents/weavefoundry/weavepy/target/release/weavepy-runtime-gc-candidate-index",
+      "sha256": "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce"
+    },
+    "jit": {
+      "path": "/Users/owencarey/Documents/weavefoundry/weavepy/target/release/weavepy-runtime-gc-traversal-lists",
+      "sha256": "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c"
+    },
+    "interp": {
+      "path": "/Users/owencarey/Documents/weavefoundry/weavepy/target/release/weavepy-runtime-gc-traversal-lists",
+      "sha256": "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c"
+    },
+    "cpython": {
+      "path": "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/bin/python3.14",
+      "sha256": "87d4df53fd91304be5bac391fb204643c36b7df2023c04a0953bcbc7d4fdf634"
+    }
+  },
+  "rows": {
+    "slot_updates": {
+      "case": {
+        "path": "target/gc-traversal-lists-setter-long-inputs/slot_updates.py",
+        "source_sha256": "be5de5c3ee5ed98ddb171706196ef070b477946fa43cb02002edebf8da3156ef",
+        "driver": "target/gc-traversal-lists-setter-long-inputs/slot_updates-verify.py",
+        "driver_sha256": "7665158e03e430f79607be2e44e633168eabcaa625a3a17ce0af73b27e92c38c",
+        "original_path": "target/shared-slot-keys-control-inputs/slot_updates.py"
+      },
+      "samples": {
+        "previous_jit": [
+          {
+            "ns": 172439291,
+            "wall_ns": 374643084,
+            "cpu_ns": 372527000,
+            "rss_bytes": 31096832,
+            "work_cpu_ns": 172322000
+          },
+          {
+            "ns": 173255791,
+            "wall_ns": 376892208,
+            "cpu_ns": 374524000,
+            "rss_bytes": 30998528,
+            "work_cpu_ns": 173156000
+          },
+          {
+            "ns": 173150834,
+            "wall_ns": 374842666,
+            "cpu_ns": 372767000,
+            "rss_bytes": 31014912,
+            "work_cpu_ns": 173026000
+          },
+          {
+            "ns": 172403584,
+            "wall_ns": 372231667,
+            "cpu_ns": 370057000,
+            "rss_bytes": 31031296,
+            "work_cpu_ns": 172207000
+          },
+          {
+            "ns": 172493250,
+            "wall_ns": 375159000,
+            "cpu_ns": 373269000,
+            "rss_bytes": 30965760,
+            "work_cpu_ns": 172367000
+          },
+          {
+            "ns": 171702334,
+            "wall_ns": 376661084,
+            "cpu_ns": 374252000,
+            "rss_bytes": 31064064,
+            "work_cpu_ns": 171570000
+          },
+          {
+            "ns": 173879291,
+            "wall_ns": 375668375,
+            "cpu_ns": 373514000,
+            "rss_bytes": 31129600,
+            "work_cpu_ns": 173720000
+          }
+        ],
+        "previous_interp": [
+          {
+            "ns": 103856833,
+            "wall_ns": 234533667,
+            "cpu_ns": 232604000,
+            "rss_bytes": 28278784,
+            "work_cpu_ns": 103823000
+          },
+          {
+            "ns": 105343250,
+            "wall_ns": 236290208,
+            "cpu_ns": 234248000,
+            "rss_bytes": 28114944,
+            "work_cpu_ns": 105223000
+          },
+          {
+            "ns": 104971375,
+            "wall_ns": 236812791,
+            "cpu_ns": 234827000,
+            "rss_bytes": 28295168,
+            "work_cpu_ns": 104916000
+          },
+          {
+            "ns": 104925542,
+            "wall_ns": 236092833,
+            "cpu_ns": 234063000,
+            "rss_bytes": 28180480,
+            "work_cpu_ns": 104862000
+          },
+          {
+            "ns": 103522500,
+            "wall_ns": 235175625,
+            "cpu_ns": 233202000,
+            "rss_bytes": 28377088,
+            "work_cpu_ns": 103437000
+          },
+          {
+            "ns": 103476250,
+            "wall_ns": 234872417,
+            "cpu_ns": 232872000,
+            "rss_bytes": 28131328,
+            "work_cpu_ns": 103389000
+          },
+          {
+            "ns": 104796083,
+            "wall_ns": 237170750,
+            "cpu_ns": 235138000,
+            "rss_bytes": 28082176,
+            "work_cpu_ns": 104623000
+          }
+        ],
+        "jit": [
+          {
+            "ns": 179612750,
+            "wall_ns": 385044875,
+            "cpu_ns": 382920000,
+            "rss_bytes": 30867456,
+            "work_cpu_ns": 179471000
+          },
+          {
+            "ns": 171672042,
+            "wall_ns": 371181042,
+            "cpu_ns": 368949000,
+            "rss_bytes": 30965760,
+            "work_cpu_ns": 171452000
+          },
+          {
+            "ns": 172506333,
+            "wall_ns": 374182917,
+            "cpu_ns": 372069000,
+            "rss_bytes": 30916608,
+            "work_cpu_ns": 172384000
+          },
+          {
+            "ns": 172719291,
+            "wall_ns": 374650500,
+            "cpu_ns": 372497000,
+            "rss_bytes": 30867456,
+            "work_cpu_ns": 172592000
+          },
+          {
+            "ns": 172348833,
+            "wall_ns": 373243500,
+            "cpu_ns": 371018000,
+            "rss_bytes": 30916608,
+            "work_cpu_ns": 172168000
+          },
+          {
+            "ns": 173335291,
+            "wall_ns": 375991167,
+            "cpu_ns": 373745000,
+            "rss_bytes": 31014912,
+            "work_cpu_ns": 173174000
+          },
+          {
+            "ns": 172927458,
+            "wall_ns": 375089291,
+            "cpu_ns": 373008000,
+            "rss_bytes": 30965760,
+            "work_cpu_ns": 172797000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 103225792,
+            "wall_ns": 233780292,
+            "cpu_ns": 231791000,
+            "rss_bytes": 28196864,
+            "work_cpu_ns": 103144000
+          },
+          {
+            "ns": 104073333,
+            "wall_ns": 234882500,
+            "cpu_ns": 232887000,
+            "rss_bytes": 28213248,
+            "work_cpu_ns": 104023000
+          },
+          {
+            "ns": 103487167,
+            "wall_ns": 233122792,
+            "cpu_ns": 231172000,
+            "rss_bytes": 28196864,
+            "work_cpu_ns": 103399000
+          },
+          {
+            "ns": 103726291,
+            "wall_ns": 234039375,
+            "cpu_ns": 232044000,
+            "rss_bytes": 28213248,
+            "work_cpu_ns": 103626000
+          },
+          {
+            "ns": 103776666,
+            "wall_ns": 235663375,
+            "cpu_ns": 231812000,
+            "rss_bytes": 28295168,
+            "work_cpu_ns": 103701000
+          },
+          {
+            "ns": 103586500,
+            "wall_ns": 233660958,
+            "cpu_ns": 231504000,
+            "rss_bytes": 28147712,
+            "work_cpu_ns": 103514000
+          },
+          {
+            "ns": 103131792,
+            "wall_ns": 233616708,
+            "cpu_ns": 231640000,
+            "rss_bytes": 28164096,
+            "work_cpu_ns": 103042000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 7606542,
+            "wall_ns": 34707333,
+            "cpu_ns": 32967000,
+            "rss_bytes": 15663104,
+            "work_cpu_ns": 7589000
+          },
+          {
+            "ns": 7443583,
+            "wall_ns": 34371500,
+            "cpu_ns": 32529000,
+            "rss_bytes": 15712256,
+            "work_cpu_ns": 7437000
+          },
+          {
+            "ns": 7313541,
+            "wall_ns": 34184250,
+            "cpu_ns": 32324000,
+            "rss_bytes": 15663104,
+            "work_cpu_ns": 7313000
+          },
+          {
+            "ns": 7279459,
+            "wall_ns": 34005625,
+            "cpu_ns": 32178000,
+            "rss_bytes": 15712256,
+            "work_cpu_ns": 7264000
+          },
+          {
+            "ns": 7372708,
+            "wall_ns": 34084041,
+            "cpu_ns": 32274000,
+            "rss_bytes": 15646720,
+            "work_cpu_ns": 7355000
+          },
+          {
+            "ns": 7292208,
+            "wall_ns": 34450875,
+            "cpu_ns": 32598000,
+            "rss_bytes": 15761408,
+            "work_cpu_ns": 7290000
+          },
+          {
+            "ns": 7318333,
+            "wall_ns": 34001583,
+            "cpu_ns": 32261000,
+            "rss_bytes": 15679488,
+            "work_cpu_ns": 7318000
+          }
+        ]
+      },
+      "frozen_cache": {
+        "before": {
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_collections": "fa365d9df04a1643a8842a6eb90f49708ef9efa9c6005f646e322d51a5fcc3ce",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_collections_abc": "146cf458a118e73e7e98e26ecb8fbf11bbe8ac9c508cd5aec86351f1df27ce49",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_contextvars": "2cc2dd878888ca872b0b0eebbf5edffe77fa02473dfa4d29cd314c1caff75493",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_frozen_importlib": "84b6d9b5c1c167f36ebbe784ec74ed0fba72c1fc166a5ed8370eca701ba25f6d",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_frozen_importlib_external": "74cef56966c3aec1e4d379afc3613988b5c6316cc8c1c8f40064815481ff8b2f",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_seqtools": "38bb1b3cf0dcceff2e00077689951e5b107ce0b74b848a929a1b709b0dc0d4bd",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_sitebuiltins": "d5b433cf9b5a1c974456e2ba26f62dddb59629dde0f270478d9a7787d366cdb6",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_types": "26b6b7606b67d98ed1d99f408a66ecd5cee5005515b6627357e9acd670fd822d",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weakrefset": "4fdbc7711145b9d26af119a3d9064498ccf520879226173a1cca30c555fe66e3",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_capsule": "175960799469bb8b42a0640a5eae8987dd1d6d712a30b221f4f67e19477c7c51",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_envinit": "12b3b7cb872733bebd6420e61f9f6646807a9ed49f07dcc63f62f8cce696b202",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_frame_locals": "a0f76740a5b3f148c27d4345e19f6690d52c42458594d97c415960d8f7ffc5d8",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_import_fallback": "137e28af0e1ac45f8b3ec522f33edb0a6ffb09f5391ce432efbe27c11374a790",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_spec": "915a1798990bc6423e596d77f5697abc8c99ca56792dac286f26dcdd00dda3c2",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/abc": "bc0c3a03efa2cc83e62d223b72e267c0ecc4d4f40f00eeaa988cbe33bf560494",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/codecs": "3ed201d65de41286076a6ba61dcd7c95ba0067e0c5894f6b1d3e8dd345da745b",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/collections": "3fd76b787f5892f60c1a1cf74d9135eb29780c2b17fdd25eb02e919dc759e542",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/contextvars": "6c03f23a47c540c8a22cdfe633c43a132cb9d218914f25d68b08859465a2c760",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/copyreg": "fcd878cbf5165e43dfa91b6e77c5928408b25b2de79093ef977eca4238263938",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/enum": "e925f0eaa4a1a5e91e272342bec38511247caa5a62712d16ed1d5b69f21b471b",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/functools": "f903e1ac1f8db134fc4b8440bf230b344ed1659dc66192daab63a94bc8b687f0",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/genericpath": "7274e8864b9f9a9dc3c05260f85f0c847004cb8129df0c1e3e48662538d7eb98",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/importlib": "16aa2699ff828cce6af58664a47ca1d69f4a89ef50cc3060e1812033b8a58120",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/importlib.machinery": "4e9982652a4324b6a4cb8067a3f47051975eedc0fcd9fa4a8d742befd76937ea",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/itertools": "2004f48a71e3425a7f4a2249f0dc7f6c84567298bf5fa37f9083e56ffe520c90",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/json": "585c0fe7e64b2cbebbc1a90d2985507cdedb11c1b270d00ac15a6ddef2c66674",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/json.decoder": "821713d33c7a8000438fa6f1abf096836ba8dc5fbdce292b2dcf5a30f6b0b29d",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/json.encoder": "292994f37c09570f68d9660064a88a8668c55bed137254f3c496a1d4254f94f4",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/json.scanner": "e7bc83b560dda4e8d007eb8b342f0f6989ff5233b78e05f5c0eac4698c9d9de3",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/keyword": "14a6905be4a0f4387ef9d7fee070f8e002da2b1dbf16d24130b69550d1b3c4e9",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/linecache": "50c058140b895606048f52cae8c6aedb392e251ce6fb17f03da6c5ea8aab23ff",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/operator": "167e3d1e80298f0c491caf27ff34c689103bd4ee94f6b3eba56aa7f4d6aa32d3",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/posix": "d3b7911543e58ccfce20230de40f2764284d91b1c11f405254294b0c83325e12",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/posixpath": "855ef925e36c9df7dfcc8bd832cb6ecf4de4c4c823cbbcd801be4d1fb27b69b9",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re": "d029407e29aae8120994f4b33ca618c1c831ecadf06cc835ca7443e5e4baa92f",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._casefix": "f377bb696ac1985838a89ab529b4bcfdfd4af109ef535bc4ef6675724b90b3b2",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._compiler": "ae52d6aa75b36524543a2149cfe01dc90c25e3ade3e2c0b3d2ffae52a796d16a",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._constants": "5ec7f0237131c983f5d8ce84bda62a29f5c350a82187dc7a73f166038ba242e0",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._engine": "df5e79f3b1dd6d579de344bf953868814404b6d41a184542723ce5310825f0f6",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._parser": "81b71690d1be6d2d2e1469f996a455005a92271e820853f413f8227387c67973",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/reprlib": "30ef91bc19f586807598c5a1736848926ef4d30d3ba03153801a70b1ba8e6709",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/site": "430c770641477a8c6a4fb56ee3066afb2972e21d700607de76367d0fb1c32f9d",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/stat": "9eeb8142fae305174af8733ada4d7a93fd8730fb75933874a53771d976796a5b",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/types": "44435a0a78072b28d38d302207915ec82b31f73075fcd39cf10f707a0aa20c60",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/zipimport": "b731ec4a8ab3686e1f90eff49314e09a2417489191ed95dd39003dda1e0c683a",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_collections": "fa365d9df04a1643a8842a6eb90f49708ef9efa9c6005f646e322d51a5fcc3ce",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_collections_abc": "146cf458a118e73e7e98e26ecb8fbf11bbe8ac9c508cd5aec86351f1df27ce49",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_contextvars": "2cc2dd878888ca872b0b0eebbf5edffe77fa02473dfa4d29cd314c1caff75493",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_frozen_importlib": "84b6d9b5c1c167f36ebbe784ec74ed0fba72c1fc166a5ed8370eca701ba25f6d",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_frozen_importlib_external": "74cef56966c3aec1e4d379afc3613988b5c6316cc8c1c8f40064815481ff8b2f",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_seqtools": "38bb1b3cf0dcceff2e00077689951e5b107ce0b74b848a929a1b709b0dc0d4bd",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_sitebuiltins": "d5b433cf9b5a1c974456e2ba26f62dddb59629dde0f270478d9a7787d366cdb6",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_types": "26b6b7606b67d98ed1d99f408a66ecd5cee5005515b6627357e9acd670fd822d",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weakrefset": "4fdbc7711145b9d26af119a3d9064498ccf520879226173a1cca30c555fe66e3",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_capsule": "175960799469bb8b42a0640a5eae8987dd1d6d712a30b221f4f67e19477c7c51",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_envinit": "12b3b7cb872733bebd6420e61f9f6646807a9ed49f07dcc63f62f8cce696b202",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_frame_locals": "a0f76740a5b3f148c27d4345e19f6690d52c42458594d97c415960d8f7ffc5d8",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_import_fallback": "137e28af0e1ac45f8b3ec522f33edb0a6ffb09f5391ce432efbe27c11374a790",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_spec": "915a1798990bc6423e596d77f5697abc8c99ca56792dac286f26dcdd00dda3c2",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/abc": "bc0c3a03efa2cc83e62d223b72e267c0ecc4d4f40f00eeaa988cbe33bf560494",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/codecs": "3ed201d65de41286076a6ba61dcd7c95ba0067e0c5894f6b1d3e8dd345da745b",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/collections": "3fd76b787f5892f60c1a1cf74d9135eb29780c2b17fdd25eb02e919dc759e542",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/contextvars": "6c03f23a47c540c8a22cdfe633c43a132cb9d218914f25d68b08859465a2c760",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/copyreg": "fcd878cbf5165e43dfa91b6e77c5928408b25b2de79093ef977eca4238263938",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/enum": "e925f0eaa4a1a5e91e272342bec38511247caa5a62712d16ed1d5b69f21b471b",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/functools": "f903e1ac1f8db134fc4b8440bf230b344ed1659dc66192daab63a94bc8b687f0",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/genericpath": "7274e8864b9f9a9dc3c05260f85f0c847004cb8129df0c1e3e48662538d7eb98",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/importlib": "16aa2699ff828cce6af58664a47ca1d69f4a89ef50cc3060e1812033b8a58120",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/importlib.machinery": "4e9982652a4324b6a4cb8067a3f47051975eedc0fcd9fa4a8d742befd76937ea",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/itertools": "2004f48a71e3425a7f4a2249f0dc7f6c84567298bf5fa37f9083e56ffe520c90",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/json": "585c0fe7e64b2cbebbc1a90d2985507cdedb11c1b270d00ac15a6ddef2c66674",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/json.decoder": "821713d33c7a8000438fa6f1abf096836ba8dc5fbdce292b2dcf5a30f6b0b29d",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/json.encoder": "292994f37c09570f68d9660064a88a8668c55bed137254f3c496a1d4254f94f4",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/json.scanner": "e7bc83b560dda4e8d007eb8b342f0f6989ff5233b78e05f5c0eac4698c9d9de3",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/keyword": "14a6905be4a0f4387ef9d7fee070f8e002da2b1dbf16d24130b69550d1b3c4e9",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/linecache": "50c058140b895606048f52cae8c6aedb392e251ce6fb17f03da6c5ea8aab23ff",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/operator": "167e3d1e80298f0c491caf27ff34c689103bd4ee94f6b3eba56aa7f4d6aa32d3",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/posix": "d3b7911543e58ccfce20230de40f2764284d91b1c11f405254294b0c83325e12",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/posixpath": "855ef925e36c9df7dfcc8bd832cb6ecf4de4c4c823cbbcd801be4d1fb27b69b9",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re": "d029407e29aae8120994f4b33ca618c1c831ecadf06cc835ca7443e5e4baa92f",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._casefix": "f377bb696ac1985838a89ab529b4bcfdfd4af109ef535bc4ef6675724b90b3b2",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._compiler": "ae52d6aa75b36524543a2149cfe01dc90c25e3ade3e2c0b3d2ffae52a796d16a",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._constants": "5ec7f0237131c983f5d8ce84bda62a29f5c350a82187dc7a73f166038ba242e0",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._engine": "df5e79f3b1dd6d579de344bf953868814404b6d41a184542723ce5310825f0f6",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._parser": "81b71690d1be6d2d2e1469f996a455005a92271e820853f413f8227387c67973",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/reprlib": "30ef91bc19f586807598c5a1736848926ef4d30d3ba03153801a70b1ba8e6709",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/site": "430c770641477a8c6a4fb56ee3066afb2972e21d700607de76367d0fb1c32f9d",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/stat": "9eeb8142fae305174af8733ada4d7a93fd8730fb75933874a53771d976796a5b",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/types": "44435a0a78072b28d38d302207915ec82b31f73075fcd39cf10f707a0aa20c60",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/zipimport": "b731ec4a8ab3686e1f90eff49314e09a2417489191ed95dd39003dda1e0c683a"
+        },
+        "after": {
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_collections": "fa365d9df04a1643a8842a6eb90f49708ef9efa9c6005f646e322d51a5fcc3ce",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_collections_abc": "146cf458a118e73e7e98e26ecb8fbf11bbe8ac9c508cd5aec86351f1df27ce49",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_contextvars": "2cc2dd878888ca872b0b0eebbf5edffe77fa02473dfa4d29cd314c1caff75493",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_frozen_importlib": "84b6d9b5c1c167f36ebbe784ec74ed0fba72c1fc166a5ed8370eca701ba25f6d",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_frozen_importlib_external": "74cef56966c3aec1e4d379afc3613988b5c6316cc8c1c8f40064815481ff8b2f",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_seqtools": "38bb1b3cf0dcceff2e00077689951e5b107ce0b74b848a929a1b709b0dc0d4bd",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_sitebuiltins": "d5b433cf9b5a1c974456e2ba26f62dddb59629dde0f270478d9a7787d366cdb6",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_types": "26b6b7606b67d98ed1d99f408a66ecd5cee5005515b6627357e9acd670fd822d",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weakrefset": "4fdbc7711145b9d26af119a3d9064498ccf520879226173a1cca30c555fe66e3",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_capsule": "175960799469bb8b42a0640a5eae8987dd1d6d712a30b221f4f67e19477c7c51",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_envinit": "12b3b7cb872733bebd6420e61f9f6646807a9ed49f07dcc63f62f8cce696b202",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_frame_locals": "a0f76740a5b3f148c27d4345e19f6690d52c42458594d97c415960d8f7ffc5d8",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_import_fallback": "137e28af0e1ac45f8b3ec522f33edb0a6ffb09f5391ce432efbe27c11374a790",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_spec": "915a1798990bc6423e596d77f5697abc8c99ca56792dac286f26dcdd00dda3c2",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/abc": "bc0c3a03efa2cc83e62d223b72e267c0ecc4d4f40f00eeaa988cbe33bf560494",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/codecs": "3ed201d65de41286076a6ba61dcd7c95ba0067e0c5894f6b1d3e8dd345da745b",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/collections": "3fd76b787f5892f60c1a1cf74d9135eb29780c2b17fdd25eb02e919dc759e542",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/contextvars": "6c03f23a47c540c8a22cdfe633c43a132cb9d218914f25d68b08859465a2c760",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/copyreg": "fcd878cbf5165e43dfa91b6e77c5928408b25b2de79093ef977eca4238263938",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/enum": "e925f0eaa4a1a5e91e272342bec38511247caa5a62712d16ed1d5b69f21b471b",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/functools": "f903e1ac1f8db134fc4b8440bf230b344ed1659dc66192daab63a94bc8b687f0",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/genericpath": "7274e8864b9f9a9dc3c05260f85f0c847004cb8129df0c1e3e48662538d7eb98",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/importlib": "16aa2699ff828cce6af58664a47ca1d69f4a89ef50cc3060e1812033b8a58120",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/importlib.machinery": "4e9982652a4324b6a4cb8067a3f47051975eedc0fcd9fa4a8d742befd76937ea",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/itertools": "2004f48a71e3425a7f4a2249f0dc7f6c84567298bf5fa37f9083e56ffe520c90",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/json": "585c0fe7e64b2cbebbc1a90d2985507cdedb11c1b270d00ac15a6ddef2c66674",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/json.decoder": "821713d33c7a8000438fa6f1abf096836ba8dc5fbdce292b2dcf5a30f6b0b29d",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/json.encoder": "292994f37c09570f68d9660064a88a8668c55bed137254f3c496a1d4254f94f4",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/json.scanner": "e7bc83b560dda4e8d007eb8b342f0f6989ff5233b78e05f5c0eac4698c9d9de3",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/keyword": "14a6905be4a0f4387ef9d7fee070f8e002da2b1dbf16d24130b69550d1b3c4e9",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/linecache": "50c058140b895606048f52cae8c6aedb392e251ce6fb17f03da6c5ea8aab23ff",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/operator": "167e3d1e80298f0c491caf27ff34c689103bd4ee94f6b3eba56aa7f4d6aa32d3",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/posix": "d3b7911543e58ccfce20230de40f2764284d91b1c11f405254294b0c83325e12",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/posixpath": "855ef925e36c9df7dfcc8bd832cb6ecf4de4c4c823cbbcd801be4d1fb27b69b9",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re": "d029407e29aae8120994f4b33ca618c1c831ecadf06cc835ca7443e5e4baa92f",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._casefix": "f377bb696ac1985838a89ab529b4bcfdfd4af109ef535bc4ef6675724b90b3b2",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._compiler": "ae52d6aa75b36524543a2149cfe01dc90c25e3ade3e2c0b3d2ffae52a796d16a",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._constants": "5ec7f0237131c983f5d8ce84bda62a29f5c350a82187dc7a73f166038ba242e0",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._engine": "df5e79f3b1dd6d579de344bf953868814404b6d41a184542723ce5310825f0f6",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._parser": "81b71690d1be6d2d2e1469f996a455005a92271e820853f413f8227387c67973",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/reprlib": "30ef91bc19f586807598c5a1736848926ef4d30d3ba03153801a70b1ba8e6709",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/site": "430c770641477a8c6a4fb56ee3066afb2972e21d700607de76367d0fb1c32f9d",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/stat": "9eeb8142fae305174af8733ada4d7a93fd8730fb75933874a53771d976796a5b",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/types": "44435a0a78072b28d38d302207915ec82b31f73075fcd39cf10f707a0aa20c60",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/zipimport": "b731ec4a8ab3686e1f90eff49314e09a2417489191ed95dd39003dda1e0c683a",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_collections": "fa365d9df04a1643a8842a6eb90f49708ef9efa9c6005f646e322d51a5fcc3ce",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_collections_abc": "146cf458a118e73e7e98e26ecb8fbf11bbe8ac9c508cd5aec86351f1df27ce49",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_contextvars": "2cc2dd878888ca872b0b0eebbf5edffe77fa02473dfa4d29cd314c1caff75493",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_frozen_importlib": "84b6d9b5c1c167f36ebbe784ec74ed0fba72c1fc166a5ed8370eca701ba25f6d",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_frozen_importlib_external": "74cef56966c3aec1e4d379afc3613988b5c6316cc8c1c8f40064815481ff8b2f",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_seqtools": "38bb1b3cf0dcceff2e00077689951e5b107ce0b74b848a929a1b709b0dc0d4bd",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_sitebuiltins": "d5b433cf9b5a1c974456e2ba26f62dddb59629dde0f270478d9a7787d366cdb6",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_types": "26b6b7606b67d98ed1d99f408a66ecd5cee5005515b6627357e9acd670fd822d",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weakrefset": "4fdbc7711145b9d26af119a3d9064498ccf520879226173a1cca30c555fe66e3",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_capsule": "175960799469bb8b42a0640a5eae8987dd1d6d712a30b221f4f67e19477c7c51",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_envinit": "12b3b7cb872733bebd6420e61f9f6646807a9ed49f07dcc63f62f8cce696b202",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_frame_locals": "a0f76740a5b3f148c27d4345e19f6690d52c42458594d97c415960d8f7ffc5d8",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_import_fallback": "137e28af0e1ac45f8b3ec522f33edb0a6ffb09f5391ce432efbe27c11374a790",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_spec": "915a1798990bc6423e596d77f5697abc8c99ca56792dac286f26dcdd00dda3c2",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/abc": "bc0c3a03efa2cc83e62d223b72e267c0ecc4d4f40f00eeaa988cbe33bf560494",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/codecs": "3ed201d65de41286076a6ba61dcd7c95ba0067e0c5894f6b1d3e8dd345da745b",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/collections": "3fd76b787f5892f60c1a1cf74d9135eb29780c2b17fdd25eb02e919dc759e542",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/contextvars": "6c03f23a47c540c8a22cdfe633c43a132cb9d218914f25d68b08859465a2c760",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/copyreg": "fcd878cbf5165e43dfa91b6e77c5928408b25b2de79093ef977eca4238263938",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/enum": "e925f0eaa4a1a5e91e272342bec38511247caa5a62712d16ed1d5b69f21b471b",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/functools": "f903e1ac1f8db134fc4b8440bf230b344ed1659dc66192daab63a94bc8b687f0",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/genericpath": "7274e8864b9f9a9dc3c05260f85f0c847004cb8129df0c1e3e48662538d7eb98",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/importlib": "16aa2699ff828cce6af58664a47ca1d69f4a89ef50cc3060e1812033b8a58120",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/importlib.machinery": "4e9982652a4324b6a4cb8067a3f47051975eedc0fcd9fa4a8d742befd76937ea",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/itertools": "2004f48a71e3425a7f4a2249f0dc7f6c84567298bf5fa37f9083e56ffe520c90",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/json": "585c0fe7e64b2cbebbc1a90d2985507cdedb11c1b270d00ac15a6ddef2c66674",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/json.decoder": "821713d33c7a8000438fa6f1abf096836ba8dc5fbdce292b2dcf5a30f6b0b29d",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/json.encoder": "292994f37c09570f68d9660064a88a8668c55bed137254f3c496a1d4254f94f4",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/json.scanner": "e7bc83b560dda4e8d007eb8b342f0f6989ff5233b78e05f5c0eac4698c9d9de3",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/keyword": "14a6905be4a0f4387ef9d7fee070f8e002da2b1dbf16d24130b69550d1b3c4e9",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/linecache": "50c058140b895606048f52cae8c6aedb392e251ce6fb17f03da6c5ea8aab23ff",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/operator": "167e3d1e80298f0c491caf27ff34c689103bd4ee94f6b3eba56aa7f4d6aa32d3",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/posix": "d3b7911543e58ccfce20230de40f2764284d91b1c11f405254294b0c83325e12",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/posixpath": "855ef925e36c9df7dfcc8bd832cb6ecf4de4c4c823cbbcd801be4d1fb27b69b9",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re": "d029407e29aae8120994f4b33ca618c1c831ecadf06cc835ca7443e5e4baa92f",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._casefix": "f377bb696ac1985838a89ab529b4bcfdfd4af109ef535bc4ef6675724b90b3b2",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._compiler": "ae52d6aa75b36524543a2149cfe01dc90c25e3ade3e2c0b3d2ffae52a796d16a",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._constants": "5ec7f0237131c983f5d8ce84bda62a29f5c350a82187dc7a73f166038ba242e0",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._engine": "df5e79f3b1dd6d579de344bf953868814404b6d41a184542723ce5310825f0f6",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._parser": "81b71690d1be6d2d2e1469f996a455005a92271e820853f413f8227387c67973",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/reprlib": "30ef91bc19f586807598c5a1736848926ef4d30d3ba03153801a70b1ba8e6709",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/site": "430c770641477a8c6a4fb56ee3066afb2972e21d700607de76367d0fb1c32f9d",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/stat": "9eeb8142fae305174af8733ada4d7a93fd8730fb75933874a53771d976796a5b",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/types": "44435a0a78072b28d38d302207915ec82b31f73075fcd39cf10f707a0aa20c60",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/zipimport": "b731ec4a8ab3686e1f90eff49314e09a2417489191ed95dd39003dda1e0c683a"
+        },
+        "unchanged": true
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 23.612930816657556,
+          "wall_ns": 10.95068216823234,
+          "cpu_ns": 11.510611310481377,
+          "rss_bytes": 1.9708029197080292,
+          "work_cpu_ns": 23.612599070784366
+        },
+        "interp": {
+          "ns": 14.09225188304495,
+          "wall_ns": 6.833641243472063,
+          "cpu_ns": 7.159365489255741,
+          "rss_bytes": 1.7962382445141065,
+          "work_cpu_ns": 14.099388171312032
+        }
+      },
+      "previous_comparisons": {
+        "jit": {
+          "ns": 0.999162767238718,
+          "wall_ns": 0.9982399308834283,
+          "cpu_ns": 0.9986452978207198,
+          "rss_bytes": 0.9968304278922345,
+          "work_cpu_ns": 0.9988454866650809
+        },
+        "interp": {
+          "ns": 0.9885704569436486,
+          "wall_ns": 0.9940424615479623,
+          "cpu_ns": 0.9940395022341146,
+          "rss_bytes": 1.0005824111822947,
+          "work_cpu_ns": 0.9885956492401852
+        }
+      }
+    },
+    "slot_reinsertion": {
+      "case": {
+        "path": "target/gc-traversal-lists-setter-long-inputs/slot_reinsertion.py",
+        "source_sha256": "5c3f33cd68120c66494c65e7952044844c42a3ae67d0a4a6c53613679a51169d",
+        "driver": "target/gc-traversal-lists-setter-long-inputs/slot_reinsertion-verify.py",
+        "driver_sha256": "7fea904a5b8d42e0d2d307a27398c1af8291c4814c286d6b12ed89c7a6939af2",
+        "original_path": "target/shared-slot-keys-control-inputs/slot_reinsertion.py"
+      },
+      "samples": {
+        "previous_jit": [
+          {
+            "ns": 205176458,
+            "wall_ns": 438142417,
+            "cpu_ns": 435829000,
+            "rss_bytes": 30490624,
+            "work_cpu_ns": 204993000
+          },
+          {
+            "ns": 206525167,
+            "wall_ns": 441728583,
+            "cpu_ns": 439636000,
+            "rss_bytes": 30294016,
+            "work_cpu_ns": 206405000
+          },
+          {
+            "ns": 206417542,
+            "wall_ns": 440630750,
+            "cpu_ns": 438438000,
+            "rss_bytes": 30244864,
+            "work_cpu_ns": 206285000
+          },
+          {
+            "ns": 204852584,
+            "wall_ns": 440683916,
+            "cpu_ns": 438774000,
+            "rss_bytes": 30277632,
+            "work_cpu_ns": 204756000
+          },
+          {
+            "ns": 206085416,
+            "wall_ns": 439366167,
+            "cpu_ns": 437291000,
+            "rss_bytes": 30162944,
+            "work_cpu_ns": 205881000
+          },
+          {
+            "ns": 205301083,
+            "wall_ns": 437372042,
+            "cpu_ns": 435250000,
+            "rss_bytes": 30326784,
+            "work_cpu_ns": 205173000
+          },
+          {
+            "ns": 206924667,
+            "wall_ns": 440987291,
+            "cpu_ns": 438840000,
+            "rss_bytes": 30212096,
+            "work_cpu_ns": 206700000
+          }
+        ],
+        "previous_interp": [
+          {
+            "ns": 205210958,
+            "wall_ns": 439604291,
+            "cpu_ns": 437449000,
+            "rss_bytes": 28311552,
+            "work_cpu_ns": 205022000
+          },
+          {
+            "ns": 207147000,
+            "wall_ns": 440923291,
+            "cpu_ns": 438708000,
+            "rss_bytes": 28229632,
+            "work_cpu_ns": 206982000
+          },
+          {
+            "ns": 213401708,
+            "wall_ns": 455795792,
+            "cpu_ns": 454011000,
+            "rss_bytes": 28377088,
+            "work_cpu_ns": 213272000
+          },
+          {
+            "ns": 207713209,
+            "wall_ns": 476299584,
+            "cpu_ns": 449436000,
+            "rss_bytes": 28196864,
+            "work_cpu_ns": 207553000
+          },
+          {
+            "ns": 206271042,
+            "wall_ns": 440711750,
+            "cpu_ns": 438531000,
+            "rss_bytes": 28246016,
+            "work_cpu_ns": 206148000
+          },
+          {
+            "ns": 205157292,
+            "wall_ns": 437243416,
+            "cpu_ns": 435067000,
+            "rss_bytes": 28213248,
+            "work_cpu_ns": 205001000
+          },
+          {
+            "ns": 206396250,
+            "wall_ns": 440682250,
+            "cpu_ns": 438579000,
+            "rss_bytes": 28098560,
+            "work_cpu_ns": 206272000
+          }
+        ],
+        "jit": [
+          {
+            "ns": 207577584,
+            "wall_ns": 438072459,
+            "cpu_ns": 435787000,
+            "rss_bytes": 30294016,
+            "work_cpu_ns": 207297000
+          },
+          {
+            "ns": 203511417,
+            "wall_ns": 435433417,
+            "cpu_ns": 433276000,
+            "rss_bytes": 30277632,
+            "work_cpu_ns": 203359000
+          },
+          {
+            "ns": 204241334,
+            "wall_ns": 435913542,
+            "cpu_ns": 433652000,
+            "rss_bytes": 30343168,
+            "work_cpu_ns": 204022000
+          },
+          {
+            "ns": 204838666,
+            "wall_ns": 438622084,
+            "cpu_ns": 436329000,
+            "rss_bytes": 30408704,
+            "work_cpu_ns": 204608000
+          },
+          {
+            "ns": 203459500,
+            "wall_ns": 434465375,
+            "cpu_ns": 432246000,
+            "rss_bytes": 30294016,
+            "work_cpu_ns": 203318000
+          },
+          {
+            "ns": 210191750,
+            "wall_ns": 450387792,
+            "cpu_ns": 448076000,
+            "rss_bytes": 30310400,
+            "work_cpu_ns": 210021000
+          },
+          {
+            "ns": 213422042,
+            "wall_ns": 454249500,
+            "cpu_ns": 452138000,
+            "rss_bytes": 30326784,
+            "work_cpu_ns": 213292000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 203862084,
+            "wall_ns": 434555083,
+            "cpu_ns": 432409000,
+            "rss_bytes": 28213248,
+            "work_cpu_ns": 203727000
+          },
+          {
+            "ns": 204984333,
+            "wall_ns": 437471708,
+            "cpu_ns": 435246000,
+            "rss_bytes": 28196864,
+            "work_cpu_ns": 204828000
+          },
+          {
+            "ns": 205053167,
+            "wall_ns": 436952750,
+            "cpu_ns": 434703000,
+            "rss_bytes": 28229632,
+            "work_cpu_ns": 204877000
+          },
+          {
+            "ns": 211532459,
+            "wall_ns": 448959791,
+            "cpu_ns": 446805000,
+            "rss_bytes": 28262400,
+            "work_cpu_ns": 211382000
+          },
+          {
+            "ns": 203208958,
+            "wall_ns": 435826250,
+            "cpu_ns": 433869000,
+            "rss_bytes": 28278784,
+            "work_cpu_ns": 203111000
+          },
+          {
+            "ns": 203768625,
+            "wall_ns": 434908709,
+            "cpu_ns": 432835000,
+            "rss_bytes": 28196864,
+            "work_cpu_ns": 203649000
+          },
+          {
+            "ns": 207724167,
+            "wall_ns": 439474625,
+            "cpu_ns": 437192000,
+            "rss_bytes": 28131328,
+            "work_cpu_ns": 207483000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 12660292,
+            "wall_ns": 45032958,
+            "cpu_ns": 43189000,
+            "rss_bytes": 15745024,
+            "work_cpu_ns": 12645000
+          },
+          {
+            "ns": 12832417,
+            "wall_ns": 45421500,
+            "cpu_ns": 43506000,
+            "rss_bytes": 15712256,
+            "work_cpu_ns": 12823000
+          },
+          {
+            "ns": 12657042,
+            "wall_ns": 44741166,
+            "cpu_ns": 42851000,
+            "rss_bytes": 15663104,
+            "work_cpu_ns": 12643000
+          },
+          {
+            "ns": 12674792,
+            "wall_ns": 45327000,
+            "cpu_ns": 43612000,
+            "rss_bytes": 15810560,
+            "work_cpu_ns": 12670000
+          },
+          {
+            "ns": 12639667,
+            "wall_ns": 44544333,
+            "cpu_ns": 42698000,
+            "rss_bytes": 15679488,
+            "work_cpu_ns": 12624000
+          },
+          {
+            "ns": 12619917,
+            "wall_ns": 45228625,
+            "cpu_ns": 43387000,
+            "rss_bytes": 15777792,
+            "work_cpu_ns": 12610000
+          },
+          {
+            "ns": 12626208,
+            "wall_ns": 44852375,
+            "cpu_ns": 43002000,
+            "rss_bytes": 15695872,
+            "work_cpu_ns": 12614000
+          }
+        ]
+      },
+      "frozen_cache": {
+        "before": {
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_collections": "fa365d9df04a1643a8842a6eb90f49708ef9efa9c6005f646e322d51a5fcc3ce",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_collections_abc": "146cf458a118e73e7e98e26ecb8fbf11bbe8ac9c508cd5aec86351f1df27ce49",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_contextvars": "2cc2dd878888ca872b0b0eebbf5edffe77fa02473dfa4d29cd314c1caff75493",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_frozen_importlib": "84b6d9b5c1c167f36ebbe784ec74ed0fba72c1fc166a5ed8370eca701ba25f6d",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_frozen_importlib_external": "74cef56966c3aec1e4d379afc3613988b5c6316cc8c1c8f40064815481ff8b2f",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_seqtools": "38bb1b3cf0dcceff2e00077689951e5b107ce0b74b848a929a1b709b0dc0d4bd",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_sitebuiltins": "d5b433cf9b5a1c974456e2ba26f62dddb59629dde0f270478d9a7787d366cdb6",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_types": "26b6b7606b67d98ed1d99f408a66ecd5cee5005515b6627357e9acd670fd822d",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weakrefset": "4fdbc7711145b9d26af119a3d9064498ccf520879226173a1cca30c555fe66e3",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_capsule": "175960799469bb8b42a0640a5eae8987dd1d6d712a30b221f4f67e19477c7c51",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_envinit": "12b3b7cb872733bebd6420e61f9f6646807a9ed49f07dcc63f62f8cce696b202",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_frame_locals": "a0f76740a5b3f148c27d4345e19f6690d52c42458594d97c415960d8f7ffc5d8",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_import_fallback": "137e28af0e1ac45f8b3ec522f33edb0a6ffb09f5391ce432efbe27c11374a790",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_spec": "915a1798990bc6423e596d77f5697abc8c99ca56792dac286f26dcdd00dda3c2",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/abc": "bc0c3a03efa2cc83e62d223b72e267c0ecc4d4f40f00eeaa988cbe33bf560494",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/codecs": "3ed201d65de41286076a6ba61dcd7c95ba0067e0c5894f6b1d3e8dd345da745b",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/collections": "3fd76b787f5892f60c1a1cf74d9135eb29780c2b17fdd25eb02e919dc759e542",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/contextvars": "6c03f23a47c540c8a22cdfe633c43a132cb9d218914f25d68b08859465a2c760",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/copyreg": "fcd878cbf5165e43dfa91b6e77c5928408b25b2de79093ef977eca4238263938",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/enum": "e925f0eaa4a1a5e91e272342bec38511247caa5a62712d16ed1d5b69f21b471b",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/functools": "f903e1ac1f8db134fc4b8440bf230b344ed1659dc66192daab63a94bc8b687f0",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/genericpath": "7274e8864b9f9a9dc3c05260f85f0c847004cb8129df0c1e3e48662538d7eb98",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/importlib": "16aa2699ff828cce6af58664a47ca1d69f4a89ef50cc3060e1812033b8a58120",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/importlib.machinery": "4e9982652a4324b6a4cb8067a3f47051975eedc0fcd9fa4a8d742befd76937ea",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/itertools": "2004f48a71e3425a7f4a2249f0dc7f6c84567298bf5fa37f9083e56ffe520c90",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/json": "585c0fe7e64b2cbebbc1a90d2985507cdedb11c1b270d00ac15a6ddef2c66674",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/json.decoder": "821713d33c7a8000438fa6f1abf096836ba8dc5fbdce292b2dcf5a30f6b0b29d",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/json.encoder": "292994f37c09570f68d9660064a88a8668c55bed137254f3c496a1d4254f94f4",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/json.scanner": "e7bc83b560dda4e8d007eb8b342f0f6989ff5233b78e05f5c0eac4698c9d9de3",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/keyword": "14a6905be4a0f4387ef9d7fee070f8e002da2b1dbf16d24130b69550d1b3c4e9",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/linecache": "50c058140b895606048f52cae8c6aedb392e251ce6fb17f03da6c5ea8aab23ff",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/operator": "167e3d1e80298f0c491caf27ff34c689103bd4ee94f6b3eba56aa7f4d6aa32d3",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/posix": "d3b7911543e58ccfce20230de40f2764284d91b1c11f405254294b0c83325e12",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/posixpath": "855ef925e36c9df7dfcc8bd832cb6ecf4de4c4c823cbbcd801be4d1fb27b69b9",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re": "d029407e29aae8120994f4b33ca618c1c831ecadf06cc835ca7443e5e4baa92f",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._casefix": "f377bb696ac1985838a89ab529b4bcfdfd4af109ef535bc4ef6675724b90b3b2",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._compiler": "ae52d6aa75b36524543a2149cfe01dc90c25e3ade3e2c0b3d2ffae52a796d16a",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._constants": "5ec7f0237131c983f5d8ce84bda62a29f5c350a82187dc7a73f166038ba242e0",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._engine": "df5e79f3b1dd6d579de344bf953868814404b6d41a184542723ce5310825f0f6",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._parser": "81b71690d1be6d2d2e1469f996a455005a92271e820853f413f8227387c67973",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/reprlib": "30ef91bc19f586807598c5a1736848926ef4d30d3ba03153801a70b1ba8e6709",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/site": "430c770641477a8c6a4fb56ee3066afb2972e21d700607de76367d0fb1c32f9d",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/stat": "9eeb8142fae305174af8733ada4d7a93fd8730fb75933874a53771d976796a5b",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/types": "44435a0a78072b28d38d302207915ec82b31f73075fcd39cf10f707a0aa20c60",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/zipimport": "b731ec4a8ab3686e1f90eff49314e09a2417489191ed95dd39003dda1e0c683a",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_collections": "fa365d9df04a1643a8842a6eb90f49708ef9efa9c6005f646e322d51a5fcc3ce",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_collections_abc": "146cf458a118e73e7e98e26ecb8fbf11bbe8ac9c508cd5aec86351f1df27ce49",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_contextvars": "2cc2dd878888ca872b0b0eebbf5edffe77fa02473dfa4d29cd314c1caff75493",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_frozen_importlib": "84b6d9b5c1c167f36ebbe784ec74ed0fba72c1fc166a5ed8370eca701ba25f6d",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_frozen_importlib_external": "74cef56966c3aec1e4d379afc3613988b5c6316cc8c1c8f40064815481ff8b2f",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_seqtools": "38bb1b3cf0dcceff2e00077689951e5b107ce0b74b848a929a1b709b0dc0d4bd",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_sitebuiltins": "d5b433cf9b5a1c974456e2ba26f62dddb59629dde0f270478d9a7787d366cdb6",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_types": "26b6b7606b67d98ed1d99f408a66ecd5cee5005515b6627357e9acd670fd822d",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weakrefset": "4fdbc7711145b9d26af119a3d9064498ccf520879226173a1cca30c555fe66e3",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_capsule": "175960799469bb8b42a0640a5eae8987dd1d6d712a30b221f4f67e19477c7c51",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_envinit": "12b3b7cb872733bebd6420e61f9f6646807a9ed49f07dcc63f62f8cce696b202",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_frame_locals": "a0f76740a5b3f148c27d4345e19f6690d52c42458594d97c415960d8f7ffc5d8",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_import_fallback": "137e28af0e1ac45f8b3ec522f33edb0a6ffb09f5391ce432efbe27c11374a790",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_spec": "915a1798990bc6423e596d77f5697abc8c99ca56792dac286f26dcdd00dda3c2",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/abc": "bc0c3a03efa2cc83e62d223b72e267c0ecc4d4f40f00eeaa988cbe33bf560494",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/codecs": "3ed201d65de41286076a6ba61dcd7c95ba0067e0c5894f6b1d3e8dd345da745b",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/collections": "3fd76b787f5892f60c1a1cf74d9135eb29780c2b17fdd25eb02e919dc759e542",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/contextvars": "6c03f23a47c540c8a22cdfe633c43a132cb9d218914f25d68b08859465a2c760",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/copyreg": "fcd878cbf5165e43dfa91b6e77c5928408b25b2de79093ef977eca4238263938",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/enum": "e925f0eaa4a1a5e91e272342bec38511247caa5a62712d16ed1d5b69f21b471b",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/functools": "f903e1ac1f8db134fc4b8440bf230b344ed1659dc66192daab63a94bc8b687f0",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/genericpath": "7274e8864b9f9a9dc3c05260f85f0c847004cb8129df0c1e3e48662538d7eb98",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/importlib": "16aa2699ff828cce6af58664a47ca1d69f4a89ef50cc3060e1812033b8a58120",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/importlib.machinery": "4e9982652a4324b6a4cb8067a3f47051975eedc0fcd9fa4a8d742befd76937ea",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/itertools": "2004f48a71e3425a7f4a2249f0dc7f6c84567298bf5fa37f9083e56ffe520c90",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/json": "585c0fe7e64b2cbebbc1a90d2985507cdedb11c1b270d00ac15a6ddef2c66674",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/json.decoder": "821713d33c7a8000438fa6f1abf096836ba8dc5fbdce292b2dcf5a30f6b0b29d",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/json.encoder": "292994f37c09570f68d9660064a88a8668c55bed137254f3c496a1d4254f94f4",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/json.scanner": "e7bc83b560dda4e8d007eb8b342f0f6989ff5233b78e05f5c0eac4698c9d9de3",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/keyword": "14a6905be4a0f4387ef9d7fee070f8e002da2b1dbf16d24130b69550d1b3c4e9",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/linecache": "50c058140b895606048f52cae8c6aedb392e251ce6fb17f03da6c5ea8aab23ff",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/operator": "167e3d1e80298f0c491caf27ff34c689103bd4ee94f6b3eba56aa7f4d6aa32d3",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/posix": "d3b7911543e58ccfce20230de40f2764284d91b1c11f405254294b0c83325e12",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/posixpath": "855ef925e36c9df7dfcc8bd832cb6ecf4de4c4c823cbbcd801be4d1fb27b69b9",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re": "d029407e29aae8120994f4b33ca618c1c831ecadf06cc835ca7443e5e4baa92f",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._casefix": "f377bb696ac1985838a89ab529b4bcfdfd4af109ef535bc4ef6675724b90b3b2",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._compiler": "ae52d6aa75b36524543a2149cfe01dc90c25e3ade3e2c0b3d2ffae52a796d16a",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._constants": "5ec7f0237131c983f5d8ce84bda62a29f5c350a82187dc7a73f166038ba242e0",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._engine": "df5e79f3b1dd6d579de344bf953868814404b6d41a184542723ce5310825f0f6",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._parser": "81b71690d1be6d2d2e1469f996a455005a92271e820853f413f8227387c67973",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/reprlib": "30ef91bc19f586807598c5a1736848926ef4d30d3ba03153801a70b1ba8e6709",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/site": "430c770641477a8c6a4fb56ee3066afb2972e21d700607de76367d0fb1c32f9d",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/stat": "9eeb8142fae305174af8733ada4d7a93fd8730fb75933874a53771d976796a5b",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/types": "44435a0a78072b28d38d302207915ec82b31f73075fcd39cf10f707a0aa20c60",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/zipimport": "b731ec4a8ab3686e1f90eff49314e09a2417489191ed95dd39003dda1e0c683a"
+        },
+        "after": {
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_collections": "fa365d9df04a1643a8842a6eb90f49708ef9efa9c6005f646e322d51a5fcc3ce",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_collections_abc": "146cf458a118e73e7e98e26ecb8fbf11bbe8ac9c508cd5aec86351f1df27ce49",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_contextvars": "2cc2dd878888ca872b0b0eebbf5edffe77fa02473dfa4d29cd314c1caff75493",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_frozen_importlib": "84b6d9b5c1c167f36ebbe784ec74ed0fba72c1fc166a5ed8370eca701ba25f6d",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_frozen_importlib_external": "74cef56966c3aec1e4d379afc3613988b5c6316cc8c1c8f40064815481ff8b2f",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_seqtools": "38bb1b3cf0dcceff2e00077689951e5b107ce0b74b848a929a1b709b0dc0d4bd",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_sitebuiltins": "d5b433cf9b5a1c974456e2ba26f62dddb59629dde0f270478d9a7787d366cdb6",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_types": "26b6b7606b67d98ed1d99f408a66ecd5cee5005515b6627357e9acd670fd822d",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weakrefset": "4fdbc7711145b9d26af119a3d9064498ccf520879226173a1cca30c555fe66e3",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_capsule": "175960799469bb8b42a0640a5eae8987dd1d6d712a30b221f4f67e19477c7c51",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_envinit": "12b3b7cb872733bebd6420e61f9f6646807a9ed49f07dcc63f62f8cce696b202",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_frame_locals": "a0f76740a5b3f148c27d4345e19f6690d52c42458594d97c415960d8f7ffc5d8",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_import_fallback": "137e28af0e1ac45f8b3ec522f33edb0a6ffb09f5391ce432efbe27c11374a790",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/_weave_spec": "915a1798990bc6423e596d77f5697abc8c99ca56792dac286f26dcdd00dda3c2",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/abc": "bc0c3a03efa2cc83e62d223b72e267c0ecc4d4f40f00eeaa988cbe33bf560494",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/codecs": "3ed201d65de41286076a6ba61dcd7c95ba0067e0c5894f6b1d3e8dd345da745b",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/collections": "3fd76b787f5892f60c1a1cf74d9135eb29780c2b17fdd25eb02e919dc759e542",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/contextvars": "6c03f23a47c540c8a22cdfe633c43a132cb9d218914f25d68b08859465a2c760",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/copyreg": "fcd878cbf5165e43dfa91b6e77c5928408b25b2de79093ef977eca4238263938",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/enum": "e925f0eaa4a1a5e91e272342bec38511247caa5a62712d16ed1d5b69f21b471b",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/functools": "f903e1ac1f8db134fc4b8440bf230b344ed1659dc66192daab63a94bc8b687f0",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/genericpath": "7274e8864b9f9a9dc3c05260f85f0c847004cb8129df0c1e3e48662538d7eb98",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/importlib": "16aa2699ff828cce6af58664a47ca1d69f4a89ef50cc3060e1812033b8a58120",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/importlib.machinery": "4e9982652a4324b6a4cb8067a3f47051975eedc0fcd9fa4a8d742befd76937ea",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/itertools": "2004f48a71e3425a7f4a2249f0dc7f6c84567298bf5fa37f9083e56ffe520c90",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/json": "585c0fe7e64b2cbebbc1a90d2985507cdedb11c1b270d00ac15a6ddef2c66674",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/json.decoder": "821713d33c7a8000438fa6f1abf096836ba8dc5fbdce292b2dcf5a30f6b0b29d",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/json.encoder": "292994f37c09570f68d9660064a88a8668c55bed137254f3c496a1d4254f94f4",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/json.scanner": "e7bc83b560dda4e8d007eb8b342f0f6989ff5233b78e05f5c0eac4698c9d9de3",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/keyword": "14a6905be4a0f4387ef9d7fee070f8e002da2b1dbf16d24130b69550d1b3c4e9",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/linecache": "50c058140b895606048f52cae8c6aedb392e251ce6fb17f03da6c5ea8aab23ff",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/operator": "167e3d1e80298f0c491caf27ff34c689103bd4ee94f6b3eba56aa7f4d6aa32d3",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/posix": "d3b7911543e58ccfce20230de40f2764284d91b1c11f405254294b0c83325e12",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/posixpath": "855ef925e36c9df7dfcc8bd832cb6ecf4de4c4c823cbbcd801be4d1fb27b69b9",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re": "d029407e29aae8120994f4b33ca618c1c831ecadf06cc835ca7443e5e4baa92f",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._casefix": "f377bb696ac1985838a89ab529b4bcfdfd4af109ef535bc4ef6675724b90b3b2",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._compiler": "ae52d6aa75b36524543a2149cfe01dc90c25e3ade3e2c0b3d2ffae52a796d16a",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._constants": "5ec7f0237131c983f5d8ce84bda62a29f5c350a82187dc7a73f166038ba242e0",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._engine": "df5e79f3b1dd6d579de344bf953868814404b6d41a184542723ce5310825f0f6",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/re._parser": "81b71690d1be6d2d2e1469f996a455005a92271e820853f413f8227387c67973",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/reprlib": "30ef91bc19f586807598c5a1736848926ef4d30d3ba03153801a70b1ba8e6709",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/site": "430c770641477a8c6a4fb56ee3066afb2972e21d700607de76367d0fb1c32f9d",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/stat": "9eeb8142fae305174af8733ada4d7a93fd8730fb75933874a53771d976796a5b",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/types": "44435a0a78072b28d38d302207915ec82b31f73075fcd39cf10f707a0aa20c60",
+          "8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce/weavepy/frozen-weavepy-314-53/zipimport": "b731ec4a8ab3686e1f90eff49314e09a2417489191ed95dd39003dda1e0c683a",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_collections": "fa365d9df04a1643a8842a6eb90f49708ef9efa9c6005f646e322d51a5fcc3ce",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_collections_abc": "146cf458a118e73e7e98e26ecb8fbf11bbe8ac9c508cd5aec86351f1df27ce49",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_contextvars": "2cc2dd878888ca872b0b0eebbf5edffe77fa02473dfa4d29cd314c1caff75493",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_frozen_importlib": "84b6d9b5c1c167f36ebbe784ec74ed0fba72c1fc166a5ed8370eca701ba25f6d",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_frozen_importlib_external": "74cef56966c3aec1e4d379afc3613988b5c6316cc8c1c8f40064815481ff8b2f",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_seqtools": "38bb1b3cf0dcceff2e00077689951e5b107ce0b74b848a929a1b709b0dc0d4bd",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_sitebuiltins": "d5b433cf9b5a1c974456e2ba26f62dddb59629dde0f270478d9a7787d366cdb6",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_types": "26b6b7606b67d98ed1d99f408a66ecd5cee5005515b6627357e9acd670fd822d",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weakrefset": "4fdbc7711145b9d26af119a3d9064498ccf520879226173a1cca30c555fe66e3",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_capsule": "175960799469bb8b42a0640a5eae8987dd1d6d712a30b221f4f67e19477c7c51",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_envinit": "12b3b7cb872733bebd6420e61f9f6646807a9ed49f07dcc63f62f8cce696b202",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_frame_locals": "a0f76740a5b3f148c27d4345e19f6690d52c42458594d97c415960d8f7ffc5d8",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_import_fallback": "137e28af0e1ac45f8b3ec522f33edb0a6ffb09f5391ce432efbe27c11374a790",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/_weave_spec": "915a1798990bc6423e596d77f5697abc8c99ca56792dac286f26dcdd00dda3c2",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/abc": "bc0c3a03efa2cc83e62d223b72e267c0ecc4d4f40f00eeaa988cbe33bf560494",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/codecs": "3ed201d65de41286076a6ba61dcd7c95ba0067e0c5894f6b1d3e8dd345da745b",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/collections": "3fd76b787f5892f60c1a1cf74d9135eb29780c2b17fdd25eb02e919dc759e542",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/contextvars": "6c03f23a47c540c8a22cdfe633c43a132cb9d218914f25d68b08859465a2c760",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/copyreg": "fcd878cbf5165e43dfa91b6e77c5928408b25b2de79093ef977eca4238263938",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/enum": "e925f0eaa4a1a5e91e272342bec38511247caa5a62712d16ed1d5b69f21b471b",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/functools": "f903e1ac1f8db134fc4b8440bf230b344ed1659dc66192daab63a94bc8b687f0",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/genericpath": "7274e8864b9f9a9dc3c05260f85f0c847004cb8129df0c1e3e48662538d7eb98",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/importlib": "16aa2699ff828cce6af58664a47ca1d69f4a89ef50cc3060e1812033b8a58120",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/importlib.machinery": "4e9982652a4324b6a4cb8067a3f47051975eedc0fcd9fa4a8d742befd76937ea",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/itertools": "2004f48a71e3425a7f4a2249f0dc7f6c84567298bf5fa37f9083e56ffe520c90",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/json": "585c0fe7e64b2cbebbc1a90d2985507cdedb11c1b270d00ac15a6ddef2c66674",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/json.decoder": "821713d33c7a8000438fa6f1abf096836ba8dc5fbdce292b2dcf5a30f6b0b29d",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/json.encoder": "292994f37c09570f68d9660064a88a8668c55bed137254f3c496a1d4254f94f4",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/json.scanner": "e7bc83b560dda4e8d007eb8b342f0f6989ff5233b78e05f5c0eac4698c9d9de3",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/keyword": "14a6905be4a0f4387ef9d7fee070f8e002da2b1dbf16d24130b69550d1b3c4e9",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/linecache": "50c058140b895606048f52cae8c6aedb392e251ce6fb17f03da6c5ea8aab23ff",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/operator": "167e3d1e80298f0c491caf27ff34c689103bd4ee94f6b3eba56aa7f4d6aa32d3",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/posix": "d3b7911543e58ccfce20230de40f2764284d91b1c11f405254294b0c83325e12",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/posixpath": "855ef925e36c9df7dfcc8bd832cb6ecf4de4c4c823cbbcd801be4d1fb27b69b9",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re": "d029407e29aae8120994f4b33ca618c1c831ecadf06cc835ca7443e5e4baa92f",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._casefix": "f377bb696ac1985838a89ab529b4bcfdfd4af109ef535bc4ef6675724b90b3b2",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._compiler": "ae52d6aa75b36524543a2149cfe01dc90c25e3ade3e2c0b3d2ffae52a796d16a",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._constants": "5ec7f0237131c983f5d8ce84bda62a29f5c350a82187dc7a73f166038ba242e0",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._engine": "df5e79f3b1dd6d579de344bf953868814404b6d41a184542723ce5310825f0f6",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/re._parser": "81b71690d1be6d2d2e1469f996a455005a92271e820853f413f8227387c67973",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/reprlib": "30ef91bc19f586807598c5a1736848926ef4d30d3ba03153801a70b1ba8e6709",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/site": "430c770641477a8c6a4fb56ee3066afb2972e21d700607de76367d0fb1c32f9d",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/stat": "9eeb8142fae305174af8733ada4d7a93fd8730fb75933874a53771d976796a5b",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/types": "44435a0a78072b28d38d302207915ec82b31f73075fcd39cf10f707a0aa20c60",
+          "b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c/weavepy/frozen-weavepy-314-53/zipimport": "b731ec4a8ab3686e1f90eff49314e09a2417489191ed95dd39003dda1e0c683a"
+        },
+        "unchanged": true
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 16.16110670691874,
+          "wall_ns": 9.743008083428133,
+          "cpu_ns": 10.11999719959861,
+          "rss_bytes": 1.927007299270073,
+          "work_cpu_ns": 16.149013417521704
+        },
+        "interp": {
+          "ns": 16.146589949838813,
+          "wall_ns": 9.766235193781046,
+          "cpu_ns": 10.144524048446945,
+          "rss_bytes": 1.792275574112735,
+          "work_cpu_ns": 16.149801744647107
+        }
+      },
+      "previous_comparisons": {
+        "jit": {
+          "ns": 0.9999320584601461,
+          "wall_ns": 0.9953212905551108,
+          "cpu_ns": 0.9944276552393715,
+          "rss_bytes": 1.0032502708559046,
+          "work_cpu_ns": 0.9992771884584579
+        },
+        "interp": {
+          "ns": 0.9932312081795269,
+          "wall_ns": 0.9889145229279682,
+          "cpu_ns": 0.9921086462977653,
+          "rss_bytes": 0.9994192799070848,
+          "work_cpu_ns": 0.9934049102199501
+        }
+      }
+    }
+  },
+  "verification": {
+    "slot_updates": {
+      "previous_jit": {
+        "returncode": 0,
+        "stdout": "[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n",
+        "stderr": ""
+      },
+      "previous_interp": {
+        "returncode": 0,
+        "stdout": "[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n",
+        "stderr": ""
+      },
+      "jit": {
+        "returncode": 0,
+        "stdout": "[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n",
+        "stderr": ""
+      }
+    },
+    "slot_reinsertion": {
+      "previous_jit": {
+        "returncode": 0,
+        "stdout": "[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n",
+        "stderr": ""
+      },
+      "previous_interp": {
+        "returncode": 0,
+        "stdout": "[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n",
+        "stderr": ""
+      },
+      "jit": {
+        "returncode": 0,
+        "stdout": "[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n[199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999, 199999]\n",
+        "stderr": ""
+      }
+    }
+  },
+  "frozen_caches": {
+    "previous_jit": "/Users/owencarey/Documents/weavefoundry/weavepy/target/gc-traversal-lists-setter-long-work/frozen/8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce",
+    "previous_interp": "/Users/owencarey/Documents/weavefoundry/weavepy/target/gc-traversal-lists-setter-long-work/frozen/8c8e8b5aa8a57c3f769b9dfa8f84e26fa93c698d0dcfa0cce5eafd8549e4e7ce",
+    "jit": "/Users/owencarey/Documents/weavefoundry/weavepy/target/gc-traversal-lists-setter-long-work/frozen/b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c",
+    "interp": "/Users/owencarey/Documents/weavefoundry/weavepy/target/gc-traversal-lists-setter-long-work/frozen/b9e580991c6ee99c0ac9700634d176d129d8cacbf2eb75a455b10f1216bbf60c"
+  },
+  "measurement_inputs": {
+    "tools/bench_compare.py": "1cdb0ae49378d06c26d61668e0004efd03c8e768bc87be57a60b56ea29df33d7",
+    "/Users/owencarey/Documents/weavefoundry/weavepy/target/check_datetime_components_isolated.py": "5406de7dbb99e2a83156ee6f8269ad737d95607fc2313abb69879ab5401261ae"
+  }
+}

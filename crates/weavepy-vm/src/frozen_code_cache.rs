@@ -174,7 +174,7 @@ pub fn get_disk(name: &str, source: &str, filename: &str) -> Option<CodeObject> 
     }
     match marshal_mod::load_from_bytes(&bytes[FROZEN_HEADER_LEN..]).ok()? {
         Object::Code(c) => {
-            let mut code = (*c).clone();
+            let mut code = crate::pycache::own_decoded_code(c);
             if code.filename != filename {
                 crate::pycache::rewrite_filenames(&mut code, filename);
             }

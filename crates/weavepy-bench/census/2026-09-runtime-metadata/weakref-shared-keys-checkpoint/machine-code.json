@@ -1,0 +1,797 @@
+{
+  "purpose": "Record static weakref factory/getter code and allocation bindings.",
+  "limits": "Static instructions are not execution times, dynamic counts, or measured RSS.",
+  "binaries": {
+    "before": {
+      "path": "target/release/weavepy-runtime-gc-borrowed-handles",
+      "sha256": "36989234372e807ab95dc79686d9e5dd3bb51b458a9f7a1d92992357c30373a0",
+      "nm_command": [
+        "xcrun",
+        "nm",
+        "-n",
+        "target/release/weavepy-runtime-gc-borrowed-handles"
+      ],
+      "nm_sha256": "950374c865b723d15810b0f414f240be72d35c79a4e4eae1f413f8e6ed529b04",
+      "functions": {
+        "make_ref_object_with_class": {
+          "symbol": "__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class",
+          "begin": 4306097016,
+          "end": 4306103192,
+          "bytes": 6176,
+          "command": [
+            "xcrun",
+            "llvm-objdump",
+            "--disassemble",
+            "--no-show-raw-insn",
+            "--start-address=0x100a9d378",
+            "--stop-address=0x100a9eb98",
+            "target/release/weavepy-runtime-gc-borrowed-handles"
+          ],
+          "sha256": "81674c5f57fb766f7b8400b0de0c24ea9e7b54238146daad6ac91be6f17c7567",
+          "direct_malloc_sites": [
+            {
+              "return_offset": 212,
+              "context": [
+                "100a9d434:     \tstp\tx28, x28, [sp, #0x190]",
+                "100a9d438:     \tstrb\twzr, [sp, #0x1a0]",
+                "100a9d43c:     \tstrb\tw24, [sp, #0x1a1]",
+                "100a9d440:     \tstrb\tw8, [sp, #0x1a2]",
+                "100a9d444:     \tmov\tw0, #0x78               ; =120",
+                "100a9d448:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9d44c:     \tcbz\tx0, 0x100a9e1f8 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xe80>"
+              ]
+            },
+            {
+              "return_offset": 416,
+              "context": [
+                "100a9d500:     \tadrp\tx8, 0x10261b000 <_anon.df712fbecb95671e907c51ef51acc9de.176+0x8>",
+                "100a9d504:     \tadd\tx8, x8, #0xc30",
+                "100a9d508:     \tldp\tq0, q1, [x8]",
+                "100a9d50c:     \tstp\tq0, q1, [sp, #0x170]",
+                "100a9d510:     \tmov\tw0, #0x60               ; =96",
+                "100a9d514:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9d518:     \tcbz\tx0, 0x100a9e208 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xe90>"
+              ]
+            },
+            {
+              "return_offset": 776,
+              "context": [
+                "100a9d668:     \tldr\tx8, [x25, #0x8]",
+                "100a9d66c:     \tadd\tx8, x8, #0x1",
+                "100a9d670:     \tstr\tx8, [x25, #0x8]",
+                "100a9d674:     \tmov\tw19, #0x18              ; =24",
+                "100a9d678:     \tmov\tw0, #0x18               ; =24",
+                "100a9d67c:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9d680:     \tcmp\tx0, #0x0"
+              ]
+            },
+            {
+              "return_offset": 852,
+              "context": [
+                "100a9d6b4:     \tstrb\tw8, [sp, #0xf8]",
+                "100a9d6b8:     \tmov\tw8, #0x8                ; =8",
+                "100a9d6bc:     \tstp\tx0, x8, [sp, #0x100]",
+                "100a9d6c0:     \tstr\tx22, [sp, #0x130]",
+                "100a9d6c4:     \tmov\tw0, #0x8                ; =8",
+                "100a9d6c8:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9d6cc:     \tcbz\tx0, 0x100a9e21c <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xea4>"
+              ]
+            },
+            {
+              "return_offset": 916,
+              "context": [
+                "100a9d6f4:     \tadd\tx8, x8, #0x830",
+                "100a9d6f8:     \tstp\tx0, x8, [sp, #0x150]",
+                "100a9d6fc:     \tstr\txzr, [sp, #0x160]",
+                "100a9d700:     \tstrb\twzr, [sp, #0x170]",
+                "100a9d704:     \tmov\tw0, #0x48               ; =72",
+                "100a9d708:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9d70c:     \tcbz\tx0, 0x100a9e22c <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xeb4>"
+              ]
+            },
+            {
+              "return_offset": 1124,
+              "context": [
+                "100a9d7c4:     \tmov\tw21, #0x1               ; =1",
+                "100a9d7c8:     \tmov\tw26, #0x1               ; =1",
+                "100a9d7cc:     \tbl\t0x10060cc04 <__RINvNtCs8Mbv00yxnRz_4core3ptr9drop_glueNtNtCshqYhlee0Vj9_10weavepy_vm6object6ObjectEBF_>",
+                "100a9d7d0:     \tmov\tw19, #0x20              ; =32",
+                "100a9d7d4:     \tmov\tw0, #0x20               ; =32",
+                "100a9d7d8:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9d7dc:     \tcbz\tx0, 0x100a9e1d8 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xe60>"
+              ]
+            },
+            {
+              "return_offset": 1192,
+              "context": [
+                "100a9d808:     \tstrb\tw8, [sp, #0xf8]",
+                "100a9d80c:     \tmov\tw8, #0xf                ; =15",
+                "100a9d810:     \tstp\tx0, x8, [sp, #0x100]",
+                "100a9d814:     \tstr\tx22, [sp, #0x130]",
+                "100a9d818:     \tmov\tw0, #0x8                ; =8",
+                "100a9d81c:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9d820:     \tcbz\tx0, 0x100a9e240 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xec8>"
+              ]
+            },
+            {
+              "return_offset": 1248,
+              "context": [
+                "100a9d840:     \tadd\tx8, x8, #0x770",
+                "100a9d844:     \tstp\tx0, x8, [sp, #0x150]",
+                "100a9d848:     \tstr\txzr, [sp, #0x160]",
+                "100a9d84c:     \tstrb\twzr, [sp, #0x170]",
+                "100a9d850:     \tmov\tw0, #0x48               ; =72",
+                "100a9d854:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9d858:     \tcbz\tx0, 0x100a9e250 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xed8>"
+              ]
+            },
+            {
+              "return_offset": 1448,
+              "context": [
+                "100a9d908:     \tadd\tx0, sp, #0x50",
+                "100a9d90c:     \tmov\tw21, #0x1               ; =1",
+                "100a9d910:     \tmov\tw26, #0x1               ; =1",
+                "100a9d914:     \tbl\t0x10060cc04 <__RINvNtCs8Mbv00yxnRz_4core3ptr9drop_glueNtNtCshqYhlee0Vj9_10weavepy_vm6object6ObjectEBF_>",
+                "100a9d918:     \tmov\tw0, #0x20               ; =32",
+                "100a9d91c:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9d920:     \tcbz\tx0, 0x100a9e3d0 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x1058>"
+              ]
+            },
+            {
+              "return_offset": 1516,
+              "context": [
+                "100a9d94c:     \tstrb\tw8, [sp, #0xf8]",
+                "100a9d950:     \tmov\tw8, #0x9                ; =9",
+                "100a9d954:     \tstp\tx0, x8, [sp, #0x100]",
+                "100a9d958:     \tstp\tx22, x28, [sp, #0x130]",
+                "100a9d95c:     \tmov\tw0, #0x10               ; =16",
+                "100a9d960:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9d964:     \tcbz\tx0, 0x100a9e264 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xeec>"
+              ]
+            },
+            {
+              "return_offset": 1572,
+              "context": [
+                "100a9d984:     \tadd\tx8, x8, #0x7a0",
+                "100a9d988:     \tstp\tx0, x8, [sp, #0x150]",
+                "100a9d98c:     \tstr\txzr, [sp, #0x160]",
+                "100a9d990:     \tstrb\twzr, [sp, #0x170]",
+                "100a9d994:     \tmov\tw0, #0x48               ; =72",
+                "100a9d998:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9d99c:     \tcbz\tx0, 0x100a9e274 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xefc>"
+              ]
+            },
+            {
+              "return_offset": 1772,
+              "context": [
+                "100a9da4c:     \tmov\tw27, #0x0               ; =0",
+                "100a9da50:     \tadd\tx0, sp, #0x50",
+                "100a9da54:     \tmov\tw26, #0x1               ; =1",
+                "100a9da58:     \tbl\t0x10060cc04 <__RINvNtCs8Mbv00yxnRz_4core3ptr9drop_glueNtNtCshqYhlee0Vj9_10weavepy_vm6object6ObjectEBF_>",
+                "100a9da5c:     \tmov\tw0, #0x20               ; =32",
+                "100a9da60:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9da64:     \tcbz\tx0, 0x100a9e3f0 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x1078>"
+              ]
+            },
+            {
+              "return_offset": 1840,
+              "context": [
+                "100a9da90:     \tstrb\tw8, [sp, #0xf8]",
+                "100a9da94:     \tmov\tw8, #0x9                ; =9",
+                "100a9da98:     \tstp\tx0, x8, [sp, #0x100]",
+                "100a9da9c:     \tstr\tx22, [sp, #0x130]",
+                "100a9daa0:     \tmov\tw0, #0x8                ; =8",
+                "100a9daa4:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9daa8:     \tcbz\tx0, 0x100a9e28c <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xf14>"
+              ]
+            },
+            {
+              "return_offset": 1896,
+              "context": [
+                "100a9dac8:     \tadd\tx8, x8, #0x7d0",
+                "100a9dacc:     \tstp\tx0, x8, [sp, #0x150]",
+                "100a9dad0:     \tstr\txzr, [sp, #0x160]",
+                "100a9dad4:     \tstrb\twzr, [sp, #0x170]",
+                "100a9dad8:     \tmov\tw0, #0x48               ; =72",
+                "100a9dadc:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9dae0:     \tcbz\tx0, 0x100a9e2a0 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xf28>"
+              ]
+            },
+            {
+              "return_offset": 2096,
+              "context": [
+                "100a9db90:     \tmov\tw27, #0x0               ; =0",
+                "100a9db94:     \tmov\tw21, #0x0               ; =0",
+                "100a9db98:     \tadd\tx0, sp, #0x50",
+                "100a9db9c:     \tbl\t0x10060cc04 <__RINvNtCs8Mbv00yxnRz_4core3ptr9drop_glueNtNtCshqYhlee0Vj9_10weavepy_vm6object6ObjectEBF_>",
+                "100a9dba0:     \tmov\tw0, #0x18               ; =24",
+                "100a9dba4:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9dba8:     \tcbz\tx0, 0x100a9e410 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x1098>"
+              ]
+            },
+            {
+              "return_offset": 2160,
+              "context": [
+                "100a9dbd0:     \tstrb\tw8, [sp, #0xf8]",
+                "100a9dbd4:     \tmov\tw8, #0x8                ; =8",
+                "100a9dbd8:     \tstp\tx0, x8, [sp, #0x100]",
+                "100a9dbdc:     \tstr\tx22, [sp, #0x130]",
+                "100a9dbe0:     \tmov\tw0, #0x8                ; =8",
+                "100a9dbe4:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9dbe8:     \tcbz\tx0, 0x100a9e2b8 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xf40>"
+              ]
+            },
+            {
+              "return_offset": 2224,
+              "context": [
+                "100a9dc10:     \tadd\tx8, x8, #0x800",
+                "100a9dc14:     \tstp\tx0, x8, [sp, #0x150]",
+                "100a9dc18:     \tstr\txzr, [sp, #0x160]",
+                "100a9dc1c:     \tstrb\twzr, [sp, #0x170]",
+                "100a9dc20:     \tmov\tw0, #0x48               ; =72",
+                "100a9dc24:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9dc28:     \tcbz\tx0, 0x100a9e2cc <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xf54>"
+              ]
+            },
+            {
+              "return_offset": 2448,
+              "context": [
+                "100a9dcf0:     \tldr\tq0, [x24]",
+                "100a9dcf4:     \tstr\tq0, [sp, #0xe0]",
+                "100a9dcf8:     \tldr\tx8, [sp, #0xd8]",
+                "100a9dcfc:     \tstr\tx8, [sp, #0xf0]",
+                "100a9dd00:     \tmov\tw0, #0x20               ; =32",
+                "100a9dd04:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9dd08:     \tldr\tx28, [sp, #0x30]"
+              ]
+            },
+            {
+              "return_offset": 2660,
+              "context": [
+                "100a9ddc4:     \tb.eq\t0x100a9dea4 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xb2c>",
+                "100a9ddc8:     \tadd\tx0, sp, #0x50",
+                "100a9ddcc:     \tbl\t0x10060cc04 <__RINvNtCs8Mbv00yxnRz_4core3ptr9drop_glueNtNtCshqYhlee0Vj9_10weavepy_vm6object6ObjectEBF_>",
+                "100a9ddd0:     \tb\t0x100a9dea4 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xb2c>",
+                "100a9ddd4:     \tmov\tw0, #0x20               ; =32",
+                "100a9ddd8:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9dddc:     \tcbz\tx0, 0x100a9e2fc <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xf84>"
+              ]
+            },
+            {
+              "return_offset": 2868,
+              "context": [
+                "100a9de94:     \tmov\tw21, #0x0               ; =0",
+                "100a9de98:     \tmov\tw26, #0x0               ; =0",
+                "100a9de9c:     \tadd\tx0, sp, #0x50",
+                "100a9dea0:     \tbl\t0x10060cc04 <__RINvNtCs8Mbv00yxnRz_4core3ptr9drop_glueNtNtCshqYhlee0Vj9_10weavepy_vm6object6ObjectEBF_>",
+                "100a9dea4:     \tmov\tw0, #0x20               ; =32",
+                "100a9dea8:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9deac:     \tcbz\tx0, 0x100a9e2fc <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xf84>"
+              ]
+            },
+            {
+              "return_offset": 3208,
+              "context": [
+                "100a9dfe8:     \tldr\tq0, [x9, #0xf50]",
+                "100a9dfec:     \tadd\tx9, sp, #0xd9",
+                "100a9dff0:     \tstur\tq0, [x9, #0xff]",
+                "100a9dff4:     \tstrh\tw8, [sp, #0x1e8]",
+                "100a9dff8:     \tmov\tw0, #0xc0               ; =192",
+                "100a9dffc:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9e000:     \tcbz\tx0, 0x100a9e2e4 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xf6c>"
+              ]
+            }
+          ]
+        },
+        "ref_type_call": {
+          "symbol": "__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real13ref_type_call",
+          "begin": 4306076340,
+          "end": 4306077320,
+          "bytes": 980,
+          "command": [
+            "xcrun",
+            "llvm-objdump",
+            "--disassemble",
+            "--no-show-raw-insn",
+            "--start-address=0x100a982b4",
+            "--stop-address=0x100a98688",
+            "target/release/weavepy-runtime-gc-borrowed-handles"
+          ],
+          "sha256": "d995290872e34e7bd99f5c4458e1922d0dcc281b0e84d70a3b4360baa51f64a8",
+          "direct_malloc_sites": [
+            {
+              "return_offset": 148,
+              "context": [
+                "100a98330:     \tstr\tx8, [x21]",
+                "100a98334:     \tldr\tx8, [x20, #0x8]",
+                "100a98338:     \tadd\tx8, x8, #0x1",
+                "100a9833c:     \tstr\tx8, [x20, #0x8]",
+                "100a98340:     \tmov\tw0, #0x20               ; =32",
+                "100a98344:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a98348:     \tcbz\tx0, 0x100a98548 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real13ref_type_call+0x294>"
+              ]
+            }
+          ]
+        },
+        "wrapper_referent": {
+          "symbol": "__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real16wrapper_referent",
+          "begin": 4306086940,
+          "end": 4306088464,
+          "bytes": 1524,
+          "command": [
+            "xcrun",
+            "llvm-objdump",
+            "--disassemble",
+            "--no-show-raw-insn",
+            "--start-address=0x100a9ac1c",
+            "--stop-address=0x100a9b210",
+            "target/release/weavepy-runtime-gc-borrowed-handles"
+          ],
+          "sha256": "ddb2178cb3aa328a9e7f80321b3d2e53fd0dc2b0516fd364110541e72ddd8960",
+          "direct_malloc_sites": [
+            {
+              "return_offset": 160,
+              "context": [
+                "100a9aca4:     \tstr\tx8, [x21]",
+                "100a9aca8:     \tldr\tx8, [x20, #0x8]",
+                "100a9acac:     \tadd\tx8, x8, #0x1",
+                "100a9acb0:     \tstr\tx8, [x20, #0x8]",
+                "100a9acb4:     \tmov\tw0, #0x20               ; =32",
+                "100a9acb8:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a9acbc:     \tcbz\tx0, 0x100a9b0b0 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real16wrapper_referent+0x494>"
+              ]
+            }
+          ]
+        },
+        "ref_callback_get": {
+          "symbol": "__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real16ref_callback_get",
+          "begin": 4306083044,
+          "end": 4306083708,
+          "bytes": 664,
+          "command": [
+            "xcrun",
+            "llvm-objdump",
+            "--disassemble",
+            "--no-show-raw-insn",
+            "--start-address=0x100a99ce4",
+            "--stop-address=0x100a99f7c",
+            "target/release/weavepy-runtime-gc-borrowed-handles"
+          ],
+          "sha256": "502cecc0fab0b77991bf5f658c42483c9ba2800c9f2dc519d917dae1bd43d489",
+          "direct_malloc_sites": [
+            {
+              "return_offset": 236,
+              "context": [
+                "100a99db8:     \tstr\tx8, [x19]",
+                "100a99dbc:     \tldr\tx8, [x20, #0x8]",
+                "100a99dc0:     \tadd\tx8, x8, #0x1",
+                "100a99dc4:     \tstr\tx8, [x20, #0x8]",
+                "100a99dc8:     \tmov\tw0, #0x20               ; =32",
+                "100a99dcc:     \tbl\t0x10100f68c <dyld_stub_binder+0x10100f68c>",
+                "100a99dd0:     \tcbz\tx0, 0x100a99ecc <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real16ref_callback_get+0x1e8>"
+              ]
+            }
+          ]
+        }
+      },
+      "bindings_command": [
+        "xcrun",
+        "llvm-objdump",
+        "--macho",
+        "--indirect-symbols",
+        "target/release/weavepy-runtime-gc-borrowed-handles"
+      ],
+      "malloc_stubs": [
+        "0x10100f68c",
+        "0x1025c8058",
+        "0x102668618"
+      ]
+    },
+    "after": {
+      "path": "target/release/weavepy-runtime-weakref-shared-keys",
+      "sha256": "8899e3679267f571bc5d50167197c8a558e19c5f3278bf3e74df0a8607213284",
+      "nm_command": [
+        "xcrun",
+        "nm",
+        "-n",
+        "target/release/weavepy-runtime-weakref-shared-keys"
+      ],
+      "nm_sha256": "0260df9b25ca0ef4d02bdd7ec82a308d43dab579b3d7ae7b5a214e2d5b92df3f",
+      "functions": {
+        "make_ref_object_with_class": {
+          "symbol": "__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class",
+          "begin": 4306095776,
+          "end": 4306103072,
+          "bytes": 7296,
+          "command": [
+            "xcrun",
+            "llvm-objdump",
+            "--disassemble",
+            "--no-show-raw-insn",
+            "--start-address=0x100a9cea0",
+            "--stop-address=0x100a9eb20",
+            "target/release/weavepy-runtime-weakref-shared-keys"
+          ],
+          "sha256": "041e7ef40810ad03a5962d5512b49e0113575e27c62cea3df68bb7d9c82c350b",
+          "direct_malloc_sites": [
+            {
+              "return_offset": 208,
+              "context": [
+                "100a9cf58:     \tstp\tx19, x19, [sp, #0x1a0]",
+                "100a9cf5c:     \tstrb\twzr, [sp, #0x1b0]",
+                "100a9cf60:     \tstrb\tw25, [sp, #0x1b1]",
+                "100a9cf64:     \tstrb\tw8, [sp, #0x1b2]",
+                "100a9cf68:     \tmov\tw0, #0x78               ; =120",
+                "100a9cf6c:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9cf70:     \tcbz\tx0, 0x100a9d940 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xaa0>"
+              ]
+            },
+            {
+              "return_offset": 412,
+              "context": [
+                "100a9d024:     \tadrp\tx8, 0x10261b000 <_anon.4a648d71e3f4ceef3490e5ee9c9cf32f.176+0x8>",
+                "100a9d028:     \tadd\tx8, x8, #0xc30",
+                "100a9d02c:     \tldp\tq0, q1, [x8]",
+                "100a9d030:     \tstp\tq0, q1, [sp, #0x180]",
+                "100a9d034:     \tmov\tw0, #0x60               ; =96",
+                "100a9d038:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9d03c:     \tcbz\tx0, 0x100a9d950 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xab0>"
+              ]
+            },
+            {
+              "return_offset": 868,
+              "context": [
+                "100a9d1ec:     \tstur\tq0, [x24, #0x31]",
+                "100a9d1f0:     \tldur\tx8, [sp, #0x6f]",
+                "100a9d1f4:     \tstr\tx8, [sp, #0x118]",
+                "100a9d1f8:     \tstr\tx22, [sp, #0x140]",
+                "100a9d1fc:     \tmov\tw0, #0x8                ; =8",
+                "100a9d200:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9d204:     \tcbz\tx0, 0x100a9daf0 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xc50>"
+              ]
+            },
+            {
+              "return_offset": 932,
+              "context": [
+                "100a9d22c:     \tadd\tx8, x8, #0x830",
+                "100a9d230:     \tstp\tx0, x8, [sp, #0x160]",
+                "100a9d234:     \tstr\txzr, [sp, #0x170]",
+                "100a9d238:     \tstrb\twzr, [sp, #0x180]",
+                "100a9d23c:     \tmov\tw0, #0x48               ; =72",
+                "100a9d240:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9d244:     \tcbz\tx0, 0x100a9d964 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xac4>"
+              ]
+            },
+            {
+              "return_offset": 1228,
+              "context": [
+                "100a9d354:     \tstur\tq0, [x24, #0x31]",
+                "100a9d358:     \tldur\tx8, [sp, #0x6f]",
+                "100a9d35c:     \tstr\tx8, [sp, #0x118]",
+                "100a9d360:     \tstr\tx22, [sp, #0x140]",
+                "100a9d364:     \tmov\tw0, #0x8                ; =8",
+                "100a9d368:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9d36c:     \tcbz\tx0, 0x100a9db6c <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xccc>"
+              ]
+            },
+            {
+              "return_offset": 1284,
+              "context": [
+                "100a9d38c:     \tadd\tx8, x8, #0x770",
+                "100a9d390:     \tstp\tx0, x8, [sp, #0x160]",
+                "100a9d394:     \tstr\txzr, [sp, #0x170]",
+                "100a9d398:     \tstrb\twzr, [sp, #0x180]",
+                "100a9d39c:     \tmov\tw0, #0x48               ; =72",
+                "100a9d3a0:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9d3a4:     \tcbz\tx0, 0x100a9d978 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xad8>"
+              ]
+            },
+            {
+              "return_offset": 1580,
+              "context": [
+                "100a9d4b4:     \tstur\tq0, [x24, #0x31]",
+                "100a9d4b8:     \tldur\tx8, [sp, #0x6f]",
+                "100a9d4bc:     \tstr\tx8, [sp, #0x118]",
+                "100a9d4c0:     \tstp\tx22, x19, [sp, #0x140]",
+                "100a9d4c4:     \tmov\tw0, #0x10               ; =16",
+                "100a9d4c8:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9d4cc:     \tcbz\tx0, 0x100a9dbec <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xd4c>"
+              ]
+            },
+            {
+              "return_offset": 1636,
+              "context": [
+                "100a9d4ec:     \tadd\tx8, x8, #0x7a0",
+                "100a9d4f0:     \tstp\tx0, x8, [sp, #0x160]",
+                "100a9d4f4:     \tstr\txzr, [sp, #0x170]",
+                "100a9d4f8:     \tstrb\twzr, [sp, #0x180]",
+                "100a9d4fc:     \tmov\tw0, #0x48               ; =72",
+                "100a9d500:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9d504:     \tcbz\tx0, 0x100a9d98c <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xaec>"
+              ]
+            },
+            {
+              "return_offset": 1928,
+              "context": [
+                "100a9d610:     \tstur\tq0, [x24, #0x31]",
+                "100a9d614:     \tldur\tx8, [sp, #0x6f]",
+                "100a9d618:     \tstr\tx8, [sp, #0x118]",
+                "100a9d61c:     \tstr\tx22, [sp, #0x140]",
+                "100a9d620:     \tmov\tw0, #0x8                ; =8",
+                "100a9d624:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9d628:     \tcbz\tx0, 0x100a9dc68 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xdc8>"
+              ]
+            },
+            {
+              "return_offset": 1984,
+              "context": [
+                "100a9d648:     \tadd\tx8, x8, #0x7d0",
+                "100a9d64c:     \tstp\tx0, x8, [sp, #0x160]",
+                "100a9d650:     \tstr\txzr, [sp, #0x170]",
+                "100a9d654:     \tstrb\twzr, [sp, #0x180]",
+                "100a9d658:     \tmov\tw0, #0x48               ; =72",
+                "100a9d65c:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9d660:     \tcbz\tx0, 0x100a9d9a0 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xb00>"
+              ]
+            },
+            {
+              "return_offset": 2268,
+              "context": [
+                "100a9d764:     \tstur\tq0, [x24, #0x31]",
+                "100a9d768:     \tldur\tx8, [sp, #0x6f]",
+                "100a9d76c:     \tstr\tx8, [sp, #0x118]",
+                "100a9d770:     \tstr\tx22, [sp, #0x140]",
+                "100a9d774:     \tmov\tw0, #0x8                ; =8",
+                "100a9d778:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9d77c:     \tcbz\tx0, 0x100a9dce8 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xe48>"
+              ]
+            },
+            {
+              "return_offset": 2332,
+              "context": [
+                "100a9d7a4:     \tadd\tx8, x8, #0x800",
+                "100a9d7a8:     \tstp\tx0, x8, [sp, #0x160]",
+                "100a9d7ac:     \tstr\txzr, [sp, #0x170]",
+                "100a9d7b0:     \tstrb\twzr, [sp, #0x180]",
+                "100a9d7b4:     \tmov\tw0, #0x48               ; =72",
+                "100a9d7b8:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9d7bc:     \tcbz\tx0, 0x100a9d9b4 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xb14>"
+              ]
+            },
+            {
+              "return_offset": 3084,
+              "context": [
+                "100a9da94:     \tbl\t0x100fc67e4 <__RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_>",
+                "100a9da98:     \tmov\tx1, x0",
+                "100a9da9c:     \tmov\tx19, x27",
+                "100a9daa0:     \tcbnz\tx1, 0x100a9d1c0 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x320>",
+                "100a9daa4:     \tmov\tw0, #0x18               ; =24",
+                "100a9daa8:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9daac:     \tcbz\tx0, 0x100a9de3c <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xf9c>"
+              ]
+            },
+            {
+              "return_offset": 3148,
+              "context": [
+                "100a9dad4:     \tstrb\tw8, [sp, #0x108]",
+                "100a9dad8:     \tmov\tw8, #0x8                ; =8",
+                "100a9dadc:     \tstp\tx0, x8, [sp, #0x110]",
+                "100a9dae0:     \tstr\tx22, [sp, #0x140]",
+                "100a9dae4:     \tmov\tw0, #0x8                ; =8",
+                "100a9dae8:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9daec:     \tcbnz\tx0, 0x100a9d208 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x368>"
+              ]
+            },
+            {
+              "return_offset": 3212,
+              "context": [
+                "100a9db14:     \tmov\tx0, x28",
+                "100a9db18:     \tbl\t0x100fc67e4 <__RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_>",
+                "100a9db1c:     \tmov\tx8, x0",
+                "100a9db20:     \tcbnz\tx0, 0x100a9d324 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x484>",
+                "100a9db24:     \tmov\tw0, #0x20               ; =32",
+                "100a9db28:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9db2c:     \tcbz\tx0, 0x100a9de60 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xfc0>"
+              ]
+            },
+            {
+              "return_offset": 3272,
+              "context": [
+                "100a9db50:     \tstrb\tw8, [sp, #0x108]",
+                "100a9db54:     \tmov\tw8, #0xf                ; =15",
+                "100a9db58:     \tstp\tx0, x8, [sp, #0x110]",
+                "100a9db5c:     \tstr\tx22, [sp, #0x140]",
+                "100a9db60:     \tmov\tw0, #0x8                ; =8",
+                "100a9db64:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9db68:     \tcbnz\tx0, 0x100a9d370 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x4d0>"
+              ]
+            },
+            {
+              "return_offset": 3340,
+              "context": [
+                "100a9db94:     \tbl\t0x100fc67e4 <__RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_>",
+                "100a9db98:     \tmov\tx8, x0",
+                "100a9db9c:     \tldr\tx19, [sp, #0x30]",
+                "100a9dba0:     \tcbnz\tx0, 0x100a9d484 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x5e4>",
+                "100a9dba4:     \tmov\tw0, #0x20               ; =32",
+                "100a9dba8:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9dbac:     \tcbz\tx0, 0x100a9de84 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xfe4>"
+              ]
+            },
+            {
+              "return_offset": 3400,
+              "context": [
+                "100a9dbd0:     \tstrb\tw8, [sp, #0x108]",
+                "100a9dbd4:     \tmov\tw8, #0x9                ; =9",
+                "100a9dbd8:     \tstp\tx0, x8, [sp, #0x110]",
+                "100a9dbdc:     \tstp\tx22, x19, [sp, #0x140]",
+                "100a9dbe0:     \tmov\tw0, #0x10               ; =16",
+                "100a9dbe4:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9dbe8:     \tcbnz\tx0, 0x100a9d4d0 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x630>"
+              ]
+            },
+            {
+              "return_offset": 3464,
+              "context": [
+                "100a9dc10:     \tmov\tx0, x28",
+                "100a9dc14:     \tbl\t0x100fc67e4 <__RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_>",
+                "100a9dc18:     \tmov\tx8, x0",
+                "100a9dc1c:     \tcbnz\tx0, 0x100a9d5e0 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x740>",
+                "100a9dc20:     \tmov\tw0, #0x20               ; =32",
+                "100a9dc24:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9dc28:     \tcbz\tx0, 0x100a9dea8 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x1008>"
+              ]
+            },
+            {
+              "return_offset": 3524,
+              "context": [
+                "100a9dc4c:     \tstrb\tw8, [sp, #0x108]",
+                "100a9dc50:     \tmov\tw8, #0x9                ; =9",
+                "100a9dc54:     \tstp\tx0, x8, [sp, #0x110]",
+                "100a9dc58:     \tstr\tx22, [sp, #0x140]",
+                "100a9dc5c:     \tmov\tw0, #0x8                ; =8",
+                "100a9dc60:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9dc64:     \tcbnz\tx0, 0x100a9d62c <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x78c>"
+              ]
+            },
+            {
+              "return_offset": 3588,
+              "context": [
+                "100a9dc8c:     \tmov\tx0, x28",
+                "100a9dc90:     \tbl\t0x100fc67e4 <__RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_>",
+                "100a9dc94:     \tmov\tx8, x0",
+                "100a9dc98:     \tcbnz\tx0, 0x100a9d734 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x894>",
+                "100a9dc9c:     \tmov\tw0, #0x18               ; =24",
+                "100a9dca0:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9dca4:     \tcbz\tx0, 0x100a9decc <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x102c>"
+              ]
+            },
+            {
+              "return_offset": 3652,
+              "context": [
+                "100a9dccc:     \tstrb\tw8, [sp, #0x108]",
+                "100a9dcd0:     \tmov\tw8, #0x8                ; =8",
+                "100a9dcd4:     \tstp\tx0, x8, [sp, #0x110]",
+                "100a9dcd8:     \tstr\tx22, [sp, #0x140]",
+                "100a9dcdc:     \tmov\tw0, #0x8                ; =8",
+                "100a9dce0:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9dce4:     \tcbnz\tx0, 0x100a9d780 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x8e0>"
+              ]
+            },
+            {
+              "return_offset": 3752,
+              "context": [
+                "100a9dd30:     \tmov\tx0, x28",
+                "100a9dd34:     \tbl\t0x100fc67e4 <__RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_>",
+                "100a9dd38:     \tmov\tx8, x0",
+                "100a9dd3c:     \tcbnz\tx0, 0x100a9d8b8 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xa18>",
+                "100a9dd40:     \tmov\tw0, #0x20               ; =32",
+                "100a9dd44:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9dd48:     \tcbz\tx0, 0x100a9e47c <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x15dc>"
+              ]
+            },
+            {
+              "return_offset": 4220,
+              "context": [
+                "100a9df04:     \tmov\tx0, x28",
+                "100a9df08:     \tbl\t0x100fc67e4 <__RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_>",
+                "100a9df0c:     \tmov\tx8, x0",
+                "100a9df10:     \tcbnz\tx0, 0x100a9d904 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0xa64>",
+                "100a9df14:     \tmov\tw0, #0x20               ; =32",
+                "100a9df18:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9df1c:     \tcbz\tx0, 0x100a9e444 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x15a4>"
+              ]
+            },
+            {
+              "return_offset": 4560,
+              "context": [
+                "100a9e058:     \tmov\tx0, x28",
+                "100a9e05c:     \tbl\t0x100fc67e4 <__RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_>",
+                "100a9e060:     \tmov\tx28, x0",
+                "100a9e064:     \tcbnz\tx0, 0x100a9e008 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x1168>",
+                "100a9e068:     \tmov\tw0, #0x20               ; =32",
+                "100a9e06c:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9e070:     \tcbz\tx0, 0x100a9e444 <__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+0x15a4>"
+              ]
+            },
+            {
+              "return_offset": 4928,
+              "context": [
+                "100a9e1c8:     \tldr\tq0, [x9, #0xf50]",
+                "100a9e1cc:     \tadd\tx9, sp, #0xe9",
+                "100a9e1d0:     \tstur\tq0, [x9, #0xff]",
+                "100a9e1d4:     \tstrh\tw8, [sp, #0x1f8]",
+                "100a9e1d8:     \tmov\tw0, #0xc0               ; =192",
+                "100a9e1dc:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+                "100a9e1e0:     \tldr\tx27, [sp, #0x40]"
+              ]
+            }
+          ]
+        },
+        "ref_type_call": {
+          "symbol": "__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real13ref_type_call",
+          "begin": 4306075996,
+          "end": 4306076756,
+          "bytes": 760,
+          "command": [
+            "xcrun",
+            "llvm-objdump",
+            "--disassemble",
+            "--no-show-raw-insn",
+            "--start-address=0x100a9815c",
+            "--stop-address=0x100a98454",
+            "target/release/weavepy-runtime-weakref-shared-keys"
+          ],
+          "sha256": "c4c6aaee6edd059ae6bc705cf3f5665b7f2f9a6d12c16d09fe20011fefe5a27f",
+          "direct_malloc_sites": []
+        },
+        "wrapper_referent": {
+          "symbol": "__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real16wrapper_referent",
+          "begin": 4306086256,
+          "end": 4306087224,
+          "bytes": 968,
+          "command": [
+            "xcrun",
+            "llvm-objdump",
+            "--disassemble",
+            "--no-show-raw-insn",
+            "--start-address=0x100a9a970",
+            "--stop-address=0x100a9ad38",
+            "target/release/weavepy-runtime-weakref-shared-keys"
+          ],
+          "sha256": "a5f0977f6ca0a836219ee1207bafe567f66417e8ab780f3d964b4fa4d48efcf2",
+          "direct_malloc_sites": []
+        },
+        "ref_callback_get": {
+          "symbol": "__RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real16ref_callback_get",
+          "begin": 4306082480,
+          "end": 4306083024,
+          "bytes": 544,
+          "command": [
+            "xcrun",
+            "llvm-objdump",
+            "--disassemble",
+            "--no-show-raw-insn",
+            "--start-address=0x100a99ab0",
+            "--stop-address=0x100a99cd0",
+            "target/release/weavepy-runtime-weakref-shared-keys"
+          ],
+          "sha256": "80fc889de4882cef969af1c22a067dd89d1a1edf7df9ef2b891339c2c7210e8b",
+          "direct_malloc_sites": []
+        }
+      },
+      "bindings_command": [
+        "xcrun",
+        "llvm-objdump",
+        "--macho",
+        "--indirect-symbols",
+        "target/release/weavepy-runtime-weakref-shared-keys"
+      ],
+      "malloc_stubs": [
+        "0x10100f90c",
+        "0x1025c8058",
+        "0x102668618"
+      ]
+    }
+  }
+}

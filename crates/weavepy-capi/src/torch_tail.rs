@@ -206,7 +206,7 @@ pub unsafe extern "C" fn PyCode_GetVarnames(code: *mut PyObject) -> *mut PyObjec
         .iter()
         .map(|s| Object::from_str(s.clone()))
         .collect();
-    into_owned(Object::Tuple(weavepy_vm::sync::Rc::from(items)))
+    into_owned(Object::new_tuple(items))
 }
 
 // ---------------------------------------------------------------------------

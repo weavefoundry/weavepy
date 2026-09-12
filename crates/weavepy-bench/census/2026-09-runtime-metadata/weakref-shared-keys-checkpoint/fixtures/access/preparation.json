@@ -1,0 +1,54 @@
+{
+  "purpose": "Draft generator for weakref storage, lookup, and construction controls.",
+  "work": 100000,
+  "rows": {
+    "ordinary_attr": {
+      "path": "target/weakref-shared-keys-inputs/access/ordinary_attr.py",
+      "source_sha256": "ae602dd1b26e11b14720acb224d1886ce6f969fb1b35ab595f73df43244b6468",
+      "driver": "target/weakref-shared-keys-inputs/access/ordinary_attr-verify.py",
+      "driver_sha256": "b1c966864e752e116a7dfe4d1652466168bdb8d802245447c8c6eacfe48130f3"
+    },
+    "ref_call": {
+      "path": "target/weakref-shared-keys-inputs/access/ref_call.py",
+      "source_sha256": "8f48c8e2e03012ec17bfc7fe06c55d0ed4fb48ef23747eba94c68b619683a260",
+      "driver": "target/weakref-shared-keys-inputs/access/ref_call-verify.py",
+      "driver_sha256": "955bd94a2ad967c2c28f7498973c8845d0fbcff6d2912379d54e84fbfe7949cb"
+    },
+    "ref_explicit_call": {
+      "path": "target/weakref-shared-keys-inputs/access/ref_explicit_call.py",
+      "source_sha256": "b0a8caab4e15740f231e59e49980e110dda6b3b2276a81956308e21afcdb83c6",
+      "driver": "target/weakref-shared-keys-inputs/access/ref_explicit_call-verify.py",
+      "driver_sha256": "e54fa1566417fd3e094bfb7ce0464ffc5f6f3adc4c66a15bc14685be382e08f9"
+    },
+    "callback_read": {
+      "path": "target/weakref-shared-keys-inputs/access/callback_read.py",
+      "source_sha256": "e94f68c54f05af156707135a7b64c2947b51974f78bb338af855de7a81652058",
+      "driver": "target/weakref-shared-keys-inputs/access/callback_read-verify.py",
+      "driver_sha256": "8e79b47b927f2a10ef20b0aeb4293a244b8d5c878d6af32f346982a0ee42834d"
+    },
+    "proxy_attr": {
+      "path": "target/weakref-shared-keys-inputs/access/proxy_attr.py",
+      "source_sha256": "2f8812ea953f692c9872b32563b3116e5a878ecd7a793c6232326fb7dd562d37",
+      "driver": "target/weakref-shared-keys-inputs/access/proxy_attr-verify.py",
+      "driver_sha256": "0949f8a218ca84d42ba2eb7cbf16b69346c907e97ccc897e409418663a461c01"
+    },
+    "proxy_call": {
+      "path": "target/weakref-shared-keys-inputs/access/proxy_call.py",
+      "source_sha256": "c695337f422a9a186451b68db53f60ebafc0a2e4c6079a68b996c8e2318ef748",
+      "driver": "target/weakref-shared-keys-inputs/access/proxy_call-verify.py",
+      "driver_sha256": "b587e4bbe41bb444715939e2058e7ca7ee64fd6fb442316765cf478fe06cd276"
+    },
+    "weak_dict_get": {
+      "path": "target/weakref-shared-keys-inputs/access/weak_dict_get.py",
+      "source_sha256": "c729e4cf7a730c57b980e2cc8ec8ac39efe6c29e409b6417e6aa49e6ab52199a",
+      "driver": "target/weakref-shared-keys-inputs/access/weak_dict_get-verify.py",
+      "driver_sha256": "1908157dec93927a99552db06fba60f536ee0891ca59f2be03752bbde7cac9f9"
+    },
+    "dead_ref_call": {
+      "path": "target/weakref-shared-keys-inputs/access/dead_ref_call.py",
+      "source_sha256": "9fb48ccb7e2e042dbc780ecdb65bb4befea1ac3ac656e649e6cc5df5fe4e9728",
+      "driver": "target/weakref-shared-keys-inputs/access/dead_ref_call-verify.py",
+      "driver_sha256": "8dd9ddccd81d3c2ad7885bb0af56edad4d7d11a20711d98556864344b0edd708"
+    }
+  }
+}

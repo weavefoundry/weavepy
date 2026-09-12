@@ -1,0 +1,10 @@
+{
+  "time_utc": "2026-09-11T19:45:49.739604+00:00",
+  "logical_cpus": 8,
+  "load_average_1_5_15_minutes": [
+    12.8583984375,
+    17.42236328125,
+    14.33544921875
+  ],
+  "limitation": "A late-run host snapshot, not a continuous record or proof of the cause of timing variability."
+}

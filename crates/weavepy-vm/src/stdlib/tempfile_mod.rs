@@ -135,7 +135,7 @@ fn mkstemp(args: &[Object]) -> Result<Object, RuntimeError> {
             // Python wrapper turns the first into an io stream via
             // `os.fdopen`-style code we ship inside `tempfile.py`).
             drop(f);
-            return Ok(Object::new_tuple(vec![
+            return Ok(Object::new_tuple_array([
                 Object::from_str(path.to_string_lossy().into_owned()),
                 Object::from_str(path.to_string_lossy().into_owned()),
             ]));

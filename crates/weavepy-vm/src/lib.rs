@@ -26,6 +26,20 @@ use weavepy_compiler::{
     COMPARE_OP_TO_BOOL_FLAG, COOLDOWN,
 };
 
+// Keep the three main interpreter entry points independently aligned on
+// Apple silicon without padding every function in the executable. These
+// directives set Mach-O section alignment and emit no instructions.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+core::arch::global_asm!(
+    ".section __TEXT,__wp_loop,regular,pure_instructions",
+    ".p2align 5",
+    ".section __TEXT,__wp_step,regular,pure_instructions",
+    ".p2align 5",
+    ".section __TEXT,__wp_call,regular,pure_instructions",
+    ".p2align 5",
+    ".text",
+);
+
 pub mod builtin_docs_data;
 pub mod builtin_types;
 pub mod builtins;
@@ -44,6 +58,7 @@ pub mod hot_filter;
 pub mod hot_gates;
 pub mod import;
 pub mod import_time;
+mod lazy_arc;
 pub mod linejump;
 pub mod malloc_stats;
 pub mod object;
@@ -62,6 +77,7 @@ pub mod thread_registry;
 #[cfg(feature = "jit")]
 mod tier2;
 pub mod trace;
+mod tuple_storage;
 pub mod type_surface;
 pub mod types;
 pub mod unicode_case;
@@ -844,7 +860,7 @@ pub struct Interpreter {
     /// freelist analogue (one LIFO bucket per length 1..=16, like
     /// CPython's per-size freelists). A refcount-dead, untracked,
     /// unwatched tuple reaching the prompt reaper parks its
-    /// `Rc<[Object]>` allocation here (elements cleared), and
+    /// `Rc<crate::object::TupleStorage>` allocation here (elements cleared), and
     /// `BuildTuple` refills the most recently parked same-length
     /// allocation in place via `Rc::get_mut`. Besides the malloc
     /// round-trip saved, this makes the free-then-reallocate `id()`
@@ -853,7 +869,7 @@ pub struct Interpreter {
     /// (test_genexps' tupleids doctest), while the system allocator
     /// only usually does (macOS's tiny-magazine allocator was observed
     /// alternating between two blocks under system load).
-    tuple_pool: ThreadCell<[Vec<Rc<[Object]>>; 16]>,
+    tuple_pool: ThreadCell<[Vec<Rc<crate::object::TupleStorage>>; 16]>,
     /// Recycled operand-stack vectors, same motivation. The operand
     /// stack is never shared, so every returned frame donates one.
     frame_stack_pool: ThreadCell<Vec<Vec<Object>>>,
@@ -1464,7 +1480,7 @@ impl Interpreter {
                 // values live in `inst.dict`, which we mutate directly (the
                 // struct-sequence `__setattr__` guard is bypassed, exactly as
                 // the Rust-side builders do).
-                Some(Object::Instance(inst)) => Some(inst.dict.clone()),
+                Some(Object::Instance(inst)) => Some(inst.dict.share()),
                 _ => None,
             };
             if let Some(fl) = flags_inner {
@@ -2485,6 +2501,7 @@ impl Interpreter {
                     | Object::Set(_)
                     | Object::FrozenSet(_)
                     | Object::Instance(_)
+                    | Object::Frame(_)
             ) && Self::is_refcount_dead(&dropped, 1)
                 && Self::anchors_tracked_child(&dropped, 6))
             {
@@ -3320,6 +3337,23 @@ impl Interpreter {
         Object::new_tuple(items)
     }
 
+    /// Reuse the tuple free list without allocating a temporary vector
+    /// for small bytecode tuples. A miss needs only the final allocation.
+    fn alloc_tuple_array<const N: usize>(&self, items: [Object; N]) -> Object {
+        if N > 0 && N <= 16 {
+            let popped = self.tuple_pool.borrow_mut()[N - 1].pop();
+            if let Some(mut tuple) = popped {
+                if let Some(slots) = Rc::get_mut(&mut tuple) {
+                    for (slot, value) in slots.iter_mut().zip(items) {
+                        *slot = value;
+                    }
+                    return Object::Tuple(tuple);
+                }
+            }
+        }
+        Object::new_tuple_array(items)
+    }
+
     /// Is an exhausted iterator's backing list refcount-dead — held only by
     /// the iterator itself (plus the cycle collector's tracking handle,
     /// which `BuildList` installs on every list, and any weakref slots'
@@ -3404,6 +3438,10 @@ impl Interpreter {
                 // collector handle. See the `BoundMethod` arm of
                 // `prompt_reap_dropped`.
                 | Object::BoundMethod(_)
+                // An escaped frame owns locals after its activation exits.
+                // Releasing the last frame alias must retire those locals,
+                // including tracked containers and weakly held instances.
+                | Object::Frame(_)
         )
     }
 
@@ -3663,6 +3701,7 @@ impl Interpreter {
                 | Object::BoundMethod(_)
                 | Object::Function(_)
                 | Object::Type(_)
+                | Object::Frame(_)
         )
     }
 
@@ -5165,6 +5204,10 @@ impl Interpreter {
         })
     }
 
+    #[cfg_attr(
+        all(target_arch = "aarch64", target_os = "macos"),
+        unsafe(link_section = "__TEXT,__wp_loop")
+    )]
     fn run_until_yield_or_return_impl(
         &mut self,
         frame: &mut Frame,
@@ -5635,6 +5678,9 @@ impl Interpreter {
                 // relaxed load when empty (the overwhelming case), while
                 // `cext_call_active` is a thread-local read — so ask
                 // "is there anything to do" before "may we do it".
+                // Native side exits share this queue: their obsolete pins
+                // can be reaped now that the continuation's frame is on
+                // the stack and its recursion depth is accounted for.
                 if hot & crate::hot_gates::PENDING_CEXT != 0
                     && crate::vm_singletons::has_pending_cext_drops()
                     && !crate::vm_singletons::cext_call_active()
@@ -6641,10 +6687,10 @@ impl Interpreter {
             locals_mirror: RefCell::new(Some(frame.locals.clone())),
             trace: RefCell::new(Object::None),
             gen_owner: RefCell::new(frame.gen_owner.clone()),
-            override_lineno: Cell::new(None),
+            override_lineno: crate::sync::RefCell::new(None),
             trace_event: Cell::new(crate::linejump::TraceEvent::None),
-            pending_jump: Cell::new(None),
-            last_line: Cell::new(None),
+            pending_jump: crate::sync::RefCell::new(None),
+            last_line: crate::sync::RefCell::new(None),
             trace_lines: Cell::new(true),
             trace_opcodes: Cell::new(false),
             on_stack: Cell::new(0),
@@ -7589,7 +7635,7 @@ impl Interpreter {
                 Object::Instance(inst) => Object::Type(inst.cls()),
                 _ => Object::None,
             };
-            let arg = Object::new_tuple(vec![exc_type, exc.instance.clone(), tb_arg.clone()]);
+            let arg = Object::new_tuple_array([exc_type, exc.instance.clone(), tb_arg.clone()]);
             let _ = self.invoke_observe_hook(
                 &frame_trace,
                 py_frame,
@@ -8782,6 +8828,10 @@ impl Interpreter {
     /// Run a single instruction. The `pc` is advanced past it; if the
     /// instruction returns from the frame we surface that via
     /// `StepOutcome::Return`.
+    #[cfg_attr(
+        all(target_arch = "aarch64", target_os = "macos"),
+        unsafe(link_section = "__TEXT,__wp_step")
+    )]
     fn step(&mut self, frame: &mut Frame) -> Result<StepOutcome, RuntimeError> {
         let raised_at = frame.pc;
         let ins = frame
@@ -8916,14 +8966,7 @@ impl Interpreter {
                         let attr_pc = frame.pc;
                         let attr_ins = frame.code.instructions.get(attr_pc as usize).copied();
                         let hit = match (frame.code.caches.get(attr_pc), attr_ins) {
-                            (
-                                IC::LoadAttrInstance {
-                                    type_id,
-                                    key_idx,
-                                    ver,
-                                },
-                                Some(attr_ins),
-                            ) => {
+                            (IC::LoadAttrInstance { key_idx, ver }, Some(attr_ins)) => {
                                 // SAFETY: RFC 0065 (WS3) — see
                                 // `load_fast_value`; the shared raw
                                 // reference to the receiver slot never
@@ -8935,23 +8978,24 @@ impl Interpreter {
                                     Some(Object::Instance(inst)) => {
                                         let guard_ok = {
                                             let cls = inst.class.borrow();
-                                            specialize::rc_id(&cls) == type_id
-                                                && cls.attr_version.get() == ver
+                                            cls.attr_version.get() == ver
                                         };
                                         if guard_ok {
-                                            let dict = inst.dict.borrow();
-                                            match dict.get_index(key_idx as usize) {
-                                                Some((k, v))
-                                                    if self.cached_slot_name_matches(
-                                                        &frame.code,
-                                                        attr_ins.arg,
-                                                        k,
-                                                    ) =>
-                                                {
-                                                    Some(Self::clone_operand(v))
+                                            inst.dict.get().and_then(|dict| {
+                                                let dict = dict.borrow();
+                                                match dict.get_index(key_idx as usize) {
+                                                    Some((k, v))
+                                                        if self.cached_slot_name_matches(
+                                                            &frame.code,
+                                                            attr_ins.arg,
+                                                            k,
+                                                        ) =>
+                                                    {
+                                                        Some(Self::clone_operand(v))
+                                                    }
+                                                    _ => None,
                                                 }
-                                                _ => None,
-                                            }
+                                            })
                                         } else {
                                             None
                                         }
@@ -10204,7 +10248,7 @@ impl Interpreter {
                             if let Some(ctor) = construct {
                                 let call_args = vec![
                                     callable.clone(),
-                                    Object::Tuple(pos_args.clone().into()),
+                                    Object::new_tuple(pos_args.clone()),
                                     Object::Dict(d.clone()),
                                 ];
                                 let r =
@@ -10234,7 +10278,7 @@ impl Interpreter {
                             if let Some(raw) = raw {
                                 let call_args = vec![
                                     bm.receiver.clone(),
-                                    Object::Tuple(pos_args.clone().into()),
+                                    Object::new_tuple(pos_args.clone()),
                                     Object::Dict(d.clone()),
                                 ];
                                 let r =
@@ -10591,9 +10635,26 @@ impl Interpreter {
                 }
             }
             OpCode::BuildTuple => {
-                let n = ins.arg as usize;
-                let split = frame.stack.len().saturating_sub(n);
-                let items = frame.stack.split_off(split);
+                let n = (ins.arg as usize).min(frame.stack.len());
+                let obj = match n {
+                    0 => Object::new_tuple_array([]),
+                    1 => self.alloc_tuple_array([frame.pop()?]),
+                    2 => {
+                        let b = frame.pop()?;
+                        let a = frame.pop()?;
+                        self.alloc_tuple_array([a, b])
+                    }
+                    3 => {
+                        let c = frame.pop()?;
+                        let b = frame.pop()?;
+                        let a = frame.pop()?;
+                        self.alloc_tuple_array([a, b, c])
+                    }
+                    _ => {
+                        let split = frame.stack.len() - n;
+                        self.alloc_tuple(frame.stack.split_off(split))
+                    }
+                };
                 // A tuple is immutable, so it can never *anchor* a reference
                 // cycle on its own: any cycle that passes through a tuple
                 // (`l = []; t = (l,); l.append(t)`) is necessarily closed by a
@@ -10606,7 +10667,6 @@ impl Interpreter {
                 // point CPython frees it by refcount — inflating
                 // `sys.getrefcount` of its elements (`test_traceback`'s
                 // `test_no_refs_to_exception_and_traceback_objects`).
-                let obj = self.alloc_tuple(items);
                 self.record_alloc(&obj);
                 frame.push(obj);
             }
@@ -10614,12 +10674,14 @@ impl Interpreter {
                 let n = ins.arg as usize;
                 let split = frame.stack.len().saturating_sub(n);
                 let items = frame.stack.split_off(split);
-                // Set insertion hashes each element; unhashable elements
-                // raise (`{ {} }` is a set holding a dict).
-                for it in &items {
-                    builtins::ensure_set_element(it)?;
+                // Validate and hash in insertion order. Stop immediately if
+                // a key's hash or an existing key's comparison raises.
+                let mut data = crate::object::SetData::default();
+                for item in items {
+                    builtins::ensure_set_element(&item)?;
+                    crate::object::key_cmp_scope(|| data.insert(DictKey(item)))?;
                 }
-                let obj = Object::new_set_from(items);
+                let obj = Object::Set(Rc::new(RefCell::new(data)));
                 self.record_alloc(&obj);
                 // CPython tracks every set (`gc.is_tracked(set())` is True);
                 // track unconditionally like lists.
@@ -10642,7 +10704,8 @@ impl Interpreter {
                     let v = it.next().ok_or_else(|| {
                         RuntimeError::Internal("BUILD_MAP missing value".to_owned())
                     })?;
-                    d.insert(DictKey(k), v);
+                    builtins::ensure_dict_key(&k)?;
+                    crate::object::key_cmp_scope(|| d.insert(DictKey(k), v))?;
                 }
                 let obj = Object::Dict(Rc::new(RefCell::new(d)));
                 self.record_alloc(&obj);
@@ -10761,7 +10824,7 @@ impl Interpreter {
                     })?;
                 if let Object::Set(s) = s {
                     builtins::ensure_set_element(&v)?;
-                    s.borrow_mut().insert(DictKey(v));
+                    crate::object::key_cmp_scope(|| s.borrow_mut().insert(DictKey(v)))?;
                 }
             }
             OpCode::SetUpdate => {
@@ -10783,7 +10846,7 @@ impl Interpreter {
                 let items = self.collect_iterable(&v, &globals)?;
                 for item in items {
                     builtins::ensure_set_element(&item)?;
-                    s.borrow_mut().insert(DictKey(item));
+                    crate::object::key_cmp_scope(|| s.borrow_mut().insert(DictKey(item)))?;
                 }
             }
             OpCode::MapAdd => {
@@ -10798,7 +10861,8 @@ impl Interpreter {
                         RuntimeError::Internal("MAP_ADD depth out of range".to_owned())
                     })?;
                 if let Object::Dict(d) = d {
-                    d.borrow_mut().insert(DictKey(k), v);
+                    builtins::ensure_dict_key(&k)?;
+                    crate::object::key_cmp_scope(|| d.borrow_mut().insert(DictKey(k), v))?;
                 }
             }
             OpCode::UnpackSequence => {
@@ -12488,7 +12552,7 @@ impl Interpreter {
                                 subject.type_name()
                             ))
                         })?;
-                        let sentinel = Object::new_tuple(vec![Object::None]);
+                        let sentinel = Object::new_tuple_array([Object::None]);
                         let globals = frame.globals.clone();
                         let mut values = Vec::with_capacity(keys.len());
                         let mut found = true;
@@ -14168,7 +14232,7 @@ impl Interpreter {
                     "__annotate__" => return Ok(Object::None),
                     // PEP 695: every function carries `__type_params__`
                     // (an empty tuple unless it declares type parameters).
-                    "__type_params__" => return Ok(Object::new_tuple(vec![])),
+                    "__type_params__" => return Ok(Object::new_tuple_array([])),
                     // A function is a non-data descriptor; `f.__get__(obj,
                     // cls)` binds it. Exposing the hook lets descriptor-aware
                     // code (`functools.partialmethod`, custom descriptors)
@@ -14714,9 +14778,9 @@ impl Interpreter {
                         // takes one and ignores it here — both produce the
                         // same 2-tuple, exactly as CPython's method type.
                         call: Box::new(move |_args| {
-                            Ok(Object::new_tuple(vec![
+                            Ok(Object::new_tuple_array([
                                 getattr_fn.clone(),
-                                Object::new_tuple(vec![
+                                Object::new_tuple_array([
                                     receiver.clone(),
                                     Object::from_str(fname.clone()),
                                 ]),
@@ -15511,8 +15575,10 @@ impl Interpreter {
         }
 
         // (2) Instance dict.
-        if let Some(v) = inst.dict.borrow().get(&crate::object::StrKey(name)) {
-            return Ok(v.clone());
+        if let Some(dict) = inst.dict.get() {
+            if let Some(v) = dict.borrow().get(&crate::object::StrKey(name)) {
+                return Ok(v.clone());
+            }
         }
 
         // (3) Non-data descriptor / function on class.
@@ -15539,7 +15605,7 @@ impl Interpreter {
                         inst.cls().name
                     )));
                 }
-                return Ok(Object::Dict(inst.dict.clone()));
+                return Ok(Object::Dict(inst.dict.share()));
             }
             "__class__" => {
                 // A weakproxy lies about its class: CPython forwards the
@@ -15966,7 +16032,7 @@ impl Interpreter {
             // PEP 695: `type.__type_params__` is a getset defaulting to
             // `()` when the class dict has no entry (generic classes
             // store theirs; `type.__type_params__` itself reads `()`).
-            "__type_params__" => return Ok(Object::new_tuple(vec![])),
+            "__type_params__" => return Ok(Object::new_tuple_array([])),
             // CPython: `type.__dict__` is a read-only `mappingproxy`
             // (direct `cls.__dict__[k] = v` raises TypeError; mutation
             // must go through `setattr`). The proxy *shares* the dict, so
@@ -16299,7 +16365,7 @@ impl Interpreter {
                                 inst.cls().name
                             )));
                         }
-                        return Ok(Object::Dict(inst.dict.clone()));
+                        return Ok(Object::Dict(inst.dict.share()));
                     }
                     match inst.slot_get(&slot.name) {
                         Some(v) => Ok(v),
@@ -16771,6 +16837,9 @@ impl Interpreter {
         if matches!(v, Object::Str(_) | Object::WStr(_)) {
             return Ok(v.clone());
         }
+        if let Some(text) = crate::object::native_scalar_repr(v) {
+            return Ok(text);
+        }
         if let Object::Instance(inst) = v {
             // `PyObject_Str` returns the `__str__` result *unchanged*, so a
             // str-subclass result keeps its type
@@ -17207,6 +17276,9 @@ impl Interpreter {
         v: &Object,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        if let Some(text) = crate::object::native_scalar_repr(v) {
+            return Ok(text);
+        }
         // `PyObject_Repr` hands the `__repr__` result back as-is, so a
         // str-subclass result keeps its type (test_str.test_repr).
         if let Object::Instance(_) = v {
@@ -17439,7 +17511,7 @@ impl Interpreter {
             }
             let q = self.op_binary(a, b, weavepy_compiler::BinOpKind::FloorDiv)?;
             let r = self.op_binary(a, b, weavepy_compiler::BinOpKind::Mod)?;
-            return Ok(Object::new_tuple(vec![q, r]));
+            return Ok(Object::new_tuple_array([q, r]));
         }
         // The dunder protocol is exhausted. For a user instance with no
         // native numeric payload, raise the canonical `divmod()` TypeError
@@ -18682,7 +18754,7 @@ impl Interpreter {
         attr: &'static str,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
-        let fromlist = Object::new_tuple(vec![Object::from_static(attr)]);
+        let fromlist = Object::new_tuple_array([Object::from_static(attr)]);
         let module = self.do_import("string.templatelib", &fromlist, 0, globals)?;
         let val = match &module {
             Object::Module(m) => m
@@ -18810,7 +18882,8 @@ impl Interpreter {
                 let it = self.make_iter(&keys, globals)?;
                 while let Some(k) = self.iter_next(&it, globals)? {
                     let val = self.subscr_via_protocol(v, &k, globals)?;
-                    d.insert(DictKey(k), val);
+                    builtins::ensure_dict_key(&k)?;
+                    crate::object::key_cmp_scope(|| d.insert(DictKey(k), val))?;
                 }
                 return Ok(Some(Object::Dict(Rc::new(RefCell::new(d)))));
             }
@@ -18876,7 +18949,8 @@ impl Interpreter {
             } else {
                 self.binary_subscr(v, &k)?
             };
-            d.insert(DictKey(k), val);
+            builtins::ensure_dict_key(&k)?;
+            crate::object::key_cmp_scope(|| d.insert(DictKey(k), val))?;
         }
         Ok(Some(Object::Dict(Rc::new(RefCell::new(d)))))
     }
@@ -18886,6 +18960,9 @@ impl Interpreter {
         v: &Object,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Vec<Object>, RuntimeError> {
+        if let Some(items) = crate::object::collect_small_int_range(v) {
+            return items;
+        }
         match v {
             Object::List(items) => Ok(items.borrow().clone()),
             Object::Tuple(items) => Ok(items.to_vec()),
@@ -19119,6 +19196,15 @@ impl Interpreter {
             }
             _ => {}
         }
+        if let Some(total) = builtins::sum_small_int_sequence(&args[0], &acc) {
+            return Ok(total);
+        }
+        if let Some(total) = builtins::sum_numeric_sequence(&args[0], &acc) {
+            return total;
+        }
+        if let Some(total) = builtins::sum_exact_int_range(&args[0], &acc) {
+            return Ok(total);
+        }
         // Accumulate through the interpreter's binary dispatch so reflected
         // operands fire: `sum([Fraction(3,5), Fraction(4,5)])` starts at the
         // int `0`, and `int.__add__(0, Fraction)` returns NotImplemented —
@@ -19142,8 +19228,10 @@ impl Interpreter {
             }
             return Ok(acc);
         }
-        let items = self.collect_iterable(&args[0], globals)?;
-        for x in items {
+        // Stream the live iterator. Addition can mutate the source or
+        // raise, so don't consume later elements or request a length hint.
+        let iter = self.make_iter(&args[0], globals)?;
+        while let Some(x) = self.iter_next(&iter, globals)? {
             acc = self.op_binary(&acc, &x, BinOpKind::Add)?;
         }
         Ok(acc)
@@ -19721,6 +19809,38 @@ impl Interpreter {
         }
     }
 
+    /// Narrow a Python hash-method result without invoking integer
+    /// conversion hooks. CPython preserves any value that fits the hash
+    /// word, hashes larger integers, and reserves -1 for errors.
+    fn normalize_hash_result(&mut self, result: Object) -> Result<Object, RuntimeError> {
+        // Exact integers are the common result and have no finalizers or
+        // collector handles. Keep them out of the temporary-object reaper.
+        if let Object::Int(value) = result {
+            return Ok(Object::Int(if value == -1 { -2 } else { value }));
+        }
+        let native = match &result {
+            Object::Instance(inst) => inst.native.get().unwrap_or(&result),
+            _ => &result,
+        };
+        let value = match native {
+            Object::Int(value) => Some(*value),
+            Object::Bool(value) => Some(i64::from(*value)),
+            Object::Long(value) => Some(
+                value
+                    .to_i64()
+                    .unwrap_or_else(|| crate::object::py_hash_long_bigint(value)),
+            ),
+            _ => None,
+        };
+        // The temporary result is released before hash() returns, including
+        // an integer subclass with a finalizer. External references survive.
+        self.maybe_prompt_reap_replaced(result);
+        match value {
+            Some(value) => Ok(Object::Int(if value == -1 { -2 } else { value })),
+            None => Err(type_error("__hash__ method should return an integer")),
+        }
+    }
+
     /// `hash(obj)` — dispatch through the instance's `__hash__` if
     /// defined, otherwise fall back to the structural hash. We also
     /// reject objects whose class has `__hash__ = None` (CPython's
@@ -19776,17 +19896,22 @@ impl Interpreter {
         // `hash((idx, "value"))` instead of degrading to identity (pandas'
         // `is_hashable((Index, col))` gates `.loc` setitem paths on that).
         if let Object::Tuple(items) = obj {
-            let mut lanes = Vec::with_capacity(items.len());
+            if let Some(hash) = items.cached_hash() {
+                return Ok(Object::Int(hash));
+            }
+            let mut hash = crate::object::TupleHasher::new();
             for x in items.iter() {
                 // Same result-narrowing as `reentrant_py_hash`.
                 match self.do_hash_call(x, globals)? {
-                    Object::Int(h) => lanes.push(h),
-                    Object::Bool(b) => lanes.push(i64::from(b)),
-                    Object::Long(b) => lanes.push(crate::object::py_hash_long_bigint(&b)),
-                    _ => lanes.push(crate::object::identity_hash(x)),
+                    Object::Int(h) => hash.push(h),
+                    Object::Bool(b) => hash.push(i64::from(b)),
+                    Object::Long(b) => hash.push(crate::object::py_hash_long_bigint(&b)),
+                    _ => hash.push(crate::object::identity_hash(x)),
                 }
             }
-            return Ok(Object::Int(crate::object::combine_tuple_hash(&lanes)));
+            let hash = hash.finish(items.len());
+            items.store_hash(hash);
+            return Ok(Object::Int(hash));
         }
         // `memory_hash` hashes the *exporter* before the contents: the
         // exporter must itself be hashable (a `toreadonly()` view over a
@@ -19818,28 +19943,15 @@ impl Interpreter {
                 Some((method @ (Object::Function(_) | Object::BoundMethod(_)), _)) => {
                     let bound = Object::BoundMethod(Rc::new(BoundMethod::new(obj.clone(), method)));
                     let result = self.call(&bound, &[], &[], globals)?;
-                    // CPython narrows through `PyLong_Check` — a `__hash__`
-                    // returning a float (or anything non-int) is a TypeError
-                    // (gh-140406, test_builtin test_invalid_hash_typeerror).
-                    return match &result {
-                        Object::Int(_) | Object::Bool(_) | Object::Long(_) => Ok(result),
-                        Object::Instance(inst)
-                            if matches!(
-                                inst.native.get(),
-                                Some(Object::Int(_) | Object::Long(_))
-                            ) =>
-                        {
-                            Ok(result)
-                        }
-                        _ => Err(type_error("__hash__ method should return an integer")),
-                    };
+                    return self.normalize_hash_result(result);
                 }
                 // A builtin `tp_hash` slot materialized in a type dict
                 // (e.g. `object.__hash__`, `weakref.__hash__`). CPython
                 // calls it as `type(obj).__hash__(obj)`; every such
                 // builtin computes natively (no `hash()` re-entry).
                 Some((Object::Builtin(b), owner)) if owner.flags.is_builtin => {
-                    return (b.call)(std::slice::from_ref(obj));
+                    let result = (b.call)(std::slice::from_ref(obj))?;
+                    return self.normalize_hash_result(result);
                 }
                 // A non-function attribute supplied by a *user* class.
                 // CPython's `lookup_maybe_method`: a descriptor is bound
@@ -19854,7 +19966,8 @@ impl Interpreter {
                     // instance-binding slot, so pass the receiver.
                     if let Object::Builtin(b) = &other {
                         if b.binds_instance {
-                            return (b.call)(std::slice::from_ref(obj));
+                            let result = (b.call)(std::slice::from_ref(obj))?;
+                            return self.normalize_hash_result(result);
                         }
                     }
                     let is_descr = match &other {
@@ -19879,7 +19992,8 @@ impl Interpreter {
                     } else {
                         other
                     };
-                    return self.call(&target, &[], &[], globals);
+                    let result = self.call(&target, &[], &[], globals)?;
+                    return self.normalize_hash_result(result);
                 }
                 _ => {}
             }
@@ -19898,10 +20012,7 @@ impl Interpreter {
                 {
                     let bound = Object::BoundMethod(Rc::new(BoundMethod::new(obj.clone(), method)));
                     let result = self.call(&bound, &[], &[], globals)?;
-                    return match &result {
-                        Object::Int(_) | Object::Bool(_) | Object::Long(_) => Ok(result),
-                        _ => Err(type_error("__hash__ method should return an integer")),
-                    };
+                    return self.normalize_hash_result(result);
                 }
             }
         }
@@ -20958,6 +21069,24 @@ impl Interpreter {
         self.store_attr(obj, name, value)
     }
 
+    /// Preserve a code-owned name through generic instance dispatch. User
+    /// hooks still receive the ordinary attribute-store behavior; only a
+    /// direct slot insertion can retain the shared allocation.
+    #[cfg(feature = "jit")]
+    fn store_attr_shared_name(
+        &mut self,
+        obj: &Object,
+        name: &Rc<str>,
+        value: Object,
+    ) -> Result<(), RuntimeError> {
+        match obj {
+            Object::Instance(inst) => {
+                self.store_attr_instance_with_name(inst, obj, name, value, Some(name))
+            }
+            _ => self.store_attr(obj, name, value),
+        }
+    }
+
     /// Attribute delete mirroring `DELETE_ATTR` (weakproxy `__delattr__`
     /// forwarding; the C-API `PyObject_SetAttr(o, n, NULL)` bridge).
     pub fn delete_attr_public(&mut self, obj: &Object, name: &str) -> Result<(), RuntimeError> {
@@ -21563,7 +21692,7 @@ impl Interpreter {
             other => other.clone(),
         };
         let it = crate::object::PyIterator::Tuple {
-            items: Rc::from(vec![starred]),
+            items: crate::object::TupleStorage::from_array([starred]),
             index: 0,
         };
         Ok(Object::Iter(Rc::new(RefCell::new(it))))
@@ -21899,7 +22028,7 @@ impl Interpreter {
                         indices.clear();
                         indices.resize(pools.len(), 0);
                         let t: Vec<Object> = pools.iter().map(|p| p[0].clone()).collect();
-                        return Ok(Some(Object::Tuple(t.into())));
+                        return Ok(Some(Object::new_tuple(t)));
                     }
                     let n = pools.len();
                     let mut i = n as i64 - 1;
@@ -21921,7 +22050,7 @@ impl Interpreter {
                         .zip(indices.iter())
                         .map(|(p, &ix)| p[ix].clone())
                         .collect();
-                    return Ok(Some(Object::Tuple(t.into())));
+                    return Ok(Some(Object::new_tuple(t)));
                 }
                 LazyIterKind::Permutations {
                     pool,
@@ -21940,7 +22069,7 @@ impl Interpreter {
                         *started = true;
                         let t: Vec<Object> =
                             indices[..r].iter().map(|&ix| pool[ix].clone()).collect();
-                        return Ok(Some(Object::Tuple(t.into())));
+                        return Ok(Some(Object::new_tuple(t)));
                     }
                     if n == 0 {
                         *stopped = true;
@@ -21958,7 +22087,7 @@ impl Interpreter {
                             indices.swap(k, j);
                             let t: Vec<Object> =
                                 indices[..r].iter().map(|&ix| pool[ix].clone()).collect();
-                            return Ok(Some(Object::Tuple(t.into())));
+                            return Ok(Some(Object::new_tuple(t)));
                         }
                         i -= 1;
                     }
@@ -21980,7 +22109,7 @@ impl Interpreter {
                     if !*started {
                         *started = true;
                         let t: Vec<Object> = indices.iter().map(|&ix| pool[ix].clone()).collect();
-                        return Ok(Some(Object::Tuple(t.into())));
+                        return Ok(Some(Object::new_tuple(t)));
                     }
                     let mut i = r as i64 - 1;
                     while i >= 0 && indices[i as usize] == i as usize + n - r {
@@ -21996,7 +22125,7 @@ impl Interpreter {
                         indices[j] = indices[j - 1] + 1;
                     }
                     let t: Vec<Object> = indices.iter().map(|&ix| pool[ix].clone()).collect();
-                    return Ok(Some(Object::Tuple(t.into())));
+                    return Ok(Some(Object::new_tuple(t)));
                 }
                 LazyIterKind::Cwr {
                     pool,
@@ -22013,7 +22142,7 @@ impl Interpreter {
                     if !*started {
                         *started = true;
                         let t: Vec<Object> = indices.iter().map(|&ix| pool[ix].clone()).collect();
-                        return Ok(Some(Object::Tuple(t.into())));
+                        return Ok(Some(Object::new_tuple(t)));
                     }
                     let mut i = r as i64 - 1;
                     while i >= 0 && indices[i as usize] == n - 1 {
@@ -22029,7 +22158,7 @@ impl Interpreter {
                         *slot = v;
                     }
                     let t: Vec<Object> = indices.iter().map(|&ix| pool[ix].clone()).collect();
-                    return Ok(Some(Object::Tuple(t.into())));
+                    return Ok(Some(Object::new_tuple(t)));
                 }
                 _ => {}
             }
@@ -22453,7 +22582,7 @@ impl Interpreter {
                 if let LazyIterKind::Pairwise { old: o, .. } = &mut *l.state.borrow_mut() {
                     *o = Some(new.clone());
                 }
-                Ok(Some(Object::Tuple(vec![old, new].into())))
+                Ok(Some(Object::new_tuple_array([old, new])))
             }
             Snap::ZipLongest {
                 mut iters,
@@ -22495,7 +22624,7 @@ impl Interpreter {
                     *i = iters;
                     *na = numactive;
                 }
-                Ok(Some(Object::Tuple(result.into())))
+                Ok(Some(Object::new_tuple(result)))
             }
             Snap::Accumulate {
                 source,
@@ -22550,11 +22679,11 @@ impl Interpreter {
                             if strict {
                                 return Err(value_error("batched(): incomplete batch"));
                             }
-                            return Ok(Some(Object::Tuple(batch.into())));
+                            return Ok(Some(Object::new_tuple(batch)));
                         }
                     }
                 }
-                Ok(Some(Object::Tuple(batch.into())))
+                Ok(Some(Object::new_tuple(batch)))
             }
             Snap::Tee {
                 shared,
@@ -26226,7 +26355,6 @@ impl Interpreter {
     fn load_method_ic_hit(&self, frame: &Frame, cache_pc: u32, name_idx: u32) -> Option<Object> {
         use weavepy_compiler::InlineCache as IC;
         let IC::LoadAttrMethod {
-            type_id,
             ver,
             mro_idx,
             key_idx,
@@ -26238,11 +26366,11 @@ impl Interpreter {
             return None;
         };
         let cls = inst.class.borrow();
-        if specialize::rc_id(&cls) != type_id || cls.attr_version.get() != ver {
+        if cls.attr_version.get() != ver {
             return None;
         }
-        {
-            let d = inst.dict.borrow();
+        if let Some(dict) = inst.dict.get() {
+            let d = dict.borrow();
             if !d.is_empty() && d.contains_key(&code_name_key(&frame.code, name_idx)?) {
                 return None;
             }
@@ -26304,19 +26432,15 @@ impl Interpreter {
         // read the class through a borrow instead of `cls()`'s Arc clone.
         let receiver = frame.pop()?;
         match cache {
-            IC::LoadAttrInstance {
-                type_id,
-                key_idx,
-                ver,
-            } => {
+            IC::LoadAttrInstance { key_idx, ver } => {
                 if let Object::Instance(inst) = &receiver {
                     let guard_ok = {
                         let cls = inst.class.borrow();
-                        specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver
+                        cls.attr_version.get() == ver
                     };
                     if guard_ok {
-                        let hit = {
-                            let dict = inst.dict.borrow();
+                        let hit = inst.dict.get().and_then(|dict| {
+                            let dict = dict.borrow();
                             match dict.get_index(key_idx as usize) {
                                 Some((k, v))
                                     if self.cached_slot_name_matches(&frame.code, name_idx, k) =>
@@ -26325,7 +26449,7 @@ impl Interpreter {
                                 }
                                 _ => None,
                             }
-                        };
+                        });
                         if let Some(v) = hit {
                             specialize::record_hit(op_idx);
                             return Ok(v);
@@ -26356,21 +26480,32 @@ impl Interpreter {
                 }
                 self.deopt_load_attr_taken(frame, cache_pc, name_idx, receiver)
             }
-            IC::LoadAttrSlot { type_id, ver } => {
+            IC::LoadAttrSlot { key_idx, ver } => {
                 if let Object::Instance(inst) = &receiver {
                     let guard_ok = {
                         let cls = inst.class.borrow();
-                        specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver
+                        cls.attr_version.get() == ver
                     };
                     if guard_ok {
-                        // Read the slot side table directly; the class was
+                        // Read the ordered slot entry directly; the class was
                         // validated at specialisation time (stock lookup, a
                         // genuine `__slots__` member descriptor for this
                         // name) and the version guard covers class-dict /
                         // MRO changes since.
                         let name = frame.code.names.get(name_idx as usize).map(String::as_str);
                         if let Some(name) = name {
-                            if let Some(v) = inst.slot_get(name) {
+                            let hit = {
+                                let slots = inst.slots.borrow();
+                                let indexed = slots
+                                    .get_index(key_idx as usize)
+                                    .filter(|(key, _)| matches!(&key.0, Object::Str(stored) if stored.as_ref() == name))
+                                    .map(|(_, value)| value);
+                                // Assignment order differs across instances,
+                                // and deletion shifts ordered entries. Keep
+                                // the validated slot lookup in those cases.
+                                indexed.or_else(|| slots.get(name)).map(Self::clone_operand)
+                            };
+                            if let Some(v) = hit {
                                 specialize::record_hit(op_idx);
                                 return Ok(v);
                             }
@@ -26382,14 +26517,13 @@ impl Interpreter {
                 self.deopt_load_attr_taken(frame, cache_pc, name_idx, receiver)
             }
             IC::LoadAttrMethod {
-                type_id,
                 ver,
                 mro_idx,
                 key_idx,
             } => {
                 let func = if let Object::Instance(inst) = &receiver {
                     let cls = inst.class.borrow();
-                    if specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver {
+                    if cls.attr_version.get() == ver {
                         // Per-instance shadow guard: an instance dict
                         // entry beats a non-data descriptor. The
                         // specialised site saw an empty/missing entry;
@@ -26397,12 +26531,12 @@ impl Interpreter {
                         // differ, so probe when non-empty (with the
                         // name's memoised hash — no siphash, no
                         // allocation).
-                        let shadowed = {
-                            let d = inst.dict.borrow();
+                        let shadowed = inst.dict.get().is_some_and(|dict| {
+                            let d = dict.borrow();
                             !d.is_empty()
                                 && code_name_key(&frame.code, name_idx)
                                     .is_none_or(|k| d.contains_key(&k))
-                        };
+                        });
                         if !shadowed {
                             let slot = code_method_slot(&frame.code, cache_pc);
                             match slot.and_then(|s| s.get(ver)) {
@@ -26440,14 +26574,10 @@ impl Interpreter {
                 }
                 self.deopt_load_attr_taken(frame, cache_pc, name_idx, receiver)
             }
-            IC::LoadAttrType {
-                type_id,
-                key_idx,
-                ver,
-            } => {
+            IC::LoadAttrType { key_idx, ver } => {
                 let hit = if let Object::Instance(inst) = &receiver {
                     let cls = inst.class.borrow();
-                    if specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver {
+                    if cls.attr_version.get() == ver {
                         // Per-instance shadow guard: an instance dict entry
                         // beats a plain class attribute. The specialised
                         // site saw the name missing from *that* receiver's
@@ -26455,15 +26585,15 @@ impl Interpreter {
                         // it (pandas `MultiIndex.__new__` writes `_names`
                         // over a class-level default), so probe when
                         // non-empty — one hash of the interned name.
-                        let shadowed = {
+                        let shadowed = inst.dict.get().is_some_and(|dict| {
                             match code_name_key(&frame.code, name_idx) {
                                 Some(key) => {
-                                    let d = inst.dict.borrow();
+                                    let d = dict.borrow();
                                     !d.is_empty() && d.contains_key(&key)
                                 }
                                 None => true,
                             }
-                        };
+                        });
                         if shadowed {
                             None
                         } else {
@@ -26598,15 +26728,11 @@ impl Interpreter {
         // mark.
         gc_trace::note_dropped(&receiver);
         match cache {
-            IC::StoreAttrInstance {
-                type_id,
-                key_idx,
-                ver,
-            } => {
+            IC::StoreAttrInstance { key_idx, ver } => {
                 if let Object::Instance(inst) = &receiver {
                     let guard_ok = {
                         let cls = inst.class.borrow();
-                        specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver
+                        cls.attr_version.get() == ver
                     };
                     if guard_ok {
                         // Validate the cached index still holds *this* name:
@@ -26649,11 +26775,11 @@ impl Interpreter {
                 }
                 self.deopt_store_attr_taken(frame, cache_pc, name_idx, receiver)
             }
-            IC::StoreAttrNewKey { type_id, ver } => {
+            IC::StoreAttrNewKey { ver } => {
                 if let Object::Instance(inst) = &receiver {
                     let guard_ok = {
                         let cls = inst.class.borrow();
-                        specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver
+                        cls.attr_version.get() == ver
                     };
                     if guard_ok {
                         // Validated at specialisation time (and guarded by
@@ -26725,11 +26851,11 @@ impl Interpreter {
                 }
                 self.deopt_store_attr_taken(frame, cache_pc, name_idx, receiver)
             }
-            IC::StoreAttrSlot { type_id, ver } => {
+            IC::StoreAttrSlot { key_idx, ver } => {
                 if let Object::Instance(inst) = &receiver {
                     let guard_ok = {
                         let cls = inst.class.borrow();
-                        specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver
+                        cls.attr_version.get() == ver
                     };
                     if guard_ok {
                         // The class was validated at specialisation time: a
@@ -26743,7 +26869,21 @@ impl Interpreter {
                         let code = frame.code.clone();
                         if let Some(name) = code.names.get(name_idx as usize) {
                             let val = frame.pop()?;
-                            inst.slot_set(name, val);
+                            let old = {
+                                let mut slots = inst.slots.borrow_mut();
+                                match slots.get_index_mut(key_idx as usize) {
+                                    Some((key, slot)) if matches!(&key.0, Object::Str(stored) if stored.as_ref() == name) => {
+                                        Some(std::mem::replace(slot, val))
+                                    }
+                                    _ => match code_name_obj(&code, name_idx) {
+                                        Some(Object::Str(shared)) => {
+                                            slots.insert_shared(shared, val)
+                                        }
+                                        _ => slots.insert(name, val),
+                                    },
+                                }
+                            };
+                            drop(old);
                             gc_trace::mark_maybe_dead();
                             specialize::record_hit(op_idx);
                             return Ok(());
@@ -28229,6 +28369,17 @@ impl Interpreter {
         name: &str,
         value: Object,
     ) -> Result<(), RuntimeError> {
+        self.store_attr_instance_with_name(inst, obj, name, value, None)
+    }
+
+    fn store_attr_instance_with_name(
+        &mut self,
+        inst: &Rc<PyInstance>,
+        obj: &Object,
+        name: &str,
+        value: Object,
+        shared_name: Option<&Rc<str>>,
+    ) -> Result<(), RuntimeError> {
         // User-defined __setattr__ on the class overrides everything.
         // The stock default (`object.__setattr__`) — cached per class in
         // `setattr_kind` — goes straight to the generic store: routing it
@@ -28264,7 +28415,7 @@ impl Interpreter {
                 }
             }
         }
-        self.generic_setattr_instance(inst, obj, name, value)
+        self.generic_setattr_instance_with_name(inst, obj, name, value, shared_name)
     }
 
     /// CPython `PyObject_GenericGetAttr` — the `object.__getattribute__` slot
@@ -28372,6 +28523,17 @@ impl Interpreter {
         obj: &Object,
         name: &str,
         value: Object,
+    ) -> Result<(), RuntimeError> {
+        self.generic_setattr_instance_with_name(inst, obj, name, value, None)
+    }
+
+    fn generic_setattr_instance_with_name(
+        &mut self,
+        inst: &Rc<PyInstance>,
+        obj: &Object,
+        name: &str,
+        value: Object,
+        shared_name: Option<&Rc<str>>,
     ) -> Result<(), RuntimeError> {
         // BaseException getset descriptors (CPython `BaseException_*`
         // setters): `args` coerces through tuple(), `__traceback__`
@@ -28565,7 +28727,12 @@ impl Interpreter {
                         // fixed message.
                         return Err(attribute_error("readonly attribute".to_owned()));
                     }
-                    inst.slot_set(name, value);
+                    match shared_name {
+                        Some(shared) => {
+                            inst.slots.borrow_mut().insert_shared(shared, value);
+                        }
+                        None => inst.slot_set(name, value),
+                    }
                     return Ok(());
                 }
                 Object::Instance(descriptor_inst) => {
@@ -30132,6 +30299,10 @@ impl Interpreter {
 
     // ---------- calling ----------
 
+    #[cfg_attr(
+        all(target_arch = "aarch64", target_os = "macos"),
+        unsafe(link_section = "__TEXT,__wp_call")
+    )]
     fn call(
         &mut self,
         callable: &Object,
@@ -34735,8 +34906,10 @@ impl Interpreter {
                                 kv.len()
                             )));
                         }
-                        crate::builtins::ensure_hashable(&kv[0])?;
-                        d.insert(DictKey(kv[0].clone()), kv[1].clone());
+                        crate::builtins::ensure_dict_key(&kv[0])?;
+                        crate::object::key_cmp_scope(|| {
+                            d.insert(DictKey(kv[0].clone()), kv[1].clone())
+                        })?;
                     }
                     let out = Object::Dict(Rc::new(RefCell::new(d)));
                     crate::gc_trace::track(out.clone());
@@ -34773,12 +34946,17 @@ impl Interpreter {
                                     kv.len()
                                 )));
                             }
-                            d.insert(DictKey(kv[0].clone()), kv[1].clone());
+                            builtins::ensure_dict_key(&kv[0])?;
+                            crate::object::key_cmp_scope(|| {
+                                d.insert(DictKey(kv[0].clone()), kv[1].clone())
+                            })?;
                         }
                     }
                 }
                 for (k, v) in kwargs {
-                    d.insert(DictKey(Object::Str(Rc::from(k.as_str()))), v.clone());
+                    crate::object::key_cmp_scope(|| {
+                        d.insert(DictKey(Object::Str(Rc::from(k.as_str()))), v.clone())
+                    })?;
                 }
                 let out = Object::Dict(Rc::new(RefCell::new(d)));
                 crate::gc_trace::track(out.clone());
@@ -35064,7 +35242,7 @@ impl Interpreter {
                         // `vars(spam)` sees the constructor keywords and
                         // plain setattr/delattr mutate the namespace.
                         if let Object::SimpleNamespace(d) = &desc {
-                            pi.dict = d.clone();
+                            pi.dict = d.clone().into();
                         }
                         Object::Instance(Rc::new(pi))
                     }
@@ -35700,8 +35878,11 @@ impl Interpreter {
                 Some(v) => v,
                 None => &f.defaults,
             };
+            // Code replacement and __defaults__ assignment may leave more
+            // defaults than parameters. Only the trailing suffix binds.
+            let defaults = &defaults[defaults.len().saturating_sub(total_args)..];
             let needed = total_args;
-            let first_default = needed.saturating_sub(defaults.len());
+            let first_default = needed - defaults.len();
             for (i, d) in defaults.iter().enumerate() {
                 let slot = first_default + i;
                 if slot < needed && !filled[slot] {
@@ -35881,7 +36062,7 @@ impl Interpreter {
                         .rev()
                         .take(depth as usize)
                         .map(|py| {
-                            Object::new_tuple(vec![
+                            Object::new_tuple_array([
                                 Object::from_str(py.code.filename.clone()),
                                 Object::Int(i64::from(py.current_lineno())),
                                 Object::from_str(py.code.name.clone()),
@@ -37427,9 +37608,9 @@ impl Interpreter {
                         };
                         (get("__origin__"), get("__args__"))
                     };
-                    return Ok(Object::new_tuple(vec![
+                    return Ok(Object::new_tuple_array([
                         helper,
-                        Object::new_tuple(vec![origin, args]),
+                        Object::new_tuple_array([origin, args]),
                     ]));
                 }
             }
@@ -37521,13 +37702,14 @@ impl Interpreter {
         match recv {
             Object::Range(r) => {
                 let type_obj = crate::builtins::class_of(recv);
-                let args = Object::new_tuple(vec![r.start_obj(), r.stop_obj(), r.step_obj()]);
-                return Ok(Object::new_tuple(vec![Object::Type(type_obj), args]));
+                let args = Object::new_tuple_array([r.start_obj(), r.stop_obj(), r.step_obj()]);
+                return Ok(Object::new_tuple_array([Object::Type(type_obj), args]));
             }
             Object::Slice(s) => {
                 let type_obj = crate::builtins::class_of(recv);
-                let args = Object::new_tuple(vec![s.start.clone(), s.stop.clone(), s.step.clone()]);
-                return Ok(Object::new_tuple(vec![Object::Type(type_obj), args]));
+                let args =
+                    Object::new_tuple_array([s.start.clone(), s.stop.clone(), s.step.clone()]);
+                return Ok(Object::new_tuple_array([Object::Type(type_obj), args]));
             }
             _ => {}
         }
@@ -37553,7 +37735,7 @@ impl Interpreter {
                 _ => unreachable!("set_payload is Set or FrozenSet by construction"),
             };
             let type_obj = crate::builtins::class_of(recv);
-            let args = Object::new_tuple(vec![Object::new_list(elems)]);
+            let args = Object::new_tuple_array([Object::new_list(elems)]);
             // Subclass instance state (`s.x = ...` in `__dict__`, plus any
             // `__slots__` values) rides in the pickle state. Route through the
             // object's own `__getstate__` (CPython `set_reduce` calls
@@ -37568,7 +37750,11 @@ impl Interpreter {
                 }
                 _ => Object::None,
             };
-            return Ok(Object::new_tuple(vec![Object::Type(type_obj), args, state]));
+            return Ok(Object::new_tuple_array([
+                Object::Type(type_obj),
+                args,
+                state,
+            ]));
         }
         self.object_default_reduce(recv, proto, globals)
     }
@@ -37628,9 +37814,9 @@ impl Interpreter {
         if matches!(ty_name.as_str(), "method_descriptor" | "wrapper_descriptor") {
             if let Ok(objclass @ Object::Type(_)) = self.load_attr(recv, "__objclass__") {
                 let getattr_fn = self.live_builtin("getattr")?;
-                return Ok(Some(Object::new_tuple(vec![
+                return Ok(Some(Object::new_tuple_array([
                     getattr_fn,
-                    Object::new_tuple(vec![objclass, Object::from_str(name)]),
+                    Object::new_tuple_array([objclass, Object::from_str(name)]),
                 ])));
             }
         }
@@ -37656,9 +37842,9 @@ impl Interpreter {
         // unpickler by name.
         let self_obj = self_obj.expect("module_level=false implies Some");
         let getattr_fn = self.live_builtin("getattr")?;
-        Ok(Some(Object::new_tuple(vec![
+        Ok(Some(Object::new_tuple_array([
             getattr_fn,
-            Object::new_tuple(vec![self_obj, Object::from_str(name)]),
+            Object::new_tuple_array([self_obj, Object::from_str(name)]),
         ])))
     }
 
@@ -37824,14 +38010,14 @@ impl Interpreter {
             // no buffer, no index (CPython `bytearrayiter_reduce` with
             // `it_seq == NULL`).
             if *index == usize::MAX {
-                return Ok(Object::new_tuple(vec![
+                return Ok(Object::new_tuple_array([
                     builtin,
-                    Object::new_tuple(vec![Object::new_tuple(vec![])]),
+                    Object::new_tuple_array([Object::new_tuple_array([])]),
                 ]));
             }
-            return Ok(Object::new_tuple(vec![
+            return Ok(Object::new_tuple_array([
                 builtin,
-                Object::new_tuple(vec![Object::ByteArray(data.clone())]),
+                Object::new_tuple_array([Object::ByteArray(data.clone())]),
                 Object::Int(*index as i64),
             ]));
         }
@@ -37851,14 +38037,14 @@ impl Interpreter {
             // so an empty backing store is the exhausted signal
             // (test_iter `test_reduce_mutating_builtins_iter`).
             if items.borrow().is_empty() {
-                return Ok(Object::new_tuple(vec![
+                return Ok(Object::new_tuple_array([
                     builtin,
-                    Object::new_tuple(vec![Object::new_list(Vec::new())]),
+                    Object::new_tuple_array([Object::new_list(Vec::new())]),
                 ]));
             }
-            return Ok(Object::new_tuple(vec![
+            return Ok(Object::new_tuple_array([
                 builtin,
-                Object::new_tuple(vec![Object::List(items.clone())]),
+                Object::new_tuple_array([Object::List(items.clone())]),
                 Object::Int(*index as i64),
             ]));
         }
@@ -37876,9 +38062,9 @@ impl Interpreter {
                 Some(b) => Object::Long(Rc::new((**b).clone())),
                 None => Object::Int(*count),
             };
-            return Ok(Object::new_tuple(vec![
+            return Ok(Object::new_tuple_array([
                 builtin,
-                Object::new_tuple(vec![Object::Iter(inner.clone()), idx]),
+                Object::new_tuple_array([Object::Iter(inner.clone()), idx]),
             ]));
         }
         // A reverse iterator reduces to `(reversed, (forward_list,), index)`
@@ -37889,14 +38075,14 @@ impl Interpreter {
             // `listreviter_reduce` with `it_seq == NULL`); detach empties
             // `items`, so an empty store is the exhausted signal.
             if items.borrow().is_empty() {
-                return Ok(Object::new_tuple(vec![
+                return Ok(Object::new_tuple_array([
                     builtin,
-                    Object::new_tuple(vec![Object::new_list(Vec::new())]),
+                    Object::new_tuple_array([Object::new_list(Vec::new())]),
                 ]));
             }
-            return Ok(Object::new_tuple(vec![
+            return Ok(Object::new_tuple_array([
                 builtin,
-                Object::new_tuple(vec![Object::List(items.clone())]),
+                Object::new_tuple_array([Object::List(items.clone())]),
                 Object::Int(*index),
             ]));
         }
@@ -37932,9 +38118,9 @@ impl Interpreter {
             _ => None,
         };
         if let Some(r) = range_rest {
-            return Ok(Object::new_tuple(vec![
+            return Ok(Object::new_tuple_array([
                 builtin,
-                Object::new_tuple(vec![Object::Range(Rc::new(r))]),
+                Object::new_tuple_array([Object::Range(Rc::new(r))]),
             ]));
         }
         // Snapshot remaining *after* the lookup, mirroring CPython reading
@@ -37948,8 +38134,8 @@ impl Interpreter {
                 it.reduce_remaining()
             }
         };
-        let args_tuple = Object::new_tuple(vec![remaining]);
-        Ok(Object::new_tuple(vec![builtin, args_tuple]))
+        let args_tuple = Object::new_tuple_array([remaining]);
+        Ok(Object::new_tuple_array([builtin, args_tuple]))
     }
 
     /// `file.writelines(iterable)` — write each item, pulling them lazily
@@ -40515,7 +40701,7 @@ impl Interpreter {
                 .cloned()?;
             let fl = match flags {
                 Object::Dict(fl) | Object::SimpleNamespace(fl) => fl,
-                Object::Instance(inst) => inst.dict.clone(),
+                Object::Instance(inst) => inst.dict.share(),
                 _ => return None,
             };
             let v = fl
@@ -40786,7 +40972,7 @@ impl Interpreter {
                     Some(Object::Str(s)) => s.to_string(),
                     _ => inst.cls().name.clone(),
                 };
-                (inst.dict.clone(), name)
+                (inst.dict.share(), name)
             }
             other => {
                 return Err(type_error(format!(
@@ -41734,7 +41920,7 @@ fn decode_source_bytes_inner(
                         d[2] = Object::Int(-1);
                         inst.slot_set(
                             "args",
-                            Object::new_tuple(vec![args[0].clone(), Object::new_tuple(d)]),
+                            Object::new_tuple_array([args[0].clone(), Object::new_tuple(d)]),
                         );
                     }
                 }
@@ -42532,7 +42718,7 @@ fn attach_syntax_error_metadata(err: &RuntimeError, last_stmt: (u32, u32), sourc
     }
     inst.slot_set(
         "_metadata",
-        Object::new_tuple(vec![
+        Object::new_tuple_array([
             Object::Int(i64::from(last_stmt.0)),
             Object::Int(i64::from(last_stmt.1)),
             Object::from_str(source.to_owned()),
@@ -44331,13 +44517,14 @@ fn exception_holds_nonatomic(obj: &Object) -> bool {
     // Exception state lives in the slot side table (`args`, OSError
     // fields, …); user attributes land in the dict. Check both.
     if let Ok(slots) = inst.slots.try_borrow() {
-        if let Some(slots) = slots.as_ref() {
-            if slots.iter().any(|(_, v)| nonatomic(v)) {
-                return true;
-            }
+        if slots.iter().any(|(_, v)| nonatomic(v)) {
+            return true;
         }
     }
-    let Ok(dict) = inst.dict.try_borrow() else {
+    let Some(dict) = inst.dict.get() else {
+        return false;
+    };
+    let Ok(dict) = dict.try_borrow() else {
         // Borrowed elsewhere (shouldn't happen on a just-built instance); err
         // toward tracking rather than silently leaking a potential cycle.
         return true;
@@ -47714,7 +47901,7 @@ struct CodeConstObjects {
 /// the name compare that the `InlineCache` shape needs. The reference
 /// is weak (CPython's `_PyType_Lookup` cache is a borrowed pointer for
 /// the same reason): a site must not keep a class or module alive.
-struct MethodSlot(std::cell::UnsafeCell<(u32, crate::sync::Weak<crate::object::PyFunction>)>);
+struct MethodSlot(std::cell::UnsafeCell<(u64, crate::sync::Weak<crate::object::PyFunction>)>);
 
 // SAFETY: read and written only from the dispatch loop with the GIL
 // held (the same invariant `weavepy_compiler::CacheSlot` documents).
@@ -47728,7 +47915,7 @@ impl MethodSlot {
 
     /// The cached function if the slot was filled under `ver`.
     #[inline]
-    fn get(&self, ver: u32) -> Option<Rc<crate::object::PyFunction>> {
+    fn get(&self, ver: u64) -> Option<Rc<crate::object::PyFunction>> {
         // SAFETY: GIL-serialized; no `&mut` escapes `set`.
         let (v, w) = unsafe { &*self.0.get() };
         if *v == ver {
@@ -47739,7 +47926,7 @@ impl MethodSlot {
     }
 
     #[inline]
-    fn set(&self, ver: u32, f: &Rc<crate::object::PyFunction>) {
+    fn set(&self, ver: u64, f: &Rc<crate::object::PyFunction>) {
         // SAFETY: GIL-serialized; the exclusive reference lives only for
         // the assignment.
         unsafe { *self.0.get() = (ver, Rc::downgrade(f)) };
@@ -47964,7 +48151,7 @@ fn dict_view_set_elems(obj: &Object) -> Option<Vec<Object>> {
         crate::object::DictViewKind::Keys => Some(d.keys().map(|k| k.0.clone()).collect()),
         crate::object::DictViewKind::Items => Some(
             d.iter()
-                .map(|(k, val)| Object::new_tuple(vec![k.0.clone(), val.clone()]))
+                .map(|(k, val)| Object::new_tuple_array([k.0.clone(), val.clone()]))
                 .collect(),
         ),
         crate::object::DictViewKind::Values => None,
@@ -49369,7 +49556,7 @@ fn make_generic_alias(origin: Object, params: Object) -> Object {
     let mut d = DictData::default();
     let args_tuple = match &params {
         Object::Tuple(_) => params.clone(),
-        other => Object::new_tuple(vec![other.clone()]),
+        other => Object::new_tuple_array([other.clone()]),
     };
     // `__parameters__` collects the TypeVar-ish entries of `__args__`
     // *recursively* through nested aliases (CPython's
@@ -50184,6 +50371,89 @@ mod tests {
     use weavepy_compiler::compile_module;
     use weavepy_parser::parse_module;
 
+    // The collector spans all interpreters in this process. A get_objects()
+    // snapshot in one fixture roots objects owned by other fixtures, so tests
+    // asserting prompt heap retirement must not hold competing snapshots.
+    #[cfg(feature = "jit")]
+    static HEAP_SNAPSHOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn range_collection_preserves_python_semantics() {
+        #[cfg(feature = "jit")]
+        let _guard = HEAP_SNAPSHOT_TEST_LOCK.lock().unwrap();
+        assert_eq!(
+            run(include_str!(
+                "../../../tests/regrtest/test_range_collection.py"
+            )),
+            "ok\n"
+        );
+    }
+
+    #[test]
+    fn range_sum_preserves_full_precision_and_start_protocols() {
+        assert_eq!(
+            run(include_str!("../../../tests/regrtest/test_sum_range.py")),
+            "ok\n"
+        );
+    }
+
+    #[test]
+    fn range_iteration_preserves_wide_exhaustion_and_hints() {
+        assert_eq!(
+            run(include_str!(
+                "../../../tests/regrtest/test_range_iteration_bounds.py"
+            )),
+            "ok\n"
+        );
+    }
+
+    #[test]
+    fn sum_numeric_preserves_float_bits_and_overflow_transitions() {
+        assert_eq!(
+            run(include_str!("../../../tests/regrtest/test_sum_numeric.py")),
+            "ok\n"
+        );
+    }
+
+    #[test]
+    fn sum_streaming_preserves_callbacks_and_integer_results() {
+        #[cfg(feature = "jit")]
+        let _guard = HEAP_SNAPSHOT_TEST_LOCK.lock().unwrap();
+        assert_eq!(
+            run(include_str!(
+                "../../../tests/regrtest/test_sum_streaming.py"
+            )),
+            "ok\n"
+        );
+    }
+
+    #[test]
+    fn sum_streaming_integer_fastpath_preserves_boundaries_and_fallbacks() {
+        let zero = Object::Int(0);
+        for sequence in [
+            Object::new_list(vec![Object::Int(i64::MAX), Object::Int(1), Object::Int(-1)]),
+            Object::new_tuple(vec![Object::Int(i64::MAX), Object::Int(1), Object::Int(-1)]),
+        ] {
+            assert_eq!(
+                builtins::sum_small_int_sequence(&sequence, &zero)
+                    .unwrap()
+                    .as_i64(),
+                Some(i64::MAX)
+            );
+        }
+        let wide = Object::new_list(vec![Object::Int(i64::MIN), Object::Int(-1)]);
+        assert_eq!(
+            builtins::sum_small_int_sequence(&wide, &zero)
+                .unwrap()
+                .repr(),
+            "-9223372036854775809"
+        );
+        let mixed = Object::new_list(vec![Object::Int(7), Object::Float(0.5)]);
+        assert!(builtins::sum_small_int_sequence(&mixed, &zero).is_none());
+        let empty = Object::new_tuple(Vec::new());
+        assert!(builtins::sum_small_int_sequence(&empty, &Object::Bool(true)).is_none());
+    }
+
     fn run(src: &str) -> String {
         let module = parse_module(src).expect("parse");
         let code = compile_module(&module).expect("compile");
@@ -50191,9 +50461,109 @@ mod tests {
         let buf: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
         let writer: Stdout = buf.clone() as Rc<RefCell<dyn Write + Send + Sync>>;
         interp.set_stdout(writer);
-        interp.run_module(&code).expect("run");
+        interp
+            .run_module(&code)
+            .unwrap_or_else(|error| panic!("run: {error}"));
         let bytes = buf.borrow().clone();
         String::from_utf8(bytes).expect("utf-8")
+    }
+
+    fn check_constructor_slot_names(typed_store: bool) {
+        let mut source = r"
+class Row:
+    __slots__ = ('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i')
+    def __init__(self, value):
+        self.a = value
+        self.b = value
+        self.c = value
+        self.d = value
+        self.e = value
+        self.f = value
+        self.g = value
+        self.h = value
+        self.i = value
+for i in range(100):
+    Row(i)
+first = Row(17)
+second = Row(23)
+"
+        .to_owned();
+        if typed_store {
+            source.push_str(
+                r"
+def refill(row, value):
+    row.a = value
+    row.b = value
+    row.c = value
+    row.d = value
+    row.e = value
+    row.f = value
+    row.g = value
+    row.h = value
+    row.i = value
+for i in range(100):
+    refill(first, 17)
+del second.a
+del second.c
+refill(second, 23)
+",
+            );
+        }
+        let module = parse_module(&source).expect("parse");
+        let code = compile_module(&module).expect("compile");
+        let mut interp = Interpreter::new();
+        interp.run_module(&code).expect("run");
+        let Some(Object::Module(module)) = interp.cache.get("__main__") else {
+            panic!("missing main module");
+        };
+        let globals = module.dict.borrow();
+        let Some(Object::Instance(first)) = globals.get(&crate::object::StrKey("first")) else {
+            panic!("missing first row");
+        };
+        let Some(Object::Instance(second)) = globals.get(&crate::object::StrKey("second")) else {
+            panic!("missing second row");
+        };
+        let Some(Object::Function(init)) = first.cls().lookup("__init__") else {
+            panic!("missing initializer");
+        };
+        let code = init.code.borrow();
+        let first_slots = first.slots.borrow();
+        let second_slots = second.slots.borrow();
+        assert_eq!(first_slots.iter().count(), 9);
+        assert_eq!(second_slots.iter().count(), 9);
+        for (first_key, first_value) in first_slots.iter() {
+            let Object::Str(name) = &first_key.0 else {
+                panic!("slot key must be a string");
+            };
+            let second_idx = second_slots.index_of(name).unwrap();
+            let (second_key, second_value) = second_slots.get_index(second_idx as usize).unwrap();
+            assert!(first_key.0.is_same(&second_key.0));
+            let name_idx = code.names.iter().position(|n| n == name.as_ref()).unwrap();
+            assert!(first_key
+                .0
+                .is_same(code_name_obj(&code, name_idx as u32).unwrap()));
+            assert_eq!(first_value.as_i64(), Some(17));
+            assert_eq!(second_value.as_i64(), Some(23));
+        }
+    }
+
+    #[test]
+    fn constructor_slot_writes_share_code_names() {
+        check_constructor_slot_names(false);
+    }
+
+    #[test]
+    #[cfg(feature = "jit")]
+    fn jit_slot_writes_share_code_names_after_deletion() {
+        std::thread::spawn(|| {
+            crate::tier2::force_enable_for_test(2);
+            check_constructor_slot_names(true);
+            let (compiled, entries, _) = crate::tier2::stats_for_test();
+            assert!(compiled >= 2, "initializer and refill must compile");
+            assert!(entries >= 100, "slot stores must execute in native code");
+        })
+        .join()
+        .expect("jit worker thread");
     }
 
     /// RFC 0032 — run `src` with the tier-2 JIT forced on, on a fresh
@@ -50210,6 +50580,91 @@ mod tests {
         })
         .join()
         .expect("jit worker thread")
+    }
+
+    fn check_cold_instance_dictionaries() {
+        let source = r"
+import gc
+class Plain:
+    value = 17
+    def read(self):
+        return 17
+class Slotted:
+    __slots__ = ('value',)
+class Empty:
+    __slots__ = ()
+class Number(int):
+    pass
+plain = Plain()
+slotted = Slotted()
+slotted.value = 11
+empty = Empty()
+native = Number(7)
+def reads(item, n):
+    total = 0
+    for i in range(n):
+        total += item.read()
+    return total
+assert reads(plain, 1000) == 17000
+assert reads(plain, 1000) == 17000
+for i in range(100):
+    assert plain.value == 17
+    assert slotted.value == 11
+assert native + 1 == 8
+assert plain.__getstate__() is None
+assert empty.__getstate__() is None
+written = Plain()
+written.extra = 23
+written.value = 23
+def read_attr(item):
+    return item.value
+for i in range(200):
+    assert read_attr(written) == 23
+    assert read_attr(plain) == 17
+gc.collect()
+exported = Plain()
+namespace = vars(exported)
+assert namespace is exported.__dict__
+";
+        let module = parse_module(source).expect("parse");
+        let code = compile_module(&module).expect("compile");
+        let mut interp = Interpreter::new();
+        interp.run_module(&code).expect("run");
+        let Some(Object::Module(module)) = interp.cache.get("__main__") else {
+            panic!("missing main module");
+        };
+        let globals = module.dict.borrow();
+        for name in ["plain", "slotted", "empty", "native", "written", "exported"] {
+            let Some(Object::Instance(instance)) = globals.get(&crate::object::StrKey(name)) else {
+                panic!("missing instance {name}");
+            };
+            let initialized = matches!(name, "written" | "exported");
+            assert_eq!(instance.dict.get().is_some(), initialized, "{name}");
+            // Tracing an instance's children must not create an empty dict.
+            crate::gc_trace::traverse_object(&Object::Instance(instance.clone()), &mut |_| {});
+            assert_eq!(instance.dict.get().is_some(), initialized, "{name}");
+        }
+    }
+
+    #[test]
+    fn cold_instance_dictionaries_survive_lookup_and_collection() {
+        check_cold_instance_dictionaries();
+    }
+
+    #[test]
+    #[cfg(feature = "jit")]
+    fn cold_instance_dictionaries_survive_native_method_calls() {
+        std::thread::spawn(|| {
+            crate::tier2::force_enable_for_test(2);
+            check_cold_instance_dictionaries();
+            let (compiled, entries, _) = crate::tier2::stats_for_test();
+            assert!(
+                compiled > 0 && entries > 0,
+                "native execution was not reached"
+            );
+        })
+        .join()
+        .expect("jit worker thread");
     }
 
     #[test]
@@ -53067,6 +53522,320 @@ mod tests {
 
     #[cfg(feature = "jit")]
     #[test]
+    fn jit_side_exit_retires_temporary_pins_before_continuation() {
+        let _heap_guard = HEAP_SNAPSHOT_TEST_LOCK.lock().expect("heap snapshot lock");
+        std::thread::spawn(|| {
+            crate::tier2::force_enable_for_test(2);
+            let out = run(include_str!(
+                "../../../tests/regrtest/test_native_pin_retirement.py"
+            ));
+            assert_eq!(out, "ok\n");
+            assert!(
+                crate::tier2::direct_call_count_for_test() >= 1,
+                "retirement regression must enter a frameless native call"
+            );
+        })
+        .join()
+        .expect("native pin retirement worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_pin_pressure_reenters_without_retiring_code() {
+        std::thread::spawn(|| {
+            crate::tier2::force_enable_for_test(2);
+            let out = run(r"
+def churn(n):
+    total = 0
+    for i in range(n):
+        text = 'alpha beta'.upper().lower()
+        total += len(text)
+    return total
+print(churn(300000))
+for _ in range(10):
+    print(churn(100))
+");
+            assert_eq!(out, format!("3000000\n{}", "1000\n".repeat(10)));
+            let pressure_exits = crate::tier2::pin_pressure_exits_for_test();
+            assert!(
+                pressure_exits >= 80,
+                "long native loop must cross more than the speculative exit budget: {pressure_exits} pressure exits"
+            );
+            assert!(
+                crate::tier2::direct_call_count_for_test() >= 1,
+                "warmed calls must still enter directly after memory-pressure exits"
+            );
+        })
+        .join()
+        .expect("native pin pressure worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_completed_activations_release_entry_pins() {
+        let _heap_guard = HEAP_SNAPSHOT_TEST_LOCK.lock().expect("heap snapshot lock");
+        std::thread::spawn(|| {
+            crate::tier2::force_enable_for_test(2);
+            let out = run(include_str!(
+                "../../../tests/regrtest/test_native_pin_pressure.py"
+            ));
+            assert_eq!(out, "ok\n");
+            assert!(
+                crate::tier2::pin_pressure_exits_for_test() >= 1,
+                "pin lifetime regression must cross native resource exits"
+            );
+        })
+        .join()
+        .expect("native entry pin lifetime worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_generator_materialization_retires_pins() {
+        let _heap_guard = HEAP_SNAPSHOT_TEST_LOCK.lock().expect("heap snapshot lock");
+        let (out, parks, resumes, materialized) = run_jit_park(include_str!(
+            "../../../tests/regrtest/test_native_generator_pin_retirement.py"
+        ));
+        assert_eq!(out, "ok\n");
+        assert!(parks >= 1, "generator must park a native activation");
+        assert!(resumes >= 1, "generator must resume natively");
+        assert!(materialized >= 1, "generator must materialize native state");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_string_pressure_restores_expression_stack() {
+        for (expression, expected) in [
+            (
+                "len('alpha beta'.upper().replace('BETA', 'XYZ').lower())",
+                "128136000\n",
+            ),
+            (
+                "len('alpha beta'.upper().lower().upper().split())",
+                "128024000\n",
+            ),
+        ] {
+            std::thread::spawn(move || {
+                crate::tier2::force_enable_for_test(2);
+                // Both the running total and index remain on the native
+                // stack while the string or list result is produced.
+                let source = format!(
+                    "def total(n):\n    out = 0\n    for i in range(n):\n        out = out + (i + {expression})\n    return out\nprint(total(16000))\n"
+                );
+                assert_eq!(run(&source), expected);
+                let exits = crate::tier2::pin_pressure_exits_for_test();
+                assert!(exits >= 3, "expression must cross resource exits: {exits}");
+            })
+            .join()
+            .expect("string expression pressure worker");
+        }
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_native_string_arguments_validate_and_preserve_values() {
+        std::thread::spawn(|| {
+            crate::tier2::force_enable_for_test(2);
+            let out = run(include_str!(
+                "../../../tests/regrtest/test_native_string_arguments.py"
+            ));
+            assert_eq!(out, "ok\n");
+            assert!(
+                crate::tier2::direct_call_count_for_test() >= 1,
+                "string argument regression must enter native calls"
+            );
+        })
+        .join()
+        .expect("native string arguments worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_native_string_argument_storage_covers_arities() {
+        for (expression, input, expected) in [
+            ("value.upper()", "'abc'", Some("'ABC'")),
+            ("value.strip(' ab')", "' abXYZba '", Some("'XYZ'")),
+            ("value.split(' ', 1)", "'ab cd ef'", Some("['ab', 'cd ef']")),
+            ("value.replace('ab', 'xyz', 1)", "'abab'", Some("'xyzab'")),
+            ("value.replace('ab', 'xyz', 1, 2)", "'abab'", None),
+        ] {
+            std::thread::spawn(move || {
+                crate::tier2::force_enable_for_test(2);
+                let check = match expected {
+                    Some(value) => format!("    assert f({input}) == {value}\n"),
+                    None => format!(
+                        "    try:\n        f({input})\n    except TypeError:\n        pass\n    else:\n        raise AssertionError('extra arguments accepted')\n"
+                    ),
+                };
+                let source = format!(
+                    "def f(value):\n    return {expression}\nfor _ in range(16):\n{check}print('ok')\n"
+                );
+                assert_eq!(run(&source), "ok\n", "{expression}");
+                let (_, framed, _) = crate::tier2::stats_for_test();
+                let (nested, _, _) = crate::tier2::native_call_stats_for_test();
+                let direct = crate::tier2::direct_call_count_for_test();
+                assert!(
+                    framed + nested + direct >= 1,
+                    "argument storage case must enter natively: {expression}; {framed} framed, {nested} nested, {direct} direct"
+                );
+            })
+            .join()
+            .expect("string argument arity worker");
+        }
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_string_count_callbacks_keep_current_state() {
+        std::thread::spawn(|| {
+            crate::tier2::force_enable_for_test(2);
+            let out = run(include_str!(
+                "../../../tests/regrtest/test_native_string_callbacks.py"
+            ));
+            assert_eq!(out, "ok\n");
+            assert!(
+                crate::tier2::direct_call_count_for_test() >= 1,
+                "callback regression must exercise warmed native calls"
+            );
+        })
+        .join()
+        .expect("native string callback worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_string_split_results_remain_collectable() {
+        let _heap_guard = HEAP_SNAPSHOT_TEST_LOCK.lock().expect("heap snapshot lock");
+        std::thread::spawn(|| {
+            crate::tier2::force_enable_for_test(2);
+            let out = run(include_str!(
+                "../../../tests/regrtest/test_string_split_gc.py"
+            ));
+            assert_eq!(out, "ok\n");
+            let (_, framed, _) = crate::tier2::stats_for_test();
+            let (nested, _, _) = crate::tier2::native_call_stats_for_test();
+            let direct = crate::tier2::direct_call_count_for_test();
+            assert!(
+                framed + nested + direct >= 1,
+                "split collector regression must execute native code: {framed} framed, {nested} nested, {direct} direct"
+            );
+        })
+        .join()
+        .expect("native string split collector worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_string_list_enters_at_loop_header() {
+        std::thread::spawn(|| {
+            crate::tier2::force_enable_for_test(2);
+            let out = run(r"
+def combine(n):
+    total = 0
+    for i in range(n):
+        parts = 'alpha beta'.split()
+        total += len(' '.join(parts))
+    return total
+print(combine(200))
+");
+            assert_eq!(out, "2000\n");
+            let (compiled, _, _) = crate::tier2::stats_for_test();
+            let osr = crate::tier2::osr_stats_for_test();
+            assert!(compiled >= 1, "string-list function never compiled");
+            assert!(
+                osr >= 1,
+                "string-list function never entered its native loop"
+            );
+        })
+        .join()
+        .expect("string-list OSR worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_extreme_slice_stop_stays_native_and_exact() {
+        std::thread::spawn(|| {
+            crate::tier2::force_enable_for_test(2);
+            let out = run(r"
+def list_size(stop):
+    items = [1, 2, 3]
+    return len(items[:stop:None])
+def str_size(stop):
+    return len('abc'[:stop:None])
+total = 0
+for i in range(100):
+    total += list_size(-9223372036854775808)
+    total += list_size(-9223372036854775807)
+    total += list_size(-1) + list_size(9223372036854775807)
+    total += str_size(-9223372036854775808)
+    total += str_size(-9223372036854775807)
+    total += str_size(-1) + str_size(9223372036854775807)
+print(total)
+");
+            assert_eq!(out, "1000\n");
+            let (compiled, entries, _) = crate::tier2::stats_for_test();
+            let (calls, _, _) = crate::tier2::native_call_stats_for_test();
+            let direct = crate::tier2::direct_call_count_for_test();
+            assert!(
+                compiled >= 2 && entries + calls + direct >= 100,
+                "slice functions must enter native code: {compiled} compiled, {entries} framed, {calls} native calls, {direct} direct calls"
+            );
+        })
+        .join()
+        .expect("native slice worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_two_bound_slice_fallback_restores_exact_stack() {
+        std::thread::spawn(|| {
+            crate::tier2::force_enable_for_test(2);
+            let source = r"
+def sliced(value, stop):
+    return value[:stop:None]
+for i in range(100):
+    assert sliced('abcdef', 4) == 'abcd'
+print(sliced('é😀z', 2))
+";
+            let module = parse_module(source).expect("parse");
+            let mut code = compile_module(&module).expect("compile");
+            let nested = code
+                .constants
+                .iter_mut()
+                .find_map(|constant| match constant {
+                    Constant::Code(inner) if inner.name == "sliced" => Some(inner),
+                    _ => None,
+                })
+                .expect("slice function");
+            let function = Rc::make_mut(nested);
+            let pc = function
+                .instructions
+                .iter()
+                .position(|ins| ins.op == OpCode::BuildSlice)
+                .unwrap();
+            assert_eq!(function.instructions[pc].arg, 3);
+            assert_eq!(function.instructions[pc - 1].op, OpCode::LoadConst);
+            function.instructions[pc - 1].op = OpCode::Nop;
+            function.instructions[pc - 1].arg = 0;
+            function.instructions[pc].arg = 2;
+            let mut interp = Interpreter::new();
+            let buffer: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+            let writer: Stdout = buffer.clone() as Rc<RefCell<dyn Write + Send + Sync>>;
+            interp.set_stdout(writer);
+            interp.run_module(&code).expect("two-bound native fallback");
+            assert_eq!(String::from_utf8(buffer.borrow().clone()).unwrap(), "é😀\n");
+            let (compiled, entries, deopts) = crate::tier2::stats_for_test();
+            assert!(
+                compiled > 0 && entries > 0 && deopts > 0,
+                "native fallback must run"
+            );
+        })
+        .join()
+        .expect("native slice fallback worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
     fn jit_str_mod_and_slice_roundtrip() {
         // RFC 0074 WS5 — `%`-formatting and open/closed str slices
         // compile natively; results stay exact strs.
@@ -53542,6 +54311,262 @@ mod tests {
         // sum_{i<40} 100i + 29 = 78000 + 1160
         assert_eq!(out, "79160\n");
         assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_native_call_scratch_survives_nested_calls_and_exits() {
+        let source = include_str!("../../../tests/regrtest/test_native_call_scratch.py");
+        let (output, calls, _, deopts) = run_jit_native(source);
+        assert_eq!(output, "native call scratch: ok\n");
+        assert_eq!(output, run(source));
+        assert!(
+            calls > 1000,
+            "the nested method calls must execute natively"
+        );
+        assert!(
+            deopts > 0,
+            "overflow and exceptions must exercise native exits"
+        );
+    }
+
+    #[test]
+    fn pickle_builtin_encoder_preserves_values_and_configured_fallbacks() {
+        #[cfg(feature = "jit")]
+        let _heap_guard = HEAP_SNAPSHOT_TEST_LOCK.lock().expect("heap snapshot lock");
+        let source = r#"import _pickle
+import pickle
+import struct
+import gc
+import weakref
+from _weave_pickle import make_dumps
+
+for name in ('Pickler', 'Unpickler', 'dump', 'dumps', 'load', 'loads'):
+    assert getattr(pickle, name) is getattr(_pickle, name), 'accelerator import order: ' + name
+
+native = _pickle._native_dumps
+assert native is not None, 'encoder check 9: native is not None'
+
+def attempt(value, protocol=5):
+    return native(value, _pickle.Pickler, protocol, True, None)
+
+for protocol in (4, 5):
+    for value in (None, False, 123, 2**2500, -2**2500, -0.0,
+                  'hello é中🚀', b'\0\xff', [1, 2, 3], (1, 2), {'a': [1, 2]}):
+        blob = attempt(value, protocol)
+        assert type(blob) is bytes, 'encoder check 18: type(blob) is bytes'
+        assert pickle.dumps(value, protocol=protocol) == blob, 'encoder check 19: pickle.dumps(value, protocol=protocol) == blob'
+        restored = pickle.loads(blob)
+        assert type(restored) is type(value), 'encoder check 21: type(restored) is type(value)'
+        if type(value) is float:
+            assert struct.pack('>d', value) == struct.pack('>d', restored), "encoder check 23: struct.pack('>d', value) == struct.pack('>d', restored)"
+        else:
+            assert restored == value, 'encoder check 25: restored == value'
+
+cycle = []
+cycle.append(cycle)
+assert attempt(cycle) is None, 'encoder check 29: attempt(cycle) is None'
+assert attempt(object()) is None, 'encoder check 30: attempt(object()) is None'
+assert attempt('\ud800') is None, "encoder check 31: attempt('\\ud800') is None"
+assert attempt(None, 3) is None, 'encoder check 32: attempt(None, 3) is None'
+assert native([], _pickle.Pickler, 5, True, object()) is None, 'encoder check 33: native([], _pickle.Pickler, 5, True, object()) is None'
+assert native([], _pickle.Pickler, 5, object(), None) is None, 'encoder check 34: native([], _pickle.Pickler, 5, object(), None) is None'
+
+shared = ['shared']
+blob = attempt({'a': shared, 'b': (shared, shared)})
+back = pickle.loads(blob)
+assert back['a'] is back['b'][0] is back['b'][1], "encoder check 39: back['a'] is back['b'][0] is back['b'][1]"
+
+_pickle._encode_events = []
+def changed_none(self, value):
+    _pickle._encode_events.append('dispatch')
+    self.write(b'K\x07')
+old = _pickle.Pickler.dispatch[type(None)]
+_pickle.Pickler.dispatch[type(None)] = changed_none
+assert attempt(None) is None, 'encoder check 47: attempt(None) is None'
+assert pickle.loads(pickle.dumps(None)) == 7, 'encoder check 48: pickle.loads(pickle.dumps(None)) == 7'
+assert _pickle._encode_events == ['dispatch'], "encoder check 49: _pickle._encode_events == ['dispatch']"
+_pickle.Pickler.dispatch[type(None)] = old
+assert attempt(None) is not None, 'encoder check 51: attempt(None) is not None'
+
+# Function code replacement keeps the original module globals. Use a constant
+# implementation here, and inspect bytes to prove the altered code executed.
+def changed_none_code(self, value):
+    self.write(b'K\x08')
+code = old.__code__
+old.__code__ = changed_none_code.__code__
+assert attempt(None) is None, 'encoder check 59: attempt(None) is None'
+assert pickle.loads(pickle.dumps(None)) == 8, 'encoder check 60: pickle.loads(pickle.dumps(None)) == 8'
+old.__code__ = code
+assert attempt(None) is not None, 'encoder check 62: attempt(None) is not None'
+
+# Guard the descriptor's wrapped function as well as its class methods.
+descriptor = _pickle.Pickler.dump
+original_function = descriptor._func
+def changed_dump(self, obj):
+    _pickle._encode_events.append('dump')
+    self._file_write(b'N.')
+descriptor._func = changed_dump
+assert attempt(123) is None, 'encoder check 71: attempt(123) is None'
+assert pickle.loads(pickle.dumps(123)) is None, 'encoder check 72: pickle.loads(pickle.dumps(123)) is None'
+assert _pickle._encode_events == ['dispatch', 'dump'], "encoder check 73: _pickle._encode_events == ['dispatch', 'dump']"
+descriptor._func = original_function
+assert attempt(None) is not None, 'encoder check 75: attempt(None) is not None'
+
+# The inherited base initializer must remain guarded even though Pickler's
+# wrapper calls it through an explicit module-global base-class reference.
+base_init = pickle._Pickler.__init__
+original_code = base_init.__code__
+def blocked_init(self, *args, **kwargs):
+    raise ValueError('changed initializer')
+base_init.__code__ = blocked_init.__code__
+assert attempt(None) is None, 'encoder check 84: attempt(None) is None'
+try:
+    pickle.dumps(None)
+except ValueError as exc:
+    assert str(exc) == 'changed initializer', "encoder check 88: str(exc) == 'changed initializer'"
+else:
+    raise AssertionError('initializer override bypassed')
+base_init.__code__ = original_code
+assert attempt(None) is not None, 'encoder check 92: attempt(None) is not None'
+
+# A custom persistent-ID hook or reducer override must run exactly once.
+_pickle._encode_events.clear()
+def persistent_id(self, value):
+    _pickle._encode_events.append('persistent')
+    return None
+_pickle.Pickler.persistent_id = persistent_id
+assert attempt(None) is None, 'persistent-ID override must disable native encoding'
+assert pickle.loads(pickle.dumps(None)) is None
+assert _pickle._encode_events == ['persistent']
+del _pickle.Pickler.persistent_id
+native = _pickle._native_dumps = make_dumps(_pickle.Pickler)
+assert attempt(None) is not None, 'restored stock writer must be eligible'
+
+def reducer_override(self, value):
+    _pickle._encode_events.append('reducer')
+    return NotImplemented
+_pickle.Pickler.reducer_override = reducer_override
+assert attempt(7) is None, 'reducer override must disable native encoding'
+assert pickle.loads(pickle.dumps(7)) == 7
+assert _pickle._encode_events == ['persistent', 'reducer']
+del _pickle.Pickler.reducer_override
+native = _pickle._native_dumps = make_dumps(_pickle.Pickler)
+assert attempt(None) is not None, 'restored stock writer must be eligible'
+
+# Factory guards must not retain an otherwise unreferenced subclass.
+def transient():
+    class Temporary(_pickle.Pickler):
+        pass
+    return weakref.ref(Temporary), make_dumps(Temporary)
+ref, temporary_helper = transient()
+assert temporary_helper is not None, 'encoder check 100: temporary_helper is not None'
+gc.collect()
+assert ref() is None, 'encoder check 102: ref() is None'
+# In-place default overrides leave class and function identities intact.
+handler = _pickle.Pickler.dispatch[type(None)]
+defaults = handler.__defaults__
+handler.__defaults__ = (None,)
+assert attempt(None) is None, 'handler defaults override must disable native encoding'
+assert pickle.loads(pickle.dumps(None)) is None
+handler.__defaults__ = defaults
+print('native pickle encoding: ok')
+"#;
+        assert_eq!(run(source), "native pickle encoding: ok\n");
+    }
+
+    #[test]
+    fn pickle_builtin_decoder_preserves_values_and_configured_fallbacks() {
+        #[cfg(feature = "jit")]
+        let _heap_guard = HEAP_SNAPSHOT_TEST_LOCK.lock().expect("heap snapshot lock");
+        let mut source =
+            include_str!("../../../tests/regrtest/test_pickle_builtin_data.py").to_owned();
+        source.push_str(
+            r#"
+import _pickle
+import _weave_pickle
+import gc
+import weakref
+
+assert _pickle._native_loads is not None
+def native(blob):
+    return _pickle._native_loads(blob, _pickle.Unpickler, True, "ASCII", "strict", None)
+
+for value in (None, [1, 2], {"a": [1, 2]}, list(range(40000)), b"x" * 80000):
+    blob = pickle.dumps(value, protocol=5)
+    result = native(blob)
+    assert result is not None
+    same(result[0], value)
+    if type(value) is list and len(value) == 40000:
+        large_blob = blob
+
+shared = []
+back = native(pickle.dumps([shared, shared], protocol=5))[0]
+assert back[0] is back[1]
+shared.append(shared)
+assert native(pickle.dumps(shared, protocol=5)) is None
+
+original_float = _pickle.Unpickler.dispatch[ord("G")]
+def changed_float(self):
+    self.read(8)
+    self.append("custom float")
+_pickle.Unpickler.dispatch[ord("G")] = changed_float
+assert native(b"\x80\x05N.") == (None,)
+float_blob = pickle.dumps(1.5, protocol=5)
+assert native(float_blob) is None
+assert pickle.loads(float_blob) == "custom float"
+_pickle.Unpickler.dispatch[ord("G")] = original_float
+
+original = _pickle.Unpickler.dispatch[ord("N")]
+original_none_code = original.__code__
+def changed_none_code(self):
+    self.append("changed handler code")
+original.__code__ = changed_none_code.__code__
+assert native(b"\x80\x05N.") is None
+assert pickle.loads(b"\x80\x05N.") == "changed handler code"
+original.__code__ = original_none_code
+assert native(b"\x80\x05N.") == (None,)
+
+def changed_none(self):
+    events.append("dispatch")
+    self.append("changed")
+_pickle.Unpickler.dispatch[ord("N")] = changed_none
+assert native(b"\x80\x05N.") is None
+assert pickle.loads(b"\x80\x05N.") == "changed"
+assert events == [42, "dispatch"]
+_pickle.Unpickler.dispatch[ord("N")] = original
+assert native(b"\x80\x05N.") == (None,)
+
+old_code = _pickle.Unpickler.load.__code__
+_pickle._decoder_test_events = events
+def changed_load(self):
+    _decoder_test_events.append("load")
+    return "replaced load"
+_pickle.Unpickler.load.__code__ = changed_load.__code__
+assert native(b"\x80\x05N.") is None
+assert pickle.loads(b"\x80\x05N.") == "replaced load"
+assert native(large_blob) is None
+assert pickle.loads(large_blob) == "replaced load"
+assert events == [42, "dispatch", "load", "load"]
+_pickle.Unpickler.load.__code__ = old_code
+del _pickle._decoder_test_events
+assert native(b"\x80\x05N.") == (None,)
+
+class Temporary(_pickle.Unpickler):
+    pass
+ref = weakref.ref(Temporary)
+helper = _weave_pickle.make_loads(Temporary)
+assert helper is not None
+del Temporary
+gc.collect()
+assert ref() is None
+print("native pickle coverage: ok")
+"#,
+        );
+        assert_eq!(
+            run(&source),
+            "pickle built-in data: ok\nnative pickle coverage: ok\n"
+        );
     }
 
     #[cfg(feature = "jit")]

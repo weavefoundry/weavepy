@@ -2499,10 +2499,21 @@ pub fn decode_full(
     firstlineno: u32,
     constants: &[Constant],
 ) -> Option<DecodedCode> {
-    let mut varnames = Vec::new();
-    let mut cellvars = Vec::new();
-    let mut freevars = Vec::new();
-    let mut hidden_locals = Vec::new();
+    // Names can belong to multiple partitions. Count the same paired entries
+    // used below so every retained buffer has its final capacity immediately.
+    let mut counts = [0; 4];
+    for &kind in localspluskinds.iter().take(localsplusnames.len()) {
+        counts[0] += usize::from(kind & CO_FAST_LOCAL != 0);
+        counts[1] += usize::from(kind & CO_FAST_CELL != 0);
+        counts[2] += usize::from(kind & CO_FAST_FREE != 0);
+        counts[3] += usize::from(
+            kind & (CO_FAST_LOCAL | CO_FAST_HIDDEN) == (CO_FAST_LOCAL | CO_FAST_HIDDEN),
+        );
+    }
+    let mut varnames = Vec::with_capacity(counts[0]);
+    let mut cellvars = Vec::with_capacity(counts[1]);
+    let mut freevars = Vec::with_capacity(counts[2]);
+    let mut hidden_locals = Vec::with_capacity(counts[3]);
     for (name, &kind) in localsplusnames.iter().zip(localspluskinds.iter()) {
         // An escaping parameter carries LOCAL|CELL on one shared slot:
         // it belongs to *both* co_varnames and co_cellvars.
@@ -2523,9 +2534,10 @@ pub fn decode_full(
     let raws = decode_raws(co_code);
     let (instructions, mut wire_marks) = decode_instructions(&raws, &slots, constants)?;
     if wire_marks.iter().all(|&m| m == wire::PLAIN) {
-        wire_marks.clear();
+        wire_marks = Vec::new();
     }
-    let (linetable, coltable) = decode_linetable(co_linetable, &raws, firstlineno);
+    let (linetable, coltable) =
+        decode_linetable(co_linetable, &raws, firstlineno, instructions.len());
     let exception_table = decode_exception_table(co_exceptiontable, &raws);
     // Recover the NO_INTERRUPT flag per decoded instruction index (the
     // internal stream folds both backward jumps into one opcode).
@@ -2587,6 +2599,7 @@ fn decode_linetable(
     table: &[u8],
     raws: &[DecodedRaw],
     firstlineno: u32,
+    instruction_count: usize,
 ) -> (Vec<u32>, Vec<crate::ColSpan>) {
     let mut unit_lines: Vec<u32> = Vec::new();
     let mut unit_cols: Vec<crate::ColSpan> = Vec::new();
@@ -2659,8 +2672,10 @@ fn decode_linetable(
             unit_cols.push(span);
         }
     }
-    let mut lines = Vec::with_capacity(raws.len());
-    let mut cols = Vec::with_capacity(raws.len());
+    // Fused wire instructions can expand into multiple interpreter
+    // instructions. Reserve for that decoded length, not the raw count.
+    let mut lines = Vec::with_capacity(instruction_count);
+    let mut cols = Vec::with_capacity(instruction_count);
     for r in raws {
         let line = unit_lines.get(r.start_unit).copied().unwrap_or(firstlineno);
         let col = unit_cols.get(r.start_unit).copied().unwrap_or_default();
@@ -3113,6 +3128,96 @@ mod tests {
         // Handler at instruction 3 starts at unit 1 + 10 + 1 = 12.
         assert_eq!(target, 12);
         assert_eq!(dl >> 1, 2);
+    }
+
+    #[test]
+    fn decoded_buffers_cover_expanded_instruction_locations() {
+        let names = vec!["left".to_owned(), "right".to_owned()];
+        let decoded = decode_full(
+            &[
+                op::RESUME,
+                0,
+                op::LOAD_FAST_LOAD_FAST,
+                0x01,
+                op::RETURN_VALUE,
+                0,
+            ],
+            &[0xf2, 0, 0, 4, 8], // Three units on line 9, columns 3 through 7.
+            &[],
+            &names,
+            &[CO_FAST_LOCAL, CO_FAST_LOCAL],
+            9,
+            &[],
+        )
+        .expect("fused loads must decode");
+        assert_eq!(
+            decoded.instructions,
+            vec![
+                Instruction::new(OpCode::Resume, 0),
+                Instruction::new(OpCode::LoadFast, 0),
+                Instruction::new(OpCode::LoadFast, 1),
+                Instruction::new(OpCode::ReturnValue, 0),
+            ]
+        );
+        assert_eq!(decoded.linetable, vec![9; 4]);
+        assert_eq!(
+            decoded.coltable,
+            vec![
+                crate::ColSpan {
+                    end_lineno: 9,
+                    col: 3,
+                    end_col: 7
+                };
+                4
+            ]
+        );
+        assert_eq!(decoded.linetable.capacity(), decoded.instructions.len());
+        assert_eq!(decoded.coltable.capacity(), decoded.instructions.len());
+        assert_eq!(
+            decoded.wire_marks,
+            [wire::PLAIN, wire::FUSE_HEAD, wire::FUSE_TAIL, wire::PLAIN]
+        );
+        let plain = decode_full(
+            &[op::RESUME, 0, op::LOAD_FAST, 0, op::RETURN_VALUE, 0],
+            &[0xf2, 0, 0, 4, 8],
+            &[],
+            &names,
+            &[CO_FAST_LOCAL, CO_FAST_LOCAL],
+            9,
+            &[],
+        )
+        .unwrap();
+        assert!(plain.wire_marks.is_empty());
+        assert_eq!(plain.wire_marks.capacity(), 0);
+    }
+
+    #[test]
+    fn decoded_buffers_partition_shared_and_hidden_locals() {
+        let names = vec!["shared".to_owned(), "plain".to_owned(), "outer".to_owned()];
+        let kinds = [
+            CO_FAST_LOCAL | CO_FAST_CELL | CO_FAST_HIDDEN,
+            CO_FAST_LOCAL,
+            CO_FAST_FREE,
+        ];
+        let decoded = decode_full(&[], &[], &[], &names, &kinds, 1, &[]).unwrap();
+        assert_eq!(decoded.varnames, ["shared", "plain"]);
+        assert_eq!(decoded.cellvars, ["shared"]);
+        assert_eq!(decoded.freevars, ["outer"]);
+        assert_eq!(decoded.hidden_locals, ["shared"]);
+        for names in [
+            &decoded.varnames,
+            &decoded.cellvars,
+            &decoded.freevars,
+            &decoded.hidden_locals,
+        ] {
+            assert_eq!(names.capacity(), names.len());
+        }
+        // Only paired name/kind entries contribute, as before.
+        let truncated = decode_full(&[], &[], &[], &names[..1], &kinds, 1, &[]).unwrap();
+        assert_eq!(truncated.varnames, ["shared"]);
+        assert!(truncated.freevars.is_empty());
+        assert_eq!(truncated.varnames.capacity(), 1);
+        assert_eq!(truncated.freevars.capacity(), 0);
     }
 
     #[test]

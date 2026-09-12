@@ -977,13 +977,14 @@ impl Instruction {
 /// - `Cooldown(n)` — the previous specialization attempt deopted;
 ///   run the generic handler `n` more times before retrying.
 ///
-/// Variants are 24 bytes or smaller; the enum is `Copy` so it fits
-/// in a `Cell<…>`.
+/// Variants are 16 bytes or smaller. Storage encodes their initialized
+/// fields explicitly, without reading enum padding.
 ///
-/// `type_id` / `module_id` / `globals_id` / `builtins_id` are all
-/// `Rc::as_ptr(&value) as u64` — a cheap monotonic identity that
-/// changes when the underlying allocation does. Address reuse after
-/// drop is handled by the deopt path on the next guard miss.
+/// Attribute versions are process-unique class-resolution tokens.
+/// `module_id` / `globals_id` / `builtins_id` are all
+/// allocation-address fingerprints; indexed loads also validate the
+/// cached key. Narrow fields precede u64 fields so each tagged payload
+/// fits within sixteen bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum InlineCache {
@@ -1021,29 +1022,28 @@ pub enum InlineCache {
     CompareOpFloat,
     CompareOpStr,
 
-    // LOAD_ATTR family — fingerprint + dict slot index + the class's
+    // LOAD_ATTR family — dict slot index + the class's
     // attribute-resolution version (`TypeObject::attr_version`) observed
     // at specialisation time. A class-dict or MRO mutation bumps the
     // version, deopting stale sites (CPython's `tp_version_tag` role).
     LoadAttrInstance {
-        type_id: u64,
         key_idx: u32,
-        ver: u32,
+        ver: u64,
     },
     LoadAttrModule {
-        module_id: u64,
         key_idx: u32,
+        module_id: u64,
     },
     /// Attribute backed by a `__slots__` member descriptor: the value
-    /// lives in the instance's slot side table, keyed by the attr name.
+    /// lives in the instance's ordered slot storage. The cached index is
+    /// checked against the name because population order can differ.
     LoadAttrSlot {
-        type_id: u64,
-        ver: u32,
+        key_idx: u32,
+        ver: u64,
     },
     LoadAttrType {
-        type_id: u64,
         key_idx: u32,
-        ver: u32,
+        ver: u64,
     },
     /// Method load (`obj.m` resolving to a plain Python function on the
     /// class MRO, about to be bound). `mro_idx` locates the defining
@@ -1052,35 +1052,34 @@ pub enum InlineCache {
     /// allocation, going straight to bind. Guarded by `ver`
     /// (`TypeObject::attr_version`) plus a name check on the slot.
     LoadAttrMethod {
-        type_id: u64,
-        ver: u32,
         mro_idx: u16,
         key_idx: u32,
+        ver: u64,
     },
 
     // LOAD_GLOBAL family — globals/builtins dict version + key idx.
     LoadGlobalModule {
-        globals_id: u64,
         key_idx: u32,
+        globals_id: u64,
     },
     LoadGlobalBuiltin {
-        builtins_id: u64,
         key_idx: u32,
+        builtins_id: u64,
     },
 
     // STORE_ATTR family — fingerprint + dict slot index + resolution
     // version (see the LOAD_ATTR family note).
     StoreAttrInstance {
-        type_id: u64,
         key_idx: u32,
-        ver: u32,
+        ver: u64,
     },
     /// Store to a `__slots__` member: writes the instance's slot side
     /// table directly (the class was validated at specialisation time to
-    /// have the stock `__setattr__` and a genuine slot descriptor).
+    /// have the stock `__setattr__` and a genuine slot descriptor). The
+    /// index is guarded by its name, with named insertion on a miss.
     StoreAttrSlot {
-        type_id: u64,
-        ver: u32,
+        key_idx: u32,
+        ver: u64,
     },
     /// First store of a not-yet-present attribute on a plain instance —
     /// the constructor pattern (`self.x = …` on a fresh object). One
@@ -1089,8 +1088,7 @@ pub enum InlineCache {
     /// for the name, instances carry a `__dict__`) and `ver` guards
     /// against class mutations since.
     StoreAttrNewKey {
-        type_id: u64,
-        ver: u32,
+        ver: u64,
     },
 
     // FOR_ITER family.
@@ -1116,15 +1114,15 @@ pub enum InlineCache {
     /// closure — so the frame's locals are just the arguments padded
     /// with `None`, skipping the whole argument-binding dance.
     CallPyExactNoFree {
-        func_id: u64,
         argc: u32,
+        func_id: u64,
     },
     /// Plain Python function with the same exact-arity guarantee but a
     /// non-trivial cell/closure layout — still skips argument binding,
     /// but builds the frame (and its cells) through `make_frame`.
     CallPyExact {
-        func_id: u64,
         argc: u32,
+        func_id: u64,
     },
     /// Bound method (`obj.m(...)`) whose target is a plain Python
     /// function with exact arity `argc + 1` (receiver prepended) —
@@ -1132,16 +1130,16 @@ pub enum InlineCache {
     /// `LOAD_METHOD` opcode; the `LoadAttrMethod` + this pair is the
     /// CPython fusion equivalent (RFC 0058 WS3).
     CallBoundMethodExact {
-        func_id: u64,
         argc: u32,
+        func_id: u64,
     },
     /// Plain Python function called with fewer positionals than it
     /// declares, the missing tail covered verbatim by `__defaults__`
     /// — skips the binder and splices the defaults suffix directly
     /// (RFC 0058 WS3).
     CallPyDefaults {
-        func_id: u64,
         argc: u32,
+        func_id: u64,
     },
     /// Keyword call (`CALL_KW`) on a plain Python function whose name
     /// tuple resolves to a fixed name→slot permutation: bind is the
@@ -1155,25 +1153,25 @@ pub enum InlineCache {
     /// than 8 keywords, or callees with more than 16 parameter slots,
     /// stay generic.
     CallPyKwNames {
-        func_id: u64,
-        perm: u32,
         argc: u8,
         kwc: u8,
+        perm: u32,
+        func_id: u64,
     },
     /// Module-level native callable (`math.sqrt`, `ord`, …) with no
     /// interpreter-aware dispatch chain: straight to the Rust `fn`
     /// (RFC 0058 WS3). Deopts whenever observers (profile/trace
     /// hooks) are active so `c_call` events still fire.
     CallNative {
-        func_id: u64,
         argc: u32,
+        func_id: u64,
     },
     /// Bound native method (`xs.append`, `s.startswith`, …): receiver
     /// prepended, straight to the Rust `fn` (RFC 0058 WS3). Same
     /// observer deopt as [`InlineCache::CallNative`].
     CallNativeMethod {
-        func_id: u64,
         argc: u32,
+        func_id: u64,
     },
 
     // BINARY_SUBSCR family (RFC 0058 WS3). The container's enum
@@ -1230,57 +1228,258 @@ pub enum InlineCache {
 /// sites.
 pub const COOLDOWN: u8 = 64;
 
-/// One [`InlineCache`] slot. RFC 0025: needs to be `Send + Sync`
-/// because the parent `CodeObject` is shared across OS threads via
-/// `Arc<CodeObject>`. We use raw [`UnsafeCell`] and assert
-/// `unsafe impl Send + Sync` with a SAFETY note tied to the GIL.
-///
-/// Why not `parking_lot::Mutex`? Because the table is read on every
-/// single opcode (it's the dispatch hot path); even a 5ns mutex
-/// would add measurable per-instruction overhead. CPython does the
-/// same thing — its inline caches are bare arrays accessed under
-/// the GIL.
-///
-/// Why not an atomic? Because the largest [`InlineCache`] variant
-/// (`LoadAttrInstance { type_id: u64, key_idx: u32 }`) is ~24 bytes
-/// and no portable atomic is that wide.
-#[derive(Default)]
-pub struct CacheSlot {
-    inner: std::cell::UnsafeCell<InlineCache>,
-}
-
-// SAFETY: `CacheSlot::get` / `set` are only called by the dispatch
-// loop while the GIL is held (see `weavepy-vm::gil`). The GIL
-// serialises bytecode execution across threads, so concurrent reads
-// or writes to the same slot are impossible. Treating the cell as
-// `Send + Sync` is therefore sound — the `unsafe impl`s below
-// document that invariant at the type level.
-unsafe impl Send for CacheSlot {}
-unsafe impl Sync for CacheSlot {}
-
-impl CacheSlot {
-    /// Build a slot holding `value`.
-    pub const fn new(value: InlineCache) -> Self {
-        Self {
-            inner: std::cell::UnsafeCell::new(value),
+impl InlineCache {
+    // Explicit initialized bits, independent of Rust enum padding, target
+    // endianness, and field alignment. Tags are private cache storage only.
+    #[inline(always)]
+    const fn encode(self) -> u128 {
+        match self {
+            Self::Empty => 0,
+            Self::Cooldown(value) => 1 | ((value as u128) << 8),
+            Self::BinOpAddInt => 2,
+            Self::BinOpSubInt => 3,
+            Self::BinOpMulInt => 4,
+            Self::BinOpAddFloat => 5,
+            Self::BinOpSubFloat => 6,
+            Self::BinOpMulFloat => 7,
+            Self::BinOpAddStr => 8,
+            Self::BinOpDivInt => 9,
+            Self::BinOpFloorDivInt => 10,
+            Self::BinOpModInt => 11,
+            Self::BinOpPowInt => 12,
+            Self::BinOpDivFloat => 13,
+            Self::BinOpFloorDivFloat => 14,
+            Self::BinOpModFloat => 15,
+            Self::BinOpPowFloat => 16,
+            Self::CompareOpInt => 17,
+            Self::CompareOpFloat => 18,
+            Self::CompareOpStr => 19,
+            Self::LoadAttrInstance { key_idx, ver } => {
+                20 | ((key_idx as u128) << 8) | ((ver as u128) << 40)
+            }
+            Self::LoadAttrModule { key_idx, module_id } => {
+                21 | ((key_idx as u128) << 8) | ((module_id as u128) << 40)
+            }
+            Self::LoadAttrSlot { key_idx, ver } => {
+                22 | ((key_idx as u128) << 8) | ((ver as u128) << 40)
+            }
+            Self::LoadAttrType { key_idx, ver } => {
+                23 | ((key_idx as u128) << 8) | ((ver as u128) << 40)
+            }
+            Self::LoadAttrMethod {
+                mro_idx,
+                key_idx,
+                ver,
+            } => 24 | ((mro_idx as u128) << 8) | ((key_idx as u128) << 24) | ((ver as u128) << 56),
+            Self::LoadGlobalModule {
+                key_idx,
+                globals_id,
+            } => 25 | ((key_idx as u128) << 8) | ((globals_id as u128) << 40),
+            Self::LoadGlobalBuiltin {
+                key_idx,
+                builtins_id,
+            } => 26 | ((key_idx as u128) << 8) | ((builtins_id as u128) << 40),
+            Self::StoreAttrInstance { key_idx, ver } => {
+                27 | ((key_idx as u128) << 8) | ((ver as u128) << 40)
+            }
+            Self::StoreAttrSlot { key_idx, ver } => {
+                28 | ((key_idx as u128) << 8) | ((ver as u128) << 40)
+            }
+            Self::StoreAttrNewKey { ver } => 29 | ((ver as u128) << 8),
+            Self::ForIterList => 30,
+            Self::ForIterTuple => 31,
+            Self::ForIterRange => 32,
+            Self::ForIterStr => 33,
+            Self::ForIterDict => 34,
+            Self::UnpackSequenceTuple => 35,
+            Self::UnpackSequenceList => 36,
+            Self::UnpackSequenceTwoTuple => 37,
+            Self::CallPyExactNoFree { argc, func_id } => {
+                38 | ((argc as u128) << 8) | ((func_id as u128) << 40)
+            }
+            Self::CallPyExact { argc, func_id } => {
+                39 | ((argc as u128) << 8) | ((func_id as u128) << 40)
+            }
+            Self::CallBoundMethodExact { argc, func_id } => {
+                40 | ((argc as u128) << 8) | ((func_id as u128) << 40)
+            }
+            Self::CallPyDefaults { argc, func_id } => {
+                41 | ((argc as u128) << 8) | ((func_id as u128) << 40)
+            }
+            Self::CallPyKwNames {
+                argc,
+                kwc,
+                perm,
+                func_id,
+            } => {
+                42 | ((argc as u128) << 8)
+                    | ((kwc as u128) << 16)
+                    | ((perm as u128) << 24)
+                    | ((func_id as u128) << 56)
+            }
+            Self::CallNative { argc, func_id } => {
+                43 | ((argc as u128) << 8) | ((func_id as u128) << 40)
+            }
+            Self::CallNativeMethod { argc, func_id } => {
+                44 | ((argc as u128) << 8) | ((func_id as u128) << 40)
+            }
+            Self::SubscrListInt => 45,
+            Self::SubscrTupleInt => 46,
+            Self::SubscrStrInt => 47,
+            Self::SubscrDict => 48,
+            Self::StoreSubscrListInt => 49,
+            Self::StoreSubscrDict => 50,
+            Self::FuseLoadFastLoadFast => 51,
+            Self::FuseLoadFastLoadConst => 52,
+            Self::FuseLoadFastLoadAttr => 53,
+            Self::FuseCompareIntPopJump => 54,
+            Self::FuseBlocked => 55,
         }
     }
 
-    /// Read the slot. SAFETY relies on the GIL invariant above.
-    #[inline]
-    pub fn get(&self) -> InlineCache {
-        // SAFETY: `&self` plus the GIL invariant guarantees no
-        // concurrent write or `&mut InlineCache` exists.
-        unsafe { *self.inner.get() }
+    #[inline(always)]
+    const fn decode(bits: u128) -> Self {
+        match bits as u8 {
+            0 => Self::Empty,
+            1 => Self::Cooldown((bits >> 8) as u8),
+            2 => Self::BinOpAddInt,
+            3 => Self::BinOpSubInt,
+            4 => Self::BinOpMulInt,
+            5 => Self::BinOpAddFloat,
+            6 => Self::BinOpSubFloat,
+            7 => Self::BinOpMulFloat,
+            8 => Self::BinOpAddStr,
+            9 => Self::BinOpDivInt,
+            10 => Self::BinOpFloorDivInt,
+            11 => Self::BinOpModInt,
+            12 => Self::BinOpPowInt,
+            13 => Self::BinOpDivFloat,
+            14 => Self::BinOpFloorDivFloat,
+            15 => Self::BinOpModFloat,
+            16 => Self::BinOpPowFloat,
+            17 => Self::CompareOpInt,
+            18 => Self::CompareOpFloat,
+            19 => Self::CompareOpStr,
+            20 => Self::LoadAttrInstance {
+                key_idx: (bits >> 8) as u32,
+                ver: (bits >> 40) as u64,
+            },
+            21 => Self::LoadAttrModule {
+                key_idx: (bits >> 8) as u32,
+                module_id: (bits >> 40) as u64,
+            },
+            22 => Self::LoadAttrSlot {
+                key_idx: (bits >> 8) as u32,
+                ver: (bits >> 40) as u64,
+            },
+            23 => Self::LoadAttrType {
+                key_idx: (bits >> 8) as u32,
+                ver: (bits >> 40) as u64,
+            },
+            24 => Self::LoadAttrMethod {
+                mro_idx: (bits >> 8) as u16,
+                key_idx: (bits >> 24) as u32,
+                ver: (bits >> 56) as u64,
+            },
+            25 => Self::LoadGlobalModule {
+                key_idx: (bits >> 8) as u32,
+                globals_id: (bits >> 40) as u64,
+            },
+            26 => Self::LoadGlobalBuiltin {
+                key_idx: (bits >> 8) as u32,
+                builtins_id: (bits >> 40) as u64,
+            },
+            27 => Self::StoreAttrInstance {
+                key_idx: (bits >> 8) as u32,
+                ver: (bits >> 40) as u64,
+            },
+            28 => Self::StoreAttrSlot {
+                key_idx: (bits >> 8) as u32,
+                ver: (bits >> 40) as u64,
+            },
+            29 => Self::StoreAttrNewKey {
+                ver: (bits >> 8) as u64,
+            },
+            30 => Self::ForIterList,
+            31 => Self::ForIterTuple,
+            32 => Self::ForIterRange,
+            33 => Self::ForIterStr,
+            34 => Self::ForIterDict,
+            35 => Self::UnpackSequenceTuple,
+            36 => Self::UnpackSequenceList,
+            37 => Self::UnpackSequenceTwoTuple,
+            38 => Self::CallPyExactNoFree {
+                argc: (bits >> 8) as u32,
+                func_id: (bits >> 40) as u64,
+            },
+            39 => Self::CallPyExact {
+                argc: (bits >> 8) as u32,
+                func_id: (bits >> 40) as u64,
+            },
+            40 => Self::CallBoundMethodExact {
+                argc: (bits >> 8) as u32,
+                func_id: (bits >> 40) as u64,
+            },
+            41 => Self::CallPyDefaults {
+                argc: (bits >> 8) as u32,
+                func_id: (bits >> 40) as u64,
+            },
+            42 => Self::CallPyKwNames {
+                argc: (bits >> 8) as u8,
+                kwc: (bits >> 16) as u8,
+                perm: (bits >> 24) as u32,
+                func_id: (bits >> 56) as u64,
+            },
+            43 => Self::CallNative {
+                argc: (bits >> 8) as u32,
+                func_id: (bits >> 40) as u64,
+            },
+            44 => Self::CallNativeMethod {
+                argc: (bits >> 8) as u32,
+                func_id: (bits >> 40) as u64,
+            },
+            45 => Self::SubscrListInt,
+            46 => Self::SubscrTupleInt,
+            47 => Self::SubscrStrInt,
+            48 => Self::SubscrDict,
+            49 => Self::StoreSubscrListInt,
+            50 => Self::StoreSubscrDict,
+            51 => Self::FuseLoadFastLoadFast,
+            52 => Self::FuseLoadFastLoadConst,
+            53 => Self::FuseLoadFastLoadAttr,
+            54 => Self::FuseCompareIntPopJump,
+            55 => Self::FuseBlocked,
+            _ => Self::Empty,
+        }
+    }
+}
+
+/// One coherent instruction-cache value, including concurrent shared-code
+/// reads and writes. No enum padding is read and no pointer is dereferenced
+/// from the cached integer fingerprints.
+#[derive(Default)]
+pub struct CacheSlot {
+    inner: crate::cache_snapshot::CacheSnapshot,
+}
+
+impl CacheSlot {
+    pub const fn new(value: InlineCache) -> Self {
+        Self {
+            inner: crate::cache_snapshot::CacheSnapshot::new(value.encode()),
+        }
     }
 
-    /// Overwrite the slot. SAFETY relies on the GIL invariant above.
-    #[inline]
+    #[inline(always)]
+    pub fn get(&self) -> InlineCache {
+        self.inner
+            .load()
+            .map(InlineCache::decode)
+            .unwrap_or(InlineCache::Empty)
+    }
+
+    #[inline(always)]
     pub fn set(&self, value: InlineCache) {
-        // SAFETY: the GIL guarantees no concurrent reader or writer
-        // exists. We materialise an exclusive `&mut InlineCache`
-        // only for the duration of the assignment.
-        unsafe { *self.inner.get() = value };
+        self.inner.store(value.encode());
     }
 }
 
@@ -1302,73 +1501,156 @@ impl PartialEq for CacheSlot {
     }
 }
 
-/// Parallel side-table: one [`InlineCache`] per [`Instruction`].
+/// Per-instruction cache storage allocated on the first cache write.
 ///
-/// Lazily-initialised — the compiler emits an empty `CacheTable` and
-/// the VM extends it on first dispatch into a code object. Slots
-/// are interior-mutable so the dispatcher can warm them through a
-/// shared `&CodeObject`. The slot type is `Send + Sync` (under the
-/// GIL invariant) so `Arc<CodeObject>` can cross thread boundaries
-/// (RFC 0025).
-#[derive(Debug, Default)]
+/// The atomic pointer owns either no allocation or exactly `len` slots. An
+/// acquire load both checks initialization and obtains the published storage.
+/// Only exclusive access can resize or release it. Publication synchronizes
+/// initialization; individual cache values also use coherent atomic loads and stores.
+#[derive(Default)]
 pub struct CacheTable {
-    pub slots: Vec<CacheSlot>,
+    slots: std::sync::atomic::AtomicPtr<CacheSlot>,
+    len: usize,
 }
 
 impl CacheTable {
-    /// Allocate `n` empty cache slots.
+    /// Reserve a logical instruction count without allocating cache storage.
     pub fn with_len(n: usize) -> Self {
         Self {
-            slots: (0..n).map(|_| CacheSlot::new(InlineCache::Empty)).collect(),
+            slots: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            len: n,
         }
     }
 
-    /// Read the cache for instruction `pc`. Out-of-range indices
-    /// silently return `Empty` so the dispatcher doesn't have to
-    /// branch on the table length on every step.
     #[inline]
+    fn initialized(&self) -> Option<&[CacheSlot]> {
+        let slots = self.slots.load(std::sync::atomic::Ordering::Acquire);
+        if slots.is_null() {
+            None
+        } else {
+            // SAFETY: a nonnull pointer owns `len` initialized slots. Acquire
+            // observes their publication, and this shared borrow prevents
+            // resize/drop. CacheSlot provides the slots' interior mutability.
+            Some(unsafe { std::slice::from_raw_parts(slots, self.len) })
+        }
+    }
+
+    /// Read a cache, returning `Empty` for cold tables or out-of-range indices.
+    #[inline(always)]
     pub fn get(&self, pc: u32) -> InlineCache {
-        self.slots
-            .get(pc as usize)
+        self.initialized()
+            .and_then(|slots| slots.get(pc as usize))
             .map(CacheSlot::get)
             .unwrap_or(InlineCache::Empty)
     }
 
-    /// Set the cache for instruction `pc`. No-op when `pc` is out of
-    /// range (matches `get`'s defensive shape).
-    #[inline]
+    #[cold]
+    #[inline(never)]
+    fn allocate(&self) -> &[CacheSlot] {
+        let storage: Box<[CacheSlot]> = (0..self.len)
+            .map(|_| CacheSlot::new(InlineCache::Empty))
+            .collect();
+        let allocation = Box::into_raw(storage).cast::<CacheSlot>();
+        let slots = match self.slots.compare_exchange(
+            std::ptr::null_mut(),
+            allocation,
+            std::sync::atomic::Ordering::Release,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => allocation,
+            Err(published) => {
+                // SAFETY: this thread's losing allocation was never published.
+                // Restore its exact slice metadata and release it once.
+                unsafe {
+                    drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                        allocation, self.len,
+                    )));
+                }
+                published
+            }
+        };
+        // SAFETY: the winning allocation has `len` initialized slots. This
+        // thread either initialized it or acquired its publication. Shared
+        // access prevents exclusive resize/drop for the returned lifetime.
+        unsafe { std::slice::from_raw_parts(slots, self.len) }
+    }
+
+    /// Set a cache, allocating on its first valid write. Invalid writes are no-ops.
+    #[inline(always)]
     pub fn set(&self, pc: u32, value: InlineCache) {
-        if let Some(slot) = self.slots.get(pc as usize) {
+        if pc as usize >= self.len {
+            return;
+        }
+        let slots = match self.initialized() {
+            Some(slots) => slots,
+            None => self.allocate(),
+        };
+        if let Some(slot) = slots.get(pc as usize) {
             slot.set(value);
         }
     }
 
-    /// Clear every slot back to `Empty`. Used after an opcode
-    /// rewrite or when the user calls `gc.collect()` and we want to
-    /// discard stale type fingerprints.
+    /// Clear existing caches without allocating storage for a cold table.
     pub fn clear(&self) {
-        for slot in &self.slots {
-            slot.set(InlineCache::Empty);
+        if let Some(slots) = self.initialized() {
+            for slot in slots {
+                slot.set(InlineCache::Empty);
+            }
         }
     }
 
-    /// Resize the table to match a new instruction count. Existing
-    /// slots are preserved up to the new length; newly-added slots
-    /// start `Empty`.
-    pub fn resize(&mut self, n: usize) {
-        if self.slots.len() < n {
-            self.slots
-                .resize_with(n, || CacheSlot::new(InlineCache::Empty));
+    fn take_slots(&mut self) -> Option<Box<[CacheSlot]>> {
+        let slots = std::mem::replace(self.slots.get_mut(), std::ptr::null_mut());
+        if slots.is_null() {
+            None
         } else {
-            self.slots.truncate(n);
+            // SAFETY: exclusive access prevents outstanding storage borrows
+            // or concurrent publication. Take ownership with the original
+            // length, clearing the pointer so it cannot be released twice.
+            Some(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(slots, self.len)) })
         }
+    }
+
+    /// Update the instruction count, preserving initialized slots in range.
+    pub fn resize(&mut self, n: usize) {
+        if n == self.len {
+            return;
+        }
+        let previous = self.take_slots();
+        self.len = n;
+        if let Some(slots) = previous {
+            if n != 0 {
+                let mut slots = slots.into_vec();
+                slots.resize_with(n, || CacheSlot::new(InlineCache::Empty));
+                *self.slots.get_mut() = Box::into_raw(slots.into_boxed_slice()).cast::<CacheSlot>();
+            }
+        }
+    }
+}
+
+impl Drop for CacheTable {
+    fn drop(&mut self) {
+        drop(self.take_slots());
+    }
+}
+
+impl std::fmt::Debug for CacheTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheTable")
+            .field("slots", &self.initialized())
+            .field("len", &self.len)
+            .finish()
     }
 }
 
 impl Clone for CacheTable {
     fn clone(&self) -> Self {
+        let slots = self.initialized().map_or(std::ptr::null_mut(), |slots| {
+            Box::into_raw(slots.to_vec().into_boxed_slice()).cast::<CacheSlot>()
+        });
         Self {
-            slots: self.slots.clone(),
+            slots: std::sync::atomic::AtomicPtr::new(slots),
+            len: self.len,
         }
     }
 }
@@ -1417,5 +1699,378 @@ mod cache_tests {
         // PartialEq is intentionally insensitive to specialization
         // state.
         assert_eq!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod compact_cache_layout_tests {
+    #[test]
+    fn cache_slots_match_the_selected_atomic_storage() {
+        assert_eq!(std::mem::size_of::<super::InlineCache>(), 16);
+        assert_eq!(
+            std::mem::size_of::<super::CacheSlot>(),
+            std::mem::size_of::<crate::cache_snapshot::CacheSnapshot>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod lazy_cache_tests {
+    use super::*;
+
+    #[test]
+    fn cold_code_stays_unallocated_through_reads_clear_clone_and_resize() {
+        let mut table = CacheTable::with_len(1000);
+        assert!(table.initialized().is_none());
+        for pc in [0, 999, 1000, u32::MAX] {
+            assert_eq!(table.get(pc), InlineCache::Empty);
+        }
+        table.set(1000, InlineCache::BinOpAddInt);
+        table.clear();
+        let copied = table.clone();
+        table.resize(2000);
+        assert!(table.initialized().is_none());
+        assert!(copied.initialized().is_none());
+        table.set(1999, InlineCache::CompareOpInt);
+        assert_eq!(table.initialized().unwrap().len(), 2000);
+        assert_eq!(table.get(1999), InlineCache::CompareOpInt);
+        assert_eq!(table.get(1000), InlineCache::Empty);
+        assert_eq!(copied.get(1999), InlineCache::Empty);
+    }
+
+    #[test]
+    fn warm_resize_preserves_slots_and_discards_removed_entries() {
+        let mut table = CacheTable::with_len(4);
+        table.set(0, InlineCache::BinOpAddInt);
+        table.set(3, InlineCache::CompareOpInt);
+        table.resize(8);
+        assert_eq!(table.get(0), InlineCache::BinOpAddInt);
+        assert_eq!(table.get(3), InlineCache::CompareOpInt);
+        assert_eq!(table.get(7), InlineCache::Empty);
+        table.resize(2);
+        table.resize(4);
+        assert_eq!(table.get(0), InlineCache::BinOpAddInt);
+        assert_eq!(table.get(3), InlineCache::Empty);
+        table.clear();
+        assert_eq!(table.get(0), InlineCache::Empty);
+        table.resize(0);
+        assert!(table.initialized().is_none());
+        table.resize(5);
+        table.set(4, InlineCache::CompareOpInt);
+        assert_eq!(table.get(4), InlineCache::CompareOpInt);
+    }
+}
+
+#[cfg(test)]
+mod cache_publication_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn table_header_is_two_machine_words() {
+        assert_eq!(
+            std::mem::size_of::<CacheTable>(),
+            2 * std::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    fn concurrent_publication_returns_one_initialized_allocation() {
+        let table = Arc::new(CacheTable::with_len(64));
+        let barrier = Arc::new(Barrier::new(8));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let table = Arc::clone(&table);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    // Exercise even losing allocations without concurrently
+                    // mutating any cache value (CacheSlot's separate contract).
+                    let slots = table.allocate();
+                    assert_eq!(slots.as_ptr(), table.initialized().unwrap().as_ptr());
+                    assert_eq!(slots.len(), 64);
+                    for slot in slots {
+                        assert_eq!(slot.get(), InlineCache::Empty);
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn concurrent_first_writes_to_disjoint_slots_survive_resize_and_drop() {
+        let table = Arc::new(CacheTable::with_len(8));
+        let barrier = Arc::new(Barrier::new(8));
+        std::thread::scope(|scope| {
+            for pc in 0..8 {
+                let table = Arc::clone(&table);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    table.set(pc, InlineCache::Cooldown(pc as u8));
+                    assert_eq!(table.get(pc), InlineCache::Cooldown(pc as u8));
+                });
+            }
+        });
+        let mut table = Arc::try_unwrap(table).unwrap();
+        let copied = table.clone();
+        table.resize(20);
+        for pc in 0..8 {
+            assert_eq!(table.get(pc), InlineCache::Cooldown(pc as u8));
+            assert_eq!(copied.get(pc), InlineCache::Cooldown(pc as u8));
+        }
+        table.resize(0);
+        assert!(table.initialized().is_none());
+        assert_eq!(copied.get(7), InlineCache::Cooldown(7));
+    }
+}
+
+#[cfg(test)]
+mod atomic_slot_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn every_variant_round_trips_at_field_boundaries() {
+        for value in [
+            InlineCache::Empty,
+            InlineCache::Empty,
+            InlineCache::Cooldown(0),
+            InlineCache::Cooldown(u8::MAX),
+            InlineCache::BinOpAddInt,
+            InlineCache::BinOpAddInt,
+            InlineCache::BinOpSubInt,
+            InlineCache::BinOpSubInt,
+            InlineCache::BinOpMulInt,
+            InlineCache::BinOpMulInt,
+            InlineCache::BinOpAddFloat,
+            InlineCache::BinOpAddFloat,
+            InlineCache::BinOpSubFloat,
+            InlineCache::BinOpSubFloat,
+            InlineCache::BinOpMulFloat,
+            InlineCache::BinOpMulFloat,
+            InlineCache::BinOpAddStr,
+            InlineCache::BinOpAddStr,
+            InlineCache::BinOpDivInt,
+            InlineCache::BinOpDivInt,
+            InlineCache::BinOpFloorDivInt,
+            InlineCache::BinOpFloorDivInt,
+            InlineCache::BinOpModInt,
+            InlineCache::BinOpModInt,
+            InlineCache::BinOpPowInt,
+            InlineCache::BinOpPowInt,
+            InlineCache::BinOpDivFloat,
+            InlineCache::BinOpDivFloat,
+            InlineCache::BinOpFloorDivFloat,
+            InlineCache::BinOpFloorDivFloat,
+            InlineCache::BinOpModFloat,
+            InlineCache::BinOpModFloat,
+            InlineCache::BinOpPowFloat,
+            InlineCache::BinOpPowFloat,
+            InlineCache::CompareOpInt,
+            InlineCache::CompareOpInt,
+            InlineCache::CompareOpFloat,
+            InlineCache::CompareOpFloat,
+            InlineCache::CompareOpStr,
+            InlineCache::CompareOpStr,
+            InlineCache::LoadAttrInstance { key_idx: 0, ver: 0 },
+            InlineCache::LoadAttrInstance {
+                key_idx: u32::MAX,
+                ver: u64::MAX,
+            },
+            InlineCache::LoadAttrModule {
+                key_idx: 0,
+                module_id: 0,
+            },
+            InlineCache::LoadAttrModule {
+                key_idx: u32::MAX,
+                module_id: u64::MAX,
+            },
+            InlineCache::LoadAttrSlot { key_idx: 0, ver: 0 },
+            InlineCache::LoadAttrSlot {
+                key_idx: u32::MAX,
+                ver: u64::MAX,
+            },
+            InlineCache::LoadAttrType { key_idx: 0, ver: 0 },
+            InlineCache::LoadAttrType {
+                key_idx: u32::MAX,
+                ver: u64::MAX,
+            },
+            InlineCache::LoadAttrMethod {
+                mro_idx: 0,
+                key_idx: 0,
+                ver: 0,
+            },
+            InlineCache::LoadAttrMethod {
+                mro_idx: u16::MAX,
+                key_idx: u32::MAX,
+                ver: u64::MAX,
+            },
+            InlineCache::LoadGlobalModule {
+                key_idx: 0,
+                globals_id: 0,
+            },
+            InlineCache::LoadGlobalModule {
+                key_idx: u32::MAX,
+                globals_id: u64::MAX,
+            },
+            InlineCache::LoadGlobalBuiltin {
+                key_idx: 0,
+                builtins_id: 0,
+            },
+            InlineCache::LoadGlobalBuiltin {
+                key_idx: u32::MAX,
+                builtins_id: u64::MAX,
+            },
+            InlineCache::StoreAttrInstance { key_idx: 0, ver: 0 },
+            InlineCache::StoreAttrInstance {
+                key_idx: u32::MAX,
+                ver: u64::MAX,
+            },
+            InlineCache::StoreAttrSlot { key_idx: 0, ver: 0 },
+            InlineCache::StoreAttrSlot {
+                key_idx: u32::MAX,
+                ver: u64::MAX,
+            },
+            InlineCache::StoreAttrNewKey { ver: 0 },
+            InlineCache::StoreAttrNewKey { ver: u64::MAX },
+            InlineCache::ForIterList,
+            InlineCache::ForIterList,
+            InlineCache::ForIterTuple,
+            InlineCache::ForIterTuple,
+            InlineCache::ForIterRange,
+            InlineCache::ForIterRange,
+            InlineCache::ForIterStr,
+            InlineCache::ForIterStr,
+            InlineCache::ForIterDict,
+            InlineCache::ForIterDict,
+            InlineCache::UnpackSequenceTuple,
+            InlineCache::UnpackSequenceTuple,
+            InlineCache::UnpackSequenceList,
+            InlineCache::UnpackSequenceList,
+            InlineCache::UnpackSequenceTwoTuple,
+            InlineCache::UnpackSequenceTwoTuple,
+            InlineCache::CallPyExactNoFree {
+                argc: 0,
+                func_id: 0,
+            },
+            InlineCache::CallPyExactNoFree {
+                argc: u32::MAX,
+                func_id: u64::MAX,
+            },
+            InlineCache::CallPyExact {
+                argc: 0,
+                func_id: 0,
+            },
+            InlineCache::CallPyExact {
+                argc: u32::MAX,
+                func_id: u64::MAX,
+            },
+            InlineCache::CallBoundMethodExact {
+                argc: 0,
+                func_id: 0,
+            },
+            InlineCache::CallBoundMethodExact {
+                argc: u32::MAX,
+                func_id: u64::MAX,
+            },
+            InlineCache::CallPyDefaults {
+                argc: 0,
+                func_id: 0,
+            },
+            InlineCache::CallPyDefaults {
+                argc: u32::MAX,
+                func_id: u64::MAX,
+            },
+            InlineCache::CallPyKwNames {
+                argc: 0,
+                kwc: 0,
+                perm: 0,
+                func_id: 0,
+            },
+            InlineCache::CallPyKwNames {
+                argc: u8::MAX,
+                kwc: u8::MAX,
+                perm: u32::MAX,
+                func_id: u64::MAX,
+            },
+            InlineCache::CallNative {
+                argc: 0,
+                func_id: 0,
+            },
+            InlineCache::CallNative {
+                argc: u32::MAX,
+                func_id: u64::MAX,
+            },
+            InlineCache::CallNativeMethod {
+                argc: 0,
+                func_id: 0,
+            },
+            InlineCache::CallNativeMethod {
+                argc: u32::MAX,
+                func_id: u64::MAX,
+            },
+            InlineCache::SubscrListInt,
+            InlineCache::SubscrListInt,
+            InlineCache::SubscrTupleInt,
+            InlineCache::SubscrTupleInt,
+            InlineCache::SubscrStrInt,
+            InlineCache::SubscrStrInt,
+            InlineCache::SubscrDict,
+            InlineCache::SubscrDict,
+            InlineCache::StoreSubscrListInt,
+            InlineCache::StoreSubscrListInt,
+            InlineCache::StoreSubscrDict,
+            InlineCache::StoreSubscrDict,
+            InlineCache::FuseLoadFastLoadFast,
+            InlineCache::FuseLoadFastLoadFast,
+            InlineCache::FuseLoadFastLoadConst,
+            InlineCache::FuseLoadFastLoadConst,
+            InlineCache::FuseLoadFastLoadAttr,
+            InlineCache::FuseLoadFastLoadAttr,
+            InlineCache::FuseCompareIntPopJump,
+            InlineCache::FuseCompareIntPopJump,
+            InlineCache::FuseBlocked,
+            InlineCache::FuseBlocked,
+        ] {
+            assert_eq!(InlineCache::decode(value.encode()), value);
+            let slot = CacheSlot::new(InlineCache::Empty);
+            slot.set(value);
+            assert_eq!(slot.get(), value);
+        }
+    }
+
+    #[test]
+    fn shared_slot_updates_publish_whole_values() {
+        let a = InlineCache::LoadAttrMethod {
+            mro_idx: u16::MAX,
+            key_idx: 0,
+            ver: u64::MAX,
+        };
+        let b = InlineCache::CallPyKwNames {
+            argc: 3,
+            kwc: 5,
+            perm: u32::MAX,
+            func_id: 1,
+        };
+        let slot = Arc::new(CacheSlot::new(a));
+        let barrier = Arc::new(Barrier::new(4));
+        std::thread::scope(|scope| {
+            for value in [a, b, a, b] {
+                let slot = Arc::clone(&slot);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..100 {
+                        slot.set(value);
+                        let observed = slot.get();
+                        assert!(
+                            observed == a || observed == b || observed == InlineCache::Empty,
+                            "{observed:?}"
+                        );
+                    }
+                });
+            }
+        });
     }
 }

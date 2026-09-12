@@ -1,0 +1,46 @@
+{
+  "status": "passed",
+  "scope": "macOS ARM64 workspace checks for the user-requested checkpoint",
+  "checks": {
+    "format.txt": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "status": "passed"
+    },
+    "clippy.txt": {
+      "sha256": "7efa1e08a80b2b7a77a73a695266c9d9a619af5495ad7f8993511d2a9dd9b661",
+      "status": "passed"
+    },
+    "pylib.txt": {
+      "sha256": "608bdca915bb856d09dcd6b7f60c350528b8f07f506d8002b6bc98ffc804a3c7",
+      "status": "passed"
+    },
+    "tests.txt": {
+      "sha256": "173c36fb295c89435c50b41059140e90f9327683fef5787cd579239e34c1376a",
+      "status": "blocked by sandbox"
+    },
+    "tests-outside.txt": {
+      "passed": 729,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered": 0,
+      "test_binaries": 42
+    },
+    "doc-tests-outside.txt": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 1,
+      "measured": 0,
+      "filtered": 0,
+      "test_binaries": 12
+    }
+  },
+  "prior_attempt": "The sandboxed workspace test attempt stopped at socket fixture52 with PermissionError. Its complete log is preserved. The full outside-sandbox rerun passed; no runtime source changes were made between attempts.",
+  "commands": [
+    "cargo fmt --all -- --check",
+    "cargo clippy --offline --locked --workspace --all-targets --all-features -j 1 -- -D warnings",
+    "cargo build --offline --locked -p weavepy-pylib -j 1",
+    "cargo test --offline --locked --workspace --all-targets --all-features -j 1",
+    "cargo test --offline --locked --workspace --doc -j 1"
+  ]
+}

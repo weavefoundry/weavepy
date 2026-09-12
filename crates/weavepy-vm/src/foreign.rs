@@ -315,7 +315,10 @@ pub fn str_(s: &PyForeignSoul) -> Result<String, RuntimeError> {
 }
 
 pub fn hash(s: &PyForeignSoul) -> Result<i64, RuntimeError> {
-    (hooks()?.hash)(s.ptr)
+    // The hook turns a C hash error into Err before returning here. Keep
+    // successful values consistent with PyObject_Hash's normalization and
+    // the VM's cached hashes, including weak references to foreign objects.
+    (hooks()?.hash)(s.ptr).map(|value| if value == -1 { -2 } else { value })
 }
 
 pub fn is_true(s: &PyForeignSoul) -> bool {

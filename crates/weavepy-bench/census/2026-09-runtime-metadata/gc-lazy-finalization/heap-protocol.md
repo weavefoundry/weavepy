@@ -1,0 +1,9 @@
+# GC metadata decision experiment
+
+Compare validated releases 36989234372e807ab95dc79686d9e5dd3bb51b458a9f7a1d92992357c30373a0 (before) and 75702d77194b76d049d7fab76e4ebb66ed01d76f64a1423e10d3d8324347cfea (candidate), plus local CPython 3.14.7. These are a new isolated comparison; the earlier borrowed-handles stage remains unmeasured.
+
+Run the four previously prepared 100,000-node retained heaps: ordinary, finalizers, weakrefs without callbacks, and weakrefs with callbacks. Keep identical class slots and population sizes. Setup occurs outside the five-full-collection work timer, but process CPU, wall time, and peak RSS include setup and shutdown. Verify roots and watcher identities before and after warmup on both WeavePy releases and CPython, plus candidate GIL-disabled correctness. Use seven paired cycles after one warm cycle, alternating variant order, with a separate stable frozen-code cache for each release. Preserve every sample and report regressions.
+
+Before starting, require three consecutive ten-second observations with both one- and five-minute host load at most four, on this eight-logical-CPU host. Wait at most 600 seconds. If unmet, retain the failed gate and do not invent measurements. Once started, retain all samples and load telemetry regardless of later load. There is no sample exclusion or automatic benchmark retry.
+
+This is the first decision experiment for the lazy metadata design. Instrumented allocation counts and statically verified allocation requests explain its mechanism; they are separate from uninstrumented peak RSS. A clear increase in memory on finalizer or callback heaps is grounds to revise or reject the candidate before spending time on the full census. If the candidate survives this comparison, run the existing retained-graph, setter, startup, and full-workload controls before accepting it. No outcome of these finite tests proves superiority on every workload or metric.

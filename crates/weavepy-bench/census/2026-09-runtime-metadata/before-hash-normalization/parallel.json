@@ -1,0 +1,351 @@
+{
+  "work_per_thread": 1000000,
+  "threads": 8,
+  "samples": 5,
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "cpython": "python3.14",
+  "cpython_gil": true,
+  "jit_requested": true,
+  "binaries": {
+    "base": {
+      "path": "target/release/weavepy-perf-9a69c41",
+      "sha256": "87cde9f2ef038ecf98b0a127ae6b478f04a4aebd3e4f948422e4e0eb4e195132"
+    },
+    "new": {
+      "path": "target/release/weavepy-runtime-small-tuples",
+      "sha256": "43c70898ea0a57a7aa9ce2db7e6e2aeced2b5e3076c642f28dde525329920181"
+    }
+  },
+  "modes": {
+    "1": {
+      "samples": {
+        "base": [
+          {
+            "serial_ns": 46963375,
+            "parallel_ns": 47952250,
+            "serial_cpu_ns": 46730000,
+            "parallel_cpu_ns": 48168000,
+            "wall_ns": 262998667,
+            "cpu_ns": 259755000,
+            "rss_bytes": 61784064
+          },
+          {
+            "serial_ns": 43077292,
+            "parallel_ns": 45162042,
+            "serial_cpu_ns": 42910000,
+            "parallel_cpu_ns": 45389000,
+            "wall_ns": 250567000,
+            "cpu_ns": 247720000,
+            "rss_bytes": 62193664
+          },
+          {
+            "serial_ns": 41011625,
+            "parallel_ns": 42879875,
+            "serial_cpu_ns": 40853000,
+            "parallel_cpu_ns": 43111000,
+            "wall_ns": 232700458,
+            "cpu_ns": 229706000,
+            "rss_bytes": 61947904
+          },
+          {
+            "serial_ns": 39866625,
+            "parallel_ns": 42697834,
+            "serial_cpu_ns": 39720000,
+            "parallel_cpu_ns": 42853000,
+            "wall_ns": 228358041,
+            "cpu_ns": 225558000,
+            "rss_bytes": 62259200
+          },
+          {
+            "serial_ns": 45223333,
+            "parallel_ns": 48684459,
+            "serial_cpu_ns": 45138000,
+            "parallel_cpu_ns": 48847000,
+            "wall_ns": 263879083,
+            "cpu_ns": 260548000,
+            "rss_bytes": 61702144
+          }
+        ],
+        "new": [
+          {
+            "serial_ns": 47454875,
+            "parallel_ns": 48238208,
+            "serial_cpu_ns": 47280000,
+            "parallel_cpu_ns": 48490000,
+            "wall_ns": 260177792,
+            "cpu_ns": 256814000,
+            "rss_bytes": 61325312
+          },
+          {
+            "serial_ns": 41735542,
+            "parallel_ns": 43656042,
+            "serial_cpu_ns": 41536000,
+            "parallel_cpu_ns": 43813000,
+            "wall_ns": 237349584,
+            "cpu_ns": 233972000,
+            "rss_bytes": 61554688
+          },
+          {
+            "serial_ns": 42621708,
+            "parallel_ns": 45484916,
+            "serial_cpu_ns": 42510000,
+            "parallel_cpu_ns": 45713000,
+            "wall_ns": 244308916,
+            "cpu_ns": 241098000,
+            "rss_bytes": 61259776
+          },
+          {
+            "serial_ns": 45002041,
+            "parallel_ns": 49227750,
+            "serial_cpu_ns": 44744000,
+            "parallel_cpu_ns": 49301000,
+            "wall_ns": 256064250,
+            "cpu_ns": 252376000,
+            "rss_bytes": 61440000
+          },
+          {
+            "serial_ns": 46979083,
+            "parallel_ns": 49783833,
+            "serial_cpu_ns": 46905000,
+            "parallel_cpu_ns": 50003000,
+            "wall_ns": 272431375,
+            "cpu_ns": 269143000,
+            "rss_bytes": 61489152
+          }
+        ],
+        "cpython": [
+          {
+            "serial_ns": 476705459,
+            "parallel_ns": 462439375,
+            "serial_cpu_ns": 475599000,
+            "parallel_cpu_ns": 465195000,
+            "wall_ns": 1023240042,
+            "cpu_ns": 1021997000,
+            "rss_bytes": 16105472
+          },
+          {
+            "serial_ns": 442821125,
+            "parallel_ns": 446226667,
+            "serial_cpu_ns": 441788000,
+            "parallel_cpu_ns": 448970000,
+            "wall_ns": 964159416,
+            "cpu_ns": 963251000,
+            "rss_bytes": 15974400
+          },
+          {
+            "serial_ns": 438821459,
+            "parallel_ns": 437776750,
+            "serial_cpu_ns": 437741000,
+            "parallel_cpu_ns": 441068000,
+            "wall_ns": 961715417,
+            "cpu_ns": 961092000,
+            "rss_bytes": 16039936
+          },
+          {
+            "serial_ns": 409752834,
+            "parallel_ns": 415982292,
+            "serial_cpu_ns": 408552000,
+            "parallel_cpu_ns": 417730000,
+            "wall_ns": 903658917,
+            "cpu_ns": 901745000,
+            "rss_bytes": 16007168
+          },
+          {
+            "serial_ns": 425198833,
+            "parallel_ns": 497895417,
+            "serial_cpu_ns": 424003000,
+            "parallel_cpu_ns": 499050000,
+            "wall_ns": 1004404875,
+            "cpu_ns": 1001372000,
+            "rss_bytes": 16072704
+          }
+        ]
+      },
+      "comparisons": {
+        "base": {
+          "serial_ns": 1.0388239849548462,
+          "parallel_ns": 1.0225816209645053,
+          "serial_cpu_ns": 1.0391466170410741,
+          "parallel_cpu_ns": 1.023665731774725,
+          "wall_ns": 1.0324098897978966,
+          "cpu_ns": 1.0329881634094293,
+          "rss_bytes": 0.9897260273972602
+        },
+        "cpython": {
+          "serial_ns": 0.09954758038548076,
+          "parallel_ns": 0.10389979824191212,
+          "serial_cpu_ns": 0.09941147899806349,
+          "parallel_cpu_ns": 0.10364161535182784,
+          "wall_ns": 0.25426857953238696,
+          "cpu_ns": 0.25128645191717786,
+          "rss_bytes": 3.8256880733944953
+        }
+      }
+    },
+    "0": {
+      "samples": {
+        "base": [
+          {
+            "serial_ns": 1602863500,
+            "parallel_ns": 441139209,
+            "serial_cpu_ns": 1596207000,
+            "parallel_cpu_ns": 2510811000,
+            "wall_ns": 2436870375,
+            "cpu_ns": 4495144000,
+            "rss_bytes": 57589760
+          },
+          {
+            "serial_ns": 1616464208,
+            "parallel_ns": 357960125,
+            "serial_cpu_ns": 1610710000,
+            "parallel_cpu_ns": 2289564000,
+            "wall_ns": 2336136416,
+            "cpu_ns": 4257877000,
+            "rss_bytes": 57606144
+          },
+          {
+            "serial_ns": 1692473208,
+            "parallel_ns": 391812458,
+            "serial_cpu_ns": 1687882000,
+            "parallel_cpu_ns": 2566745000,
+            "wall_ns": 2470635917,
+            "cpu_ns": 4636214000,
+            "rss_bytes": 58048512
+          },
+          {
+            "serial_ns": 2240390833,
+            "parallel_ns": 1026469375,
+            "serial_cpu_ns": 2102341000,
+            "parallel_cpu_ns": 3690607000,
+            "wall_ns": 3667327584,
+            "cpu_ns": 6177541000,
+            "rss_bytes": 57753600
+          },
+          {
+            "serial_ns": 1746709041,
+            "parallel_ns": 380782417,
+            "serial_cpu_ns": 1741640000,
+            "parallel_cpu_ns": 2449126000,
+            "wall_ns": 2496368166,
+            "cpu_ns": 4555976000,
+            "rss_bytes": 57622528
+          }
+        ],
+        "new": [
+          {
+            "serial_ns": 1516067792,
+            "parallel_ns": 365299208,
+            "serial_cpu_ns": 1511234000,
+            "parallel_cpu_ns": 2395884000,
+            "wall_ns": 2166901500,
+            "cpu_ns": 4189466000,
+            "rss_bytes": 57360384
+          },
+          {
+            "serial_ns": 1455373125,
+            "parallel_ns": 404636500,
+            "serial_cpu_ns": 1449933000,
+            "parallel_cpu_ns": 2184779000,
+            "wall_ns": 2182627000,
+            "cpu_ns": 3953850000,
+            "rss_bytes": 57294848
+          },
+          {
+            "serial_ns": 1777173667,
+            "parallel_ns": 380365542,
+            "serial_cpu_ns": 1772142000,
+            "parallel_cpu_ns": 2452345000,
+            "wall_ns": 2517469750,
+            "cpu_ns": 4579628000,
+            "rss_bytes": 57278464
+          },
+          {
+            "serial_ns": 7496534541,
+            "parallel_ns": 1475127084,
+            "serial_cpu_ns": 2608897000,
+            "parallel_cpu_ns": 3599176000,
+            "wall_ns": 10273742750,
+            "cpu_ns": 6790744000,
+            "rss_bytes": 57507840
+          },
+          {
+            "serial_ns": 1743377792,
+            "parallel_ns": 376344583,
+            "serial_cpu_ns": 1734393000,
+            "parallel_cpu_ns": 2383954000,
+            "wall_ns": 2542549583,
+            "cpu_ns": 4524134000,
+            "rss_bytes": 57507840
+          }
+        ],
+        "cpython": [
+          {
+            "serial_ns": 424635625,
+            "parallel_ns": 412482875,
+            "serial_cpu_ns": 423531000,
+            "parallel_cpu_ns": 415076000,
+            "wall_ns": 922805708,
+            "cpu_ns": 921327000,
+            "rss_bytes": 15908864
+          },
+          {
+            "serial_ns": 591678708,
+            "parallel_ns": 564201125,
+            "serial_cpu_ns": 589244000,
+            "parallel_cpu_ns": 566050000,
+            "wall_ns": 1272142750,
+            "cpu_ns": 1267617000,
+            "rss_bytes": 16023552
+          },
+          {
+            "serial_ns": 521284792,
+            "parallel_ns": 585581542,
+            "serial_cpu_ns": 518862000,
+            "parallel_cpu_ns": 587601000,
+            "wall_ns": 1211491250,
+            "cpu_ns": 1207472000,
+            "rss_bytes": 15958016
+          },
+          {
+            "serial_ns": 2667033042,
+            "parallel_ns": 907137708,
+            "serial_cpu_ns": 886404000,
+            "parallel_cpu_ns": 848700000,
+            "wall_ns": 3837424417,
+            "cpu_ns": 1883214000,
+            "rss_bytes": 16351232
+          },
+          {
+            "serial_ns": 707553417,
+            "parallel_ns": 707461875,
+            "serial_cpu_ns": 702041000,
+            "parallel_cpu_ns": 709235000,
+            "wall_ns": 1552469667,
+            "cpu_ns": 1543905000,
+            "rss_bytes": 15941632
+          }
+        ]
+      },
+      "comparisons": {
+        "base": {
+          "serial_ns": 0.9980928426419017,
+          "parallel_ns": 0.9883454860259475,
+          "serial_cpu_ns": 0.995838979352794,
+          "parallel_cpu_ns": 0.9554299316839031,
+          "wall_ns": 1.018499441560336,
+          "cpu_ns": 0.9877947825531781,
+          "rss_bytes": 0.9957446808510638
+        },
+        "cpython": {
+          "serial_ns": 2.8108142729939227,
+          "parallel_ns": 0.7171848514126944,
+          "serial_cpu_ns": 2.943236943876607,
+          "parallel_cpu_ns": 4.173486770784938,
+          "wall_ns": 2.0779925154226246,
+          "cpu_ns": 3.6059332609039654,
+          "rss_bytes": 3.589322381930185
+        }
+      }
+    }
+  }
+}

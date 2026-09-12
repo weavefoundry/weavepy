@@ -1,0 +1,43 @@
+{
+  "source_sha256": "39b682279a1cb8d4e6684d87206aee7e939f805de2ff1037299761ca507949e2",
+  "checks": {
+    "cpython": {
+      "command": [
+        "python3.14",
+        "tests/regrtest/test_weakref_wrapper_keys.py"
+      ],
+      "returncode": 0,
+      "stdout": "weakref wrapper access ok\n",
+      "stderr": ""
+    },
+    "jit": {
+      "command": [
+        "target/release/weavepy-runtime-gc-borrowed-handles",
+        "tests/regrtest/test_weakref_wrapper_keys.py"
+      ],
+      "returncode": 0,
+      "stdout": "weakref wrapper access ok\n",
+      "stderr": ""
+    },
+    "interp": {
+      "command": [
+        "target/release/weavepy-runtime-gc-borrowed-handles",
+        "tests/regrtest/test_weakref_wrapper_keys.py"
+      ],
+      "returncode": 0,
+      "stdout": "weakref wrapper access ok\n",
+      "stderr": ""
+    },
+    "gil0": {
+      "command": [
+        "target/release/weavepy-runtime-gc-borrowed-handles",
+        "-X",
+        "gil=0",
+        "tests/regrtest/test_weakref_wrapper_keys.py"
+      ],
+      "returncode": 0,
+      "stdout": "weakref wrapper access ok\n",
+      "stderr": ""
+    }
+  }
+}

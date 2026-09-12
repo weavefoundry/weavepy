@@ -20,12 +20,13 @@
 //!   methods for `T: Copy`), but is `Send + Sync` when `T: Send`.
 //!   Backed by a `parking_lot::ReentrantMutex` so the codebase's
 //!   pervasive nested-borrow patterns keep working.
-//! - [`RefCell`] / [`Cell`] — type aliases for [`GilCell`] so
-//!   existing `RefCell<T>` / `Cell<T>` signatures don't need any
-//!   per-call-site edits.
+//! - [`RefCell`] aliases [`GilCell`] for borrowed data. [`Cell`] holds
+//!   copyable values in compact atomic storage without borrow guards.
 //!
 //! The RFC 0024 surface (real lock / event / barrier primitives
 //! that back `threading.Lock` etc.) lives below the new aliases.
+
+pub use crate::lazy_arc::LazyArc;
 
 use std::cell::UnsafeCell;
 use std::fmt;
@@ -115,11 +116,141 @@ unsafe impl<T: ?Sized + Send> Sync for GilCell<T> {}
 /// caller previously imported `std::cell::RefCell`.
 pub type RefCell<T> = GilCell<T>;
 
-/// `Cell<T>` is the workspace's name for [`GilCell`] when the
-/// caller previously imported `std::cell::Cell`. Use the
-/// `GilCell::get` / `GilCell::set` methods (available for
-/// `T: Copy`) for the classic `Cell` ergonomics.
-pub type Cell<T> = GilCell<T>;
+/// A thread-safe cell for copyable object metadata.
+///
+/// Loads acquire and stores release. Values must fit a native atomic;
+/// construction checks this at compile time. No operation runs callbacks
+/// or exposes a reference to the payload, so it needs
+/// no reentrant owner lock or live-borrow bookkeeping. Data that must be
+/// borrowed still uses [`RefCell`]. The cell occupies only its payload's
+/// space, avoiding a separate lock in every object flag.
+///
+/// Larger or insufficiently aligned values must use [`GilCell`], whose
+/// owner lock supports recovery after `fork()`. Crossbeam's global-lock
+/// fallback cannot recover a lock held by a thread absent in the child.
+#[repr(transparent)]
+pub struct Cell<T: Copy>(crossbeam_utils::atomic::AtomicCell<T>);
+
+impl<T: Copy> Cell<T> {
+    pub const fn new(value: T) -> Self {
+        const {
+            assert!(
+                crossbeam_utils::atomic::AtomicCell::<T>::is_lock_free(),
+                "use GilCell for metadata without native atomic support"
+            );
+        }
+        Self(crossbeam_utils::atomic::AtomicCell::new(value))
+    }
+
+    #[inline]
+    pub fn get(&self) -> T {
+        self.0.load()
+    }
+
+    #[inline]
+    pub fn set(&self, value: T) {
+        self.0.store(value);
+    }
+
+    #[inline]
+    pub fn replace(&self, value: T) -> T {
+        self.0.swap(value)
+    }
+
+    pub fn into_inner(self) -> T {
+        self.0.into_inner()
+    }
+
+    pub fn take(&self) -> T
+    where
+        T: Default,
+    {
+        self.0.take()
+    }
+}
+
+impl<T: Copy + Default> Default for Cell<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T: Copy> From<T> for Cell<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
+impl<T: Copy> Clone for Cell<T> {
+    fn clone(&self) -> Self {
+        Self::new(self.get())
+    }
+}
+
+impl<T: Copy + fmt::Debug> fmt::Debug for Cell<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Cell").field(&self.get()).finish()
+    }
+}
+
+/// An initially empty cache for a normalized Python hash.
+///
+/// Python reserves `-1` for errors and maps a successful hash of `-1`
+/// to `-2`. That leaves one native atomic word for both the value and
+/// the empty state, with acquiring reads and releasing writes. Stores
+/// normalize their input so an initialized cache never becomes empty.
+#[repr(transparent)]
+pub struct CachedHash {
+    value: Cell<i64>,
+}
+
+impl CachedHash {
+    const fn normalize(value: i64) -> i64 {
+        if value == -1 {
+            -2
+        } else {
+            value
+        }
+    }
+
+    pub const fn new(value: Option<i64>) -> Self {
+        Self {
+            value: Cell::new(match value {
+                Some(value) => Self::normalize(value),
+                None => -1,
+            }),
+        }
+    }
+
+    #[inline]
+    pub fn get(&self) -> Option<i64> {
+        let value = self.value.get();
+        (value != -1).then_some(value)
+    }
+
+    #[inline]
+    pub fn store(&self, value: i64) {
+        self.value.set(Self::normalize(value));
+    }
+}
+
+impl Default for CachedHash {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl Clone for CachedHash {
+    fn clone(&self) -> Self {
+        Self::new(self.get())
+    }
+}
+
+impl fmt::Debug for CachedHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("CachedHash").field(&self.get()).finish()
+    }
+}
 
 /// A plain `std::cell::RefCell` for state that one interpreter owns
 /// outright and never publishes to another thread: the frame, stack,
@@ -1358,6 +1489,108 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+
+    #[test]
+    fn copy_cells_are_compact() {
+        assert_eq!(std::mem::size_of::<Cell<bool>>(), 1);
+        assert_eq!(std::mem::size_of::<Cell<u64>>(), 8);
+    }
+
+    #[test]
+    fn cached_hash_preserves_python_hash_boundaries() {
+        assert_eq!(std::mem::size_of::<CachedHash>(), 8);
+        let cache = CachedHash::new(None);
+        assert_eq!(cache.get(), None);
+        assert_eq!(cache.clone().get(), None);
+        for (value, expected) in [
+            (0, 0),
+            (-1, -2),
+            (-2, -2),
+            (1, 1),
+            (i64::MIN, i64::MIN),
+            (i64::MAX, i64::MAX),
+        ] {
+            cache.store(value);
+            assert_eq!(cache.get(), Some(expected));
+            let cloned = cache.clone();
+            cache.store(value.wrapping_add(1));
+            assert_eq!(cloned.get(), Some(expected));
+            assert_eq!(CachedHash::new(Some(value)).get(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn cached_hash_publication_and_updates_do_not_tear() {
+        let cache = CachedHash::new(None);
+        let barrier = std::sync::Barrier::new(5);
+        let values = [i64::MIN, i64::MAX, -1, 0x1234_5678_7654_3210];
+        let expected = [i64::MIN, i64::MAX, -2, 0x1234_5678_7654_3210];
+        thread::scope(|scope| {
+            for value in values {
+                let cache = &cache;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..10_000 {
+                        cache.store(value);
+                    }
+                });
+            }
+            barrier.wait();
+            let mut published = false;
+            for _ in 0..10_000 {
+                match cache.get() {
+                    Some(value) => {
+                        assert!(expected.contains(&value));
+                        published = true;
+                    }
+                    None => assert!(!published),
+                }
+            }
+        });
+        assert!(expected.contains(&cache.get().expect("writers published a hash")));
+    }
+
+    #[test]
+    fn copy_cell_publishes_prior_writes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let ready = Cell::new(false);
+        let value = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                value.store(42, Ordering::Relaxed);
+                ready.set(true);
+            });
+            while !ready.get() {
+                thread::yield_now();
+            }
+            assert_eq!(value.load(Ordering::Relaxed), 42);
+        });
+    }
+
+    #[test]
+    fn copy_cell_replacements_do_not_tear() {
+        let cell = Cell::new(0_u64);
+        let barrier = std::sync::Barrier::new(5);
+        thread::scope(|scope| {
+            for writer in 1_u64..=4 {
+                let cell = &cell;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..10_000 {
+                        let previous = cell.replace(writer << 32 | writer);
+                        assert_eq!(previous >> 32, previous & 0xffff_ffff);
+                    }
+                });
+            }
+            barrier.wait();
+            for _ in 0..10_000 {
+                let observed = cell.get();
+                assert_eq!(observed >> 32, observed & 0xffff_ffff);
+            }
+        });
+    }
 
     // ----- GilCell tests (RFC 0025) -----
 

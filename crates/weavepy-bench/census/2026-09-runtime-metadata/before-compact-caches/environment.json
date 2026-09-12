@@ -1,0 +1,63 @@
+{
+  "baseline_commit": "9a69c4161ade6527a5f4457d7e7272075cb1f0d9",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "python": "3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 21.0.0 (clang-2100.1.1.101)]",
+  "rust": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "build_command": "cargo build --offline --locked --release -p weavepy-cli --bin weavepy -j 1",
+  "stdlib_cache": "/Users/owencarey/Documents/weavefoundry/weavepy/target/performance-stdlib-cache",
+  "binaries": {
+    "base": {
+      "path": "target/release/weavepy-perf-9a69c41",
+      "bytes": 44184864,
+      "sha256": "87cde9f2ef038ecf98b0a127ae6b478f04a4aebd3e4f948422e4e0eb4e195132"
+    },
+    "new": {
+      "path": "target/release/weavepy-runtime-list-reap",
+      "bytes": 44099696,
+      "sha256": "52caabfed72a5f5269e0e5eddcde0c4d325f26bc6c5219ba03ef3effcdc51aab"
+    }
+  },
+  "sources": {
+    "Cargo.lock": "5618b9d2557881b3b31e2959a705dad7fd44893721a8967f342279cbee4cfe57",
+    "Cargo.toml": "259bda8434c9d78d08f3f0d06ddf903461bc9482a129cf40b7c9a5125432baf4",
+    "crates/weavepy-jit/src/analyze.rs": "a40e35fa53acf316151cd7ad10e0b27cd3c3a37206f5fc59037c9220e7a8dd50",
+    "crates/weavepy-jit/src/ir.rs": "3b73903d967772270ef3c22ccc9ddb877472c2e9804915a03b68a0922cc84891",
+    "crates/weavepy-jit/src/lower.rs": "5fd086dd1a9fd5767dbbae10d07a628733f432d6b16ed97782a82b8fd2be1852",
+    "crates/weavepy-jit/src/runtime.rs": "a3c4372b761edf425aca25e3ebbc1567f818722ac391a7bac10b31cd7d7c9620",
+    "crates/weavepy-jit/tests/frame_coverage.rs": "93a522484aa0a616170b5f05d51c2519ec4344263653749d4d6af0d8341c1a5d",
+    "crates/weavepy-vm/Cargo.toml": "3507b7dab7d93d694940d26bdb0bf68a6d9db5067feae9e0dc73edf7b8d70ac1",
+    "crates/weavepy-vm/src/builtin_types.rs": "7046d3a214c7ce5e565adae028dd688c2506f8607cfe9ebd73c9fd4a7ccce93e",
+    "crates/weavepy-vm/src/builtins.rs": "ad664a44e007b134de274f2bd766bc264f47ee322497dcac61add1cbc48011b6",
+    "crates/weavepy-vm/src/lib.rs": "26f99d7ac1c21e01644fb12d770ddfcef3310d59f06896d9943b9a835b277bbf",
+    "crates/weavepy-vm/src/object.rs": "f4543a6698b54c86e0c787aa148393779d3555ab5c52ee5181180030ce525185",
+    "crates/weavepy-vm/src/stdlib/json_accel.rs": "e997a780b5fc50a872d0a98f20b00de1a4337ca41619cb25b2885cd5e4bbe039",
+    "crates/weavepy-vm/src/stdlib/multiprocessing_mod.rs": "4f61b21e072f76a58b742bb992e88f338f3b8edc875425a4b5ed42a90e27ad32",
+    "crates/weavepy-vm/src/stdlib/thread_real.rs": "82e57ae63d5a891e1e236854ab81d1509225aa57c009208b064b7151d8f82228",
+    "crates/weavepy-vm/src/stdlib/weakref_real.rs": "66aeecd4abe430020de50d68a397a86d6cc6e842373ab8a08cee634dac0e2d6e",
+    "crates/weavepy-vm/src/stdlib/weave_frame_mod.rs": "479ae00cd2ab99d553674d2ca6862257fe338f4efda04d47cda891ef71f429b6",
+    "crates/weavepy-vm/src/sync.rs": "fcaab58e6d595653e3655700f67fa08eaab8ac26f30d94dd4f2b4adaf43d0771",
+    "crates/weavepy-vm/src/tier2.rs": "bf40b664b189f9e545e9850b53f682b8aca4937ea99e99913cef5b261b0d999b",
+    "crates/weavepy-vm/src/types.rs": "2f411283102d6dcf69146ed8ac04a39aa38b65a8fa9d2a9b98286564f155c58c",
+    "tests/regrtest/test_float_text.py": "6d2e49d787b417ec30ec9159c45449a70ae69156338654b54a6481605e3e6d48",
+    "tests/regrtest/test_jit_enumerate.py": "542e63609f9892e9f5382b57257340e1a5f38f488a113aad5cde658bde97acb0",
+    "tests/regrtest/test_jit_list_builders.py": "884c6094636cf78d0600888724f9c38fd28431c9f3317e1b4a08482f3cb4715f",
+    "tests/regrtest/test_jit_list_lifetime.py": "0e24fa3112bbe4a6e3519cf9f31e392a1921a0b787ada75de1ddc6945c7c31a6",
+    "tests/regrtest/test_json_buffers.py": "9589b73c13c47eb81e78d2f61b24a1d1b4277a557daafa16578ecc03de2b6663",
+    "tests/regrtest/test_key_comparison_state.py": "44fb198bcbf78f06f2dedd62d0d43857067ec662e8469aef7625962502ebd88d",
+    "tools/bench_compare.py": "f5ce064d1ed05ae046b808fbf64f9cc73884a41f8692267f5fcf68269a3c35e3"
+  },
+  "recorded_at_utc": "2026-09-10T03:21:12.226878+00:00",
+  "measurement_scripts": {
+    "crates/weavepy-bench/census/2026-09-execution/probes.py": "aff641223c8c5a68c48cb6f123b08dd76a344cdae69d2f002453686d8a01ca74",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/builder_probes.py": "2512eb05ac1f4c306739251fd9e06e5055b1ee8ada54eaa92de4c428ea2620f6",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/jit_probes.py": "2ff66089f62e0a6e0f95ee92e6dfaae29e5b3ef4e0b8af70100085b649437132",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/parallel.py": "a787310100035e6a62b861c5c79ab24991adca425411ebba9b98dd97254a283e",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/probes.py": "b4f45986f7ce96b8f256c8ffbb92ba7234ce8a018bb0dceb66ae5a1b94a7f3f6",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/summarize.py": "c585ebf79d142ce09b2bff88de5f752226e9ed3e846903293d43196022f33f08",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/validate.py": "ffc2ccd8cd7ef94a4c7979492113cbfbe02ff4a37a7656b42b1e7a691a29e84b",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/verify_builders.py": "cf8dc06b08fce0f5aa6e15e78d4dcd12ba392fe25bd1b78f362400fcd835f75d",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/verify_float.py": "37dbe9f522a9bb2de9b68e95f20b840fb08e580117a9a2ca7dc89542b79f3b2c",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/verify_jit.py": "c7762db8de73eaeacc94721f39aea1b105add286d863013d519d4c5bc4843ce7",
+    "tools/bench_compare.py": "f5ce064d1ed05ae046b808fbf64f9cc73884a41f8692267f5fcf68269a3c35e3"
+  }
+}

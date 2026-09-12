@@ -1,11 +1,11 @@
-"""WeavePy's `_pickle` — the "C accelerator" lane built on the pure
-implementation.
+"""WeavePy's `_pickle` accelerator and compatibility implementation.
 
 CPython's `_pickle` is a C rewrite of `pickle.py`; `pickle.py` imports it
 for the fast paths and `test_pickle` runs its matrix against both lanes.
-WeavePy's pickle *is* the pure-Python implementation, so this module
-re-exports it under the accelerator's names — with one real difference
-kept faithful: the C module's *error discipline*. Where the pure engine
+WeavePy uses guarded native encoding and decoding for supported protocol
+4/5 built-in data. Other operations use the pure-Python implementation
+under the accelerator's names, with the C module's error discipline.
+Where the pure engine
 leaks `IndexError` / `struct.error` on malformed input and tolerates
 sloppy `__reduce__` values, the C one raises `UnpicklingError` /
 `PicklingError`, and `test_pickle`'s C lanes assert exactly that
@@ -22,7 +22,8 @@ its pure definitions, and pickle's *final* `from _pickle import …`
 re-imports this module successfully. `import _pickle` first: the
 `from pickle import …` below fully initializes pickle (its own
 `from _pickle import …` attempts see this half-built module and fall
-back), then resolves. Either way both modules share one set of classes.
+back), then resolves. When this module finishes, it updates pickle's
+public entry points. Either way both modules share one set of classes.
 """
 
 import io as _io
@@ -448,6 +449,10 @@ def dump(obj, file, protocol=None, *, fix_imports=True, buffer_callback=None):
 
 @_BuiltinFunction
 def dumps(obj, protocol=None, *, fix_imports=True, buffer_callback=None):
+    if _native_dumps is not None:
+        encoded = _native_dumps(obj, Pickler, protocol, fix_imports, buffer_callback)
+        if encoded is not None:
+            return encoded
     f = _io.BytesIO()
     Pickler(f, protocol, fix_imports=fix_imports,
             buffer_callback=buffer_callback).dump(obj)
@@ -468,6 +473,31 @@ def loads(s, /, *, fix_imports=True, encoding="ASCII", errors="strict",
           buffers=None):
     if isinstance(s, str):
         raise TypeError("Can't load pickle from unicode string")
+    if _native_loads is not None:
+        decoded = _native_loads(s, Unpickler, fix_imports, encoding, errors, buffers)
+        if decoded is not None:
+            return decoded[0]
     file = _io.BytesIO(s)
     return Unpickler(file, fix_imports=fix_imports, buffers=buffers,
                      encoding=encoding, errors=errors).load()
+
+
+try:
+    from _weave_pickle import make_loads as _make_native_loads
+    from _weave_pickle import make_dumps as _make_native_dumps
+except ImportError:
+    _native_loads = None
+    _native_dumps = None
+else:
+    _native_loads = _make_native_loads(Unpickler)
+    _native_dumps = _make_native_dumps(Pickler)
+
+# Importing _pickle first initializes pickle while this module is incomplete.
+# Its final accelerator import then falls back. Publish the completed entry
+# points so both import orders expose the accelerator, as they do on CPython.
+_pickle_module = _sys.modules.get("pickle")
+if _pickle_module is not None:
+    for _public_name in ("Pickler", "Unpickler", "dump", "dumps", "load", "loads"):
+        setattr(_pickle_module, _public_name, globals()[_public_name])
+    del _public_name
+del _pickle_module

@@ -1,0 +1,2458 @@
+{
+  "purpose": "Verify datetime component values and measure paired time, CPU, and RSS.",
+  "execution_context": {
+    "declared_launch_context": "outside-tool-filesystem-sandbox (require_escalated)",
+    "environment": {
+      "TZ": null,
+      "LANG": "C.UTF-8",
+      "LC_ALL": "C.UTF-8",
+      "LC_TIME": null,
+      "PYTHON_JIT": null,
+      "PYTHON_GIL": null
+    }
+  },
+  "samples": 7,
+  "work": 2000,
+  "binaries": {
+    "jit": {
+      "path": "/Users/owencarey/Documents/weavefoundry/weavepy/target/release/weavepy-runtime-pickle-borrowed-strings",
+      "sha256": "e910f2dd2f1d87427f7613de9c304b42a3d1b87d8b2b0823c102f32d348c132b"
+    },
+    "interp": {
+      "path": "/Users/owencarey/Documents/weavefoundry/weavepy/target/release/weavepy-runtime-pickle-borrowed-strings",
+      "sha256": "e910f2dd2f1d87427f7613de9c304b42a3d1b87d8b2b0823c102f32d348c132b"
+    },
+    "cpython": {
+      "path": "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/bin/python3.14",
+      "sha256": "87d4df53fd91304be5bac391fb204643c36b7df2023c04a0953bcbc7d4fdf634"
+    }
+  },
+  "rows": {
+    "datetime_construct": {
+      "case": {
+        "path": "target/datetime-components-probes/datetime_construct.py",
+        "source_sha256": "a17a8473480ee35764b699495307d0c14a807101d8d7c052264b4af6829431e2",
+        "driver": "target/datetime-components-probes/datetime_construct-verify.py",
+        "driver_sha256": "87a34da8e72c6c7a8c450f3afe315ecc4e7fefafe0274c684b975a10bdb58efd",
+        "expression": "datetime(2024, 1, 15, 8, 30, 0, 123456, tzinfo=timezone.utc)"
+      },
+      "samples": {
+        "jit": [
+          {
+            "ns": 19007917,
+            "wall_ns": 70700875,
+            "cpu_ns": 68617000,
+            "rss_bytes": 35389440,
+            "work_cpu_ns": 19003000
+          },
+          {
+            "ns": 19117334,
+            "wall_ns": 70236959,
+            "cpu_ns": 68214000,
+            "rss_bytes": 35487744,
+            "work_cpu_ns": 19113000
+          },
+          {
+            "ns": 18948166,
+            "wall_ns": 70100042,
+            "cpu_ns": 68101000,
+            "rss_bytes": 35405824,
+            "work_cpu_ns": 18943000
+          },
+          {
+            "ns": 19085667,
+            "wall_ns": 70282208,
+            "cpu_ns": 68333000,
+            "rss_bytes": 35520512,
+            "work_cpu_ns": 19081000
+          },
+          {
+            "ns": 19049541,
+            "wall_ns": 73011625,
+            "cpu_ns": 70740000,
+            "rss_bytes": 35438592,
+            "work_cpu_ns": 19042000
+          },
+          {
+            "ns": 19144042,
+            "wall_ns": 71843334,
+            "cpu_ns": 69709000,
+            "rss_bytes": 35422208,
+            "work_cpu_ns": 19139000
+          },
+          {
+            "ns": 18963834,
+            "wall_ns": 69955000,
+            "cpu_ns": 67885000,
+            "rss_bytes": 35618816,
+            "work_cpu_ns": 18958000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 18926834,
+            "wall_ns": 68201000,
+            "cpu_ns": 66134000,
+            "rss_bytes": 29605888,
+            "work_cpu_ns": 18923000
+          },
+          {
+            "ns": 19325708,
+            "wall_ns": 68491875,
+            "cpu_ns": 66472000,
+            "rss_bytes": 29704192,
+            "work_cpu_ns": 19322000
+          },
+          {
+            "ns": 19116083,
+            "wall_ns": 68054708,
+            "cpu_ns": 66104000,
+            "rss_bytes": 29638656,
+            "work_cpu_ns": 19113000
+          },
+          {
+            "ns": 18936500,
+            "wall_ns": 68868125,
+            "cpu_ns": 66793000,
+            "rss_bytes": 29638656,
+            "work_cpu_ns": 18930000
+          },
+          {
+            "ns": 18933750,
+            "wall_ns": 69690917,
+            "cpu_ns": 67498000,
+            "rss_bytes": 29736960,
+            "work_cpu_ns": 18927000
+          },
+          {
+            "ns": 18943917,
+            "wall_ns": 69036833,
+            "cpu_ns": 66936000,
+            "rss_bytes": 29736960,
+            "work_cpu_ns": 18938000
+          },
+          {
+            "ns": 18981333,
+            "wall_ns": 68831042,
+            "cpu_ns": 66789000,
+            "rss_bytes": 29589504,
+            "work_cpu_ns": 18974000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 356875,
+            "wall_ns": 20371958,
+            "cpu_ns": 18357000,
+            "rss_bytes": 15663104,
+            "work_cpu_ns": 356000
+          },
+          {
+            "ns": 372792,
+            "wall_ns": 20268917,
+            "cpu_ns": 18375000,
+            "rss_bytes": 15745024,
+            "work_cpu_ns": 372000
+          },
+          {
+            "ns": 385708,
+            "wall_ns": 20174667,
+            "cpu_ns": 18268000,
+            "rss_bytes": 15712256,
+            "work_cpu_ns": 383000
+          },
+          {
+            "ns": 359459,
+            "wall_ns": 22892166,
+            "cpu_ns": 20739000,
+            "rss_bytes": 15679488,
+            "work_cpu_ns": 359000
+          },
+          {
+            "ns": 367042,
+            "wall_ns": 22669625,
+            "cpu_ns": 20467000,
+            "rss_bytes": 15695872,
+            "work_cpu_ns": 365000
+          },
+          {
+            "ns": 357417,
+            "wall_ns": 21961166,
+            "cpu_ns": 20317000,
+            "rss_bytes": 15663104,
+            "work_cpu_ns": 356000
+          },
+          {
+            "ns": 389042,
+            "wall_ns": 21422667,
+            "cpu_ns": 19743000,
+            "rss_bytes": 15679488,
+            "work_cpu_ns": 388000
+          }
+        ]
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 51.90016673841141,
+          "wall_ns": 3.271380672592703,
+          "cpu_ns": 3.456295500073289,
+          "rss_bytes": 2.2594142259414225,
+          "work_cpu_ns": 52.16986301369863
+        },
+        "interp": {
+          "ns": 51.84045794974141,
+          "wall_ns": 3.2130006035196272,
+          "cpu_ns": 3.382920528795016,
+          "rss_bytes": 1.8901673640167365,
+          "work_cpu_ns": 51.94086021505376
+        }
+      }
+    },
+    "timedelta_construct": {
+      "case": {
+        "path": "target/datetime-components-probes/timedelta_construct.py",
+        "source_sha256": "70f06c89b55964f19557df1aa368298e5880af5381b6e1016bc2958ddb706e31",
+        "driver": "target/datetime-components-probes/timedelta_construct-verify.py",
+        "driver_sha256": "ab0f11580c59eab0e30b2581797c20f8563aad84f6c5d9711df38554efe49569",
+        "expression": "timedelta(minutes=37, seconds=11, microseconds=321)"
+      },
+      "samples": {
+        "jit": [
+          {
+            "ns": 6038416,
+            "wall_ns": 46083334,
+            "cpu_ns": 43878000,
+            "rss_bytes": 33914880,
+            "work_cpu_ns": 6032000
+          },
+          {
+            "ns": 5967583,
+            "wall_ns": 44584292,
+            "cpu_ns": 42437000,
+            "rss_bytes": 33964032,
+            "work_cpu_ns": 5963000
+          },
+          {
+            "ns": 5925250,
+            "wall_ns": 43588542,
+            "cpu_ns": 41646000,
+            "rss_bytes": 33849344,
+            "work_cpu_ns": 5922000
+          },
+          {
+            "ns": 6042459,
+            "wall_ns": 44143958,
+            "cpu_ns": 42159000,
+            "rss_bytes": 33865728,
+            "work_cpu_ns": 6040000
+          },
+          {
+            "ns": 5952334,
+            "wall_ns": 43165583,
+            "cpu_ns": 41236000,
+            "rss_bytes": 33964032,
+            "work_cpu_ns": 5949000
+          },
+          {
+            "ns": 5903917,
+            "wall_ns": 43132666,
+            "cpu_ns": 41190000,
+            "rss_bytes": 33964032,
+            "work_cpu_ns": 5901000
+          },
+          {
+            "ns": 6062750,
+            "wall_ns": 44013917,
+            "cpu_ns": 41926000,
+            "rss_bytes": 33832960,
+            "work_cpu_ns": 6056000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 5914791,
+            "wall_ns": 41971292,
+            "cpu_ns": 39935000,
+            "rss_bytes": 29671424,
+            "work_cpu_ns": 5909000
+          },
+          {
+            "ns": 5914291,
+            "wall_ns": 42377833,
+            "cpu_ns": 40344000,
+            "rss_bytes": 29687808,
+            "work_cpu_ns": 5912000
+          },
+          {
+            "ns": 5921500,
+            "wall_ns": 42592083,
+            "cpu_ns": 40568000,
+            "rss_bytes": 29704192,
+            "work_cpu_ns": 5917000
+          },
+          {
+            "ns": 5962667,
+            "wall_ns": 41596125,
+            "cpu_ns": 39634000,
+            "rss_bytes": 29671424,
+            "work_cpu_ns": 5960000
+          },
+          {
+            "ns": 5852667,
+            "wall_ns": 41842834,
+            "cpu_ns": 39781000,
+            "rss_bytes": 29622272,
+            "work_cpu_ns": 5849000
+          },
+          {
+            "ns": 5834542,
+            "wall_ns": 41704000,
+            "cpu_ns": 39730000,
+            "rss_bytes": 29786112,
+            "work_cpu_ns": 5832000
+          },
+          {
+            "ns": 5841792,
+            "wall_ns": 41607583,
+            "cpu_ns": 39674000,
+            "rss_bytes": 29638656,
+            "work_cpu_ns": 5839000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 810292,
+            "wall_ns": 20840375,
+            "cpu_ns": 19024000,
+            "rss_bytes": 15745024,
+            "work_cpu_ns": 808000
+          },
+          {
+            "ns": 807791,
+            "wall_ns": 22052209,
+            "cpu_ns": 20071000,
+            "rss_bytes": 15679488,
+            "work_cpu_ns": 807000
+          },
+          {
+            "ns": 791333,
+            "wall_ns": 21784250,
+            "cpu_ns": 19751000,
+            "rss_bytes": 15777792,
+            "work_cpu_ns": 790000
+          },
+          {
+            "ns": 790625,
+            "wall_ns": 21218709,
+            "cpu_ns": 19334000,
+            "rss_bytes": 15728640,
+            "work_cpu_ns": 790000
+          },
+          {
+            "ns": 790250,
+            "wall_ns": 20665334,
+            "cpu_ns": 18836000,
+            "rss_bytes": 15679488,
+            "work_cpu_ns": 788000
+          },
+          {
+            "ns": 771084,
+            "wall_ns": 21218250,
+            "cpu_ns": 19301000,
+            "rss_bytes": 15663104,
+            "work_cpu_ns": 771000
+          },
+          {
+            "ns": 767666,
+            "wall_ns": 20857458,
+            "cpu_ns": 18965000,
+            "rss_bytes": 15728640,
+            "work_cpu_ns": 766000
+          }
+        ]
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 7.5322163872192345,
+          "wall_ns": 2.0804261936953847,
+          "cpu_ns": 2.180562739215889,
+          "rss_bytes": 2.154006243496358,
+          "work_cpu_ns": 7.549492385786802
+        },
+        "interp": {
+          "ns": 7.482943337381355,
+          "wall_ns": 1.9654778315836603,
+          "cpu_ns": 2.058442567742604,
+          "rss_bytes": 1.8864583333333333,
+          "work_cpu_ns": 7.489873417721519
+        }
+      }
+    },
+    "datetime_add": {
+      "case": {
+        "path": "target/datetime-components-probes/datetime_add.py",
+        "source_sha256": "2a56a93ee4d34fadb76b8a467aadb97bb9a8e12e9c1c989163ef32e5dbbc2845",
+        "driver": "target/datetime-components-probes/datetime_add-verify.py",
+        "driver_sha256": "f77cdf928b51a9430d70d2dac2024a41a4ffbc81016adbd835549efea6f0f0b1",
+        "expression": "base + step"
+      },
+      "samples": {
+        "jit": [
+          {
+            "ns": 83432750,
+            "wall_ns": 199900000,
+            "cpu_ns": 197727000,
+            "rss_bytes": 35880960,
+            "work_cpu_ns": 83419000
+          },
+          {
+            "ns": 84860667,
+            "wall_ns": 203432542,
+            "cpu_ns": 201223000,
+            "rss_bytes": 35864576,
+            "work_cpu_ns": 84855000
+          },
+          {
+            "ns": 88774542,
+            "wall_ns": 213360666,
+            "cpu_ns": 211161000,
+            "rss_bytes": 35913728,
+            "work_cpu_ns": 88768000
+          },
+          {
+            "ns": 87936417,
+            "wall_ns": 211818042,
+            "cpu_ns": 209574000,
+            "rss_bytes": 35913728,
+            "work_cpu_ns": 87930000
+          },
+          {
+            "ns": 88923792,
+            "wall_ns": 218023125,
+            "cpu_ns": 215560000,
+            "rss_bytes": 35962880,
+            "work_cpu_ns": 88917000
+          },
+          {
+            "ns": 87987458,
+            "wall_ns": 212374833,
+            "cpu_ns": 210693000,
+            "rss_bytes": 35864576,
+            "work_cpu_ns": 87932000
+          },
+          {
+            "ns": 87772875,
+            "wall_ns": 210749917,
+            "cpu_ns": 208615000,
+            "rss_bytes": 36012032,
+            "work_cpu_ns": 87769000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 78388500,
+            "wall_ns": 186995625,
+            "cpu_ns": 184926000,
+            "rss_bytes": 29753344,
+            "work_cpu_ns": 78310000
+          },
+          {
+            "ns": 87280209,
+            "wall_ns": 204281500,
+            "cpu_ns": 202147000,
+            "rss_bytes": 29655040,
+            "work_cpu_ns": 87255000
+          },
+          {
+            "ns": 84286958,
+            "wall_ns": 208327875,
+            "cpu_ns": 205790000,
+            "rss_bytes": 29720576,
+            "work_cpu_ns": 84253000
+          },
+          {
+            "ns": 82896542,
+            "wall_ns": 199307000,
+            "cpu_ns": 196947000,
+            "rss_bytes": 29622272,
+            "work_cpu_ns": 82855000
+          },
+          {
+            "ns": 92757083,
+            "wall_ns": 213406291,
+            "cpu_ns": 210582000,
+            "rss_bytes": 29687808,
+            "work_cpu_ns": 92514000
+          },
+          {
+            "ns": 83806792,
+            "wall_ns": 200809125,
+            "cpu_ns": 198647000,
+            "rss_bytes": 29687808,
+            "work_cpu_ns": 83803000
+          },
+          {
+            "ns": 83178542,
+            "wall_ns": 198317875,
+            "cpu_ns": 196222000,
+            "rss_bytes": 29687808,
+            "work_cpu_ns": 83173000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 88583,
+            "wall_ns": 19660333,
+            "cpu_ns": 17668000,
+            "rss_bytes": 15613952,
+            "work_cpu_ns": 87000
+          },
+          {
+            "ns": 98667,
+            "wall_ns": 23825208,
+            "cpu_ns": 21575000,
+            "rss_bytes": 15630336,
+            "work_cpu_ns": 98000
+          },
+          {
+            "ns": 95292,
+            "wall_ns": 23279959,
+            "cpu_ns": 21025000,
+            "rss_bytes": 15712256,
+            "work_cpu_ns": 94000
+          },
+          {
+            "ns": 88167,
+            "wall_ns": 22459333,
+            "cpu_ns": 20099000,
+            "rss_bytes": 15613952,
+            "work_cpu_ns": 88000
+          },
+          {
+            "ns": 99333,
+            "wall_ns": 22038750,
+            "cpu_ns": 20149000,
+            "rss_bytes": 15679488,
+            "work_cpu_ns": 97000
+          },
+          {
+            "ns": 97667,
+            "wall_ns": 21254417,
+            "cpu_ns": 19240000,
+            "rss_bytes": 15663104,
+            "work_cpu_ns": 97000
+          },
+          {
+            "ns": 93541,
+            "wall_ns": 20797916,
+            "cpu_ns": 18820000,
+            "rss_bytes": 15728640,
+            "work_cpu_ns": 92000
+          }
+        ]
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 931.6054023422743,
+          "wall_ns": 9.892717372809257,
+          "cpu_ns": 10.69829768226711,
+          "rss_bytes": 2.2936259143155695,
+          "work_cpu_ns": 944.3404255319149
+        },
+        "interp": {
+          "ns": 884.9158416400438,
+          "wall_ns": 9.447877351799393,
+          "cpu_ns": 10.32468814968815,
+          "rss_bytes": 1.895397489539749,
+          "work_cpu_ns": 900.1149425287356
+        }
+      }
+    },
+    "datetime_subtract": {
+      "case": {
+        "path": "target/datetime-components-probes/datetime_subtract.py",
+        "source_sha256": "73f76ee27a934dee3bf8d1ac2ef0afd5095f5c480a75d72ef5565f5d20361379",
+        "driver": "target/datetime-components-probes/datetime_subtract-verify.py",
+        "driver_sha256": "91a3c8c35bc760f1455c82c4ea704334ea126843303788ae97ab7059c7caee04",
+        "expression": "base - other"
+      },
+      "samples": {
+        "jit": [
+          {
+            "ns": 12896917,
+            "wall_ns": 58745959,
+            "cpu_ns": 56601000,
+            "rss_bytes": 33931264,
+            "work_cpu_ns": 12889000
+          },
+          {
+            "ns": 12680875,
+            "wall_ns": 58677750,
+            "cpu_ns": 56596000,
+            "rss_bytes": 33882112,
+            "work_cpu_ns": 12677000
+          },
+          {
+            "ns": 13015875,
+            "wall_ns": 58780625,
+            "cpu_ns": 56840000,
+            "rss_bytes": 33865728,
+            "work_cpu_ns": 13011000
+          },
+          {
+            "ns": 12998292,
+            "wall_ns": 59127500,
+            "cpu_ns": 57002000,
+            "rss_bytes": 33882112,
+            "work_cpu_ns": 12995000
+          },
+          {
+            "ns": 13141500,
+            "wall_ns": 59870666,
+            "cpu_ns": 57780000,
+            "rss_bytes": 33882112,
+            "work_cpu_ns": 13138000
+          },
+          {
+            "ns": 12905458,
+            "wall_ns": 59699417,
+            "cpu_ns": 57636000,
+            "rss_bytes": 34045952,
+            "work_cpu_ns": 12902000
+          },
+          {
+            "ns": 12650000,
+            "wall_ns": 60666625,
+            "cpu_ns": 58209000,
+            "rss_bytes": 34062336,
+            "work_cpu_ns": 12643000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 12703084,
+            "wall_ns": 56462166,
+            "cpu_ns": 54421000,
+            "rss_bytes": 29704192,
+            "work_cpu_ns": 12696000
+          },
+          {
+            "ns": 12498292,
+            "wall_ns": 55792959,
+            "cpu_ns": 53704000,
+            "rss_bytes": 29655040,
+            "work_cpu_ns": 12497000
+          },
+          {
+            "ns": 12471792,
+            "wall_ns": 55248750,
+            "cpu_ns": 53227000,
+            "rss_bytes": 29638656,
+            "work_cpu_ns": 12470000
+          },
+          {
+            "ns": 12218750,
+            "wall_ns": 55642250,
+            "cpu_ns": 53533000,
+            "rss_bytes": 29736960,
+            "work_cpu_ns": 12215000
+          },
+          {
+            "ns": 12339458,
+            "wall_ns": 57573041,
+            "cpu_ns": 55379000,
+            "rss_bytes": 29655040,
+            "work_cpu_ns": 12336000
+          },
+          {
+            "ns": 12094000,
+            "wall_ns": 55864542,
+            "cpu_ns": 53841000,
+            "rss_bytes": 29671424,
+            "work_cpu_ns": 12091000
+          },
+          {
+            "ns": 12074041,
+            "wall_ns": 57411542,
+            "cpu_ns": 55311000,
+            "rss_bytes": 29704192,
+            "work_cpu_ns": 12068000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 90791,
+            "wall_ns": 21034042,
+            "cpu_ns": 19217000,
+            "rss_bytes": 15728640,
+            "work_cpu_ns": 90000
+          },
+          {
+            "ns": 85666,
+            "wall_ns": 20187208,
+            "cpu_ns": 18314000,
+            "rss_bytes": 15712256,
+            "work_cpu_ns": 84000
+          },
+          {
+            "ns": 95542,
+            "wall_ns": 20419667,
+            "cpu_ns": 18585000,
+            "rss_bytes": 15613952,
+            "work_cpu_ns": 94000
+          },
+          {
+            "ns": 89417,
+            "wall_ns": 20727875,
+            "cpu_ns": 18804000,
+            "rss_bytes": 15663104,
+            "work_cpu_ns": 89000
+          },
+          {
+            "ns": 88292,
+            "wall_ns": 20500542,
+            "cpu_ns": 18970000,
+            "rss_bytes": 15613952,
+            "work_cpu_ns": 87000
+          },
+          {
+            "ns": 93708,
+            "wall_ns": 20802875,
+            "cpu_ns": 18803000,
+            "rss_bytes": 15613952,
+            "work_cpu_ns": 93000
+          },
+          {
+            "ns": 92625,
+            "wall_ns": 20245792,
+            "cpu_ns": 18309000,
+            "rss_bytes": 15630336,
+            "work_cpu_ns": 91000
+          }
+        ]
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 142.0506107433556,
+          "wall_ns": 2.8786279913379587,
+          "cpu_ns": 3.0583804143126176,
+          "rss_bytes": 2.16894018887723,
+          "work_cpu_ns": 143.2111111111111
+        },
+        "interp": {
+          "ns": 136.64907120569913,
+          "wall_ns": 2.705663613417398,
+          "cpu_ns": 2.863976324993274,
+          "rss_bytes": 1.8985355648535565,
+          "work_cpu_ns": 137.24719101123594
+        }
+      }
+    },
+    "timedelta_multiply": {
+      "case": {
+        "path": "target/datetime-components-probes/timedelta_multiply.py",
+        "source_sha256": "95fd86072d1714475cd2bd4f2dc0905e6e1ee197b3110f981be2c9029c19d63c",
+        "driver": "target/datetime-components-probes/timedelta_multiply-verify.py",
+        "driver_sha256": "38cefd7a5cc9100a56244ec22ac3c8ee26a15222160b7513606718d073f45b11",
+        "expression": "day * 30"
+      },
+      "samples": {
+        "jit": [
+          {
+            "ns": 7654125,
+            "wall_ns": 47793000,
+            "cpu_ns": 46294000,
+            "rss_bytes": 32079872,
+            "work_cpu_ns": 7651000
+          },
+          {
+            "ns": 7565208,
+            "wall_ns": 48715584,
+            "cpu_ns": 46529000,
+            "rss_bytes": 31981568,
+            "work_cpu_ns": 7563000
+          },
+          {
+            "ns": 7298750,
+            "wall_ns": 48689875,
+            "cpu_ns": 46387000,
+            "rss_bytes": 32178176,
+            "work_cpu_ns": 7294000
+          },
+          {
+            "ns": 7355541,
+            "wall_ns": 48052584,
+            "cpu_ns": 45867000,
+            "rss_bytes": 32161792,
+            "work_cpu_ns": 7351000
+          },
+          {
+            "ns": 7525542,
+            "wall_ns": 47708292,
+            "cpu_ns": 45678000,
+            "rss_bytes": 32129024,
+            "work_cpu_ns": 7523000
+          },
+          {
+            "ns": 7547833,
+            "wall_ns": 47825709,
+            "cpu_ns": 45784000,
+            "rss_bytes": 32112640,
+            "work_cpu_ns": 7544000
+          },
+          {
+            "ns": 7455875,
+            "wall_ns": 47799792,
+            "cpu_ns": 45799000,
+            "rss_bytes": 32145408,
+            "work_cpu_ns": 7453000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 7413958,
+            "wall_ns": 45755750,
+            "cpu_ns": 43623000,
+            "rss_bytes": 29687808,
+            "work_cpu_ns": 7411000
+          },
+          {
+            "ns": 7614625,
+            "wall_ns": 46792250,
+            "cpu_ns": 44686000,
+            "rss_bytes": 29622272,
+            "work_cpu_ns": 7612000
+          },
+          {
+            "ns": 7251375,
+            "wall_ns": 47273875,
+            "cpu_ns": 45012000,
+            "rss_bytes": 29655040,
+            "work_cpu_ns": 7246000
+          },
+          {
+            "ns": 7587083,
+            "wall_ns": 47601750,
+            "cpu_ns": 45498000,
+            "rss_bytes": 29671424,
+            "work_cpu_ns": 7583000
+          },
+          {
+            "ns": 7447542,
+            "wall_ns": 45203000,
+            "cpu_ns": 43127000,
+            "rss_bytes": 29720576,
+            "work_cpu_ns": 7445000
+          },
+          {
+            "ns": 7457292,
+            "wall_ns": 46142667,
+            "cpu_ns": 44134000,
+            "rss_bytes": 29671424,
+            "work_cpu_ns": 7455000
+          },
+          {
+            "ns": 7548666,
+            "wall_ns": 45856875,
+            "cpu_ns": 43918000,
+            "rss_bytes": 29622272,
+            "work_cpu_ns": 7547000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 335417,
+            "wall_ns": 22029000,
+            "cpu_ns": 19905000,
+            "rss_bytes": 15712256,
+            "work_cpu_ns": 334000
+          },
+          {
+            "ns": 349000,
+            "wall_ns": 21399041,
+            "cpu_ns": 19531000,
+            "rss_bytes": 15794176,
+            "work_cpu_ns": 348000
+          },
+          {
+            "ns": 352167,
+            "wall_ns": 21785333,
+            "cpu_ns": 19782000,
+            "rss_bytes": 15745024,
+            "work_cpu_ns": 351000
+          },
+          {
+            "ns": 348750,
+            "wall_ns": 21841375,
+            "cpu_ns": 19965000,
+            "rss_bytes": 15728640,
+            "work_cpu_ns": 348000
+          },
+          {
+            "ns": 333917,
+            "wall_ns": 20573791,
+            "cpu_ns": 18642000,
+            "rss_bytes": 15728640,
+            "work_cpu_ns": 331000
+          },
+          {
+            "ns": 349875,
+            "wall_ns": 20585875,
+            "cpu_ns": 18721000,
+            "rss_bytes": 15679488,
+            "work_cpu_ns": 349000
+          },
+          {
+            "ns": 344958,
+            "wall_ns": 20437250,
+            "cpu_ns": 18557000,
+            "rss_bytes": 15712256,
+            "work_cpu_ns": 344000
+          }
+        ]
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 21.6138631369616,
+          "wall_ns": 2.276531177261635,
+          "cpu_ns": 2.3823152936357586,
+          "rss_bytes": 2.043704474505723,
+          "work_cpu_ns": 21.665697674418606
+        },
+        "interp": {
+          "ns": 21.818409742120345,
+          "wall_ns": 2.1866517289256096,
+          "cpu_ns": 2.287952485791818,
+          "rss_bytes": 1.8864583333333333,
+          "work_cpu_ns": 21.873563218390803
+        }
+      }
+    },
+    "datetime_fields": {
+      "case": {
+        "path": "target/datetime-components-probes/datetime_fields.py",
+        "source_sha256": "03d808606936efb5f3d7055ee4fdc403a90994e5d4417775091e096f9a164535",
+        "driver": "target/datetime-components-probes/datetime_fields-verify.py",
+        "driver_sha256": "1247fd1e6fd4c067a9b7575b45e8bf0d841b6d8d4a9618a49c7b1d03cb86c0ec",
+        "expression": "(base.year, base.month, base.day, base.hour, base.minute, base.second, base.microsecond, base.fold)"
+      },
+      "samples": {
+        "jit": [
+          {
+            "ns": 8376292,
+            "wall_ns": 50039584,
+            "cpu_ns": 47917000,
+            "rss_bytes": 32571392,
+            "work_cpu_ns": 8373000
+          },
+          {
+            "ns": 8371917,
+            "wall_ns": 50754375,
+            "cpu_ns": 48686000,
+            "rss_bytes": 32653312,
+            "work_cpu_ns": 8369000
+          },
+          {
+            "ns": 8374542,
+            "wall_ns": 50620166,
+            "cpu_ns": 48572000,
+            "rss_bytes": 32522240,
+            "work_cpu_ns": 8371000
+          },
+          {
+            "ns": 8473375,
+            "wall_ns": 50622834,
+            "cpu_ns": 48576000,
+            "rss_bytes": 32653312,
+            "work_cpu_ns": 8466000
+          },
+          {
+            "ns": 8423500,
+            "wall_ns": 50315166,
+            "cpu_ns": 48283000,
+            "rss_bytes": 32587776,
+            "work_cpu_ns": 8420000
+          },
+          {
+            "ns": 8378458,
+            "wall_ns": 50322375,
+            "cpu_ns": 48346000,
+            "rss_bytes": 32571392,
+            "work_cpu_ns": 8376000
+          },
+          {
+            "ns": 8361792,
+            "wall_ns": 50520167,
+            "cpu_ns": 48569000,
+            "rss_bytes": 32604160,
+            "work_cpu_ns": 8359000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 6101792,
+            "wall_ns": 43718583,
+            "cpu_ns": 41569000,
+            "rss_bytes": 29720576,
+            "work_cpu_ns": 6099000
+          },
+          {
+            "ns": 6189500,
+            "wall_ns": 43419333,
+            "cpu_ns": 41399000,
+            "rss_bytes": 29622272,
+            "work_cpu_ns": 6187000
+          },
+          {
+            "ns": 6225417,
+            "wall_ns": 43278500,
+            "cpu_ns": 41366000,
+            "rss_bytes": 29753344,
+            "work_cpu_ns": 6222000
+          },
+          {
+            "ns": 6358667,
+            "wall_ns": 43547250,
+            "cpu_ns": 41612000,
+            "rss_bytes": 29720576,
+            "work_cpu_ns": 6357000
+          },
+          {
+            "ns": 6147125,
+            "wall_ns": 42960291,
+            "cpu_ns": 41053000,
+            "rss_bytes": 29753344,
+            "work_cpu_ns": 6144000
+          },
+          {
+            "ns": 6245834,
+            "wall_ns": 43669459,
+            "cpu_ns": 41735000,
+            "rss_bytes": 29556736,
+            "work_cpu_ns": 6244000
+          },
+          {
+            "ns": 6156167,
+            "wall_ns": 43033375,
+            "cpu_ns": 41060000,
+            "rss_bytes": 29736960,
+            "work_cpu_ns": 6154000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 286166,
+            "wall_ns": 20743000,
+            "cpu_ns": 18768000,
+            "rss_bytes": 15630336,
+            "work_cpu_ns": 285000
+          },
+          {
+            "ns": 286958,
+            "wall_ns": 20741459,
+            "cpu_ns": 18720000,
+            "rss_bytes": 15679488,
+            "work_cpu_ns": 287000
+          },
+          {
+            "ns": 289750,
+            "wall_ns": 20430416,
+            "cpu_ns": 18486000,
+            "rss_bytes": 15679488,
+            "work_cpu_ns": 289000
+          },
+          {
+            "ns": 281167,
+            "wall_ns": 20833791,
+            "cpu_ns": 18924000,
+            "rss_bytes": 15712256,
+            "work_cpu_ns": 280000
+          },
+          {
+            "ns": 283708,
+            "wall_ns": 20636459,
+            "cpu_ns": 18725000,
+            "rss_bytes": 15663104,
+            "work_cpu_ns": 283000
+          },
+          {
+            "ns": 282167,
+            "wall_ns": 20681709,
+            "cpu_ns": 18739000,
+            "rss_bytes": 15695872,
+            "work_cpu_ns": 281000
+          },
+          {
+            "ns": 285959,
+            "wall_ns": 20414958,
+            "cpu_ns": 18575000,
+            "rss_bytes": 15761408,
+            "work_cpu_ns": 285000
+          }
+        ]
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 29.270744952230523,
+          "wall_ns": 2.4381685830887943,
+          "cpu_ns": 2.579966913922835,
+          "rss_bytes": 2.0782064650677787,
+          "work_cpu_ns": 29.378947368421052
+        },
+        "interp": {
+          "ns": 21.569358582092153,
+          "wall_ns": 2.107630670587668,
+          "cpu_ns": 2.2114850427350428,
+          "rss_bytes": 1.8915537017726798,
+          "work_cpu_ns": 21.59298245614035
+        }
+      }
+    },
+    "datetime_weekday": {
+      "case": {
+        "path": "target/datetime-components-probes/datetime_weekday.py",
+        "source_sha256": "08467a8751937b52ec5aad10a6fa8b2826f60eca3c0f4cc33a2dcc225695b904",
+        "driver": "target/datetime-components-probes/datetime_weekday-verify.py",
+        "driver_sha256": "11717314d2edde413d87fe1e7c8e0ba345b83c755a9013b0b44395b6b5c6d6bf",
+        "expression": "base.weekday()"
+      },
+      "samples": {
+        "jit": [
+          {
+            "ns": 4572833,
+            "wall_ns": 41371042,
+            "cpu_ns": 39475000,
+            "rss_bytes": 32276480,
+            "work_cpu_ns": 4571000
+          },
+          {
+            "ns": 4595625,
+            "wall_ns": 42066833,
+            "cpu_ns": 40113000,
+            "rss_bytes": 32210944,
+            "work_cpu_ns": 4594000
+          },
+          {
+            "ns": 4549792,
+            "wall_ns": 42088667,
+            "cpu_ns": 40079000,
+            "rss_bytes": 32276480,
+            "work_cpu_ns": 4547000
+          },
+          {
+            "ns": 4553125,
+            "wall_ns": 42084375,
+            "cpu_ns": 40075000,
+            "rss_bytes": 32227328,
+            "work_cpu_ns": 4551000
+          },
+          {
+            "ns": 4769250,
+            "wall_ns": 42255584,
+            "cpu_ns": 40223000,
+            "rss_bytes": 32096256,
+            "work_cpu_ns": 4766000
+          },
+          {
+            "ns": 4556875,
+            "wall_ns": 42473000,
+            "cpu_ns": 40582000,
+            "rss_bytes": 32260096,
+            "work_cpu_ns": 4554000
+          },
+          {
+            "ns": 4586542,
+            "wall_ns": 42121792,
+            "cpu_ns": 40106000,
+            "rss_bytes": 32079872,
+            "work_cpu_ns": 4579000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 2603167,
+            "wall_ns": 35919875,
+            "cpu_ns": 33990000,
+            "rss_bytes": 29720576,
+            "work_cpu_ns": 2602000
+          },
+          {
+            "ns": 2602708,
+            "wall_ns": 35921875,
+            "cpu_ns": 33998000,
+            "rss_bytes": 29638656,
+            "work_cpu_ns": 2601000
+          },
+          {
+            "ns": 2599209,
+            "wall_ns": 36379833,
+            "cpu_ns": 34327000,
+            "rss_bytes": 29540352,
+            "work_cpu_ns": 2597000
+          },
+          {
+            "ns": 2618167,
+            "wall_ns": 36097834,
+            "cpu_ns": 34187000,
+            "rss_bytes": 29687808,
+            "work_cpu_ns": 2617000
+          },
+          {
+            "ns": 2584750,
+            "wall_ns": 36244542,
+            "cpu_ns": 34204000,
+            "rss_bytes": 29736960,
+            "work_cpu_ns": 2583000
+          },
+          {
+            "ns": 2614541,
+            "wall_ns": 36077584,
+            "cpu_ns": 34133000,
+            "rss_bytes": 29655040,
+            "work_cpu_ns": 2613000
+          },
+          {
+            "ns": 2764125,
+            "wall_ns": 37586875,
+            "cpu_ns": 35561000,
+            "rss_bytes": 29622272,
+            "work_cpu_ns": 2762000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 77042,
+            "wall_ns": 19657791,
+            "cpu_ns": 17892000,
+            "rss_bytes": 15712256,
+            "work_cpu_ns": 76000
+          },
+          {
+            "ns": 73500,
+            "wall_ns": 20623667,
+            "cpu_ns": 18732000,
+            "rss_bytes": 15663104,
+            "work_cpu_ns": 72000
+          },
+          {
+            "ns": 79209,
+            "wall_ns": 20492833,
+            "cpu_ns": 18514000,
+            "rss_bytes": 15663104,
+            "work_cpu_ns": 79000
+          },
+          {
+            "ns": 73083,
+            "wall_ns": 20537459,
+            "cpu_ns": 18662000,
+            "rss_bytes": 15646720,
+            "work_cpu_ns": 71000
+          },
+          {
+            "ns": 69167,
+            "wall_ns": 19890333,
+            "cpu_ns": 18027000,
+            "rss_bytes": 15646720,
+            "work_cpu_ns": 69000
+          },
+          {
+            "ns": 68292,
+            "wall_ns": 20481334,
+            "cpu_ns": 18509000,
+            "rss_bytes": 15695872,
+            "work_cpu_ns": 67000
+          },
+          {
+            "ns": 80041,
+            "wall_ns": 20181209,
+            "cpu_ns": 18322000,
+            "rss_bytes": 15646720,
+            "work_cpu_ns": 79000
+          }
+        ]
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 62.30074025423149,
+          "wall_ns": 2.0737418763836377,
+          "cpu_ns": 2.188953171051195,
+          "rss_bytes": 2.0553235908141962,
+          "work_cpu_ns": 63.80555555555556
+        },
+        "interp": {
+          "ns": 35.41099319727891,
+          "wall_ns": 1.7752466435460632,
+          "cpu_ns": 1.8541104029383169,
+          "rss_bytes": 1.8922594142259415,
+          "work_cpu_ns": 36.125
+        }
+      }
+    },
+    "datetime_isoformat": {
+      "case": {
+        "path": "target/datetime-components-probes/datetime_isoformat.py",
+        "source_sha256": "ee8bc0a08b0e2c83844edb40f0cb137df766487c3a6cdee2ddce6c34a9e79ff8",
+        "driver": "target/datetime-components-probes/datetime_isoformat-verify.py",
+        "driver_sha256": "86f336fb898b5cafd7952a35d847fd4ab8fd7aebfbdce2e35ad2ce1293db2c26",
+        "expression": "base.isoformat()"
+      },
+      "samples": {
+        "jit": [
+          {
+            "ns": 86043000,
+            "wall_ns": 210361250,
+            "cpu_ns": 208007000,
+            "rss_bytes": 32374784,
+            "work_cpu_ns": 86029000
+          },
+          {
+            "ns": 82225083,
+            "wall_ns": 205673208,
+            "cpu_ns": 203443000,
+            "rss_bytes": 32276480,
+            "work_cpu_ns": 82218000
+          },
+          {
+            "ns": 85506667,
+            "wall_ns": 206907209,
+            "cpu_ns": 204701000,
+            "rss_bytes": 32342016,
+            "work_cpu_ns": 85501000
+          },
+          {
+            "ns": 81535291,
+            "wall_ns": 198116083,
+            "cpu_ns": 195909000,
+            "rss_bytes": 32358400,
+            "work_cpu_ns": 81530000
+          },
+          {
+            "ns": 79612875,
+            "wall_ns": 195970291,
+            "cpu_ns": 193452000,
+            "rss_bytes": 32391168,
+            "work_cpu_ns": 79604000
+          },
+          {
+            "ns": 84083708,
+            "wall_ns": 202833834,
+            "cpu_ns": 200190000,
+            "rss_bytes": 32309248,
+            "work_cpu_ns": 84076000
+          },
+          {
+            "ns": 85003792,
+            "wall_ns": 207412750,
+            "cpu_ns": 205119000,
+            "rss_bytes": 32358400,
+            "work_cpu_ns": 84997000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 84837375,
+            "wall_ns": 198498583,
+            "cpu_ns": 196058000,
+            "rss_bytes": 29573120,
+            "work_cpu_ns": 84721000
+          },
+          {
+            "ns": 82796666,
+            "wall_ns": 197297792,
+            "cpu_ns": 195005000,
+            "rss_bytes": 29589504,
+            "work_cpu_ns": 82716000
+          },
+          {
+            "ns": 82408625,
+            "wall_ns": 197013208,
+            "cpu_ns": 194853000,
+            "rss_bytes": 29704192,
+            "work_cpu_ns": 82400000
+          },
+          {
+            "ns": 82328750,
+            "wall_ns": 197084208,
+            "cpu_ns": 194856000,
+            "rss_bytes": 29687808,
+            "work_cpu_ns": 82268000
+          },
+          {
+            "ns": 82331917,
+            "wall_ns": 198063708,
+            "cpu_ns": 195650000,
+            "rss_bytes": 29655040,
+            "work_cpu_ns": 82327000
+          },
+          {
+            "ns": 85434500,
+            "wall_ns": 203531375,
+            "cpu_ns": 200998000,
+            "rss_bytes": 29704192,
+            "work_cpu_ns": 85286000
+          },
+          {
+            "ns": 86080416,
+            "wall_ns": 206816916,
+            "cpu_ns": 204401000,
+            "rss_bytes": 29720576,
+            "work_cpu_ns": 86073000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 1253042,
+            "wall_ns": 24626750,
+            "cpu_ns": 22404000,
+            "rss_bytes": 15646720,
+            "work_cpu_ns": 1252000
+          },
+          {
+            "ns": 1283167,
+            "wall_ns": 23811542,
+            "cpu_ns": 21626000,
+            "rss_bytes": 15728640,
+            "work_cpu_ns": 1282000
+          },
+          {
+            "ns": 1271833,
+            "wall_ns": 23142209,
+            "cpu_ns": 20983000,
+            "rss_bytes": 15794176,
+            "work_cpu_ns": 1266000
+          },
+          {
+            "ns": 1236500,
+            "wall_ns": 24270458,
+            "cpu_ns": 21973000,
+            "rss_bytes": 15613952,
+            "work_cpu_ns": 1235000
+          },
+          {
+            "ns": 1274000,
+            "wall_ns": 25851875,
+            "cpu_ns": 23422000,
+            "rss_bytes": 15728640,
+            "work_cpu_ns": 1273000
+          },
+          {
+            "ns": 1296583,
+            "wall_ns": 25768750,
+            "cpu_ns": 23279000,
+            "rss_bytes": 15679488,
+            "work_cpu_ns": 1295000
+          },
+          {
+            "ns": 1340958,
+            "wall_ns": 25711167,
+            "cpu_ns": 23421000,
+            "rss_bytes": 15613952,
+            "work_cpu_ns": 1313000
+          }
+        ]
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 64.85023172446346,
+          "wall_ns": 8.162848966426592,
+          "cpu_ns": 8.915896782414782,
+          "rss_bytes": 2.0606060606060606,
+          "work_cpu_ns": 64.92355212355213
+        },
+        "interp": {
+          "ns": 64.7951617861779,
+          "wall_ns": 8.060283350421797,
+          "cpu_ns": 8.75102660239243,
+          "rss_bytes": 1.8900523560209423,
+          "work_cpu_ns": 65.55445544554455
+        }
+      }
+    },
+    "datetime_strftime": {
+      "case": {
+        "path": "target/datetime-components-probes/datetime_strftime.py",
+        "source_sha256": "0949599ecdc5224dffed6a9a46b90fbc5f9692b58bd08b9d73726e5ef97e147d",
+        "driver": "target/datetime-components-probes/datetime_strftime-verify.py",
+        "driver_sha256": "e0a98465ee48bb8da8cbcba296b74fb0d5099d6fc9baeca450616edeb3183bd8",
+        "expression": "base.strftime(\"%Y-%m-%d %H:%M:%S\")"
+      },
+      "samples": {
+        "jit": [
+          {
+            "ns": 44841042,
+            "wall_ns": 123094625,
+            "cpu_ns": 120958000,
+            "rss_bytes": 32276480,
+            "work_cpu_ns": 44838000
+          },
+          {
+            "ns": 43777791,
+            "wall_ns": 122170000,
+            "cpu_ns": 120108000,
+            "rss_bytes": 32292864,
+            "work_cpu_ns": 43773000
+          },
+          {
+            "ns": 44230417,
+            "wall_ns": 121971875,
+            "cpu_ns": 119889000,
+            "rss_bytes": 32292864,
+            "work_cpu_ns": 44226000
+          },
+          {
+            "ns": 43641750,
+            "wall_ns": 122439792,
+            "cpu_ns": 120258000,
+            "rss_bytes": 32260096,
+            "work_cpu_ns": 43630000
+          },
+          {
+            "ns": 43481792,
+            "wall_ns": 122688833,
+            "cpu_ns": 120305000,
+            "rss_bytes": 32243712,
+            "work_cpu_ns": 43469000
+          },
+          {
+            "ns": 43595208,
+            "wall_ns": 121090041,
+            "cpu_ns": 118892000,
+            "rss_bytes": 32227328,
+            "work_cpu_ns": 43591000
+          },
+          {
+            "ns": 43676416,
+            "wall_ns": 122263250,
+            "cpu_ns": 119805000,
+            "rss_bytes": 32227328,
+            "work_cpu_ns": 43668000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 39799792,
+            "wall_ns": 111149417,
+            "cpu_ns": 109031000,
+            "rss_bytes": 29655040,
+            "work_cpu_ns": 39795000
+          },
+          {
+            "ns": 39212625,
+            "wall_ns": 110120167,
+            "cpu_ns": 108089000,
+            "rss_bytes": 29736960,
+            "work_cpu_ns": 39209000
+          },
+          {
+            "ns": 39649625,
+            "wall_ns": 110279792,
+            "cpu_ns": 108324000,
+            "rss_bytes": 29720576,
+            "work_cpu_ns": 39646000
+          },
+          {
+            "ns": 38287625,
+            "wall_ns": 111806334,
+            "cpu_ns": 109281000,
+            "rss_bytes": 29769728,
+            "work_cpu_ns": 38280000
+          },
+          {
+            "ns": 39587708,
+            "wall_ns": 111353333,
+            "cpu_ns": 109276000,
+            "rss_bytes": 29671424,
+            "work_cpu_ns": 39542000
+          },
+          {
+            "ns": 38999833,
+            "wall_ns": 109427917,
+            "cpu_ns": 107365000,
+            "rss_bytes": 29589504,
+            "work_cpu_ns": 38995000
+          },
+          {
+            "ns": 39645833,
+            "wall_ns": 110617959,
+            "cpu_ns": 108601000,
+            "rss_bytes": 29589504,
+            "work_cpu_ns": 39641000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 2917417,
+            "wall_ns": 26803000,
+            "cpu_ns": 24712000,
+            "rss_bytes": 15630336,
+            "work_cpu_ns": 2916000
+          },
+          {
+            "ns": 2915417,
+            "wall_ns": 26652083,
+            "cpu_ns": 24668000,
+            "rss_bytes": 15663104,
+            "work_cpu_ns": 2914000
+          },
+          {
+            "ns": 2871500,
+            "wall_ns": 26337333,
+            "cpu_ns": 24322000,
+            "rss_bytes": 15794176,
+            "work_cpu_ns": 2870000
+          },
+          {
+            "ns": 2950750,
+            "wall_ns": 29352833,
+            "cpu_ns": 26935000,
+            "rss_bytes": 15695872,
+            "work_cpu_ns": 2949000
+          },
+          {
+            "ns": 2815500,
+            "wall_ns": 28521541,
+            "cpu_ns": 26030000,
+            "rss_bytes": 15695872,
+            "work_cpu_ns": 2813000
+          },
+          {
+            "ns": 2962959,
+            "wall_ns": 27175459,
+            "cpu_ns": 25075000,
+            "rss_bytes": 15695872,
+            "work_cpu_ns": 2961000
+          },
+          {
+            "ns": 2911208,
+            "wall_ns": 26693917,
+            "cpu_ns": 24545000,
+            "rss_bytes": 15679488,
+            "work_cpu_ns": 2909000
+          }
+        ]
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 15.015962039049645,
+          "wall_ns": 4.580191434625349,
+          "cpu_ns": 4.868980055132155,
+          "rss_bytes": 2.0553235908141962,
+          "work_cpu_ns": 15.021619766643788
+        },
+        "interp": {
+          "ns": 13.618344343653906,
+          "wall_ns": 4.131765873609203,
+          "cpu_ns": 4.381749635154857,
+          "rss_bytes": 1.8903966597077244,
+          "work_cpu_ns": 13.627019594362324
+        }
+      }
+    },
+    "datetime_fromisoformat": {
+      "case": {
+        "path": "target/datetime-components-probes/datetime_fromisoformat.py",
+        "source_sha256": "068dd05c9cacede753e3ed16e1dd0caac131240171cfe5bb90639906793bd22c",
+        "driver": "target/datetime-components-probes/datetime_fromisoformat-verify.py",
+        "driver_sha256": "1d492f6911553e9bf5b09e20b0c78a9e1fd1eb43bb62fcb418fe3f49231e18e9",
+        "expression": "datetime.fromisoformat(text)"
+      },
+      "samples": {
+        "jit": [
+          {
+            "ns": 165081292,
+            "wall_ns": 359772291,
+            "cpu_ns": 357490000,
+            "rss_bytes": 36061184,
+            "work_cpu_ns": 165076000
+          },
+          {
+            "ns": 163481375,
+            "wall_ns": 364419875,
+            "cpu_ns": 362181000,
+            "rss_bytes": 36159488,
+            "work_cpu_ns": 163390000
+          },
+          {
+            "ns": 160369666,
+            "wall_ns": 353812000,
+            "cpu_ns": 351291000,
+            "rss_bytes": 36028416,
+            "work_cpu_ns": 160360000
+          },
+          {
+            "ns": 158409417,
+            "wall_ns": 351668333,
+            "cpu_ns": 349057000,
+            "rss_bytes": 36077568,
+            "work_cpu_ns": 158341000
+          },
+          {
+            "ns": 158077334,
+            "wall_ns": 352920333,
+            "cpu_ns": 350569000,
+            "rss_bytes": 36143104,
+            "work_cpu_ns": 158062000
+          },
+          {
+            "ns": 158088875,
+            "wall_ns": 353100417,
+            "cpu_ns": 350440000,
+            "rss_bytes": 36159488,
+            "work_cpu_ns": 158062000
+          },
+          {
+            "ns": 159586416,
+            "wall_ns": 355900375,
+            "cpu_ns": 353720000,
+            "rss_bytes": 36077568,
+            "work_cpu_ns": 159575000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 141655500,
+            "wall_ns": 328160417,
+            "cpu_ns": 313794000,
+            "rss_bytes": 29982720,
+            "work_cpu_ns": 141540000
+          },
+          {
+            "ns": 141617541,
+            "wall_ns": 317405250,
+            "cpu_ns": 315269000,
+            "rss_bytes": 29999104,
+            "work_cpu_ns": 141585000
+          },
+          {
+            "ns": 142480375,
+            "wall_ns": 317221709,
+            "cpu_ns": 315131000,
+            "rss_bytes": 29966336,
+            "work_cpu_ns": 142447000
+          },
+          {
+            "ns": 149284667,
+            "wall_ns": 335295833,
+            "cpu_ns": 332284000,
+            "rss_bytes": 29868032,
+            "work_cpu_ns": 149147000
+          },
+          {
+            "ns": 140409167,
+            "wall_ns": 316917583,
+            "cpu_ns": 314624000,
+            "rss_bytes": 29818880,
+            "work_cpu_ns": 140404000
+          },
+          {
+            "ns": 139660291,
+            "wall_ns": 312883000,
+            "cpu_ns": 310683000,
+            "rss_bytes": 29917184,
+            "work_cpu_ns": 139654000
+          },
+          {
+            "ns": 140100208,
+            "wall_ns": 314275167,
+            "cpu_ns": 311995000,
+            "rss_bytes": 30015488,
+            "work_cpu_ns": 140094000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 196709,
+            "wall_ns": 21113667,
+            "cpu_ns": 19436000,
+            "rss_bytes": 15745024,
+            "work_cpu_ns": 195000
+          },
+          {
+            "ns": 198083,
+            "wall_ns": 20967500,
+            "cpu_ns": 18929000,
+            "rss_bytes": 15663104,
+            "work_cpu_ns": 197000
+          },
+          {
+            "ns": 205375,
+            "wall_ns": 20763166,
+            "cpu_ns": 18859000,
+            "rss_bytes": 15679488,
+            "work_cpu_ns": 204000
+          },
+          {
+            "ns": 210500,
+            "wall_ns": 24225583,
+            "cpu_ns": 21673000,
+            "rss_bytes": 15581184,
+            "work_cpu_ns": 209000
+          },
+          {
+            "ns": 219500,
+            "wall_ns": 24107208,
+            "cpu_ns": 21596000,
+            "rss_bytes": 15663104,
+            "work_cpu_ns": 218000
+          },
+          {
+            "ns": 191375,
+            "wall_ns": 22339625,
+            "cpu_ns": 20433000,
+            "rss_bytes": 15679488,
+            "work_cpu_ns": 191000
+          },
+          {
+            "ns": 195208,
+            "wall_ns": 22859584,
+            "cpu_ns": 20500000,
+            "rss_bytes": 15712256,
+            "work_cpu_ns": 193000
+          }
+        ]
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 817.5198557436171,
+          "wall_ns": 15.806013619297548,
+          "cpu_ns": 17.254634146341463,
+          "rss_bytes": 2.3061650992685476,
+          "work_cpu_ns": 826.8134715025907
+        },
+        "interp": {
+          "ns": 714.9404088185256,
+          "wall_ns": 14.005740920002014,
+          "cpu_ns": 15.331703040649657,
+          "rss_bytes": 1.910323253388947,
+          "work_cpu_ns": 718.7055837563452
+        }
+      }
+    },
+    "date_construct": {
+      "case": {
+        "path": "target/datetime-components-probes/date_construct.py",
+        "source_sha256": "d2666a8e4ce77768c3a39f1db6bde506c97028fc93071577285ead8426b6ab10",
+        "driver": "target/datetime-components-probes/date_construct-verify.py",
+        "driver_sha256": "8029357fcc339ce3209ce0de80605a9e3efb4e60b9d813faa069f6343d23d72b",
+        "expression": "date(2024, 1, 15)"
+      },
+      "samples": {
+        "jit": [
+          {
+            "ns": 9729333,
+            "wall_ns": 52955208,
+            "cpu_ns": 50679000,
+            "rss_bytes": 33210368,
+            "work_cpu_ns": 9725000
+          },
+          {
+            "ns": 9942500,
+            "wall_ns": 54632833,
+            "cpu_ns": 52344000,
+            "rss_bytes": 33357824,
+            "work_cpu_ns": 9913000
+          },
+          {
+            "ns": 10003334,
+            "wall_ns": 54353625,
+            "cpu_ns": 52046000,
+            "rss_bytes": 33341440,
+            "work_cpu_ns": 9999000
+          },
+          {
+            "ns": 9853333,
+            "wall_ns": 53774375,
+            "cpu_ns": 51502000,
+            "rss_bytes": 33259520,
+            "work_cpu_ns": 9849000
+          },
+          {
+            "ns": 9892375,
+            "wall_ns": 52839625,
+            "cpu_ns": 50776000,
+            "rss_bytes": 33390592,
+            "work_cpu_ns": 9887000
+          },
+          {
+            "ns": 9783708,
+            "wall_ns": 53494875,
+            "cpu_ns": 51421000,
+            "rss_bytes": 33275904,
+            "work_cpu_ns": 9779000
+          },
+          {
+            "ns": 9965083,
+            "wall_ns": 53620875,
+            "cpu_ns": 51430000,
+            "rss_bytes": 33275904,
+            "work_cpu_ns": 9961000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 9542250,
+            "wall_ns": 50897459,
+            "cpu_ns": 48802000,
+            "rss_bytes": 29736960,
+            "work_cpu_ns": 9539000
+          },
+          {
+            "ns": 9559125,
+            "wall_ns": 52024000,
+            "cpu_ns": 49795000,
+            "rss_bytes": 29638656,
+            "work_cpu_ns": 9556000
+          },
+          {
+            "ns": 9661542,
+            "wall_ns": 51626750,
+            "cpu_ns": 49524000,
+            "rss_bytes": 29687808,
+            "work_cpu_ns": 9657000
+          },
+          {
+            "ns": 9651959,
+            "wall_ns": 51177584,
+            "cpu_ns": 49050000,
+            "rss_bytes": 29638656,
+            "work_cpu_ns": 9628000
+          },
+          {
+            "ns": 9661083,
+            "wall_ns": 50869834,
+            "cpu_ns": 48792000,
+            "rss_bytes": 29704192,
+            "work_cpu_ns": 9659000
+          },
+          {
+            "ns": 9602000,
+            "wall_ns": 51526792,
+            "cpu_ns": 49474000,
+            "rss_bytes": 29704192,
+            "work_cpu_ns": 9599000
+          },
+          {
+            "ns": 9731542,
+            "wall_ns": 51516958,
+            "cpu_ns": 49508000,
+            "rss_bytes": 29622272,
+            "work_cpu_ns": 9729000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 160000,
+            "wall_ns": 20952791,
+            "cpu_ns": 19308000,
+            "rss_bytes": 15581184,
+            "work_cpu_ns": 159000
+          },
+          {
+            "ns": 167792,
+            "wall_ns": 21247042,
+            "cpu_ns": 19561000,
+            "rss_bytes": 15695872,
+            "work_cpu_ns": 166000
+          },
+          {
+            "ns": 160792,
+            "wall_ns": 20958250,
+            "cpu_ns": 18870000,
+            "rss_bytes": 15630336,
+            "work_cpu_ns": 161000
+          },
+          {
+            "ns": 155458,
+            "wall_ns": 21424583,
+            "cpu_ns": 19831000,
+            "rss_bytes": 15581184,
+            "work_cpu_ns": 155000
+          },
+          {
+            "ns": 157167,
+            "wall_ns": 20913333,
+            "cpu_ns": 19000000,
+            "rss_bytes": 15663104,
+            "work_cpu_ns": 156000
+          },
+          {
+            "ns": 159958,
+            "wall_ns": 21715375,
+            "cpu_ns": 19815000,
+            "rss_bytes": 15745024,
+            "work_cpu_ns": 159000
+          },
+          {
+            "ns": 162167,
+            "wall_ns": 20625333,
+            "cpu_ns": 18621000,
+            "rss_bytes": 15613952,
+            "work_cpu_ns": 161000
+          }
+        ]
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 61.4495119228943,
+          "wall_ns": 2.5273581929968185,
+          "cpu_ns": 2.672421052631579,
+          "rss_bytes": 2.131440588853838,
+          "work_cpu_ns": 61.869565217391305
+        },
+        "interp": {
+          "ns": 60.028257417572114,
+          "wall_ns": 2.4324116103348996,
+          "cpu_ns": 2.5456265017125914,
+          "rss_bytes": 1.8971668415529905,
+          "work_cpu_ns": 60.37106918238994
+        }
+      }
+    },
+    "date_arithmetic": {
+      "case": {
+        "path": "target/datetime-components-probes/date_arithmetic.py",
+        "source_sha256": "b14e4a9240d653512f5321eb63a2d566db2f8be9d956eb99558b3bfe0c01ff4e",
+        "driver": "target/datetime-components-probes/date_arithmetic-verify.py",
+        "driver_sha256": "20ecc90cb1fe9f790bd99fc83f063d54deaedb5e5a380646ed0a233d39f2734c",
+        "expression": "date(2024, 1, 15) - date(2000, 1, 1)"
+      },
+      "samples": {
+        "jit": [
+          {
+            "ns": 30858292,
+            "wall_ns": 96002333,
+            "cpu_ns": 93887000,
+            "rss_bytes": 33964032,
+            "work_cpu_ns": 30852000
+          },
+          {
+            "ns": 32113833,
+            "wall_ns": 99445166,
+            "cpu_ns": 97362000,
+            "rss_bytes": 33931264,
+            "work_cpu_ns": 32107000
+          },
+          {
+            "ns": 31988834,
+            "wall_ns": 114842292,
+            "cpu_ns": 99105000,
+            "rss_bytes": 33996800,
+            "work_cpu_ns": 31984000
+          },
+          {
+            "ns": 32202083,
+            "wall_ns": 101341208,
+            "cpu_ns": 99119000,
+            "rss_bytes": 33882112,
+            "work_cpu_ns": 32181000
+          },
+          {
+            "ns": 30738500,
+            "wall_ns": 100759083,
+            "cpu_ns": 97614000,
+            "rss_bytes": 33980416,
+            "work_cpu_ns": 30730000
+          },
+          {
+            "ns": 31725375,
+            "wall_ns": 100500458,
+            "cpu_ns": 97903000,
+            "rss_bytes": 34013184,
+            "work_cpu_ns": 31701000
+          },
+          {
+            "ns": 30781000,
+            "wall_ns": 97541291,
+            "cpu_ns": 95063000,
+            "rss_bytes": 33882112,
+            "work_cpu_ns": 30773000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 30023708,
+            "wall_ns": 92010333,
+            "cpu_ns": 89966000,
+            "rss_bytes": 29638656,
+            "work_cpu_ns": 30008000
+          },
+          {
+            "ns": 31286209,
+            "wall_ns": 96263208,
+            "cpu_ns": 94281000,
+            "rss_bytes": 29687808,
+            "work_cpu_ns": 31283000
+          },
+          {
+            "ns": 32103792,
+            "wall_ns": 96955125,
+            "cpu_ns": 93855000,
+            "rss_bytes": 29687808,
+            "work_cpu_ns": 31843000
+          },
+          {
+            "ns": 31204458,
+            "wall_ns": 97069250,
+            "cpu_ns": 94887000,
+            "rss_bytes": 29687808,
+            "work_cpu_ns": 31198000
+          },
+          {
+            "ns": 30426791,
+            "wall_ns": 97370334,
+            "cpu_ns": 94709000,
+            "rss_bytes": 29720576,
+            "work_cpu_ns": 30418000
+          },
+          {
+            "ns": 30100750,
+            "wall_ns": 95111833,
+            "cpu_ns": 92505000,
+            "rss_bytes": 29671424,
+            "work_cpu_ns": 30093000
+          },
+          {
+            "ns": 30048875,
+            "wall_ns": 93073833,
+            "cpu_ns": 90729000,
+            "rss_bytes": 29671424,
+            "work_cpu_ns": 30038000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 383750,
+            "wall_ns": 21379125,
+            "cpu_ns": 19438000,
+            "rss_bytes": 15679488,
+            "work_cpu_ns": 383000
+          },
+          {
+            "ns": 362292,
+            "wall_ns": 22209334,
+            "cpu_ns": 20241000,
+            "rss_bytes": 15630336,
+            "work_cpu_ns": 361000
+          },
+          {
+            "ns": 383500,
+            "wall_ns": 22744125,
+            "cpu_ns": 21169000,
+            "rss_bytes": 15630336,
+            "work_cpu_ns": 383000
+          },
+          {
+            "ns": 378875,
+            "wall_ns": 25752042,
+            "cpu_ns": 23358000,
+            "rss_bytes": 15679488,
+            "work_cpu_ns": 377000
+          },
+          {
+            "ns": 400958,
+            "wall_ns": 25821792,
+            "cpu_ns": 23422000,
+            "rss_bytes": 15597568,
+            "work_cpu_ns": 398000
+          },
+          {
+            "ns": 356125,
+            "wall_ns": 25628917,
+            "cpu_ns": 21597000,
+            "rss_bytes": 15613952,
+            "work_cpu_ns": 354000
+          },
+          {
+            "ns": 358708,
+            "wall_ns": 23538250,
+            "cpu_ns": 21225000,
+            "rss_bytes": 15630336,
+            "work_cpu_ns": 358000
+          }
+        ]
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 84.99395051138238,
+          "wall_ns": 4.143948296920969,
+          "cpu_ns": 4.533175904060749,
+          "rss_bytes": 2.1708595387840672,
+          "work_cpu_ns": 85.36074270557029
+        },
+        "interp": {
+          "ns": 83.7126258148631,
+          "wall_ns": 3.9541526239206397,
+          "cpu_ns": 4.283233782469788,
+          "rss_bytes": 1.89937106918239,
+          "work_cpu_ns": 83.14099216710183
+        }
+      }
+    }
+  },
+  "verification": {
+    "datetime_construct": {
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"datetime\", 2024, 1, 15, 8, 30, 0, 123456, 0, \"0:00:00\", \"UTC\"]\n[\"datetime\", 2024, 1, 15, 8, 30, 0, 123456, 0, \"0:00:00\", \"UTC\"]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"datetime\", 2024, 1, 15, 8, 30, 0, 123456, 0, \"0:00:00\", \"UTC\"]\n[\"datetime\", 2024, 1, 15, 8, 30, 0, 123456, 0, \"0:00:00\", \"UTC\"]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"datetime\", 2024, 1, 15, 8, 30, 0, 123456, 0, \"0:00:00\", \"UTC\"]\n[\"datetime\", 2024, 1, 15, 8, 30, 0, 123456, 0, \"0:00:00\", \"UTC\"]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"datetime\", 2024, 1, 15, 8, 30, 0, 123456, 0, \"0:00:00\", \"UTC\"]\n[\"datetime\", 2024, 1, 15, 8, 30, 0, 123456, 0, \"0:00:00\", \"UTC\"]\n",
+        "stderr": ""
+      }
+    },
+    "timedelta_construct": {
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"timedelta\", 0, 2231, 321]\n[\"timedelta\", 0, 2231, 321]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"timedelta\", 0, 2231, 321]\n[\"timedelta\", 0, 2231, 321]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"timedelta\", 0, 2231, 321]\n[\"timedelta\", 0, 2231, 321]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"timedelta\", 0, 2231, 321]\n[\"timedelta\", 0, 2231, 321]\n",
+        "stderr": ""
+      }
+    },
+    "datetime_add": {
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"datetime\", 2024, 1, 15, 9, 7, 11, 123777, 0, \"0:00:00\", \"UTC\"]\n[\"datetime\", 2024, 1, 15, 9, 7, 11, 123777, 0, \"0:00:00\", \"UTC\"]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"datetime\", 2024, 1, 15, 9, 7, 11, 123777, 0, \"0:00:00\", \"UTC\"]\n[\"datetime\", 2024, 1, 15, 9, 7, 11, 123777, 0, \"0:00:00\", \"UTC\"]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"datetime\", 2024, 1, 15, 9, 7, 11, 123777, 0, \"0:00:00\", \"UTC\"]\n[\"datetime\", 2024, 1, 15, 9, 7, 11, 123777, 0, \"0:00:00\", \"UTC\"]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"datetime\", 2024, 1, 15, 9, 7, 11, 123777, 0, \"0:00:00\", \"UTC\"]\n[\"datetime\", 2024, 1, 15, 9, 7, 11, 123777, 0, \"0:00:00\", \"UTC\"]\n",
+        "stderr": ""
+      }
+    },
+    "datetime_subtract": {
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"timedelta\", 14, 30600, 469135]\n[\"timedelta\", 14, 30600, 469135]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"timedelta\", 14, 30600, 469135]\n[\"timedelta\", 14, 30600, 469135]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"timedelta\", 14, 30600, 469135]\n[\"timedelta\", 14, 30600, 469135]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"timedelta\", 14, 30600, 469135]\n[\"timedelta\", 14, 30600, 469135]\n",
+        "stderr": ""
+      }
+    },
+    "timedelta_multiply": {
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"timedelta\", 30, 0, 0]\n[\"timedelta\", 30, 0, 0]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"timedelta\", 30, 0, 0]\n[\"timedelta\", 30, 0, 0]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"timedelta\", 30, 0, 0]\n[\"timedelta\", 30, 0, 0]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"timedelta\", 30, 0, 0]\n[\"timedelta\", 30, 0, 0]\n",
+        "stderr": ""
+      }
+    },
+    "datetime_fields": {
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"tuple\", [2024, 1, 15, 8, 30, 0, 123456, 0]]\n[\"tuple\", [2024, 1, 15, 8, 30, 0, 123456, 0]]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"tuple\", [2024, 1, 15, 8, 30, 0, 123456, 0]]\n[\"tuple\", [2024, 1, 15, 8, 30, 0, 123456, 0]]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"tuple\", [2024, 1, 15, 8, 30, 0, 123456, 0]]\n[\"tuple\", [2024, 1, 15, 8, 30, 0, 123456, 0]]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"tuple\", [2024, 1, 15, 8, 30, 0, 123456, 0]]\n[\"tuple\", [2024, 1, 15, 8, 30, 0, 123456, 0]]\n",
+        "stderr": ""
+      }
+    },
+    "datetime_weekday": {
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"int\", 0]\n[\"int\", 0]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"int\", 0]\n[\"int\", 0]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"int\", 0]\n[\"int\", 0]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"int\", 0]\n[\"int\", 0]\n",
+        "stderr": ""
+      }
+    },
+    "datetime_isoformat": {
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"str\", \"2024-01-15T08:30:00.123456+00:00\"]\n[\"str\", \"2024-01-15T08:30:00.123456+00:00\"]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"str\", \"2024-01-15T08:30:00.123456+00:00\"]\n[\"str\", \"2024-01-15T08:30:00.123456+00:00\"]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"str\", \"2024-01-15T08:30:00.123456+00:00\"]\n[\"str\", \"2024-01-15T08:30:00.123456+00:00\"]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"str\", \"2024-01-15T08:30:00.123456+00:00\"]\n[\"str\", \"2024-01-15T08:30:00.123456+00:00\"]\n",
+        "stderr": ""
+      }
+    },
+    "datetime_strftime": {
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"str\", \"2024-01-15 08:30:00\"]\n[\"str\", \"2024-01-15 08:30:00\"]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"str\", \"2024-01-15 08:30:00\"]\n[\"str\", \"2024-01-15 08:30:00\"]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"str\", \"2024-01-15 08:30:00\"]\n[\"str\", \"2024-01-15 08:30:00\"]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"str\", \"2024-01-15 08:30:00\"]\n[\"str\", \"2024-01-15 08:30:00\"]\n",
+        "stderr": ""
+      }
+    },
+    "datetime_fromisoformat": {
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"datetime\", 2024, 1, 15, 8, 30, 0, 123456, 0, \"0:00:00\", \"UTC\"]\n[\"datetime\", 2024, 1, 15, 8, 30, 0, 123456, 0, \"0:00:00\", \"UTC\"]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"datetime\", 2024, 1, 15, 8, 30, 0, 123456, 0, \"0:00:00\", \"UTC\"]\n[\"datetime\", 2024, 1, 15, 8, 30, 0, 123456, 0, \"0:00:00\", \"UTC\"]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"datetime\", 2024, 1, 15, 8, 30, 0, 123456, 0, \"0:00:00\", \"UTC\"]\n[\"datetime\", 2024, 1, 15, 8, 30, 0, 123456, 0, \"0:00:00\", \"UTC\"]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"datetime\", 2024, 1, 15, 8, 30, 0, 123456, 0, \"0:00:00\", \"UTC\"]\n[\"datetime\", 2024, 1, 15, 8, 30, 0, 123456, 0, \"0:00:00\", \"UTC\"]\n",
+        "stderr": ""
+      }
+    },
+    "date_construct": {
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"date\", 2024, 1, 15]\n[\"date\", 2024, 1, 15]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"date\", 2024, 1, 15]\n[\"date\", 2024, 1, 15]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"date\", 2024, 1, 15]\n[\"date\", 2024, 1, 15]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"date\", 2024, 1, 15]\n[\"date\", 2024, 1, 15]\n",
+        "stderr": ""
+      }
+    },
+    "date_arithmetic": {
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"timedelta\", 8780, 0, 0]\n[\"timedelta\", 8780, 0, 0]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"timedelta\", 8780, 0, 0]\n[\"timedelta\", 8780, 0, 0]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"timedelta\", 8780, 0, 0]\n[\"timedelta\", 8780, 0, 0]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"timedelta\", 8780, 0, 0]\n[\"timedelta\", 8780, 0, 0]\n",
+        "stderr": ""
+      }
+    }
+  }
+}

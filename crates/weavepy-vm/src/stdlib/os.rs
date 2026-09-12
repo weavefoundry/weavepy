@@ -4256,7 +4256,7 @@ fn os_waitpid(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         break rc;
     };
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(i64::from(rc)),
         Object::Int(i64::from(status)),
     ]))
@@ -4290,7 +4290,7 @@ fn os_waitpid(args: &[Object]) -> Result<Object, RuntimeError> {
     if rc == -1 {
         return Err(crate::stdlib::nt_support::last_crt_error_to_py(None));
     }
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(rc as i64),
         Object::Int(i64::from(status) << 8),
     ]))
@@ -4431,7 +4431,7 @@ fn os_pipe(_args: &[Object]) -> Result<Object, RuntimeError> {
                 }
             }
         }
-        Ok(Object::new_tuple(vec![
+        Ok(Object::new_tuple_array([
             Object::Int(i64::from(fds[0])),
             Object::Int(i64::from(fds[1])),
         ]))
@@ -4467,7 +4467,7 @@ fn os_pipe(_args: &[Object]) -> Result<Object, RuntimeError> {
                 CloseHandle(write);
                 return Err(e);
             }
-            Ok(Object::new_tuple(vec![
+            Ok(Object::new_tuple_array([
                 Object::Int(i64::from(rfd)),
                 Object::Int(i64::from(wfd)),
             ]))
@@ -4508,7 +4508,7 @@ fn os_openpty(_args: &[Object]) -> Result<Object, RuntimeError> {
                 }
             }
         }
-        Ok(Object::new_tuple(vec![
+        Ok(Object::new_tuple_array([
             Object::Int(i64::from(master)),
             Object::Int(i64::from(slave)),
         ]))
@@ -6695,7 +6695,7 @@ fn nt_getdiskusage(args: &[Object]) -> Result<Object, RuntimeError> {
     if ok == 0 {
         return Err(last_win32_error_to_py(Some(&p)));
     }
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(total as i64),
         Object::Int(free as i64),
     ]))
@@ -6758,7 +6758,7 @@ fn nt_path_splitroot_ex(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::Str(s) => {
             let full = s.to_string();
             let (d, r) = nt_splitroot_indices(full.as_bytes());
-            Ok(Object::new_tuple(vec![
+            Ok(Object::new_tuple_array([
                 Object::from_str(full[..d].to_owned()),
                 Object::from_str(full[d..r].to_owned()),
                 Object::from_str(full[r..].to_owned()),
@@ -6766,7 +6766,7 @@ fn nt_path_splitroot_ex(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         Object::Bytes(b) => {
             let (d, r) = nt_splitroot_indices(b);
-            Ok(Object::new_tuple(vec![
+            Ok(Object::new_tuple_array([
                 Object::new_bytes(b[..d].to_vec()),
                 Object::new_bytes(b[d..r].to_vec()),
                 Object::new_bytes(b[r..].to_vec()),
@@ -6791,7 +6791,7 @@ fn nt_path_splitroot(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::Str(s) => {
             let full = s.to_string().replace('/', "\\");
             let (_, r) = nt_splitroot_indices(full.as_bytes());
-            Ok(Object::new_tuple(vec![
+            Ok(Object::new_tuple_array([
                 Object::from_str(full[..r].to_owned()),
                 Object::from_str(full[r..].to_owned()),
             ]))
@@ -6802,7 +6802,7 @@ fn nt_path_splitroot(args: &[Object]) -> Result<Object, RuntimeError> {
                 .map(|&c| if c == b'/' { b'\\' } else { c })
                 .collect();
             let (_, r) = nt_splitroot_indices(&full);
-            Ok(Object::new_tuple(vec![
+            Ok(Object::new_tuple_array([
                 Object::new_bytes(full[..r].to_vec()),
                 Object::new_bytes(full[r..].to_vec()),
             ]))
@@ -6862,7 +6862,7 @@ fn path_like_type_singleton(name: &str) -> Rc<crate::types::TypeObject> {
     // __slots__ = ()` stays dict-less (`test_pathlike_subclass_slots`).
     dict.insert(
         DictKey(Object::from_static("__slots__")),
-        Object::Tuple(Rc::from(Vec::new())),
+        Object::new_tuple_array([]),
     );
     // `os.PathLike.__module__ == 'os'`: `typing._PROTO_ALLOWLIST` keys on
     // `(base.__module__, base.__name__)` to let `class P(os.PathLike,
@@ -7612,9 +7612,9 @@ fn struct_seq_reduce(
     let cls = struct_seq_lookup(layout.name)
         .map(|(t, _)| Object::Type(t))
         .ok_or_else(|| type_error("unknown struct sequence type"))?;
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         cls,
-        Object::new_tuple(vec![visible, Object::Dict(extra)]),
+        Object::new_tuple_array([visible, Object::Dict(extra)]),
     ]))
 }
 
@@ -7745,7 +7745,7 @@ fn path_split(args: &[Object]) -> Result<Object, RuntimeError> {
     let tail = p
         .file_name()
         .map_or(String::new(), |x| x.to_string_lossy().into_owned());
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::from_str(head),
         Object::from_str(tail),
     ]))
@@ -7755,12 +7755,12 @@ fn path_splitext(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = first_path(args, "splitext")?;
     if let Some(dot) = find_ext_dot(&s) {
         let (root, ext) = s.split_at(dot);
-        Ok(Object::new_tuple(vec![
+        Ok(Object::new_tuple_array([
             Object::from_str(root.to_owned()),
             Object::from_str(ext.to_owned()),
         ]))
     } else {
-        Ok(Object::new_tuple(vec![
+        Ok(Object::new_tuple_array([
             Object::from_str(s),
             Object::from_static(""),
         ]))
@@ -7773,7 +7773,7 @@ fn path_splitext(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `fsdecode`s first), so we reuse the `first_path` string coercion.
 fn path_splitdrive(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = first_path(args, "splitdrive")?;
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::from_static(""),
         Object::from_str(s),
     ]))

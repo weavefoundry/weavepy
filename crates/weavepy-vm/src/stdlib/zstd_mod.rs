@@ -1291,7 +1291,7 @@ fn zstddict_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object,
 fn zstddict_as_mode(mode: i64) -> impl Fn(&[Object]) -> Result<Object, RuntimeError> {
     move |args: &[Object]| {
         let inst = self_instance(args)?;
-        Ok(Object::new_tuple(vec![
+        Ok(Object::new_tuple_array([
             Object::Instance(inst),
             Object::Int(mode),
         ]))
@@ -1570,7 +1570,7 @@ fn m_get_frame_info(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let dict_id =
         unsafe { zstd_sys::ZSTD_getDictID_fromFrame(data.as_ptr().cast::<c_void>(), data.len()) };
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         size_obj,
         Object::Int(i64::from(dict_id)),
     ]))
@@ -1629,7 +1629,7 @@ fn m_get_param_bounds(
             "Unable to get zstd decompression parameter bounds"
         },
     )?;
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(i64::from(bounds.lowerBound)),
         Object::Int(i64::from(bounds.upperBound)),
     ]))

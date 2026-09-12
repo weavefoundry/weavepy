@@ -1434,7 +1434,7 @@ fn list_reversed_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let reversed: Vec<Object> = items.borrow().iter().rev().cloned().collect();
     Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Tuple {
-        items: Rc::from(reversed.as_slice()),
+        items: crate::object::TupleStorage::from_vec(reversed),
         index: 0,
     }))))
 }
@@ -1451,7 +1451,7 @@ fn dict_reversed_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let keys: Vec<Object> = d.borrow().keys().rev().map(|k| k.0.clone()).collect();
     Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Tuple {
-        items: Rc::from(keys.as_slice()),
+        items: crate::object::TupleStorage::from_vec(keys),
         index: 0,
     }))))
 }
@@ -1475,11 +1475,11 @@ fn dict_view_reversed_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
         crate::object::DictViewKind::Items => d
             .iter()
             .rev()
-            .map(|(k, val)| Object::new_tuple(vec![k.0.clone(), val.clone()]))
+            .map(|(k, val)| Object::new_tuple_array([k.0.clone(), val.clone()]))
             .collect(),
     };
     Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Tuple {
-        items: Rc::from(items.as_slice()),
+        items: crate::object::TupleStorage::from_vec(items),
         index: 0,
     }))))
 }

@@ -23,8 +23,8 @@ RFC 0024/0025 cross-thread waves:
   RMW. There is no plain-`Rc` heap tier to migrate and no second
   object layout to ship — which is why WS11 is one binary with a
   runtime flag, not a `weavepy-3.13t` ABI.
-- Interior mutability is uniformly `sync::GilCell` (aliased as the
-  workspace's `RefCell`/`Cell`). A `GilCell` is a hand-rolled
+- Borrowed mutable data uses `sync::GilCell` (aliased as the
+  workspace's `RefCell`). A `GilCell` is a hand-rolled
   cross-thread **reentrant mutex** (`owner: AtomicU64` holding
   `gil::current_thread_id()`, CAS on fresh acquire, relaxed-load
   reentry — see `GilCell::lock_acquire`) plus a CPython-shaped borrow
@@ -33,7 +33,26 @@ RFC 0024/0025 cross-thread waves:
   `Object::List(Rc<RefCell<Vec<Object>>>)`,
   `Object::Dict(Rc<RefCell<DictData>>)`, `Object::Set`,
   `Object::ByteArray` (`crates/weavepy-vm/src/object.rs`), instance
-  dicts, and `TypeObject`'s mutable fields — already sits behind one.
+  dicts, and `TypeObject`'s borrowed fields already sits behind one.
+- Copyable metadata uses `sync::Cell`, backed by Crossbeam's
+  `AtomicCell`. Loads acquire and stores release. Flags and counters
+  must support native atomics, checked at compile time; larger or
+  insufficiently aligned values retain `GilCell` storage and its
+  recovery after `fork()`.
+  A cell occupies only its payload's space and exposes no borrowed
+  references. Compound updates still need external synchronization.
+- Initially empty Python hash caches use `sync::CachedHash`, an
+  eight-byte native atomic word. Successful hashes normalize `-1` to
+  `-2`, leaving `-1` for the empty state. Reads acquire and stores
+  release; storing a value never resets the cache. No owner lock can
+  be inherited across `fork()`. Instance slot values remain behind
+  `GilCell`, whether their storage contains one inline entry or an
+  ordered table.
+- Tuple elements and their cached hash share one reference-counted
+  allocation. Successful hashes publish through `CachedHash`; failures
+  leave it empty. The tuple free list obtains unique ownership with
+  `Arc::get_mut`, and writable element access clears the old hash before
+  reuse. Neither hash publication nor cache reads mutate the elements.
 - `Object` is `Send + Sync` by construction (compile-time assertion in
   `object.rs`); worker threads share the heap by `Arc` cloning, and
   `Interpreter::fork_for_thread` (`crates/weavepy-vm/src/lib.rs`)
@@ -130,7 +149,7 @@ a sweep of `static` state in `crates/weavepy-vm/src`:
 
 ### 2b. GilCell-protected containers — sound under `gil=0`, with a generalized discipline
 
-Every dict/list/set/bytearray body, instance dict, and mutable
+Every dict/list/set/bytearray body, instance dict, and borrowed mutable
 `TypeObject` field is a `GilCell`, i.e. **already a per-object
 critical section**: a `borrow_mut()` on thread A blocks thread B's
 `borrow()` on the same cell, GIL or no GIL. Single mutations (one
@@ -153,12 +172,11 @@ must be generalized:
   guarded become *real cross-thread blocking windows*, and new
   inversion pairs appear that the GIL made unreachable (section 3 and
   the risk list below).
-- `GilCell::get`/`set` for `T: Copy` (the interpreter's hottest
-  operation, RFC 0065 WS2) read/write directly under the owner lock in
-  release builds. The safety argument in the source cites "no GIL
-  hand-off can occur while the lock is held"; the argument survives
-  `gil=0` because the owner lock itself excludes cross-thread access —
-  but the comment's invariants are re-audited, not assumed, in WS11.
+- Copyable object metadata uses `Cell::get`/`set`, whose atomic
+  operations expose no borrow and run no Python callbacks. These
+  operations need no GIL handoff guard. `GilCell::get`/`set` remain
+  available for copyable values in storage that also supports borrowing;
+  those accesses continue to hold the owner lock.
 
 ### 2c. Genuinely GIL-assumed state — the WS11 audit list
 
@@ -166,15 +184,17 @@ These are the places where correctness (not just performance) rides on
 the GIL's serialization. Each one must be fixed, fenced, or disabled
 before `gil=0` runs bytecode concurrently:
 
-1. **Tier-1 inline caches** — `weavepy-compiler/src/bytecode.rs::
-   CacheSlot` is a bare `UnsafeCell<InlineCache>` with
-   `unsafe impl Send + Sync` whose SAFETY note is *explicitly tied to
-   the GIL* ("get/set are only called by the dispatch loop while the
-   GIL is held"). `CodeObject.caches` (`CacheTable`) is shared
-   cross-thread via `Arc<CodeObject>`, so under `gil=0` two threads
-   warming the same call site is an instant data race, and
-   `InlineCache`'s largest variant (~24 bytes) exceeds portable atomic
-   width. This is the CAS-publication item in section 4.
+1. **Tier-1 inline caches:** the former `UnsafeCell<InlineCache>` and
+   GIL-dependent `Send`/`Sync` assertions have been replaced with coherent
+   atomic snapshots. On targets with always-lock-free 128-bit atomics, a slot
+   occupies 16 bytes. Other targets use three atomic 64-bit words and return
+   a cache miss on contention. This fallback never waits for a writer that
+   might have vanished at fork, and its checked epoch cannot wrap. Encoding
+   copies explicit integer fields without reading enum padding. Cache-table
+   allocation uses release/acquire pointer publication; resizing and release
+   require exclusive access. These changes address the shared-slot data race.
+   They do not make the guarded objects' other concurrent operations atomic
+   or resolve the remaining items in this list.
 2. **The cycle collector** — `gc_trace.rs::GC_STATE` is deliberately
    process-global ("safe because every mutation of a tracked object
    and every collection happens under the GIL", per its own doc
@@ -279,10 +299,10 @@ Per the RFC 0076 WS11 charter, one discipline per class:
    becomes the epoch: writers bump it with release ordering *after*
    completing the invalidation walk; readers acquire-load the version,
    read the derived state (`instance_plan`, cache fingerprints), and
-   re-check the version — a seqlock read. Tier-1 `CacheSlot` writes
-   become CAS-published (repacked `InlineCache` or a version-guarded
-   double-word protocol); a torn read must be impossible, a stale read
-   merely deopts, which the cooldown machinery already tolerates.
+   re-check the version, using a seqlock read. Tier-1 `CacheSlot` storage
+   is now coherent: wide atomic publication or checked atomic-word snapshots
+   prevent torn reads. A contended fallback read produces an empty cache;
+   ordinary guards still validate stale cache values before using them.
    `hot_gates` orderings get audited per-consumer (2c.6).
 
 ## 4. The JIT posture
@@ -402,7 +422,7 @@ acceptance criterion 4):
 | --- | --- | --- |
 | Atomic heap | `Rc = Arc`, `GilCell`, `cell_guards_live` | `weavepy-vm/src/sync.rs` |
 | GIL + mode flags | `GilState`, `maybe_yield_gil`, `no_gil_handoff`, `set_free_threading`, `free_threading_enabled`, `reenable_gil_for_extension` | `weavepy-vm/src/gil.rs` |
-| GIL-assumed caches | `CacheSlot` / `CacheTable` | `weavepy-compiler/src/bytecode.rs` |
+| Atomic instruction caches | `CacheSlot` / `CacheTable` / `CacheSnapshot` | `weavepy-compiler/src/bytecode.rs`; `cache_snapshot.rs` |
 | GIL-assumed collector | `GC_STATE` | `weavepy-vm/src/gc_trace.rs` |
 | Per-thread pools | `INTERN_POOL`; `BUILTIN_TYPES` + `SEED_BUILTIN_TYPES` | `stdlib/sys.rs`; `builtin_types.rs` / `vm_singletons.rs` |
 | Cache epoch | `TypeObject::attr_version` | `weavepy-vm/src/types.rs` |

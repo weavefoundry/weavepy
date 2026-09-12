@@ -1,0 +1,68 @@
+   Compiling rustc-demangle v0.1.28
+   Compiling weavepy-bench v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-bench)
+   Compiling weavepy-pylib v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-pylib)
+   Compiling weavepy-cli v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-cli)
+   Compiling weavepy-conformance v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-conformance)
+   Compiling weavepy-dist v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-dist)
+   Compiling weavepy-capi v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-capi)
+   Compiling weavepy v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy)
+   Compiling weavepy-vm v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-vm)
+   Compiling expat-sys v2.6.4 (/Users/owencarey/Documents/weavefoundry/weavepy/vendor/expat-sys)
+   Compiling weavepy-jit v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-jit)
+   Compiling weavepy-compiler v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-compiler)
+   Compiling weavepy-parser v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-parser)
+   Compiling weavepy-lexer v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-lexer)
+   Compiling weavepy-version v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-version)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 54.87s
+     Running unittests src/lib.rs (target/debug/deps/expat_sys-7d5dd346c1375115)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/weavepy-b92f9580b096bc14)
+
+running 3 tests
+test tests::syntax_error_carries_caret ... ok
+test tests::runtime_error_includes_filename ... ok
+test tests::run_empty_source_succeeds ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/fixtures.rs (target/debug/deps/fixtures-99c8326e7377150e)
+
+running 1 test
+/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy/tests/fixtures/run/37_async_await.py:23: RuntimeWarning: coroutine 'succ' was never awaited
+  print(type(succ(0)).__name__)
+RuntimeWarning: Enable tracemalloc to get the object allocation traceback
+error: Unrecognized option: 'c'
+/Users/owencarey/Documents/weavefoundry/weavepy/target/performance-stdlib-cache/a3f42d09dd2e10e0/lib/weavepy3.14/multiprocessing/resource_tracker.py:233: UserWarning: resource_tracker: process died unexpectedly, relaunching.  Some resources might leak.
+  warnings.warn('resource_tracker: process died unexpectedly, '
+error: Unrecognized option: 'c'
+/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy/tests/fixtures/run/45_asyncio_extras.py:85: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+  asyncio.iscoroutinefunction(coro),
+/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy/tests/fixtures/run/45_asyncio_extras.py:86: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+  asyncio.iscoroutinefunction(sync),
+/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy/tests/fixtures/run/45_asyncio_extras.py:87: RuntimeWarning: coroutine 'main.<locals>.coro' was never awaited
+  asyncio.iscoroutine(coro()),
+RuntimeWarning: Enable tracemalloc to get the object allocation traceback
+test all_run_fixtures_match ... FAILED
+
+failures:
+
+---- all_run_fixtures_match stdout ----
+
+thread '<unnamed>' (8635048) panicked at crates/weavepy/tests/fixtures.rs:119:13:
+run /Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy/tests/fixtures/run/52_socket_basic.py: PermissionError: [Errno 1] Operation not permitted
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'all_run_fixtures_match' (8635047) panicked at crates/weavepy/tests/fixtures.rs:159:10:
+fixture thread panicked: Any { .. }
+
+
+failures:
+    all_run_fixtures_match
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.12s
+
+error: test failed, to rerun pass `-p weavepy --test fixtures`

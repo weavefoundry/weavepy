@@ -1,0 +1,2 @@
+    Checking weavepy-vm v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-vm)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 27.40s

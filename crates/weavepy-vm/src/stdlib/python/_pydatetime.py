@@ -20,6 +20,18 @@ except ImportError:
     _ymd_toordinal = None
     _ordinal_toymd = None
 
+try:
+    from _weave_datetime import parse_time_parts as _parse_time_parts
+except ImportError:
+    _parse_time_parts = None
+
+try:
+    from _weave_datetime import date_fields as _date_fields
+    from _weave_datetime import time_fields as _time_fields
+except ImportError:
+    _date_fields = None
+    _time_fields = None
+
 
 def _cmp(x, y):
     return 0 if x == y else 1 if x > y else -1
@@ -421,6 +433,10 @@ _FRACTION_CORRECTION = [100000, 10000, 1000, 100, 10]
 
 def _parse_hh_mm_ss_ff(tstr):
     # Parses things of the form HH[:?MM[:?SS[{.,}fff[fff]]]]
+    if _parse_time_parts is not None:
+        parts = _parse_time_parts(tstr)
+        if parts is not None:
+            return parts
     len_str = len(tstr)
 
     time_comps = [0, 0, 0, 0]
@@ -581,6 +597,10 @@ def _check_utc_offset(name, offset):
                          f"timedelta(hours=24), not {offset!r}")
 
 def _check_date_fields(year, month, day):
+    if _date_fields is not None:
+        parts = _date_fields(year, month, day)
+        if parts is not None:
+            return parts
     year = _index(year)
     month = _index(month)
     day = _index(day)
@@ -605,6 +625,10 @@ def _check_date_fields(year, month, day):
     return year, month, day
 
 def _check_time_fields(hour, minute, second, microsecond, fold):
+    if _time_fields is not None:
+        parts = _time_fields(hour, minute, second, microsecond, fold)
+        if parts is not None:
+            return parts
     hour = _index(hour)
     minute = _index(minute)
     second = _index(second)

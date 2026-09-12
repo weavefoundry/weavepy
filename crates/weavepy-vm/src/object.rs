@@ -10,6 +10,8 @@
 //! and value equality for the value-type variants. RFC 0002 will
 //! replace this with a proper type-slot-based object model.
 
+pub use crate::tuple_storage::TupleStorage;
+
 use crate::sync::Rc;
 use crate::sync::Weak;
 use crate::sync::{Cell, RefCell};
@@ -115,7 +117,7 @@ pub enum Object {
     /// `surrogateescape` filenames, `surrogatepass`, and `chr(0xD800)` all
     /// round-trip.
     WStr(Rc<[u32]>),
-    Tuple(Rc<[Object]>),
+    Tuple(Rc<TupleStorage>),
     List(Rc<RefCell<Vec<Object>>>),
     Dict(Rc<RefCell<DictData>>),
     Range(Rc<Range>),
@@ -430,7 +432,7 @@ pub struct PyFrame {
     /// Per-frame `f_lineno` override. Set alongside a validated
     /// [`Self::pending_jump`] so reads report the jump target until
     /// the dispatch loop applies it (RFC 0050); cleared on apply.
-    pub override_lineno: Cell<Option<u32>>,
+    pub override_lineno: crate::sync::RefCell<Option<u32>>,
     /// The trace event this frame is currently dispatching. CPython's
     /// `frame_setlineno` gates `f_lineno` assignment on the event kind
     /// (`'line'` and yield events allow jumps; `'call'`/`'return'`/
@@ -441,12 +443,12 @@ pub struct PyFrame {
     /// legality analysis (`linejump::compute_jump`) and parks the plan
     /// here; the dispatch loop applies it to the live frame right
     /// after the trace callback returns (RFC 0050).
-    pub pending_jump: Cell<Option<crate::linejump::PendingJump>>,
+    pub pending_jump: crate::sync::RefCell<Option<crate::linejump::PendingJump>>,
     /// Most recently observed source line on this frame, used by
     /// the dispatcher to know when to fire a `'line'` event. `None`
     /// means "no line event has fired on this frame yet" — the
     /// next `step` will fire one.
-    pub last_line: Cell<Option<u32>>,
+    pub last_line: crate::sync::RefCell<Option<u32>>,
     /// Mirrors CPython's `frame.f_trace_lines`. When `true` (the
     /// default) the dispatcher fires `'line'` events; debuggers set it
     /// `false` to suppress them.
@@ -1020,10 +1022,10 @@ impl FrameShell {
             locals_mirror: RefCell::new(Some(self.locals.clone())),
             trace: RefCell::new(Object::None),
             gen_owner: RefCell::new(self.gen_owner.borrow().clone()),
-            override_lineno: Cell::new(None),
+            override_lineno: crate::sync::RefCell::new(None),
             trace_event: Cell::new(crate::linejump::TraceEvent::None),
-            pending_jump: Cell::new(None),
-            last_line: Cell::new(None),
+            pending_jump: crate::sync::RefCell::new(None),
+            last_line: crate::sync::RefCell::new(None),
             trace_lines: Cell::new(true),
             trace_opcodes: Cell::new(false),
             on_stack: Cell::new(1),
@@ -2228,14 +2230,14 @@ pub type SetData = indexmap::IndexSet<DictKey, crate::fasthash::FxBuildHasher>;
 pub struct FrozenSetObj {
     data: SetData,
     /// `None` until the first `hash()`; then the bit-exact CPython hash.
-    hash: crate::sync::Cell<Option<i64>>,
+    hash: crate::sync::CachedHash,
 }
 
 impl FrozenSetObj {
     pub fn new(data: SetData) -> Self {
         Self {
             data,
-            hash: crate::sync::Cell::new(None),
+            hash: crate::sync::CachedHash::new(None),
         }
     }
 
@@ -2246,7 +2248,7 @@ impl FrozenSetObj {
 
     /// Memoise the computed hash for subsequent `hash()` calls.
     pub fn store_hash(&self, value: i64) {
-        self.hash.set(Some(value));
+        self.hash.store(value);
     }
 }
 
@@ -2373,6 +2375,47 @@ impl Range {
             None => int_from_i128(self.step),
         }
     }
+}
+
+/// Collect an exact range whose bounds fit the inline integer lane.
+/// Wider bounds and iterator objects keep their existing collection paths.
+pub(crate) fn collect_small_int_range(value: &Object) -> Option<Result<Vec<Object>, RuntimeError>> {
+    let Object::Range(range) = value else {
+        return None;
+    };
+    if range.big.is_some() || range.step == 0 {
+        return None;
+    }
+    let start = i128::from(i64::try_from(range.start).ok()?);
+    let stop = i128::from(i64::try_from(range.stop).ok()?);
+    let step = i128::from(i64::try_from(range.step).ok()?);
+    // The widened arithmetic also handles opposite i64 endpoints and
+    // i64::MIN steps without overflowing the span or its absolute step.
+    let len = if step > 0 && start < stop {
+        (stop - start - 1) / step + 1
+    } else if step < 0 && start > stop {
+        (start - stop - 1) / -step + 1
+    } else {
+        0
+    };
+    let Ok(len) = isize::try_from(len) else {
+        return Some(Err(crate::error::overflow_error(
+            "Python int too large to convert to C ssize_t",
+        )));
+    };
+    let len = len as usize;
+    let mut items = Vec::new();
+    if items.try_reserve_exact(len).is_err() {
+        return Some(Err(crate::error::memory_error(String::new())));
+    }
+    let mut current = start;
+    for _ in 0..len {
+        // Every yielded value lies between the checked i64 bounds.
+        // The final advance may cross an endpoint, so keep it in i128.
+        items.push(Object::Int(current as i64));
+        current += step;
+    }
+    Some(Ok(items))
 }
 
 /// Full-precision element count of `r` (CPython `compute_range_length`
@@ -3139,7 +3182,7 @@ impl PartialEq for DictKey {
             // (gh-140551: that user code may mutate the very dict being
             // walked); the caller retries on the borrow-free path.
             if key_eq_defer_active() {
-                KEY_EQ_DEFERRED.with(|c| c.set(true));
+                KEY_COMPARISON.with(|state| state.deferred.set(true));
                 return false;
             }
             // CPython dispatches `__eq__` only between keys in the *same
@@ -3174,7 +3217,7 @@ impl PartialEq for DictKey {
 
 impl Eq for DictKey {}
 
-thread_local! {
+struct KeyComparisonState {
     /// First exception raised by a Python `__hash__`/`__eq__` invoked from
     /// `DictKey`'s `Hash`/`Eq` while a `set`/`dict` probed the hash table.
     /// Those Rust traits are infallible, so they can't return the error the
@@ -3182,7 +3225,22 @@ thread_local! {
     /// -1 to abort the operation). Instead the error is parked here and the
     /// surrounding set/dict operation re-raises it via [`key_cmp_scope`]
     /// (`test_set` `test_badcmp` / `test_8420_set_merge`).
-    static KEY_CMP_ERROR: RefCell<Option<RuntimeError>> = const { RefCell::new(None) };
+    error: std::cell::RefCell<Option<RuntimeError>>,
+    /// Depth of active `with_key_eq_deferred` scopes.
+    defer_depth: std::cell::Cell<usize>,
+    /// A stored key needs a Python comparison outside the table borrow.
+    deferred: std::cell::Cell<bool>,
+}
+
+thread_local! {
+    // Only this thread accesses the bookkeeping, and no borrow survives
+    // a Python callback. Keep related fields together so each scope needs
+    // one TLS lookup and no cross-thread lock.
+    static KEY_COMPARISON: KeyComparisonState = const { KeyComparisonState {
+        error: std::cell::RefCell::new(None),
+        defer_depth: std::cell::Cell::new(0),
+        deferred: std::cell::Cell::new(false),
+    } };
 }
 
 /// Park `err` as the pending key-comparison error (first one wins, matching
@@ -3202,12 +3260,17 @@ pub(crate) fn force_hash_for_tiny_table(len: usize, key: &Object) {
 }
 
 pub(crate) fn stash_key_cmp_error(err: RuntimeError) {
-    KEY_CMP_ERROR.with(|slot| {
-        let mut slot = slot.borrow_mut();
+    KEY_COMPARISON.with(|state| {
+        let mut slot = state.error.borrow_mut();
         if slot.is_none() {
             *slot = Some(err);
         }
     });
+}
+
+#[inline]
+fn key_cmp_error_pending() -> bool {
+    KEY_COMPARISON.with(|state| state.error.borrow().is_some())
 }
 
 /// Run `f` — a closure that performs `IndexSet`/`IndexMap` probes which may
@@ -3217,22 +3280,15 @@ pub(crate) fn stash_key_cmp_error(err: RuntimeError) {
 /// inside a comparison (`bad_eq.__eq__` calling `set2.clear()`) neither loses
 /// nor steals the outer operation's error.
 pub(crate) fn key_cmp_scope<T>(f: impl FnOnce() -> T) -> Result<T, RuntimeError> {
-    let saved = KEY_CMP_ERROR.with(|slot| slot.borrow_mut().take());
-    let out = f();
-    let mine = KEY_CMP_ERROR.with(|slot| slot.borrow_mut().take());
-    KEY_CMP_ERROR.with(|slot| *slot.borrow_mut() = saved);
-    match mine {
-        Some(err) => Err(err),
-        None => Ok(out),
-    }
-}
-
-thread_local! {
-    /// Depth of active [`with_key_eq_deferred`] scopes.
-    static KEY_EQ_DEFER_DEPTH: Cell<usize> = const { Cell::new(0) };
-    /// Set by `DictKey::eq` when it *would have* dispatched a Python
-    /// `__eq__` inside a defer scope (see [`with_key_eq_deferred`]).
-    static KEY_EQ_DEFERRED: Cell<bool> = const { Cell::new(false) };
+    KEY_COMPARISON.with(|state| {
+        let saved = state.error.borrow_mut().take();
+        let out = f();
+        let mine = state.error.replace(saved);
+        match mine {
+            Some(err) => Err(err),
+            None => Ok(out),
+        }
+    })
 }
 
 /// Run a native dict-table probe with Python `__eq__` dispatch *deferred*:
@@ -3244,16 +3300,18 @@ thread_local! {
 /// side of gh-140551/bpo-40489: a plain `'test' in d` probe can hit a
 /// stored `str` subclass whose `__eq__` clears the dict mid-walk.
 pub(crate) fn with_key_eq_deferred<T>(f: impl FnOnce() -> T) -> (T, bool) {
-    KEY_EQ_DEFER_DEPTH.with(|c| c.set(c.get() + 1));
-    let saved = KEY_EQ_DEFERRED.with(|c| c.replace(false));
-    let out = f();
-    let deferred = KEY_EQ_DEFERRED.with(|c| c.replace(saved));
-    KEY_EQ_DEFER_DEPTH.with(|c| c.set(c.get() - 1));
-    (out, deferred)
+    KEY_COMPARISON.with(|state| {
+        state.defer_depth.set(state.defer_depth.get() + 1);
+        let saved = state.deferred.replace(false);
+        let out = f();
+        let deferred = state.deferred.replace(saved);
+        state.defer_depth.set(state.defer_depth.get() - 1);
+        (out, deferred)
+    })
 }
 
 fn key_eq_defer_active() -> bool {
-    KEY_EQ_DEFER_DEPTH.with(|c| c.get() > 0)
+    KEY_COMPARISON.with(|state| state.defer_depth.get() > 0)
 }
 
 /// True when a dict operation keyed by `key` can run *user Python* during
@@ -4405,7 +4463,7 @@ fn obj_to_bigint(o: &Object) -> BigInt {
 
 /// Build the `(b'', dec_flags)` tuple a decoder `setstate` expects.
 fn make_state_tuple(dec_flags: &BigInt) -> Object {
-    Object::new_tuple(vec![
+    Object::new_tuple_array([
         Object::new_bytes(Vec::new()),
         Object::int_from_bigint(dec_flags.clone()),
     ])
@@ -7194,7 +7252,7 @@ pub enum LazyIterKind {
     },
     /// `itertools.product` over materialised pools.
     Product {
-        pools: Vec<Rc<[Object]>>,
+        pools: Vec<Rc<crate::object::TupleStorage>>,
         indices: Vec<usize>,
         started: bool,
         stopped: bool,
@@ -7202,7 +7260,7 @@ pub enum LazyIterKind {
     /// `itertools.permutations(pool, r)` (Sedgewick's cycles algorithm,
     /// like CPython).
     Permutations {
-        pool: Rc<[Object]>,
+        pool: Rc<crate::object::TupleStorage>,
         r: usize,
         indices: Vec<usize>,
         cycles: Vec<usize>,
@@ -7211,7 +7269,7 @@ pub enum LazyIterKind {
     },
     /// `itertools.combinations(pool, r)`.
     Combinations {
-        pool: Rc<[Object]>,
+        pool: Rc<crate::object::TupleStorage>,
         r: usize,
         indices: Vec<usize>,
         started: bool,
@@ -7219,7 +7277,7 @@ pub enum LazyIterKind {
     },
     /// `itertools.combinations_with_replacement(pool, r)`.
     Cwr {
-        pool: Rc<[Object]>,
+        pool: Rc<crate::object::TupleStorage>,
         r: usize,
         indices: Vec<usize>,
         started: bool,
@@ -7248,7 +7306,7 @@ pub enum PyIterator {
         owner: Option<Box<Object>>,
     },
     Tuple {
-        items: Rc<[Object]>,
+        items: Rc<crate::object::TupleStorage>,
         index: usize,
     },
     Str {
@@ -7479,7 +7537,10 @@ impl PyIterator {
                     return None;
                 }
                 let v = *current;
-                *current += *step;
+                // Advancing past the final value can cross i128's boundary
+                // even though every yielded value and the stop are valid.
+                // Such an advance is necessarily beyond the stop, so exhaust.
+                *current = current.checked_add(*step).unwrap_or(*stop);
                 Some(int_from_i128(v))
             }
             PyIterator::RangeBig {
@@ -7534,7 +7595,7 @@ impl PyIterator {
                         Some(match kind {
                             DictViewKind::Keys => k,
                             DictViewKind::Values => v,
-                            DictViewKind::Items => Object::new_tuple(vec![k, v]),
+                            DictViewKind::Items => Object::new_tuple_array([k, v]),
                         })
                     }
                     None => {
@@ -7593,7 +7654,7 @@ impl PyIterator {
                     }
                     Object::Int(i)
                 };
-                Some(Object::new_tuple(vec![idx, v]))
+                Some(Object::new_tuple_array([idx, v]))
             }
             PyIterator::Shared(inner) => inner.borrow_mut().next_value(),
             PyIterator::KeepAlive { inner, owner } => {
@@ -7899,13 +7960,13 @@ impl PyIterator {
             } => {
                 if *step > 0 && *current < *stop {
                     Some(
-                        ((i128::from(*stop - *current) + i128::from(*step) - 1) / i128::from(*step))
-                            as usize,
+                        ((i128::from(*stop) - i128::from(*current) + i128::from(*step) - 1)
+                            / i128::from(*step)) as usize,
                     )
                 } else if *step < 0 && *current > *stop {
                     Some(
-                        ((i128::from(*current - *stop) + i128::from(-*step) - 1)
-                            / i128::from(-*step)) as usize,
+                        ((i128::from(*current) - i128::from(*stop) - i128::from(*step) - 1)
+                            / -i128::from(*step)) as usize,
                     )
                 } else {
                     Some(0)
@@ -7915,15 +7976,7 @@ impl PyIterator {
                 current,
                 stop,
                 step,
-            } => {
-                if *step > 0 && *current < *stop {
-                    usize::try_from((*stop - *current + *step - 1) / *step).ok()
-                } else if *step < 0 && *current > *stop {
-                    usize::try_from((*current - *stop + (-*step) - 1) / (-*step)).ok()
-                } else {
-                    Some(0)
-                }
-            }
+            } => range_len_bigint(&Range::new(*current, *stop, *step)).to_usize(),
             PyIterator::RangeBig {
                 current,
                 stop,
@@ -7988,7 +8041,9 @@ impl PyIterator {
                         .map(|(k, v)| match kind {
                             DictViewKind::Keys => k.0.clone(),
                             DictViewKind::Values => v.clone(),
-                            DictViewKind::Items => Object::new_tuple(vec![k.0.clone(), v.clone()]),
+                            DictViewKind::Items => {
+                                Object::new_tuple_array([k.0.clone(), v.clone()])
+                            }
                         })
                         .collect()
                 }
@@ -8033,12 +8088,18 @@ impl PyIterator {
                 if sp > 0 {
                     while c < st {
                         out.push(int_from_i128(c));
-                        c += sp;
+                        let Some(next) = c.checked_add(sp) else {
+                            break;
+                        };
+                        c = next;
                     }
                 } else if sp < 0 {
                     while c > st {
                         out.push(int_from_i128(c));
-                        c += sp;
+                        let Some(next) = c.checked_add(sp) else {
+                            break;
+                        };
+                        c = next;
                     }
                 }
                 out
@@ -8080,13 +8141,16 @@ impl PyIterator {
                     Some(b) => {
                         let mut i = (**b).clone();
                         for v in rest {
-                            out.push(Object::new_tuple(vec![Object::Long(Rc::new(i.clone())), v]));
+                            out.push(Object::new_tuple_array([
+                                Object::Long(Rc::new(i.clone())),
+                                v,
+                            ]));
                             i += 1;
                         }
                     }
                     None => {
                         for (i, v) in (*count..).zip(rest) {
-                            out.push(Object::new_tuple(vec![Object::Int(i), v]));
+                            out.push(Object::new_tuple_array([Object::Int(i), v]));
                         }
                     }
                 }
@@ -10971,23 +11035,44 @@ fn native_is_immutable(native: Option<&Object>) -> bool {
 /// rotate/multiply order must match CPython exactly. Shared by the value
 /// hasher below and the interpreter's `hash()` (which dispatches each lane's
 /// `__hash__` so element errors propagate).
+pub(crate) struct TupleHasher {
+    acc: u64,
+}
+
+impl TupleHasher {
+    const PRIME_1: u64 = 11_400_714_785_074_694_791;
+    const PRIME_2: u64 = 14_029_467_366_897_019_727;
+    const PRIME_5: u64 = 2_870_177_450_012_600_261;
+
+    pub(crate) fn new() -> Self {
+        Self { acc: Self::PRIME_5 }
+    }
+
+    pub(crate) fn push(&mut self, lane: i64) {
+        self.acc = self
+            .acc
+            .wrapping_add((lane as u64).wrapping_mul(Self::PRIME_2));
+        self.acc = self.acc.rotate_left(31).wrapping_mul(Self::PRIME_1);
+    }
+
+    pub(crate) fn finish(self, len: usize) -> i64 {
+        let value = self
+            .acc
+            .wrapping_add((len as u64) ^ (Self::PRIME_5 ^ 3_527_539)) as i64;
+        if value == -1 {
+            1_546_275_796
+        } else {
+            value
+        }
+    }
+}
+
 pub(crate) fn combine_tuple_hash(lanes: &[i64]) -> i64 {
-    const XXPRIME_1: u64 = 11_400_714_785_074_694_791;
-    const XXPRIME_2: u64 = 14_029_467_366_897_019_727;
-    const XXPRIME_5: u64 = 2_870_177_450_012_600_261;
-    let mut acc: u64 = XXPRIME_5;
+    let mut hash = TupleHasher::new();
     for &lane in lanes {
-        acc = acc.wrapping_add((lane as u64).wrapping_mul(XXPRIME_2));
-        acc = acc.rotate_left(31);
-        acc = acc.wrapping_mul(XXPRIME_1);
+        hash.push(lane);
     }
-    acc = acc.wrapping_add((lanes.len() as u64) ^ (XXPRIME_5 ^ 3_527_539));
-    let v = acc as i64;
-    if v == -1 {
-        1_546_275_796
-    } else {
-        v
-    }
+    hash.finish(lanes.len())
 }
 
 /// The hash previously *recorded* for `obj` when it was hashed for a keyed
@@ -11065,11 +11150,59 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             Some(h)
         }
         Object::Tuple(items) => {
-            let lanes: Vec<i64> = items
-                .iter()
-                .map(|x| py_hash_value(x).unwrap_or_else(|| identity_hash(x)))
-                .collect();
-            Some(combine_tuple_hash(&lanes))
+            if let Some(hash) = items.cached_hash() {
+                return Some(hash);
+            }
+            // Hash table callbacks communicate errors through the ambient
+            // scope. Isolate this walk so a failed lane is never cached,
+            // and stop before invoking any later element's hash method.
+            match key_cmp_scope(|| {
+                let mut hash = TupleHasher::new();
+                for item in items.iter() {
+                    if let Err(error) = crate::builtins::ensure_hashable(item) {
+                        stash_key_cmp_error(error);
+                        return None;
+                    }
+                    let lane = py_hash_value(item).unwrap_or_else(|| identity_hash(item));
+                    if key_cmp_error_pending() {
+                        return None;
+                    }
+                    hash.push(lane);
+                }
+                Some(hash.finish(items.len()))
+            }) {
+                Ok(hash) => {
+                    if let Some(hash) = hash {
+                        // Rust bootstrap code can build keyed tables before
+                        // an interpreter exists. A custom hash then falls
+                        // back to identity; don't memoize that placeholder.
+                        if crate::vm_singletons::current_interpreter_ptr().is_some()
+                            || items.iter().all(|item| {
+                                matches!(
+                                    item,
+                                    Object::Int(_)
+                                        | Object::Long(_)
+                                        | Object::Float(_)
+                                        | Object::Complex(_)
+                                        | Object::Bool(_)
+                                        | Object::None
+                                        | Object::Str(_)
+                                        | Object::WStr(_)
+                                        | Object::Bytes(_)
+                                        | Object::Range(_)
+                                )
+                            })
+                        {
+                            items.store_hash(hash);
+                        }
+                    }
+                    hash
+                }
+                Err(error) => {
+                    stash_key_cmp_error(error);
+                    None
+                }
+            }
         }
         // Slices hash since 3.12 (gh-101335): CPython `slicehash` builds
         // the `(start, stop, step)` tuple and hashes that. Unhashable
@@ -11143,7 +11276,7 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
                     }
                     let h = current_interp_hash(obj);
                     if let Some(h) = h {
-                        inst.hash_cache.set(Some(h));
+                        inst.hash_cache.store(h);
                     }
                     return h;
                 }
@@ -11157,7 +11290,7 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
                 // `test_setdefault_atomic` counts exactly one call per key.
                 let h = current_interp_hash(obj);
                 if let Some(hv) = h {
-                    inst.hash_cache.set(Some(hv));
+                    inst.hash_cache.store(hv);
                 }
                 return h;
             }
@@ -11180,7 +11313,13 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
         // while a container holds its cell mutex during a probe.
         Object::Foreign(s) => {
             let _no_yield = crate::gil::no_gil_handoff();
-            crate::foreign::hash(s).ok()
+            match crate::foreign::hash(s) {
+                Ok(hash) => Some(hash),
+                Err(error) => {
+                    stash_key_cmp_error(error);
+                    None
+                }
+            }
         }
         // `range` hashes as CPython's `range_hash`: the hash of the
         // `(length, start | None, step | None)` triple. Collapsing start/step
@@ -11197,11 +11336,8 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             } else {
                 (r.start_obj(), r.step_obj())
             };
-            let triple = Object::Tuple(Rc::from(vec![
-                Object::int_from_bigint(len),
-                start_obj,
-                step_obj,
-            ]));
+            let triple =
+                Object::new_tuple_array([Object::int_from_bigint(len), start_obj, step_obj]);
             py_hash_value(&triple)
         }
         _ => None,
@@ -11230,71 +11366,106 @@ pub(crate) fn bigint_from_f64_trunc(f: f64) -> BigInt {
     }
 }
 
-/// Render a `complex` the way CPython does: bare `Xj` if real is
-/// zero, `(R+Ij)` / `(R-Ij)` otherwise.  Special-cases `nan` and
-/// signed zeros to match CPython's `repr` exactly.
-/// CPython-compatible `repr(float)` — the shortest decimal string that
-/// round-trips, switching to exponential notation exactly when CPython
-/// does (`decpt <= -4 || decpt > 16`, i.e. magnitudes below 1e-4 or at
-/// or above 1e16). Mirrors `float_repr` /
-/// `PyOS_double_to_string(v, 'r', 0, Py_DTSF_ADD_DOT_0, ...)`.
-///
-/// Rust's `f64::to_string()` is *also* shortest-round-trip, but never
-/// uses exponential form, so `1e100` would otherwise print as a 101-digit
-/// integer. We recover the shortest digits + decimal exponent from
-/// `{:e}` (Ryū) and reassemble them under CPython's rules.
+/// Python's shortest float representation, including ties-to-even
+/// decimal rounding and its fixed/scientific notation boundaries.
 pub fn float_repr(f: f64) -> String {
+    let mut out = String::with_capacity(24);
+    write_float_repr(&mut out, f).expect("writing to a String cannot fail");
+    out
+}
+
+/// Write directly into the caller's output without temporary heap strings.
+pub(crate) fn write_float_repr(out: &mut impl fmt::Write, f: f64) -> fmt::Result {
     if f.is_nan() {
-        return "nan".to_owned();
+        return out.write_str("nan");
     }
     if f.is_infinite() {
-        return if f < 0.0 { "-inf" } else { "inf" }.to_owned();
+        return out.write_str(if f < 0.0 { "-inf" } else { "inf" });
     }
-    if f == 0.0 {
-        return if f.is_sign_negative() { "-0.0" } else { "0.0" }.to_owned();
+    if f.is_sign_negative() {
+        out.write_char('-')?;
     }
-    let neg = f.is_sign_negative();
-    let a = f.abs();
-    let sci = format!("{a:e}");
-    let (mant, exp_str) = sci.split_once('e').expect("scientific form has 'e'");
-    let exp: i32 = exp_str.parse().expect("valid exponent");
-    let digits: String = mant.chars().filter(|c| *c != '.').collect();
-    let ndigits = digits.len() as i32;
-    let decpt = exp + 1; // count of digits left of the decimal point
-    let body = if decpt <= -4 || decpt > 16 {
-        let e = decpt - 1;
-        let mut s = digits[..1].to_owned();
+    // Zmij supplies shortest, correctly rounded digits in a stack buffer.
+    // Its fixed notation includes exponent -5; Python switches at -4.
+    // Python also pads single-digit scientific exponents with a zero.
+    let mut buffer = zmij::Buffer::new();
+    let text = buffer.format_finite(f.abs());
+    if let Some((mantissa, exponent)) = text.split_once('e') {
+        out.write_str(mantissa)?;
+        out.write_char('e')?;
+        if exponent.len() == 2 {
+            out.write_str(&exponent[..1])?;
+            out.write_char('0')?;
+            out.write_str(&exponent[1..])
+        } else {
+            out.write_str(exponent)
+        }
+    } else if let Some(digits) = text.strip_prefix("0.0000") {
+        out.write_str(&digits[..1])?;
         if digits.len() > 1 {
-            s.push('.');
-            s.push_str(&digits[1..]);
+            out.write_char('.')?;
+            out.write_str(&digits[1..])?;
         }
-        s.push('e');
-        s.push(if e < 0 { '-' } else { '+' });
-        s.push_str(&format!("{:02}", e.unsigned_abs()));
-        s
-    } else if decpt <= 0 {
-        let mut s = String::from("0.");
-        for _ in 0..(-decpt) {
-            s.push('0');
-        }
-        s.push_str(&digits);
-        s
-    } else if decpt >= ndigits {
-        let mut s = digits.clone();
-        for _ in 0..(decpt - ndigits) {
-            s.push('0');
-        }
-        s.push_str(".0");
-        s
+        out.write_str("e-05")
     } else {
-        let d = decpt as usize;
-        format!("{}.{}", &digits[..d], &digits[d..])
-    };
-    if neg {
-        format!("-{body}")
-    } else {
-        body
+        out.write_str(text)
     }
+}
+
+/// Fixed-capacity text for native scalar spellings. Appending complete
+/// strings keeps the initialized prefix valid UTF-8 without unsafe code.
+struct StackText<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StackText<N> {
+    fn new() -> Self {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).expect("complete UTF-8 fragments")
+    }
+}
+
+impl<const N: usize> fmt::Write for StackText<N> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let end = self.len.checked_add(text.len()).ok_or(fmt::Error)?;
+        self.bytes
+            .get_mut(self.len..end)
+            .ok_or(fmt::Error)?
+            .copy_from_slice(text.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+/// Exact native scalars have the same `str` and `repr`. Build their Python
+/// string directly, avoiding an intermediate heap-allocated Rust String.
+/// Subclasses and large integers retain their protocol and digit-limit paths.
+pub(crate) fn native_scalar_repr(value: &Object) -> Option<Object> {
+    Some(match value {
+        Object::Int(value) => Object::Str(Rc::from(itoa::Buffer::new().format(*value))),
+        Object::Float(value) => {
+            let mut text = StackText::<32>::new();
+            write_float_repr(&mut text, *value).expect("float text fits in 32 bytes");
+            Object::Str(Rc::from(text.as_str()))
+        }
+        Object::Complex(value) => {
+            let mut text = StackText::<64>::new();
+            write_complex_repr(&mut text, value.real, value.imag)
+                .expect("complex text fits in 64 bytes");
+            Object::Str(Rc::from(text.as_str()))
+        }
+        Object::Bool(true) => Object::from_static("True"),
+        Object::Bool(false) => Object::from_static("False"),
+        Object::None => Object::from_static("None"),
+        _ => return None,
+    })
 }
 
 /// `repr`-shortest rendering of a single complex component. Unlike
@@ -11302,25 +11473,42 @@ pub fn float_repr(f: f64) -> String {
 /// trailing `.0` (e.g. `4j`, not `4.0j`), but otherwise uses the same
 /// shortest/exponential rules.
 pub(crate) fn complex_component_repr(p: f64) -> String {
-    let r = float_repr(p);
-    match r.strip_suffix(".0") {
-        Some(stripped) => stripped.to_owned(),
-        None => r,
-    }
+    let mut text = StackText::<32>::new();
+    write_float_repr(&mut text, p).expect("float text fits in 32 bytes");
+    text.as_str()
+        .strip_suffix(".0")
+        .unwrap_or(text.as_str())
+        .to_owned()
 }
 
 pub(crate) fn complex_repr(real: f64, imag: f64) -> String {
-    let fmt_part = complex_component_repr;
+    let mut text = String::with_capacity(52);
+    write_complex_repr(&mut text, real, imag).expect("writing to a String cannot fail");
+    text
+}
+
+fn write_complex_repr(out: &mut impl fmt::Write, real: f64, imag: f64) -> fmt::Result {
+    let mut im = StackText::<32>::new();
+    write_float_repr(&mut im, imag)?;
+    let im = im.as_str().strip_suffix(".0").unwrap_or(im.as_str());
     if real == 0.0 && real.is_sign_positive() {
-        format!("{}j", fmt_part(imag))
+        out.write_str(im)?;
+        out.write_char('j')
     } else {
         // Insert the joining sign based on the *rendered* imaginary part,
         // not its raw sign bit: `-nan` keeps a set sign bit yet renders as
         // "nan" (no leading '-'), so CPython prints `(nan+nanj)`, and a
         // genuine negative like -2.0 renders "-2" and needs no extra '+'.
-        let im = fmt_part(imag);
-        let sep = if im.starts_with('-') { "" } else { "+" };
-        format!("({}{sep}{im}j)", fmt_part(real))
+        let mut re = StackText::<32>::new();
+        write_float_repr(&mut re, real)?;
+        let re = re.as_str().strip_suffix(".0").unwrap_or(re.as_str());
+        out.write_char('(')?;
+        out.write_str(re)?;
+        if !im.starts_with('-') {
+            out.write_char('+')?;
+        }
+        out.write_str(im)?;
+        out.write_str("j)")
     }
 }
 
@@ -11573,11 +11761,22 @@ impl Object {
             // `functools.update_wrapper` asserts identity on copied
             // `__type_params__` and similar empty-tuple attributes.
             thread_local! {
-                static EMPTY_TUPLE: Rc<[Object]> = Rc::from(Vec::new().into_boxed_slice());
+                static EMPTY_TUPLE: Rc<TupleStorage> = TupleStorage::from_array([]);
             }
             return Object::Tuple(EMPTY_TUPLE.with(Clone::clone));
         }
-        Object::Tuple(Rc::from(items.into_boxed_slice()))
+        Object::Tuple(TupleStorage::from_vec(items))
+    }
+
+    /// Build a fixed-size tuple directly in reference-counted storage,
+    /// avoiding an intermediate vector allocation. Empty arrays retain
+    /// the ordinary constructor's interned empty tuple.
+    #[inline]
+    pub fn new_tuple_array<const N: usize>(items: [Object; N]) -> Self {
+        if N == 0 {
+            return Self::new_tuple(Vec::new());
+        }
+        Object::Tuple(TupleStorage::from_array(items))
     }
 
     pub fn new_dict() -> Self {
@@ -11756,6 +11955,93 @@ impl Object {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_int_range_collection_preserves_boundary_values() {
+        for (start, stop, step, expected) in [
+            (i64::MAX, i64::MIN, i64::MIN, vec![i64::MAX, -1]),
+            (
+                i64::MIN,
+                i64::MAX,
+                i64::MAX,
+                vec![i64::MIN, -1, i64::MAX - 1],
+            ),
+            (9, 2, 3, vec![]),
+            (2, 9, -3, vec![]),
+            (11, -1, -3, vec![11, 8, 5, 2]),
+        ] {
+            let range = Object::Range(Rc::new(Range::new(start.into(), stop.into(), step.into())));
+            let result = collect_small_int_range(&range).unwrap().unwrap();
+            let ints: Vec<_> = result
+                .iter()
+                .map(|value| match value {
+                    Object::Int(n) => *n,
+                    _ => panic!("range value left the inline integer lane"),
+                })
+                .collect();
+            assert_eq!(ints, expected);
+        }
+        let wide = Object::Range(Rc::new(Range::new(i64::MAX.into(), i128::MAX, 1)));
+        assert!(collect_small_int_range(&wide).is_none());
+        let huge = BigInt::from(1) << 200;
+        let big = Object::Range(Rc::new(Range::from_bigints(
+            huge,
+            BigInt::from(1) << 201,
+            BigInt::from(1),
+        )));
+        assert!(collect_small_int_range(&big).is_none());
+        let iterator = Object::Iter(Rc::new(RefCell::new(PyIterator::Range {
+            current: 0,
+            stop: 5,
+            step: 1,
+        })));
+        assert!(collect_small_int_range(&iterator).is_none());
+    }
+
+    #[test]
+    fn small_int_range_collection_rejects_impossible_capacities() {
+        // Neither case can attempt a large allocation: the first fails
+        // length conversion, and the second exceeds Vec's layout limit.
+        for (range, expected) in [
+            (
+                Range::new(i64::MIN.into(), i64::MAX.into(), 1),
+                "OverflowError",
+            ),
+            (Range::new(0, isize::MAX as i128, 1), "MemoryError"),
+        ] {
+            let result = collect_small_int_range(&Object::Range(Rc::new(range))).unwrap();
+            match result {
+                Err(RuntimeError::PyException(error)) => assert_eq!(error.type_name(), expected),
+                other => panic!("expected {expected}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn empty_tuple_arrays_use_the_interned_tuple() {
+        let empty = Object::new_tuple(Vec::new());
+        assert!(Object::new_tuple_array([]).is_same(&empty));
+    }
+
+    #[test]
+    fn tuple_arrays_preserve_order_identity_and_ownership() {
+        let text: Rc<str> = Rc::from("owned by the tuple");
+        let weak = Rc::downgrade(&text);
+        let tuple =
+            Object::new_tuple_array([Object::Str(text.clone()), Object::Int(-7), Object::None]);
+        let Object::Tuple(items) = &tuple else {
+            unreachable!()
+        };
+        assert!(matches!(
+            &items[..],
+            [Object::Str(_), Object::Int(-7), Object::None]
+        ));
+        assert!(items[0].is_same(&Object::Str(text.clone())));
+        drop(text);
+        assert!(weak.upgrade().is_some());
+        drop(tuple);
+        assert!(weak.upgrade().is_none());
+    }
 
     /// `hash(b"...")` under `PYTHONHASHSEED=0` on CPython 3.13 (an all-zero
     /// siphash13 key), one value per tail length 0..=7 plus two multi-chunk

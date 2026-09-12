@@ -1,0 +1,9 @@
+# Exact numeric sequence reduction
+
+The existing integer-only i128 loop stays first, preserving its tight reduction and memory behavior. A second path handles exact list/tuple elements in the Int/Bool/Long/Float lanes. It validates primitive types while holding a single container borrow; unknown types return to live iterator/callback dispatch with the original start. No Python runs under the borrow. This prepass trades an extra scan for simpler callback and error-order guarantees.
+
+The numeric path follows the one-way integer/float/generic transition order observed in CPython 3.14.7. Checked i64 accumulation ends permanently on overflow or a non-small-int operand, followed by ordinary arithmetic. A float produced by that first transition enables compensated reduction. Large starts, bool starts, and floats reached later through generic arithmetic stay generic. Neumaier compensation uses ordered operations, preserves negative zero, and omits nonfinite or zero compensation from final addition. Integer-to-float overflow raises the existing OverflowError.
+
+The algorithm was independently implemented after inspecting the primary source: https://raw.githubusercontent.com/python/cpython/v3.14.7/Python/bltinmodule.c (builtin_sum_impl and CompensatedSum). The complete 764-case before oracle includes exact float encodings, special values, overflow recovery, deterministic random inputs, list/tuple/iterator/generator forms, subclasses, and callbacks. It records 82 existing CPython differences per execution mode. The permanent 185 value/start cases run in list and tuple forms; complex and callback cases remain in the broader oracle. This change doesn't claim compensated arithmetic for generators, complex values, or subclass callback paths.
+
+No new unsafe code, public Rust API, or object layout is introduced. Runtime validation and performance results determine acceptance; this design note alone establishes no speed claim.

@@ -1,0 +1,3 @@
+# Select the nested tuple suite explicitly; discovery expands only some packages.
+[tests."cpython/Lib/test/test_capi/test_tuple.py"]
+status = "pass"

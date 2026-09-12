@@ -1,0 +1,36 @@
+{
+  "work": 60000,
+  "samples": [
+    {
+      "ns": 315294375,
+      "wall_ns": 343491459,
+      "cpu_ns": 331874000,
+      "rss_bytes": 15400960
+    },
+    {
+      "ns": 308806458,
+      "wall_ns": 344088834,
+      "cpu_ns": 337238000,
+      "rss_bytes": 15417344
+    },
+    {
+      "ns": 309717625,
+      "wall_ns": 338411959,
+      "cpu_ns": 330957000,
+      "rss_bytes": 15335424
+    },
+    {
+      "ns": 317204166,
+      "wall_ns": 347633500,
+      "cpu_ns": 339837000,
+      "rss_bytes": 15368192
+    },
+    {
+      "ns": 329998292,
+      "wall_ns": 355799917,
+      "cpu_ns": 347712000,
+      "rss_bytes": 15400960
+    }
+  ],
+  "note": "CPython-only repeat of the original unmodified file through the standard measurement helper, after the full phase15 census and identity diagnostic; no builds or other task benchmarks active."
+}

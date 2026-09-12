@@ -1364,8 +1364,45 @@ fn range_iter_remaining(current: i128, stop: i128, step: i128) -> i128 {
 fn iter_length_hint(args: &[Object]) -> Result<Object, RuntimeError> {
     match args.first() {
         Some(Object::Iter(it)) => {
-            let n = it.borrow().remaining().unwrap_or(0);
-            Ok(Object::Int(n as i64))
+            let iterator = it.borrow();
+            // Range hints can exceed usize even when the iterator itself is
+            // cheap. Preserve the full Python integer, including wide spans.
+            let range = match &*iterator {
+                PyIterator::Range {
+                    current,
+                    stop,
+                    step,
+                } => {
+                    let count = range_iter_remaining(
+                        i128::from(*current),
+                        i128::from(*stop),
+                        i128::from(*step),
+                    );
+                    return Ok(crate::object::int_from_i128(count));
+                }
+                PyIterator::RangeHuge {
+                    current,
+                    stop,
+                    step,
+                } => Some(Range::new(*current, *stop, *step)),
+                PyIterator::RangeBig {
+                    current,
+                    stop,
+                    step,
+                } => Some(Range::from_bigints(
+                    (**current).clone(),
+                    (**stop).clone(),
+                    (**step).clone(),
+                )),
+                _ => None,
+            };
+            if let Some(range) = range {
+                return Ok(Object::int_from_bigint(crate::object::range_len_bigint(
+                    &range,
+                )));
+            }
+            let n = iterator.remaining().unwrap_or(0);
+            Ok(crate::object::int_from_i128(n as i128))
         }
         _ => Err(type_error("__length_hint__() requires an iterator")),
     }
@@ -1568,7 +1605,7 @@ fn slice_indices_method(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         o => clamp(to_big(o)?),
     };
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         big_obj(start),
         big_obj(stop),
         big_obj(step),
@@ -1794,8 +1831,10 @@ fn num_getnewargs(self_o: &Object) -> Object {
     let native = self_o.native_value();
     let v = native.as_ref().unwrap_or(self_o);
     match v {
-        Object::Complex(c) => Object::new_tuple(vec![Object::Float(c.real), Object::Float(c.imag)]),
-        other => Object::new_tuple(vec![other.clone()]),
+        Object::Complex(c) => {
+            Object::new_tuple_array([Object::Float(c.real), Object::Float(c.imag)])
+        }
+        other => Object::new_tuple_array([other.clone()]),
     }
 }
 
@@ -1995,9 +2034,9 @@ fn instance_getnewargs(args: &[Object]) -> Result<Object, RuntimeError> {
         // `unicode_getnewargs` builds a *fresh* string
         // (test_str.test_getnewargs asserts `args[0] is not text`), so don't
         // hand back the same allocation.
-        Some(Object::Str(s)) => Ok(Object::new_tuple(vec![Object::Str(Rc::from(&*s))])),
-        Some(Object::WStr(cps)) => Ok(Object::new_tuple(vec![Object::WStr(cps.to_vec().into())])),
-        Some(v) => Ok(Object::new_tuple(vec![v])),
+        Some(Object::Str(s)) => Ok(Object::new_tuple_array([Object::Str(Rc::from(&*s))])),
+        Some(Object::WStr(cps)) => Ok(Object::new_tuple_array([Object::WStr(cps.to_vec().into())])),
+        Some(v) => Ok(Object::new_tuple_array([v])),
         None => Ok(Object::new_tuple(Vec::new())),
     }
 }
@@ -2145,7 +2184,7 @@ pub fn unbound_method(type_name: &str, name: &str) -> Option<Object> {
         // resolves to the unbound slot wrapper; the actual call receives the
         // real iterator as `self`. `operator.length_hint` reaches it this way.
         "iterator" => Object::Iter(Rc::new(RefCell::new(crate::object::PyIterator::Tuple {
-            items: Rc::from(Vec::<Object>::new()),
+            items: crate::object::TupleStorage::from_array([]),
             index: 0,
         }))),
         // `enumerate` / `reversed` are real types whose instances share
@@ -2155,7 +2194,7 @@ pub fn unbound_method(type_name: &str, name: &str) -> Option<Object> {
         "enumerate" => Object::Iter(Rc::new(RefCell::new(
             crate::object::PyIterator::Enumerate {
                 inner: Rc::new(RefCell::new(crate::object::PyIterator::Tuple {
-                    items: Rc::from(Vec::<Object>::new()),
+                    items: crate::object::TupleStorage::from_array([]),
                     index: 0,
                 })),
                 count: 0,
@@ -2615,7 +2654,7 @@ fn slot_sizeof(args: &[Object]) -> Result<Object, RuntimeError> {
                     return Ok(Object::Int(28 + 4 * ndigits));
                 }
             }
-            16 + 8 * inst.dict.borrow().len() as i64
+            16 + 8 * inst.dict.get().map_or(0, |dict| dict.borrow().len()) as i64
         }
         // CPython's compact-unicode layout (test_str.test_raiseMemError):
         // ASCII is a 40-byte struct + len+1 one-byte units; anything wider
@@ -2658,18 +2697,18 @@ fn slot_getstate(args: &[Object]) -> Result<Object, RuntimeError> {
     let o = one(args, "__getstate__")?;
     if let Object::Instance(inst) = o {
         let slots = inst.slots_snapshot();
-        let dict_is_empty = inst.dict.borrow().is_empty();
+        let dict_is_empty = inst.dict.get().is_none_or(|dict| dict.borrow().is_empty());
         let dict_state = if dict_is_empty {
             Object::None
         } else {
-            Object::Dict(inst.dict.clone())
+            Object::Dict(inst.dict.share())
         };
         if !slots.is_empty() {
             let mut slot_dict = crate::object::DictData::default();
             for (name, value) in slots {
                 slot_dict.insert(DictKey(Object::from_str(name)), value);
             }
-            return Ok(Object::new_tuple(vec![
+            return Ok(Object::new_tuple_array([
                 dict_state,
                 Object::Dict(Rc::new(RefCell::new(slot_dict))),
             ]));
@@ -3016,6 +3055,9 @@ fn b_str(args: &[Object]) -> Result<Object, RuntimeError> {
     if matches!(&args[0], Object::Str(_) | Object::WStr(_)) {
         return Ok(args[0].clone());
     }
+    if let Some(text) = crate::object::native_scalar_repr(&args[0]) {
+        return Ok(text);
+    }
     // Dispatch `__str__` virtually when a VM is live — the subclass
     // constructor reaches `b_str` directly (not through the interpreter's
     // `str` interception), and `StrSubclass(WithStr('abc'))` must convert
@@ -3091,6 +3133,9 @@ fn b_str_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
 
 fn b_repr(args: &[Object]) -> Result<Object, RuntimeError> {
     let v = one(args, "repr")?;
+    if let Some(text) = crate::object::native_scalar_repr(v) {
+        return Ok(text);
+    }
     if let Object::Long(b) = v {
         long_str_limit_check(b)?;
     }
@@ -3766,7 +3811,7 @@ fn property_dunder_delete(args: &[Object]) -> Result<Object, RuntimeError> {
 pub(crate) fn wstr_attr_dict(obj: &Object) -> Option<Rc<RefCell<crate::object::DictData>>> {
     match obj {
         Object::Module(m) => Some(m.dict.clone()),
-        Object::Instance(inst) => Some(inst.dict.clone()),
+        Object::Instance(inst) => Some(inst.dict.share()),
         _ => None,
     }
 }
@@ -3892,7 +3937,7 @@ fn b_vars(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Instance(inst)) if inst.cls().forbids_dict => {
             Err(type_error("vars() argument must have __dict__ attribute"))
         }
-        Some(Object::Instance(inst)) => Ok(Object::Dict(inst.dict.clone())),
+        Some(Object::Instance(inst)) => Ok(Object::Dict(inst.dict.share())),
         Some(Object::Module(m)) => Ok(Object::Dict(m.dict.clone())),
         Some(Object::Type(t)) => Ok(Object::Dict(t.dict.clone())),
         Some(other) => Err(type_error(format!(
@@ -4013,7 +4058,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                 return Some(bind_descriptor(&v, obj));
             }
             match name {
-                "__dict__" => Some(Object::Dict(inst.dict.clone())),
+                "__dict__" => Some(Object::Dict(inst.dict.share())),
                 "__class__" => Some(Object::Type(inst.cls())),
                 _ => None,
             }
@@ -4889,7 +4934,7 @@ fn code_co_positions(args: &[Object]) -> Result<Object, RuntimeError> {
             .into_iter()
             .map(|line| {
                 let l = line.map_or(Object::None, |v| Object::Int(i64::from(v)));
-                Object::new_tuple(vec![l.clone(), l, Object::None, Object::None])
+                Object::new_tuple_array([l.clone(), l, Object::None, Object::None])
             })
             .collect();
         return list_iter(items);
@@ -4917,12 +4962,7 @@ fn code_co_positions(args: &[Object]) -> Result<Object, RuntimeError> {
             // end_line collapses onto line (CPython stores no
             // end-position table; test_endline_and_columntable_none_…).
             let end_lineno = if debug_ranges { p.end_lineno } else { p.lineno };
-            Object::new_tuple(vec![
-                line(p.lineno),
-                line(end_lineno),
-                col(p.col),
-                col(p.end_col),
-            ])
+            Object::new_tuple_array([line(p.lineno), line(end_lineno), col(p.col), col(p.end_col)])
         })
         .collect();
     list_iter(items)
@@ -5015,7 +5055,7 @@ fn code_co_lines(args: &[Object]) -> Result<Object, RuntimeError> {
         while i < n && lines[i] == line {
             i += 1;
         }
-        out.push(Object::new_tuple(vec![
+        out.push(Object::new_tuple_array([
             Object::Int((start * 2) as i64),
             Object::Int((i * 2) as i64),
             // PEP 626: a range with no source line yields None (-1
@@ -5046,7 +5086,7 @@ fn code_co_branches(args: &[Object]) -> Result<Object, RuntimeError> {
     let n = code.len() / 2;
     let unit = |i: usize| (code[2 * i], code[2 * i + 1]);
     let triple = |a: usize, b: usize, c: usize| {
-        Object::new_tuple(vec![
+        Object::new_tuple_array([
             Object::Int((a * 2) as i64),
             Object::Int((b * 2) as i64),
             Object::Int((c * 2) as i64),
@@ -5527,7 +5567,7 @@ fn int_as_integer_ratio(args: &[Object]) -> Result<Object, RuntimeError> {
             v.type_name()
         ))
     })?;
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::int_from_bigint(n),
         Object::Int(1),
     ]))
@@ -5856,7 +5896,7 @@ fn float_as_integer_ratio(args: &[Object]) -> Result<Object, RuntimeError> {
     if sign < 0 {
         num = -num;
     }
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::int_from_bigint(num),
         Object::int_from_bigint(den),
     ]))
@@ -6964,6 +7004,8 @@ fn parse_complex_inner(s: &str) -> Option<(f64, f64)> {
 fn b_list(args: &[Object]) -> Result<Object, RuntimeError> {
     let out = if args.is_empty() {
         Vec::new()
+    } else if let Some(items) = crate::object::collect_small_int_range(&args[0]) {
+        items?
     } else {
         let mut it = args[0].make_iter()?;
         let mut out = Vec::new();
@@ -6995,6 +7037,9 @@ fn b_tuple(args: &[Object]) -> Result<Object, RuntimeError> {
     if let Object::Tuple(_) = &args[0] {
         return Ok(args[0].clone());
     }
+    if let Some(items) = crate::object::collect_small_int_range(&args[0]) {
+        return Ok(Object::new_tuple(items?));
+    }
     let mut it = args[0].make_iter()?;
     let mut out = Vec::new();
     while let Some(v) = it.next_value() {
@@ -7019,10 +7064,8 @@ fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
     // re-iterating as a sequence of pairs (which would fail, since
     // iter(dict) yields keys, not items).
     if let Object::Dict(src) = &args[0] {
-        let mut d = DictData::default();
-        for (k, v) in src.borrow().iter() {
-            d.insert(k.clone(), v.clone());
-        }
+        // Clone the stored table so copying never rehashes user keys.
+        let d = src.borrow().clone();
         let obj = Object::Dict(Rc::new(RefCell::new(d)));
         crate::gc_trace::track(obj.clone());
         return Ok(obj);
@@ -7071,7 +7114,10 @@ fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
             )));
         }
         let mut kv = kv.into_iter();
-        d.insert(DictKey(kv.next().unwrap()), kv.next().unwrap());
+        let key = kv.next().unwrap();
+        let value = kv.next().unwrap();
+        ensure_dict_key(&key)?;
+        crate::object::key_cmp_scope(|| d.insert(DictKey(key), value))?;
         i += 1;
     }
     let obj = Object::Dict(Rc::new(RefCell::new(d)));
@@ -7983,8 +8029,205 @@ fn b_max(args: &[Object]) -> Result<Object, RuntimeError> {
     min_or_max(args, false)
 }
 
+/// Sum exact integer sequences without cloning their element buffers.
+/// A non-integer value or start retains the ordinary arithmetic protocol.
+pub(crate) fn sum_small_int_sequence(iterable: &Object, start: &Object) -> Option<Object> {
+    let Object::Int(start) = start else {
+        return None;
+    };
+    let accumulate = |items: &[Object]| {
+        let mut total = i128::from(*start);
+        for item in items {
+            let value = match item {
+                Object::Int(value) => i128::from(*value),
+                Object::Bool(value) => i128::from(*value),
+                _ => return None,
+            };
+            total = total.checked_add(value)?;
+        }
+        Some(crate::object::int_from_i128(total))
+    };
+    // These borrows span only primitive arithmetic, with no Python calls.
+    // On a miss, discard the tentative total before generic iteration.
+    match iterable {
+        Object::List(items) => accumulate(&items.borrow()),
+        Object::Tuple(items) => accumulate(items),
+        _ => None,
+    }
+}
+
+/// Reduce other exact numeric sequences without iterator locks or VM calls.
+/// Keep the common all-inline-integer loop above separate from float state.
+pub(crate) fn sum_numeric_sequence(
+    iterable: &Object,
+    start: &Object,
+) -> Option<Result<Object, RuntimeError>> {
+    fn numeric(value: &Object) -> bool {
+        matches!(
+            value,
+            Object::Int(_) | Object::Long(_) | Object::Bool(_) | Object::Float(_)
+        )
+    }
+    if !numeric(start) {
+        return None;
+    }
+    let accumulate = |items: &[Object]| {
+        // Reject callback-bearing values before arithmetic. Fallback must see
+        // the original start and the live input, with no borrowed Python calls.
+        if !items.iter().all(numeric) {
+            return None;
+        }
+        Some((|| {
+            let mut total = start.clone();
+            let mut remaining = items.iter();
+            if let Object::Int(mut integer) = total {
+                loop {
+                    let Some(item) = remaining.next() else {
+                        return Ok(Object::Int(integer));
+                    };
+                    let small = match item {
+                        Object::Int(value) => Some(*value),
+                        Object::Bool(value) => Some(i64::from(*value)),
+                        _ => None,
+                    };
+                    if let Some(next) = small.and_then(|value| integer.checked_add(value)) {
+                        integer = next;
+                        continue;
+                    }
+                    // CPython leaves its integer loop permanently on overflow.
+                    // If this addition yields a float, its float loop follows;
+                    // later floats reached through generic arithmetic don't.
+                    total = crate::binary_op(
+                        &Object::Int(integer),
+                        item,
+                        weavepy_compiler::BinOpKind::Add,
+                    )?;
+                    break;
+                }
+            }
+            if let Object::Float(mut high) = total {
+                let mut low = 0.0;
+                for item in remaining {
+                    let value = match item {
+                        Object::Float(value) => *value,
+                        Object::Int(value) => *value as f64,
+                        Object::Bool(value) => f64::from(*value),
+                        Object::Long(value) => match value.to_f64() {
+                            Some(value) if value.is_finite() => value,
+                            _ => {
+                                return Err(crate::error::overflow_error(
+                                    "int too large to convert to float",
+                                ));
+                            }
+                        },
+                        _ => unreachable!("validated numeric sequence"),
+                    };
+                    // Neumaier compensation, with the same operation order as
+                    // CPython's sum. Don't fold nonfinite compensation into the
+                    // result or turn a negative zero into positive zero.
+                    let next = high + value;
+                    low += if high.abs() >= value.abs() {
+                        (high - next) + value
+                    } else {
+                        (value - next) + high
+                    };
+                    high = next;
+                }
+                if low != 0.0 && low.is_finite() {
+                    high += low;
+                }
+                return Ok(crate::object::fresh_float(high));
+            }
+            for item in remaining {
+                total = crate::binary_op(&total, item, weavepy_compiler::BinOpKind::Add)?;
+            }
+            Ok(total)
+        })())
+    };
+    match iterable {
+        Object::List(items) => accumulate(&items.borrow()),
+        Object::Tuple(items) => accumulate(items),
+        _ => None,
+    }
+}
+
+/// Sum an exact range with an exact integer start using its arithmetic series.
+/// Other starts keep the per-element Python addition protocol.
+pub(crate) fn sum_exact_int_range(iterable: &Object, start: &Object) -> Option<Object> {
+    let Object::Range(range) = iterable else {
+        return None;
+    };
+    let small_start = match start {
+        Object::Int(value) => Some(i128::from(*value)),
+        Object::Bool(value) => Some(i128::from(*value)),
+        Object::Long(value) => value.to_i128(),
+        _ => return None,
+    };
+    if range.step == 0 && range.big.is_none() {
+        return None;
+    }
+    // Avoid BigInt allocation for ordinary ranges. All intermediate arithmetic
+    // is checked; even valid i128 endpoints can have an unrepresentable span.
+    let small_total = || {
+        if range.big.is_some() {
+            return None;
+        }
+        let initial = small_start?;
+        let count = if range.step > 0 && range.start < range.stop {
+            let span = range.stop.checked_sub(range.start)?;
+            (span - 1) / range.step + 1
+        } else if range.step < 0 && range.start > range.stop {
+            let span = range.start.checked_sub(range.stop)?;
+            (span - 1) / range.step.checked_neg()? + 1
+        } else {
+            0
+        };
+        if count == 0 {
+            return Some(start.clone());
+        }
+        let last = range
+            .start
+            .checked_add((count - 1).checked_mul(range.step)?)?;
+        let pair = range.start.checked_add(last)?;
+        // One factor is even. Divide it first to avoid needless overflow.
+        let total = if count % 2 == 0 {
+            (count / 2).checked_mul(pair)?
+        } else {
+            count.checked_mul(pair / 2)?
+        };
+        Some(crate::object::int_from_i128(total.checked_add(initial)?))
+    };
+    if let Some(total) = small_total() {
+        return Some(total);
+    }
+    let count = crate::object::range_len_bigint(range);
+    if count.is_zero() {
+        return Some(start.clone());
+    }
+    let (first, _, step) = range.bounds();
+    let last = &first + (&count - 1) * step;
+    let initial = match start {
+        Object::Int(value) => BigInt::from(*value),
+        Object::Bool(value) => BigInt::from(u8::from(*value)),
+        Object::Long(value) => (**value).clone(),
+        _ => unreachable!("validated integer start"),
+    };
+    Some(Object::int_from_bigint(
+        count * (first + last) / 2 + initial,
+    ))
+}
+
 fn b_sum(args: &[Object]) -> Result<Object, RuntimeError> {
     let iterable = one(args, "sum")?;
+    if let Some(total) = sum_small_int_sequence(iterable, &Object::Int(0)) {
+        return Ok(total);
+    }
+    if let Some(total) = sum_numeric_sequence(iterable, &Object::Int(0)) {
+        return total;
+    }
+    if let Some(total) = sum_exact_int_range(iterable, &Object::Int(0)) {
+        return Ok(total);
+    }
     let mut total = Object::Int(0);
     let mut it = iterable.make_iter()?;
     while let Some(v) = it.next_value() {
@@ -8316,11 +8559,12 @@ pub(crate) fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object 
                 Object::Type(class),
             );
             d
-        })),
+        }))
+        .into(),
         native: std::sync::OnceLock::new(),
         inline_values: crate::sync::Cell::new(true),
-        slots: crate::sync::RefCell::new(None),
-        hash_cache: crate::sync::Cell::new(None),
+        slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
+        hash_cache: crate::sync::CachedHash::new(None),
         finalize_ran: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
     };
@@ -8393,11 +8637,12 @@ pub(crate) fn build_super_proxy(
                 Object::Type(receiver_class),
             );
             d
-        })),
+        }))
+        .into(),
         native: std::sync::OnceLock::new(),
         inline_values: crate::sync::Cell::new(true),
-        slots: crate::sync::RefCell::new(None),
-        hash_cache: crate::sync::Cell::new(None),
+        slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
+        hash_cache: crate::sync::CachedHash::new(None),
         finalize_ran: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
     };
@@ -8873,7 +9118,7 @@ fn b_id(args: &[Object]) -> Result<Object, RuntimeError> {
 /// ids" semantics without trying to intern.
 pub(crate) fn object_identity(obj: &Object) -> i64 {
     use crate::object::Object;
-    // For DST-backed Rc<T> (`Rc<str>`, `Rc<[u8]>`, `Rc<[Object]>`) we
+    // For DST-backed Rc<T> (strings, bytes, and tuple storage) we
     // can't `as usize` the fat pointer directly; route through the
     // thin pointer of the underlying byte/data buffer.
     fn rc_str_ptr(s: &Rc<str>) -> i64 {
@@ -8882,8 +9127,8 @@ pub(crate) fn object_identity(obj: &Object) -> i64 {
     fn rc_bytes_ptr(s: &Rc<[u8]>) -> i64 {
         s.as_ptr() as usize as i64
     }
-    fn rc_obj_slice_ptr(s: &Rc<[Object]>) -> i64 {
-        s.as_ptr() as usize as i64
+    fn rc_obj_slice_ptr(s: &Rc<crate::object::TupleStorage>) -> i64 {
+        Rc::as_ptr(s).cast::<()>() as usize as i64
     }
     match obj {
         Object::Str(s) => rc_str_ptr(s),
@@ -8965,6 +9210,11 @@ pub fn ensure_hashable(obj: &Object) -> Result<(), RuntimeError> {
             return Ok(());
         }
         Object::Tuple(items) => {
+            // CPython 3.14 retains a successful tuple hash even if an
+            // element's class later becomes unhashable.
+            if items.cached_hash().is_some() {
+                return Ok(());
+            }
             for it in items.iter() {
                 ensure_hashable(it)?;
             }
@@ -9164,7 +9414,7 @@ pub fn hash_object(obj: &Object) -> Result<Object, RuntimeError> {
         let _no_yield = crate::gil::no_gil_handoff();
         return Ok(Object::Int(crate::foreign::hash(s)?));
     }
-    if let Some(h) = crate::object::py_hash_value(obj) {
+    if let Some(h) = crate::object::key_cmp_scope(|| crate::object::py_hash_value(obj))? {
         return Ok(Object::Int(h));
     }
     Ok(Object::Int(crate::object::identity_hash(obj)))
@@ -10221,7 +10471,7 @@ pub(crate) fn b_divmod(args: &[Object]) -> Result<Object, RuntimeError> {
         if let (Some(x), Some(y)) = (float_operand(&args[0]), float_operand(&args[1])) {
             let (x, y) = (x?, y?);
             let (q, r) = crate::py_float_divmod(x, y, "division by zero")?;
-            return Ok(Object::new_tuple(vec![
+            return Ok(Object::new_tuple_array([
                 crate::object::fresh_float(q),
                 crate::object::fresh_float(r),
             ]));
@@ -10229,7 +10479,7 @@ pub(crate) fn b_divmod(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let q = crate::binary_op(&args[0], &args[1], weavepy_compiler::BinOpKind::FloorDiv)?;
     let r = crate::binary_op(&args[0], &args[1], weavepy_compiler::BinOpKind::Mod)?;
-    Ok(Object::new_tuple(vec![q, r]))
+    Ok(Object::new_tuple_array([q, r]))
 }
 
 /// Clinic-bind `round(number, ndigits=None)` keywords into a positional
@@ -10625,6 +10875,15 @@ fn str_split_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
     out
 }
 
+/// Split results can later be mutated into cycles, even when their
+/// initial elements are all strings. Register them before returning
+/// through either the interpreter or a native string helper.
+fn new_str_split_list(items: Vec<Object>) -> Object {
+    let result = Object::new_list(items);
+    crate::gc_trace::track(result.clone());
+    result
+}
+
 fn str_split(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     str_arity("split", args, 0, 2)?;
     let s = str_self(args)?;
@@ -10662,7 +10921,7 @@ fn str_split(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
             }
         }
     };
-    Ok(Object::new_list(wrap(out)))
+    Ok(new_str_split_list(wrap(out)))
 }
 
 fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -10899,29 +11158,56 @@ fn str_match_prefix_suffix(
 
 fn str_replace_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
-    let from = match args.get(1).and_then(str_arg_bridged) {
-        Some(p) => p,
-        None => return Err(type_error("replace() expected str")),
-    };
-    let to = match args.get(2).and_then(str_arg_bridged) {
-        Some(p) => p,
-        None => return Err(type_error("replace() expected str")),
-    };
-    let (from, to) = (from.as_ref(), to.as_ref());
-    let mut count_obj = args.get(3).cloned();
-    for (k, v) in kwargs {
-        match k.as_str() {
-            "count" => count_obj = Some(v.clone()),
-            other => {
-                return Err(type_error(format!(
-                    "replace() got an unexpected keyword argument '{other}'"
-                )))
-            }
+    let positional = args.len().saturating_sub(1);
+    let total = positional + kwargs.len();
+    if total > 3 {
+        let kind = if positional == 0 {
+            "keyword arguments"
+        } else {
+            "arguments"
+        };
+        return Err(type_error(format!(
+            "replace() takes at most 3 {kind} ({total} given)"
+        )));
+    }
+    if positional < 2 {
+        return Err(type_error(format!(
+            "replace() takes at least 2 positional arguments ({positional} given)"
+        )));
+    }
+    // Bind and validate keywords before converting positional values.
+    // The total-count check above also rejects a duplicate count argument.
+    let mut count_obj = args.get(3);
+    for (name, value) in kwargs {
+        if name == "count" {
+            count_obj = Some(value);
+        } else {
+            return Err(type_error(format!(
+                "replace() got an unexpected keyword argument '{name}'"
+            )));
         }
     }
+    let from = str_arg_bridged(&args[1]).ok_or_else(|| {
+        type_error(format!(
+            "replace() argument 1 must be str, not {}",
+            args[1].type_name_owned()
+        ))
+    })?;
+    let to = str_arg_bridged(&args[2]).ok_or_else(|| {
+        type_error(format!(
+            "replace() argument 2 must be str, not {}",
+            args[2].type_name_owned()
+        ))
+    })?;
+    let (from, to) = (from.as_ref(), to.as_ref());
     let count = match count_obj {
-        None | Some(Object::None) => -1i64,
-        Some(o) => coerce_index_i64(&o)?,
+        None => -1i64,
+        Some(o) => match o.as_i64() {
+            Some(value) => value,
+            None => coerce_index_object(o)?.as_i64().ok_or_else(|| {
+                crate::error::overflow_error("Python int too large to convert to C ssize_t")
+            })?,
+        },
     };
     if count == 0 {
         return Ok(str_result(args, s.into_owned()));
@@ -11187,7 +11473,7 @@ fn str_rsplit(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
             pieces.drain(..).map(Object::from_str).collect()
         }
     };
-    Ok(Object::new_list(wrap(out)))
+    Ok(new_str_split_list(wrap(out)))
 }
 
 fn str_splitlines(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
@@ -11237,7 +11523,7 @@ fn str_splitlines(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
     if start < s.len() {
         out.push(str_result(args, s[start..].to_owned()));
     }
-    Ok(Object::new_list(out))
+    Ok(new_str_split_list(out))
 }
 
 fn str_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -11320,14 +11606,14 @@ fn str_partition(args: &[Object]) -> Result<Object, RuntimeError> {
     let (head, tail) = match s.find(&*sep) {
         Some(i) => (s[..i].to_owned(), s[i + sep.len()..].to_owned()),
         None => {
-            return Ok(Object::new_tuple(vec![
+            return Ok(Object::new_tuple_array([
                 str_result(args, s.to_owned()),
                 Object::from_static(""),
                 Object::from_static(""),
             ]))
         }
     };
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         str_result(args, head),
         str_result(args, sep.into_owned()),
         str_result(args, tail),
@@ -11347,14 +11633,14 @@ fn str_rpartition(args: &[Object]) -> Result<Object, RuntimeError> {
     let (head, tail) = match s.rfind(&*sep) {
         Some(i) => (s[..i].to_owned(), s[i + sep.len()..].to_owned()),
         None => {
-            return Ok(Object::new_tuple(vec![
+            return Ok(Object::new_tuple_array([
                 Object::from_static(""),
                 Object::from_static(""),
                 str_result(args, s.to_owned()),
             ]))
         }
     };
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         str_result(args, head),
         str_result(args, sep.into_owned()),
         str_result(args, tail),
@@ -13129,7 +13415,7 @@ fn dict_popitem(args: &[Object]) -> Result<Object, RuntimeError> {
         if crate::capi_watchers::dicts_active() {
             crate::capi_watchers::dict_event("DELETED", &d, Some(&k.0), None);
         }
-        Ok(Object::new_tuple(vec![k.0, v]))
+        Ok(Object::new_tuple_array([k.0, v]))
     } else {
         Err(key_error("popitem(): dictionary is empty"))
     }
@@ -14699,7 +14985,7 @@ fn bytes_partition(args: &[Object]) -> Result<Object, RuntimeError> {
         ),
         None => (data, Vec::new(), Vec::new()),
     };
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         bytes_like_result(args, head),
         bytes_like_result(args, mid),
         bytes_like_result(args, tail),
@@ -14723,7 +15009,7 @@ fn bytes_rpartition(args: &[Object]) -> Result<Object, RuntimeError> {
         ),
         None => (Vec::new(), Vec::new(), data),
     };
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         bytes_like_result(args, head),
         bytes_like_result(args, mid),
         bytes_like_result(args, tail),
@@ -16299,7 +16585,10 @@ pub(crate) fn file_readall(args: &[Object]) -> Result<Object, RuntimeError> {
 fn mem_dict_slot(receiver: &Object) -> Object {
     match receiver {
         Object::Instance(inst) => {
-            let d = inst.dict.borrow();
+            let Some(dict) = inst.dict.get() else {
+                return Object::None;
+            };
+            let d = dict.borrow();
             if d.is_empty() {
                 Object::None
             } else {
@@ -16378,14 +16667,18 @@ pub(crate) fn file_getstate_mem(args: &[Object]) -> Result<Object, RuntimeError>
             Some(s) => Object::from_str(s),
             None => Object::None,
         };
-        Ok(Object::new_tuple(vec![
+        Ok(Object::new_tuple_array([
             value,
             nl,
             Object::Int(pos),
             dict_slot,
         ]))
     } else {
-        Ok(Object::new_tuple(vec![value, Object::Int(pos), dict_slot]))
+        Ok(Object::new_tuple_array([
+            value,
+            Object::Int(pos),
+            dict_slot,
+        ]))
     }
 }
 
@@ -16407,7 +16700,7 @@ pub(crate) fn file_reduce_mem(args: &[Object]) -> Result<Object, RuntimeError> {
     // reconstruction tuple is protocol-independent, so it is ignored. Reuse the
     // same `self` slot for `__getstate__`.
     let state = file_getstate_mem(&args[..1])?;
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         cls,
         Object::new_tuple(Vec::new()),
         state,
@@ -17146,7 +17439,7 @@ fn memoryview_iter(args: &[Object]) -> Result<Object, RuntimeError> {
     let items = crate::mv_element_objects(&mv)?;
     Ok(Object::Iter(Rc::new(crate::sync::RefCell::new(
         crate::object::PyIterator::Tuple {
-            items: Rc::from(items),
+            items: crate::object::TupleStorage::from_vec(items),
             index: 0,
         },
     ))))
@@ -17425,7 +17718,7 @@ fn ns_dict_of(recv: &Object) -> Option<Rc<RefCell<crate::object::DictData>>> {
     match recv {
         Object::SimpleNamespace(d) => Some(d.clone()),
         Object::Instance(i) if matches!(i.native.get(), Some(Object::SimpleNamespace(_))) => {
-            Some(i.dict.clone())
+            Some(i.dict.share())
         }
         _ => None,
     }
@@ -17462,9 +17755,9 @@ pub(crate) fn namespace_reduce(args: &[Object]) -> Result<Object, RuntimeError> 
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         ns_class_of(recv),
-        Object::new_tuple(vec![]),
+        Object::new_tuple_array([]),
         Object::Dict(Rc::new(RefCell::new(snapshot))),
     ]))
 }

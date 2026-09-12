@@ -871,8 +871,11 @@ pub fn queue_container_removed(obj: &Object) {
     queue_cext_dropped(obj);
 }
 
-/// As [`queue_cext_dropped`] but with **no kind filter** — the entry point
-/// for the prompt reaper's escaped-subgraph park (RFC 0047, wave 5). The
+/// As [`queue_cext_dropped`] but with **no kind filter**. Native side exits
+/// also use this queue to retire temporary pins before the interpreter
+/// continuation runs, with callbacks deferred until its frame is installed.
+/// This is the entry point for the prompt reaper's escaped-subgraph park
+/// (RFC 0047, wave 5). The
 /// reaper has already established the object is refcount-dead and anchors
 /// an escaped instance, so the park must not lose it: a closure *function*
 /// (the compiler's `<genexpr>`/`<listcomp>` temporary, or any `def` whose
@@ -1228,7 +1231,7 @@ pub fn quitter(name: &'static str) -> Object {
             );
             if let Object::Instance(inst_rc) = &inst {
                 inst_rc.slot_set("code", code.clone());
-                inst_rc.slot_set("args", Object::new_tuple(vec![code]));
+                inst_rc.slot_set("args", Object::new_tuple_array([code]));
             }
             Err(crate::error::RuntimeError::PyException(
                 crate::error::PyException::new(inst),

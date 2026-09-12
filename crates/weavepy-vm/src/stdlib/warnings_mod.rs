@@ -111,7 +111,7 @@ fn new_context_var() -> Option<Object> {
 fn default_filters() -> Vec<Object> {
     let bt = crate::builtin_types::builtin_types();
     let entry = |action: &'static str, category: &Rc<TypeObject>, module: Object| {
-        Object::new_tuple(vec![
+        Object::new_tuple_array([
             Object::from_static(action),
             Object::None,
             Object::Type(category.clone()),
@@ -741,7 +741,7 @@ fn warn_explicit_locked(
         }
     };
 
-    let key = Object::new_tuple(vec![
+    let key = Object::new_tuple_array([
         text.clone(),
         Object::Type(category_cls.clone()),
         Object::Int(lineno),
@@ -782,11 +782,12 @@ fn warn_explicit_locked(
                     d
                 }
             };
-            let altkey = Object::new_tuple(vec![text.clone(), Object::Type(category_cls.clone())]);
+            let altkey =
+                Object::new_tuple_array([text.clone(), Object::Type(category_cls.clone())]);
             suppressed = already_warned(&once_rc, &altkey, true)?;
         } else if action == "module" {
             if let Some(reg) = &registry_rc {
-                let altkey = Object::new_tuple(vec![
+                let altkey = Object::new_tuple_array([
                     text.clone(),
                     Object::Type(category_cls.clone()),
                     Object::Int(0),

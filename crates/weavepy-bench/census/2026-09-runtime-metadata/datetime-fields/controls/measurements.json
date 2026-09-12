@@ -1,0 +1,339 @@
+{
+  "purpose": "Measure verified datetime components with separate stable per-binary frozen caches.",
+  "execution_context": {
+    "declared_launch_context": "outside-tool-filesystem-sandbox (require_escalated)",
+    "environment": {
+      "TZ": null,
+      "LANG": "C.UTF-8",
+      "LC_ALL": "C.UTF-8",
+      "LC_TIME": null,
+      "PYTHON_JIT": null,
+      "PYTHON_GIL": null
+    }
+  },
+  "samples": 7,
+  "work": 2000,
+  "binaries": {
+    "previous_jit": {
+      "path": "/Users/owencarey/Documents/weavefoundry/weavepy/target/release/weavepy-runtime-datetime-time-parts",
+      "sha256": "21b59ded060c615b5f5ea7995b2f6e0a20ec01ef0aa556c34f0fc8626e42cff8"
+    },
+    "previous_interp": {
+      "path": "/Users/owencarey/Documents/weavefoundry/weavepy/target/release/weavepy-runtime-datetime-time-parts",
+      "sha256": "21b59ded060c615b5f5ea7995b2f6e0a20ec01ef0aa556c34f0fc8626e42cff8"
+    },
+    "jit": {
+      "path": "/Users/owencarey/Documents/weavefoundry/weavepy/target/release/weavepy-runtime-datetime-fields",
+      "sha256": "8f1c86d7d8407d23488e14ce8a91d7f89fca206435cdbe0fd25467fa395c6565"
+    },
+    "interp": {
+      "path": "/Users/owencarey/Documents/weavefoundry/weavepy/target/release/weavepy-runtime-datetime-fields",
+      "sha256": "8f1c86d7d8407d23488e14ce8a91d7f89fca206435cdbe0fd25467fa395c6565"
+    },
+    "cpython": {
+      "path": "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/bin/python3.14",
+      "sha256": "87d4df53fd91304be5bac391fb204643c36b7df2023c04a0953bcbc7d4fdf634"
+    }
+  },
+  "rows": {},
+  "verification": {
+    "time_construct": {
+      "previous_jit": {
+        "returncode": 0,
+        "stdout": "[\"12:34:56.123456\", 0]\n[\"12:34:56.123456\", 0]\n",
+        "stderr": ""
+      },
+      "previous_interp": {
+        "returncode": 0,
+        "stdout": "[\"12:34:56.123456\", 0]\n[\"12:34:56.123456\", 0]\n",
+        "stderr": ""
+      },
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"12:34:56.123456\", 0]\n[\"12:34:56.123456\", 0]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"12:34:56.123456\", 0]\n[\"12:34:56.123456\", 0]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"12:34:56.123456\", 0]\n[\"12:34:56.123456\", 0]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"12:34:56.123456\", 0]\n[\"12:34:56.123456\", 0]\n",
+        "stderr": ""
+      }
+    },
+    "time_fold": {
+      "previous_jit": {
+        "returncode": 0,
+        "stdout": "[\"23:59:59.999999\", 1]\n[\"23:59:59.999999\", 1]\n",
+        "stderr": ""
+      },
+      "previous_interp": {
+        "returncode": 0,
+        "stdout": "[\"23:59:59.999999\", 1]\n[\"23:59:59.999999\", 1]\n",
+        "stderr": ""
+      },
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"23:59:59.999999\", 1]\n[\"23:59:59.999999\", 1]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"23:59:59.999999\", 1]\n[\"23:59:59.999999\", 1]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"23:59:59.999999\", 1]\n[\"23:59:59.999999\", 1]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"23:59:59.999999\", 1]\n[\"23:59:59.999999\", 1]\n",
+        "stderr": ""
+      }
+    },
+    "date_leap": {
+      "previous_jit": {
+        "returncode": 0,
+        "stdout": "[\"2000-02-29\", null]\n[\"2000-02-29\", null]\n",
+        "stderr": ""
+      },
+      "previous_interp": {
+        "returncode": 0,
+        "stdout": "[\"2000-02-29\", null]\n[\"2000-02-29\", null]\n",
+        "stderr": ""
+      },
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"2000-02-29\", null]\n[\"2000-02-29\", null]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"2000-02-29\", null]\n[\"2000-02-29\", null]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"2000-02-29\", null]\n[\"2000-02-29\", null]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"2000-02-29\", null]\n[\"2000-02-29\", null]\n",
+        "stderr": ""
+      }
+    },
+    "date_century": {
+      "previous_jit": {
+        "returncode": 0,
+        "stdout": "[\"1900-02-28\", null]\n[\"1900-02-28\", null]\n",
+        "stderr": ""
+      },
+      "previous_interp": {
+        "returncode": 0,
+        "stdout": "[\"1900-02-28\", null]\n[\"1900-02-28\", null]\n",
+        "stderr": ""
+      },
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"1900-02-28\", null]\n[\"1900-02-28\", null]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"1900-02-28\", null]\n[\"1900-02-28\", null]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"1900-02-28\", null]\n[\"1900-02-28\", null]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"1900-02-28\", null]\n[\"1900-02-28\", null]\n",
+        "stderr": ""
+      }
+    },
+    "date_index": {
+      "previous_jit": {
+        "returncode": 0,
+        "stdout": "[\"2024-12-31\", null]\n[\"2024-12-31\", null]\n",
+        "stderr": ""
+      },
+      "previous_interp": {
+        "returncode": 0,
+        "stdout": "[\"2024-12-31\", null]\n[\"2024-12-31\", null]\n",
+        "stderr": ""
+      },
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"2024-12-31\", null]\n[\"2024-12-31\", null]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"2024-12-31\", null]\n[\"2024-12-31\", null]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"2024-12-31\", null]\n[\"2024-12-31\", null]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"2024-12-31\", null]\n[\"2024-12-31\", null]\n",
+        "stderr": ""
+      }
+    },
+    "time_index": {
+      "previous_jit": {
+        "returncode": 0,
+        "stdout": "[\"12:34:56.123456\", 0]\n[\"12:34:56.123456\", 0]\n",
+        "stderr": ""
+      },
+      "previous_interp": {
+        "returncode": 0,
+        "stdout": "[\"12:34:56.123456\", 0]\n[\"12:34:56.123456\", 0]\n",
+        "stderr": ""
+      },
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"12:34:56.123456\", 0]\n[\"12:34:56.123456\", 0]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"12:34:56.123456\", 0]\n[\"12:34:56.123456\", 0]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"12:34:56.123456\", 0]\n[\"12:34:56.123456\", 0]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"12:34:56.123456\", 0]\n[\"12:34:56.123456\", 0]\n",
+        "stderr": ""
+      }
+    },
+    "date_int_subclass": {
+      "previous_jit": {
+        "returncode": 0,
+        "stdout": "[\"2024-02-29\", null]\n[\"2024-02-29\", null]\n",
+        "stderr": ""
+      },
+      "previous_interp": {
+        "returncode": 0,
+        "stdout": "[\"2024-02-29\", null]\n[\"2024-02-29\", null]\n",
+        "stderr": ""
+      },
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"2024-02-29\", null]\n[\"2024-02-29\", null]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"2024-02-29\", null]\n[\"2024-02-29\", null]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"2024-02-29\", null]\n[\"2024-02-29\", null]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"2024-02-29\", null]\n[\"2024-02-29\", null]\n",
+        "stderr": ""
+      }
+    },
+    "date_bool": {
+      "previous_jit": {
+        "returncode": 0,
+        "stdout": "[\"0001-01-01\", null]\n[\"0001-01-01\", null]\n",
+        "stderr": ""
+      },
+      "previous_interp": {
+        "returncode": 0,
+        "stdout": "[\"0001-01-01\", null]\n[\"0001-01-01\", null]\n",
+        "stderr": ""
+      },
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"0001-01-01\", null]\n[\"0001-01-01\", null]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"0001-01-01\", null]\n[\"0001-01-01\", null]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"0001-01-01\", null]\n[\"0001-01-01\", null]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"0001-01-01\", null]\n[\"0001-01-01\", null]\n",
+        "stderr": ""
+      }
+    },
+    "time_bool_fold": {
+      "previous_jit": {
+        "returncode": 0,
+        "stdout": "[\"12:34:56.123456\", true]\n[\"12:34:56.123456\", true]\n",
+        "stderr": ""
+      },
+      "previous_interp": {
+        "returncode": 0,
+        "stdout": "[\"12:34:56.123456\", true]\n[\"12:34:56.123456\", true]\n",
+        "stderr": ""
+      },
+      "jit": {
+        "returncode": 0,
+        "stdout": "[\"12:34:56.123456\", true]\n[\"12:34:56.123456\", true]\n",
+        "stderr": ""
+      },
+      "interp": {
+        "returncode": 0,
+        "stdout": "[\"12:34:56.123456\", true]\n[\"12:34:56.123456\", true]\n",
+        "stderr": ""
+      },
+      "cpython": {
+        "returncode": 0,
+        "stdout": "[\"12:34:56.123456\", 1]\n[\"12:34:56.123456\", 1]\n",
+        "stderr": ""
+      },
+      "gil0": {
+        "returncode": 0,
+        "stdout": "[\"12:34:56.123456\", true]\n[\"12:34:56.123456\", true]\n",
+        "stderr": ""
+      }
+    }
+  },
+  "frozen_caches": {
+    "previous_jit": "/Users/owencarey/Documents/weavefoundry/weavepy/target/datetime-fields-controls/frozen/21b59ded060c615b5f5ea7995b2f6e0a20ec01ef0aa556c34f0fc8626e42cff8",
+    "previous_interp": "/Users/owencarey/Documents/weavefoundry/weavepy/target/datetime-fields-controls/frozen/21b59ded060c615b5f5ea7995b2f6e0a20ec01ef0aa556c34f0fc8626e42cff8",
+    "jit": "/Users/owencarey/Documents/weavefoundry/weavepy/target/datetime-fields-controls/frozen/8f1c86d7d8407d23488e14ce8a91d7f89fca206435cdbe0fd25467fa395c6565",
+    "interp": "/Users/owencarey/Documents/weavefoundry/weavepy/target/datetime-fields-controls/frozen/8f1c86d7d8407d23488e14ce8a91d7f89fca206435cdbe0fd25467fa395c6565"
+  },
+  "measurement_inputs": {
+    "tools/bench_compare.py": "1cdb0ae49378d06c26d61668e0004efd03c8e768bc87be57a60b56ea29df33d7",
+    "/Users/owencarey/Documents/weavefoundry/weavepy/target/check_datetime_components_isolated.py": "5406de7dbb99e2a83156ee6f8269ad737d95607fc2313abb69879ab5401261ae"
+  }
+}

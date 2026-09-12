@@ -1,0 +1,2202 @@
+[
+  {
+    "name": "pickle_builtin_data_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.17573541594902053,
+    "stdout": "pickle built-in data: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_call_scratch_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.0593954169889912,
+    "stdout": "native call scratch: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "cached_code_relocation_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.3054881250136532,
+    "stdout": "cached code relocation: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "sum_range_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.04708679101895541,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "range_iteration_bounds_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.08368479099590331,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "sum_numeric_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.044277749955654144,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "sum_streaming_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.051862541993614286,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "range_collection_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.051195124979130924,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "shared_code_caches_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.20981000002939254,
+    "stdout": "shared code cache semantics: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "lazy_instance_dict_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.22136904200306162,
+    "stdout": "lazy instance dictionary semantics: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "gc_metadata_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.0683819170226343,
+    "stdout": "collector metadata lifecycle: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "string_split_gc_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.5467928330181167,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_string_arguments_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.05160641699330881,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_string_callbacks_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.11910462501691654,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_pin_pressure_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.22655700001632795,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_generator_pin_retirement_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.05126625002594665,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_pin_retirement_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.05505570798413828,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_slice_bounds_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.07786220900015905,
+    "stdout": "native slice bounds: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "default_suffix_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.04184716701274738,
+    "stdout": "default suffix semantics: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "lazy_code_caches_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.12770212499890476,
+    "stdout": "lazy code cache semantics: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "class_version_tokens_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.22088891704333946,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "indexed_slot_access_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.1715393749764189,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "type_cache_names_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.03965049999533221,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_scalar_leaf_calls_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.05117641598917544,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_unboxed_calls_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.11279924999689683,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_scalar_results_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.11411404103273526,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_constants_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.1675102089648135,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "small_slot_storage_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.21298400004161522,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "tuple_hash_cache_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.1713550839922391,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "hash_results_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.0481730829924345,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "tuple_storage_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.046219582960475236,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "instance_metadata_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.16217279201373458,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_list_lifetime_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.05697841598885134,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_list_builders_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.053836833976674825,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_enumerate_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.07714179198956117,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "float_text_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.20864204096142203,
+    "stdout": "",
+    "stderr": "......\n----------------------------------------------------------------------\nRan 6 tests in 0.013s\n\nOK\n"
+  },
+  {
+    "name": "key_comparison_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.2148326660390012,
+    "stdout": "",
+    "stderr": "....\n----------------------------------------------------------------------\nRan 4 tests in 0.024s\n\nOK\n"
+  },
+  {
+    "name": "collections_datetime_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 1.081104958022479,
+    "stdout": "",
+    "stderr": "...........\n----------------------------------------------------------------------\nRan 11 tests in 0.878s\n\nOK\n"
+  },
+  {
+    "name": "json_buffers_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.12678345799213275,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "string_fastpaths_jit",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.18938191694905981,
+    "stdout": "",
+    "stderr": ".......\n----------------------------------------------------------------------\nRan 7 tests in 0.011s\n\nOK\n"
+  },
+  {
+    "name": "pickle_builtin_data_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.13884412497282028,
+    "stdout": "pickle built-in data: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_call_scratch_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.04206400003749877,
+    "stdout": "native call scratch: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "cached_code_relocation_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.22341254097409546,
+    "stdout": "cached code relocation: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "sum_range_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.03727991599589586,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "range_iteration_bounds_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.06122391700046137,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "sum_numeric_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.03425120800966397,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "sum_streaming_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.0349449579953216,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "range_collection_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.040268875018227845,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "shared_code_caches_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.16889079101383686,
+    "stdout": "shared code cache semantics: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "lazy_instance_dict_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.17516691703349352,
+    "stdout": "lazy instance dictionary semantics: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "gc_metadata_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.060249750036746264,
+    "stdout": "collector metadata lifecycle: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "string_split_gc_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.5598079170449637,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_string_arguments_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.03501579200383276,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_string_callbacks_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.10853441600920632,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_pin_pressure_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.45618920802371576,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_generator_pin_retirement_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.04145366698503494,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_pin_retirement_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.0422839589882642,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_slice_bounds_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.06214691698551178,
+    "stdout": "native slice bounds: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "default_suffix_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.04142016597324982,
+    "stdout": "default suffix semantics: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "lazy_code_caches_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.12451008299831301,
+    "stdout": "lazy code cache semantics: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "class_version_tokens_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.19323958305176347,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "indexed_slot_access_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.1329877910320647,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "type_cache_names_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.031716750003397465,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_scalar_leaf_calls_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.0691045830026269,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_unboxed_calls_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.12524412502534688,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_scalar_results_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.0928352500195615,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_constants_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.16766616702079773,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "small_slot_storage_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.16425312496721745,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "tuple_hash_cache_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.12796783400699496,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "hash_results_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.04156899999361485,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "tuple_storage_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.04557145800208673,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "instance_metadata_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.15730241598794237,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_list_lifetime_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.18379366595763713,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_list_builders_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.10079749999567866,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_enumerate_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.11854141601361334,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "float_text_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.19191216700710356,
+    "stdout": "",
+    "stderr": "......\n----------------------------------------------------------------------\nRan 6 tests in 0.013s\n\nOK\n"
+  },
+  {
+    "name": "key_comparison_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.19599979097256437,
+    "stdout": "",
+    "stderr": "....\n----------------------------------------------------------------------\nRan 4 tests in 0.018s\n\nOK\n"
+  },
+  {
+    "name": "collections_datetime_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 1.1270322499913163,
+    "stdout": "",
+    "stderr": "...........\n----------------------------------------------------------------------\nRan 11 tests in 0.935s\n\nOK\n"
+  },
+  {
+    "name": "json_buffers_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.13454958400689065,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "string_fastpaths_interp",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.18980641599046066,
+    "stdout": "",
+    "stderr": ".......\n----------------------------------------------------------------------\nRan 7 tests in 0.012s\n\nOK\n"
+  },
+  {
+    "name": "pickle_builtin_data_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.16137654200429097,
+    "stdout": "pickle built-in data: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_call_scratch_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.047219290980137885,
+    "stdout": "native call scratch: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "cached_code_relocation_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.24637183296727017,
+    "stdout": "cached code relocation: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "sum_range_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.03947591595351696,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "range_iteration_bounds_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.06652325001778081,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "sum_numeric_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.035072124970611185,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "sum_streaming_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.03664437495172024,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "range_collection_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.039345833007246256,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "shared_code_caches_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.1862947079935111,
+    "stdout": "shared code cache semantics: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "lazy_instance_dict_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.17513666697777808,
+    "stdout": "lazy instance dictionary semantics: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "gc_metadata_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.05732137500308454,
+    "stdout": "collector metadata lifecycle: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "string_split_gc_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.5490482079912908,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_string_arguments_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.035864416975528,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_string_callbacks_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.11065695900470018,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_pin_pressure_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.44951508298981935,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_generator_pin_retirement_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.04158791701775044,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_pin_retirement_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.04673791700042784,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "native_slice_bounds_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.1769170830375515,
+    "stdout": "native slice bounds: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "default_suffix_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.03983137500472367,
+    "stdout": "default suffix semantics: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "lazy_code_caches_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.12115949997678399,
+    "stdout": "lazy code cache semantics: ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "class_version_tokens_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.1889760410413146,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "indexed_slot_access_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.13229820900596678,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "type_cache_names_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.030674166977405548,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_scalar_leaf_calls_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.07038449996616691,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_unboxed_calls_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.12337354203918949,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_scalar_results_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.09943524998379871,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_constants_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.16801895800745115,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "small_slot_storage_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.17073499999241903,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "tuple_hash_cache_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.13252537499647588,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "hash_results_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.04372474999399856,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "tuple_storage_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.04715275001944974,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "instance_metadata_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.16516600002069026,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_list_lifetime_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.19226825004443526,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_list_builders_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.10622804198646918,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "jit_enumerate_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.11897445796057582,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "float_text_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.19436508399667218,
+    "stdout": "",
+    "stderr": "......\n----------------------------------------------------------------------\nRan 6 tests in 0.013s\n\nOK\n"
+  },
+  {
+    "name": "key_comparison_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.19758224999532104,
+    "stdout": "",
+    "stderr": "....\n----------------------------------------------------------------------\nRan 4 tests in 0.016s\n\nOK\n"
+  },
+  {
+    "name": "collections_datetime_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 1.145855583017692,
+    "stdout": "",
+    "stderr": "...........\n----------------------------------------------------------------------\nRan 11 tests in 0.952s\n\nOK\n"
+  },
+  {
+    "name": "json_buffers_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.1302358329994604,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "string_fastpaths_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.18637720798142254,
+    "stdout": "",
+    "stderr": ".......\n----------------------------------------------------------------------\nRan 7 tests in 0.012s\n\nOK\n"
+  },
+  {
+    "name": "cpython_datetime_oracles",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 1.429565041034948,
+    "stdout": "JIT passed: 1500 timedelta cases and 500 calendar cases; 5 unchanged CPython differences\ninterpreter passed: 1500 timedelta cases and 500 calendar cases; 5 unchanged CPython differences\nfree threading passed: 1500 timedelta cases and 500 calendar cases; 5 unchanged CPython differences\n",
+    "stderr": ""
+  },
+  {
+    "name": "cpython_float_oracles",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 17.069039624999277,
+    "stdout": "cpython checked 262376 values\nbase checked 262376 values\nnew checked 262376 values\n{'new_vs_base': 66, 'base_vs_cpython': 66, 'new_vs_cpython': 0}\n",
+    "stderr": ""
+  },
+  {
+    "name": "test_frame_recycling_jit1",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.03676795895444229,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "test_frame_recycling_jit0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.033744500018656254,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "test_frame_recycling_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.0336616660351865,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "test_cross_thread_heap_jit1",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.1162546249688603,
+    "stdout": "cross-thread heap ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "test_cross_thread_heap_jit0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.10896016703918576,
+    "stdout": "cross-thread heap ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "test_cross_thread_heap_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.10813779197633266,
+    "stdout": "cross-thread heap ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "test_threading_primitives_jit1",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.10287737497128546,
+    "stdout": "threading primitives ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "test_threading_primitives_jit0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.09610379103105515,
+    "stdout": "threading primitives ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "test_threading_primitives_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.09545575000811368,
+    "stdout": "threading primitives ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "test_ws4_gc_cascade_jit1",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.044901875022333115,
+    "stdout": "WS4 cycle-GC cascade + finalization ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "test_ws4_gc_cascade_jit0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.04256670904578641,
+    "stdout": "WS4 cycle-GC cascade + finalization ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "test_ws4_gc_cascade_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.04308674996718764,
+    "stdout": "WS4 cycle-GC cascade + finalization ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "test_pickle_callables_jit1",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.046356292034033686,
+    "stdout": "pickle callables ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "test_pickle_callables_jit0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.0448522079968825,
+    "stdout": "pickle callables ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "test_pickle_callables_gil0",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.044187874998897314,
+    "stdout": "pickle callables ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "test_jit_object_lanes",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.3755011250032112,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "test_jit_dyn_calls",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.3608720000484027,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "test_jit_osr",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.35542524995980784,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "test_jit_calls",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.36109583399957046,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "test_jit_cells",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.3578410840127617,
+    "stdout": "ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "gil0_runtime",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.9236663749907166,
+    "stdout": "",
+    "stderr": ".............\n----------------------------------------------------------------------\nRan 13 tests in 0.754s\n\nOK\n"
+  },
+  {
+    "name": "collections",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.026114750013221055,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "queue_pingpong",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.10892575001344085,
+    "stdout": "WS3 blocking queue ping-pong ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "cpython_json_oracles",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.4369923329795711,
+    "stdout": "JIT passed: 250 encodings, 281 decodings, 219 error positions\ninterpreter passed: 250 encodings, 281 decodings, 219 error positions\nfree threading passed: 250 encodings, 281 decodings, 219 error positions\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/01_arith.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.02715891704428941,
+    "stdout": "3\n7\n20\n3\n2\n1024\n9\n-7\nFalse\n-6\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/02_control_flow.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025724791979882866,
+    "stdout": "positive\n0\n1\n2\n0\n1\n2\n1\n3\n5\n7\n9\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/03_functions.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.02633929200237617,
+    "stdout": "5\n120\n3628800\n55\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/04_closures.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025574625004082918,
+    "stdout": "8\n13\n15\n1\n2\n3\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/05_collections.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.02532050001900643,
+    "stdout": "[1, 2, 3, 4, 5]\n5\n15\n5\n1\n[1, 2, 3, 4, 5, 6]\n(10, 20, 30)\n20\n1\ndefault\n['a', 'b', 'c']\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/06_comprehensions.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.02513854199787602,
+    "stdout": "[0, 1, 4, 9, 16, 25]\n[0, 2, 4, 6, 8]\n[(0, 1), (0, 2), (1, 2)]\n[(0, 0), (1, 1), (2, 8), (3, 27), (4, 64)]\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/07_strings.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025119292025920004,
+    "stdout": "hello\nHELLO\nhello, world\nhellohellohello\n5\n['a', 'b', 'c']\nx-y-z\nTrue\nTrue\nheLLo\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/08_lambda_chained.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025454332993831486,
+    "stdout": "14\n[1, 1, 2, 3, 4, 5, 6, 9]\nout\nout\nin\nout\nout\n1\n2\ndefault\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/09_fizzbuzz.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025104875036049634,
+    "stdout": "1\n2\nFizz\n4\nBuzz\nFizz\n7\n8\nFizz\nBuzz\n11\nFizz\n13\n14\nFizzBuzz\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/100_rfc0025_cross_thread_heap.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.16128066700184718,
+    "stdout": "shared list after join: [1, 2, 3, 4, 5]\nlocked counter total: 400\nevent waiter: ['woke']\nalive after join: False\nactive_count >= 4: True\nexcepthook fired: ('RuntimeError', 'boom')\nident stable: True\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/101_rfc0025_daemon_and_join.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.13605358300264925,
+    "stdout": "worker saw: [('reporter', True)]\ndaemon-after-start raised\nalive after short join: True\nalive after final join: False\nshutdown ran: ['done']\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/102_rfc0025_distinct_native_threads.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.10348083300050348,
+    "stdout": "count of workers: 4\nany matched parent: False\nids are integers: True\nthreading.get_native_id matches _thread: True\nmain thread name: MainThread\nmain thread has native_id: True\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/10_classes_basic.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025368915987201035,
+    "stdout": "hello, Owen\nOwen\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/11_classes_inheritance.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.0252775420085527,
+    "stdout": "rex makes a generic sound\nrex says woof\nrex says woof (and wags tail)\nTrue\nTrue\nFalse\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/12_exceptions.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.02506541699403897,
+    "stdout": "5\ncaught: cannot divide by zero\nkey: missing\nidx: list index out of range\nany Exception\n11\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/13_with_statement.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.02511591702932492,
+    "stdout": "enter outer\nbody outer\nexit outer\nenter A\nenter B\nnested A B\nexit B\nexit A\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/14_iter_protocol.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.02526470902375877,
+    "stdout": "0\n1\n4\n9\n16\n0\n1\n2\nagain 0\nagain 1\nagain 2\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/15_dunders.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025259041984099895,
+    "stdout": "Vec(4, 6)\nTrue\nFalse\n2\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/16_import_math.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025265042029786855,
+    "stdout": "3.14159\n2.71828\n3\n4\n4\n6\n120\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/17_import_as.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.024805459019262344,
+    "stdout": "1024\nc.txt\n/a/b\n.txt\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/18_from_import.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025030874996446073,
+    "stdout": "3.1416\n9\n2\nc.txt\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/19_user_module.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.026614458009134978,
+    "stdout": "hello from _calc\n5\n16\n12\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/20_sys_module.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.02532258298015222,
+    "stdout": "3\n14\nTrue\nTrue\nlist\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/21_import_star.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.027075374964624643,
+    "stdout": "12.56636\n9\n3.14159\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/22_user_package.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.027013958024326712,
+    "stdout": "hello from _pkg.core\n0.1\n0.1\nhello from _pkg.core to WeavePy\nTrue\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/23_fstrings.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.02526075002970174,
+    "stdout": "hello, WeavePy!\nversion = 0.1\nWeavePy 'WeavePy'\n0xff 11111111\npi rounded: 3.14\npadded: [   42] [42   ] [ 42  ]\n12.500000%\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/24_generators.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025087916001211852,
+    "stdout": "0\n1\n2\n3\n4\n[1, 2, 3, 4, 5, 6]\n[0, 1, 4, 9, 16, 25]\n1\ndone: finished\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/25_match.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025110874965321273,
+    "stdout": "zero\nsmall\nsmall\nnegative (-5)\nother\norigin\non x-axis at 3\non y-axis at 4\npoint (1, 2)\nempty\nsingle: 42\nfirst=1, rest=[2, 3, 4]\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/26_match_class.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025614041951484978,
+    "stdout": "origin\ny-axis @ 5\nx-axis @ 7\ndiagonal @ 3\n(1,2)\npos int\nstring of len 5\nlist with 3 elements\nother\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/27_sets_and_frozensets.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.0254782079719007,
+    "stdout": "[1, 2, 3, 4]\n[1, 3, 4, 5]\n[1, 2, 3, 4, 5, 6]\n[3, 4]\n[1, 2]\n[1, 2, 5, 6]\n[1, 2, 3]\nTrue False\n[0, 2, 4, 6, 8]\n[1]\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/28_bytes_basics.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025043917004950345,
+    "stdout": "b'hello'\n5\n104\nb'hello world'\nb'HELLO'\nb'heLLo'\n[b'he', b'', b'o']\nbytearray(b'hello!')\nb'hello!'\n616263\n['a', 'b', 'c']\nb'a,b,c'\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/29_str_format.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025171999994199723,
+    "stdout": "1 + 2 = 3\na-b-a\nAda is 37\n[        hi]\n[hi        ]\n[    hi    ]\n[****hi****]\n3.142\n00003.14\n+42\n101010\n52\nff\nFF\n10 / 3 = 3\nAda says hello\n 3.14\nleft      |\nAda/37\nP(1,2)\n(1,2)\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/30_descriptors.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025541124981828034,
+    "stdout": "20\n100\nrejected: below absolute zero\n0\n1\n2\n25\n3 4\nrejected: must be positive\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/31_metaclasses.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.02482912497362122,
+    "stdout": "['A', 'B', 'C']\n1 2\nHolder tag\n('GenericLike', 'int')\n('GenericLike', 'str')\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/32_dataclasses.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.08282183395931497,
+    "stdout": "Point(x=1, y=2)\n{'x': 1, 'y': 2}\n(1, 2)\nPoint(x=99, y=2)\n['x', 'y']\nFrozen(name='hi', value=10) hi 10\nfrozen rejected: cannot assign to field 'name'\nTrue\nTrue\nTrue\n[1] []\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/33_enums.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.03276770800584927,
+    "stdout": "Color.RED\nRED 1\nColor.GREEN\nColor.BLUE\n['RED', 'GREEN', 'BLUE']\nTrue\nFalse\nTrue\nTrue\n6\n1 2 4\nPerm.READ|WRITE\nTrue\nFalse\nunique rejected: duplicate values found in <enum 'Bad'>: B -> A\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/34_abc.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.026113874977454543,
+    "stdout": "abstract reject: Can't instantiate abstract class Shape w\nsquare 16\npartial reject: Can't instantiate abstract class Partial\nTrue\nTrue\nFalse\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/35_typing.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.08833445800701156,
+    "stdout": "int | None\nint | str\ntyping.List[int]\ntyping.Dict[str, int]\ntyping.Tuple[int, str, float]\n<class 'list'>\n(<class 'str'>, <class 'int'>)\n42\nTrue\nFalse\n5\ntyping.Any\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/36_slots.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025394833006430417,
+    "stdout": "3 4\n10 4\nslot reject: 'Point' object has no attribute 'z' and no __dict__ for setting new attributes\n1 2 3\nnested slot reject: 'Vec3' object has no attribute 'w' and no __dict__ for setting new attributes\n7 8 fine\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/37_async_await.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.06250812497455627,
+    "stdout": "coroutine\n5\n12\n1\n-1\n",
+    "stderr": "/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy/tests/fixtures/run/37_async_await.py:23: RuntimeWarning: coroutine 'succ' was never awaited\n  print(type(succ(0)).__name__)\nRuntimeWarning: Enable tracemalloc to get the object allocation traceback\n"
+  },
+  {
+    "name": "fixture/38_async_generators.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025864916970022023,
+    "stdout": "[0, 1, 4, 9, 16]\n[0, 4, 16]\n[0, 1, 4, 'done']\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/39_async_with.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.026208832976408303,
+    "stdout": "enter a\ninside a\nexit a\nenter outer\nenter inner\ninside both\nexit inner\nexit outer\nenter x\nenter y\ninside x and y\nexit y\nexit x\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/40_threading.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.10626062500523403,
+    "stdout": "[0, 1, 2]\ninside lock\nlocked: False\nrlock state: False\nset? False\nset? True\nset? False\nsem depleted\nsem refilled\nmain name: MainThread\nactive: 1\nident type: int\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/41_queue.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.10547604103339836,
+    "stdout": "qsize: 5\n[0, 1, 2, 3, 4]\n['d', 'c', 'b', 'a']\n[1, 2, 3, 4, 5]\n2 x y True\nempty ok\nfull ok\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/42_concurrent_futures.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.35378254199167714,
+    "stdout": "[0, 1, 4, 9, 16]\n[1, 4, 9]\npending: True\ndone: True value: 42\ncaught: boom 7\nas_completed: [0, 1, 4]\nwait done: 3 not done: 0\nProcessPoolExecutor: constructed\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/43_async_comprehensions.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.21091479202732444,
+    "stdout": "list: [20, 22, 24]\nset: [20]\ndict: {0: 20, 1: 22, 2: 24}\nasync-for: [0, 1, 2, 3]\ncombined: [20, 22, 24, 26]\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/44_try_finally_reraise.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025822624971624464,
+    "stdout": "finally ran\ncaught: boom\n1\n2\ninner finally\ncaught: late boom\ninner\nouter\ncaught: v\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/45_asyncio_extras.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.21503216598648578,
+    "stdout": "to_thread: 49\nas_completed: [0, 1, 2]\nbounded: BoundedSemaphore released too many times\ncondition: woken\nlifo: [2, 1, 0]\nprio: [1, 1, 2, 3, 4, 5, 6, 9]\nintrospect: True True False True\n",
+    "stderr": "/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy/tests/fixtures/run/45_asyncio_extras.py:85: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead\n  asyncio.iscoroutinefunction(coro),\n/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy/tests/fixtures/run/45_asyncio_extras.py:86: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead\n  asyncio.iscoroutinefunction(sync),\n/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy/tests/fixtures/run/45_asyncio_extras.py:87: RuntimeWarning: coroutine 'main.<locals>.coro' was never awaited\n  asyncio.iscoroutine(coro()),\nRuntimeWarning: Enable tracemalloc to get the object allocation traceback\n"
+  },
+  {
+    "name": "fixture/46_hashlib_hmac.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.03418020799290389,
+    "stdout": "--- hashlib ---\nmd5: 5eb63bbbe01eeed093cb22bb8f5acdc3\nsha1: 2aae6c35c94fcfb415dbe95f408b9ce91ee846ed\nsha256: b94d27b9934d3e08a52e ...\nincremental sha256 matches: True\n--- hmac ---\nhmac sha256: 9307b3b915efb5171ff1 ...\nhmac eq: True False\n--- base64 ---\nb64encode: b'V2VhdmVQeSByb2Nrcw=='\nb64decode: b'WeavePy rocks'\nb32encode: b'NBUQ===='\nb16encode: b'6869'\n--- binascii ---\nhex: b'4142'\nunhex: b'AB'\ncrc32: 907060870\n--- secrets ---\ntoken_hex len: 16\nrandbelow ok: True\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/47_urllib_parse.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.05844649998471141,
+    "stdout": "scheme: https\nnetloc: user:pass@example.com:8080\nhostname: example.com\nport: 8080\npath: /path/to\nquery: key=val&x=1\nfragment: frag\nusername: user\npassword: pass\nunparse: https://user:pass@example.com:8080/path/to?key=val&x=1#frag\nsplit: https example.com /foo bar=1 z\nunsplit: https://example.com/foo?bar=1#z\nurljoin: https://a.com/z?q=1\nurljoin abs: https://b.com/y\nquote: hello%20world%20%26%20friends\nunquote: hello world & friends\nurlencode: a=1&b=two+words\nparse_qsl: [('a', '1'), ('b', 'two words'), ('a', '2')]\nparse_qs: {'a': ['1', '2'], 'b': ['two words']}\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/48_ipaddress.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.04400049999821931,
+    "stdout": "v4: 192.168.1.10 3232235786\nprivate: True\nloopback: False\nv4 from int: 10.0.0.1\nnet: 10.0.0.0/8 broadcast: 10.255.255.255 num: 16777216\nnet contains 10.1.2.3: True\nnet contains 11.1.2.3: False\nv6: ::1 loopback: True\ngeneric: 172.16.0.1 version: 4\ninterface: 192.168.1.10/24 network: 192.168.1.0/24\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/49_csv_mimetypes.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.10203058400657028,
+    "stdout": "--- csv reader ---\n['name', 'age']\n['Alice', '30']\n['Bob', '25']\n--- csv DictReader ---\n{'name': 'Alice', 'age': '30'}\n{'name': 'Bob', 'age': '25'}\n--- csv writer ---\n'x,y\\r\\n1,2\\r\\n3,4\\r\\n'\n--- csv DictWriter ---\n'k,v\\r\\na,1\\r\\nb,2\\r\\n'\n--- mimetypes ---\njson: ('application/json', None)\npng: ('image/png', None)\ntar.gz: ('application/x-tar', 'gzip')\nunknown: (None, None)\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/50_os_modules.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.063775832997635,
+    "stdout": "--- tempfile ---\nends with suffix: True\ndir exists: True\ndir starts with prefix: True\n--- glob ---\ntxt files: ['a.txt', 'b.txt']\n--- fnmatch ---\na.txt vs *.txt: True\na.md vs *.txt: False\ntranslate: (?s:.*\\.py)\\z ...\n--- shutil ---\ncopied content: hello\ndir gone: True\n--- zlib ---\ncompressed shorter: True\nroundtrip: True\ncrc32: 907060870\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/51_xml_html.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.06528841704130173,
+    "stdout": "--- html ---\nescape: &lt;b&gt;&#x27;one&#x27; &amp; &quot;two&quot;&lt;/b&gt;\nunescape: &lt;>\"AB\n--- xml.etree ---\nroot tag: root\nchildren count: 2\nperson 1 Alice 30\nperson 2 Bob 25\nserialised: <greeting>hello &amp; welcome<to>world</to></greeting>\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/52_socket_basic.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.035410875047091395,
+    "stdout": "--- constants ---\nAF_INET: 2\nSOCK_STREAM: 1\nSOL_SOCKET is int: True\n--- helpers ---\nhtons(80): 20480\nntohs(htons(80)): 80\ninet_aton('127.0.0.1'): b'\\x7f\\x00\\x00\\x01'\ninet_ntoa: 192.168.0.1\n--- getaddrinfo ---\nlen: 1\nfamily: True kind: True\naddr: ('127.0.0.1', 80)\n--- TCP echo ---\nlistening on: 127.0.0.1 with port>0: True\naccepted from: 127.0.0.1\nserver got: b'ping\\n'\nclient got: b'pong\\n'\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/53_subprocess.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.1377039589569904,
+    "stdout": "--- run / check_output ---\nreturncode: 0\nstdout: 'hello world\\n'\nstderr: ''\n--- check_output ---\ngot: 'weave\\n'\n--- stdin pipe ---\nreturncode: 0\nstdout: b'HELLO WORLD'\n--- failing command ---\nreturncode: 1\n--- check_call raises ---\nCalledProcessError: 1\n--- env ---\ngot: 'hi\\n'\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/54_email_cookies.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.1034810830024071,
+    "stdout": "--- email parse ---\nfrom: alice@example.com\nto: bob@example.com\nsubject: Hello\nbody starts: Hi Bob,\n--- email build ---\nFrom in str: True\nBody in str: True\n--- cookies ---\ncontains session: True\ncontains theme: True\nparsed a: 1\nparsed b: two\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/55_selectors_async.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.22376287495717406,
+    "stdout": "--- selectors ---\nevents: 1\ndata: reader\nread mask: True\n--- asyncio sleep ---\nsleep result: 42\n--- asyncio sock primitives ---\nlistener up on 127.0.0.1 port>0: True\naccepted from: 127.0.0.1\nserver got: b'hello async\\n'\nclient got: b'hi back\\n'\n--- asyncio gather ---\ngathered: [4, 9, 16]\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/56_frame_introspection.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025647917005699128,
+    "stdout": "self: inner\nparent: outer\nvars: ['x', 'y']\nvalues: 1 hello\nself name: trace_self\nparent name: <module>\nlineno_positive: True\nfilename_set: True\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/57_exception_groups.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.02549229096621275,
+    "stdout": "ExceptionGroup\nboom\n['ValueError', 'TypeError', 'KeyError']\ncaught V: ['a']\ncaught T: ['b']\nV count: 2\nremaining: ['KeyError']\ngot MyError: ['b']\ngot SystemExit: ['a']\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/58_weakref_and_gc.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.035042000003159046,
+    "stdout": "alive: True\nvalue: 42\nafter release: None\ncallback fired: ['died']\nin set: True 1\nsize: 2\nk: True\nkeys: ['k']\ngc enabled: True\ndisabled: False\nre-enabled: True\ncollected is int: True\nthreshold: (700, 10, 10)\nthreshold: (800, 12, 14)\ncount len: 3\nobjects is list: True\ndebug: 0\ndebug: 1\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/59_datetime.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.029951958975289017,
+    "stdout": "2024 3 15\n2024-03-15\n4\nTrue\n2024-12-25\n15:30:45\n2024-03-15T09:00:00\n2024 3 15 9\n2024-03-15\n09:00:00\n2024-03-20\n5\n2024-03-15 12:00:00\nUTC\n0:00:00\n2024-06-01 12:00:00\n2024-06-01 12:00:00.123456\nTrue\nTrue\nTrue\n3600.0\n1 day, 12:00:00\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/60_inspect_and_signature.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.09313641599146649,
+    "stdout": "signature: (x, y, z=10, *args, kw_only=None, **kwargs)\nparams: ['x', 'y', 'z', 'args', 'kw_only', 'kwargs']\ndefault z: 10\nargs: ['x', 'y', 'z']\nvarargs: args\nvarkw: kwargs\nkwonly: ['kw_only']\nmethod: (x, y=2)\nisfunction: True\nismethod: True\nisclass: True\nisgeneratorfunction: True\ncaller name: caller\nstack depth >= 2: True\ntop name: show_stack\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/61_traceback_and_warnings.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.10348662501201034,
+    "stdout": "has 'ValueError: hello': True\nhas 'boom': True\nhas 'direct cause': True\nhas 'TypeError: wrapped': True\nTE has 'ValueError': True\nwarnings captured: 2\nfirst category: UserWarning\nfirst msg: first warning\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/62_logging.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.1624559159972705,
+    "stdout": "DEBUG present: True\nINFO present: True\nWARNING present: True\nERROR present: True\nEXC present: True\nlevel >= True\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/63_contextvars.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.02519287500763312,
+    "stdout": "default: default\nouter: outer\nin child sees: outer\nin child set: child-only\nafter run still: outer\ntemp: temp\nreset: outer\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/64_unittest_basics.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.141152709024027,
+    "stdout": "tests run: 7\nfailures: 0\nerrors: 0\nwas successful: True\n",
+    "stderr": "----------------------------------------------------------------------\nRan 7 tests in 0.001s\n\nOK\n"
+  },
+  {
+    "name": "fixture/65_unittest_mock.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.24700104200746864,
+    "stdout": "mock call result: 42\ncall count: 1\ncalled once: True\ndo_thing called: True\ndo_thing args: (3,)\nmm.thing() type: True\nseq: 10 20 30\nsentinel works: True\nsentinels distinct: True\npatched: patched\nrestored: real\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/66_asyncio_taskgroup.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.20555587497074157,
+    "stdout": "('a', 1)\n('b', 2)\n('c', 3)\ncaught 1 value error(s): nope\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/67_runpy.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.04112562496447936,
+    "stdout": "module ran as __main__: 42\nnamespace value: 21\nnamespace doubled: 42\nvalue via run_path: 21\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/68_exec_compile_eval.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.02558204100932926,
+    "stdout": "code is set: True\nx: 2\ny: 42\neval result: 15\neval expr: 54\nns2 v: 14\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/69_bignum_complex.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025301332992967218,
+    "stdout": "2**100: 1267650600228229401496703205376\n2**100 + 1: 1267650600228229401496703205377\ntype: int\nhex: 0x10000000000000000000000000\noct: 0o2000000000000000000000000000000000\nbin: 0b10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\nbit_length: 101\nroundtrip int: True\nc+d: (4+6j)\nc*d: (-5+10j)\nc.conjugate(): (1-2j)\nabs(c): 2.23606797749979\ncomplex literal: (1+2j)\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/70_struct_codecs.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.03056325000943616,
+    "stdout": "struct len: 10\nunpack: (305419896, -1, 3.140000104904175)\ncalcsize: 10\ns.size: 8\npacked: 61626301ffff0000\nascii: b'hello'\nlatin-1: b'\\xe9'\nBOM_UTF8: efbbbf\nutf-16-le bytes: 14\ndecoded: WeavePy\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/71_compression.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.034192458959296346,
+    "stdout": "gzip ok: True\ngzip smaller: True\nbz2 ok: True\nlzma ok: True\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/72_pickle_marshal.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.0447135420399718,
+    "stdout": "None == True\nTrue == True\nFalse == True\n0 == True\n42 == True\n-7 == True\n1267650600228229401496703205376 == True\n-1267650600228229401496703205376 == True\n1.5 == True\n'hello' == True\nb'\\x00\\x01\\x02' == True\n[] == True\n[1, 2, 3] == True\n{'a': 1} == True\n(1, 2, 3) == True\n{1, 2, 3} == True\nfrozenset({1, 2}) == True\nmarshal ok: True\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/73_sqlite3.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.039475792029406875,
+    "stdout": "rows: [('Bob', 25), ('Alice', 30), ('Charlie', 35)]\ncount: (3,)\nlastrowid: 4\nrowcount: 1\n> 27: ['Alice', 'Charlie', 'Dora']\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/74_decimal_fractions.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.07603454199852422,
+    "stdout": "0.3\nTrue\n3.14\n1024\n33.33333333333333333333333333\n1/2\n1/2\n1/2\n3/4\n1/10\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/75_int_float_methods.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025277582986745983,
+    "stdout": "6\n8\nb'\\x00*'\n42\nTrue\n(-7, 1)\n0\nFalse\nTrue\n0x1.8000000000000p+0\n1.5\n(7, 2)\nb'\\xde\\xad\\xbe\\xef'\ndeadbeef\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/76_zip_tar.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.13501154200639576,
+    "stdout": "zip names: ['hello.txt', 'nested/data.txt']\nhello: b'Hello, ZIP!'\nnested len: 100\nis_zipfile: True\ntar names: ['hello.txt']\nhello: b'Hello, TAR!'\nis_tarfile: True\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/92_specialize_basic.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.026768457959406078,
+    "stdout": "499500\n4950.0\nabcabcabcabcabc\n4950\n1225\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/93_specialize_polymorphic.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025169041007757187,
+    "stdout": "3\nTrue\n3.0\nTrue\nhello, world\nTrue\n7\nTrue\n8.0\nTrue\nab\nTrue\n30\nTrue\n2.5\nFalse\nxx\nFalse\n19900\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/94_specialize_attr_module.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.02647120802430436,
+    "stdout": "157.07963267948966\n0.0\n10000\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/95_specialize_load_global.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.025424708030186594,
+    "stdout": "700\n200\n3\n3\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/96_rfc0023_drop_in_parity.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.0838275839923881,
+    "stdout": "=== builtins ===\n1024\n1\nb'weave'\n=== walrus ===\nn = 7\nwalrus loop sum: 20\n=== generic alias ===\n[1, 2, 3] 3\nTrue\n=== bisect ===\n2 3\n[1, 3, 5, 6, 7, 9]\n=== copy ===\norig: [[1, 2], [3, 4]]\ndeep: [[1, 2, 99], [3, 4]]\n=== operator ===\n20\n42\n=== statistics ===\n3\n2.5\n2.1381\n=== textwrap ===\nthe quick brown\nfox jumps over\nthe lazy dog\n=== stat ===\nTrue\n493\n=== posixpath ===\n/a/b/c.txt\n('foo/bar.tar', '.gz')\n=== numbers ===\nTrue\nTrue\nTrue\n=== dict views ===\n['a', 'b']\n[1, 2]\n[('a', 1), ('b', 2)]\n=== sys.implementation ===\nweavepy\n3\nalias name: TypeAliasType\nok\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/97_rfc0024_threads.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.10240662499563769,
+    "stdout": "lock starts unlocked: True\nlock locked: True\nlock released: True\ninside lock context: True\nafter lock context: True\nrlock fully released\nevent starts cleared: True\nevent set: True\nevent cleared: True\nnon-blocking on depleted: False\nbounded semaphore raised on over-release\ncondition no-op notify ok\nworker output: [0, 1, 2, 3, 4]\nident type: int\nactive_count >= 1: True\nmain thread name: MainThread\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/98_rfc0024_gc.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.02930504101095721,
+    "stdout": "enabled: True\nafter disable: False\nafter enable: True\nthreshold: (800, 12, 14)\ndefault threshold: (700, 10, 10)\ncount tuple length: 3\nbox tracked initially: True\ncycle collect returned int: True\ncollect returned int: True\ndebug: 0\ndebug after set: True\nget_objects is list: True\nget_referents is list: True\nget_referrers is list: True\nfreeze count: 0\nfreeze count after unfreeze: 0\nstats list: True\nstats has 3 entries: True\nDEBUG_STATS: 1\nDEBUG_LEAK: 38\ngarbage is list: True\ncallbacks is list: True\n",
+    "stderr": ""
+  },
+  {
+    "name": "fixture/99_rfc0024_weakref.py",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.03217079199384898,
+    "stdout": "alive: True\nattr through ref: 7\nref eq same target: True\nref hashable: True\ncallback fired: True\nref returns None after release: True\nproxy created: True\nweakset size: 3\nb in set: True\nd['a'] is b: True\nlen: 2\nkeys: ['a', 'b']\nwkd[b]: value-b\nwkd len: 2\nweakmethod constructed: True\nfinalizer alive: True\nafter fire: True\nfinalizer alive after fire: False\nReferenceType is _weakref.ReferenceType: True\nProxyTypes is tuple: True\n",
+    "stderr": ""
+  },
+  {
+    "name": "cpython/test_import",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 5.850650875014253,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_import.py` | pass | pass | 5813 | .........s......sss....ss.........s.............s................s...sssss.s......................ssssssss.ss......sss. |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_range",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 4.56225675001042,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_range.py` | pass | pass | 4553 | ............................. |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_iter",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.3809078749618493,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_iter.py` | pass | pass | 372 | ...............................s.........s............... |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_iterlen",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.28102125000441447,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_iterlen.py` | pass | pass | 272 | ...................... |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_int",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 24.120643166010268,
+    "stdout": "# WeavePy regrtest\n2 total \u2014 pass 2 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_int.py` | pass | pass | 920 | ...................................ss.....s.sss.s.s. |\n| `cpython/Lib/test/test_interpreters.py` | pass | pass | 23191 | ......................................................................s.s...............s.......................................s..s..................Exception ignored while calling deallocator <function Queue.__del__ at 0xa9d6aad10>: |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_bool",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.2943139590206556,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_bool.py` | pass | \u2014 | 274 | ............................... |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_hash",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 1.0974342499976046,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_hash.py` | pass | pass | 1086 | .............................. |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_enumerate",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.44497541699092835,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_enumerate.py` | pass | pass | 436 | ..s........s..s........s..s........s..s........s..s........s..s........s..........s........s..s.........s |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_tuple",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.37698541703866795,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_tuple.py` | pass | pass | 369 | ..s..............................sss.. |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_genexps",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.3940188339911401,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_genexps.py` | pass | pass | 383 | . |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_list",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 1.3701285839779302,
+    "stdout": "# WeavePy regrtest\n2 total \u2014 pass 2 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_list.py` | pass | pass | 979 | ...........................................s...s.................... |\n| `cpython/Lib/test/test_listcomps.py` | pass | pass | 382 | .................................................................. |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_float",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.5504057919606566,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_float.py` | pass | pass | 542 | ....................................................s. |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_complex",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.38796387502225116,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_complex.py` | pass | pass | 380 | ..................................... |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_datetime",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 4.661048416979611,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_datetime.py` | pass | pass | 4652 | sssssssssssssssssssssssss.................................................................................................................................................................................................................................................................................s............s......s..................................................................s....................................................................................................................................................................... |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_deque",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 4.859301374992356,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_deque.py` | pass | pass | 4851 | ..............................................s.........s..............s......... |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_collections",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 1.9503457080572844,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_collections.py` | pass | pass | 1941 | ............................................................s.ss..s................................................. |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_queue",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 13.706083500001114,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_queue.py` | pass | pass | 13697 | ...........................................................................sss..............................................................................sss... |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_json",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 24.61033600004157,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_json.py` | pass | pass | 24601 | .......................................................................s.....................................................s.....s............................................................................................. |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_scope",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.2762632920057513,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_scope.py` | pass | pass | 267 | ....s.........s....s..................... |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_frame",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 11.145670125028118,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_frame.py` | pass | pass | 11137 | ......s......ss..ss......ss....s.s..................s.....s |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_exceptions",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 3.020626417011954,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_exceptions.py` | pass | pass | 3009 | ............s..s.....s...........ss................ss...........sss..s.......s.............................. |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_generators",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 6.858777291956358,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_generators.py` | pass | pass | 6849 | ................................................s.......... |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_sys_settrace",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 2.713105832983274,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_sys_settrace.py` | pass | pass | 2704 | .................s.....................................................................................................................................s......s................................................................s......s...........................................................s......s...............ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss.............................................s......s.............. |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_sys_setprofile",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.284064750012476,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_sys_setprofile.py` | pass | pass | 275 | ............................. |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_gc",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 3.4305659999954514,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_gc.py` | pass | pass | 3422 | .s.s.....s....s...s...s..s..s......ss........s....s...... |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_str",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 23.65366620797431,
+    "stdout": "# WeavePy regrtest\n8 total \u2014 pass 8 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_str.py` | pass | pass | 12939 | ..........s.......................ss..................s.s....................s.s..........s..............sss............................... |\n| `cpython/Lib/test/test_string.py` | pass | pass | 868 | s...................................................... |\n| `cpython/Lib/test/test_string_literals.py` | pass | pass | 1288 | .................... |\n| `cpython/Lib/test/test_stringprep.py` | pass | pass | 269 | . |\n| `cpython/Lib/test/test_strptime.py` | pass | pass | 1025 | s.....................sssssssssssssssssssssssssssss............ssss....ssssssssssssss............. |\n| `cpython/Lib/test/test_strtod.py` | pass | pass | 1669 | ....s.... |\n| `cpython/Lib/test/test_struct.py` | pass | pass | 5150 | ...s.s................ss.................... |\n| `cpython/Lib/test/test_structseq.py` | pass | pass | 433 | ......................... |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_userstring",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 26.91769624996232,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_userstring.py` | pass | pass | 26904 | ..........................s........................s................... |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_type",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 2.5663575840299018,
+    "stdout": "# WeavePy regrtest\n5 total \u2014 pass 5 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_type_aliases.py` | pass | pass | 485 | .............................. |\n| `cpython/Lib/test/test_type_cache.py` | pass | pass | 378 | ssssssssssss |\n| `cpython/Lib/test/test_type_comments.py` | pass | pass | 494 | .................. |\n| `cpython/Lib/test/test_type_params.py` | pass | pass | 543 | ............................................................<test string>:2: SyntaxWarning: invalid decimal literal |\n| `cpython/Lib/test/test_types.py` | pass | pass | 649 | ......................................................................s...................................s...................... |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_dict",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 2.6716081670019776,
+    "stdout": "# WeavePy regrtest\n3 total \u2014 pass 3 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_dict.py` | pass | pass | 1073 | s.................ss........................................................sssssss...................................... |\n| `cpython/Lib/test/test_dictcomps.py` | pass | pass | 385 | .......... |\n| `cpython/Lib/test/test_dictviews.py` | pass | pass | 1202 | ................ |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_set",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 33.4605283329729,
+    "stdout": "# WeavePy regrtest\n2 total \u2014 pass 2 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_set.py` | pass | pass | 33070 | ...................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................... |\n| `cpython/Lib/test/test_setcomps.py` | pass | pass | 379 | .. |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_memoryview",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 2.6718252500286326,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_memoryview.py` | pass | pass | 2661 | s.......s.s........s..s..ss.......s.s.........s..s..s.s........s.s........s..s..s.........................................................................................s |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_io",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 66.03395295800874,
+    "stdout": "# WeavePy regrtest\n2 total \u2014 pass 2 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_io.py` | pass | pass | 65748 | ..........................s.............s.s...........................s.............s.s..ss...s..................................s.s...................................s....s......................s.s.....................................s...........................................................s.............................................s..s....................................................................s..........................s..........................................................................................................................................................................ss...............................ss.ss....ss.ss..sssss.. |\n| `cpython/Lib/test/test_ioctl.py` | pass | pass | 275 | ss.ss |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_pickle",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 53.85091570898658,
+    "stdout": "# WeavePy regrtest\n3 total \u2014 pass 3 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_pickle.py` | pass | pass | 45654 | ...........................s..........s........s.........................................................................................s.s.....s................s...................s..........s........s.......................................................................................................s........................................s..s........................sss...............sss.....................................s..........s........s.........................................................................................ss...s................................ssssss.......ssssss......s.....sssss....sss.......................sss..................................................................................s........s.s.....s................s...................s..........s........s..................................................................................................s..........s................................s........................sss...............sss.........ss.. |\n| `cpython/Lib/test/test_picklebuffer.py` | pass | pass | 324 | ......... |\n| `cpython/Lib/test/test_pickletools.py` | pass | pass | 7860 | ......................................................ssssss.....ssssss...s................................................................................................................... |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_weakref",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 14.894508500001393,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_weakref.py` | pass | pass | 14884 | ............sssss...............s........................s............s...........s....s................................s................ |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_threading",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 138.673981040949,
+    "stdout": "# WeavePy regrtest\n2 total \u2014 pass 2 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_threading.py` | pass | pass | 134774 | ............................................................s...........................s..........................ss..................................ss...s...s...........s...s.........s..s............s......s.................. |\n| `cpython/Lib/test/test_threading_local.py` | pass | pass | 3886 | ......s..........s.... |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_threading_local",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 3.809648416994605,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_threading_local.py` | pass | pass | 3796 | ......s..........s.... |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_monitoring",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.4397323749726638,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_monitoring.py` | pass | pass | 431 | .......s................................................................................ |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_descr",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 1.659710375010036,
+    "stdout": "# WeavePy regrtest\n2 total \u2014 pass 2 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_descr.py` | pass | pass | 1276 | .....x...............s...............................ss..s............................ss...x.....................s........s.......s......................ss.......s |\n| `cpython/Lib/test/test_descrtut.py` | pass | pass | 374 | ........ |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_class",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.32987162499921396,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_class.py` | pass | pass | 321 | .........................s........... |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_functools",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 1.311244042008184,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_functools.py` | pass | pass | 1300 | .................s............s.....................................................................................................................................................................................................................................s................................................................ |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_tracemalloc",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 1.4069420419982634,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_tracemalloc.py` | pass | pass | 1396 | ................................................... |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  },
+  {
+    "name": "cpython/test_capi/test_tuple",
+    "passed": true,
+    "returncode": 0,
+    "seconds": 0.28057804197305813,
+    "stdout": "# WeavePy regrtest\n1 total \u2014 pass 1 / fail 0 / error 0 / skip 0 / timeout 0 \u2014 unexpected 0\n\n| Test | Status | Expected | Time (ms) | Note |\n|------|--------|----------|-----------|------|\n| `cpython/Lib/test/test_capi/test_tuple.py` | pass | pass | 270 | .............. |\n",
+    "stderr": "wrote regrtest.md and regrtest.json to /Users/owencarey/Documents/weavefoundry/weavepy/target/conformance\n"
+  }
+]

@@ -290,8 +290,9 @@ pub(crate) fn list_set_helper_addr() -> usize {
 pub type ListLenHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64) -> i64;
 
 /// RFC 0065 WS5 — the embedder's pinned-list *append* helper. The
-/// value to append is pre-staged in [`JitFrame::ret_bits`],
-/// interpreted per the pin's element lane; returns `0` (Ok) or
+/// value to append is pre-staged in [`JitFrame::ret_bits`] with its
+/// [`JitFrame::ret_tag`]. Generic lists accept native scalars or object
+/// pins; typed lists require their exact element lane. Returns `0` (Ok) or
 /// non-zero to deopt (defensive). Same safety contract as
 /// [`ListGetHelper`].
 pub type ListAppendHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64) -> i64;
@@ -674,6 +675,41 @@ pub(crate) fn const_str_helper_addr() -> usize {
     CONST_STR_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
+static CONST_TUPLE_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TUPLE_LEN_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register helpers for immutable tuple constants and exact-tuple length.
+/// Both return a negative value to deopt without running Python code.
+/// Registration must precede compilation of either operation.
+pub fn register_tuple_read_helpers(constant: StrLenHelper, len: StrLenHelper) {
+    CONST_TUPLE_HELPER.store(constant as usize, std::sync::atomic::Ordering::Release);
+    TUPLE_LEN_HELPER.store(len as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn const_tuple_helper_addr() -> usize {
+    CONST_TUPLE_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn tuple_len_helper_addr() -> usize {
+    TUPLE_LEN_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static UNBOX_INT_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the exact-integer pin guard. On success it writes the integer
+/// to frame.ret_bits and returns zero. A nonzero status deopts without
+/// invoking Python code or changing the pinned object.
+pub fn register_unbox_int_helper(f: StrLenHelper) {
+    UNBOX_INT_HELPER.store(f as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn unbox_int_helper_addr() -> usize {
+    UNBOX_INT_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
 static DICT_ITER_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Register the process-wide dict-iterator capture helper (RFC 0073
@@ -948,11 +984,24 @@ pub type CallDynHelper = unsafe extern "C" fn(
 ) -> i64;
 
 static CALL_DYN_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CALL_DYN_INT_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Register the process-wide opaque-call helper (RFC 0074 WS2). Must
 /// precede the first compile of a frame containing `CallDyn` ops.
 pub fn register_call_dyn_helper(helper: CallDynHelper) {
     CALL_DYN_HELPER.store(helper as usize, std::sync::atomic::Ordering::Release);
+}
+
+/// Register a generic-call helper that returns exact integers unboxed.
+/// Other completed results use `Boxed`, including booleans and subclasses.
+/// Argument staging and exception/rejection statuses match [`CallDynHelper`].
+pub fn register_call_dyn_int_helper(helper: CallDynHelper) {
+    CALL_DYN_INT_HELPER.store(helper as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn call_dyn_int_helper_addr() -> usize {
+    CALL_DYN_INT_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
 #[must_use]

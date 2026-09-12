@@ -18,6 +18,18 @@ use crate::value::JitType;
 /// Index of a [`TBlock`] within a [`TFunc`].
 pub type BlockId = usize;
 
+/// Slice producer to resume when a native helper falls back. Its operand
+/// count determines the exact interpreter stack to reconstruct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SliceOrigin {
+    /// Resume LOAD_CONST with only the container on the stack.
+    Constant,
+    /// Resume BUILD_SLICE 2 with the container, start, and stop.
+    TwoBounds,
+    /// Resume BUILD_SLICE 3 with an additional None step.
+    ThreeBounds,
+}
+
 /// Arithmetic operations the JIT lowers. `TrueDiv` (`/`) always yields a
 /// `float`; `FloorDiv`/`Mod` carry Python's round-toward-negative-
 /// infinity semantics on integers.
@@ -113,7 +125,8 @@ pub enum TOp {
     /// divisor (the interpreter raises `ZeroDivisionError`).
     FloatArith(ArithKind),
     /// `int / int → float` (Python true division). Deopts on a zero
-    /// divisor (the interpreter raises `ZeroDivisionError`).
+    /// divisor or operands outside the exact f64 integer range, so the
+    /// interpreter can raise or compute a correctly rounded quotient.
     IntTrueDiv,
     /// `int (cmp) int → bool`.
     IntCmp(CmpKind),
@@ -213,15 +226,14 @@ pub enum TOp {
     /// the store in that case and the interpreter re-executes it.
     CellSet { idx: u32, lane: JitType },
     /// RFC 0065 WS5 — `x.append(v)` on a pinned list: pops the value
-    /// (staged through the frame's `ret_bits`, interpreted per the
-    /// pin's element lane) and the pin reference, and calls
-    /// `wpjit_list_append`. The analyzer guarantees the value's lane
-    /// matches the pinned element lane, so the append preserves the
-    /// pinned shape; a non-zero status (defensive) deopts at this pc,
+    /// (staged through the frame's `ret_bits` and `ret_tag`) and the pin
+    /// reference, and calls `wpjit_list_append`. Generic lists accept
+    /// native scalars or object pins; typed lists require their exact
+    /// element lane. A non-zero status deopts before the mutation at this pc,
     /// where the interpreter re-executes the `CALL`.
     ListAppend,
     /// RFC 0073 WS1 — `LIST_APPEND` inside an inlined comprehension
-    /// loop: pops the value (staged through `ret_bits` like
+    /// loop: pops the value (staged through `ret_bits` and `ret_tag` like
     /// [`Self::ListAppend`]) but *keeps* the accumulator pin on the
     /// stack — the comprehension's accumulator stays live across the
     /// whole loop. The analyzer guarantees the value's lane matches
@@ -375,6 +387,16 @@ pub enum TOp {
     /// constant index)` — a loop re-executing the load reuses one pin,
     /// so the pin table stays bounded. Cap pressure deopts at this pc.
     PushConstStr { idx: u32 },
+    /// Pin the code object's immutable tuple constant, reusing one pin
+    /// per constant per activation. Cap pressure deopts at LOAD_CONST.
+    PushConstTuple { idx: u32 },
+    /// Length of an exact tuple on the generic object lane. Other
+    /// objects deopt at CALL before invoking any Python __len__ method.
+    TupleLen,
+    /// Guard an object operand as an exact machine-sized integer, at
+    /// depth 0 or 1 from TOS. A miss resumes at the consuming opcode
+    /// with the original object, without replaying its producer.
+    UnboxInt { depth: u8 },
     /// RFC 0073 WS2 — `BUILD_MAP n` (`n` *pairs*): pops `2n`
     /// interleaved key/value entries (staged through the marshal
     /// buffer with per-slot tags), builds a fresh GC-tracked dict
@@ -462,14 +484,13 @@ pub enum TOp {
     /// `None` marker, never a native value) and the pin, calls the
     /// registered `wpjit_list_slice` helper (CPython index clamping),
     /// and pushes the fresh pinned list on the same lane. Cap
-    /// pressure deopts at this pc. `konst` marks CPython 3.14's folded
-    /// shape (`LOAD_CONST slice(a, b, None)` + `BINARY_OP NB_SUBSCR`):
-    /// the bounds are constants the deopt spill must *not* materialize
-    /// (the interpreter re-executes the `LOAD_CONST` itself).
+    /// pressure deopts at this pc. `origin` distinguishes folded constants
+    /// from two- and three-bound BUILD_SLICE producers, preserving their
+    /// exact operand stacks when execution returns to the interpreter.
     ListSlice {
         start: bool,
         stop: bool,
-        konst: bool,
+        origin: SliceOrigin,
     },
     /// RFC 0074 WS1 — a `LOAD_GLOBAL` resolving to an arbitrary
     /// object (a builtin, a class, a `*args`/`**kwargs` function, a
@@ -501,7 +522,15 @@ pub enum TOp {
     /// the positionals; `names` is the constant-pool index of the
     /// interned kwnames tuple (the erased `LOAD_CONST` of the
     /// `CALL_KW` shape).
-    CallDyn { argc: u8, kwc: u8, names: u32 },
+    /// If `int_result` is set, the immediately following integer consumer
+    /// is fused into the call: exact integers return unboxed, and other
+    /// completed values park and resume at the next bytecode instruction.
+    CallDyn {
+        argc: u8,
+        kwc: u8,
+        names: u32,
+        int_result: bool,
+    },
     /// RFC 0074 WS2/WS4 — an eager generic `LOAD_ATTR` (either form)
     /// on a receiver the burned-fingerprint lanes don't cover: pops
     /// the receiver pin and performs the interpreter's exact
@@ -566,11 +595,11 @@ pub enum TOp {
     /// bounds (`stop` above `start`) and the pin, applies CPython's
     /// slice clamping through the interpreter's subscript core, and
     /// pushes the fresh `str` pin. Cap pressure deopts at this pc.
-    /// `konst` as on [`TOp::ListSlice`].
+    /// `origin` as on [`TOp::ListSlice`].
     StrSlice {
         start: bool,
         stop: bool,
-        konst: bool,
+        origin: SliceOrigin,
     },
 }
 
@@ -1430,6 +1459,9 @@ impl TOp {
                 | TOp::DictLen
                 | TOp::BuildMap { .. }
                 | TOp::PushConstStr { .. }
+                | TOp::PushConstTuple { .. }
+                | TOp::TupleLen
+                | TOp::UnboxInt { .. }
                 | TOp::StrConcat
                 | TOp::StrGetItem
                 | TOp::BuildString { .. }

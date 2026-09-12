@@ -145,7 +145,7 @@ fn run_call(args: &[Object]) -> Result<Object, RuntimeError> {
     let out_bytes = out_join.map(join_reader).unwrap_or_default();
     let err_bytes = err_join.map(join_reader).unwrap_or_default();
     let rc = status_code(status);
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(rc),
         Object::new_bytes(out_bytes),
         Object::new_bytes(err_bytes),

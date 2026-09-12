@@ -636,7 +636,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // and its test suite read the attribute unconditionally).
         d.insert(
             DictKey(Object::from_static("_git")),
-            Object::new_tuple(vec![
+            Object::new_tuple_array([
                 Object::from_static("WeavePy"),
                 Object::from_static(""),
                 Object::from_static(""),
@@ -1651,9 +1651,9 @@ fn sys_exc_info(
             Object::Instance(i) => i.slot_get("__traceback__").unwrap_or(Object::None),
             _ => Object::None,
         };
-        Ok(Object::new_tuple(vec![type_obj, inst, tb]))
+        Ok(Object::new_tuple_array([type_obj, inst, tb]))
     } else {
-        Ok(Object::new_tuple(vec![
+        Ok(Object::new_tuple_array([
             Object::None,
             Object::None,
             Object::None,
@@ -2132,7 +2132,7 @@ fn sys_getwindowsversion(_args: &[Object]) -> Result<Object, RuntimeError> {
         );
         d.insert(
             DictKey(Object::from_static("platform_version")),
-            Object::new_tuple(vec![
+            Object::new_tuple_array([
                 Object::Int(i64::from(info.dwMajorVersion)),
                 Object::Int(i64::from(info.dwMinorVersion)),
                 Object::Int(i64::from(info.dwBuildNumber)),

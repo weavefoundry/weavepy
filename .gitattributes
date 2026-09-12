@@ -13,6 +13,11 @@
 *.yml       text eol=lf
 *.yaml      text eol=lf
 
+# Keep generated benchmark evidence available without expanding it in PR reviews.
+crates/weavepy-bench/census/2026-09-runtime-metadata/**/*.json linguist-generated=true
+# Captured logs retain their original whitespace, including final blank lines.
+crates/weavepy-bench/census/2026-09-runtime-metadata/**/*.txt linguist-generated=true -whitespace
+
 # Binary safety: never normalise these.
 *.png       binary
 *.jpg       binary

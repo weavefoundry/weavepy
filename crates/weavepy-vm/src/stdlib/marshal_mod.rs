@@ -1806,7 +1806,13 @@ fn string_of(o: &Object, field: &str) -> Result<String, RuntimeError> {
 /// Extract a tuple of `str` from a marshalled value.
 fn tuple_of_strings(o: &Object, field: &str) -> Result<Vec<String>, RuntimeError> {
     match o {
-        Object::Tuple(items) => items.iter().map(|x| string_of(x, field)).collect(),
+        Object::Tuple(items) => {
+            let mut strings = Vec::with_capacity(items.len());
+            for item in items.iter() {
+                strings.push(string_of(item, field)?);
+            }
+            Ok(strings)
+        }
         _ => Err(value_error(format!(
             "marshal: code object field '{field}' is not a tuple"
         ))),

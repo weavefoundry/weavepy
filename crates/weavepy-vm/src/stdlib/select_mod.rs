@@ -432,7 +432,7 @@ fn select_select(args: &[Object]) -> Result<Object, RuntimeError> {
     let rmask = libc::POLLIN | libc::POLLHUP | libc::POLLERR;
     let wmask = libc::POLLOUT | libc::POLLHUP | libc::POLLERR;
     let xmask = libc::POLLPRI;
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::new_list(ready(&rlist, rmask)),
         Object::new_list(ready(&wlist, wmask)),
         Object::new_list(ready(&xlist, xmask)),
@@ -518,7 +518,7 @@ fn select_select(args: &[Object]) -> Result<Object, RuntimeError> {
                 Ok(0)
             })?;
         }
-        return Ok(Object::new_tuple(vec![
+        return Ok(Object::new_tuple_array([
             Object::new_list(Vec::new()),
             Object::new_list(Vec::new()),
             Object::new_list(Vec::new()),
@@ -573,7 +573,7 @@ fn select_select(args: &[Object]) -> Result<Object, RuntimeError> {
             .map(|(_, o)| o.clone())
             .collect()
     };
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::new_list(ready(&rlist, &rset)),
         Object::new_list(ready(&wlist, &wset)),
         Object::new_list(ready(&xlist, &xset)),
@@ -878,7 +878,7 @@ fn poll_poll(args: &[Object]) -> Result<Object, RuntimeError> {
         .iter()
         .filter(|p| p.revents != 0)
         .map(|p| {
-            Object::new_tuple(vec![
+            Object::new_tuple_array([
                 Object::Int(i64::from(p.fd)),
                 Object::Int(i64::from(p.revents)),
             ])

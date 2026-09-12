@@ -62,7 +62,7 @@ enum Probe {
     ByteArray(Weak<RefCell<Vec<u8>>>),
     Str(Weak<str>),
     WStr(Weak<[u32]>),
-    Tuple(Weak<[Object]>),
+    Tuple(Weak<crate::object::TupleStorage>),
     List(Weak<RefCell<Vec<Object>>>),
     Dict(Weak<RefCell<DictData>>),
     Set(Weak<RefCell<SetData>>),
@@ -483,10 +483,10 @@ fn t_get_traced_memory(_args: &[Object]) -> Result<Object, RuntimeError> {
         sweep(s);
         (s.current, s.peak)
     });
-    Ok(Object::Tuple(Rc::from(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(cur as i64),
         Object::Int(peak as i64),
-    ])))
+    ]))
 }
 
 fn t_get_tracemalloc_memory(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -532,9 +532,9 @@ fn t_get_traceback_limit(_args: &[Object]) -> Result<Object, RuntimeError> {
 fn frames_to_tuple(frames: &[(String, i64)]) -> Object {
     let items: Vec<Object> = frames
         .iter()
-        .map(|(f, l)| Object::Tuple(Rc::from(vec![Object::from_str(f.clone()), Object::Int(*l)])))
+        .map(|(f, l)| Object::new_tuple_array([Object::from_str(f.clone()), Object::Int(*l)]))
         .collect();
-    Object::Tuple(Rc::from(items))
+    Object::new_tuple(items)
 }
 
 fn t_get_traces(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -553,12 +553,12 @@ fn t_get_traces(_args: &[Object]) -> Result<Object, RuntimeError> {
                 .entry(frames.clone())
                 .or_insert_with(|| frames_to_tuple(frames))
                 .clone();
-            out.push(Object::Tuple(Rc::from(vec![
+            out.push(Object::new_tuple_array([
                 Object::Int(i64::from(domain)),
                 Object::Int(size as i64),
                 tb,
                 Object::Int(i64::from(total)),
-            ])));
+            ]));
         };
         for t in s.live.values() {
             push(0, t.size, &t.frames, t.total_nframe);

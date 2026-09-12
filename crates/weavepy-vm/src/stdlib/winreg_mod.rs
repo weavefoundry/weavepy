@@ -1086,7 +1086,7 @@ fn winreg_enum_value(args: &[Object]) -> Result<Object, RuntimeError> {
         check(rc)?;
         let name = str_from_utf16(&name_buf[..name_len as usize]);
         let value = reg_to_py(&data_buf[..data_len as usize], typ);
-        return Ok(Object::new_tuple(vec![
+        return Ok(Object::new_tuple_array([
             name,
             value,
             Object::Int(i64::from(typ)),
@@ -1187,7 +1187,7 @@ fn winreg_query_info_key(args: &[Object]) -> Result<Object, RuntimeError> {
     });
     check(rc)?;
     let quad = (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime);
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(i64::from(nsubkeys)),
         Object::Int(i64::from(nvalues)),
         Object::int_from_i128(i128::from(quad)),
@@ -1313,7 +1313,10 @@ fn winreg_query_value_ex(args: &[Object]) -> Result<Object, RuntimeError> {
         break size;
     };
     let value = reg_to_py(&buf[..size as usize], typ);
-    Ok(Object::new_tuple(vec![value, Object::Int(i64::from(typ))]))
+    Ok(Object::new_tuple_array([
+        value,
+        Object::Int(i64::from(typ)),
+    ]))
 }
 
 /// `SaveKey(key, file_name)` — write the subtree to a hive file

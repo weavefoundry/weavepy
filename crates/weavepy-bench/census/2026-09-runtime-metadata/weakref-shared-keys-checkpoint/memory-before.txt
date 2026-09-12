@@ -1,0 +1,2 @@
+hw.memsize: 25769803776
+vm.swapusage: total = 7168.00M  used = 5888.81M  free = 1279.19M  (encrypted)

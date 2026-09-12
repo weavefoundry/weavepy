@@ -104,6 +104,78 @@ assert json.loads('{"a":1,"a":2}', object_pairs_hook=lambda x: x) == [("a", 1), 
 decoded = json.loads('[{"same":1},{"same":2}]')
 assert next(iter(decoded[0])) is next(iter(decoded[1]))
 
+
+def check_duplicate_callbacks(parser_name, tokens, pairs_hook):
+    events = []
+
+    class Box:
+        def __init__(self, value):
+            self.value = value
+
+        def __del__(self):
+            events.append(("drop", self.value))
+
+    def parse(text):
+        events.append(("parse", text))
+        return Box(text)
+
+    options = {parser_name: parse}
+    if pairs_hook:
+        options["object_pairs_hook"] = lambda pairs: pairs
+    document = '{"same":' + tokens[0] + ',"same":' + tokens[1] + ',"tail":' + tokens[2] + '}'
+    result = json.loads(document, **options)
+    expected = [("parse", tokens[0]), ("parse", tokens[1])]
+    if not pairs_hook:
+        expected.append(("drop", tokens[0]))
+    expected.append(("parse", tokens[2]))
+    assert events == expected, (parser_name, pairs_hook, events)
+    if pairs_hook:
+        assert [value.value for key, value in result] == tokens
+    else:
+        assert result["same"].value == tokens[1]
+
+
+for parser_name, tokens in (
+    ("parse_int", ["1", "2", "3"]),
+    ("parse_float", ["1.0", "2.0", "3.0"]),
+    ("parse_constant", ["NaN", "Infinity", "-Infinity"]),
+):
+    for pairs_hook in (False, True):
+        check_duplicate_callbacks(parser_name, tokens, pairs_hook)
+
+# Memoization must use decoded text, regardless of the spelling or input
+# storage. A surrogate value makes the entire input use wide storage.
+for first, second, expected_key in [
+    ('"repeated_key"', '"repeated_key"', "repeated_key"),
+    ('"repeated_key"', '"repeated_\\u006bey"', "repeated_key"),
+    ('"repeated_\\u006bey"', '"repeated_key"', "repeated_key"),
+    ('"caf\\u00e9"', '"café"', "café"),
+    ('"café"', '"caf\\u00e9"', "café"),
+    ('"\\ud83d\\ude00"', '"😀"', "😀"),
+    ('"\\ud800_key"', '"\ud800_key"', "\ud800_key"),
+    ('"line\\nkey"', '"line\\u000akey"', "line\nkey"),
+]:
+    for prefix in ('"text"', '"\udfff"'):
+        document = '[' + prefix + ',{' + first + ':1},{' + second + ':2}]'
+        decoded = json.loads(document)
+        a, b = next(iter(decoded[1])), next(iter(decoded[2]))
+        assert a == b == expected_key
+        assert a is b, (first, second, prefix)
+        pairs = json.loads('{' + first + ':1,' + second + ':2}',
+                           object_pairs_hook=lambda value: value)
+        assert pairs[0][0] is pairs[1][0]
+
+
+def reentrant_object_hook(value):
+    inner = json.loads('{"repeated_key":3}')
+    assert inner == {"repeated_key": 3}
+    return value
+
+
+decoded = json.loads('[{"repeated_key":1},{"repeated_key":2}]',
+                     object_hook=reentrant_object_hook)
+assert next(iter(decoded[0])) is next(iter(decoded[1]))
+
 # Scanner arguments and results are character offsets, even when UTF-8
 # byte lengths differ and raw_decode starts partway through the document.
 decoder = json.JSONDecoder()

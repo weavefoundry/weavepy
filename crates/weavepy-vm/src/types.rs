@@ -25,7 +25,7 @@ static METACLASS_DRIFT_HOOK: std::sync::OnceLock<fn(usize, &TypeObject)> =
 
 /// Process-wide allocator for [`AttrVersion`] values. Starts at 1 so a
 /// zeroed [`type_cache`] entry can never match a live type.
-static NEXT_TYPE_VERSION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+static NEXT_TYPE_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// A type's attribute-resolution version, WeavePy's `tp_version_tag`.
 ///
@@ -36,28 +36,24 @@ static NEXT_TYPE_VERSION: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 /// cached entry (RFC 0077 WS4, [`type_cache`]). Reads are relaxed atomic
 /// loads — the previous `Cell<u32>` paid a `GilCell` lock round-trip on
 /// every inline-cache guard.
-pub struct AttrVersion(std::sync::atomic::AtomicU32);
+pub struct AttrVersion(std::sync::atomic::AtomicU64);
 
 impl AttrVersion {
     /// A never-before-used version.
     pub fn fresh() -> Self {
-        Self(std::sync::atomic::AtomicU32::new(next_type_version()))
+        Self(std::sync::atomic::AtomicU64::new(next_type_version()))
     }
 
     #[inline]
-    pub fn get(&self) -> u32 {
+    pub fn get(&self) -> u64 {
         self.0.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    #[inline]
-    pub fn set(&self, v: u32) {
-        self.0.store(v, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Move to a fresh, never-before-used version.
     #[inline]
     pub fn bump(&self) {
-        self.set(next_type_version());
+        self.0
+            .store(next_type_version(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -67,14 +63,69 @@ impl std::fmt::Debug for AttrVersion {
     }
 }
 
-fn next_type_version() -> u32 {
-    let v = NEXT_TYPE_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // Wrapped past `u32::MAX` (four billion class mutations): skip the
-    // reserved 0 so the "never matches" sentinel stays sound.
-    if v == 0 {
-        NEXT_TYPE_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    } else {
-        v
+fn next_type_version() -> u64 {
+    allocate_type_version(&NEXT_TYPE_VERSION).expect("type version space exhausted")
+}
+
+/// Never publish zero or reuse a token, including at counter exhaustion.
+fn allocate_type_version(counter: &std::sync::atomic::AtomicU64) -> Option<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    counter
+        .fetch_update(Relaxed, Relaxed, |value| {
+            if value == 0 {
+                None
+            } else {
+                value.checked_add(1)
+            }
+        })
+        .ok()
+}
+
+#[cfg(test)]
+mod attr_version_tests {
+    use super::{allocate_type_version, AttrVersion};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    #[test]
+    fn exhausted_tokens_never_wrap_or_reuse_zero() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(allocate_type_version(&counter), Some(u64::MAX - 1));
+        assert_eq!(allocate_type_version(&counter), None);
+        assert_eq!(allocate_type_version(&counter), None);
+        assert_eq!(counter.load(Relaxed), u64::MAX);
+        let zero = AtomicU64::new(0);
+        assert_eq!(allocate_type_version(&zero), None);
+        assert_eq!(zero.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn concurrent_classes_and_mutations_have_distinct_tokens() {
+        let values = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut values = Vec::new();
+                        for _ in 0..256 {
+                            let version = AttrVersion::fresh();
+                            values.push(version.get());
+                            version.bump();
+                            values.push(version.get());
+                        }
+                        values
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .flat_map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let count = values.len();
+        let mut unique = values;
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), count);
+        assert!(unique.iter().all(|&value| value != 0));
     }
 }
 
@@ -99,35 +150,33 @@ fn next_type_version() -> u32 {
 /// unique ([`AttrVersion`]), so a freed-and-reallocated type cannot alias
 /// a stale entry; positive hits additionally confirm the key at the
 /// recorded slot spells `name`, falling back to the walk otherwise. The
-/// name is identified by a 64-bit Fx hash plus length; two distinct
-/// attribute names of one type colliding on both is not a practical
-/// concern (the same trust CPython places in interned pointer identity).
+/// name hash selects a cache slot, but every hit also compares the exact
+/// spelling. In particular, a negative hit must not hide a different name
+/// whose hash and length happen to collide.
 pub(crate) mod type_cache {
     use std::cell::RefCell;
     use std::hash::Hasher;
+    use std::rc::Rc;
 
-    /// Entries per thread (CPython's `MCACHE_SIZE_EXP` is 12 too). 32 B
-    /// each, 128 KiB per thread, allocated on first use.
+    /// Entries per thread (CPython's `MCACHE_SIZE_EXP` is 12 too). The
+    /// table is allocated on first use. Names are owned by this
+    /// thread's entries and released when those entries are replaced.
     const SIZE: usize = 1 << 12;
     const MASK: usize = SIZE - 1;
     /// `mro_idx` value recording "the walk found nothing".
     const ABSENT: u32 = u32::MAX;
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     struct Entry {
-        ty: usize,
-        name_hash: u64,
-        ver: u32,
-        name_len: u32,
+        name: Option<Rc<str>>,
+        ver: u64,
         mro_idx: u32,
         dict_idx: u32,
     }
 
     const EMPTY: Entry = Entry {
-        ty: 0,
-        name_hash: 0,
+        name: None,
         ver: 0,
-        name_len: 0,
         mro_idx: ABSENT,
         dict_idx: 0,
     };
@@ -153,27 +202,21 @@ pub(crate) mod type_cache {
     }
 
     #[inline]
-    fn slot(ty: usize, ver: u32, name_hash: u64) -> usize {
+    fn slot(ty: usize, ver: u64, name_hash: u64) -> usize {
         // Mix the type identity in so the same dunder on many classes
         // does not pile into one slot; the version keeps a class's
         // entries moving after each mutation so stale slots recycle.
-        ((name_hash ^ (ty as u64 >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ u64::from(ver))
-            as usize)
-            & MASK
+        ((name_hash ^ (ty as u64 >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ ver) as usize) & MASK
     }
 
     /// Probe the cache. `ver` is the type's *current* version.
     #[inline]
-    pub(crate) fn probe(ty: usize, ver: u32, name: &str, name_hash: u64) -> Option<Hit> {
+    pub(crate) fn probe(ty: usize, ver: u64, name: &str, name_hash: u64) -> Option<Hit> {
         CACHE.with(|c| {
             let c = c.try_borrow().ok()?;
             let table = c.as_ref()?;
             let e = &table[slot(ty, ver, name_hash)];
-            if e.ty == ty
-                && e.ver == ver
-                && e.name_hash == name_hash
-                && e.name_len as usize == name.len()
-            {
+            if e.ver == ver && e.name.as_deref() == Some(name) {
                 Some(if e.mro_idx == ABSENT {
                     Hit::Absent
                 } else {
@@ -190,7 +233,7 @@ pub(crate) mod type_cache {
 
     /// Record the outcome of a full walk.
     #[inline]
-    pub(crate) fn fill(ty: usize, ver: u32, name: &str, name_hash: u64, hit: Hit) {
+    pub(crate) fn fill(ty: usize, ver: u64, name: &str, name_hash: u64, hit: Hit) {
         CACHE.with(|c| {
             let Ok(mut c) = c.try_borrow_mut() else {
                 return;
@@ -200,15 +243,71 @@ pub(crate) mod type_cache {
                 Hit::At { mro_idx, dict_idx } => (mro_idx, dict_idx),
                 Hit::Absent => (ABSENT, 0),
             };
-            table[slot(ty, ver, name_hash)] = Entry {
-                ty,
-                name_hash,
-                ver,
-                name_len: name.len() as u32,
-                mro_idx,
-                dict_idx,
-            };
+            let entry = &mut table[slot(ty, ver, name_hash)];
+            if entry.name.as_deref() != Some(name) {
+                entry.name = Some(Rc::from(name));
+            }
+            entry.ver = ver;
+            entry.mro_idx = mro_idx;
+            entry.dict_idx = dict_idx;
         });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{fill, probe, Hit};
+
+        #[test]
+        fn colliding_slots_require_the_current_class_token() {
+            let first_type = 0x100;
+            let second_type = 0x200;
+            let first_version = 41;
+            let second_version = 42;
+            let first_hash = 17;
+            let mix = |ty: usize| (ty as u64 >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let second_hash =
+                first_hash ^ mix(first_type) ^ first_version ^ mix(second_type) ^ second_version;
+            assert_eq!(
+                super::slot(first_type, first_version, first_hash),
+                super::slot(second_type, second_version, second_hash)
+            );
+            fill(first_type, first_version, "value", first_hash, Hit::Absent);
+            assert_eq!(
+                probe(second_type, second_version, "value", second_hash),
+                None
+            );
+            let hit = Hit::At {
+                mro_idx: 0,
+                dict_idx: 0,
+            };
+            fill(second_type, second_version, "value", second_hash, hit);
+            assert_eq!(
+                probe(second_type, second_version, "value", second_hash),
+                Some(hit)
+            );
+            assert_eq!(probe(first_type, first_version, "value", first_hash), None);
+        }
+
+        #[test]
+        fn unique_version_cache_entries_fit_in_thirty_two_bytes() {
+            assert!(std::mem::size_of::<super::Entry>() <= 32);
+        }
+
+        #[test]
+        fn colliding_names_do_not_share_positive_or_negative_hits() {
+            let collision = 17;
+            fill(123, 4, "missing", collision, Hit::Absent);
+            assert_eq!(probe(123, 4, "missing", collision), Some(Hit::Absent));
+            assert_eq!(probe(123, 4, "present", collision), None);
+            let hit = Hit::At {
+                mro_idx: 2,
+                dict_idx: 3,
+            };
+            fill(123, 4, "present", collision, hit);
+            assert_eq!(probe(123, 4, "present", collision), Some(hit));
+            assert_eq!(probe(123, 4, "missing", collision), None);
+            assert_eq!(probe(123, 5, "present", collision), None);
+        }
     }
 }
 
@@ -308,7 +407,7 @@ pub struct TypeObject {
     /// the [`Self::attr_version`] observed when it was built. Rebuilt
     /// lazily whenever the version moved on. See
     /// `Interpreter::instance_plan`.
-    pub instance_plan: RefCell<Option<(u32, Rc<InstancePlan>)>>,
+    pub instance_plan: RefCell<Option<(u64, Rc<InstancePlan>)>>,
     /// The C `tp_name` of the extension type this class bridges, when it
     /// differs from the bare [`Self::name`] (`"numpy.ndarray"` vs
     /// `"ndarray"`). CPython's `tp_name`-based error text (the
@@ -316,7 +415,7 @@ pub struct TypeObject {
     /// string while `__name__` stays bare; set by the C-API bridge when a
     /// stock extension type is readied. The `&'static` is a leaked copy —
     /// bridged types are immortal.
-    pub c_tp_name: Cell<Option<&'static str>>,
+    pub c_tp_name: crate::sync::RefCell<Option<&'static str>>,
     /// The bridged C type carries a real `tp_as_sequence->sq_item` (RFC
     /// 0047, wave 5). Set by the C-API bridge when an extension type is
     /// readied/spec-built. `PyObject_GetIter`'s legacy fallback keys on
@@ -678,7 +777,7 @@ impl TypeObject {
             attr_version: AttrVersion::fresh(),
             has_del: Cell::new(0),
             instance_plan: RefCell::new(None),
-            c_tp_name: Cell::new(None),
+            c_tp_name: crate::sync::RefCell::new(None),
             c_sq_item: Cell::new(false),
             immutable: Cell::new(false),
             frozen_heap_type: Cell::new(false),
@@ -1517,6 +1616,252 @@ pub fn register_instance_body_free(f: fn(usize)) {
     let _ = INSTANCE_BODY_FREE.set(f);
 }
 
+/// Slot values stored separately from an instance's `__dict__`.
+///
+/// Empty and single-slot instances need no dictionary allocation. A
+/// second distinct slot promotes to a small ordered vector; the ninth
+/// promotes to the same ordered table used by larger instances. Rust can
+/// place the single-entry payload in the table representation's unused niche
+/// without enlarging the field on 64-bit targets. Smaller targets retain
+/// ordinary table storage.
+#[cfg(target_pointer_width = "64")]
+#[derive(Debug, Clone)]
+pub struct SlotStorage {
+    data: SlotData,
+}
+
+#[cfg(target_pointer_width = "64")]
+#[derive(Debug, Clone)]
+enum SlotData {
+    Single { key: Option<DictKey>, value: Object },
+    Small(Vec<(DictKey, Object)>),
+    Many(DictData),
+}
+
+#[cfg(target_pointer_width = "64")]
+impl Default for SlotStorage {
+    fn default() -> Self {
+        Self {
+            data: SlotData::Single {
+                key: None,
+                value: Object::None,
+            },
+        }
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+impl SlotStorage {
+    /// The current ordered position of a populated slot. Positions can
+    /// change after deletion or differ between instances of the same class.
+    pub fn index_of(&self, name: &str) -> Option<u32> {
+        match &self.data {
+            SlotData::Single { .. } => self.get(name).map(|_| 0),
+            SlotData::Small(entries) => entries
+                .iter()
+                .position(
+                    |(key, _)| matches!(&key.0, Object::Str(stored) if stored.as_ref() == name),
+                )
+                .map(|index| index as u32),
+            SlotData::Many(table) => table
+                .get_index_of(&crate::object::StrKey(name))
+                .and_then(|index| u32::try_from(index).ok()),
+        }
+    }
+
+    /// Read an ordered entry. Callers caching an index must also validate
+    /// its key; the class identity alone does not determine slot order.
+    #[inline]
+    pub fn get_index(&self, index: usize) -> Option<(&DictKey, &Object)> {
+        match &self.data {
+            SlotData::Single { key, value } if index == 0 => key.as_ref().map(|key| (key, value)),
+            SlotData::Small(entries) => entries.get(index).map(|(key, value)| (key, value)),
+            SlotData::Many(table) => table.get_index(index),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn get_index_mut(&mut self, index: usize) -> Option<(&DictKey, &mut Object)> {
+        match &mut self.data {
+            SlotData::Single { key, value } if index == 0 => key.as_ref().map(|key| (key, value)),
+            SlotData::Small(entries) => entries.get_mut(index).map(|(key, value)| (&*key, value)),
+            SlotData::Many(table) => table.get_index_mut(index),
+            _ => None,
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Object> {
+        match &self.data {
+            SlotData::Single {
+                key: Some(DictKey(Object::Str(stored))),
+                value,
+            } if stored.as_ref() == name => Some(value),
+            SlotData::Small(entries) => entries.iter().find_map(|(key, value)| {
+                matches!(&key.0, Object::Str(stored) if stored.as_ref() == name).then_some(value)
+            }),
+            SlotData::Many(table) => table.get(&crate::object::StrKey(name)),
+            _ => None,
+        }
+    }
+
+    pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {
+        self.insert_with_key(name, value, || DictKey(Object::Str(Rc::from(name))))
+    }
+
+    /// Reuse an existing name allocation when populating a new slot.
+    /// Updating a populated slot keeps its original key allocation.
+    pub fn insert_shared(&mut self, name: &Rc<str>, value: Object) -> Option<Object> {
+        self.insert_with_key(name, value, || DictKey(Object::Str(name.clone())))
+    }
+
+    fn insert_with_key(
+        &mut self,
+        name: &str,
+        value: Object,
+        make_key: impl FnOnce() -> DictKey,
+    ) -> Option<Object> {
+        match &mut self.data {
+            SlotData::Single { key, value: slot } if key.is_none() => {
+                *key = Some(make_key());
+                *slot = value;
+                return None;
+            }
+            SlotData::Single {
+                key: Some(DictKey(Object::Str(stored))),
+                value: slot,
+            } if stored.as_ref() == name => return Some(std::mem::replace(slot, value)),
+            SlotData::Small(entries) => {
+                if let Some((_, slot)) = entries.iter_mut().find(
+                    |(key, _)| matches!(&key.0, Object::Str(stored) if stored.as_ref() == name),
+                ) {
+                    return Some(std::mem::replace(slot, value));
+                }
+                if entries.len() < 8 {
+                    entries.push((make_key(), value));
+                    return None;
+                }
+            }
+            SlotData::Many(table) => {
+                // Updating a populated slot keeps its existing key allocation.
+                if let Some(slot) = table.get_mut(&crate::object::StrKey(name)) {
+                    return Some(std::mem::replace(slot, value));
+                }
+                table.insert(make_key(), value);
+                return None;
+            }
+            _ => {}
+        }
+        self.data = match std::mem::take(self).data {
+            SlotData::Single {
+                key: Some(key),
+                value: previous,
+            } => SlotData::Small(vec![(key, previous), (make_key(), value)]),
+            SlotData::Small(entries) => {
+                let mut table = DictData::with_capacity_and_hasher(
+                    entries.len() + 1,
+                    crate::fasthash::FxBuildHasher,
+                );
+                for (key, previous) in entries {
+                    table.insert(key, previous);
+                }
+                table.insert(make_key(), value);
+                SlotData::Many(table)
+            }
+            _ => unreachable!("only populated single or small slots need promotion"),
+        };
+        None
+    }
+
+    pub fn remove(&mut self, name: &str) -> Option<Object> {
+        match &mut self.data {
+            SlotData::Single { key, value } if matches!(key.as_ref(), Some(DictKey(Object::Str(stored))) if stored.as_ref() == name) =>
+            {
+                *key = None;
+                Some(std::mem::replace(value, Object::None))
+            }
+            SlotData::Small(entries) => entries
+                .iter()
+                .position(
+                    |(key, _)| matches!(&key.0, Object::Str(stored) if stored.as_ref() == name),
+                )
+                .map(|index| entries.remove(index).1),
+            SlotData::Many(table) => table.shift_remove(&crate::object::StrKey(name)),
+            _ => None,
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&DictKey, &Object)> {
+        let (single, small, many) = match &self.data {
+            SlotData::Single { key, value } => (key.as_ref().map(|key| (key, value)), None, None),
+            SlotData::Small(entries) => (None, Some(entries), None),
+            SlotData::Many(table) => (None, None, Some(table)),
+        };
+        single
+            .into_iter()
+            .chain(small.into_iter().flatten().map(|(key, value)| (key, value)))
+            .chain(many.into_iter().flat_map(|table| table.iter()))
+    }
+}
+
+/// Slot storage for targets where an inline object pair would enlarge
+/// every instance. An empty table allocates no backing storage.
+#[cfg(not(target_pointer_width = "64"))]
+#[derive(Debug, Clone, Default)]
+pub struct SlotStorage(DictData);
+
+#[cfg(not(target_pointer_width = "64"))]
+impl SlotStorage {
+    pub fn index_of(&self, name: &str) -> Option<u32> {
+        self.0
+            .get_index_of(&crate::object::StrKey(name))
+            .and_then(|index| u32::try_from(index).ok())
+    }
+
+    #[inline]
+    pub fn get_index(&self, index: usize) -> Option<(&DictKey, &Object)> {
+        self.0.get_index(index)
+    }
+
+    #[inline]
+    pub fn get_index_mut(&mut self, index: usize) -> Option<(&DictKey, &mut Object)> {
+        self.0.get_index_mut(index)
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Object> {
+        self.0.get(&crate::object::StrKey(name))
+    }
+
+    pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {
+        self.insert_with_key(name, value, || DictKey(Object::Str(Rc::from(name))))
+    }
+
+    /// Share the name allocation only for a newly populated slot.
+    pub fn insert_shared(&mut self, name: &Rc<str>, value: Object) -> Option<Object> {
+        self.insert_with_key(name, value, || DictKey(Object::Str(name.clone())))
+    }
+
+    fn insert_with_key(
+        &mut self,
+        name: &str,
+        value: Object,
+        make_key: impl FnOnce() -> DictKey,
+    ) -> Option<Object> {
+        if let Some(slot) = self.0.get_mut(&crate::object::StrKey(name)) {
+            return Some(std::mem::replace(slot, value));
+        }
+        self.0.insert(make_key(), value)
+    }
+
+    pub fn remove(&mut self, name: &str) -> Option<Object> {
+        self.0.shift_remove(&crate::object::StrKey(name))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&DictKey, &Object)> {
+        self.0.iter()
+    }
+}
+
 /// An instance of a user-defined class.
 ///
 /// `dict` mirrors CPython's `__dict__` — attribute writes land here
@@ -1528,7 +1873,9 @@ pub struct PyInstance {
     /// `obj.__class__ = OtherClass` for layout-compatible heap types;
     /// read through [`PyInstance::cls`].
     pub class: RefCell<Rc<TypeObject>>,
-    pub dict: Rc<RefCell<DictData>>,
+    /// Instance attributes, allocated on the first write or exported handle.
+    /// Reads through `get()` preserve the absence of an unused dictionary.
+    pub dict: crate::sync::LazyArc<RefCell<DictData>>,
     /// For instances of a subclass of an immutable built-in
     /// (`int`, `str`, `float`, `bytes`, `tuple`, …) this holds the
     /// underlying primitive value the instance *is* — the moral
@@ -1552,8 +1899,9 @@ pub struct PyInstance {
     /// members *outside* the instance `__dict__`; we mirror that
     /// separation with a side table so `vars(obj)` never exposes slot
     /// values and `object.__getstate__` can report them separately.
-    /// `None` until the first slot write (most instances have none).
-    pub slots: RefCell<Option<DictData>>,
+    /// Empty and single-slot storage stays inline; two to eight slots
+    /// use an ordered vector, and larger instances use an ordered table.
+    pub slots: RefCell<SlotStorage>,
     /// Memoised Python `__hash__` result, populated lazily *only* for
     /// instances that wrap an **immutable** builtin value (an `int`/`str`/
     /// `tuple`/… subclass). Such an instance's value can't change, so its
@@ -1564,7 +1912,7 @@ pub struct PyInstance {
     /// `object` subclass with a side-effecting or conditionally-raising
     /// `__hash__` (test_dict's `BadHash`) wraps no native value and is
     /// never cached here, so it is re-invoked on every probe like CPython.
-    pub hash_cache: Cell<Option<i64>>,
+    pub hash_cache: crate::sync::CachedHash,
     /// One-shot "has `__del__` already run for this instance?" guard,
     /// mirroring [`crate::object::PyGenerator::finalize_ran`] and CPython's
     /// `_PyGC_FINALIZED` bit. Set by `Vm::invoke_finalizer` the moment the
@@ -1591,11 +1939,11 @@ impl PyInstance {
     pub fn new(class: Rc<TypeObject>) -> Self {
         Self {
             class: RefCell::new(class),
-            dict: Rc::new(RefCell::new(DictData::default())),
+            dict: crate::sync::LazyArc::new(),
             native: std::sync::OnceLock::new(),
             inline_values: Cell::new(true),
-            slots: RefCell::new(None),
-            hash_cache: Cell::new(None),
+            slots: RefCell::new(SlotStorage::default()),
+            hash_cache: crate::sync::CachedHash::new(None),
             finalize_ran: Cell::new(false),
             c_body: CBody::default(),
         }
@@ -1606,11 +1954,11 @@ impl PyInstance {
     pub fn with_native(class: Rc<TypeObject>, native: Object) -> Self {
         Self {
             class: RefCell::new(class),
-            dict: Rc::new(RefCell::new(DictData::default())),
+            dict: crate::sync::LazyArc::new(),
             native: std::sync::OnceLock::from(native),
             inline_values: Cell::new(true),
-            slots: RefCell::new(None),
-            hash_cache: Cell::new(None),
+            slots: RefCell::new(SlotStorage::default()),
+            hash_cache: crate::sync::CachedHash::new(None),
             finalize_ran: Cell::new(false),
             c_body: CBody::default(),
         }
@@ -1631,32 +1979,17 @@ impl PyInstance {
     /// Keys in the side table are always plain `Str` (only `slot_set`
     /// writes it), so the allocation-free probe is authoritative.
     pub fn slot_get(&self, name: &str) -> Option<Object> {
-        self.slots
-            .borrow()
-            .as_ref()
-            .and_then(|s| s.get(&crate::object::StrKey(name)).cloned())
+        self.slots.borrow().get(name).cloned()
     }
 
     /// Write slot `name` into the side table.
     pub fn slot_set(&self, name: &str, value: Object) {
-        let mut guard = self.slots.borrow_mut();
-        let table = guard.get_or_insert_with(DictData::default);
-        // Overwrite in place without re-allocating the key when the
-        // slot already exists (every write after the first).
-        if let Some(v) = table.get_mut(&crate::object::StrKey(name)) {
-            *v = value;
-        } else {
-            table.insert(DictKey(Object::from_str(name)), value);
-        }
+        self.slots.borrow_mut().insert(name, value);
     }
 
     /// Delete slot `name` from the side table; `false` when unset.
     pub fn slot_del(&self, name: &str) -> bool {
-        self.slots
-            .borrow_mut()
-            .as_mut()
-            .map(|s| s.shift_remove(&crate::object::StrKey(name)).is_some())
-            .unwrap_or(false)
+        self.slots.borrow_mut().remove(name).is_some()
     }
 
     /// Snapshot of the populated slot values (for `__getstate__`,
@@ -1664,16 +1997,12 @@ impl PyInstance {
     pub fn slots_snapshot(&self) -> Vec<(String, Object)> {
         self.slots
             .borrow()
-            .as_ref()
-            .map(|s| {
-                s.iter()
-                    .filter_map(|(k, v)| match &k.0 {
-                        Object::Str(name) => Some((name.to_string(), v.clone())),
-                        _ => None,
-                    })
-                    .collect()
+            .iter()
+            .filter_map(|(k, v)| match &k.0 {
+                Object::Str(name) => Some((name.to_string(), v.clone())),
+                _ => None,
             })
-            .unwrap_or_default()
+            .collect()
     }
 }
 
@@ -1740,12 +2069,217 @@ impl Drop for PyInstance {
             },
             inline_values: Cell::new(self.inline_values.get()),
             slots: RefCell::new(self.slots.borrow().clone()),
-            hash_cache: Cell::new(self.hash_cache.get()),
+            hash_cache: crate::sync::CachedHash::new(self.hash_cache.get()),
             finalize_ran: Cell::new(true),
             // The resurrected copy is a distinct object that owns no C
             // body (the dying `self` already freed its own above).
             c_body: CBody::default(),
         }));
         crate::vm_singletons::try_push_pending_finalizer(resurrected);
+    }
+}
+
+#[cfg(all(test, target_pointer_width = "64"))]
+mod slot_storage_tests {
+    use super::*;
+
+    #[test]
+    fn shared_slot_names_survive_promotion_and_release_with_their_owners() {
+        let names: Vec<Rc<str>> = (0..16).map(|i| Rc::from(format!("slot{i}"))).collect();
+        let mut first = SlotStorage::default();
+        let mut second = SlotStorage::default();
+        for (i, name) in names.iter().enumerate() {
+            first.insert_shared(name, Object::Int(i as i64));
+            second.insert_shared(name, Object::None);
+            assert_eq!(Rc::strong_count(name), 3);
+            for slots in [&first, &second] {
+                let (key, _) = slots.get_index(i).unwrap();
+                let Object::Str(stored) = &key.0 else {
+                    panic!("slot key must be a string");
+                };
+                assert!(Rc::ptr_eq(stored, name));
+            }
+        }
+        let replacement: Rc<str> = Rc::from("slot5");
+        assert_eq!(
+            first
+                .insert_shared(&replacement, Object::Int(100))
+                .and_then(|v| v.as_i64()),
+            Some(5)
+        );
+        assert_eq!(Rc::strong_count(&replacement), 1);
+        assert_eq!(Rc::strong_count(&names[5]), 3);
+        first.remove("slot5");
+        first.insert_shared(&replacement, Object::Int(200));
+        assert_eq!(first.index_of("slot5"), Some(15));
+        assert_eq!(Rc::strong_count(&names[5]), 2);
+        assert_eq!(Rc::strong_count(&replacement), 2);
+        let cloned = first.clone();
+        assert_eq!(Rc::strong_count(&replacement), 3);
+        drop(first);
+        assert_eq!(cloned.get("slot5").and_then(Object::as_i64), Some(200));
+        drop(cloned);
+        drop(second);
+        assert!(names.iter().all(|name| Rc::strong_count(name) == 1));
+        assert_eq!(Rc::strong_count(&replacement), 1);
+    }
+
+    #[test]
+    fn existing_slots_do_not_request_a_replacement_key() {
+        let mut slots = SlotStorage::default();
+        for i in 0..16 {
+            let name = format!("slot{i}");
+            slots.insert(&name, Object::Int(i));
+            assert_eq!(
+                slots
+                    .insert_with_key(&name, Object::None, || {
+                        panic!("updating a populated slot must not construct a key")
+                    })
+                    .and_then(|v| v.as_i64()),
+                Some(i)
+            );
+        }
+    }
+
+    #[test]
+    fn inline_slot_storage_does_not_enlarge_instances() {
+        assert!(
+            std::mem::size_of::<RefCell<SlotStorage>>()
+                <= std::mem::size_of::<RefCell<Option<DictData>>>()
+        );
+    }
+
+    #[test]
+    fn single_slot_replaces_deletes_and_reuses_inline_storage() {
+        let mut slots = SlotStorage::default();
+        assert_eq!(slots.iter().count(), 0);
+        assert!(slots.get("value").is_none());
+        assert!(slots.insert("value", Object::Int(1)).is_none());
+        assert_eq!(slots.get("value").and_then(Object::as_i64), Some(1));
+        assert_eq!(
+            slots
+                .insert("value", Object::Int(2))
+                .and_then(|v| v.as_i64()),
+            Some(1)
+        );
+        assert!(matches!(slots.data, SlotData::Single { .. }));
+        assert!(slots.remove("missing").is_none());
+        assert_eq!(slots.remove("value").and_then(|v| v.as_i64()), Some(2));
+        assert_eq!(slots.iter().count(), 0);
+        assert!(slots.insert("α", Object::None).is_none());
+        assert!(matches!(slots.get("α"), Some(Object::None)));
+        assert_eq!(slots.iter().count(), 1);
+        assert!(matches!(slots.data, SlotData::Single { .. }));
+    }
+
+    #[test]
+    fn ninth_slot_promotes_without_replacing_existing_keys() {
+        let mut slots = SlotStorage::default();
+        let mut keys = Vec::new();
+        for i in 0..16 {
+            let name = format!("slot{i}");
+            assert!(slots.insert(&name, Object::Int(i)).is_none());
+            keys.push(slots.iter().last().unwrap().0 .0.clone());
+            match i {
+                0 => assert!(matches!(slots.data, SlotData::Single { .. })),
+                1..=7 => assert!(matches!(slots.data, SlotData::Small(_))),
+                _ => assert!(matches!(slots.data, SlotData::Many(_))),
+            }
+            for (index, (key, value)) in slots.iter().enumerate() {
+                assert!(key.0.is_same(&keys[index]));
+                assert_eq!(value.as_i64(), Some(index as i64));
+            }
+        }
+        let mut cloned = slots.clone();
+        for i in (0..16).rev() {
+            let name = format!("slot{i}");
+            assert_eq!(slots.remove(&name).and_then(|v| v.as_i64()), Some(i));
+            assert!(slots.get(&name).is_none());
+            assert_eq!(cloned.get(&name).and_then(Object::as_i64), Some(i));
+        }
+        assert_eq!(slots.iter().count(), 0);
+        cloned.insert("slot0", Object::None);
+        assert!(matches!(cloned.get("slot0"), Some(Object::None)));
+    }
+
+    #[test]
+    fn small_vector_preserves_order_after_removal() {
+        let mut slots = SlotStorage::default();
+        for name in [
+            "one", "two", "three", "four", "five", "six", "seven", "eight",
+        ] {
+            slots.insert(name, Object::None);
+        }
+        assert!(matches!(&slots.data, SlotData::Small(entries) if entries.len() == 8));
+        assert!(slots.remove("two").is_some());
+        slots.insert("α", Object::Int(9));
+        assert!(matches!(&slots.data, SlotData::Small(entries) if entries.len() == 8));
+        assert!(
+            matches!(&slots.iter().last().unwrap().0 .0, Object::Str(name) if name.as_ref() == "α")
+        );
+        let mut cloned = slots.clone();
+        cloned.insert("α", Object::Int(10));
+        assert_eq!(slots.get("α").and_then(Object::as_i64), Some(9));
+        assert_eq!(cloned.get("α").and_then(Object::as_i64), Some(10));
+    }
+
+    #[test]
+    fn ordered_slot_indices_track_promotions_and_removals() {
+        let mut slots = SlotStorage::default();
+        assert!(slots.get_index(0).is_none());
+        assert!(slots.get_index_mut(usize::MAX).is_none());
+        for i in 0..16 {
+            let name = format!("slot{i}");
+            slots.insert(&name, Object::Int(i));
+            assert_eq!(slots.index_of(&name), Some(i as u32));
+            assert_eq!(slots.get_index(i as usize).unwrap().1.as_i64(), Some(i));
+        }
+        for i in (0..16).step_by(2) {
+            slots.remove(&format!("slot{i}"));
+        }
+        for index in 0..8 {
+            let name = format!("slot{}", 2 * index + 1);
+            assert_eq!(slots.index_of(&name), Some(index));
+            let (key, value) = slots.get_index_mut(index as usize).unwrap();
+            assert!(matches!(&key.0, Object::Str(stored) if stored.as_ref() == name));
+            *value = Object::Int(100 + i64::from(index));
+            assert_eq!(
+                slots.get(&name).and_then(Object::as_i64),
+                Some(100 + i64::from(index))
+            );
+        }
+        assert!(slots.index_of("slot0").is_none());
+        slots.insert("slot0", Object::Int(900));
+        assert_eq!(slots.index_of("slot0"), Some(8));
+        assert!(slots.get_index(9).is_none());
+    }
+
+    #[test]
+    fn promotion_preserves_keys_order_and_independent_clones() {
+        let mut slots = SlotStorage::default();
+        slots.insert("first", Object::Int(1));
+        let original_key = slots.iter().next().unwrap().0 .0.clone();
+        slots.insert("second", Object::Int(2));
+        assert!(matches!(slots.data, SlotData::Small(_)));
+        assert!(slots.iter().next().unwrap().0 .0.is_same(&original_key));
+        let names = |slots: &SlotStorage| {
+            slots
+                .iter()
+                .map(|(key, _)| match &key.0 {
+                    Object::Str(name) => name.to_string(),
+                    _ => panic!("slot key must be a string"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&slots), ["first", "second"]);
+        slots.insert("first", Object::Int(3));
+        assert_eq!(names(&slots), ["first", "second"]);
+        slots.remove("first");
+        slots.insert("first", Object::Int(4));
+        assert_eq!(names(&slots), ["second", "first"]);
+        let mut cloned = slots.clone();
+        cloned.insert("first", Object::Int(5));
+        assert_eq!(slots.get("first").and_then(Object::as_i64), Some(4));
+        assert_eq!(cloned.get("first").and_then(Object::as_i64), Some(5));
     }
 }

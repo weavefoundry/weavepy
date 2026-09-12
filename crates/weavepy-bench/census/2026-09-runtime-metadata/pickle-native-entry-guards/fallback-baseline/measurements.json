@@ -1,0 +1,1971 @@
+{
+  "purpose": "Measure small native and fallback pickle loads, including unsupported protocols.",
+  "execution_context": {
+    "declared_launch_context": "outside-tool-filesystem-sandbox (require_escalated)",
+    "environment": {
+      "TZ": null,
+      "LANG": "C.UTF-8",
+      "LC_ALL": "C.UTF-8",
+      "LC_TIME": null,
+      "PYTHON_JIT": null,
+      "PYTHON_GIL": null
+    }
+  },
+  "samples": 7,
+  "rows": {
+    "none_p0": {
+      "source": "target/pickle-native-entry-guards-fallback-baseline/none_p0.py",
+      "source_sha256": "976fdc25bf20f42522c556ffa59343d7a6ea382bbd1aa30b6a9996f6cd0d1db0",
+      "work": 2000,
+      "supported": false,
+      "verification": {
+        "previous_jit": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "previous_interp": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "jit": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "interp": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "cpython": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        }
+      },
+      "samples": {
+        "previous_jit": [
+          {
+            "ns": 199893209,
+            "wall_ns": 546739334,
+            "cpu_ns": 512677000,
+            "rss_bytes": 38060032,
+            "work_cpu_ns": 187805000
+          },
+          {
+            "ns": 200325000,
+            "wall_ns": 547531834,
+            "cpu_ns": 503829000,
+            "rss_bytes": 37945344,
+            "work_cpu_ns": 186831000
+          },
+          {
+            "ns": 204037000,
+            "wall_ns": 598083167,
+            "cpu_ns": 520960000,
+            "rss_bytes": 37961728,
+            "work_cpu_ns": 188434000
+          },
+          {
+            "ns": 196960375,
+            "wall_ns": 556933500,
+            "cpu_ns": 509613000,
+            "rss_bytes": 38027264,
+            "work_cpu_ns": 184168000
+          },
+          {
+            "ns": 207515417,
+            "wall_ns": 563774208,
+            "cpu_ns": 523713000,
+            "rss_bytes": 37814272,
+            "work_cpu_ns": 194478000
+          },
+          {
+            "ns": 203495375,
+            "wall_ns": 556299250,
+            "cpu_ns": 509456000,
+            "rss_bytes": 38141952,
+            "work_cpu_ns": 189016000
+          },
+          {
+            "ns": 204324875,
+            "wall_ns": 585108000,
+            "cpu_ns": 525218000,
+            "rss_bytes": 38010880,
+            "work_cpu_ns": 191233000
+          }
+        ],
+        "previous_interp": [
+          {
+            "ns": 193694125,
+            "wall_ns": 555996875,
+            "cpu_ns": 508893000,
+            "rss_bytes": 36110336,
+            "work_cpu_ns": 182341000
+          },
+          {
+            "ns": 193502292,
+            "wall_ns": 588349791,
+            "cpu_ns": 503432000,
+            "rss_bytes": 35028992,
+            "work_cpu_ns": 177617000
+          },
+          {
+            "ns": 192884708,
+            "wall_ns": 541042541,
+            "cpu_ns": 499091000,
+            "rss_bytes": 36159488,
+            "work_cpu_ns": 179238000
+          },
+          {
+            "ns": 182705125,
+            "wall_ns": 528240917,
+            "cpu_ns": 484010000,
+            "rss_bytes": 35078144,
+            "work_cpu_ns": 173051000
+          },
+          {
+            "ns": 201311625,
+            "wall_ns": 569815666,
+            "cpu_ns": 515084000,
+            "rss_bytes": 36110336,
+            "work_cpu_ns": 188463000
+          },
+          {
+            "ns": 199594667,
+            "wall_ns": 552183875,
+            "cpu_ns": 500198000,
+            "rss_bytes": 34930688,
+            "work_cpu_ns": 184183000
+          },
+          {
+            "ns": 209873000,
+            "wall_ns": 592790291,
+            "cpu_ns": 526306000,
+            "rss_bytes": 36093952,
+            "work_cpu_ns": 193632000
+          }
+        ],
+        "jit": [
+          {
+            "ns": 206615666,
+            "wall_ns": 573149000,
+            "cpu_ns": 522916000,
+            "rss_bytes": 38174720,
+            "work_cpu_ns": 189739000
+          },
+          {
+            "ns": 207471000,
+            "wall_ns": 599201666,
+            "cpu_ns": 539340000,
+            "rss_bytes": 39370752,
+            "work_cpu_ns": 188985000
+          },
+          {
+            "ns": 193012250,
+            "wall_ns": 563849875,
+            "cpu_ns": 514201000,
+            "rss_bytes": 38043648,
+            "work_cpu_ns": 184068000
+          },
+          {
+            "ns": 201175250,
+            "wall_ns": 555573250,
+            "cpu_ns": 520132000,
+            "rss_bytes": 39321600,
+            "work_cpu_ns": 189353000
+          },
+          {
+            "ns": 206162917,
+            "wall_ns": 556999667,
+            "cpu_ns": 519492000,
+            "rss_bytes": 38223872,
+            "work_cpu_ns": 193301000
+          },
+          {
+            "ns": 220771791,
+            "wall_ns": 586705666,
+            "cpu_ns": 532860000,
+            "rss_bytes": 39321600,
+            "work_cpu_ns": 197275000
+          },
+          {
+            "ns": 244743916,
+            "wall_ns": 641202125,
+            "cpu_ns": 550714000,
+            "rss_bytes": 38125568,
+            "work_cpu_ns": 208107000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 192756334,
+            "wall_ns": 536304667,
+            "cpu_ns": 493618000,
+            "rss_bytes": 35110912,
+            "work_cpu_ns": 179269000
+          },
+          {
+            "ns": 209094958,
+            "wall_ns": 547124542,
+            "cpu_ns": 496597000,
+            "rss_bytes": 35012608,
+            "work_cpu_ns": 185423000
+          },
+          {
+            "ns": 207026666,
+            "wall_ns": 586881958,
+            "cpu_ns": 502376000,
+            "rss_bytes": 35110912,
+            "work_cpu_ns": 187806000
+          },
+          {
+            "ns": 223727166,
+            "wall_ns": 570661417,
+            "cpu_ns": 505976000,
+            "rss_bytes": 35160064,
+            "work_cpu_ns": 188949000
+          },
+          {
+            "ns": 185654375,
+            "wall_ns": 540289875,
+            "cpu_ns": 495682000,
+            "rss_bytes": 34979840,
+            "work_cpu_ns": 176297000
+          },
+          {
+            "ns": 203197708,
+            "wall_ns": 589455083,
+            "cpu_ns": 510471000,
+            "rss_bytes": 34914304,
+            "work_cpu_ns": 188087000
+          },
+          {
+            "ns": 209040125,
+            "wall_ns": 593321417,
+            "cpu_ns": 515704000,
+            "rss_bytes": 35094528,
+            "work_cpu_ns": 188298000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 801875,
+            "wall_ns": 80465375,
+            "cpu_ns": 68536000,
+            "rss_bytes": 16203776,
+            "work_cpu_ns": 796000
+          },
+          {
+            "ns": 1034000,
+            "wall_ns": 84135167,
+            "cpu_ns": 65180000,
+            "rss_bytes": 16138240,
+            "work_cpu_ns": 945000
+          },
+          {
+            "ns": 825208,
+            "wall_ns": 77512125,
+            "cpu_ns": 61046000,
+            "rss_bytes": 16072704,
+            "work_cpu_ns": 821000
+          },
+          {
+            "ns": 835875,
+            "wall_ns": 78374417,
+            "cpu_ns": 66146000,
+            "rss_bytes": 16039936,
+            "work_cpu_ns": 809000
+          },
+          {
+            "ns": 894792,
+            "wall_ns": 69972208,
+            "cpu_ns": 61747000,
+            "rss_bytes": 16220160,
+            "work_cpu_ns": 845000
+          },
+          {
+            "ns": 822666,
+            "wall_ns": 76613458,
+            "cpu_ns": 63168000,
+            "rss_bytes": 16138240,
+            "work_cpu_ns": 820000
+          },
+          {
+            "ns": 813125,
+            "wall_ns": 110090792,
+            "cpu_ns": 70975000,
+            "rss_bytes": 16121856,
+            "work_cpu_ns": 810000
+          }
+        ]
+      },
+      "previous_comparisons": {
+        "jit": {
+          "ns": 1.0336302420358863,
+          "wall_ns": 1.0483039436851638,
+          "cpu_ns": 1.0206411531887922,
+          "rss_bytes": 1.0108318890814558,
+          "work_cpu_ns": 1.0115291359570948
+        },
+        "interp": {
+          "ns": 1.0180517899308401,
+          "wall_ns": 1.0008959762129437,
+          "cpu_ns": 0.9864231912154968,
+          "rss_bytes": 0.9723230490018149,
+          "work_cpu_ns": 1.0211963101914943
+        }
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 240.6762374756991,
+          "wall_ns": 7.122927097524867,
+          "cpu_ns": 8.274624117827555,
+          "rss_bytes": 2.36697247706422,
+          "work_cpu_ns": 234.05809641532755
+        },
+        "interp": {
+          "ns": 246.99903484524702,
+          "wall_ns": 7.281220567165431,
+          "cpu_ns": 7.649381670849333,
+          "rss_bytes": 2.1695431472081217,
+          "work_cpu_ns": 228.75274056029232
+        }
+      }
+    },
+    "none_p5": {
+      "source": "target/pickle-native-entry-guards-fallback-baseline/none_p5.py",
+      "source_sha256": "aa303652e3e7f1e2ddcacc741eafa50f4ef4f6b872a9e9cba4d9cdbacbd3f7fd",
+      "work": 2000,
+      "supported": true,
+      "verification": {
+        "previous_jit": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "previous_interp": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "jit": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "interp": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "cpython": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        }
+      },
+      "samples": {
+        "previous_jit": [
+          {
+            "ns": 227770833,
+            "wall_ns": 673982125,
+            "cpu_ns": 558715000,
+            "rss_bytes": 38027264,
+            "work_cpu_ns": 207968000
+          },
+          {
+            "ns": 226331417,
+            "wall_ns": 628592250,
+            "cpu_ns": 562760000,
+            "rss_bytes": 37961728,
+            "work_cpu_ns": 206906000
+          },
+          {
+            "ns": 224291709,
+            "wall_ns": 615386000,
+            "cpu_ns": 553513000,
+            "rss_bytes": 38027264,
+            "work_cpu_ns": 203764000
+          },
+          {
+            "ns": 222207000,
+            "wall_ns": 610644625,
+            "cpu_ns": 551940000,
+            "rss_bytes": 37978112,
+            "work_cpu_ns": 206895000
+          },
+          {
+            "ns": 231498709,
+            "wall_ns": 620387958,
+            "cpu_ns": 561500000,
+            "rss_bytes": 37928960,
+            "work_cpu_ns": 210757000
+          },
+          {
+            "ns": 215217417,
+            "wall_ns": 593015625,
+            "cpu_ns": 549481000,
+            "rss_bytes": 38027264,
+            "work_cpu_ns": 202281000
+          },
+          {
+            "ns": 264564125,
+            "wall_ns": 715883375,
+            "cpu_ns": 586001000,
+            "rss_bytes": 38076416,
+            "work_cpu_ns": 221807000
+          }
+        ],
+        "previous_interp": [
+          {
+            "ns": 249027334,
+            "wall_ns": 671328875,
+            "cpu_ns": 573705000,
+            "rss_bytes": 36093952,
+            "work_cpu_ns": 216172000
+          },
+          {
+            "ns": 227691334,
+            "wall_ns": 591561000,
+            "cpu_ns": 528480000,
+            "rss_bytes": 35143680,
+            "work_cpu_ns": 198262000
+          },
+          {
+            "ns": 219284625,
+            "wall_ns": 639954500,
+            "cpu_ns": 547261000,
+            "rss_bytes": 36159488,
+            "work_cpu_ns": 197418000
+          },
+          {
+            "ns": 215373208,
+            "wall_ns": 592514167,
+            "cpu_ns": 538220000,
+            "rss_bytes": 34897920,
+            "work_cpu_ns": 201637000
+          },
+          {
+            "ns": 211712042,
+            "wall_ns": 589843500,
+            "cpu_ns": 538171000,
+            "rss_bytes": 35946496,
+            "work_cpu_ns": 200003000
+          },
+          {
+            "ns": 210343917,
+            "wall_ns": 574947458,
+            "cpu_ns": 529051000,
+            "rss_bytes": 34848768,
+            "work_cpu_ns": 195621000
+          },
+          {
+            "ns": 205858875,
+            "wall_ns": 570626667,
+            "cpu_ns": 531018000,
+            "rss_bytes": 36208640,
+            "work_cpu_ns": 195425000
+          }
+        ],
+        "jit": [
+          {
+            "ns": 17495500,
+            "wall_ns": 194402875,
+            "cpu_ns": 170598000,
+            "rss_bytes": 37732352,
+            "work_cpu_ns": 16591000
+          },
+          {
+            "ns": 17101417,
+            "wall_ns": 210340083,
+            "cpu_ns": 180786000,
+            "rss_bytes": 39141376,
+            "work_cpu_ns": 16489000
+          },
+          {
+            "ns": 23965125,
+            "wall_ns": 214714292,
+            "cpu_ns": 178470000,
+            "rss_bytes": 37748736,
+            "work_cpu_ns": 18808000
+          },
+          {
+            "ns": 16767167,
+            "wall_ns": 194264667,
+            "cpu_ns": 173980000,
+            "rss_bytes": 39206912,
+            "work_cpu_ns": 16242000
+          },
+          {
+            "ns": 16232750,
+            "wall_ns": 183071708,
+            "cpu_ns": 165557000,
+            "rss_bytes": 37847040,
+            "work_cpu_ns": 15949000
+          },
+          {
+            "ns": 17753833,
+            "wall_ns": 193501791,
+            "cpu_ns": 176514000,
+            "rss_bytes": 39157760,
+            "work_cpu_ns": 16633000
+          },
+          {
+            "ns": 19553917,
+            "wall_ns": 190847417,
+            "cpu_ns": 174679000,
+            "rss_bytes": 37814272,
+            "work_cpu_ns": 18184000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 16611583,
+            "wall_ns": 185008791,
+            "cpu_ns": 163156000,
+            "rss_bytes": 34930688,
+            "work_cpu_ns": 15912000
+          },
+          {
+            "ns": 15274625,
+            "wall_ns": 177309208,
+            "cpu_ns": 158134000,
+            "rss_bytes": 34783232,
+            "work_cpu_ns": 14277000
+          },
+          {
+            "ns": 15427000,
+            "wall_ns": 198350500,
+            "cpu_ns": 162200000,
+            "rss_bytes": 34832384,
+            "work_cpu_ns": 15128000
+          },
+          {
+            "ns": 15682833,
+            "wall_ns": 181752583,
+            "cpu_ns": 160076000,
+            "rss_bytes": 34947072,
+            "work_cpu_ns": 15289000
+          },
+          {
+            "ns": 17043333,
+            "wall_ns": 174946917,
+            "cpu_ns": 159573000,
+            "rss_bytes": 35143680,
+            "work_cpu_ns": 16144000
+          },
+          {
+            "ns": 19643625,
+            "wall_ns": 184040333,
+            "cpu_ns": 163485000,
+            "rss_bytes": 34963456,
+            "work_cpu_ns": 16811000
+          },
+          {
+            "ns": 15383625,
+            "wall_ns": 187476000,
+            "cpu_ns": 162687000,
+            "rss_bytes": 34848768,
+            "work_cpu_ns": 14400000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 888834,
+            "wall_ns": 73985042,
+            "cpu_ns": 62833000,
+            "rss_bytes": 16154624,
+            "work_cpu_ns": 848000
+          },
+          {
+            "ns": 842291,
+            "wall_ns": 74222333,
+            "cpu_ns": 63608000,
+            "rss_bytes": 16171008,
+            "work_cpu_ns": 839000
+          },
+          {
+            "ns": 914417,
+            "wall_ns": 69684084,
+            "cpu_ns": 58958000,
+            "rss_bytes": 16039936,
+            "work_cpu_ns": 911000
+          },
+          {
+            "ns": 875459,
+            "wall_ns": 68567000,
+            "cpu_ns": 59681000,
+            "rss_bytes": 16089088,
+            "work_cpu_ns": 849000
+          },
+          {
+            "ns": 942375,
+            "wall_ns": 82153042,
+            "cpu_ns": 63373000,
+            "rss_bytes": 16171008,
+            "work_cpu_ns": 938000
+          },
+          {
+            "ns": 1154084,
+            "wall_ns": 74906834,
+            "cpu_ns": 61419000,
+            "rss_bytes": 16154624,
+            "work_cpu_ns": 974000
+          },
+          {
+            "ns": 935750,
+            "wall_ns": 78140458,
+            "cpu_ns": 64951000,
+            "rss_bytes": 16171008,
+            "work_cpu_ns": 930000
+          }
+        ]
+      },
+      "previous_comparisons": {
+        "jit": {
+          "ns": 0.07555918319549955,
+          "wall_ns": 0.3181304789180778,
+          "cpu_ns": 0.31521542196615576,
+          "rss_bytes": 0.9978401727861771,
+          "work_cpu_ns": 0.07977669641483305
+        },
+        "interp": {
+          "ns": 0.07281700981117391,
+          "wall_ns": 0.3067480798311444,
+          "cpu_ns": 0.2974174129538107,
+          "rss_bytes": 0.9776663628076573,
+          "work_cpu_ns": 0.07582437747040474
+        }
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 19.683652965570623,
+          "wall_ns": 2.627597008054682,
+          "cpu_ns": 2.8421896616777764,
+          "rss_bytes": 2.3534218590398366,
+          "work_cpu_ns": 19.55268817204301
+        },
+        "interp": {
+          "ns": 17.91384062531769,
+          "wall_ns": 2.456923129336904,
+          "cpu_ns": 2.59666099024398,
+          "rss_bytes": 2.1643002028397564,
+          "work_cpu_ns": 17.211087420042645
+        }
+      }
+    },
+    "list_p2": {
+      "source": "target/pickle-native-entry-guards-fallback-baseline/list_p2.py",
+      "source_sha256": "d242ec7331222365ed3c3416630a82c0e2fb81c20dd1cc05399fd50d22358a25",
+      "work": 2000,
+      "supported": false,
+      "verification": {
+        "previous_jit": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "previous_interp": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "jit": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "interp": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "cpython": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        }
+      },
+      "samples": {
+        "previous_jit": [
+          {
+            "ns": 398903833,
+            "wall_ns": 948677958,
+            "cpu_ns": 877849000,
+            "rss_bytes": 38043648,
+            "work_cpu_ns": 370421000
+          },
+          {
+            "ns": 373876125,
+            "wall_ns": 913462375,
+            "cpu_ns": 859722000,
+            "rss_bytes": 38371328,
+            "work_cpu_ns": 353749000
+          },
+          {
+            "ns": 378781750,
+            "wall_ns": 916854333,
+            "cpu_ns": 853467000,
+            "rss_bytes": 38174720,
+            "work_cpu_ns": 355275000
+          },
+          {
+            "ns": 389174000,
+            "wall_ns": 933915417,
+            "cpu_ns": 868482000,
+            "rss_bytes": 37994496,
+            "work_cpu_ns": 363232000
+          },
+          {
+            "ns": 388463000,
+            "wall_ns": 973910542,
+            "cpu_ns": 877703000,
+            "rss_bytes": 38223872,
+            "work_cpu_ns": 363717000
+          },
+          {
+            "ns": 370367291,
+            "wall_ns": 895029750,
+            "cpu_ns": 844497000,
+            "rss_bytes": 38010880,
+            "work_cpu_ns": 352862000
+          },
+          {
+            "ns": 400959750,
+            "wall_ns": 945474208,
+            "cpu_ns": 860652000,
+            "rss_bytes": 37928960,
+            "work_cpu_ns": 362286000
+          }
+        ],
+        "previous_interp": [
+          {
+            "ns": 365734250,
+            "wall_ns": 868011083,
+            "cpu_ns": 806473000,
+            "rss_bytes": 36126720,
+            "work_cpu_ns": 341455000
+          },
+          {
+            "ns": 351265792,
+            "wall_ns": 849706959,
+            "cpu_ns": 798973000,
+            "rss_bytes": 34996224,
+            "work_cpu_ns": 332462000
+          },
+          {
+            "ns": 362923042,
+            "wall_ns": 882873541,
+            "cpu_ns": 809305000,
+            "rss_bytes": 36257792,
+            "work_cpu_ns": 340258000
+          },
+          {
+            "ns": 340013792,
+            "wall_ns": 852640250,
+            "cpu_ns": 785749000,
+            "rss_bytes": 34799616,
+            "work_cpu_ns": 322883000
+          },
+          {
+            "ns": 355820166,
+            "wall_ns": 870568792,
+            "cpu_ns": 802649000,
+            "rss_bytes": 36257792,
+            "work_cpu_ns": 334486000
+          },
+          {
+            "ns": 352857084,
+            "wall_ns": 840539250,
+            "cpu_ns": 794573000,
+            "rss_bytes": 35209216,
+            "work_cpu_ns": 334059000
+          },
+          {
+            "ns": 351836833,
+            "wall_ns": 866189292,
+            "cpu_ns": 810783000,
+            "rss_bytes": 36257792,
+            "work_cpu_ns": 334203000
+          }
+        ],
+        "jit": [
+          {
+            "ns": 391664708,
+            "wall_ns": 940103083,
+            "cpu_ns": 865576000,
+            "rss_bytes": 38371328,
+            "work_cpu_ns": 358974000
+          },
+          {
+            "ns": 373192917,
+            "wall_ns": 911820750,
+            "cpu_ns": 860940000,
+            "rss_bytes": 39616512,
+            "work_cpu_ns": 355142000
+          },
+          {
+            "ns": 397128208,
+            "wall_ns": 962956292,
+            "cpu_ns": 882112000,
+            "rss_bytes": 38420480,
+            "work_cpu_ns": 369555000
+          },
+          {
+            "ns": 372405833,
+            "wall_ns": 915946000,
+            "cpu_ns": 862251000,
+            "rss_bytes": 39485440,
+            "work_cpu_ns": 354055000
+          },
+          {
+            "ns": 412473792,
+            "wall_ns": 975969083,
+            "cpu_ns": 894556000,
+            "rss_bytes": 38092800,
+            "work_cpu_ns": 375161000
+          },
+          {
+            "ns": 379628709,
+            "wall_ns": 918626292,
+            "cpu_ns": 867513000,
+            "rss_bytes": 39583744,
+            "work_cpu_ns": 360549000
+          },
+          {
+            "ns": 378576584,
+            "wall_ns": 885860875,
+            "cpu_ns": 841925000,
+            "rss_bytes": 38223872,
+            "work_cpu_ns": 358288000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 383547666,
+            "wall_ns": 958208125,
+            "cpu_ns": 842160000,
+            "rss_bytes": 35045376,
+            "work_cpu_ns": 349948000
+          },
+          {
+            "ns": 368824500,
+            "wall_ns": 868567000,
+            "cpu_ns": 806378000,
+            "rss_bytes": 35094528,
+            "work_cpu_ns": 344330000
+          },
+          {
+            "ns": 399759000,
+            "wall_ns": 930001625,
+            "cpu_ns": 830119000,
+            "rss_bytes": 35176448,
+            "work_cpu_ns": 352861000
+          },
+          {
+            "ns": 356144083,
+            "wall_ns": 848816750,
+            "cpu_ns": 792584000,
+            "rss_bytes": 34881536,
+            "work_cpu_ns": 330934000
+          },
+          {
+            "ns": 357062875,
+            "wall_ns": 867244167,
+            "cpu_ns": 811478000,
+            "rss_bytes": 35078144,
+            "work_cpu_ns": 340233000
+          },
+          {
+            "ns": 385478209,
+            "wall_ns": 887684041,
+            "cpu_ns": 823505000,
+            "rss_bytes": 35127296,
+            "work_cpu_ns": 353291000
+          },
+          {
+            "ns": 356409542,
+            "wall_ns": 842085167,
+            "cpu_ns": 776722000,
+            "rss_bytes": 35012608,
+            "work_cpu_ns": 326634000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 1339666,
+            "wall_ns": 75474500,
+            "cpu_ns": 62876000,
+            "rss_bytes": 16154624,
+            "work_cpu_ns": 1296000
+          },
+          {
+            "ns": 1225125,
+            "wall_ns": 74025042,
+            "cpu_ns": 62202000,
+            "rss_bytes": 16252928,
+            "work_cpu_ns": 1221000
+          },
+          {
+            "ns": 1344333,
+            "wall_ns": 79266583,
+            "cpu_ns": 67786000,
+            "rss_bytes": 16187392,
+            "work_cpu_ns": 1322000
+          },
+          {
+            "ns": 1212625,
+            "wall_ns": 74561416,
+            "cpu_ns": 62508000,
+            "rss_bytes": 16252928,
+            "work_cpu_ns": 1209000
+          },
+          {
+            "ns": 1245791,
+            "wall_ns": 73755125,
+            "cpu_ns": 64938000,
+            "rss_bytes": 16269312,
+            "work_cpu_ns": 1208000
+          },
+          {
+            "ns": 1276375,
+            "wall_ns": 75579208,
+            "cpu_ns": 64950000,
+            "rss_bytes": 16187392,
+            "work_cpu_ns": 1261000
+          },
+          {
+            "ns": 1339250,
+            "wall_ns": 71511125,
+            "cpu_ns": 62998000,
+            "rss_bytes": 16171008,
+            "work_cpu_ns": 1316000
+          }
+        ]
+      },
+      "previous_comparisons": {
+        "jit": {
+          "ns": 0.9981726353882586,
+          "wall_ns": 0.9982028542773861,
+          "cpu_ns": 1.0014167370382518,
+          "rss_bytes": 1.0086132644272179,
+          "work_cpu_ns": 1.0039378203189266
+        },
+        "interp": {
+          "ns": 1.0487059005275006,
+          "wall_ns": 1.0221959356696289,
+          "cpu_ns": 1.0109998268234308,
+          "rss_bytes": 0.9701762313601446,
+          "work_cpu_ns": 1.0249347286788093
+        }
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 297.4272521790226,
+          "wall_ns": 12.317733639381116,
+          "cpu_ns": 13.766397353521217,
+          "rss_bytes": 2.3752535496957403,
+          "work_cpu_ns": 285.9230769230769
+        },
+        "interp": {
+          "ns": 293.6968007421915,
+          "wall_ns": 11.745082602612083,
+          "cpu_ns": 12.679060816012317,
+          "rss_bytes": 2.1651469098277607,
+          "work_cpu_ns": 273.7253928866832
+        }
+      }
+    },
+    "list_p5": {
+      "source": "target/pickle-native-entry-guards-fallback-baseline/list_p5.py",
+      "source_sha256": "9ed704dde6f4c8bdc7ab0320e472383a18fb643320602155f84a8fc8aa6ea359",
+      "work": 2000,
+      "supported": true,
+      "verification": {
+        "previous_jit": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "previous_interp": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "jit": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "interp": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "cpython": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        }
+      },
+      "samples": {
+        "previous_jit": [
+          {
+            "ns": 453038833,
+            "wall_ns": 1150292458,
+            "cpu_ns": 999393000,
+            "rss_bytes": 37961728,
+            "work_cpu_ns": 421476000
+          },
+          {
+            "ns": 450734459,
+            "wall_ns": 1062908459,
+            "cpu_ns": 998623000,
+            "rss_bytes": 38060032,
+            "work_cpu_ns": 430363000
+          },
+          {
+            "ns": 450874667,
+            "wall_ns": 1054316750,
+            "cpu_ns": 996691000,
+            "rss_bytes": 38207488,
+            "work_cpu_ns": 424340000
+          },
+          {
+            "ns": 482224958,
+            "wall_ns": 1087581333,
+            "cpu_ns": 1005736000,
+            "rss_bytes": 38141952,
+            "work_cpu_ns": 439478000
+          },
+          {
+            "ns": 472358375,
+            "wall_ns": 1110501917,
+            "cpu_ns": 1046065000,
+            "rss_bytes": 38387712,
+            "work_cpu_ns": 445706000
+          },
+          {
+            "ns": 459643208,
+            "wall_ns": 1077637208,
+            "cpu_ns": 1010742000,
+            "rss_bytes": 38223872,
+            "work_cpu_ns": 437130000
+          },
+          {
+            "ns": 652899125,
+            "wall_ns": 1286139667,
+            "cpu_ns": 1063375000,
+            "rss_bytes": 38371328,
+            "work_cpu_ns": 475654000
+          }
+        ],
+        "previous_interp": [
+          {
+            "ns": 424798791,
+            "wall_ns": 970944250,
+            "cpu_ns": 910115000,
+            "rss_bytes": 36405248,
+            "work_cpu_ns": 395589000
+          },
+          {
+            "ns": 406957792,
+            "wall_ns": 963773167,
+            "cpu_ns": 917899000,
+            "rss_bytes": 35028992,
+            "work_cpu_ns": 390182000
+          },
+          {
+            "ns": 417343250,
+            "wall_ns": 968864833,
+            "cpu_ns": 923307000,
+            "rss_bytes": 36192256,
+            "work_cpu_ns": 397650000
+          },
+          {
+            "ns": 436152541,
+            "wall_ns": 1015095750,
+            "cpu_ns": 940879000,
+            "rss_bytes": 35061760,
+            "work_cpu_ns": 401606000
+          },
+          {
+            "ns": 412779792,
+            "wall_ns": 1003541375,
+            "cpu_ns": 937982000,
+            "rss_bytes": 36257792,
+            "work_cpu_ns": 391382000
+          },
+          {
+            "ns": 401247209,
+            "wall_ns": 930755667,
+            "cpu_ns": 891806000,
+            "rss_bytes": 34848768,
+            "work_cpu_ns": 387053000
+          },
+          {
+            "ns": 408963875,
+            "wall_ns": 995527916,
+            "cpu_ns": 928344000,
+            "rss_bytes": 36339712,
+            "work_cpu_ns": 393614000
+          }
+        ],
+        "jit": [
+          {
+            "ns": 24518625,
+            "wall_ns": 197805750,
+            "cpu_ns": 178118000,
+            "rss_bytes": 37797888,
+            "work_cpu_ns": 23353000
+          },
+          {
+            "ns": 25529833,
+            "wall_ns": 211590000,
+            "cpu_ns": 190557000,
+            "rss_bytes": 39075840,
+            "work_cpu_ns": 24247000
+          },
+          {
+            "ns": 24361500,
+            "wall_ns": 187983750,
+            "cpu_ns": 177879000,
+            "rss_bytes": 37879808,
+            "work_cpu_ns": 23808000
+          },
+          {
+            "ns": 21747791,
+            "wall_ns": 200271833,
+            "cpu_ns": 185281000,
+            "rss_bytes": 38879232,
+            "work_cpu_ns": 21591000
+          },
+          {
+            "ns": 23281458,
+            "wall_ns": 199479792,
+            "cpu_ns": 182878000,
+            "rss_bytes": 37748736,
+            "work_cpu_ns": 22740000
+          },
+          {
+            "ns": 25172292,
+            "wall_ns": 206082459,
+            "cpu_ns": 190517000,
+            "rss_bytes": 38928384,
+            "work_cpu_ns": 24447000
+          },
+          {
+            "ns": 23851541,
+            "wall_ns": 184660208,
+            "cpu_ns": 173098000,
+            "rss_bytes": 37683200,
+            "work_cpu_ns": 23267000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 24889083,
+            "wall_ns": 183717125,
+            "cpu_ns": 167920000,
+            "rss_bytes": 34848768,
+            "work_cpu_ns": 23548000
+          },
+          {
+            "ns": 22570375,
+            "wall_ns": 198351000,
+            "cpu_ns": 179832000,
+            "rss_bytes": 35045376,
+            "work_cpu_ns": 21830000
+          },
+          {
+            "ns": 23628458,
+            "wall_ns": 214063292,
+            "cpu_ns": 174149000,
+            "rss_bytes": 34701312,
+            "work_cpu_ns": 22532000
+          },
+          {
+            "ns": 25474333,
+            "wall_ns": 192248291,
+            "cpu_ns": 175150000,
+            "rss_bytes": 34848768,
+            "work_cpu_ns": 23428000
+          },
+          {
+            "ns": 21967791,
+            "wall_ns": 185790083,
+            "cpu_ns": 169913000,
+            "rss_bytes": 34684928,
+            "work_cpu_ns": 21226000
+          },
+          {
+            "ns": 20580167,
+            "wall_ns": 187232667,
+            "cpu_ns": 172077000,
+            "rss_bytes": 35012608,
+            "work_cpu_ns": 20074000
+          },
+          {
+            "ns": 22997083,
+            "wall_ns": 180449458,
+            "cpu_ns": 169688000,
+            "rss_bytes": 35078144,
+            "work_cpu_ns": 22073000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 1056583,
+            "wall_ns": 68111834,
+            "cpu_ns": 62265000,
+            "rss_bytes": 16105472,
+            "work_cpu_ns": 1052000
+          },
+          {
+            "ns": 1367625,
+            "wall_ns": 72595333,
+            "cpu_ns": 62968000,
+            "rss_bytes": 16252928,
+            "work_cpu_ns": 1345000
+          },
+          {
+            "ns": 1267000,
+            "wall_ns": 272955292,
+            "cpu_ns": 64838000,
+            "rss_bytes": 16154624,
+            "work_cpu_ns": 1121000
+          },
+          {
+            "ns": 1303292,
+            "wall_ns": 80129584,
+            "cpu_ns": 64023000,
+            "rss_bytes": 16138240,
+            "work_cpu_ns": 1294000
+          },
+          {
+            "ns": 1338416,
+            "wall_ns": 67215333,
+            "cpu_ns": 60931000,
+            "rss_bytes": 16154624,
+            "work_cpu_ns": 1331000
+          },
+          {
+            "ns": 1205834,
+            "wall_ns": 69188500,
+            "cpu_ns": 60952000,
+            "rss_bytes": 16187392,
+            "work_cpu_ns": 1201000
+          },
+          {
+            "ns": 1032875,
+            "wall_ns": 70980916,
+            "cpu_ns": 61381000,
+            "rss_bytes": 16138240,
+            "work_cpu_ns": 1030000
+          }
+        ]
+      },
+      "previous_comparisons": {
+        "jit": {
+          "ns": 0.05403164511791034,
+          "wall_ns": 0.1796302995485959,
+          "cpu_ns": 0.17846955576000986,
+          "rss_bytes": 0.9956840742339231,
+          "work_cpu_ns": 0.05540766259526046
+        },
+        "interp": {
+          "ns": 0.056232553547669706,
+          "wall_ns": 0.18938931721465685,
+          "cpu_ns": 0.18615571183967333,
+          "rss_bytes": 0.9652840396753832,
+          "work_cpu_ns": 0.05607778178621695
+        }
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 19.22770323599053,
+          "wall_ns": 2.904131901660437,
+          "cpu_ns": 2.893975602517845,
+          "rss_bytes": 2.3468972533062056,
+          "work_cpu_ns": 20.355537052456288
+        },
+        "interp": {
+          "ns": 18.64913812154696,
+          "wall_ns": 2.6972864216224157,
+          "cpu_ns": 2.7645036737752724,
+          "rss_bytes": 2.1593908629441625,
+          "work_cpu_ns": 18.105100463678518
+        }
+      }
+    },
+    "list_encoding": {
+      "source": "target/pickle-native-entry-guards-fallback-baseline/list_encoding.py",
+      "source_sha256": "ee9c28c6598fb6c29865094d1e3dbe7b6a6753b04005d692cd38e8ff8b82daad",
+      "work": 2000,
+      "supported": false,
+      "verification": {
+        "previous_jit": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "previous_interp": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "jit": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "interp": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "cpython": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        }
+      },
+      "samples": {
+        "previous_jit": [
+          {
+            "ns": 467929958,
+            "wall_ns": 1069546292,
+            "cpu_ns": 1008518000,
+            "rss_bytes": 38191104,
+            "work_cpu_ns": 437758000
+          },
+          {
+            "ns": 441985417,
+            "wall_ns": 1050176292,
+            "cpu_ns": 985742000,
+            "rss_bytes": 38338560,
+            "work_cpu_ns": 421811000
+          },
+          {
+            "ns": 441591209,
+            "wall_ns": 1030945542,
+            "cpu_ns": 988569000,
+            "rss_bytes": 38158336,
+            "work_cpu_ns": 426879000
+          },
+          {
+            "ns": 359857000,
+            "wall_ns": 865296291,
+            "cpu_ns": 848809000,
+            "rss_bytes": 38223872,
+            "work_cpu_ns": 354937000
+          },
+          {
+            "ns": 288713500,
+            "wall_ns": 696715167,
+            "cpu_ns": 686602000,
+            "rss_bytes": 38125568,
+            "work_cpu_ns": 286692000
+          },
+          {
+            "ns": 286145000,
+            "wall_ns": 688640333,
+            "cpu_ns": 678931000,
+            "rss_bytes": 38223872,
+            "work_cpu_ns": 283592000
+          },
+          {
+            "ns": 290348875,
+            "wall_ns": 698300500,
+            "cpu_ns": 688150000,
+            "rss_bytes": 38191104,
+            "work_cpu_ns": 287637000
+          }
+        ],
+        "previous_interp": [
+          {
+            "ns": 403978750,
+            "wall_ns": 960945250,
+            "cpu_ns": 921098000,
+            "rss_bytes": 36241408,
+            "work_cpu_ns": 391204000
+          },
+          {
+            "ns": 427286917,
+            "wall_ns": 1000253166,
+            "cpu_ns": 922222000,
+            "rss_bytes": 34865152,
+            "work_cpu_ns": 393531000
+          },
+          {
+            "ns": 404987042,
+            "wall_ns": 973459125,
+            "cpu_ns": 924036000,
+            "rss_bytes": 36634624,
+            "work_cpu_ns": 391991000
+          },
+          {
+            "ns": 315691750,
+            "wall_ns": 781228833,
+            "cpu_ns": 759095000,
+            "rss_bytes": 35045376,
+            "work_cpu_ns": 310523000
+          },
+          {
+            "ns": 278696291,
+            "wall_ns": 672991208,
+            "cpu_ns": 662266000,
+            "rss_bytes": 36585472,
+            "work_cpu_ns": 276543000
+          },
+          {
+            "ns": 279695625,
+            "wall_ns": 654290125,
+            "cpu_ns": 642835000,
+            "rss_bytes": 35061760,
+            "work_cpu_ns": 276175000
+          },
+          {
+            "ns": 281565750,
+            "wall_ns": 672088209,
+            "cpu_ns": 663464000,
+            "rss_bytes": 36192256,
+            "work_cpu_ns": 279683000
+          }
+        ],
+        "jit": [
+          {
+            "ns": 447342917,
+            "wall_ns": 1082443792,
+            "cpu_ns": 1013716000,
+            "rss_bytes": 38338560,
+            "work_cpu_ns": 429441000
+          },
+          {
+            "ns": 453028041,
+            "wall_ns": 1090669416,
+            "cpu_ns": 1024204000,
+            "rss_bytes": 39682048,
+            "work_cpu_ns": 431528000
+          },
+          {
+            "ns": 450170000,
+            "wall_ns": 1058911250,
+            "cpu_ns": 998164000,
+            "rss_bytes": 38305792,
+            "work_cpu_ns": 426409000
+          },
+          {
+            "ns": 358074416,
+            "wall_ns": 854064375,
+            "cpu_ns": 835243000,
+            "rss_bytes": 39600128,
+            "work_cpu_ns": 352228000
+          },
+          {
+            "ns": 322050458,
+            "wall_ns": 785658333,
+            "cpu_ns": 773481000,
+            "rss_bytes": 38207488,
+            "work_cpu_ns": 319194000
+          },
+          {
+            "ns": 302368625,
+            "wall_ns": 718249667,
+            "cpu_ns": 705185000,
+            "rss_bytes": 39567360,
+            "work_cpu_ns": 299061000
+          },
+          {
+            "ns": 305762667,
+            "wall_ns": 733323792,
+            "cpu_ns": 722499000,
+            "rss_bytes": 38158336,
+            "work_cpu_ns": 303571000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 424215417,
+            "wall_ns": 986759000,
+            "cpu_ns": 925461000,
+            "rss_bytes": 35061760,
+            "work_cpu_ns": 398512000
+          },
+          {
+            "ns": 417686584,
+            "wall_ns": 963220208,
+            "cpu_ns": 907851000,
+            "rss_bytes": 35192832,
+            "work_cpu_ns": 391551000
+          },
+          {
+            "ns": 406872458,
+            "wall_ns": 970873000,
+            "cpu_ns": 916765000,
+            "rss_bytes": 35127296,
+            "work_cpu_ns": 387419000
+          },
+          {
+            "ns": 323086209,
+            "wall_ns": 750342500,
+            "cpu_ns": 737641000,
+            "rss_bytes": 35225600,
+            "work_cpu_ns": 319218000
+          },
+          {
+            "ns": 306055917,
+            "wall_ns": 730815334,
+            "cpu_ns": 720008000,
+            "rss_bytes": 35192832,
+            "work_cpu_ns": 303535000
+          },
+          {
+            "ns": 319117667,
+            "wall_ns": 736571083,
+            "cpu_ns": 723937000,
+            "rss_bytes": 35192832,
+            "work_cpu_ns": 314024000
+          },
+          {
+            "ns": 295518000,
+            "wall_ns": 705873209,
+            "cpu_ns": 695254000,
+            "rss_bytes": 35127296,
+            "work_cpu_ns": 292700000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 1309833,
+            "wall_ns": 68953500,
+            "cpu_ns": 61214000,
+            "rss_bytes": 16203776,
+            "work_cpu_ns": 1306000
+          },
+          {
+            "ns": 1999667,
+            "wall_ns": 74647167,
+            "cpu_ns": 65107000,
+            "rss_bytes": 16138240,
+            "work_cpu_ns": 1410000
+          },
+          {
+            "ns": 1340875,
+            "wall_ns": 79211792,
+            "cpu_ns": 61766000,
+            "rss_bytes": 16187392,
+            "work_cpu_ns": 1336000
+          },
+          {
+            "ns": 1122417,
+            "wall_ns": 55470250,
+            "cpu_ns": 50753000,
+            "rss_bytes": 16023552,
+            "work_cpu_ns": 1120000
+          },
+          {
+            "ns": 1136083,
+            "wall_ns": 55783250,
+            "cpu_ns": 51062000,
+            "rss_bytes": 16105472,
+            "work_cpu_ns": 1133000
+          },
+          {
+            "ns": 1158709,
+            "wall_ns": 54428291,
+            "cpu_ns": 50001000,
+            "rss_bytes": 16154624,
+            "work_cpu_ns": 1155000
+          },
+          {
+            "ns": 1129000,
+            "wall_ns": 56151167,
+            "cpu_ns": 51001000,
+            "rss_bytes": 16121856,
+            "work_cpu_ns": 1125000
+          }
+        ]
+      },
+      "previous_comparisons": {
+        "jit": {
+          "ns": 1.0249841365241243,
+          "wall_ns": 1.0385584061537736,
+          "cpu_ns": 1.0386696144379914,
+          "rss_bytes": 1.003864319450408,
+          "work_cpu_ns": 1.0230363835936
+        },
+        "interp": {
+          "ns": 1.0495523692068371,
+          "wall_ns": 1.0268628727807334,
+          "cpu_ns": 1.0047367381103856,
+          "rss_bytes": 0.9705749207786328,
+          "work_cpu_ns": 1.0280011464529197
+        }
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 283.47440988026403,
+          "wall_ns": 14.084126202757997,
+          "cpu_ns": 15.731088823014423,
+          "rss_bytes": 2.372329603255341,
+          "work_cpu_ns": 306.0482269503546
+        },
+        "interp": {
+          "ns": 275.4079471204591,
+          "wall_ns": 13.100981638753568,
+          "cpu_ns": 14.47845043099138,
+          "rss_bytes": 2.178861788617886,
+          "work_cpu_ns": 277.6957446808511
+        }
+      }
+    },
+    "list_buffers": {
+      "source": "target/pickle-native-entry-guards-fallback-baseline/list_buffers.py",
+      "source_sha256": "356d623fe69c9979481a64a264306beb9266c546f25ebbe460e3bb8b7fccbabf",
+      "work": 2000,
+      "supported": false,
+      "verification": {
+        "previous_jit": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "previous_interp": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "jit": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "interp": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        },
+        "cpython": {
+          "returncode": 0,
+          "stdout": "ok\n",
+          "stderr": ""
+        }
+      },
+      "samples": {
+        "previous_jit": [
+          {
+            "ns": 255566542,
+            "wall_ns": 586201500,
+            "cpu_ns": 578256000,
+            "rss_bytes": 38092800,
+            "work_cpu_ns": 253352000
+          },
+          {
+            "ns": 308204375,
+            "wall_ns": 755225417,
+            "cpu_ns": 740815000,
+            "rss_bytes": 38141952,
+            "work_cpu_ns": 304816000
+          },
+          {
+            "ns": 239325208,
+            "wall_ns": 575056125,
+            "cpu_ns": 566463000,
+            "rss_bytes": 38191104,
+            "work_cpu_ns": 237726000
+          },
+          {
+            "ns": 281108583,
+            "wall_ns": 605224500,
+            "cpu_ns": 597322000,
+            "rss_bytes": 38092800,
+            "work_cpu_ns": 278630000
+          },
+          {
+            "ns": 243520083,
+            "wall_ns": 583740292,
+            "cpu_ns": 577291000,
+            "rss_bytes": 38141952,
+            "work_cpu_ns": 242301000
+          },
+          {
+            "ns": 243441250,
+            "wall_ns": 572016125,
+            "cpu_ns": 566152000,
+            "rss_bytes": 38256640,
+            "work_cpu_ns": 242248000
+          },
+          {
+            "ns": 248734083,
+            "wall_ns": 596543375,
+            "cpu_ns": 589008000,
+            "rss_bytes": 38240256,
+            "work_cpu_ns": 247535000
+          }
+        ],
+        "previous_interp": [
+          {
+            "ns": 235280916,
+            "wall_ns": 567710125,
+            "cpu_ns": 560574000,
+            "rss_bytes": 36192256,
+            "work_cpu_ns": 234031000
+          },
+          {
+            "ns": 225213834,
+            "wall_ns": 539385667,
+            "cpu_ns": 531732000,
+            "rss_bytes": 35045376,
+            "work_cpu_ns": 224140000
+          },
+          {
+            "ns": 221513917,
+            "wall_ns": 534015209,
+            "cpu_ns": 526595000,
+            "rss_bytes": 36274176,
+            "work_cpu_ns": 220590000
+          },
+          {
+            "ns": 237198416,
+            "wall_ns": 611218458,
+            "cpu_ns": 602989000,
+            "rss_bytes": 35061760,
+            "work_cpu_ns": 235866000
+          },
+          {
+            "ns": 253351708,
+            "wall_ns": 565157250,
+            "cpu_ns": 558273000,
+            "rss_bytes": 36274176,
+            "work_cpu_ns": 251123000
+          },
+          {
+            "ns": 286050750,
+            "wall_ns": 626186208,
+            "cpu_ns": 618400000,
+            "rss_bytes": 34963456,
+            "work_cpu_ns": 283742000
+          },
+          {
+            "ns": 228426000,
+            "wall_ns": 545439666,
+            "cpu_ns": 538989000,
+            "rss_bytes": 36421632,
+            "work_cpu_ns": 227521000
+          }
+        ],
+        "jit": [
+          {
+            "ns": 245338042,
+            "wall_ns": 582259583,
+            "cpu_ns": 576287000,
+            "rss_bytes": 38273024,
+            "work_cpu_ns": 244511000
+          },
+          {
+            "ns": 256033916,
+            "wall_ns": 597495583,
+            "cpu_ns": 591061000,
+            "rss_bytes": 39419904,
+            "work_cpu_ns": 254635000
+          },
+          {
+            "ns": 239184666,
+            "wall_ns": 568312125,
+            "cpu_ns": 562116000,
+            "rss_bytes": 38305792,
+            "work_cpu_ns": 238150000
+          },
+          {
+            "ns": 242434792,
+            "wall_ns": 577171875,
+            "cpu_ns": 570835000,
+            "rss_bytes": 39583744,
+            "work_cpu_ns": 241156000
+          },
+          {
+            "ns": 245179458,
+            "wall_ns": 583767250,
+            "cpu_ns": 577360000,
+            "rss_bytes": 38256640,
+            "work_cpu_ns": 244201000
+          },
+          {
+            "ns": 247360834,
+            "wall_ns": 625068125,
+            "cpu_ns": 617867000,
+            "rss_bytes": 39616512,
+            "work_cpu_ns": 245891000
+          },
+          {
+            "ns": 242001083,
+            "wall_ns": 573095375,
+            "cpu_ns": 565572000,
+            "rss_bytes": 38191104,
+            "work_cpu_ns": 240746000
+          }
+        ],
+        "interp": [
+          {
+            "ns": 245299458,
+            "wall_ns": 593121083,
+            "cpu_ns": 583917000,
+            "rss_bytes": 35176448,
+            "work_cpu_ns": 242913000
+          },
+          {
+            "ns": 229230542,
+            "wall_ns": 539621333,
+            "cpu_ns": 533257000,
+            "rss_bytes": 35209216,
+            "work_cpu_ns": 228007000
+          },
+          {
+            "ns": 222771625,
+            "wall_ns": 530205000,
+            "cpu_ns": 524544000,
+            "rss_bytes": 35209216,
+            "work_cpu_ns": 221729000
+          },
+          {
+            "ns": 240708167,
+            "wall_ns": 545335333,
+            "cpu_ns": 538799000,
+            "rss_bytes": 35160064,
+            "work_cpu_ns": 238728000
+          },
+          {
+            "ns": 236443083,
+            "wall_ns": 550083333,
+            "cpu_ns": 543541000,
+            "rss_bytes": 35143680,
+            "work_cpu_ns": 234857000
+          },
+          {
+            "ns": 229117250,
+            "wall_ns": 535214916,
+            "cpu_ns": 529040000,
+            "rss_bytes": 35192832,
+            "work_cpu_ns": 227458000
+          },
+          {
+            "ns": 236620292,
+            "wall_ns": 560626709,
+            "cpu_ns": 553556000,
+            "rss_bytes": 35061760,
+            "work_cpu_ns": 235087000
+          }
+        ],
+        "cpython": [
+          {
+            "ns": 872542,
+            "wall_ns": 39642500,
+            "cpu_ns": 36352000,
+            "rss_bytes": 16072704,
+            "work_cpu_ns": 870000
+          },
+          {
+            "ns": 869333,
+            "wall_ns": 40368834,
+            "cpu_ns": 37147000,
+            "rss_bytes": 16039936,
+            "work_cpu_ns": 867000
+          },
+          {
+            "ns": 863500,
+            "wall_ns": 40500042,
+            "cpu_ns": 37001000,
+            "rss_bytes": 16072704,
+            "work_cpu_ns": 862000
+          },
+          {
+            "ns": 864458,
+            "wall_ns": 42725583,
+            "cpu_ns": 38362000,
+            "rss_bytes": 16138240,
+            "work_cpu_ns": 862000
+          },
+          {
+            "ns": 886292,
+            "wall_ns": 41338792,
+            "cpu_ns": 37777000,
+            "rss_bytes": 16203776,
+            "work_cpu_ns": 883000
+          },
+          {
+            "ns": 1130750,
+            "wall_ns": 41674583,
+            "cpu_ns": 38091000,
+            "rss_bytes": 16105472,
+            "work_cpu_ns": 1086000
+          },
+          {
+            "ns": 827667,
+            "wall_ns": 40288416,
+            "cpu_ns": 36722000,
+            "rss_bytes": 16056320,
+            "work_cpu_ns": 825000
+          }
+        ]
+      },
+      "previous_comparisons": {
+        "jit": {
+          "ns": 0.9729309312226423,
+          "wall_ns": 0.9882724490587766,
+          "cpu_ns": 0.9923260654270447,
+          "rss_bytes": 1.0047311827956988,
+          "work_cpu_ns": 0.9725735754539762
+        },
+        "interp": {
+          "ns": 1.0147966881869903,
+          "wall_ns": 0.992864980368003,
+          "cpu_ns": 0.996105166209326,
+          "rss_bytes": 0.9719330013580806,
+          "work_cpu_ns": 1.0121340082928443
+        }
+      },
+      "cpython_comparisons": {
+        "jit": {
+          "ns": 280.44716111135534,
+          "wall_ns": 14.224817749101875,
+          "cpu_ns": 15.401448722836447,
+          "rss_bytes": 2.383282364933741,
+          "work_cpu_ns": 279.7633410672854
+        },
+        "interp": {
+          "ns": 266.7778598926765,
+          "wall_ns": 13.306710389602095,
+          "cpu_ns": 14.355318060677847,
+          "rss_bytes": 2.185147507629705,
+          "work_cpu_ns": 265.9762174405436
+        }
+      }
+    }
+  },
+  "binaries": {
+    "previous_jit": {
+      "path": "/Users/owencarey/Documents/weavefoundry/weavepy/target/release/weavepy-runtime-native-empty-tables",
+      "sha256": "988d15d15f83af8a51e42028753650b0693ca3dcc130f3081167554e5c5b79d3"
+    },
+    "previous_interp": {
+      "path": "/Users/owencarey/Documents/weavefoundry/weavepy/target/release/weavepy-runtime-native-empty-tables",
+      "sha256": "988d15d15f83af8a51e42028753650b0693ca3dcc130f3081167554e5c5b79d3"
+    },
+    "jit": {
+      "path": "/Users/owencarey/Documents/weavefoundry/weavepy/target/release/weavepy-runtime-pickle-native-entry-guards",
+      "sha256": "247f3eb9b1c1bde87c77ccb9958c7b80430ef4bf652b3facd99408a70a1502cd"
+    },
+    "interp": {
+      "path": "/Users/owencarey/Documents/weavefoundry/weavepy/target/release/weavepy-runtime-pickle-native-entry-guards",
+      "sha256": "247f3eb9b1c1bde87c77ccb9958c7b80430ef4bf652b3facd99408a70a1502cd"
+    },
+    "cpython": {
+      "path": "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/bin/python3.14",
+      "sha256": "87d4df53fd91304be5bac391fb204643c36b7df2023c04a0953bcbc7d4fdf634"
+    }
+  }
+}

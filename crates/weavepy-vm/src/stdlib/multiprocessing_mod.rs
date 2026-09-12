@@ -589,11 +589,11 @@ fn make_semlock_instance(inner: Arc<SemInner>) -> Object {
     }
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(semlock_type()),
-        dict,
+        dict: dict.into(),
         native: std::sync::OnceLock::new(),
         inline_values: crate::sync::Cell::new(true),
-        slots: crate::sync::RefCell::new(None),
-        hash_cache: crate::sync::Cell::new(None),
+        slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
+        hash_cache: crate::sync::CachedHash::new(None),
         finalize_ran: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
     });
@@ -1221,11 +1221,11 @@ fn nt_make_semlock_instance(inner: &Arc<NtSemInner>) -> Object {
     }
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(nt_semlock_type()),
-        dict,
+        dict: dict.into(),
         native: std::sync::OnceLock::new(),
         inline_values: crate::sync::Cell::new(true),
-        slots: crate::sync::RefCell::new(None),
-        hash_cache: crate::sync::Cell::new(None),
+        slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
+        hash_cache: crate::sync::CachedHash::new(None),
         finalize_ran: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
     });

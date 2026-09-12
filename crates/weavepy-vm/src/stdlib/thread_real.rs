@@ -707,11 +707,11 @@ fn make_lock_object(lock: Arc<RealLock>) -> Object {
     }
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(lock_type()),
-        dict,
+        dict: dict.into(),
         native: std::sync::OnceLock::new(),
         inline_values: crate::sync::Cell::new(true),
-        slots: crate::sync::RefCell::new(None),
-        hash_cache: crate::sync::Cell::new(None),
+        slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
+        hash_cache: crate::sync::CachedHash::new(None),
         finalize_ran: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
     });
@@ -770,7 +770,7 @@ fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
     let repr_state_lock = rlock.clone();
     let repr_state = move |_args: &[Object]| -> Result<Object, RuntimeError> {
         let (owner, depth) = repr_state_lock.owner_and_depth();
-        Ok(Object::new_tuple(vec![
+        Ok(Object::new_tuple_array([
             Object::Int(i64::try_from(owner).unwrap_or(i64::MAX)),
             Object::Int(depth as i64),
         ]))
@@ -891,11 +891,11 @@ fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
     }
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(rlock_type()),
-        dict,
+        dict: dict.into(),
         native: std::sync::OnceLock::new(),
         inline_values: crate::sync::Cell::new(true),
-        slots: crate::sync::RefCell::new(None),
-        hash_cache: crate::sync::Cell::new(None),
+        slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
+        hash_cache: crate::sync::CachedHash::new(None),
         finalize_ran: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
     });
@@ -1530,7 +1530,7 @@ pub(crate) fn silent_system_exit() -> RuntimeError {
     );
     if let Object::Instance(inst_rc) = &inst {
         inst_rc.slot_set("code", Object::None);
-        inst_rc.slot_set("args", Object::new_tuple(vec![]));
+        inst_rc.slot_set("args", Object::new_tuple_array([]));
     }
     RuntimeError::PyException(crate::error::PyException::new(inst))
 }
@@ -1826,11 +1826,11 @@ fn make_thread_handle_object(state: Arc<ThreadHandleState>, ident: Object) -> Ob
     }
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(thread_handle_type()),
-        dict,
+        dict: dict.into(),
         native: std::sync::OnceLock::new(),
         inline_values: crate::sync::Cell::new(true),
-        slots: crate::sync::RefCell::new(None),
-        hash_cache: crate::sync::Cell::new(None),
+        slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
+        hash_cache: crate::sync::CachedHash::new(None),
         finalize_ran: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
     });

@@ -1860,7 +1860,7 @@ fn sre_exec(args: &[Object]) -> Result<Object, RuntimeError> {
         };
         marks_out.push(Object::Int(v as i64));
     }
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(mstart as i64),
         Object::Int(mend as i64),
         Object::Int(m.lastindex as i64),

@@ -1546,16 +1546,13 @@ fn math_frexp(args: &[Object]) -> Result<Object, RuntimeError> {
     // NaN/inf/0 are returned unchanged with exponent 0 (CPython sidesteps
     // platform `frexp` differences for these).
     if x.is_nan() || x.is_infinite() || x == 0.0 {
-        return Ok(Object::Tuple(crate::sync::Rc::from(vec![
-            Object::Float(x),
-            Object::Int(0),
-        ])));
+        return Ok(Object::new_tuple_array([Object::Float(x), Object::Int(0)]));
     }
     let (mantissa, exp) = frexp(x);
-    Ok(Object::Tuple(crate::sync::Rc::from(vec![
+    Ok(Object::new_tuple_array([
         Object::Float(mantissa),
         Object::Int(exp),
-    ])))
+    ]))
 }
 
 /// C `frexp`: split a finite, nonzero `x` into `(m, e)` with `x = m·2**e`
@@ -1580,23 +1577,23 @@ fn math_modf(args: &[Object]) -> Result<Object, RuntimeError> {
     let x = to_f64(args, "modf", 0)?;
     // modf(±inf) = (±0.0, ±inf); modf(nan) = (nan, nan).
     if x.is_infinite() {
-        return Ok(Object::Tuple(crate::sync::Rc::from(vec![
+        return Ok(Object::new_tuple_array([
             Object::Float(0.0_f64.copysign(x)),
             Object::Float(x),
-        ])));
+        ]));
     }
     if x.is_nan() {
-        return Ok(Object::Tuple(crate::sync::Rc::from(vec![
+        return Ok(Object::new_tuple_array([
             Object::Float(x),
             Object::Float(x),
-        ])));
+        ]));
     }
     let int_part = x.trunc();
     let frac = x - int_part;
-    Ok(Object::Tuple(crate::sync::Rc::from(vec![
+    Ok(Object::new_tuple_array([
         Object::Float(frac),
         Object::Float(int_part),
-    ])))
+    ]))
 }
 
 fn math_comb(args: &[Object]) -> Result<Object, RuntimeError> {

@@ -281,7 +281,7 @@ pub fn try_load(source_path: &Path, optimize: u8) -> Option<CodeObject> {
     let body = &bytes[HEADER_LEN..];
     match marshal_mod::load_from_bytes(body).ok()? {
         Object::Code(c) => {
-            let mut code = (*c).clone();
+            let mut code = own_decoded_code(c);
             // The cache may have been written under a different spelling of
             // the same file (a symlinked `sys.path` entry — e.g. a vendored
             // `Lib -> /opt/.../python3.14`). CPython re-imports record the
@@ -299,6 +299,13 @@ pub fn try_load(source_path: &Path, optimize: u8) -> Option<CodeObject> {
     }
 }
 
+/// Reuse freshly decoded code while preserving the shared-root clone fallback.
+pub(crate) fn own_decoded_code(code: Rc<CodeObject>) -> CodeObject {
+    // The decoder has released its reference table, so the normal case can
+    // move the root and later relocate uniquely owned children in place.
+    Rc::unwrap_or_clone(code)
+}
+
 /// Recursively stamp `filename` on a code object and every nested code
 /// constant (function/class bodies, comprehensions).
 pub(crate) fn rewrite_filenames(code: &mut CodeObject, filename: &str) {
@@ -308,7 +315,8 @@ pub(crate) fn rewrite_filenames(code: &mut CodeObject, filename: &str) {
             // Freshly decoded pools own their code Arcs uniquely, so
             // `make_mut` rewrites in place (no clone).
             weavepy_compiler::Constant::Code(inner) => {
-                rewrite_filenames(std::sync::Arc::make_mut(inner), filename)
+                let inner = std::sync::Arc::make_mut(inner);
+                rewrite_filenames(inner, filename)
             }
             weavepy_compiler::Constant::Tuple(items) => {
                 for it in items {
@@ -395,4 +403,79 @@ fn mtime_seconds(meta: &fs::Metadata) -> u32 {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| u32::try_from(d.as_secs() & u64::from(u32::MAX)).unwrap_or(0))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use weavepy_compiler::{compile_module, Constant};
+
+    #[test]
+    fn decoded_code_relocates_without_copying_unique_children() {
+        let module = weavepy_parser::parse_module(
+            "def outer(x):\n    def inner(y):\n        return x + y\n    return inner\n",
+        )
+        .unwrap();
+        let mut code = compile_module(&module).unwrap();
+        rewrite_filenames(&mut code, "old/module.py");
+        let Object::Bytes(bytes) = marshal_mod::b_dumps(&[Object::Code(Rc::new(code))]).unwrap()
+        else {
+            panic!("marshal must return bytes");
+        };
+        let Object::Code(decoded) = marshal_mod::load_from_bytes(&bytes).unwrap() else {
+            panic!("marshal must return code");
+        };
+        assert_eq!(Rc::strong_count(&decoded), 1);
+        let expected = (*decoded).clone();
+        let mut code = own_decoded_code(decoded);
+        assert_eq!(code, expected);
+        drop(expected);
+        fn collect(code: &CodeObject, rows: &mut Vec<(*const CodeObject, String)>) {
+            for c in &code.constants {
+                if let Constant::Code(inner) = c {
+                    rows.push((Rc::as_ptr(inner), inner.filename.clone()));
+                    collect(inner, rows);
+                }
+            }
+        }
+        let mut before = Vec::new();
+        collect(&code, &mut before);
+        assert_eq!(before.len(), 2);
+        rewrite_filenames(&mut code, "relocated/module.py");
+        let mut after = Vec::new();
+        collect(&code, &mut after);
+        assert_eq!(code.filename, "relocated/module.py");
+        assert_eq!(before.len(), after.len());
+        for ((old_ptr, old_name), (new_ptr, new_name)) in before.iter().zip(&after) {
+            assert_eq!(old_ptr, new_ptr);
+            assert_eq!(old_name, "old/module.py");
+            assert_eq!(new_name, "relocated/module.py");
+        }
+    }
+
+    #[test]
+    fn relocation_preserves_shared_code_and_nested_tuple_constants() {
+        let child = Rc::new(CodeObject {
+            name: "child".to_owned(),
+            filename: "original.py".to_owned(),
+            ..CodeObject::default()
+        });
+        let root = Rc::new(CodeObject {
+            filename: "original.py".to_owned(),
+            constants: vec![Constant::Tuple(vec![Constant::Code(child.clone())])],
+            ..CodeObject::default()
+        });
+        let mut moved = own_decoded_code(root.clone());
+        rewrite_filenames(&mut moved, "relocated.py");
+        assert_eq!(root.filename, "original.py");
+        assert_eq!(child.filename, "original.py");
+        let Constant::Tuple(items) = &moved.constants[0] else {
+            panic!("expected tuple");
+        };
+        let Constant::Code(relocated) = &items[0] else {
+            panic!("expected code");
+        };
+        assert_eq!(relocated.filename, "relocated.py");
+        assert!(!Rc::ptr_eq(&child, relocated));
+    }
 }

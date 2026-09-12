@@ -402,46 +402,55 @@ fn lru_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
 
     let typed = matches!(lru_get(&inst, "_lru_typed"), Some(Object::Bool(true)));
     let key = lru_make_key(call_args, kwargs, typed);
-    // Unhashable arguments raise TypeError, as in CPython (the key tuple's
-    // hash is taken eagerly there).
-    crate::builtins::ensure_hashable(&key)?;
+    // Compute a tuple key's hash before touching the cache. Successful
+    // hashes are retained by the tuple, so lookup, recency updates, and
+    // insertion invoke each argument's hash only once per call. Errors
+    // propagate before the wrapped function or cache statistics change.
+    // The scalar shortcut only produces exact integers and strings.
+    if matches!(key, Object::Tuple(_)) {
+        interp.do_hash_call(&key, &globals)?;
+    }
     let Some(Object::Dict(cache)) = lru_get(&inst, "_lru_cache") else {
         return Err(type_error("lru_cache wrapper lost its cache"));
     };
     let bounded = matches!(maxsize, Object::Int(m) if m > 0);
 
-    let hit = with_stolen_cache(&cache, |c| {
-        if bounded {
-            // Hit: refresh recency by moving the entry to the back.
-            match c.shift_remove(&DictKey(key.clone())) {
-                Some(v) => {
-                    c.insert(DictKey(key.clone()), v.clone());
-                    Some(v)
+    let hit = crate::object::key_cmp_scope(|| {
+        with_stolen_cache(&cache, |c| {
+            if bounded {
+                // Hit: refresh recency by moving the entry to the back.
+                match c.shift_remove(&DictKey(key.clone())) {
+                    Some(v) => {
+                        c.insert(DictKey(key.clone()), v.clone());
+                        Some(v)
+                    }
+                    None => None,
                 }
-                None => None,
+            } else {
+                c.get(&DictKey(key.clone())).cloned()
             }
-        } else {
-            c.get(&DictKey(key.clone())).cloned()
-        }
-    });
+        })
+    })?;
     if let Some(v) = hit {
         lru_counter_bump(&inst, "_lru_hits");
         return Ok(v);
     }
     lru_counter_bump(&inst, "_lru_misses");
     let result = interp.call(&func, call_args, kwargs, &globals)?;
-    with_stolen_cache(&cache, |c| {
-        // A reentrant call may have populated the key while `func` ran;
-        // keep the existing entry (CPython does the same).
-        if !c.contains_key(&DictKey(key.clone())) {
-            c.insert(DictKey(key.clone()), result.clone());
-            if let Object::Int(m) = maxsize {
-                while c.len() > m.max(0) as usize {
-                    c.shift_remove_index(0);
+    crate::object::key_cmp_scope(|| {
+        with_stolen_cache(&cache, |c| {
+            // A reentrant call may have populated the key while `func` ran;
+            // keep the existing entry (CPython does the same).
+            if !c.contains_key(&DictKey(key.clone())) {
+                c.insert(DictKey(key.clone()), result.clone());
+                if let Object::Int(m) = maxsize {
+                    while c.len() > m.max(0) as usize {
+                        c.shift_remove_index(0);
+                    }
                 }
             }
-        }
-    });
+        })
+    })?;
     Ok(result)
 }
 

@@ -18,6 +18,9 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         ("timedelta_parts", timedelta_parts as Helper),
         ("ymd_toordinal", ymd_toordinal as Helper),
         ("ordinal_toymd", ordinal_toymd as Helper),
+        ("parse_time_parts", parse_time_parts as Helper),
+        ("date_fields", date_fields as Helper),
+        ("time_fields", time_fields as Helper),
     ] {
         let function = Object::Builtin(Rc::new(BuiltinFn {
             name,
@@ -38,8 +41,104 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 const DAYS_BEFORE_MONTH: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
 const DAYS_IN_MONTH: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
+/// Parse exact ASCII time components without Python slicing or digit callbacks.
+/// None leaves unsupported inputs and all errors to the existing Python parser.
+fn ascii_time_parts(text: &[u8]) -> Option<[i64; 4]> {
+    let mut parts = [0; 4];
+    let mut pos = 0;
+    let mut separated = false;
+    for (component, part) in parts[..3].iter_mut().enumerate() {
+        let digits = text.get(pos..pos + 2)?;
+        if !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        *part = i64::from(digits[0] - b'0') * 10 + i64::from(digits[1] - b'0');
+        pos += 2;
+        if component == 0 {
+            separated = text.get(pos) == Some(&b':');
+        }
+        if pos == text.len() || component == 2 {
+            break;
+        }
+        if separated {
+            if text.get(pos) != Some(&b':') {
+                return None;
+            }
+            pos += 1;
+        }
+    }
+    if pos < text.len() {
+        if !matches!(text[pos], b'.' | b',') {
+            return None;
+        }
+        let fraction = &text[pos + 1..];
+        // Short fractions use the Python module's correction table. Keep
+        // that path, including any replacement of the table or its entries.
+        if fraction.len() < 6 || !fraction.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        parts[3] = fraction[..6]
+            .iter()
+            .fold(0, |value, digit| value * 10 + i64::from(digit - b'0'));
+    }
+    Some(parts)
+}
+
+fn parse_time_parts(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Str(text)] = args else {
+        return Ok(Object::None);
+    };
+    Ok(match ascii_time_parts(text.as_bytes()) {
+        Some(parts) => Object::new_list(parts.into_iter().map(Object::Int).collect()),
+        None => Object::None,
+    })
+}
+
 fn is_leap(year: i64) -> bool {
     year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+/// Accept only already-normalized fields. Leave conversion, callbacks, and
+/// every invalid-input error to the Python validation functions.
+fn date_fields(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Int(year), Object::Int(month), Object::Int(day)] = args else {
+        return Ok(Object::None);
+    };
+    if !(1..=9999).contains(year) || !(1..=12).contains(month) {
+        return Ok(Object::None);
+    }
+    let days = DAYS_IN_MONTH[(*month - 1) as usize] + i64::from(*month == 2 && is_leap(*year));
+    if !(1..=days).contains(day) {
+        return Ok(Object::None);
+    }
+    Ok(Object::new_tuple_array([
+        Object::Int(*year),
+        Object::Int(*month),
+        Object::Int(*day),
+    ]))
+}
+
+fn time_fields(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Int(hour), Object::Int(minute), Object::Int(second), Object::Int(microsecond), Object::Int(fold)] =
+        args
+    else {
+        return Ok(Object::None);
+    };
+    if !(0..=23).contains(hour)
+        || !(0..=59).contains(minute)
+        || !(0..=59).contains(second)
+        || !(0..=999_999).contains(microsecond)
+        || !(0..=1).contains(fold)
+    {
+        return Ok(Object::None);
+    }
+    Ok(Object::new_tuple_array([
+        Object::Int(*hour),
+        Object::Int(*minute),
+        Object::Int(*second),
+        Object::Int(*microsecond),
+        Object::Int(*fold),
+    ]))
 }
 
 fn ymd_toordinal(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -101,7 +200,7 @@ fn ordinal_toymd(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         (month, remaining + 1)
     };
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(year),
         Object::Int(month),
         Object::Int(day),
@@ -165,9 +264,59 @@ fn timedelta_parts(args: &[Object]) -> Result<Object, RuntimeError> {
         )));
     }
     let remainder = total.rem_euclid(MICROS[0]);
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(days as i64),
         Object::Int((remainder / 1_000_000) as i64),
         Object::Int((remainder % 1_000_000) as i64),
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ascii_time_parts;
+
+    #[test]
+    fn ascii_time_components_preserve_shape_and_fraction_truncation() {
+        for (text, expected) in [
+            ("00", [0, 0, 0, 0]),
+            ("1234", [12, 34, 0, 0]),
+            ("12:34", [12, 34, 0, 0]),
+            ("123456", [12, 34, 56, 0]),
+            ("12:34:56", [12, 34, 56, 0]),
+            ("12:34:56.123456", [12, 34, 56, 123_456]),
+            ("123456,000001999", [12, 34, 56, 1]),
+            // Range validation belongs to the original caller.
+            ("99:99:99", [99, 99, 99, 0]),
+            ("24:00:00.000000", [24, 0, 0, 0]),
+        ] {
+            assert_eq!(ascii_time_parts(text.as_bytes()), Some(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn unsupported_time_inputs_request_the_existing_parser() {
+        for text in [
+            "",
+            "1",
+            "123",
+            "12:",
+            "12:3",
+            "12:3456",
+            "1234:56",
+            "12.123456",
+            "12:34.123456",
+            "12:34:56.",
+            "12:34:56.1",
+            "12:34:56.12345",
+            "12:34:56.123456x",
+            "12:34:56+00:00",
+            "12:34:56Z",
+            "１２:３４:５６",
+            "12:34:56.١٢٣٤٥٦",
+            "-1",
+            "+1",
+        ] {
+            assert_eq!(ascii_time_parts(text.as_bytes()), None, "{text}");
+        }
+    }
 }

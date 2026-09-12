@@ -835,7 +835,7 @@ fn imp_find_frozen(args: &[Object]) -> Result<Object, RuntimeError> {
             None => Object::from_str(n),
         },
     };
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::from_static(frozen.source),
         Object::Bool(frozen.is_package),
         origname,

@@ -1,0 +1,1004 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.45s
+     Running unittests src/lib.rs (target/debug/deps/expat_sys-7d5dd346c1375115)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/weavepy-b92f9580b096bc14)
+
+running 3 tests
+test tests::syntax_error_carries_caret ... ok
+test tests::run_empty_source_succeeds ... ok
+test tests::runtime_error_includes_filename ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests/fixtures.rs (target/debug/deps/fixtures-99c8326e7377150e)
+
+running 1 test
+/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy/tests/fixtures/run/37_async_await.py:23: RuntimeWarning: coroutine 'succ' was never awaited
+  print(type(succ(0)).__name__)
+RuntimeWarning: Enable tracemalloc to get the object allocation traceback
+error: Unrecognized option: 'c'
+/Users/owencarey/Documents/weavefoundry/weavepy/target/performance-stdlib-cache/a3f42d09dd2e10e0/lib/weavepy3.14/multiprocessing/resource_tracker.py:233: UserWarning: resource_tracker: process died unexpectedly, relaunching.  Some resources might leak.
+  warnings.warn('resource_tracker: process died unexpectedly, '
+error: Unrecognized option: 'c'
+/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy/tests/fixtures/run/45_asyncio_extras.py:85: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+  asyncio.iscoroutinefunction(coro),
+/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy/tests/fixtures/run/45_asyncio_extras.py:86: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+  asyncio.iscoroutinefunction(sync),
+/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy/tests/fixtures/run/45_asyncio_extras.py:87: RuntimeWarning: coroutine 'main.<locals>.coro' was never awaited
+  asyncio.iscoroutine(coro()),
+RuntimeWarning: Enable tracemalloc to get the object allocation traceback
+----------------------------------------------------------------------
+Ran 7 tests in 0.011s
+
+OK
+test all_run_fixtures_match ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.15s
+
+     Running tests/stdlib_sync.rs (target/debug/deps/stdlib_sync-0fbf80ed8fed95b0)
+
+running 1 test
+test bundled_stdlib_verbatim_set_has_not_drifted ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+     Running unittests examples/dis_dump.rs (target/debug/examples/dis_dump-c3b0f4f2c7c1383a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/weavepy_bench-b640826f3ca89724)
+
+running 20 tests
+test fixtures::tests::host_baseline_path_uses_host_platform_key ... ok
+test report::tests::ab_gate_flags_relative_regression_only ... ok
+test report::tests::ab_geomean_catches_broad_under_threshold_regression ... ok
+test report::tests::ab_row_without_base_leg_is_skipped ... ok
+test report::tests::baseline_without_platform_refused ... ok
+test report::tests::gate_absolute_fallback_without_ratios ... ok
+test fixtures::tests::baseline_path_is_per_platform ... ok
+test report::tests::base_fields_absent_from_non_ab_serialization ... ok
+test report::tests::gate_fails_unbaselined_fixture ... ok
+test report::tests::gate_flags_ratio_regression_not_host_speed ... ok
+test report::tests::gate_refuses_platform_mismatch ... ok
+test report::tests::interp_ratio_is_gated_when_both_rows_carry_it ... ok
+test report::tests::new_reports_stamp_host_platform ... ok
+test report::tests::ratio_and_geomean_computed ... ok
+test runner::tests::demangles_legacy_rust_symbols ... ok
+test runner::tests::median_of_odd_and_even_sample_sets ... ok
+test runner::tests::parses_last_ns_line ... ok
+test runner::tests::rejects_missing_marker ... ok
+test runner::tests::sample_tree_self_samples ... ok
+test runner::tests::scaling_is_serial_over_parallel ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/weavepy_bench-dc391832fed12cac)
+
+running 4 tests
+test tests::missing_baseline_is_an_error_by_default ... ok
+test tests::missing_baseline_allowed_yields_advisory_none ... ok
+test tests::matching_platform_baseline_loads ... ok
+test tests::copied_baseline_from_other_platform_refused ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/weavepy_capi-e8f1e81d85506b92)
+
+running 33 tests
+test abi314::tests::layout_matches_sys_int_info ... ok
+test buffer_format::tests::flag_set_helper ... ok
+test buffer::tests::fill_contiguous_strides_f_order ... ok
+test buffer::tests::fill_contiguous_strides_c_order ... ok
+test buffer_format::tests::fixed_length_strings ... ok
+test buffer_format::tests::parses_byte_order_prefix ... ok
+test buffer_format::tests::parses_plain_codes ... ok
+test buffer::tests::check_contiguous_recognises_f_order ... ok
+test buffer::tests::check_contiguous_recognises_c_order ... ok
+test buffer_format::tests::parses_repeat_count ... ok
+test initconfig::tests::config_struct_layout_matches_stock_header ... ok
+test buffer_format::tests::parses_numpy_size_suffix ... ok
+test buffer_format::tests::unknown_codes_fall_back_safely ... ok
+test buffer_format::tests::format_string_for_round_trips ... ok
+test initconfig::tests::init_zeroes_a_poisoned_struct ... ok
+test initconfig::tests::wide_round_trip ... ok
+test frozen_table::tests::package_flags_match ... ok
+test abi314::tests::digits_round_trip ... ok
+test frozen_table::tests::tables_match_canonical_names ... ok
+test initconfig::tests::parse_cmdline_extracts_run_command ... ok
+test pep741::tests::create_set_get_round_trip ... ok
+test pep741::tests::errors_are_named_and_readable ... ok
+test slottable::tests::has_protocol_flags_track_installation ... ok
+test slottable::tests::install_and_lookup_round_trip ... ok
+test slottable::tests::out_of_range_install_is_noop ... ok
+test vectorcall::tests::nargs_strips_offset_bit ... ok
+test mirror::tests::long_body_encodes_small_int ... ok
+test mirror::tests::bytes_body_is_faithful ... ok
+test mirror::tests::generic_body_keeps_native_in_prefix ... ok
+test mirror::tests::long_body_encodes_negative ... ok
+test mirror::tests::float_body_is_faithful ... ok
+test mirror::tests::str_ascii_body_is_faithful ... ok
+test mirror::tests::tuple_body_holds_element_mirrors ... ok
+
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/capi_abi3check.rs (target/debug/deps/capi_abi3check-bc8a99b42fd475b4)
+
+running 8 tests
+test abi3check_skipped_when_extension_missing ... ok
+test abi3check_fromspec_counter_type ... ok
+test abi3check_multiphase_exec_ran ... ok
+test abi3check_gil_roundtrip ... ok
+test abi3check_interp_alive ... ok
+test abi3check_recursion_guard ... ok
+test abi3check_sum_ints ... ok
+test abi3check_vectorcall ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+     Running tests/capi_buffer.rs (target/debug/deps/capi_buffer-fab535a3ff29f7ad)
+
+running 10 tests
+test fill_contiguous_strides_round_trip ... ok
+test is_contiguous_flat_buffer ... ok
+test fill_info_populates_view ... ok
+test buffer_check_works_for_native_exporters ... ok
+test buffer_size_from_format_resolves_known_codes ... ok
+test memoryview_from_object_wraps_bytes ... ok
+test get_buffer_round_trips_bytes ... ok
+test memoryview_check_recognises_constructed_views ... ok
+test vectorcall_nargs_strips_offset_bit ... ok
+test vectorcall_falls_back_for_plain_builtin ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/capi_greenletconsumer.rs (target/debug/deps/capi_greenletconsumer-2be246e3a0eb6d56)
+
+running 8 tests
+test greenletconsumer_skipped_when_extension_missing ... ok
+test greenletconsumer_new_and_switch_lifecycle ... ok
+test greenletconsumer_parent_get_set ... ok
+test greenletconsumer_getcurrent_and_predicates ... ok
+test greenletconsumer_switch_under_c_frame ... ok
+test greenletconsumer_throw_and_exceptions ... ok
+test greenletconsumer_capsule_and_sizes ... ok
+test greenletconsumer_c_subclass ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.22s
+
+     Running tests/capi_loader.rs (target/debug/deps/capi_loader-df81de883acd65a4)
+
+running 9 tests
+test loader_skipped_when_extension_missing ... ok
+test dlopen_smalltest_produces_module ... ok
+test smalltest_class_and_static_methods_bind ... ok
+test smalltest_add_function_runs ... ok
+test smalltest_concat_function_runs ... ok
+test smalltest_et_converter_round_trips ... ok
+test smalltest_oops_raises_value_error ... ok
+test smalltest_module_constants_are_set ... ok
+test smalltest_slice_index_semantics ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/capi_ndarray.rs (target/debug/deps/capi_ndarray-9d0e5260b39bd909)
+
+running 14 tests
+test ndarray_class_has_dunders ... ok
+test ndarray_addition_via_dunder ... ok
+test ndarray_constructor_and_repr ... ok
+test ndarray_buffer_size_function ... ok
+test ndarray_fill_and_sum ... ok
+test ndarray_skipped_when_extension_missing ... ok
+test ndarray_dict_inspection ... ok
+test ndarray_format_size_helper ... ok
+test ndarray_iter_walks_rows ... ok
+test ndarray_module_exposes_class ... ok
+test ndarray_sequence_len_and_item ... ok
+test ndarray_setitem_and_subscript ... ok
+test ndarray_shape_property ... ok
+test ndarray_to_bytes_round_trip ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+     Running tests/capi_numpylike.rs (target/debug/deps/capi_numpylike-06c4c780d67b1dc0)
+
+running 14 tests
+test numpylike_arange_and_sum ... ok
+test numpylike_array_shape_and_dtype ... ok
+test numpylike_arange_with_keywords ... ok
+test numpylike_dtype_constants ... ok
+test numpylike_mask_select ... ok
+test numpylike_skipped_when_missing ... ok
+test numpylike_dot1d ... ok
+test numpylike_datetime_capi_year_diff ... ok
+test numpylike_binary_ufunc ... ok
+test numpylike_module_surface ... ok
+test numpylike_reshape_2d ... ok
+test numpylike_scalar_broadcast ... ok
+test numpylike_setitem_and_getitem ... ok
+test numpylike_unary_ufunc ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+
+     Running tests/capi_stockabi.rs (target/debug/deps/capi_stockabi-6e4d5c6fa8db4eb6)
+
+running 10 tests
+test stockabi_function_api ... ok
+test stockabi_skipped_when_extension_missing ... ok
+test stockabi_inlined_float_read ... ok
+test stockabi_c_side_dealloc ... ok
+test stockabi_inlined_tuple_item_read ... ok
+test stockabi_inlined_size_read ... ok
+test stockabi_exported_unicode_kind_and_data_functions ... ok
+test stockabi_module_loads_with_constants ... ok
+test stockabi_roundtrip_incref ... ok
+test stockabi_type_identity ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/capi_stockarray.rs (target/debug/deps/capi_stockarray-cc4577d63edb7fd8)
+
+running 11 tests
+test stockarray_array_interface ... ok
+test stockarray_array_struct_capsule ... ok
+test stockarray_data_pointer_is_stable ... ok
+test stockarray_skipped_when_extension_missing ... ok
+test stockarray_dealloc_frees_buffer ... ok
+test stockarray_fill_then_sum ... ok
+test stockarray_import_array_capsule_roundtrip ... ok
+test stockarray_inline_storage_persists_across_calls ... ok
+test stockarray_member_write_roundtrips ... ok
+test stockarray_members_read_inline_fields ... ok
+test stockarray_module_loads_with_type_and_capsule ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/capi_stockcython.rs (target/debug/deps/capi_stockcython-6b24a5ec1358f374)
+
+running 7 tests
+test stockcython_skipped_when_extension_missing ... ok
+test stockcython_base_slots_direct ... ok
+test stockcython_partial_subclass_merges_suite ... ok
+test stockcython_module_loads_with_types ... ok
+test stockcython_pure_subclass_inherits_all_slots ... ok
+test stockcython_python_level_dispatch_on_subclass ... ok
+test stockcython_runtime_surface ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+     Running tests/capi_stockdatetime.rs (target/debug/deps/capi_stockdatetime-463147a9e5d5dcca)
+
+running 10 tests
+test stockdatetime_skipped_when_extension_missing ... ok
+test stockdatetime_capsule_imports_with_faithful_sizes ... ok
+test stockdatetime_module_size_check ... ok
+test stockdatetime_read_datetime ... ok
+test stockdatetime_read_date ... ok
+test stockdatetime_read_delta ... ok
+test stockdatetime_capsule_constructors ... ok
+test stockdatetime_read_time ... ok
+test stockdatetime_type_checks ... ok
+test stockdatetime_type_slot_methods ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.33s
+
+     Running tests/capi_stocktype.rs (target/debug/deps/capi_stocktype-aedbc13ec3967bbe)
+
+running 11 tests
+test stocktype_async_protocol ... ok
+test stocktype_call_type_object_from_c ... ok
+test stocktype_descriptor_protocol ... ok
+test stocktype_skipped_when_extension_missing ... ok
+test stocktype_gc_cycle_through_c_memory ... ok
+test stocktype_call_protocol ... ok
+test stocktype_getattro_setattro ... ok
+test stocktype_module_loads_with_types ... ok
+test stocktype_number_and_richcompare ... ok
+test stocktype_ready_populates_class_dict ... ok
+test stocktype_sequence_mapping_iter ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+     Running tests/capi_testbuffer.rs (target/debug/deps/capi_testbuffer-18b974c9478d0684)
+
+running 7 tests
+test testbuffer_skipped_when_extension_missing ... ok
+test testbuffer_module_helpers ... ok
+test testbuffer_imports ... ok
+test testbuffer_one_dimensional ... ok
+test testbuffer_multi_dimensional ... ok
+test testbuffer_pil_suboffsets ... ok
+test testbuffer_staticarray ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.08s
+
+     Running tests/capi_wheel_endtoend.rs (target/debug/deps/capi_wheel_endtoend-a53c5417470b6b14)
+
+running 1 test
+numpylike import OK from wheel; arr.shape = (5,) sum = 10.0
+test wheel_install_and_import_round_trip ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.18s
+
+     Running tests/embed_lifecycle.rs (target/debug/deps/embed_lifecycle-96755ba2d3e55e5e)
+
+running 1 test
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ValueError: embedding
+test embedding_lifecycle_end_to_end ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s
+
+     Running tests/force_link_completeness.rs (target/debug/deps/force_link_completeness-5d1f80eae0b685f7)
+
+running 1 test
+test every_no_mangle_export_survives_dead_strip ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+
+     Running unittests src/lib.rs (target/debug/deps/weavepy_cli-37a59dbe9b967fbe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/_testembed.rs (target/debug/deps/_testembed-7dc5904fba946889)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/weavepy-8111e771905047b3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/m_test.rs (target/debug/deps/m_test-ce3d3d6b66bf3f52)
+
+running 3 tests
+test m_test_reports_failure_exit_code ... ok
+test m_test_single_bundled_fixture_passes ... ok
+test m_test_runs_multiple_named_modules ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.06s
+
+     Running tests/windows_dll.rs (target/debug/deps/windows_dll-def75be0c24a6dab)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/weavepy_compiler-922a6a043a03e199)
+
+running 38 tests
+test bytecode::cache_publication_tests::table_header_is_two_machine_words ... ok
+test bytecode::atomic_slot_tests::every_variant_round_trips_at_field_boundaries ... ok
+test bytecode::cache_tests::cache_table_clone_copies_state ... ok
+test bytecode::cache_tests::cache_table_round_trip ... ok
+test bytecode::cache_tests::cache_table_partial_eq_ignores_state ... ok
+test bytecode::compact_cache_layout_tests::cache_slots_match_the_selected_atomic_storage ... ok
+test bytecode::atomic_slot_tests::shared_slot_updates_publish_whole_values ... ok
+test bytecode::lazy_cache_tests::cold_code_stays_unallocated_through_reads_clear_clone_and_resize ... ok
+test cache_snapshot::tests::exhausted_epoch_never_wraps_or_reuses_a_stamp ... ok
+test bytecode::cache_publication_tests::concurrent_publication_returns_one_initialized_allocation ... ok
+test cache_snapshot::tests::interrupted_writer_never_blocks_readers_or_writers ... ok
+test bytecode::cache_publication_tests::concurrent_first_writes_to_disjoint_slots_survive_resize_and_drop ... ok
+test bytecode::lazy_cache_tests::warm_resize_preserves_slots_and_discards_removed_entries ... ok
+test cache_snapshot::tests::shared_snapshots_are_complete_or_miss ... ok
+test cpython_code::tests::decoded_buffers_partition_shared_and_hidden_locals ... ok
+test cpython_code::tests::exception_table_encodes_code_units ... ok
+test cpython_code::tests::cache_units_inserted ... ok
+test cpython_code::tests::decode_full_round_trips_tables_and_locals ... ok
+test cpython_code::stack_effects_agree_with_wire_shape ... ok
+test cpython_code::tests::decoded_buffers_cover_expanded_instruction_locations ... ok
+test cpython_code::tests::extended_arg_units_emitted ... ok
+test cpython_code::tests::linetable_covers_all_units ... ok
+test cpython_code::tests::roundtrip_arg_transforms ... ok
+test cpython_code::tests::roundtrip_extended_arg ... ok
+test cpython_code::tests::roundtrip_forward_jump ... ok
+test cpython_code::tests::roundtrip_jump_over_caches_needs_extended_arg ... ok
+test cpython_code::tests::roundtrip_simple ... ok
+test cpython_code::tests::roundtrip_backward_jump_loop ... ok
+test intern::tests::collisions_and_threshold_keep_first_slot ... ok
+test intern::tests::constant_keys_preserve_python_pool_equality ... ok
+test tests::empty_module_compiles_to_return_none ... ok
+test tests::dis_listing_includes_opcode_names ... ok
+test intern::tests::names_cross_threshold_without_changing_order ... ok
+test tests::for_loop_uses_get_iter_for_iter ... ok
+test tests::simple_expression_emits_load_and_pop ... ok
+test tests::function_def_makes_function ... ok
+test cpython_code::decode_shared_slot_comprehension_local ... ok
+test cpython_code::pyc_roundtrip_chain_repro ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/weavepy_conformance-82d8644973c74cf4)
+
+running 62 tests
+test corpus::tests::discover_returns_empty_for_missing_root ... ok
+test ecosystem::tests::expectations_stamp_only_read_from_top_level ... ok
+test ecosystem::tests::expectations_selftest_status_default_is_absent ... ok
+test ecosystem::tests::expectations_missing_stamp_means_all_measured ... ok
+test ecosystem::tests::expectations_keep_free_form_keys_legal ... ok
+test ecosystem::tests::expectations_os_override_resolution_order ... ok
+test ecosystem::tests::expectations_measured_os_stamp_parses ... ok
+test ecosystem::tests::expectations_stamp_rejects_unknown_os ... ok
+test ecosystem::tests::expectations_stamp_resolves_per_host ... ok
+test ecosystem::tests::expectations_suffix_only_row_needs_base_status ... ok
+test ecosystem::tests::gate_blocks_everywhere_without_stamp ... ok
+test ecosystem::tests::gate_blocks_on_measured_host_and_advises_elsewhere ... ok
+test ecosystem::tests::expectations_reject_unknown_os_suffix ... ok
+test ecosystem::tests::manifest_parses_installed_mode_selftest ... ok
+test ecosystem::tests::manifest_rejects_installed_mode_with_source ... ok
+test ecosystem::tests::manifest_rejects_overlay_in_sdist_mode ... ok
+test ecosystem::tests::manifest_rejects_overlay_without_source ... ok
+test ecosystem::tests::manifest_rejects_unknown_selftest_mode ... ok
+test ecosystem::tests::manifest_rejects_unpinned_no_binary ... ok
+test ecosystem::tests::manifest_parses_overlay_selftest ... ok
+test ecosystem::tests::manifest_rejects_orphan_selftest ... ok
+test ecosystem::tests::manifest_rejects_unpinned_selftest_source ... ok
+test ecosystem::tests::manifest_rejects_unknown_subtable ... ok
+test ecosystem::tests::manifest_rejects_no_binary_without_requirement ... ok
+test ecosystem::tests::no_binary_accepts_comma_and_space_separation ... ok
+test ecosystem::tests::manifest_parses_no_binary_and_selftest ... ok
+test ecosystem::tests::requirement_helpers ... ok
+test ecosystem::tests::strings_decode_backslash_escapes ... ok
+test normalize::tests::oracle_token_round_trips ... ok
+test normalize::tests::canonical_dis_keeps_opnames ... ok
+test normalize::tests::weavepy_eof_normalizes_to_endmarker ... ok
+test regrtest::simple_toml::tests::bad_status_value_in_override_rejected ... ok
+test regrtest::simple_toml::tests::base_applies_on_other_hosts ... ok
+test regrtest::simple_toml::tests::divergence_requires_ids_and_reason ... ok
+test regrtest::simple_toml::tests::measured_os_rejects_non_array_values ... ok
+test normalize::tests::canonical_ast_ignores_whitespace ... ok
+test regrtest::simple_toml::tests::measured_os_rejects_unknown_os_names ... ok
+test regrtest::simple_toml::tests::measured_os_stamp_resolves_per_host ... ok
+test regrtest::simple_toml::tests::measured_os_stamp_parses ... ok
+test regrtest::simple_toml::tests::missing_measured_os_stamp_means_all_measured ... ok
+test regrtest::simple_toml::tests::os_override_applies_on_matching_host ... ok
+test ecosystem::tests::shard_cost_ignores_selftests_when_disabled ... ok
+test regrtest::simple_toml::tests::os_override_without_base_optional_keys ... ok
+test regrtest::simple_toml::tests::parses_divergence_row ... ok
+test ecosystem::tests::shards_partition_every_row_exactly_once ... ok
+test regrtest::simple_toml::tests::parses_minimal_expectations ... ok
+test regrtest::simple_toml::tests::status_override_requires_base_status ... ok
+test regrtest::simple_toml::tests::unknown_os_suffix_is_a_hard_error ... ok
+test regrtest::simple_toml::tests::unrelated_unknown_keys_still_ignored ... ok
+test regrtest::tests::gate_blocks_everywhere_without_stamp ... ok
+test regrtest::tests::gate_blocks_on_measured_host ... ok
+test regrtest::tests::gate_is_advisory_on_unmeasured_host ... ok
+test regrtest::tests::gate_never_blocks_without_unexpected ... ok
+test regrtest::tests::missing_expectations_default_to_pass ... ok
+test regrtest::tests::missing_expectations_flag_failures ... ok
+test regrtest::tests::summary_counts_each_status ... ok
+test report::tests::empty_report_renders_without_panic ... ok
+test report::tests::truncate_keeps_short_strings ... ok
+test runner::tests::summary_match_rate_excludes_oracle_errors ... ok
+test runner::tests::summary_match_rate_handles_zero_denominator ... ok
+test report::tests::truncate_shortens_long_strings ... ok
+test regrtest::tests::divergence_matches_exact_failure_set ... ok
+
+test result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/main.rs (target/debug/deps/weavepy_conformance-e967a2506bec0951)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/weavepy_dist-1e65ef3aa1beafa6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/weavepy_jit-41dfc60ac170d5f2)
+
+running 2 tests
+test engine::tests::scalar_leaf_allowlist_is_conservative ... ok
+test engine::tests::scalar_leaf_returns_and_deopts_with_no_embedder_context ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/frame_coverage.rs (target/debug/deps/frame_coverage-838e3f677009cbec)
+
+running 29 tests
+test dict_receiver_attr_trains_container_lane ... ok
+test enumerate_bytes_requests_parameter_training ... ok
+test call_dyn_result_arithmetic_checks_the_returned_integer ... ok
+test dyn_attr_get_and_set_fall_back ... ok
+test enumerate_bytes_pair_loop_trains_integer_lanes ... ok
+test enumerate_generic_source_keeps_integer_index ... ok
+test dict_items_pair_loop_trains_lanes ... ok
+test enumerate_local_object_keeps_integer_index ... ok
+test enumerate_pair_loop_trains_lanes ... ok
+test folded_slice_fallback_resumes_the_constant_load ... ok
+test empty_list_accepts_native_scalar_appends ... ok
+test missing_global_still_rejects ... ok
+test guarded_integer_division_retains_float_result ... ok
+test obj_global_burns_with_guard ... ok
+test object_parameter_length_keeps_the_tuple_guard ... ok
+test opaque_global_callee_rides_call_dyn ... ok
+test open_ended_str_slice_analyzes ... ok
+test opaque_integer_call_results_guard_each_operand_position ... ok
+test shadowed_enumerate_gets_no_trained_lanes ... ok
+test slice_fallback_preserves_explicit_none_step ... ok
+test slice_fallback_preserves_two_bound_producer ... ok
+test param_callee_rides_call_dyn ... ok
+test str_mod_and_slice_lanes ... ok
+test stored_call_result_keeps_its_object_lane ... ok
+test tuple_constant_length_has_a_runtime_shape_guard ... ok
+test two_opaque_arithmetic_operands_do_not_guess_a_scalar_lane ... ok
+test typed_list_still_rejects_mismatched_append ... ok
+test unrecognized_pair_source_defaults_to_obj_lanes ... ok
+test tuple_constants_pin_without_copying_or_scalar_restrictions ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/helper_registration.rs (target/debug/deps/helper_registration-ce460f8ab9ff4f4f)
+
+running 1 test
+test reject_each_unregistered_constant_and_scalar_helper ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/numeric.rs (target/debug/deps/numeric-6bd563c64985f6b0)
+
+running 9 tests
+test add_overflow_deopts_with_operands_spilled ... ok
+test while_loop_sums ... ok
+test floordiv_by_zero_deopts ... ok
+test int_truediv_returns_float ... ok
+test add_two_ints ... ok
+test python_mod_semantics ... ok
+test while_loop_zero_iterations ... ok
+test python_floordiv_semantics ... ok
+test int_truediv_preserves_precision_and_deopt_operands ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/range_loops.rs (target/debug/deps/range_loops-0876695a7acc9dd4)
+
+running 11 tests
+test non_range_iterable_stays_interpreted ... ok
+test mixed_int_float_arith_analyzes ... ok
+test const_global_burns_in_with_guard ... ok
+test non_unit_step_stays_interpreted ... ok
+test opaque_global_disqualifies ... ok
+test break_in_range_loop_analyzes ... ok
+test params_are_entry_guarded ... ok
+test nested_range_loops_get_distinct_synthetics ... ok
+test shadowed_range_stays_interpreted ... ok
+test simple_range_loop_analyzes ... ok
+test two_arg_range_and_unit_step_analyze ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/weavepy_lexer-dcf811eff42c1c6c)
+
+running 26 tests
+test flufl_probe_tests::lexes_lessgreater_as_notequal ... ok
+test tests::comments_are_emitted_as_trivia_then_nl ... ok
+test tests::empty_source_emits_only_endmarker ... ok
+test tests::backslash_line_continuation ... ok
+test tests::eof_bare_identifier_no_newline_gets_newline ... ok
+test lang_preview_tests::t_prefix_gated ... ok
+test tests::float_kinds ... ok
+test tests::eof_without_trailing_newline_terminates_indented_block ... ok
+test tests::fstring_bracket_mismatch_messages ... ok
+test tests::fstring_nested_dict_and_calls_still_valid ... ok
+test tests::fstring_newline_in_single_line_spec ... ok
+test tests::fstring_same_quote_reuse_is_valid ... ok
+test tests::fstring_unmatched_and_never_closed ... ok
+test tests::fstring_unterminated_field_is_expecting_brace ... ok
+test tests::fstring_unterminated_literal_messages ... ok
+test tests::fstring_unterminated_nested_string_stays_string_error ... ok
+test tests::fstring_unterminated_spec_names_format_specs ... ok
+test tests::fstring_unterminated_triple_messages ... ok
+test tests::identifier_and_eof ... ok
+test tests::implicit_continuation_inside_brackets ... ok
+test tests::integer_kinds ... ok
+test tests::keywords_classified ... ok
+test tests::operators_have_distinct_kinds ... ok
+test tests::simple_indent_dedent ... ok
+test tests::string_kinds ... ok
+test tests::tstring_field_diagnostics_name_the_kind ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/weavepy_parser-2821d779ca2dcfcf)
+
+running 20 tests
+test tests::parses_empty_module ... ok
+test tests::parses_class_with_body ... ok
+test tests::parses_for_with_range ... ok
+test tests::match_is_soft_keyword_when_not_at_statement_start ... ok
+test tests::parses_chained_comparison ... ok
+test tests::parses_fstring_with_conversion_and_spec ... ok
+test tests::parses_fstring_debug_form ... ok
+test tests::parses_fstring_with_format_spec ... ok
+test tests::parses_function_def_and_call ... ok
+test tests::parses_if_elif_else ... ok
+test tests::parses_list_comp ... ok
+test tests::parses_match_with_class_pattern ... ok
+test tests::parses_match_with_literal_and_capture ... ok
+test tests::parses_match_with_or_and_guard ... ok
+test tests::parses_match_with_sequence_and_star ... ok
+test tests::parses_simple_expression_statement ... ok
+test tests::parses_try_except ... ok
+test tests::parses_simple_fstring ... ok
+test tests::parses_yield_expression ... ok
+test tests::parses_yield_from ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/python314-6184fed20e6cfb46)
+
+running 1 test
+test tests::varargs_export_list_matches_c_source ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/weavepy_version-1160d947d5bf535d)
+
+running 2 tests
+test tests::vconcat_builds_static_strs ... ok
+test tests::derived_literals_agree ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/weavepy_vm-8bdb2394b2cc9c61)
+
+running 341 tests
+test fasthash::tests::distinct_keys_hash_apart ... ok
+test fasthash::tests::map_roundtrip ... ok
+test gc_trace::tests::generation_constructor_rejects_out_of_range_indices ... ok
+test gil::tests::breaker_basic_flag_lifecycle ... ok
+test frozen_code_cache::tests::cache_returns_fresh_copies ... ok
+test gc_trace::tests::freeze_unfreeze_round_trip ... ok
+test gc_trace::tests::track_and_untrack ... ok
+test frozen_code_cache::tests::cache_clears_inline_caches_on_clone ... ok
+test gil::tests::switch_interval_round_trips ... ok
+test gil::tests::gil_acquire_release_basic ... ok
+test gil::tests::waiters_count_increments ... ok
+test gil::tests::pending_calls_drain ... ok
+test hot_filter::tests::fresh_filter_rejects ... ok
+test hot_filter::tests::inserted_ids_are_found ... ok
+test gc_trace::tests::collect_clears_simple_cycle ... ok
+test import::tests::resolve_absolute_passes_through ... ok
+test gc_trace::tests::live_roots_promote_freeze_and_untrack ... ok
+test lazy_arc::tests::exclusive_replacement_releases_only_the_previous_count ... ok
+test lazy_arc::tests::empty_inspection_does_not_materialize_storage ... ok
+test lazy_arc::tests::empty_clone_shares_later_mutations ... ok
+test import::tests::resolve_relative_one_level_drops_last_component ... ok
+test import::tests::resolve_relative_two_levels_drops_two ... ok
+test import::tests::resolve_relative_overshoot_errors ... ok
+test lazy_arc::tests::reentrant_initializer_keeps_the_first_published_owner ... ok
+test lazy_arc::tests::sharing_keeps_identity_and_exact_ownership ... ok
+test lazy_arc::tests::panicking_initialization_does_not_publish_or_poison ... ok
+test object::tests::equality_handles_numeric_coercion ... ok
+test object::tests::identity_of_same_list_handle ... ok
+test object::tests::siphash13_tail_lengths_match_cpython ... ok
+test object::tests::list_iter_yields_elements_in_order ... ok
+test object::tests::empty_tuple_arrays_use_the_interned_tuple ... ok
+test object::tests::tuple_arrays_preserve_order_identity_and_ownership ... ok
+test object::tests::truthiness_matches_python_basics ... ok
+test lazy_arc::tests::publication_losers_release_their_private_values ... ok
+test pycache::ownership_tests::relocation_preserves_shared_code_and_nested_tuple_constants ... ok
+test specialize::tests::binop_int_division_family_specializes ... ok
+test specialize::tests::binop_float_division_family_specializes ... ok
+test specialize::tests::binop_int_float_does_not_specialize ... ok
+test specialize::tests::binop_ints_specialize_to_add_int ... ok
+test gc_trace::tests::gc_index_distributes_aligned_object_addresses ... ok
+test recursion::tests::depth_balances_across_guards ... ok
+test specialize::tests::compare_op_floats_specialize ... ok
+test object::tests::small_int_range_collection_preserves_boundary_values ... ok
+test specialize::tests::for_iter_str_and_dict_specialize ... ok
+test recursion::tests::over_limit_raises_every_time_without_inflating_depth ... ok
+test specialize::tests::store_subscr_decisions_cover_ws3_shapes ... ok
+test specialize::tests::unpack_three_tuple_uses_general_tuple_path ... ok
+test specialize::tests::unpack_two_tuple_special_cases ... ok
+test specialize::tests::subscr_decisions_cover_ws3_shapes ... ok
+test stdlib::datetime_accel::tests::unsupported_time_inputs_request_the_existing_parser ... ok
+test stdlib::datetime_accel::tests::ascii_time_components_preserve_shape_and_fraction_truncation ... ok
+test stdlib::os::tests::splitext_handles_simple_extensions ... ok
+test stdlib::pickle_accel::encode::tests::compact_integer_encoding_ignores_internal_bigint_representation ... ok
+test stdlib::os::tests::normpath_collapses_dots ... ok
+test stdlib::pickle_accel::encode::tests::insufficient_python_headroom_uses_fallback ... ok
+test stdlib::pickle_accel::encode::tests::frame_boundary_and_small_stream_bytes_match_the_reference ... ok
+test stdlib::pickle_accel::tests::decoded_strings_keep_utf8_and_memo_aliases ... ok
+test stdlib::pickle_accel::tests::decode_scalars_frames_and_memo_aliases ... ok
+test stdlib::pickle_accel::tests::preflight_rejects_bad_frames_arguments_and_text ... ok
+test stdlib::pickle_accel::tests::preflight_rejects_cycles_deep_graphs_and_unsupported_keys ... ok
+test stdlib::thread_real::tests::parse_timeout_handles_floats_and_negatives ... ok
+test stdlib_tree::tests::rel_path_shapes ... ok
+test stdlib::pickle_accel::encode::tests::list_batches_preserve_shared_children ... ok
+test sync::tests::barrier_releases_all_parties ... ok
+test pycache::ownership_tests::decoded_code_relocates_without_copying_unique_children ... ok
+test sync::tests::cached_hash_preserves_python_hash_boundaries ... ok
+test sync::tests::copy_cell_publishes_prior_writes ... ok
+test sync::tests::copy_cells_are_compact ... ok
+test sync::tests::cached_hash_publication_and_updates_do_not_tear ... ok
+test sync::tests::copy_cell_replacements_do_not_tear ... ok
+test sync::tests::gilcell_borrow_mut_mutates ... ok
+test sync::tests::gilcell_borrow_returns_inner ... ok
+test sync::tests::gilcell_clone_deep_copies ... ok
+test sync::tests::gilcell_cross_thread_mutation ... ok
+test sync::tests::gilcell_is_send_sync ... ok
+test sync::tests::gilcell_multi_shared_borrows ... ok
+test sync::tests::gilcell_mut_borrow_blocks_shared ... ok
+test sync::tests::gilcell_nested_borrow_mut_panics - should panic ... ok
+test sync::tests::gilcell_reentrant_shared_borrow_on_same_thread ... ok
+test sync::tests::gilcell_release_re_enables ... ok
+test sync::tests::gilcell_replace_returns_old ... ok
+test sync::tests::gilcell_shared_borrow_blocks_mut ... ok
+test sync::tests::gilcell_swap_exchanges ... ok
+test sync::tests::gilcell_take_resets_to_default ... ok
+test sync::tests::lock_basic_acquire_release ... ok
+test sync::tests::rlock_reentrant ... ok
+test sync::tests::semaphore_blocks_at_zero ... ok
+test sync::tests::gilcell_contended_borrows_publish_consistent_state ... ok
+test stdlib::thread_real::tests::allocate_lock_returns_lock_object ... ok
+test stdlib::weakref_real::tests::ref_returns_alive_target_then_none_after_clear ... ok
+test object::tests::small_int_range_collection_rejects_impossible_capacities ... ok
+test tests::arithmetic_precedence ... ok
+test tests::builtin_slot_wrappers_identity_and_calls ... ok
+test tests::call_spec_defaults_use_generic_path ... ok
+test sync::tests::event_signal_across_threads ... ok
+test tests::call_spec_kwnames_code_rename_deopts ... ok
+test tests::call_spec_kwnames_defaults_rebind_deopts ... ok
+test tests::call_spec_kwnames_hit ... ok
+test tests::call_spec_repeated_closure ... ok
+test tests::call_spec_repeated_plain ... ok
+test tests::call_spec_polymorphic_site_deopts ... ok
+test tests::class_attribute_default ... ok
+test tests::class_iter_protocol ... ok
+test tests::closure ... ok
+test stdlib::pickle_accel::encode::tests::list_encoding_tolerates_concurrent_resizing ... ok
+test stdlib_tree::tests::build_id_matches_embedded_manifest ... ok
+test tests::cold_instance_dictionaries_survive_lookup_and_collection ... ok
+test tests::constructor_slot_writes_share_code_names ... ok
+test tests::dunder_add_dispatch ... ok
+test tests::dunder_len_dispatch ... ok
+test tests::dunder_str_overrides_repr ... ok
+test tests::except_does_not_match_other ... ok
+test tests::cold_instance_dictionaries_survive_native_method_calls ... ok
+test tests::dunder_repr_used_by_print ... ok
+test tests::fibonacci ... ok
+test tests::from_import_binds_names ... ok
+test tests::for_loop_range ... ok
+test tests::fstring_format_spec_fixed ... ok
+test tests::fstring_expression ... ok
+test tests::fstring_format_spec_width_align ... ok
+test tests::fstring_hex_and_binary ... ok
+test tests::generator_basic_yield ... ok
+test tests::function_call ... ok
+test tests::fstring_plain_interpolation ... ok
+test tests::generator_expression_is_lazy ... ok
+test tests::fstring_repr_conversion ... ok
+test tests::dotted_import_walks_attributes ... ok
+test tests::generator_returns_value_in_stopiteration ... ok
+test tests::generator_yield_from ... ok
+test tests::generator_next_then_loop ... ok
+test tests::import_as_renames ... ok
+test tests::if_else ... ok
+test tests::imports_math_module ... ok
+test tests::isinstance_with_class ... ok
+test tests::jit_append_pins_lane_of_empty_list ... ok
+test tests::jit_attr_class_mutation_stays_exact ... ok
+test tests::jit_attr_chain_compiles_clean ... ok
+test tests::jit_attr_dict_reshape_deopts ... ok
+test tests::jit_attr_scalar_roundtrip_compiles_clean ... ok
+test tests::jit_attr_chain_inner_reshape_stays_exact ... ok
+test tests::jit_attr_float_lane_matches_interpreter ... ok
+test tests::jit_bare_yield_and_yield_none ... ok
+test tests::jit_branchy_kernel_matches_interpreter ... ok
+test tests::jit_build_list_mixed_lanes ... ok
+test tests::jit_build_list_past_the_cap ... ok
+test tests::jit_build_list_repeat_and_slice_compile_clean ... ok
+test tests::jit_build_tuple_compiles ... ok
+test tests::jit_build_tuple_identity_and_type ... ok
+test tests::jit_bytes_subscript_and_len ... ok
+test tests::jit_call_dyn_param_callee ... ok
+test tests::jit_call_dyn_raise_propagates ... ok
+test tests::jit_call_result_outside_lane_deopts_with_result ... ok
+test tests::jit_callee_code_rebind_fails_entry_guard ... ok
+test tests::jit_calls_helper_with_known_return_lane ... ok
+test tests::jit_call_raising_callee_propagates_exception ... ok
+test tests::jit_ctor_attr_residue_class_swap_stays_exact ... ok
+test tests::jit_ctor_attr_residue_compiles ... ok
+test tests::jit_ctor_attr_residue_const_field_and_store ... ok
+test tests::jit_ctor_self_body_residue_compiles ... ok
+test tests::jit_class_call_init_rebind_stays_exact ... ok
+test tests::jit_ctor_self_body_residue_nonempty_dict_stays_exact ... ok
+test tests::jit_dict_contains_and_negate ... ok
+test tests::jit_dict_int_key_fill_from_empty ... ok
+test tests::jit_dict_items_mutation_raises_exact ... ok
+test tests::jit_dict_items_pair_loop ... ok
+test tests::jit_dict_iterate_int_keys ... ok
+test tests::jit_dict_iterate_str_keys_feed_dict_get ... ok
+test tests::jit_dict_literal_builds_native ... ok
+test tests::jit_dict_missing_key_raises_exact_keyerror ... ok
+test tests::jit_class_call_constructs_natively ... ok
+test tests::jit_dict_mutation_during_iteration_stays_exact ... ok
+test tests::jit_dict_obj_values_feed_attr_lane ... ok
+test tests::jit_dict_str_key_get_set_compiles ... ok
+test tests::jit_dict_value_lane_surprise_stays_exact ... ok
+test tests::jit_elem_residue_class_surprise_stays_exact ... ok
+test tests::jit_extreme_slice_stop_stays_native_and_exact ... ok
+test tests::jit_elem_residue_osr_enters_first_loop ... ok
+test tests::jit_enumerate_pair_loop ... ok
+test tests::jit_fluent_method_return_compiles ... ok
+test tests::jit_floordiv_mod_negative_semantics ... ok
+test tests::jit_for_iter_generator_raise_propagates_exactly ... ok
+test tests::jit_for_iter_generator_param_compiles_clean ... ok
+test tests::jit_for_list_int_compiles_clean ... ok
+test tests::jit_for_list_heterogeneous_element_deopts_exactly ... ok
+test tests::jit_for_iter_lane_surprise_deopts_exactly ... ok
+test tests::jit_chronic_deopt_retires_code ... ok
+test tests::jit_dyn_attr_property_roundtrip ... ok
+test tests::jit_for_list_mutation_during_iteration ... ok
+test tests::jit_for_list_object_elements_with_none ... ok
+test tests::jit_for_iter_osr_enters_mid_loop ... ok
+test tests::jit_for_range_loop_compiles_and_matches ... ok
+test tests::jit_generator_close_and_throw_between_resumes ... ok
+test tests::jit_generator_parked_abandoned_mid_iteration ... ok
+test tests::jit_generator_parked_close_and_throw ... ok
+test tests::jit_generator_int_send_falls_back_exactly ... ok
+test tests::jit_generator_parks_and_resumes_persistently ... ok
+test tests::jit_generator_send_and_expression_yield ... ok
+test tests::jit_generator_object_lane_traversal ... ok
+test tests::jit_generator_range_loop_yields_natively ... ok
+test tests::jit_generator_gi_frame_locals_after_yield ... ok
+test tests::jit_global_const_burnin_and_rebind_guard ... ok
+test tests::jit_generator_parked_gi_frame_materializes ... ok
+test tests::jit_is_none_check_compiles_clean ... ok
+test tests::jit_len_on_pinned_list_compiles_clean ... ok
+test tests::jit_linked_list_traversal_compiles_clean ... ok
+test tests::jit_generator_while_loop_with_return_value ... ok
+test tests::jit_list_append_grows_and_len_agrees ... ok
+test tests::jit_generator_trailing_yield_parks_natively ... ok
+test tests::jit_generator_while_trailing_yield_parks_natively ... ok
+test tests::jit_list_float_lane_and_store ... ok
+test tests::jit_list_heterogeneous_element_deopts ... ok
+test tests::jit_list_int_sum_compiles_clean ... ok
+test tests::jit_list_negative_index_and_bounds_deopt ... ok
+test tests::jit_listcomp_buried_in_expression_stack ... ok
+test tests::jit_listcomp_int_compiles_clean ... ok
+test tests::jit_listcomp_lane_surprise_deopts_exactly ... ok
+test tests::jit_listcomp_object_lane ... ok
+test tests::jit_listcomp_raise_mid_loop_restores_exactly ... ok
+test tests::jit_listcomp_result_is_gc_tracked ... ok
+test tests::jit_listcomp_target_read_after_comp_stays_interpreted ... ok
+test tests::jit_listcomp_two_comps_share_target_slot ... ok
+test tests::jit_listcomp_with_filter ... ok
+test tests::jit_mixed_compare_exactness_deopts_past_2_53 ... ok
+test tests::jit_mixed_int_float_arith ... ok
+test tests::jit_native_call_defaults_rebind_honored ... ok
+test tests::jit_native_call_defaults_splice ... ok
+test tests::jit_native_call_kwnames ... ok
+test tests::jit_native_call_kwnames_defaults_window ... ok
+test tests::jit_native_callee_deopt_materializes_exactly ... ok
+test tests::jit_native_callee_raise_propagates ... ok
+test tests::jit_native_cross_function_call ... ok
+test tests::jit_native_call_kwnames_gap_stays_interpreted ... ok
+test tests::jit_native_lane_mismatch_falls_back ... ok
+test tests::jit_native_recursion_limit_matches_interpreter ... ok
+test tests::jit_method_guard_miss_raises_exact_attribute_error ... ok
+test tests::jit_native_self_recursive_fib ... ok
+test tests::jit_nested_range_loops ... ok
+test tests::jit_none_fill_list_repeat_object_lane ... ok
+test tests::jit_none_receiver_attr_access_raises_exactly ... ok
+test tests::jit_native_string_argument_storage_covers_arities ... ok
+test tests::jit_none_receiver_method_call_raises_exactly ... ok
+test tests::jit_native_string_arguments_validate_and_preserve_values ... ok
+test tests::jit_none_store_flips_object_local ... ok
+test tests::jit_numeric_kernel_matches_interpreter ... ok
+test tests::jit_obj_global_pins_with_identity ... ok
+test tests::jit_object_arg_crosses_native_call ... ok
+test tests::jit_object_attr_store_and_reload ... ok
+test tests::jit_object_attr_store_reapable_displacement_deopts ... ok
+test tests::jit_object_return_crosses_native_call ... ok
+test tests::jit_osr_enters_range_loop_mid_iteration ... ok
+test tests::jit_osr_enters_single_hot_activation ... ok
+test tests::jit_overflow_deopts_to_bigint ... ok
+test tests::jit_pair_loop_lane_surprise_deopts_correctly ... ok
+test tests::jit_param_type_change_skips_native_entry ... ok
+test tests::jit_probe_miss_retries_other_entries ... ok
+test tests::jit_range_loop_overflow_deopt_rebuilds_iterator ... ok
+test tests::jit_range_start_stop_and_break ... ok
+test tests::jit_self_recursive_call_compiles ... ok
+test tests::jit_shadowed_range_stays_generic ... ok
+test tests::jit_slot_writes_share_code_names_after_deletion ... ok
+test tests::jit_slots_class_mutation_deopts_exactly ... ok
+test tests::jit_slots_object_lane_traversal ... ok
+test tests::jit_slots_scalar_roundtrip_compiles_clean ... ok
+test tests::jit_str_attr_eq_through_instance ... ok
+test tests::jit_str_concat_index_and_fstring ... ok
+test tests::jit_str_eq_kernel_compiles_clean ... ok
+test tests::jit_str_get_non_ascii_stays_exact ... ok
+test tests::jit_str_len_counts_characters ... ok
+test tests::jit_str_method_raise_is_exact ... ok
+test tests::jit_str_method_scalar_lanes ... ok
+test tests::jit_native_call_scratch_survives_nested_calls_and_exits ... ok
+test tests::jit_str_split_iter_join_roundtrip ... ok
+test tests::jit_pin_pressure_reenters_without_retiring_code ... ok
+test tests::jit_string_list_enters_at_loop_header ... ok
+test tests::jit_str_mod_and_slice_roundtrip ... ok
+test tests::jit_to_bool_int_and_float_branches ... ok
+test tests::jit_two_bound_slice_fallback_restores_exact_stack ... ok
+test tests::list_comprehension ... ok
+test tests::match_capture_with_guard ... ok
+test tests::jit_string_pressure_restores_expression_stack ... ok
+test tests::match_or_pattern ... ok
+test tests::match_literal_and_wildcard ... ok
+test tests::match_sequence_pattern ... ok
+test tests::metaclass_prepare_custom_namespace ... ok
+test tests::missing_module_raises_module_not_found_error ... ok
+test tests::nested_try_except ... ok
+test tests::jit_poll_observes_cross_thread_flag ... ok
+test tests::raise_from_chains_cause ... ok
+test tests::raise_propagates_from_function ... ok
+test tests::jit_completed_activations_release_entry_pins ... ok
+test tests::range_iteration_preserves_wide_exhaustion_and_hints ... ok
+test tests::range_sum_preserves_full_precision_and_start_protocols ... ok
+test tests::runs_print_int ... ok
+test tests::simple_class ... ok
+test tests::single_inheritance ... ok
+test tests::jit_string_count_callbacks_keep_current_state ... ok
+test tests::sum_streaming_integer_fastpath_preserves_boundaries_and_fallbacks ... ok
+test tests::sum_numeric_preserves_float_bits_and_overflow_transitions ... ok
+test tests::super_two_arg_form ... ok
+test tests::try_except_catches ... ok
+test tests::try_finally_runs ... ok
+test tests::variable_assignment ... ok
+test tests::while_loop ... ok
+test tests::with_statement_calls_exit ... ok
+test thread_registry::tests::entry_join_completes ... ok
+test thread_registry::tests::registry_register_unregister ... ok
+test tier2::native_pair_tests::a_live_borrow_does_not_consume_a_byte ... ok
+test tier2::native_pair_tests::counter_overflow_leaves_the_value_for_generic_promotion ... ok
+test tier2::native_pair_tests::shares_cursors_with_interpreted_steps_and_stays_exhausted ... ok
+test tier2::native_pair_tests::tuple_borrows_and_wrappers_do_not_consume_values ... ok
+test tier2::native_pair_tests::tuple_mutable_values_and_counter_overflow_keep_generic_continuations ... ok
+test tier2::native_pair_tests::tuple_pairs_preserve_identity_shared_cursors_and_exhaustion ... ok
+test tier2::native_pair_tests::tuple_pin_pressure_preserves_values_and_allows_none ... ok
+test tier2::native_pair_tests::unsupported_sources_do_not_advance_either_cursor ... ok
+test tuple_storage::tests::dynamic_layout_preserves_values_and_reference_ownership ... ok
+test tuple_storage::tests::fixed_arrays_and_unique_mutation_reset_the_hash ... ok
+test tuple_storage::tests::shared_cache_publication_does_not_change_elements ... ok
+test types::attr_version_tests::concurrent_classes_and_mutations_have_distinct_tokens ... ok
+test types::attr_version_tests::exhausted_tokens_never_wrap_or_reuse_zero ... ok
+test types::slot_storage_tests::existing_slots_do_not_request_a_replacement_key ... ok
+test types::slot_storage_tests::inline_slot_storage_does_not_enlarge_instances ... ok
+test types::slot_storage_tests::ninth_slot_promotes_without_replacing_existing_keys ... ok
+test types::slot_storage_tests::ordered_slot_indices_track_promotions_and_removals ... ok
+test types::slot_storage_tests::promotion_preserves_keys_order_and_independent_clones ... ok
+test types::slot_storage_tests::shared_slot_names_survive_promotion_and_release_with_their_owners ... ok
+test types::slot_storage_tests::single_slot_replaces_deletes_and_reuses_inline_storage ... ok
+test types::slot_storage_tests::small_vector_preserves_order_after_removal ... ok
+test types::type_cache::tests::colliding_names_do_not_share_positive_or_negative_hits ... ok
+test types::type_cache::tests::colliding_slots_require_the_current_class_token ... ok
+test types::type_cache::tests::unique_version_cache_entries_fit_in_thirty_two_bytes ... ok
+test unicode_numeric::tests::nesting_and_samples ... ok
+test weakref_registry::tests::registry_register_and_clear ... ok
+test weakref_registry::tests::shrink_drops_dead_slots ... ok
+test weakref_registry::tests::thread_local_registry_works ... ok
+test tests::jit_generator_materialization_retires_pins ... ok
+test tests::jit_side_exit_retires_temporary_pins_before_continuation ... ok
+test tests::jit_string_split_results_remain_collectable ... ok
+test tests::pickle_builtin_decoder_preserves_values_and_configured_fallbacks ... ok
+test tests::pickle_builtin_encoder_preserves_values_and_configured_fallbacks ... ok
+test tests::range_collection_preserves_python_semantics ... ok
+test tests::sum_streaming_preserves_callbacks_and_integer_results ... ok
+
+test result: ok. 341 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 36.25s
+

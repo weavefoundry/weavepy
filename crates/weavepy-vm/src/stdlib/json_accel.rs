@@ -128,6 +128,9 @@ where
 /// Translate byte offsets only at the public boundary and on errors.
 trait JsonChar: Copy + Into<u32> {
     fn string(s: &[Self]) -> Object;
+    fn key(s: &[Self], memo: &mut KeyMemo) -> Object {
+        memo.intern(Self::string(s))
+    }
     fn text(s: &[Self]) -> std::borrow::Cow<'_, str>;
     fn position(s: &[Self], offset: usize) -> usize;
     fn append(s: &[Self], out: &mut Vec<u32>);
@@ -137,6 +140,10 @@ trait JsonChar: Copy + Into<u32> {
 impl JsonChar for u8 {
     fn string(s: &[Self]) -> Object {
         Object::Str(Rc::from(std::str::from_utf8(s).expect("UTF-8 JSON span")))
+    }
+
+    fn key(s: &[Self], memo: &mut KeyMemo) -> Object {
+        memo.utf8(std::str::from_utf8(s).expect("UTF-8 JSON span"))
     }
 
     fn text(s: &[Self]) -> std::borrow::Cow<'_, str> {
@@ -332,7 +339,7 @@ fn json_scanstring(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
     with_interp(|interp| {
         let cps = arg_codepoints_cached(interp, s, "first argument")?;
         let (decoded, new_end) = scan_string(interp, s, &cps[..], end.max(0) as usize, strict)?;
-        Ok(Object::new_tuple(vec![
+        Ok(Object::new_tuple_array([
             decoded,
             Object::Int(new_end as i64),
         ]))
@@ -346,8 +353,19 @@ fn scan_string<C: JsonChar>(
     interp: &mut Interpreter,
     doc: &Object,
     cps: &[C],
+    end: usize,
+    strict: bool,
+) -> Result<(Object, usize), RuntimeError> {
+    scan_string_with_memo(interp, doc, cps, end, strict, None)
+}
+
+fn scan_string_with_memo<C: JsonChar>(
+    interp: &mut Interpreter,
+    doc: &Object,
+    cps: &[C],
     mut end: usize,
     strict: bool,
+    memo: Option<&mut KeyMemo>,
 ) -> Result<(Object, usize), RuntimeError> {
     let begin = end.wrapping_sub(1);
     let mut out: Vec<u32> = Vec::new();
@@ -372,7 +390,12 @@ fn scan_string<C: JsonChar>(
             i += 1;
         }
         if cps[i].into() == 0x22 && out.is_empty() && chunk_start == begin.wrapping_add(1) {
-            return Ok((C::string(&cps[chunk_start..i]), i + 1));
+            let span = &cps[chunk_start..i];
+            let value = match memo {
+                Some(memo) => C::key(span, memo),
+                None => C::string(span),
+            };
+            return Ok((value, i + 1));
         }
         C::append(&cps[chunk_start..i], &mut out);
         let terminator = cps[i].into();
@@ -438,7 +461,12 @@ fn scan_string<C: JsonChar>(
             out.push(uni);
         }
     }
-    Ok((Object::str_from_codepoints(out), end))
+    let value = Object::str_from_codepoints(out);
+    let value = match memo {
+        Some(memo) => memo.intern(value),
+        None => value,
+    };
+    Ok((value, end))
 }
 
 /// `_decode_uXXXX(s, pos)` — `pos` is the index of the `'u'`; reads four hex
@@ -676,7 +704,7 @@ fn scanner_call(cfg: &ScannerCfg, args: &[Object]) -> Result<Object, RuntimeErro
         _ => return Err(type_error("second argument must be an integer")),
     };
     with_interp(|interp| {
-        let mut memo = HashSet::new();
+        let mut memo = KeyMemo::default();
         let idx = idx.max(0) as usize;
         let result = match &s {
             Object::Str(text) => {
@@ -716,7 +744,7 @@ fn scanner_call(cfg: &ScannerCfg, args: &[Object]) -> Result<Object, RuntimeErro
             }
         };
         match result {
-            Ok((obj, end)) => Ok(Object::new_tuple(vec![obj, Object::Int(end as i64)])),
+            Ok((obj, end)) => Ok(Object::new_tuple_array([obj, Object::Int(end as i64)])),
             Err(ScanErr::NoValue(i)) => Err(stop_iteration_value(interp, i)),
             Err(ScanErr::Err(e)) => Err(e),
         }
@@ -743,7 +771,7 @@ fn scan_once<C: JsonChar>(
     doc: &Object,
     cps: &[C],
     idx: usize,
-    memo: &mut HashSet<StringKey>,
+    memo: &mut KeyMemo,
 ) -> Result<(Object, usize), ScanErr> {
     if idx >= cps.len() {
         return Err(ScanErr::NoValue(idx));
@@ -900,13 +928,17 @@ fn parse_object<C: JsonChar>(
     doc: &Object,
     cps: &[C],
     mut end: usize,
-    memo: &mut HashSet<StringKey>,
+    memo: &mut KeyMemo,
 ) -> Result<(Object, usize), ScanErr> {
     let _depth_guard = match crate::recursion::enter() {
         crate::recursion::Enter::Ok(g) => g,
         crate::recursion::Enter::Overflow => return Err(ScanErr::Err(recursion_overflow())),
     };
-    let mut pairs: Vec<(Object, Object)> = Vec::new();
+    let mut object = if is_set(&cfg.object_pairs_hook) {
+        DecodedObject::Pairs(Vec::new())
+    } else {
+        DecodedObject::Dict(DictData::default())
+    };
     let mut nextchar = cps.get(end).copied().map(Into::into);
 
     if nextchar != Some(0x22) {
@@ -918,7 +950,7 @@ fn parse_object<C: JsonChar>(
         }
         if nextchar == Some(0x7d) {
             // empty object
-            let result = finish_object(interp, cfg, pairs)?;
+            let result = finish_object(interp, cfg, object)?;
             return Ok((result, end + 1));
         } else if nextchar != Some(0x22) {
             return Err(ScanErr::Err(decode_error(
@@ -933,9 +965,9 @@ fn parse_object<C: JsonChar>(
     end += 1;
     loop {
         // key
-        let (key_obj, new_end) = scan_string(interp, doc, cps, end, cfg.strict)?;
+        let (key_obj, new_end) =
+            scan_string_with_memo(interp, doc, cps, end, cfg.strict, Some(memo))?;
         end = new_end;
-        let key_obj = intern_key(memo, key_obj);
 
         // ':'
         if cps.get(end).copied().map(Into::into) != Some(0x3a) {
@@ -979,7 +1011,17 @@ fn parse_object<C: JsonChar>(
             Err(e) => return Err(e),
         };
         end = new_end;
-        pairs.push((key_obj, value));
+        match &mut object {
+            DecodedObject::Dict(dict) => {
+                if let Some(previous) = dict.insert(DictKey(key_obj), value) {
+                    // CPython replaces duplicate values as it parses. Run
+                    // a displaced value's finalizer before the next field,
+                    // with no table borrow held across user code.
+                    interp.prompt_reap_dropped(previous);
+                }
+            }
+            DecodedObject::Pairs(pairs) => pairs.push((key_obj, value)),
+        }
 
         // delimiter
         let mut nc = cps.get(end).copied().map(Into::into);
@@ -1027,60 +1069,74 @@ fn parse_object<C: JsonChar>(
             )));
         }
     }
-    let result = finish_object(interp, cfg, pairs)?;
+    let result = finish_object(interp, cfg, object)?;
     Ok((result, end))
 }
 
 /// Only immutable string storage can enter the decoder's key memo.
-/// Keeping that invariant in the type avoids both code-point copies and
-/// the interior-mutable variants of a general Python dictionary key.
-#[derive(PartialEq, Eq, Hash)]
-enum StringKey {
-    Utf8(Rc<str>),
-    Wide(Rc<[u32]>),
+/// Separate tables allow lookup with borrowed input text before allocating
+/// a string. Escaped spellings still share the same canonical storage.
+#[derive(Default)]
+struct KeyMemo {
+    utf8: HashSet<Rc<str>>,
+    wide: HashSet<Rc<[u32]>>,
 }
 
-impl StringKey {
-    fn object(&self) -> Object {
-        match self {
-            Self::Utf8(s) => Object::Str(s.clone()),
-            Self::Wide(cps) => Object::WStr(cps.clone()),
+impl KeyMemo {
+    fn utf8(&mut self, text: &str) -> Object {
+        if let Some(existing) = self.utf8.get(text) {
+            return Object::Str(existing.clone());
+        }
+        let value: Rc<str> = Rc::from(text);
+        self.utf8.insert(value.clone());
+        Object::Str(value)
+    }
+
+    fn intern(&mut self, value: Object) -> Object {
+        match value {
+            Object::Str(text) => {
+                if let Some(existing) = self.utf8.get(text.as_ref()) {
+                    return Object::Str(existing.clone());
+                }
+                self.utf8.insert(text.clone());
+                Object::Str(text)
+            }
+            Object::WStr(cps) => {
+                if let Some(existing) = self.wide.get(cps.as_ref()) {
+                    return Object::WStr(existing.clone());
+                }
+                self.wide.insert(cps.clone());
+                Object::WStr(cps)
+            }
+            other => other,
         }
     }
 }
 
-fn intern_key(memo: &mut HashSet<StringKey>, key_obj: Object) -> Object {
-    let key = match key_obj {
-        Object::Str(s) => StringKey::Utf8(s),
-        Object::WStr(cps) => StringKey::Wide(cps),
-        other => return other,
-    };
-    if let Some(existing) = memo.get(&key) {
-        return existing.object();
-    }
-    let value = key.object();
-    memo.insert(key);
-    value
+/// Only the pairs hook needs staging. Ordinary objects build their final
+/// dictionary directly, avoiding a temporary vector and a second traversal.
+enum DecodedObject {
+    Dict(DictData),
+    Pairs(Vec<(Object, Object)>),
 }
 
-/// Apply `object_pairs_hook` / `object_hook` to the parsed key/value pairs.
+/// Apply `object_pairs_hook` / `object_hook` to the parsed object.
 fn finish_object(
     interp: &mut Interpreter,
     cfg: &ScannerCfg,
-    pairs: Vec<(Object, Object)>,
+    object: DecodedObject,
 ) -> Result<Object, RuntimeError> {
-    if is_set(&cfg.object_pairs_hook) {
-        let pair_objs: Vec<Object> = pairs
-            .into_iter()
-            .map(|(k, v)| Object::new_tuple(vec![k, v]))
-            .collect();
-        let arg = Object::new_list(pair_objs);
-        return interp.call_object(cfg.object_pairs_hook.clone(), &[arg], &[]);
-    }
-    let mut d = DictData::default();
-    for (k, v) in pairs {
-        d.insert(DictKey(k), v);
-    }
+    let d = match object {
+        DecodedObject::Pairs(pairs) => {
+            let pair_objs: Vec<Object> = pairs
+                .into_iter()
+                .map(|(k, v)| Object::new_tuple_array([k, v]))
+                .collect();
+            let arg = Object::new_list(pair_objs);
+            return interp.call_object(cfg.object_pairs_hook.clone(), &[arg], &[]);
+        }
+        DecodedObject::Dict(dict) => dict,
+    };
     let dict_obj = Object::Dict(Rc::new(RefCell::new(d)));
     if is_set(&cfg.object_hook) {
         return interp.call_object(cfg.object_hook.clone(), &[dict_obj], &[]);
@@ -1095,7 +1151,7 @@ fn parse_array<C: JsonChar>(
     doc: &Object,
     cps: &[C],
     mut end: usize,
-    memo: &mut HashSet<StringKey>,
+    memo: &mut KeyMemo,
 ) -> Result<(Object, usize), ScanErr> {
     let _depth_guard = match crate::recursion::enter() {
         crate::recursion::Enter::Ok(g) => g,
@@ -1187,6 +1243,13 @@ fn parse_array<C: JsonChar>(
 struct JsonWriter {
     text: String,
     wide: Option<Vec<u32>>,
+}
+
+impl std::fmt::Write for JsonWriter {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.push_str(text);
+        Ok(())
+    }
 }
 
 impl JsonWriter {
@@ -1501,7 +1564,7 @@ fn encoder_call(cfg: &EncoderCfg, args: &[Object]) -> Result<Object, RuntimeErro
         )?;
         // `_json.c` writes into one `PyUnicodeWriter` and returns
         // `(result,)`: a single joined chunk, as a tuple.
-        Ok(Object::new_tuple(vec![out.finish()]))
+        Ok(Object::new_tuple_array([out.finish()]))
     })
 }
 
@@ -1757,8 +1820,16 @@ fn encode_value_impl(
         Kind::Null => out.push_str("null"),
         Kind::True => out.push_str("true"),
         Kind::False => out.push_str("false"),
-        Kind::Int => out.push_object(&intstr(interp, o)?)?,
-        Kind::Float => out.push_object(&floatstr(interp, o, cfg.allow_nan)?)?,
+        Kind::Int => match o {
+            Object::Int(value) => out.push_str(itoa::Buffer::new().format(*value)),
+            _ => out.push_object(&intstr(interp, o)?)?,
+        },
+        Kind::Float => match o {
+            Object::Float(value) if value.is_finite() => {
+                crate::object::write_float_repr(out, *value).expect("JSON output cannot fail");
+            }
+            _ => out.push_object(&floatstr(interp, o, cfg.allow_nan)?)?,
+        },
         Kind::List => {
             encode_list(interp, cfg, o, level, out, track, cycle)?;
         }
@@ -1965,7 +2036,7 @@ fn sort_items(
 ) -> Result<Vec<(Object, Object)>, RuntimeError> {
     let tuples: Vec<Object> = items
         .into_iter()
-        .map(|(k, v)| Object::new_tuple(vec![k, v]))
+        .map(|(k, v)| Object::new_tuple_array([k, v]))
         .collect();
     let list = Object::new_list(tuples);
     let sort = interp.load_attr_public(&list, "sort")?;
