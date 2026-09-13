@@ -67,11 +67,13 @@ correctness validation but have no performance measurements.
 
 ## Validation and reproduction
 
-The active checkpoint's 340 source hashes match its validated build: 353 VM
-tests, 156 C API tests, 99 targeted checks, 44 independent CPython result checks,
-and 275 compatibility checks passed, together with formatting, strict lint,
-and no-JIT checks. This cleanup changes documentation and tracked research
-artifacts; it does not change those runtime sources or regression tests.
+At checkpoint `c410f1ae`, the active runtime's 340 source hashes matched its
+validated build: 353 VM tests, 156 C API tests, 99 targeted checks, 44 independent
+CPython result checks, and 275 compatibility checks passed, together with
+formatting, strict lint, and no-JIT checks. Those results describe that
+checkpoint. Subsequent Windows portability fixes gate a Unix-only import and
+share the lazy instance dictionary in the DLL-directory helper; the PR's CI
+runs validate the updated sources on Linux, macOS, and Windows.
 
 Build the CLI and retain a separate executable for the revision being compared:
 

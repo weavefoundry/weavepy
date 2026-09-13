@@ -53,6 +53,7 @@
 
 use crate::import::ModuleCache;
 use crate::object::{DictData, DictKey, Object, PyModule};
+#[cfg(unix)]
 use crate::shared_value::SharedSlice;
 use crate::sync::Rc;
 use crate::sync::RefCell;

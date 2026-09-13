@@ -6450,7 +6450,7 @@ fn added_dll_directory_type() -> Rc<crate::types::TypeObject> {
     }
     fn self_dict(args: &[Object]) -> Option<Rc<RefCell<DictData>>> {
         match args.first() {
-            Some(Object::Instance(i)) => Some(i.dict.clone()),
+            Some(Object::Instance(i)) => Some(i.dict.share()),
             _ => None,
         }
     }
