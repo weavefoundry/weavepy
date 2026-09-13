@@ -1,8 +1,0 @@
-Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
-Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
-Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
-Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
-Frozen inputs, 64 JIT, 351 VM, 156 C API, 99 targeted, 275 compatibility checks, and 44 fixture paths verified.
-sources.tar.gz 340 members; 3802246 stored bytes; all hashes verified.
-evidence.tar.gz 931 members; 3183671 stored bytes; all hashes verified.
-Complete candidate sources, raw comparisons, allocation counts, validation, and post-timing correctness diagnostic preserved.

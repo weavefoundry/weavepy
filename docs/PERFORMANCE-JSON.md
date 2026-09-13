@@ -1,5 +1,10 @@
 # JSON and string performance
 
+This is a historical measurement report. The reusable probes and oracles remain
+in the repository; generated results are preserved in the linked checkpoint.
+New measurements should write to `target/`. These results do not describe every
+later revision.
+
 This pass measures changes against release commit `33c211b` and CPython
 3.14.7 on macOS ARM64. It doesn't establish that WeavePy is faster than
 CPython for every workload or metric.
@@ -57,7 +62,7 @@ first-entry JIT costs but exclude process initialization. Datetime and pickle
 still rely on Python implementations; deque uses a Python class with native
 end operations. These remain substantial performance gaps.
 
-[Raw samples, environment, and validation results](../crates/weavepy-bench/census/2026-09-json/)
+[Raw samples, environment, and validation results](https://github.com/weavefoundry/weavepy/tree/c410f1ae7e157f9d53798af4180a77c8f385f2a5/crates/weavepy-bench/census/2026-09-json/)
 retain every recorded metric, including both execution modes and per-process
 CPU time.
 

@@ -1,9 +1,0 @@
-   Compiling weavepy-compiler v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-compiler)
-   Compiling weavepy-vm v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-vm)
-   Compiling weavepy-jit v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-jit)
-   Compiling weavepy-capi v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-capi)
-   Compiling weavepy v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy)
-   Compiling weavepy-conformance v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-conformance)
-   Compiling weavepy-cli v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-cli)
-   Compiling weavepy-pylib v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/crates/weavepy-pylib)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 36.68s

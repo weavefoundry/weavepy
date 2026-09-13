@@ -1,5 +1,0 @@
-{
-  "prototype_sha256": "52379fb1300ed5dd5aaf4270be62435df6ddd46b1c25cb684a420d7fe643f553",
-  "source": "target/thin_shared_slice_prototype.rs",
-  "status": "Unapplied standalone prototype. Two ordinary tests pass; Miri not run yet."
-}

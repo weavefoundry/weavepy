@@ -1,5 +1,10 @@
 # Deque and datetime performance
 
+This is a historical measurement report. The reusable probes and oracles remain
+in the repository; generated results are preserved in the linked checkpoint.
+New measurements should write to `target/`. These results do not describe every
+later revision.
+
 This pass continues from commit `4177e850a63ad79f585ad936c5bcb4a63692ebb9`
 on `perf/speed-up-json-and-strings`, using CPython 3.14.7 on macOS ARM64.
 The goal of beating CPython across every meaningful metric remains unmet.
@@ -131,19 +136,19 @@ cargo build --offline --locked --release -p weavepy-cli --bin weavepy -j 1
 export WEAVEPY_STDLIB_CACHE="$PWD/target/performance-stdlib-cache"
 python3.14 tools/bench_compare.py \
   --base target/release/weavepy-perf-4177e85 --new target/release/weavepy \
-  --samples 5 --out crates/weavepy-bench/census/2026-09-collections-datetime/suite.json
+  --samples 5 --out target/collections-datetime-suite.json
 python3.14 crates/weavepy-bench/census/2026-09-collections-datetime/probes.py \
   --base target/release/weavepy-perf-4177e85 --new target/release/weavepy \
-  --samples 5 --out crates/weavepy-bench/census/2026-09-collections-datetime/probes.json
+  --samples 5 --out target/collections-datetime-probes.json
 ```
 
 The baseline executable must be built from the checkpoint commit with the
 same release flags. Preserve its executable mode when copying it. Binary
 hashes, source hashes, measurements, and validation results are retained in
-the [census directory](../crates/weavepy-bench/census/2026-09-collections-datetime/).
+the [census directory](https://github.com/weavefoundry/weavepy/tree/c410f1ae7e157f9d53798af4180a77c8f385f2a5/crates/weavepy-bench/census/2026-09-collections-datetime/).
 The `before-iterator` and `before-validation` subdirectories retain
 intermediate candidates; the report uses the final files at the census
-directory's root. Run `summarize.py` there to regenerate the tables.
+directory's root. Its historical `summarize.py` is preserved in that checkpoint.
 
 ## Validation
 

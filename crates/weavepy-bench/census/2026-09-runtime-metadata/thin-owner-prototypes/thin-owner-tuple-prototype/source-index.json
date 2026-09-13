@@ -1,5 +1,0 @@
-{
-  "source": "target/thin_owner_tuple_prototype.rs",
-  "sha256": "051289a2427f1a31cdf8191c0a05bd91690f3948628b3201d91f59a8eeafaf4c",
-  "status": "Unapplied standalone prototype; three ordinary tests passed; Miri pending."
-}

@@ -1,9 +1,0 @@
-# Collector candidate positions decision experiment
-
-This first performance screen compares validated release 36989234372e807ab95dc79686d9e5dd3bb51b458a9f7a1d92992357c30373a0 with candidate 46c0ad28911b504eea8f4c82a0d7589be5de4fad69613655ea29f0faa898bd99 and local CPython 3.14.7. The baseline includes the preceding borrowed-handles change, whose separate timing remains pending. The rejected lazy-finalization candidate is not part of this comparison.
-
-Reuse all four small-collection fixtures, all four large retained-graph fixtures, and all four 100,000-node ordinary/finalizer/weakref heaps, unchanged. Use seven paired cycles after one warm cycle, alternating variant order, with separate stable per-binary frozen caches. Verify values before and after warmup for both releases and CPython, plus candidate GIL-disabled correctness. Keep every raw sample. Work timers cover the existing specified number of full collections; process wall time, CPU, and peak RSS include setup and shutdown.
-
-Before starting, require three consecutive ten-second observations with both one- and five-minute host load at most four on the eight-logical-CPU host. Wait at most 600 seconds. Once started, retain every sample and subsequent load observation. There is no sample exclusion or automatic benchmark retry.
-
-This screen checks whether smaller temporary-handle allocations and fewer Arc operations outweigh added candidate-position lookups. A clear speed or memory regression is grounds to revise or reject the design before the full census. A favorable result still needs retained-construction, setter, startup, and full-workload controls. Neither this finite screen nor the compatibility suite establishes universal performance or complete CPython compatibility. No energy or controlled build-time claim is planned.

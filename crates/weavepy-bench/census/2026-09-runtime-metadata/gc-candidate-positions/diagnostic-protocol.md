@@ -1,9 +1,0 @@
-# Collector positions diagnostic under background load
-
-The original quiet-run gate expired after 600 seconds without launching a benchmark or collecting any samples. Its completed record, gc-candidate-positions-screen-load.json, remains unchanged. A read-only process check found no remaining processes from our test or benchmark executables. The host's one- and five-minute load remained near four on eight logical CPUs.
-
-Before collecting any measurements, declare a separate diagnostic with both load averages at most six for three consecutive ten-second observations, again with a 600-second deadline. This operational change permits progress under the observed background load. It does not establish a quiet host. Timing results from this run are provisional and cannot be used alone to claim a small causal speedup. Record raw vm_stat and physical-memory/swap queries before and after the run as additional context; these are observations, not a memory-pressure guarantee.
-
-Keep the exact twelve fixtures, seven paired cycles, alternating order, warm cycle, correctness checks, and separate stable per-binary frozen caches from the original screen protocol. Compare validated 36989234372e807ab95dc79686d9e5dd3bb51b458a9f7a1d92992357c30373a0, candidate 46c0ad28911b504eea8f4c82a0d7589be5de4fad69613655ea29f0faa898bd99, and CPython 3.14.7. Use fresh diagnostic output paths and telemetry. Preserve every sample and all regressions, with no filtering or automatic retry.
-
-The run can screen the intended memory reduction and expose large regressions. Actual RSS remains an OS observation under the recorded conditions. Smaller timing differences need quieter or otherwise stronger evidence before acceptance. Any candidate retained after this screen still needs construction, setter, startup, and full-workload controls. This experiment cannot establish superiority on every workload or metric.
