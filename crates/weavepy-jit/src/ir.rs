@@ -364,7 +364,7 @@ pub enum TOp {
     /// RFC 0073 WS3 — guarded exact-`str` `+` (the
     /// `BINARY_OP_ADD_UNICODE` shape): pops two `str` pins, calls the
     /// registered `wpjit_str_concat` helper (which allocates the
-    /// joined `Rc<str>`), and pushes the fresh pin. Cap pressure or a
+    /// joined `weavepy_vm::shared_value::SharedStr`), and pushes the fresh pin. Cap pressure or a
     /// pin surprise deopts at this pc and the interpreter re-executes
     /// the add.
     StrConcat,
@@ -742,6 +742,9 @@ pub enum TTerm {
     /// successors — post-yield code runs interpreted until the next
     /// loop back edge OSR-enters the compiled body again.
     Yield { pc: u32 },
+    /// Resume interpretation at an explicit error operation without consuming
+    /// its operands. The interpreter handles construction, chaining, and handlers.
+    Deopt { pc: u32 },
 }
 
 /// A basic block: a static entry-stack shape, a straight-line body, and
@@ -847,10 +850,11 @@ pub struct GlobalGuard {
 pub struct CalleeSpanMeta {
     /// Callee-table index (same space as [`TOp::CallPy`]'s `token`).
     pub token: u32,
-    /// The erased `LOAD_GLOBAL` pc.
+    /// Exclusive lower bound, normally the erased `LOAD_GLOBAL` pc.
+    /// A split interval can instead start at a proven marker-free exit.
     pub live_from: u32,
-    /// The `CALL` pc (the call itself consumes the callee, so the span
-    /// is open only for pcs strictly between the endpoints).
+    /// Exclusive upper bound, normally the pc after the consuming `CALL`.
+    /// A split interval can instead end at a proven marker-free exit.
     pub live_to: u32,
     /// Absolute interpreter-stack index of the callee object,
     /// accounting for enclosing erased entities (range iterators and
@@ -873,10 +877,11 @@ pub struct MethodSpanMeta {
     /// Bottom-based index of the receiver in the native operand stack
     /// (equal to its index in the deopt spill).
     pub native_index: u32,
-    /// The `LOAD_ATTR` pc (exclusive — the receiver is a plain value
-    /// before it executes).
+    /// Exclusive lower bound, normally the `LOAD_ATTR` pc. A split
+    /// interval can instead start at a proven marker-free exit.
     pub live_from: u32,
-    /// The pc after the `CALL` (exclusive).
+    /// Exclusive upper bound, normally the pc after the `CALL`. A split
+    /// interval can instead end at a proven marker-free exit.
     pub live_to: u32,
     /// RFC 0069 WS1 — `Some(token)` for a burned-in method site (the
     /// bound method rebuilds from the embedder's method table);

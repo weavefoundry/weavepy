@@ -21,6 +21,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         ("parse_time_parts", parse_time_parts as Helper),
         ("date_fields", date_fields as Helper),
         ("time_fields", time_fields as Helper),
+        ("format_time_parts", format_time_parts as Helper),
     ] {
         let function = Object::Builtin(Rc::new(BuiltinFn {
             name,
@@ -38,8 +39,77 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     })
 }
 
+struct TimeText {
+    bytes: [u8; 15],
+    len: usize,
+}
+
+impl TimeText {
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).expect("ASCII time fields")
+    }
+}
+
+/// Decline invalid fields and unknown precision; callers retain their fallback.
+fn ascii_time_text(
+    hour: i64,
+    minute: i64,
+    second: i64,
+    micros: i64,
+    spec: &str,
+) -> Option<TimeText> {
+    if !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=59).contains(&second)
+        || !(0..=999_999).contains(&micros)
+    {
+        return None;
+    }
+    let len = match spec {
+        "hours" => 2,
+        "minutes" => 5,
+        "seconds" => 8,
+        "milliseconds" => 12,
+        "microseconds" => 15,
+        "auto" => {
+            if micros == 0 {
+                8
+            } else {
+                15
+            }
+        }
+        _ => return None,
+    };
+    let mut bytes = [b'0'; 15];
+    for (offset, field) in [(0, hour), (3, minute), (6, second)] {
+        bytes[offset] += (field / 10) as u8;
+        bytes[offset + 1] += (field % 10) as u8;
+    }
+    bytes[2] = b':';
+    bytes[5] = b':';
+    bytes[8] = b'.';
+    let mut fraction = micros;
+    for byte in bytes[9..].iter_mut().rev() {
+        *byte += (fraction % 10) as u8;
+        fraction /= 10;
+    }
+    Some(TimeText { bytes, len })
+}
+
 const DAYS_BEFORE_MONTH: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
 const DAYS_IN_MONTH: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+/// Format exact ordinary fields without Python format callbacks or a format map.
+/// Unusual values, subclasses, and all errors retain the existing Python path.
+fn format_time_parts(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Int(hour), Object::Int(minute), Object::Int(second), Object::Int(micros), Object::Str(spec)] =
+        args
+    else {
+        return Ok(Object::None);
+    };
+    Ok(ascii_time_text(*hour, *minute, *second, *micros, spec)
+        .map_or(Object::None, |text| Object::from_str(text.as_str())))
+}
 
 /// Parse exact ASCII time components without Python slicing or digit callbacks.
 /// None leaves unsupported inputs and all errors to the existing Python parser.
@@ -317,6 +387,106 @@ mod tests {
             "+1",
         ] {
             assert_eq!(ascii_time_parts(text.as_bytes()), None, "{text}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod time_format_tests {
+    use super::ascii_time_text as format_time;
+
+    #[test]
+    fn object_adapter_accepts_only_exact_supported_fields() {
+        use crate::object::Object;
+        let good = [
+            Object::Int(3),
+            Object::Int(4),
+            Object::Int(5),
+            Object::Int(1999),
+            Object::from_str("milliseconds"),
+        ];
+        assert!(
+            matches!(super::format_time_parts(&good).unwrap(), Object::Str(s) if &*s == "03:04:05.001")
+        );
+        for index in 0..4 {
+            for replacement in [
+                Object::Bool(true),
+                Object::Float(1.0),
+                Object::None,
+                Object::from_str("1"),
+            ] {
+                let mut args = good.clone();
+                args[index] = replacement;
+                assert!(matches!(
+                    super::format_time_parts(&args).unwrap(),
+                    Object::None
+                ));
+            }
+        }
+        let mut args = good.clone();
+        args[4] = Object::Bool(false);
+        assert!(matches!(
+            super::format_time_parts(&args).unwrap(),
+            Object::None
+        ));
+        assert!(matches!(
+            super::format_time_parts(&good[..4]).unwrap(),
+            Object::None
+        ));
+    }
+
+    #[test]
+    fn precisions_pad_and_truncate_without_rounding() {
+        for (spec, expected) in [
+            ("hours", "03"),
+            ("minutes", "03:04"),
+            ("seconds", "03:04:05"),
+            ("milliseconds", "03:04:05.001"),
+            ("microseconds", "03:04:05.001999"),
+            ("auto", "03:04:05.001999"),
+        ] {
+            assert_eq!(format_time(3, 4, 5, 1999, spec).unwrap().as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn automatic_precision_depends_only_on_nonzero_fraction() {
+        for (us, expected) in [
+            (0, "23:59:59"),
+            (1, "23:59:59.000001"),
+            (999, "23:59:59.000999"),
+            (1000, "23:59:59.001000"),
+            (999_999, "23:59:59.999999"),
+        ] {
+            assert_eq!(
+                format_time(23, 59, 59, us, "auto").unwrap().as_str(),
+                expected
+            );
+        }
+        assert_eq!(
+            format_time(0, 0, 0, 0, "microseconds").unwrap().as_str(),
+            "00:00:00.000000"
+        );
+    }
+
+    #[test]
+    fn out_of_range_and_unknown_values_request_fallback() {
+        for fields in [
+            [i64::MIN, 0, 0, 0],
+            [i64::MAX, 0, 0, 0],
+            [24, 0, 0, 0],
+            [0, -1, 0, 0],
+            [0, 60, 0, 0],
+            [0, 0, -1, 0],
+            [0, 0, 60, 0],
+            [0, 0, 0, -1],
+            [0, 0, 0, 1_000_000],
+            [0, 0, 0, i64::MAX],
+        ] {
+            assert!(format_time(fields[0], fields[1], fields[2], fields[3], "hours").is_none());
+        }
+        for spec in ["", "Auto", "nanoseconds", "秒", "seconds\0"] {
+            assert!(format_time(1, 2, 3, 4, spec).is_none());
         }
     }
 }

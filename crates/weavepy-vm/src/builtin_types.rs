@@ -10,6 +10,7 @@
 //! `BuiltinTypes::with(|bt| bt.type_error.clone())` — to construct
 //! exception instances.
 
+use crate::shared_value::SharedSlice;
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
@@ -1735,7 +1736,7 @@ fn native_seed_for_new(cls: &Rc<TypeObject>, value: Option<&Object>) -> Option<O
                     .collect()
             })
             .unwrap_or_default();
-        return Some(Object::Bytes(Rc::from(bytes.as_slice())));
+        return Some(Object::Bytes(SharedSlice::from(bytes.as_slice())));
     }
     if is_strict(&bt.tuple_) {
         let els = value.and_then(any_elements).unwrap_or_default();

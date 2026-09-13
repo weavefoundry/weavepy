@@ -1,0 +1,55 @@
+{
+  "status": "unapplied prototype; ordinary and Miri checks passed",
+  "runtime_migrated": false,
+  "timed_samples": 0,
+  "miri_flags": "-Zmiri-strict-provenance",
+  "miri_toolchain": "nightly 1.100.0 (0fc141305 2026-09-11)",
+  "miri_target": "aarch64-apple-darwin",
+  "ordinary_tests": 2,
+  "miri_tests": 2,
+  "miri_elapsed_seconds_observed": 269.76,
+  "limitations": [
+    "Not a formal soundness proof",
+    "No production API, string invariant, C API, or VM migration yet",
+    "No performance measurement",
+    "No cross-architecture Miri run yet"
+  ],
+  "files": {
+    "target/thin_shared_slice_prototype.rs": {
+      "bytes": 6378,
+      "sha256": "52379fb1300ed5dd5aaf4270be62435df6ddd46b1c25cb684a420d7fe643f553"
+    },
+    "target/thin-shared-slice-prototype/src/lib.rs": {
+      "bytes": 6378,
+      "sha256": "52379fb1300ed5dd5aaf4270be62435df6ddd46b1c25cb684a420d7fe643f553"
+    },
+    "target/thin-shared-slice-prototype/Cargo.toml": {
+      "bytes": 95,
+      "sha256": "755f660fe41e6f95fc1ccae4e25379a52095fd03fe56ac4fc9ff50d0b6b8ee3d"
+    },
+    "target/thin-shared-slice-prototype/Cargo.lock": {
+      "bytes": 171,
+      "sha256": "fa2c0143d601346529a91dd283f8f30f4a5a86885a528b237887ce010269e3f1"
+    },
+    "target/thin_shared_slice_prototype_build.txt": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "target/thin_shared_slice_prototype_tests.txt": {
+      "bytes": 228,
+      "sha256": "fe843c65791c62227d2c1f6f0a57ebc02cdc43a5cfdcb1a25cc4a9d9509e7b75"
+    },
+    "target/thin_shared_slice_miri_install.txt": {
+      "bytes": 326,
+      "sha256": "9d3298292a0f938b416f9ccd4c3ee708ed1b8d47c04a0177ddfbdd2d3f1f97a6"
+    },
+    "target/thin_shared_slice_miri_rust_src.txt": {
+      "bytes": 37,
+      "sha256": "d9fec78088427efcd882bf0df92c4c67598a47f807f95644c6cd94903dbfd02d"
+    },
+    "target/thin_shared_slice_miri_tests.txt": {
+      "bytes": 2552,
+      "sha256": "df279f6aaffacc9af7d5c5e4d4d509083ee8491412d53da3f93dbc26769ff64b"
+    }
+  }
+}

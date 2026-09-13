@@ -1,0 +1,41 @@
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Frozen inputs, 74 JIT, 357 VM, 156 C API, 99 targeted, 275 compatibility checks, and 44 fixture paths verified.
+Exact exit bindings and callback counts match CPython; native exit confirmed.
+Indexing identity, callbacks, errors, guards, recursion, and lifetimes checked against CPython and baseline; preexisting differences remain explicit.
+The inherited formatting control compiles in both candidates, with identical CPython checksums and native fallback traces; other43 expectations remain unchanged.
+Sixteen keyword binding, callable identity, mutation, metaclass, error, and exit-state cases verified with native compilation evidence.
+Nine construction cases, nine inherited indexing controls, and all24 authoritative results verified; timing sources frozen.
+focused previous complete: expected sample counts, verification results, and stable caches.
+full previous complete: expected sample counts, verification results, and stable caches.
+focused retained complete: expected sample counts, verification results, and stable caches.
+full retained: gate expired without launching a child or collecting samples.
+Three completed comparisons verified; full retained-reference timing remains unmeasured.
+sources.tar.gz 340 members; 3808004 stored bytes; all hashes verified.
+evidence.tar.gz 1454 members; 4779357 stored bytes; all hashes verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Frozen inputs, 74 JIT, 357 VM, 156 C API, 99 targeted, 275 compatibility checks, and 44 fixture paths verified.
+Exact exit bindings and callback counts match CPython; native exit confirmed.
+Indexing identity, callbacks, errors, guards, recursion, and lifetimes checked against CPython and baseline; preexisting differences remain explicit.
+The inherited formatting control compiles in both candidates, with identical CPython checksums and native fallback traces; other43 expectations remain unchanged.
+Sixteen keyword binding, callable identity, mutation, metaclass, error, and exit-state cases verified with native compilation evidence.
+Nine construction cases, nine inherited indexing controls, and all24 authoritative results verified; timing sources frozen.
+focused previous complete: expected sample counts, verification results, and stable caches.
+full previous complete: expected sample counts, verification results, and stable caches.
+focused retained complete: expected sample counts, verification results, and stable caches.
+full retained: gate expired without launching a child or collecting samples.
+Three completed comparisons verified; full retained-reference timing remains unmeasured.
+Complete keyword-constructor sources, validation, every timing sample, static costs, failed readiness versions, and census traces preserved.

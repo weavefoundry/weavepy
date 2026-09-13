@@ -33,6 +33,7 @@
 //! (`ConnectRegistry`) or a hive on slow storage these are real
 //! blocking I/O.
 
+use crate::shared_value::SharedSlice;
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
@@ -736,7 +737,7 @@ fn reg_to_py(data: &[u8], typ: u32) -> Object {
             if data.is_empty() {
                 Object::None
             } else {
-                Object::Bytes(Rc::from(data))
+                Object::Bytes(SharedSlice::from(data))
             }
         }
     }

@@ -32,6 +32,11 @@ except ImportError:
     _date_fields = None
     _time_fields = None
 
+try:
+    from _weave_datetime import format_time_parts as _format_time_parts
+except ImportError:
+    _format_time_parts = None
+
 
 def _cmp(x, y):
     return 0 if x == y else 1 if x > y else -1
@@ -200,6 +205,10 @@ def _build_struct_time(y, m, d, hh, mm, ss, dstflag):
     return _time.struct_time((y, m, d, hh, mm, ss, wday, dnum, dstflag))
 
 def _format_time(hh, mm, ss, us, timespec='auto'):
+    if _format_time_parts is not None:
+        text = _format_time_parts(hh, mm, ss, us, timespec)
+        if text is not None:
+            return text
     specs = {
         'hours': '{:02d}',
         'minutes': '{:02d}:{:02d}',

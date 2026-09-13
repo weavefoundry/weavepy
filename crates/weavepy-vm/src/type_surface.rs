@@ -26,6 +26,7 @@
 //! installed by `builtin_types.rs` (`__new__`, `__init__`, exception
 //! `__str__`, …) keep priority.
 
+use crate::shared_value::ThinArc;
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
@@ -2122,7 +2123,7 @@ pub(crate) fn release_buffer_builtin(args: &[Object]) -> Result<Object, RuntimeE
     // "memoryview's buffer is not this object").
     let matches_recv = match (&recv, &view.buffer) {
         (Object::ByteArray(b), crate::object::MemoryViewBuffer::ByteArray(vb)) => Rc::ptr_eq(b, vb),
-        (Object::Bytes(b), crate::object::MemoryViewBuffer::Bytes(vb)) => Rc::ptr_eq(b, vb),
+        (Object::Bytes(b), crate::object::MemoryViewBuffer::Bytes(vb)) => ThinArc::ptr_eq(b, vb),
         (Object::MemoryView(m), _) => m.shares_buffer(&view),
         _ => false,
     };

@@ -15,6 +15,7 @@
 //! `print`, which needs the interpreter's stdout sink) are installed
 //! by [`crate::Interpreter::install_print_into`].
 
+use crate::shared_value::{SharedSlice, SharedStr, ThinArc};
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
@@ -2034,7 +2035,7 @@ fn instance_getnewargs(args: &[Object]) -> Result<Object, RuntimeError> {
         // `unicode_getnewargs` builds a *fresh* string
         // (test_str.test_getnewargs asserts `args[0] is not text`), so don't
         // hand back the same allocation.
-        Some(Object::Str(s)) => Ok(Object::new_tuple_array([Object::Str(Rc::from(&*s))])),
+        Some(Object::Str(s)) => Ok(Object::new_tuple_array([Object::Str(SharedStr::from(&*s))])),
         Some(Object::WStr(cps)) => Ok(Object::new_tuple_array([Object::WStr(cps.to_vec().into())])),
         Some(v) => Ok(Object::new_tuple_array([v])),
         None => Ok(Object::new_tuple(Vec::new())),
@@ -2223,7 +2224,7 @@ pub fn unbound_method(type_name: &str, name: &str) -> Option<Object> {
         // type-level access (`memoryview.hex`, `range.count`,
         // `slice.indices`) to the same tables.
         "memoryview" => Object::MemoryView(Rc::new(crate::object::PyMemoryView::from_bytes(
-            Rc::from(Vec::<u8>::new()),
+            SharedSlice::from(Vec::<u8>::new()),
         ))),
         "range" => Object::Range(Rc::new(crate::object::Range::new(0, 0, 1))),
         "slice" => Object::Slice(Rc::new(crate::object::PySlice {
@@ -4299,20 +4300,20 @@ pub(crate) fn code_synthetic_attr(
         // executors and shows the same listing).
         "co_code" | "_co_code_adaptive" => Some(Object::Bytes(
             match c.wire.as_ref().and_then(|w| w.co_code.as_deref()) {
-                Some(b) => Rc::from(b.to_vec()),
-                None => Rc::from(c.to_cpython().co_code.clone()),
+                Some(b) => SharedSlice::from(b.to_vec()),
+                None => SharedSlice::from(c.to_cpython().co_code.clone()),
             },
         )),
         "co_linetable" => Some(Object::Bytes(
             match c.wire.as_ref().and_then(|w| w.co_linetable.as_deref()) {
-                Some(b) => Rc::from(b.to_vec()),
-                None => Rc::from(c.to_cpython().co_linetable.clone()),
+                Some(b) => SharedSlice::from(b.to_vec()),
+                None => SharedSlice::from(c.to_cpython().co_linetable.clone()),
             },
         )),
         "co_exceptiontable" => Some(Object::Bytes(
             match c.wire.as_ref().and_then(|w| w.co_exceptiontable.as_deref()) {
-                Some(b) => Rc::from(b.to_vec()),
-                None => Rc::from(c.to_cpython().co_exceptiontable.clone()),
+                Some(b) => SharedSlice::from(b.to_vec()),
+                None => SharedSlice::from(c.to_cpython().co_exceptiontable.clone()),
             },
         )),
         "co_localsplusnames" => Some(Object::new_tuple(
@@ -4322,7 +4323,7 @@ pub(crate) fn code_synthetic_attr(
                 .map(Object::from_str)
                 .collect(),
         )),
-        "co_localspluskinds" => Some(Object::Bytes(Rc::from(
+        "co_localspluskinds" => Some(Object::Bytes(SharedSlice::from(
             c.to_cpython().localspluskinds.clone(),
         ))),
         "co_lines" => Some(code_method(c, "co_lines", code_co_lines)),
@@ -4331,7 +4332,7 @@ pub(crate) fn code_synthetic_attr(
         // Deprecated pre-PEP-626 line table, derived on demand from the
         // position records exactly like CPython's `decode_linetable`
         // (`dis.findlinestarts` fallbacks and legacy tools read it).
-        "co_lnotab" => Some(Object::Bytes(Rc::from(code_lnotab_bytes(c)))),
+        "co_lnotab" => Some(Object::Bytes(SharedSlice::from(code_lnotab_bytes(c)))),
         "_varname_from_oparg" => Some(code_method(
             c,
             "_varname_from_oparg",
@@ -9121,14 +9122,14 @@ pub(crate) fn object_identity(obj: &Object) -> i64 {
     // For DST-backed Rc<T> (strings, bytes, and tuple storage) we
     // can't `as usize` the fat pointer directly; route through the
     // thin pointer of the underlying byte/data buffer.
-    fn rc_str_ptr(s: &Rc<str>) -> i64 {
+    fn rc_str_ptr(s: &SharedStr) -> i64 {
         s.as_ptr() as usize as i64
     }
-    fn rc_bytes_ptr(s: &Rc<[u8]>) -> i64 {
+    fn rc_bytes_ptr(s: &SharedSlice<u8>) -> i64 {
         s.as_ptr() as usize as i64
     }
-    fn rc_obj_slice_ptr(s: &Rc<crate::object::TupleStorage>) -> i64 {
-        Rc::as_ptr(s).cast::<()>() as usize as i64
+    fn rc_obj_slice_ptr(s: &crate::object::SharedTuple) -> i64 {
+        ThinArc::as_ptr(s).cast::<()>() as usize as i64
     }
     match obj {
         Object::Str(s) => rc_str_ptr(s),
@@ -10852,7 +10853,7 @@ fn str_split_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
         return s
             .split(is_space)
             .filter(|f| !f.is_empty())
-            .map(|s| Object::Str(Rc::from(s)))
+            .map(|s| Object::Str(SharedStr::from(s)))
             .collect();
     }
     let mut out = Vec::new();
@@ -10864,11 +10865,11 @@ fn str_split_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
             break;
         }
         if splits >= maxsplit {
-            out.push(Object::Str(Rc::from(rest)));
+            out.push(Object::Str(SharedStr::from(rest)));
             break;
         }
         let end = rest.find(is_space).unwrap_or(rest.len());
-        out.push(Object::Str(Rc::from(&rest[..end])));
+        out.push(Object::Str(SharedStr::from(&rest[..end])));
         rest = &rest[end..];
         splits += 1;
     }
@@ -10913,10 +10914,12 @@ fn str_split(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
                 return Err(value_error("empty separator"));
             }
             if maxsplit < 0 {
-                s.split(&*sep).map(|s| Object::Str(Rc::from(s))).collect()
+                s.split(&*sep)
+                    .map(|s| Object::Str(SharedStr::from(s)))
+                    .collect()
             } else {
                 s.splitn((maxsplit as usize).saturating_add(1), &*sep)
-                    .map(|s| Object::Str(Rc::from(s)))
+                    .map(|s| Object::Str(SharedStr::from(s)))
                     .collect()
             }
         }
@@ -11290,7 +11293,7 @@ fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 /// Whether `s` is pure ASCII, memoized by buffer identity. CPython's PEP 393
-/// layout makes char↔byte offset mapping O(1); our UTF-8 `Rc<str>` needs a
+/// layout makes char↔byte offset mapping O(1); our UTF-8 `SharedStr` needs a
 /// scan. Callers like `str.find(sub, start)`-in-a-loop (email's
 /// `_parseparam`, N=100k windows over one big header) would otherwise turn
 /// linear algorithms quadratic. A one-slot cache suffices: hot loops hammer
@@ -11414,7 +11417,7 @@ fn str_rsplit_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
             break;
         }
         if out_rev.len() as i64 == maxsplit {
-            out_rev.push(Object::Str(Rc::from(rest)));
+            out_rev.push(Object::Str(SharedStr::from(rest)));
             break;
         }
         let start = rest
@@ -11422,7 +11425,7 @@ fn str_rsplit_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
             .rev()
             .find(|(_, c)| is_space(*c))
             .map_or(0, |(i, c)| i + c.len_utf8());
-        out_rev.push(Object::Str(Rc::from(&rest[start..])));
+        out_rev.push(Object::Str(SharedStr::from(&rest[start..])));
         rest = &rest[..start];
     }
     out_rev.reverse();
@@ -16968,7 +16971,9 @@ fn memoryview_tobytes(
         _ => false,
     };
     if !fortran {
-        return Ok(Object::Bytes(Rc::from(mv.to_bytes().into_boxed_slice())));
+        return Ok(Object::Bytes(SharedSlice::from(
+            mv.to_bytes().into_boxed_slice(),
+        )));
     }
     // Fortran gather: first index varies fastest.
     let shape = mv.shape_dims();
@@ -16994,7 +16999,7 @@ fn memoryview_tobytes(
             idx[d] = 0;
         }
     }
-    Ok(Object::Bytes(Rc::from(out.into_boxed_slice())))
+    Ok(Object::Bytes(SharedSlice::from(out.into_boxed_slice())))
 }
 
 fn memoryview_tolist(args: &[Object]) -> Result<Object, RuntimeError> {

@@ -1,0 +1,1227 @@
+{
+  "purpose": "Select source changes and compact new research evidence without deleting local files.",
+  "packing": "Original bytes and repository-relative paths are preserved. Reports remain directly readable. Extract this archive at the repository root to restore its referenced evidence. Generated caches and stack logs are excluded; original manifests inside the archive remain historical records.",
+  "excluded_generated_paths": [],
+  "archive": {
+    "bytes": 370915,
+    "sha256": "50ff6fa2e63c75b6ba09537bfed3725c35e78340a05f604523b227e30b7ade78",
+    "members": {
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/REPORT.md": {
+        "bytes": 3836,
+        "sha256": "c7d4e26bff5024a4b0ea330691d3e8d1e16f9379851ad48d5cae8e3f6624c73d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/candidate/environment.json": {
+        "bytes": 71828,
+        "sha256": "dbe6f87adb78fae43e039d17e442e295fd04312fe96d9465acbbd8a232d2a058"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/candidate/source-changes.diff": {
+        "bytes": 79727,
+        "sha256": "ca9c263df4e76adc1d57b8d996a3c7b9f7f547b308e460017617c3a1a122c1ea"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/candidate/tests/regrtest/test_bound_native_entry.py": {
+        "bytes": 4707,
+        "sha256": "5690b0a3dd58189982e4d407029e271446618800a4ba8db19d8b3f09ac724973"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/baseline-preflight/report.json": {
+        "bytes": 1656,
+        "sha256": "7dcc48a42a055ad7afa5ca8944dd5682fa5d0cae16c470057125ffb64f363724"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/baseline-preflight/test_bound_native_entry_draft.py": {
+        "bytes": 4707,
+        "sha256": "5690b0a3dd58189982e4d407029e271446618800a4ba8db19d8b3f09ac724973"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/call-assembly/new-stderr.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/call-assembly/new.txt": {
+        "bytes": 245501,
+        "sha256": "2893b5e6c6c122337f3458e75f50c4b76b8f06e46a8d8979a9dfddb44f15ce33"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/call-assembly/previous-stderr.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/call-assembly/previous.txt": {
+        "bytes": 237719,
+        "sha256": "118051419d5b7f9fd98ec2450c1891b6c9d3110d4a97568abd99e8f28addfc8a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/call-assembly/report.json": {
+        "bytes": 1062,
+        "sha256": "a841196224fef353a82c12bbe063e9cfe3c8ce82afbdeaf5fbe5fa4bf7e21eb6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/native-coverage.stderr.txt": {
+        "bytes": 3745,
+        "sha256": "9d9d5183872a7dd5693366f902ffe94ffc68c760d273a14669177c1a3b676e94"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/native-coverage.stdout.txt": {
+        "bytes": 23,
+        "sha256": "5e479c003b60dee7bb1fd1dc318db889b89b19126f0d199d1d05a47ec19a23d6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_bound_native_entry-gil0.txt": {
+        "bytes": 23,
+        "sha256": "5e479c003b60dee7bb1fd1dc318db889b89b19126f0d199d1d05a47ec19a23d6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_bound_native_entry-interp.txt": {
+        "bytes": 23,
+        "sha256": "5e479c003b60dee7bb1fd1dc318db889b89b19126f0d199d1d05a47ec19a23d6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_bound_native_entry-jit.txt": {
+        "bytes": 23,
+        "sha256": "5e479c003b60dee7bb1fd1dc318db889b89b19126f0d199d1d05a47ec19a23d6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_cross_thread_heap-gil0.txt": {
+        "bytes": 21,
+        "sha256": "2bd5c63696ec23dcae3a2a2489c3156645616a07a373a4a71bc01e9b2188f2cd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_cross_thread_heap-interp.txt": {
+        "bytes": 21,
+        "sha256": "2bd5c63696ec23dcae3a2a2489c3156645616a07a373a4a71bc01e9b2188f2cd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_cross_thread_heap-jit.txt": {
+        "bytes": 21,
+        "sha256": "2bd5c63696ec23dcae3a2a2489c3156645616a07a373a4a71bc01e9b2188f2cd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_default_suffix-gil0.txt": {
+        "bytes": 29,
+        "sha256": "9bffc14f0dc7d3e9defa3bfdfedc23b9a6db56901ba8c8c40f895d7677f209cf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_default_suffix-interp.txt": {
+        "bytes": 29,
+        "sha256": "9bffc14f0dc7d3e9defa3bfdfedc23b9a6db56901ba8c8c40f895d7677f209cf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_default_suffix-jit.txt": {
+        "bytes": 29,
+        "sha256": "9bffc14f0dc7d3e9defa3bfdfedc23b9a6db56901ba8c8c40f895d7677f209cf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_extcall_kwonly_messages-gil0.txt": {
+        "bytes": 27,
+        "sha256": "3937009c748b49e6adc45b055b829c25ed6f2a103b6e327af5824d027ad449b7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_extcall_kwonly_messages-interp.txt": {
+        "bytes": 27,
+        "sha256": "3937009c748b49e6adc45b055b829c25ed6f2a103b6e327af5824d027ad449b7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_extcall_kwonly_messages-jit.txt": {
+        "bytes": 27,
+        "sha256": "3937009c748b49e6adc45b055b829c25ed6f2a103b6e327af5824d027ad449b7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_frame_recycling-gil0.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_frame_recycling-interp.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_frame_recycling-jit.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_calls-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_calls-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_calls-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_cells-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_cells-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_cells-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_dyn_calls-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_dyn_calls-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_dyn_calls-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_object_lanes-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_object_lanes-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_object_lanes-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_raise_exits-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_raise_exits-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_raise_exits-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_scalar_leaf_calls-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_scalar_leaf_calls-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_scalar_leaf_calls-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_unboxed_calls-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_unboxed_calls-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_jit_unboxed_calls-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_native_call_scratch-gil0.txt": {
+        "bytes": 24,
+        "sha256": "63a2075f41e6d240e672189143f5136da800fc426e4ad995e35d8158027664a5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_native_call_scratch-interp.txt": {
+        "bytes": 24,
+        "sha256": "63a2075f41e6d240e672189143f5136da800fc426e4ad995e35d8158027664a5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_native_call_scratch-jit.txt": {
+        "bytes": 24,
+        "sha256": "63a2075f41e6d240e672189143f5136da800fc426e4ad995e35d8158027664a5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_native_generator_pin_retirement-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_native_generator_pin_retirement-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_native_generator_pin_retirement-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_native_pin_pressure-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_native_pin_pressure-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_native_pin_pressure-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_native_pin_retirement-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_native_pin_retirement-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_native_pin_retirement-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_pickle_callables-gil0.txt": {
+        "bytes": 20,
+        "sha256": "ddfbaeecfb2e489bc8f8794cdb8158003e69ea424cc0d61bd5c779c4cf33dc77"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_pickle_callables-interp.txt": {
+        "bytes": 20,
+        "sha256": "ddfbaeecfb2e489bc8f8794cdb8158003e69ea424cc0d61bd5c779c4cf33dc77"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_pickle_callables-jit.txt": {
+        "bytes": 20,
+        "sha256": "ddfbaeecfb2e489bc8f8794cdb8158003e69ea424cc0d61bd5c779c4cf33dc77"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_recursion_guard-gil0.txt": {
+        "bytes": 19,
+        "sha256": "ee260b4a7670a75456d1720e1e57f3b01fc4470576c4c2b072d153e21baf5b1d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_recursion_guard-interp.txt": {
+        "bytes": 19,
+        "sha256": "ee260b4a7670a75456d1720e1e57f3b01fc4470576c4c2b072d153e21baf5b1d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_recursion_guard-jit.txt": {
+        "bytes": 19,
+        "sha256": "ee260b4a7670a75456d1720e1e57f3b01fc4470576c4c2b072d153e21baf5b1d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_small_slot_storage-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_small_slot_storage-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_small_slot_storage-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_weakref_basic-gil0.txt": {
+        "bytes": 19,
+        "sha256": "679783b7ec6d6519078d6be12a12621ec71cb51a96fe2525a76b01a1308aeb4c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_weakref_basic-interp.txt": {
+        "bytes": 19,
+        "sha256": "679783b7ec6d6519078d6be12a12621ec71cb51a96fe2525a76b01a1308aeb4c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/checks/test_weakref_basic-jit.txt": {
+        "bytes": 19,
+        "sha256": "679783b7ec6d6519078d6be12a12621ec71cb51a96fe2525a76b01a1308aeb4c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/bound_method-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/bound_method-new.trace.txt": {
+        "bytes": 2986,
+        "sha256": "32c872ea8c55e2b15eb8eb550999cb14324c93c1728dc22ed3165769e451c623"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/bound_method-previous.trace.txt": {
+        "bytes": 2986,
+        "sha256": "cb47b448a83e5412eb3d895f8b65379eadb8ea707dff0af2cc63ffd7da4b5bec"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/bound_method.py": {
+        "bytes": 617,
+        "sha256": "5b53d546653abdb6663aa97875cee94addde5450e7ad80f4b73c60898490fa67"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/builtin-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/builtin-new.trace.txt": {
+        "bytes": 2931,
+        "sha256": "1aba90db9053474b7573907289548d44b66b146d3b74661816b8516924297dac"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/builtin-previous.trace.txt": {
+        "bytes": 2932,
+        "sha256": "497f57f057fb08bba1732630973be1c7ba6d648a715247b5dda2947ce79151d0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/builtin.py": {
+        "bytes": 618,
+        "sha256": "ae7f79d0965e3125922ebdfb76fd7097ea476165d5a409f83ca0fb6325983017"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/closure-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/closure-new.trace.txt": {
+        "bytes": 2987,
+        "sha256": "981db66a63d3ef7d2905864a658e0febe2186818d5c6910d44b4b473bd0d9d36"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/closure-previous.trace.txt": {
+        "bytes": 2988,
+        "sha256": "998714a854d139f39d90819a124640f041d393b761d0adfb6d01dcde9bc20bc5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/closure.py": {
+        "bytes": 249,
+        "sha256": "962667e314d795da6665e24aff0ee6fb2d24597a67a68875b1eeaba315938940"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/defaults-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/defaults-new.trace.txt": {
+        "bytes": 2994,
+        "sha256": "984a973929a535d536dc0874091f8a4c0a5d7869d4d0c56f92a4de37dd6acfc0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/defaults-previous.trace.txt": {
+        "bytes": 2995,
+        "sha256": "da6803e00bd71251baaff97e33bd6b7a6c95319182894525151d79040e4ed2ec"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/defaults.py": {
+        "bytes": 626,
+        "sha256": "e609d9c58f8fb944f2678a9f1c4fbe7c9a6433058f7865a5d8d6eeef036d93e0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/keyword_only-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/keyword_only-new.trace.txt": {
+        "bytes": 2987,
+        "sha256": "0fdc51cae0256c7817de2e8bc4abe83556351cd3c4d303301024ddfc54734753"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/keyword_only-previous.trace.txt": {
+        "bytes": 2988,
+        "sha256": "1c5c4f44c6319f169c8d031f3d4b7e4e3ac8bd22b0fcc757e30a49ba4c9ef4b0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/keyword_only.py": {
+        "bytes": 186,
+        "sha256": "0d011825a1450e25ecc833e9e0edfe0b64bda217aeb8e320b0c8a86dcced4e94"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/many_locals-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/many_locals-new.trace.txt": {
+        "bytes": 2986,
+        "sha256": "15dcca47acff0dd7abfbe1c82987575e86ffd8903d49af3c159c7d0b9a38d5f1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/many_locals-previous.trace.txt": {
+        "bytes": 2988,
+        "sha256": "85aec93805b8eb9aff4fa2ab57b4fd0e191895ae7f79964118042534dc5a211c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/many_locals.py": {
+        "bytes": 245,
+        "sha256": "6a71e254281cc75f2ff270c81505c40abe93eba7c021b66841643f45a499784e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/method-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/method-new.trace.txt": {
+        "bytes": 2987,
+        "sha256": "256f5a49467630c49e1af7951a14a03eebd9918707fc7e80146102c5f1f3377c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/method-previous.trace.txt": {
+        "bytes": 2988,
+        "sha256": "bb60af27a8f8574e66450cec66b6904393d40a7ad6c5f1c6a185027c8728835e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/method.py": {
+        "bytes": 619,
+        "sha256": "c63c3b5c67ab9c6af812eaacb053f624bcc5269918ad95d865a2f993daa9eaa9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/positional-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/positional-new.trace.txt": {
+        "bytes": 2985,
+        "sha256": "d49865a1e5902dd707e0deeddfe420c282fc18f7d0cabac0fa189bfdc9904915"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/positional-previous.trace.txt": {
+        "bytes": 2986,
+        "sha256": "028694f42765a2c4c8834732937181296926e45cd4e244070733c94a89b373bc"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/positional.py": {
+        "bytes": 620,
+        "sha256": "23ef1ad4f9432a26ea9f770cb823185f210e8873c3b8649b81020a575f2a1b60"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/report.json": {
+        "bytes": 51989,
+        "sha256": "0f8eb8b56d631bd8c6394f20a507150709956d5b2579c9c60cd20b1fadf91877"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/sparse_keyword-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/sparse_keyword-new.trace.txt": {
+        "bytes": 2996,
+        "sha256": "7b6dbc554cbc43400da48ceb6048f51d4fb391121f0168e24b2a48f2621e6499"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/sparse_keyword-previous.trace.txt": {
+        "bytes": 2998,
+        "sha256": "bba2ebe207522acda9a65c323b04a3e3223f275159fafcca4b5117213e591927"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/sparse_keyword.py": {
+        "bytes": 631,
+        "sha256": "8e5df8a423b21cc20fe52db0e9ba8bc9ee8751fa9c5feed25ca8be2e2422af6c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/variadic_keyword-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/variadic_keyword-new.trace.txt": {
+        "bytes": 2905,
+        "sha256": "e9f1a121827adfac46ffe01f40337694635c72eda64ae74ea73e461f5ed815a6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/variadic_keyword-previous.trace.txt": {
+        "bytes": 2906,
+        "sha256": "06ef659cf19ca09a9a6f594556c331e5eddc9d4c5ad07aa55ae4ceb72fd1b35b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/coverage/variadic_keyword.py": {
+        "bytes": 633,
+        "sha256": "abacbabb7b3617887ae470f34b8525274f921c9174d1ec9eb34e2e1b26953c4d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/extra-checks/report.json": {
+        "bytes": 5417,
+        "sha256": "5edbb41419ff9459e8deaec8d8a3cfadc3a0de956666f02e601cf2bddd779b3b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/retained-preflight/report.json": {
+        "bytes": 1653,
+        "sha256": "3500bbdeb307da074bb6ea0418d4f75d0d4e934baa5d64b32a05706b918561af"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/retained-preflight/test_bound_native_entry_draft.py": {
+        "bytes": 4707,
+        "sha256": "5690b0a3dd58189982e4d407029e271446618800a4ba8db19d8b3f09ac724973"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/validation/float-oracle.json": {
+        "bytes": 14757,
+        "sha256": "db605e1ff4209c07d69610cead8da04248d7261c2efcdfa9d2abc0ac5826968e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/validation/oracles.json": {
+        "bytes": 6778,
+        "sha256": "2d137b860c2ffca2c2f435f9990eb27cff45081e328fd025010675344049bf19"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/validation/validation.json": {
+        "bytes": 87907,
+        "sha256": "000503e002014a407d6fdc400781c970318cd21a0f3e0d5c7a19f7a36c781f47"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/checks/validation/validation.txt": {
+        "bytes": 8085,
+        "sha256": "811ba1fecf53cbf71d1814bea8794681744f6269474357cfdf755fe412827bb5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/cold-continuation/cold-exceptions.json": {
+        "bytes": 165151,
+        "sha256": "6e5c836ba8d751a4f4967e4db0d9358ff714425cd9619fa239564eb0e799c9c0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/cold-continuation/cold-exceptions.txt": {
+        "bytes": 2359,
+        "sha256": "3b4aa992b8c4dc2beead016928fd02249cab448fd483e94e087de59bd7d88929"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/cold-continuation/memory-after.txt": {
+        "bytes": 102,
+        "sha256": "b651dda41ca4fcef377b52ccc759c2a843fb5f8b2a45187d4239e81271021941"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/cold-continuation/memory-before.txt": {
+        "bytes": 102,
+        "sha256": "b651dda41ca4fcef377b52ccc759c2a843fb5f8b2a45187d4239e81271021941"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/cold-continuation/stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/cold-continuation/vm-after.txt": {
+        "bytes": 1247,
+        "sha256": "e3681c979b511e50c57c49b4a5c51c5ecef12b8d42b78b2a8ddc2945eac8469f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/cold-continuation/vm-before.txt": {
+        "bytes": 1247,
+        "sha256": "fdd2ccaa90e28a90bd0d6bcedee0192607c7d7ad5c72ec33506f6ea8d959c695"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/conditions/bound-native-cold-continuation-protocol.md": {
+        "bytes": 1849,
+        "sha256": "bd0e0984669c680703d10de2074dfceb7d24e3b1ba680ae2497aace69672642f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/conditions/bound-native-entry-cold-continuation-load.json": {
+        "bytes": 1686,
+        "sha256": "ac663971d8e535b9e07b4604f62c28b313a307d7a40248e895cda822da3b951a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/conditions/bound-native-entry-focused-load.json": {
+        "bytes": 2417,
+        "sha256": "e88eb8220ecc11791d7559dc524f0f057843ad7f1b336ca0b530ed5971b4f222"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/conditions/bound-native-entry-full-load.json": {
+        "bytes": 9749,
+        "sha256": "626738887116eeafd669cca22ea87ff6d95fc12ef6eb61ba2a605d109c1a3d47"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/conditions/bound-native-entry-load-protocol.md": {
+        "bytes": 1706,
+        "sha256": "3c58d00b5ee4bdc7c1932b8e0f6265a9d8eae0fdeacb2d62f42daead8f7c541b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/conditions/bound-native-entry-prebuild-sources.json": {
+        "bytes": 16332,
+        "sha256": "89489cf7c62f2229f26c94058b8d45ba55acb1e9bbb613f614107d0a7fc5e12d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/conditions/bound-native-entry-slot-coverage-diagnostic.patch": {
+        "bytes": 622,
+        "sha256": "233fdb382737d3e0a3a96866d610eb8b368cdb56ee0959ecbcbc74c0e80b17a3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/conditions/bound-native-entry-v3-prebuild-sources.json": {
+        "bytes": 16332,
+        "sha256": "6547252315af4072cfefe13184461615bc3f3d50fb8332e4ad42621c30eea2f4"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/conditions/performance_phase61_status.md": {
+        "bytes": 10614,
+        "sha256": "dcfd27f563c699a1afc8372905ec0b2d7f53ed4d261e3443413a3ddf84840d06"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/focused-complete/README.md": {
+        "bytes": 691,
+        "sha256": "1e9cdd4740026a6a0ad6a6b576ea5a5429d7da280e56291427f010e69f809a0d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/focused-complete/stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/focused-complete/summary.json": {
+        "bytes": 105392,
+        "sha256": "c3bf017a92bfd64b135c10451801bd54d32eb790bec10814383368ebc26e028f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/focused/calls.json": {
+        "bytes": 429351,
+        "sha256": "313a99fa3085699a48aa460723f99f602339d48f57f286f4fe8fb4e0809d3daf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/focused/calls.txt": {
+        "bytes": 7140,
+        "sha256": "f83e969d521d32e41d660174e80d17142eef611e5176051f0b5405b846fe7bbc"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/focused/cold-exceptions.json": {
+        "bytes": 5775,
+        "sha256": "8cc54d10e5a9ee04f0675aaa093c13e61c97cab5ff9f1d0993806827380c123e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/focused/cold-exceptions.txt": {
+        "bytes": 715,
+        "sha256": "a37a0a2febfc71f72df19c63e8275e544e256ee363c52223ace53514885617a6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/focused/exceptions.json": {
+        "bytes": 173740,
+        "sha256": "0c16bab2f804e278d334830c96f8483788916a859b7db77c4758c69cc0ac2ac8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/focused/exceptions.txt": {
+        "bytes": 2899,
+        "sha256": "5cf8aebd15d4ec9e627ac13480d20fe9d24635cbd2790c8c4ebadfbc79c9d6a0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/focused/memory-before.txt": {
+        "bytes": 102,
+        "sha256": "b651dda41ca4fcef377b52ccc759c2a843fb5f8b2a45187d4239e81271021941"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/focused/stage.txt": {
+        "bytes": 32,
+        "sha256": "ba4c8960000818bb2f89a397d3c002b9e0564d0c6e08ef172c19c1f49b20de02"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/focused/vm-before.txt": {
+        "bytes": 1247,
+        "sha256": "97c6fad67a58e2216ff75bbec4427ee7d4618898b7ab947432ff757199614439"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/full/memory-after.txt": {
+        "bytes": 102,
+        "sha256": "b651dda41ca4fcef377b52ccc759c2a843fb5f8b2a45187d4239e81271021941"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/full/memory-before.txt": {
+        "bytes": 102,
+        "sha256": "b651dda41ca4fcef377b52ccc759c2a843fb5f8b2a45187d4239e81271021941"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/full/stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/full/startup.json": {
+        "bytes": 224247,
+        "sha256": "31ec45fee5af984a4e7acdeee5d0e887d4dd0ad123f2a6e354376373fde42a54"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/full/startup.txt": {
+        "bytes": 2081,
+        "sha256": "c0ff27ca1241c7d0ddf402e8bf06977417bfd20bed71acacf5cea719265ab71e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/full/suite.json": {
+        "bytes": 711814,
+        "sha256": "fd21ea63c1e8c4d29b0a73ddbc030db46b78f7bb84d61381e0ec360d3bcc0dce"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/full/suite.txt": {
+        "bytes": 2143,
+        "sha256": "79d40265a80b26b65c198c29a1efc252adb60c65f2b30e7551fde4dbb89dfb02"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/full/summary.json": {
+        "bytes": 25642,
+        "sha256": "f4b7edb55e667405f42549abe3b5663110b46e06e0b180c6c1f366a4b74317c7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/full/summary.txt": {
+        "bytes": 3766,
+        "sha256": "74acb23d44c7cfb3c8045f48b40c79b78cafea66e6b2989654b17810766b02e0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/full/vm-after.txt": {
+        "bytes": 1247,
+        "sha256": "7325ee9bb7aa1a092496726904f3843383cbcc5aed86274db2d4310dd7544fb2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/full/vm-before.txt": {
+        "bytes": 1247,
+        "sha256": "34b6003d95c1f0b5bbef16f7d92f2c2eae1945813350e54fc44dc7956e8d7a5a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/index.json": {
+        "bytes": 73678,
+        "sha256": "65dae213eb96d8911e7960992073342e0634627c10b18b8a0a844298cb767b17"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/bound_method-verify.py": {
+        "bytes": 478,
+        "sha256": "f4dc15f1bac97dcbb2a67006534e197e95ee922e5dfe3c8ce2d25b4fdc245793"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/bound_method.py": {
+        "bytes": 570,
+        "sha256": "eb402cfeeea8044a97ea605722fe502d630e8e2eb5400f5ee2508e3028ddb7d5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/builtin-verify.py": {
+        "bytes": 473,
+        "sha256": "99d9cadfc26fc03f2970710beeaf2828aea107672816157c0d071acf230d7cbd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/builtin.py": {
+        "bytes": 571,
+        "sha256": "932ca3f6e162327dae41a491fc4931e27107b9c65e766ab3e6f6f06af04f05ed"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/closure-verify.py": {
+        "bytes": 473,
+        "sha256": "eeccdb4e7371f6f67a99f7b73732453f448888246589fabe5c0b7303f10c39ce"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/closure.py": {
+        "bytes": 202,
+        "sha256": "cad0183274c463d6a2aa0c3c6b888decc312b1f330077d7280fad328fa1fd43f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/defaults-verify.py": {
+        "bytes": 474,
+        "sha256": "e9711d9a34c84bae2e7072d5b75079c08725894700fd73a73bf4ad92f25ccbda"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/defaults.py": {
+        "bytes": 579,
+        "sha256": "52874cace6577d70f090cb4869d8fbba59c9c17df0dbc01a089bfae1bbddb23d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/keyword_only-verify.py": {
+        "bytes": 478,
+        "sha256": "fb267c163a0c89e8fbaaeda758fd9fbb03cef4cd637c00a88f72c0407259e1d5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/keyword_only.py": {
+        "bytes": 139,
+        "sha256": "599665899c90babe280b49c5c7bf7d2623066811d3acb23c3994573717e5399b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/many_locals-verify.py": {
+        "bytes": 477,
+        "sha256": "a90562494ebe8de5a95b6ed8a936209dba41e1c2d0346f50278d41cfb29d0346"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/many_locals.py": {
+        "bytes": 198,
+        "sha256": "66d6a55363ebdcded486475140f5e0df0723540bf7b52ca4e7970f2a08d61634"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/method-verify.py": {
+        "bytes": 472,
+        "sha256": "f0964cbf3d1074447ffa01caf243513ee7db31963bb128acb07a6fd5aeb0bcc9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/method.py": {
+        "bytes": 572,
+        "sha256": "d35db8066b4b7133269e473ad918e0240d9a8f13d823eb23aa320fcae653adcc"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/positional-verify.py": {
+        "bytes": 476,
+        "sha256": "91322b8b15a427031d9865cd65b86eb8182c7c73f5fb0d523c010121d97e9a59"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/positional.py": {
+        "bytes": 573,
+        "sha256": "ead6872b9e5c1aa8a1e3b0b24de776956a638ae763183b8c86c3f987b3b4701e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/preparation.json": {
+        "bytes": 3615,
+        "sha256": "24eda1410663c35f83a9c0079c072fc38f51cd6c4bde0d81b300685d67f75e7a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/sparse_keyword-verify.py": {
+        "bytes": 480,
+        "sha256": "79d6f574e4c3be9c5a3afab5a6e6b6e948bfb1bb2de1e25232c5af822045c75e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/sparse_keyword.py": {
+        "bytes": 584,
+        "sha256": "1fc69eaf7cb3e95bc9a6c9f6da46b5c245a33f4d876d1c437358f5396f179b48"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/variadic_keyword-verify.py": {
+        "bytes": 482,
+        "sha256": "51f155624dcfc7af08871853215728fff5d4adeb92f610eaf3ed7b9ad438c4d9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/calls/variadic_keyword.py": {
+        "bytes": 586,
+        "sha256": "e848ae7568ab97ac6c8510b313dc0d4597e34b9ab8ae6035db5d1bab8c1c985b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/cold-exceptions/exceptions_every_1-verify.py": {
+        "bytes": 491,
+        "sha256": "5cdbb23f411269f32832d475120b29ca9e815a94433c4d3900877ecfb99e4bd1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/cold-exceptions/exceptions_every_1.py": {
+        "bytes": 545,
+        "sha256": "dad6d9fd7ae298561cb1ae000e238ae78ce280c7415a1de95fe2c030c2d65315"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/cold-exceptions/exceptions_every_100-verify.py": {
+        "bytes": 493,
+        "sha256": "59b7093e5a72fa67f3a24c9e52cdc269a62eaaf21f89c4c1801ec86a83ee928f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/cold-exceptions/exceptions_every_100.py": {
+        "bytes": 547,
+        "sha256": "47e70d4b7b274436bae224defc801f8f050836e7f178e9c573c5a32adf6f30ac"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/cold-exceptions/exceptions_every_2-verify.py": {
+        "bytes": 491,
+        "sha256": "2366de25371f142a9c0d95c306e3f2f85089757f094e38d716a18884806fd2e3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/cold-exceptions/exceptions_every_2.py": {
+        "bytes": 545,
+        "sha256": "5e8035688b8ec57d77444a7f8bcb7e65b148828c3553c642d3e2f6e221c2fb5e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/cold-exceptions/exceptions_none-verify.py": {
+        "bytes": 488,
+        "sha256": "83624b41a35f0fad11a4835a3089407daa3d759070c195253855c13bb0088374"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/cold-exceptions/exceptions_none.py": {
+        "bytes": 540,
+        "sha256": "3e897894721a8b0c8624652e03723ac9e4fb606f81e691191f0a0d9cf7051e78"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/cold-exceptions/preparation.json": {
+        "bytes": 1636,
+        "sha256": "f401b5ab5bae4bc4c419d7423c002dded5c2df65d741f2e3d5ce8213ce03f03f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/exceptions/exceptions_every_1-verify.py": {
+        "bytes": 486,
+        "sha256": "f8143a8de0367fce80173925415f77a7b5b8267a30bef78c9a6072573f351c0b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/exceptions/exceptions_every_1.py": {
+        "bytes": 325,
+        "sha256": "f1eaf824998184397270ed66a605f47054bf5dc4a24ad095b6468fb02e58b94f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/exceptions/exceptions_every_100-verify.py": {
+        "bytes": 488,
+        "sha256": "7a3fd824f4b1837d1cd3930a4b523dbbe5ac8affba76661911779da42bd7a9c5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/exceptions/exceptions_every_100.py": {
+        "bytes": 327,
+        "sha256": "58cb45927c44496e65346781045d43ab9edb974d56053b3dcacd236243cc6ed4"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/exceptions/exceptions_every_2-verify.py": {
+        "bytes": 486,
+        "sha256": "0cf9a18acb94797acd97ac3c54b7d9169a33ca5074beee220f6c3cda96d8b1a8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/exceptions/exceptions_every_2.py": {
+        "bytes": 325,
+        "sha256": "1b92f0ca344ef6eb1c14fa8a2617876706ebb25f36c0cfde9e3195cc111b1c1e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/exceptions/exceptions_none-verify.py": {
+        "bytes": 483,
+        "sha256": "31b47ff44deebca5964b40e5b619ac3cfbb2b2f3bfb95b8ee4820bd9c1a09347"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/exceptions/exceptions_none.py": {
+        "bytes": 320,
+        "sha256": "4533ba20559e902af46d8e9ed80ae5cbdd29fb1757a9aa32e15b45496c4054f3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/exceptions/preparation.json": {
+        "bytes": 1596,
+        "sha256": "ba4e70921bdba6651e8fc8afeadc1140195aae5c1a3f6c4064aa08b5ae773991"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/inputs/protocol.md": {
+        "bytes": 2140,
+        "sha256": "7dcd3c1af247a298eb27249db8636df591447cfa8c2adee783a79fc0c99f7516"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-baseline-preflight.txt": {
+        "bytes": 159,
+        "sha256": "06e73d2d610a973f20deda5d97427a7943ab6a9d61b2d71b0f186544d482811b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-check-stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-checks-pipeline.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-cold-continuation-load.txt": {
+        "bytes": 55,
+        "sha256": "bf36a316575b5fdc50d33ca6e31a1fad20163ab8509c0f693c979e53df7e665b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-coverage.txt": {
+        "bytes": 11342,
+        "sha256": "2c2bd17ca5449276bfe57049e54f8a8501e14c7bb126077cd908f667eaad8463"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-dependency-fetch.txt": {
+        "bytes": 11373,
+        "sha256": "5c105fca1003b4c9332852b6695b1e85549aa87ea70bedcb55f8a92d2dcbc033"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-extra-checks.txt": {
+        "bytes": 1995,
+        "sha256": "0580bf640f33848ed7d61c8d3cd35501a19e899bf47a1d0b327fabd4ea2034c5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-focused-load.txt": {
+        "bytes": 55,
+        "sha256": "bf36a316575b5fdc50d33ca6e31a1fad20163ab8509c0f693c979e53df7e665b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-format.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-full-load.txt": {
+        "bytes": 55,
+        "sha256": "bf36a316575b5fdc50d33ca6e31a1fad20163ab8509c0f693c979e53df7e665b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-pipeline.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-previous.txt": {
+        "bytes": 52,
+        "sha256": "feba96bb28b3f420d45e793525f099da44acf53f09e1933b0cc6342b11e7acb8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-retained-preflight.txt": {
+        "bytes": 159,
+        "sha256": "06e73d2d610a973f20deda5d97427a7943ab6a9d61b2d71b0f186544d482811b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-slot-coverage-diagnostic.txt": {
+        "bytes": 996,
+        "sha256": "410bba21cdafc91f22ee0d3ce452ba8007f1cf827b52a3f5f0c9b0aefd74ab84"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-stage.txt": {
+        "bytes": 27,
+        "sha256": "3e36499ce336428721cc18728fdbea244718dfe1e996ec7353c8added7947070"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-v2-format.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-v2-pipeline.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-v2-previous.txt": {
+        "bytes": 52,
+        "sha256": "feba96bb28b3f420d45e793525f099da44acf53f09e1933b0cc6342b11e7acb8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-v2-stage.txt": {
+        "bytes": 27,
+        "sha256": "3e36499ce336428721cc18728fdbea244718dfe1e996ec7353c8added7947070"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-v2-vm-tests.txt": {
+        "bytes": 21597,
+        "sha256": "375aea745ba190f6ca1c29ced4d91cab7a50e39e87d53161ffb5f66c026019eb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-v3-build.txt": {
+        "bytes": 588,
+        "sha256": "40d545dd8b9542902f02168933b3a5d5ef90b98847de3262dbfb302e854665b3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-v3-clippy.txt": {
+        "bytes": 172,
+        "sha256": "b1cfb53959c6a07ad8365c995d5a39c876ed3d026227f9c48fb4ea52ac98bff0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-v3-format.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-v3-no-jit.txt": {
+        "bytes": 171,
+        "sha256": "6278b1d6c9744d79838e223beada20a82223d176af426b050ae89754e97bfd9c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-v3-pipeline.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-v3-previous.txt": {
+        "bytes": 52,
+        "sha256": "feba96bb28b3f420d45e793525f099da44acf53f09e1933b0cc6342b11e7acb8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-v3-snapshot.txt": {
+        "bytes": 205,
+        "sha256": "0a4e6eb4d7849427e4796a16736e6ad7e7fe4530574c7bf914dc280c1c13c09e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-v3-stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-v3-vm-tests.txt": {
+        "bytes": 496,
+        "sha256": "0b7d1dc0b85b1103a4df8ff3ddf6ffd51e759dab0bb0beda61485ddda1e84cb8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-validation-pipeline.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-validation-stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/logs/bound-native-entry-vm-tests.txt": {
+        "bytes": 117,
+        "sha256": "88c0cf8a3221fc9debfa462ed5c03afa91137fca133f3abaa4c7321a9766b582"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/build_bound_native_entry.sh": {
+        "bytes": 1447,
+        "sha256": "48c7f7b64efda9af6a4c42ea0eb78c4a3c8636b7631392dcc92c9aa82d528dc4"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/build_bound_native_entry_v2.sh": {
+        "bytes": 1486,
+        "sha256": "14855217ae96dde2d85a66dcbeb2569649163ea9f15e85dd3b2e50cb5eda7195"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/build_bound_native_entry_v3.sh": {
+        "bytes": 1581,
+        "sha256": "f0d1c0af80a99e8b315d19c0fae33c89fb9b159613d1441fb064cc30712f508d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/check_bound_native_entry.sh": {
+        "bytes": 1589,
+        "sha256": "cbbc72cfea33660a71a06d4a544b46af933af66b4942c6dbff298c8dc4f3caab"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/check_bound_native_entry_extra.py": {
+        "bytes": 1827,
+        "sha256": "827effd8415af4ddaf097a4961809ff0b7d192de904a1f2648f63e2d3e035b52"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/cold-continuation-inputs/bench_compare.py": {
+        "bytes": 12860,
+        "sha256": "1cdb0ae49378d06c26d61668e0004efd03c8e768bc87be57a60b56ea29df33d7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/cold-continuation-inputs/bound-native-cold-continuation-protocol.md": {
+        "bytes": 1849,
+        "sha256": "bd0e0984669c680703d10de2074dfceb7d24e3b1ba680ae2497aace69672642f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/cold-continuation-inputs/index.json": {
+        "bytes": 1631,
+        "sha256": "2af5d9aa2d88f8cc57363c670e58e98e34257b2fdeadda6783e4d80ab85d3b6c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/cold-continuation-inputs/measure_bound_native_cold_continuation.sh": {
+        "bytes": 1664,
+        "sha256": "fc3cec2751b459322428b430f9fe54c8b11f470dac9c5aad578944620a325fce"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/cold-continuation-inputs/measure_verified_python_components.py": {
+        "bytes": 4981,
+        "sha256": "2e7cf9d837886a596d8532f0252a9ac5e57d93d4a5cb7964f92846393580c6e7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/cold-continuation-inputs/prepare_bound_native_cold_continuation.py": {
+        "bytes": 1129,
+        "sha256": "56c10d73db0121274408008a8c513d4e1deb9dae3623a05f685d75c9b7e1f967"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/cold-continuation-inputs/run_performance_under_load_gate.py": {
+        "bytes": 3259,
+        "sha256": "92bbbd8cc196407fc0db2e54eecd58822f9226e2887ef0a69c11cad6e870d1d0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/complete_bound_native_focused.py": {
+        "bytes": 4236,
+        "sha256": "5d980556d0ab857dcceb2349fdfa2e00f47136427b7230b641da4f5aab06ee44"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/export_bound_entry_first.py": {
+        "bytes": 7939,
+        "sha256": "a3331ddfbc94b5f97c64190597cf6bc22d1fb5a4ebbaeaa1e6d2e723522137d3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/inspect_bound_native_entry.py": {
+        "bytes": 3589,
+        "sha256": "858a14c63f19fdac77962980bd858f44ea733f800f647b0b7d1fe117d3226366"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/measure_bound_native_cold_continuation.sh": {
+        "bytes": 1664,
+        "sha256": "fc3cec2751b459322428b430f9fe54c8b11f470dac9c5aad578944620a325fce"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/measure_bound_native_entry_diagnostic.sh": {
+        "bytes": 1949,
+        "sha256": "9c1e8bd6dac0d5270e9a2290e625be3f889f583e9e8f783b5092f678486a155e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/measure_bound_native_entry_focused.sh": {
+        "bytes": 1679,
+        "sha256": "ebdc6e8a69bf09f62a63cf7cddf543eeb1f70eb6ab6969ac174025fc3849c289"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/measure_bound_native_entry_full.sh": {
+        "bytes": 1261,
+        "sha256": "9e9bca02fee92df73a448a9c30fa6a37948ce239a2b4a3f583ad9679ded2a268"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/measurement-inputs/bench_compare.py": {
+        "bytes": 12860,
+        "sha256": "1cdb0ae49378d06c26d61668e0004efd03c8e768bc87be57a60b56ea29df33d7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/measurement-inputs/check_bound_native_entry.sh": {
+        "bytes": 1589,
+        "sha256": "fc7b2008f2facd4558aa40bd22a6631c061018a0898991237e1cae2b1c49adb7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/measurement-inputs/index.json": {
+        "bytes": 2297,
+        "sha256": "ed28d1369d9222298a7420b61907d6c76d81ce5496c6ac9df0398ba0fe3a8563"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/measurement-inputs/inspect_bound_native_entry.py": {
+        "bytes": 3589,
+        "sha256": "4543c7a2b5ef70e532a9278dcaf64e91f28f72f197c7d99b7f58a120b2e42a5a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/measurement-inputs/measure_bound_native_entry_focused.sh": {
+        "bytes": 1096,
+        "sha256": "44f5e84fed44047d55246facd2a2908bf3ec409e9415091f7bdebfe6741316ca"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/measurement-inputs/measure_verified_python_components.py": {
+        "bytes": 4981,
+        "sha256": "2e7cf9d837886a596d8532f0252a9ac5e57d93d4a5cb7964f92846393580c6e7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/measurement-inputs/prepare_bound_native_entry_inputs.py": {
+        "bytes": 3669,
+        "sha256": "07d84affd015feaf5415de88b54c2cf4f6e7171731e9802b740dbc0219b85fcd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/measurement-inputs/protocol.md": {
+        "bytes": 1458,
+        "sha256": "2669f4a9f88f64422e7c9556fb9da98a7521df0bc935c22bd38cf238d9918231"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/measurement-inputs/run_performance_under_load_gate.py": {
+        "bytes": 3259,
+        "sha256": "92bbbd8cc196407fc0db2e54eecd58822f9226e2887ef0a69c11cad6e870d1d0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/measurement-inputs/validate_bound_native_entry.sh": {
+        "bytes": 679,
+        "sha256": "f576892a5cd2a11465fad17af232a996c57f127c169bb36a23c8d32e50e7360a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/preflight_bound_native_entry.py": {
+        "bytes": 1824,
+        "sha256": "339b76564bc29b8b9e68eab8f6e07888dfc435408fca88b69440e23580e6172d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/preflight_bound_native_entry_retained.py": {
+        "bytes": 1821,
+        "sha256": "5af87b985e4f1b2c1ab4c8910ad6fd09ddee88678c62d9b3b1e06d13d7850518"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/prepare_bound_native_cold_continuation.py": {
+        "bytes": 1129,
+        "sha256": "56c10d73db0121274408008a8c513d4e1deb9dae3623a05f685d75c9b7e1f967"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/prepare_bound_native_entry_draft.py": {
+        "bytes": 2191,
+        "sha256": "7133989cf776d85feb46c65fa15a6da81aac4f72eadc688a2e84cf68bfd9a451"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/prepare_bound_native_entry_inputs.py": {
+        "bytes": 3669,
+        "sha256": "07d84affd015feaf5415de88b54c2cf4f6e7171731e9802b740dbc0219b85fcd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/prepare_bound_native_exception_inputs.py": {
+        "bytes": 1793,
+        "sha256": "6b18e1d9dc2513c42e25b6be41096bb65d144905ae8b7c128840bf9772a34171"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/test_bound_native_entry_draft.py": {
+        "bytes": 4707,
+        "sha256": "5690b0a3dd58189982e4d407029e271446618800a4ba8db19d8b3f09ac724973"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v3-measurement-inputs/bench_compare.py": {
+        "bytes": 12860,
+        "sha256": "1cdb0ae49378d06c26d61668e0004efd03c8e768bc87be57a60b56ea29df33d7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v3-measurement-inputs/bound-native-entry-load-protocol.md": {
+        "bytes": 1706,
+        "sha256": "3c58d00b5ee4bdc7c1932b8e0f6265a9d8eae0fdeacb2d62f42daead8f7c541b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v3-measurement-inputs/check_bound_native_entry.sh": {
+        "bytes": 1589,
+        "sha256": "cbbc72cfea33660a71a06d4a544b46af933af66b4942c6dbff298c8dc4f3caab"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v3-measurement-inputs/index.json": {
+        "bytes": 3908,
+        "sha256": "90198cbdd574ce497dce78efcf0d62681c4e682b2d40b2e76c9c8964e2fd61ee"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v3-measurement-inputs/inspect_bound_native_entry.py": {
+        "bytes": 3589,
+        "sha256": "858a14c63f19fdac77962980bd858f44ea733f800f647b0b7d1fe117d3226366"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v3-measurement-inputs/measure_bound_native_entry_diagnostic.sh": {
+        "bytes": 1366,
+        "sha256": "1734a6c39659eb10c1bbc9629d20dc772b56ddbce1e16f2ef378e6f4a2e1e727"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v3-measurement-inputs/measure_bound_native_entry_focused.sh": {
+        "bytes": 1096,
+        "sha256": "0f867fa522cd5c8346559b16cc1b23ae6747a0ae4c4ece91b0e6065bcc9e547d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v3-measurement-inputs/measure_bound_native_entry_full.sh": {
+        "bytes": 1261,
+        "sha256": "9e9bca02fee92df73a448a9c30fa6a37948ce239a2b4a3f583ad9679ded2a268"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v3-measurement-inputs/measure_verified_python_components.py": {
+        "bytes": 4981,
+        "sha256": "2e7cf9d837886a596d8532f0252a9ac5e57d93d4a5cb7964f92846393580c6e7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v3-measurement-inputs/prepare_bound_native_entry_inputs.py": {
+        "bytes": 3669,
+        "sha256": "07d84affd015feaf5415de88b54c2cf4f6e7171731e9802b740dbc0219b85fcd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v3-measurement-inputs/protocol.md": {
+        "bytes": 1458,
+        "sha256": "2669f4a9f88f64422e7c9556fb9da98a7521df0bc935c22bd38cf238d9918231"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v3-measurement-inputs/run_performance_diagnostic.py": {
+        "bytes": 1866,
+        "sha256": "ed68080f8a94867aa6f90d7004ea12c698c91258fd9723076e2d46f3eed1a070"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v3-measurement-inputs/run_performance_under_load_gate.py": {
+        "bytes": 3259,
+        "sha256": "92bbbd8cc196407fc0db2e54eecd58822f9226e2887ef0a69c11cad6e870d1d0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v3-measurement-inputs/shared_slot_keys_startup_probes.py": {
+        "bytes": 7330,
+        "sha256": "c89b7ce2541f025882bf592dabd29eccb96fe5e0bf50fa1f4fb670564d0bc2ce"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v3-measurement-inputs/summarize_runtime_suite.py": {
+        "bytes": 2919,
+        "sha256": "e0fcbfce1ef9c793701d78724289d37382e848b991737d3b9fcdc18c9ef1f804"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v3-measurement-inputs/validate_bound_native_entry.sh": {
+        "bytes": 679,
+        "sha256": "f576892a5cd2a11465fad17af232a996c57f127c169bb36a23c8d32e50e7360a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v4-measurement-inputs/bench_compare.py": {
+        "bytes": 12860,
+        "sha256": "1cdb0ae49378d06c26d61668e0004efd03c8e768bc87be57a60b56ea29df33d7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v4-measurement-inputs/bound-native-entry-load-protocol.md": {
+        "bytes": 1706,
+        "sha256": "3c58d00b5ee4bdc7c1932b8e0f6265a9d8eae0fdeacb2d62f42daead8f7c541b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v4-measurement-inputs/check_bound_native_entry.sh": {
+        "bytes": 1589,
+        "sha256": "cbbc72cfea33660a71a06d4a544b46af933af66b4942c6dbff298c8dc4f3caab"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v4-measurement-inputs/check_bound_native_entry_extra.py": {
+        "bytes": 1827,
+        "sha256": "827effd8415af4ddaf097a4961809ff0b7d192de904a1f2648f63e2d3e035b52"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v4-measurement-inputs/index.json": {
+        "bytes": 4450,
+        "sha256": "5e8ef52e58a8b139cf9f49f397396d8756d9bac97fe4ad46e251f5ac6e88e3af"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v4-measurement-inputs/inspect_bound_native_entry.py": {
+        "bytes": 3589,
+        "sha256": "858a14c63f19fdac77962980bd858f44ea733f800f647b0b7d1fe117d3226366"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v4-measurement-inputs/measure_bound_native_entry_diagnostic.sh": {
+        "bytes": 1949,
+        "sha256": "9c1e8bd6dac0d5270e9a2290e625be3f889f583e9e8f783b5092f678486a155e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v4-measurement-inputs/measure_bound_native_entry_focused.sh": {
+        "bytes": 1679,
+        "sha256": "ebdc6e8a69bf09f62a63cf7cddf543eeb1f70eb6ab6969ac174025fc3849c289"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v4-measurement-inputs/measure_bound_native_entry_full.sh": {
+        "bytes": 1261,
+        "sha256": "9e9bca02fee92df73a448a9c30fa6a37948ce239a2b4a3f583ad9679ded2a268"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v4-measurement-inputs/measure_verified_python_components.py": {
+        "bytes": 4981,
+        "sha256": "2e7cf9d837886a596d8532f0252a9ac5e57d93d4a5cb7964f92846393580c6e7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v4-measurement-inputs/prepare_bound_native_entry_inputs.py": {
+        "bytes": 3669,
+        "sha256": "07d84affd015feaf5415de88b54c2cf4f6e7171731e9802b740dbc0219b85fcd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v4-measurement-inputs/prepare_bound_native_exception_inputs.py": {
+        "bytes": 1793,
+        "sha256": "6b18e1d9dc2513c42e25b6be41096bb65d144905ae8b7c128840bf9772a34171"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v4-measurement-inputs/protocol.md": {
+        "bytes": 2140,
+        "sha256": "7dcd3c1af247a298eb27249db8636df591447cfa8c2adee783a79fc0c99f7516"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v4-measurement-inputs/run_performance_diagnostic.py": {
+        "bytes": 1866,
+        "sha256": "ed68080f8a94867aa6f90d7004ea12c698c91258fd9723076e2d46f3eed1a070"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v4-measurement-inputs/run_performance_under_load_gate.py": {
+        "bytes": 3259,
+        "sha256": "92bbbd8cc196407fc0db2e54eecd58822f9226e2887ef0a69c11cad6e870d1d0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v4-measurement-inputs/shared_slot_keys_startup_probes.py": {
+        "bytes": 7330,
+        "sha256": "c89b7ce2541f025882bf592dabd29eccb96fe5e0bf50fa1f4fb670564d0bc2ce"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v4-measurement-inputs/summarize_runtime_suite.py": {
+        "bytes": 2919,
+        "sha256": "e0fcbfce1ef9c793701d78724289d37382e848b991737d3b9fcdc18c9ef1f804"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/v4-measurement-inputs/validate_bound_native_entry.sh": {
+        "bytes": 679,
+        "sha256": "f576892a5cd2a11465fad17af232a996c57f127c169bb36a23c8d32e50e7360a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/bound-native-entry-first/methods/validate_bound_native_entry.sh": {
+        "bytes": 679,
+        "sha256": "f576892a5cd2a11465fad17af232a996c57f127c169bb36a23c8d32e50e7360a"
+      }
+    }
+  }
+}

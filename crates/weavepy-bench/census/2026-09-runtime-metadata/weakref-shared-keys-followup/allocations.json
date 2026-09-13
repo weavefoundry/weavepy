@@ -1,0 +1,3027 @@
+{
+  "purpose": "Compare live allocations at exact, disassembly-verified weakref sites.\n\nThis is selected live-allocation evidence, not allocation churn, timing, or RSS.\nReported instrumented block sizes remain separate from malloc request sizes.\n",
+  "evidence": {
+    "target/weakref-shared-keys-machine-code/report.json": "d74cac1e729a92521c1e989453342461f7eaf41040bb9db8fa539de7f0a15812",
+    "target/weakref-shared-keys-machine-code/key-allocation-sites.json": "ef823b396a29a0f6f34c40111ddd3ec1f73bc87f46225e6e8a79b76ef1550e93",
+    "target/weakref-shared-keys-machine-code/after.wrapper-keys-init.json": "6479cb6da7f1d42321919895a5baad93d67ac9c81fcf5b233646d9ad409b2ed8",
+    "/Users/owencarey/Documents/weavefoundry/weavepy/target/summarize_weakref_key_allocations.py": "e2d53092daba7676568d1847bf1cebbf661225eda7a51c9bd2f205b1fe161712"
+  },
+  "variants": {
+    "before": {
+      "binary_sha256": "36989234372e807ab95dc79686d9e5dd3bb51b458a9f7a1d92992357c30373a0",
+      "capture_root": "target/gc-lazy-finalization-live-before",
+      "capture_report_sha256": "f927a930c51fe6915fa01b96cc1a0ca687ec9220ca7ffe3706d732805589687e",
+      "rows": {
+        "ordinary_0": {
+          "history_sha256": "5b0d59d1c2f9c4e829339f6351da334466ddbc45e983b24756f7dafe0022b7f4",
+          "values": [
+            0,
+            0,
+            null,
+            null,
+            null,
+            true
+          ],
+          "totals": {
+            "factory": {
+              "calls": 3054,
+              "instrumented_reported_bytes": 193920,
+              "inferred_requested_bytes": 157328
+            },
+            "factory_keys": {
+              "calls": 1064,
+              "instrumented_reported_bytes": 46208,
+              "inferred_requested_bytes": 31616
+            },
+            "thread_key_init": {
+              "calls": 0,
+              "instrumented_reported_bytes": 0,
+              "inferred_requested_bytes": 0
+            }
+          },
+          "selected_group_count": 622,
+          "sites": {
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+3208": {
+              "category": "factory",
+              "requested_bytes_each": 192,
+              "calls": 152,
+              "instrumented_reported_bytes": 34048,
+              "inferred_requested_bytes": 29184
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+212": {
+              "category": "factory",
+              "requested_bytes_each": 120,
+              "calls": 166,
+              "instrumented_reported_bytes": 21248,
+              "inferred_requested_bytes": 19920
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+416": {
+              "category": "factory",
+              "requested_bytes_each": 96,
+              "calls": 152,
+              "instrumented_reported_bytes": 17024,
+              "inferred_requested_bytes": 14592
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1248": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2224": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+916": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1896": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1572": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1124": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__weakref_get__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2868": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__weakref_kind__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2660": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 112,
+              "instrumented_reported_bytes": 5376,
+              "inferred_requested_bytes": 3584,
+              "key": "__callback__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1772": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__alive__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1448": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__clear__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1516": {
+              "category": "factory",
+              "requested_bytes_each": 16,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 2432
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+776": {
+              "category": "factory",
+              "requested_bytes_each": 24,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 3648,
+              "key": "__call__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2096": {
+              "category": "factory",
+              "requested_bytes_each": 24,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 3648,
+              "key": "__repr__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2448": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 40,
+              "instrumented_reported_bytes": 1920,
+              "inferred_requested_bytes": 1280,
+              "key": "__callback__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2160": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1840": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+852": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1192": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            }
+          }
+        },
+        "ordinary_3000": {
+          "history_sha256": "11a80a3c56b83f29d6a99b39635793fbb432e0c438fe9ee25af78d1f2ed495a7",
+          "values": [
+            3000,
+            0,
+            0,
+            1500,
+            2999,
+            true
+          ],
+          "totals": {
+            "factory": {
+              "calls": 3054,
+              "instrumented_reported_bytes": 193920,
+              "inferred_requested_bytes": 157328
+            },
+            "factory_keys": {
+              "calls": 1064,
+              "instrumented_reported_bytes": 46208,
+              "inferred_requested_bytes": 31616
+            },
+            "thread_key_init": {
+              "calls": 0,
+              "instrumented_reported_bytes": 0,
+              "inferred_requested_bytes": 0
+            }
+          },
+          "selected_group_count": 622,
+          "sites": {
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+3208": {
+              "category": "factory",
+              "requested_bytes_each": 192,
+              "calls": 152,
+              "instrumented_reported_bytes": 34048,
+              "inferred_requested_bytes": 29184
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+212": {
+              "category": "factory",
+              "requested_bytes_each": 120,
+              "calls": 166,
+              "instrumented_reported_bytes": 21248,
+              "inferred_requested_bytes": 19920
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+416": {
+              "category": "factory",
+              "requested_bytes_each": 96,
+              "calls": 152,
+              "instrumented_reported_bytes": 17024,
+              "inferred_requested_bytes": 14592
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2224": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1248": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+916": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1572": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1896": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1772": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__alive__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2660": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 112,
+              "instrumented_reported_bytes": 5376,
+              "inferred_requested_bytes": 3584,
+              "key": "__callback__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2868": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__weakref_kind__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1124": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__weakref_get__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1448": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__clear__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+776": {
+              "category": "factory",
+              "requested_bytes_each": 24,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 3648,
+              "key": "__call__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2096": {
+              "category": "factory",
+              "requested_bytes_each": 24,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 3648,
+              "key": "__repr__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1516": {
+              "category": "factory",
+              "requested_bytes_each": 16,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 2432
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2448": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 40,
+              "instrumented_reported_bytes": 1920,
+              "inferred_requested_bytes": 1280,
+              "key": "__callback__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2160": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1192": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+852": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1840": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            }
+          }
+        },
+        "finalizer_0": {
+          "history_sha256": "f4f853b524cf82f7ea0b271d5c14b3cd3ee588190e2c373b591d299b5bc8672c",
+          "values": [
+            0,
+            0,
+            null,
+            null,
+            null,
+            true
+          ],
+          "totals": {
+            "factory": {
+              "calls": 3054,
+              "instrumented_reported_bytes": 193920,
+              "inferred_requested_bytes": 157328
+            },
+            "factory_keys": {
+              "calls": 1064,
+              "instrumented_reported_bytes": 46208,
+              "inferred_requested_bytes": 31616
+            },
+            "thread_key_init": {
+              "calls": 0,
+              "instrumented_reported_bytes": 0,
+              "inferred_requested_bytes": 0
+            }
+          },
+          "selected_group_count": 622,
+          "sites": {
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+3208": {
+              "category": "factory",
+              "requested_bytes_each": 192,
+              "calls": 152,
+              "instrumented_reported_bytes": 34048,
+              "inferred_requested_bytes": 29184
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+212": {
+              "category": "factory",
+              "requested_bytes_each": 120,
+              "calls": 166,
+              "instrumented_reported_bytes": 21248,
+              "inferred_requested_bytes": 19920
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+416": {
+              "category": "factory",
+              "requested_bytes_each": 96,
+              "calls": 152,
+              "instrumented_reported_bytes": 17024,
+              "inferred_requested_bytes": 14592
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1572": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1896": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2224": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+916": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1248": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1772": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__alive__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2868": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__weakref_kind__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2660": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 112,
+              "instrumented_reported_bytes": 5376,
+              "inferred_requested_bytes": 3584,
+              "key": "__callback__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1124": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__weakref_get__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1448": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__clear__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2096": {
+              "category": "factory",
+              "requested_bytes_each": 24,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 3648,
+              "key": "__repr__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1516": {
+              "category": "factory",
+              "requested_bytes_each": 16,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 2432
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+776": {
+              "category": "factory",
+              "requested_bytes_each": 24,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 3648,
+              "key": "__call__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2448": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 40,
+              "instrumented_reported_bytes": 1920,
+              "inferred_requested_bytes": 1280,
+              "key": "__callback__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1192": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+852": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1840": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2160": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            }
+          }
+        },
+        "finalizer_3000": {
+          "history_sha256": "5c1b1c2e1744abc70d6aed0298dc53e360f1c02f0a1c7fb1c8b84d79b24ee2ca",
+          "values": [
+            3000,
+            0,
+            0,
+            1500,
+            2999,
+            true
+          ],
+          "totals": {
+            "factory": {
+              "calls": 3054,
+              "instrumented_reported_bytes": 193920,
+              "inferred_requested_bytes": 157328
+            },
+            "factory_keys": {
+              "calls": 1064,
+              "instrumented_reported_bytes": 46208,
+              "inferred_requested_bytes": 31616
+            },
+            "thread_key_init": {
+              "calls": 0,
+              "instrumented_reported_bytes": 0,
+              "inferred_requested_bytes": 0
+            }
+          },
+          "selected_group_count": 622,
+          "sites": {
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+3208": {
+              "category": "factory",
+              "requested_bytes_each": 192,
+              "calls": 152,
+              "instrumented_reported_bytes": 34048,
+              "inferred_requested_bytes": 29184
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+212": {
+              "category": "factory",
+              "requested_bytes_each": 120,
+              "calls": 166,
+              "instrumented_reported_bytes": 21248,
+              "inferred_requested_bytes": 19920
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+416": {
+              "category": "factory",
+              "requested_bytes_each": 96,
+              "calls": 152,
+              "instrumented_reported_bytes": 17024,
+              "inferred_requested_bytes": 14592
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2224": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1248": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1896": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1572": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+916": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2660": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 112,
+              "instrumented_reported_bytes": 5376,
+              "inferred_requested_bytes": 3584,
+              "key": "__callback__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1448": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__clear__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1124": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__weakref_get__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1772": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__alive__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2868": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__weakref_kind__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2096": {
+              "category": "factory",
+              "requested_bytes_each": 24,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 3648,
+              "key": "__repr__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+776": {
+              "category": "factory",
+              "requested_bytes_each": 24,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 3648,
+              "key": "__call__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1516": {
+              "category": "factory",
+              "requested_bytes_each": 16,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 2432
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2448": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 40,
+              "instrumented_reported_bytes": 1920,
+              "inferred_requested_bytes": 1280,
+              "key": "__callback__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1192": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1840": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2160": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+852": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            }
+          }
+        },
+        "weak_no_callback_0": {
+          "history_sha256": "9121bcb92a7d0043189051c3f33fa5e9e3884aeba4839b63b4027a776c218d30",
+          "values": [
+            0,
+            0,
+            null,
+            null,
+            null,
+            true
+          ],
+          "totals": {
+            "factory": {
+              "calls": 3054,
+              "instrumented_reported_bytes": 193920,
+              "inferred_requested_bytes": 157328
+            },
+            "factory_keys": {
+              "calls": 1064,
+              "instrumented_reported_bytes": 46208,
+              "inferred_requested_bytes": 31616
+            },
+            "thread_key_init": {
+              "calls": 0,
+              "instrumented_reported_bytes": 0,
+              "inferred_requested_bytes": 0
+            }
+          },
+          "selected_group_count": 622,
+          "sites": {
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+3208": {
+              "category": "factory",
+              "requested_bytes_each": 192,
+              "calls": 152,
+              "instrumented_reported_bytes": 34048,
+              "inferred_requested_bytes": 29184
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+212": {
+              "category": "factory",
+              "requested_bytes_each": 120,
+              "calls": 166,
+              "instrumented_reported_bytes": 21248,
+              "inferred_requested_bytes": 19920
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+416": {
+              "category": "factory",
+              "requested_bytes_each": 96,
+              "calls": 152,
+              "instrumented_reported_bytes": 17024,
+              "inferred_requested_bytes": 14592
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+916": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1248": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2224": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1572": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1896": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1448": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__clear__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1772": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__alive__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2868": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__weakref_kind__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2660": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 112,
+              "instrumented_reported_bytes": 5376,
+              "inferred_requested_bytes": 3584,
+              "key": "__callback__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1124": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__weakref_get__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+776": {
+              "category": "factory",
+              "requested_bytes_each": 24,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 3648,
+              "key": "__call__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2096": {
+              "category": "factory",
+              "requested_bytes_each": 24,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 3648,
+              "key": "__repr__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1516": {
+              "category": "factory",
+              "requested_bytes_each": 16,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 2432
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2448": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 40,
+              "instrumented_reported_bytes": 1920,
+              "inferred_requested_bytes": 1280,
+              "key": "__callback__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+852": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2160": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1192": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1840": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            }
+          }
+        },
+        "weak_no_callback_3000": {
+          "history_sha256": "93ca949e63b7fec5ce625f7e94b25ffa5378bd42b2e27a49371622dae97c17f1",
+          "values": [
+            3000,
+            3000,
+            0,
+            1500,
+            2999,
+            true
+          ],
+          "totals": {
+            "factory": {
+              "calls": 63054,
+              "instrumented_reported_bytes": 3985920,
+              "inferred_requested_bytes": 3229328
+            },
+            "factory_keys": {
+              "calls": 22064,
+              "instrumented_reported_bytes": 958208,
+              "inferred_requested_bytes": 655616
+            },
+            "thread_key_init": {
+              "calls": 0,
+              "instrumented_reported_bytes": 0,
+              "inferred_requested_bytes": 0
+            }
+          },
+          "selected_group_count": 662,
+          "sites": {
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+3208": {
+              "category": "factory",
+              "requested_bytes_each": 192,
+              "calls": 3152,
+              "instrumented_reported_bytes": 706048,
+              "inferred_requested_bytes": 605184
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+212": {
+              "category": "factory",
+              "requested_bytes_each": 120,
+              "calls": 3166,
+              "instrumented_reported_bytes": 405248,
+              "inferred_requested_bytes": 379920
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+416": {
+              "category": "factory",
+              "requested_bytes_each": 96,
+              "calls": 3152,
+              "instrumented_reported_bytes": 353024,
+              "inferred_requested_bytes": 302592
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+916": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1572": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1248": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2224": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1896": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1448": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 3152,
+              "instrumented_reported_bytes": 151296,
+              "inferred_requested_bytes": 100864,
+              "key": "__clear__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2868": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 3152,
+              "instrumented_reported_bytes": 151296,
+              "inferred_requested_bytes": 100864,
+              "key": "__weakref_kind__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1124": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 3152,
+              "instrumented_reported_bytes": 151296,
+              "inferred_requested_bytes": 100864,
+              "key": "__weakref_get__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2660": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 3112,
+              "instrumented_reported_bytes": 149376,
+              "inferred_requested_bytes": 99584,
+              "key": "__callback__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1772": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 3152,
+              "instrumented_reported_bytes": 151296,
+              "inferred_requested_bytes": 100864,
+              "key": "__alive__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1516": {
+              "category": "factory",
+              "requested_bytes_each": 16,
+              "calls": 3152,
+              "instrumented_reported_bytes": 100864,
+              "inferred_requested_bytes": 50432
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2096": {
+              "category": "factory",
+              "requested_bytes_each": 24,
+              "calls": 3152,
+              "instrumented_reported_bytes": 100864,
+              "inferred_requested_bytes": 75648,
+              "key": "__repr__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+776": {
+              "category": "factory",
+              "requested_bytes_each": 24,
+              "calls": 3152,
+              "instrumented_reported_bytes": 100864,
+              "inferred_requested_bytes": 75648,
+              "key": "__call__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2160": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 3152,
+              "instrumented_reported_bytes": 50432,
+              "inferred_requested_bytes": 25216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1840": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 3152,
+              "instrumented_reported_bytes": 50432,
+              "inferred_requested_bytes": 25216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1192": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 3152,
+              "instrumented_reported_bytes": 50432,
+              "inferred_requested_bytes": 25216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+852": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 3152,
+              "instrumented_reported_bytes": 50432,
+              "inferred_requested_bytes": 25216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2448": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 40,
+              "instrumented_reported_bytes": 1920,
+              "inferred_requested_bytes": 1280,
+              "key": "__callback__"
+            }
+          }
+        },
+        "weak_callback_0": {
+          "history_sha256": "7ce9eee242cafebbadb05bf2699edaf3267f6882a2d4df1de9fe1dd07121b45f",
+          "values": [
+            0,
+            0,
+            null,
+            null,
+            null,
+            true
+          ],
+          "totals": {
+            "factory": {
+              "calls": 3054,
+              "instrumented_reported_bytes": 193920,
+              "inferred_requested_bytes": 157328
+            },
+            "factory_keys": {
+              "calls": 1064,
+              "instrumented_reported_bytes": 46208,
+              "inferred_requested_bytes": 31616
+            },
+            "thread_key_init": {
+              "calls": 0,
+              "instrumented_reported_bytes": 0,
+              "inferred_requested_bytes": 0
+            }
+          },
+          "selected_group_count": 622,
+          "sites": {
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+3208": {
+              "category": "factory",
+              "requested_bytes_each": 192,
+              "calls": 152,
+              "instrumented_reported_bytes": 34048,
+              "inferred_requested_bytes": 29184
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+212": {
+              "category": "factory",
+              "requested_bytes_each": 120,
+              "calls": 166,
+              "instrumented_reported_bytes": 21248,
+              "inferred_requested_bytes": 19920
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+416": {
+              "category": "factory",
+              "requested_bytes_each": 96,
+              "calls": 152,
+              "instrumented_reported_bytes": 17024,
+              "inferred_requested_bytes": 14592
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1248": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1572": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+916": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2224": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1896": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1448": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__clear__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1772": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__alive__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2868": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__weakref_kind__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2660": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 112,
+              "instrumented_reported_bytes": 5376,
+              "inferred_requested_bytes": 3584,
+              "key": "__callback__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1124": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 152,
+              "instrumented_reported_bytes": 7296,
+              "inferred_requested_bytes": 4864,
+              "key": "__weakref_get__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+776": {
+              "category": "factory",
+              "requested_bytes_each": 24,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 3648,
+              "key": "__call__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1516": {
+              "category": "factory",
+              "requested_bytes_each": 16,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 2432
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2096": {
+              "category": "factory",
+              "requested_bytes_each": 24,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 3648,
+              "key": "__repr__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2448": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 40,
+              "instrumented_reported_bytes": 1920,
+              "inferred_requested_bytes": 1280,
+              "key": "__callback__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1840": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+852": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2160": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1192": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            }
+          }
+        },
+        "weak_callback_3000": {
+          "history_sha256": "9f7d72ed5466aaf0ffee8842c664caad448906ef4917a2d6999c7d9f1215f780",
+          "values": [
+            3000,
+            3000,
+            0,
+            1500,
+            2999,
+            true
+          ],
+          "totals": {
+            "factory": {
+              "calls": 63054,
+              "instrumented_reported_bytes": 3985920,
+              "inferred_requested_bytes": 3229328
+            },
+            "factory_keys": {
+              "calls": 22064,
+              "instrumented_reported_bytes": 958208,
+              "inferred_requested_bytes": 655616
+            },
+            "thread_key_init": {
+              "calls": 0,
+              "instrumented_reported_bytes": 0,
+              "inferred_requested_bytes": 0
+            }
+          },
+          "selected_group_count": 662,
+          "sites": {
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+3208": {
+              "category": "factory",
+              "requested_bytes_each": 192,
+              "calls": 3152,
+              "instrumented_reported_bytes": 706048,
+              "inferred_requested_bytes": 605184
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+212": {
+              "category": "factory",
+              "requested_bytes_each": 120,
+              "calls": 3166,
+              "instrumented_reported_bytes": 405248,
+              "inferred_requested_bytes": 379920
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+416": {
+              "category": "factory",
+              "requested_bytes_each": 96,
+              "calls": 3152,
+              "instrumented_reported_bytes": 353024,
+              "inferred_requested_bytes": 302592
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1248": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+916": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2224": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1896": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1572": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1448": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 3152,
+              "instrumented_reported_bytes": 151296,
+              "inferred_requested_bytes": 100864,
+              "key": "__clear__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1124": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 3152,
+              "instrumented_reported_bytes": 151296,
+              "inferred_requested_bytes": 100864,
+              "key": "__weakref_get__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2448": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 3040,
+              "instrumented_reported_bytes": 145920,
+              "inferred_requested_bytes": 97280,
+              "key": "__callback__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2868": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 3152,
+              "instrumented_reported_bytes": 151296,
+              "inferred_requested_bytes": 100864,
+              "key": "__weakref_kind__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1772": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 3152,
+              "instrumented_reported_bytes": 151296,
+              "inferred_requested_bytes": 100864,
+              "key": "__alive__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1516": {
+              "category": "factory",
+              "requested_bytes_each": 16,
+              "calls": 3152,
+              "instrumented_reported_bytes": 100864,
+              "inferred_requested_bytes": 50432
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+776": {
+              "category": "factory",
+              "requested_bytes_each": 24,
+              "calls": 3152,
+              "instrumented_reported_bytes": 100864,
+              "inferred_requested_bytes": 75648,
+              "key": "__call__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2096": {
+              "category": "factory",
+              "requested_bytes_each": 24,
+              "calls": 3152,
+              "instrumented_reported_bytes": 100864,
+              "inferred_requested_bytes": 75648,
+              "key": "__repr__"
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1192": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 3152,
+              "instrumented_reported_bytes": 50432,
+              "inferred_requested_bytes": 25216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+852": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 3152,
+              "instrumented_reported_bytes": 50432,
+              "inferred_requested_bytes": 25216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2160": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 3152,
+              "instrumented_reported_bytes": 50432,
+              "inferred_requested_bytes": 25216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1840": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 3152,
+              "instrumented_reported_bytes": 50432,
+              "inferred_requested_bytes": 25216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2660": {
+              "category": "factory",
+              "requested_bytes_each": 32,
+              "calls": 112,
+              "instrumented_reported_bytes": 5376,
+              "inferred_requested_bytes": 3584,
+              "key": "__callback__"
+            }
+          }
+        }
+      },
+      "population_deltas": {
+        "ordinary": {
+          "factory": {
+            "calls": 0,
+            "instrumented_reported_bytes": 0,
+            "inferred_requested_bytes": 0
+          },
+          "factory_keys": {
+            "calls": 0,
+            "instrumented_reported_bytes": 0,
+            "inferred_requested_bytes": 0
+          },
+          "thread_key_init": {
+            "calls": 0,
+            "instrumented_reported_bytes": 0,
+            "inferred_requested_bytes": 0
+          }
+        },
+        "finalizer": {
+          "factory": {
+            "calls": 0,
+            "instrumented_reported_bytes": 0,
+            "inferred_requested_bytes": 0
+          },
+          "factory_keys": {
+            "calls": 0,
+            "instrumented_reported_bytes": 0,
+            "inferred_requested_bytes": 0
+          },
+          "thread_key_init": {
+            "calls": 0,
+            "instrumented_reported_bytes": 0,
+            "inferred_requested_bytes": 0
+          }
+        },
+        "weak_no_callback": {
+          "factory": {
+            "calls": 60000,
+            "instrumented_reported_bytes": 3792000,
+            "inferred_requested_bytes": 3072000
+          },
+          "factory_keys": {
+            "calls": 21000,
+            "instrumented_reported_bytes": 912000,
+            "inferred_requested_bytes": 624000
+          },
+          "thread_key_init": {
+            "calls": 0,
+            "instrumented_reported_bytes": 0,
+            "inferred_requested_bytes": 0
+          }
+        },
+        "weak_callback": {
+          "factory": {
+            "calls": 60000,
+            "instrumented_reported_bytes": 3792000,
+            "inferred_requested_bytes": 3072000
+          },
+          "factory_keys": {
+            "calls": 21000,
+            "instrumented_reported_bytes": 912000,
+            "inferred_requested_bytes": 624000
+          },
+          "thread_key_init": {
+            "calls": 0,
+            "instrumented_reported_bytes": 0,
+            "inferred_requested_bytes": 0
+          }
+        }
+      }
+    },
+    "after": {
+      "binary_sha256": "8899e3679267f571bc5d50167197c8a558e19c5f3278bf3e74df0a8607213284",
+      "capture_root": "target/weakref-shared-keys-live-after",
+      "capture_report_sha256": "2bcb080793ffed9e7867bf43b556999a669708fd11839a444b4e85bc3db7889e",
+      "rows": {
+        "ordinary_0": {
+          "history_sha256": "3187a9b9465986a43459b95bdc39bca12e5000224a19d342d7248abaded34948",
+          "values": [
+            0,
+            0,
+            null,
+            null,
+            null,
+            true
+          ],
+          "totals": {
+            "factory": {
+              "calls": 1990,
+              "instrumented_reported_bytes": 147712,
+              "inferred_requested_bytes": 125712
+            },
+            "factory_keys": {
+              "calls": 0,
+              "instrumented_reported_bytes": 0,
+              "inferred_requested_bytes": 0
+            },
+            "thread_key_init": {
+              "calls": 7,
+              "instrumented_reported_bytes": 304,
+              "inferred_requested_bytes": 208
+            }
+          },
+          "selected_group_count": 412,
+          "sites": {
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+4928": {
+              "category": "factory",
+              "requested_bytes_each": 192,
+              "calls": 152,
+              "instrumented_reported_bytes": 34048,
+              "inferred_requested_bytes": 29184
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+208": {
+              "category": "factory",
+              "requested_bytes_each": 120,
+              "calls": 166,
+              "instrumented_reported_bytes": 21248,
+              "inferred_requested_bytes": 19920
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+412": {
+              "category": "factory",
+              "requested_bytes_each": 96,
+              "calls": 152,
+              "instrumented_reported_bytes": 17024,
+              "inferred_requested_bytes": 14592
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1636": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+932": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1984": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2332": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1284": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1580": {
+              "category": "factory",
+              "requested_bytes_each": 16,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 2432
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2268": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1928": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1228": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+868": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+376": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+444": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+256": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+192": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+128": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+316": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 24,
+              "calls": 1,
+              "instrumented_reported_bytes": 32,
+              "inferred_requested_bytes": 24
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+60": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 24,
+              "calls": 1,
+              "instrumented_reported_bytes": 32,
+              "inferred_requested_bytes": 24
+            }
+          }
+        },
+        "ordinary_3000": {
+          "history_sha256": "a636dd61775b04d4c355664fb6eed553072d959b4409362c01c26e06133aeced",
+          "values": [
+            3000,
+            0,
+            0,
+            1500,
+            2999,
+            true
+          ],
+          "totals": {
+            "factory": {
+              "calls": 1990,
+              "instrumented_reported_bytes": 147712,
+              "inferred_requested_bytes": 125712
+            },
+            "factory_keys": {
+              "calls": 0,
+              "instrumented_reported_bytes": 0,
+              "inferred_requested_bytes": 0
+            },
+            "thread_key_init": {
+              "calls": 7,
+              "instrumented_reported_bytes": 304,
+              "inferred_requested_bytes": 208
+            }
+          },
+          "selected_group_count": 412,
+          "sites": {
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+4928": {
+              "category": "factory",
+              "requested_bytes_each": 192,
+              "calls": 152,
+              "instrumented_reported_bytes": 34048,
+              "inferred_requested_bytes": 29184
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+208": {
+              "category": "factory",
+              "requested_bytes_each": 120,
+              "calls": 166,
+              "instrumented_reported_bytes": 21248,
+              "inferred_requested_bytes": 19920
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+412": {
+              "category": "factory",
+              "requested_bytes_each": 96,
+              "calls": 152,
+              "instrumented_reported_bytes": 17024,
+              "inferred_requested_bytes": 14592
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2332": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1636": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1284": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+932": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1984": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1580": {
+              "category": "factory",
+              "requested_bytes_each": 16,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 2432
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+868": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1228": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2268": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1928": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+376": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+444": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+128": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+192": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+256": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+60": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 24,
+              "calls": 1,
+              "instrumented_reported_bytes": 32,
+              "inferred_requested_bytes": 24
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+316": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 24,
+              "calls": 1,
+              "instrumented_reported_bytes": 32,
+              "inferred_requested_bytes": 24
+            }
+          }
+        },
+        "finalizer_0": {
+          "history_sha256": "bba7fe8bf448a4e9d5c99c666272ef6e91f45c7df834d066ffb5595188511035",
+          "values": [
+            0,
+            0,
+            null,
+            null,
+            null,
+            true
+          ],
+          "totals": {
+            "factory": {
+              "calls": 1990,
+              "instrumented_reported_bytes": 147712,
+              "inferred_requested_bytes": 125712
+            },
+            "factory_keys": {
+              "calls": 0,
+              "instrumented_reported_bytes": 0,
+              "inferred_requested_bytes": 0
+            },
+            "thread_key_init": {
+              "calls": 7,
+              "instrumented_reported_bytes": 304,
+              "inferred_requested_bytes": 208
+            }
+          },
+          "selected_group_count": 412,
+          "sites": {
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+4928": {
+              "category": "factory",
+              "requested_bytes_each": 192,
+              "calls": 152,
+              "instrumented_reported_bytes": 34048,
+              "inferred_requested_bytes": 29184
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+208": {
+              "category": "factory",
+              "requested_bytes_each": 120,
+              "calls": 166,
+              "instrumented_reported_bytes": 21248,
+              "inferred_requested_bytes": 19920
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+412": {
+              "category": "factory",
+              "requested_bytes_each": 96,
+              "calls": 152,
+              "instrumented_reported_bytes": 17024,
+              "inferred_requested_bytes": 14592
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1984": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2332": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1636": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1284": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+932": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1580": {
+              "category": "factory",
+              "requested_bytes_each": 16,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 2432
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+868": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1228": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1928": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2268": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+128": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+192": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+444": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+376": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+256": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+316": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 24,
+              "calls": 1,
+              "instrumented_reported_bytes": 32,
+              "inferred_requested_bytes": 24
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+60": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 24,
+              "calls": 1,
+              "instrumented_reported_bytes": 32,
+              "inferred_requested_bytes": 24
+            }
+          }
+        },
+        "finalizer_3000": {
+          "history_sha256": "6c9de8f5e91f474a9480cadd0f0225f051fc882cb0130794c5f1a7f32e6230b6",
+          "values": [
+            3000,
+            0,
+            0,
+            1500,
+            2999,
+            true
+          ],
+          "totals": {
+            "factory": {
+              "calls": 1990,
+              "instrumented_reported_bytes": 147712,
+              "inferred_requested_bytes": 125712
+            },
+            "factory_keys": {
+              "calls": 0,
+              "instrumented_reported_bytes": 0,
+              "inferred_requested_bytes": 0
+            },
+            "thread_key_init": {
+              "calls": 7,
+              "instrumented_reported_bytes": 304,
+              "inferred_requested_bytes": 208
+            }
+          },
+          "selected_group_count": 412,
+          "sites": {
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+4928": {
+              "category": "factory",
+              "requested_bytes_each": 192,
+              "calls": 152,
+              "instrumented_reported_bytes": 34048,
+              "inferred_requested_bytes": 29184
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+208": {
+              "category": "factory",
+              "requested_bytes_each": 120,
+              "calls": 166,
+              "instrumented_reported_bytes": 21248,
+              "inferred_requested_bytes": 19920
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+412": {
+              "category": "factory",
+              "requested_bytes_each": 96,
+              "calls": 152,
+              "instrumented_reported_bytes": 17024,
+              "inferred_requested_bytes": 14592
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1284": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+932": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2332": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1984": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1636": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1580": {
+              "category": "factory",
+              "requested_bytes_each": 16,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 2432
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1228": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+868": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2268": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1928": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+256": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+376": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+192": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+444": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+128": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+60": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 24,
+              "calls": 1,
+              "instrumented_reported_bytes": 32,
+              "inferred_requested_bytes": 24
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+316": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 24,
+              "calls": 1,
+              "instrumented_reported_bytes": 32,
+              "inferred_requested_bytes": 24
+            }
+          }
+        },
+        "weak_no_callback_0": {
+          "history_sha256": "7de364715a4ce0b2a50de34bd8c53e1b8ee16908e9271f23c0a4c65b22463129",
+          "values": [
+            0,
+            0,
+            null,
+            null,
+            null,
+            true
+          ],
+          "totals": {
+            "factory": {
+              "calls": 1990,
+              "instrumented_reported_bytes": 147712,
+              "inferred_requested_bytes": 125712
+            },
+            "factory_keys": {
+              "calls": 0,
+              "instrumented_reported_bytes": 0,
+              "inferred_requested_bytes": 0
+            },
+            "thread_key_init": {
+              "calls": 7,
+              "instrumented_reported_bytes": 304,
+              "inferred_requested_bytes": 208
+            }
+          },
+          "selected_group_count": 412,
+          "sites": {
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+4928": {
+              "category": "factory",
+              "requested_bytes_each": 192,
+              "calls": 152,
+              "instrumented_reported_bytes": 34048,
+              "inferred_requested_bytes": 29184
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+208": {
+              "category": "factory",
+              "requested_bytes_each": 120,
+              "calls": 166,
+              "instrumented_reported_bytes": 21248,
+              "inferred_requested_bytes": 19920
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+412": {
+              "category": "factory",
+              "requested_bytes_each": 96,
+              "calls": 152,
+              "instrumented_reported_bytes": 17024,
+              "inferred_requested_bytes": 14592
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1284": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2332": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1636": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+932": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1984": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1580": {
+              "category": "factory",
+              "requested_bytes_each": 16,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 2432
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+868": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1928": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1228": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2268": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+376": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+128": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+256": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+444": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+192": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+60": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 24,
+              "calls": 1,
+              "instrumented_reported_bytes": 32,
+              "inferred_requested_bytes": 24
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+316": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 24,
+              "calls": 1,
+              "instrumented_reported_bytes": 32,
+              "inferred_requested_bytes": 24
+            }
+          }
+        },
+        "weak_no_callback_3000": {
+          "history_sha256": "e3f8ac7256262943b13deda073e50f01498ec182c0f64e2bf55bf97cd37aff63",
+          "values": [
+            3000,
+            3000,
+            0,
+            1500,
+            2999,
+            true
+          ],
+          "totals": {
+            "factory": {
+              "calls": 40990,
+              "instrumented_reported_bytes": 3027712,
+              "inferred_requested_bytes": 2573712
+            },
+            "factory_keys": {
+              "calls": 0,
+              "instrumented_reported_bytes": 0,
+              "inferred_requested_bytes": 0
+            },
+            "thread_key_init": {
+              "calls": 7,
+              "instrumented_reported_bytes": 304,
+              "inferred_requested_bytes": 208
+            }
+          },
+          "selected_group_count": 438,
+          "sites": {
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+4928": {
+              "category": "factory",
+              "requested_bytes_each": 192,
+              "calls": 3152,
+              "instrumented_reported_bytes": 706048,
+              "inferred_requested_bytes": 605184
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+208": {
+              "category": "factory",
+              "requested_bytes_each": 120,
+              "calls": 3166,
+              "instrumented_reported_bytes": 405248,
+              "inferred_requested_bytes": 379920
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+412": {
+              "category": "factory",
+              "requested_bytes_each": 96,
+              "calls": 3152,
+              "instrumented_reported_bytes": 353024,
+              "inferred_requested_bytes": 302592
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1284": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+932": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2332": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1984": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1636": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1580": {
+              "category": "factory",
+              "requested_bytes_each": 16,
+              "calls": 3152,
+              "instrumented_reported_bytes": 100864,
+              "inferred_requested_bytes": 50432
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1928": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 3152,
+              "instrumented_reported_bytes": 50432,
+              "inferred_requested_bytes": 25216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+868": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 3152,
+              "instrumented_reported_bytes": 50432,
+              "inferred_requested_bytes": 25216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1228": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 3152,
+              "instrumented_reported_bytes": 50432,
+              "inferred_requested_bytes": 25216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2268": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 3152,
+              "instrumented_reported_bytes": 50432,
+              "inferred_requested_bytes": 25216
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+192": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+444": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+128": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+376": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+256": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+316": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 24,
+              "calls": 1,
+              "instrumented_reported_bytes": 32,
+              "inferred_requested_bytes": 24
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+60": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 24,
+              "calls": 1,
+              "instrumented_reported_bytes": 32,
+              "inferred_requested_bytes": 24
+            }
+          }
+        },
+        "weak_callback_0": {
+          "history_sha256": "bc5c2545ca7bd3b60ad63f458126bdc7beaa92f50a11d8a2e564c8482bee5e59",
+          "values": [
+            0,
+            0,
+            null,
+            null,
+            null,
+            true
+          ],
+          "totals": {
+            "factory": {
+              "calls": 1990,
+              "instrumented_reported_bytes": 147712,
+              "inferred_requested_bytes": 125712
+            },
+            "factory_keys": {
+              "calls": 0,
+              "instrumented_reported_bytes": 0,
+              "inferred_requested_bytes": 0
+            },
+            "thread_key_init": {
+              "calls": 7,
+              "instrumented_reported_bytes": 304,
+              "inferred_requested_bytes": 208
+            }
+          },
+          "selected_group_count": 412,
+          "sites": {
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+4928": {
+              "category": "factory",
+              "requested_bytes_each": 192,
+              "calls": 152,
+              "instrumented_reported_bytes": 34048,
+              "inferred_requested_bytes": 29184
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+208": {
+              "category": "factory",
+              "requested_bytes_each": 120,
+              "calls": 166,
+              "instrumented_reported_bytes": 21248,
+              "inferred_requested_bytes": 19920
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+412": {
+              "category": "factory",
+              "requested_bytes_each": 96,
+              "calls": 152,
+              "instrumented_reported_bytes": 17024,
+              "inferred_requested_bytes": 14592
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1984": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1636": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1284": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+932": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2332": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 152,
+              "instrumented_reported_bytes": 12160,
+              "inferred_requested_bytes": 10944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1580": {
+              "category": "factory",
+              "requested_bytes_each": 16,
+              "calls": 152,
+              "instrumented_reported_bytes": 4864,
+              "inferred_requested_bytes": 2432
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2268": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1928": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+868": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1228": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 152,
+              "instrumented_reported_bytes": 2432,
+              "inferred_requested_bytes": 1216
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+128": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+192": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+376": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+444": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+256": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+316": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 24,
+              "calls": 1,
+              "instrumented_reported_bytes": 32,
+              "inferred_requested_bytes": 24
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+60": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 24,
+              "calls": 1,
+              "instrumented_reported_bytes": 32,
+              "inferred_requested_bytes": 24
+            }
+          }
+        },
+        "weak_callback_3000": {
+          "history_sha256": "72cdbc3ace2271461b2b0c3dd563787aec5163aee722044d829cb6581492efcd",
+          "values": [
+            3000,
+            3000,
+            0,
+            1500,
+            2999,
+            true
+          ],
+          "totals": {
+            "factory": {
+              "calls": 40990,
+              "instrumented_reported_bytes": 3027712,
+              "inferred_requested_bytes": 2573712
+            },
+            "factory_keys": {
+              "calls": 0,
+              "instrumented_reported_bytes": 0,
+              "inferred_requested_bytes": 0
+            },
+            "thread_key_init": {
+              "calls": 7,
+              "instrumented_reported_bytes": 304,
+              "inferred_requested_bytes": 208
+            }
+          },
+          "selected_group_count": 438,
+          "sites": {
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+4928": {
+              "category": "factory",
+              "requested_bytes_each": 192,
+              "calls": 3152,
+              "instrumented_reported_bytes": 706048,
+              "inferred_requested_bytes": 605184
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+208": {
+              "category": "factory",
+              "requested_bytes_each": 120,
+              "calls": 3166,
+              "instrumented_reported_bytes": 405248,
+              "inferred_requested_bytes": 379920
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+412": {
+              "category": "factory",
+              "requested_bytes_each": 96,
+              "calls": 3152,
+              "instrumented_reported_bytes": 353024,
+              "inferred_requested_bytes": 302592
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1984": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1636": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1284": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+932": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2332": {
+              "category": "factory",
+              "requested_bytes_each": 72,
+              "calls": 3152,
+              "instrumented_reported_bytes": 252160,
+              "inferred_requested_bytes": 226944
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1580": {
+              "category": "factory",
+              "requested_bytes_each": 16,
+              "calls": 3152,
+              "instrumented_reported_bytes": 100864,
+              "inferred_requested_bytes": 50432
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+868": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 3152,
+              "instrumented_reported_bytes": 50432,
+              "inferred_requested_bytes": 25216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1928": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 3152,
+              "instrumented_reported_bytes": 50432,
+              "inferred_requested_bytes": 25216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+2268": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 3152,
+              "instrumented_reported_bytes": 50432,
+              "inferred_requested_bytes": 25216
+            },
+            "_RNvNtNtCshqYhlee0Vj9_10weavepy_vm6stdlib12weakref_real26make_ref_object_with_class+1228": {
+              "category": "factory",
+              "requested_bytes_each": 8,
+              "calls": 3152,
+              "instrumented_reported_bytes": 50432,
+              "inferred_requested_bytes": 25216
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+256": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+376": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+192": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+444": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+128": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 32,
+              "calls": 1,
+              "instrumented_reported_bytes": 48,
+              "inferred_requested_bytes": 32
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+316": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 24,
+              "calls": 1,
+              "instrumented_reported_bytes": 32,
+              "inferred_requested_bytes": 24
+            },
+            "_RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+60": {
+              "category": "thread_key_init",
+              "requested_bytes_each": 24,
+              "calls": 1,
+              "instrumented_reported_bytes": 32,
+              "inferred_requested_bytes": 24
+            }
+          }
+        }
+      },
+      "population_deltas": {
+        "ordinary": {
+          "factory": {
+            "calls": 0,
+            "instrumented_reported_bytes": 0,
+            "inferred_requested_bytes": 0
+          },
+          "factory_keys": {
+            "calls": 0,
+            "instrumented_reported_bytes": 0,
+            "inferred_requested_bytes": 0
+          },
+          "thread_key_init": {
+            "calls": 0,
+            "instrumented_reported_bytes": 0,
+            "inferred_requested_bytes": 0
+          }
+        },
+        "finalizer": {
+          "factory": {
+            "calls": 0,
+            "instrumented_reported_bytes": 0,
+            "inferred_requested_bytes": 0
+          },
+          "factory_keys": {
+            "calls": 0,
+            "instrumented_reported_bytes": 0,
+            "inferred_requested_bytes": 0
+          },
+          "thread_key_init": {
+            "calls": 0,
+            "instrumented_reported_bytes": 0,
+            "inferred_requested_bytes": 0
+          }
+        },
+        "weak_no_callback": {
+          "factory": {
+            "calls": 39000,
+            "instrumented_reported_bytes": 2880000,
+            "inferred_requested_bytes": 2448000
+          },
+          "factory_keys": {
+            "calls": 0,
+            "instrumented_reported_bytes": 0,
+            "inferred_requested_bytes": 0
+          },
+          "thread_key_init": {
+            "calls": 0,
+            "instrumented_reported_bytes": 0,
+            "inferred_requested_bytes": 0
+          }
+        },
+        "weak_callback": {
+          "factory": {
+            "calls": 39000,
+            "instrumented_reported_bytes": 2880000,
+            "inferred_requested_bytes": 2448000
+          },
+          "factory_keys": {
+            "calls": 0,
+            "instrumented_reported_bytes": 0,
+            "inferred_requested_bytes": 0
+          },
+          "thread_key_init": {
+            "calls": 0,
+            "instrumented_reported_bytes": 0,
+            "inferred_requested_bytes": 0
+          }
+        }
+      }
+    }
+  },
+  "limits": "Only direct verified malloc return sites are counted. Zero-node controls and all selected stacks are retained. Instrumentation changes allocation sizes. These counts do not establish process RSS or churn.",
+  "complete_local_summary": {
+    "path": "target/weakref-shared-keys-allocation-summary.json",
+    "bytes": 21761275,
+    "sha256": "a451a21f69b295b0c97dd9f84a0c94d2691c37f392ac118d77c9ad1951a815d9"
+  }
+}

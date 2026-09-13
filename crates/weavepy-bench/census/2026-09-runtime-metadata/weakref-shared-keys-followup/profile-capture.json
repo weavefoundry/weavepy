@@ -1,0 +1,201 @@
+{
+  "purpose": "Capture live allocation stacks for ordinary, finalizable, and watched heaps.\n\nThese instrumented live allocations are not execution times, allocation churn,\nor OS peak RSS. Keep all zero-count controls and both release identities.\n",
+  "binary": "/Users/owencarey/Documents/weavefoundry/weavepy/target/release/weavepy-runtime-weakref-shared-keys",
+  "sha256": "8899e3679267f571bc5d50167197c8a558e19c5f3278bf3e74df0a8607213284",
+  "instrumentation": "MallocStackLogging=1; malloc_history -allBySize -fullStacks",
+  "launch_context": "outside-tool-filesystem-sandbox (require_escalated)",
+  "rows": {
+    "ordinary_0": {
+      "source_sha256": "c7cfb905dc150507951ca0e865e4ef7db68c49484cc542d8acd541da8e60cb04",
+      "count": 0,
+      "kind": "ordinary",
+      "jit": false,
+      "values": [
+        0,
+        0,
+        null,
+        null,
+        null,
+        true
+      ],
+      "pid": 1475,
+      "command": [
+        "/usr/bin/malloc_history",
+        "1475",
+        "-allBySize",
+        "-fullStacks"
+      ],
+      "returncode": 0,
+      "history_bytes": 263089063,
+      "history_sha256": "3187a9b9465986a43459b95bdc39bca12e5000224a19d342d7248abaded34948"
+    },
+    "ordinary_3000": {
+      "source_sha256": "ce9efd2a3d13337b9635974bd97630676474a40322750b6c07854b0eb84d33da",
+      "count": 3000,
+      "kind": "ordinary",
+      "jit": false,
+      "values": [
+        3000,
+        0,
+        0,
+        1500,
+        2999,
+        true
+      ],
+      "pid": 1477,
+      "command": [
+        "/usr/bin/malloc_history",
+        "1477",
+        "-allBySize",
+        "-fullStacks"
+      ],
+      "returncode": 0,
+      "history_bytes": 151960884,
+      "history_sha256": "a636dd61775b04d4c355664fb6eed553072d959b4409362c01c26e06133aeced"
+    },
+    "finalizer_0": {
+      "source_sha256": "f995bf2f2233cc283595b26b42127c7566605c9e69e173cf85eabfc582851dd6",
+      "count": 0,
+      "kind": "finalizer",
+      "jit": false,
+      "values": [
+        0,
+        0,
+        null,
+        null,
+        null,
+        true
+      ],
+      "pid": 1484,
+      "command": [
+        "/usr/bin/malloc_history",
+        "1484",
+        "-allBySize",
+        "-fullStacks"
+      ],
+      "returncode": 0,
+      "history_bytes": 151763810,
+      "history_sha256": "bba7fe8bf448a4e9d5c99c666272ef6e91f45c7df834d066ffb5595188511035"
+    },
+    "finalizer_3000": {
+      "source_sha256": "e7473b9f1965227c00bd0f3c1991511fe087f72a779879933d310fe582a92969",
+      "count": 3000,
+      "kind": "finalizer",
+      "jit": false,
+      "values": [
+        3000,
+        0,
+        0,
+        1500,
+        2999,
+        true
+      ],
+      "pid": 1487,
+      "command": [
+        "/usr/bin/malloc_history",
+        "1487",
+        "-allBySize",
+        "-fullStacks"
+      ],
+      "returncode": 0,
+      "history_bytes": 151847355,
+      "history_sha256": "6c9de8f5e91f474a9480cadd0f0225f051fc882cb0130794c5f1a7f32e6230b6"
+    },
+    "weak_no_callback_0": {
+      "source_sha256": "93c6392a3917d9849f99b5b2de4f0d519b78a13bf6eda4a860cf231346627d0c",
+      "count": 0,
+      "kind": "weak_no_callback",
+      "jit": false,
+      "values": [
+        0,
+        0,
+        null,
+        null,
+        null,
+        true
+      ],
+      "pid": 1489,
+      "command": [
+        "/usr/bin/malloc_history",
+        "1489",
+        "-allBySize",
+        "-fullStacks"
+      ],
+      "returncode": 0,
+      "history_bytes": 151947781,
+      "history_sha256": "7de364715a4ce0b2a50de34bd8c53e1b8ee16908e9271f23c0a4c65b22463129"
+    },
+    "weak_no_callback_3000": {
+      "source_sha256": "8fd2976488be243b94920fafafaa68b9f97defe1a760a9c8ea801a6ed1f128ec",
+      "count": 3000,
+      "kind": "weak_no_callback",
+      "jit": false,
+      "values": [
+        3000,
+        3000,
+        0,
+        1500,
+        2999,
+        true
+      ],
+      "pid": 1495,
+      "command": [
+        "/usr/bin/malloc_history",
+        "1495",
+        "-allBySize",
+        "-fullStacks"
+      ],
+      "returncode": 0,
+      "history_bytes": 151914375,
+      "history_sha256": "e3f8ac7256262943b13deda073e50f01498ec182c0f64e2bf55bf97cd37aff63"
+    },
+    "weak_callback_0": {
+      "source_sha256": "1f31935b5a8d06d7deb4590a34ac3fd67acdfa78df5b2d71be4ccb9e4a8be826",
+      "count": 0,
+      "kind": "weak_callback",
+      "jit": false,
+      "values": [
+        0,
+        0,
+        null,
+        null,
+        null,
+        true
+      ],
+      "pid": 1497,
+      "command": [
+        "/usr/bin/malloc_history",
+        "1497",
+        "-allBySize",
+        "-fullStacks"
+      ],
+      "returncode": 0,
+      "history_bytes": 151786099,
+      "history_sha256": "bc5c2545ca7bd3b60ad63f458126bdc7beaa92f50a11d8a2e564c8482bee5e59"
+    },
+    "weak_callback_3000": {
+      "source_sha256": "8e0d7ad3b54de870774282b21f08f37cfc56a4cb9473c2f56cb1c438684c735f",
+      "count": 3000,
+      "kind": "weak_callback",
+      "jit": false,
+      "values": [
+        3000,
+        3000,
+        0,
+        1500,
+        2999,
+        true
+      ],
+      "pid": 1500,
+      "command": [
+        "/usr/bin/malloc_history",
+        "1500",
+        "-allBySize",
+        "-fullStacks"
+      ],
+      "returncode": 0,
+      "history_bytes": 151978374,
+      "history_sha256": "72cdbc3ace2271461b2b0c3dd563787aec5163aee722044d829cb6581492efcd"
+    }
+  }
+}

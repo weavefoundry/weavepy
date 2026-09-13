@@ -10,8 +10,9 @@
 //! and value equality for the value-type variants. RFC 0002 will
 //! replace this with a proper type-slot-based object model.
 
-pub use crate::tuple_storage::TupleStorage;
+pub use crate::tuple_storage::{SharedTuple, TupleStorage};
 
+use crate::shared_value::{SharedSlice, SharedStr, ThinArc};
 use crate::sync::Rc;
 use crate::sync::Weak;
 use crate::sync::{Cell, RefCell};
@@ -45,7 +46,7 @@ const _: () = {
 const STR_LEN_CACHE_CAP: usize = 1024;
 
 thread_local! {
-    /// Direct-mapped cache of `Rc<str>` heap identity -> code-point length.
+    /// Direct-mapped cache of `SharedStr` heap identity -> code-point length.
     ///
     /// WeavePy stores `str` as UTF-8, so counting code points — needed by
     /// `len(s)`, index/slice bounds, and `re` span clamping — is O(n).
@@ -55,7 +56,7 @@ thread_local! {
     /// the source `Rc` so a freed allocation cannot be reused at the same
     /// address and alias a stale length; collisions simply recompute and
     /// overwrite, so the cache is always correct and bounded to CAP entries.
-    static STR_LEN_CACHE: std::cell::RefCell<Vec<Option<(usize, Rc<str>, usize)>>> =
+    static STR_LEN_CACHE: std::cell::RefCell<Vec<Option<(usize, SharedStr, usize)>>> =
         std::cell::RefCell::new(vec![None; STR_LEN_CACHE_CAP]);
 }
 
@@ -63,12 +64,12 @@ thread_local! {
 /// cache hit; O(n) (and caches the result) on a miss. Strings of 0 or 1
 /// bytes are counted directly — they are necessarily 0 or 1 code points, so
 /// caching them would only evict useful entries.
-pub(crate) fn str_char_len(s: &Rc<str>) -> usize {
+pub(crate) fn str_char_len(s: &SharedStr) -> usize {
     let bytes = s.len();
     if bytes <= 1 {
         return bytes;
     }
-    let ptr = Rc::as_ptr(s).cast::<u8>() as usize;
+    let ptr = SharedStr::as_ptr(s).cast::<u8>() as usize;
     let slot = (ptr / 8) % STR_LEN_CACHE_CAP;
     STR_LEN_CACHE.with(|c| {
         let mut cache = c.borrow_mut();
@@ -103,7 +104,7 @@ pub enum Object {
     Float(f64),
     /// Complex number with rectangular components (RFC 0019).
     Complex(Rc<PyComplex>),
-    Str(Rc<str>),
+    Str(SharedStr),
     /// A `str` containing at least one lone surrogate (U+D800..U+DFFF), which
     /// Rust's `str`/UTF-8 cannot represent. Stored as a sequence of code
     /// points — each a Unicode scalar value *or* a lone surrogate. Produced by
@@ -116,8 +117,8 @@ pub enum Object {
     /// (RFC 0040) — CPython stores lone surrogates natively, so PEP 383
     /// `surrogateescape` filenames, `surrogatepass`, and `chr(0xD800)` all
     /// round-trip.
-    WStr(Rc<[u32]>),
-    Tuple(Rc<TupleStorage>),
+    WStr(SharedSlice<u32>),
+    Tuple(crate::object::SharedTuple),
     List(Rc<RefCell<Vec<Object>>>),
     Dict(Rc<RefCell<DictData>>),
     Range(Rc<Range>),
@@ -151,7 +152,7 @@ pub enum Object {
     /// underlying async generator. See [`AsyncGenAwait`].
     AsyncGenAwait(Rc<AsyncGenAwait>),
     /// Immutable byte string `b"..."`.
-    Bytes(Rc<[u8]>),
+    Bytes(SharedSlice<u8>),
     /// Mutable byte string `bytearray(...)`.
     ByteArray(Rc<RefCell<Vec<u8>>>),
     /// Mutable set `{1, 2, 3}` / `set(...)`. Backed by an
@@ -262,7 +263,7 @@ pub enum Object {
 pub struct PyCapsuleSoul {
     /// Capsule name (e.g. `"_stockarray._ARRAY_API"`), used only for
     /// `repr`. A capsule may be unnamed, hence `Option`.
-    pub name: Option<Rc<str>>,
+    pub name: Option<SharedStr>,
     /// Opaque handle owned by the cpyext layer (the retained capsule
     /// `PyObject*`, as an integer). Never dereferenced by the VM.
     pub handle: usize,
@@ -1293,7 +1294,7 @@ pub trait SharedMemBuffer: std::fmt::Debug + Send + Sync {
 #[derive(Debug)]
 pub enum MemoryViewBuffer {
     /// Immutable bytes; the view exposes them read-only.
-    Bytes(Rc<[u8]>),
+    Bytes(SharedSlice<u8>),
     /// Mutable bytearray; the view participates in `bytearray`'s
     /// shared-state semantics so writes through the view land in
     /// the underlying buffer.
@@ -1409,7 +1410,7 @@ pub struct PyMemoryView {
 }
 
 impl PyMemoryView {
-    pub fn from_bytes(b: Rc<[u8]>) -> Self {
+    pub fn from_bytes(b: SharedSlice<u8>) -> Self {
         let len = b.len();
         Self {
             buffer: MemoryViewBuffer::Bytes(b),
@@ -1553,7 +1554,7 @@ impl PyMemoryView {
     /// content) — `bytearray.__release_buffer__` validation.
     pub fn shares_buffer(&self, other: &PyMemoryView) -> bool {
         match (&self.buffer, &other.buffer) {
-            (MemoryViewBuffer::Bytes(a), MemoryViewBuffer::Bytes(b)) => Rc::ptr_eq(a, b),
+            (MemoryViewBuffer::Bytes(a), MemoryViewBuffer::Bytes(b)) => ThinArc::ptr_eq(a, b),
             (MemoryViewBuffer::ByteArray(a), MemoryViewBuffer::ByteArray(b)) => Rc::ptr_eq(a, b),
             (MemoryViewBuffer::Shared(a), MemoryViewBuffer::Shared(b)) => {
                 std::ptr::addr_eq(Rc::as_ptr(a), Rc::as_ptr(b))
@@ -2815,7 +2816,7 @@ pub struct DictKey(pub Object);
 ///
 /// `map.get(&StrKey(name))` replaces the historic
 /// `map.get(&crate::object::StrKey(name))`, which heap-allocated a
-/// fresh `Rc<str>` *per probe* — measurable on every attribute/global
+/// fresh `SharedStr` *per probe* — measurable on every attribute/global
 /// lookup. Hash must mirror [`DictKey`]'s exactly for `Object::Str`
 /// (the canonical Python hash fed to the table hasher), so a probe
 /// lands in the same bucket as the stored key.
@@ -6938,7 +6939,7 @@ impl PyFile {
     pub fn getvalue(&self) -> Option<Object> {
         match &*self.backend.borrow() {
             FileBackend::MemBytes { data, .. } => {
-                Some(Object::Bytes(Rc::from(data.borrow().as_slice())))
+                Some(Object::Bytes(SharedSlice::from(data.borrow().as_slice())))
             }
             // The buffer stores lone surrogates as bridged PUA code points
             // (so a Rust `String` can hold them); map them back to a `str`/
@@ -7252,7 +7253,7 @@ pub enum LazyIterKind {
     },
     /// `itertools.product` over materialised pools.
     Product {
-        pools: Vec<Rc<crate::object::TupleStorage>>,
+        pools: Vec<crate::object::SharedTuple>,
         indices: Vec<usize>,
         started: bool,
         stopped: bool,
@@ -7260,7 +7261,7 @@ pub enum LazyIterKind {
     /// `itertools.permutations(pool, r)` (Sedgewick's cycles algorithm,
     /// like CPython).
     Permutations {
-        pool: Rc<crate::object::TupleStorage>,
+        pool: crate::object::SharedTuple,
         r: usize,
         indices: Vec<usize>,
         cycles: Vec<usize>,
@@ -7269,7 +7270,7 @@ pub enum LazyIterKind {
     },
     /// `itertools.combinations(pool, r)`.
     Combinations {
-        pool: Rc<crate::object::TupleStorage>,
+        pool: crate::object::SharedTuple,
         r: usize,
         indices: Vec<usize>,
         started: bool,
@@ -7277,7 +7278,7 @@ pub enum LazyIterKind {
     },
     /// `itertools.combinations_with_replacement(pool, r)`.
     Cwr {
-        pool: Rc<crate::object::TupleStorage>,
+        pool: crate::object::SharedTuple,
         r: usize,
         indices: Vec<usize>,
         started: bool,
@@ -7306,11 +7307,11 @@ pub enum PyIterator {
         owner: Option<Box<Object>>,
     },
     Tuple {
-        items: Rc<crate::object::TupleStorage>,
+        items: crate::object::SharedTuple,
         index: usize,
     },
     Str {
-        s: Rc<str>,
+        s: SharedStr,
         index: usize,
     },
     Range {
@@ -7378,7 +7379,7 @@ pub enum PyIterator {
         reverse: bool,
     },
     Bytes {
-        data: Rc<[u8]>,
+        data: SharedSlice<u8>,
         index: usize,
     },
     /// Live view over a bytearray (CPython's `bytearray_iterator`
@@ -7500,7 +7501,7 @@ impl PyIterator {
                 let ch = rest.chars().next()?;
                 let len = ch.len_utf8();
                 *index += len;
-                Some(Object::Str(Rc::from(ch.to_string().as_str())))
+                Some(Object::Str(SharedStr::from(ch.to_string().as_str())))
             }
             PyIterator::Range {
                 current,
@@ -8019,7 +8020,7 @@ impl PyIterator {
                 let start = (*index).min(s.len());
                 s[start..]
                     .chars()
-                    .map(|c| Object::Str(Rc::from(c.to_string().as_str())))
+                    .map(|c| Object::Str(SharedStr::from(c.to_string().as_str())))
                     .collect()
             }
             PyIterator::DictKeys {
@@ -8352,9 +8353,9 @@ impl Object {
                         && a.imag.to_bits() == b.imag.to_bits())
             }
             (Object::Float(a), Object::Float(b)) => a.to_bits() == b.to_bits(),
-            (Object::Str(a), Object::Str(b)) => Rc::ptr_eq(a, b),
-            (Object::WStr(a), Object::WStr(b)) => Rc::ptr_eq(a, b),
-            (Object::Tuple(a), Object::Tuple(b)) => Rc::ptr_eq(a, b),
+            (Object::Str(a), Object::Str(b)) => SharedStr::ptr_eq(a, b),
+            (Object::WStr(a), Object::WStr(b)) => SharedSlice::ptr_eq(a, b),
+            (Object::Tuple(a), Object::Tuple(b)) => ThinArc::ptr_eq(a, b),
             (Object::List(a), Object::List(b)) => Rc::ptr_eq(a, b),
             (Object::Dict(a), Object::Dict(b)) => Rc::ptr_eq(a, b),
             (Object::Range(a), Object::Range(b)) => Rc::ptr_eq(a, b),
@@ -8372,7 +8373,7 @@ impl Object {
             (Object::Coroutine(a), Object::Coroutine(b)) => Rc::ptr_eq(a, b),
             (Object::AsyncGenerator(a), Object::AsyncGenerator(b)) => Rc::ptr_eq(a, b),
             (Object::AsyncGenAwait(a), Object::AsyncGenAwait(b)) => Rc::ptr_eq(a, b),
-            (Object::Bytes(a), Object::Bytes(b)) => Rc::ptr_eq(a, b),
+            (Object::Bytes(a), Object::Bytes(b)) => SharedSlice::ptr_eq(a, b),
             (Object::ByteArray(a), Object::ByteArray(b)) => Rc::ptr_eq(a, b),
             (Object::Set(a), Object::Set(b)) => Rc::ptr_eq(a, b),
             (Object::FrozenSet(a), Object::FrozenSet(b)) => Rc::ptr_eq(a, b),
@@ -9396,7 +9397,7 @@ impl Object {
                 out
             }
             Object::Tuple(items) => {
-                let id = Rc::as_ptr(items).cast::<()>() as usize;
+                let id = ThinArc::as_ptr(items).cast::<()>() as usize;
                 if !repr_enter(id) {
                     return "(...)".to_owned();
                 }
@@ -11449,17 +11450,17 @@ impl<const N: usize> fmt::Write for StackText<N> {
 /// Subclasses and large integers retain their protocol and digit-limit paths.
 pub(crate) fn native_scalar_repr(value: &Object) -> Option<Object> {
     Some(match value {
-        Object::Int(value) => Object::Str(Rc::from(itoa::Buffer::new().format(*value))),
+        Object::Int(value) => Object::Str(SharedStr::from(itoa::Buffer::new().format(*value))),
         Object::Float(value) => {
             let mut text = StackText::<32>::new();
             write_float_repr(&mut text, *value).expect("float text fits in 32 bytes");
-            Object::Str(Rc::from(text.as_str()))
+            Object::Str(SharedStr::from(text.as_str()))
         }
         Object::Complex(value) => {
             let mut text = StackText::<64>::new();
             write_complex_repr(&mut text, value.real, value.imag)
                 .expect("complex text fits in 64 bytes");
-            Object::Str(Rc::from(text.as_str()))
+            Object::Str(SharedStr::from(text.as_str()))
         }
         Object::Bool(true) => Object::from_static("True"),
         Object::Bool(false) => Object::from_static("False"),
@@ -11685,19 +11686,19 @@ fn seq_cmp(a: &[Object], b: &[Object]) -> Result<Ordering, RuntimeError> {
 
 impl Object {
     pub fn from_str(s: impl Into<String>) -> Self {
-        Object::Str(Rc::from(s.into().as_str()))
+        Object::Str(SharedStr::from(s.into().as_str()))
     }
 
     /// Build a `str` from a sequence of code points, each a Unicode scalar
     /// value *or* a lone surrogate (U+D800..U+DFFF). Canonicalises: if no lone
     /// surrogate is present the result is a normal [`Object::Str`] (so the
-    /// common path keeps the compact `Rc<str>` representation and ordinary
+    /// common path keeps the compact `SharedStr` representation and ordinary
     /// `str` fast paths); only a genuinely surrogate-bearing string becomes an
     /// [`Object::WStr`]. This is the single chokepoint that preserves the
     /// "`WStr` always holds >= 1 surrogate" invariant.
     pub fn str_from_codepoints(cps: Vec<u32>) -> Self {
         if cps.iter().any(|&c| (0xD800..=0xDFFF).contains(&c)) {
-            Object::WStr(Rc::from(cps.into_boxed_slice()))
+            Object::WStr(SharedSlice::from(cps.into_boxed_slice()))
         } else {
             // No surrogates: every code point is a valid scalar value.
             let mut s = String::with_capacity(cps.len());
@@ -11708,7 +11709,7 @@ impl Object {
                     s.push(ch);
                 }
             }
-            Object::Str(Rc::from(s.as_str()))
+            Object::Str(SharedStr::from(s.as_str()))
         }
     }
 
@@ -11730,25 +11731,26 @@ impl Object {
     }
 
     /// Identity-stable string: repeated calls with the same text return
-    /// the *same* `Rc<str>` allocation. Used where CPython exposes a
+    /// the *same* `SharedStr` allocation. Used where CPython exposes a
     /// stored string with stable identity — e.g. `cls.__name__`, which
     /// `inspect.classify_class_attrs` compares with `is`.
     pub fn interned_str(s: &str) -> Self {
-        use std::collections::HashMap;
+        use std::collections::HashSet;
         use std::sync::{Mutex, OnceLock};
-        static TABLE: OnceLock<Mutex<HashMap<String, Rc<str>>>> = OnceLock::new();
-        let table = TABLE.get_or_init(|| Mutex::new(HashMap::new()));
+        // The canonical string is also the key; don't duplicate its text.
+        static TABLE: OnceLock<Mutex<HashSet<SharedStr>>> = OnceLock::new();
+        let table = TABLE.get_or_init(|| Mutex::new(HashSet::new()));
         let mut t = table.lock().unwrap();
         if let Some(rc) = t.get(s) {
             return Object::Str(rc.clone());
         }
-        let rc: Rc<str> = Rc::from(s);
-        t.insert(s.to_owned(), rc.clone());
+        let rc: SharedStr = SharedStr::from(s);
+        t.insert(rc.clone());
         Object::Str(rc)
     }
 
     pub fn from_static(s: &'static str) -> Self {
-        Object::Str(Rc::from(s))
+        Object::Str(SharedStr::from(s))
     }
 
     pub fn new_list(items: Vec<Object>) -> Self {
@@ -11761,7 +11763,7 @@ impl Object {
             // `functools.update_wrapper` asserts identity on copied
             // `__type_params__` and similar empty-tuple attributes.
             thread_local! {
-                static EMPTY_TUPLE: Rc<TupleStorage> = TupleStorage::from_array([]);
+                static EMPTY_TUPLE: crate::object::SharedTuple = TupleStorage::from_array([]);
             }
             return Object::Tuple(EMPTY_TUPLE.with(Clone::clone));
         }
@@ -11829,10 +11831,10 @@ impl Object {
         if v.is_empty() {
             // CPython caches the empty bytes object (`b"" is b""` across
             // compiles — test_ast ConstantTests.test_singletons).
-            static EMPTY: std::sync::OnceLock<Rc<[u8]>> = std::sync::OnceLock::new();
-            return Object::Bytes(EMPTY.get_or_init(|| Rc::from(&[][..])).clone());
+            static EMPTY: std::sync::OnceLock<SharedSlice<u8>> = std::sync::OnceLock::new();
+            return Object::Bytes(EMPTY.get_or_init(|| SharedSlice::from(&[][..])).clone());
         }
-        Object::Bytes(Rc::from(v.as_slice()))
+        Object::Bytes(SharedSlice::from(v.as_slice()))
     }
 
     pub fn new_bytearray(data: impl Into<Vec<u8>>) -> Self {
@@ -12025,8 +12027,8 @@ mod tests {
 
     #[test]
     fn tuple_arrays_preserve_order_identity_and_ownership() {
-        let text: Rc<str> = Rc::from("owned by the tuple");
-        let weak = Rc::downgrade(&text);
+        let text: SharedStr = SharedStr::from("owned by the tuple");
+        let weak = SharedStr::downgrade(&text);
         let tuple =
             Object::new_tuple_array([Object::Str(text.clone()), Object::Int(-7), Object::None]);
         let Object::Tuple(items) = &tuple else {

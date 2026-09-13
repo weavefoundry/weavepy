@@ -1,0 +1,9 @@
+Exact datetime candidate/source, native validation, predecessor, and primary CLI verified.
+Constructor parity, actual cold timers, complete release checks, all24 census values, and measurement identities verified.
+All 48 focused rows, 48 census rows, 18 startup rows, exact samples/caches, and paired ratios verified.
+sources.tar.gz 340 members; 3818110 stored bytes; all hashes verified.
+evidence.tar.gz 1378 members; 5560771 stored bytes; all hashes verified.
+Exact datetime candidate/source, native validation, predecessor, and primary CLI verified.
+Constructor parity, actual cold timers, complete release checks, all24 census values, and measurement identities verified.
+All 48 focused rows, 48 census rows, 18 startup rows, exact samples/caches, and paired ratios verified.
+Complete phase95 sources, validation, every sample, failures/corrections, and limitations preserved.

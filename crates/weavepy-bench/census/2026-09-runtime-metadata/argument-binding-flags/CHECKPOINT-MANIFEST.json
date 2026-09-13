@@ -1,0 +1,1767 @@
+{
+  "purpose": "Select source changes and compact new research evidence without deleting local files.",
+  "packing": "Original bytes and repository-relative paths are preserved. Reports remain directly readable. Extract this archive at the repository root to restore its referenced evidence. Generated caches and stack logs are excluded; original manifests inside the archive remain historical records.",
+  "excluded_generated_paths": [],
+  "archive": {
+    "bytes": 427439,
+    "sha256": "fb53ddb336d35bbba6786de6e4a486ea3f3db29a638e36ff6dd24c688c47bddc",
+    "members": {
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/REPORT.md": {
+        "bytes": 5446,
+        "sha256": "4c9380f5ddfe5b2bce39bde5f90b82fd196f9b76727440d2c612b629bdbe6ffe"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/candidate/environment.json": {
+        "bytes": 139393,
+        "sha256": "7f55bdf2a07e6fd7236d5813c12a894a5ca6aa7cc7c64c106b3f84be54b3ec30"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/candidate/source-changes.diff": {
+        "bytes": 185643,
+        "sha256": "84d866622cacd00b994e4280fd4d12dccd29533a91098a306fcbebccd4eb338b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/candidate/tests/regrtest/test_argument_binding_storage.py": {
+        "bytes": 3635,
+        "sha256": "791fb1357c0e084d3d0af10b3bf7381e5c7d3a27c2db54ccae40142b62ef487b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/candidate/tests/regrtest/test_bound_native_entry.py": {
+        "bytes": 4707,
+        "sha256": "5690b0a3dd58189982e4d407029e271446618800a4ba8db19d8b3f09ac724973"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/baseline-preflight/report.json": {
+        "bytes": 1552,
+        "sha256": "bbd9a8f88d601100a47db72300ba5b64545f4a255f57209c191381387da869d4"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/native-coverage.stderr.txt": {
+        "bytes": 3746,
+        "sha256": "70b3de1a8adb9021f0afef447321a3c11de49e3dda793695a0bb40d22d41d154"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/native-coverage.stdout.txt": {
+        "bytes": 23,
+        "sha256": "5e479c003b60dee7bb1fd1dc318db889b89b19126f0d199d1d05a47ec19a23d6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_argument_binding_storage-gil0.txt": {
+        "bytes": 29,
+        "sha256": "ab7e01fccb0d6d24483cc405cecd383908bf990a94ea149ddb3765ac939d7cbf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_argument_binding_storage-interp.txt": {
+        "bytes": 29,
+        "sha256": "ab7e01fccb0d6d24483cc405cecd383908bf990a94ea149ddb3765ac939d7cbf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_argument_binding_storage-jit.txt": {
+        "bytes": 29,
+        "sha256": "ab7e01fccb0d6d24483cc405cecd383908bf990a94ea149ddb3765ac939d7cbf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_bound_native_entry-gil0.txt": {
+        "bytes": 23,
+        "sha256": "5e479c003b60dee7bb1fd1dc318db889b89b19126f0d199d1d05a47ec19a23d6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_bound_native_entry-interp.txt": {
+        "bytes": 23,
+        "sha256": "5e479c003b60dee7bb1fd1dc318db889b89b19126f0d199d1d05a47ec19a23d6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_bound_native_entry-jit.txt": {
+        "bytes": 23,
+        "sha256": "5e479c003b60dee7bb1fd1dc318db889b89b19126f0d199d1d05a47ec19a23d6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_cross_thread_heap-gil0.txt": {
+        "bytes": 21,
+        "sha256": "2bd5c63696ec23dcae3a2a2489c3156645616a07a373a4a71bc01e9b2188f2cd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_cross_thread_heap-interp.txt": {
+        "bytes": 21,
+        "sha256": "2bd5c63696ec23dcae3a2a2489c3156645616a07a373a4a71bc01e9b2188f2cd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_cross_thread_heap-jit.txt": {
+        "bytes": 21,
+        "sha256": "2bd5c63696ec23dcae3a2a2489c3156645616a07a373a4a71bc01e9b2188f2cd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_default_suffix-gil0.txt": {
+        "bytes": 29,
+        "sha256": "9bffc14f0dc7d3e9defa3bfdfedc23b9a6db56901ba8c8c40f895d7677f209cf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_default_suffix-interp.txt": {
+        "bytes": 29,
+        "sha256": "9bffc14f0dc7d3e9defa3bfdfedc23b9a6db56901ba8c8c40f895d7677f209cf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_default_suffix-jit.txt": {
+        "bytes": 29,
+        "sha256": "9bffc14f0dc7d3e9defa3bfdfedc23b9a6db56901ba8c8c40f895d7677f209cf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_extcall_kwonly_messages-gil0.txt": {
+        "bytes": 27,
+        "sha256": "3937009c748b49e6adc45b055b829c25ed6f2a103b6e327af5824d027ad449b7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_extcall_kwonly_messages-interp.txt": {
+        "bytes": 27,
+        "sha256": "3937009c748b49e6adc45b055b829c25ed6f2a103b6e327af5824d027ad449b7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_extcall_kwonly_messages-jit.txt": {
+        "bytes": 27,
+        "sha256": "3937009c748b49e6adc45b055b829c25ed6f2a103b6e327af5824d027ad449b7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_frame_recycling-gil0.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_frame_recycling-interp.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_frame_recycling-jit.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_calls-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_calls-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_calls-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_cells-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_cells-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_cells-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_dyn_calls-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_dyn_calls-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_dyn_calls-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_object_lanes-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_object_lanes-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_object_lanes-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_raise_exits-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_raise_exits-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_raise_exits-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_scalar_leaf_calls-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_scalar_leaf_calls-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_scalar_leaf_calls-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_unboxed_calls-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_unboxed_calls-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_jit_unboxed_calls-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_native_call_scratch-gil0.txt": {
+        "bytes": 24,
+        "sha256": "63a2075f41e6d240e672189143f5136da800fc426e4ad995e35d8158027664a5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_native_call_scratch-interp.txt": {
+        "bytes": 24,
+        "sha256": "63a2075f41e6d240e672189143f5136da800fc426e4ad995e35d8158027664a5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_native_call_scratch-jit.txt": {
+        "bytes": 24,
+        "sha256": "63a2075f41e6d240e672189143f5136da800fc426e4ad995e35d8158027664a5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_native_generator_pin_retirement-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_native_generator_pin_retirement-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_native_generator_pin_retirement-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_native_pin_pressure-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_native_pin_pressure-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_native_pin_pressure-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_native_pin_retirement-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_native_pin_retirement-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_native_pin_retirement-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_pickle_callables-gil0.txt": {
+        "bytes": 20,
+        "sha256": "ddfbaeecfb2e489bc8f8794cdb8158003e69ea424cc0d61bd5c779c4cf33dc77"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_pickle_callables-interp.txt": {
+        "bytes": 20,
+        "sha256": "ddfbaeecfb2e489bc8f8794cdb8158003e69ea424cc0d61bd5c779c4cf33dc77"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_pickle_callables-jit.txt": {
+        "bytes": 20,
+        "sha256": "ddfbaeecfb2e489bc8f8794cdb8158003e69ea424cc0d61bd5c779c4cf33dc77"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_recursion_guard-gil0.txt": {
+        "bytes": 19,
+        "sha256": "ee260b4a7670a75456d1720e1e57f3b01fc4470576c4c2b072d153e21baf5b1d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_recursion_guard-interp.txt": {
+        "bytes": 19,
+        "sha256": "ee260b4a7670a75456d1720e1e57f3b01fc4470576c4c2b072d153e21baf5b1d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_recursion_guard-jit.txt": {
+        "bytes": 19,
+        "sha256": "ee260b4a7670a75456d1720e1e57f3b01fc4470576c4c2b072d153e21baf5b1d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_small_slot_storage-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_small_slot_storage-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_small_slot_storage-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_weakref_basic-gil0.txt": {
+        "bytes": 19,
+        "sha256": "679783b7ec6d6519078d6be12a12621ec71cb51a96fe2525a76b01a1308aeb4c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_weakref_basic-interp.txt": {
+        "bytes": 19,
+        "sha256": "679783b7ec6d6519078d6be12a12621ec71cb51a96fe2525a76b01a1308aeb4c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/checks/test_weakref_basic-jit.txt": {
+        "bytes": 19,
+        "sha256": "679783b7ec6d6519078d6be12a12621ec71cb51a96fe2525a76b01a1308aeb4c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/bound_method-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/bound_method-new.trace.txt": {
+        "bytes": 2986,
+        "sha256": "ffda77dda49a9a0e7b122e21bea5e48380b14af29031a7c7c2e0650d6db6e7ea"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/bound_method-previous.trace.txt": {
+        "bytes": 2986,
+        "sha256": "18efa78be25feebc3170437a1cb3da3204371ebced91e3679786c92f1e9fe6da"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/bound_method.py": {
+        "bytes": 617,
+        "sha256": "5b53d546653abdb6663aa97875cee94addde5450e7ad80f4b73c60898490fa67"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/builtin-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/builtin-new.trace.txt": {
+        "bytes": 2932,
+        "sha256": "4eb48782c395adbd1c3b1f5f60694059324af2b25b80d924436b45cfbc02dac4"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/builtin-previous.trace.txt": {
+        "bytes": 2932,
+        "sha256": "8c71b2c6e13e0ffd2dcb2d7b618b0e89977e6496d348914ab464a51a5a4e54be"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/builtin.py": {
+        "bytes": 618,
+        "sha256": "ae7f79d0965e3125922ebdfb76fd7097ea476165d5a409f83ca0fb6325983017"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/closure-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/closure-new.trace.txt": {
+        "bytes": 2988,
+        "sha256": "d82e7d6c9aad9e26519553990669bfb82ba980846b3974bc15f050aa60bf3046"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/closure-previous.trace.txt": {
+        "bytes": 2988,
+        "sha256": "10d5e00a32bb5dc18738058fefb821c273c95db087fa1d4a3798ada63a857059"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/closure.py": {
+        "bytes": 249,
+        "sha256": "962667e314d795da6665e24aff0ee6fb2d24597a67a68875b1eeaba315938940"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/defaults-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/defaults-new.trace.txt": {
+        "bytes": 2995,
+        "sha256": "adeefe2b1a4018417dc9fbb5501dc555f4125f0417780478810d1c7e3f643c5f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/defaults-previous.trace.txt": {
+        "bytes": 2995,
+        "sha256": "31bfea452660c606c93f0dabdca595504cda0535ad3f2f0e4f9c2296aad4dda8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/defaults.py": {
+        "bytes": 626,
+        "sha256": "e609d9c58f8fb944f2678a9f1c4fbe7c9a6433058f7865a5d8d6eeef036d93e0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/keyword_only-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/keyword_only-new.trace.txt": {
+        "bytes": 2988,
+        "sha256": "c9a2d1f310e6fa0ea4ad0b693a1a3ad136bb7c35d3264d303aa183ac55c5ad4c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/keyword_only-previous.trace.txt": {
+        "bytes": 2988,
+        "sha256": "bf8ecdc2d647aedb015c1aef632b2baac5cffe3caa89f74e6f8ee27fe1187c27"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/keyword_only.py": {
+        "bytes": 186,
+        "sha256": "0d011825a1450e25ecc833e9e0edfe0b64bda217aeb8e320b0c8a86dcced4e94"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/many_locals-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/many_locals-new.trace.txt": {
+        "bytes": 2987,
+        "sha256": "2d8dd6025c8c2fa468bd9337b43a8c9c9b192c566c92fe5d32c6e0057825f5e2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/many_locals-previous.trace.txt": {
+        "bytes": 2987,
+        "sha256": "0396b2c2b1e7785ea00b26e47f74807596c2ab74242a3e23dc44c68b01e529e9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/many_locals.py": {
+        "bytes": 245,
+        "sha256": "6a71e254281cc75f2ff270c81505c40abe93eba7c021b66841643f45a499784e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/method-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/method-new.trace.txt": {
+        "bytes": 2988,
+        "sha256": "e0796b87c9ff38f1460e5cae691821e4f6e2316e3033d9aa1cad7b0d993a00d0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/method-previous.trace.txt": {
+        "bytes": 2988,
+        "sha256": "215d7ce9233bd1248e5dd07ad4f1aca490448e5a14817f7d6f657ebb4d2cf4ff"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/method.py": {
+        "bytes": 619,
+        "sha256": "c63c3b5c67ab9c6af812eaacb053f624bcc5269918ad95d865a2f993daa9eaa9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/positional-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/positional-new.trace.txt": {
+        "bytes": 2986,
+        "sha256": "81d9a7a954a1620ebefea63ae2e72829a95936f60635cc8d7ac761d310e6c5a5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/positional-previous.trace.txt": {
+        "bytes": 2986,
+        "sha256": "a6a7281c502fb35f07132be67f66e99268807122d501bd1783a805dea01f3d57"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/positional.py": {
+        "bytes": 620,
+        "sha256": "23ef1ad4f9432a26ea9f770cb823185f210e8873c3b8649b81020a575f2a1b60"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/report.json": {
+        "bytes": 51983,
+        "sha256": "4067d633b813d6f88e2acbaff3ba218575dc24866bf7aec01e667c25ab4a61b2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/sparse_keyword-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/sparse_keyword-new.trace.txt": {
+        "bytes": 2997,
+        "sha256": "9b726540c6bc5c1422263bfb154a70adcb909c373678695942d0bfa0b4b6e930"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/sparse_keyword-previous.trace.txt": {
+        "bytes": 2998,
+        "sha256": "00b61ed1d7e9f533bf56a2e8417d73e900f6d12ffa1c8d4ca14118e78b697cf2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/sparse_keyword.py": {
+        "bytes": 631,
+        "sha256": "8e5df8a423b21cc20fe52db0e9ba8bc9ee8751fa9c5feed25ca8be2e2422af6c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/variadic_keyword-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/variadic_keyword-new.trace.txt": {
+        "bytes": 2906,
+        "sha256": "cff8557cc67efa5a4a5a62e510418814c488e19d5acfdb7ed1bf0198800c16fe"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/variadic_keyword-previous.trace.txt": {
+        "bytes": 2906,
+        "sha256": "13b2ff49b4f020916caf70073599506ece5bbe7763f326ea2ba1e2cf95ed9730"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/coverage/variadic_keyword.py": {
+        "bytes": 633,
+        "sha256": "abacbabb7b3617887ae470f34b8525274f921c9174d1ec9eb34e2e1b26953c4d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/extra-checks/report.json": {
+        "bytes": 5388,
+        "sha256": "a72000323d9614b49612fb0d0fe30aa173de313cc29b25cec758ba9b32d717bc"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/defaults_130-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/defaults_130-new.trace.txt": {
+        "bytes": 2986,
+        "sha256": "2d98ecd79e35a6fc76792e330cd2feaf912f64679fe2f172574615284119d798"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/defaults_130-previous.trace.txt": {
+        "bytes": 2987,
+        "sha256": "ccf00837f83e517855bcc40f77c304111538c7b96386cb26dc3ed1b9967358ed"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/defaults_130.py": {
+        "bytes": 1263,
+        "sha256": "1841818b29f0c86ba9a4cd4a16cbff498cf1041a24055cebbf23f45d6b313c09"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/defaults_16-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/defaults_16-new.trace.txt": {
+        "bytes": 2987,
+        "sha256": "97fb336fb9f8f9a6c02c9e6a9f4fe8bdc88ca496b0e047d04f539bb75c4e632f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/defaults_16-previous.trace.txt": {
+        "bytes": 2988,
+        "sha256": "ecde5cfe15ca461105b6753437d2ae6644d73e5df67b2677a0be6e0d85e6e78d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/defaults_16.py": {
+        "bytes": 289,
+        "sha256": "b0361fac33cb920415ea6697d585396e1d33bcd78616b61ff0ef60511e61dfeb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/defaults_17-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/defaults_17-new.trace.txt": {
+        "bytes": 2986,
+        "sha256": "c34f8b3f16a4fb5f97d38902561d164dd2a91c90e381ee86fc4310b9b5c61d3d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/defaults_17-previous.trace.txt": {
+        "bytes": 2986,
+        "sha256": "1e28bff0078290aeb9f71c61016338de8892f3b55aff6eb8b939ff50bdc8a158"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/defaults_17.py": {
+        "bytes": 297,
+        "sha256": "0a0b30a9e64f6be791826561af13e05c21cf1feed806109dd44d9c4f19c6ce4a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/defaults_64-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/defaults_64-new.trace.txt": {
+        "bytes": 2986,
+        "sha256": "b56054ccb1163b9c2a6c848cf4e4ccd32a4b46129c62eae5046f6a7ec3ee7c0d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/defaults_64-previous.trace.txt": {
+        "bytes": 2987,
+        "sha256": "6efdfeee3eb367f7c298e58d618db8bec6e7772df06e908d76a62ee14c69a6cb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/defaults_64.py": {
+        "bytes": 673,
+        "sha256": "bb7cd3eaf0f5d62b2108dd7f761f4fed042b6d3b13c1565a9c6e37316f15195c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/keyword_only_16-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/keyword_only_16-new.trace.txt": {
+        "bytes": 2988,
+        "sha256": "f3d65119be47b6bfaee0bf0db16512e7a54f33523186250c149eefc1f1adb3b5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/keyword_only_16-previous.trace.txt": {
+        "bytes": 2988,
+        "sha256": "9754f4ca14f0f3d822c4a1eb83372790c8169e08ae0b5a2300c98d32c54e8bbc"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/keyword_only_16.py": {
+        "bytes": 292,
+        "sha256": "98a271b2bdf8632b064f9f77afb94bd937e812541c4caf3a969829e630eaef6d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/keyword_only_17-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/keyword_only_17-new.trace.txt": {
+        "bytes": 2988,
+        "sha256": "aff5482d1036678ab2cabd91e29be2f254697f341c4de75250f0fcef1b0fec94"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/keyword_only_17-previous.trace.txt": {
+        "bytes": 2987,
+        "sha256": "4149ee26ff4b222fcf64928626a3ed941c5aa94fe451e4bbe74ee3cdb4cc4220"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/keyword_only_17.py": {
+        "bytes": 300,
+        "sha256": "6a0e4571d97cc967e693b662c7eab8d6a2819603a76a6c10ac5f22b00be17af4"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/keyword_only_64-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/keyword_only_64-new.trace.txt": {
+        "bytes": 2988,
+        "sha256": "7bd107cdf59a4498ae7c9c938ca8d05826ea741bf852e4d46e0269bae74bcb2b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/keyword_only_64-previous.trace.txt": {
+        "bytes": 2988,
+        "sha256": "e91c0a82ba60f93070716eddc3fbf20c7a7a7bf9d829e6f45636f5a1c7ea3060"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/keyword_only_64.py": {
+        "bytes": 676,
+        "sha256": "6677a8e2eceb9dfeb1374a58137d2064deda07af7d77684503632d19f48822a8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/many_body_locals-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/many_body_locals-new.trace.txt": {
+        "bytes": 2989,
+        "sha256": "2c66c249e1e38b980a18c00312275807c930297384b678f656c51a44c198c16f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/many_body_locals-previous.trace.txt": {
+        "bytes": 2989,
+        "sha256": "b7558a0cea775eff9d31b381f2013d92109a7bbb2b49fa314507aaa3bfeb85ad"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/many_body_locals.py": {
+        "bytes": 2846,
+        "sha256": "8e4c87ff70966580fd2a1f101943ad1af33d0501c1b8f106ab746b158a2b9f3a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/report.json": {
+        "bytes": 52316,
+        "sha256": "ff87eaae5a4f485f0ea8eeb47d4a6e3f58da02587bffaa90f2ac5a338e83099f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/variadic_14-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/variadic_14-new.trace.txt": {
+        "bytes": 2898,
+        "sha256": "51f27aff9177da5c42325f109fb1170264aac8513ec3a6b60c4566b7e01de033"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/variadic_14-previous.trace.txt": {
+        "bytes": 2898,
+        "sha256": "9944ce92d3bced7c7cd3ea16dcef4b49206a49783a40d4ac3414c981d3d927d7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/variadic_14.py": {
+        "bytes": 325,
+        "sha256": "48832d19d4c0dc07a832ae69bbf07b891972bfb2bd7cb11d6bcfaf4ed7c52b46"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/variadic_15-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/variadic_15-new.trace.txt": {
+        "bytes": 2898,
+        "sha256": "cd77f2335427a177a327cd9bfdf6138d850d41e35d6b410153b1c55db6abf113"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/variadic_15-previous.trace.txt": {
+        "bytes": 2898,
+        "sha256": "8e2f2198ac758d5bab1f7c0a12e6ac47495f24abbbe435dbd16a0cd84258bb7d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v2/variadic_15.py": {
+        "bytes": 333,
+        "sha256": "52b5535d81dee89f1520b63d73b9cab78549cdd86a175b9f2db0f14af7eb01c3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v3/many_body_locals-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v3/many_body_locals-new.trace.txt": {
+        "bytes": 3037,
+        "sha256": "60f6938610066bd7c565d76be2b0187c1924ce51d2d663f17d9b23311f814403"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v3/many_body_locals-previous.trace.txt": {
+        "bytes": 3038,
+        "sha256": "467ca5e0916c8bc77d05cc0619e08c4012092515b3cdf382961eece25f44a41f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v3/many_body_locals.py": {
+        "bytes": 2855,
+        "sha256": "e2bdf5855a11ae31845621a8814c1fa95ed26da0d550a64e64b5e689c5a6eb14"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths-v3/report.json": {
+        "bytes": 5779,
+        "sha256": "72d29858dafe6280489707b59ede555b8042474b6e6f31efff674ff30d6083ff"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/defaults_130-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/defaults_130-new.trace.txt": {
+        "bytes": 2986,
+        "sha256": "2d98ecd79e35a6fc76792e330cd2feaf912f64679fe2f172574615284119d798"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/defaults_130-previous.trace.txt": {
+        "bytes": 2987,
+        "sha256": "8a763af23e8b2894a84b47f7fb4283ad5636474c26c736bff4f533e2ad65221e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/defaults_130.py": {
+        "bytes": 1263,
+        "sha256": "1841818b29f0c86ba9a4cd4a16cbff498cf1041a24055cebbf23f45d6b313c09"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/defaults_16-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/defaults_16-new.trace.txt": {
+        "bytes": 2987,
+        "sha256": "670259f8e91d6d822128317987c58e375e15156f2d6197308ede4b90325503df"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/defaults_16-previous.trace.txt": {
+        "bytes": 2988,
+        "sha256": "7ef2259fec39338c335e0b836d50187c8001d0bbd5b285190f5714f7383fd89d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/defaults_16.py": {
+        "bytes": 289,
+        "sha256": "b0361fac33cb920415ea6697d585396e1d33bcd78616b61ff0ef60511e61dfeb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/defaults_17-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/defaults_17-new.trace.txt": {
+        "bytes": 2986,
+        "sha256": "c5be03a7906d79a7c9a121221738f4c24c4090aa843edcdce5120b40b8aa2e62"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/defaults_17-previous.trace.txt": {
+        "bytes": 2987,
+        "sha256": "33c50d1b75b26c38f504b80e4ed194db49533723233fea545818b1b25a4546ea"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/defaults_17.py": {
+        "bytes": 297,
+        "sha256": "0a0b30a9e64f6be791826561af13e05c21cf1feed806109dd44d9c4f19c6ce4a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/defaults_64-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/defaults_64-new.trace.txt": {
+        "bytes": 2986,
+        "sha256": "7537facd1bd05e14c9c70c50bb13abc2d6ebfa2c62088e870e2737a1d1f62980"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/defaults_64-previous.trace.txt": {
+        "bytes": 2986,
+        "sha256": "b96e31a729a1c852bbad507cdab04a326302d9249f565c31411fe153aae6af1e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/defaults_64.py": {
+        "bytes": 673,
+        "sha256": "bb7cd3eaf0f5d62b2108dd7f761f4fed042b6d3b13c1565a9c6e37316f15195c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/keyword_only_16-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/keyword_only_16-new.trace.txt": {
+        "bytes": 2988,
+        "sha256": "f0bc691c2322fab5f4d804f2c13297c2dca34fa8c4e3ec88526b0763799d07a9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/keyword_only_16-previous.trace.txt": {
+        "bytes": 2988,
+        "sha256": "bec890d2dad67984b92ac4d5240a10017439d6d07f4a0d7d3196985b83644539"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/keyword_only_16.py": {
+        "bytes": 292,
+        "sha256": "98a271b2bdf8632b064f9f77afb94bd937e812541c4caf3a969829e630eaef6d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/keyword_only_17-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/keyword_only_17-new.trace.txt": {
+        "bytes": 2988,
+        "sha256": "23cb5f912216afb5a74e791a70c30480d5f8fd5da086e37f412de09c6371a641"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/keyword_only_17-previous.trace.txt": {
+        "bytes": 2988,
+        "sha256": "506e3c8301ea1eb7630d049019ab128bc76da912cf7df5b96786e0147d5192e0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/keyword_only_17.py": {
+        "bytes": 300,
+        "sha256": "6a0e4571d97cc967e693b662c7eab8d6a2819603a76a6c10ac5f22b00be17af4"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/keyword_only_64-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/keyword_only_64-new.trace.txt": {
+        "bytes": 2988,
+        "sha256": "4c44a1bb2ad65101f05c38d55dfe1f95b0dfdd41bae44a9e82e0f8e5e12534ac"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/keyword_only_64-previous.trace.txt": {
+        "bytes": 2988,
+        "sha256": "d02d359d5693b302a4cf1fefe7877d159449943f91ba51d6dccdfb90b5dc96cc"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/keyword_only_64.py": {
+        "bytes": 676,
+        "sha256": "6677a8e2eceb9dfeb1374a58137d2064deda07af7d77684503632d19f48822a8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/many_body_locals-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/many_body_locals-new.trace.txt": {
+        "bytes": 2989,
+        "sha256": "ceda0ebd24e978c2e5c7f17796c383e30b5dd7f3d8729825132e8fdfdbcb22d9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/many_body_locals-previous.trace.txt": {
+        "bytes": 2989,
+        "sha256": "b57feeb0a07f488a70599d00895a078ea916837d44415eb4b80d280552423f8c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/many_body_locals.py": {
+        "bytes": 2837,
+        "sha256": "c23f9dab17d8f8bc182c8fc3058176351f9e82edf0fd214b89f71a5f9b66919c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/report.json": {
+        "bytes": 52315,
+        "sha256": "b03e2d345c425ca10e7138b7489f9b47f0fd403f34e4c5d592e656a0a70cfd54"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/variadic_14-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/variadic_14-new.trace.txt": {
+        "bytes": 2898,
+        "sha256": "bcc8f1315e064c735688d16572edc545fa4663fc05247fd6222630c4dfebb7e5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/variadic_14-previous.trace.txt": {
+        "bytes": 2898,
+        "sha256": "b283c5cbbb3668f2ec4d2af503ec02fbebe16178fd5ba71a990b9b51d70a6166"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/variadic_14.py": {
+        "bytes": 325,
+        "sha256": "48832d19d4c0dc07a832ae69bbf07b891972bfb2bd7cb11d6bcfaf4ed7c52b46"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/variadic_15-cpython.trace.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/variadic_15-new.trace.txt": {
+        "bytes": 2898,
+        "sha256": "ef0594a245c1103e2bd14521a103f5f6162f493a433a28ab134caac48472d64d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/variadic_15-previous.trace.txt": {
+        "bytes": 2898,
+        "sha256": "13d63a12432ab01916af98e38a596a9e0ef8a95bfa5875359141a0b8e2d2a94a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/signature-paths/variadic_15.py": {
+        "bytes": 333,
+        "sha256": "52b5535d81dee89f1520b63d73b9cab78549cdd86a175b9f2db0f14af7eb01c3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/validation/float-oracle.json": {
+        "bytes": 14751,
+        "sha256": "2eb4548e1e2067bb61f0a83430d621bf8960e8cb4830b9d41e67786ea4beb9a6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/validation/oracles.json": {
+        "bytes": 6778,
+        "sha256": "2d137b860c2ffca2c2f435f9990eb27cff45081e328fd025010675344049bf19"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/validation/validation.json": {
+        "bytes": 87916,
+        "sha256": "06b707af5bc01307c292ab37bf6e1c74bd4b0bed206a0d8492127819ba98f5e8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/checks/validation/validation.txt": {
+        "bytes": 8085,
+        "sha256": "811ba1fecf53cbf71d1814bea8794681744f6269474357cfdf755fe412827bb5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/conditions/argument-binder-flags-baseline-preflight.txt": {
+        "bytes": 216,
+        "sha256": "badafb0e3d26e70d000a800be07fd6525f81f0a4354be06ffa027242ebaeb3d2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/conditions/binder-flags-focused-load.json": {
+        "bytes": 6727,
+        "sha256": "c1855b2ad5e424efb24f844e8aa95e975f5765934689812debaeb8a95eee3298"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/conditions/binder-flags-full-load.json": {
+        "bytes": 9802,
+        "sha256": "c17e7a272c2ef3eeddee2e719f067af09c04c442251cb2d59b5cba3de4530851"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/conditions/binder-flags-prebuild-sources.json": {
+        "bytes": 16453,
+        "sha256": "895339750b10a0f3d59929c82c99567a52216765db8a03701568dd5acca3c28e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/conditions/performance_phase63_status.md": {
+        "bytes": 6661,
+        "sha256": "88afdf1338ccb4f0688a47fa25b59d695a29806bd1630fee46b0e86b55d97b27"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/draft/candidate.patch": {
+        "bytes": 1096,
+        "sha256": "3a4c71bd016066bf4f0b4cf706e071e1e45c659fd5ed5a31f8e175f7a6cab373"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/draft/index.json": {
+        "bytes": 281,
+        "sha256": "abb5dccd6ac26d1b15775547dbc4123415853b1966b7be136972ab5fe8d90dfb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/focused/calls.json": {
+        "bytes": 633131,
+        "sha256": "8b1168dff40c4df422efea6aaf394ea2232094a4fd4f38c1209f749bd6d74dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/focused/calls.txt": {
+        "bytes": 7128,
+        "sha256": "40045ae85c24d3952fa9a6b99f4d5ae99aeea83fc99ea3a44f029c6155910276"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/focused/cold-exceptions.json": {
+        "bytes": 243402,
+        "sha256": "5f90f9fdc057b107f3c1de8f897bce9dac9924c595c95c6049692f9479206f32"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/focused/cold-exceptions.txt": {
+        "bytes": 2387,
+        "sha256": "a277c6aed9fb320ef72f3ff9f810b1cabcde9cd9d1449c43a9fcc5738ddec6a7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/focused/exceptions.json": {
+        "bytes": 255861,
+        "sha256": "9a9f9e75272e40ae640c91fb567a2cedd17d18e1e18a840cc3a6f73bb455296b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/focused/exceptions.txt": {
+        "bytes": 2929,
+        "sha256": "f0181927ed410b919933a192258e1ae514e2a4117d79fd3bbacb75c0af180d03"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/focused/memory-after.txt": {
+        "bytes": 102,
+        "sha256": "fd19d16264e5744c11772b3bdeed17bb3a624f91b026d633d209c8e4f62b6410"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/focused/memory-before.txt": {
+        "bytes": 102,
+        "sha256": "fd19d16264e5744c11772b3bdeed17bb3a624f91b026d633d209c8e4f62b6410"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/focused/signatures.json": {
+        "bytes": 634220,
+        "sha256": "3ae6eb5a19348050249b79ea2d9a61257e66876cb3a74ef7186cadce5331fa7a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/focused/signatures.txt": {
+        "bytes": 7216,
+        "sha256": "1e12f7ba16ed305beb95cece26972b37d1a3e94f476e8caf3480ec160f631a79"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/focused/stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/focused/summary.json": {
+        "bytes": 333401,
+        "sha256": "a9942ddb13b36bd85d8fe62ba4b1191f8551db0e28851975760f614b15763ffb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/focused/summary.txt": {
+        "bytes": 3341,
+        "sha256": "5f9a0982399ce568952c4cb1f30c8c0f72c15c9bfb2d569c94fa8eae2763082c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/focused/vm-after.txt": {
+        "bytes": 1247,
+        "sha256": "490cc732a90ffa98c507e1ef1fcfac1153747d86bdc2097893d54360c54dc2c1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/focused/vm-before.txt": {
+        "bytes": 1247,
+        "sha256": "450cb5a6ebe1eed1e5c77d99bdc16e9fe0184518e9f413edebab31c45934d7ad"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/full/memory-after.txt": {
+        "bytes": 102,
+        "sha256": "fd19d16264e5744c11772b3bdeed17bb3a624f91b026d633d209c8e4f62b6410"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/full/memory-before.txt": {
+        "bytes": 102,
+        "sha256": "fd19d16264e5744c11772b3bdeed17bb3a624f91b026d633d209c8e4f62b6410"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/full/stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/full/startup.json": {
+        "bytes": 222711,
+        "sha256": "492f853a8ab3598befcc41d589aecef0115febf1b5cb7803cee95ca6d68fcf4d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/full/startup.txt": {
+        "bytes": 2071,
+        "sha256": "639293db9cd9afcce5fcf95c08640c6dd25ea3d3bb53a85afac377b7805b891f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/full/suite.json": {
+        "bytes": 711776,
+        "sha256": "8a52287a90dfb701032107eada086ee6e900ba3a951be40b46f9b1f1b72f2fc5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/full/suite.txt": {
+        "bytes": 2143,
+        "sha256": "6990965bda6995d70fa0016a93196276e1723db2303ce498907bc0e9a4d3f344"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/full/summary.json": {
+        "bytes": 25635,
+        "sha256": "2490578f4626ac991caea1d905bffb83e731626debf927bef6fe6580952ad231"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/full/summary.txt": {
+        "bytes": 3761,
+        "sha256": "77b9bce09ae502abe2e364ac6e8e56345da1904851449ca77b9b3708544e8705"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/full/vm-after.txt": {
+        "bytes": 1247,
+        "sha256": "cefa8cf34ad814b533986f80a0426ed0f7e8310917f6e3d560007efe463d2e07"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/full/vm-before.txt": {
+        "bytes": 1247,
+        "sha256": "a8706dc7e6bc7b17cec74c1e6212e4236e8e6e8b1dda872dfab94158624cc086"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/index.json": {
+        "bytes": 107628,
+        "sha256": "3320f90eb3c99d60e86d0c84ec6b77e91ec64f0dd17a5bad30b13afd80358b97"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/defaults_130-verify.py": {
+        "bytes": 468,
+        "sha256": "a72eae4ea4a7424354c5840f048f463ad6abda4ea29dc7afea4deb15ae5c9b66"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/defaults_130.py": {
+        "bytes": 1216,
+        "sha256": "9a836dfff8ee8c46b7d1ef4b526189d6c9981776db7ce245e521a4265ec06775"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/defaults_16-verify.py": {
+        "bytes": 467,
+        "sha256": "61db5fb0b5d481466f30a3a9184c6d8334453f73e4660cb906f6c612d783add0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/defaults_16.py": {
+        "bytes": 242,
+        "sha256": "8afc6f1608a9e36b34ce1216665e66f57bf4fe447f08df941d5c5d27fece34d3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/defaults_17-verify.py": {
+        "bytes": 467,
+        "sha256": "b64c3085d4201c965d1a2e6225d23942a2c78ea93d4adbd302cee14d383d0682"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/defaults_17.py": {
+        "bytes": 250,
+        "sha256": "f64177fda4b5315cedffc2a6474dde771a55d8ccc6e3324c9c58bc86e5bee54a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/defaults_64-verify.py": {
+        "bytes": 467,
+        "sha256": "1715585421e3d1686b9d8f1f037fb8d8f84b06b683187de438c80b1ea1c85d87"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/defaults_64.py": {
+        "bytes": 626,
+        "sha256": "59d0774a3818465bb6de0858a095ac3ac6a8c8eaecd160b712e2b1d6538388eb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/keyword_only_16-verify.py": {
+        "bytes": 471,
+        "sha256": "c818eb3097a9a0e410f579b3073665dfe7cb945b5958eedf67932eefbdef18ed"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/keyword_only_16.py": {
+        "bytes": 245,
+        "sha256": "601f4f941c10ba818738cd1a6d10eec4d0b8207e4f9d6d1e7941fd47e606c9f8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/keyword_only_17-verify.py": {
+        "bytes": 471,
+        "sha256": "7bf5eb79aa67a50102bab06c28ecb2ec720eb57bf32e543da85c2fd077a06a43"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/keyword_only_17.py": {
+        "bytes": 253,
+        "sha256": "e27d74251c028836dc6a5c7d9a93a497401714041ae87696b3084cfada5700fd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/keyword_only_64-verify.py": {
+        "bytes": 471,
+        "sha256": "e9cb4097e6c0f34222e1bc817d466aa364d34584ea3bac313272bada38289d4d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/keyword_only_64.py": {
+        "bytes": 629,
+        "sha256": "1d91adda835b497b303615c6fa75142b61e1c70a4d0c4b5f15e14f6f9d29d5b9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/many_body_locals-verify.py": {
+        "bytes": 472,
+        "sha256": "9bbffdfe1efd570da922761c3f6cc17f4c864f2f37a1fc268babb41e82ad5962"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/many_body_locals.py": {
+        "bytes": 2799,
+        "sha256": "1a0a0f1eed9e8772665f14f38653efe27e86085e46d7ccb7787a592a45fb0d56"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/preparation.json": {
+        "bytes": 3724,
+        "sha256": "f136c5ffd02192a77c61841494da9b8346d50e76492245c56ced0895cab47137"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/protocol.md": {
+        "bytes": 1066,
+        "sha256": "9cd668497218c27fc3d1c66dd5c34d264cd090a0edc7febac95001763c34dc89"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/variadic_14-verify.py": {
+        "bytes": 467,
+        "sha256": "ccfe49b2eae08f0409cf96a860ed1390660d562f7e29812c6231d10417c64b46"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/variadic_14.py": {
+        "bytes": 278,
+        "sha256": "f7d31ac081e578429ca4bba95e6280191245c2a57e80a637d0e1efc2dd5fe166"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/variadic_15-verify.py": {
+        "bytes": 467,
+        "sha256": "3fd6377f7e12102ef0722519858bfd3d211ff30f0d01f069eeb75f3e61cc6195"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v2/variadic_15.py": {
+        "bytes": 286,
+        "sha256": "9f02128e8a049c720aef64b2e48226aace95fd9f71aa84c08f3f6aaa0fa9438d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/defaults_130-verify.py": {
+        "bytes": 468,
+        "sha256": "24aff7ac9a005845f8438667503a03b0a0068455919b84a984f8023a28b07b4e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/defaults_130.py": {
+        "bytes": 1216,
+        "sha256": "9a836dfff8ee8c46b7d1ef4b526189d6c9981776db7ce245e521a4265ec06775"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/defaults_16-verify.py": {
+        "bytes": 467,
+        "sha256": "f0630c4a0924356096671ce773bcbe7e8ac9134501ee04fc7a6275ba136956cb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/defaults_16.py": {
+        "bytes": 242,
+        "sha256": "8afc6f1608a9e36b34ce1216665e66f57bf4fe447f08df941d5c5d27fece34d3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/defaults_17-verify.py": {
+        "bytes": 467,
+        "sha256": "c81e2736f908add707e562ac347c631459dbc511cf8a0eb3604352d6b1fa909a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/defaults_17.py": {
+        "bytes": 250,
+        "sha256": "f64177fda4b5315cedffc2a6474dde771a55d8ccc6e3324c9c58bc86e5bee54a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/defaults_64-verify.py": {
+        "bytes": 467,
+        "sha256": "aeedde1045baaef212fec3bc3f20c07bfc6f3704c9c6e674887c901fa7aab52a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/defaults_64.py": {
+        "bytes": 626,
+        "sha256": "59d0774a3818465bb6de0858a095ac3ac6a8c8eaecd160b712e2b1d6538388eb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/keyword_only_16-verify.py": {
+        "bytes": 471,
+        "sha256": "8a972a6e05065f354288c9e8da7cc388bedef885f764d64e8f714f550e9fd055"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/keyword_only_16.py": {
+        "bytes": 245,
+        "sha256": "601f4f941c10ba818738cd1a6d10eec4d0b8207e4f9d6d1e7941fd47e606c9f8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/keyword_only_17-verify.py": {
+        "bytes": 471,
+        "sha256": "9da99af9d59b3775db46cf36d08d8d111e65e0a9d919ed8077b8174fa7c0756e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/keyword_only_17.py": {
+        "bytes": 253,
+        "sha256": "e27d74251c028836dc6a5c7d9a93a497401714041ae87696b3084cfada5700fd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/keyword_only_64-verify.py": {
+        "bytes": 471,
+        "sha256": "76eb0347e73260bef251705c29470c6830511f3bd4b9636c0b6f8781e891f6e2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/keyword_only_64.py": {
+        "bytes": 629,
+        "sha256": "1d91adda835b497b303615c6fa75142b61e1c70a4d0c4b5f15e14f6f9d29d5b9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/many_body_locals-verify.py": {
+        "bytes": 472,
+        "sha256": "9863755b9a737cec57502cc499bdce2f6822d2c1b5e74e5faffd56561159675e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/many_body_locals.py": {
+        "bytes": 2808,
+        "sha256": "bd426ee7758525cb311deba57b5efc426ad6df60416df59f9d330525f56ab32f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/preparation.json": {
+        "bytes": 3719,
+        "sha256": "2a17959cd3b504571f63001d47275c087d2cb9f1761966617cf08b5d50df6aa7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/protocol.md": {
+        "bytes": 1449,
+        "sha256": "02938b32740c69c022987f809bdf32fa6b0c44f289bd642a51199ef192b401f2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/variadic_14-verify.py": {
+        "bytes": 467,
+        "sha256": "43d6069bf70378ee3675aee7119f91d1446849e55f5f67b6f632aad5d827ad9e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/variadic_14.py": {
+        "bytes": 278,
+        "sha256": "f7d31ac081e578429ca4bba95e6280191245c2a57e80a637d0e1efc2dd5fe166"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/variadic_15-verify.py": {
+        "bytes": 467,
+        "sha256": "573e667cd7b99b4bf6db40dfc8be77137cae853b6d8e2d7b093f8e8a9a1f6da0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs-v3/variadic_15.py": {
+        "bytes": 286,
+        "sha256": "9f02128e8a049c720aef64b2e48226aace95fd9f71aa84c08f3f6aaa0fa9438d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/defaults_130-verify.py": {
+        "bytes": 465,
+        "sha256": "ca1b84ba2f1c32c83b365b699e59b5a5069642d72aa460eb922bed0a90a954d5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/defaults_130.py": {
+        "bytes": 1216,
+        "sha256": "9a836dfff8ee8c46b7d1ef4b526189d6c9981776db7ce245e521a4265ec06775"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/defaults_16-verify.py": {
+        "bytes": 464,
+        "sha256": "4fd9948cc444d0e21053d91f99dd3443a55773be35fdd6d186b502a600ef7f71"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/defaults_16.py": {
+        "bytes": 242,
+        "sha256": "8afc6f1608a9e36b34ce1216665e66f57bf4fe447f08df941d5c5d27fece34d3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/defaults_17-verify.py": {
+        "bytes": 464,
+        "sha256": "ab6a4485afee28b4d67c18f461074e5c3c6c839a141948c1e8aa03c48f80c2db"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/defaults_17.py": {
+        "bytes": 250,
+        "sha256": "f64177fda4b5315cedffc2a6474dde771a55d8ccc6e3324c9c58bc86e5bee54a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/defaults_64-verify.py": {
+        "bytes": 464,
+        "sha256": "eb2fa379a973aceed9226e6f2c9cf4e5e1b6f60e2aeb4857571993255e214915"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/defaults_64.py": {
+        "bytes": 626,
+        "sha256": "59d0774a3818465bb6de0858a095ac3ac6a8c8eaecd160b712e2b1d6538388eb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/keyword_only_16-verify.py": {
+        "bytes": 468,
+        "sha256": "17dcd1c642c85af4fa53b56d005c6fc47ed85df79f3992070b517f55d5769b1f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/keyword_only_16.py": {
+        "bytes": 245,
+        "sha256": "601f4f941c10ba818738cd1a6d10eec4d0b8207e4f9d6d1e7941fd47e606c9f8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/keyword_only_17-verify.py": {
+        "bytes": 468,
+        "sha256": "6c913612dd7f3ddb335f8441c2412009ab17ba8119d49f895d1495ba0823af8b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/keyword_only_17.py": {
+        "bytes": 253,
+        "sha256": "e27d74251c028836dc6a5c7d9a93a497401714041ae87696b3084cfada5700fd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/keyword_only_64-verify.py": {
+        "bytes": 468,
+        "sha256": "505fc77d00e52a0267a33f93027676620ab905961c1b9966d367299a9a214048"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/keyword_only_64.py": {
+        "bytes": 629,
+        "sha256": "1d91adda835b497b303615c6fa75142b61e1c70a4d0c4b5f15e14f6f9d29d5b9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/many_body_locals-verify.py": {
+        "bytes": 469,
+        "sha256": "3abda908ca0634780f1c44c853d9ed01d62da1f1896a9b58b1df403cb195beaa"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/many_body_locals.py": {
+        "bytes": 2790,
+        "sha256": "82d7e11f1e3fe042c0aa2602547aa10c0931122433a9d2288e1f80a37c7e1634"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/preparation.json": {
+        "bytes": 3430,
+        "sha256": "323dabce843b42e1f5f9d7115a72932c865752260917a291119338ccf556e76b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/protocol.md": {
+        "bytes": 673,
+        "sha256": "2aef5fa6bc8637ef516656120968318df88f3a2002a96ab34bc1fde7a5c8ef53"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/variadic_14-verify.py": {
+        "bytes": 464,
+        "sha256": "1301a3ad93b1ce8924adc431dadd962b3bb30cc518e0f682f5f9ec40fb6e0444"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/variadic_14.py": {
+        "bytes": 278,
+        "sha256": "f7d31ac081e578429ca4bba95e6280191245c2a57e80a637d0e1efc2dd5fe166"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/variadic_15-verify.py": {
+        "bytes": 464,
+        "sha256": "fc2036f2a439045c8edf3de061aa7e51e71514b27398986c4d3a6aad78f8fd18"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/binder-flag-inputs/variadic_15.py": {
+        "bytes": 286,
+        "sha256": "9f02128e8a049c720aef64b2e48226aace95fd9f71aa84c08f3f6aaa0fa9438d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/bound_method-verify.py": {
+        "bytes": 478,
+        "sha256": "f4dc15f1bac97dcbb2a67006534e197e95ee922e5dfe3c8ce2d25b4fdc245793"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/bound_method.py": {
+        "bytes": 570,
+        "sha256": "eb402cfeeea8044a97ea605722fe502d630e8e2eb5400f5ee2508e3028ddb7d5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/builtin-verify.py": {
+        "bytes": 473,
+        "sha256": "99d9cadfc26fc03f2970710beeaf2828aea107672816157c0d071acf230d7cbd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/builtin.py": {
+        "bytes": 571,
+        "sha256": "932ca3f6e162327dae41a491fc4931e27107b9c65e766ab3e6f6f06af04f05ed"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/closure-verify.py": {
+        "bytes": 473,
+        "sha256": "eeccdb4e7371f6f67a99f7b73732453f448888246589fabe5c0b7303f10c39ce"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/closure.py": {
+        "bytes": 202,
+        "sha256": "cad0183274c463d6a2aa0c3c6b888decc312b1f330077d7280fad328fa1fd43f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/defaults-verify.py": {
+        "bytes": 474,
+        "sha256": "e9711d9a34c84bae2e7072d5b75079c08725894700fd73a73bf4ad92f25ccbda"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/defaults.py": {
+        "bytes": 579,
+        "sha256": "52874cace6577d70f090cb4869d8fbba59c9c17df0dbc01a089bfae1bbddb23d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/keyword_only-verify.py": {
+        "bytes": 478,
+        "sha256": "fb267c163a0c89e8fbaaeda758fd9fbb03cef4cd637c00a88f72c0407259e1d5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/keyword_only.py": {
+        "bytes": 139,
+        "sha256": "599665899c90babe280b49c5c7bf7d2623066811d3acb23c3994573717e5399b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/many_locals-verify.py": {
+        "bytes": 477,
+        "sha256": "a90562494ebe8de5a95b6ed8a936209dba41e1c2d0346f50278d41cfb29d0346"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/many_locals.py": {
+        "bytes": 198,
+        "sha256": "66d6a55363ebdcded486475140f5e0df0723540bf7b52ca4e7970f2a08d61634"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/method-verify.py": {
+        "bytes": 472,
+        "sha256": "f0964cbf3d1074447ffa01caf243513ee7db31963bb128acb07a6fd5aeb0bcc9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/method.py": {
+        "bytes": 572,
+        "sha256": "d35db8066b4b7133269e473ad918e0240d9a8f13d823eb23aa320fcae653adcc"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/positional-verify.py": {
+        "bytes": 476,
+        "sha256": "91322b8b15a427031d9865cd65b86eb8182c7c73f5fb0d523c010121d97e9a59"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/positional.py": {
+        "bytes": 573,
+        "sha256": "ead6872b9e5c1aa8a1e3b0b24de776956a638ae763183b8c86c3f987b3b4701e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/preparation.json": {
+        "bytes": 3615,
+        "sha256": "24eda1410663c35f83a9c0079c072fc38f51cd6c4bde0d81b300685d67f75e7a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/sparse_keyword-verify.py": {
+        "bytes": 480,
+        "sha256": "79d6f574e4c3be9c5a3afab5a6e6b6e948bfb1bb2de1e25232c5af822045c75e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/sparse_keyword.py": {
+        "bytes": 584,
+        "sha256": "1fc69eaf7cb3e95bc9a6c9f6da46b5c245a33f4d876d1c437358f5396f179b48"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/variadic_keyword-verify.py": {
+        "bytes": 482,
+        "sha256": "51f155624dcfc7af08871853215728fff5d4adeb92f610eaf3ed7b9ad438c4d9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/calls/variadic_keyword.py": {
+        "bytes": 586,
+        "sha256": "e848ae7568ab97ac6c8510b313dc0d4597e34b9ab8ae6035db5d1bab8c1c985b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/cold-exceptions/exceptions_every_1-verify.py": {
+        "bytes": 491,
+        "sha256": "5cdbb23f411269f32832d475120b29ca9e815a94433c4d3900877ecfb99e4bd1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/cold-exceptions/exceptions_every_1.py": {
+        "bytes": 545,
+        "sha256": "dad6d9fd7ae298561cb1ae000e238ae78ce280c7415a1de95fe2c030c2d65315"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/cold-exceptions/exceptions_every_100-verify.py": {
+        "bytes": 493,
+        "sha256": "59b7093e5a72fa67f3a24c9e52cdc269a62eaaf21f89c4c1801ec86a83ee928f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/cold-exceptions/exceptions_every_100.py": {
+        "bytes": 547,
+        "sha256": "47e70d4b7b274436bae224defc801f8f050836e7f178e9c573c5a32adf6f30ac"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/cold-exceptions/exceptions_every_2-verify.py": {
+        "bytes": 491,
+        "sha256": "2366de25371f142a9c0d95c306e3f2f85089757f094e38d716a18884806fd2e3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/cold-exceptions/exceptions_every_2.py": {
+        "bytes": 545,
+        "sha256": "5e8035688b8ec57d77444a7f8bcb7e65b148828c3553c642d3e2f6e221c2fb5e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/cold-exceptions/exceptions_none-verify.py": {
+        "bytes": 488,
+        "sha256": "83624b41a35f0fad11a4835a3089407daa3d759070c195253855c13bb0088374"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/cold-exceptions/exceptions_none.py": {
+        "bytes": 540,
+        "sha256": "3e897894721a8b0c8624652e03723ac9e4fb606f81e691191f0a0d9cf7051e78"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/cold-exceptions/preparation.json": {
+        "bytes": 1636,
+        "sha256": "f401b5ab5bae4bc4c419d7423c002dded5c2df65d741f2e3d5ce8213ce03f03f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/exceptions/exceptions_every_1-verify.py": {
+        "bytes": 486,
+        "sha256": "f8143a8de0367fce80173925415f77a7b5b8267a30bef78c9a6072573f351c0b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/exceptions/exceptions_every_1.py": {
+        "bytes": 325,
+        "sha256": "f1eaf824998184397270ed66a605f47054bf5dc4a24ad095b6468fb02e58b94f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/exceptions/exceptions_every_100-verify.py": {
+        "bytes": 488,
+        "sha256": "7a3fd824f4b1837d1cd3930a4b523dbbe5ac8affba76661911779da42bd7a9c5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/exceptions/exceptions_every_100.py": {
+        "bytes": 327,
+        "sha256": "58cb45927c44496e65346781045d43ab9edb974d56053b3dcacd236243cc6ed4"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/exceptions/exceptions_every_2-verify.py": {
+        "bytes": 486,
+        "sha256": "0cf9a18acb94797acd97ac3c54b7d9169a33ca5074beee220f6c3cda96d8b1a8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/exceptions/exceptions_every_2.py": {
+        "bytes": 325,
+        "sha256": "1b92f0ca344ef6eb1c14fa8a2617876706ebb25f36c0cfde9e3195cc111b1c1e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/exceptions/exceptions_none-verify.py": {
+        "bytes": 483,
+        "sha256": "31b47ff44deebca5964b40e5b619ac3cfbb2b2f3bfb95b8ee4820bd9c1a09347"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/exceptions/exceptions_none.py": {
+        "bytes": 320,
+        "sha256": "4533ba20559e902af46d8e9ed80ae5cbdd29fb1757a9aa32e15b45496c4054f3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/exceptions/preparation.json": {
+        "bytes": 1596,
+        "sha256": "ba4e70921bdba6651e8fc8afeadc1140195aae5c1a3f6c4064aa08b5ae773991"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/inputs/original-entry-controls/protocol.md": {
+        "bytes": 2140,
+        "sha256": "7dcd3c1af247a298eb27249db8636df591447cfa8c2adee783a79fc0c99f7516"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-build-pipeline.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-build-stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-build.txt": {
+        "bytes": 588,
+        "sha256": "ef34cd5a2d1fd54580f7db9d5e601b1f1ba01a5c49ee2568b772ebdcfd2c47d1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-check-stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-checks-pipeline.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-clippy.txt": {
+        "bytes": 172,
+        "sha256": "c5c6d40fba4dc0aaed1018577a302bf748e2aa98ed575c9cf177337d98f98b96"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-coverage.txt": {
+        "bytes": 11342,
+        "sha256": "2c2bd17ca5449276bfe57049e54f8a8501e14c7bb126077cd908f667eaad8463"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-extra-checks.txt": {
+        "bytes": 1996,
+        "sha256": "765cfce77e438eaeb401284e85a9cf54d62ea526ea0c4274a3286cf8291045d6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-focused-load.txt": {
+        "bytes": 55,
+        "sha256": "bf36a316575b5fdc50d33ca6e31a1fad20163ab8509c0f693c979e53df7e665b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-format.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-full-load.txt": {
+        "bytes": 55,
+        "sha256": "bf36a316575b5fdc50d33ca6e31a1fad20163ab8509c0f693c979e53df7e665b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-no-jit.txt": {
+        "bytes": 171,
+        "sha256": "38a4bb38b75e1ef386bd70143968d004ea6ad3c37b9938a610ac17ef12626999"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-previous.txt": {
+        "bytes": 49,
+        "sha256": "5b8eb64f4201108719cfc1a43fc4441c449474b4b29181411728075aea2d386d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-reference.txt": {
+        "bytes": 52,
+        "sha256": "feba96bb28b3f420d45e793525f099da44acf53f09e1933b0cc6342b11e7acb8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-signature-paths-v2.txt": {
+        "bytes": 11647,
+        "sha256": "e2e0d97d9e4269ed83513375f7307c3588a6d9a15df05a3b7d3417704ef12d50"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-signature-paths-v3.txt": {
+        "bytes": 1226,
+        "sha256": "c43def4e4e3e39fd88323b8e607611710c1b93ed44f58fc70928c958f00bd7a0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-signature-paths.txt": {
+        "bytes": 11365,
+        "sha256": "815df3da3e996abc79eba036b549274aa8df008bb2ce88958e24ad87e58e49ba"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-snapshot.txt": {
+        "bytes": 199,
+        "sha256": "9d2188152f8d23fdc134035d17a979cce949ebac93531d2b62f5ed7a11c735d7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-validation-pipeline.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-validation-stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/logs/binder-flags-vm-tests.txt": {
+        "bytes": 21101,
+        "sha256": "e443709e48b97ce5da56d56e3d47543e3720cf3bc10f0162c69a087320a62333"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/export_binder_flags_followup.py": {
+        "bytes": 8732,
+        "sha256": "fd6497a39ad6a98c1cf9f13212cb0c3ecb2f897832d9b66cacc6839f39bb4356"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/bench_compare.py": {
+        "bytes": 12860,
+        "sha256": "1cdb0ae49378d06c26d61668e0004efd03c8e768bc87be57a60b56ea29df33d7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/binder-flags-experiment-protocol.md": {
+        "bytes": 2218,
+        "sha256": "2efacf0c90d9215263516ce8d66f39be8ee800cc84f793cb253496ce634ef08a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/build_binder_flags.sh": {
+        "bytes": 1764,
+        "sha256": "9c737348e2ceb2215bfdb3449da046f827f2a89e270e3dc4895b6f1164d343f3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/check_binder_flags.sh": {
+        "bytes": 1550,
+        "sha256": "850e8b6e14af0f445df57374c082c497bcb50ea0d2b911f49a0e9b0d963133b9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/check_binder_flags_extra.py": {
+        "bytes": 1815,
+        "sha256": "924a7fcb0aa168433c05d953cda0d2d5bc0910d6871dbc545d527fa5316093e5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/index.json": {
+        "bytes": 2086,
+        "sha256": "2a9028b4b20d2882188a4c25e32beed3d95c3dd6a90439342182367bfdc480fe"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/inspect_binder_flags.py": {
+        "bytes": 3566,
+        "sha256": "222ac434fa18c546d92c21c39daaebb49d153886a61f6654469dcff2448b70a1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/measure_binder_flags_focused.sh": {
+        "bytes": 2314,
+        "sha256": "3d84ce5bc4cd4fc52d0af45adcda865c5c3c7ebe9f3b7c3723aec7815a885ca1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/measure_binder_flags_full.sh": {
+        "bytes": 1241,
+        "sha256": "cfc35d009f26e6ac078d7b5af8f2a948b86a958614cdb51de3167c5d658161ac"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/measure_verified_python_components_with_reference.py": {
+        "bytes": 5277,
+        "sha256": "78a66587899906d71c9ef5ff7eb409429bee9f84667179933a9661e32f8336bf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/preflight_binder_flags.py": {
+        "bytes": 1805,
+        "sha256": "0ed2f4f0a612d248e1425bc43ae375c40a668c9abbf58c12a87a6173d82b4de9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/prepare_binder_flag_inputs.py": {
+        "bytes": 3015,
+        "sha256": "7779d8b890fe89f94bd25eb1163d4637b5fbda270278d437786141e35d96a424"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/prepare_binder_flag_methods.py": {
+        "bytes": 909,
+        "sha256": "a79dd50c01ffd576f3dff4498863cf5e04519d3267203ff470e8f471a6cc04ab"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/prepare_binder_flags_draft.py": {
+        "bytes": 1394,
+        "sha256": "7ca4184ddb03251c1422a1d45ba442d7772be3e6ccb339bc0d26354dc7bd1a6a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/prepare_binder_reference_harness.py": {
+        "bytes": 994,
+        "sha256": "0eddce24378a07e4a2a536f2f4e4e3756e6dfecb181e82fa88c07d95202751f6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/run_performance_under_load_gate.py": {
+        "bytes": 3259,
+        "sha256": "92bbbd8cc196407fc0db2e54eecd58822f9226e2887ef0a69c11cad6e870d1d0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/shared_slot_keys_startup_probes.py": {
+        "bytes": 7330,
+        "sha256": "c89b7ce2541f025882bf592dabd29eccb96fe5e0bf50fa1f4fb670564d0bc2ce"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/summarize_binder_flags.py": {
+        "bytes": 2238,
+        "sha256": "cd6eeb07e72fbeb9cb9de2dd842f3d1b7cf294e3bc8bb39dfc6268f248c215d5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/summarize_runtime_suite.py": {
+        "bytes": 2919,
+        "sha256": "e0fcbfce1ef9c793701d78724289d37382e848b991737d3b9fcdc18c9ef1f804"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/measurement-inputs/validate_binder_flags.sh": {
+        "bytes": 643,
+        "sha256": "572a738eab51f286fb6817deb7a50628946d473421dbce53f4e26e29f4930646"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/signature-path-method/index.json": {
+        "bytes": 117,
+        "sha256": "787157362982b50eee1db8c083ed996be89f65aa489ee980bb0798248158b41a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/signature-path-method/inspect_binder_signature_paths.py": {
+        "bytes": 3212,
+        "sha256": "64566e4f3469cf8a1c5670070861fdc942d29e41d41a8aa633db5223a7944772"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/bench_compare.py": {
+        "bytes": 12860,
+        "sha256": "1cdb0ae49378d06c26d61668e0004efd03c8e768bc87be57a60b56ea29df33d7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/binder-flags-experiment-protocol.md": {
+        "bytes": 2218,
+        "sha256": "2efacf0c90d9215263516ce8d66f39be8ee800cc84f793cb253496ce634ef08a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/build_binder_flags.sh": {
+        "bytes": 1764,
+        "sha256": "9c737348e2ceb2215bfdb3449da046f827f2a89e270e3dc4895b6f1164d343f3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/check_binder_flags.sh": {
+        "bytes": 1550,
+        "sha256": "850e8b6e14af0f445df57374c082c497bcb50ea0d2b911f49a0e9b0d963133b9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/check_binder_flags_extra.py": {
+        "bytes": 1815,
+        "sha256": "924a7fcb0aa168433c05d953cda0d2d5bc0910d6871dbc545d527fa5316093e5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/index.json": {
+        "bytes": 2545,
+        "sha256": "6a671cfc331c91bd474fcdd90fbd2f9af5c79f0884d21b6d17c0c26e2d6e1081"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/inspect_binder_flags.py": {
+        "bytes": 3566,
+        "sha256": "222ac434fa18c546d92c21c39daaebb49d153886a61f6654469dcff2448b70a1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/inspect_binder_signature_paths.py": {
+        "bytes": 3212,
+        "sha256": "64566e4f3469cf8a1c5670070861fdc942d29e41d41a8aa633db5223a7944772"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/inspect_binder_signature_paths_v2.py": {
+        "bytes": 3312,
+        "sha256": "a78300137318e0ff420e9bbeab6ddc8b403ddaaa79071bf6cc260283b5193d01"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/measure_binder_flags_focused.sh": {
+        "bytes": 2314,
+        "sha256": "3d84ce5bc4cd4fc52d0af45adcda865c5c3c7ebe9f3b7c3723aec7815a885ca1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/measure_binder_flags_focused_v2.sh": {
+        "bytes": 2428,
+        "sha256": "3952e84d257dce52a6e7f6bd1f034c6d6beaa328933ab70760a4397fd55c5033"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/measure_binder_flags_full.sh": {
+        "bytes": 1241,
+        "sha256": "cfc35d009f26e6ac078d7b5af8f2a948b86a958614cdb51de3167c5d658161ac"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/measure_verified_python_components_with_reference.py": {
+        "bytes": 5277,
+        "sha256": "78a66587899906d71c9ef5ff7eb409429bee9f84667179933a9661e32f8336bf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/preflight_binder_flags.py": {
+        "bytes": 1805,
+        "sha256": "0ed2f4f0a612d248e1425bc43ae375c40a668c9abbf58c12a87a6173d82b4de9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/prepare_binder_flag_inputs.py": {
+        "bytes": 3015,
+        "sha256": "7779d8b890fe89f94bd25eb1163d4637b5fbda270278d437786141e35d96a424"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/prepare_binder_flag_inputs_v2.py": {
+        "bytes": 3620,
+        "sha256": "f1a48fbc7b4f6545bce69b7d04c99c51eeca741ca1577e861c068422a19a3866"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/prepare_binder_flag_methods.py": {
+        "bytes": 909,
+        "sha256": "a79dd50c01ffd576f3dff4498863cf5e04519d3267203ff470e8f471a6cc04ab"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/prepare_binder_flags_draft.py": {
+        "bytes": 1394,
+        "sha256": "7ca4184ddb03251c1422a1d45ba442d7772be3e6ccb339bc0d26354dc7bd1a6a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/prepare_binder_reference_harness.py": {
+        "bytes": 994,
+        "sha256": "0eddce24378a07e4a2a536f2f4e4e3756e6dfecb181e82fa88c07d95202751f6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/run_performance_under_load_gate.py": {
+        "bytes": 3259,
+        "sha256": "92bbbd8cc196407fc0db2e54eecd58822f9226e2887ef0a69c11cad6e870d1d0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/shared_slot_keys_startup_probes.py": {
+        "bytes": 7330,
+        "sha256": "c89b7ce2541f025882bf592dabd29eccb96fe5e0bf50fa1f4fb670564d0bc2ce"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/summarize_binder_flags.py": {
+        "bytes": 2238,
+        "sha256": "cd6eeb07e72fbeb9cb9de2dd842f3d1b7cf294e3bc8bb39dfc6268f248c215d5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/summarize_runtime_suite.py": {
+        "bytes": 2919,
+        "sha256": "e0fcbfce1ef9c793701d78724289d37382e848b991737d3b9fcdc18c9ef1f804"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v2-measurement-inputs/validate_binder_flags.sh": {
+        "bytes": 643,
+        "sha256": "572a738eab51f286fb6817deb7a50628946d473421dbce53f4e26e29f4930646"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/bench_compare.py": {
+        "bytes": 12860,
+        "sha256": "1cdb0ae49378d06c26d61668e0004efd03c8e768bc87be57a60b56ea29df33d7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/binder-flags-experiment-protocol.md": {
+        "bytes": 2218,
+        "sha256": "2efacf0c90d9215263516ce8d66f39be8ee800cc84f793cb253496ce634ef08a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/build_binder_flags.sh": {
+        "bytes": 1764,
+        "sha256": "9c737348e2ceb2215bfdb3449da046f827f2a89e270e3dc4895b6f1164d343f3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/check_binder_flags.sh": {
+        "bytes": 1550,
+        "sha256": "850e8b6e14af0f445df57374c082c497bcb50ea0d2b911f49a0e9b0d963133b9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/check_binder_flags_extra.py": {
+        "bytes": 1815,
+        "sha256": "924a7fcb0aa168433c05d953cda0d2d5bc0910d6871dbc545d527fa5316093e5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/index.json": {
+        "bytes": 2890,
+        "sha256": "fc812ece204eea25d50e575641108503410d362b0583304514f6bc53d07d9d29"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/inspect_binder_flags.py": {
+        "bytes": 3566,
+        "sha256": "222ac434fa18c546d92c21c39daaebb49d153886a61f6654469dcff2448b70a1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/inspect_binder_signature_paths.py": {
+        "bytes": 3212,
+        "sha256": "64566e4f3469cf8a1c5670070861fdc942d29e41d41a8aa633db5223a7944772"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/inspect_binder_signature_paths_v2.py": {
+        "bytes": 3312,
+        "sha256": "a78300137318e0ff420e9bbeab6ddc8b403ddaaa79071bf6cc260283b5193d01"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/inspect_binder_signature_paths_v3.py": {
+        "bytes": 3395,
+        "sha256": "1d03adeabe659f885ee44cec58809ed7a3c0b0e94f5c606416d883de8ecbcc9f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/measure_binder_flags_focused.sh": {
+        "bytes": 2314,
+        "sha256": "3d84ce5bc4cd4fc52d0af45adcda865c5c3c7ebe9f3b7c3723aec7815a885ca1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/measure_binder_flags_focused_v2.sh": {
+        "bytes": 2428,
+        "sha256": "3952e84d257dce52a6e7f6bd1f034c6d6beaa328933ab70760a4397fd55c5033"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/measure_binder_flags_focused_v3.sh": {
+        "bytes": 2428,
+        "sha256": "04daaecf8202214aaa4cb6bfe1c2ea4b7f8a4097f4ffa57fe132e5247223bd34"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/measure_binder_flags_full.sh": {
+        "bytes": 1241,
+        "sha256": "cfc35d009f26e6ac078d7b5af8f2a948b86a958614cdb51de3167c5d658161ac"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/measure_verified_python_components_with_reference.py": {
+        "bytes": 5277,
+        "sha256": "78a66587899906d71c9ef5ff7eb409429bee9f84667179933a9661e32f8336bf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/preflight_binder_flags.py": {
+        "bytes": 1805,
+        "sha256": "0ed2f4f0a612d248e1425bc43ae375c40a668c9abbf58c12a87a6173d82b4de9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/prepare_binder_flag_inputs.py": {
+        "bytes": 3015,
+        "sha256": "7779d8b890fe89f94bd25eb1163d4637b5fbda270278d437786141e35d96a424"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/prepare_binder_flag_inputs_v2.py": {
+        "bytes": 3620,
+        "sha256": "f1a48fbc7b4f6545bce69b7d04c99c51eeca741ca1577e861c068422a19a3866"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/prepare_binder_flag_inputs_v3.py": {
+        "bytes": 3514,
+        "sha256": "e53b29cc4d057ce6556da37e2c7081aa8738ee48f1dabb5d1d5e72b9eeedd0e5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/prepare_binder_flag_methods.py": {
+        "bytes": 909,
+        "sha256": "a79dd50c01ffd576f3dff4498863cf5e04519d3267203ff470e8f471a6cc04ab"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/prepare_binder_flags_draft.py": {
+        "bytes": 1394,
+        "sha256": "7ca4184ddb03251c1422a1d45ba442d7772be3e6ccb339bc0d26354dc7bd1a6a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/prepare_binder_reference_harness.py": {
+        "bytes": 994,
+        "sha256": "0eddce24378a07e4a2a536f2f4e4e3756e6dfecb181e82fa88c07d95202751f6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/run_performance_under_load_gate.py": {
+        "bytes": 3259,
+        "sha256": "92bbbd8cc196407fc0db2e54eecd58822f9226e2887ef0a69c11cad6e870d1d0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/shared_slot_keys_startup_probes.py": {
+        "bytes": 7330,
+        "sha256": "c89b7ce2541f025882bf592dabd29eccb96fe5e0bf50fa1f4fb670564d0bc2ce"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/summarize_binder_flags.py": {
+        "bytes": 2238,
+        "sha256": "cd6eeb07e72fbeb9cb9de2dd842f3d1b7cf294e3bc8bb39dfc6268f248c215d5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/summarize_runtime_suite.py": {
+        "bytes": 2919,
+        "sha256": "e0fcbfce1ef9c793701d78724289d37382e848b991737d3b9fcdc18c9ef1f804"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/argument-binding-flags/methods/v3-measurement-inputs/validate_binder_flags.sh": {
+        "bytes": 643,
+        "sha256": "572a738eab51f286fb6817deb7a50628946d473421dbce53f4e26e29f4930646"
+      }
+    }
+  }
+}

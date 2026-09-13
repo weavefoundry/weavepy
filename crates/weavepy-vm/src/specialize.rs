@@ -385,7 +385,7 @@ pub fn attempt_specialize_unpack_sequence(seq: &Object, n: usize) -> InlineCache
 /// guard, re-checked at the start of every hit.
 ///
 /// The string shape only installs for pure-ASCII strings (code-point
-/// count == byte count, both cached on the `Rc<str>`), where indexing
+/// count == byte count, both cached on the `crate::shared_value::SharedStr`), where indexing
 /// is an O(1) byte read; the fast path re-verifies that property per
 /// hit because a cache slot outlives any one receiver.
 pub fn attempt_specialize_binary_subscr(container: &Object, index: &Object) -> InlineCache {
@@ -1019,7 +1019,7 @@ mod tests {
     #[test]
     fn for_iter_str_and_dict_specialize() {
         let s_iter = Object::Iter(Rc::new(RefCell::new(PyIterator::Str {
-            s: Rc::from("abc"),
+            s: crate::shared_value::SharedStr::from("abc"),
             index: 0,
         })));
         assert_eq!(

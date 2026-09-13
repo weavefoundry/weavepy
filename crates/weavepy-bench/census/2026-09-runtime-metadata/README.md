@@ -1,18 +1,22 @@
 # Runtime metadata and numeric text census
 
-Git checkpoint note: see [CHECKPOINT.md](CHECKPOINT.md) for the selected files and the full archives retained locally. The [weakref key checkpoint](weakref-shared-keys-checkpoint/REPORT.md) adds focused observations and lists its outstanding validation work.
+Git checkpoint note: see [CHECKPOINT-2026-09-13.md](CHECKPOINT-2026-09-13.md) for the latest active runtime, isolated experiments, measured improvements, and remaining gaps. The earlier [CHECKPOINT.md](CHECKPOINT.md) records the previous selection and local archive omissions.
 
 The subsequent [native-call scratch screen](native-call-scratch/REPORT.md) is preserved but not retained. It improves attribute access by about 2 to 3 percent while regressing some controls. Follow-up coverage also shows that its original isolated shape probes do not exercise the changed native-to-native buffer path. The exact-decoder stage below predates the empty-table stage.
 
-The checkpoint is commit `9a69c4161ade6527a5f4457d7e7272075cb1f0d9` on
+The original measurement checkpoint is commit `9a69c4161ade6527a5f4457d7e7272075cb1f0d9` on
 `perf/speed-up-json-and-strings`. The baseline executable was copied to
 `target/release/weavepy-perf-9a69c41` before editing. Each environment file records
 binary and source checksums. This work does not establish that WeavePy is faster
 or uses less memory than CPython across all workloads.
 
-The latest complete census is [gc-traversal-lists/REPORT.md](gc-traversal-lists/REPORT.md). Removing copied collector lists reduces peak RSS on the large slotted and nested-tuple graphs by about 1.7 to 5.6 percent. The archive preserves all original and follow-up controls, every regression, complete compatibility and startup results, and exact source identities. WeavePy wins 6/23 JIT workload timers and 0/24 JIT peak-RSS comparisons; the overall goal remains unachieved.
+The latest census that passed the strict load precondition is the [weakref key follow-up](weakref-shared-keys-followup/REPORT.md). Its 23 JIT workload timers have a geometric mean of 3.45x CPython; the original 21-fixture headline, including startup and excluding the three accelerator rows, is 2.12x. See the [cohort reconciliation](headline-cohorts/REPORT.md) for the comparison with the historical 2.91x result.
 
-The later [lazy finalization metadata experiment](gc-lazy-finalization/REPORT.md) is rejected. Its ordinary-heap memory savings came with about 4.2 percent higher finalizer-heap RSS and slower callback-heavy collection. The archive preserves all measurements, allocation profiles, source identities, and successful correctness checks. The preceding borrowed-handle change remains separately unmeasured.
+The subsequent [explicit-raise follow-up](jit-raise-exits-followup/REPORT.md) preserves a separate full diagnostic under host contention, including all regressions and the rejected prototype. Its focused guarded loops improve substantially, while always-raising calls regress. The full 23-workload mean is 0.4 percent slower than checkpoint 566c7bf's runtime, with 0.3 percent lower peak RSS; these small differences remain provisional. Its original 21-row timing cohort is 2.11x CPython by ratio of medians, and its complete 23-workload paired-ratio mean is 3.48x. It doesn't replace the preceding strict-load comparison.
+
+The earlier collector-list census is [gc-traversal-lists/REPORT.md](gc-traversal-lists/REPORT.md). Removing copied collector lists reduces peak RSS on the large slotted and nested-tuple graphs by about 1.7 to 5.6 percent. The archive preserves all original and follow-up controls, every regression, complete compatibility and startup results, and exact source identities. WeavePy wins 6/23 JIT workload timers and 0/24 JIT peak-RSS comparisons; the overall goal remains unachieved.
+
+The later [lazy finalization metadata experiment](gc-lazy-finalization/REPORT.md) is rejected. Its ordinary-heap memory savings came with about 4.2 percent higher finalizer-heap RSS and slower callback-heavy collection. The archive preserves all measurements, allocation profiles, source identities, and successful correctness checks. The preceding borrowed-handle change is now separately compared in the full-suite weakref follow-up; its focused collector measurements remain outstanding.
 
 The [collector candidate-position experiment](gc-candidate-positions/REPORT.md) is deferred and its runtime change is removed. All correctness checks pass, but high and changing host load prevents a reliable performance conclusion. The archive retains all twelve cases, seven paired samples per case, observed regressions, OS memory context, and exact allocation-site evidence. It does not replace the latest complete census.
 
@@ -408,3 +412,139 @@ The [streaming-sum stage](sum-streaming/REPORT.md) contains 256 configured compa
 The [numeric-sum stage](sum-numeric/REPORT.md) adds exact float and large-integer sequence reduction. All 259 configured compatibility checks pass; 36 numerical oracle differences are fixed, and 46 existing differences remain. The six numeric sum timers beat CPython in a 15-cycle repeat, while their process elapsed time and RSS remain higher. All 50 original focused cases and 22 repeated controls remain available, including smaller integer/range/attribute regressions. That focused numeric stage didn't repeat the full census.
 
 The [range-sum and iterator stage](range-formula/REPORT.md) contains 265 configured compatibility checks, 72 focused cases, and a full 24-fixture census. It repairs wide forward-range iteration and computes exact integer sums without walking the population. Large range timers beat CPython, while tiny-range speed and process memory remain higher. The standard census still wins 6/23 workload timers and 0/24 peak-RSS comparisons. All numerical/callback limitations and regressions remain recorded. Subsequent full results appear above.
+
+The [weakref follow-up](weakref-shared-keys-followup/REPORT.md) records the post-checkpoint allocation profiles, startup controls, and complete workload comparison.
+
+The [guarded pickle lookup follow-up](pickle-special-lookup-followup/REPORT.md)
+was deferred. Several hook cases improved, but every metaclass-fallback pair
+regressed and the standard JIT pickle case showed no clear benefit. Its exact
+code, compatibility evidence, failures, and complete diagnostic samples remain
+archived. The two runtime files were restored to the retained predecessor.
+
+The [first post-binding native entry experiment](bound-native-entry-first/REPORT.md)
+records complete qualified measurements and compatibility checks. Sparse keyword
+and many-local calls improved, but excluded call shapes consistently regressed.
+It is under refinement; the 3.4336 workload and 2.0732 peak-RSS ratios to CPython
+do not satisfy the performance goal. Every original sample and failure is retained.
+
+The [earlier native-entry exclusions](bound-native-entry-early-exclusions/REPORT.md)
+pass the full correctness gate, but focused timing has wide dispersion and
+retains fallback regressions. The complete focused and full measurements are
+archived. This refinement does not establish that the regressions are fixed.
+
+The [inline argument-binding flags experiment](argument-binding-flags/REPORT.md)
+reduces small-signature flag storage and preserves large signatures. All
+correctness gates pass, but the combined entry/storage change retains fallback
+regressions. Both predecessor comparisons, all original samples, and the failed
+probe that bypassed binding are archived. The performance goal remains unachieved.
+
+The [startup memory diagnostics](startup-memory-regions-followup/REPORT.md)
+separate RSS snapshots, shared mappings, virtual stack reservations, and live
+allocator sites. Cold and warm cache conditions remain distinct. They identify
+code/metadata and name-storage leads without claiming an RSS reduction.
+
+The [outlined native-entry experiment](outlined-native-entry/REPORT.md)
+improves several call controls versus its immediate predecessor but retains
+fallback regressions against the earlier reference. Its complete focused and
+full results, assembly, correctness checks, and load telemetry are preserved.
+The performance goal remains unachieved.
+
+The [compact intern-pool experiment](compact-intern-pools/REPORT.md) removes
+duplicate string keys, improving intern-hit and marshal controls while reducing
+string-pool memory. Complete paired results retain the short-string insertion
+regression and the remaining CPython gaps. Large raw artifacts are compressed
+losslessly, with stored and original hashes recorded.
+
+The [assertion-exit experiment](jit-assertion-exits/REPORT.md) enables native
+success paths around canonical exception constants. Its evidence includes
+frequent-failure and recovery controls, all broader results, and a corrected
+extra-suite filter that initially selected zero tests. CPython gaps remain.
+
+The [guarded integer-comparison experiment](integer-comparison-guards/REPORT.md)
+retains native success and fallback controls, full-suite results, and the
+original analyzer-fixture failure. CPython gaps and individual regressions remain.
+
+The [thin-owner prototypes](thin-owner-prototypes/REPORT.md) preserve standalone
+ownership and Miri checks, including a correction that tuple owners also carry
+wide slice metadata. They have not been integrated into WeavePy or benchmarked.
+
+The [comparison call-fusion follow-up](comparison-call-fusion/REPORT.md) retains
+simple-call gains, persistent complex-callback regressions, full-suite results,
+and the corrected native-coverage fixture. Its decision is deferred.
+
+The [shared value-storage follow-up](thin-value-storage/REPORT.md) records
+16-byte values, broad memory savings, short-allocation regressions, and all
+corrected validation and paired results. It remains a candidate under refinement.
+
+The [compact metadata trial](compact-arc-storage/REPORT.md) preserves both
+reference comparisons, smaller allocation headers, and shared-value cloning
+regressions. It remains unfinished and motivates a narrower clone-path trial.
+
+The [compact-owner clone follow-up](compact-arc-clone/REPORT.md) retains
+focused gains, broader regressions, and a transparent correction of overlapping
+measurement stages. Both packed-owner trials are deferred in favor of bf2.
+
+The [aligned string-owner experiment](niche-string-owner/REPORT.md) preserves
+validated ownership and compact layouts alongside measured runtime regressions.
+It is deferred in favor of the retained bf2 implementation.
+
+The [positional-default borrowing trial](borrowed-defaults/REPORT.md) records
+consistent targeted gains alongside broader JIT regressions. It remains under
+refinement; bf2 remains the retained acceptance reference.
+
+The [combined-default borrowing trial](borrowed-keyword-defaults/REPORT.md) records
+strong keyword and positional gains alongside remaining broader JIT regressions. It remains under
+refinement; bf2 remains the retained acceptance reference.
+
+The [native time-formatting trial](ascii-time-format/REPORT.md) preserves
+correctness checks, focused gains and losses, and complete predecessor and retained-baseline comparisons.
+
+The [short generic-call argument trial](native-dynamic-small-args/REPORT.md) preserves
+call-path validation, stack tradeoffs, and complete direct and retained-baseline comparisons.
+
+The [unobserved native-shell trial](native-unobserved-shell/REPORT.md) preserves
+observer exclusion, ownership review, and complete direct and retained-baseline comparisons.
+
+The [nested native scratch trial](native-nested-scratch/REPORT.md) preserves
+ownership validation, recursion coverage, and direct and retained-baseline comparisons.
+
+The [initial compiler scratch trial](jit-compiler-scratch-initial/REPORT.md) preserves
+correctness validation, substantially lower retained heap allocations in three
+recursive workloads, and a cleanup-stack tradeoff being refined before timing.
+Its source and raw evidence are packed into verified archives; it has no timing
+samples and does not establish a peak RSS or CPython performance improvement.
+
+The [compiler scratch cold-reset trial](jit-compiler-cold-reset/REPORT.md) preserves
+lower retained heap, static stack improvements, all four timing comparisons,
+and the remaining process-time and peak-RSS tradeoffs.
+
+The [shared terminal JIT-exit trial](jit-shared-exits/REPORT.md) preserves lower
+peak requested compiler allocations, increased allocation activity, complete
+correctness checks, and a timing gate that collected no samples because host
+load stayed above its threshold. Runtime speed and peak RSS remain unmeasured.
+
+The [early guard sealing experiment](jit-early-guard-sealing/REPORT.md) preserves all four runtime comparisons, compiler allocation tradeoffs, exact source identities, and the preexisting local-binding diagnostic.
+
+The [native local writeback candidate](jit-local-writeback/REPORT.md) fixes unassigned locals on native exits and preserves full correctness and current census coverage evidence. Its runtime performance remains unmeasured.
+
+The [object indexing experiment](jit-object-indexing/REPORT.md) preserves substantial focused integer-indexing gains, all four controlled comparisons, full semantic and native-path evidence, and the remaining startup, fallback, and peak-memory regressions. It does not establish an overall performance win.
+
+The [exact builtin indexing candidate](jit-exact-indexing/REPORT.md) preserves callback-free indexing changes, complete correctness and census checks, and a load gate that collected no timing samples. Runtime speed and peak memory remain unmeasured.
+
+The [keyword constructor replanning experiment](jit-keyword-constructors/REPORT.md) preserves expanded compilation coverage, three completed timing comparisons, construction-time regressions, and one unqualified gate. It remains an unsuccessful experimental candidate.
+
+The [dynamic native object-return fix](jit-dynamic-object-return/REPORT.md) preserves the reproduced and corrected caller-retirement regression, complete correctness checks, remaining pin-pressure exits, and an unqualified timing gate. Its runtime speed and peak RSS remain unmeasured.
+
+The [direct dynamic integer-return experiment](jit-dynamic-integer-return/REPORT.md) preserves zero temporary-integer pin-pressure exits, complete correctness checks, all four timing comparisons, and every measured regression. It does not establish an overall speed or peak-memory improvement.
+
+The [observed integer arithmetic experiment](jit-observed-integer-arithmetic/REPORT.md) preserves substantial gains in six newly compiled arithmetic paths, complete correctness validation, all four comparisons, and the remaining memory, changed-type, and full-census regressions.
+
+The [arithmetic call-result fusion experiment](jit-arithmetic-call-fusion/REPORT.md) preserves focused arithmetic gains, complete correctness checks, two completed comparisons, the unlaunched retained comparison, and the remaining full-suite speed and memory regressions.
+
+The [scalar list-store candidate](jit-scalar-list-stores/REPORT.md) preserves native assignment coverage, exact type and finalizer checks, explicit socket-test reconciliation, and an unlaunched timing gate. Runtime speed and peak RSS remain unmeasured.
+
+The [scalar-list cold-entry candidate](jit-scalar-list-entry/REPORT.md) preserves first-call native-store coverage, complete correctness validation, a separate JIT-enabled C API check, and an unlaunched timing gate. Runtime speed and peak RSS remain unmeasured.
+
+The [scalar-list read experiment](jit-scalar-list-read/REPORT.md) preserves substantial focused speed gains, small peak-memory increases, complete correctness checks, every original and resumed timing sample, and explicit timer-wrapper and audit corrections. Full-suite and retained-baseline performance remain unmeasured.
+
+[Datetime slot initialization](datetime-slot-initialization/REPORT.md) preserves a fully measured, unpromoted experiment: small constructor gains and lower retained-object RSS, slower custom-metaclass fallback, and no whole-suite gain. All source versions, validation outcomes, and measured samples are archived.

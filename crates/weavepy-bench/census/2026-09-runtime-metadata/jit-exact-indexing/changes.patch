@@ -1,0 +1,202 @@
+--- a/crates/weavepy-vm/src/lib.rs
++++ b/crates/weavepy-vm/src/lib.rs
+@@ -53566,6 +53566,122 @@
+     }
+ 
+     #[cfg(feature = "jit")]
++    fn run_jit_exact_index(src: &str) -> (String, u64, u64) {
++        let src = src.to_owned();
++        std::thread::spawn(move || {
++            crate::tier2::force_enable_for_test(2);
++            let out = run(&src);
++            (
++                out,
++                crate::tier2::object_index_calls_for_test(),
++                crate::tier2::exact_index_calls_for_test(),
++            )
++        })
++        .join()
++        .expect("exact indexing jit worker thread")
++    }
++
++    #[cfg(feature = "jit")]
++    #[test]
++    fn jit_exact_indexing_preserves_values_and_bounds() {
++        let src = r#"
++class Opaque:
++    def __getitem__(self, index):
++        return 9
++
++def read_item(obj, index):
++    return obj[index]
++
++for _ in range(80):
++    assert read_item(Opaque(), 1) == 9
++containers = [(3, 9, 15), [3, 9, 15], bytes([3, 9, 15]),
++              bytearray([3, 9, 15]), range(3, 21, 6)]
++for obj in containers:
++    for _ in range(80):
++        assert read_item(obj, 1) == 9
++    assert read_item(obj, -1) == 15
++for value in [None, True, 1.5, "text", object(), 1 << 80]:
++    assert read_item((value,), 0) is value
++    assert read_item([value], 0) is value
++assert read_item(range(1 << 90, (1 << 90) + 3), 1) == (1 << 90) + 1
++messages = []
++for obj in containers:
++    try:
++        read_item(obj, 3)
++    except IndexError as error:
++        messages.append(str(error))
++    else:
++        raise AssertionError("missing bounds error")
++assert messages == ["tuple index out of range", "list index out of range",
++                    "index out of range", "bytearray index out of range",
++                    "range object index out of range"]
++print("exact indexing values and bounds ok")
++"#;
++        let (out, calls, exact_calls) = run_jit_exact_index(src);
++        assert!(exact_calls >= 100, "exact indexing branch never warmed");
++        assert!(calls > exact_calls, "generic control never ran");
++        assert_eq!(out, "exact indexing values and bounds ok\n");
++        assert_eq!(out, run(src));
++    }
++
++    #[cfg(feature = "jit")]
++    #[test]
++    fn jit_exact_indexing_keeps_subclass_and_key_callbacks() {
++        let src = r#"
++OFFSET = 1
++TRIGGER = False
++events = []
++def read_offset(obj):
++    return obj[0] + OFFSET
++
++for _ in range(80):
++    assert read_offset((3,)) == 4
++
++class Key:
++    def __hash__(self):
++        return 0
++    def __eq__(self, other):
++        global OFFSET
++        events.append("equality")
++        if TRIGGER:
++            OFFSET = 7
++        return other == 0
++
++mapping = {Key(): 3}
++for _ in range(80):
++    assert read_offset(mapping) == 4
++TRIGGER = True
++before = len(events)
++assert read_offset(mapping) == 10
++assert events[before:] == ["equality"]
++OFFSET = 1
++TRIGGER = False
++
++class Overridden(tuple):
++    def __getitem__(self, index):
++        global OFFSET
++        events.append("subclass")
++        if TRIGGER:
++            OFFSET = 7
++        return 3
++
++obj = Overridden((99,))
++for _ in range(80):
++    assert read_offset(obj) == 4
++TRIGGER = True
++before = len(events)
++assert read_offset(obj) == 10
++assert events[before:] == ["subclass"]
++print("subclass and key callbacks preserved")
++"#;
++        let (out, calls, exact_calls) = run_jit_exact_index(src);
++        assert!(exact_calls > 0, "exact indexing control never ran");
++        assert!(calls > exact_calls, "callback protocol never ran");
++        assert_eq!(out, "subclass and key callbacks preserved\n");
++        assert_eq!(out, run(src));
++    }
++
++    #[cfg(feature = "jit")]
+     #[test]
+     fn jit_dyn_attr_property_roundtrip() {
+         // RFC 0074 WS4 — property get/set on an unprobeable receiver
+--- a/crates/weavepy-vm/src/tier2.rs
++++ b/crates/weavepy-vm/src/tier2.rs
+@@ -6099,24 +6099,44 @@
+             None => return 3,
+         }
+     };
+-    ctx.dirty = true;
+-    let result = call_with_activation_shell(interp, ctx, jf, |interp| {
+-        interp.subscr_get_public(&receiver, &Object::Int(index))
+-    });
++    // These exact enum variants with an exact integer key only clone a
++    // stored value or perform native arithmetic. They cannot invoke Python
++    // getters, index coercion, or key equality. Subclasses are Instance
++    // objects and keep the full protocol below. Dictionary key equality
++    // can run Python; memoryview backing access requires a separate audit.
++    let callback_free = matches!(
++        receiver,
++        Object::List(_)
++            | Object::Tuple(_)
++            | Object::Bytes(_)
++            | Object::ByteArray(_)
++            | Object::Range(_)
++    );
++    let result = if callback_free {
++        #[cfg(test)]
++        EXACT_INDEX_TEST_CALLS.with(|count| count.set(count.get() + 1));
++        interp.binary_subscr(&receiver, &Object::Int(index))
++    } else {
++        ctx.dirty = true;
++        call_with_activation_shell(interp, ctx, jf, |interp| {
++            interp.subscr_get_public(&receiver, &Object::Int(index))
++        })
++    };
+     match result {
+         Err(error) => {
+             ctx.raised = Some(error);
+             1
+         }
+         Ok(value) => {
+-            let still_valid = guards_hold(
+-                interp,
+-                &ctx.globals,
+-                &ctx.builtins,
+-                &ctx.guard_snapshot,
+-                &ctx.callees,
+-                &ctx.math,
+-            );
++            let still_valid = callback_free
++                || guards_hold(
++                    interp,
++                    &ctx.globals,
++                    &ctx.builtins,
++                    &ctx.guard_snapshot,
++                    &ctx.callees,
++                    &ctx.math,
++                );
+             if still_valid {
+                 if let Object::Int(integer) = &value {
+                     jf.ret_bits = *integer as u64;
+@@ -9083,6 +9103,7 @@
+ #[cfg(test)]
+ std::thread_local! {
+     static OBJECT_INDEX_TEST_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
++    static EXACT_INDEX_TEST_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+ }
+ 
+ /// Test-only proof that a source oracle entered the subscription helper.
+@@ -9090,3 +9111,9 @@
+ pub(crate) fn object_index_calls_for_test() -> u64 {
+     OBJECT_INDEX_TEST_CALLS.with(std::cell::Cell::get)
+ }
++
++/// Test-only proof that a source oracle used the callback-free branch.
++#[cfg(test)]
++pub(crate) fn exact_index_calls_for_test() -> u64 {
++    EXACT_INDEX_TEST_CALLS.with(std::cell::Cell::get)
++}

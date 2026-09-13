@@ -23,6 +23,7 @@
 use crate::error::{runtime_error, type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
+use crate::shared_value::{SharedStr, ThinArc};
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
@@ -1754,9 +1755,9 @@ thread_local! {
 /// behind the same pointer (mutable `bytearray`).
 fn subject_cache_key(obj: &Object) -> Option<usize> {
     match obj {
-        Object::Str(s) => Some(Rc::as_ptr(s).cast::<u8>() as usize),
-        Object::WStr(s) => Some(Rc::as_ptr(s).cast::<u8>() as usize),
-        Object::Bytes(b) => Some(Rc::as_ptr(b).cast::<u8>() as usize),
+        Object::Str(s) => Some(SharedStr::as_ptr(s).cast::<u8>() as usize),
+        Object::WStr(s) => Some(ThinArc::as_ptr(s).cast::<u8>() as usize),
+        Object::Bytes(b) => Some(ThinArc::as_ptr(b).cast::<u8>() as usize),
         _ => None,
     }
 }

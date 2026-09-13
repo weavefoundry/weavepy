@@ -1,0 +1,82 @@
+--- a/crates/weavepy-vm/src/lib.rs
++++ b/crates/weavepy-vm/src/lib.rs
+@@ -51312,6 +51312,40 @@
+ 
+     #[cfg(feature = "jit")]
+     #[test]
++    fn jit_scalar_list_stores_enter_cold_loops() {
++        for (value, expected) in [
++            ("i * 3", "[12276, 12279, 12282, 12285]"),
++            ("i + 0.5", "[4092.5, 4093.5, 4094.5, 4095.5]"),
++            ("(i & 1) == 0", "[True, False, True, False]"),
++        ] {
++            let source = format!(
++                "def fill(n):\n    items = [None] * 4\n    for i in range(n):\n        items[i & 3] = {value}\n    return items\nprint(fill(4096))\n"
++            );
++            let native_source = source.clone();
++            let (output, stores, osr_entries) = std::thread::spawn(move || {
++                crate::tier2::force_enable_for_test(2);
++                let output = run(&native_source);
++                (
++                    output,
++                    crate::tier2::scalar_list_store_calls_for_test(),
++                    crate::tier2::osr_stats_for_test(),
++                )
++            })
++            .join()
++            .expect("cold scalar list entry worker");
++            eprintln!("cold scalar native stores: {value}: stores={stores}, osr={osr_entries}");
++            assert_eq!(output, format!("{expected}\n"));
++            assert!(
++                stores >= 4000,
++                "cold loop did not enter native scalar stores: {value}, stores={stores}"
++            );
++            assert!(osr_entries > 0, "cold loop had no OSR entry: {value}");
++            assert_eq!(output, run(&source));
++        }
++    }
++
++    #[cfg(feature = "jit")]
++    #[test]
+     fn jit_scalar_list_stores_preserve_exact_value_types() {
+         for (value, expected, lane) in [
+             ("i * i", "[15376, 15625, 15876, 16129]", "int"),
+--- a/crates/weavepy-vm/src/tier2.rs
++++ b/crates/weavepy-vm/src/tier2.rs
+@@ -1825,14 +1825,12 @@
+     }
+ }
+ 
+-/// Entry-guard check for one managed local (RFC 0061/0065 WS5): a
+-/// scalar lane must pack; a pinned-list lane must hold a `list` whose
+-/// *first* element matches the compiled element lane (an O(1) proxy
+-/// for the probe's full scan — the access helpers re-validate per
+-/// element, so a heterogeneous tail costs a deopt, never correctness);
+-/// a pinned-instance lane must hold an instance — or, RFC 0070 WS1,
+-/// the `None` singleton (the lane is nullable; `None` packs as the
+-/// machine value `-1` and every access helper deopts on it).
++/// Entry guard for one managed local. Scalar lanes must pack exactly.
++/// A homogeneous list checks its first element as an O(1) proxy for the
++/// probe's full scan; access helpers still validate every loaded element.
++/// Heterogeneous lists also admit native scalar elements produced by
++/// append or assignment. Their access helpers retain their own shape
++/// checks and can still deopt. An object-lane local admits any bound value.
+ fn entry_local_ok(obj: &Object, ty: JitType) -> bool {
+     if ty == JitType::Obj {
+         // RFC 0076 WS8 — the object lane admits *any* bound value:
+@@ -1869,7 +1867,14 @@
+             | (Some(Object::Int(_)), JitType::Int)
+             | (Some(Object::Float(_)), JitType::Float)
+             | (
+-                Some(Object::Instance(_) | Object::Str(_) | Object::None),
++                Some(
++                    Object::Instance(_)
++                        | Object::Str(_)
++                        | Object::None
++                        | Object::Int(_)
++                        | Object::Float(_)
++                        | Object::Bool(_),
++                ),
+                 JitType::Obj
+             )
+     )

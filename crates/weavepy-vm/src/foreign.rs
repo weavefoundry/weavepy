@@ -22,6 +22,7 @@
 //! no foreign object is ever created), so this module is inert unless
 //! `weavepy-capi` has installed its bridge.
 
+use crate::shared_value::SharedStr;
 use std::sync::OnceLock;
 
 use weavepy_compiler::{BinOpKind, CompareKind};
@@ -42,14 +43,14 @@ pub struct PyForeignSoul {
     /// The *bare* type name (the tail of `tp_name` after the last `.`), i.e.
     /// what Python's `type(x).__name__` reports (`float64`, `Nano`). Cached so
     /// `repr` fallbacks and `__name__` need no C round-trip.
-    pub type_name: Rc<str>,
+    pub type_name: SharedStr,
     /// The full, unmodified `Py_TYPE(ptr)->tp_name` (`numpy.float64`,
     /// `pandas._libs.tslibs.offsets.Nano`, but bare `Timestamp` when the C
     /// type itself sets no module prefix). This is exactly the string CPython
     /// interpolates into `tp_name`-based `TypeError` messages
     /// (`unsupported operand type(s) for /: 'float' and 'X'`, `'X' object is
     /// not iterable`, …), so error text must use *this*, never `type_name`.
-    pub tp_name: Rc<str>,
+    pub tp_name: SharedStr,
 }
 
 impl std::fmt::Debug for PyForeignSoul {
@@ -244,7 +245,7 @@ fn hooks() -> Result<&'static ForeignHooks, RuntimeError> {
 /// Construct a foreign proxy soul for `ptr`, pinning one reference.
 /// `type_name` is the *bare* tail; `tp_name` is the full C `tp_name`.
 /// Returns the raw soul; the caller wraps it in [`Object::Foreign`].
-pub fn wrap(ptr: usize, type_name: Rc<str>, tp_name: Rc<str>) -> Rc<PyForeignSoul> {
+pub fn wrap(ptr: usize, type_name: SharedStr, tp_name: SharedStr) -> Rc<PyForeignSoul> {
     if soul_trace_enabled() {
         eprintln!("[SOUL-WRAP] ptr=0x{ptr:x} type={tp_name}");
     }

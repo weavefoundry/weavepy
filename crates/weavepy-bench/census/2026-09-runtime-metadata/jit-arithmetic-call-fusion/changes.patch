@@ -1,0 +1,110 @@
+--- a/crates/weavepy-jit/src/analyze.rs
++++ b/crates/weavepy-jit/src/analyze.rs
+@@ -6013,18 +6013,15 @@
+             let kind = bin_kind(ins.arg)?;
+             let mut b = pop_val(stack)?;
+             let mut a = pop_val(stack)?;
+-            if observed_integer_operands(code, pc, kind, a, b) {
+-                // Guard the lower operand first. The following guard then
+-                // sees an Int/Obj stack, so either miss restores the exact
+-                // state before BINARY_OP without repeating either producer.
+-                stack.push(ESlot::val(a));
+-                stack.push(ESlot::val(b));
+-                push(TOp::UnboxInt { depth: 1 }, None, stack, stmts);
+-                stack.pop();
+-                stack.pop();
+-                a = JitType::Int;
+-            }
+-            if let Some(depth) = integer_operand_guard(a, b) {
++            // Start with TOS for an observed pair so an immediately preceding
++            // dynamic call can return the integer directly. Each iteration
++            // converts one opaque operand, so at most two guards are needed.
++            let mut guard = if observed_integer_operands(code, pc, kind, a, b) {
++                Some(0)
++            } else {
++                integer_operand_guard(a, b)
++            };
++            while let Some(depth) = guard {
+                 let fused = depth == 0
+                     && stmts.last_mut().is_some_and(|previous| {
+                         if previous.pc.checked_add(1) != Some(pc) {
+@@ -6052,6 +6049,7 @@
+                 } else {
+                     a = JitType::Int;
+                 }
++                guard = integer_operand_guard(a, b);
+             }
+             // RFC 0071 WS4 — `list * int` repeats the pinned list on
+             // the same lane through `wpjit_list_repeat`.
+--- a/crates/weavepy-jit/tests/frame_coverage.rs
++++ b/crates/weavepy-jit/tests/frame_coverage.rs
+@@ -442,11 +442,68 @@
+                     }
+                 })
+                 .collect();
+-            assert_eq!(guards, [(pc, 1), (pc, 0)], "{operator}, inplace={inplace}");
++            assert_eq!(guards, [(pc, 0), (pc, 1)], "{operator}, inplace={inplace}");
+             assert_eq!(tf.ret_lane, Some(result));
+             assert_eq!(tf.local_types, [Some(JitType::Obj), Some(JitType::Obj)]);
+         }
+     }
++}
++
++#[test]
++fn observed_integer_arithmetic_fuses_last_dynamic_result() {
++    use weavepy_compiler::{InlineCache, OpCode};
++
++    let code = compile_first_fn(
++        "def k(n, first, second):\n    total = 0\n    for i in range(n):\n        total += first(i) + second(i)\n    return total\n",
++    );
++    for (pc, ins) in code.instructions.iter().enumerate() {
++        if ins.op == OpCode::BinaryOp {
++            code.caches
++                .set(u32::try_from(pc).unwrap(), InlineCache::BinOpAddInt);
++        }
++    }
++    let tf = analyze_code_cfg(
++        &code,
++        &Cfg {
++            obj_params: vec![1, 2],
++            ..Cfg::default()
++        },
++    )
++    .expect("observed opaque arithmetic should analyze");
++    let results: Vec<_> = tf
++        .blocks
++        .iter()
++        .flat_map(|block| &block.stmts)
++        .filter_map(|stmt| {
++            if let TOp::CallDyn { int_result, .. } = stmt.op {
++                Some(int_result)
++            } else {
++                None
++            }
++        })
++        .collect();
++    assert_eq!(
++        results,
++        [false, true],
++        "the last dynamic result must use the integer lane"
++    );
++    let guards: Vec<_> = tf
++        .blocks
++        .iter()
++        .flat_map(|block| &block.stmts)
++        .filter_map(|stmt| {
++            if let TOp::UnboxInt { depth } = stmt.op {
++                Some(depth)
++            } else {
++                None
++            }
++        })
++        .collect();
++    assert_eq!(
++        guards,
++        [1],
++        "only the earlier result needs a separate guard"
++    );
+ }
+ 
+ #[test]

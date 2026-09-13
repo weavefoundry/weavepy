@@ -1,0 +1,55 @@
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Frozen inputs, 79 JIT, 368 VM, 156 C API, 99 targeted, 275 compatibility checks, and 44 fixture paths verified.
+Exact exit bindings and callback counts match CPython; native exit confirmed.
+Indexing identity, callbacks, errors, guards, recursion, and lifetimes checked against CPython and baseline; preexisting differences remain explicit.
+The inherited formatting control compiles in both candidates, with identical CPython checksums and native fallback traces; other43 expectations remain unchanged.
+Sixteen keyword binding, callable identity, mutation, metaclass, error, and exit-state cases verified with native compilation evidence.
+Scalar-store native execution, exact value types, bounds, callback order, and finalizer observations verified.
+Original 273 successes preserved; two permission failures retained and resolved by explicit loopback rechecks.
+Nine construction cases, nine inherited indexing controls, and all24 authoritative results verified; timing sources frozen.
+Both complete constructor probes preserve native execution and avoid temporary-integer pin pressure.
+Six arithmetic paths, two changed-operand exits, and four conservative fallback controls verified.
+Every inherited arithmetic probe preserves native execution and pin-pressure counts.
+Six newly compiled scalar-store kernels and two unchanged homogeneous controls match CPython; cold entry costs remain in timing.
+Full correctness and identities verified; first gate timed out with no child/samples; remaining stages unattempted.
+sources.tar.gz 340 members; 3812866 stored bytes; all hashes verified.
+evidence.tar.gz 1482 members; 8401212 stored bytes; all hashes verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Frozen inputs, 79 JIT, 368 VM, 156 C API, 99 targeted, 275 compatibility checks, and 44 fixture paths verified.
+Exact exit bindings and callback counts match CPython; native exit confirmed.
+Indexing identity, callbacks, errors, guards, recursion, and lifetimes checked against CPython and baseline; preexisting differences remain explicit.
+The inherited formatting control compiles in both candidates, with identical CPython checksums and native fallback traces; other43 expectations remain unchanged.
+Sixteen keyword binding, callable identity, mutation, metaclass, error, and exit-state cases verified with native compilation evidence.
+Scalar-store native execution, exact value types, bounds, callback order, and finalizer observations verified.
+Original 273 successes preserved; two permission failures retained and resolved by explicit loopback rechecks.
+Nine construction cases, nine inherited indexing controls, and all24 authoritative results verified; timing sources frozen.
+Both complete constructor probes preserve native execution and avoid temporary-integer pin pressure.
+Six arithmetic paths, two changed-operand exits, and four conservative fallback controls verified.
+Every inherited arithmetic probe preserves native execution and pin-pressure counts.
+Six newly compiled scalar-store kernels and two unchanged homogeneous controls match CPython; cold entry costs remain in timing.
+Full correctness and identities verified; first gate timed out with no child/samples; remaining stages unattempted.
+Complete observed integer-arithmetic sources, validation, static costs, the unlaunched timing gate, and census traces preserved.

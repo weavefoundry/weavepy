@@ -1,0 +1,2670 @@
+{
+  "purpose": "Select source changes and compact new research evidence without deleting local files.",
+  "packing": "Original bytes and repository-relative paths are preserved. Reports remain directly readable. Extract this archive at the repository root to restore its referenced evidence. Generated caches and stack logs are excluded; original manifests inside the archive remain historical records.",
+  "excluded_generated_paths": [
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/abc_mod.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/ast_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/asyncio_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/cmath_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/codecs_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/datetime_accel.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/datetime_mod.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/fcntl_mod.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/functools_mod.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/gc_mod.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/gc_real.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/greenlet_native.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/https_mod.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/imp_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/interpreters_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/io.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/itertools_mod.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/json_accel.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/marshal_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/math.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/mmap_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/mod.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/multiprocessing_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/os.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/os_process.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/overlapped_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/pickle_accel.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/pickle_accel/encode.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/pyexpat_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/python/_pickle.py",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/python/_pydatetime.py",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/python/copyreg.py",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/python/functools.py",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/resource_mod.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/select_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/shutil_mod.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/signal_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/socket_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/sqlite3_native/mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/sqlite3_native/stmt.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/sre_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/ssl_real.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/string_mod.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/subprocess_mod.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/sys.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/tempfile_mod.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/termios_mod.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/testinternalcapi_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/thread_real.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/time.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/tokenize_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/tracemalloc_real.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/warnings_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/weakref_real.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/weave_frame_mod.rs",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/winapi_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/winreg_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/stdlib/zstd_mod.rs.gz",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/integer_population.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/integer_population.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/shared_bytes_population.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/shared_bytes_population.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/shared_dictionary_population.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/shared_dictionary_population.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/shared_string_population.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/shared_string_population.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/shared_tuple_population.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/shared_tuple_population.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_ascii_129.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_ascii_129.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_ascii_17.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_ascii_17.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_ascii_33.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_ascii_33.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_ascii_7.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_ascii_7.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_ascii_9.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_ascii_9.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_bytes_129.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_bytes_129.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_bytes_17.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_bytes_17.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_bytes_3.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_bytes_3.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_bytes_33.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_bytes_33.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_bytes_9.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_bytes_9.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_surrogate.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_surrogate.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_tuple_1.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_tuple_1.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_tuple_2.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_tuple_2.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_tuple_8.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_tuple_8.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_unicode.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/__pycache__/unique_unicode.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/__pycache__/bytes_length_index.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/__pycache__/bytes_length_index.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/__pycache__/shared_value_calls.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/__pycache__/shared_value_calls.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/__pycache__/string_dictionary_lookup.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/__pycache__/string_dictionary_lookup.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/__pycache__/string_length_index.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/__pycache__/string_length_index.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/__pycache__/surrogate_length_index.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/__pycache__/surrogate_length_index.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/__pycache__/tuple_hash_lookup.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/__pycache__/tuple_hash_lookup.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/__pycache__/tuple_length_index.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/__pycache__/tuple_length_index.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/integer_population.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/integer_population.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/shared_bytes_population.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/shared_bytes_population.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/shared_dictionary_population.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/shared_dictionary_population.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/shared_string_population.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/shared_string_population.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/shared_tuple_population.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/shared_tuple_population.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_ascii_129.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_ascii_129.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_ascii_17.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_ascii_17.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_ascii_33.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_ascii_33.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_ascii_7.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_ascii_7.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_ascii_9.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_ascii_9.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_bytes_129.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_bytes_129.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_bytes_17.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_bytes_17.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_bytes_3.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_bytes_3.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_bytes_33.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_bytes_33.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_bytes_9.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_bytes_9.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_surrogate.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_surrogate.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_tuple_1.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_tuple_1.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_tuple_2.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_tuple_2.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_tuple_8.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_tuple_8.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_unicode.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/__pycache__/unique_unicode.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/__pycache__/bytes_length_index.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/__pycache__/bytes_length_index.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/__pycache__/shared_value_calls.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/__pycache__/shared_value_calls.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/__pycache__/string_dictionary_lookup.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/__pycache__/string_dictionary_lookup.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/__pycache__/string_length_index.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/__pycache__/string_length_index.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/__pycache__/surrogate_length_index.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/__pycache__/surrogate_length_index.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/__pycache__/tuple_hash_lookup.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/__pycache__/tuple_hash_lookup.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/__pycache__/tuple_length_index.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/__pycache__/tuple_length_index.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/integer_population.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/integer_population.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/shared_bytes_population.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/shared_bytes_population.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/shared_dictionary_population.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/shared_dictionary_population.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/shared_string_population.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/shared_string_population.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/shared_tuple_population.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/shared_tuple_population.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_ascii_129.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_ascii_129.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_ascii_17.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_ascii_17.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_ascii_33.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_ascii_33.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_ascii_7.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_ascii_7.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_ascii_9.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_ascii_9.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_bytes_129.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_bytes_129.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_bytes_17.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_bytes_17.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_bytes_3.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_bytes_3.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_bytes_33.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_bytes_33.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_bytes_9.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_bytes_9.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_surrogate.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_surrogate.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_tuple_1.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_tuple_1.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_tuple_2.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_tuple_2.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_tuple_8.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_tuple_8.weavepy-314-53.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_unicode.cpython-314.pyc",
+    "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/__pycache__/unique_unicode.weavepy-314-53.pyc"
+  ],
+  "archive": {
+    "bytes": 2759089,
+    "sha256": "95900e34071c5b592859c7ffe3064f51231891db08debc8203c6b123bfdedbbf",
+    "members": {
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/REPORT.md": {
+        "bytes": 6946,
+        "sha256": "0ce11f315c8ec4c721d8fdbeab0cb756afa1dabbe128d3088308644653f6e2d0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/Cargo.lock": {
+        "bytes": 85724,
+        "sha256": "3405caf8c6c32cccca040550b53af5400f14a41eac7aa4fce97709e671eb0e8d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/Cargo.toml": {
+        "bytes": 12948,
+        "sha256": "b37e98b9fbc6388c328ae76195d2b5f8432238f596c6a51ac3b869b98b7b6afa"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/README.md": {
+        "bytes": 325,
+        "sha256": "6e537ed3256cde5f9c31ed525ad31403c11eeb55f723a0961acca2dd9828a7d2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/build_compact_arc_clone.sh": {
+        "bytes": 1329,
+        "sha256": "2012eebee21d286a87612adad3d3ce41988f66c762c44dcc144618ec3dd2a88f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/capture_runtime_environment.py": {
+        "bytes": 6280,
+        "sha256": "3ce82f607c69a98eb67569c3db45fcbf73ba2ab79a856a7d6da1e2f46a6d8301"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/check_compact_arc_clone.sh": {
+        "bytes": 1797,
+        "sha256": "542f4f058c785cf7b1a388e566aadfcb492be1c2aac5081beb752495d65ad7b2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/check_compact_arc_clone_extra.py": {
+        "bytes": 2936,
+        "sha256": "07dc64702871d1822ce1b5660a9c955f1a107f4e774b32c474fd260c077e060a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/compact-arc-clone-protocol.md": {
+        "bytes": 3320,
+        "sha256": "14d80101c20c752033f03975548ce4bfd31a567a730219b1f8dfd3f227d75d07"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-execution/probes.py": {
+        "bytes": 5870,
+        "sha256": "aff641223c8c5a68c48cb6f123b08dd76a344cdae69d2f002453686d8a01ca74"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/builder_probes.py": {
+        "bytes": 1340,
+        "sha256": "2512eb05ac1f4c306739251fd9e06e5055b1ee8ada54eaa92de4c428ea2620f6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/code_cache_probes.py": {
+        "bytes": 1494,
+        "sha256": "a4500804f243d6c0888580e0b95ee47546731077051c773672462632baec6df4"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/constant_probes.py": {
+        "bytes": 1844,
+        "sha256": "e58a46371da9e1ec5791851d91f910c3fe71167a66f877ef6f8e6cca44d7223e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/gc_metadata_probes.py": {
+        "bytes": 1935,
+        "sha256": "ba6f7e7b7c35a8eed65cd3ec0406f4d85b887a1c074fdd1e81033fb3232bb61a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/gc_pause_probes.py": {
+        "bytes": 5132,
+        "sha256": "b79bed3094876b084fdaafb0c616e1a00429fb5f2cf9d91f07ed8ea9e54a8feb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/instance_dict_probes.py": {
+        "bytes": 1864,
+        "sha256": "82d01741cb9ca2d8a016c9a3d11a94b2cd8192aa1e10bb2e0a60d20601a39f5b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/instance_probes.py": {
+        "bytes": 3109,
+        "sha256": "313e3433580c0657c3de87747ea6f0d97a0b91a0fc2d037288b4a774ffa6c20b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/jit_probes.py": {
+        "bytes": 3916,
+        "sha256": "2ff66089f62e0a6e0f95ee92e6dfaae29e5b3ef4e0b8af70100085b649437132"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/jit_slot_probes.py": {
+        "bytes": 1368,
+        "sha256": "32ed7facfac6a50641718833a43daeed45b4ae8914932e74a745a66ad603e7cf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/long_scalar_probes.py": {
+        "bytes": 804,
+        "sha256": "51f7a4949e724b735ebf3d6bd914275473184b9f42aaaaa691efe9db9dd561ae"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/native_slice_probes.py": {
+        "bytes": 1250,
+        "sha256": "2ac2fee7ac002b622c04aff25268eec554aea93cdc13b049d25afdf90054d64d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/parallel.py": {
+        "bytes": 5116,
+        "sha256": "a787310100035e6a62b861c5c79ab24991adca425411ebba9b98dd97254a283e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/probes.py": {
+        "bytes": 7471,
+        "sha256": "54fed414ca182063c0c510ab04f3bb37e4ab2c3e401b4d66dc9cfcd1fadb0298"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/scalar_leaf_probes.py": {
+        "bytes": 1269,
+        "sha256": "a3f6883678e4f1858ae6732e2ec80ca92624b415a1acaebf4c56463b0e091bb8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/scalar_result_probes.py": {
+        "bytes": 1115,
+        "sha256": "d43bf68e65282dfb5c9c40c4a61344a0305c8e542bbf59a8076122f9101366c8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/slot_index_probes.py": {
+        "bytes": 1186,
+        "sha256": "3c6e34dc236f3ab5a48f06eb0932206a3f0d43e8cbb690d88ce41542b50677aa"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/small_slot_probes.py": {
+        "bytes": 1567,
+        "sha256": "78a6b6477e883828de022d9926b937a77ffd8dab2b14a8846b174185b8b9b6e7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/summarize.py": {
+        "bytes": 34330,
+        "sha256": "5f12b58d89683bddba2d6fcdbcefe39512fcde9c7308980bb61f95abefbe0f34"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/tuple-capi-expectations.toml": {
+        "bytes": 149,
+        "sha256": "c874b704306b068b41f7ae2bb4b282a5967c0cf3835d7372a80e3f6811f4312a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/tuple_hash_probes.py": {
+        "bytes": 2340,
+        "sha256": "29977020c00b3fde691f155f98d172027a1450fc865343cde9a6a13056e3f539"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/tuple_probes.py": {
+        "bytes": 2061,
+        "sha256": "caf21e1649ea89e2e77d54a7714e2c97a0db52212fcd218cdb22103cc2d856f6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/type_cache_probes.py": {
+        "bytes": 1258,
+        "sha256": "0260f678e1a935cd30566384db7af7f2590b73069817ff47fd16dad1d1482fba"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/validate.py": {
+        "bytes": 11497,
+        "sha256": "26e60cb09f5938425c37ac1e77ed20e94e91f83aca862b74f55e187194941ff3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/verify_builders.py": {
+        "bytes": 4110,
+        "sha256": "cf8dc06b08fce0f5aa6e15e78d4dcd12ba392fe25bd1b78f362400fcd835f75d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/verify_class_versions.py": {
+        "bytes": 2138,
+        "sha256": "3df00fcb54fab47d7b95f0616309071bf180b30d25af3d377110f144ea4ec42a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/verify_constants.py": {
+        "bytes": 4162,
+        "sha256": "19d908441799b2d33de0b9c09843263bfc2a21975f03a6ac5cd18ddfcfcef882"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/verify_default_suffix.py": {
+        "bytes": 3616,
+        "sha256": "e01244838ea09242fbddec42c54cf56bf4b7661e4cdf5fd4f301679d2a7c3755"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/verify_float.py": {
+        "bytes": 3648,
+        "sha256": "37dbe9f522a9bb2de9b68e95f20b840fb08e580117a9a2ca7dc89542b79f3b2c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/verify_jit.py": {
+        "bytes": 3097,
+        "sha256": "c7762db8de73eaeacc94721f39aea1b105add286d863013d519d4c5bc4843ce7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/verify_lazy_caches.py": {
+        "bytes": 1985,
+        "sha256": "478199cee8e903d85c7ca6ed9e7200badf4d76be24291c3305f92381090aa21b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/verify_native_slices.py": {
+        "bytes": 2554,
+        "sha256": "338ff23aa2cfe491be3d65d18c52b6259599a1f3936dbac982c88cc064f0fe58"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/verify_scalar_leaves.py": {
+        "bytes": 2772,
+        "sha256": "fa729a484f37fb25348d40fa7dff2b03ac470e2eb194e7e7368802cfcd4a82f4"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/verify_scalar_results.py": {
+        "bytes": 3072,
+        "sha256": "e0db421b77982c47c1d7ba52b8dda7957a3a79c7017f5192bb273070859c16da"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/verify_slot_indices.py": {
+        "bytes": 2934,
+        "sha256": "9832d466a86f3870548fb87fccb195d742f11eec7b2e48960071f51f03288b0c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-bench/census/2026-09-runtime-metadata/verify_unboxed_calls.py": {
+        "bytes": 3673,
+        "sha256": "565d21802c203e47fca29c1761c9d90f7b78ef6e262ad1dc84059fa49c8e3592"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-capi/src/abi313.rs": {
+        "bytes": 30125,
+        "sha256": "6a8a691b98c1829ff00aceb4cf48d48caad9a2cb8afbbdb4abefded97ad86f35"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-capi/src/abi314.rs.gz": {
+        "bytes": 14137,
+        "sha256": "cf4aed90c9014af3f10fdefc33bc91b6bafdec58d8aa2c09e11b986d930b9f02"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-capi/src/abstract_.rs.gz": {
+        "bytes": 47746,
+        "sha256": "5fae4434cbdd574a8ec1237ceac67a3b4ba8cc232f240a9f83268d5be3bbf0cb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-capi/src/capsule.rs": {
+        "bytes": 25759,
+        "sha256": "b8a6a3316b2ca4fd0065e765c448626d896d4aa3abf79d878228c7be14ffc41e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-capi/src/containers.rs.gz": {
+        "bytes": 17021,
+        "sha256": "1745ad85f92daf523dc4906e2992f04e5a15ab134989825409ab7175ac957d2b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-capi/src/dunder_shim.rs.gz": {
+        "bytes": 11684,
+        "sha256": "b3c385b82050672aca7e6f7cd3db163959d848d45205ada67c01bacb118fb4e5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-capi/src/foreign.rs": {
+        "bytes": 23966,
+        "sha256": "7bce9d711801aab2cf7226ea829e83dedd1ebccb4183282a08010371123f72b6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-capi/src/genericalloc.rs": {
+        "bytes": 22762,
+        "sha256": "941c9d18cc89d1c282f12f3cb17093ddcdacec3041073284544023a5459083d9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-capi/src/getset.rs": {
+        "bytes": 22554,
+        "sha256": "16c1fb59c64ad90be1c0f8bef48760150e34442074e9408975994a0c7b2a1a68"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-capi/src/mirror.rs.gz": {
+        "bytes": 58493,
+        "sha256": "cd60d842f61f51ea5238d041b68a1101b92e4f4a325de79eea326f3322b83b45"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-capi/src/mypyc_tail.rs": {
+        "bytes": 30528,
+        "sha256": "f1845b951811d24e85e8b4305079456a51146755f8d76f03887d01ecb2a08773"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-capi/src/object.rs.gz": {
+        "bytes": 22589,
+        "sha256": "12e66c1046db0a49085f74591cc2b4f8170d62f8ffd40e4b23197ab852209ff1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-capi/src/pep741.rs.gz": {
+        "bytes": 8322,
+        "sha256": "ab8159a5811fd0eea00e9ceab1a629b7fb87e47ce6726eabc472d25e8c5709f9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-capi/src/strings.rs.gz": {
+        "bytes": 12926,
+        "sha256": "b1ae466f7204693ec75a5487cffd6d9e9f2b50c783db89d3f0f316440742bcd5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-capi/src/torch_tail.rs": {
+        "bytes": 20225,
+        "sha256": "2a23ec531d1e03980ed69dc72735737e6b43468c08fcfbef9149e4c30a6c0f22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-capi/tests/capi_loader.rs": {
+        "bytes": 10792,
+        "sha256": "c3dd5df2a117c8569f215c7338afd231d02afbd18604a5dc62f556ec3a1a67e4"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-cli/src/repl.rs": {
+        "bytes": 23666,
+        "sha256": "b9f4a33e08c857e4614a5962d29b582153fa2e217d1e21a1d90ff01c8bed56db"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-compiler/Cargo.toml": {
+        "bytes": 873,
+        "sha256": "26f3399136e55dc8100710dcfd7c4670650402fbd58fa0ff7773f79c5bee451f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-compiler/src/bytecode.rs.gz": {
+        "bytes": 21703,
+        "sha256": "7628098ea8273acabff1e098b05c67e5e0391c7af9eb1bfc727aa6feb7dff19d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-compiler/src/cache_snapshot.rs": {
+        "bytes": 5211,
+        "sha256": "dac321fbe01d6ed04a8804e122512ac7d3e2f6423a82e5e2f3054d6f6876aa80"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-compiler/src/cpython_code.rs.gz": {
+        "bytes": 36543,
+        "sha256": "bd28f093b5ad9b4631ddeefb619a817a35dc65187ace18694f1dda3362e23138"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-compiler/src/lib.rs.gz": {
+        "bytes": 156392,
+        "sha256": "2072baaa25ba6ec071f8d73ef3a247a9001075446033c459c224247d708554bb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-jit/src/analyze.rs.gz": {
+        "bytes": 73826,
+        "sha256": "b923b30a97f9f64c1b95df1b2790439ce45f08452b4f7f9e81e1aedeecdaa20f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-jit/src/engine.rs": {
+        "bytes": 22262,
+        "sha256": "dbf6d6c3f9a898e65db035566257cb56b1b244c42f2ebe170a23cbd502478699"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-jit/src/engine/tests.rs": {
+        "bytes": 5767,
+        "sha256": "780283bba101992de0236928be917a25aad4307886ea13ba16636e875e8775ae"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-jit/src/ir.rs.gz": {
+        "bytes": 20040,
+        "sha256": "7d26b51deb87ba5d4617dde3ba6dfe44e347c242be6267e9f2cedbb6a55b0191"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-jit/src/lib.rs": {
+        "bytes": 3859,
+        "sha256": "b99283b4f2927d48c33e0d73db4ceef569a5d404ee29d44667f80ac586d5c606"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-jit/src/lower.rs.gz": {
+        "bytes": 22282,
+        "sha256": "573ed65ea0b1df14ab1ba6bb3db71e14d43212578c5cd6047c1a6eb57e9c46e6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-jit/src/runtime.rs.gz": {
+        "bytes": 12639,
+        "sha256": "1416cd0cf14f773d323bb87676dfc1d144242dea85b7dc2185ec50a52c95e8ea"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-jit/tests/frame_coverage.rs": {
+        "bytes": 27943,
+        "sha256": "09fcdc3c654f8fbea8ce2d3f984adb3963a0d0fe8a053a009f7460ec3a24ae26"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-jit/tests/helper_registration.rs": {
+        "bytes": 2580,
+        "sha256": "39faea3579e39efe6fcda53ce48f8c8e207f46cf1e71ec347eb6f8d6ac98ba59"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-jit/tests/numeric.rs": {
+        "bytes": 12581,
+        "sha256": "f1fa2e21bf02bd47e2604bddbb1652ae3dd3c36e8408c5310cb62cfd26de6908"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/Cargo.toml": {
+        "bytes": 3791,
+        "sha256": "3507b7dab7d93d694940d26bdb0bf68a6d9db5067feae9e0dc73edf7b8d70ac1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/examples/value_storage_layout.rs": {
+        "bytes": 1340,
+        "sha256": "42b561f63c3a4f299e37a350c5cd2745224c2442aeb6dbe4c38ec69cfb2aacb3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/builtin_types.rs.gz": {
+        "bytes": 56481,
+        "sha256": "9ddc93bc6bee9a1eb5ae78841253d755fa938574a624753615f1b64624db0735"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/builtins.rs.gz": {
+        "bytes": 166789,
+        "sha256": "514ecd701e27fa5d30d09e89f957cc73c31dc6b63691490ea2209fa17317021d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/error.rs.gz": {
+        "bytes": 8747,
+        "sha256": "f6ec446aae97cb361c992c03776147094687f50c1f2d7f2c26d422b843092f65"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/foreign.rs": {
+        "bytes": 21487,
+        "sha256": "e46323df11b829b4002b9c32fa0e7dfbe2afebbe47c589f74994c3a6efb92da5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/frozen_code_cache.rs": {
+        "bytes": 10036,
+        "sha256": "57fe07ac497900332d050e6e2f126ab656a0d2b5e82c9babee96d3bf5149b08d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/gc_trace.rs.gz": {
+        "bytes": 54530,
+        "sha256": "911d87f0e49d25dd7057eb3a73429b92e60a87d205f5f50cef911afcdd3a288a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/lazy_arc.rs": {
+        "bytes": 9495,
+        "sha256": "9f6e3c6ba728284258188b2bd1e1f0a9f6a76b868062c0a4a4609c2e60135336"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/lib.rs.gz": {
+        "bytes": 589339,
+        "sha256": "34bdc638edd6ee321255552f537ddb69c180d21605cede430f860de1dfa98caa"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/object.rs.gz": {
+        "bytes": 142415,
+        "sha256": "39cd17a1adcf94beb7b49928129b725ccb0ab5c7ea21487e2132201be30e54d2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/pycache.rs": {
+        "bytes": 23507,
+        "sha256": "3eb4e6c8925ebb3168bc4610f690ad4202c157a7c87d70020f150db06e597a0d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/shared_value.rs": {
+        "bytes": 24823,
+        "sha256": "02711d435faf26e508f57fbee048d3eb04d51a931247a10d05f59a7fe59b829e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/specialize.rs.gz": {
+        "bytes": 10788,
+        "sha256": "bd59b4d8dab110bdaa1da1a22195051bffdca3b377cc26b9e0d46805968bb5cd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/sync.rs.gz": {
+        "bytes": 15053,
+        "sha256": "067afad5acd450f4078d1fbaf4a4049a71227eb343864834e8fd3269349ed46c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/tier2.rs.gz": {
+        "bytes": 86900,
+        "sha256": "ed5383cb4ecf7e6486cc2087897e3b27b94993c29e39a79d00b2b04d14e1ea9a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/tuple_storage.rs": {
+        "bytes": 6869,
+        "sha256": "5b461aa5403553a865724ac56a906096d5498c5e85fc96078b3f0df467ff60bf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/type_surface.rs.gz": {
+        "bytes": 21258,
+        "sha256": "2bd84a0d42229d441972ee013bf4126d5b73ebc793826aef1aefcccf5fdabf84"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/types.rs.gz": {
+        "bytes": 26989,
+        "sha256": "6b1c5fc64ebacdda4537c7e25fdb4d47071b865ae0a76ab7a444605d9471b77c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/vm_singletons.rs.gz": {
+        "bytes": 17101,
+        "sha256": "7863a83def1af80b469dd06d2fba147a6b4646c9fae4993ee4b266229df6ab65"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/crates/weavepy-vm/src/weakref_registry.rs": {
+        "bytes": 24091,
+        "sha256": "78705063d0c7b0ba62e4139df3837972257e5d78c7aaa794ba7834d298fdcf0c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/environment.json.gz": {
+        "bytes": 36385,
+        "sha256": "0f8c4e9a98b15e21f43b4aa31281dc5a2ddbe843add6a14bd223907fbcb72ed4"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/freeze_compact_arc_clone_sources.py": {
+        "bytes": 1946,
+        "sha256": "41957bcef45796bd0a84a51246c10e2675c2fc48c6cf67263992af712b974801"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/freeze_runtime_candidate.py": {
+        "bytes": 2507,
+        "sha256": "73f03bad9c719dc933cc6c60c0cc36950b681fd85d370d037097d8fe9550e881"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/measure_compact_arc_clone_focused.sh": {
+        "bytes": 1176,
+        "sha256": "c52720b4e575a81d407ee04eb9bbc71a046eb5c4823e59313dbeb0e74a5f33fa"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/measure_compact_arc_clone_full.sh": {
+        "bytes": 1265,
+        "sha256": "cc3fefec708023524a39e78114859baa44c7fec5f85451cabf97a5f414d0a678"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/measure_verified_python_components.py": {
+        "bytes": 4981,
+        "sha256": "2e7cf9d837886a596d8532f0252a9ac5e57d93d4a5cb7964f92846393580c6e7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/source-changes.diff.gz": {
+        "bytes": 91079,
+        "sha256": "6ca5ce474ac5adf029a9a9364cd4d438d4513ea2d18c20deef85b8373ef7ab07"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/summarize_compact_arc_clone.py": {
+        "bytes": 1794,
+        "sha256": "47f7a70c99a978257601799de590d86b5efa99eeea3f0d7159a9988825d27d99"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_argument_binding_storage.py": {
+        "bytes": 3635,
+        "sha256": "791fb1357c0e084d3d0af10b3bf7381e5c7d3a27c2db54ccae40142b62ef487b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_bound_native_entry.py": {
+        "bytes": 4707,
+        "sha256": "5690b0a3dd58189982e4d407029e271446618800a4ba8db19d8b3f09ac724973"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_cached_code_relocation.py": {
+        "bytes": 2739,
+        "sha256": "ee58191356e138b26383c6b84febe2701b7fbd5ac78dc6c45762af7fdc4f0229"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_class_version_tokens.py": {
+        "bytes": 4325,
+        "sha256": "8667f8884d522813cea0db771c1f85ed1f7b09d4e6dcde7bec97ea59091d692c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_compact_intern_pools.py": {
+        "bytes": 3707,
+        "sha256": "660112007f29f0076b280540e35d605386f61970808ea2750ee451a2f7525d14"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_datetime_fields.py": {
+        "bytes": 3732,
+        "sha256": "31fa951bcc05664b5b921548b8246875219a4e2935ec887986a7c14f9a1986a1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_datetime_time_parts.py": {
+        "bytes": 2964,
+        "sha256": "aa922d1d01b8c40759a6cae6a29cb7e6b2f380df5e675c9a15bf5b0b83bdb3a9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_default_suffix.py": {
+        "bytes": 2388,
+        "sha256": "7f00a287027527104435f026bc45ee7cc2bbba5932352d93fc187e9a9ca59f3d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_float_text.py": {
+        "bytes": 4131,
+        "sha256": "6d2e49d787b417ec30ec9159c45449a70ae69156338654b54a6481605e3e6d48"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_gc_candidate_positions.py": {
+        "bytes": 1966,
+        "sha256": "0db68ffb09cce6994019c43566d651781105a2d5926af4902c75abc166bd4401"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_gc_discovery_frontier.py": {
+        "bytes": 2808,
+        "sha256": "0a3e6382aa0aea58e173b921171e6a5023a1b18522a2a80eb7292e627274ff41"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_gc_finalization_cache.py": {
+        "bytes": 2915,
+        "sha256": "c0dd0243725ab464c294c7044e07aaa11858c3e95beb75eaa78aa70c86cb4f83"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_gc_metadata.py": {
+        "bytes": 1890,
+        "sha256": "358f531e231eb80ce408ea4e014b730db2a520c257fd8ab61747d23027b5560c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_hash_results.py": {
+        "bytes": 7158,
+        "sha256": "cf9e825a081bdb175e2a8a1e588dc266b1ad9c427994835cb32f1257d9b8cb2c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_indexed_slot_access.py": {
+        "bytes": 4278,
+        "sha256": "789dcf5cfacf483994943c5449332d388fcc2928a245d172940a03765074a6bd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_instance_metadata.py": {
+        "bytes": 3182,
+        "sha256": "7e6491b890f14be84475da812c757c5a4a6d8197b683e2e47c49eb4886f6aed5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_jit_assertion_exits.py": {
+        "bytes": 4207,
+        "sha256": "064f796cc29b271fea748af6a6150311878722f2abccdb2483056b3998b0ddd6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_jit_constants.py": {
+        "bytes": 3988,
+        "sha256": "0d89179b93bc1c81762a1da941efa8b7b3189cfa3f2f73d7334e7937640fe65b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_jit_enumerate.py": {
+        "bytes": 3755,
+        "sha256": "db26accca164f8ac2be278a56b62f94af087bd3746ecc8c2b350009dedddcc3d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_jit_list_builders.py": {
+        "bytes": 3662,
+        "sha256": "884c6094636cf78d0600888724f9c38fd28431c9f3317e1b4a08482f3cb4715f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_jit_list_lifetime.py": {
+        "bytes": 1721,
+        "sha256": "0e24fa3112bbe4a6e3519cf9f31e392a1921a0b787ada75de1ddc6945c7c31a6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_jit_raise_exits.py": {
+        "bytes": 4136,
+        "sha256": "66d14e42229ba585e6763509cefcdfb3963aaabc1b8a584d2367f2d94903cf40"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_jit_scalar_leaf_calls.py": {
+        "bytes": 3644,
+        "sha256": "a311062ac8626cda775692169f5c747a331f8f12c9c80d593fd2483bdd637f42"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_jit_scalar_results.py": {
+        "bytes": 5530,
+        "sha256": "7c5b1dc495eafa4e798a0960ebe01c302a6a7dc2d1d98cb6684b196ff5c83894"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_jit_unboxed_calls.py": {
+        "bytes": 2074,
+        "sha256": "d3720406cbb22e6384755e5f3374e8acdab366fcab63d9e55326038e3d3f27b2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_json_buffers.py": {
+        "bytes": 8743,
+        "sha256": "9589b73c13c47eb81e78d2f61b24a1d1b4277a557daafa16578ecc03de2b6663"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_key_comparison_state.py": {
+        "bytes": 3298,
+        "sha256": "44fb198bcbf78f06f2dedd62d0d43857067ec662e8469aef7625962502ebd88d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_lazy_code_caches.py": {
+        "bytes": 2402,
+        "sha256": "0f2e5a52abdb5e69ff3082831766331ff9afac7aacbf181c0e296f8dbb06ee5d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_lazy_instance_dict.py": {
+        "bytes": 4040,
+        "sha256": "984e61936c27f9f09bd08a415b8d22c3e7dac61074509aea5201afe51b82489e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_native_call_scratch.py": {
+        "bytes": 1605,
+        "sha256": "f1dfe5ea5e79e4bb8d07258735715611c727975b7783bc5898fbff9f0aadf652"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_native_generator_pin_retirement.py": {
+        "bytes": 1947,
+        "sha256": "62cf43288ae5c452115c9615e2022fa77c1e81e212b0c8ea1c49e8bef287af3b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_native_pin_pressure.py": {
+        "bytes": 2476,
+        "sha256": "96c11283655955151520f63cdf6fb42ec6e53d9670bf88d099ef7debe4be6c2b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_native_pin_retirement.py": {
+        "bytes": 2630,
+        "sha256": "6a220df0e99de914fe22ce785993fc156694dbe2fed7fa022524f1e891f3b263"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_native_slice_bounds.py": {
+        "bytes": 2898,
+        "sha256": "76e9622689808c1c72e7dd9e5a60ba62c92413dc6796040fe695eced20c0ee9d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_native_string_arguments.py": {
+        "bytes": 10022,
+        "sha256": "e7d4d4c9879d9fb414d37290b36eea37121c1f439bfbd2c3f639cbb95c04be8f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_native_string_callbacks.py": {
+        "bytes": 1520,
+        "sha256": "fa30cf2aebb78d5ef9f19fdb9544bb89cf259b278e3b949d178552e7503ca4b0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_pickle_builtin_data.py": {
+        "bytes": 3934,
+        "sha256": "d0a4e041653f5feed363e54fd40e2ae411d7e2d74bc3e58b5d58a999ef4a2973"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_range_collection.py": {
+        "bytes": 5937,
+        "sha256": "3be43484d9eeedb66577365d732c6e2872f91413f7779d3c88ea474efd57149b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_range_iteration_bounds.py": {
+        "bytes": 15715,
+        "sha256": "144003d123e59dff206c9bb9f0d28b5a325bb78998b6d24397e7bbcbe31ac568"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_shared_code_caches.py": {
+        "bytes": 1832,
+        "sha256": "9d36348b872ea2727d978ffc44ec59c1d854873bc107f459b26773d12d92e407"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_shared_slot_keys.py": {
+        "bytes": 2259,
+        "sha256": "daffaf95588804040398c30b2c7b5fc4b0f892bfd8f85e0e0faea3e84587429e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_shared_value_storage.py": {
+        "bytes": 4426,
+        "sha256": "4fcf1eabdb590204ec9fec9dc01b356179322bfb5f0d62467cf91ccdceebf801"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_small_slot_storage.py": {
+        "bytes": 2359,
+        "sha256": "3ae258b6573f8537a484718f1a609ef8dd17ac9d2a5ec32747f31c314b199b50"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_string_split_gc.py": {
+        "bytes": 1623,
+        "sha256": "8f614056ba9915f59e82ad4b3f638078d6125d735f69d4d80d14aecaa0a83756"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_sum_numeric.py": {
+        "bytes": 31776,
+        "sha256": "0c2d89d841bcd37d4e1846c1c363e98d201d480d3df526a299169762a1885f66"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_sum_range.py": {
+        "bytes": 62176,
+        "sha256": "4e4974cbb4dd78457a188479953aa571e6f42e4c96c7b284c9115c02f1be0e00"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_sum_streaming.py": {
+        "bytes": 8570,
+        "sha256": "4fc562e4b49d0f6d4e6fa211cf1aa1529893dcd9ab50e94b1df6e89cf35ad93d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_tuple_hash_cache.py": {
+        "bytes": 6023,
+        "sha256": "80af65a095be9d781e2fd8ebcebf31f8e8db94cf65dc906d931a7d87d0eec6cc"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_tuple_storage.py": {
+        "bytes": 1928,
+        "sha256": "308f1ef9a8d81bed10421a3921005c2df8e544e3f3d9fb703c8b53cf17ab7d13"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_type_cache_names.py": {
+        "bytes": 1069,
+        "sha256": "f7ba03bc6800757258d800c9cbe6cc89a86e23118ab6af0846234a777d885cc8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tests/regrtest/test_weakref_wrapper_keys.py": {
+        "bytes": 3729,
+        "sha256": "39b682279a1cb8d4e6684d87206aee7e939f805de2ff1037299761ca507949e2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/tools/bench_compare.py": {
+        "bytes": 12860,
+        "sha256": "1cdb0ae49378d06c26d61668e0004efd03c8e768bc87be57a60b56ea29df33d7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/validate_compact_arc_clone.sh": {
+        "bytes": 673,
+        "sha256": "3cfe4c7a1725acd63019eb910a4f0467880aa0a9c5359a3d3a45d64d4a333714"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/candidate/verify_compact_arc_clone_ready.py": {
+        "bytes": 1859,
+        "sha256": "5e465b124dd1bba006863c80eb121e5defdf5f19b8ee041c36da5213570d0a88"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/native-coverage.stderr.txt": {
+        "bytes": 3746,
+        "sha256": "70e5a0391a379e44322b1394840fd8637faab6b7088eef513eaf8284cd91e59d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/native-coverage.stdout.txt": {
+        "bytes": 23,
+        "sha256": "5e479c003b60dee7bb1fd1dc318db889b89b19126f0d199d1d05a47ec19a23d6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_argument_binding_storage-gil0.txt": {
+        "bytes": 29,
+        "sha256": "ab7e01fccb0d6d24483cc405cecd383908bf990a94ea149ddb3765ac939d7cbf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_argument_binding_storage-interp.txt": {
+        "bytes": 29,
+        "sha256": "ab7e01fccb0d6d24483cc405cecd383908bf990a94ea149ddb3765ac939d7cbf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_argument_binding_storage-jit.txt": {
+        "bytes": 29,
+        "sha256": "ab7e01fccb0d6d24483cc405cecd383908bf990a94ea149ddb3765ac939d7cbf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_bound_native_entry-gil0.txt": {
+        "bytes": 23,
+        "sha256": "5e479c003b60dee7bb1fd1dc318db889b89b19126f0d199d1d05a47ec19a23d6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_bound_native_entry-interp.txt": {
+        "bytes": 23,
+        "sha256": "5e479c003b60dee7bb1fd1dc318db889b89b19126f0d199d1d05a47ec19a23d6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_bound_native_entry-jit.txt": {
+        "bytes": 23,
+        "sha256": "5e479c003b60dee7bb1fd1dc318db889b89b19126f0d199d1d05a47ec19a23d6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_compact_intern_pools-gil0.txt": {
+        "bytes": 40,
+        "sha256": "6475aed25bbb2452e29ae4800dd2ec8a34d422694c9097b5b1e2b14a3d9a61ac"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_compact_intern_pools-interp.txt": {
+        "bytes": 40,
+        "sha256": "6475aed25bbb2452e29ae4800dd2ec8a34d422694c9097b5b1e2b14a3d9a61ac"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_compact_intern_pools-jit.txt": {
+        "bytes": 40,
+        "sha256": "6475aed25bbb2452e29ae4800dd2ec8a34d422694c9097b5b1e2b14a3d9a61ac"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_cross_thread_heap-gil0.txt": {
+        "bytes": 21,
+        "sha256": "2bd5c63696ec23dcae3a2a2489c3156645616a07a373a4a71bc01e9b2188f2cd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_cross_thread_heap-interp.txt": {
+        "bytes": 21,
+        "sha256": "2bd5c63696ec23dcae3a2a2489c3156645616a07a373a4a71bc01e9b2188f2cd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_cross_thread_heap-jit.txt": {
+        "bytes": 21,
+        "sha256": "2bd5c63696ec23dcae3a2a2489c3156645616a07a373a4a71bc01e9b2188f2cd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_default_suffix-gil0.txt": {
+        "bytes": 29,
+        "sha256": "9bffc14f0dc7d3e9defa3bfdfedc23b9a6db56901ba8c8c40f895d7677f209cf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_default_suffix-interp.txt": {
+        "bytes": 29,
+        "sha256": "9bffc14f0dc7d3e9defa3bfdfedc23b9a6db56901ba8c8c40f895d7677f209cf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_default_suffix-jit.txt": {
+        "bytes": 29,
+        "sha256": "9bffc14f0dc7d3e9defa3bfdfedc23b9a6db56901ba8c8c40f895d7677f209cf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_extcall_kwonly_messages-gil0.txt": {
+        "bytes": 27,
+        "sha256": "3937009c748b49e6adc45b055b829c25ed6f2a103b6e327af5824d027ad449b7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_extcall_kwonly_messages-interp.txt": {
+        "bytes": 27,
+        "sha256": "3937009c748b49e6adc45b055b829c25ed6f2a103b6e327af5824d027ad449b7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_extcall_kwonly_messages-jit.txt": {
+        "bytes": 27,
+        "sha256": "3937009c748b49e6adc45b055b829c25ed6f2a103b6e327af5824d027ad449b7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_frame_recycling-gil0.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_frame_recycling-interp.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_frame_recycling-jit.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_assertion_exits-gil0.txt": {
+        "bytes": 39,
+        "sha256": "cf53f2f65e5a5db6a4efcd95b43b49b45d79b50b3494acaead2a7a3bf338d2b9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_assertion_exits-interp.txt": {
+        "bytes": 39,
+        "sha256": "cf53f2f65e5a5db6a4efcd95b43b49b45d79b50b3494acaead2a7a3bf338d2b9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_assertion_exits-jit.txt": {
+        "bytes": 39,
+        "sha256": "cf53f2f65e5a5db6a4efcd95b43b49b45d79b50b3494acaead2a7a3bf338d2b9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_calls-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_calls-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_calls-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_cells-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_cells-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_cells-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_dyn_calls-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_dyn_calls-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_dyn_calls-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_object_lanes-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_object_lanes-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_object_lanes-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_raise_exits-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_raise_exits-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_raise_exits-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_scalar_leaf_calls-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_scalar_leaf_calls-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_scalar_leaf_calls-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_unboxed_calls-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_unboxed_calls-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_jit_unboxed_calls-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_json_buffers-gil0.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_json_buffers-interp.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_json_buffers-jit.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_marshal_roundtrip-gil0.txt": {
+        "bytes": 27,
+        "sha256": "2afa01f8a359d5c280585dd1e83d68a5c4f87f3ddc821abea4c8a6a1c8bc583c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_marshal_roundtrip-interp.txt": {
+        "bytes": 27,
+        "sha256": "2afa01f8a359d5c280585dd1e83d68a5c4f87f3ddc821abea4c8a6a1c8bc583c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_marshal_roundtrip-jit.txt": {
+        "bytes": 27,
+        "sha256": "2afa01f8a359d5c280585dd1e83d68a5c4f87f3ddc821abea4c8a6a1c8bc583c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_native_call_scratch-gil0.txt": {
+        "bytes": 24,
+        "sha256": "63a2075f41e6d240e672189143f5136da800fc426e4ad995e35d8158027664a5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_native_call_scratch-interp.txt": {
+        "bytes": 24,
+        "sha256": "63a2075f41e6d240e672189143f5136da800fc426e4ad995e35d8158027664a5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_native_call_scratch-jit.txt": {
+        "bytes": 24,
+        "sha256": "63a2075f41e6d240e672189143f5136da800fc426e4ad995e35d8158027664a5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_native_generator_pin_retirement-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_native_generator_pin_retirement-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_native_generator_pin_retirement-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_native_pin_pressure-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_native_pin_pressure-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_native_pin_pressure-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_native_pin_retirement-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_native_pin_retirement-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_native_pin_retirement-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_pickle_callables-gil0.txt": {
+        "bytes": 20,
+        "sha256": "ddfbaeecfb2e489bc8f8794cdb8158003e69ea424cc0d61bd5c779c4cf33dc77"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_pickle_callables-interp.txt": {
+        "bytes": 20,
+        "sha256": "ddfbaeecfb2e489bc8f8794cdb8158003e69ea424cc0d61bd5c779c4cf33dc77"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_pickle_callables-jit.txt": {
+        "bytes": 20,
+        "sha256": "ddfbaeecfb2e489bc8f8794cdb8158003e69ea424cc0d61bd5c779c4cf33dc77"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_recursion_guard-gil0.txt": {
+        "bytes": 19,
+        "sha256": "ee260b4a7670a75456d1720e1e57f3b01fc4470576c4c2b072d153e21baf5b1d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_recursion_guard-interp.txt": {
+        "bytes": 19,
+        "sha256": "ee260b4a7670a75456d1720e1e57f3b01fc4470576c4c2b072d153e21baf5b1d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_recursion_guard-jit.txt": {
+        "bytes": 19,
+        "sha256": "ee260b4a7670a75456d1720e1e57f3b01fc4470576c4c2b072d153e21baf5b1d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_rfc0050_unicode_codecs-gil0.txt": {
+        "bytes": 36,
+        "sha256": "8c47c9f8b41d50a45eb89d062f3a504cf372a4133d68de0985d82b7a8ea1164b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_rfc0050_unicode_codecs-interp.txt": {
+        "bytes": 36,
+        "sha256": "8c47c9f8b41d50a45eb89d062f3a504cf372a4133d68de0985d82b7a8ea1164b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_rfc0050_unicode_codecs-jit.txt": {
+        "bytes": 36,
+        "sha256": "8c47c9f8b41d50a45eb89d062f3a504cf372a4133d68de0985d82b7a8ea1164b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_shared_value_storage-gil0.txt": {
+        "bytes": 31,
+        "sha256": "2f139dd0487676e5815454972134890497b99a07f2408b28d7fede98be4f424d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_shared_value_storage-interp.txt": {
+        "bytes": 31,
+        "sha256": "2f139dd0487676e5815454972134890497b99a07f2408b28d7fede98be4f424d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_shared_value_storage-jit.txt": {
+        "bytes": 31,
+        "sha256": "2f139dd0487676e5815454972134890497b99a07f2408b28d7fede98be4f424d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_small_slot_storage-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_small_slot_storage-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_small_slot_storage-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_tuple_hash_cache-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_tuple_hash_cache-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_tuple_hash_cache-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_tuple_storage-gil0.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_tuple_storage-interp.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_tuple_storage-jit.txt": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_weakref_basic-gil0.txt": {
+        "bytes": 19,
+        "sha256": "679783b7ec6d6519078d6be12a12621ec71cb51a96fe2525a76b01a1308aeb4c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_weakref_basic-interp.txt": {
+        "bytes": 19,
+        "sha256": "679783b7ec6d6519078d6be12a12621ec71cb51a96fe2525a76b01a1308aeb4c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/checks/test_weakref_basic-jit.txt": {
+        "bytes": 19,
+        "sha256": "679783b7ec6d6519078d6be12a12621ec71cb51a96fe2525a76b01a1308aeb4c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-after-codegen.rs": {
+        "bytes": 309,
+        "sha256": "c39abafff1b65cef606ae868062667c892d944c11a5e6c281b1442c81b431f0f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-after-codegen.s": {
+        "bytes": 16169,
+        "sha256": "7c22cad57ccab7ad09fc8a311a37e151703cf750a425212a2d5ee44d868a58c3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-after-codegen.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-after-v2-codegen.rs": {
+        "bytes": 312,
+        "sha256": "bf2551bf92f768314c8de850b96c193f9ebc2b61671eba2f631ceee30baf2936"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-after-v2-codegen.s": {
+        "bytes": 17186,
+        "sha256": "8783b0f550b462a15830a5a1811456c847825146ca007c4b1ebf8649cc76e19a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-after-v2-codegen.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-before-codegen.rs": {
+        "bytes": 303,
+        "sha256": "9635cf7d6238a17a431386dde34ab0a5276cd1298added5b990f96a1e58e7029"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-before-codegen.s": {
+        "bytes": 15990,
+        "sha256": "ac1e6cce826a1ea167eb07cb8575a9f6323ff2680e18ccc7a5988db734edec5e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-before-codegen.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-body.rs": {
+        "bytes": 532,
+        "sha256": "95758824551cf51e07169bfbc72f3d196911717c29e1b3ff1fa58d70f73c450d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-build-stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-build.txt": {
+        "bytes": 588,
+        "sha256": "7aef774b27ed3d38fa9d784d3f751983b6016653a0b4f9ce692cf433f75dce04"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-capi-tests-01.txt": {
+        "bytes": 11313,
+        "sha256": "46a8bd029b0701cb8403c6f8ee7e7c321e3c8165d97d08b2ecb977930e6eca69"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-check-stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-clippy-01.txt": {
+        "bytes": 586,
+        "sha256": "1aaede59bdebabbb8c4fc9c464f4572cec57ab0a1c47a9a0e2e92da041a19b0d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-corrected-methods.json": {
+        "bytes": 238,
+        "sha256": "f8babdc1cbe9bfe58c432d37c870b31c730e3f7325d56f2199e40c082b831e88"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-extra-checks.txt": {
+        "bytes": 3270,
+        "sha256": "16dc2544d287e6525bc167dc90b5a5e64aec2ef9712155f64191b417842c8637"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-focused-previous-load.json": {
+        "bytes": 4154,
+        "sha256": "8b2c3f2700f6aed6c64e5c8f048ff65d00cb9cbcb0ac44c88389a30e17953fea"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-focused-retained-isolated-load.json": {
+        "bytes": 4183,
+        "sha256": "ac65a60b9363ab61bc464f5894c75de6cbacf21a0840e31f3ccc43c77a73eb62"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-focused-retained-load.json": {
+        "bytes": 3161,
+        "sha256": "82388884e8b3010758a5822d630846bcda889f911a773209ec1937ee36854ddd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-format.txt": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-full-previous-isolated-load.json": {
+        "bytes": 9165,
+        "sha256": "40c463134a86fbf78766f9880060fa04809cbe977991a643ebaf15f2c18a04ed"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-full-previous-load.json": {
+        "bytes": 9143,
+        "sha256": "4ad4d120272b08b5206ec1075703d3120af1747fcff7e0dd082b5411958aa517"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-full-retained-isolated-load.json": {
+        "bytes": 9190,
+        "sha256": "bec0539275dd689bd520f96e4cf7a05012b46adb3ed42ba18b71de029cf89bd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-integrated-api/Cargo.lock": {
+        "bytes": 176,
+        "sha256": "07433fc2c4fd2a1e66b5f510cdfcd3ee7f01462e4617f1b30824334f86e8cf96"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-integrated-api/Cargo.toml": {
+        "bytes": 93,
+        "sha256": "d799cb5d2350281d9fa9245729dae305f0ccfbd8b12817dc7ad9944412953037"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-integrated-api/src/lib.rs": {
+        "bytes": 938,
+        "sha256": "2121817a6fc8233ad8f82faf528d34bebe0ef2c160a42a22db336be4e5eeccbb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-integrated-miri-arm64-01.txt": {
+        "bytes": 2709,
+        "sha256": "612c02911916d631d14f760def1db19b2ec1ac06b59dcd8a42e1d257bdcd05b1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-integrated-miri-i686-01.txt": {
+        "bytes": 2711,
+        "sha256": "f972741b0df88c262c18c5032a0183dc0ef38c2a9c94c3ce06ac9ac4cc7edf8b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-integrated-miri-report.json": {
+        "bytes": 1077,
+        "sha256": "89ec2a8e3acda3511fb26ef2e0ee5c7c6501e0da24e1b2354b3575eed00308ff"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-layout-build.txt": {
+        "bytes": 230,
+        "sha256": "0f76041421fc6697cb95b921b260b23a0f0c28b8bd99480fb02b03832c8824d3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-layout.json": {
+        "bytes": 451,
+        "sha256": "a1370742f0828ab096dbb8aa2d4db97569dbf9460acbee0dd77318a37260e2b0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-lease-check.json": {
+        "bytes": 147,
+        "sha256": "037307d1ab08dfc1fed58b98a8609493190f33eee62ffc1b18c5e12a163ccb65"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-measurement-correction.md": {
+        "bytes": 2463,
+        "sha256": "f0cd52c2df1a08bef7b8554573608a5bbe0ff5e822cadf8f2dcd841cb305ad41"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-nojit-check.txt": {
+        "bytes": 171,
+        "sha256": "288ce9bbf7f77ea52a096b09abff49a183be971543046dee3fc331e129f23ba2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-overlap-incident.json": {
+        "bytes": 13905,
+        "sha256": "031b04873351fe3c50d7da67874ec69ab1f3cb5df6effcdfaca8a25833fdb05b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-prebuild.json.gz": {
+        "bytes": 20173,
+        "sha256": "53ccdcc38faf942a99e93920ba021ee6158bee6eda25ef971fdff414a535916e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-preflight-report.json": {
+        "bytes": 3832,
+        "sha256": "57eceb7fa8d3a0a6bdfc14f8e696fccda453e28b30d3d10a3c221e054f603b60"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-protocol.md": {
+        "bytes": 3320,
+        "sha256": "14d80101c20c752033f03975548ce4bfd31a567a730219b1f8dfd3f227d75d07"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-prototype-clippy.txt": {
+        "bytes": 205,
+        "sha256": "164ced7083f1a8113df7c38e83ae5807a375f46f26fe095f4c1e79ba7d810b33"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-prototype-miri-arm64.txt": {
+        "bytes": 1301,
+        "sha256": "2c5b2283ae44273789c59b15133807277c8d437d2867b79265d4b4fe97787c5a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-prototype-miri-i686.txt": {
+        "bytes": 1303,
+        "sha256": "e954cb89a446b32a81833100f95cca4a68e4f4b345d1079041a42bd732493dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-prototype-tests.txt": {
+        "bytes": 1225,
+        "sha256": "da8ea03d6d8380c129e9ca1e4a2ab0a6a86f18aade94910359122a69af7f1b93"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-prototype-v2-clippy.txt": {
+        "bytes": 211,
+        "sha256": "dede7f27384cb0ee5d00b3ae8002380d41ddb8525028e778d57b6bfd25b12fb5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-prototype-v2-miri-arm64.txt": {
+        "bytes": 1319,
+        "sha256": "acb4339c67b916ca2d9749e8e53f2229181b0cb04f82c5fdf44f2574389a661a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-prototype-v2-miri-i686.txt": {
+        "bytes": 1321,
+        "sha256": "1749e477d9843de4610fecc43c603baef12d0487db4619b858eddaa8e2e836d2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-prototype-v2-tests.txt": {
+        "bytes": 1240,
+        "sha256": "495def0a683ebbd3482afe3fe6e4a813922cbc48c993db53efcd2fbafb064125"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-prototype-v2/Cargo.lock": {
+        "bytes": 174,
+        "sha256": "383d6fba93b0fe8bb5bc93257c4ae356bbf55c409ddb57ce3e476adcd6541662"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-prototype-v2/Cargo.toml": {
+        "bytes": 91,
+        "sha256": "7bcacf378b8f37f00aff049149c9f1eaad9ed67a0b8c5661a87d8900f739ba01"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-prototype-v2/src/lib.rs": {
+        "bytes": 10284,
+        "sha256": "dca301bfa5d77cb6511fbd61497df43d8e640d45ba42b70f34bdb1110db6572c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-prototype-v2/src/tests.rs": {
+        "bytes": 8244,
+        "sha256": "aa5ed8d0e916f809a39c85f175a0d3914faf6e7771978beaccdaae34c815ee14"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-prototype/Cargo.lock": {
+        "bytes": 171,
+        "sha256": "d90e1b41dec5d63a5137a8e0ba4674a4493e90784e192c8877d1cb43dfe6697c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-prototype/Cargo.toml": {
+        "bytes": 88,
+        "sha256": "6a0cccb22ffa00d84e24acfed2ea11d4f3ad7a0c182266214877f152c8fd058f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-prototype/src/lib.rs": {
+        "bytes": 10176,
+        "sha256": "067d94d3bdd878454491c0e13ceb40881b004401d80df0be81ad215dcba97847"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-prototype/src/tests.rs": {
+        "bytes": 8244,
+        "sha256": "aa5ed8d0e916f809a39c85f175a0d3914faf6e7771978beaccdaae34c815ee14"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-review.diff": {
+        "bytes": 1135,
+        "sha256": "3dd655e8b998282960c1f6d99730a1c5500ae0621c6ddcdc23d454902fc50d7d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-snapshot.txt": {
+        "bytes": 204,
+        "sha256": "d2dc54dd670d15d10445d66db7364364e68780fcdd2ffadc402626cb020ab322"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-validation-stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/compact-arc-clone-vm-tests-01.txt": {
+        "bytes": 22405,
+        "sha256": "ae4436ca7ceba498c474caf4ca39486ebc5f5a04e929b9294957d3a6c5e7f133"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/export_compact_arc_clone.py": {
+        "bytes": 10952,
+        "sha256": "3fa53c9f6afc1ee97c7f4fca3b6da7b041bc92436954b112bcf704e15c8e8202"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/performance_phase71_status.md": {
+        "bytes": 5616,
+        "sha256": "8d44f00cadc153cd95bc5f73986ad04f0e504d075fee3457a67eac0e1ecf011d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/prepare_compact_arc_clone_methods.py": {
+        "bytes": 2001,
+        "sha256": "7423a8d68f21496edcb34457eed8301fcdcb37ee9b628ac28f78c4a02a7a137e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/development/run_serial_performance_gate.py": {
+        "bytes": 1677,
+        "sha256": "791e61b162e783747d22a7b2def038c39d769592b4be6bebfa337b884e48cd00"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/extra-checks/report.json": {
+        "bytes": 9819,
+        "sha256": "43eadb68edbd11083f379630f236838050af9bb7ac7a3bb2fb43043da4d86b19"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold.txt": {
+        "bytes": 11827,
+        "sha256": "b91b4db27db4ff8cd32596e94dae56050b3d029f5f3f525a53d7f314cbaf9665"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/integer_population-verify.py": {
+        "bytes": 429,
+        "sha256": "4bb7548116da8ecf5f51963ac4886bf1ebd0b0b600ebcfd6a32b9a15a4ed58bb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/integer_population.py": {
+        "bytes": 451,
+        "sha256": "d8d10770664383226c788cce05fbbac21799cf94743da8b08aa936a14fa77c7e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/preparation.json": {
+        "bytes": 7545,
+        "sha256": "359c365940185a23955d502194bf8ea1d820454032995b76f546a4527e28ca30"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/shared_bytes_population-verify.py": {
+        "bytes": 434,
+        "sha256": "7e7a4f9752f1ef43f90d7af15c27212f74b4ac3dde808fe01c9839c10c1adaba"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/shared_bytes_population.py": {
+        "bytes": 507,
+        "sha256": "b8a5c162a62ea6c448f7173a05ba874f4c7c871d5dd8a2b74919d74f40ffe10f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/shared_dictionary_population-verify.py": {
+        "bytes": 439,
+        "sha256": "75108f5152f06ad39f2a813ce536d60c60cd92a080cff731aacbcbb26311b58b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/shared_dictionary_population.py": {
+        "bytes": 529,
+        "sha256": "222f7e3ad9f8e4f50bf84030dd08f05a38117c1b31aae7f1e0a5c6032a0efd7a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/shared_string_population-verify.py": {
+        "bytes": 435,
+        "sha256": "d7878d2862078b5a2e5ee94a31e9457190aa01ef84c8e78333427f6929d0ef8a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/shared_string_population.py": {
+        "bytes": 522,
+        "sha256": "cc744ddeaf1b9010d9e438e67a350f3622ce371143b02265225aa0041aa6130a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/shared_tuple_population-verify.py": {
+        "bytes": 434,
+        "sha256": "407b0e142f29f15df4c445b0023f4385b72994cb2d04f47a476a8c54a9765405"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/shared_tuple_population.py": {
+        "bytes": 506,
+        "sha256": "3629a992d77d7e7e14a4c5c2c4aa269103e2ae56ebdb3b07d0778db5462e6a77"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_ascii_129-verify.py": {
+        "bytes": 427,
+        "sha256": "317cd159b2110ff95daea9ef6411e2a794cd4e77c31f873265ce6378b25197d3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_ascii_129.py": {
+        "bytes": 511,
+        "sha256": "216330cecd8468e0ae8db58eefff078a9390f753b3de844dc48a4b38267d72d7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_ascii_17-verify.py": {
+        "bytes": 426,
+        "sha256": "bd1a50a239940270a251bd98e455b8c78dd70fcbb2336f84668f77819673a477"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_ascii_17.py": {
+        "bytes": 510,
+        "sha256": "8759f62b35fbf17c5db78ae03f09e71b1bb454c8464240e1c69404109edb604a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_ascii_33-verify.py": {
+        "bytes": 426,
+        "sha256": "bd3995b7b2eec2f1efa68b30a82d751974830e26308d255b164290983ab39d41"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_ascii_33.py": {
+        "bytes": 510,
+        "sha256": "12d7214a9fb7e876e1941ff447be7054d97b509c42c28012a445f3b674379c82"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_ascii_7-verify.py": {
+        "bytes": 425,
+        "sha256": "29f78a35d5ec43f60683e2d1638a3b1a776c799bd075b4fd7661f853c5367e98"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_ascii_7.py": {
+        "bytes": 509,
+        "sha256": "8a63ec4fd54209a6c3821446297b0331e6a7cccc80906f096df709a2e5c392b8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_ascii_9-verify.py": {
+        "bytes": 425,
+        "sha256": "e8f44609dad99c7814d935a20ffddd40d5d80640b07cc9f6f77e32b221a94b46"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_ascii_9.py": {
+        "bytes": 509,
+        "sha256": "3c69135e76155e9e8744677e218ff62b27f22ba5d0294ebd4fcdc1b1d59e2436"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_bytes_129-verify.py": {
+        "bytes": 427,
+        "sha256": "bb036bdfa2fdcf12230bfeada5966f7d414eee08ed1be98d0a04989c1c309136"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_bytes_129.py": {
+        "bytes": 540,
+        "sha256": "ef075758bca0ffb344fe490ccfee4734de9f09685d2f6adb2e87f49d806a5838"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_bytes_17-verify.py": {
+        "bytes": 426,
+        "sha256": "260ab6e630c65808404a341ca2e8fdcce6d37f004a59c5b700d3346f9fa73cc1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_bytes_17.py": {
+        "bytes": 539,
+        "sha256": "dd25d5dc11d43a5087bc1db8be708d594469bef8e6246d87468f1af823e616f2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_bytes_3-verify.py": {
+        "bytes": 425,
+        "sha256": "b5f9c9116b2d5dbfca5a5261bc3e45cee77e3fb26ce088cef100e485f87f3ea9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_bytes_3.py": {
+        "bytes": 538,
+        "sha256": "e5fc8a7140c457a3167cbc2886d94446e7a473282f911b171d7a8483411d0c50"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_bytes_33-verify.py": {
+        "bytes": 426,
+        "sha256": "b6763691e953fa4b22268758a5f07181d940d48c85fb1f43937e9eabb732f952"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_bytes_33.py": {
+        "bytes": 539,
+        "sha256": "9086c13e456fad16e896dcb11d34db18646d69111a36eb087794c38197e80322"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_bytes_9-verify.py": {
+        "bytes": 425,
+        "sha256": "0e22414699042c82c188ab597801b88463339c385ab8940cbf895474d5a014e8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_bytes_9.py": {
+        "bytes": 538,
+        "sha256": "5c883a335a6567db670547ca6526634dcea9051202a34caddc0381a523b71ba6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_surrogate-verify.py": {
+        "bytes": 427,
+        "sha256": "c1e8617f5908eac9977bd4086c2a00cd795f20b179fbe80e2e9d5ebf83664d43"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_surrogate.py": {
+        "bytes": 506,
+        "sha256": "9ba8d100d8d9d711719d56b5c8742f54913442a876d13696f1306ae7c2dfd033"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_tuple_1-verify.py": {
+        "bytes": 425,
+        "sha256": "f76b08aecfcc411971e3f6984f048fa3c73a1f9b073ca38394e84f42b7695a07"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_tuple_1.py": {
+        "bytes": 499,
+        "sha256": "812ab458fa455da8e36a24618c56fc4bf2dd0c4e737d24079548ed62c21c7b30"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_tuple_2-verify.py": {
+        "bytes": 425,
+        "sha256": "d3ece84913a1a3b6af2b8075895639f7e32a4d8127c63318b62aafd69c6d2848"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_tuple_2.py": {
+        "bytes": 499,
+        "sha256": "7cb22f735abed8fe7c68f0d702d913d1a958603e60da0f37cdc5dba6b0ddbb94"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_tuple_8-verify.py": {
+        "bytes": 425,
+        "sha256": "423a229f6eae74158f394c3b3c5cf42f5cf12e8a2392875b0e367ede528d3e1f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_tuple_8.py": {
+        "bytes": 499,
+        "sha256": "c6c019720d78472b74e37120a45e90c8689d413e9591fdbff1afc4f14646315f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_unicode-verify.py": {
+        "bytes": 425,
+        "sha256": "23459b093f2b920f3ecfba290c8cec4d74883f7d53b0590690e10e3e0ad77be9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/inputs/unique_unicode.py": {
+        "bytes": 528,
+        "sha256": "ba4c636a9c6ce908e0568073ca0fdef5c746d20d5de1c255ea96d643371a5606"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/cold/measurements.json.gz": {
+        "bytes": 35727,
+        "sha256": "3dd08c13e43891acee70f09e67c67337af93a184030741ef6b1e49ca6eba6f45"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/memory-after.txt": {
+        "bytes": 102,
+        "sha256": "da96c90f733b5d9e14d92c191eb61fbe6716e59ada04900945b68e59c33637fd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/memory-before.txt": {
+        "bytes": 102,
+        "sha256": "da96c90f733b5d9e14d92c191eb61fbe6716e59ada04900945b68e59c33637fd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/summary.json.gz": {
+        "bytes": 23074,
+        "sha256": "38d670f86f7a8dafbcda423cc722bf1d418be3d197f9e47da9bb80477aca0e4b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/summary.txt": {
+        "bytes": 4225,
+        "sha256": "7653c8e10e8bb48f6923ca5113a6d2913de235332fd0b163bdb2288727647a42"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/vm-after.txt": {
+        "bytes": 1247,
+        "sha256": "a9cf1c6b8fd7c8306b31dc73dde704ef3c49d895e9be8af7b1a51d7c0ffb857f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/vm-before.txt": {
+        "bytes": 1247,
+        "sha256": "742160b09766e2fdf49a812c4c2122ee0ec218f9e7aeda46f0bf3f348c4d985c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm.txt": {
+        "bytes": 5150,
+        "sha256": "e5c1df5945eb44590adf5518d1950b12d7a7dec0f174731837d55ef844336e07"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/bytes_length_index-verify.py": {
+        "bytes": 427,
+        "sha256": "ff700aa022d2be5666e3f50c049e87a9ddb3c057e1019b99cec5aceb589c2c0c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/bytes_length_index.py": {
+        "bytes": 195,
+        "sha256": "dcf403aaeee494bc655b810384f89de1a6679663def486d962c9e13c6869ce6f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/preparation.json": {
+        "bytes": 2719,
+        "sha256": "fc876afcedac7c79000e3f34d4455e29de95d467f19f0bef08f4f526c615399b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/shared_value_calls-verify.py": {
+        "bytes": 427,
+        "sha256": "ea7c5212bdba0731e2664f7c9e52c048275b882166f71820873c566fdaa52cbb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/shared_value_calls.py": {
+        "bytes": 272,
+        "sha256": "0ba4817d9ad464a5f141ce4b8891e581e25018f8a023213f9a6246cc1dc84dca"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/string_dictionary_lookup-verify.py": {
+        "bytes": 433,
+        "sha256": "4a73f7691b4475929ae35aed02b5e4bb69d5d257b3477b0d2351de4502616118"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/string_dictionary_lookup.py": {
+        "bytes": 231,
+        "sha256": "0e73b722b56450d3ba64c745a49907f2adb634c4c7af9080e4761ed9795550f4"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/string_length_index-verify.py": {
+        "bytes": 428,
+        "sha256": "b7405ef1b6ac5dba797d5a5e4a5c6e53eddd7a1b22d538695b84fd9ebd467ca5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/string_length_index.py": {
+        "bytes": 202,
+        "sha256": "0b826768a0474f04846c7bf52d900ef2088caaa890feb57700b767b39840c8b8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/surrogate_length_index-verify.py": {
+        "bytes": 431,
+        "sha256": "0890dfa435b5b6c0c5c6aa95115a67e439030ae80d443f5af8afb0ddd53cbc5a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/surrogate_length_index.py": {
+        "bytes": 201,
+        "sha256": "50e2116479d76b3f7e1bb96cccb380b9bee657fd97f95a5a370e1a0321245e42"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/tuple_hash_lookup-verify.py": {
+        "bytes": 426,
+        "sha256": "b2adfa6845d0fcba489c1fabfc251ac2672f2e1f8ea97f7e0fc70b1d886f8089"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/tuple_hash_lookup.py": {
+        "bytes": 218,
+        "sha256": "0f0a310265c308a53e0663f5c95acb1b2f5ae879b883d327dd0f570b58a4ef50"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/tuple_length_index-verify.py": {
+        "bytes": 427,
+        "sha256": "08daa95a3e7b9e3d7b0dfe26b16d89c913b2e7d57b235bffd14703b182b1a68e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/inputs/tuple_length_index.py": {
+        "bytes": 194,
+        "sha256": "b975dd1cc2e13fd2d8a4ca6ce76a52f20c3bf7c4aba667764ac424abf4723a7f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-previous/warm/measurements.json.gz": {
+        "bytes": 16249,
+        "sha256": "bf8c1dc72d3ce283193f4f3adf87faed5eaf48f0b1d10e7b8c95fbc462f86842"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold.txt": {
+        "bytes": 11844,
+        "sha256": "45f3ddf28c4c5e014cc67ff9c3646ea587667415b4c931e006c04554f8814e00"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/integer_population-verify.py": {
+        "bytes": 429,
+        "sha256": "4bb7548116da8ecf5f51963ac4886bf1ebd0b0b600ebcfd6a32b9a15a4ed58bb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/integer_population.py": {
+        "bytes": 451,
+        "sha256": "d8d10770664383226c788cce05fbbac21799cf94743da8b08aa936a14fa77c7e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/preparation.json": {
+        "bytes": 7545,
+        "sha256": "359c365940185a23955d502194bf8ea1d820454032995b76f546a4527e28ca30"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/shared_bytes_population-verify.py": {
+        "bytes": 434,
+        "sha256": "7e7a4f9752f1ef43f90d7af15c27212f74b4ac3dde808fe01c9839c10c1adaba"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/shared_bytes_population.py": {
+        "bytes": 507,
+        "sha256": "b8a5c162a62ea6c448f7173a05ba874f4c7c871d5dd8a2b74919d74f40ffe10f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/shared_dictionary_population-verify.py": {
+        "bytes": 439,
+        "sha256": "75108f5152f06ad39f2a813ce536d60c60cd92a080cff731aacbcbb26311b58b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/shared_dictionary_population.py": {
+        "bytes": 529,
+        "sha256": "222f7e3ad9f8e4f50bf84030dd08f05a38117c1b31aae7f1e0a5c6032a0efd7a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/shared_string_population-verify.py": {
+        "bytes": 435,
+        "sha256": "d7878d2862078b5a2e5ee94a31e9457190aa01ef84c8e78333427f6929d0ef8a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/shared_string_population.py": {
+        "bytes": 522,
+        "sha256": "cc744ddeaf1b9010d9e438e67a350f3622ce371143b02265225aa0041aa6130a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/shared_tuple_population-verify.py": {
+        "bytes": 434,
+        "sha256": "407b0e142f29f15df4c445b0023f4385b72994cb2d04f47a476a8c54a9765405"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/shared_tuple_population.py": {
+        "bytes": 506,
+        "sha256": "3629a992d77d7e7e14a4c5c2c4aa269103e2ae56ebdb3b07d0778db5462e6a77"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_ascii_129-verify.py": {
+        "bytes": 427,
+        "sha256": "317cd159b2110ff95daea9ef6411e2a794cd4e77c31f873265ce6378b25197d3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_ascii_129.py": {
+        "bytes": 511,
+        "sha256": "216330cecd8468e0ae8db58eefff078a9390f753b3de844dc48a4b38267d72d7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_ascii_17-verify.py": {
+        "bytes": 426,
+        "sha256": "bd1a50a239940270a251bd98e455b8c78dd70fcbb2336f84668f77819673a477"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_ascii_17.py": {
+        "bytes": 510,
+        "sha256": "8759f62b35fbf17c5db78ae03f09e71b1bb454c8464240e1c69404109edb604a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_ascii_33-verify.py": {
+        "bytes": 426,
+        "sha256": "bd3995b7b2eec2f1efa68b30a82d751974830e26308d255b164290983ab39d41"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_ascii_33.py": {
+        "bytes": 510,
+        "sha256": "12d7214a9fb7e876e1941ff447be7054d97b509c42c28012a445f3b674379c82"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_ascii_7-verify.py": {
+        "bytes": 425,
+        "sha256": "29f78a35d5ec43f60683e2d1638a3b1a776c799bd075b4fd7661f853c5367e98"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_ascii_7.py": {
+        "bytes": 509,
+        "sha256": "8a63ec4fd54209a6c3821446297b0331e6a7cccc80906f096df709a2e5c392b8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_ascii_9-verify.py": {
+        "bytes": 425,
+        "sha256": "e8f44609dad99c7814d935a20ffddd40d5d80640b07cc9f6f77e32b221a94b46"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_ascii_9.py": {
+        "bytes": 509,
+        "sha256": "3c69135e76155e9e8744677e218ff62b27f22ba5d0294ebd4fcdc1b1d59e2436"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_bytes_129-verify.py": {
+        "bytes": 427,
+        "sha256": "bb036bdfa2fdcf12230bfeada5966f7d414eee08ed1be98d0a04989c1c309136"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_bytes_129.py": {
+        "bytes": 540,
+        "sha256": "ef075758bca0ffb344fe490ccfee4734de9f09685d2f6adb2e87f49d806a5838"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_bytes_17-verify.py": {
+        "bytes": 426,
+        "sha256": "260ab6e630c65808404a341ca2e8fdcce6d37f004a59c5b700d3346f9fa73cc1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_bytes_17.py": {
+        "bytes": 539,
+        "sha256": "dd25d5dc11d43a5087bc1db8be708d594469bef8e6246d87468f1af823e616f2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_bytes_3-verify.py": {
+        "bytes": 425,
+        "sha256": "b5f9c9116b2d5dbfca5a5261bc3e45cee77e3fb26ce088cef100e485f87f3ea9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_bytes_3.py": {
+        "bytes": 538,
+        "sha256": "e5fc8a7140c457a3167cbc2886d94446e7a473282f911b171d7a8483411d0c50"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_bytes_33-verify.py": {
+        "bytes": 426,
+        "sha256": "b6763691e953fa4b22268758a5f07181d940d48c85fb1f43937e9eabb732f952"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_bytes_33.py": {
+        "bytes": 539,
+        "sha256": "9086c13e456fad16e896dcb11d34db18646d69111a36eb087794c38197e80322"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_bytes_9-verify.py": {
+        "bytes": 425,
+        "sha256": "0e22414699042c82c188ab597801b88463339c385ab8940cbf895474d5a014e8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_bytes_9.py": {
+        "bytes": 538,
+        "sha256": "5c883a335a6567db670547ca6526634dcea9051202a34caddc0381a523b71ba6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_surrogate-verify.py": {
+        "bytes": 427,
+        "sha256": "c1e8617f5908eac9977bd4086c2a00cd795f20b179fbe80e2e9d5ebf83664d43"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_surrogate.py": {
+        "bytes": 506,
+        "sha256": "9ba8d100d8d9d711719d56b5c8742f54913442a876d13696f1306ae7c2dfd033"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_tuple_1-verify.py": {
+        "bytes": 425,
+        "sha256": "f76b08aecfcc411971e3f6984f048fa3c73a1f9b073ca38394e84f42b7695a07"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_tuple_1.py": {
+        "bytes": 499,
+        "sha256": "812ab458fa455da8e36a24618c56fc4bf2dd0c4e737d24079548ed62c21c7b30"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_tuple_2-verify.py": {
+        "bytes": 425,
+        "sha256": "d3ece84913a1a3b6af2b8075895639f7e32a4d8127c63318b62aafd69c6d2848"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_tuple_2.py": {
+        "bytes": 499,
+        "sha256": "7cb22f735abed8fe7c68f0d702d913d1a958603e60da0f37cdc5dba6b0ddbb94"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_tuple_8-verify.py": {
+        "bytes": 425,
+        "sha256": "423a229f6eae74158f394c3b3c5cf42f5cf12e8a2392875b0e367ede528d3e1f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_tuple_8.py": {
+        "bytes": 499,
+        "sha256": "c6c019720d78472b74e37120a45e90c8689d413e9591fdbff1afc4f14646315f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_unicode-verify.py": {
+        "bytes": 425,
+        "sha256": "23459b093f2b920f3ecfba290c8cec4d74883f7d53b0590690e10e3e0ad77be9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/inputs/unique_unicode.py": {
+        "bytes": 528,
+        "sha256": "ba4c636a9c6ce908e0568073ca0fdef5c746d20d5de1c255ea96d643371a5606"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/cold/measurements.json.gz": {
+        "bytes": 36014,
+        "sha256": "a33bcb6f311f8c280ace227fd6be53aab1008de6024ed0b8a6a5472cc17bb02f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/memory-after.txt": {
+        "bytes": 102,
+        "sha256": "da96c90f733b5d9e14d92c191eb61fbe6716e59ada04900945b68e59c33637fd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/memory-before.txt": {
+        "bytes": 102,
+        "sha256": "da96c90f733b5d9e14d92c191eb61fbe6716e59ada04900945b68e59c33637fd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/summary.json.gz": {
+        "bytes": 23071,
+        "sha256": "edfc64061b466368516acc3207f5cdd856f953e1a71352ec52f555eaea7fd6f2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/summary.txt": {
+        "bytes": 4228,
+        "sha256": "e39091371a9df9d49ff586d21070191d2fc4f9a43f38f8c106e7cf031c5fe9e8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/vm-after.txt": {
+        "bytes": 1247,
+        "sha256": "8113961d8b17effe888d5b3415a0bc9413ccf67399f4b6dbe5d6599a8e331221"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/vm-before.txt": {
+        "bytes": 1247,
+        "sha256": "da29d48721742522d127b773451014a2e747388875c531d3090c7755a4d60976"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm.txt": {
+        "bytes": 5125,
+        "sha256": "8a49ecaaa46d6288677474da25bcf3e2761ffc230e5b16e5e1fc7797fd62f9e8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/bytes_length_index-verify.py": {
+        "bytes": 427,
+        "sha256": "ff700aa022d2be5666e3f50c049e87a9ddb3c057e1019b99cec5aceb589c2c0c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/bytes_length_index.py": {
+        "bytes": 195,
+        "sha256": "dcf403aaeee494bc655b810384f89de1a6679663def486d962c9e13c6869ce6f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/preparation.json": {
+        "bytes": 2719,
+        "sha256": "fc876afcedac7c79000e3f34d4455e29de95d467f19f0bef08f4f526c615399b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/shared_value_calls-verify.py": {
+        "bytes": 427,
+        "sha256": "ea7c5212bdba0731e2664f7c9e52c048275b882166f71820873c566fdaa52cbb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/shared_value_calls.py": {
+        "bytes": 272,
+        "sha256": "0ba4817d9ad464a5f141ce4b8891e581e25018f8a023213f9a6246cc1dc84dca"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/string_dictionary_lookup-verify.py": {
+        "bytes": 433,
+        "sha256": "4a73f7691b4475929ae35aed02b5e4bb69d5d257b3477b0d2351de4502616118"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/string_dictionary_lookup.py": {
+        "bytes": 231,
+        "sha256": "0e73b722b56450d3ba64c745a49907f2adb634c4c7af9080e4761ed9795550f4"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/string_length_index-verify.py": {
+        "bytes": 428,
+        "sha256": "b7405ef1b6ac5dba797d5a5e4a5c6e53eddd7a1b22d538695b84fd9ebd467ca5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/string_length_index.py": {
+        "bytes": 202,
+        "sha256": "0b826768a0474f04846c7bf52d900ef2088caaa890feb57700b767b39840c8b8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/surrogate_length_index-verify.py": {
+        "bytes": 431,
+        "sha256": "0890dfa435b5b6c0c5c6aa95115a67e439030ae80d443f5af8afb0ddd53cbc5a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/surrogate_length_index.py": {
+        "bytes": 201,
+        "sha256": "50e2116479d76b3f7e1bb96cccb380b9bee657fd97f95a5a370e1a0321245e42"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/tuple_hash_lookup-verify.py": {
+        "bytes": 426,
+        "sha256": "b2adfa6845d0fcba489c1fabfc251ac2672f2e1f8ea97f7e0fc70b1d886f8089"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/tuple_hash_lookup.py": {
+        "bytes": 218,
+        "sha256": "0f0a310265c308a53e0663f5c95acb1b2f5ae879b883d327dd0f570b58a4ef50"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/tuple_length_index-verify.py": {
+        "bytes": 427,
+        "sha256": "08daa95a3e7b9e3d7b0dfe26b16d89c913b2e7d57b235bffd14703b182b1a68e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/inputs/tuple_length_index.py": {
+        "bytes": 194,
+        "sha256": "b975dd1cc2e13fd2d8a4ca6ce76a52f20c3bf7c4aba667764ac424abf4723a7f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/focused-retained-isolated/warm/measurements.json.gz": {
+        "bytes": 16399,
+        "sha256": "b0532b7bdc38e696fc94bcc58638c37b6afdaa64d8baf2c36a85364009ca1189"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-previous-isolated/memory-after.txt": {
+        "bytes": 102,
+        "sha256": "da96c90f733b5d9e14d92c191eb61fbe6716e59ada04900945b68e59c33637fd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-previous-isolated/memory-before.txt": {
+        "bytes": 102,
+        "sha256": "da96c90f733b5d9e14d92c191eb61fbe6716e59ada04900945b68e59c33637fd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-previous-isolated/stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-previous-isolated/startup.json.gz": {
+        "bytes": 24307,
+        "sha256": "e51c4b5eeb11049b1b423f7c8b6c5885719f3e3e5149ed04e76ed6a88f38ea7f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-previous-isolated/startup.txt": {
+        "bytes": 2076,
+        "sha256": "58601509d631281941013fc596c4100eb5a04c40eef8468963dc88c6aaff9007"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-previous-isolated/suite.json.gz": {
+        "bytes": 30097,
+        "sha256": "5a152b0ed678ec9a58bd6c6947fc04da041c00d63a4f5df623a280e326638fc9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-previous-isolated/suite.txt": {
+        "bytes": 2143,
+        "sha256": "9947fa6cd34aea5590dea53ffe56bbb972d03be8bab07c69e2351f726b45a53d"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-previous-isolated/summary.json": {
+        "bytes": 25692,
+        "sha256": "de415d8e6c2e9672475319bc855adfe26410c1e656bab0134fb755a38e66826c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-previous-isolated/summary.txt": {
+        "bytes": 3761,
+        "sha256": "521eed55b93e8c4d8210ed53641b6ad734cfd27efe3d209b253229ae9d03dff6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-previous-isolated/vm-after.txt": {
+        "bytes": 1247,
+        "sha256": "9ca02e3f8fb8934dcb8366b49211fbca824442b54c3b7815252f9d167a75afba"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-previous-isolated/vm-before.txt": {
+        "bytes": 1247,
+        "sha256": "e3d2a1a5de02dc5665a0f87a4223795753bda6c132bb51c21d48a6a0366916e7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-retained-isolated/memory-after.txt": {
+        "bytes": 102,
+        "sha256": "da96c90f733b5d9e14d92c191eb61fbe6716e59ada04900945b68e59c33637fd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-retained-isolated/memory-before.txt": {
+        "bytes": 102,
+        "sha256": "da96c90f733b5d9e14d92c191eb61fbe6716e59ada04900945b68e59c33637fd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-retained-isolated/stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-retained-isolated/startup.json.gz": {
+        "bytes": 24414,
+        "sha256": "ea588170ab2e3287bdffd536e13f1bcdab0464af5d00d45f7745b2774a70e2db"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-retained-isolated/startup.txt": {
+        "bytes": 2078,
+        "sha256": "bdb38794ea39cdd7fef25ff046fe06bacc30db294885848f404101b19bc41e69"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-retained-isolated/suite.json.gz": {
+        "bytes": 30343,
+        "sha256": "52f9e5ffcc63df556318d1d1259dda76516ee0b910ab06b155238b0900298280"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-retained-isolated/suite.txt": {
+        "bytes": 2143,
+        "sha256": "72328d9c74ce40a9b0352eca0a5d3a40960ddaa5236a5b255ed0bc29b92b0b56"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-retained-isolated/summary.json": {
+        "bytes": 25736,
+        "sha256": "4cfffb36a45c0e9abf9d26b8d6ea3a9bdfe13935866846c5b794777c0e9b6ae0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-retained-isolated/summary.txt": {
+        "bytes": 3766,
+        "sha256": "0c5873f0594b2b6416f497488400e7fea87e52af4eb8ce93b73247e5f6dc5fda"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-retained-isolated/vm-after.txt": {
+        "bytes": 1247,
+        "sha256": "2cd478f6ef90322164b27ee78331f7b4e543505701d4895223ecb05b149551b1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/full-retained-isolated/vm-before.txt": {
+        "bytes": 1247,
+        "sha256": "b3267d8247de759c7a675d0b936538be0af882c831a9a1716f887645ffe27713"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/index.json": {
+        "bytes": 331364,
+        "sha256": "c400bf8d0282d07ad2ff7c019a8c4bbf48e12ddac5783512aed0fdec9c00640a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/correction/target/compact-arc-clone-measurement-correction.md": {
+        "bytes": 2463,
+        "sha256": "f0cd52c2df1a08bef7b8554573608a5bbe0ff5e822cadf8f2dcd841cb305ad41"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/correction/target/run_serial_performance_gate.py": {
+        "bytes": 1677,
+        "sha256": "791e61b162e783747d22a7b2def038c39d769592b4be6bebfa337b884e48cd00"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/crates/weavepy-bench/census/2026-09-runtime-metadata/validate.py": {
+        "bytes": 11497,
+        "sha256": "26e60cb09f5938425c37ac1e77ed20e94e91f83aca862b74f55e187194941ff3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/build_compact_arc_clone.sh": {
+        "bytes": 1329,
+        "sha256": "2012eebee21d286a87612adad3d3ce41988f66c762c44dcc144618ec3dd2a88f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/capture_runtime_environment.py": {
+        "bytes": 6280,
+        "sha256": "3ce82f607c69a98eb67569c3db45fcbf73ba2ab79a856a7d6da1e2f46a6d8301"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/check_compact_arc_clone.sh": {
+        "bytes": 1797,
+        "sha256": "542f4f058c785cf7b1a388e566aadfcb492be1c2aac5081beb752495d65ad7b2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/check_compact_arc_clone_extra.py": {
+        "bytes": 2936,
+        "sha256": "07dc64702871d1822ce1b5660a9c955f1a107f4e774b32c474fd260c077e060a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/compact-arc-clone-integrated-miri-report.json": {
+        "bytes": 1077,
+        "sha256": "89ec2a8e3acda3511fb26ef2e0ee5c7c6501e0da24e1b2354b3575eed00308ff"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/compact-arc-clone-protocol.md": {
+        "bytes": 3320,
+        "sha256": "14d80101c20c752033f03975548ce4bfd31a567a730219b1f8dfd3f227d75d07"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/freeze_compact_arc_clone_sources.py": {
+        "bytes": 1946,
+        "sha256": "41957bcef45796bd0a84a51246c10e2675c2fc48c6cf67263992af712b974801"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/freeze_runtime_candidate.py": {
+        "bytes": 2507,
+        "sha256": "73f03bad9c719dc933cc6c60c0cc36950b681fd85d370d037097d8fe9550e881"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/measure_compact_arc_clone_focused.sh": {
+        "bytes": 1176,
+        "sha256": "c52720b4e575a81d407ee04eb9bbc71a046eb5c4823e59313dbeb0e74a5f33fa"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/measure_compact_arc_clone_full.sh": {
+        "bytes": 1265,
+        "sha256": "cc3fefec708023524a39e78114859baa44c7fec5f85451cabf97a5f414d0a678"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/measure_verified_python_components.py": {
+        "bytes": 4981,
+        "sha256": "2e7cf9d837886a596d8532f0252a9ac5e57d93d4a5cb7964f92846393580c6e7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/run_performance_under_load_gate.py": {
+        "bytes": 3259,
+        "sha256": "92bbbd8cc196407fc0db2e54eecd58822f9226e2887ef0a69c11cad6e870d1d0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/shared_slot_keys_startup_probes.py": {
+        "bytes": 7330,
+        "sha256": "c89b7ce2541f025882bf592dabd29eccb96fe5e0bf50fa1f4fb670564d0bc2ce"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/summarize_compact_arc_clone.py": {
+        "bytes": 1794,
+        "sha256": "47f7a70c99a978257601799de590d86b5efa99eeea3f0d7159a9988825d27d99"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/summarize_runtime_suite.py": {
+        "bytes": 2919,
+        "sha256": "e0fcbfce1ef9c793701d78724289d37382e848b991737d3b9fcdc18c9ef1f804"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-capi-selection.toml": {
+        "bytes": 272,
+        "sha256": "6fd914f56be9a46f2f5df9a916ffc5c6bfda7e6d13083b98e2c9f5485ef6823a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/integer_population-verify.py": {
+        "bytes": 429,
+        "sha256": "4bb7548116da8ecf5f51963ac4886bf1ebd0b0b600ebcfd6a32b9a15a4ed58bb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/integer_population.py": {
+        "bytes": 451,
+        "sha256": "d8d10770664383226c788cce05fbbac21799cf94743da8b08aa936a14fa77c7e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/preparation.json": {
+        "bytes": 7545,
+        "sha256": "359c365940185a23955d502194bf8ea1d820454032995b76f546a4527e28ca30"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/shared_bytes_population-verify.py": {
+        "bytes": 434,
+        "sha256": "7e7a4f9752f1ef43f90d7af15c27212f74b4ac3dde808fe01c9839c10c1adaba"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/shared_bytes_population.py": {
+        "bytes": 507,
+        "sha256": "b8a5c162a62ea6c448f7173a05ba874f4c7c871d5dd8a2b74919d74f40ffe10f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/shared_dictionary_population-verify.py": {
+        "bytes": 439,
+        "sha256": "75108f5152f06ad39f2a813ce536d60c60cd92a080cff731aacbcbb26311b58b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/shared_dictionary_population.py": {
+        "bytes": 529,
+        "sha256": "222f7e3ad9f8e4f50bf84030dd08f05a38117c1b31aae7f1e0a5c6032a0efd7a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/shared_string_population-verify.py": {
+        "bytes": 435,
+        "sha256": "d7878d2862078b5a2e5ee94a31e9457190aa01ef84c8e78333427f6929d0ef8a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/shared_string_population.py": {
+        "bytes": 522,
+        "sha256": "cc744ddeaf1b9010d9e438e67a350f3622ce371143b02265225aa0041aa6130a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/shared_tuple_population-verify.py": {
+        "bytes": 434,
+        "sha256": "407b0e142f29f15df4c445b0023f4385b72994cb2d04f47a476a8c54a9765405"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/shared_tuple_population.py": {
+        "bytes": 506,
+        "sha256": "3629a992d77d7e7e14a4c5c2c4aa269103e2ae56ebdb3b07d0778db5462e6a77"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_ascii_129-verify.py": {
+        "bytes": 427,
+        "sha256": "317cd159b2110ff95daea9ef6411e2a794cd4e77c31f873265ce6378b25197d3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_ascii_129.py": {
+        "bytes": 511,
+        "sha256": "216330cecd8468e0ae8db58eefff078a9390f753b3de844dc48a4b38267d72d7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_ascii_17-verify.py": {
+        "bytes": 426,
+        "sha256": "bd1a50a239940270a251bd98e455b8c78dd70fcbb2336f84668f77819673a477"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_ascii_17.py": {
+        "bytes": 510,
+        "sha256": "8759f62b35fbf17c5db78ae03f09e71b1bb454c8464240e1c69404109edb604a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_ascii_33-verify.py": {
+        "bytes": 426,
+        "sha256": "bd3995b7b2eec2f1efa68b30a82d751974830e26308d255b164290983ab39d41"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_ascii_33.py": {
+        "bytes": 510,
+        "sha256": "12d7214a9fb7e876e1941ff447be7054d97b509c42c28012a445f3b674379c82"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_ascii_7-verify.py": {
+        "bytes": 425,
+        "sha256": "29f78a35d5ec43f60683e2d1638a3b1a776c799bd075b4fd7661f853c5367e98"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_ascii_7.py": {
+        "bytes": 509,
+        "sha256": "8a63ec4fd54209a6c3821446297b0331e6a7cccc80906f096df709a2e5c392b8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_ascii_9-verify.py": {
+        "bytes": 425,
+        "sha256": "e8f44609dad99c7814d935a20ffddd40d5d80640b07cc9f6f77e32b221a94b46"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_ascii_9.py": {
+        "bytes": 509,
+        "sha256": "3c69135e76155e9e8744677e218ff62b27f22ba5d0294ebd4fcdc1b1d59e2436"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_bytes_129-verify.py": {
+        "bytes": 427,
+        "sha256": "bb036bdfa2fdcf12230bfeada5966f7d414eee08ed1be98d0a04989c1c309136"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_bytes_129.py": {
+        "bytes": 540,
+        "sha256": "ef075758bca0ffb344fe490ccfee4734de9f09685d2f6adb2e87f49d806a5838"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_bytes_17-verify.py": {
+        "bytes": 426,
+        "sha256": "260ab6e630c65808404a341ca2e8fdcce6d37f004a59c5b700d3346f9fa73cc1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_bytes_17.py": {
+        "bytes": 539,
+        "sha256": "dd25d5dc11d43a5087bc1db8be708d594469bef8e6246d87468f1af823e616f2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_bytes_3-verify.py": {
+        "bytes": 425,
+        "sha256": "b5f9c9116b2d5dbfca5a5261bc3e45cee77e3fb26ce088cef100e485f87f3ea9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_bytes_3.py": {
+        "bytes": 538,
+        "sha256": "e5fc8a7140c457a3167cbc2886d94446e7a473282f911b171d7a8483411d0c50"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_bytes_33-verify.py": {
+        "bytes": 426,
+        "sha256": "b6763691e953fa4b22268758a5f07181d940d48c85fb1f43937e9eabb732f952"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_bytes_33.py": {
+        "bytes": 539,
+        "sha256": "9086c13e456fad16e896dcb11d34db18646d69111a36eb087794c38197e80322"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_bytes_9-verify.py": {
+        "bytes": 425,
+        "sha256": "0e22414699042c82c188ab597801b88463339c385ab8940cbf895474d5a014e8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_bytes_9.py": {
+        "bytes": 538,
+        "sha256": "5c883a335a6567db670547ca6526634dcea9051202a34caddc0381a523b71ba6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_surrogate-verify.py": {
+        "bytes": 427,
+        "sha256": "c1e8617f5908eac9977bd4086c2a00cd795f20b179fbe80e2e9d5ebf83664d43"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_surrogate.py": {
+        "bytes": 506,
+        "sha256": "9ba8d100d8d9d711719d56b5c8742f54913442a876d13696f1306ae7c2dfd033"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_tuple_1-verify.py": {
+        "bytes": 425,
+        "sha256": "f76b08aecfcc411971e3f6984f048fa3c73a1f9b073ca38394e84f42b7695a07"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_tuple_1.py": {
+        "bytes": 499,
+        "sha256": "812ab458fa455da8e36a24618c56fc4bf2dd0c4e737d24079548ed62c21c7b30"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_tuple_2-verify.py": {
+        "bytes": 425,
+        "sha256": "d3ece84913a1a3b6af2b8075895639f7e32a4d8127c63318b62aafd69c6d2848"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_tuple_2.py": {
+        "bytes": 499,
+        "sha256": "7cb22f735abed8fe7c68f0d702d913d1a958603e60da0f37cdc5dba6b0ddbb94"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_tuple_8-verify.py": {
+        "bytes": 425,
+        "sha256": "423a229f6eae74158f394c3b3c5cf42f5cf12e8a2392875b0e367ede528d3e1f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_tuple_8.py": {
+        "bytes": 499,
+        "sha256": "c6c019720d78472b74e37120a45e90c8689d413e9591fdbff1afc4f14646315f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_unicode-verify.py": {
+        "bytes": 425,
+        "sha256": "23459b093f2b920f3ecfba290c8cec4d74883f7d53b0590690e10e3e0ad77be9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/cold/unique_unicode.py": {
+        "bytes": 528,
+        "sha256": "ba4c636a9c6ce908e0568073ca0fdef5c746d20d5de1c255ea96d643371a5606"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/warm/bytes_length_index-verify.py": {
+        "bytes": 427,
+        "sha256": "ff700aa022d2be5666e3f50c049e87a9ddb3c057e1019b99cec5aceb589c2c0c"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/warm/bytes_length_index.py": {
+        "bytes": 195,
+        "sha256": "dcf403aaeee494bc655b810384f89de1a6679663def486d962c9e13c6869ce6f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/warm/preparation.json": {
+        "bytes": 2719,
+        "sha256": "fc876afcedac7c79000e3f34d4455e29de95d467f19f0bef08f4f526c615399b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/warm/shared_value_calls-verify.py": {
+        "bytes": 427,
+        "sha256": "ea7c5212bdba0731e2664f7c9e52c048275b882166f71820873c566fdaa52cbb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/warm/shared_value_calls.py": {
+        "bytes": 272,
+        "sha256": "0ba4817d9ad464a5f141ce4b8891e581e25018f8a023213f9a6246cc1dc84dca"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/warm/string_dictionary_lookup-verify.py": {
+        "bytes": 433,
+        "sha256": "4a73f7691b4475929ae35aed02b5e4bb69d5d257b3477b0d2351de4502616118"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/warm/string_dictionary_lookup.py": {
+        "bytes": 231,
+        "sha256": "0e73b722b56450d3ba64c745a49907f2adb634c4c7af9080e4761ed9795550f4"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/warm/string_length_index-verify.py": {
+        "bytes": 428,
+        "sha256": "b7405ef1b6ac5dba797d5a5e4a5c6e53eddd7a1b22d538695b84fd9ebd467ca5"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/warm/string_length_index.py": {
+        "bytes": 202,
+        "sha256": "0b826768a0474f04846c7bf52d900ef2088caaa890feb57700b767b39840c8b8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/warm/surrogate_length_index-verify.py": {
+        "bytes": 431,
+        "sha256": "0890dfa435b5b6c0c5c6aa95115a67e439030ae80d443f5af8afb0ddd53cbc5a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/warm/surrogate_length_index.py": {
+        "bytes": 201,
+        "sha256": "50e2116479d76b3f7e1bb96cccb380b9bee657fd97f95a5a370e1a0321245e42"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/warm/tuple_hash_lookup-verify.py": {
+        "bytes": 426,
+        "sha256": "b2adfa6845d0fcba489c1fabfc251ac2672f2e1f8ea97f7e0fc70b1d886f8089"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/warm/tuple_hash_lookup.py": {
+        "bytes": 218,
+        "sha256": "0f0a310265c308a53e0663f5c95acb1b2f5ae879b883d327dd0f570b58a4ef50"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/warm/tuple_length_index-verify.py": {
+        "bytes": 427,
+        "sha256": "08daa95a3e7b9e3d7b0dfe26b16d89c913b2e7d57b235bffd14703b182b1a68e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/thin-value-storage-inputs/warm/tuple_length_index.py": {
+        "bytes": 194,
+        "sha256": "b975dd1cc2e13fd2d8a4ca6ce76a52f20c3bf7c4aba667764ac424abf4723a7f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/validate_compact_arc_clone.sh": {
+        "bytes": 673,
+        "sha256": "3cfe4c7a1725acd63019eb910a4f0467880aa0a9c5359a3d3a45d64d4a333714"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/target/verify_compact_arc_clone_ready.py": {
+        "bytes": 1859,
+        "sha256": "5e465b124dd1bba006863c80eb121e5defdf5f19b8ee041c36da5213570d0a88"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/tests/regrtest/expectations.toml": {
+        "bytes": 153374,
+        "sha256": "b93cbb43a62558f426d80434efaa673c1e3e235cfadb0aa9442fc2719ec134ca"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/methods/original/tools/bench_compare.py": {
+        "bytes": 12860,
+        "sha256": "1cdb0ae49378d06c26d61668e0004efd03c8e768bc87be57a60b56ea29df33d7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold.txt": {
+        "bytes": 9739,
+        "sha256": "207e2ed80b0e78e4d5d652e713dac52ebc68933292f34a0004bf4db00aac8553"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/integer_population-verify.py": {
+        "bytes": 429,
+        "sha256": "4bb7548116da8ecf5f51963ac4886bf1ebd0b0b600ebcfd6a32b9a15a4ed58bb"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/integer_population.py": {
+        "bytes": 451,
+        "sha256": "d8d10770664383226c788cce05fbbac21799cf94743da8b08aa936a14fa77c7e"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/preparation.json": {
+        "bytes": 7545,
+        "sha256": "359c365940185a23955d502194bf8ea1d820454032995b76f546a4527e28ca30"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/shared_bytes_population-verify.py": {
+        "bytes": 434,
+        "sha256": "7e7a4f9752f1ef43f90d7af15c27212f74b4ac3dde808fe01c9839c10c1adaba"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/shared_bytes_population.py": {
+        "bytes": 507,
+        "sha256": "b8a5c162a62ea6c448f7173a05ba874f4c7c871d5dd8a2b74919d74f40ffe10f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/shared_dictionary_population-verify.py": {
+        "bytes": 439,
+        "sha256": "75108f5152f06ad39f2a813ce536d60c60cd92a080cff731aacbcbb26311b58b"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/shared_dictionary_population.py": {
+        "bytes": 529,
+        "sha256": "222f7e3ad9f8e4f50bf84030dd08f05a38117c1b31aae7f1e0a5c6032a0efd7a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/shared_string_population-verify.py": {
+        "bytes": 435,
+        "sha256": "d7878d2862078b5a2e5ee94a31e9457190aa01ef84c8e78333427f6929d0ef8a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/shared_string_population.py": {
+        "bytes": 522,
+        "sha256": "cc744ddeaf1b9010d9e438e67a350f3622ce371143b02265225aa0041aa6130a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/shared_tuple_population-verify.py": {
+        "bytes": 434,
+        "sha256": "407b0e142f29f15df4c445b0023f4385b72994cb2d04f47a476a8c54a9765405"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/shared_tuple_population.py": {
+        "bytes": 506,
+        "sha256": "3629a992d77d7e7e14a4c5c2c4aa269103e2ae56ebdb3b07d0778db5462e6a77"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_ascii_129-verify.py": {
+        "bytes": 427,
+        "sha256": "317cd159b2110ff95daea9ef6411e2a794cd4e77c31f873265ce6378b25197d3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_ascii_129.py": {
+        "bytes": 511,
+        "sha256": "216330cecd8468e0ae8db58eefff078a9390f753b3de844dc48a4b38267d72d7"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_ascii_17-verify.py": {
+        "bytes": 426,
+        "sha256": "bd1a50a239940270a251bd98e455b8c78dd70fcbb2336f84668f77819673a477"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_ascii_17.py": {
+        "bytes": 510,
+        "sha256": "8759f62b35fbf17c5db78ae03f09e71b1bb454c8464240e1c69404109edb604a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_ascii_33-verify.py": {
+        "bytes": 426,
+        "sha256": "bd3995b7b2eec2f1efa68b30a82d751974830e26308d255b164290983ab39d41"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_ascii_33.py": {
+        "bytes": 510,
+        "sha256": "12d7214a9fb7e876e1941ff447be7054d97b509c42c28012a445f3b674379c82"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_ascii_7-verify.py": {
+        "bytes": 425,
+        "sha256": "29f78a35d5ec43f60683e2d1638a3b1a776c799bd075b4fd7661f853c5367e98"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_ascii_7.py": {
+        "bytes": 509,
+        "sha256": "8a63ec4fd54209a6c3821446297b0331e6a7cccc80906f096df709a2e5c392b8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_ascii_9-verify.py": {
+        "bytes": 425,
+        "sha256": "e8f44609dad99c7814d935a20ffddd40d5d80640b07cc9f6f77e32b221a94b46"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_ascii_9.py": {
+        "bytes": 509,
+        "sha256": "3c69135e76155e9e8744677e218ff62b27f22ba5d0294ebd4fcdc1b1d59e2436"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_bytes_129-verify.py": {
+        "bytes": 427,
+        "sha256": "bb036bdfa2fdcf12230bfeada5966f7d414eee08ed1be98d0a04989c1c309136"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_bytes_129.py": {
+        "bytes": 540,
+        "sha256": "ef075758bca0ffb344fe490ccfee4734de9f09685d2f6adb2e87f49d806a5838"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_bytes_17-verify.py": {
+        "bytes": 426,
+        "sha256": "260ab6e630c65808404a341ca2e8fdcce6d37f004a59c5b700d3346f9fa73cc1"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_bytes_17.py": {
+        "bytes": 539,
+        "sha256": "dd25d5dc11d43a5087bc1db8be708d594469bef8e6246d87468f1af823e616f2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_bytes_3-verify.py": {
+        "bytes": 425,
+        "sha256": "b5f9c9116b2d5dbfca5a5261bc3e45cee77e3fb26ce088cef100e485f87f3ea9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_bytes_3.py": {
+        "bytes": 538,
+        "sha256": "e5fc8a7140c457a3167cbc2886d94446e7a473282f911b171d7a8483411d0c50"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_bytes_33-verify.py": {
+        "bytes": 426,
+        "sha256": "b6763691e953fa4b22268758a5f07181d940d48c85fb1f43937e9eabb732f952"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_bytes_33.py": {
+        "bytes": 539,
+        "sha256": "9086c13e456fad16e896dcb11d34db18646d69111a36eb087794c38197e80322"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_bytes_9-verify.py": {
+        "bytes": 425,
+        "sha256": "0e22414699042c82c188ab597801b88463339c385ab8940cbf895474d5a014e8"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_bytes_9.py": {
+        "bytes": 538,
+        "sha256": "5c883a335a6567db670547ca6526634dcea9051202a34caddc0381a523b71ba6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_surrogate-verify.py": {
+        "bytes": 427,
+        "sha256": "c1e8617f5908eac9977bd4086c2a00cd795f20b179fbe80e2e9d5ebf83664d43"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_surrogate.py": {
+        "bytes": 506,
+        "sha256": "9ba8d100d8d9d711719d56b5c8742f54913442a876d13696f1306ae7c2dfd033"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_tuple_1-verify.py": {
+        "bytes": 425,
+        "sha256": "f76b08aecfcc411971e3f6984f048fa3c73a1f9b073ca38394e84f42b7695a07"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_tuple_1.py": {
+        "bytes": 499,
+        "sha256": "812ab458fa455da8e36a24618c56fc4bf2dd0c4e737d24079548ed62c21c7b30"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_tuple_2-verify.py": {
+        "bytes": 425,
+        "sha256": "d3ece84913a1a3b6af2b8075895639f7e32a4d8127c63318b62aafd69c6d2848"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_tuple_2.py": {
+        "bytes": 499,
+        "sha256": "7cb22f735abed8fe7c68f0d702d913d1a958603e60da0f37cdc5dba6b0ddbb94"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_tuple_8-verify.py": {
+        "bytes": 425,
+        "sha256": "423a229f6eae74158f394c3b3c5cf42f5cf12e8a2392875b0e367ede528d3e1f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_tuple_8.py": {
+        "bytes": 499,
+        "sha256": "c6c019720d78472b74e37120a45e90c8689d413e9591fdbff1afc4f14646315f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_unicode-verify.py": {
+        "bytes": 425,
+        "sha256": "23459b093f2b920f3ecfba290c8cec4d74883f7d53b0590690e10e3e0ad77be9"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/inputs/unique_unicode.py": {
+        "bytes": 528,
+        "sha256": "ba4c636a9c6ce908e0568073ca0fdef5c746d20d5de1c255ea96d643371a5606"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/cold/measurements.json.gz": {
+        "bytes": 29853,
+        "sha256": "48d20f95a14974d8719811cf06a8181c332da797f8b0c5daf859b2b739b80cf2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/memory-before.txt": {
+        "bytes": 102,
+        "sha256": "da96c90f733b5d9e14d92c191eb61fbe6716e59ada04900945b68e59c33637fd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/stage.txt": {
+        "bytes": 23,
+        "sha256": "b29033a9cdb681dad17e78767fcc225cfa18b08484ab5a7b0ba5265abb8bfbd3"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/focused-retained/vm-before.txt": {
+        "bytes": 1247,
+        "sha256": "b27d74de20a856b7977976868e312941f091398c3781fff18436844df61365ab"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/full-previous/memory-after.txt": {
+        "bytes": 102,
+        "sha256": "da96c90f733b5d9e14d92c191eb61fbe6716e59ada04900945b68e59c33637fd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/full-previous/memory-before.txt": {
+        "bytes": 102,
+        "sha256": "da96c90f733b5d9e14d92c191eb61fbe6716e59ada04900945b68e59c33637fd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/full-previous/stage.txt": {
+        "bytes": 5,
+        "sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/full-previous/startup.json.gz": {
+        "bytes": 24223,
+        "sha256": "f51c244db90ca86613cf3ea6f5a3354b50295b25bda7a34681d34167258e6156"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/full-previous/startup.txt": {
+        "bytes": 2071,
+        "sha256": "9abd59c9c07309da98ab976a1ecc10ed9ffd0ce38bdb675d08525f3440ad5d11"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/full-previous/suite.json.gz": {
+        "bytes": 30131,
+        "sha256": "8d9d554d5fa8c11d5949ccf79e24e848359fecd3b176824c2e55a572d1f4e545"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/full-previous/suite.txt": {
+        "bytes": 2143,
+        "sha256": "9807f1cbecd4b5f6f3cc12822aebb03f6cbfed4b4b124e7d314f8ec6aa09db30"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/full-previous/summary.json": {
+        "bytes": 25713,
+        "sha256": "15b68434aa2b85f00ad27a7df14ff270a2a20fe6a7fdaf16f4940c276e89bfbd"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/full-previous/summary.txt": {
+        "bytes": 3769,
+        "sha256": "4c194006dad922bff112f8ef14c656835ab889c720a96d81f2521aabb11ece5a"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/full-previous/vm-after.txt": {
+        "bytes": 1247,
+        "sha256": "26b48a818ae5fbed1c3b66296e081dae6d33bad66ca6f7a146b5fa4892a69470"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/overlap-diagnostics/full-previous/vm-before.txt": {
+        "bytes": 1247,
+        "sha256": "858b16de1c98038479bd2d34b9ba1ad998d94c6bd44a088aa8c140644858530f"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/preimages/index.json": {
+        "bytes": 226,
+        "sha256": "034fc838402f7f6d5f6a6e92ae837e6284ec2b5afe6cb4afe3bafd5d6105c0a0"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/preimages/shared_value.rs": {
+        "bytes": 24236,
+        "sha256": "f8769e8aa6e6de415a5eb4c7b664398e05cbbb196e536465c92f0dbbb437b011"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/preimages/tuple_storage.rs": {
+        "bytes": 6869,
+        "sha256": "5b461aa5403553a865724ac56a906096d5498c5e85fc96078b3f0df467ff60bf"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/validation/float-oracle.json": {
+        "bytes": 14756,
+        "sha256": "25e051a638180680b6bd826dc692b2b8e45f0d77df454b59de02fc4fdd251f74"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/validation/oracles.json": {
+        "bytes": 6778,
+        "sha256": "2d137b860c2ffca2c2f435f9990eb27cff45081e328fd025010675344049bf19"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/validation/validation.json.gz": {
+        "bytes": 14205,
+        "sha256": "3f790e6ebbdfc3ed3602ecb01da1d2eaa8d3675836d5960410cd7d29091a2dd6"
+      },
+      "crates/weavepy-bench/census/2026-09-runtime-metadata/compact-arc-clone/validation/validation.txt": {
+        "bytes": 8085,
+        "sha256": "811ba1fecf53cbf71d1814bea8794681744f6269474357cfdf755fe412827bb5"
+      }
+    }
+  }
+}

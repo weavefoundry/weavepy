@@ -135,3 +135,44 @@ fn scalar_leaf_returns_and_deopts_with_no_embedder_context() {
         }
     }
 }
+
+#[test]
+fn explicit_exit_preserves_operands_and_updated_locals() {
+    use crate::runtime::{JitFrame, JitStatus, SlotTag};
+    let mut tf = function(&[
+        TOp::LoadLocal(0),
+        TOp::PushConstInt(99),
+        TOp::StoreLocal(0),
+        TOp::LoadLocal(1),
+    ]);
+    tf.blocks[0].term = TTerm::Deopt { pc: 17 };
+    assert!(!is_scalar_leaf(&tf));
+    let mut engine = super::JitEngine::new().expect("host ISA");
+    let compiled = engine.compile_tfunc(&tf).expect("compile explicit exit");
+    let mut locals = [41u64, 7];
+    let mut spill = [0u64; 3];
+    let mut tags = [0u32; 3];
+    let mut frame = JitFrame {
+        locals: locals.as_mut_ptr(),
+        n_locals: 2,
+        entry_pc: 0,
+        ret_bits: 0,
+        ret_tag: 0,
+        deopt_pc: 0,
+        stack_spill: spill.as_mut_ptr(),
+        stack_tags: tags.as_mut_ptr(),
+        stack_len: 0,
+        stack_cap: 3,
+        ctx: std::ptr::null_mut(),
+        call_args: std::ptr::null_mut(),
+        call_tags: std::ptr::null_mut(),
+    };
+    // SAFETY: this IR uses only scalar loads/stores and an explicit exit,
+    // needs no helpers, and all buffers fit the live compiled metadata.
+    assert_eq!(unsafe { compiled.enter(&raw mut frame) }, JitStatus::Deopt);
+    assert_eq!(frame.deopt_pc, 17);
+    assert_eq!(frame.stack_len, 2);
+    assert_eq!(&spill[..2], &[41, 7]);
+    assert_eq!(&tags[..2], &[SlotTag::Int as u32; 2]);
+    assert_eq!(locals, [99, 7]);
+}

@@ -1,0 +1,102 @@
+{
+  "binary_sha256": "8899e3679267f571bc5d50167197c8a558e19c5f3278bf3e74df0a8607213284",
+  "symbol": "__RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_",
+  "begin": 4311508964,
+  "end": 4311509732,
+  "command": [
+    "xcrun",
+    "llvm-objdump",
+    "--disassemble",
+    "--no-show-raw-insn",
+    "--start-address=0x100fc67e4",
+    "--stop-address=0x100fc6ae4",
+    "target/release/weavepy-runtime-weakref-shared-keys"
+  ],
+  "sha256": "5a12674c5e849edc6a3b78c933cd850fe3ad9b104674e61c528457c8461b2bac",
+  "direct_malloc_sites": [
+    {
+      "return_offset": 60,
+      "context": [
+        "100fc6808:     \tcsel\tx0, x0, xzr, eq",
+        "100fc680c:     \tb\t0x100fc6a70 <__RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+0x28c>",
+        "100fc6810:     \tmov\tx22, x0",
+        "100fc6814:     \tmov\tw20, #0x18              ; =24",
+        "100fc6818:     \tmov\tw0, #0x18               ; =24",
+        "100fc681c:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+        "100fc6820:     \tmov\tx19, x0"
+      ]
+    },
+    {
+      "return_offset": 128,
+      "context": [
+        "100fc684c:     \tstrb\tw23, [sp, #0xa8]",
+        "100fc6850:     \tmov\tw8, #0x8                ; =8",
+        "100fc6854:     \tstp\tx19, x8, [sp, #0xb0]",
+        "100fc6858:     \tmov\tw20, #0x20              ; =32",
+        "100fc685c:     \tmov\tw0, #0x20               ; =32",
+        "100fc6860:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+        "100fc6864:     \tcbz\tx0, 0x100fc6ab4 <__RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+0x2d0>"
+      ]
+    },
+    {
+      "return_offset": 192,
+      "context": [
+        "100fc688c:     \tstrb\tw23, [sp, #0xc0]",
+        "100fc6890:     \tmov\tw8, #0xf                ; =15",
+        "100fc6894:     \tstp\tx0, x8, [sp, #0xc8]",
+        "100fc6898:     \tmov\tw20, #0x20              ; =32",
+        "100fc689c:     \tmov\tw0, #0x20               ; =32",
+        "100fc68a0:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+        "100fc68a4:     \tcbz\tx0, 0x100fc6a90 <__RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+0x2ac>"
+      ]
+    },
+    {
+      "return_offset": 256,
+      "context": [
+        "100fc68cc:     \tstrb\tw23, [sp, #0xd8]",
+        "100fc68d0:     \tmov\tw8, #0x9                ; =9",
+        "100fc68d4:     \tstp\tx0, x8, [sp, #0xe0]",
+        "100fc68d8:     \tmov\tw20, #0x20              ; =32",
+        "100fc68dc:     \tmov\tw0, #0x20               ; =32",
+        "100fc68e0:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+        "100fc68e4:     \tcbz\tx0, 0x100fc6a98 <__RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+0x2b4>"
+      ]
+    },
+    {
+      "return_offset": 316,
+      "context": [
+        "100fc6908:     \tstrb\tw23, [sp, #0xf0]",
+        "100fc690c:     \tmov\tw8, #0x9                ; =9",
+        "100fc6910:     \tstp\tx0, x8, [sp, #0xf8]",
+        "100fc6914:     \tmov\tw20, #0x18              ; =24",
+        "100fc6918:     \tmov\tw0, #0x18               ; =24",
+        "100fc691c:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+        "100fc6920:     \tcbz\tx0, 0x100fc6aa0 <__RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+0x2bc>"
+      ]
+    },
+    {
+      "return_offset": 376,
+      "context": [
+        "100fc6944:     \tstrb\tw23, [sp, #0x108]",
+        "100fc6948:     \tmov\tw8, #0x8                ; =8",
+        "100fc694c:     \tstp\tx0, x8, [sp, #0x110]",
+        "100fc6950:     \tmov\tw20, #0x20              ; =32",
+        "100fc6954:     \tmov\tw0, #0x20               ; =32",
+        "100fc6958:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+        "100fc695c:     \tcbz\tx0, 0x100fc6aa8 <__RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+0x2c4>"
+      ]
+    },
+    {
+      "return_offset": 444,
+      "context": [
+        "100fc6988:     \tstrb\tw23, [sp, #0x120]",
+        "100fc698c:     \tmov\tw8, #0xc                ; =12",
+        "100fc6990:     \tstp\tx0, x8, [sp, #0x128]",
+        "100fc6994:     \tmov\tw20, #0x20              ; =32",
+        "100fc6998:     \tmov\tw0, #0x20               ; =32",
+        "100fc699c:     \tbl\t0x10100f90c <dyld_stub_binder+0x10100f90c>",
+        "100fc69a0:     \tcbz\tx0, 0x100fc6ab0 <__RINvMs0_NtNtNtNtCs82bWklYMk3w_3std3sys12thread_local6native4lazyINtB6_7StorageANtNtCshqYhlee0Vj9_10weavepy_vm6object7DictKeyj7_uE16get_or_init_slowNvNvNtB1j_16weakref_registry12WRAPPER_KEYS27___rust_std_internal_init_fnEB1j_+0x2cc>"
+      ]
+    }
+  ]
+}

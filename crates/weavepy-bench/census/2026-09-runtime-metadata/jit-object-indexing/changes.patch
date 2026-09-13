@@ -1,0 +1,471 @@
+--- a/crates/weavepy-jit/src/analyze.rs
++++ b/crates/weavepy-jit/src/analyze.rs
+@@ -4145,6 +4145,13 @@
+                 return Ok(());
+             }
+             check_subscr_index(&idx, local_types, changed)?;
++            if cont.ty == JitType::Obj {
++                // Speculate a machine-integer result. The runtime checks
++                // the completed result and parks any other value, so this
++                // never coerces a value or repeats a user lookup.
++                stack.push(SE::known(JitType::Int));
++                return Ok(());
++            }
+             // RFC 0071 WS6 — `bytes[i]` reads a byte as an `Int`.
+             if cont.ty == JitType::Bytes {
+                 stack.push(SE::known(JitType::Int));
+@@ -7523,6 +7530,10 @@
+             if idx != JitType::Int {
+                 return Err(JitVerdict::UnsupportedOpcode("subscript index lane"));
+             }
++            if cont == JitType::Obj {
++                push(TOp::ObjGetItemInt, Some(JitType::Int), stack, stmts);
++                return Ok(());
++            }
+             // RFC 0071 WS6 — `bytes[i]` through the registered helper.
+             if cont == JitType::Bytes {
+                 push(TOp::BytesGetItem, Some(JitType::Int), stack, stmts);
+--- a/crates/weavepy-jit/src/engine.rs
++++ b/crates/weavepy-jit/src/engine.rs
+@@ -281,6 +281,10 @@
+                     runtime::tuple_len_helper_addr(),
+                     "tuple length (no helper registered)",
+                 )),
++                TOp::ObjGetItemInt => Some((
++                    runtime::obj_getitem_int_helper_addr(),
++                    "object subscription (no helper registered)",
++                )),
+                 TOp::UnboxInt { .. } => Some((
+                     runtime::unbox_int_helper_addr(),
+                     "integer guard (no helper registered)",
+--- a/crates/weavepy-jit/src/engine/tests.rs
++++ b/crates/weavepy-jit/src/engine/tests.rs
+@@ -83,6 +83,7 @@
+         },
+         TOp::ListLen,
+         TOp::DynAttrGet { name: 0 },
++        TOp::ObjGetItemInt,
+     ] {
+         assert!(!is_scalar_leaf(&function(&[op])), "{op:?}");
+     }
+@@ -720,3 +721,16 @@
+     assert_eq!(locals[1], 7);
+     assert_eq!(written, [0, 1]);
+ }
++
++#[test]
++fn object_indexing_requires_its_registered_helper() {
++    let mut tf = function(&[TOp::LoadLocal(0), TOp::LoadLocal(1), TOp::ObjGetItemInt]);
++    tf.local_types[0] = Some(JitType::Obj);
++    let mut engine = super::JitEngine::new().unwrap();
++    assert!(matches!(
++        engine.compile_tfunc(&tf),
++        Err(crate::JitVerdict::UnsupportedOpcode(
++            "object subscription (no helper registered)"
++        ))
++    ));
++}
+--- a/crates/weavepy-jit/src/ir.rs
++++ b/crates/weavepy-jit/src/ir.rs
+@@ -544,6 +544,11 @@
+     /// through the opaque-call lane. `name` is the `names` index.
+     /// Cap pressure deopts at this pc.
+     DynAttrGet { name: u32 },
++    /// Generic object subscription with an integer index. The helper runs
++    /// the exact indexing protocol and returns a machine integer unboxed.
++    /// Other results are parked and resume after the completed subscription;
++    /// errors raise at this instruction, without repeating the lookup.
++    ObjGetItemInt,
+     /// RFC 0074 WS4 — the matching `STORE_ATTR` fallback: pops the
+     /// receiver pin (stack top) and the value below it (staged
+     /// through the marshal buffer with its tag), and performs the
+@@ -1480,6 +1485,7 @@
+                 | TOp::PushGlobalObj { .. }
+                 | TOp::CallDyn { .. }
+                 | TOp::DynAttrGet { .. }
++                | TOp::ObjGetItemInt
+                 | TOp::DynAttrSet { .. }
+                 | TOp::Truth
+                 | TOp::ContainsDyn { .. }
+--- a/crates/weavepy-jit/src/lib.rs
++++ b/crates/weavepy-jit/src/lib.rs
+@@ -47,16 +47,17 @@
+     register_contains_dyn_helper, register_dict_helpers, register_dict_iter_helper,
+     register_dyn_attr_helpers, register_global_obj_helper, register_iter_helpers,
+     register_iter_new_helper, register_iter_next_pair_helper, register_list_extra_helpers,
+-    register_list_helpers, register_list_next_helper, register_math_helpers, register_poll_helper,
+-    register_str_format_helpers, register_str_helpers, register_str_method_helper,
+-    register_str_write_helpers, register_truth_helper, register_tuple_read_helpers,
+-    register_unbox_int_helper, AttrGetHelper, AttrSetHelper, BuildListHelper, BuildTupleHelper,
+-    BytesGetHelper, CallDynHelper, CallMethodHelper, CallPyHelper, CallStatus, CellGetHelper,
+-    CellSetHelper, DictAccessHelper, DynAttrHelper, GetIterHelper, IterNextHelper,
+-    IterNextPairHelper, JitFrame, JitStatus, ListAppendHelper, ListGetHelper, ListLenHelper,
+-    ListNextHelper, ListRepeatHelper, ListSetHelper, ListSliceHelper, MathBinaryHelper,
+-    MathUnaryHelper, PollHelper, SlotTag, StrEqHelper, StrLenHelper, StrModHelper, DICT_KEY_INT,
+-    DICT_KEY_STR, DICT_VAL_FLOAT, DICT_VAL_INT, DICT_VAL_OBJ, ITER_ELEM_STR, JIT_POLL_STRIDE,
++    register_list_helpers, register_list_next_helper, register_math_helpers,
++    register_obj_getitem_int_helper, register_poll_helper, register_str_format_helpers,
++    register_str_helpers, register_str_method_helper, register_str_write_helpers,
++    register_truth_helper, register_tuple_read_helpers, register_unbox_int_helper, AttrGetHelper,
++    AttrSetHelper, BuildListHelper, BuildTupleHelper, BytesGetHelper, CallDynHelper,
++    CallMethodHelper, CallPyHelper, CallStatus, CellGetHelper, CellSetHelper, DictAccessHelper,
++    DynAttrHelper, GetIterHelper, IterNextHelper, IterNextPairHelper, JitFrame, JitStatus,
++    ListAppendHelper, ListGetHelper, ListLenHelper, ListNextHelper, ListRepeatHelper,
++    ListSetHelper, ListSliceHelper, MathBinaryHelper, MathUnaryHelper, ObjGetItemIntHelper,
++    PollHelper, SlotTag, StrEqHelper, StrLenHelper, StrModHelper, DICT_KEY_INT, DICT_KEY_STR,
++    DICT_VAL_FLOAT, DICT_VAL_INT, DICT_VAL_OBJ, ITER_ELEM_STR, JIT_POLL_STRIDE,
+ };
+ pub use value::JitType;
+ 
+--- a/crates/weavepy-jit/src/lower.rs
++++ b/crates/weavepy-jit/src/lower.rs
+@@ -918,6 +918,7 @@
+                 int_result,
+             } => self.emit_call_dyn(argc, kwc, names, int_result, stmt.pc),
+             TOp::DynAttrGet { name } => self.emit_dyn_attr_get(name, stmt.pc),
++            TOp::ObjGetItemInt => self.emit_obj_getitem_int(stmt.pc),
+             TOp::DynAttrSet { name } => self.emit_dyn_attr_set(name, stmt.pc),
+             TOp::Truth => self.emit_truth(stmt.pc),
+             TOp::ContainsDyn { negate } => self.emit_contains_dyn(negate, stmt.pc),
+@@ -1263,6 +1264,65 @@
+             .ins()
+             .load(types::I64, trusted, self.frame_ptr, OFF_RET_BITS);
+         self.vstack.push((res, JitType::Obj));
++    }
++
++    /// The integer-result subscription uses the same completed-operation
++    /// statuses as dynamic attributes, with both original operands on reject.
++    fn emit_obj_getitem_int(&mut self, pc: u32) {
++        let trusted = MemFlags::trusted();
++        let snapshot_full = self.vstack.clone();
++        let (index, _) = self.pop();
++        let (pin, _) = self.pop();
++        let snapshot = self.vstack.clone();
++
++        self.writeback_locals();
++
++        let sig = self.list_helper_sig();
++        let helper = self
++            .b
++            .ins()
++            .iconst(self.ptr_ty, runtime::obj_getitem_int_helper_addr() as i64);
++        // Publish the real caller location before a getter can inspect it.
++        let pcv = self.b.ins().iconst(types::I32, i64::from(pc));
++        self.b
++            .ins()
++            .store(trusted, pcv, self.frame_ptr, OFF_DEOPT_PC);
++        let call = self
++            .b
++            .ins()
++            .call_indirect(sig, helper, &[self.frame_ptr, pin, index]);
++        let status = self.b.inst_results(call)[0];
++
++        let ok_b = self.b.create_block();
++        let bad_b = self.b.create_block();
++        let is_ok = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
++        self.b.ins().brif(is_ok, ok_b, &[], bad_b, &[]);
++
++        self.b.switch_to_block(bad_b);
++        let raised_b = self.b.create_block();
++        let not_raised_b = self.b.create_block();
++        let is_raised = self.b.ins().icmp_imm(IntCC::Equal, status, 1);
++        self.b
++            .ins()
++            .brif(is_raised, raised_b, &[], not_raised_b, &[]);
++        self.b.switch_to_block(raised_b);
++        self.emit_exit(pc, &snapshot, JitStatus::Raised);
++        self.b.switch_to_block(not_raised_b);
++        let boxed_b = self.b.create_block();
++        let reject_b = self.b.create_block();
++        let is_boxed = self.b.ins().icmp_imm(IntCC::Equal, status, 2);
++        self.b.ins().brif(is_boxed, boxed_b, &[], reject_b, &[]);
++        self.b.switch_to_block(boxed_b);
++        self.emit_exit(pc + 1, &snapshot, JitStatus::Deopt);
++        self.b.switch_to_block(reject_b);
++        self.emit_exit(pc, &snapshot_full, JitStatus::Deopt);
++
++        self.b.switch_to_block(ok_b);
++        let res = self
++            .b
++            .ins()
++            .load(types::I64, trusted, self.frame_ptr, OFF_RET_BITS);
++        self.vstack.push((res, JitType::Int));
+     }
+ 
+     /// RFC 0074 WS4 — the eager generic attribute store via
+--- a/crates/weavepy-jit/src/runtime.rs
++++ b/crates/weavepy-jit/src/runtime.rs
+@@ -1054,6 +1054,26 @@
+     DYN_ATTR_SET_HELPER.load(std::sync::atomic::Ordering::Acquire)
+ }
+ 
++/// Generic subscription with an integer index and an unboxed integer result.
++/// Arguments are `(frame, receiver_pin, index)`. Statuses follow
++/// [`DynAttrHelper`]: 0 returns integer bits in `ret_bits`, 1 raises at this
++/// instruction, 2 parks an already-computed noninteger or invalidated result
++/// and resumes at the next instruction, and 3 rejects before any lookup.
++pub type ObjGetItemIntHelper = DynAttrHelper;
++
++static OBJ_GETITEM_INT_HELPER: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++
++/// Register the subscription helper before compiling [`crate::TOp::ObjGetItemInt`].
++pub fn register_obj_getitem_int_helper(helper: ObjGetItemIntHelper) {
++    OBJ_GETITEM_INT_HELPER.store(helper as usize, std::sync::atomic::Ordering::Release);
++}
++
++#[must_use]
++pub(crate) fn obj_getitem_int_helper_addr() -> usize {
++    OBJ_GETITEM_INT_HELPER.load(std::sync::atomic::Ordering::Acquire)
++}
++
+ static TRUTH_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+ 
+ /// RFC 0076 WS8 — register the process-wide truthiness helper
+--- a/crates/weavepy-jit/tests/frame_coverage.rs
++++ b/crates/weavepy-jit/tests/frame_coverage.rs
+@@ -801,3 +801,59 @@
+         );
+     }
+ }
++
++#[test]
++fn opaque_integer_indexing_admits_a_guarded_integer_result() {
++    let tf = analyze_cfg(
++        "def k(obj, index):\n    return obj[index] + obj[-1]\n",
++        &Cfg {
++            obj_params: vec![0],
++            ..Cfg::default()
++        },
++    )
++    .unwrap();
++    assert_eq!(tf.local_types[0], Some(JitType::Obj));
++    assert_eq!(tf.local_types[1], Some(JitType::Int));
++    assert_eq!(tf.ret_lane, Some(JitType::Int));
++    assert_eq!(
++        tf.blocks
++            .iter()
++            .flat_map(|b| &b.stmts)
++            .filter(|s| s.op == TOp::ObjGetItemInt)
++            .count(),
++        2
++    );
++    assert!(TOp::ObjGetItemInt.can_deopt());
++}
++
++#[test]
++fn opaque_noninteger_index_keeps_its_existing_fallback() {
++    let result = analyze_cfg(
++        "def k(obj, index):\n    return obj[index]\n",
++        &Cfg {
++            typed_params: vec![(0, JitType::Obj), (1, JitType::Str)],
++            ..Cfg::default()
++        },
++    );
++    assert!(matches!(
++        result,
++        Err(JitVerdict::UnsupportedOpcode("subscript index lane"))
++    ));
++}
++
++#[test]
++fn trained_lists_keep_their_existing_indexing_lane() {
++    let tf = analyze_cfg(
++        "def k(items, index):\n    return items[index] + 1\n",
++        &Cfg {
++            list: Some((0, JitType::Int)),
++            ..Cfg::default()
++        },
++    )
++    .unwrap();
++    assert!(has_op(&tf, |op| matches!(
++        op,
++        TOp::ListGet { elem: JitType::Int }
++    )));
++    assert!(!has_op(&tf, |op| matches!(op, TOp::ObjGetItemInt)));
++}
+--- a/crates/weavepy-vm/src/lib.rs
++++ b/crates/weavepy-vm/src/lib.rs
+@@ -53478,6 +53478,94 @@
+     }
+ 
+     #[cfg(feature = "jit")]
++    fn run_jit_object_index(src: &str) -> (String, u64) {
++        let src = src.to_owned();
++        std::thread::spawn(move || {
++            crate::tier2::force_enable_for_test(2);
++            let out = run(&src);
++            (out, crate::tier2::object_index_calls_for_test())
++        })
++        .join()
++        .expect("indexing jit worker thread")
++    }
++
++    #[cfg(feature = "jit")]
++    #[test]
++    fn jit_object_indexing_preserves_noninteger_results_and_errors() {
++        let src = r#"
++events = []
++class Bag:
++    def __init__(self, value):
++        self.value = value
++    def __getitem__(self, index):
++        events.append(index)
++        if index == 7:
++            raise LookupError("item unavailable")
++        return self.value
++
++def read_item(obj, index):
++    return obj[index]
++
++bag = Bag(9)
++for _ in range(80):
++    assert read_item(bag, 0) == 9
++for value in [None, True, 1.5, "text", object(), 1 << 80]:
++    bag.value = value
++    before = len(events)
++    assert read_item(bag, -1) is value
++    assert len(events) == before + 1
++before = len(events)
++try:
++    read_item(bag, 7)
++except LookupError as error:
++    assert str(error) == "item unavailable"
++else:
++    raise AssertionError("lookup did not raise")
++assert len(events) == before + 1
++print("index results and errors ok")
++"#;
++        let (out, helper_calls) = run_jit_object_index(src);
++        assert!(helper_calls > 0, "index helper never ran");
++        assert_eq!(out, "index results and errors ok\n");
++        assert_eq!(out, run(src));
++    }
++
++    #[cfg(feature = "jit")]
++    #[test]
++    fn jit_object_indexing_rechecks_guards_without_replaying_getter() {
++        let src = r#"
++OFFSET = 1
++TRIGGER = False
++events = []
++class Changes:
++    def __getitem__(self, index):
++        global OFFSET
++        events.append(index)
++        if TRIGGER:
++            OFFSET = 7
++        return 3
++
++def read_offset(obj):
++    return obj[0] + OFFSET
++
++obj = Changes()
++for _ in range(80):
++    assert read_offset(obj) == 4
++TRIGGER = True
++before = len(events)
++assert read_offset(obj) == 10
++assert len(events) == before + 1
++assert read_offset(obj) == 10
++assert len(events) == before + 2
++print("index guard and callback order ok")
++"#;
++        let (out, helper_calls) = run_jit_object_index(src);
++        assert!(helper_calls > 0, "index helper never ran");
++        assert_eq!(out, "index guard and callback order ok\n");
++        assert_eq!(out, run(src));
++    }
++
++    #[cfg(feature = "jit")]
+     #[test]
+     fn jit_dyn_attr_property_roundtrip() {
+         // RFC 0074 WS4 — property get/set on an unprobeable receiver
+--- a/crates/weavepy-vm/src/tier2.rs
++++ b/crates/weavepy-vm/src/tier2.rs
+@@ -499,6 +499,7 @@
+         weavepy_jit::register_call_dyn_helper(wpjit_call_dyn);
+         weavepy_jit::register_call_dyn_int_helper(wpjit_call_dyn_int);
+         weavepy_jit::register_dyn_attr_helpers(wpjit_dyn_attr_get, wpjit_dyn_attr_set);
++        weavepy_jit::register_obj_getitem_int_helper(wpjit_obj_getitem_int);
+         // RFC 0076 WS8 — object-lane truthiness, generic membership,
+         // and set literals.
+         weavepy_jit::register_truth_helper(wpjit_truth);
+@@ -6074,6 +6075,62 @@
+     }
+ }
+ 
++/// Read through the interpreter's full subscription protocol. Only an exact
++/// machine integer continues natively; every other completed result is parked.
++///
++/// # Safety
++///
++/// Same live-frame, context, and pin ownership contract as [`wpjit_call_py`].
++/// The receiver is an object-lane pin and `index` is a signed integer value.
++unsafe extern "C" fn wpjit_obj_getitem_int(frame: *mut JitFrame, pin: i64, index: i64) -> i64 {
++    #[cfg(test)]
++    OBJECT_INDEX_TEST_CALLS.with(|count| count.set(count.get() + 1));
++    // SAFETY: generated code supplies the live activation and its context.
++    let jf = unsafe { &mut *frame };
++    #[allow(clippy::cast_ptr_alignment)]
++    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
++    // SAFETY: the entering interpreter borrow is dormant during the helper.
++    let interp = unsafe { &mut *ctx.interp };
++    let receiver = if pin == -1 {
++        Object::None
++    } else {
++        match ctx.pins.get(pin as usize) {
++            Some(value) => value.to_object(),
++            None => return 3,
++        }
++    };
++    ctx.dirty = true;
++    let result = call_with_activation_shell(interp, ctx, jf, |interp| {
++        interp.subscr_get_public(&receiver, &Object::Int(index))
++    });
++    match result {
++        Err(error) => {
++            ctx.raised = Some(error);
++            1
++        }
++        Ok(value) => {
++            let still_valid = guards_hold(
++                interp,
++                &ctx.globals,
++                &ctx.builtins,
++                &ctx.guard_snapshot,
++                &ctx.callees,
++                &ctx.math,
++            );
++            if still_valid {
++                if let Object::Int(integer) = &value {
++                    jf.ret_bits = *integer as u64;
++                    return 0;
++                }
++            }
++            // The lookup already ran, including any callbacks. Reconstruction
++            // pushes this exact object and resumes after BINARY_SUBSCR.
++            ctx.parked = Some(value);
++            2
++        }
++    }
++}
++
+ /// The `wpjit_dyn_attr_set` helper (RFC 0074 WS4): the interpreter's
+ /// exact attribute store on a pinned receiver (`__setattr__` dispatch
+ /// included — arbitrary Python; the dirtiness discipline applies).
+@@ -9022,3 +9079,14 @@
+         ));
+     }
+ }
++
++#[cfg(test)]
++std::thread_local! {
++    static OBJECT_INDEX_TEST_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
++}
++
++/// Test-only proof that a source oracle entered the subscription helper.
++#[cfg(test)]
++pub(crate) fn object_index_calls_for_test() -> u64 {
++    OBJECT_INDEX_TEST_CALLS.with(std::cell::Cell::get)
++}

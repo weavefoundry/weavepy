@@ -17,6 +17,7 @@
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
+use weavepy_vm::shared_value::SharedStr;
 
 use weavepy_vm::error::{type_error, RuntimeError};
 use weavepy_vm::object::{BuiltinFn, Object, PyProperty};
@@ -142,7 +143,7 @@ pub unsafe fn collect_getsets(mut defs: *mut PyGetSetDef) -> Vec<(String, Object
         let doc = if entry.doc.is_null() {
             Object::None
         } else {
-            Object::Str(Rc::from(
+            Object::Str(SharedStr::from(
                 unsafe { CStr::from_ptr(entry.doc) }
                     .to_string_lossy()
                     .as_ref(),
@@ -452,14 +453,16 @@ unsafe fn read_member(body: *mut PyObject, ty: c_int, offset: PySsizeT) -> Objec
             T_DOUBLE => Object::Float(std::ptr::read_unaligned(field as *const f64)),
             T_CHAR => {
                 let c = std::ptr::read_unaligned(field as *const u8);
-                Object::Str(Rc::from((c as char).to_string().as_str()))
+                Object::Str(SharedStr::from((c as char).to_string().as_str()))
             }
             T_STRING => {
                 let p = std::ptr::read_unaligned(field as *const *const c_char);
                 if p.is_null() {
                     Object::None
                 } else {
-                    Object::Str(Rc::from(CStr::from_ptr(p).to_string_lossy().as_ref()))
+                    Object::Str(SharedStr::from(
+                        CStr::from_ptr(p).to_string_lossy().as_ref(),
+                    ))
                 }
             }
             T_OBJECT | T_OBJECT_EX => {

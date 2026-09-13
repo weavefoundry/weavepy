@@ -1,0 +1,63 @@
+Process:         weavepy-runtime-binder-flags [36127]
+Path:            /Users/USER/Documents/*/weavepy-runtime-binder-flags
+Load Address:    0x100670000
+Identifier:      weavepy-runtime-binder-flags
+Version:         0
+Code Type:       ARM64
+Platform:        macOS
+Parent Process:  Python [36104]
+Target Type:     live task
+
+Date/Time:       2026-09-12 02:19:14.753 -0700
+Launch Time:     2026-09-12 02:19:14.720 -0700
+OS Version:      macOS 26.6.2 (25G83)
+Report Version:  7
+Analysis Tool:   /usr/bin/vmmap
+
+Physical footprint:         11.0M
+Physical footprint (peak):  11.0M
+Idle exit:                  untracked
+----
+
+ReadOnly portion of Libraries: Total=902.5M resident=186.8M(21%) swapped_out_or_unallocated=715.6M(79%)
+Writable regions: Total=1.1G written=9792K(1%) resident=9792K(1%) swapped_out=0K(0%) unallocated=1.1G(99%)
+
+                                VIRTUAL RESIDENT    DIRTY  SWAPPED VOLATILE   NONVOL    EMPTY   REGION 
+REGION TYPE                        SIZE     SIZE     SIZE     SIZE     SIZE     SIZE     SIZE    COUNT (non-coalesced) 
+===========                     ======= ========    =====  ======= ========   ======    =====  ======= 
+Kernel Alloc Once                   32K      16K      16K       0K       0K       0K       0K        1 
+MALLOC guard page                 3296K       0K       0K       0K       0K       0K       0K        4 
+MALLOC metadata                    752K     320K     320K       0K       0K       0K       0K        4 
+MALLOC_SMALL                      24.0M    8480K    8480K       0K       0K       0K       0K        6         see MALLOC ZONE table below
+MALLOC_SMALL (empty)              4096K      32K      32K       0K       0K       0K       0K        1         see MALLOC ZONE table below
+MALLOC_TINY                       4096K     208K     208K       0K       0K       0K       0K        1         see MALLOC ZONE table below
+Memory Tag 22                     64.0M      16K      16K       0K       0K       0K       0K        1 
+STACK GUARD                         16K       0K       0K       0K       0K       0K       0K        1 
+Stack                              1.0G     352K     352K       0K       0K       0K       0K        4 
+Stack Guard                       56.0M       0K       0K       0K       0K       0K       0K        1 
+VM_ALLOCATE                         64K      16K      16K       0K       0K       0K       0K        4 
+VM_ALLOCATE (reserved)             256K       0K       0K       0K       0K       0K       0K        2         reserved VM address space (unallocated)
+__AUTH                            1321K     731K      16K       0K       0K       0K       0K      149 
+__AUTH_CONST                      17.7M     9.8M       0K       0K       0K       0K       0K      340 
+__CTF                               824      824       0K       0K       0K       0K       0K        1 
+__DATA                            4501K    2302K     266K       0K       0K       0K       0K      297 
+__DATA_CONST                      16.9M    9288K     640K       0K       0K       0K       0K      339 
+__DATA_DIRTY                      1320K     964K     351K       0K       0K       0K       0K      284 
+__FONT_DATA                        2352     2352       0K       0K       0K       0K       0K        1 
+__LINKEDIT                       576.1M    28.7M       0K       0K       0K       0K       0K        2 
+__OBJC_RO                         79.2M    56.1M       0K       0K       0K       0K       0K        1 
+__OBJC_RW                         2599K    2199K      39K       0K       0K       0K       0K        1 
+__TEXT                           326.3M   158.2M       0K       0K       0K       0K       0K      348 
+__TPRO_CONST                       128K      80K      48K       0K       0K       0K       0K        2 
+page table in kernel               320K     320K     320K       0K       0K       0K       0K        1 
+shared memory                       48K      48K      48K       0K       0K       0K       0K        2 
+unused but dirty shlib __DATA       79K      79K      79K       0K       0K       0K       0K       39 
+===========                     ======= ========    =====  ======= ========   ======    =====  ======= 
+TOTAL                              2.2G   277.6M    11.0M       0K       0K       0K       0K     1837 
+TOTAL, minus reserved VM space     2.2G   277.6M    11.0M       0K       0K       0K       0K     1837 
+
+                                 VIRTUAL   RESIDENT      DIRTY    SWAPPED ALLOCATION      BYTES DIRTY+SWAP          REGION
+MALLOC ZONE                         SIZE       SIZE       SIZE       SIZE      COUNT  ALLOCATED  FRAG SIZE  % FRAG   COUNT
+===========                      =======  =========  =========  =========  =========  =========  =========  ======  ======
+DefaultMallocZone_0x103614000      32.7M      9008K      9008K         0K      55113      6346K      2662K     30%      10
+

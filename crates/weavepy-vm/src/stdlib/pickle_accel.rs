@@ -6,6 +6,7 @@
 
 mod encode;
 
+use crate::shared_value::{SharedSlice, SharedStr};
 use num_bigint::BigInt;
 use weavepy_compiler::CodeObject;
 
@@ -330,7 +331,7 @@ fn make_dumps(args: &[Object]) -> Result<Object, RuntimeError> {
                 return Ok(Object::None);
             }
             Ok(encode::encode(value, protocol)
-                .map_or(Object::None, |data| Object::Bytes(Rc::from(data))))
+                .map_or(Object::None, |data| Object::Bytes(SharedSlice::from(data))))
         }),
         call_kw: None,
     })))
@@ -726,7 +727,7 @@ impl Sink for Objects {
             Scalar::Int(value) => Object::Int(value),
             Scalar::Long(bytes) => Object::int_from_bigint(BigInt::from_signed_bytes_le(bytes)),
             Scalar::Float(value) => Object::Float(value),
-            Scalar::Str(value) => Object::Str(Rc::from(value)),
+            Scalar::Str(value) => Object::Str(SharedStr::from(value)),
             Scalar::Bytes(value) => Object::new_bytes(value),
         }
     }

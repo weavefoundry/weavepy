@@ -14,6 +14,7 @@
 //! attributes on every use, so `del warnings.filters` degrades exactly
 //! the way `test_warnings._WarningsTests` asserts.
 
+use crate::shared_value::SharedSlice;
 use std::sync::Mutex;
 
 use crate::error::{runtime_error, type_error, value_error, PyException, RuntimeError};
@@ -643,7 +644,7 @@ fn normalize_module(filename: &Object) -> Object {
         }
         let suffix: [u32; 3] = ['.' as u32, 'p' as u32, 'y' as u32];
         if cps.len() >= 3 && cps[cps.len() - 3..] == suffix {
-            return Object::WStr(Rc::from(&cps[..cps.len() - 3]));
+            return Object::WStr(SharedSlice::from(&cps[..cps.len() - 3]));
         }
         return filename.clone();
     }

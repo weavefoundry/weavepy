@@ -71,6 +71,7 @@
 //! up as `gc_refs > 0`, so the cycle survives one more
 //! generation than it strictly has to).
 
+use crate::shared_value::ThinArc;
 use crate::sync::RefCell;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -2390,7 +2391,7 @@ pub fn strong_count_for(obj: &Object) -> usize {
         Object::Dict(d) => Rc::strong_count(d),
         Object::Set(s) => Rc::strong_count(s),
         Object::FrozenSet(s) => Rc::strong_count(s),
-        Object::Tuple(t) => Rc::strong_count(t),
+        Object::Tuple(t) => ThinArc::strong_count(t),
         Object::Instance(i) => Rc::strong_count(i),
         Object::Function(f) => Rc::strong_count(f),
         Object::Builtin(b) => Rc::strong_count(b),
@@ -2401,7 +2402,7 @@ pub fn strong_count_for(obj: &Object) -> usize {
         Object::ByteArray(b) => Rc::strong_count(b),
         // Not cycle-capable, but `sys.getrefcount(b"...")` parity matters
         // to ctypes' keepalive tests (test_internals.test_c_char_p).
-        Object::Bytes(b) => Rc::strong_count(b),
+        Object::Bytes(b) => ThinArc::strong_count(b),
         Object::Iter(i) => Rc::strong_count(i),
         Object::Frame(f) => Rc::strong_count(f),
         Object::Traceback(t) => Rc::strong_count(t),

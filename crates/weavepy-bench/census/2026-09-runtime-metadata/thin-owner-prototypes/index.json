@@ -1,0 +1,138 @@
+[
+  {
+    "path": "thin_shared_slice_prototype.rs",
+    "source": "target/thin_shared_slice_prototype.rs",
+    "bytes": 6378,
+    "sha256": "52379fb1300ed5dd5aaf4270be62435df6ddd46b1c25cb684a420d7fe643f553"
+  },
+  {
+    "path": "thin_shared_slice_prototype_build.txt",
+    "source": "target/thin_shared_slice_prototype_build.txt",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "thin_shared_slice_prototype_tests.txt",
+    "source": "target/thin_shared_slice_prototype_tests.txt",
+    "bytes": 228,
+    "sha256": "fe843c65791c62227d2c1f6f0a57ebc02cdc43a5cfdcb1a25cc4a9d9509e7b75"
+  },
+  {
+    "path": "thin_shared_slice_miri_install.txt",
+    "source": "target/thin_shared_slice_miri_install.txt",
+    "bytes": 326,
+    "sha256": "9d3298292a0f938b416f9ccd4c3ee708ed1b8d47c04a0177ddfbdd2d3f1f97a6"
+  },
+  {
+    "path": "thin_shared_slice_miri_rust_src.txt",
+    "source": "target/thin_shared_slice_miri_rust_src.txt",
+    "bytes": 37,
+    "sha256": "d9fec78088427efcd882bf0df92c4c67598a47f807f95644c6cd94903dbfd02d"
+  },
+  {
+    "path": "thin_shared_slice_miri_tests.txt",
+    "source": "target/thin_shared_slice_miri_tests.txt",
+    "bytes": 2552,
+    "sha256": "df279f6aaffacc9af7d5c5e4d4d509083ee8491412d53da3f93dbc26769ff64b"
+  },
+  {
+    "path": "thin_shared_slice_prototype_report.json",
+    "source": "target/thin_shared_slice_prototype_report.json",
+    "bytes": 2038,
+    "sha256": "782993d3910acb25bc1dbd7cad13e4fe47176b5e37c644adf39f8bb1fc75e542"
+  },
+  {
+    "path": "thin_owner_tuple_prototype.rs",
+    "source": "target/thin_owner_tuple_prototype.rs",
+    "bytes": 8003,
+    "sha256": "051289a2427f1a31cdf8191c0a05bd91690f3948628b3201d91f59a8eeafaf4c"
+  },
+  {
+    "path": "thin_owner_tuple_prototype_build.txt",
+    "source": "target/thin_owner_tuple_prototype_build.txt",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "thin_owner_tuple_prototype_tests.txt",
+    "source": "target/thin_owner_tuple_prototype_tests.txt",
+    "bytes": 330,
+    "sha256": "27b76a2e342660298c280df94e193a4c258f2f22428176dd4bdcb083d9b84993"
+  },
+  {
+    "path": "thin_owner_tuple_miri_tests.txt",
+    "source": "target/thin_owner_tuple_miri_tests.txt",
+    "bytes": 2765,
+    "sha256": "0cae87ca60f3cbf75671fbde5457a3cc474b6b2b0340c93e1101625031813c46"
+  },
+  {
+    "path": "thin_owner_tuple_miri_i686_tests.txt",
+    "source": "target/thin_owner_tuple_miri_i686_tests.txt",
+    "bytes": 2837,
+    "sha256": "6950a1c05cd7c5ddeab1fb560fb6be735f4e450846e5411b2414d2e5595a15c5"
+  },
+  {
+    "path": "thin_owner_tuple_prototype_report.json",
+    "source": "target/thin_owner_tuple_prototype_report.json",
+    "bytes": 2243,
+    "sha256": "a198cd9dcd4cf69070eaf98011c58af57018c29c152b3e97ba0d67ac76b5a41d"
+  },
+  {
+    "path": "thin_shared_payload_design.md",
+    "source": "target/thin_shared_payload_design.md",
+    "bytes": 4128,
+    "sha256": "008fcebd92b6669df9016ba662ffbe9321559704cebcb42e791ec8a273094941"
+  },
+  {
+    "path": "thin_object_payload_followup.md",
+    "source": "target/thin_object_payload_followup.md",
+    "bytes": 3764,
+    "sha256": "05987ebc3e9e1b66b23ba261f8fa0d1f9669c8240b7e2888d54fd58aab348e9d"
+  },
+  {
+    "path": "thin-shared-slice-prototype/Cargo.toml",
+    "source": "target/thin-shared-slice-prototype/Cargo.toml",
+    "bytes": 95,
+    "sha256": "755f660fe41e6f95fc1ccae4e25379a52095fd03fe56ac4fc9ff50d0b6b8ee3d"
+  },
+  {
+    "path": "thin-shared-slice-prototype/Cargo.lock",
+    "source": "target/thin-shared-slice-prototype/Cargo.lock",
+    "bytes": 171,
+    "sha256": "fa2c0143d601346529a91dd283f8f30f4a5a86885a528b237887ce010269e3f1"
+  },
+  {
+    "path": "thin-shared-slice-prototype/source-index.json",
+    "source": "target/thin-shared-slice-prototype/source-index.json",
+    "bytes": 236,
+    "sha256": "1d83630e767e7813fe3619021ea82f5ce756c42acf479f058823428986839243"
+  },
+  {
+    "path": "thin-owner-tuple-prototype/Cargo.toml",
+    "source": "target/thin-owner-tuple-prototype/Cargo.toml",
+    "bytes": 94,
+    "sha256": "3d70b5d33f8e77adb32e1491fb84fa46328f306356fdaf321ae5393ec539000e"
+  },
+  {
+    "path": "thin-owner-tuple-prototype/Cargo.lock",
+    "source": "target/thin-owner-tuple-prototype/Cargo.lock",
+    "bytes": 170,
+    "sha256": "9efe1faba1d6d336245fb0f00d87309861cf6e9715bc0ccb528cf39c91c91daa"
+  },
+  {
+    "path": "thin-owner-tuple-prototype/source-index.json",
+    "source": "target/thin-owner-tuple-prototype/source-index.json",
+    "bytes": 225,
+    "sha256": "2beb9510f69b6f0068334411728356803c19ad6119608500ab3f78d3157eb770"
+  },
+  {
+    "path": "REPORT.md",
+    "bytes": 2562,
+    "sha256": "ca08a1bcffa9d127a4a72b1575ff0186cf0284ed9b1908fc3cf52c25130ba529"
+  },
+  {
+    "path": "export_thin_owner_prototypes.py",
+    "bytes": 5009,
+    "sha256": "7a15a110af84ded298ac36d23f7e8efc729b08f110aa2635f99f4a9f5deb0a52"
+  }
+]

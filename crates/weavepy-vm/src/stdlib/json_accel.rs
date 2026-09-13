@@ -21,6 +21,7 @@
 //! argument validation, `make_scanner` reading attributes eagerly) are
 //! reproduced explicitly.
 
+use crate::shared_value::{SharedSlice, SharedStr, ThinArc};
 use std::collections::HashSet;
 
 use crate::builtin_types::builtin_types;
@@ -139,7 +140,9 @@ trait JsonChar: Copy + Into<u32> {
 
 impl JsonChar for u8 {
     fn string(s: &[Self]) -> Object {
-        Object::Str(Rc::from(std::str::from_utf8(s).expect("UTF-8 JSON span")))
+        Object::Str(SharedStr::from(
+            std::str::from_utf8(s).expect("UTF-8 JSON span"),
+        ))
     }
 
     fn key(s: &[Self], memo: &mut KeyMemo) -> Object {
@@ -236,8 +239,8 @@ fn arg_codepoints_cached(
     what: &str,
 ) -> Result<Rc<Vec<u32>>, RuntimeError> {
     let key = match o {
-        Object::Str(s) => Some(Rc::as_ptr(s).cast::<u8>() as usize),
-        Object::WStr(s) => Some(Rc::as_ptr(s).cast::<u8>() as usize),
+        Object::Str(s) => Some(SharedStr::as_ptr(s).cast::<u8>() as usize),
+        Object::WStr(s) => Some(ThinArc::as_ptr(s).cast::<u8>() as usize),
         _ => None,
     };
     if let Some(k) = key {
@@ -1078,8 +1081,8 @@ fn parse_object<C: JsonChar>(
 /// a string. Escaped spellings still share the same canonical storage.
 #[derive(Default)]
 struct KeyMemo {
-    utf8: HashSet<Rc<str>>,
-    wide: HashSet<Rc<[u32]>>,
+    utf8: HashSet<SharedStr>,
+    wide: HashSet<SharedSlice<u32>>,
 }
 
 impl KeyMemo {
@@ -1087,7 +1090,7 @@ impl KeyMemo {
         if let Some(existing) = self.utf8.get(text) {
             return Object::Str(existing.clone());
         }
-        let value: Rc<str> = Rc::from(text);
+        let value: SharedStr = SharedStr::from(text);
         self.utf8.insert(value.clone());
         Object::Str(value)
     }
@@ -1616,7 +1619,7 @@ fn obj_id(o: &Object) -> usize {
     match o {
         Object::List(r) => Rc::as_ptr(r).cast::<()>() as usize,
         Object::Dict(r) => Rc::as_ptr(r).cast::<()>() as usize,
-        Object::Tuple(r) => Rc::as_ptr(r).cast::<()>() as usize,
+        Object::Tuple(r) => ThinArc::as_ptr(r).cast::<()>() as usize,
         Object::Instance(r) => Rc::as_ptr(r).cast::<()>() as usize,
         // Anything else routed through `default()` (a class, a module,
         // `Ellipsis`, ...) needs a real identity too: the `markers` cycle

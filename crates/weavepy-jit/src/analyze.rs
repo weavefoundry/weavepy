@@ -917,6 +917,28 @@ fn analyze_once(
     let mut comp_saved: Vec<CompSavedMeta> = out.comp_saved.values().copied().collect();
     comp_saved.sort_unstable_by_key(|s| s.live_from);
 
+    // An admitted explicit error exit has no pending call markers: emission
+    // requires every operand to be a plain value (or materialized None).
+    // Conditional expressions can duplicate a consuming CALL across arms,
+    // leaving one arm's lexical span overlapping the other's raise. Exclude
+    // these known marker-free exits without changing reconstruction at the
+    // calls themselves or erasing enclosing loop iterators.
+    for block in &blocks {
+        if let TTerm::Deopt { pc } = block.term {
+            for spans in [
+                &mut out.callee_spans,
+                &mut out.len_spans,
+                &mut out.math_spans,
+                &mut out.null_spans,
+            ] {
+                exclude_span_pc(spans, pc, |s| (&mut s.live_from, &mut s.live_to));
+            }
+            for spans in [&mut out.method_spans, &mut out.str_method_spans] {
+                exclude_span_pc(spans, pc, |s| (&mut s.live_from, &mut s.live_to));
+            }
+        }
+    }
+
     Ok(TFunc {
         n_locals,
         local_types,
@@ -945,6 +967,39 @@ fn analyze_once(
         ret_lane: ret_lane.filter(|t| t.is_representable()),
         ret_none,
     })
+}
+
+/// Remove one proven inactive PC from open reconstruction intervals.
+fn exclude_span_pc<T: Copy + PartialEq>(
+    spans: &mut Vec<T>,
+    pc: u32,
+    bounds: fn(&mut T) -> (&mut u32, &mut u32),
+) {
+    for index in 0..spans.len() {
+        let mut span = spans[index];
+        let (from, to) = bounds(&mut span);
+        if *from < pc && pc < *to {
+            let original_end = *to;
+            *to = pc;
+            spans[index] = span;
+            let (from, to) = bounds(&mut span);
+            *from = pc;
+            *to = original_end;
+            spans.push(span);
+        }
+    }
+    // Splitting two arms can produce identical intervals for their shared
+    // argument prefix. The interpreter has only one marker at that depth.
+    let mut index = 0;
+    while index < spans.len() {
+        let mut span = spans[index];
+        let (from, to) = bounds(&mut span);
+        if to.saturating_sub(*from) <= 1 || spans[..index].contains(&span) {
+            spans.remove(index);
+        } else {
+            index += 1;
+        }
+    }
 }
 
 /// RFC 0069 WS1 — the function's return typing accumulated across
@@ -1737,6 +1792,19 @@ pub fn returns_self_syntactically(code: &CodeObject) -> bool {
     true
 }
 
+/// The interpreter materializes canonical exception classes at these exits.
+/// Other common constants retain their existing analysis and fallback behavior.
+fn common_error_constant(ins: weavepy_compiler::Instruction) -> bool {
+    use weavepy_compiler::bytecode::{
+        COMMON_CONSTANT_ASSERTION_ERROR, COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR,
+    };
+    ins.op == OpCode::LoadCommonConstant
+        && matches!(
+            ins.arg,
+            COMMON_CONSTANT_ASSERTION_ERROR | COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR
+        )
+}
+
 /// Build the basic blocks, resolving relative jumps to absolute indices.
 fn build_blocks(code: &CodeObject) -> Result<Vec<RawBlock>, JitVerdict> {
     let n = code.instructions.len();
@@ -1786,7 +1854,10 @@ fn build_blocks(code: &CodeObject) -> Result<Vec<RawBlock>, JitVerdict> {
                     leaders.insert(i + 1);
                 }
             }
-            OpCode::ReturnValue if i + 1 < n => {
+            OpCode::ReturnValue | OpCode::RaiseVarargs if i + 1 < n => {
+                leaders.insert(i + 1);
+            }
+            OpCode::LoadCommonConstant if common_error_constant(*ins) && i + 1 < n => {
                 leaders.insert(i + 1);
             }
             // RFC 0070 WS2 — a yield ends its block (the suspension
@@ -1812,7 +1883,8 @@ fn build_blocks(code: &CodeObject) -> Result<Vec<RawBlock>, JitVerdict> {
         let last = end - 1;
         let ins = code.instructions[last];
         let succs = match ins.op {
-            OpCode::ReturnValue => Vec::new(),
+            OpCode::ReturnValue | OpCode::RaiseVarargs => Vec::new(),
+            OpCode::LoadCommonConstant if common_error_constant(ins) => Vec::new(),
             // RFC 0070 WS2 — control leaves native code at a yield.
             // RFC 0071 WS5 — the continuation block is still a
             // *dataflow* successor (the yielded value replaced by the
@@ -1951,7 +2023,9 @@ fn entry_unassigned_reads(blocks: &[TBlock], entry: BlockId) -> Vec<u32> {
                 Some((body, [Some(var1_slot), Some(var2_slot)])),
                 Some((exit, [None, None])),
             ],
-            TTerm::Return | TTerm::ReturnNone | TTerm::Yield { .. } => [None, None],
+            TTerm::Return | TTerm::ReturnNone | TTerm::Yield { .. } | TTerm::Deopt { .. } => {
+                [None, None]
+            }
         };
         for (t, extra) in succs.into_iter().flatten() {
             let mut out = cur.clone();
@@ -2000,7 +2074,9 @@ fn has_native_cycle(blocks: &[TBlock]) -> bool {
             | TTerm::ForList { body, exit, .. }
             | TTerm::ForIter { body, exit, .. }
             | TTerm::ForIterPair { body, exit, .. } => [Some(*body), Some(*exit)],
-            TTerm::Return | TTerm::ReturnNone | TTerm::Yield { .. } => [None, None],
+            TTerm::Return | TTerm::ReturnNone | TTerm::Yield { .. } | TTerm::Deopt { .. } => {
+                [None, None]
+            }
         }
     }
     // 0 = unvisited, 1 = on the DFS stack, 2 = done.
@@ -2632,6 +2708,30 @@ fn infer_block(
                     *changed = true;
                 }
                 merge_ret_lane(&mut ret.lane, v.ty, changed);
+            }
+            Vec::new()
+        }
+        OpCode::RaiseVarargs | OpCode::LoadCommonConstant
+            if ins.op == OpCode::RaiseVarargs || common_error_constant(ins) =>
+        {
+            if ins.op == OpCode::RaiseVarargs {
+                if ins.arg > 2 {
+                    return Err(JitVerdict::UnsupportedOpcode("RAISE_VARARGS (arity)"));
+                }
+                if stack.len() < ins.arg as usize {
+                    return Err(JitVerdict::StackUnderflow);
+                }
+            }
+            // No operand is consumed before the interpreter resumes. A top
+            // None (raise None, or raise exc from None) can be materialized;
+            // deeper None markers retain the existing interpreted path.
+            for (index, value) in stack.iter().enumerate() {
+                if value.none_const && index + 1 == stack.len() {
+                    continue;
+                }
+                if !value.is_plain() {
+                    return Err(escape_verdict(code, &[value], "error exit (operand shape)"));
+                }
             }
             Vec::new()
         }
@@ -5463,6 +5563,22 @@ fn emit_block(
                 seed_entry(emit_entries, succ, &cont);
             }
             TTerm::Yield { pc: last as u32 }
+        }
+        OpCode::RaiseVarargs | OpCode::LoadCommonConstant
+            if ins.op == OpCode::RaiseVarargs || common_error_constant(ins) =>
+        {
+            for (index, value) in stack.iter().enumerate() {
+                if value.none_const && index + 1 == stack.len() {
+                    stmts.push(TStmt {
+                        pc: last as u32,
+                        op: TOp::PushNone,
+                    });
+                } else if !value.is_plain() || !value.ty.is_representable() {
+                    return Err(JitVerdict::TypeUnknown);
+                }
+            }
+            out.max_stack = out.max_stack.max(stack.len() as u32);
+            TTerm::Deopt { pc: last as u32 }
         }
         _ => {
             emit_instr(

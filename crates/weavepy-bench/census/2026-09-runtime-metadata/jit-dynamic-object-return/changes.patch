@@ -1,0 +1,215 @@
+--- a/crates/weavepy-vm/src/tier2.rs
++++ b/crates/weavepy-vm/src/tier2.rs
+@@ -2898,7 +2898,7 @@
+ /// entries of the marshal buffers are initialized. `nc` must have been
+ /// resolved from this thread's tier cache (its `CompiledFrame` is
+ /// backed by the thread's engine).
+-#[allow(clippy::too_many_lines)]
++#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+ unsafe fn try_native_call(
+     jf: &mut JitFrame,
+     ctx: &mut CallCtx,
+@@ -2907,6 +2907,7 @@
+     argc: u32,
+     expect_tag: u32,
+     recv: Option<&Object>,
++    generic_obj_result: bool,
+ ) -> Option<i64> {
+     // Deep native call trees have no back edges, so this is their poll
+     // point (RFC 0067 WS2): hand the GIL off inline; route pending
+@@ -3317,7 +3318,15 @@
+             // RFC 0071 WS1 — an object-lane return pins into the
+             // *caller's* table (`None` rides as the nullable `-1`).
+             if guards_ok && expect_tag == SlotTag::ObjPin as u32 {
+-                return Some(match obj_ret_bits(&v, &mut ctx.pins) {
++                // Dynamic callers admit every object, including a scalar
++                // carried by an opaque attribute or call result. Keep the
++                // older instance-only contract for typed call sites.
++                let bits = if generic_obj_result {
++                    pin_any(v.clone(), &mut ctx.pins)
++                } else {
++                    obj_ret_bits(&v, &mut ctx.pins)
++                };
++                return Some(match bits {
+                     Some(bits) => {
+                         jf.ret_bits = bits;
+                         jf.ret_tag = expect_tag;
+@@ -3380,8 +3389,18 @@
+     // `__init__` is a procedure: its `None` rides the procedure lane.
+     // A `try_native_call` rejection discards the fresh (empty, never
+     // `__init__`-ed) instance and re-allocates on the interpreter path.
+-    let status =
+-        unsafe { try_native_call(jf, ctx, interp, nc, argc, SlotTag::None as u32, Some(&inst)) }?;
++    let status = unsafe {
++        try_native_call(
++            jf,
++            ctx,
++            interp,
++            nc,
++            argc,
++            SlotTag::None as u32,
++            Some(&inst),
++            false,
++        )
++    }?;
+     if status == CallStatus::Raised as i64 {
+         // A raising `__init__` discards the instance (CPython's
+         // `type_call` propagates before returning it).
+@@ -3608,7 +3627,7 @@
+             let attempted = if nc.ctor.is_some() {
+                 unsafe { try_native_ctor(jf, ctx, interp, nc, argc, expect_tag) }
+             } else {
+-                unsafe { try_native_call(jf, ctx, interp, nc, argc, expect_tag, None) }
++                unsafe { try_native_call(jf, ctx, interp, nc, argc, expect_tag, None, false) }
+             };
+             match attempted {
+                 Some(status) => return status,
+@@ -3880,8 +3899,9 @@
+                 // SAFETY: `jf`/`ctx` are this activation's live buffers
+                 // (see the function contract) and `nc` came from this
+                 // thread's tier cache via the activation's resolved table.
+-                match unsafe { try_native_call(jf, ctx, interp, nc, argc, expect_tag, Some(&recv)) }
+-                {
++                match unsafe {
++                    try_native_call(jf, ctx, interp, nc, argc, expect_tag, Some(&recv), false)
++                } {
+                     Some(status) => return status,
+                     None => {
+                         NATIVE_CALL_STATS.with(|s| s.fallbacks.set(s.fallbacks.get() + 1));
+@@ -5799,7 +5819,8 @@
+         }
+         tag
+     };
+-    let status = unsafe { try_native_call(jf, ctx, interp, &nc, argc, expect, recv.as_ref()) }?;
++    let status =
++        unsafe { try_native_call(jf, ctx, interp, &nc, argc, expect, recv.as_ref(), true) }?;
+     Some(if status == CallStatus::Ok as i64 {
+         finish_dyn_native_result(jf, ctx, int_result)
+     } else {
+--- a/crates/weavepy-vm/src/lib.rs
++++ b/crates/weavepy-vm/src/lib.rs
+@@ -54565,6 +54565,124 @@
+ 
+     #[cfg(feature = "jit")]
+     #[test]
++    fn jit_dynamic_native_object_integer_return_stays_native() {
++        let src = r#"class Box:
++    def __init__(self, value):
++        self.value = value
++def read_value(n):
++    return Box(value=n).value
++def driver(n):
++    total = 0
++    for i in range(n):
++        total += read_value(i)
++    return total
++total = 0
++for j in range(8):
++    total += driver(128)
++print(total)
++"#;
++        let (out, compiled, deopts, osr) = run_jit_osr(src);
++        assert_eq!(out, "65024\n");
++        assert!(compiled >= 3, "constructor and callers must compile");
++        assert!(osr > 0, "the caller must enter through a hot loop");
++        assert_eq!(
++            deopts, 0,
++            "an object-tagged integer return must not retire its caller"
++        );
++        assert_eq!(out, run(src));
++    }
++
++    #[cfg(feature = "jit")]
++    #[test]
++    fn jit_dynamic_native_object_returns_preserve_value_and_identity() {
++        for payload in [
++            "123456789",
++            "2 ** 100",
++            "0.5",
++            "True",
++            "None",
++            "'native object result'",
++            "b'native object result'",
++            "(1, 2, 3)",
++            "[1, 2, 3]",
++            "{'key': 7}",
++        ] {
++            let src = format!(
++                r#"PAYLOAD = {payload}
++class Box:
++    def __init__(self, value):
++        self.value = value
++def read_value(n):
++    if n < 0:
++        return None
++    return Box(value=PAYLOAD).value
++def driver(n):
++    value = None
++    for i in range(n):
++        value = read_value(i)
++    return value
++value = driver(128)
++print(value is PAYLOAD)
++"#
++            );
++            let source = src.clone();
++            let (out, compiled, deopts, osr, calls) = std::thread::spawn(move || {
++                crate::tier2::force_enable_for_test(2);
++                let out = run(&source);
++                let (compiled, _, deopts) = crate::tier2::stats_for_test();
++                let osr = crate::tier2::osr_stats_for_test();
++                let (calls, _, _) = crate::tier2::native_call_stats_for_test();
++                (out, compiled, deopts, osr, calls)
++            })
++            .join()
++            .expect("jit object return worker thread");
++            assert_eq!(out, "True\n", "payload: {payload}");
++            assert!(
++                compiled >= 2,
++                "callee and caller did not compile: {payload}"
++            );
++            assert!(
++                calls >= 100,
++                "result crossed only {calls} native calls: {payload}"
++            );
++            assert!(osr > 0, "caller did not enter its hot loop: {payload}");
++            assert_eq!(deopts, 0, "representable object return exited: {payload}");
++            assert_eq!(out, run(&src));
++        }
++    }
++
++    #[cfg(feature = "jit")]
++    #[test]
++    fn jit_dynamic_native_object_return_revalidates_after_callbacks() {
++        let src = r#"BIAS = 1
++events = []
++class Box:
++    def __init__(self, value):
++        global BIAS
++        events.append(value)
++        if value == 80:
++            BIAS = 3
++        self.value = value
++def read_value(n):
++    return Box(value=n).value
++def driver(n):
++    total = 0
++    for i in range(n):
++        total += read_value(i) + BIAS
++    return total
++result = driver(128)
++assert events == list(range(128))
++print(result, len(events))
++"#;
++        let (out, compiled, deopts, osr) = run_jit_osr(src);
++        assert_eq!(out, "8352 128\n");
++        assert!(compiled >= 2 && osr > 0, "the caller must run natively");
++        assert!(deopts > 0, "the changed global must invalidate the caller");
++        assert_eq!(out, run(src));
++    }
++
++    #[cfg(feature = "jit")]
++    #[test]
+     fn jit_keyword_constructors_preserve_defaults_and_callable_identity() {
+         let src = r#"events = []
+ class Box:

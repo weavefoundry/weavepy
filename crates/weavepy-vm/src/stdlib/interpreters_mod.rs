@@ -15,6 +15,7 @@
 //! None, and tuples of shareable values. Anything else raises
 //! `interpreters.NotShareableError`.
 
+use crate::shared_value::SharedSlice;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -329,7 +330,7 @@ fn is_shareable(obj: &Object) -> bool {
 fn xid_rebuild(obj: &Object) -> Object {
     match obj {
         Object::Str(s) => Object::from_str(s.to_string()),
-        Object::Bytes(b) => Object::Bytes(crate::sync::Rc::from(&b[..])),
+        Object::Bytes(b) => Object::Bytes(SharedSlice::from(&b[..])),
         Object::Tuple(items) => Object::new_tuple(items.iter().map(xid_rebuild).collect()),
         other => other.clone(),
     }

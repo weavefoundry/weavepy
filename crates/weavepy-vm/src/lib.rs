@@ -15,6 +15,7 @@
 //! output (REPL, test runners, the conformance harness) plug in a
 //! `Vec<u8>` writer; the CLI uses the process stdout.
 
+use crate::shared_value::{SharedSlice, SharedStr, ThinArc};
 use crate::sync::Rc;
 use crate::sync::{Cell, RefCell, ThreadCell};
 use std::io::Write;
@@ -67,6 +68,7 @@ pub mod py_errno;
 pub mod pycache;
 pub mod rare_events;
 pub mod recursion;
+pub mod shared_value;
 pub mod specialize;
 pub mod stdlib;
 pub mod stdlib_tree;
@@ -860,7 +862,7 @@ pub struct Interpreter {
     /// freelist analogue (one LIFO bucket per length 1..=16, like
     /// CPython's per-size freelists). A refcount-dead, untracked,
     /// unwatched tuple reaching the prompt reaper parks its
-    /// `Rc<crate::object::TupleStorage>` allocation here (elements cleared), and
+    /// `crate::object::SharedTuple` allocation here (elements cleared), and
     /// `BuildTuple` refills the most recently parked same-length
     /// allocation in place via `Rc::get_mut`. Besides the malloc
     /// round-trip saved, this makes the free-then-reallocate `id()`
@@ -869,7 +871,7 @@ pub struct Interpreter {
     /// (test_genexps' tupleids doctest), while the system allocator
     /// only usually does (macOS's tiny-magazine allocator was observed
     /// alternating between two blocks under system load).
-    tuple_pool: ThreadCell<[Vec<Rc<crate::object::TupleStorage>>; 16]>,
+    tuple_pool: ThreadCell<[Vec<crate::object::SharedTuple>; 16]>,
     /// Recycled operand-stack vectors, same motivation. The operand
     /// stack is never shared, so every returned frame donates one.
     frame_stack_pool: ThreadCell<Vec<Vec<Object>>>,
@@ -2885,7 +2887,7 @@ impl Interpreter {
             // (strong count 1 = the scan's clone); park its allocation.
             // Anything still referenced elsewhere just sheds the clone.
             for cand in pool_candidates {
-                if matches!(&cand, Object::Tuple(t) if Rc::strong_count(t) == 1) {
+                if matches!(&cand, Object::Tuple(t) if ThinArc::strong_count(t) == 1) {
                     self.maybe_donate_tuple(cand);
                 }
             }
@@ -3298,11 +3300,11 @@ impl Interpreter {
     fn maybe_donate_tuple(&self, dropped: Object) {
         const PER_LEN_CAP: usize = 8;
         let Object::Tuple(t) = dropped else { return };
-        if t.is_empty() || t.len() > 16 || Rc::strong_count(&t) != 1 {
+        if t.is_empty() || t.len() > 16 || ThinArc::strong_count(&t) != 1 {
             return;
         }
         let mut t = t;
-        if let Some(slots) = Rc::get_mut(&mut t) {
+        if let Some(slots) = ThinArc::get_mut(&mut t) {
             for s in slots.iter_mut() {
                 *s = Object::Unbound;
             }
@@ -3326,7 +3328,7 @@ impl Interpreter {
             if let Some(mut t) = popped {
                 // Parked handles are unique by construction; a failed
                 // `get_mut` can't happen, but fall through safely.
-                if let Some(slots) = Rc::get_mut(&mut t) {
+                if let Some(slots) = ThinArc::get_mut(&mut t) {
                     for (s, v) in slots.iter_mut().zip(items) {
                         *s = v;
                     }
@@ -3343,7 +3345,7 @@ impl Interpreter {
         if N > 0 && N <= 16 {
             let popped = self.tuple_pool.borrow_mut()[N - 1].pop();
             if let Some(mut tuple) = popped {
-                if let Some(slots) = Rc::get_mut(&mut tuple) {
+                if let Some(slots) = ThinArc::get_mut(&mut tuple) {
                     for (slot, value) in slots.iter_mut().zip(items) {
                         *slot = value;
                     }
@@ -5319,9 +5321,7 @@ impl Interpreter {
         if crate::trace::eval_frame_record_active() {
             // CPython's `record_eval` appends `co_name` (a str), not the
             // code object itself; `Test_Pep523API` compares against names.
-            crate::trace::record_eval_frame(Object::Str(crate::sync::Rc::from(
-                frame.code.name.as_str(),
-            )));
+            crate::trace::record_eval_frame(Object::Str(SharedStr::from(frame.code.name.as_str())));
         }
         let observers_active = crate::trace::any_observers_active();
         let suppress_call = std::mem::take(&mut frame.suppress_call_event);
@@ -13005,6 +13005,7 @@ impl Interpreter {
             if matches!(c, Object::None) {
                 pe.cause = None;
                 if let Object::Instance(ref inst_rc) = pe.instance {
+                    inst_rc.slot_set("__cause__", Object::None);
                     inst_rc.slot_set("__suppress_context__", Object::Bool(true));
                 }
             } else {
@@ -13115,7 +13116,7 @@ impl Interpreter {
         // pointer compare; only a key minted elsewhere (another thread's
         // pool, a Rust-side insert) pays the byte compare.
         if let Some(Object::Str(n)) = code_name_obj(code, name_idx) {
-            if Rc::ptr_eq(n, s) {
+            if SharedStr::ptr_eq(n, s) {
                 return true;
             }
         }
@@ -18337,7 +18338,7 @@ impl Interpreter {
                         "int() can't convert non-string with explicit base",
                     ));
                 }
-                let a: Vec<Object> = vec![Object::Bytes(Rc::from(mv.to_bytes()))];
+                let a: Vec<Object> = vec![Object::Bytes(SharedSlice::from(mv.to_bytes()))];
                 builtins::b_int_compat(&a)
             }
             other => {
@@ -18388,7 +18389,7 @@ impl Interpreter {
                 if let Some(method) = instance_method(other, "__buffer__") {
                     let view = self.call(&method, &[Object::Int(0)], &[], globals)?;
                     if let Some(bytes) = view.as_bytes_view() {
-                        return builtins::b_int_compat(&[Object::Bytes(Rc::from(bytes))]);
+                        return builtins::b_int_compat(&[Object::Bytes(SharedSlice::from(bytes))]);
                     }
                 }
                 Err(type_error(format!(
@@ -18512,7 +18513,7 @@ impl Interpreter {
                 if let Some(method) = instance_method(other, "__buffer__") {
                     let view = self.call(&method, &[Object::Int(0)], &[], globals)?;
                     if let Some(bytes) = view.as_bytes_view() {
-                        return builtins::b_float_compat(&[Object::Bytes(Rc::from(bytes))]);
+                        return builtins::b_float_compat(&[Object::Bytes(SharedSlice::from(bytes))]);
                     }
                 }
                 Err(type_error(format!(
@@ -21076,7 +21077,7 @@ impl Interpreter {
     fn store_attr_shared_name(
         &mut self,
         obj: &Object,
-        name: &Rc<str>,
+        name: &SharedStr,
         value: Object,
     ) -> Result<(), RuntimeError> {
         match obj {
@@ -28378,7 +28379,7 @@ impl Interpreter {
         obj: &Object,
         name: &str,
         value: Object,
-        shared_name: Option<&Rc<str>>,
+        shared_name: Option<&SharedStr>,
     ) -> Result<(), RuntimeError> {
         // User-defined __setattr__ on the class overrides everything.
         // The stock default (`object.__setattr__`) — cached per class in
@@ -28533,7 +28534,7 @@ impl Interpreter {
         obj: &Object,
         name: &str,
         value: Object,
-        shared_name: Option<&Rc<str>>,
+        shared_name: Option<&SharedStr>,
     ) -> Result<(), RuntimeError> {
         // BaseException getset descriptors (CPython `BaseException_*`
         // setters): `args` coerces through tuple(), `__traceback__`
@@ -29531,7 +29532,7 @@ impl Interpreter {
                         _ => return Err(type_error("bytes slice produced non-int")),
                     }
                 }
-                Ok(Object::Bytes(Rc::from(out.as_slice())))
+                Ok(Object::Bytes(SharedSlice::from(out.as_slice())))
             }
             (Object::ByteArray(buf), Object::Slice(slc)) => {
                 let buf = buf.borrow();
@@ -34955,7 +34956,7 @@ impl Interpreter {
                 }
                 for (k, v) in kwargs {
                     crate::object::key_cmp_scope(|| {
-                        d.insert(DictKey(Object::Str(Rc::from(k.as_str()))), v.clone())
+                        d.insert(DictKey(Object::Str(SharedStr::from(k.as_str()))), v.clone())
                     })?;
                 }
                 let out = Object::Dict(Rc::new(RefCell::new(d)));
@@ -35579,7 +35580,7 @@ impl Interpreter {
                 if mro_has("UnicodeDecodeError") {
                     if let Object::ByteArray(b) = &args[1] {
                         let bytes: Vec<u8> = b.borrow().clone();
-                        object = Object::Bytes(Rc::from(bytes.into_boxed_slice()));
+                        object = Object::Bytes(SharedSlice::from(bytes.into_boxed_slice()));
                     }
                 }
                 for (name, v) in [
@@ -35684,7 +35685,18 @@ impl Interpreter {
         // caller has relinquished ownership); remainder go to *args if
         // present, else error.
         let mut positional: Vec<Object> = vec![Object::Unbound; code.varnames.len()];
-        let mut filled = vec![false; code.varnames.len()];
+        // Only argument slots need binding flags; body locals cannot be
+        // supplied by keyword. Keep common signatures inline and retain a
+        // heap fallback for arbitrary parameter counts.
+        let flag_count = kwonly_end + usize::from(has_varargs) + usize::from(kwargs_slot.is_some());
+        let mut inline_filled = [false; 16];
+        let mut heap_filled;
+        let filled: &mut [bool] = if flag_count <= inline_filled.len() {
+            &mut inline_filled[..flag_count]
+        } else {
+            heap_filled = vec![false; flag_count];
+            &mut heap_filled
+        };
         let provided = args.len();
         let direct = provided.min(total_args);
         let mut arg_iter = args.into_iter();
@@ -35869,14 +35881,12 @@ impl Interpreter {
         // replaces the compiled tuple wholesale; `None` clears it.
         if filled.iter().take(total_args).any(|x| !x) {
             let def_override = f.slot("__defaults__");
-            let overridden: Option<Vec<Object>> = match def_override {
-                Some(Object::Tuple(t)) => Some(t.iter().cloned().collect()),
-                Some(Object::None) => Some(Vec::new()),
-                _ => None,
-            };
-            let defaults: &[Object] = match &overridden {
-                Some(v) => v,
-                None => &f.defaults,
+            // Keep the override tuple alive while borrowing its elements.
+            // Only values that fill missing arguments need another owner.
+            let defaults: &[Object] = match &def_override {
+                Some(Object::Tuple(t)) => t,
+                Some(Object::None) => &[],
+                _ => &f.defaults,
             };
             // Code replacement and __defaults__ assignment may leave more
             // defaults than parameters. Only the trailing suffix binds.
@@ -35897,28 +35907,17 @@ impl Interpreter {
         // `__kwdefaults__` (stored on the function's slot store) replaces
         // the compiled set wholesale — CPython's `func.__kwdefaults__ =
         // {...}` makes any keyword-only name absent from the new mapping
-        // required again. Only the override path allocates; otherwise we
-        // borrow the compiled `kw_defaults` directly.
-        if kwonly_count > 0 {
+        // required again. Borrow either source and clone only defaults
+        // that fill missing arguments. Release all borrows before calling.
+        if kwonly_count > 0
+            && filled
+                .iter()
+                .skip(kwonly_start)
+                .take(kwonly_count)
+                .any(|x| !x)
+        {
             let kwd_override = f.slot("__kwdefaults__");
-            let overridden: Option<Vec<(String, Object)>> = match kwd_override {
-                Some(Object::Dict(d)) => Some(
-                    d.borrow()
-                        .iter()
-                        .filter_map(|(k, v)| match &k.0 {
-                            Object::Str(s) => Some((s.to_string(), v.clone())),
-                            _ => None,
-                        })
-                        .collect(),
-                ),
-                Some(Object::None) => Some(Vec::new()),
-                _ => None,
-            };
-            let kw_defaults_iter: &[(String, Object)] = match &overridden {
-                Some(v) => v,
-                None => &f.kw_defaults,
-            };
-            for (name, default) in kw_defaults_iter {
+            let mut bind_default = |name: &str, default: &Object| {
                 if let Some(p) = code
                     .varnames
                     .get(kwonly_start..kwonly_end)
@@ -35928,6 +35927,23 @@ impl Interpreter {
                     if !filled[slot] {
                         positional[slot] = default.clone();
                         filled[slot] = true;
+                    }
+                }
+            };
+            match &kwd_override {
+                Some(Object::Dict(d)) => {
+                    // Preserve plain-string iteration without hash probes
+                    // that could invoke exotic-key equality under a borrow.
+                    for (key, default) in d.borrow().iter() {
+                        if let Object::Str(name) = &key.0 {
+                            bind_default(name, default);
+                        }
+                    }
+                }
+                Some(Object::None) => {}
+                _ => {
+                    for (name, default) in &f.kw_defaults {
+                        bind_default(name, default);
                     }
                 }
             }
@@ -36041,6 +36057,13 @@ impl Interpreter {
                 },
             )?
         };
+        // Keep native eligibility outside the argument binder so its layout
+        // values need not stay live across keyword and default processing.
+        #[cfg(feature = "jit")]
+        if let Some(result) = crate::tier2::try_call_native_bound(self, f, &code, &positional) {
+            self.recycle_scratch(positional);
+            return result;
+        }
         let mut frame = self.make_frame(
             code.clone(),
             positional,
@@ -43288,7 +43311,7 @@ fn str_byte_span(s: &str, start: usize, stop: Option<usize>) -> (usize, usize) {
 /// only as far as `stop` and slices the underlying UTF-8 directly, turning a
 /// full scan from O(n^2) into O(n). Negative bounds or a non-unit step fall
 /// back to the general code-point walk.
-pub(crate) fn str_subscript_slice(s: &Rc<str>, slc: &PySlice) -> Result<Object, RuntimeError> {
+pub(crate) fn str_subscript_slice(s: &SharedStr, slc: &PySlice) -> Result<Object, RuntimeError> {
     let step = match &slc.step {
         Object::None => 1i64,
         Object::Int(i) => *i,
@@ -43570,7 +43593,7 @@ pub(crate) fn mv_unpack_single(fmt: char, bytes: &[u8]) -> Result<Object, Runtim
         'b' => Object::Int(i64::from(bytes[0] as i8)),
         'B' => Object::Int(i64::from(bytes[0])),
         '?' => Object::Bool(bytes[0] != 0),
-        'c' => Object::Bytes(Rc::from(&bytes[..1])),
+        'c' => Object::Bytes(SharedSlice::from(&bytes[..1])),
         'h' => Object::Int(i64::from(i16::from_ne_bytes(a2()))),
         'H' => Object::Int(i64::from(u16::from_ne_bytes(a2()))),
         'i' => Object::Int(i64::from(i32::from_ne_bytes(a4()))),
@@ -50559,8 +50582,17 @@ refill(second, 23)
             crate::tier2::force_enable_for_test(2);
             check_constructor_slot_names(true);
             let (compiled, entries, _) = crate::tier2::stats_for_test();
+            let direct = crate::tier2::direct_call_count_for_test();
+            println!(
+                "slot name native coverage: compiled={compiled}, framed={entries}, direct={direct}"
+            );
             assert!(compiled >= 2, "initializer and refill must compile");
-            assert!(entries >= 100, "slot stores must execute in native code");
+            // Frameless native calls aren't included in the framed-entry
+            // counter; both paths execute the same guarded slot helpers.
+            assert!(
+                entries + direct >= 100,
+                "slot stores must execute in native code"
+            );
         })
         .join()
         .expect("jit worker thread");
@@ -54904,6 +54936,27 @@ print("native pickle coverage: ok")
             "    print(r.args[0])\n"
         );
         assert_eq!(run(src), "RuntimeError\nouter\n");
+    }
+
+    #[test]
+    fn raise_from_none_clears_a_reused_exceptions_cause() {
+        let src = concat!(
+            "error = ValueError('outer')\n",
+            "cause = LookupError('inner')\n",
+            "try:\n",
+            "    raise error from cause\n",
+            "except ValueError as caught:\n",
+            "    assert caught is error\n",
+            "    assert caught.__cause__ is cause\n",
+            "try:\n",
+            "    raise error from None\n",
+            "except ValueError as caught:\n",
+            "    assert caught is error\n",
+            "    assert caught.__cause__ is None\n",
+            "    assert caught.__suppress_context__\n",
+            "print('ok')\n"
+        );
+        assert_eq!(run(src), "ok\n");
     }
 
     #[test]

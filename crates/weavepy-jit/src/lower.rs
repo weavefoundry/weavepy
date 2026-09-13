@@ -655,6 +655,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let snapshot = self.vstack.clone();
                 self.emit_exit(pc, &snapshot, JitStatus::Yielded);
             }
+            TTerm::Deopt { pc } => {
+                let snapshot = self.vstack.clone();
+                self.emit_exit(pc, &snapshot, JitStatus::Deopt);
+            }
         }
     }
 

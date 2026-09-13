@@ -106,6 +106,100 @@ fn has_op(tf: &TFunc, pred: impl Fn(&TOp) -> bool) -> bool {
 }
 
 #[test]
+fn explicit_raises_exit_at_the_original_opcode() {
+    use weavepy_compiler::OpCode;
+    for body in [
+        "raise",
+        "raise ValueError",
+        "raise problem",
+        "raise problem from cause",
+        "raise problem from None",
+        "raise None",
+        "raise 7",
+    ] {
+        let source = format!("def k(n):\n    if n < 0:\n        {body}\n    return n + 1\n");
+        let code = compile_first_fn(&source);
+        let pc = code
+            .instructions
+            .iter()
+            .position(|i| i.op == OpCode::RaiseVarargs)
+            .unwrap();
+        let tf = analyze_code_cfg(&code, &Cfg::default()).expect("normal path should compile");
+        assert!(tf
+            .blocks
+            .iter()
+            .any(|b| b.term == TTerm::Deopt { pc: pc as u32 }));
+        assert!(tf.blocks.iter().any(|b| b.term == TTerm::Return));
+        assert_eq!(tf.ret_lane, Some(JitType::Int));
+    }
+}
+
+#[test]
+fn conditional_raise_arguments_do_not_restore_another_arms_call_marker() {
+    use weavepy_compiler::OpCode;
+    let code = compile_first_fn(
+        "def k(n, msg):\n    if n < 0:\n        raise factory('closed' if msg is None else msg)\n    return n + 1\n",
+    );
+    let cfg = Cfg {
+        obj_params: vec![1],
+        ..Cfg::default()
+    };
+    let tf = analyze_code_cfg(&code, &cfg).expect("conditional constructor should compile");
+    let mut calls = 0;
+    let mut raises = 0;
+    for (pc, ins) in code.instructions.iter().enumerate() {
+        let pc = pc as u32;
+        if ins.op == OpCode::RaiseVarargs {
+            raises += 1;
+            assert!(tf
+                .null_spans
+                .iter()
+                .all(|s| !(s.live_from < pc && pc < s.live_to)));
+            assert!(tf
+                .callee_spans
+                .iter()
+                .all(|s| !(s.live_from < pc && pc < s.live_to)));
+        } else if ins.op == OpCode::Call {
+            calls += 1;
+            assert_eq!(
+                tf.null_spans
+                    .iter()
+                    .filter(|s| s.live_from < pc && pc < s.live_to)
+                    .count(),
+                1,
+                "each call must restore exactly one self-or-null marker"
+            );
+        }
+    }
+    assert_eq!(
+        calls, 2,
+        "the compiler splits the call across conditional arms"
+    );
+    assert_eq!(raises, 2);
+}
+
+#[test]
+fn malformed_raise_operands_are_rejected() {
+    use weavepy_compiler::OpCode;
+    let mut code = compile_first_fn("def k(n):\n    if n < 0:\n        raise\n    return n + 1\n");
+    let pc = code
+        .instructions
+        .iter()
+        .position(|i| i.op == OpCode::RaiseVarargs)
+        .unwrap();
+    code.instructions[pc].arg = 3;
+    assert!(matches!(
+        analyze_code_cfg(&code, &Cfg::default()),
+        Err(JitVerdict::UnsupportedOpcode(_))
+    ));
+    code.instructions[pc].arg = 1;
+    assert!(matches!(
+        analyze_code_cfg(&code, &Cfg::default()),
+        Err(JitVerdict::StackUnderflow)
+    ));
+}
+
+#[test]
 fn tuple_constants_pin_without_copying_or_scalar_restrictions() {
     for literal in ["()", "(1, 2, 3)", "(None, (1, 'two words'), b'bytes')"] {
         let src = format!(
@@ -638,5 +732,72 @@ fn folded_slice_fallback_resumes_the_constant_load() {
                 ..
             }
         )));
+    }
+}
+
+#[test]
+fn assertions_exit_before_constructing_the_exception_or_message() {
+    use weavepy_compiler::OpCode;
+    for assertion in [
+        "assert n >= 0",
+        "assert n >= 0, n",
+        "assert n >= 0, f'value: {n}'",
+        "assert n >= 0, factory('bad' if n < -1 else 'worse')",
+    ] {
+        let source = format!("def k(n):\n    {assertion}\n    return n + 1\n");
+        let code = compile_first_fn(&source);
+        let pc = code
+            .instructions
+            .iter()
+            .position(|i| i.op == OpCode::LoadCommonConstant)
+            .unwrap();
+        let tf =
+            analyze_code_cfg(&code, &Cfg::default()).expect("successful assertion should compile");
+        assert!(tf
+            .blocks
+            .iter()
+            .any(|b| b.term == TTerm::Deopt { pc: pc as u32 }));
+        assert!(tf.blocks.iter().any(|b| b.term == TTerm::Return));
+        assert_eq!(tf.ret_lane, Some(JitType::Int));
+        for span in &tf.null_spans {
+            assert!(!(span.live_from <= pc as u32 && (pc as u32) < span.live_to));
+        }
+        for span in &tf.callee_spans {
+            assert!(!(span.live_from <= pc as u32 && (pc as u32) < span.live_to));
+        }
+    }
+}
+
+#[test]
+fn common_constant_exits_are_limited_to_exception_classes() {
+    use weavepy_compiler::bytecode::{
+        COMMON_CONSTANT_ALL, COMMON_CONSTANT_ANY, COMMON_CONSTANT_ASSERTION_ERROR,
+        COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR, COMMON_CONSTANT_TUPLE,
+    };
+    use weavepy_compiler::OpCode;
+    for arg in [
+        COMMON_CONSTANT_ASSERTION_ERROR,
+        COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR,
+        COMMON_CONSTANT_TUPLE,
+        COMMON_CONSTANT_ALL,
+        COMMON_CONSTANT_ANY,
+        u32::MAX,
+    ] {
+        let mut code = compile_first_fn("def k(n):\n    assert n >= 0\n    return n + 1\n");
+        let ins = code
+            .instructions
+            .iter_mut()
+            .find(|i| i.op == OpCode::LoadCommonConstant)
+            .unwrap();
+        ins.arg = arg;
+        let result = analyze_code_cfg(&code, &Cfg::default());
+        assert_eq!(
+            result.is_ok(),
+            matches!(
+                arg,
+                COMMON_CONSTANT_ASSERTION_ERROR | COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR
+            ),
+            "common constant {arg}"
+        );
     }
 }

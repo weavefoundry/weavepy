@@ -1,0 +1,186 @@
+--- a/crates/weavepy-jit/src/engine.rs
++++ b/crates/weavepy-jit/src/engine.rs
+@@ -26,6 +26,11 @@
+ use crate::runtime::{self, JitFrame, JitStatus};
+ use crate::value::JitType;
+ use weavepy_compiler::CodeObject;
++
++// Reuse compiler allocations for ordinary functions, but release the backing
++// storage after large compilations. Created IR instructions are a size proxy,
++// not a byte-capacity bound. Executable code remains owned by the JITModule.
++const MAX_RETAINED_IR_INSTRUCTIONS: usize = 8_192;
+ 
+ /// The native ABI of a compiled frame: takes a `*mut JitFrame`, returns
+ /// an `i64` [`JitStatus`].
+@@ -154,6 +159,23 @@
+ }
+ 
+ impl JitEngine {
++    fn clear_compilation_scratch(&mut self) {
++        if self.ctx.func.dfg.num_insts() > MAX_RETAINED_IR_INSTRUCTIONS {
++            self.reset_compilation_scratch();
++        } else {
++            self.module.clear_context(&mut self.ctx);
++        }
++    }
++
++    // Constructing the replacement contexts needs large stack temporaries.
++    // Keep those off the ordinary compilation path that reuses its buffers.
++    #[cold]
++    #[inline(never)]
++    fn reset_compilation_scratch(&mut self) {
++        self.ctx = self.module.make_context();
++        self.fbctx = FunctionBuilderContext::new();
++    }
++
+     /// Build a fresh engine for the host target. Returns `None` if the
+     /// host ISA can't be configured (e.g. an unsupported platform), in
+     /// which case the VM simply never tiers up.
+@@ -379,7 +401,7 @@
+                 "float floordiv/mod (no helper registered)",
+             ));
+         }
+-        self.module.clear_context(&mut self.ctx);
++        self.clear_compilation_scratch();
+ 
+         // Signature: (frame: ptr) -> i64.
+         self.ctx
+@@ -397,14 +419,21 @@
+ 
+         let name = format!("wpjit_{}", self.next_id);
+         self.next_id += 1;
+-        let id = self
+-            .module
+-            .declare_function(&name, Linkage::Local, &self.ctx.func.signature)
+-            .map_err(|_| JitVerdict::NotConverged)?;
+-        self.module
+-            .define_function(id, &mut self.ctx)
+-            .map_err(|_| JitVerdict::NotConverged)?;
+-        self.module.clear_context(&mut self.ctx);
++        let declaration =
++            self.module
++                .declare_function(&name, Linkage::Local, &self.ctx.func.signature);
++        let id = match declaration {
++            Ok(id) => id,
++            Err(_) => {
++                self.clear_compilation_scratch();
++                return Err(JitVerdict::NotConverged);
++            }
++        };
++        let definition = self.module.define_function(id, &mut self.ctx);
++        // Optimization can grow the IR. Check its size after the definition
++        // attempt, and release scratch even when the definition failed.
++        self.clear_compilation_scratch();
++        definition.map_err(|_| JitVerdict::NotConverged)?;
+         self.module
+             .finalize_definitions()
+             .map_err(|_| JitVerdict::NotConverged)?;
+--- a/crates/weavepy-jit/src/engine/tests.rs
++++ b/crates/weavepy-jit/src/engine/tests.rs
+@@ -176,3 +176,106 @@
+     assert_eq!(&tags[..2], &[SlotTag::Int as u32; 2]);
+     assert_eq!(locals, [99, 7]);
+ }
++
++fn oversized_function(kind: ArithKind) -> TFunc {
++    // Distinct dead constants grow compiler IR without requiring helpers or
++    // performing extra work when the resulting native function is entered.
++    let mut ops = Vec::new();
++    for value in 0..=super::MAX_RETAINED_IR_INSTRUCTIONS {
++        ops.push(TOp::PushConstInt(value as i64));
++        ops.push(TOp::Pop);
++    }
++    ops.extend([TOp::LoadLocal(0), TOp::LoadLocal(1), TOp::IntArith(kind)]);
++    function(&ops)
++}
++
++fn check_scalar_entry(compiled: &super::CompiledFrame, a: i64, b: i64, expected: Result<i64, u32>) {
++    use crate::runtime::{JitFrame, JitStatus, SlotTag};
++    let mut locals = [a as u64, b as u64];
++    let mut spill = [0u64; 3];
++    let mut tags = [0u32; 3];
++    let mut frame = JitFrame {
++        locals: locals.as_mut_ptr(),
++        n_locals: 2,
++        entry_pc: 0,
++        ret_bits: 0,
++        ret_tag: 0,
++        deopt_pc: 0,
++        stack_spill: spill.as_mut_ptr(),
++        stack_tags: tags.as_mut_ptr(),
++        stack_len: 0,
++        stack_cap: 3,
++        ctx: std::ptr::null_mut(),
++        call_args: std::ptr::null_mut(),
++        call_tags: std::ptr::null_mut(),
++    };
++    // SAFETY: the tests keep the owning engine alive. These functions use only
++    // scalar operations with no helpers, and all exchange buffers fit their IR.
++    let status = unsafe { compiled.enter(&raw mut frame) };
++    match expected {
++        Ok(value) => {
++            assert_eq!(status, JitStatus::Returned);
++            assert_eq!(frame.ret_bits, value as u64);
++            assert_eq!(frame.ret_tag, SlotTag::Int as u32);
++        }
++        Err(pc) => {
++            assert_eq!(status, JitStatus::Deopt);
++            assert_eq!(frame.deopt_pc, pc);
++            assert_eq!(frame.stack_len, 2);
++            assert_eq!(&spill[..2], &[a as u64, b as u64]);
++            assert_eq!(&tags[..2], &[SlotTag::Int as u32; 2]);
++        }
++    }
++    assert_eq!(locals, [a as u64, b as u64]);
++}
++
++#[test]
++fn compiler_scratch_reset_preserves_old_code_and_exact_exits() {
++    let mut engine = super::JitEngine::new().expect("host ISA");
++    let small = |kind| function(&[TOp::LoadLocal(0), TOp::LoadLocal(1), TOp::IntArith(kind)]);
++    let first = engine.compile_tfunc(&small(ArithKind::Add)).unwrap();
++    let large_ir = oversized_function(ArithKind::Sub);
++    let large_pc = large_ir.blocks[0].stmts.last().unwrap().pc;
++    let large = engine.compile_tfunc(&large_ir).unwrap();
++    let last = engine.compile_tfunc(&small(ArithKind::Mul)).unwrap();
++
++    // Enter every function after subsequent compilations have recycled the
++    // contexts. Distinct results also catch an accidentally replaced entry.
++    for _ in 0..3 {
++        check_scalar_entry(&first, 40, 2, Ok(42));
++        check_scalar_entry(&large, 40, 2, Ok(38));
++        check_scalar_entry(&last, 40, 2, Ok(80));
++        check_scalar_entry(&first, i64::MAX, 1, Err(2));
++        check_scalar_entry(&large, i64::MIN, 1, Err(large_pc));
++        check_scalar_entry(&last, i64::MAX, 2, Err(2));
++    }
++}
++
++#[test]
++fn failed_definition_clears_scratch_and_preserves_old_code() {
++    let mut engine = super::JitEngine::new().expect("host ISA");
++    let small = function(&[
++        TOp::LoadLocal(0),
++        TOp::LoadLocal(1),
++        TOp::IntArith(ArithKind::Add),
++    ]);
++    let first = engine.compile_tfunc(&small).unwrap();
++    // Reuse an already-defined symbol to make module definition fail after
++    // lowering a large body. No invalid IR or platform-specific ISA is needed.
++    engine.next_id = 0;
++    let large_ir = oversized_function(ArithKind::Sub);
++    assert!(matches!(
++        engine.compile_tfunc(&large_ir),
++        Err(crate::analyze::JitVerdict::NotConverged)
++    ));
++    assert_eq!(engine.ctx.func.dfg.num_insts(), 0);
++    assert!(engine.ctx.compiled_code().is_none());
++    check_scalar_entry(&first, 40, 2, Ok(42));
++    check_scalar_entry(&first, i64::MAX, 1, Err(2));
++
++    let recovered = engine.compile_tfunc(&large_ir).unwrap();
++    let last = engine.compile_tfunc(&small).unwrap();
++    check_scalar_entry(&recovered, 40, 2, Ok(38));
++    check_scalar_entry(&last, 40, 2, Ok(42));
++    check_scalar_entry(&first, 40, 2, Ok(42));
++}

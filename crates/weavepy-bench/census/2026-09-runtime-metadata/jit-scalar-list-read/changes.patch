@@ -1,0 +1,234 @@
+--- a/crates/weavepy-vm/src/lib.rs
++++ b/crates/weavepy-vm/src/lib.rs
+@@ -51299,6 +51299,148 @@
+     }
+ 
+     #[cfg(feature = "jit")]
++    #[test]
++    fn jit_scalar_list_reads_preserve_values_and_pin_pressure() {
++        for (value, expected, initial_expected) in [
++            ("i * 3", "[59988, 59991, 59994, 59997]", "[0, 3, 6, 9]"),
++            (
++                "i + 0.5",
++                "[19996.5, 19997.5, 19998.5, 19999.5]",
++                "[0.5, 1.5, 2.5, 3.5]",
++            ),
++            (
++                "(i & 1) == 0",
++                "[True, False, True, False]",
++                "[True, False, True, False]",
++            ),
++        ] {
++            for iteration in [false, true] {
++                let source = if iteration {
++                    format!("def read(n):\n    items = [None] * 4\n    for i in range(4):\n        items[i] = {value}\n    result = [None] * 4\n    for outer in range(n):\n        k = 0\n        for value in items:\n            result[k] = value\n            k = k + 1\n    return result\nprint(read(5000))\n")
++                } else {
++                    format!("def read(n):\n    items = [None] * 4\n    result = [None] * 4\n    for i in range(n):\n        items[i & 3] = {value}\n        result[i & 3] = items[(i & 3) - 4]\n    return result\nprint(read(20000))\n")
++                };
++                let native_source = source.clone();
++                let (output, reads, pressure) = std::thread::spawn(move || {
++                    crate::tier2::force_enable_for_test(2);
++                    let output = run(&native_source);
++                    (
++                        output,
++                        crate::tier2::scalar_list_read_calls_for_test(),
++                        crate::tier2::pin_pressure_exits_for_test(),
++                    )
++                })
++                .join()
++                .expect("scalar list read worker");
++                let count = if iteration { reads.1 } else { reads.0 };
++                eprintln!("scalar native reads: {value}, iteration={iteration}, count={count}, pressure={pressure}");
++                assert_eq!(
++                    output,
++                    format!(
++                        "{}\n",
++                        if iteration {
++                            initial_expected
++                        } else {
++                            expected
++                        }
++                    )
++                );
++                assert!(count >= 18000, "scalar list reads did not stay native: count={count}, iteration={iteration}, {value}");
++                assert!(pressure > 0, "no temporary-pin pressure was exercised");
++                assert_eq!(output, run(&source));
++            }
++        }
++    }
++
++    #[cfg(feature = "jit")]
++    #[test]
++    fn jit_scalar_list_reads_mutation() {
++        let source = r#"events = []
++marker = object()
++huge = 1 << 80
++def change(items):
++    events.append('change')
++    items[91:] = [False, 0.5, huge, None, marker]
++def collect(n):
++    items = [None] * n
++    result = []
++    index = 0
++    for i in range(n):
++        items[i] = i
++    for value in items:
++        result.append(value)
++        if index == 90:
++            change(items)
++        index = index + 1
++    return result
++result = collect(128)
++assert result == list(range(91)) + [False, 0.5, huge, None, marker]
++assert type(result[91]) is bool
++assert type(result[92]) is float
++assert type(result[93]) is int
++assert result[-1] is marker
++assert events == ['change']
++print('scalar list mutation and unsupported value ok')
++"#;
++        let (output, reads) = std::thread::spawn(move || {
++            crate::tier2::force_enable_for_test(2);
++            let output = run(source);
++            (output, crate::tier2::scalar_list_read_calls_for_test())
++        })
++        .join()
++        .expect("scalar list read semantics worker");
++        let count = reads.1;
++        eprintln!("scalar native reads before mutation fallback: count={count}");
++        assert_eq!(output, "scalar list mutation and unsupported value ok\n");
++        assert!(
++            count >= 90,
++            "scalar list read native prefix missing: {count}"
++        );
++        assert_eq!(output, run(source));
++    }
++
++    #[cfg(feature = "jit")]
++    #[test]
++    fn jit_scalar_list_reads_bounds() {
++        let source = r#"events = []
++seen = []
++def index(i):
++    events.append(i)
++    return i + 0
++def collect(n):
++    items = [None] * 128
++    for i in range(128):
++        items[i] = i * 2
++    for i in range(n):
++        seen.append(items[(index(i) + 0) - 128])
++try:
++    collect(300)
++except IndexError:
++    pass
++else:
++    raise AssertionError('out-of-range read must fail')
++assert seen == [i * 2 for i in range(128)] * 2
++assert events == list(range(257))
++print('scalar list read bounds and callback order ok')
++"#;
++        let (output, reads) = std::thread::spawn(move || {
++            crate::tier2::force_enable_for_test(2);
++            let output = run(source);
++            (output, crate::tier2::scalar_list_read_calls_for_test())
++        })
++        .join()
++        .expect("scalar list read semantics worker");
++        let count = reads.0;
++        eprintln!("scalar native reads before bounds fallback: count={count}");
++        assert_eq!(output, "scalar list read bounds and callback order ok\n");
++        assert!(
++            count >= 200,
++            "scalar list read native prefix missing: {count}"
++        );
++        assert_eq!(output, run(source));
++    }
++
++    #[cfg(feature = "jit")]
+     fn run_jit_scalar_list_store(src: &str) -> (String, u64) {
+         let src = src.to_owned();
+         std::thread::spawn(move || {
+--- a/crates/weavepy-vm/src/tier2.rs
++++ b/crates/weavepy-vm/src/tier2.rs
+@@ -4182,9 +4182,16 @@
+             // RFC 0071 WS4 — the object element lane: `None` rides as
+             // the nullable `-1`; an instance pins below.
+             (Object::None, JitType::Obj) => Ok(u64::MAX),
+-            // RFC 0073 WS3 — exact-`str` elements pin on the object
+-            // lane (indexing into a `split` result).
+-            (v @ (Object::Instance(_) | Object::Str(_)), JitType::Obj) => Err(v.clone()),
++            // Preserve exact scalar values in the object pin lane as well
++            // as instances and strings. The consumer retains its own guard.
++            (
++                v @ (Object::Instance(_)
++                | Object::Str(_)
++                | Object::Int(_)
++                | Object::Float(_)
++                | Object::Bool(_)),
++                JitType::Obj,
++            ) => Err(v.clone()),
+             _ => return 1,
+         }
+     };
+@@ -4196,6 +4203,10 @@
+         Err(obj) => {
+             if ctx.pins.len() >= RUNTIME_PIN_CAP {
+                 return 1;
++            }
++            #[cfg(test)]
++            if matches!(obj, Object::Int(_) | Object::Float(_) | Object::Bool(_)) {
++                SCALAR_LIST_GET_TEST_CALLS.with(|count| count.set(count.get() + 1));
+             }
+             jf.ret_bits = ctx.pins.len() as u64;
+             ctx.pins.push(Pin::Obj(obj));
+@@ -4913,9 +4924,16 @@
+             (Object::Float(f), JitType::Float) => Ok(f.to_bits()),
+             (Object::Bool(b), JitType::Bool) => Ok(u64::from(*b)),
+             (Object::None, JitType::Obj) => Ok(u64::MAX),
+-            // RFC 0073 WS3 — exact-`str` elements pin on the object
+-            // lane (a `split` result's `ForList` consumer).
+-            (v @ (Object::Instance(_) | Object::Str(_)), JitType::Obj) => Err(v.clone()),
++            // Scalar values retain their exact type through the same object
++            // pin path as instances and strings, including reconstruction.
++            (
++                v @ (Object::Instance(_)
++                | Object::Str(_)
++                | Object::Int(_)
++                | Object::Float(_)
++                | Object::Bool(_)),
++                JitType::Obj,
++            ) => Err(v.clone()),
+             _ => return 2,
+         }
+     };
+@@ -4927,6 +4945,10 @@
+         Err(obj) => {
+             if ctx.pins.len() >= RUNTIME_PIN_CAP {
+                 return 2;
++            }
++            #[cfg(test)]
++            if matches!(obj, Object::Int(_) | Object::Float(_) | Object::Bool(_)) {
++                SCALAR_LIST_NEXT_TEST_CALLS.with(|count| count.set(count.get() + 1));
+             }
+             jf.ret_bits = ctx.pins.len() as u64;
+             ctx.pins.push(Pin::Obj(obj));
+@@ -9167,3 +9189,18 @@
+ pub(crate) fn scalar_list_store_calls_for_test() -> u64 {
+     SCALAR_LIST_STORE_TEST_CALLS.with(std::cell::Cell::get)
+ }
++
++#[cfg(test)]
++std::thread_local! {
++    static SCALAR_LIST_GET_TEST_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
++    static SCALAR_LIST_NEXT_TEST_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
++}
++
++/// Test-only completed scalar reads on the heterogeneous list lane.
++#[cfg(test)]
++pub(crate) fn scalar_list_read_calls_for_test() -> (u64, u64) {
++    (
++        SCALAR_LIST_GET_TEST_CALLS.with(std::cell::Cell::get),
++        SCALAR_LIST_NEXT_TEST_CALLS.with(std::cell::Cell::get),
++    )
++}

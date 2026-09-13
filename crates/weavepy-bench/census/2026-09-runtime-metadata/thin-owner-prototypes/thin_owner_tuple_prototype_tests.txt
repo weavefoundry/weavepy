@@ -1,0 +1,8 @@
+
+running 3 tests
+test tests::fixed_arrays_and_unique_mutation_preserve_ownership ... ok
+test tests::destructors_run_at_last_strong_owner_before_weak_release ... ok
+test tests::atomic_header_and_elements_survive_thread_handoffs ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

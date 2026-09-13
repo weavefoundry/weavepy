@@ -11,6 +11,7 @@
 //! cache, and the raw function pointers they hand out never cross thread
 //! boundaries — hence the thread-local state and the plain [`StdRc`].
 
+use crate::shared_value::SharedStr;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc as StdRc;
@@ -80,7 +81,7 @@ enum AttrStorage {
 struct AttrGuard {
     /// The attribute name (the indexed dict hit must still carry it —
     /// a `del` of an earlier attribute shift-renumbers later slots).
-    name: Rc<str>,
+    name: SharedStr,
     /// The value lane the site was compiled with.
     lane: JitType,
     /// The class's `attr_version` at compile time (bumps on any class
@@ -2125,7 +2126,7 @@ fn attr_site_guard(
                 Object::Str(name) => Some(name.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| Rc::from(site.name.as_str()))
+            .unwrap_or_else(|| SharedStr::from(site.name.as_str()))
     };
     // RFC 0073 WS1 — a constructor-resolved site has no live receiver
     // to fingerprint: burn the indexed guard from the class's
@@ -2679,9 +2680,15 @@ fn guards_hold(
 struct JitBufs {
     u64s: Vec<Vec<u64>>,
     u32s: Vec<Vec<u32>>,
+    u64_capacity_bytes: usize,
+    u32_capacity_bytes: usize,
 }
 
 const JIT_BUF_POOL_CAP: usize = 64;
+// Bound retained element capacity as well as entry count. This excludes
+// allocator rounding and the pool's own Vec headers. Active buffers can grow
+// without this limit; oversized owners are simply released after their call.
+const JIT_BUF_POOL_CAPACITY_BYTES: usize = 16 * 1024;
 
 thread_local! {
     static JIT_BUFS: RefCell<JitBufs> = RefCell::new(JitBufs::default());
@@ -2690,7 +2697,12 @@ thread_local! {
 /// A pooled `u64` buffer of exactly `n` zeroed entries.
 fn take_u64(n: usize) -> Vec<u64> {
     let mut v = JIT_BUFS
-        .with(|p| p.borrow_mut().u64s.pop())
+        .with(|p| {
+            let mut p = p.borrow_mut();
+            let v = p.u64s.pop()?;
+            p.u64_capacity_bytes -= v.capacity() * std::mem::size_of::<u64>();
+            Some(v)
+        })
         .unwrap_or_default();
     v.clear();
     v.resize(n, 0);
@@ -2700,7 +2712,12 @@ fn take_u64(n: usize) -> Vec<u64> {
 /// A pooled `u32` buffer of exactly `n` zeroed entries.
 fn take_u32(n: usize) -> Vec<u32> {
     let mut v = JIT_BUFS
-        .with(|p| p.borrow_mut().u32s.pop())
+        .with(|p| {
+            let mut p = p.borrow_mut();
+            let v = p.u32s.pop()?;
+            p.u32_capacity_bytes -= v.capacity() * std::mem::size_of::<u32>();
+            Some(v)
+        })
         .unwrap_or_default();
     v.clear();
     v.resize(n, 0);
@@ -2710,7 +2727,11 @@ fn take_u32(n: usize) -> Vec<u32> {
 fn put_u64(v: Vec<u64>) {
     JIT_BUFS.with(|p| {
         let mut p = p.borrow_mut();
-        if p.u64s.len() < JIT_BUF_POOL_CAP {
+        let bytes = v.capacity() * std::mem::size_of::<u64>();
+        if p.u64s.len() < JIT_BUF_POOL_CAP
+            && bytes <= JIT_BUF_POOL_CAPACITY_BYTES - p.u64_capacity_bytes
+        {
+            p.u64_capacity_bytes += bytes;
             p.u64s.push(v);
         }
     });
@@ -2719,10 +2740,99 @@ fn put_u64(v: Vec<u64>) {
 fn put_u32(v: Vec<u32>) {
     JIT_BUFS.with(|p| {
         let mut p = p.borrow_mut();
-        if p.u32s.len() < JIT_BUF_POOL_CAP {
+        let bytes = v.capacity() * std::mem::size_of::<u32>();
+        if p.u32s.len() < JIT_BUF_POOL_CAP
+            && bytes <= JIT_BUF_POOL_CAPACITY_BYTES - p.u32_capacity_bytes
+        {
+            p.u32_capacity_bytes += bytes;
             p.u32s.push(v);
         }
     });
+}
+
+#[cfg(test)]
+mod scratch_pool_tests {
+    use super::*;
+
+    fn assert_accounting() {
+        JIT_BUFS.with(|pool| {
+            let pool = pool.borrow();
+            assert!(pool.u64s.len() <= JIT_BUF_POOL_CAP);
+            assert!(pool.u32s.len() <= JIT_BUF_POOL_CAP);
+            assert!(pool.u64_capacity_bytes <= JIT_BUF_POOL_CAPACITY_BYTES);
+            assert!(pool.u32_capacity_bytes <= JIT_BUF_POOL_CAPACITY_BYTES);
+            assert_eq!(
+                pool.u64_capacity_bytes,
+                pool.u64s.iter().map(|v| v.capacity() * 8).sum::<usize>()
+            );
+            assert_eq!(
+                pool.u32_capacity_bytes,
+                pool.u32s.iter().map(|v| v.capacity() * 4).sum::<usize>()
+            );
+        });
+    }
+
+    #[test]
+    fn scratch_pool_enforces_count_and_capacity_limits() {
+        std::thread::spawn(|| {
+            for _ in 0..JIT_BUF_POOL_CAP + 3 {
+                put_u64(vec![17]);
+                put_u32(vec![19]);
+            }
+            assert_accounting();
+            JIT_BUFS.with(|pool| {
+                let mut pool = pool.borrow_mut();
+                assert_eq!(pool.u64s.len(), JIT_BUF_POOL_CAP);
+                assert_eq!(pool.u32s.len(), JIT_BUF_POOL_CAP);
+                *pool = JitBufs::default();
+            });
+            put_u64(Vec::with_capacity(JIT_BUF_POOL_CAPACITY_BYTES / 8 + 1));
+            put_u32(Vec::with_capacity(JIT_BUF_POOL_CAPACITY_BYTES / 4 + 1));
+            JIT_BUFS.with(|pool| {
+                let pool = pool.borrow();
+                assert!(pool.u64s.is_empty());
+                assert!(pool.u32s.is_empty());
+            });
+            assert_accounting();
+            for _ in 0..3 {
+                put_u64(Vec::with_capacity(JIT_BUF_POOL_CAPACITY_BYTES / 16));
+                put_u32(Vec::with_capacity(JIT_BUF_POOL_CAPACITY_BYTES / 8));
+            }
+            assert_accounting();
+            JIT_BUFS.with(|pool| {
+                let pool = pool.borrow();
+                assert_eq!(pool.u64s.len(), 2);
+                assert_eq!(pool.u32s.len(), 2);
+            });
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn scratch_pool_releases_budget_before_reused_buffers_grow() {
+        std::thread::spawn(|| {
+            for _ in 0..8 {
+                for n in [1, 128, 4096, 2, 8192, 0] {
+                    let mut words = take_u64(n);
+                    assert_eq!(words.len(), n);
+                    assert!(words.iter().all(|v| *v == 0));
+                    assert_accounting();
+                    words.fill(17);
+                    put_u64(words);
+                    let mut tags = take_u32(n);
+                    assert_eq!(tags.len(), n);
+                    assert!(tags.iter().all(|v| *v == 0));
+                    assert_accounting();
+                    tags.fill(19);
+                    put_u32(tags);
+                    assert_accounting();
+                }
+            }
+        })
+        .join()
+        .unwrap();
+    }
 }
 
 /// The `wpjit_poll` helper (RFC 0067 WS2): native loop headers call
@@ -3047,8 +3157,17 @@ unsafe fn try_native_call(
         };
     }
 
+    // Keep disjoint regions in one pooled owner per element width, as
+    // direct native entry does. Owners stay live through every native or
+    // materialized continuation; no pool borrow crosses the call.
     let n_locals = nc.cf.n_locals as usize;
-    let mut locals_buf = take_u64(n_locals);
+    let cap = nc.cf.max_stack as usize + 1;
+    let call_cap = (nc.cf.max_call_args as usize).max(1);
+    let mut u64_buf = take_u64(n_locals + cap + call_cap);
+    let (locals_buf, rest) = u64_buf.split_at_mut(n_locals);
+    let (spill, call_args) = rest.split_at_mut(cap);
+    let mut u32_buf = take_u32(cap + call_cap);
+    let (tags, call_tags) = u32_buf.split_at_mut(cap);
     let mut pins: PinTable = Vec::new();
     if let Some(r) = recv {
         // The receiver slot carries pin index 0 (`take_u64` zeroed it).
@@ -3099,12 +3218,6 @@ unsafe fn try_native_call(
         };
     }
     let entry_pin_count = pins.len();
-    let cap = nc.cf.max_stack as usize + 1;
-    let mut spill = take_u64(cap);
-    let mut tags = take_u32(cap);
-    let call_cap = (nc.cf.max_call_args as usize).max(1);
-    let mut call_args = take_u64(call_cap);
-    let mut call_tags = take_u32(call_cap);
     let callee_key = Rc::as_ptr(&nc.code).cast::<CodeObject>();
     // Self-recursion reuses this activation's own tables. An immutable
     // compilation with no call tokens needs no resolution, even when
@@ -3222,25 +3335,15 @@ unsafe fn try_native_call(
                 None
             };
             match finish_deopted_callee(
-                interp,
-                nc,
-                &mut nctx,
-                &locals_buf,
-                &spill,
-                &tags,
-                &njf,
-                pending,
+                interp, nc, &mut nctx, locals_buf, spill, tags, &njf, pending,
             ) {
                 Ok(v) => Done::Obj(v),
                 Err(e) => Done::Raised(e),
             }
         }
     };
-    put_u64(locals_buf);
-    put_u64(spill);
-    put_u32(tags);
-    put_u64(call_args);
-    put_u32(call_tags);
+    put_u64(u64_buf);
+    put_u32(u32_buf);
     // Reap the callee's pins (after every
     // pin-based rebuild above); a reap cascade runs Python, so it
     // dirties the call like any interpreter-path work.
@@ -4410,7 +4513,7 @@ unsafe extern "C" fn wpjit_str_eq(frame: *mut JitFrame, a: i64, b: i64) -> i64 {
     let Some(Pin::Obj(Object::Str(sb))) = ctx.pins.get(b as usize) else {
         return 2;
     };
-    if a == b || Rc::ptr_eq(sa, sb) {
+    if a == b || SharedStr::ptr_eq(sa, sb) {
         return 1;
     }
     i64::from(sa == sb)
@@ -5154,7 +5257,7 @@ unsafe extern "C" fn wpjit_build_tuple(frame: *mut JitFrame, n: i64) -> i64 {
 
 /// Resolve a pin to its exact-`str` payload (RFC 0073 WS3). `None`
 /// on any surprise — the callers deopt.
-fn pin_str(ctx: &CallCtx, pin: i64) -> Option<Rc<str>> {
+fn pin_str(ctx: &CallCtx, pin: i64) -> Option<SharedStr> {
     match ctx.pins.get(pin as usize) {
         Some(Pin::Obj(Object::Str(s))) => Some(s.clone()),
         _ => None,
@@ -5162,7 +5265,7 @@ fn pin_str(ctx: &CallCtx, pin: i64) -> Option<Rc<str>> {
 }
 
 /// The `wpjit_str_concat` helper (RFC 0073 WS3): guarded exact-`str`
-/// `+`. Allocates the joined `Rc<str>` and pins it — the same
+/// `+`. Allocates the joined `SharedStr` and pins it — the same
 /// allocation the interpreter's `BinOpAddStr` fast path performs,
 /// with fewer dispatches. Negative deopts (pin surprise, cap
 /// pressure). Never runs Python code.
@@ -6735,6 +6838,31 @@ unsafe extern "C" fn wpjit_str_slice(frame: *mut JitFrame, pin: i64, start: i64,
     let idx = ctx.pins.len() as i64;
     ctx.pins.push(Pin::Obj(Object::from_str(out)));
     idx
+}
+
+/// Attempt native entry after the ordinary argument binder has finished.
+/// Keep this eligibility check out of the caller so argument counts and layout
+/// flags don't stay live across its inlined keyword/default binding code.
+/// All execution guards remain in `try_call_native_direct`.
+#[inline(never)]
+pub(crate) fn try_call_native_bound(
+    interp: &mut super::Interpreter,
+    f: &Rc<PyFunction>,
+    code: &Rc<CodeObject>,
+    bound: &[Object],
+) -> Option<Result<Object, RuntimeError>> {
+    if code.has_varargs
+        || code.has_varkeywords
+        || code.kwonly_count != 0
+        || !f.closure.is_empty()
+        || code.is_generator
+        || code.is_coroutine
+        || code.is_async_generator
+    {
+        return None;
+    }
+    let args = bound.get(..code.arg_count as usize)?;
+    try_call_native_direct(interp, f, code, args)
 }
 
 /// RFC 0069 WS3b — a frameless interpreter→native call. When the
@@ -8672,7 +8800,7 @@ mod native_pair_tests {
 
     fn enumeration(data: &[u8], count: i64) -> (Object, Rc<RefCell<PyIterator>>) {
         let inner = Rc::new(RefCell::new(PyIterator::Bytes {
-            data: Rc::from(data),
+            data: crate::shared_value::SharedSlice::from(data),
             index: 0,
         }));
         let outer = Object::Iter(Rc::new(RefCell::new(PyIterator::Enumerate {
@@ -8743,7 +8871,7 @@ mod native_pair_tests {
     #[test]
     fn unsupported_sources_do_not_advance_either_cursor() {
         let inner = Rc::new(RefCell::new(PyIterator::Bytes {
-            data: Rc::from([42_u8].as_slice()),
+            data: crate::shared_value::SharedSlice::from([42_u8].as_slice()),
             index: 0,
         }));
         let wrapped = Rc::new(RefCell::new(PyIterator::Shared(inner.clone())));

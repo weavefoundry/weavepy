@@ -1,0 +1,160 @@
+--- predecessor/crates/weavepy-vm/src/tier2.rs
++++ candidate/crates/weavepy-vm/src/tier2.rs
+@@ -2680,9 +2680,15 @@
+ struct JitBufs {
+     u64s: Vec<Vec<u64>>,
+     u32s: Vec<Vec<u32>>,
++    u64_capacity_bytes: usize,
++    u32_capacity_bytes: usize,
+ }
+ 
+ const JIT_BUF_POOL_CAP: usize = 64;
++// Bound retained element capacity as well as entry count. This excludes
++// allocator rounding and the pool's own Vec headers. Active buffers can grow
++// without this limit; oversized owners are simply released after their call.
++const JIT_BUF_POOL_CAPACITY_BYTES: usize = 16 * 1024;
+ 
+ thread_local! {
+     static JIT_BUFS: RefCell<JitBufs> = RefCell::new(JitBufs::default());
+@@ -2691,7 +2697,12 @@
+ /// A pooled `u64` buffer of exactly `n` zeroed entries.
+ fn take_u64(n: usize) -> Vec<u64> {
+     let mut v = JIT_BUFS
+-        .with(|p| p.borrow_mut().u64s.pop())
++        .with(|p| {
++            let mut p = p.borrow_mut();
++            let v = p.u64s.pop()?;
++            p.u64_capacity_bytes -= v.capacity() * std::mem::size_of::<u64>();
++            Some(v)
++        })
+         .unwrap_or_default();
+     v.clear();
+     v.resize(n, 0);
+@@ -2701,7 +2712,12 @@
+ /// A pooled `u32` buffer of exactly `n` zeroed entries.
+ fn take_u32(n: usize) -> Vec<u32> {
+     let mut v = JIT_BUFS
+-        .with(|p| p.borrow_mut().u32s.pop())
++        .with(|p| {
++            let mut p = p.borrow_mut();
++            let v = p.u32s.pop()?;
++            p.u32_capacity_bytes -= v.capacity() * std::mem::size_of::<u32>();
++            Some(v)
++        })
+         .unwrap_or_default();
+     v.clear();
+     v.resize(n, 0);
+@@ -2711,7 +2727,11 @@
+ fn put_u64(v: Vec<u64>) {
+     JIT_BUFS.with(|p| {
+         let mut p = p.borrow_mut();
+-        if p.u64s.len() < JIT_BUF_POOL_CAP {
++        let bytes = v.capacity() * std::mem::size_of::<u64>();
++        if p.u64s.len() < JIT_BUF_POOL_CAP
++            && bytes <= JIT_BUF_POOL_CAPACITY_BYTES - p.u64_capacity_bytes
++        {
++            p.u64_capacity_bytes += bytes;
+             p.u64s.push(v);
+         }
+     });
+@@ -2720,10 +2740,99 @@
+ fn put_u32(v: Vec<u32>) {
+     JIT_BUFS.with(|p| {
+         let mut p = p.borrow_mut();
+-        if p.u32s.len() < JIT_BUF_POOL_CAP {
++        let bytes = v.capacity() * std::mem::size_of::<u32>();
++        if p.u32s.len() < JIT_BUF_POOL_CAP
++            && bytes <= JIT_BUF_POOL_CAPACITY_BYTES - p.u32_capacity_bytes
++        {
++            p.u32_capacity_bytes += bytes;
+             p.u32s.push(v);
+         }
+     });
++}
++
++#[cfg(test)]
++mod scratch_pool_tests {
++    use super::*;
++
++    fn assert_accounting() {
++        JIT_BUFS.with(|pool| {
++            let pool = pool.borrow();
++            assert!(pool.u64s.len() <= JIT_BUF_POOL_CAP);
++            assert!(pool.u32s.len() <= JIT_BUF_POOL_CAP);
++            assert!(pool.u64_capacity_bytes <= JIT_BUF_POOL_CAPACITY_BYTES);
++            assert!(pool.u32_capacity_bytes <= JIT_BUF_POOL_CAPACITY_BYTES);
++            assert_eq!(
++                pool.u64_capacity_bytes,
++                pool.u64s.iter().map(|v| v.capacity() * 8).sum::<usize>()
++            );
++            assert_eq!(
++                pool.u32_capacity_bytes,
++                pool.u32s.iter().map(|v| v.capacity() * 4).sum::<usize>()
++            );
++        });
++    }
++
++    #[test]
++    fn scratch_pool_enforces_count_and_capacity_limits() {
++        std::thread::spawn(|| {
++            for _ in 0..JIT_BUF_POOL_CAP + 3 {
++                put_u64(vec![17]);
++                put_u32(vec![19]);
++            }
++            assert_accounting();
++            JIT_BUFS.with(|pool| {
++                let mut pool = pool.borrow_mut();
++                assert_eq!(pool.u64s.len(), JIT_BUF_POOL_CAP);
++                assert_eq!(pool.u32s.len(), JIT_BUF_POOL_CAP);
++                *pool = JitBufs::default();
++            });
++            put_u64(Vec::with_capacity(JIT_BUF_POOL_CAPACITY_BYTES / 8 + 1));
++            put_u32(Vec::with_capacity(JIT_BUF_POOL_CAPACITY_BYTES / 4 + 1));
++            JIT_BUFS.with(|pool| {
++                let pool = pool.borrow();
++                assert!(pool.u64s.is_empty());
++                assert!(pool.u32s.is_empty());
++            });
++            assert_accounting();
++            for _ in 0..3 {
++                put_u64(Vec::with_capacity(JIT_BUF_POOL_CAPACITY_BYTES / 16));
++                put_u32(Vec::with_capacity(JIT_BUF_POOL_CAPACITY_BYTES / 8));
++            }
++            assert_accounting();
++            JIT_BUFS.with(|pool| {
++                let pool = pool.borrow();
++                assert_eq!(pool.u64s.len(), 2);
++                assert_eq!(pool.u32s.len(), 2);
++            });
++        })
++        .join()
++        .unwrap();
++    }
++
++    #[test]
++    fn scratch_pool_releases_budget_before_reused_buffers_grow() {
++        std::thread::spawn(|| {
++            for _ in 0..8 {
++                for n in [1, 128, 4096, 2, 8192, 0] {
++                    let mut words = take_u64(n);
++                    assert_eq!(words.len(), n);
++                    assert!(words.iter().all(|v| *v == 0));
++                    assert_accounting();
++                    words.fill(17);
++                    put_u64(words);
++                    let mut tags = take_u32(n);
++                    assert_eq!(tags.len(), n);
++                    assert!(tags.iter().all(|v| *v == 0));
++                    assert_accounting();
++                    tags.fill(19);
++                    put_u32(tags);
++                    assert_accounting();
++                }
++            }
++        })
++        .join()
++        .unwrap();
++    }
+ }
+ 
+ /// The `wpjit_poll` helper (RFC 0067 WS2): native loop headers call

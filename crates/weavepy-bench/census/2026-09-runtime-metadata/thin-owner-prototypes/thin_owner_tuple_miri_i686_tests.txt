@@ -1,0 +1,82 @@
+Preparing a sysroot for Miri (target: i686-unknown-linux-gnu)... done
+   Compiling thin-owner-tuple-prototype v0.0.0 (/Users/owencarey/Documents/weavefoundry/weavepy/target/thin-owner-tuple-prototype)
+warning: struct `Payload` is never constructed
+ --> src/lib.rs:9:8
+  |
+9 | struct Payload<H, T: ?Sized> {
+  |        ^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `ThinOwner` is never constructed
+  --> src/lib.rs:15:8
+   |
+15 | struct ThinOwner<H, T> {
+   |        ^^^^^^^^^
+
+warning: struct `WeakOwner` is never constructed
+  --> src/lib.rs:25:8
+   |
+25 | struct WeakOwner<H, T>(Weak<Payload<H, [T]>>);
+   |        ^^^^^^^^^
+
+warning: multiple associated items are never used
+   --> src/lib.rs:28:8
+    |
+ 27 | impl<H, T> ThinOwner<H, T> {
+    | -------------------------- associated items in this implementation
+ 28 |     fn from_array<const N: usize>(header: H, items: [T; N]) -> Self {
+    |        ^^^^^^^^^^
+...
+ 33 |     fn from_vec(header: H, items: Vec<T>) -> Self {
+    |        ^^^^^^^^
+...
+ 48 |     fn from_vec_aligned<Word>(header: H, items: Vec<T>, layout: Layout) -> Self {
+    |        ^^^^^^^^^^^^^^^^
+...
+ 70 |     fn from_arc(arc: Arc<Payload<H, [T]>>) -> Self {
+    |        ^^^^^^^^
+...
+ 79 |     fn raw(&self) -> *const Payload<H, [T]> {
+    |        ^^^
+...
+ 86 |     fn arc_view(&self) -> ManuallyDrop<Arc<Payload<H, [T]>>> {
+    |        ^^^^^^^^
+...
+ 91 |     fn items(&self) -> &[T] {
+    |        ^^^^^
+...
+ 96 |     fn header(&self) -> &H {
+    |        ^^^^^^
+...
+101 |     fn get_mut(&mut self) -> Option<(&mut H, &mut [T])> {
+    |        ^^^^^^^
+...
+110 |     fn downgrade(&self) -> WeakOwner<H, T> {
+    |        ^^^^^^^^^
+
+warning: method `upgrade` is never used
+   --> src/lib.rs:128:8
+    |
+127 | impl<H, T> WeakOwner<H, T> {
+    | -------------------------- method in this implementation
+128 |     fn upgrade(&self) -> Option<ThinOwner<H, T>> { self.0.upgrade().map(ThinOwner::from_arc) }
+    |        ^^^^^^^
+
+warning: `thin-owner-tuple-prototype` (lib) generated 5 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.25s
+     Running unittests src/lib.rs (target/thin-owner-tuple-prototype/target/miri/i686-unknown-linux-gnu/debug/build/thin-owner-tuple-prototype/9927d88cdf349f2f/out/thin_owner_tuple_prototype-9927d88cdf349f2f)
+
+running 3 tests
+test tests::atomic_header_and_elements_survive_thread_handoffs ... ok
+test tests::destructors_run_at_last_strong_owner_before_weak_release ... ok
+test tests::fixed_arrays_and_unique_mutation_preserve_ownership ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.60s
+
+   Doc-tests thin_owner_tuple_prototype
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

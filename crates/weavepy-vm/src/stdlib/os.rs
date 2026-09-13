@@ -10,6 +10,7 @@
 //! propagating to spawned processes) is intentionally absent until
 //! we have a clear story for sandboxing.
 
+use crate::shared_value::SharedSlice;
 use crate::sync::Rc;
 use crate::sync::RefCell;
 use std::path::{Path, PathBuf};
@@ -1222,7 +1223,7 @@ fn os_getcwdb(args: &[Object]) -> Result<Object, RuntimeError> {
             cwd.to_string_lossy().into_owned().into_bytes()
         }
     };
-    Ok(Object::Bytes(Rc::from(bytes.as_slice())))
+    Ok(Object::Bytes(SharedSlice::from(bytes.as_slice())))
 }
 
 fn os_getenv(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -3259,12 +3260,12 @@ fn os_fsencode(args: &[Object]) -> Result<Object, RuntimeError> {
         .first()
         .ok_or_else(|| type_error("fsencode() takes exactly one argument (0 given)"))?;
     match fspath_to_str_or_bytes(obj, "fsencode")? {
-        Object::Str(s) => Ok(Object::Bytes(Rc::from(s.as_bytes()))),
+        Object::Str(s) => Ok(Object::Bytes(SharedSlice::from(s.as_bytes()))),
         // PEP 383: a surrogate-bearing path encodes with `surrogateescape`,
         // mapping U+DC80..U+DCFF back to the original raw bytes.
         w @ Object::WStr(_) => {
             let bytes = crate::stdlib::codecs_mod::encode_obj(&w, "utf-8", "surrogateescape")?;
-            Ok(Object::Bytes(Rc::from(bytes.as_slice())))
+            Ok(Object::Bytes(SharedSlice::from(bytes.as_slice())))
         }
         b @ Object::Bytes(_) => Ok(b),
         _ => unreachable!("fspath_to_str_or_bytes returns only str/bytes"),
@@ -3383,11 +3384,13 @@ fn dir_entry_name_bytes(entry: &std::fs::DirEntry) -> Object {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        Object::Bytes(Rc::from(entry.file_name().as_bytes()))
+        Object::Bytes(SharedSlice::from(entry.file_name().as_bytes()))
     }
     #[cfg(not(unix))]
     {
-        Object::Bytes(Rc::from(entry.file_name().to_string_lossy().as_bytes()))
+        Object::Bytes(SharedSlice::from(
+            entry.file_name().to_string_lossy().as_bytes(),
+        ))
     }
 }
 
@@ -3413,11 +3416,11 @@ fn dir_entry_path_bytes(entry: &std::fs::DirEntry) -> Object {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        Object::Bytes(Rc::from(entry.path().as_os_str().as_bytes()))
+        Object::Bytes(SharedSlice::from(entry.path().as_os_str().as_bytes()))
     }
     #[cfg(not(unix))]
     {
-        Object::Bytes(Rc::from(entry.path().to_string_lossy().as_bytes()))
+        Object::Bytes(SharedSlice::from(entry.path().to_string_lossy().as_bytes()))
     }
 }
 

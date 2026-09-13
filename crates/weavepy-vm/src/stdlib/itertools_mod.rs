@@ -336,7 +336,7 @@ fn as_bool(o: &Object) -> bool {
 
 /// Materialised pool argument: a tuple (the Python wrappers always
 /// pass tuples).
-fn pool_of(o: &Object, what: &str) -> Result<Rc<crate::object::TupleStorage>, RuntimeError> {
+fn pool_of(o: &Object, what: &str) -> Result<crate::object::SharedTuple, RuntimeError> {
     match o {
         Object::Tuple(items) => Ok(items.clone()),
         _ => Err(type_error(format!("{what} must be a tuple"))),
@@ -538,7 +538,7 @@ fn product_core(args: &[Object]) -> Result<Object, RuntimeError> {
     let [pools, indices, started, stopped] = args else {
         return Err(type_error("product_core expected 4 arguments"));
     };
-    let pools: Vec<Rc<crate::object::TupleStorage>> = match pools {
+    let pools: Vec<crate::object::SharedTuple> = match pools {
         Object::Tuple(items) => items
             .iter()
             .map(|p| pool_of(p, "pool"))

@@ -1,0 +1,340 @@
+--- a/crates/weavepy-jit/src/analyze.rs
++++ b/crates/weavepy-jit/src/analyze.rs
+@@ -4432,9 +4432,8 @@
+                 ..SE::known(JitType::Unknown)
+             });
+         }
+-        // RFC 0061 WS5 — pinned-list element write. The stored value's
+-        // lane must equal the pinned element lane exactly (a `bool`
+-        // into an int list, say, would change list shape).
++        // Typed lists retain their exact element lane. Heterogeneous
++        // lists accept scalar bits tagged with their exact value type.
+         OpCode::StoreSubscr => {
+             let idx = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+             let cont = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+@@ -4461,7 +4460,7 @@
+             let elem = resolve_list_container(&cont, local_types, changed, probes)?;
+             if let Some(el) = elem {
+                 if val.ty.is_representable() {
+-                    if val.ty != el {
++                    if !list_value_lane_matches(el, val.ty) {
+                         return Err(JitVerdict::UnsupportedOpcode("STORE_SUBSCR (value lane)"));
+                     }
+                 } else if let Some(slot) = val.src {
+@@ -4882,9 +4881,9 @@
+     Ok(())
+ }
+ 
+-/// A generic list can box native scalars on append. Typed lists keep
++/// A generic list can box native scalars on append or assignment. Typed lists keep
+ /// their exact element lane so later reads retain their existing guards.
+-fn append_lane_matches(elem: JitType, value: JitType) -> bool {
++fn list_value_lane_matches(elem: JitType, value: JitType) -> bool {
+     elem == value
+         || (elem == JitType::Obj && matches!(value, JitType::Int | JitType::Float | JitType::Bool))
+ }
+@@ -4900,7 +4899,7 @@
+ ) -> Result<(), JitVerdict> {
+     if let Some(elem) = recv.ty.elem_lane() {
+         if val.ty.is_representable() {
+-            if !append_lane_matches(elem, val.ty) {
++            if !list_value_lane_matches(elem, val.ty) {
+                 return Err(JitVerdict::UnsupportedOpcode("append (value lane)"));
+             }
+         } else if let Some(vs) = val.src {
+@@ -6685,7 +6684,7 @@
+                 let elem =
+                     f.ty.elem_lane()
+                         .ok_or(JitVerdict::UnsupportedOpcode("append (receiver lane)"))?;
+-                if !append_lane_matches(elem, arg_tys[0]) {
++                if !list_value_lane_matches(elem, arg_tys[0]) {
+                     return Err(JitVerdict::UnsupportedOpcode("append (value lane)"));
+                 }
+                 // The receiver's bottom-based native-stack index equals
+@@ -7615,7 +7614,7 @@
+                 .elem_lane()
+                 .ok_or(JitVerdict::UnsupportedOpcode("subscript container lane"))?;
+             let val = pop_val(stack)?;
+-            if val != elem {
++            if !list_value_lane_matches(elem, val) {
+                 return Err(JitVerdict::UnsupportedOpcode("STORE_SUBSCR (value lane)"));
+             }
+             push(TOp::ListSet, None, stack, stmts);
+--- a/crates/weavepy-jit/src/ir.rs
++++ b/crates/weavepy-jit/src/ir.rs
+@@ -198,7 +198,9 @@
+     ListGet { elem: JitType },
+     /// RFC 0061 WS5 — `STORE_SUBSCR` on a pinned list: pops the index,
+     /// the pin reference, and the value (staged through the frame's
+-    /// `ret_bits`), and calls `wpjit_list_set`. Out-of-range deopts at
++    /// `ret_bits` and `ret_tag`), and calls `wpjit_list_set`. Heterogeneous
++    /// lists accept scalar values; typed lists retain their element lane.
++    /// Out-of-range deopts at
+     /// this pc; the interpreter re-executes the store and raises.
+     ListSet,
+     /// RFC 0065 WS5 — `len(x)` on a pinned list: pops the pin
+--- a/crates/weavepy-jit/src/lower.rs
++++ b/crates/weavepy-jit/src/lower.rs
+@@ -2771,11 +2771,15 @@
+         let snapshot = self.vstack.clone();
+         let (idx, _) = self.pop();
+         let (pin, _) = self.pop();
+-        let (val, _) = self.pop();
++        let (val, ty) = self.pop();
+         // Typed store: an F64 value lands as its bit pattern.
+         self.b
+             .ins()
+             .store(trusted, val, self.frame_ptr, OFF_RET_BITS);
++        let tag = self.b.ins().iconst(types::I32, Self::tag(ty));
++        self.b
++            .ins()
++            .store(trusted, tag, self.frame_ptr, OFF_RET_TAG);
+         let sig = self.list_helper_sig();
+         let helper = self
+             .b
+--- a/crates/weavepy-jit/tests/frame_coverage.rs
++++ b/crates/weavepy-jit/tests/frame_coverage.rs
+@@ -555,6 +555,29 @@
+ }
+ 
+ #[test]
++fn generic_list_accepts_native_scalar_stores() {
++    for value in ["i * i", "i + 0.5", "i < 2"] {
++        let source = format!(
++            "def k(n):\n    out = [None] * 4\n    for i in range(n):\n        out[i & 3] = {value}\n    return out\n"
++        );
++        let tf = analyze_cfg(&source, &Cfg::default()).expect("scalar store should compile");
++        assert!(has_op(&tf, |op| matches!(op, TOp::ListSet)));
++        assert!(tf.local_types.contains(&Some(JitType::ListObj)));
++    }
++}
++
++#[test]
++fn typed_list_still_rejects_mismatched_scalar_stores() {
++    for (seed, value) in [("1", "0.5"), ("1", "True"), ("1.5", "1")] {
++        let source = format!("def k(n):\n    out = [{seed}]\n    for i in range(n):\n        out[0] = {value}\n    return out\n");
++        assert!(matches!(
++            analyze_cfg(&source, &Cfg::default()),
++            Err(JitVerdict::UnsupportedOpcode("STORE_SUBSCR (value lane)"))
++        ));
++    }
++}
++
++#[test]
+ fn typed_list_still_rejects_mismatched_append() {
+     let err = analyze_cfg(
+         "def k(n):\n    out = [1]\n    for i in range(n):\n        out.append(0.5)\n    return out\n",
+--- a/crates/weavepy-vm/src/lib.rs
++++ b/crates/weavepy-vm/src/lib.rs
+@@ -51299,6 +51299,121 @@
+     }
+ 
+     #[cfg(feature = "jit")]
++    fn run_jit_scalar_list_store(src: &str) -> (String, u64) {
++        let src = src.to_owned();
++        std::thread::spawn(move || {
++            crate::tier2::force_enable_for_test(2);
++            let output = run(&src);
++            (output, crate::tier2::scalar_list_store_calls_for_test())
++        })
++        .join()
++        .expect("scalar list store worker")
++    }
++
++    #[cfg(feature = "jit")]
++    #[test]
++    fn jit_scalar_list_stores_preserve_exact_value_types() {
++        for (value, expected, lane) in [
++            ("i * i", "[15376, 15625, 15876, 16129]", "int"),
++            ("i + 0.5", "[124.5, 125.5, 126.5, 127.5]", "float"),
++            ("i < 126", "[True, True, False, False]", "bool"),
++        ] {
++            let src = format!(
++                r#"def fill(n):
++    items = [None] * 4
++    for i in range(n):
++        items[(i & 3) - 4] = {value}
++    return items
++for iteration in range(20):
++    result = fill(128)
++assert result == {expected}
++for value in result:
++    assert type(value) is {lane}
++print(result)
++"#
++            );
++            let (output, stores) = run_jit_scalar_list_store(&src);
++            assert!(
++                stores >= 2000,
++                "native scalar stores missing: {lane}, stores={stores}"
++            );
++            assert_eq!(output, format!("{expected}\n"));
++            assert_eq!(output, run(&src));
++        }
++    }
++
++    #[cfg(feature = "jit")]
++    #[test]
++    fn jit_scalar_list_stores_preserve_bounds_and_callback_order() {
++        let src = r#"events = []
++def produce(i):
++    events.append(('value', i))
++    return i + 0
++def index(i):
++    events.append(('index', i))
++    return i - 4
++def fill(n):
++    items = [None] * 4
++    for i in range(n):
++        items[index(i) + 0] = produce(i) + 1
++    return items
++for iteration in range(40):
++    assert fill(4) == [1, 2, 3, 4]
++events.clear()
++try:
++    fill(9)
++except IndexError:
++    pass
++else:
++    raise AssertionError('out-of-range store must fail')
++assert events == [(kind, i) for i in range(9) for kind in ('value', 'index')]
++print('scalar store bounds and callback order ok')
++"#;
++        let (output, stores) = run_jit_scalar_list_store(src);
++        assert!(
++            stores >= 100,
++            "native scalar stores missing before fallback: {stores}"
++        );
++        assert_eq!(output, "scalar store bounds and callback order ok\n");
++        assert_eq!(output, run(src));
++    }
++
++    #[cfg(feature = "jit")]
++    #[test]
++    fn jit_scalar_list_stores_preserve_finalizer_observation() {
++        let src = r#"events = []
++observed = []
++class Replaced:
++    def __del__(self):
++        events.append(observed[0][0])
++def install(items):
++    observed.append(items)
++    items[0] = Replaced()
++def replace(n):
++    items = [None] * 2
++    for i in range(n):
++        if i == 100:
++            install(items)
++        items[0] = i
++    return items
++for warmup in range(3):
++    replace(8)
++result = replace(120)
++assert result == [119, None]
++assert events == [100]
++assert observed[0] is result
++print('scalar store finalizer observation ok')
++"#;
++        let (output, stores) = run_jit_scalar_list_store(src);
++        assert!(
++            stores >= 90,
++            "native scalar stores missing before finalizer: {stores}"
++        );
++        assert_eq!(output, "scalar store finalizer observation ok\n");
++        assert_eq!(output, run(src));
++    }
++
++    #[cfg(feature = "jit")]
+     #[test]
+     fn jit_list_float_lane_and_store() {
+         // Float lane, plus `xs[i] = v` through `wpjit_list_set`: the
+--- a/crates/weavepy-vm/src/tier2.rs
++++ b/crates/weavepy-vm/src/tier2.rs
+@@ -4200,8 +4200,8 @@
+ }
+ 
+ /// The `wpjit_list_set` helper (RFC 0061 WS5): write one element of a
+-/// pinned list. The value's bits are pre-staged in
+-/// [`JitFrame::ret_bits`], interpreted per the pin's element lane.
++/// pinned list. The value is staged in [`JitFrame::ret_bits`] and
++/// [`JitFrame::ret_tag`], then checked against the pin's element lane.
+ /// Deopts (non-zero) when out of range or when the displaced element
+ /// is a heap object — replacing it here would drop it inside the
+ /// helper, and the drop-site machinery (prompt reap, parked
+@@ -4215,31 +4215,27 @@
+     let jf = unsafe { &mut *frame };
+     #[allow(clippy::cast_ptr_alignment)]
+     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+-    // RFC 0071 WS4 — the object lane's staged bits are a pin index
+-    // (`-1` for `None`), resolved before the list borrow below.
+-    let staged_obj = match ctx.pins.get(pin as usize) {
+-        Some(Pin::List(_, JitType::Obj)) => {
++    let Some(Pin::List(list, elem)) = ctx.pins.get(pin as usize) else {
++        return 1;
++    };
++    let v = match (elem, jf.ret_tag) {
++        (JitType::Int | JitType::Obj, tag) if tag == SlotTag::Int as u32 => {
++            Object::Int(jf.ret_bits as i64)
++        }
++        (JitType::Float | JitType::Obj, tag) if tag == SlotTag::Float as u32 => {
++            Object::Float(f64::from_bits(jf.ret_bits))
++        }
++        (JitType::Obj, tag) if tag == SlotTag::Bool as u32 => Object::Bool(jf.ret_bits != 0),
++        (JitType::Obj, tag) if tag == SlotTag::ObjPin as u32 => {
+             if jf.ret_bits == u64::MAX {
+-                Some(Object::None)
++                Object::None
+             } else {
+                 match ctx.pins.get(jf.ret_bits as usize) {
+-                    Some(Pin::Obj(o)) => Some(o.clone()),
++                    Some(Pin::Obj(o)) => o.clone(),
+                     _ => return 1,
+                 }
+             }
+         }
+-        _ => None,
+-    };
+-    let Some(Pin::List(list, elem)) = ctx.pins.get(pin as usize) else {
+-        return 1;
+-    };
+-    let v = match elem {
+-        JitType::Int => Object::Int(jf.ret_bits as i64),
+-        JitType::Float => Object::Float(f64::from_bits(jf.ret_bits)),
+-        JitType::Obj => match staged_obj {
+-            Some(o) => o,
+-            None => return 1,
+-        },
+         _ => return 1,
+     };
+     let mut items = list.borrow_mut();
+@@ -4262,6 +4258,15 @@
+         return 1;
+     }
+     *dst = v;
++    #[cfg(test)]
++    if *elem == JitType::Obj
++        && matches!(
++            SlotTag::from_raw(jf.ret_tag),
++            SlotTag::Int | SlotTag::Float | SlotTag::Bool
++        )
++    {
++        SCALAR_LIST_STORE_TEST_CALLS.with(|count| count.set(count.get() + 1));
++    }
+     0
+ }
+ 
+@@ -9146,3 +9151,14 @@
+ pub(crate) fn exact_index_calls_for_test() -> u64 {
+     EXACT_INDEX_TEST_CALLS.with(std::cell::Cell::get)
+ }
++
++#[cfg(test)]
++std::thread_local! {
++    static SCALAR_LIST_STORE_TEST_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
++}
++
++/// Test-only proof of a completed scalar assignment into a heterogeneous list.
++#[cfg(test)]
++pub(crate) fn scalar_list_store_calls_for_test() -> u64 {
++    SCALAR_LIST_STORE_TEST_CALLS.with(std::cell::Cell::get)
++}

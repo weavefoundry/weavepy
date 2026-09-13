@@ -1,0 +1,238 @@
+[
+  {
+    "path": "regions/cpython-inspect-stderr.txt",
+    "source": "target/binder-flags-startup-memory-regions/cpython-inspect-stderr.txt",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "regions/cpython-rss-stderr.txt",
+    "source": "target/binder-flags-startup-memory-regions/cpython-rss-stderr.txt",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "regions/cpython-rss.txt",
+    "source": "target/binder-flags-startup-memory-regions/cpython-rss.txt",
+    "bytes": 7,
+    "sha256": "c3eb82e97bd77d9cd95da304244a42d584df52115560bf25df2fa6f6a70a097c"
+  },
+  {
+    "path": "regions/cpython-seed-stderr.txt",
+    "source": "target/binder-flags-startup-memory-regions/cpython-seed-stderr.txt",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "regions/cpython-vmmap-stderr.txt",
+    "source": "target/binder-flags-startup-memory-regions/cpython-vmmap-stderr.txt",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "regions/cpython-vmmap.txt",
+    "source": "target/binder-flags-startup-memory-regions/cpython-vmmap.txt",
+    "bytes": 4589,
+    "sha256": "e6326ecee61ef5fe170f0f353043cc2b64fd45f601222707be3b308a57d173fa"
+  },
+  {
+    "path": "regions/driver.py",
+    "source": "target/binder-flags-startup-memory-regions/driver.py",
+    "bytes": 72,
+    "sha256": "ab934d07c9e3e61f2dbb9693efc93448e7c47cc3e67412b8952ac96a99c37b2f"
+  },
+  {
+    "path": "regions/new-inspect-stderr.txt",
+    "source": "target/binder-flags-startup-memory-regions/new-inspect-stderr.txt",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "regions/new-rss-stderr.txt",
+    "source": "target/binder-flags-startup-memory-regions/new-rss-stderr.txt",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "regions/new-rss.txt",
+    "source": "target/binder-flags-startup-memory-regions/new-rss.txt",
+    "bytes": 7,
+    "sha256": "0c75903d22ce5e57c0bdb10a0d2b2f60f1b15bd9d7eb5443abeb3664e1580927"
+  },
+  {
+    "path": "regions/new-seed-stderr.txt",
+    "source": "target/binder-flags-startup-memory-regions/new-seed-stderr.txt",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "regions/new-vmmap-stderr.txt",
+    "source": "target/binder-flags-startup-memory-regions/new-vmmap-stderr.txt",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "regions/new-vmmap.txt",
+    "source": "target/binder-flags-startup-memory-regions/new-vmmap.txt",
+    "bytes": 4926,
+    "sha256": "d988f0283bc2e686e0f7cfee6be11a103cd2af394a3a680b0034d51fa2354854"
+  },
+  {
+    "path": "regions/reference-inspect-stderr.txt",
+    "source": "target/binder-flags-startup-memory-regions/reference-inspect-stderr.txt",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "regions/reference-rss-stderr.txt",
+    "source": "target/binder-flags-startup-memory-regions/reference-rss-stderr.txt",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "regions/reference-rss.txt",
+    "source": "target/binder-flags-startup-memory-regions/reference-rss.txt",
+    "bytes": 7,
+    "sha256": "9fbc7d733529937a30f9026f87444493c33ea54ffda0ed3d2b946d8a5b6144f3"
+  },
+  {
+    "path": "regions/reference-seed-stderr.txt",
+    "source": "target/binder-flags-startup-memory-regions/reference-seed-stderr.txt",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "regions/reference-vmmap-stderr.txt",
+    "source": "target/binder-flags-startup-memory-regions/reference-vmmap-stderr.txt",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "regions/reference-vmmap.txt",
+    "source": "target/binder-flags-startup-memory-regions/reference-vmmap.txt",
+    "bytes": 4950,
+    "sha256": "a43a3fa5d526d26f50db9dd35fa0d3adcac4f755a97c4b748686bcf2e753ccaf"
+  },
+  {
+    "path": "regions/report.json",
+    "source": "target/binder-flags-startup-memory-regions/report.json",
+    "bytes": 15451,
+    "sha256": "75e24c8a5fae94717f3d48ba039a222c9f914c2cfcdcb4faa5f954b213104004"
+  },
+  {
+    "path": "allocations/cold/driver.py",
+    "source": "target/binder-flags-startup-live-allocations/driver.py",
+    "bytes": 72,
+    "sha256": "ab934d07c9e3e61f2dbb9693efc93448e7c47cc3e67412b8952ac96a99c37b2f"
+  },
+  {
+    "path": "allocations/cold/report.json",
+    "source": "target/binder-flags-startup-live-allocations/report.json",
+    "bytes": 970,
+    "sha256": "7900633baba8d3d5340bed0bda25b8568a34f60d1271e5d844469c76cce978e9"
+  },
+  {
+    "path": "allocations/cold/history-stderr.txt",
+    "source": "target/binder-flags-startup-live-allocations/history-stderr.txt",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "allocations/cold/child-stderr.txt",
+    "source": "target/binder-flags-startup-live-allocations/child-stderr.txt",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "allocations/warm/driver.py",
+    "source": "target/binder-flags-startup-live-allocations-warm/driver.py",
+    "bytes": 72,
+    "sha256": "ab934d07c9e3e61f2dbb9693efc93448e7c47cc3e67412b8952ac96a99c37b2f"
+  },
+  {
+    "path": "allocations/warm/report.json",
+    "source": "target/binder-flags-startup-live-allocations-warm/report.json",
+    "bytes": 5886,
+    "sha256": "c809ccb25b4546d3b068262b6bc03db12e34c383bd3f8f74b7f43a7cc736d81e"
+  },
+  {
+    "path": "allocations/warm/history-stderr.txt",
+    "source": "target/binder-flags-startup-live-allocations-warm/history-stderr.txt",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "allocations/warm/child-stderr.txt",
+    "source": "target/binder-flags-startup-live-allocations-warm/child-stderr.txt",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "methods/profile_startup_memory_regions.py",
+    "source": "target/profile_startup_memory_regions.py",
+    "bytes": 4372,
+    "sha256": "fb41094e3117123da40dccbb1001c35b088985d29d8784a53f0314c30064c938"
+  },
+  {
+    "path": "methods/profile_startup_live_allocations.py",
+    "source": "target/profile_startup_live_allocations.py",
+    "bytes": 2710,
+    "sha256": "70dfa26fcff94744c62ce13cda47d2c3aab890d2e8f280be5d8a0a737659796b"
+  },
+  {
+    "path": "methods/profile_startup_live_allocations_warm.py",
+    "source": "target/profile_startup_live_allocations_warm.py",
+    "bytes": 3237,
+    "sha256": "fa27ee22e0f22cb5565c9ee16818cd44d1203b179bb5aae76d1571afaf1ed650"
+  },
+  {
+    "path": "methods/summarize_startup_live_allocations.py",
+    "source": "target/summarize_startup_live_allocations.py",
+    "bytes": 2511,
+    "sha256": "3f18e17aeb347a34ca8acbd06f28ebbefb73a27c08c81a4765803675c61f5edf"
+  },
+  {
+    "path": "methods/summarize_startup_live_allocations_demangled.py",
+    "source": "target/summarize_startup_live_allocations_demangled.py",
+    "bytes": 3321,
+    "sha256": "fe915e2a024786e359609ce7e8916b8454900df7fe0ee5733566376a4632e9b1"
+  },
+  {
+    "path": "methods/startup-memory-regions-protocol.md",
+    "source": "target/startup-memory-regions-protocol.md",
+    "bytes": 912,
+    "sha256": "db4380723daf669af6c8e97f5e4768d7b231937ef94f3909bde2621f6f8e057b"
+  },
+  {
+    "path": "methods/export_startup_memory_followup.py",
+    "source": "target/export_startup_memory_followup.py",
+    "bytes": 6882,
+    "sha256": "39afd2a0e78013abc79107f3b00f1078fd53ce6795ad4c093a80a087b0abfa42"
+  },
+  {
+    "path": "allocations/binder-flags-startup-allocation-summary.json.gz",
+    "source": "target/binder-flags-startup-allocation-summary.json",
+    "bytes": 304562,
+    "sha256": "3c1934bcfdbdb2cf3ac0307c56dc3d79afd61f23b690da317eab76acf3c428ef",
+    "uncompressed_bytes": 9595109,
+    "uncompressed_sha256": "e084a2748f17b9636af591bca39b232fd3079b53a6cdc525f7f3ad94b1bb0c3c"
+  },
+  {
+    "path": "allocations/binder-flags-startup-allocation-sites.json.gz",
+    "source": "target/binder-flags-startup-allocation-sites.json",
+    "bytes": 627151,
+    "sha256": "7c3fe261b24506af43049131197998bcc51b2f77abf6d469f18b383888262fac",
+    "uncompressed_bytes": 17914950,
+    "uncompressed_sha256": "83c236f5ca579894e6d94d3bf4f49823be2734b1c88723712c724bab129d2c0b"
+  },
+  {
+    "path": "local-raw-traces.json",
+    "bytes": 690,
+    "sha256": "718918610730fd0242fac1813d431f7db9b193a18de7081d09de048e7bfc3541"
+  },
+  {
+    "path": "REPORT.md",
+    "bytes": 3560,
+    "sha256": "12bcfd642fe2127cf8e8d90cbe29603d58f1025735ec33a388cd6509930ae3a6"
+  }
+]

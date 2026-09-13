@@ -15,6 +15,7 @@
 //! raises `termios.error(errno, strerror)` — a distinct exception type,
 //! *not* an `OSError` subclass, exactly like upstream.
 
+use crate::shared_value::SharedSlice;
 use std::sync::OnceLock;
 
 use crate::sync::Rc;
@@ -188,7 +189,7 @@ fn termios_tcgetattr(args: &[Object]) -> Result<Object, RuntimeError> {
         if icanon_off && (i == libc::VMIN as usize || i == libc::VTIME as usize) {
             cc.push(Object::Int(i64::from(ch)));
         } else {
-            cc.push(Object::Bytes(Rc::from(&[ch as u8][..])));
+            cc.push(Object::Bytes(SharedSlice::from(&[ch as u8][..])));
         }
     }
     let items = vec![

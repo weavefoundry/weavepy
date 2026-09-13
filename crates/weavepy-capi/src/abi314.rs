@@ -25,6 +25,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use weavepy_vm::shared_value::SharedSlice;
 
 use num_bigint::{BigInt, Sign};
 use num_traits::{ToPrimitive, Zero};
@@ -813,7 +814,7 @@ pub unsafe extern "C" fn Py_HashBuffer(p: *const c_void, len: PySsizeT) -> PySsi
     } else {
         unsafe { std::slice::from_raw_parts(p as *const u8, len as usize) }
     };
-    let b = into_owned(Object::Bytes(Rc::from(data)));
+    let b = into_owned(Object::Bytes(SharedSlice::from(data)));
     let h = unsafe { crate::abstract_::PyObject_Hash(b) };
     unsafe { crate::object::Py_DecRef(b) };
     h as PySsizeT

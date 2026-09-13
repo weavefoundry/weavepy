@@ -5,6 +5,7 @@
 //! [`crate::object::PyFile`]; this module just exposes the factory
 //! callables that wrap them.
 
+use crate::shared_value::{SharedSlice, SharedStr};
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
@@ -1509,7 +1510,7 @@ fn ind_getstate(args: &[Object]) -> Result<Object, RuntimeError> {
     ind_check_init(&inst)?;
     let decoder = tw_get(&inst, "_ind_decoder").unwrap_or(Object::None);
     let (buf, flag) = if matches!(decoder, Object::None) {
-        (Object::Bytes(Rc::from(&b""[..])), 0i64)
+        (Object::Bytes(SharedSlice::from(&b""[..])), 0i64)
     } else {
         let st = py_call(&decoder, "getstate", &[])?;
         let (b, f) = ind_tuple2(&st)?;
@@ -3604,10 +3605,10 @@ fn tw_reset_decoded(inst: &crate::types::PyInstance) {
     }
 }
 
-fn tw_dec_state(inst: &crate::types::PyInstance) -> (Rc<str>, usize) {
+fn tw_dec_state(inst: &crate::types::PyInstance) -> (SharedStr, usize) {
     let buf = match tw_get(inst, "_dec_buf") {
         Some(Object::Str(s)) => s,
-        _ => Rc::from(""),
+        _ => SharedStr::from(""),
     };
     let pos = match tw_get(inst, "_dec_pos") {
         Some(Object::Int(n)) => n.max(0) as usize,

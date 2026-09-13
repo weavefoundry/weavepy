@@ -15,6 +15,7 @@
 //! (and any pending exception) back with [`unwrap`].
 
 use std::ffi::CStr;
+use weavepy_vm::shared_value::SharedStr;
 
 use weavepy_compiler::{BinOpKind, CompareKind};
 use weavepy_vm::error::{runtime_error, RuntimeError};
@@ -36,7 +37,7 @@ pub unsafe fn wrap_foreign(p: *mut PyObject) -> Object {
     let tp_name = unsafe { foreign_tp_name(p) };
     // `type(x).__name__` is the bare tail; CPython's `tp_name`-based error
     // messages keep the full dotted string (see `PyForeignSoul::tp_name`).
-    let bare: Rc<str> = Rc::from(tp_name.rsplit('.').next().unwrap_or(&tp_name));
+    let bare: SharedStr = SharedStr::from(tp_name.rsplit('.').next().unwrap_or(&tp_name));
     if crate::object::freebox_trace_enabled()
         && (tp_name.contains("Engine") || tp_name.contains("Index") || tp_name.contains("ndarray"))
     {
@@ -51,18 +52,18 @@ pub unsafe fn wrap_foreign(p: *mut PyObject) -> Object {
 }
 
 /// Read `Py_TYPE(p)->tp_name` (the full, unmodified dotted type name) as an
-/// owned `Rc<str>`. This is the exact string CPython uses in `tp_name`-based
+/// owned `SharedStr`. This is the exact string CPython uses in `tp_name`-based
 /// error messages; the bare `__name__` tail is derived by the caller.
-unsafe fn foreign_tp_name(p: *mut PyObject) -> Rc<str> {
+unsafe fn foreign_tp_name(p: *mut PyObject) -> SharedStr {
     let ty = unsafe { (*p).ob_type };
     if ty.is_null() {
-        return Rc::from("object");
+        return SharedStr::from("object");
     }
     let np = unsafe { (*ty).tp_name };
     if np.is_null() {
-        return Rc::from("object");
+        return SharedStr::from("object");
     }
-    Rc::from(unsafe { CStr::from_ptr(np) }.to_string_lossy().as_ref())
+    SharedStr::from(unsafe { CStr::from_ptr(np) }.to_string_lossy().as_ref())
 }
 
 /// Run `body` (a call into compiled extension/Cython code) after

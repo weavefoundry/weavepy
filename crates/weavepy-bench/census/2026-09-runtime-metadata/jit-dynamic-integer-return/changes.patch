@@ -1,0 +1,130 @@
+--- a/crates/weavepy-vm/src/tier2.rs
++++ b/crates/weavepy-vm/src/tier2.rs
+@@ -5819,6 +5819,14 @@
+         }
+         tag
+     };
++    // The integer-result site can accept an object-tagged integer directly.
++    // Keep the callee eligibility checks above, but avoid pinning a temporary
++    // only for finish_dyn_native_result to immediately unbox it again.
++    let expect = if int_result {
++        SlotTag::Int as u32
++    } else {
++        expect
++    };
+     let status =
+         unsafe { try_native_call(jf, ctx, interp, &nc, argc, expect, recv.as_ref(), true) }?;
+     Some(if status == CallStatus::Ok as i64 {
+--- a/crates/weavepy-vm/src/lib.rs
++++ b/crates/weavepy-vm/src/lib.rs
+@@ -54565,6 +54565,110 @@
+ 
+     #[cfg(feature = "jit")]
+     #[test]
++    fn jit_dynamic_integer_return_avoids_pin_pressure() {
++        let src = r#"class Box:
++    def __init__(self, value):
++        self.value = value
++def read_value(n):
++    return Box(value=n).value
++def driver(n):
++    total = 0
++    for i in range(n):
++        total += read_value(i)
++    return total
++print(driver(20000))
++"#;
++        let (out, compiled, deopts, calls, pressure) = std::thread::spawn(move || {
++            crate::tier2::force_enable_for_test(2);
++            let out = run(src);
++            let (compiled, _, deopts) = crate::tier2::stats_for_test();
++            let (calls, _, _) = crate::tier2::native_call_stats_for_test();
++            let pressure = crate::tier2::pin_pressure_exits_for_test();
++            (out, compiled, deopts, calls, pressure)
++        })
++        .join()
++        .expect("jit integer return worker thread");
++        assert_eq!(out, "199990000\n");
++        assert!(
++            compiled >= 3 && calls >= 19_000,
++            "the caller must stay native"
++        );
++        assert_eq!(deopts, 0, "exact integer results must remain representable");
++        assert_eq!(
++            pressure, 0,
++            "exact integer native results must not grow the caller pin table"
++        );
++        assert_eq!(out, run(src));
++    }
++
++    #[cfg(feature = "jit")]
++    #[test]
++    fn jit_dynamic_integer_return_preserves_changed_values() {
++        for payload in ["True", "0.5", "2 ** 80"] {
++            let src = format!(
++                r#"PAYLOAD = {payload}
++events = []
++class Box:
++    def __init__(self, value):
++        events.append(value)
++        if value >= 100:
++            self.value = PAYLOAD
++        else:
++            self.value = value
++def read_value(n):
++    return Box(value=n).value
++def driver(n):
++    total = 0
++    for i in range(n):
++        total += read_value(i)
++    return total
++result = driver(200)
++assert result == 4950 + 100 * PAYLOAD
++assert events == list(range(200))
++print('ok', len(events))
++"#
++            );
++            let (out, calls, _, _) = run_jit_native(&src);
++            assert_eq!(out, "ok 200\n", "changed result: {payload}");
++            assert!(calls >= 50, "no hot native prefix: {payload}");
++            assert_eq!(out, run(&src));
++        }
++    }
++
++    #[cfg(feature = "jit")]
++    #[test]
++    fn jit_dynamic_integer_return_preserves_none_error_without_replay() {
++        let src = r#"events = []
++class Box:
++    def __init__(self, value):
++        events.append(value)
++        if value >= 100:
++            self.value = None
++        else:
++            self.value = value
++def read_value(n):
++    return Box(value=n).value
++def driver(n):
++    total = 0
++    for i in range(n):
++        total += read_value(i)
++    return total
++try:
++    driver(200)
++except TypeError:
++    assert events == list(range(101))
++    print(events[-1], len(events))
++else:
++    raise AssertionError('None must fail at addition')
++"#;
++        let (out, calls, _, _) = run_jit_native(src);
++        assert_eq!(out, "100 101\n");
++        assert!(calls >= 50, "the prefix must cross native calls");
++        assert_eq!(out, run(src));
++    }
++
++    #[cfg(feature = "jit")]
++    #[test]
+     fn jit_dynamic_native_object_integer_return_stays_native() {
+         let src = r#"class Box:
+     def __init__(self, value):

@@ -53,6 +53,7 @@
 
 use crate::import::ModuleCache;
 use crate::object::{DictData, DictKey, Object, PyModule};
+use crate::shared_value::SharedSlice;
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
@@ -1483,7 +1484,7 @@ fn build_connection(fd: i32) -> Object {
                 ));
             }
             let buf = read_msg(guard.fd, maxlength).map_err(|e| io_error_to_py(&e))?;
-            Ok(Object::Bytes(Rc::from(buf.as_slice())))
+            Ok(Object::Bytes(SharedSlice::from(buf.as_slice())))
         };
         let i = inner.clone();
         let poll = move |args: &[Object]| -> Result<Object, RuntimeError> {
@@ -1752,7 +1753,7 @@ fn make_shared_memory(args: &[Object]) -> Result<Object, RuntimeError> {
             }
             let slice =
                 unsafe { std::slice::from_raw_parts((g.addr as *const u8).add(offset), length) };
-            Ok(Object::Bytes(Rc::from(slice)))
+            Ok(Object::Bytes(SharedSlice::from(slice)))
         };
         let i_write = inner.clone();
         let write = move |args: &[Object]| -> Result<Object, RuntimeError> {

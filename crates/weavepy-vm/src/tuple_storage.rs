@@ -1,32 +1,40 @@
 //! Tuple elements and their successful Python hash share one allocation.
 
+use crate::shared_value::ThinArc;
 use std::alloc::Layout;
 use std::ops::{Deref, DerefMut};
 
 use crate::object::Object;
 use crate::sync::{CachedHash, Rc};
 
-/// Immutable tuple storage. The slice metadata still carries the length,
-/// so adding the hash word doesn't enlarge an [`Object`] handle.
+pub type SharedTuple = ThinArc<TupleStorage>;
+
+/// Immutable tuple storage with length and cached hash in its allocation.
 #[repr(C)]
 #[derive(Debug)]
 pub struct TupleStorage<T: ?Sized = [Object]> {
+    len: usize,
     hash: CachedHash,
     items: T,
 }
 
 impl TupleStorage {
     /// Move a fixed-size array directly into its final allocation.
-    pub fn from_array<const N: usize>(items: [Object; N]) -> Rc<Self> {
-        Rc::new(TupleStorage {
+    pub fn from_array<const N: usize>(items: [Object; N]) -> SharedTuple {
+        let arc: Rc<Self> = Rc::new(TupleStorage {
+            len: N,
             hash: CachedHash::default(),
             items,
-        })
+        });
+        ThinArc::from_arc(arc)
     }
 
     /// Move a dynamically sized sequence into one reference-counted block.
-    pub fn from_vec(items: Vec<Object>) -> Rc<Self> {
-        let (layout, _) = Layout::new::<CachedHash>()
+    pub fn from_vec(items: Vec<Object>) -> SharedTuple {
+        let (prefix, _) = Layout::new::<usize>()
+            .extend(Layout::new::<CachedHash>())
+            .expect("tuple prefix exceeds layout limit");
+        let (layout, _) = prefix
             .extend(
                 Layout::array::<Object>(items.len()).expect("tuple elements exceed layout limit"),
             )
@@ -46,14 +54,14 @@ impl TupleStorage {
         panic!("unsupported tuple payload alignment: {}", layout.align());
     }
 
-    fn from_vec_aligned<Word>(items: Vec<Object>, layout: Layout) -> Rc<Self> {
+    fn from_vec_aligned<Word>(items: Vec<Object>, layout: Layout) -> SharedTuple {
         assert_eq!(layout.align(), std::mem::align_of::<Word>());
         assert_eq!(layout.size() % std::mem::size_of::<Word>(), 0);
         let len = items.len();
         let storage = Rc::<[Word]>::new_uninit_slice(layout.size() / std::mem::size_of::<Word>());
         let data = Rc::into_raw(storage).cast::<Object>().cast_mut();
         let tuple = std::ptr::slice_from_raw_parts_mut(data, len) as *mut Self;
-        // SAFETY: repr(C) places the hash before the final slice, with the
+        // SAFETY: repr(C) places length and hash before the final slice, with the
         // offset and trailing padding computed by Layout::extend above.
         // The original MaybeUninit<Word> slice and this DST have identical
         // payload size/alignment. Arc::from_raw permits this conversion;
@@ -67,6 +75,7 @@ impl TupleStorage {
         // and provenance. The final Arc drops each moved Object once;
         // the original MaybeUninit words have no destructors.
         unsafe {
+            std::ptr::addr_of_mut!((*tuple).len).write(len);
             std::ptr::addr_of_mut!((*tuple).hash).write(CachedHash::default());
             let destination = std::ptr::addr_of_mut!((*tuple).items).cast::<Object>();
             for (index, item) in items.into_iter().enumerate() {
@@ -74,7 +83,7 @@ impl TupleStorage {
             }
             let result = Rc::from_raw(tuple);
             debug_assert_eq!(Layout::for_value(result.as_ref()), layout);
-            result
+            ThinArc::from_arc(result)
         }
     }
 
@@ -99,7 +108,7 @@ impl Deref for TupleStorage {
 
 impl DerefMut for TupleStorage {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        // Only unique ownership, obtained through Arc::get_mut, permits
+        // Only unique ownership, obtained through ThinArc::get_mut, permits
         // free-list reuse. Clear the previous tuple's hash before exposing
         // any writable elements, including an empty mutable slice.
         self.hash = CachedHash::default();
@@ -128,23 +137,24 @@ impl<'a> IntoIterator for &'a mut TupleStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared_value::SharedStr;
 
     #[test]
     fn dynamic_layout_preserves_values_and_reference_ownership() {
         for len in 0..128 {
-            let text: Rc<str> = Rc::from("retained tuple element");
+            let text = SharedStr::from("retained tuple element");
             let tuple = TupleStorage::from_vec(vec![Object::Str(text.clone()); len]);
             assert_eq!(tuple.len(), len);
-            assert_eq!(Rc::strong_count(&text), len + 1);
+            assert_eq!(SharedStr::strong_count(&text), len + 1);
             assert!(tuple
                 .iter()
-                .all(|value| matches!(value, Object::Str(s) if Rc::ptr_eq(s, &text))));
-            let weak = Rc::downgrade(&tuple);
+                .all(|value| matches!(value, Object::Str(s) if SharedStr::ptr_eq(s, &text))));
+            let weak = ThinArc::downgrade(&tuple);
             let clone = tuple.clone();
             drop(tuple);
             assert!(weak.upgrade().is_some());
             drop(clone);
-            assert_eq!(Rc::strong_count(&text), 1);
+            assert_eq!(SharedStr::strong_count(&text), 1);
             assert!(weak.upgrade().is_none());
         }
     }
@@ -154,7 +164,7 @@ mod tests {
         let mut tuple = TupleStorage::from_array([Object::Int(1), Object::Int(2)]);
         tuple.store_hash(123);
         assert_eq!(tuple.cached_hash(), Some(123));
-        Rc::get_mut(&mut tuple).unwrap()[0] = Object::Int(3);
+        ThinArc::get_mut(&mut tuple).unwrap()[0] = Object::Int(3);
         assert_eq!(tuple.cached_hash(), None);
         assert!(matches!(tuple[0], Object::Int(3)));
         assert!(TupleStorage::from_array([]).is_empty());

@@ -392,7 +392,7 @@ mod tests {
             ])
         );
         for size in [65_535usize, 65_536] {
-            let value = Object::Bytes(Rc::from(vec![b'x'; size]));
+            let value = Object::Bytes(crate::shared_value::SharedSlice::from(vec![b'x'; size]));
             let actual = encode_with_headroom(&value, 5, 1000).unwrap();
             let mut expected = vec![0x80, 5];
             if size < FRAME_TARGET {

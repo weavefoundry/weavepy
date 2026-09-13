@@ -32,6 +32,7 @@
 
 use crate::error::{runtime_error, type_error, value_error, RuntimeError};
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule, SetData};
+use crate::shared_value::{SharedStr, ThinArc, ThinWeak, WeakSlice, WeakStr};
 use crate::sync::{Rc, RefCell, Weak};
 
 use std::collections::HashMap;
@@ -58,11 +59,11 @@ pub fn is_tracking() -> bool {
 /// Python API observes.)
 #[derive(Debug)]
 enum Probe {
-    Bytes(Weak<[u8]>),
+    Bytes(WeakSlice<u8>),
     ByteArray(Weak<RefCell<Vec<u8>>>),
-    Str(Weak<str>),
-    WStr(Weak<[u32]>),
-    Tuple(Weak<crate::object::TupleStorage>),
+    Str(WeakStr),
+    WStr(WeakSlice<u32>),
+    Tuple(ThinWeak<crate::object::TupleStorage>),
     List(Weak<RefCell<Vec<Object>>>),
     Dict(Weak<RefCell<DictData>>),
     Set(Weak<RefCell<SetData>>),
@@ -185,11 +186,11 @@ fn capture_frames(nframe: usize) -> (Vec<(String, i64)>, u16) {
 fn probe_for(obj: &Object) -> Option<(usize, Probe)> {
     let key = crate::builtins::object_identity(obj) as usize;
     let probe = match obj {
-        Object::Bytes(rc) => Probe::Bytes(Rc::downgrade(rc)),
+        Object::Bytes(rc) => Probe::Bytes(ThinArc::downgrade(rc)),
         Object::ByteArray(rc) => Probe::ByteArray(Rc::downgrade(rc)),
-        Object::Str(rc) => Probe::Str(Rc::downgrade(rc)),
-        Object::WStr(rc) => Probe::WStr(Rc::downgrade(rc)),
-        Object::Tuple(rc) => Probe::Tuple(Rc::downgrade(rc)),
+        Object::Str(rc) => Probe::Str(SharedStr::downgrade(rc)),
+        Object::WStr(rc) => Probe::WStr(ThinArc::downgrade(rc)),
+        Object::Tuple(rc) => Probe::Tuple(ThinArc::downgrade(rc)),
         Object::List(rc) => Probe::List(Rc::downgrade(rc)),
         Object::Dict(rc) => Probe::Dict(Rc::downgrade(rc)),
         Object::Set(rc) => Probe::Set(Rc::downgrade(rc)),

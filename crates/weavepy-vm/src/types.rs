@@ -1706,12 +1706,18 @@ impl SlotStorage {
     }
 
     pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {
-        self.insert_with_key(name, value, || DictKey(Object::Str(Rc::from(name))))
+        self.insert_with_key(name, value, || {
+            DictKey(Object::Str(crate::shared_value::SharedStr::from(name)))
+        })
     }
 
     /// Reuse an existing name allocation when populating a new slot.
     /// Updating a populated slot keeps its original key allocation.
-    pub fn insert_shared(&mut self, name: &Rc<str>, value: Object) -> Option<Object> {
+    pub fn insert_shared(
+        &mut self,
+        name: &crate::shared_value::SharedStr,
+        value: Object,
+    ) -> Option<Object> {
         self.insert_with_key(name, value, || DictKey(Object::Str(name.clone())))
     }
 
@@ -1833,11 +1839,17 @@ impl SlotStorage {
     }
 
     pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {
-        self.insert_with_key(name, value, || DictKey(Object::Str(Rc::from(name))))
+        self.insert_with_key(name, value, || {
+            DictKey(Object::Str(crate::shared_value::SharedStr::from(name)))
+        })
     }
 
     /// Share the name allocation only for a newly populated slot.
-    pub fn insert_shared(&mut self, name: &Rc<str>, value: Object) -> Option<Object> {
+    pub fn insert_shared(
+        &mut self,
+        name: &crate::shared_value::SharedStr,
+        value: Object,
+    ) -> Option<Object> {
         self.insert_with_key(name, value, || DictKey(Object::Str(name.clone())))
     }
 
@@ -2085,43 +2097,60 @@ mod slot_storage_tests {
 
     #[test]
     fn shared_slot_names_survive_promotion_and_release_with_their_owners() {
-        let names: Vec<Rc<str>> = (0..16).map(|i| Rc::from(format!("slot{i}"))).collect();
+        let names: Vec<crate::shared_value::SharedStr> = (0..16)
+            .map(|i| crate::shared_value::SharedStr::from(format!("slot{i}")))
+            .collect();
         let mut first = SlotStorage::default();
         let mut second = SlotStorage::default();
         for (i, name) in names.iter().enumerate() {
             first.insert_shared(name, Object::Int(i as i64));
             second.insert_shared(name, Object::None);
-            assert_eq!(Rc::strong_count(name), 3);
+            assert_eq!(crate::shared_value::SharedStr::strong_count(name), 3);
             for slots in [&first, &second] {
                 let (key, _) = slots.get_index(i).unwrap();
                 let Object::Str(stored) = &key.0 else {
                     panic!("slot key must be a string");
                 };
-                assert!(Rc::ptr_eq(stored, name));
+                assert!(crate::shared_value::SharedStr::ptr_eq(stored, name));
             }
         }
-        let replacement: Rc<str> = Rc::from("slot5");
+        let replacement: crate::shared_value::SharedStr =
+            crate::shared_value::SharedStr::from("slot5");
         assert_eq!(
             first
                 .insert_shared(&replacement, Object::Int(100))
                 .and_then(|v| v.as_i64()),
             Some(5)
         );
-        assert_eq!(Rc::strong_count(&replacement), 1);
-        assert_eq!(Rc::strong_count(&names[5]), 3);
+        assert_eq!(
+            crate::shared_value::SharedStr::strong_count(&replacement),
+            1
+        );
+        assert_eq!(crate::shared_value::SharedStr::strong_count(&names[5]), 3);
         first.remove("slot5");
         first.insert_shared(&replacement, Object::Int(200));
         assert_eq!(first.index_of("slot5"), Some(15));
-        assert_eq!(Rc::strong_count(&names[5]), 2);
-        assert_eq!(Rc::strong_count(&replacement), 2);
+        assert_eq!(crate::shared_value::SharedStr::strong_count(&names[5]), 2);
+        assert_eq!(
+            crate::shared_value::SharedStr::strong_count(&replacement),
+            2
+        );
         let cloned = first.clone();
-        assert_eq!(Rc::strong_count(&replacement), 3);
+        assert_eq!(
+            crate::shared_value::SharedStr::strong_count(&replacement),
+            3
+        );
         drop(first);
         assert_eq!(cloned.get("slot5").and_then(Object::as_i64), Some(200));
         drop(cloned);
         drop(second);
-        assert!(names.iter().all(|name| Rc::strong_count(name) == 1));
-        assert_eq!(Rc::strong_count(&replacement), 1);
+        assert!(names
+            .iter()
+            .all(|name| crate::shared_value::SharedStr::strong_count(name) == 1));
+        assert_eq!(
+            crate::shared_value::SharedStr::strong_count(&replacement),
+            1
+        );
     }
 
     #[test]

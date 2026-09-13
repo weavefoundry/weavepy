@@ -1,0 +1,255 @@
+{
+  "purpose": "Inspect startup memory regions; these snapshots are neither peak RSS nor timing.",
+  "driver_sha256": "ab934d07c9e3e61f2dbb9693efc93448e7c47cc3e67412b8952ac96a99c37b2f",
+  "instrumentation": "ps RSS snapshot and vmmap -summary after identical PID/checksum readiness marker",
+  "rows": {
+    "cpython": {
+      "binary": "/opt/homebrew/bin/python3.14",
+      "binary_sha256": "87d4df53fd91304be5bac391fb204643c36b7df2023c04a0953bcbc7d4fdf634",
+      "runs": [
+        {
+          "stage": "seed",
+          "pid": 36110,
+          "utc": "2026-09-12T09:19:12.235779+00:00",
+          "load": [
+            3.0166015625,
+            3.7744140625,
+            4.00537109375
+          ],
+          "readiness": "36110 323\n",
+          "child_returncode_after_owned_termination": -15,
+          "frozen_cache_after": null
+        },
+        {
+          "stage": "inspect",
+          "pid": 36111,
+          "utc": "2026-09-12T09:19:12.253044+00:00",
+          "load": [
+            3.0166015625,
+            3.7744140625,
+            4.00537109375
+          ],
+          "readiness": "36111 323\n",
+          "rss": {
+            "command": [
+              "/bin/ps",
+              "-o",
+              "rss=",
+              "-p",
+              "36111"
+            ],
+            "returncode": 0,
+            "stdout_sha256": "c3eb82e97bd77d9cd95da304244a42d584df52115560bf25df2fa6f6a70a097c"
+          },
+          "rss_snapshot_bytes": 15073280,
+          "vmmap": {
+            "command": [
+              "/usr/bin/vmmap",
+              "-summary",
+              "36111"
+            ],
+            "returncode": 0,
+            "stdout_sha256": "e6326ecee61ef5fe170f0f353043cc2b64fd45f601222707be3b308a57d173fa"
+          },
+          "child_returncode_after_owned_termination": -15,
+          "frozen_cache_after": null
+        }
+      ],
+      "frozen_cache_unchanged_after_seed": true
+    },
+    "reference": {
+      "binary": "target/release/weavepy-runtime-jit-raise-call-spans",
+      "binary_sha256": "539c6dd3e022c7ffe839861177ed75c2d733e3960625d28d3e8c8837d10a3589",
+      "runs": [
+        {
+          "stage": "seed",
+          "pid": 36122,
+          "utc": "2026-09-12T09:19:13.974773+00:00",
+          "load": [
+            3.0166015625,
+            3.7744140625,
+            4.00537109375
+          ],
+          "readiness": "36122 323\n",
+          "child_returncode_after_owned_termination": -15,
+          "frozen_cache_after": {
+            "weavepy/frozen-weavepy-314-53/_collections_abc": "146cf458a118e73e7e98e26ecb8fbf11bbe8ac9c508cd5aec86351f1df27ce49",
+            "weavepy/frozen-weavepy-314-53/_contextvars": "2cc2dd878888ca872b0b0eebbf5edffe77fa02473dfa4d29cd314c1caff75493",
+            "weavepy/frozen-weavepy-314-53/_frozen_importlib": "84b6d9b5c1c167f36ebbe784ec74ed0fba72c1fc166a5ed8370eca701ba25f6d",
+            "weavepy/frozen-weavepy-314-53/_frozen_importlib_external": "74cef56966c3aec1e4d379afc3613988b5c6316cc8c1c8f40064815481ff8b2f",
+            "weavepy/frozen-weavepy-314-53/_sitebuiltins": "d5b433cf9b5a1c974456e2ba26f62dddb59629dde0f270478d9a7787d366cdb6",
+            "weavepy/frozen-weavepy-314-53/_weakrefset": "4fdbc7711145b9d26af119a3d9064498ccf520879226173a1cca30c555fe66e3",
+            "weavepy/frozen-weavepy-314-53/_weave_envinit": "12b3b7cb872733bebd6420e61f9f6646807a9ed49f07dcc63f62f8cce696b202",
+            "weavepy/frozen-weavepy-314-53/_weave_frame_locals": "a0f76740a5b3f148c27d4345e19f6690d52c42458594d97c415960d8f7ffc5d8",
+            "weavepy/frozen-weavepy-314-53/_weave_import_fallback": "137e28af0e1ac45f8b3ec522f33edb0a6ffb09f5391ce432efbe27c11374a790",
+            "weavepy/frozen-weavepy-314-53/_weave_spec": "915a1798990bc6423e596d77f5697abc8c99ca56792dac286f26dcdd00dda3c2",
+            "weavepy/frozen-weavepy-314-53/abc": "bc0c3a03efa2cc83e62d223b72e267c0ecc4d4f40f00eeaa988cbe33bf560494",
+            "weavepy/frozen-weavepy-314-53/contextvars": "6c03f23a47c540c8a22cdfe633c43a132cb9d218914f25d68b08859465a2c760",
+            "weavepy/frozen-weavepy-314-53/genericpath": "7274e8864b9f9a9dc3c05260f85f0c847004cb8129df0c1e3e48662538d7eb98",
+            "weavepy/frozen-weavepy-314-53/importlib": "16aa2699ff828cce6af58664a47ca1d69f4a89ef50cc3060e1812033b8a58120",
+            "weavepy/frozen-weavepy-314-53/importlib.machinery": "4e9982652a4324b6a4cb8067a3f47051975eedc0fcd9fa4a8d742befd76937ea",
+            "weavepy/frozen-weavepy-314-53/posix": "d3b7911543e58ccfce20230de40f2764284d91b1c11f405254294b0c83325e12",
+            "weavepy/frozen-weavepy-314-53/posixpath": "855ef925e36c9df7dfcc8bd832cb6ecf4de4c4c823cbbcd801be4d1fb27b69b9",
+            "weavepy/frozen-weavepy-314-53/site": "430c770641477a8c6a4fb56ee3066afb2972e21d700607de76367d0fb1c32f9d",
+            "weavepy/frozen-weavepy-314-53/stat": "9eeb8142fae305174af8733ada4d7a93fd8730fb75933874a53771d976796a5b",
+            "weavepy/frozen-weavepy-314-53/zipimport": "b731ec4a8ab3686e1f90eff49314e09a2417489191ed95dd39003dda1e0c683a"
+          }
+        },
+        {
+          "stage": "inspect",
+          "pid": 36123,
+          "utc": "2026-09-12T09:19:14.063123+00:00",
+          "load": [
+            3.0166015625,
+            3.7744140625,
+            4.00537109375
+          ],
+          "readiness": "36123 323\n",
+          "rss": {
+            "command": [
+              "/bin/ps",
+              "-o",
+              "rss=",
+              "-p",
+              "36123"
+            ],
+            "returncode": 0,
+            "stdout_sha256": "9fbc7d733529937a30f9026f87444493c33ea54ffda0ed3d2b946d8a5b6144f3"
+          },
+          "rss_snapshot_bytes": 29310976,
+          "vmmap": {
+            "command": [
+              "/usr/bin/vmmap",
+              "-summary",
+              "36123"
+            ],
+            "returncode": 0,
+            "stdout_sha256": "a43a3fa5d526d26f50db9dd35fa0d3adcac4f755a97c4b748686bcf2e753ccaf"
+          },
+          "child_returncode_after_owned_termination": -15,
+          "frozen_cache_after": {
+            "weavepy/frozen-weavepy-314-53/_collections_abc": "146cf458a118e73e7e98e26ecb8fbf11bbe8ac9c508cd5aec86351f1df27ce49",
+            "weavepy/frozen-weavepy-314-53/_contextvars": "2cc2dd878888ca872b0b0eebbf5edffe77fa02473dfa4d29cd314c1caff75493",
+            "weavepy/frozen-weavepy-314-53/_frozen_importlib": "84b6d9b5c1c167f36ebbe784ec74ed0fba72c1fc166a5ed8370eca701ba25f6d",
+            "weavepy/frozen-weavepy-314-53/_frozen_importlib_external": "74cef56966c3aec1e4d379afc3613988b5c6316cc8c1c8f40064815481ff8b2f",
+            "weavepy/frozen-weavepy-314-53/_sitebuiltins": "d5b433cf9b5a1c974456e2ba26f62dddb59629dde0f270478d9a7787d366cdb6",
+            "weavepy/frozen-weavepy-314-53/_weakrefset": "4fdbc7711145b9d26af119a3d9064498ccf520879226173a1cca30c555fe66e3",
+            "weavepy/frozen-weavepy-314-53/_weave_envinit": "12b3b7cb872733bebd6420e61f9f6646807a9ed49f07dcc63f62f8cce696b202",
+            "weavepy/frozen-weavepy-314-53/_weave_frame_locals": "a0f76740a5b3f148c27d4345e19f6690d52c42458594d97c415960d8f7ffc5d8",
+            "weavepy/frozen-weavepy-314-53/_weave_import_fallback": "137e28af0e1ac45f8b3ec522f33edb0a6ffb09f5391ce432efbe27c11374a790",
+            "weavepy/frozen-weavepy-314-53/_weave_spec": "915a1798990bc6423e596d77f5697abc8c99ca56792dac286f26dcdd00dda3c2",
+            "weavepy/frozen-weavepy-314-53/abc": "bc0c3a03efa2cc83e62d223b72e267c0ecc4d4f40f00eeaa988cbe33bf560494",
+            "weavepy/frozen-weavepy-314-53/contextvars": "6c03f23a47c540c8a22cdfe633c43a132cb9d218914f25d68b08859465a2c760",
+            "weavepy/frozen-weavepy-314-53/genericpath": "7274e8864b9f9a9dc3c05260f85f0c847004cb8129df0c1e3e48662538d7eb98",
+            "weavepy/frozen-weavepy-314-53/importlib": "16aa2699ff828cce6af58664a47ca1d69f4a89ef50cc3060e1812033b8a58120",
+            "weavepy/frozen-weavepy-314-53/importlib.machinery": "4e9982652a4324b6a4cb8067a3f47051975eedc0fcd9fa4a8d742befd76937ea",
+            "weavepy/frozen-weavepy-314-53/posix": "d3b7911543e58ccfce20230de40f2764284d91b1c11f405254294b0c83325e12",
+            "weavepy/frozen-weavepy-314-53/posixpath": "855ef925e36c9df7dfcc8bd832cb6ecf4de4c4c823cbbcd801be4d1fb27b69b9",
+            "weavepy/frozen-weavepy-314-53/site": "430c770641477a8c6a4fb56ee3066afb2972e21d700607de76367d0fb1c32f9d",
+            "weavepy/frozen-weavepy-314-53/stat": "9eeb8142fae305174af8733ada4d7a93fd8730fb75933874a53771d976796a5b",
+            "weavepy/frozen-weavepy-314-53/zipimport": "b731ec4a8ab3686e1f90eff49314e09a2417489191ed95dd39003dda1e0c683a"
+          }
+        }
+      ],
+      "frozen_cache_unchanged_after_seed": true
+    },
+    "new": {
+      "binary": "target/release/weavepy-runtime-binder-flags",
+      "binary_sha256": "e5077bbae5256f8c4f8e7d9c38a636fb21ff5dc467a15418477e71f224199d70",
+      "runs": [
+        {
+          "stage": "seed",
+          "pid": 36126,
+          "utc": "2026-09-12T09:19:14.652742+00:00",
+          "load": [
+            3.0166015625,
+            3.7744140625,
+            4.00537109375
+          ],
+          "readiness": "36126 323\n",
+          "child_returncode_after_owned_termination": -15,
+          "frozen_cache_after": {
+            "weavepy/frozen-weavepy-314-53/_collections_abc": "146cf458a118e73e7e98e26ecb8fbf11bbe8ac9c508cd5aec86351f1df27ce49",
+            "weavepy/frozen-weavepy-314-53/_contextvars": "2cc2dd878888ca872b0b0eebbf5edffe77fa02473dfa4d29cd314c1caff75493",
+            "weavepy/frozen-weavepy-314-53/_frozen_importlib": "84b6d9b5c1c167f36ebbe784ec74ed0fba72c1fc166a5ed8370eca701ba25f6d",
+            "weavepy/frozen-weavepy-314-53/_frozen_importlib_external": "74cef56966c3aec1e4d379afc3613988b5c6316cc8c1c8f40064815481ff8b2f",
+            "weavepy/frozen-weavepy-314-53/_sitebuiltins": "d5b433cf9b5a1c974456e2ba26f62dddb59629dde0f270478d9a7787d366cdb6",
+            "weavepy/frozen-weavepy-314-53/_weakrefset": "4fdbc7711145b9d26af119a3d9064498ccf520879226173a1cca30c555fe66e3",
+            "weavepy/frozen-weavepy-314-53/_weave_envinit": "12b3b7cb872733bebd6420e61f9f6646807a9ed49f07dcc63f62f8cce696b202",
+            "weavepy/frozen-weavepy-314-53/_weave_frame_locals": "a0f76740a5b3f148c27d4345e19f6690d52c42458594d97c415960d8f7ffc5d8",
+            "weavepy/frozen-weavepy-314-53/_weave_import_fallback": "137e28af0e1ac45f8b3ec522f33edb0a6ffb09f5391ce432efbe27c11374a790",
+            "weavepy/frozen-weavepy-314-53/_weave_spec": "915a1798990bc6423e596d77f5697abc8c99ca56792dac286f26dcdd00dda3c2",
+            "weavepy/frozen-weavepy-314-53/abc": "bc0c3a03efa2cc83e62d223b72e267c0ecc4d4f40f00eeaa988cbe33bf560494",
+            "weavepy/frozen-weavepy-314-53/contextvars": "6c03f23a47c540c8a22cdfe633c43a132cb9d218914f25d68b08859465a2c760",
+            "weavepy/frozen-weavepy-314-53/genericpath": "7274e8864b9f9a9dc3c05260f85f0c847004cb8129df0c1e3e48662538d7eb98",
+            "weavepy/frozen-weavepy-314-53/importlib": "16aa2699ff828cce6af58664a47ca1d69f4a89ef50cc3060e1812033b8a58120",
+            "weavepy/frozen-weavepy-314-53/importlib.machinery": "4e9982652a4324b6a4cb8067a3f47051975eedc0fcd9fa4a8d742befd76937ea",
+            "weavepy/frozen-weavepy-314-53/posix": "d3b7911543e58ccfce20230de40f2764284d91b1c11f405254294b0c83325e12",
+            "weavepy/frozen-weavepy-314-53/posixpath": "855ef925e36c9df7dfcc8bd832cb6ecf4de4c4c823cbbcd801be4d1fb27b69b9",
+            "weavepy/frozen-weavepy-314-53/site": "430c770641477a8c6a4fb56ee3066afb2972e21d700607de76367d0fb1c32f9d",
+            "weavepy/frozen-weavepy-314-53/stat": "9eeb8142fae305174af8733ada4d7a93fd8730fb75933874a53771d976796a5b",
+            "weavepy/frozen-weavepy-314-53/zipimport": "b731ec4a8ab3686e1f90eff49314e09a2417489191ed95dd39003dda1e0c683a"
+          }
+        },
+        {
+          "stage": "inspect",
+          "pid": 36127,
+          "utc": "2026-09-12T09:19:14.721023+00:00",
+          "load": [
+            3.0166015625,
+            3.7744140625,
+            4.00537109375
+          ],
+          "readiness": "36127 323\n",
+          "rss": {
+            "command": [
+              "/bin/ps",
+              "-o",
+              "rss=",
+              "-p",
+              "36127"
+            ],
+            "returncode": 0,
+            "stdout_sha256": "0c75903d22ce5e57c0bdb10a0d2b2f60f1b15bd9d7eb5443abeb3664e1580927"
+          },
+          "rss_snapshot_bytes": 29605888,
+          "vmmap": {
+            "command": [
+              "/usr/bin/vmmap",
+              "-summary",
+              "36127"
+            ],
+            "returncode": 0,
+            "stdout_sha256": "d988f0283bc2e686e0f7cfee6be11a103cd2af394a3a680b0034d51fa2354854"
+          },
+          "child_returncode_after_owned_termination": -15,
+          "frozen_cache_after": {
+            "weavepy/frozen-weavepy-314-53/_collections_abc": "146cf458a118e73e7e98e26ecb8fbf11bbe8ac9c508cd5aec86351f1df27ce49",
+            "weavepy/frozen-weavepy-314-53/_contextvars": "2cc2dd878888ca872b0b0eebbf5edffe77fa02473dfa4d29cd314c1caff75493",
+            "weavepy/frozen-weavepy-314-53/_frozen_importlib": "84b6d9b5c1c167f36ebbe784ec74ed0fba72c1fc166a5ed8370eca701ba25f6d",
+            "weavepy/frozen-weavepy-314-53/_frozen_importlib_external": "74cef56966c3aec1e4d379afc3613988b5c6316cc8c1c8f40064815481ff8b2f",
+            "weavepy/frozen-weavepy-314-53/_sitebuiltins": "d5b433cf9b5a1c974456e2ba26f62dddb59629dde0f270478d9a7787d366cdb6",
+            "weavepy/frozen-weavepy-314-53/_weakrefset": "4fdbc7711145b9d26af119a3d9064498ccf520879226173a1cca30c555fe66e3",
+            "weavepy/frozen-weavepy-314-53/_weave_envinit": "12b3b7cb872733bebd6420e61f9f6646807a9ed49f07dcc63f62f8cce696b202",
+            "weavepy/frozen-weavepy-314-53/_weave_frame_locals": "a0f76740a5b3f148c27d4345e19f6690d52c42458594d97c415960d8f7ffc5d8",
+            "weavepy/frozen-weavepy-314-53/_weave_import_fallback": "137e28af0e1ac45f8b3ec522f33edb0a6ffb09f5391ce432efbe27c11374a790",
+            "weavepy/frozen-weavepy-314-53/_weave_spec": "915a1798990bc6423e596d77f5697abc8c99ca56792dac286f26dcdd00dda3c2",
+            "weavepy/frozen-weavepy-314-53/abc": "bc0c3a03efa2cc83e62d223b72e267c0ecc4d4f40f00eeaa988cbe33bf560494",
+            "weavepy/frozen-weavepy-314-53/contextvars": "6c03f23a47c540c8a22cdfe633c43a132cb9d218914f25d68b08859465a2c760",
+            "weavepy/frozen-weavepy-314-53/genericpath": "7274e8864b9f9a9dc3c05260f85f0c847004cb8129df0c1e3e48662538d7eb98",
+            "weavepy/frozen-weavepy-314-53/importlib": "16aa2699ff828cce6af58664a47ca1d69f4a89ef50cc3060e1812033b8a58120",
+            "weavepy/frozen-weavepy-314-53/importlib.machinery": "4e9982652a4324b6a4cb8067a3f47051975eedc0fcd9fa4a8d742befd76937ea",
+            "weavepy/frozen-weavepy-314-53/posix": "d3b7911543e58ccfce20230de40f2764284d91b1c11f405254294b0c83325e12",
+            "weavepy/frozen-weavepy-314-53/posixpath": "855ef925e36c9df7dfcc8bd832cb6ecf4de4c4c823cbbcd801be4d1fb27b69b9",
+            "weavepy/frozen-weavepy-314-53/site": "430c770641477a8c6a4fb56ee3066afb2972e21d700607de76367d0fb1c32f9d",
+            "weavepy/frozen-weavepy-314-53/stat": "9eeb8142fae305174af8733ada4d7a93fd8730fb75933874a53771d976796a5b",
+            "weavepy/frozen-weavepy-314-53/zipimport": "b731ec4a8ab3686e1f90eff49314e09a2417489191ed95dd39003dda1e0c683a"
+          }
+        }
+      ],
+      "frozen_cache_unchanged_after_seed": true
+    }
+  },
+  "limitations": "This is an instrumented, point-in-time region diagnostic, not an uninstrumented peak-RSS or performance comparison.",
+  "status": "complete"
+}

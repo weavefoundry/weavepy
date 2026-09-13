@@ -1,0 +1,24 @@
+{
+  "purpose": "Capture one startup live-allocation trace to locate heap costs, not churn or RSS.",
+  "binary": "/Users/owencarey/Documents/weavefoundry/weavepy/target/release/weavepy-runtime-binder-flags",
+  "binary_sha256": "e5077bbae5256f8c4f8e7d9c38a636fb21ff5dc467a15418477e71f224199d70",
+  "driver_sha256": "ab934d07c9e3e61f2dbb9693efc93448e7c47cc3e67412b8952ac96a99c37b2f",
+  "load": [
+    2.8525390625,
+    3.4130859375,
+    3.818359375
+  ],
+  "instrumentation": "MallocStackLogging=1; malloc_history -allBySize -fullStacks",
+  "limitations": "Instrumented live allocation sites only; no CPython object-count, allocator-churn, requested-byte, RSS, or timing claim.",
+  "readiness": "36183 323\n",
+  "command": [
+    "/usr/bin/malloc_history",
+    "36183",
+    "-allBySize",
+    "-fullStacks"
+  ],
+  "returncode": 0,
+  "history_bytes": 165597038,
+  "history_sha256": "a19e59fb9476403d76e5163f1b5c13aaddcbbdef74fb4222abf4741cce43cf03",
+  "owned_child_exit": -15
+}

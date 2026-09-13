@@ -14,6 +14,7 @@
 //!   tracked faithfully via [`PyInstance::inline_values`] plus a
 //!   capacity check mirroring CPython's shared-keys limit (30).
 
+use crate::shared_value::SharedSlice;
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
@@ -1722,7 +1723,7 @@ fn encode_locale_ex(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     locale_check_handler(&errors)?;
     match crate::stdlib::codecs_engine::utf8_encode(&cps, &errors) {
-        Ok(b) => Ok(Object::Bytes(Rc::from(b.into_boxed_slice()))),
+        Ok(b) => Ok(Object::Bytes(SharedSlice::from(b.into_boxed_slice()))),
         Err(e) => {
             let pos = match exc_attr(&e, "start") {
                 Some(Object::Int(i)) => i,

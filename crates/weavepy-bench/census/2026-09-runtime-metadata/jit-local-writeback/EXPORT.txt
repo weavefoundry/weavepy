@@ -1,0 +1,17 @@
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Frozen inputs, 67 JIT, 351 VM, 156 C API, 99 targeted, 275 compatibility checks, and 44 fixture paths verified.
+Exact exit bindings and callback counts match CPython; native exit confirmed.
+sources.tar.gz 340 members; 3803965 stored bytes; all hashes verified.
+evidence.tar.gz 795 members; 2622606 stored bytes; all hashes verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Isolated runtime build, complete frozen sources, method hashes, references, and unchanged primary candidate verified.
+Frozen inputs, 67 JIT, 351 VM, 156 C API, 99 targeted, 275 compatibility checks, and 44 fixture paths verified.
+Exact exit bindings and callback counts match CPython; native exit confirmed.
+Complete local-writeback sources, validation, static costs, failed diagnostic versions, and full census coverage preserved.

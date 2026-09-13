@@ -23,6 +23,7 @@
 //! pairs to insert into the type's dict.
 
 use std::os::raw::c_int;
+use weavepy_vm::shared_value::SharedStr;
 
 use weavepy_vm::error::{type_error, RuntimeError};
 use weavepy_vm::object::{BuiltinFn, DictKey, Object};
@@ -75,7 +76,7 @@ pub fn install_dunder_shims(
     new_null_raises: bool,
 ) -> Vec<(String, Object)> {
     let mut out = Vec::new();
-    let name = Rc::<str>::from(type_name.as_str());
+    let name = SharedStr::from(type_name.as_str());
 
     // Numeric protocol → __add__ / __sub__ / __mul__ / __matmul__ / …
     install_binary(&mut out, table, ids::Py_nb_add, "__add__", &name);
@@ -339,7 +340,11 @@ pub fn install_dunder_shims(
 /// builds a memoryview honouring the caller's exact flags via
 /// [`crate::memoryview::PyMemoryView_FromObjectAndFlags`] — precisely
 /// CPython's `__buffer__` wrapper around the C slot.
-fn install_buffer_dunders(out: &mut Vec<(String, Object)>, table: &SlotTable, type_name: &Rc<str>) {
+fn install_buffer_dunders(
+    out: &mut Vec<(String, Object)>,
+    table: &SlotTable,
+    type_name: &SharedStr,
+) {
     if table.get(ids::Py_bf_getbuffer).is_null() {
         return;
     }
@@ -411,7 +416,7 @@ fn install_unary(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -441,7 +446,7 @@ fn install_binary(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -478,7 +483,7 @@ fn install_binary_reflected(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -508,7 +513,7 @@ fn install_ternary(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -567,7 +572,7 @@ fn install_ternary_reflected(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -606,7 +611,7 @@ fn install_inquiry(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -641,7 +646,7 @@ fn install_lenfunc(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -676,7 +681,7 @@ fn install_ssize_arg(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -725,7 +730,7 @@ fn install_ssize_obj_arg(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -781,7 +786,7 @@ fn install_obj_obj(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -819,7 +824,7 @@ fn install_obj_obj_arg(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -870,7 +875,7 @@ fn install_delitem(
     out: &mut Vec<(String, Object)>,
     table: &SlotTable,
     slot_id: c_int,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -915,7 +920,7 @@ fn install_repr(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -947,7 +952,7 @@ fn install_get_iter(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -979,7 +984,7 @@ fn install_iter_next(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -1025,7 +1030,7 @@ fn install_richcmp(
     out: &mut Vec<(String, Object)>,
     table: &SlotTable,
     slot_id: c_int,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -1081,7 +1086,7 @@ fn install_call(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -1151,7 +1156,7 @@ fn install_init(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -1215,7 +1220,7 @@ fn install_hash(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -1250,7 +1255,7 @@ fn install_getattro(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -1308,7 +1313,7 @@ fn install_setattro(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -1367,7 +1372,7 @@ fn install_delattro(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -1424,7 +1429,7 @@ fn install_descr_get(
     out: &mut Vec<(String, Object)>,
     table: &SlotTable,
     slot_id: c_int,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -1473,7 +1478,7 @@ fn install_descr_set(
     out: &mut Vec<(String, Object)>,
     table: &SlotTable,
     slot_id: c_int,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -1520,7 +1525,7 @@ fn install_anext(
     table: &SlotTable,
     slot_id: c_int,
     name: &str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
@@ -1615,7 +1620,7 @@ fn install_new(
     out: &mut Vec<(String, Object)>,
     table: &SlotTable,
     slot_id: c_int,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
     new_null_raises: bool,
 ) {
     let slot = table.get(slot_id);
@@ -1653,7 +1658,7 @@ fn install_new(
     }
     fn cls_ptr(
         arg: &Object,
-        tn: &Rc<str>,
+        tn: &SharedStr,
     ) -> Result<*mut crate::types::PyTypeObject, RuntimeError> {
         match arg {
             // Resolve `cls` to its *canonical* C `PyTypeObject*` — the
@@ -1753,7 +1758,7 @@ fn install_new(
 fn primary_self(
     args: &[Object],
     name: &'static str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) -> Result<*mut PyObject, RuntimeError> {
     if args.is_empty() {
         return Err(type_error(format!(
@@ -1811,7 +1816,7 @@ fn wp_rcmp_diag(obj: &Object, p: *mut PyObject, role: &str) {
 fn binary_args(
     args: &[Object],
     name: &'static str,
-    type_name: &Rc<str>,
+    type_name: &SharedStr,
 ) -> Result<(*mut PyObject, *mut PyObject), RuntimeError> {
     if args.len() != 2 {
         return Err(type_error(format!(

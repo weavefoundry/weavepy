@@ -1,0 +1,16 @@
+[
+  {
+    "path": "target/binder-flags-startup-live-allocations/history.txt.gz",
+    "compressed_bytes": 7233081,
+    "compressed_sha256": "362ef4da524aa76e501a48498d55fd001e5997de4ce630f7ea9be4aae6c809e9",
+    "uncompressed_bytes": 165597038,
+    "uncompressed_sha256": "a19e59fb9476403d76e5163f1b5c13aaddcbbdef74fb4222abf4741cce43cf03"
+  },
+  {
+    "path": "target/binder-flags-startup-live-allocations-warm/history.txt.gz",
+    "compressed_bytes": 4736912,
+    "compressed_sha256": "a7b0a4dee86df188cb633946410556494d663c458bcb401f3bcd3e0a6a6f8279",
+    "uncompressed_bytes": 109571661,
+    "uncompressed_sha256": "eb593f3e7aede3fcda4cd1a0944253a56618553ac541a38a7c84028df3faea4a"
+  }
+]

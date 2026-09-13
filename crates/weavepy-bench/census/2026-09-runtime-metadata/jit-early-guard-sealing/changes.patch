@@ -1,0 +1,13 @@
+--- a/crates/weavepy-jit/src/lower.rs
++++ b/crates/weavepy-jit/src/lower.rs
+@@ -3107,6 +3107,10 @@
+         let se = self.b.create_block();
+         let cont = self.b.create_block();
+         self.b.ins().brif(cond, se, &[], cont, &[]);
++        // These private blocks have their only predecessor now. Sealing before
++        // local reads avoids temporary SSA parameters along guard chains.
++        self.b.seal_block(se);
++        self.b.seal_block(cont);
+         self.b.switch_to_block(se);
+         self.emit_deopt(pc, snapshot);
+         cont
