@@ -269,8 +269,8 @@ delta or a switch bug, never a floor regression.
 - The census methodology (the `sample`-based flat profile above) is
   scripted as `weavepy-bench profile <fixture>` (macOS `sample`,
   Linux `perf record` when present) so the next wave's census is one
-  command, and the four profiles above are committed under
-  `crates/weavepy-bench/census/wave12/` as text.
+  command. The profiles are preserved as text in the
+  [original wave 12 commit](https://github.com/weavefoundry/weavepy/tree/2c6348a5455050615c288bfd015f8cb81b5dc05e/crates/weavepy-bench/census/wave12/); generated profiles now stay outside the tracked tree.
 - `WEAVEPY_VM_STATS` gains counters for the buckets this wave touches:
   suspect sweeps run / entries probed / dead found, frame shells
   materialized versus elided, method-cache hits/misses, str-hash

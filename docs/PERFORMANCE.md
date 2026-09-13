@@ -22,7 +22,7 @@ benefit is avoiding work and memory faults during process initialization.
 The baseline is an unmodified release build of `2c6348a`. The modified binary
 uses the same release profile and default JIT feature. Measurements use
 CPython 3.14.7 as a reference and Rust 1.98.1 to build both binaries.
-[Raw samples, binary checksums, and supplemental probes](../crates/weavepy-bench/census/2026-09-performance/)
+[Raw samples, binary checksums, and supplemental probes](https://github.com/weavefoundry/weavepy/tree/971d75214077c07935710798b705ec50d5831860/crates/weavepy-bench/census/2026-09-performance/)
 are retained alongside the existing performance census.
 
 The implementation changes are:

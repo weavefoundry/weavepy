@@ -1,0 +1,10 @@
+# Research output is local by default, including newly created census folders.
+# Add a directory here and a narrow file allowlist inside it for maintained tools.
+/*
+!/.gitignore
+!/README.md
+!/2026-09-performance/
+!/2026-09-execution/
+!/2026-09-json/
+!/2026-09-collections-datetime/
+!/2026-09-runtime-metadata/
