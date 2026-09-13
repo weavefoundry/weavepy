@@ -15,6 +15,7 @@
 //! raises `termios.error(errno, strerror)` — a distinct exception type,
 //! *not* an `OSError` subclass, exactly like upstream.
 
+use crate::shared_value::SharedSlice;
 use std::sync::OnceLock;
 
 use crate::sync::Rc;
@@ -107,10 +108,7 @@ fn last_termios_error() -> RuntimeError {
     if let Object::Instance(i) = &inst {
         i.slot_set(
             "args",
-            Object::new_tuple(vec![
-                Object::Int(i64::from(errno)),
-                Object::from_str(strerror),
-            ]),
+            Object::new_tuple_array([Object::Int(i64::from(errno)), Object::from_str(strerror)]),
         );
     }
     RuntimeError::PyException(PyException::new(inst))
@@ -191,7 +189,7 @@ fn termios_tcgetattr(args: &[Object]) -> Result<Object, RuntimeError> {
         if icanon_off && (i == libc::VMIN as usize || i == libc::VTIME as usize) {
             cc.push(Object::Int(i64::from(ch)));
         } else {
-            cc.push(Object::Bytes(Rc::from(&[ch as u8][..])));
+            cc.push(Object::Bytes(SharedSlice::from(&[ch as u8][..])));
         }
     }
     let items = vec![
@@ -350,7 +348,7 @@ fn termios_tcgetwinsize(args: &[Object]) -> Result<Object, RuntimeError> {
     if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } != 0 {
         return Err(last_termios_error());
     }
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(i64::from(ws.ws_row)),
         Object::Int(i64::from(ws.ws_col)),
     ]))

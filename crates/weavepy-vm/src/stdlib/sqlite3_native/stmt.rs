@@ -623,7 +623,7 @@ pub(crate) fn build_description(stmt: &Statement, detect_types: i64) -> Object {
                 name = name[..pos].trim_end().to_owned();
             }
         }
-        cols.push(Object::new_tuple(vec![
+        cols.push(Object::new_tuple_array([
             Object::from_str(name),
             Object::None,
             Object::None,

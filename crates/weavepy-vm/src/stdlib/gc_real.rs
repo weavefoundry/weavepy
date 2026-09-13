@@ -295,7 +295,7 @@ pub(crate) fn debug_stats_end(before: Option<DebugStatsBefore>, collected: usize
 
 fn get_count(_args: &[Object]) -> Result<Object, RuntimeError> {
     let counts = gc_trace::with_state(|s| s.counts());
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(counts[0] as i64),
         Object::Int(counts[1] as i64),
         Object::Int(counts[2] as i64),
@@ -304,7 +304,7 @@ fn get_count(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn get_threshold(_args: &[Object]) -> Result<Object, RuntimeError> {
     let t = gc_trace::with_state(|s| s.thresholds());
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(t[0] as i64),
         Object::Int(t[1] as i64),
         Object::Int(t[2] as i64),
@@ -478,7 +478,7 @@ fn strong_count_dbg(args: &[Object]) -> Result<Object, RuntimeError> {
         .ok_or_else(|| type_error("_strong_count() requires 1 argument"))?;
     let strong = gc_trace::strong_count_for(target) as i64;
     let weak = crate::weakref_registry::strong_clone_count(id_of(target)) as i64;
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(strong),
         Object::Int(weak),
     ]))
@@ -492,8 +492,8 @@ fn is_tracked(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 /// `gc.is_tracked()` semantics for one object. Tuples aren't
-/// registered with the tracer (they're immutable `Rc<[Object]>`
-/// slices whose referents the collector reaches through their owners),
+/// registered with the tracer (their immutable storage has referents
+/// the collector reaches through their owners),
 /// so they answer the way a CPython tuple does *after*
 /// `_PyTuple_MaybeUntrack` — which since 3.14 runs at creation time:
 /// tracked iff some element is itself a tracked container.

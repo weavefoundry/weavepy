@@ -1630,6 +1630,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
 name = "powerfmt"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2834,6 +2840,7 @@ dependencies = [
  "num-bigint",
  "num-integer",
  "num-traits",
+ "portable-atomic",
  "thiserror 2.0.18",
  "weavepy-lexer",
  "weavepy-parser",
@@ -2927,6 +2934,7 @@ dependencies = [
  "flate2",
  "hmac",
  "indexmap",
+ "itoa",
  "libc",
  "lzma-sys",
  "md-5",
@@ -2963,6 +2971,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "x509-parser",
  "xz2",
+ "zmij",
  "zstd",
  "zstd-safe",
  "zstd-sys",

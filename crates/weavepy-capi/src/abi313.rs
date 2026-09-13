@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::Mutex;
+use weavepy_vm::shared_value::SharedSlice;
 
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -66,7 +67,7 @@ pub unsafe extern "C" fn Py_GetConstant(constant_id: u32) -> *mut PyObject {
         5 => crate::object::into_owned(Object::Int(0)),
         6 => crate::object::into_owned(Object::Int(1)),
         7 => crate::object::into_owned(Object::from_static("")),
-        8 => crate::object::into_owned(Object::Bytes(Rc::from(&b""[..]))),
+        8 => crate::object::into_owned(Object::Bytes(SharedSlice::from(&b""[..]))),
         9 => crate::object::into_owned(Object::new_tuple(vec![])),
         _ => {
             crate::errors::set_runtime_error("Py_GetConstant: unknown constant id");
@@ -161,8 +162,8 @@ pub unsafe extern "C" fn PyUnicodeDecodeError_Create(
         }
     };
     let len = length.max(0) as usize;
-    let data: Rc<[u8]> = if object.is_null() {
-        Rc::from(&b""[..])
+    let data: SharedSlice<u8> = if object.is_null() {
+        SharedSlice::from(&b""[..])
     } else {
         unsafe { std::slice::from_raw_parts(object as *const u8, len) }.into()
     };

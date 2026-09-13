@@ -35,9 +35,11 @@ use std::sync::Arc;
 
 use crate::error::{type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;
-use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
+use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule, StrKey};
 use crate::types::{PyInstance, TypeFlags, TypeObject};
-use crate::weakref_registry::{self as reg, id_of, kind, register, ObjectId, WeakRefSlot};
+use crate::weakref_registry::{
+    self as reg, id_of, kind, register, ObjectId, WeakRefSlot, WrapperKey,
+};
 
 thread_local! {
     static REF_TYPE: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
@@ -147,11 +149,7 @@ fn ref_type_call(args: &[Object]) -> Result<Object, RuntimeError> {
         .first()
         .ok_or_else(|| type_error("__call__() missing self"))?;
     if let Object::Instance(inst) = me {
-        let getter = inst
-            .dict
-            .borrow()
-            .get(&DictKey(Object::from_static("__weakref_get__")))
-            .cloned();
+        let getter = inst.dict.borrow().get(&StrKey("__weakref_get__")).cloned();
         if let Some(Object::Builtin(b)) = getter {
             return (b.call)(&[]);
         }
@@ -216,11 +214,7 @@ fn wrapper_referent(obj: &Object) -> Option<Option<Object>> {
     let Object::Instance(inst) = obj else {
         return None;
     };
-    let getter = inst
-        .dict
-        .borrow()
-        .get(&DictKey(Object::from_static("__weakref_get__")))
-        .cloned();
+    let getter = inst.dict.borrow().get(&StrKey("__weakref_get__")).cloned();
     match getter {
         Some(Object::Builtin(b)) => {
             let t = (b.call)(&[]).ok()?;
@@ -258,7 +252,7 @@ pub(crate) fn weakref_native_hash(obj: &Object) -> Option<i64> {
     let target = wrapper_referent(obj).flatten()?;
     let h = crate::object::py_hash_value(&target)
         .unwrap_or_else(|| crate::object::identity_hash(&target));
-    inst.hash_cache.set(Some(h));
+    inst.hash_cache.store(h);
     Some(h)
 }
 
@@ -329,7 +323,7 @@ fn ref_type_hash(args: &[Object]) -> Result<Object, RuntimeError> {
     // every later probe — on any thread, via either hash path — agrees on
     // the bucket and a dead ref stays discardable.
     if let Some(hv) = h.as_i64() {
-        inst.hash_cache.set(Some(hv));
+        inst.hash_cache.store(hv);
     }
     Ok(h)
 }
@@ -422,11 +416,7 @@ fn ref_type_repr(args: &[Object]) -> Result<Object, RuntimeError> {
 /// (test_set_callback_attribute).
 fn ref_callback_get(args: &[Object]) -> Result<Object, RuntimeError> {
     if let Some(Object::Instance(inst)) = args.first() {
-        if let Some(v) = inst
-            .dict
-            .borrow()
-            .get(&DictKey(Object::from_static("__callback__")))
-        {
+        if let Some(v) = inst.dict.borrow().get(&StrKey("__callback__")) {
             return Ok(v.clone());
         }
     }
@@ -533,11 +523,7 @@ pub fn proxy_referent(obj: &Object) -> Option<Result<Object, RuntimeError>> {
 /// referent has been collected — CPython's `proxy_checkref`.
 fn proxy_target(me: &Object) -> Result<Object, RuntimeError> {
     if let Object::Instance(inst) = me {
-        let getter = inst
-            .dict
-            .borrow()
-            .get(&DictKey(Object::from_static("__weakref_get__")))
-            .cloned();
+        let getter = inst.dict.borrow().get(&StrKey("__weakref_get__")).cloned();
         if let Some(Object::Builtin(b)) = getter {
             let t = (b.call)(&[])?;
             if !matches!(t, Object::None) {
@@ -1165,44 +1151,29 @@ fn make_ref_object_with_class(
 
     {
         let mut d = dict.borrow_mut();
+        d.insert(WrapperKey::Call.owned(), b_dyn("__call__", call));
         d.insert(
-            DictKey(Object::from_static("__call__")),
-            b_dyn("__call__", call),
-        );
-        d.insert(
-            DictKey(Object::from_static("__weakref_get__")),
+            WrapperKey::Get.owned(),
             b_dyn("__weakref_get__", get_target),
         );
-        d.insert(
-            DictKey(Object::from_static("__clear__")),
-            b_dyn("__clear__", clear),
-        );
-        d.insert(
-            DictKey(Object::from_static("__alive__")),
-            b_dyn("__alive__", alive),
-        );
-        d.insert(
-            DictKey(Object::from_static("__repr__")),
-            b_dyn("__repr__", repr),
-        );
+        d.insert(WrapperKey::Clear.owned(), b_dyn("__clear__", clear));
+        d.insert(WrapperKey::Alive.owned(), b_dyn("__alive__", alive));
+        d.insert(WrapperKey::Repr.owned(), b_dyn("__repr__", repr));
         if let Some(cb) = callback.clone() {
-            d.insert(DictKey(Object::from_static("__callback__")), cb);
+            d.insert(WrapperKey::Callback.owned(), cb);
         } else {
-            d.insert(DictKey(Object::from_static("__callback__")), Object::None);
+            d.insert(WrapperKey::Callback.owned(), Object::None);
         }
-        d.insert(
-            DictKey(Object::from_static("__weakref_kind__")),
-            Object::Int(i64::from(kind_tag)),
-        );
+        d.insert(WrapperKey::Kind.owned(), Object::Int(i64::from(kind_tag)));
     }
 
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(class),
-        dict,
+        dict: dict.into(),
         native: std::sync::OnceLock::new(),
         inline_values: crate::sync::Cell::new(true),
-        slots: crate::sync::RefCell::new(None),
-        hash_cache: crate::sync::Cell::new(None),
+        slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
+        hash_cache: crate::sync::CachedHash::new(None),
         finalize_ran: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
     });
@@ -1442,29 +1413,11 @@ mod tests {
     fn ref_returns_alive_target_then_none_after_clear() {
         let target = Object::from_static("hello");
         let r = make_ref_object(target.clone(), None, kind::REF);
-        if let Object::Instance(inst) = &r {
-            let call = inst
-                .dict
-                .borrow()
-                .get(&DictKey(Object::from_static("__call__")))
-                .cloned();
-            if let Some(Object::Builtin(b)) = call {
-                let live = (b.call)(&[]).unwrap();
-                assert!(matches!(live, Object::Str(_)));
-            }
-        }
+        let live = ref_type_call(std::slice::from_ref(&r)).unwrap();
+        assert!(live.is_same(&target));
         let id = id_of(&target);
         let _ = reg::notify_clear(id);
-        if let Object::Instance(inst) = &r {
-            let call = inst
-                .dict
-                .borrow()
-                .get(&DictKey(Object::from_static("__call__")))
-                .cloned();
-            if let Some(Object::Builtin(b)) = call {
-                let after = (b.call)(&[]).unwrap();
-                assert!(matches!(after, Object::None));
-            }
-        }
+        let after = ref_type_call(std::slice::from_ref(&r)).unwrap();
+        assert!(matches!(after, Object::None));
     }
 }

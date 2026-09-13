@@ -7,7 +7,8 @@
 
 use weavepy_compiler::{compile_module, CodeObject, Constant};
 use weavepy_jit::{
-    analyze_frame, JitType, JitVerdict, PathArena, Probes, ResolvedGlobal, TFunc, TOp, TTerm,
+    analyze_frame, JitType, JitVerdict, PathArena, Probes, ResolvedGlobal, SliceOrigin, TFunc, TOp,
+    TTerm,
 };
 use weavepy_parser::parse_module;
 
@@ -34,6 +35,8 @@ struct Cfg {
     dict: Option<(u32, JitType, JitType)>,
     /// Slots the (seeded) param probe grades `Obj`.
     obj_params: Vec<u32>,
+    /// Explicit parameter lanes, including exact bytes.
+    typed_params: Vec<(u32, JitType)>,
     /// Names the resolver treats as genuinely missing (`Opaque` and
     /// no obj-global token — the `NameError` shape).
     missing: Vec<&'static str>,
@@ -41,11 +44,16 @@ struct Cfg {
 
 fn analyze_cfg(src: &str, cfg: &Cfg) -> Result<TFunc, JitVerdict> {
     let code = compile_first_fn(src);
+    analyze_code_cfg(&code, cfg)
+}
+
+fn analyze_code_cfg(code: &CodeObject, cfg: &Cfg) -> Result<TFunc, JitVerdict> {
     let missing = cfg.missing.clone();
     let mut resolve = |name: &str| -> ResolvedGlobal {
         match name {
             "range" => ResolvedGlobal::RangeBuiltin,
             "enumerate" => ResolvedGlobal::EnumerateBuiltin,
+            "len" => ResolvedGlobal::LenBuiltin,
             _ => ResolvedGlobal::Opaque,
         }
     };
@@ -64,6 +72,7 @@ fn analyze_cfg(src: &str, cfg: &Cfg) -> Result<TFunc, JitVerdict> {
     let list = cfg.list;
     let dict = cfg.dict;
     let obj_params = cfg.obj_params.clone();
+    let typed_params = cfg.typed_params.clone();
     let mut paths = PathArena::default();
     let mut probes = Probes {
         list: &mut move |s| list.filter(|(slot, _)| *slot == s).map(|(_, e)| e),
@@ -73,7 +82,9 @@ fn analyze_cfg(src: &str, cfg: &Cfg) -> Result<TFunc, JitVerdict> {
         math: &mut |_, _| false,
         ctor_field: &mut |_, _| None,
         param: &mut move |s| {
-            if obj_params.contains(&s) {
+            if let Some((_, lane)) = typed_params.iter().find(|(slot, _)| *slot == s) {
+                Some(*lane)
+            } else if obj_params.contains(&s) {
                 Some(JitType::Obj)
             } else {
                 None
@@ -85,13 +96,230 @@ fn analyze_cfg(src: &str, cfg: &Cfg) -> Result<TFunc, JitVerdict> {
         obj: &mut |_| false,
         paths: &mut paths,
     };
-    analyze_frame(&code, &mut resolve, &mut probes)
+    analyze_frame(code, &mut resolve, &mut probes)
 }
 
 fn has_op(tf: &TFunc, pred: impl Fn(&TOp) -> bool) -> bool {
     tf.blocks
         .iter()
         .any(|b| b.stmts.iter().any(|s| pred(&s.op)))
+}
+
+#[test]
+fn explicit_raises_exit_at_the_original_opcode() {
+    use weavepy_compiler::OpCode;
+    for body in [
+        "raise",
+        "raise ValueError",
+        "raise problem",
+        "raise problem from cause",
+        "raise problem from None",
+        "raise None",
+        "raise 7",
+    ] {
+        let source = format!("def k(n):\n    if n < 0:\n        {body}\n    return n + 1\n");
+        let code = compile_first_fn(&source);
+        let pc = code
+            .instructions
+            .iter()
+            .position(|i| i.op == OpCode::RaiseVarargs)
+            .unwrap();
+        let tf = analyze_code_cfg(&code, &Cfg::default()).expect("normal path should compile");
+        assert!(tf
+            .blocks
+            .iter()
+            .any(|b| b.term == TTerm::Deopt { pc: pc as u32 }));
+        assert!(tf.blocks.iter().any(|b| b.term == TTerm::Return));
+        assert_eq!(tf.ret_lane, Some(JitType::Int));
+    }
+}
+
+#[test]
+fn conditional_raise_arguments_do_not_restore_another_arms_call_marker() {
+    use weavepy_compiler::OpCode;
+    let code = compile_first_fn(
+        "def k(n, msg):\n    if n < 0:\n        raise factory('closed' if msg is None else msg)\n    return n + 1\n",
+    );
+    let cfg = Cfg {
+        obj_params: vec![1],
+        ..Cfg::default()
+    };
+    let tf = analyze_code_cfg(&code, &cfg).expect("conditional constructor should compile");
+    let mut calls = 0;
+    let mut raises = 0;
+    for (pc, ins) in code.instructions.iter().enumerate() {
+        let pc = pc as u32;
+        if ins.op == OpCode::RaiseVarargs {
+            raises += 1;
+            assert!(tf
+                .null_spans
+                .iter()
+                .all(|s| !(s.live_from < pc && pc < s.live_to)));
+            assert!(tf
+                .callee_spans
+                .iter()
+                .all(|s| !(s.live_from < pc && pc < s.live_to)));
+        } else if ins.op == OpCode::Call {
+            calls += 1;
+            assert_eq!(
+                tf.null_spans
+                    .iter()
+                    .filter(|s| s.live_from < pc && pc < s.live_to)
+                    .count(),
+                1,
+                "each call must restore exactly one self-or-null marker"
+            );
+        }
+    }
+    assert_eq!(
+        calls, 2,
+        "the compiler splits the call across conditional arms"
+    );
+    assert_eq!(raises, 2);
+}
+
+#[test]
+fn malformed_raise_operands_are_rejected() {
+    use weavepy_compiler::OpCode;
+    let mut code = compile_first_fn("def k(n):\n    if n < 0:\n        raise\n    return n + 1\n");
+    let pc = code
+        .instructions
+        .iter()
+        .position(|i| i.op == OpCode::RaiseVarargs)
+        .unwrap();
+    code.instructions[pc].arg = 3;
+    assert!(matches!(
+        analyze_code_cfg(&code, &Cfg::default()),
+        Err(JitVerdict::UnsupportedOpcode(_))
+    ));
+    code.instructions[pc].arg = 1;
+    assert!(matches!(
+        analyze_code_cfg(&code, &Cfg::default()),
+        Err(JitVerdict::StackUnderflow)
+    ));
+}
+
+#[test]
+fn tuple_constants_pin_without_copying_or_scalar_restrictions() {
+    for literal in ["()", "(1, 2, 3)", "(None, (1, 'two words'), b'bytes')"] {
+        let src = format!(
+            "def k(n):\n    out = {literal}\n    for i in range(n):\n        out = {literal}\n    return out\n"
+        );
+        let tf = analyze_cfg(&src, &Cfg::default()).expect("tuple constant should compile");
+        assert!(has_op(&tf, |op| matches!(op, TOp::PushConstTuple { .. })));
+        assert!(tf.local_types.contains(&Some(JitType::Obj)));
+    }
+}
+
+#[test]
+fn tuple_constant_length_has_a_runtime_shape_guard() {
+    let tf = analyze_cfg(
+        "def k(n):\n    seq = (1, 2, 3)\n    out = 0\n    for i in range(n):\n        out += len(seq)\n    return out\n",
+        &Cfg::default(),
+    )
+    .expect("tuple length should compile");
+    assert!(has_op(&tf, |op| matches!(op, TOp::PushConstTuple { .. })));
+    assert!(has_op(&tf, |op| matches!(op, TOp::TupleLen)));
+    assert!(
+        !tf.len_spans.is_empty(),
+        "deopt must restore the len callee"
+    );
+}
+
+#[test]
+fn object_parameter_length_keeps_the_tuple_guard() {
+    let tf = analyze_cfg(
+        "def k(seq, n):\n    out = 0\n    for i in range(n):\n        out += len(seq)\n    return out\n",
+        &Cfg { obj_params: vec![0], ..Cfg::default() },
+    )
+    .expect("an object parameter can use guarded tuple length");
+    assert!(has_op(&tf, |op| matches!(op, TOp::TupleLen)));
+}
+
+#[test]
+fn opaque_integer_call_results_guard_each_operand_position() {
+    for (expression, depth) in [("total + callback(i)", 0), ("callback(i) + total", 1)] {
+        let source = format!(
+            "def k(n, callback):\n    total = 0\n    for i in range(n):\n        total = {expression}\n    return total\n"
+        );
+        let tf = analyze_cfg(
+            &source,
+            &Cfg {
+                obj_params: vec![1],
+                ..Cfg::default()
+            },
+        )
+        .expect("integer consumers can guard an opaque call result");
+        assert!(has_op(
+            &tf,
+            |op| matches!(op, TOp::CallDyn { int_result, .. } if *int_result == (depth == 0))
+        ));
+        assert_eq!(
+            has_op(
+                &tf,
+                |op| matches!(op, TOp::UnboxInt { depth: found } if *found == depth)
+            ),
+            depth != 0
+        );
+        assert!(tf.local_types.contains(&Some(JitType::Int)));
+    }
+}
+
+#[test]
+fn guarded_integer_division_retains_float_result() {
+    let tf = analyze_cfg(
+        "def k(n, callback):\n    total = 0.0\n    for i in range(n):\n        total += 10 / callback(i)\n    return total\n",
+        &Cfg { obj_params: vec![1], ..Cfg::default() },
+    )
+    .expect("checked integer division should analyze");
+    assert!(has_op(&tf, |op| matches!(
+        op,
+        TOp::CallDyn {
+            int_result: true,
+            ..
+        }
+    )));
+    assert!(has_op(&tf, |op| matches!(op, TOp::IntTrueDiv)));
+    assert!(tf.local_types.contains(&Some(JitType::Float)));
+}
+
+#[test]
+fn two_opaque_arithmetic_operands_do_not_guess_a_scalar_lane() {
+    assert!(matches!(
+        analyze_cfg(
+            "def k(a, b):\n    return a + b\n",
+            &Cfg {
+                obj_params: vec![0, 1],
+                ..Cfg::default()
+            },
+        ),
+        Err(JitVerdict::MixedArithTypes)
+    ));
+}
+
+#[test]
+fn empty_list_accepts_native_scalar_appends() {
+    for value in ["i * i", "i + 0.5", "i < 2"] {
+        let source = format!(
+            "def k(n):\n    out = []\n    for i in range(n):\n        out.append({value})\n    return out\n"
+        );
+        let tf = analyze_cfg(&source, &Cfg::default()).expect("scalar append should compile");
+        assert!(has_op(&tf, |op| matches!(op, TOp::ListAppend)));
+        assert!(tf.local_types.contains(&Some(JitType::ListObj)));
+    }
+}
+
+#[test]
+fn typed_list_still_rejects_mismatched_append() {
+    let err = analyze_cfg(
+        "def k(n):\n    out = [1]\n    for i in range(n):\n        out.append(0.5)\n    return out\n",
+        &Cfg::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        JitVerdict::UnsupportedOpcode("append (value lane)")
+    ));
 }
 
 // ---------------------------------------------------------------- WS1
@@ -158,19 +386,41 @@ fn param_callee_rides_call_dyn() {
 }
 
 #[test]
-fn call_dyn_result_arithmetic_stays_interpreted() {
-    // RFC 0074 WS2 v1: the CallDyn result is `Obj`; arithmetic on it
-    // has no lane, so the frame stays interpreted (return-lane
-    // refinement is enumerated future work).
-    let err = analyze_cfg(
+fn call_dyn_result_arithmetic_checks_the_returned_integer() {
+    // The immediate consumer lets the call guard its completed return
+    // directly, without first allocating an object pin for an integer.
+    let tf = analyze_cfg(
         "def k(f, n):\n    t = 0\n    for i in range(n):\n        t = t + f(i)\n    return t\n",
         &Cfg {
             obj_params: vec![0],
             ..Cfg::default()
         },
     )
-    .unwrap_err();
-    assert!(matches!(err, JitVerdict::MixedArithTypes), "{err:?}");
+    .expect("an integer consumer can guard the opaque result");
+    assert!(has_op(&tf, |op| matches!(
+        op,
+        TOp::CallDyn {
+            int_result: true,
+            ..
+        }
+    )));
+    assert!(!has_op(&tf, |op| matches!(op, TOp::UnboxInt { .. })));
+}
+
+#[test]
+fn stored_call_result_keeps_its_object_lane() {
+    let tf = analyze_cfg(
+        "def k(callback):\n    value = callback(1)\n    total = 0\n    total += value\n    return value\n",
+        &Cfg { obj_params: vec![0], ..Cfg::default() },
+    ).expect("a stored result keeps a separate arithmetic guard");
+    assert!(has_op(&tf, |op| matches!(
+        op,
+        TOp::CallDyn {
+            int_result: false,
+            ..
+        }
+    )));
+    assert!(has_op(&tf, |op| matches!(op, TOp::UnboxInt { depth: 0 })));
 }
 
 // ---------------------------------------------------------------- WS3
@@ -236,9 +486,70 @@ fn unrecognized_pair_source_defaults_to_obj_lanes() {
 }
 
 #[test]
+fn enumerate_bytes_pair_loop_trains_integer_lanes() {
+    let tf = analyze_cfg(
+        "def k(xs):\n    t = 0\n    for i, x in enumerate(xs):\n        t = t + (i ^ x)\n    return t\n",
+        &Cfg {
+            typed_params: vec![(0, JitType::Bytes)],
+            ..Cfg::default()
+        },
+    )
+    .expect("exact bytes enumeration should analyze");
+    let pair = tf.blocks.iter().find_map(|b| match b.term {
+        TTerm::ForIterPair { elem1, elem2, .. } => Some((elem1, elem2)),
+        _ => None,
+    });
+    assert_eq!(pair, Some((JitType::Int, JitType::Int)));
+    assert_eq!(tf.local_types[0], Some(JitType::Bytes));
+}
+
+#[test]
+fn enumerate_bytes_requests_parameter_training() {
+    assert!(matches!(
+        analyze_cfg(
+            "def k(xs):\n    t = 0\n    for i, x in enumerate(xs):\n        t = t + (i ^ x)\n    return t\n",
+            &Cfg::default(),
+        ),
+        Err(JitVerdict::TypeUnknown)
+    ));
+}
+
+#[test]
+fn enumerate_generic_source_keeps_integer_index() {
+    let tf = analyze_cfg(
+        "def k(xs):\n    t = 0\n    for i, x in enumerate(xs):\n        t = t + i\n    return t\n",
+        &Cfg {
+            obj_params: vec![0],
+            ..Cfg::default()
+        },
+    )
+    .expect("enumerate's index is an int for generic iterables too");
+    let pair = tf.blocks.iter().find_map(|b| match b.term {
+        TTerm::ForIterPair { elem1, elem2, .. } => Some((elem1, elem2)),
+        _ => None,
+    });
+    assert_eq!(pair, Some((JitType::Int, JitType::Obj)));
+}
+
+#[test]
+fn enumerate_local_object_keeps_integer_index() {
+    let tf = analyze_cfg(
+        "def k():\n    xs = DATA\n    t = 0\n    for i, x in enumerate(xs):\n        t = t + i\n    return t\n",
+        &Cfg::default(),
+    )
+    .expect("a known object local doesn't need a parameter probe");
+    let pair = tf.blocks.iter().find_map(|b| match b.term {
+        TTerm::ForIterPair { elem1, elem2, .. } => Some((elem1, elem2)),
+        _ => None,
+    });
+    assert_eq!(pair, Some((JitType::Int, JitType::Obj)));
+}
+
+#[test]
 fn shadowed_enumerate_gets_no_trained_lanes() {
     // Without the canonical certification the pair source is not
-    // recognized; lanes default to Obj and `t + i` has no lane.
+    // recognized; both values stay Obj. Arithmetic must check its
+    // index operand even when it speculates on an integer result.
     let code = compile_first_fn(
         "def k(xs):\n    t = 0\n    for i, x in enumerate(xs):\n        t = t + i\n    return t\n",
     );
@@ -258,15 +569,21 @@ fn shadowed_enumerate_gets_no_trained_lanes() {
         method: &mut |_, _, _| None,
         math: &mut |_, _| false,
         ctor_field: &mut |_, _| None,
-        param: &mut |_| None,
+        param: &mut |_| Some(JitType::Obj),
         kw_slot: &mut |_, _| None,
         obj_global: &mut obj_global,
         cell: &mut |_| None,
         obj: &mut |_| false,
         paths: &mut paths,
     };
-    let err = analyze_frame(&code, &mut resolve, &mut probes).unwrap_err();
-    assert!(matches!(err, JitVerdict::MixedArithTypes), "{err:?}");
+    let tf = analyze_frame(&code, &mut resolve, &mut probes)
+        .expect("shadowed enumeration can use a checked integer consumer");
+    let pair = tf.blocks.iter().find_map(|b| match b.term {
+        TTerm::ForIterPair { elem1, elem2, .. } => Some((elem1, elem2)),
+        _ => None,
+    });
+    assert_eq!(pair, Some((JitType::Obj, JitType::Obj)));
+    assert!(has_op(&tf, |op| matches!(op, TOp::UnboxInt { depth: 0 })));
 }
 
 // ---------------------------------------------------------------- WS4
@@ -326,4 +643,161 @@ fn open_ended_str_slice_analyzes() {
         &Cfg::default(),
     )
     .expect("open-ended str slices should analyze");
+}
+
+#[test]
+fn slice_fallback_preserves_two_bound_producer() {
+    use weavepy_compiler::OpCode;
+    for lane in [JitType::ListInt, JitType::Str] {
+        let mut code = compile_first_fn("def k(items, stop):\n    return items[:stop:None]\n");
+        let pc = code
+            .instructions
+            .iter()
+            .position(|ins| ins.op == OpCode::BuildSlice)
+            .unwrap();
+        assert_eq!(code.instructions[pc].arg, 3);
+        assert_eq!(code.instructions[pc - 1].op, OpCode::LoadConst);
+        code.instructions[pc - 1].op = OpCode::Nop;
+        code.instructions[pc - 1].arg = 0;
+        code.instructions[pc].arg = 2;
+        let tf = analyze_code_cfg(
+            &code,
+            &Cfg {
+                list: (lane == JitType::ListInt).then_some((0, JitType::Int)),
+                typed_params: vec![(0, lane), (1, JitType::Int)],
+                ..Cfg::default()
+            },
+        )
+        .expect("two-bound slice should analyze");
+        assert!(tf.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
+            stmt.pc == pc as u32
+                && matches!(
+                    stmt.op,
+                    TOp::ListSlice {
+                        origin: SliceOrigin::TwoBounds,
+                        ..
+                    } | TOp::StrSlice {
+                        origin: SliceOrigin::TwoBounds,
+                        ..
+                    }
+                )
+        }));
+    }
+}
+
+#[test]
+fn slice_fallback_preserves_explicit_none_step() {
+    for lane in [JitType::ListInt, JitType::Str] {
+        let tf = analyze_cfg(
+            "def k(items, stop):\n    return items[:stop:None]\n",
+            &Cfg {
+                list: (lane == JitType::ListInt).then_some((0, JitType::Int)),
+                typed_params: vec![(0, lane), (1, JitType::Int)],
+                ..Cfg::default()
+            },
+        )
+        .expect("three-bound slice should analyze");
+        assert!(has_op(&tf, |op| matches!(
+            op,
+            TOp::ListSlice {
+                origin: SliceOrigin::ThreeBounds,
+                ..
+            } | TOp::StrSlice {
+                origin: SliceOrigin::ThreeBounds,
+                ..
+            }
+        )));
+    }
+}
+
+#[test]
+fn folded_slice_fallback_resumes_the_constant_load() {
+    for lane in [JitType::ListInt, JitType::Str] {
+        let tf = analyze_cfg(
+            "def k(items):\n    return items[1:4]\n",
+            &Cfg {
+                list: (lane == JitType::ListInt).then_some((0, JitType::Int)),
+                typed_params: vec![(0, lane)],
+                ..Cfg::default()
+            },
+        )
+        .expect("folded slice should analyze");
+        assert!(has_op(&tf, |op| matches!(
+            op,
+            TOp::ListSlice {
+                origin: SliceOrigin::Constant,
+                ..
+            } | TOp::StrSlice {
+                origin: SliceOrigin::Constant,
+                ..
+            }
+        )));
+    }
+}
+
+#[test]
+fn assertions_exit_before_constructing_the_exception_or_message() {
+    use weavepy_compiler::OpCode;
+    for assertion in [
+        "assert n >= 0",
+        "assert n >= 0, n",
+        "assert n >= 0, f'value: {n}'",
+        "assert n >= 0, factory('bad' if n < -1 else 'worse')",
+    ] {
+        let source = format!("def k(n):\n    {assertion}\n    return n + 1\n");
+        let code = compile_first_fn(&source);
+        let pc = code
+            .instructions
+            .iter()
+            .position(|i| i.op == OpCode::LoadCommonConstant)
+            .unwrap();
+        let tf =
+            analyze_code_cfg(&code, &Cfg::default()).expect("successful assertion should compile");
+        assert!(tf
+            .blocks
+            .iter()
+            .any(|b| b.term == TTerm::Deopt { pc: pc as u32 }));
+        assert!(tf.blocks.iter().any(|b| b.term == TTerm::Return));
+        assert_eq!(tf.ret_lane, Some(JitType::Int));
+        for span in &tf.null_spans {
+            assert!(!(span.live_from <= pc as u32 && (pc as u32) < span.live_to));
+        }
+        for span in &tf.callee_spans {
+            assert!(!(span.live_from <= pc as u32 && (pc as u32) < span.live_to));
+        }
+    }
+}
+
+#[test]
+fn common_constant_exits_are_limited_to_exception_classes() {
+    use weavepy_compiler::bytecode::{
+        COMMON_CONSTANT_ALL, COMMON_CONSTANT_ANY, COMMON_CONSTANT_ASSERTION_ERROR,
+        COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR, COMMON_CONSTANT_TUPLE,
+    };
+    use weavepy_compiler::OpCode;
+    for arg in [
+        COMMON_CONSTANT_ASSERTION_ERROR,
+        COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR,
+        COMMON_CONSTANT_TUPLE,
+        COMMON_CONSTANT_ALL,
+        COMMON_CONSTANT_ANY,
+        u32::MAX,
+    ] {
+        let mut code = compile_first_fn("def k(n):\n    assert n >= 0\n    return n + 1\n");
+        let ins = code
+            .instructions
+            .iter_mut()
+            .find(|i| i.op == OpCode::LoadCommonConstant)
+            .unwrap();
+        ins.arg = arg;
+        let result = analyze_code_cfg(&code, &Cfg::default());
+        assert_eq!(
+            result.is_ok(),
+            matches!(
+                arg,
+                COMMON_CONSTANT_ASSERTION_ERROR | COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR
+            ),
+            "common constant {arg}"
+        );
+    }
 }

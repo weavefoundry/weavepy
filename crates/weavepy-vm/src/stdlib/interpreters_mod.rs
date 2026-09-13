@@ -15,6 +15,7 @@
 //! None, and tuples of shareable values. Anything else raises
 //! `interpreters.NotShareableError`.
 
+use crate::shared_value::SharedSlice;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -329,7 +330,7 @@ fn is_shareable(obj: &Object) -> bool {
 fn xid_rebuild(obj: &Object) -> Object {
     match obj {
         Object::Str(s) => Object::from_str(s.to_string()),
-        Object::Bytes(b) => Object::Bytes(crate::sync::Rc::from(&b[..])),
+        Object::Bytes(b) => Object::Bytes(SharedSlice::from(&b[..])),
         Object::Tuple(items) => Object::new_tuple(items.iter().map(xid_rebuild).collect()),
         other => other.clone(),
     }
@@ -1314,7 +1315,7 @@ fn c_recv(args: &[Object]) -> Result<Object, RuntimeError> {
             Some(op) => (Object::None, Object::Int(op)),
             None => (item.value, Object::None),
         };
-        return Ok(Object::new_tuple(vec![value, op]));
+        return Ok(Object::new_tuple_array([value, op]));
     }
     if entry.closed_send {
         entry.closed = true;
@@ -1323,7 +1324,7 @@ fn c_recv(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(channel_closed(id));
     }
     if let Some(d) = default {
-        return Ok(Object::new_tuple(vec![d, Object::None]));
+        return Ok(Object::new_tuple_array([d, Object::None]));
     }
     Err(runtime_error(format!("channel {id} is empty")))
 }
@@ -1586,7 +1587,7 @@ fn c_get_info(args: &[Object]) -> Result<Object, RuntimeError> {
         .channels
         .get(&id)
         .ok_or_else(|| value_error(format!("channel id {id} does not exist")))?;
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Bool(entry.closed || entry.closed_recv),
         Object::Bool(entry.closed_send && !entry.closed),
         Object::Int(entry.buffer.len() as i64),
@@ -1655,7 +1656,7 @@ fn q_list_all(_args: &[Object]) -> Result<Object, RuntimeError> {
         ids.into_iter()
             .map(|i| {
                 let e = &reg.queues[&i];
-                Object::new_tuple(vec![
+                Object::new_tuple_array([
                     Object::Int(i as i64),
                     Object::Int(e.default_fmt),
                     Object::Int(e.default_unboundop),
@@ -1672,7 +1673,7 @@ fn q_get_defaults(args: &[Object]) -> Result<Object, RuntimeError> {
         .queues
         .get(&(id as u64))
         .ok_or_else(|| q_not_found(id))?;
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(e.default_fmt),
         Object::Int(e.default_unboundop),
     ]))
@@ -1791,12 +1792,12 @@ fn q_get(args: &[Object]) -> Result<Object, RuntimeError> {
     // unbound op instead of a value (the wrapper resolves it —
     // test_interpreters test_queues test_put_cleared_with_subinterpreter).
     match item.unbound {
-        Some(op) => Ok(Object::new_tuple(vec![
+        Some(op) => Ok(Object::new_tuple_array([
             Object::None,
             Object::Int(item.fmt),
             Object::Int(op),
         ])),
-        None => Ok(Object::new_tuple(vec![
+        None => Ok(Object::new_tuple_array([
             item.value,
             Object::Int(item.fmt),
             Object::None,
@@ -1887,7 +1888,7 @@ fn i_incref(args: &[Object]) -> Result<Object, RuntimeError> {
 fn i_decref(args: &[Object]) -> Result<Object, RuntimeError> {
     let id = read_id(args.first(), "_decref")?;
     id_decref(id)
-        .map(|(count, linked)| Object::new_tuple(vec![Object::Int(count), Object::Bool(linked)]))
+        .map(|(count, linked)| Object::new_tuple_array([Object::Int(count), Object::Bool(linked)]))
         .ok_or_else(|| value_error(format!("interpreter id {id} does not exist")))
 }
 

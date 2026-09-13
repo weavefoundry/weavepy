@@ -1264,7 +1264,7 @@ fn os_wait(_args: &[Object]) -> Result<Object, RuntimeError> {
         }
         break rc;
     };
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(i64::from(pid)),
         Object::Int(i64::from(status)),
     ]))
@@ -1305,7 +1305,7 @@ fn wait_rusage(args: &[Object], with_pid: bool) -> Result<Object, RuntimeError> 
         break rc;
     };
     let rusage = build_rusage(&ru);
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(i64::from(pid)),
         Object::Int(i64::from(status)),
         rusage,
@@ -1328,7 +1328,7 @@ fn os_wait4(args: &[Object]) -> Result<Object, RuntimeError> {
 #[allow(clippy::cast_lossless)]
 fn build_rusage(ru: &libc::rusage) -> Object {
     let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1_000_000.0;
-    Object::new_tuple(vec![
+    Object::new_tuple_array([
         Object::Float(tv(ru.ru_utime)),
         Object::Float(tv(ru.ru_stime)),
         Object::Int(ru.ru_maxrss as i64),
@@ -1680,7 +1680,7 @@ fn os_pipe2(args: &[Object]) -> Result<Object, RuntimeError> {
     if rc != 0 {
         return Err(last_os_err());
     }
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(i64::from(fds[0])),
         Object::Int(i64::from(fds[1])),
     ]))

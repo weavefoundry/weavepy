@@ -697,7 +697,7 @@ unsafe fn conv_content_model(
     for i in 0..m.numchildren as usize {
         children.push(conv_content_model(m.children.add(i), depth + 1)?);
     }
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(i64::from(m.type_)),
         Object::Int(i64::from(m.quant)),
         conv_opt(m.name),
@@ -943,7 +943,7 @@ fn set_error_with(st: &StateRef, code: c_int, errmsg: Option<&str>) -> RuntimeEr
     };
     let cls = expat_error_type();
     let einst = PyInstance::new(cls);
-    einst.slot_set("args", Object::new_tuple(vec![Object::from_str(msg)]));
+    einst.slot_set("args", Object::new_tuple_array([Object::from_str(msg)]));
     // `code`/`lineno`/`offset` are plain instance attributes in CPython's
     // pyexpat (`PyObject_SetAttrString`), so they stay in the dict.
     {
@@ -2051,7 +2051,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("version_info")),
-            Object::new_tuple(vec![
+            Object::new_tuple_array([
                 Object::Int(i64::from(vinfo.major)),
                 Object::Int(i64::from(vinfo.minor)),
                 Object::Int(i64::from(vinfo.micro)),
@@ -2069,7 +2069,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 // Feature values are c_long: i64 on unix hosts, i32 on windows-gnu.
                 #[allow(clippy::cast_lossless, clippy::unnecessary_cast)]
                 let value = (*f).value as i64;
-                features.push(Object::new_tuple(vec![
+                features.push(Object::new_tuple_array([
                     Object::from_str(cstr((*f).name)),
                     Object::Int(value),
                 ]));

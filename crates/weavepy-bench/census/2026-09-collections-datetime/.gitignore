@@ -1,0 +1,7 @@
+# Keep reusable tools; generated results and research archives stay local.
+/*
+!/.gitignore
+!/README.md
+!/probes.py
+!/validate.py
+!/verify.py

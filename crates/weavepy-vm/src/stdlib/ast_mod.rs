@@ -22,6 +22,7 @@
 //! makes arbitrary string/bytes literals and source locations round-trip
 //! losslessly.
 
+use crate::shared_value::SharedStr;
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
@@ -169,7 +170,7 @@ fn spec_field(node: &Object, key: &'static str) -> Option<Object> {
 }
 
 /// The `_type` tag of a spec-node dict.
-fn spec_type(node: &Object) -> Option<Rc<str>> {
+fn spec_type(node: &Object) -> Option<SharedStr> {
     match spec_field(node, "_type") {
         Some(Object::Str(s)) => Some(s),
         _ => None,
@@ -178,7 +179,7 @@ fn spec_type(node: &Object) -> Option<Rc<str>> {
 
 /// The string payload of a `Constant` spec node (`None` for any other
 /// node shape or a non-str constant).
-fn const_str_of(node: &Object) -> Option<Rc<str>> {
+fn const_str_of(node: &Object) -> Option<SharedStr> {
     if !matches!(spec_type(node).as_deref(), Some("Constant")) {
         return None;
     }

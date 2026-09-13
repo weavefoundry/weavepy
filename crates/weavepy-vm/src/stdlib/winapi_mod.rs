@@ -627,7 +627,7 @@ fn win_create_pipe(args: &[Object], kw: &[(String, Object)]) -> Result<Object, R
     if ok == 0 {
         return Err(nt_support::last_win32_error_to_py(None));
     }
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         handle_to_object(read as usize),
         handle_to_object(write as usize),
     ]))
@@ -764,7 +764,7 @@ fn win_peek_named_pipe(args: &[Object], kw: &[(String, Object)]) -> Result<Objec
         if ok == 0 {
             return Err(nt_support::last_win32_error_to_py(None));
         }
-        return Ok(Object::new_tuple(vec![
+        return Ok(Object::new_tuple_array([
             Object::Int(i64::from(avail)),
             Object::Int(i64::from(left)),
         ]));
@@ -789,7 +789,7 @@ fn win_peek_named_pipe(args: &[Object], kw: &[(String, Object)]) -> Result<Objec
         }
     }
     buf.truncate(read as usize);
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::new_bytes(buf),
         Object::Int(i64::from(avail)),
         Object::Int(i64::from(left)),
@@ -889,7 +889,7 @@ fn win_read_file(args: &[Object], kw: &[(String, Object)]) -> Result<Object, Run
                 return Err(nt_support::win32_error_to_py(err as i32, None));
             }
         }
-        return Ok(Object::new_tuple(vec![
+        return Ok(Object::new_tuple_array([
             ov.into_object(),
             Object::Int(i64::from(err)),
         ]));
@@ -907,13 +907,13 @@ fn win_read_file(args: &[Object], kw: &[(String, Object)]) -> Result<Object, Run
         unsafe { fnd::GetLastError() }
     };
     match err {
-        ERROR_BROKEN_PIPE => Ok(Object::new_tuple(vec![
+        ERROR_BROKEN_PIPE => Ok(Object::new_tuple_array([
             Object::new_bytes(Vec::new()),
             Object::Int(i64::from(err)),
         ])),
         ERROR_SUCCESS | ERROR_MORE_DATA => {
             buf.truncate(nread as usize);
-            Ok(Object::new_tuple(vec![
+            Ok(Object::new_tuple_array([
                 Object::new_bytes(buf),
                 Object::Int(i64::from(err)),
             ]))
@@ -949,7 +949,7 @@ fn win_write_file(args: &[Object], kw: &[(String, Object)]) -> Result<Object, Ru
                 return Err(nt_support::win32_error_to_py(err as i32, None));
             }
         }
-        return Ok(Object::new_tuple(vec![
+        return Ok(Object::new_tuple_array([
             ov.into_object(),
             Object::Int(i64::from(err)),
         ]));
@@ -964,7 +964,7 @@ fn win_write_file(args: &[Object], kw: &[(String, Object)]) -> Result<Object, Ru
     if ret == 0 {
         return Err(nt_support::last_win32_error_to_py(None));
     }
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(i64::from(written)),
         Object::Int(0),
     ]))
@@ -1261,7 +1261,7 @@ fn win_create_process(args: &[Object], kw: &[(String, Object)]) -> Result<Object
     if ok == 0 {
         return Err(nt_support::last_win32_error_to_py(None));
     }
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         handle_to_object(pi.hProcess as usize),
         handle_to_object(pi.hThread as usize),
         Object::Int(i64::from(pi.dwProcessId)),
@@ -1691,7 +1691,7 @@ fn overlapped_get_result(args: &[Object]) -> Result<Object, RuntimeError> {
             return Err(nt_support::win32_error_to_py(err as i32, None));
         }
     }
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(i64::from(transferred)),
         Object::Int(i64::from(err)),
     ]))

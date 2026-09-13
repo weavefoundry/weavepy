@@ -1006,7 +1006,7 @@ pub unsafe extern "C" fn PyConfig_Names() -> *mut PyObject {
         .into_iter()
         .map(|n| Object::from_str(n.to_owned()))
         .collect();
-    let tuple = crate::object::into_owned(Object::Tuple(items.into()));
+    let tuple = crate::object::into_owned(Object::new_tuple(items));
     let set = unsafe { crate::containers::PyFrozenSet_New(tuple) };
     unsafe { crate::object::Py_DecRef(tuple) };
     set

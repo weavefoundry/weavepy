@@ -71,18 +71,50 @@
 //! up as `gc_refs > 0`, so the cycle survives one more
 //! generation than it strictly has to).
 
+use crate::shared_value::ThinArc;
 use crate::sync::RefCell;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::object::Object;
 use crate::weakref_registry::{id_of, ObjectId};
 
+// Object ids are aligned allocation addresses. Fx's final multiplication
+// retains their zero low bits, concentrating HashMap home buckets. Mix the
+// upper half into the lower half for this private index only.
+#[derive(Default)]
+struct GcIndexHasher(crate::fasthash::FxHasher);
+
+impl Hasher for GcIndexHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        let hash = self.0.finish();
+        hash ^ (hash >> 32)
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.write(bytes);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, word: u64) {
+        self.0.write_u64(word);
+    }
+}
+
+type GcIndex =
+    std::collections::HashMap<ObjectId, Arc<TrackedHandle>, BuildHasherDefault<GcIndexHasher>>;
+
 /// The standard CPython generation count (3) and default
 /// thresholds: gen 0 collects when 700 untracked allocations
 /// have happened; gen 1 every 10 gen 0 collections; gen 2
 /// every 10 gen 1 collections.
 pub const N_GENERATIONS: usize = 3;
+// Color and generation are bounded states; reference counts remain full-width.
+const _: () = assert!(N_GENERATIONS > 0 && N_GENERATIONS <= u8::MAX as usize + 1);
+const MAX_GENERATION: u8 = (N_GENERATIONS - 1) as u8;
 pub const DEFAULT_THRESHOLDS: [usize; N_GENERATIONS] = [700, 10, 10];
 
 /// Upper bound on the number of mark-sweep passes a single
@@ -132,10 +164,10 @@ pub struct TrackedHandle {
     /// start of every collection cycle.
     pub gc_refs: AtomicI64,
     /// Tri-color state. Reset to White at cycle start.
-    pub color: AtomicI64,
+    pub color: AtomicU8,
     /// Generation index (0..N_GENERATIONS). Survivors are
     /// promoted by incrementing this.
-    pub generation: AtomicUsize,
+    pub generation: AtomicU8,
     /// Position of this handle within its owning `Vec` —
     /// `generations[generation].handles` normally, or the `frozen`
     /// list when `color == Frozen`. Maintained by every site that
@@ -221,20 +253,21 @@ fn fin_no_cold() -> bool {
 
 #[allow(non_upper_case_globals)]
 pub mod color {
-    pub const White: i64 = 0;
-    pub const Grey: i64 = 1;
-    pub const Black: i64 = 2;
-    pub const Frozen: i64 = 3;
+    pub const White: u8 = 0;
+    pub const Grey: u8 = 1;
+    pub const Black: u8 = 2;
+    pub const Frozen: u8 = 3;
 }
 
 impl TrackedHandle {
     pub fn new(object: Object, generation: usize) -> Self {
+        assert!(generation < N_GENERATIONS, "invalid collector generation");
         Self {
             id: id_of(&object),
             object,
             gc_refs: AtomicI64::new(0),
-            color: AtomicI64::new(color::White),
-            generation: AtomicUsize::new(generation),
+            color: AtomicU8::new(color::White),
+            generation: AtomicU8::new(generation as u8),
             slot: AtomicUsize::new(0),
             finalized: AtomicBool::new(false),
             finalize_queued: AtomicBool::new(false),
@@ -316,7 +349,7 @@ pub struct GcState {
     /// so the internal fast hasher applies (consulted on every object
     /// drop via the prompt reaper — SipHash here was a top-ten CPU
     /// consumer under pandas).
-    index: RefCell<crate::fasthash::FxHashMap<ObjectId, Arc<TrackedHandle>>>,
+    index: RefCell<GcIndex>,
     /// Re-entrancy guard: a collection can indirectly allocate (e.g.
     /// queued finalizers running Python at the next safe point may
     /// re-enter `track`), and a nested collection would see torn
@@ -458,7 +491,7 @@ impl GcState {
     pub fn new() -> Self {
         Self {
             generations: RefCell::new(Default::default()),
-            index: RefCell::new(crate::fasthash::FxHashMap::default()),
+            index: RefCell::new(GcIndex::default()),
             collecting: AtomicBool::new(false),
             thresholds: RefCell::new(DEFAULT_THRESHOLDS),
             counts: RefCell::new([0; N_GENERATIONS]),
@@ -733,10 +766,12 @@ impl GcState {
             }
         } else {
             let mut gens = self.generations.borrow_mut();
-            let g = handle
-                .generation
-                .load(Ordering::Acquire)
-                .min(N_GENERATIONS - 1);
+            let g = usize::from(
+                handle
+                    .generation
+                    .load(Ordering::Acquire)
+                    .min(MAX_GENERATION),
+            );
             let slot = handle.slot.load(Ordering::Acquire);
             if gens[g]
                 .handles
@@ -1586,8 +1621,9 @@ impl GcState {
         // phases 3 and 4 are O(1) — a linear `find` here makes the
         // whole collection quadratic, which generator-heavy programs
         // (itertools pipelines) hit hard.
-        let mut by_id: std::collections::HashMap<ObjectId, Arc<TrackedHandle>> =
-            candidate_set.iter().map(|h| (h.id, h.clone())).collect();
+        // Use the same address-mixing hasher as the persistent index. This
+        // temporary map only serves identity lookups, not collection order.
+        let mut by_id: GcIndex = candidate_set.iter().map(|h| (h.id, h.clone())).collect();
 
         // Phase 2b: promote untracked iterators reachable from the candidate
         // set to *temporary* candidates for this pass only. CPython GC-tracks
@@ -1608,21 +1644,31 @@ impl GcState {
         // objects in its (dead) cycle are cleared.
         let mut temp_handles: Vec<Arc<TrackedHandle>> = Vec::new();
         {
-            // `work` holds cheap `Arc` handles, never extra `Object` clones, so
-            // the only strong reference a discovered object gains is the one
-            // inside its temporary handle. Scanning `work` by index lets newly
-            // discovered objects extend it, so a private buffer reached through
-            // an iterator (and any iterator reached through that buffer) is
-            // promoted too. We promote untracked iterators and untracked
+            // Scan the existing candidate list, then the growing temporary
+            // list, preserving discovery order without copying either list.
+            // Borrow real candidates; only a current temporary needs an
+            // owning handle while discovery extends its list. These are
+            // `Arc` handles, not extra `Object`
+            // clones: a discovered object gains only the strong reference
+            // inside its temporary handle. Newly discovered objects join the
+            // scan, including private buffers and their iterators.
+            // We promote untracked iterators and untracked
             // `list` buffers: a snapshot iterator (`frozenset`/`dict.values()`/
             // file) hands back a fresh, untracked `Object::List` for its
             // buffer, whose `-> elements` edges have to be accounted for the
             // cycle to collapse. An `iter(list)` shares the live list's buffer,
             // which is already a real candidate and is found by id below.
-            let mut work: Vec<Arc<TrackedHandle>> = candidate_set.clone();
             let mut scanned = 0usize;
-            while scanned < work.len() {
-                let h = work[scanned].clone();
+            while scanned < cs_len + temp_handles.len() {
+                let current_temporary = if scanned >= cs_len {
+                    Some(temp_handles[scanned - cs_len].clone())
+                } else {
+                    None
+                };
+                let h = match &current_temporary {
+                    Some(handle) => handle,
+                    None => &candidate_set[scanned],
+                };
                 scanned += 1;
                 // Immutable containers (tuple/frozenset) and iterators are not
                 // persistently GC-tracked — pinning them in a generation would
@@ -1721,8 +1767,7 @@ impl GcState {
                     }
                     let handle = Arc::new(TrackedHandle::new(child.clone(), 0));
                     by_id.insert(cid, handle.clone());
-                    temp_handles.push(handle.clone());
-                    work.push(handle);
+                    temp_handles.push(handle);
                 });
             }
             // Seed `gc_refs` *after* discovery: an iterator synthesises a fresh
@@ -1743,18 +1788,16 @@ impl GcState {
 
         // Real candidates plus the temporary iterator candidates take part in
         // the subtract/mark walk; only the real ones are reclaimed below.
-        let scan_all: Vec<Arc<TrackedHandle>> = candidate_set
-            .iter()
-            .chain(temp_handles.iter())
-            .cloned()
-            .collect();
+        // Cloning this iterator copies positions, not handles. The two lists
+        // retain ownership through finalizers and the resurrection re-mark.
+        let scan_all = candidate_set.iter().chain(temp_handles.iter());
 
         // Phase 3: subtract internal refs by walking each
         // tracked object's children. Self-references count too —
         // a `self.self = self` instance has one internal ref to
         // itself which must be subtracted off so a pure self-cycle
         // collapses to gc_refs == 0.
-        for handle in &scan_all {
+        for handle in scan_all.clone() {
             traverse_object(&handle.object, &mut |child| {
                 if let Some(target) = by_id.get(&id_of(child)) {
                     target.gc_refs.fetch_sub(1, Ordering::AcqRel);
@@ -1764,11 +1807,13 @@ impl GcState {
 
         // Phase 4: anything with gc_refs > 0 is reachable from
         // outside; mark it black and propagate.
-        let mut grey: Vec<Arc<TrackedHandle>> = Vec::new();
-        for handle in &scan_all {
+        // The candidate lists and immutable identity index retain ownership
+        // throughout marking, so work stacks can borrow their handles.
+        let mut grey: Vec<&TrackedHandle> = Vec::new();
+        for handle in scan_all.clone() {
             if handle.gc_refs.load(Ordering::Acquire) > 0 {
                 handle.color.store(color::Grey, Ordering::Release);
-                grey.push(handle.clone());
+                grey.push(handle.as_ref());
             }
         }
         if std::env::var_os("WP_ROOT_DBG").is_some() {
@@ -1801,7 +1846,7 @@ impl GcState {
                 if let Some(target) = by_id.get(&id_of(child)) {
                     if target.color.load(Ordering::Acquire) == color::White {
                         target.color.store(color::Grey, Ordering::Release);
-                        grey.push(target.clone());
+                        grey.push(target.as_ref());
                     }
                 }
             });
@@ -1826,7 +1871,7 @@ impl GcState {
                     if matches_dbg {
                         let exec_id = h.id;
                         let mut referrers: Vec<String> = Vec::new();
-                        for c in &scan_all {
+                        for c in scan_all.clone() {
                             if c.id == exec_id {
                                 continue;
                             }
@@ -1991,7 +2036,7 @@ impl GcState {
         // thread pickles it (RFC 0040: `ProcessPoolExecutor` / multiprocessing
         // `Queue` feeder dropping a `_CallItem` into a worker's pipe).
         if !deferred.is_empty() {
-            for handle in &scan_all {
+            for handle in scan_all.clone() {
                 let weak_clones = crate::weakref_registry::strong_clone_count(handle.id) as i64;
                 let outer = strong_count_for(&handle.object)
                     .saturating_sub(1)
@@ -1999,18 +2044,18 @@ impl GcState {
                 handle.gc_refs.store(outer, Ordering::Release);
                 handle.color.store(color::White, Ordering::Release);
             }
-            for handle in &scan_all {
+            for handle in scan_all.clone() {
                 traverse_object(&handle.object, &mut |child| {
                     if let Some(target) = by_id.get(&id_of(child)) {
                         target.gc_refs.fetch_sub(1, Ordering::AcqRel);
                     }
                 });
             }
-            let mut grey: Vec<Arc<TrackedHandle>> = Vec::new();
-            for handle in &scan_all {
+            let mut grey: Vec<&TrackedHandle> = Vec::new();
+            for handle in scan_all.clone() {
                 if handle.gc_refs.load(Ordering::Acquire) > 0 {
                     handle.color.store(color::Grey, Ordering::Release);
-                    grey.push(handle.clone());
+                    grey.push(handle.as_ref());
                 }
             }
             while let Some(h) = grey.pop() {
@@ -2019,7 +2064,7 @@ impl GcState {
                     if let Some(target) = by_id.get(&id_of(child)) {
                         if target.color.load(Ordering::Acquire) == color::White {
                             target.color.store(color::Grey, Ordering::Release);
-                            grey.push(target.clone());
+                            grey.push(target.as_ref());
                         }
                     }
                 });
@@ -2035,17 +2080,17 @@ impl GcState {
         // reclaimed by a later pass once the owning finalizer has run and they,
         // too, are plain garbage. Re-applied here so it survives the resurrection
         // re-mark above (which reset every color from the fresh refcounts).
-        let mut protect_stack: Vec<Arc<TrackedHandle>> = Vec::new();
+        let mut protect_stack: Vec<&TrackedHandle> = Vec::new();
         for h in &deferred {
             h.color.store(color::Black, Ordering::Release);
-            protect_stack.push(h.clone());
+            protect_stack.push(h.as_ref());
         }
         while let Some(h) = protect_stack.pop() {
             traverse_object(&h.object, &mut |child| {
                 if let Some(target) = by_id.get(&id_of(child)) {
                     if target.color.load(Ordering::Acquire) == color::White {
                         target.color.store(color::Black, Ordering::Release);
-                        protect_stack.push(target.clone());
+                        protect_stack.push(target.as_ref());
                     }
                 }
             });
@@ -2248,11 +2293,10 @@ impl GcState {
 
     fn snapshot_for_collection(&self, upto: usize) -> Vec<Arc<TrackedHandle>> {
         let gens = self.generations.borrow();
-        let mut out = Vec::new();
-        for g in 0..=upto.min(N_GENERATIONS - 1) {
-            for h in &gens[g].handles {
-                out.push(h.clone());
-            }
+        let selected = &gens[..=upto.min(N_GENERATIONS - 1)];
+        let mut out = Vec::with_capacity(selected.iter().map(|g| g.handles.len()).sum());
+        for g in selected {
+            out.extend_from_slice(&g.handles);
         }
         out
     }
@@ -2285,9 +2329,10 @@ impl GcState {
                 continue;
             }
             let g = h.generation.load(Ordering::Acquire);
-            let new_g = (g + 1).min(N_GENERATIONS - 1);
+            let new_g = g.saturating_add(1).min(MAX_GENERATION);
             h.generation.store(new_g, Ordering::Release);
             h.color.store(color::White, Ordering::Release);
+            let new_g = usize::from(new_g);
             h.slot.store(gens[new_g].handles.len(), Ordering::Release);
             gens[new_g].handles.push(h.clone());
         }
@@ -2346,7 +2391,7 @@ pub fn strong_count_for(obj: &Object) -> usize {
         Object::Dict(d) => Rc::strong_count(d),
         Object::Set(s) => Rc::strong_count(s),
         Object::FrozenSet(s) => Rc::strong_count(s),
-        Object::Tuple(t) => Rc::strong_count(t),
+        Object::Tuple(t) => ThinArc::strong_count(t),
         Object::Instance(i) => Rc::strong_count(i),
         Object::Function(f) => Rc::strong_count(f),
         Object::Builtin(b) => Rc::strong_count(b),
@@ -2357,7 +2402,7 @@ pub fn strong_count_for(obj: &Object) -> usize {
         Object::ByteArray(b) => Rc::strong_count(b),
         // Not cycle-capable, but `sys.getrefcount(b"...")` parity matters
         // to ctypes' keepalive tests (test_internals.test_c_char_p).
-        Object::Bytes(b) => Rc::strong_count(b),
+        Object::Bytes(b) => ThinArc::strong_count(b),
         Object::Iter(i) => Rc::strong_count(i),
         Object::Frame(f) => Rc::strong_count(f),
         Object::Traceback(t) => Rc::strong_count(t),
@@ -2440,21 +2485,23 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             // `dict -> instance -> class -> method -> __globals__` cycle
             // in a dead ModuleType namespace would be immortal
             // (test_module.test_clear_dict_in_ref_cycle).
-            let dict_obj = Object::Dict(i.dict.clone());
-            if is_tracked(id_of(&dict_obj)) {
-                visit(&dict_obj);
-            } else if let Ok(m) = i.dict.try_borrow() {
-                for (k, v) in m.iter() {
-                    visit(&k.0);
-                    visit(v);
+            if let Some(dict) = i.dict.get_shared() {
+                let dict_obj = Object::Dict(dict);
+                if is_tracked(id_of(&dict_obj)) {
+                    visit(&dict_obj);
+                } else if let Object::Dict(dict) = &dict_obj {
+                    if let Ok(m) = dict.try_borrow() {
+                        for (k, v) in m.iter() {
+                            visit(&k.0);
+                            visit(v);
+                        }
+                    }
                 }
             }
             if let Ok(slots) = i.slots.try_borrow() {
-                if let Some(slots) = slots.as_ref() {
-                    for (k, v) in slots.iter() {
-                        visit(&k.0);
-                        visit(v);
-                    }
+                for (k, v) in slots.iter() {
+                    visit(&k.0);
+                    visit(v);
                 }
             }
             // A built-in *container* subclass (`class C(list)`, `D(dict)`,
@@ -2792,15 +2839,17 @@ pub fn clear_object_fields(obj: &Object) -> bool {
             // that dict is still intact.
             run_external_clear(obj);
             if let Ok(mut slots) = i.slots.try_borrow_mut() {
-                *slots = None;
+                *slots = crate::types::SlotStorage::default();
             }
-            if crate::sync::Rc::strong_count(&i.dict) > 1 {
+            if i.dict.strong_count() > 1 {
                 // Shared `__dict__`: leave its contents to the other
                 // holder (see the doc comment).
                 return false;
             }
-            if let Ok(mut m) = i.dict.try_borrow_mut() {
-                m.clear();
+            if let Some(dict) = i.dict.get() {
+                if let Ok(mut m) = dict.try_borrow_mut() {
+                    m.clear();
+                }
             }
         }
         Object::ByteArray(b) => {
@@ -3942,6 +3991,76 @@ mod tests {
     use crate::sync::RefCell;
 
     use crate::object::DictData;
+
+    #[test]
+    fn gc_index_distributes_aligned_object_addresses() {
+        use std::hash::BuildHasher;
+        let hasher = BuildHasherDefault::<GcIndexHasher>::default();
+        // Exercise regular allocation strides at multiple address regions.
+        // The unmodified word hash uses at most 512 of these 8192 buckets.
+        for region in [0u64, 0x1_0000_0000, 0x6000_0000_0000] {
+            for stride in [16u64, 32, 96, 192, 4096] {
+                let mut buckets = [false; 8192];
+                for index in 0..4096 {
+                    let id = region + index * stride;
+                    buckets[(hasher.hash_one(id) & 8191) as usize] = true;
+                }
+                assert!(buckets.into_iter().filter(|used| *used).count() > 2048);
+            }
+        }
+    }
+
+    #[test]
+    fn live_roots_promote_freeze_and_untrack() {
+        let state = GcState::new();
+        let roots: Vec<Object> = (0..4)
+            .map(|_| Object::Dict(Rc::new(RefCell::new(DictData::default()))))
+            .collect();
+        for root in &roots {
+            state.track(root.clone());
+        }
+        for (collection, expected) in [(0, 1), (1, 2), (2, 2), (2, 2)] {
+            assert_eq!(state.collect(collection), 0);
+            for (slot, root) in roots.iter().enumerate() {
+                let handle = state.handle_for(id_of(root)).unwrap();
+                assert_eq!(handle.generation.load(Ordering::Acquire), expected);
+                assert_eq!(handle.color.load(Ordering::Acquire), color::White);
+                assert_eq!(handle.slot.load(Ordering::Acquire), slot);
+            }
+        }
+        state.freeze_all();
+        assert_eq!(state.freeze_count(), roots.len());
+        assert_eq!(state.collect(2), 0);
+        for root in &roots {
+            let handle = state.handle_for(id_of(root)).unwrap();
+            assert_eq!(handle.color.load(Ordering::Acquire), color::Frozen);
+        }
+        state.untrack_id(id_of(&roots[1]));
+        assert!(!state.is_tracked(id_of(&roots[1])));
+        assert_eq!(state.freeze_count(), 3);
+        let moved = state.handle_for(id_of(&roots[3])).unwrap();
+        assert_eq!(moved.slot.load(Ordering::Acquire), 1);
+        state.unfreeze_all();
+        assert_eq!(state.freeze_count(), 0);
+        for (slot, index) in [0, 3, 2].into_iter().enumerate() {
+            let handle = state.handle_for(id_of(&roots[index])).unwrap();
+            assert_eq!(handle.generation.load(Ordering::Acquire), 0);
+            assert_eq!(handle.color.load(Ordering::Acquire), color::White);
+            assert_eq!(handle.slot.load(Ordering::Acquire), slot);
+        }
+        state.untrack_id(id_of(&roots[3]));
+        assert!(!state.is_tracked(id_of(&roots[3])));
+        let moved = state.handle_for(id_of(&roots[2])).unwrap();
+        assert_eq!(moved.slot.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn generation_constructor_rejects_out_of_range_indices() {
+        for generation in [N_GENERATIONS, u8::MAX as usize + 1, usize::MAX] {
+            let result = std::panic::catch_unwind(|| TrackedHandle::new(Object::None, generation));
+            assert!(result.is_err());
+        }
+    }
 
     #[test]
     fn track_and_untrack() {

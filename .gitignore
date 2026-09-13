@@ -1,6 +1,6 @@
 # Rust build artifacts
-/target
-/.wpbuild
+target/
+.wpbuild/
 **/*.rs.bk
 *.pdb
 
@@ -37,6 +37,15 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.venv/
+.tox/
+.nox/
+*.egg-info/
+.coverage
+.coverage.*
+
+# Package-manager dependencies, if used by local tooling.
+node_modules/
 
 # CPython test scratch files: `test.support.TESTFN` is `@test_<pid>_tmp`, which
 # tests drop in the CWD and don't always clean up when run via the conformance

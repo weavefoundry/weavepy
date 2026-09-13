@@ -2,6 +2,10 @@
 
 For the subsequent compiler and string optimizations measured against this
 release, see [Execution and compilation performance](PERFORMANCE-EXECUTION.md).
+For the later JSON and string work, including comparisons with CPython,
+see [JSON and string performance](PERFORMANCE-JSON.md).
+For the latest object metadata, numeric text, and enumeration changes,
+see [Runtime metadata and numeric text performance](PERFORMANCE-RUNTIME-METADATA.md).
 
 The September 8, 2026, optimization pass reduces warm-cache process startup
 from 50.7 ms to 32.3 ms on the measured macOS ARM64 host. Across all 24 existing
@@ -18,7 +22,7 @@ benefit is avoiding work and memory faults during process initialization.
 The baseline is an unmodified release build of `2c6348a`. The modified binary
 uses the same release profile and default JIT feature. Measurements use
 CPython 3.14.7 as a reference and Rust 1.98.1 to build both binaries.
-[Raw samples, binary checksums, and supplemental probes](../crates/weavepy-bench/census/2026-09-performance/)
+[Raw samples, binary checksums, and supplemental probes](https://github.com/weavefoundry/weavepy/tree/971d75214077c07935710798b705ec50d5831860/crates/weavepy-bench/census/2026-09-performance/)
 are retained alongside the existing performance census.
 
 The implementation changes are:
@@ -192,6 +196,7 @@ python3.14 tools/bench_compare.py \
     --base /path/to/original/weavepy \
     --new target/release/weavepy \
     --samples 5 \
+    --frozen-cache-root target/performance-comparison-caches \
     --out target/performance-comparison.json
 ```
 
@@ -200,6 +205,14 @@ Use `--fixtures call_overhead attr_access generators` for a focused run. Add
 `work_cpu_ns` measurement. The warmup and module wrapper are included in
 whole-process CPU and RSS. `--work N` overrides the work parameter only when
 exactly one fixture is selected, and the JSON records the actual work value.
+
+Use a fresh `--frozen-cache-root` for each comparison. It gives each executable
+its own frozen standard-library cache and checks that the artifacts stay
+unchanged after the discarded preparation cycle. Builds with different embedded
+Python sources otherwise invalidate the same module cache file when alternating,
+charging recompilation time and peak memory to whichever variant runs next.
+Historical runs without this option retain that limitation; their raw results
+shouldn't be interpreted as isolated runtime costs when the sources differ.
 
 The supplemental startup and microbenchmark scripts in the census directory
 reproduce their workloads and alternating order. Run them from the repository

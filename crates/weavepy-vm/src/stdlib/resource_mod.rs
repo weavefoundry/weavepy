@@ -163,13 +163,10 @@ fn resource_getrlimit(args: &[Object]) -> Result<Object, RuntimeError> {
             last_os_error_code()
         )));
     }
-    Ok(Object::Tuple(Rc::from(
-        vec![
-            Object::Int(rlim.rlim_cur as i64),
-            Object::Int(rlim.rlim_max as i64),
-        ]
-        .into_boxed_slice(),
-    )))
+    Ok(Object::new_tuple_array([
+        Object::Int(rlim.rlim_cur as i64),
+        Object::Int(rlim.rlim_max as i64),
+    ]))
 }
 
 fn resource_setrlimit(args: &[Object]) -> Result<Object, RuntimeError> {

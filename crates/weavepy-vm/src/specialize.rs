@@ -38,12 +38,11 @@
 //!
 //! ## Fingerprints
 //!
-//! For [`InlineCache::LoadAttrInstance`] et al., the cached
-//! `type_id` / `module_id` / `globals_id` / `builtins_id` is
-//! `Rc::as_ptr(&value) as u64` — a cheap monotonic identity that
-//! changes when the underlying allocation does. Address reuse
-//! after drop is harmless: the next guard miss deopts and the
-//! cache cools down before re-attempting.
+//! Attribute caches carry a process-unique class-resolution version.
+//! A class or MRO mutation assigns a fresh token, and tokens are never
+//! reused, including after a class is freed. Module and namespace
+//! caches retain allocation-address fingerprints and validate the key
+//! at their cached index before reading its current value.
 //!
 //! ## Stats
 //!
@@ -154,10 +153,10 @@ pub fn attempt_specialize_load_attr(obj: &Object, name: &str) -> InlineCache {
                     // `__weakref__`/`__dict__` pseudo-slots read
                     // differently.
                     if sd.name == name && !matches!(name, "__weakref__" | "__dict__") {
-                        return InlineCache::LoadAttrSlot {
-                            type_id: rc_id(&cls),
-                            ver,
+                        let Some(key_idx) = inst.slots.borrow().index_of(name) else {
+                            return InlineCache::Cooldown(COOLDOWN);
                         };
+                        return InlineCache::LoadAttrSlot { key_idx, ver };
                     }
                     return InlineCache::Cooldown(COOLDOWN);
                 }
@@ -172,15 +171,11 @@ pub fn attempt_specialize_load_attr(obj: &Object, name: &str) -> InlineCache {
             }
             // First check the instance dict — that's the
             // `LoadAttrInstance` shape.
-            let dict = inst.dict.borrow();
-            if let Some(idx) = dict.index_of_key_str(name) {
-                return InlineCache::LoadAttrInstance {
-                    type_id: rc_id(&cls),
-                    key_idx: idx,
-                    ver,
-                };
+            if let Some(dict) = inst.dict.get() {
+                if let Some(idx) = dict.borrow().index_of_key_str(name) {
+                    return InlineCache::LoadAttrInstance { key_idx: idx, ver };
+                }
             }
-            drop(dict);
             // Not on the instance: resolve through the MRO. A plain
             // Python function anywhere on it is the *method* shape —
             // cache the defining class's position and the dict slot so a
@@ -193,7 +188,6 @@ pub fn attempt_specialize_load_attr(obj: &Object, name: &str) -> InlineCache {
                     if let Some(key_idx) = owner.dict.borrow().index_of_key_str(name) {
                         if let (Ok(mro_idx), key_idx) = (u16::try_from(mro_idx), key_idx) {
                             return InlineCache::LoadAttrMethod {
-                                type_id: rc_id(&cls),
                                 ver,
                                 mro_idx,
                                 key_idx,
@@ -217,11 +211,7 @@ pub fn attempt_specialize_load_attr(obj: &Object, name: &str) -> InlineCache {
                 ) {
                     return InlineCache::Cooldown(COOLDOWN);
                 }
-                return InlineCache::LoadAttrType {
-                    type_id: rc_id(&cls),
-                    key_idx: idx,
-                    ver,
-                };
+                return InlineCache::LoadAttrType { key_idx: idx, ver };
             }
             InlineCache::Cooldown(COOLDOWN)
         }
@@ -300,10 +290,13 @@ pub fn attempt_specialize_store_attr(obj: &Object, name: &str) -> InlineCache {
             match cls.lookup(name) {
                 Some(Object::SlotDescriptor(sd)) => {
                     if sd.name == name && !matches!(name, "__weakref__" | "__dict__") {
-                        return InlineCache::StoreAttrSlot {
-                            type_id: rc_id(&cls),
-                            ver,
-                        };
+                        let slots = inst.slots.borrow();
+                        // A first assignment appends. The fast path still
+                        // validates the name at this position on every use.
+                        let key_idx = slots.index_of(name).unwrap_or_else(|| {
+                            u32::try_from(slots.iter().count()).unwrap_or(u32::MAX)
+                        });
+                        return InlineCache::StoreAttrSlot { key_idx, ver };
                     }
                     return InlineCache::Cooldown(COOLDOWN);
                 }
@@ -329,24 +322,17 @@ pub fn attempt_specialize_store_attr(obj: &Object, name: &str) -> InlineCache {
             ) {
                 return InlineCache::Cooldown(COOLDOWN);
             }
-            let dict = inst.dict.borrow();
-            if let Some(idx) = dict.index_of_key_str(name) {
-                return InlineCache::StoreAttrInstance {
-                    type_id: rc_id(&cls),
-                    key_idx: idx,
-                    ver,
-                };
+            if let Some(dict) = inst.dict.get() {
+                if let Some(idx) = dict.borrow().index_of_key_str(name) {
+                    return InlineCache::StoreAttrInstance { key_idx: idx, ver };
+                }
             }
-            drop(dict);
             // Key not present: the constructor pattern (`self.x = …` on a
             // fresh instance). Specialize to a single-probe insert when
             // instances carry a `__dict__` (a `__slots__`-only class routes
             // through the slow path's read-only / no-__dict__ errors).
             if !cls.forbids_dict {
-                return InlineCache::StoreAttrNewKey {
-                    type_id: rc_id(&cls),
-                    ver,
-                };
+                return InlineCache::StoreAttrNewKey { ver };
             }
             InlineCache::Cooldown(COOLDOWN)
         }
@@ -399,7 +385,7 @@ pub fn attempt_specialize_unpack_sequence(seq: &Object, n: usize) -> InlineCache
 /// guard, re-checked at the start of every hit.
 ///
 /// The string shape only installs for pure-ASCII strings (code-point
-/// count == byte count, both cached on the `Rc<str>`), where indexing
+/// count == byte count, both cached on the `crate::shared_value::SharedStr`), where indexing
 /// is an O(1) byte read; the fast path re-verifies that property per
 /// hit because a cache slot outlives any one receiver.
 pub fn attempt_specialize_binary_subscr(container: &Object, index: &Object) -> InlineCache {
@@ -918,7 +904,7 @@ mod tests {
 
     #[test]
     fn unpack_two_tuple_special_cases() {
-        let t = Object::new_tuple(vec![Object::Int(1), Object::Int(2)]);
+        let t = Object::new_tuple_array([Object::Int(1), Object::Int(2)]);
         assert_eq!(
             attempt_specialize_unpack_sequence(&t, 2),
             InlineCache::UnpackSequenceTwoTuple
@@ -927,7 +913,7 @@ mod tests {
 
     #[test]
     fn unpack_three_tuple_uses_general_tuple_path() {
-        let t = Object::new_tuple(vec![Object::Int(1), Object::Int(2), Object::Int(3)]);
+        let t = Object::new_tuple_array([Object::Int(1), Object::Int(2), Object::Int(3)]);
         assert_eq!(
             attempt_specialize_unpack_sequence(&t, 3),
             InlineCache::UnpackSequenceTuple
@@ -982,7 +968,7 @@ mod tests {
             attempt_specialize_binary_subscr(&xs, &idx),
             InlineCache::SubscrListInt
         );
-        let t = Object::new_tuple(vec![Object::Int(1)]);
+        let t = Object::new_tuple_array([Object::Int(1)]);
         assert_eq!(
             attempt_specialize_binary_subscr(&t, &idx),
             InlineCache::SubscrTupleInt
@@ -1023,7 +1009,7 @@ mod tests {
             attempt_specialize_store_subscr(&d, &Object::from_static("k")),
             InlineCache::StoreSubscrDict
         );
-        let t = Object::new_tuple(vec![Object::Int(1)]);
+        let t = Object::new_tuple_array([Object::Int(1)]);
         assert!(matches!(
             attempt_specialize_store_subscr(&t, &idx),
             InlineCache::Cooldown(_)
@@ -1033,7 +1019,7 @@ mod tests {
     #[test]
     fn for_iter_str_and_dict_specialize() {
         let s_iter = Object::Iter(Rc::new(RefCell::new(PyIterator::Str {
-            s: Rc::from("abc"),
+            s: crate::shared_value::SharedStr::from("abc"),
             index: 0,
         })));
         assert_eq!(

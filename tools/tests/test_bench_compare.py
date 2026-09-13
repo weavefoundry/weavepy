@@ -41,6 +41,20 @@ class PairedRatioTests(unittest.TestCase):
         self.assertEqual(bench_compare.paired_ratio(after, before, "ns"), 1.5)
         self.assertEqual(bench_compare.paired_ratio(after, before, "work_cpu_ns"), 0.9)
 
+    def test_time_win_does_not_hide_memory_or_cpu_regressions(self):
+        before = [{"ns": 100, "wall_ns": 200, "cpu_ns": 150, "rss_bytes": 1000}]
+        after = [{"ns": 50, "wall_ns": 220, "cpu_ns": 300, "rss_bytes": 2000}]
+        self.assertEqual(
+            bench_compare.relative_metrics(after, before),
+            {"ns": 0.5, "wall_ns": 1.1, "cpu_ns": 2.0, "rss_bytes": 2.0},
+        )
+
+    def test_incomplete_measurements_are_rejected(self):
+        with self.assertRaises(ValueError):
+            bench_compare.relative_metrics([], [])
+        with self.assertRaises(ValueError):
+            bench_compare.relative_metrics([{"ns": 1}], [{"ns": 2, "cpu_ns": 2}])
+
 
 if __name__ == "__main__":
     unittest.main()

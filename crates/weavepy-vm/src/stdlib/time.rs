@@ -140,7 +140,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("tzname")),
-            Object::new_tuple(vec![Object::from_str(std_name), Object::from_str(dst_name)]),
+            Object::new_tuple_array([Object::from_str(std_name), Object::from_str(dst_name)]),
         );
         // `_strptime._strptime_time` slices its result to this many items
         // before building a `struct_time`: 11 = the 9 visible `tm_*` fields
@@ -186,7 +186,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                     );
                     d.insert(
                         DictKey(Object::from_static("tzname")),
-                        Object::new_tuple(vec![
+                        Object::new_tuple_array([
                             Object::from_str(std_name),
                             Object::from_str(dst_name),
                         ]),

@@ -370,3 +370,38 @@ fn int_truediv_returns_float() {
     assert_eq!(tag, SlotTag::Float as u32);
     assert!((f64::from_bits(bits) - 3.5).abs() < 1e-12);
 }
+
+#[test]
+fn int_truediv_preserves_precision_and_deopt_operands() {
+    let mut f = binop_fn(ArithKind::Add);
+    f.blocks[0].stmts[2].op = TOp::IntTrueDiv;
+    const EXACT: i64 = 1 << 53;
+    for (a, b) in [(EXACT, 3), (-EXACT, 3), (10, EXACT), (10, -EXACT), (0, -1)] {
+        let (status, bits, tag, _, _) = run(&f, &[a as u64, b as u64]);
+        assert_eq!(status, JitStatus::Returned, "{a} / {b}");
+        assert_eq!(tag, SlotTag::Float as u32);
+        assert_eq!(bits, (a as f64 / b as f64).to_bits());
+    }
+    for (a, b) in [
+        (EXACT + 1, 3),
+        (-EXACT - 1, 3),
+        (10, EXACT + 1),
+        (10, -EXACT - 1),
+        (i64::MAX, 3),
+        (i64::MIN, 3),
+        (1, i64::MAX),
+        (1, i64::MIN),
+        (1, 0),
+    ] {
+        let (status, _, _, spilled, pc) = run(&f, &[a as u64, b as u64]);
+        assert_eq!(status, JitStatus::Deopt, "{a} / {b}");
+        assert_eq!(pc, 2);
+        assert_eq!(
+            spilled,
+            vec![
+                (a as u64, SlotTag::Int as u32),
+                (b as u64, SlotTag::Int as u32)
+            ]
+        );
+    }
+}

@@ -5,6 +5,7 @@
 //! [`crate::object::PyFile`]; this module just exposes the factory
 //! callables that wrap them.
 
+use crate::shared_value::{SharedSlice, SharedStr};
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
@@ -1349,7 +1350,7 @@ fn ind_tuple2(obj: &Object) -> Result<(Object, Object), RuntimeError> {
 
 fn ind_newlines_value(seennl: i64) -> Object {
     let s = |x| Object::from_static(x);
-    let pair = |a, b| Object::new_tuple(vec![Object::from_static(a), Object::from_static(b)]);
+    let pair = |a, b| Object::new_tuple_array([Object::from_static(a), Object::from_static(b)]);
     match seennl {
         x if x == IND_LF => s("\n"),
         x if x == IND_CR => s("\r"),
@@ -1357,7 +1358,7 @@ fn ind_newlines_value(seennl: i64) -> Object {
         x if x == IND_CRLF => s("\r\n"),
         x if x == IND_LF | IND_CRLF => pair("\n", "\r\n"),
         x if x == IND_CR | IND_CRLF => pair("\r", "\r\n"),
-        x if x == IND_CR | IND_LF | IND_CRLF => Object::new_tuple(vec![
+        x if x == IND_CR | IND_LF | IND_CRLF => Object::new_tuple_array([
             Object::from_static("\r"),
             Object::from_static("\n"),
             Object::from_static("\r\n"),
@@ -1509,7 +1510,7 @@ fn ind_getstate(args: &[Object]) -> Result<Object, RuntimeError> {
     ind_check_init(&inst)?;
     let decoder = tw_get(&inst, "_ind_decoder").unwrap_or(Object::None);
     let (buf, flag) = if matches!(decoder, Object::None) {
-        (Object::Bytes(Rc::from(&b""[..])), 0i64)
+        (Object::Bytes(SharedSlice::from(&b""[..])), 0i64)
     } else {
         let st = py_call(&decoder, "getstate", &[])?;
         let (b, f) = ind_tuple2(&st)?;
@@ -1528,7 +1529,7 @@ fn ind_getstate(args: &[Object]) -> Result<Object, RuntimeError> {
     if matches!(tw_get(&inst, "_ind_pendingcr"), Some(Object::Bool(true))) {
         flag |= 1;
     }
-    Ok(Object::new_tuple(vec![buf, Object::Int(flag)]))
+    Ok(Object::new_tuple_array([buf, Object::Int(flag)]))
 }
 
 fn ind_setstate(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1550,7 +1551,7 @@ fn ind_setstate(args: &[Object]) -> Result<Object, RuntimeError> {
     tw_set(&inst, "_ind_pendingcr", Object::Bool(flag & 1 != 0));
     let decoder = tw_get(&inst, "_ind_decoder").unwrap_or(Object::None);
     if !matches!(decoder, Object::None) {
-        let inner = Object::new_tuple(vec![buf, Object::Int(flag >> 1)]);
+        let inner = Object::new_tuple_array([buf, Object::Int(flag >> 1)]);
         py_call(&decoder, "setstate", &[inner])?;
     }
     Ok(Object::None)
@@ -3604,10 +3605,10 @@ fn tw_reset_decoded(inst: &crate::types::PyInstance) {
     }
 }
 
-fn tw_dec_state(inst: &crate::types::PyInstance) -> (Rc<str>, usize) {
+fn tw_dec_state(inst: &crate::types::PyInstance) -> (SharedStr, usize) {
     let buf = match tw_get(inst, "_dec_buf") {
         Some(Object::Str(s)) => s,
-        _ => Rc::from(""),
+        _ => SharedStr::from(""),
     };
     let pos = match tw_get(inst, "_dec_pos") {
         Some(Object::Int(n)) => n.max(0) as usize,

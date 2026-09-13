@@ -30,6 +30,7 @@ pub mod cmath_mod;
 pub mod codecs_engine;
 pub mod codecs_mod;
 pub mod csv_mod;
+pub mod datetime_accel;
 pub mod datetime_mod;
 pub mod errno_mod;
 pub mod faulthandler_mod;
@@ -51,6 +52,7 @@ pub mod json_accel;
 pub mod lzma_mod;
 pub mod marshal_mod;
 pub mod math;
+pub mod pickle_accel;
 // RFC 0063 — the Windows wave: shared NT plumbing (CRT fd layer,
 // winerror bridge) plus the native module quartet the frozen Windows
 // stdlib consumes.
@@ -267,6 +269,8 @@ pub fn register_all(cache: &ModuleCache) {
     // stand-in (CPython documents append/pop from either side as
     // thread-safe; `SimpleQueue` and asyncio's ready queue rely on it).
     cache.register_builtin("_weave_collections", collections_native::build);
+    cache.register_builtin("_weave_datetime", datetime_accel::build);
+    cache.register_builtin("_weave_pickle", pickle_accel::build);
     cache.register_builtin("gc", gc_real::build);
     cache.register_builtin("_multiprocessing", multiprocessing_mod::build);
     // RFC 0040 WS5 — native XML parser behind `xml.parsers.expat`; drives the

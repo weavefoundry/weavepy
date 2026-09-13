@@ -11,6 +11,33 @@ import math as _math
 import sys
 from operator import index as _index
 
+try:
+    from _weave_datetime import timedelta_parts as _timedelta_parts
+    from _weave_datetime import ymd_toordinal as _ymd_toordinal
+    from _weave_datetime import ordinal_toymd as _ordinal_toymd
+except ImportError:
+    _timedelta_parts = None
+    _ymd_toordinal = None
+    _ordinal_toymd = None
+
+try:
+    from _weave_datetime import parse_time_parts as _parse_time_parts
+except ImportError:
+    _parse_time_parts = None
+
+try:
+    from _weave_datetime import date_fields as _date_fields
+    from _weave_datetime import time_fields as _time_fields
+except ImportError:
+    _date_fields = None
+    _time_fields = None
+
+try:
+    from _weave_datetime import format_time_parts as _format_time_parts
+except ImportError:
+    _format_time_parts = None
+
+
 def _cmp(x, y):
     return 0 if x == y else 1 if x > y else -1
 
@@ -73,6 +100,10 @@ def _days_before_month(year, month):
 
 def _ymd2ord(year, month, day):
     "year, month, day -> ordinal, considering 01-Jan-0001 as day 1."
+    if _ymd_toordinal is not None:
+        ordinal = _ymd_toordinal(year, month, day)
+        if ordinal is not None:
+            return ordinal
     assert 1 <= month <= 12, f"month must be in 1..12, not {month}"
     dim = _days_in_month(year, month)
     assert 1 <= day <= dim, f"day must be in 1..{dim}, not {day}"
@@ -98,6 +129,10 @@ assert _DI100Y == 25 * _DI4Y - 1
 
 def _ord2ymd(n):
     "ordinal -> (year, month, day), considering 01-Jan-0001 as day 1."
+    if _ordinal_toymd is not None:
+        parts = _ordinal_toymd(n)
+        if parts is not None:
+            return parts
 
     # n is a 1-based index, starting at 1-Jan-1.  The pattern of leap years
     # repeats exactly every 400 years.  The basic strategy is to find the
@@ -170,6 +205,10 @@ def _build_struct_time(y, m, d, hh, mm, ss, dstflag):
     return _time.struct_time((y, m, d, hh, mm, ss, wday, dnum, dstflag))
 
 def _format_time(hh, mm, ss, us, timespec='auto'):
+    if _format_time_parts is not None:
+        text = _format_time_parts(hh, mm, ss, us, timespec)
+        if text is not None:
+            return text
     specs = {
         'hours': '{:02d}',
         'minutes': '{:02d}:{:02d}',
@@ -403,6 +442,10 @@ _FRACTION_CORRECTION = [100000, 10000, 1000, 100, 10]
 
 def _parse_hh_mm_ss_ff(tstr):
     # Parses things of the form HH[:?MM[:?SS[{.,}fff[fff]]]]
+    if _parse_time_parts is not None:
+        parts = _parse_time_parts(tstr)
+        if parts is not None:
+            return parts
     len_str = len(tstr)
 
     time_comps = [0, 0, 0, 0]
@@ -563,6 +606,10 @@ def _check_utc_offset(name, offset):
                          f"timedelta(hours=24), not {offset!r}")
 
 def _check_date_fields(year, month, day):
+    if _date_fields is not None:
+        parts = _date_fields(year, month, day)
+        if parts is not None:
+            return parts
     year = _index(year)
     month = _index(month)
     day = _index(day)
@@ -587,6 +634,10 @@ def _check_date_fields(year, month, day):
     return year, month, day
 
 def _check_time_fields(hour, minute, second, microsecond, fold):
+    if _time_fields is not None:
+        parts = _time_fields(hour, minute, second, microsecond, fold)
+        if parts is not None:
+            return parts
     hour = _index(hour)
     minute = _index(minute)
     second = _index(second)
@@ -662,109 +713,117 @@ class timedelta:
 
     def __new__(cls, days=0, seconds=0, microseconds=0,
                 milliseconds=0, minutes=0, hours=0, weeks=0):
-        # Doing this efficiently and accurately in C is going to be difficult
-        # and error-prone, due to ubiquitous overflow possibilities, and that
-        # C double doesn't have enough bits of precision to represent
-        # microseconds over 10K years faithfully.  The code here tries to make
-        # explicit where go-fast assumptions can be relied on, in order to
-        # guide the C implementation; it's way more convoluted than speed-
-        # ignoring auto-overflow-to-long idiomatic Python could be.
-
-        for name, value in (
-            ("days", days),
-            ("seconds", seconds),
-            ("microseconds", microseconds),
-            ("milliseconds", milliseconds),
-            ("minutes", minutes),
-            ("hours", hours),
-            ("weeks", weeks)
-        ):
-            if not isinstance(value, (int, float)):
-                raise TypeError(
-                    f"unsupported type for timedelta {name} component: {type(value).__name__}"
-                )
-
-        # Final values, all integer.
-        # s and us fit in 32-bit signed ints; d isn't bounded.
-        d = s = us = 0
-
-        # Normalize everything to days, seconds, microseconds.
-        days += weeks*7
-        seconds += minutes*60 + hours*3600
-        microseconds += milliseconds*1000
-
-        # Get rid of all fractions, and normalize s and us.
-        # Take a deep breath <wink>.
-        if isinstance(days, float):
-            dayfrac, days = _math.modf(days)
-            daysecondsfrac, daysecondswhole = _math.modf(dayfrac * (24.*3600.))
-            assert daysecondswhole == int(daysecondswhole)  # can't overflow
-            s = int(daysecondswhole)
-            assert days == int(days)
-            d = int(days)
+        parts = (_timedelta_parts(days, seconds, microseconds, milliseconds,
+                                  minutes, hours, weeks)
+                 if _timedelta_parts is not None else None)
+        if parts:
+            d, s, us = parts
         else:
-            daysecondsfrac = 0.0
-            d = days
-        assert isinstance(daysecondsfrac, float)
-        assert abs(daysecondsfrac) <= 1.0
-        assert isinstance(d, int)
-        assert abs(s) <= 24 * 3600
-        # days isn't referenced again before redefinition
+            # Doing this efficiently and accurately in C is going to be difficult
+            # and error-prone, due to ubiquitous overflow possibilities, and that
+            # C double doesn't have enough bits of precision to represent
+            # microseconds over 10K years faithfully.  The code here tries to make
+            # explicit where go-fast assumptions can be relied on, in order to
+            # guide the C implementation; it's way more convoluted than speed-
+            # ignoring auto-overflow-to-long idiomatic Python could be.
 
-        if isinstance(seconds, float):
-            secondsfrac, seconds = _math.modf(seconds)
-            assert seconds == int(seconds)
-            seconds = int(seconds)
-            secondsfrac += daysecondsfrac
+            # None needs full validation; False certifies built-in types.
+            if parts is None:
+                for name, value in (
+                    ("days", days),
+                    ("seconds", seconds),
+                    ("microseconds", microseconds),
+                    ("milliseconds", milliseconds),
+                    ("minutes", minutes),
+                    ("hours", hours),
+                    ("weeks", weeks)
+                ):
+                    if not isinstance(value, (int, float)):
+                        raise TypeError(
+                            f"unsupported type for timedelta {name} component: {type(value).__name__}"
+                        )
+
+            # Final values, all integer.
+            # s and us fit in 32-bit signed ints; d isn't bounded.
+            d = s = us = 0
+
+            # Normalize everything to days, seconds, microseconds.
+            days += weeks*7
+            seconds += minutes*60 + hours*3600
+            microseconds += milliseconds*1000
+
+            # Get rid of all fractions, and normalize s and us.
+            # Take a deep breath <wink>.
+            if isinstance(days, float):
+                dayfrac, days = _math.modf(days)
+                daysecondsfrac, daysecondswhole = _math.modf(dayfrac * (24.*3600.))
+                assert daysecondswhole == int(daysecondswhole)  # can't overflow
+                s = int(daysecondswhole)
+                assert days == int(days)
+                d = int(days)
+            else:
+                daysecondsfrac = 0.0
+                d = days
+            assert isinstance(daysecondsfrac, float)
+            assert abs(daysecondsfrac) <= 1.0
+            assert isinstance(d, int)
+            assert abs(s) <= 24 * 3600
+            # days isn't referenced again before redefinition
+
+            if isinstance(seconds, float):
+                secondsfrac, seconds = _math.modf(seconds)
+                assert seconds == int(seconds)
+                seconds = int(seconds)
+                secondsfrac += daysecondsfrac
+                assert abs(secondsfrac) <= 2.0
+            else:
+                secondsfrac = daysecondsfrac
+            # daysecondsfrac isn't referenced again
+            assert isinstance(secondsfrac, float)
             assert abs(secondsfrac) <= 2.0
-        else:
-            secondsfrac = daysecondsfrac
-        # daysecondsfrac isn't referenced again
-        assert isinstance(secondsfrac, float)
-        assert abs(secondsfrac) <= 2.0
 
-        assert isinstance(seconds, int)
-        days, seconds = divmod(seconds, 24*3600)
-        d += days
-        s += int(seconds)    # can't overflow
-        assert isinstance(s, int)
-        assert abs(s) <= 2 * 24 * 3600
-        # seconds isn't referenced again before redefinition
-
-        usdouble = secondsfrac * 1e6
-        assert abs(usdouble) < 2.1e6    # exact value not critical
-        # secondsfrac isn't referenced again
-
-        if isinstance(microseconds, float):
-            microseconds = round(microseconds + usdouble)
-            seconds, microseconds = divmod(microseconds, 1000000)
+            assert isinstance(seconds, int)
             days, seconds = divmod(seconds, 24*3600)
             d += days
+            s += int(seconds)    # can't overflow
+            assert isinstance(s, int)
+            assert abs(s) <= 2 * 24 * 3600
+            # seconds isn't referenced again before redefinition
+
+            usdouble = secondsfrac * 1e6
+            assert abs(usdouble) < 2.1e6    # exact value not critical
+            # secondsfrac isn't referenced again
+
+            if isinstance(microseconds, float):
+                microseconds = round(microseconds + usdouble)
+                seconds, microseconds = divmod(microseconds, 1000000)
+                days, seconds = divmod(seconds, 24*3600)
+                d += days
+                s += seconds
+            else:
+                microseconds = int(microseconds)
+                seconds, microseconds = divmod(microseconds, 1000000)
+                days, seconds = divmod(seconds, 24*3600)
+                d += days
+                s += seconds
+                microseconds = round(microseconds + usdouble)
+            assert isinstance(s, int)
+            assert isinstance(microseconds, int)
+            assert abs(s) <= 3 * 24 * 3600
+            assert abs(microseconds) < 3.1e6
+
+            # Just a little bit of carrying possible for microseconds and seconds.
+            seconds, us = divmod(microseconds, 1000000)
             s += seconds
-        else:
-            microseconds = int(microseconds)
-            seconds, microseconds = divmod(microseconds, 1000000)
-            days, seconds = divmod(seconds, 24*3600)
+            days, s = divmod(s, 24*3600)
             d += days
-            s += seconds
-            microseconds = round(microseconds + usdouble)
-        assert isinstance(s, int)
-        assert isinstance(microseconds, int)
-        assert abs(s) <= 3 * 24 * 3600
-        assert abs(microseconds) < 3.1e6
 
-        # Just a little bit of carrying possible for microseconds and seconds.
-        seconds, us = divmod(microseconds, 1000000)
-        s += seconds
-        days, s = divmod(s, 24*3600)
-        d += days
+            assert isinstance(d, int)
+            assert isinstance(s, int) and 0 <= s < 24*3600
+            assert isinstance(us, int) and 0 <= us < 1000000
 
-        assert isinstance(d, int)
-        assert isinstance(s, int) and 0 <= s < 24*3600
-        assert isinstance(us, int) and 0 <= us < 1000000
-
-        if abs(d) > 999999999:
-            raise OverflowError("timedelta # of days is too large: %d" % d)
+            if abs(d) > 999999999:
+                raise OverflowError("timedelta # of days is too large: %d" % d)
 
         self = object.__new__(cls)
         self._days = d

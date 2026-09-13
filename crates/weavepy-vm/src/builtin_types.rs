@@ -10,6 +10,7 @@
 //! `BuiltinTypes::with(|bt| bt.type_error.clone())` — to construct
 //! exception instances.
 
+use crate::shared_value::SharedSlice;
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
@@ -425,7 +426,7 @@ impl BuiltinTypes {
                                 cls.clone(),
                                 Object::SimpleNamespace(dict.clone()),
                             );
-                            pi.dict = dict;
+                            pi.dict = dict.into();
                             let inst = Object::Instance(Rc::new(pi));
                             crate::gc_trace::track(inst.clone());
                             return Ok(inst);
@@ -488,7 +489,7 @@ impl BuiltinTypes {
                     if let Some(Object::Type(cls)) = args.first() {
                         if !cls.flags.is_builtin {
                             let mut pi = crate::types::PyInstance::with_native(cls.clone(), ns);
-                            pi.dict = dict;
+                            pi.dict = dict.into();
                             let inst = Object::Instance(Rc::new(pi));
                             crate::gc_trace::track(inst.clone());
                             return Ok(inst);
@@ -648,9 +649,9 @@ impl BuiltinTypes {
                                 .cloned()
                                 .unwrap_or(Object::None)
                         };
-                        Ok(Object::new_tuple(vec![
+                        Ok(Object::new_tuple_array([
                             Object::Type(ga_ty.clone()),
-                            Object::new_tuple(vec![get("__origin__"), get("__args__")]),
+                            Object::new_tuple_array([get("__origin__"), get("__args__")]),
                         ]))
                     }),
                     call_kw: None,
@@ -679,7 +680,7 @@ impl BuiltinTypes {
                                 ))
                             }
                         };
-                        Ok(Object::new_tuple(vec![origin]))
+                        Ok(Object::new_tuple_array([origin]))
                     }),
                     call_kw: None,
                 })),
@@ -1331,8 +1332,12 @@ impl BuiltinTypes {
 }
 
 thread_local! {
-    static BUILTIN_TYPES: RefCell<Option<Rc<BuiltinTypes>>> = const { RefCell::new(None) };
-    static PROPERTY_CLASS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    // The registry handles are local to this thread; only the referenced
+    // type objects are shared. Borrowing a handle needs no object lock.
+    static BUILTIN_TYPES: std::cell::RefCell<Option<Rc<BuiltinTypes>>> =
+        const { std::cell::RefCell::new(None) };
+    static PROPERTY_CLASS: std::cell::RefCell<Option<Rc<TypeObject>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Drop this thread's lazily-built type registry (and the derived
@@ -1365,13 +1370,12 @@ pub fn property_class() -> Rc<TypeObject> {
 
 pub fn builtin_types() -> Rc<BuiltinTypes> {
     let (bt, fresh) = BUILTIN_TYPES.with(|cell| {
-        if cell.borrow().is_none() {
-            let bt = Rc::new(BuiltinTypes::build());
-            *cell.borrow_mut() = Some(bt.clone());
-            (bt, true)
-        } else {
-            (cell.borrow().as_ref().unwrap().clone(), false)
+        if let Some(bt) = cell.borrow().as_ref() {
+            return (bt.clone(), false);
         }
+        let bt = Rc::new(BuiltinTypes::build());
+        *cell.borrow_mut() = Some(bt.clone());
+        (bt, true)
     });
     if fresh {
         // Deferred surface pass (RFC 0056 WS4): synthesizing descriptor-
@@ -1515,7 +1519,7 @@ pub fn make_exception(class_name: &str, message: impl Into<String>) -> Object {
 pub fn make_exception_with_object(class_name: &str, arg: Object) -> Object {
     let exc = make_exception(class_name, "");
     if let Object::Instance(inst) = &exc {
-        inst.slot_set("args", Object::new_tuple(vec![arg.clone()]));
+        inst.slot_set("args", Object::new_tuple_array([arg.clone()]));
         inst.slot_set("message", Object::from_str(arg.repr()));
     }
     exc
@@ -1564,7 +1568,7 @@ pub fn make_unicode_encode_error_obj(
     let reason_o = Object::from_str(reason);
     inst.slot_set(
         "args",
-        Object::new_tuple(vec![
+        Object::new_tuple_array([
             enc.clone(),
             obj.clone(),
             start_o.clone(),
@@ -1603,7 +1607,7 @@ pub fn make_unicode_decode_error(
     let reason_o = Object::from_str(reason);
     inst.slot_set(
         "args",
-        Object::new_tuple(vec![
+        Object::new_tuple_array([
             enc.clone(),
             obj.clone(),
             start_o.clone(),
@@ -1732,7 +1736,7 @@ fn native_seed_for_new(cls: &Rc<TypeObject>, value: Option<&Object>) -> Option<O
                     .collect()
             })
             .unwrap_or_default();
-        return Some(Object::Bytes(Rc::from(bytes.as_slice())));
+        return Some(Object::Bytes(SharedSlice::from(bytes.as_slice())));
     }
     if is_strict(&bt.tuple_) {
         let els = value.and_then(any_elements).unwrap_or_default();
@@ -2525,7 +2529,7 @@ fn install_module_methods(module_: &Rc<TypeObject>) {
     /// The namespace dict of either module representation.
     fn dict_of(o: &Object) -> Result<Rc<RefCell<DictData>>, RuntimeError> {
         match o {
-            Object::Instance(i) => Ok(i.dict.clone()),
+            Object::Instance(i) => Ok(i.dict.share()),
             Object::Module(m) => Ok(m.dict.clone()),
             _ => Err(crate::error::type_error(
                 "descriptor requires a 'module' object".to_owned(),
@@ -3883,7 +3887,7 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
         }
         // BaseException.__str__: "" / str(arg) / repr(args).
         match get("args") {
-            Some(Object::Tuple(items)) => Ok(match items.as_ref() {
+            Some(Object::Tuple(items)) => Ok(match &items[..] {
                 [] => Object::from_static(""),
                 [single] => Object::from_str(single.to_str()),
                 _ => Object::from_str(format!(
@@ -4081,7 +4085,7 @@ fn install_unicode_error_dunders(ty: &Rc<TypeObject>, kind: UnicodeErrorKind) {
         if get("object").is_none() || get("reason").is_none() {
             let args = get("args");
             return Ok(match args {
-                Some(Object::Tuple(t)) => match t.as_ref() {
+                Some(Object::Tuple(t)) => match &t[..] {
                     [] => Object::from_static(""),
                     [single] => Object::from_str(single.to_str()),
                     _ => Object::from_str(Object::Tuple(t.clone()).repr()),
@@ -4456,7 +4460,7 @@ fn exc_str(args: &[Object]) -> Result<Object, RuntimeError> {
             // can't easily install a per-subclass ``__str__``.
             let is_key_error = is_subclass_by_name(&inst_rc.cls(), "KeyError");
             if let Some(Object::Tuple(items)) = exc_attr(inst_rc, "args") {
-                return Ok(match items.as_ref() {
+                return Ok(match &items[..] {
                     [] => Object::from_static(""),
                     [single] => {
                         if is_key_error {
@@ -4730,9 +4734,9 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         let cls_obj = Object::Type(cls);
         let args_obj = Object::new_tuple(ctor_args);
         Ok(if state.is_empty() {
-            Object::new_tuple(vec![cls_obj, args_obj])
+            Object::new_tuple_array([cls_obj, args_obj])
         } else {
-            Object::new_tuple(vec![
+            Object::new_tuple_array([
                 cls_obj,
                 args_obj,
                 Object::Dict(Rc::new(RefCell::new(state))),
@@ -4817,7 +4821,7 @@ pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<Strin
     let args = if msg.to_str().is_empty() {
         Object::new_tuple(Vec::new())
     } else {
-        Object::new_tuple(vec![msg.clone()])
+        Object::new_tuple_array([msg.clone()])
     };
     // PEP 380: `StopIteration.value` is always present (CPython sets it
     // in `StopIteration.__init__`, defaulting to None). A Rust-raised
@@ -4959,7 +4963,7 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
     }
     fn eg_split(args: &[Object]) -> Result<Object, RuntimeError> {
         let (m, r) = eg_split_impl(args, true)?;
-        Ok(Object::new_tuple(vec![m, r]))
+        Ok(Object::new_tuple_array([m, r]))
     }
     fn eg_subgroup(args: &[Object]) -> Result<Object, RuntimeError> {
         let (m, _) = eg_split_impl(args, false)?;
@@ -5169,7 +5173,7 @@ pub(crate) fn exception_group_new(
     if let Object::Instance(inst_rc) = &inst {
         // `args` keeps the *original* second argument (mutations show
         // through `eg.args`); `.exceptions` is the frozen tuple copy.
-        inst_rc.slot_set("args", Object::new_tuple(vec![msg.clone(), excs]));
+        inst_rc.slot_set("args", Object::new_tuple_array([msg.clone(), excs]));
         inst_rc.slot_set("message", msg);
         inst_rc.slot_set("exceptions", Object::new_tuple(items));
         if let Some(s) = excs_str {
@@ -5425,7 +5429,7 @@ pub fn make_naked_eg_wrapper(exc: &Object) -> Object {
     if let Object::Instance(inst) = &wrapper {
         inst.slot_set(
             "args",
-            Object::new_tuple(vec![Object::from_static(""), items_t.clone()]),
+            Object::new_tuple_array([Object::from_static(""), items_t.clone()]),
         );
         inst.slot_set("message", Object::from_static(""));
         inst.slot_set("exceptions", items_t);
@@ -5562,7 +5566,7 @@ pub fn prep_reraise_star(orig: &Object, excs: &[Object]) -> Result<Object, Runti
     if let Object::Instance(inst) = &combined {
         inst.slot_set(
             "args",
-            Object::new_tuple(vec![Object::from_static(""), items_t.clone()]),
+            Object::new_tuple_array([Object::from_static(""), items_t.clone()]),
         );
         inst.slot_set("message", Object::from_static(""));
         inst.slot_set("exceptions", items_t);

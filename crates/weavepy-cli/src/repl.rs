@@ -21,6 +21,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use weavepy_vm::shared_value::SharedStr;
 use weavepy_vm::sync::Rc;
 use weavepy_vm::sync::RefCell;
 
@@ -123,7 +124,7 @@ impl Repl {
         for (name, value) in [("ps1", ps1()), ("ps2", ps2())] {
             let key = DictKey(Object::from_static(name));
             if !d.contains_key(&key) {
-                d.insert(key, Object::Str(Rc::from(value.as_str())));
+                d.insert(key, Object::Str(SharedStr::from(value.as_str())));
             }
         }
     }

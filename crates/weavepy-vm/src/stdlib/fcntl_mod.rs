@@ -22,6 +22,7 @@
 //! as unsupported until we have a story for the binary struct (RFC
 //! 0026 follow-up).
 
+use crate::shared_value::SharedSlice;
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
@@ -149,7 +150,7 @@ fn fcntl_with_buffer(fd: i32, op: i32, data: &[u8]) -> Result<Object, RuntimeErr
     if ret < 0 {
         return Err(last_os_err());
     }
-    Ok(Object::Bytes(Rc::from(&buf[..data.len()])))
+    Ok(Object::Bytes(SharedSlice::from(&buf[..data.len()])))
 }
 
 fn fcntl_ioctl(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -197,7 +198,7 @@ fn ioctl_with_buffer(fd: i32, request: u64, data: &[u8]) -> Result<Object, Runti
     if ret < 0 {
         return Err(last_os_err());
     }
-    Ok(Object::Bytes(Rc::from(&buf[..data.len()])))
+    Ok(Object::Bytes(SharedSlice::from(&buf[..data.len()])))
 }
 
 fn fcntl_flock(args: &[Object]) -> Result<Object, RuntimeError> {

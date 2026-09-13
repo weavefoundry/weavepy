@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
+use weavepy_vm::shared_value::SharedSlice;
 
 use weavepy_capi::loader::load_extension_module;
 use weavepy_vm::object::Object;
@@ -173,7 +174,7 @@ fn smalltest_et_converter_round_trips() {
         return;
     };
     let encoded = lookup_module_member(&module, "encoded").expect("module missing `encoded`");
-    let font_bytes: weavepy_vm::sync::Rc<[u8]> = b"FONTDATA".to_vec().into();
+    let font_bytes: SharedSlice<u8> = b"FONTDATA".to_vec().into();
     let result = interp
         .call_object(
             encoded,

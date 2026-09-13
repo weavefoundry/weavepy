@@ -658,7 +658,7 @@ pub(crate) fn adapt_object(
 ) -> Result<Object, RuntimeError> {
     // 1. Registered adapter for the exact type.
     let cls = crate::builtins::class_of(obj);
-    let key = DictKey(Object::new_tuple(vec![Object::Type(cls), proto.clone()]));
+    let key = DictKey(Object::new_tuple_array([Object::Type(cls), proto.clone()]));
     let adapter = adapters_dict().borrow().get(&key).cloned();
     if let Some(adapter) = adapter {
         return call(ip, &adapter, std::slice::from_ref(obj));
@@ -886,7 +886,7 @@ fn mod_register_adapter(args: &[Object]) -> Result<Object, RuntimeError> {
         (Some(t @ Object::Type(_)), Some(c)) => (t.clone(), c.clone()),
         _ => return Err(type_error("register_adapter(type, callable)")),
     };
-    let key = DictKey(Object::new_tuple(vec![
+    let key = DictKey(Object::new_tuple_array([
         ty,
         Object::Type(prepare_protocol_class()),
     ]));

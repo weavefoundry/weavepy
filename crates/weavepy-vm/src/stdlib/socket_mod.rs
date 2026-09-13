@@ -813,7 +813,7 @@ fn gaierror(code: i32, msg: String) -> crate::error::RuntimeError {
     if let Object::Instance(inst) = &exc {
         inst.slot_set(
             "args",
-            Object::new_tuple(vec![Object::Int(i64::from(code)), Object::from_str(&msg)]),
+            Object::new_tuple_array([Object::Int(i64::from(code)), Object::from_str(&msg)]),
         );
         inst.slot_set("errno", Object::Int(i64::from(code)));
         inst.slot_set("strerror", Object::from_str(msg));
@@ -1688,7 +1688,10 @@ fn sock_accept(args: &[Object]) -> Result<Object, RuntimeError> {
         );
     }
     let addr_tuple = sockaddr_to_tuple(&addr, family);
-    Ok(Object::new_tuple(vec![Object::Instance(inst), addr_tuple]))
+    Ok(Object::new_tuple_array([
+        Object::Instance(inst),
+        addr_tuple,
+    ]))
 }
 
 /// `_socket.socket._accept()` — the C-level accept: returns `(fd, addr)`
@@ -1708,7 +1711,7 @@ fn sock_accept_fd(args: &[Object]) -> Result<Object, RuntimeError> {
         new_sock.into_raw_socket() as i64
     };
     let addr_tuple = sockaddr_to_tuple(&addr, family);
-    Ok(Object::new_tuple(vec![Object::Int(fd), addr_tuple]))
+    Ok(Object::new_tuple_array([Object::Int(fd), addr_tuple]))
 }
 
 fn accept_parts(
@@ -2024,7 +2027,7 @@ fn sock_recvfrom(args: &[Object]) -> Result<Object, RuntimeError> {
         .map(|m| unsafe { m.assume_init() })
         .collect();
     let family = state.borrow().family;
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::new_bytes(initialised),
         sockaddr_to_tuple(&addr, family),
     ]))
@@ -2059,7 +2062,7 @@ fn sock_recvfrom_into(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     }
     let family = state.borrow().family;
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(n as i64),
         sockaddr_to_tuple(&addr, family),
     ]))
@@ -2289,7 +2292,7 @@ fn recvmsg_engine(
                     data_len = avail;
                 }
                 let data = std::slice::from_raw_parts(data_ptr.cast::<u8>(), data_len).to_vec();
-                ancdata_items.push(Object::new_tuple(vec![
+                ancdata_items.push(Object::new_tuple_array([
                     Object::Int(i64::from(level)),
                     Object::Int(i64::from(ctype)),
                     Object::new_bytes(data),
@@ -2348,7 +2351,7 @@ fn sock_recvmsg(args: &[Object]) -> Result<Object, RuntimeError> {
         recvmsg_engine(&state, &mut databuf, ancbufsize, flags)?;
     databuf.truncate(n);
 
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::new_bytes(databuf),
         Object::new_list(ancdata_items),
         Object::Int(msg_flags),
@@ -2422,7 +2425,7 @@ fn sock_recvmsg_into(args: &[Object]) -> Result<Object, RuntimeError> {
         off += take;
     }
 
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(n as i64),
         Object::new_list(ancdata_items),
         Object::Int(msg_flags),
@@ -3549,12 +3552,12 @@ fn parse_sockaddr2(arg: Option<&Object>, family: i32) -> Result<SockAddr, Runtim
 
 fn sockaddr_to_tuple(addr: &SockAddr, _family: i32) -> Object {
     if let Some(v4) = addr.as_socket_ipv4() {
-        Object::new_tuple(vec![
+        Object::new_tuple_array([
             Object::from_str(v4.ip().to_string()),
             Object::Int(i64::from(v4.port())),
         ])
     } else if let Some(v6) = addr.as_socket_ipv6() {
-        Object::new_tuple(vec![
+        Object::new_tuple_array([
             Object::from_str(v6.ip().to_string()),
             Object::Int(i64::from(v6.port())),
             Object::Int(i64::from(v6.flowinfo())),
@@ -3567,7 +3570,7 @@ fn sockaddr_to_tuple(addr: &SockAddr, _family: i32) -> Object {
         if let Some(path) = sockaddr_unix_path(addr) {
             return Object::from_str(path);
         }
-        Object::new_tuple(vec![Object::from_static(""), Object::Int(0)])
+        Object::new_tuple_array([Object::from_static(""), Object::Int(0)])
     }
 }
 
@@ -3729,7 +3732,7 @@ fn mod_if_nameindex(_args: &[Object]) -> Result<Object, RuntimeError> {
             let name = CStr::from_ptr((*cur).if_name)
                 .to_string_lossy()
                 .into_owned();
-            out.push(Object::new_tuple(vec![
+            out.push(Object::new_tuple_array([
                 Object::Int(i64::from((*cur).if_index)),
                 Object::from_str(name),
             ]));
@@ -4125,7 +4128,7 @@ fn mod_gethostbyname_ex(args: &[Object]) -> Result<Object, RuntimeError> {
     if ips.is_empty() {
         return Err(os_error("name resolution failed"));
     }
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::from_str(name),
         Object::new_list(Vec::new()),
         Object::new_list(ips),
@@ -4212,7 +4215,7 @@ fn mod_gethostbyaddr(args: &[Object]) -> Result<Object, RuntimeError> {
     } else {
         numeric.clone()
     };
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::from_str(name),
         Object::new_list(Vec::new()),
         Object::new_list(vec![Object::from_str(numeric)]),
@@ -4225,7 +4228,7 @@ fn mod_gethostbyaddr(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Str(s)) => s.to_string(),
         _ => return Err(type_error("gethostbyaddr: arg must be str")),
     };
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::from_str(addr.clone()),
         Object::new_list(Vec::new()),
         Object::new_list(vec![Object::from_str(addr)]),
@@ -4315,7 +4318,7 @@ fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
             f if f == libc::AF_INET => {
                 let sin = unsafe { &*ai.ai_addr.cast::<libc::sockaddr_in>() };
                 let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-                Object::new_tuple(vec![
+                Object::new_tuple_array([
                     Object::from_str(ip.to_string()),
                     Object::Int(i64::from(u16::from_be(sin.sin_port))),
                 ])
@@ -4323,7 +4326,7 @@ fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
             f if f == libc::AF_INET6 => {
                 let sin6 = unsafe { &*ai.ai_addr.cast::<libc::sockaddr_in6>() };
                 let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
-                Object::new_tuple(vec![
+                Object::new_tuple_array([
                     Object::from_str(ip.to_string()),
                     Object::Int(i64::from(u16::from_be(sin6.sin6_port))),
                     Object::Int(i64::from(u32::from_be(sin6.sin6_flowinfo))),
@@ -4338,7 +4341,7 @@ fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
             let c = unsafe { CStr::from_ptr(ai.ai_canonname) };
             Object::from_str(c.to_string_lossy().into_owned())
         };
-        out.push(Object::new_tuple(vec![
+        out.push(Object::new_tuple_array([
             Object::Int(i64::from(ai.ai_family)),
             Object::Int(i64::from(ai.ai_socktype)),
             Object::Int(i64::from(ai.ai_protocol)),
@@ -4424,7 +4427,7 @@ fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
                 let sin = unsafe { &*ai.ai_addr.cast::<ws::SOCKADDR_IN>() };
                 let ip =
                     std::net::Ipv4Addr::from(u32::from_be(unsafe { sin.sin_addr.S_un.S_addr }));
-                Object::new_tuple(vec![
+                Object::new_tuple_array([
                     Object::from_str(ip.to_string()),
                     Object::Int(i64::from(u16::from_be(sin.sin_port))),
                 ])
@@ -4433,7 +4436,7 @@ fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
                 #[allow(clippy::cast_ptr_alignment)] // see AF_INET arm above
                 let sin6 = unsafe { &*ai.ai_addr.cast::<ws::SOCKADDR_IN6>() };
                 let ip = std::net::Ipv6Addr::from(unsafe { sin6.sin6_addr.u.Byte });
-                Object::new_tuple(vec![
+                Object::new_tuple_array([
                     Object::from_str(ip.to_string()),
                     Object::Int(i64::from(u16::from_be(sin6.sin6_port))),
                     Object::Int(i64::from(u32::from_be(sin6.sin6_flowinfo))),
@@ -4448,7 +4451,7 @@ fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
             let c = unsafe { CStr::from_ptr(ai.ai_canonname.cast()) };
             Object::from_str(c.to_string_lossy().into_owned())
         };
-        out.push(Object::new_tuple(vec![
+        out.push(Object::new_tuple_array([
             Object::Int(i64::from(ai.ai_family)),
             Object::Int(i64::from(ai.ai_socktype)),
             Object::Int(i64::from(ai.ai_protocol)),
@@ -4499,18 +4502,18 @@ fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
             continue;
         }
         let addr_tuple = match sa {
-            SocketAddr::V4(v4) => Object::new_tuple(vec![
+            SocketAddr::V4(v4) => Object::new_tuple_array([
                 Object::from_str(v4.ip().to_string()),
                 Object::Int(i64::from(v4.port())),
             ]),
-            SocketAddr::V6(v6) => Object::new_tuple(vec![
+            SocketAddr::V6(v6) => Object::new_tuple_array([
                 Object::from_str(v6.ip().to_string()),
                 Object::Int(i64::from(v6.port())),
                 Object::Int(i64::from(v6.flowinfo())),
                 Object::Int(i64::from(v6.scope_id())),
             ]),
         };
-        out.push(Object::new_tuple(vec![
+        out.push(Object::new_tuple_array([
             Object::Int(i64::from(fam)),
             Object::Int(i64::from(kind)),
             Object::Int(i64::from(proto)),
@@ -4657,7 +4660,7 @@ fn mod_getnameinfo(args: &[Object]) -> Result<Object, RuntimeError> {
     let serv_s = unsafe { CStr::from_ptr(servbuf.as_ptr().cast()) }
         .to_string_lossy()
         .into_owned();
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::from_str(host_s),
         Object::from_str(serv_s),
     ]))
@@ -4749,7 +4752,7 @@ fn mod_getnameinfo(args: &[Object]) -> Result<Object, RuntimeError> {
             .to_string_lossy()
             .into_owned()
     };
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::from_str(decode(&hostbuf)),
         Object::from_str(decode(&servbuf)),
     ]))
@@ -4843,7 +4846,7 @@ fn unix_socketpair(family: i32, sock_type: i32, proto: i32) -> Result<Object, Ru
             .insert(DictKey(Object::from_static("_handle")), Object::Int(h));
         Object::Instance(inst)
     };
-    Ok(Object::new_tuple(vec![make(fds[0]), make(fds[1])]))
+    Ok(Object::new_tuple_array([make(fds[0]), make(fds[1])]))
 }
 
 /// Loopback-TCP emulation for the AF_INET case (and platforms without
@@ -4881,7 +4884,7 @@ fn inet_socketpair_emulation() -> Result<Object, RuntimeError> {
             .insert(DictKey(Object::from_static("_handle")), Object::Int(h));
         Object::Instance(inst)
     };
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         make_inst(client),
         make_inst(server),
     ]))

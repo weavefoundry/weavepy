@@ -201,7 +201,7 @@ fn https_request(args: &[Object]) -> Result<Object, RuntimeError> {
     crate::stdlib::ssl_real::close(id);
 
     let (status, headers, body) = parse_response(&all);
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(i64::from(status)),
         headers,
         Object::new_bytes(body),

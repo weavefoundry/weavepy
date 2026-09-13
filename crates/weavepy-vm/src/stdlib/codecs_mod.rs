@@ -365,7 +365,7 @@ pub fn b_encode(args: &[Object]) -> Result<Object, RuntimeError> {
     let errors = arg_errors(args, 2);
     let nchars = obj.len().unwrap_or(0) as i64;
     let bytes = encode_obj(obj, &encoding, &errors)?;
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::new_bytes(bytes),
         Object::Int(nchars),
     ]))
@@ -377,7 +377,7 @@ pub fn b_decode(args: &[Object]) -> Result<Object, RuntimeError> {
     let errors = arg_errors(args, 2);
     let s = decode_bytes_obj(&bytes, &encoding, &errors)?;
     let len = bytes.len() as i64;
-    Ok(Object::new_tuple(vec![s, Object::Int(len)]))
+    Ok(Object::new_tuple_array([s, Object::Int(len)]))
 }
 
 /// Call `codecs.<name>(*args)` on the frozen `codecs` module through the
@@ -1807,7 +1807,7 @@ fn decode_utf8_surrogateescape(bytes: &[u8]) -> String {
                     let byte = bytes[i + valid + j];
                     // CPython maps the undecodable byte to the lone low
                     // surrogate U+DC00+byte. WeavePy's `str` is strict UTF-8
-                    // (`Rc<str>`), which cannot hold surrogates, so we
+                    // (`crate::shared_value::SharedStr`), which cannot hold surrogates, so we
                     // substitute U+FFFD rather than panic. Full
                     // surrogateescape round-tripping needs a surrogate-capable
                     // string representation (tracked separately).
@@ -1922,7 +1922,7 @@ fn handle_decode_error(
         }
         "surrogateescape" => {
             // See `decode_utf8_surrogateescape`: the U+DC00+byte surrogate is
-            // unrepresentable in a strict-UTF-8 `Rc<str>`, so fall back to
+            // unrepresentable in a strict-UTF-8 `crate::shared_value::SharedStr`, so fall back to
             // U+FFFD instead of panicking on `char::from_u32`.
             out.push(char::from_u32(0xDC00 + u32::from(byte)).unwrap_or('\u{FFFD}'));
             Ok(())
@@ -1990,7 +1990,7 @@ macro_rules! enc_decoder {
             let errors = arg_errors(args, 1);
             let s = decode_bytes(&bytes, $encoding, &errors)?;
             let len = bytes.len() as i64;
-            Ok(Object::new_tuple(vec![
+            Ok(Object::new_tuple_array([
                 Object::from_str(s),
                 Object::Int(len),
             ]))
@@ -2005,7 +2005,7 @@ macro_rules! enc_encoder {
             let errors = arg_errors(args, 1);
             let bytes = encode_str(&s, $encoding, &errors)?;
             let len = s.chars().count() as i64;
-            Ok(Object::new_tuple(vec![
+            Ok(Object::new_tuple_array([
                 Object::new_bytes(bytes),
                 Object::Int(len),
             ]))
@@ -2060,11 +2060,11 @@ fn arg_text_codepoints(args: &[Object], idx: usize, name: &str) -> Result<Vec<u3
 }
 
 fn enc_tuple(bytes: Vec<u8>, nchars: usize) -> Object {
-    Object::new_tuple(vec![Object::new_bytes(bytes), Object::Int(nchars as i64)])
+    Object::new_tuple_array([Object::new_bytes(bytes), Object::Int(nchars as i64)])
 }
 
 fn dec_tuple(text: Object, consumed: usize) -> Object {
-    Object::new_tuple(vec![text, Object::Int(consumed as i64)])
+    Object::new_tuple_array([text, Object::Int(consumed as i64)])
 }
 
 fn b_utf8_encode(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2173,7 +2173,7 @@ macro_rules! utf1632_decode {
             };
             let (text, consumed, out_bo) = $engine(&bytes, &errors, bo, final_)?;
             if $ex {
-                Ok(Object::new_tuple(vec![
+                Ok(Object::new_tuple_array([
                     text,
                     Object::Int(consumed as i64),
                     Object::Int(i64::from(out_bo)),
@@ -2240,7 +2240,7 @@ fn b_raw_unicode_escape_decode(args: &[Object]) -> Result<Object, RuntimeError> 
     let final_ = arg_final_default_true(args, 2);
     let (obj, consumed) =
         crate::stdlib::codecs_engine::raw_unicode_escape_decode(&bytes, &errors, final_)?;
-    Ok(Object::new_tuple(vec![obj, Object::Int(consumed as i64)]))
+    Ok(Object::new_tuple_array([obj, Object::Int(consumed as i64)]))
 }
 
 /// `_codecs.unicode_escape_decode(data, errors="strict", final=True)`.
@@ -2254,7 +2254,7 @@ fn b_unicode_escape_decode(args: &[Object]) -> Result<Object, RuntimeError> {
     if let Some(msg) = warn {
         emit_deprecation(&msg)?;
     }
-    Ok(Object::new_tuple(vec![obj, Object::Int(consumed as i64)]))
+    Ok(Object::new_tuple_array([obj, Object::Int(consumed as i64)]))
 }
 
 // ---------- Windows code-page codecs (RFC 0063 WS6) ----------

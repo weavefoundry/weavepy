@@ -839,7 +839,7 @@ fn cmath_polar(args: &[Object]) -> Result<Object, RuntimeError> {
     let phi = c_atan2(z);
     let (r, errno) = c_abs(z);
     math_error(errno)?;
-    Ok(Object::new_tuple(vec![float_obj(r), float_obj(phi)]))
+    Ok(Object::new_tuple_array([float_obj(r), float_obj(phi)]))
 }
 
 /// `cmath.rect(r, phi)` — cmathmodule.c `cmath_rect_impl`, including

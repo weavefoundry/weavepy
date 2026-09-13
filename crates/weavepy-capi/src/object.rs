@@ -30,6 +30,7 @@
 
 use std::ffi::c_void;
 use std::ptr;
+use weavepy_vm::shared_value::{SharedStr, ThinArc};
 
 use weavepy_vm::object::Object;
 
@@ -996,9 +997,9 @@ pub(crate) fn same_native_identity(a: &Object, b: &Object) -> bool {
     use weavepy_vm::sync::Rc;
     match (a, b) {
         (Object::Instance(x), Object::Instance(y)) => Rc::ptr_eq(x, y),
-        (Object::Tuple(x), Object::Tuple(y)) => Rc::ptr_eq(x, y),
-        (Object::Bytes(x), Object::Bytes(y)) => Rc::ptr_eq(x, y),
-        (Object::Str(x), Object::Str(y)) => Rc::ptr_eq(x, y),
+        (Object::Tuple(x), Object::Tuple(y)) => ThinArc::ptr_eq(x, y),
+        (Object::Bytes(x), Object::Bytes(y)) => ThinArc::ptr_eq(x, y),
+        (Object::Str(x), Object::Str(y)) => SharedStr::ptr_eq(x, y),
         (Object::Long(x), Object::Long(y)) => Rc::ptr_eq(x, y),
         (Object::Complex(x), Object::Complex(y)) => Rc::ptr_eq(x, y),
         _ => false,

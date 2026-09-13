@@ -507,13 +507,13 @@ fn unparse_address(sa: &ws::SOCKADDR_IN6) -> Result<Object, RuntimeError> {
         // SAFETY: family says the storage actually holds a SOCKADDR_IN.
         let v4: &ws::SOCKADDR_IN = unsafe { &*std::ptr::from_ref(sa).cast() };
         let ip = std::net::Ipv4Addr::from(u32::from_be(unsafe { v4.sin_addr.S_un.S_addr }));
-        Ok(Object::new_tuple(vec![
+        Ok(Object::new_tuple_array([
             Object::from_str(ip.to_string()),
             Object::Int(i64::from(u16::from_be(v4.sin_port))),
         ]))
     } else if family == ws::AF_INET6 {
         let ip = std::net::Ipv6Addr::from(unsafe { sa.sin6_addr.u.Byte });
-        Ok(Object::new_tuple(vec![
+        Ok(Object::new_tuple_array([
             Object::from_str(ip.to_string()),
             Object::Int(i64::from(u16::from_be(sa.sin6_port))),
             // ntohl on unparse, mirroring CPython's asymmetric handling.
@@ -991,7 +991,7 @@ fn ov_getresult(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         Op::ReadFrom { buf, addr } => {
             let sa = unsafe { *addr.sa.get() };
-            Ok(Object::new_tuple(vec![
+            Ok(Object::new_tuple_array([
                 Object::Bytes(buf[..n.min(buf.len())].to_vec().into()),
                 unparse_address(&sa)?,
             ]))
@@ -1001,7 +1001,7 @@ fn ov_getresult(args: &[Object]) -> Result<Object, RuntimeError> {
                 copy_out(t, &buf[..n.min(buf.len())]);
             }
             let sa = unsafe { *addr.sa.get() };
-            Ok(Object::new_tuple(vec![
+            Ok(Object::new_tuple_array([
                 Object::Int(i64::from(transferred)),
                 unparse_address(&sa)?,
             ]))
@@ -1568,7 +1568,7 @@ fn mod_get_queued_completion_status(args: &[Object]) -> Result<Object, RuntimeEr
         }
         return Err(win32_error_to_py(err as i32, None));
     }
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(i64::from(err)),
         Object::Int(i64::from(bytes)),
         uint_obj(key),

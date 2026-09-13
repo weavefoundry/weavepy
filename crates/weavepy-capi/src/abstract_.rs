@@ -592,8 +592,8 @@ fn attr_lookup(o: &Object, key: &str) -> Option<Object> {
             // `_strptime.TimeRE.__init__`. Defer to the VM's full `LOAD_ATTR`
             // (return `None` -> `load_attr_public` in [`do_getattr`]), which
             // performs the proper super MRO walk.
-            {
-                let d = inst.dict.borrow();
+            if let Some(dict) = inst.dict.get() {
+                let d = dict.borrow();
                 let is_super_proxy = matches!(
                     d.get(&DictKey(Object::from_static("__self_class__"))),
                     Some(Object::Type(_))
@@ -608,9 +608,11 @@ fn attr_lookup(o: &Object, key: &str) -> Option<Object> {
                     return None;
                 }
             }
-            let kk = DictKey(Object::from_str(key));
-            if let Some(v) = inst.dict.borrow().get(&kk).cloned() {
-                return Some(v);
+            if let Some(dict) = inst.dict.get() {
+                let kk = DictKey(Object::from_str(key));
+                if let Some(v) = dict.borrow().get(&kk).cloned() {
+                    return Some(v);
+                }
             }
             // Walk the MRO and invoke descriptor protocol if the
             // resolved attribute is a property, classmethod, or

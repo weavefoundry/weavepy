@@ -34,6 +34,7 @@ use weavepy_parser::ast::{
 
 mod ast_opt;
 pub mod bytecode;
+mod cache_snapshot;
 pub mod cpython_code;
 mod flowgraph;
 mod intern;
@@ -239,10 +240,10 @@ pub struct CodeObject {
     /// Source filename or `<string>`. Used for diagnostics only.
     pub filename: String,
     pub instructions: Vec<Instruction>,
-    /// Per-instruction inline cache slots (RFC 0021 — adaptive
-    /// specialization). Same length as [`Self::instructions`]; not
-    /// serialised by marshal (caches are re-warmed on the next run
-    /// because the type pointers they capture wouldn't be valid).
+    /// Per-instruction inline caches for adaptive specialization. The logical
+    /// count matches [`Self::instructions`], with storage allocated on the first
+    /// cache write. Marshal doesn't serialize cache state; loaded code starts
+    /// cold because process-local resolution tokens wouldn't remain valid.
     pub caches: CacheTable,
     /// RFC 0061 (WS2a): VM-owned derived state (see [`VmExt`]).
     pub vm_ext: VmExt,
@@ -2266,9 +2267,8 @@ impl Compiler {
             nparams: nparams as usize,
         };
         flowgraph::optimize(&mut self.co, &input);
-        // RFC 0021: size the inline-cache side-table to match the
-        // emitted instruction stream so the VM can index into it
-        // without bounds checks on the hot path.
+        // Record the instruction count without allocating inline caches.
+        // The first cache write allocates storage for direct PC indexing.
         self.co.caches.resize(self.co.instructions.len());
         self.co
     }

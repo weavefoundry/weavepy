@@ -17,7 +17,7 @@ The baseline is an unmodified release build of `971d752`, which already
 includes the [startup and memory optimizations](PERFORMANCE.md). Both binaries
 use Rust 1.98.1, the same release profile, and the default JIT feature. CPython
 3.14.7 is the reference interpreter.
-[Raw samples, checksums, environment, probes, and validation](../crates/weavepy-bench/census/2026-09-execution/)
+[Raw samples, checksums, environment, probes, and validation](https://github.com/weavefoundry/weavepy/tree/33c211b716dc54606841e5911d7298f762c5d2ce/crates/weavepy-bench/census/2026-09-execution/)
 are retained. No existing benchmark fixture, work parameter, expectation, or
 regression threshold was removed or relaxed.
 

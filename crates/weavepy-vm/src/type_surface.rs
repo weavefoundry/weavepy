@@ -26,6 +26,7 @@
 //! installed by `builtin_types.rs` (`__new__`, `__init__`, exception
 //! `__str__`, …) keep priority.
 
+use crate::shared_value::ThinArc;
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
@@ -1434,7 +1435,7 @@ fn list_reversed_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let reversed: Vec<Object> = items.borrow().iter().rev().cloned().collect();
     Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Tuple {
-        items: Rc::from(reversed.as_slice()),
+        items: crate::object::TupleStorage::from_vec(reversed),
         index: 0,
     }))))
 }
@@ -1451,7 +1452,7 @@ fn dict_reversed_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let keys: Vec<Object> = d.borrow().keys().rev().map(|k| k.0.clone()).collect();
     Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Tuple {
-        items: Rc::from(keys.as_slice()),
+        items: crate::object::TupleStorage::from_vec(keys),
         index: 0,
     }))))
 }
@@ -1475,11 +1476,11 @@ fn dict_view_reversed_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
         crate::object::DictViewKind::Items => d
             .iter()
             .rev()
-            .map(|(k, val)| Object::new_tuple(vec![k.0.clone(), val.clone()]))
+            .map(|(k, val)| Object::new_tuple_array([k.0.clone(), val.clone()]))
             .collect(),
     };
     Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Tuple {
-        items: Rc::from(items.as_slice()),
+        items: crate::object::TupleStorage::from_vec(items),
         index: 0,
     }))))
 }
@@ -2122,7 +2123,7 @@ pub(crate) fn release_buffer_builtin(args: &[Object]) -> Result<Object, RuntimeE
     // "memoryview's buffer is not this object").
     let matches_recv = match (&recv, &view.buffer) {
         (Object::ByteArray(b), crate::object::MemoryViewBuffer::ByteArray(vb)) => Rc::ptr_eq(b, vb),
-        (Object::Bytes(b), crate::object::MemoryViewBuffer::Bytes(vb)) => Rc::ptr_eq(b, vb),
+        (Object::Bytes(b), crate::object::MemoryViewBuffer::Bytes(vb)) => ThinArc::ptr_eq(b, vb),
         (Object::MemoryView(m), _) => m.shares_buffer(&view),
         _ => false,
     };

@@ -34,11 +34,48 @@
 //! explicit `notify_clear(id)` method that callers (the GC,
 //! `gc.collect`, finaliser code) can invoke.
 
+use crate::shared_value::{SharedStr, ThinArc};
 use crate::sync::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-use crate::object::Object;
+use crate::object::{DictKey, Object, StrKey};
+
+/// Fixed names in weakref wrapper dictionaries. The immutable strings are
+/// shared per thread; callbacks and per-target closures remain wrapper-owned.
+#[derive(Clone, Copy)]
+pub(crate) enum WrapperKey {
+    Call,
+    Get,
+    Clear,
+    Alive,
+    Repr,
+    Callback,
+    Kind,
+}
+
+const WRAPPER_NAMES: [&str; 7] = [
+    "__call__",
+    "__weakref_get__",
+    "__clear__",
+    "__alive__",
+    "__repr__",
+    "__callback__",
+    "__weakref_kind__",
+];
+
+thread_local! {
+    static WRAPPER_KEYS: [DictKey; 7] = WRAPPER_NAMES.map(|name| DictKey(Object::from_static(name)));
+}
+
+impl WrapperKey {
+    pub(crate) fn owned(self) -> DictKey {
+        WRAPPER_KEYS
+            .try_with(|keys| keys[self as usize].clone())
+            // Clearing can run after this thread's cached names have dropped.
+            .unwrap_or_else(|_| DictKey(Object::from_static(WRAPPER_NAMES[self as usize])))
+    }
+}
 
 /// Identity of a referent. We use the address of an
 /// `Rc::as_ptr`'d allocation as the key; the Rc keeps the
@@ -136,12 +173,11 @@ impl WeakRefSlot {
             return None;
         }
         let inst = self.py_ref.borrow().as_ref().and_then(Weak::upgrade)?;
-        let key = crate::object::DictKey(Object::from_static("__callback__"));
         let mut d = inst.dict.try_borrow_mut().ok()?;
-        match d.get(&key).cloned() {
+        match d.get(&StrKey("__callback__")).cloned() {
             None | Some(Object::None) => None,
             Some(cb) => {
-                d.insert(key, Object::None);
+                d.insert(WrapperKey::Callback.owned(), Object::None);
                 Some(cb)
             }
         }
@@ -154,8 +190,7 @@ impl WeakRefSlot {
             return None;
         }
         let inst = self.py_ref.borrow().as_ref().and_then(Weak::upgrade)?;
-        let key = crate::object::DictKey(Object::from_static("__callback__"));
-        let v = inst.dict.borrow().get(&key).cloned();
+        let v = inst.dict.borrow().get(&StrKey("__callback__")).cloned();
         match v {
             None | Some(Object::None) => None,
             v => v,
@@ -497,10 +532,10 @@ pub fn id_of(obj: &Object) -> ObjectId {
         Object::Bool(true) => 3,
         Object::Int(n) => 0x1000_0000_0000_0000u64 ^ (*n as u64),
         Object::Float(f) => 0x2000_0000_0000_0000u64 ^ f.to_bits(),
-        Object::Str(s) => Rc::as_ptr(s).cast::<()>() as usize as u64,
-        Object::WStr(cps) => Rc::as_ptr(cps).cast::<()>() as usize as u64,
-        Object::Bytes(b) => Rc::as_ptr(b).cast::<()>() as usize as u64,
-        Object::Tuple(t) => Rc::as_ptr(t).cast::<()>() as usize as u64,
+        Object::Str(s) => SharedStr::as_ptr(s).cast::<()>() as usize as u64,
+        Object::WStr(cps) => ThinArc::as_ptr(cps).cast::<()>() as usize as u64,
+        Object::Bytes(b) => ThinArc::as_ptr(b).cast::<()>() as usize as u64,
+        Object::Tuple(t) => ThinArc::as_ptr(t).cast::<()>() as usize as u64,
         Object::List(l) => Rc::as_ptr(l) as usize as u64,
         Object::Dict(d) => Rc::as_ptr(d) as usize as u64,
         Object::Set(s) => Rc::as_ptr(s) as usize as u64,

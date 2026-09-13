@@ -915,7 +915,7 @@ fn signal_setitimer(args: &[Object]) -> Result<Object, RuntimeError> {
                 &std::io::Error::last_os_error(),
             ));
         }
-        Ok(Object::new_tuple(vec![
+        Ok(Object::new_tuple_array([
             Object::Float(timeval_to_seconds(old.it_value)),
             Object::Float(timeval_to_seconds(old.it_interval)),
         ]))
@@ -946,7 +946,7 @@ fn signal_getitimer(args: &[Object]) -> Result<Object, RuntimeError> {
                 &std::io::Error::last_os_error(),
             ));
         }
-        Ok(Object::new_tuple(vec![
+        Ok(Object::new_tuple_array([
             Object::Float(timeval_to_seconds(cur.it_value)),
             Object::Float(timeval_to_seconds(cur.it_interval)),
         ]))

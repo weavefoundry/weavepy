@@ -1159,7 +1159,7 @@ fn futprop_callbacks(args: &[Object]) -> Result<Object, RuntimeError> {
         .borrow()
         .callbacks
         .iter()
-        .map(|(cb, ctx)| Object::new_tuple(vec![cb.clone(), ctx.clone()]))
+        .map(|(cb, ctx)| Object::new_tuple_array([cb.clone(), ctx.clone()]))
         .collect();
     // The C getter reports `None` for an empty callback list (a fresh copy
     // otherwise) — `test_callbacks_copy` pins this.

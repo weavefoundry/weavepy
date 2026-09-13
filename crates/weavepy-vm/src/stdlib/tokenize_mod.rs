@@ -1864,11 +1864,11 @@ fn run(lines: Vec<String>, extra_tokens: bool) -> (Vec<Object>, Option<Object>) 
             }
         }
 
-        out.push(Object::new_tuple(vec![
+        out.push(Object::new_tuple_array([
             Object::Int(i64::from(ty)),
             Object::from_str(string),
-            Object::new_tuple(vec![Object::Int(lineno), Object::Int(col_offset)]),
-            Object::new_tuple(vec![Object::Int(end_lineno), Object::Int(end_col_offset)]),
+            Object::new_tuple_array([Object::Int(lineno), Object::Int(col_offset)]),
+            Object::new_tuple_array([Object::Int(end_lineno), Object::Int(end_col_offset)]),
             Object::from_str(line),
         ]));
 
@@ -1924,7 +1924,7 @@ fn tokenizer_error(tok: &Tok) -> PendingError {
 }
 
 fn error_object(e: PendingError) -> Object {
-    Object::new_tuple(vec![
+    Object::new_tuple_array([
         Object::from_static(match e.kind {
             "indent" => "indent",
             "tab" => "tab",
@@ -1968,7 +1968,7 @@ fn tokens_fn(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("tokens() lines must be a list of str")),
     }
     let (toks, err) = run(lines, extra_tokens);
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::new_list(toks),
         err.unwrap_or(Object::None),
     ]))

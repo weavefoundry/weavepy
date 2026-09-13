@@ -95,7 +95,7 @@ fn formatter_parser(args: &[Object]) -> Result<Object, RuntimeError> {
             i += 1; // consume the `}`
                     // Split field into name + format_spec + conversion.
             let (field_name, format_spec, conversion) = split_field(&field)?;
-            out.push(Object::new_tuple(vec![
+            out.push(Object::new_tuple_array([
                 Object::from_str(std::mem::take(&mut literal)),
                 Object::from_str(field_name),
                 Object::from_str(format_spec),
@@ -119,7 +119,7 @@ fn formatter_parser(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     }
     if !literal.is_empty() {
-        out.push(Object::new_tuple(vec![
+        out.push(Object::new_tuple_array([
             Object::from_str(literal),
             Object::None,
             Object::None,
@@ -215,7 +215,7 @@ fn formatter_field_name_split(args: &[Object]) -> Result<Object, RuntimeError> {
                 buf.push(nc);
                 chars.next();
             }
-            pieces.push(Object::new_tuple(vec![
+            pieces.push(Object::new_tuple_array([
                 Object::Bool(true),
                 Object::from_str(buf),
             ]));
@@ -234,8 +234,8 @@ fn formatter_field_name_split(args: &[Object]) -> Result<Object, RuntimeError> {
             } else {
                 Object::from_str(buf)
             };
-            pieces.push(Object::new_tuple(vec![Object::Bool(false), val]));
+            pieces.push(Object::new_tuple_array([Object::Bool(false), val]));
         }
     }
-    Ok(Object::new_tuple(vec![head, Object::new_list(pieces)]))
+    Ok(Object::new_tuple_array([head, Object::new_list(pieces)]))
 }

@@ -18,7 +18,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
-use crate::ir::{ArithKind, CmpKind, MathFunc, MethodRet, TFunc, TOp, TStmt, TTerm};
+use crate::ir::{ArithKind, CmpKind, MathFunc, MethodRet, SliceOrigin, TFunc, TOp, TStmt, TTerm};
 use crate::runtime::{self, JitFrame, JitStatus, SlotTag};
 use crate::value::JitType;
 
@@ -655,6 +655,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let snapshot = self.vstack.clone();
                 self.emit_exit(pc, &snapshot, JitStatus::Yielded);
             }
+            TTerm::Deopt { pc } => {
+                let snapshot = self.vstack.clone();
+                self.emit_exit(pc, &snapshot, JitStatus::Deopt);
+            }
         }
     }
 
@@ -820,6 +824,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::DictSet { key, val } => self.emit_dict_set(key, val, stmt.pc),
             TOp::DictContains { negate, key } => self.emit_dict_contains(negate, key, stmt.pc),
             TOp::DictLen => self.emit_pin_len(runtime::dict_len_helper_addr(), stmt.pc),
+            TOp::TupleLen => self.emit_pin_len(runtime::tuple_len_helper_addr(), stmt.pc),
+            TOp::UnboxInt { depth } => self.emit_unbox_int(depth, stmt.pc),
             TOp::IterCapture {
                 iter_slot,
                 materialize,
@@ -842,25 +848,42 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             }
             TOp::BuildTuple { n } => self.emit_build_tuple(n, stmt.pc),
             TOp::BuildMap { n } => self.emit_build_map(n, stmt.pc),
-            TOp::PushConstStr { idx } => self.emit_const_str(idx, stmt.pc),
+            TOp::PushConstStr { idx } => {
+                self.emit_const_pin(idx, stmt.pc, runtime::const_str_helper_addr(), JitType::Str)
+            }
+            TOp::PushConstTuple { idx } => self.emit_const_pin(
+                idx,
+                stmt.pc,
+                runtime::const_tuple_helper_addr(),
+                JitType::Obj,
+            ),
             TOp::StrConcat => self.emit_str_concat(stmt.pc),
             TOp::StrGetItem => self.emit_str_get(stmt.pc),
             TOp::BuildString { n } => self.emit_build_string(n, stmt.pc),
             TOp::ListRepeat => self.emit_list_repeat(stmt.pc),
-            TOp::ListSlice { start, stop, konst } => {
-                self.emit_list_slice(start, stop, konst, stmt.pc)
-            }
+            TOp::ListSlice {
+                start,
+                stop,
+                origin,
+            } => self.emit_list_slice(start, stop, origin, stmt.pc),
             TOp::PushGlobalObj { token, lane } => self.emit_push_global_obj(token, lane, stmt.pc),
-            TOp::CallDyn { argc, kwc, names } => self.emit_call_dyn(argc, kwc, names, stmt.pc),
+            TOp::CallDyn {
+                argc,
+                kwc,
+                names,
+                int_result,
+            } => self.emit_call_dyn(argc, kwc, names, int_result, stmt.pc),
             TOp::DynAttrGet { name } => self.emit_dyn_attr_get(name, stmt.pc),
             TOp::DynAttrSet { name } => self.emit_dyn_attr_set(name, stmt.pc),
             TOp::Truth => self.emit_truth(stmt.pc),
             TOp::ContainsDyn { negate } => self.emit_contains_dyn(negate, stmt.pc),
             TOp::BuildSet { n } => self.emit_build_set(n, stmt.pc),
             TOp::StrMod => self.emit_str_mod(stmt.pc),
-            TOp::StrSlice { start, stop, konst } => {
-                self.emit_str_slice(start, stop, konst, stmt.pc)
-            }
+            TOp::StrSlice {
+                start,
+                stop,
+                origin,
+            } => self.emit_str_slice(start, stop, origin, stmt.pc),
         }
     }
 
@@ -924,7 +947,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// `pc + 1` with the parked result (never re-executed); `Reject`
     /// (defensive pin miss) deopts at the call pc with the callee and
     /// arguments spilled, so the interpreter re-executes the call.
-    fn emit_call_dyn(&mut self, argc: u8, kwc: u8, names: u32, pc: u32) {
+    fn emit_call_dyn(&mut self, argc: u8, kwc: u8, names: u32, int_result: bool, pc: u32) {
         let trusted = MemFlags::trusted();
         let n = argc as usize + kwc as usize;
         // Snapshot *including* callee + args for the Reject exit.
@@ -945,10 +968,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.store_call_site_pc(pc);
 
         let sig = self.call_dyn_helper_sig();
-        let helper = self
-            .b
-            .ins()
-            .iconst(self.ptr_ty, runtime::call_dyn_helper_addr() as i64);
+        let address = if int_result {
+            runtime::call_dyn_int_helper_addr()
+        } else {
+            runtime::call_dyn_helper_addr()
+        };
+        let helper = self.b.ins().iconst(self.ptr_ty, address as i64);
         let argcv = self.b.ins().iconst(types::I32, i64::from(argc));
         let kwcv = self.b.ins().iconst(types::I32, i64::from(kwc));
         let namesv = self.b.ins().iconst(types::I32, i64::from(names));
@@ -987,7 +1012,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .b
             .ins()
             .load(types::I64, trusted, self.frame_ptr, OFF_RET_BITS);
-        self.vstack.push((res, JitType::Obj));
+        self.vstack.push((
+            res,
+            if int_result {
+                JitType::Int
+            } else {
+                JitType::Obj
+            },
+        ));
     }
 
     /// The imported signature of the `wpjit_call_dyn` helper (RFC
@@ -1317,7 +1349,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// `BUILD_SLICE`'s* pc with the bound operands spilled (absent
     /// ones as materialized `None`s) so the interpreter rebuilds the
     /// slice object and executes the subscript generically.
-    fn emit_str_slice(&mut self, start: bool, stop: bool, konst: bool, pc: u32) {
+    fn emit_str_slice(&mut self, start: bool, stop: bool, origin: SliceOrigin, pc: u32) {
         let missing = i64::MIN;
         let stop_v = if stop {
             self.pop().0
@@ -1331,12 +1363,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         };
         let (pin, _) = self.pop();
         // Spill shape at the erased BUILD_SLICE: [.., str, start,
-        // stop, step=None], `None` bounds as object-lane `-1`. The
+        // stop, optional step=None], `None` bounds as object-lane `-1`. The
         // folded `LOAD_CONST slice(...)` shape deopts at the
         // `LOAD_CONST` with just [.., str].
         let mut snapshot = self.vstack.clone();
         snapshot.push((pin, JitType::Str));
-        if !konst {
+        if origin != SliceOrigin::Constant {
             let none = self.b.ins().iconst(types::I64, -1);
             snapshot.push(if start {
                 (start_v, JitType::Int)
@@ -1348,17 +1380,29 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             } else {
                 (none, JitType::Obj)
             });
-            snapshot.push((none, JitType::Obj));
+            if origin == SliceOrigin::ThreeBounds {
+                snapshot.push((none, JitType::Obj));
+            }
         }
+        // A real minimum-integer stop clamps to zero for every valid
+        // Rust slice length. Keep it distinct from the helper's missing-
+        // bound sentinel, and retain stop_v unchanged in the deopt snapshot.
+        let stop_arg = if stop {
+            let minimum = self.b.ins().icmp_imm(IntCC::Equal, stop_v, i64::MIN);
+            let zero = self.b.ins().iconst(types::I64, 0);
+            self.b.ins().select(minimum, zero, stop_v)
+        } else {
+            stop_v
+        };
         let sig = self.quad_helper_sig();
         let helper = self
             .b
             .ins()
             .iconst(self.ptr_ty, runtime::str_slice_helper_addr() as i64);
-        let call = self
-            .b
-            .ins()
-            .call_indirect(sig, helper, &[self.frame_ptr, pin, start_v, stop_v]);
+        let call =
+            self.b
+                .ins()
+                .call_indirect(sig, helper, &[self.frame_ptr, pin, start_v, stop_arg]);
         let res = self.b.inst_results(call)[0];
         let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
         let cont = self.guard(bad, pc, &snapshot);
@@ -1637,16 +1681,42 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.vstack.push((res, JitType::Str));
     }
 
-    /// RFC 0073 WS2 — an exact-`str` constant through the memoizing
-    /// `wpjit_const_str` helper. Negative status deopts (cap
-    /// pressure) and the interpreter re-executes the `LOAD_CONST`.
-    fn emit_const_str(&mut self, idx: u32, pc: u32) {
+    /// Guard an opaque operand without consuming it on failure. Successful
+    /// guards replace only its native representation; the pin stays owned
+    /// by this activation until its ordinary cleanup.
+    fn emit_unbox_int(&mut self, depth: u8, pc: u32) {
         let snapshot = self.vstack.clone();
+        let index = self.vstack.len() - 1 - usize::from(depth);
+        let (pin, lane) = self.vstack[index];
+        debug_assert_eq!(lane, JitType::Obj);
         let sig = self.pin_helper_sig();
         let helper = self
             .b
             .ins()
-            .iconst(self.ptr_ty, runtime::const_str_helper_addr() as i64);
+            .iconst(self.ptr_ty, runtime::unbox_int_helper_addr() as i64);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, pin]);
+        let status = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        let value = self.b.ins().load(
+            types::I64,
+            MemFlags::trusted(),
+            self.frame_ptr,
+            OFF_RET_BITS,
+        );
+        self.vstack[index] = (value, JitType::Int);
+    }
+
+    /// A code constant through its memoizing pin helper. Negative status
+    /// deopts and the interpreter re-executes LOAD_CONST.
+    fn emit_const_pin(&mut self, idx: u32, pc: u32, helper_addr: usize, lane: JitType) {
+        let snapshot = self.vstack.clone();
+        let sig = self.pin_helper_sig();
+        let helper = self.b.ins().iconst(self.ptr_ty, helper_addr as i64);
         let idxv = self.b.ins().iconst(types::I64, i64::from(idx));
         let call = self
             .b
@@ -1656,7 +1726,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
-        self.vstack.push((res, JitType::Str));
+        self.vstack.push((res, lane));
     }
 
     /// RFC 0071 WS4 — `list * int` through `wpjit_list_repeat`
@@ -1688,11 +1758,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// erased `BUILD_SLICE`) pass as `i64::MIN`; present bounds pop
     /// `stop` above `start`. A negative status deopts at the *erased
     /// `BUILD_SLICE`'s* pc (`pc` here — the analyzer guarantees the
-    /// `BINARY_SUBSCR` immediately follows it), with all three bound
+    /// `BINARY_SUBSCR` immediately follows it), with the original bound
     /// operands spilled — absent ones as materialized `None`s — so
     /// the interpreter rebuilds the slice object and executes the
     /// subscript generically.
-    fn emit_list_slice(&mut self, start: bool, stop: bool, konst: bool, pc: u32) {
+    fn emit_list_slice(&mut self, start: bool, stop: bool, origin: SliceOrigin, pc: u32) {
         let missing = i64::MIN;
         let stop_v = if stop {
             self.pop().0
@@ -1706,12 +1776,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         };
         let (pin, lane) = self.pop();
         // Spill shape at the erased BUILD_SLICE: [.., list, start,
-        // stop, step=None], `None` bounds as object-lane `-1`. The
+        // stop, optional step=None], `None` bounds as object-lane `-1`. The
         // folded `LOAD_CONST slice(...)` shape deopts at the
         // `LOAD_CONST` with just [.., list].
         let mut snapshot = self.vstack.clone();
         snapshot.push((pin, lane));
-        if !konst {
+        if origin != SliceOrigin::Constant {
             let none = self.b.ins().iconst(types::I64, -1);
             snapshot.push(if start {
                 (start_v, JitType::Int)
@@ -1723,17 +1793,29 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             } else {
                 (none, JitType::Obj)
             });
-            snapshot.push((none, JitType::Obj));
+            if origin == SliceOrigin::ThreeBounds {
+                snapshot.push((none, JitType::Obj));
+            }
         }
+        // A real minimum-integer stop clamps to zero for every valid
+        // Rust slice length. Keep it distinct from the helper's missing-
+        // bound sentinel, and retain stop_v unchanged in the deopt snapshot.
+        let stop_arg = if stop {
+            let minimum = self.b.ins().icmp_imm(IntCC::Equal, stop_v, i64::MIN);
+            let zero = self.b.ins().iconst(types::I64, 0);
+            self.b.ins().select(minimum, zero, stop_v)
+        } else {
+            stop_v
+        };
         let sig = self.quad_helper_sig();
         let helper = self
             .b
             .ins()
             .iconst(self.ptr_ty, runtime::list_slice_helper_addr() as i64);
-        let call = self
-            .b
-            .ins()
-            .call_indirect(sig, helper, &[self.frame_ptr, pin, start_v, stop_v]);
+        let call =
+            self.b
+                .ins()
+                .call_indirect(sig, helper, &[self.frame_ptr, pin, start_v, stop_arg]);
         let res = self.b.inst_results(call)[0];
         let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
         let cont = self.guard(bad, pc, &snapshot);
@@ -2290,19 +2372,22 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     }
 
     /// RFC 0065 WS5 — pinned-list append via `wpjit_list_append`. The
-    /// value is staged through `ret_bits` (same trick as `ListSet`);
-    /// the analyzer guaranteed its lane matches the pinned element
-    /// lane. A non-zero status (defensive) deopts at the `CALL` pc,
+    /// value is staged through `ret_bits` and `ret_tag`, allowing a
+    /// generic list to box native scalars. A non-zero status deopts at the `CALL` pc,
     /// where the enclosing method span rebuilds the receiver as the
     /// bound `list.append` and the interpreter re-executes the call.
     fn emit_list_append(&mut self, pc: u32) {
         let trusted = MemFlags::trusted();
         let snapshot = self.vstack.clone();
-        let (val, _) = self.pop();
+        let (val, ty) = self.pop();
         let (pin, _) = self.pop();
         self.b
             .ins()
             .store(trusted, val, self.frame_ptr, OFF_RET_BITS);
+        let tag = self.b.ins().iconst(types::I32, Self::tag(ty));
+        self.b
+            .ins()
+            .store(trusted, tag, self.frame_ptr, OFF_RET_TAG);
         let sig = self.pin_helper_sig();
         let helper = self
             .b
@@ -2327,11 +2412,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     fn emit_list_append_keep(&mut self, pc: u32) {
         let trusted = MemFlags::trusted();
         let snapshot = self.vstack.clone();
-        let (val, _) = self.pop();
+        let (val, ty) = self.pop();
         let &(pin, _) = self.vstack.last().expect("comp append on empty stack");
         self.b
             .ins()
             .store(trusted, val, self.frame_ptr, OFF_RET_BITS);
+        let tag = self.b.ins().iconst(types::I32, Self::tag(ty));
+        self.b
+            .ins()
+            .store(trusted, tag, self.frame_ptr, OFF_RET_TAG);
         let sig = self.pin_helper_sig();
         let helper = self
             .b
@@ -2830,7 +2919,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let (a, _) = self.pop();
         let z = self.b.ins().iconst(types::I64, 0);
         let is_zero = self.b.ins().icmp(IntCC::Equal, b, z);
-        let cont = self.guard(is_zero, pc, &snapshot);
+        // Converting an inexact integer operand to f64 before division
+        // can round the final quotient incorrectly. Match the interpreter's
+        // exact range and let its integer-division path handle larger values.
+        // Wrapping addition maps [-EXACT, EXACT] to [0, 2 * EXACT]; every
+        // other i64 maps outside that unsigned interval, including MIN.
+        const EXACT: i64 = 1 << 53;
+        let a_offset = self.b.ins().iadd_imm(a, EXACT);
+        let b_offset = self.b.ins().iadd_imm(b, EXACT);
+        let a_large = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThan, a_offset, 2 * EXACT);
+        let b_large = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThan, b_offset, 2 * EXACT);
+        let large = self.b.ins().bor(a_large, b_large);
+        let invalid = self.b.ins().bor(is_zero, large);
+        let cont = self.guard(invalid, pc, &snapshot);
         self.b.switch_to_block(cont);
         let af = self.b.ins().fcvt_from_sint(types::F64, a);
         let bf = self.b.ins().fcvt_from_sint(types::F64, b);

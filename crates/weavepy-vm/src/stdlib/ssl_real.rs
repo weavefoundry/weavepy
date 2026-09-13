@@ -2934,7 +2934,7 @@ fn transcript_events(stream: &[u8], direction: &str, version: i64, out: &mut Vec
             20 => {
                 // change_cipher_spec: CPython reports the pseudo message type
                 // 0x0101 (_TLSMessageType.CHANGE_CIPHER_SPEC).
-                out.push(Object::new_tuple(vec![
+                out.push(Object::new_tuple_array([
                     Object::from_str(direction),
                     Object::Int(version),
                     Object::Int(20),
@@ -2952,7 +2952,7 @@ fn transcript_events(stream: &[u8], direction: &str, version: i64, out: &mut Vec
                         | usize::from(body[j + 2]) << 8
                         | usize::from(body[j + 3]);
                     let mend = (j + 4 + mlen).min(body.len());
-                    out.push(Object::new_tuple(vec![
+                    out.push(Object::new_tuple_array([
                         Object::from_str(direction),
                         Object::Int(version),
                         Object::Int(22),
@@ -3363,7 +3363,7 @@ fn x509_name_tuple(name: &x509_parser::x509::X509Name<'_>) -> Object {
                         // for unprintable data.
                         hex_upper(atv.attr_value().data)
                     });
-                    Object::new_tuple(vec![Object::from_str(&key), Object::from_str(&val)])
+                    Object::new_tuple_array([Object::from_str(&key), Object::from_str(&val)])
                 })
                 .collect();
             Object::new_tuple(pairs)
@@ -3483,7 +3483,7 @@ fn decode_cert_dict(der: &[u8]) -> Result<Object, RuntimeError> {
                 .iter()
                 .filter_map(|gn| {
                     general_name_pair(gn)
-                        .map(|(k, v)| Object::new_tuple(vec![Object::from_str(&k), v]))
+                        .map(|(k, v)| Object::new_tuple_array([Object::from_str(&k), v]))
                 })
                 .collect();
             if !names.is_empty() {
@@ -3548,7 +3548,7 @@ fn ns_decode_cert(args: &[Object]) -> Result<Object, RuntimeError> {
 fn ns_cipher(args: &[Object]) -> Result<Object, RuntimeError> {
     let id = arg_int(args, 0, "session")?;
     match cipher_info(id) {
-        Some((proto, name, bits)) => Ok(Object::new_tuple(vec![
+        Some((proto, name, bits)) => Ok(Object::new_tuple_array([
             Object::from_str(name),
             Object::from_str(proto),
             Object::Int(i64::from(bits)),
@@ -3980,7 +3980,7 @@ fn ns_bio_cipher(args: &[Object]) -> Result<Object, RuntimeError> {
         Some((tls_version_str(v), cipher_name(cs.suite())))
     });
     match info {
-        Some((proto, name)) => Ok(Object::new_tuple(vec![
+        Some((proto, name)) => Ok(Object::new_tuple_array([
             Object::from_str(name),
             Object::from_str(proto),
             Object::Int(256),
@@ -4326,7 +4326,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("OPENSSL_VERSION_INFO")),
-            Object::new_tuple(vec![
+            Object::new_tuple_array([
                 Object::Int(3),
                 Object::Int(0),
                 Object::Int(0),

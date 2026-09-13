@@ -142,7 +142,7 @@ fn disk_usage(args: &[Object]) -> Result<Object, RuntimeError> {
     // (Windows). We approximate as a triple of (total, used, free)
     // all set to a sentinel. This is good enough for code that only
     // checks "is there space free at all" via `free > 0`.
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(0),
         Object::Int(0),
         Object::Int(0),
@@ -192,7 +192,7 @@ fn get_terminal_size(_args: &[Object]) -> Result<Object, RuntimeError> {
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(24);
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(cols),
         Object::Int(rows),
     ]))

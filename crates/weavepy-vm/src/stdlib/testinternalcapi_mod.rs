@@ -14,6 +14,7 @@
 //!   tracked faithfully via [`PyInstance::inline_values`] plus a
 //!   capacity check mirroring CPython's shared-keys limit (30).
 
+use crate::shared_value::SharedSlice;
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
@@ -652,19 +653,19 @@ fn set_next_entry_fixture(args: &[Object]) -> Result<Object, RuntimeError> {
         return Ok(Object::None);
     };
     let hash = crate::builtins::hash_object(&item)?;
-    Ok(Object::Tuple(Rc::from(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(1),
         Object::Int(pos + 1),
         hash,
         item,
-    ])))
+    ]))
 }
 
 /// RFC 0068 WS3 — the in-place half of `PyTuple_SET_ITEM`
 /// (test_capi.test_tuple `test_tuple_set_item`, the tuple-*subclass*
 /// leg): CPython writes straight into the object struct's item array,
 /// preserving instance identity. WeavePy's tuple payload is an
-/// immutable `Rc<[Object]>` held in the instance's `native` slot, so
+/// immutable tuple storage held in the instance's `native` slot, so
 /// we rebuild the payload and swap the slot in place.
 fn tuple_subclass_set_item(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst_obj = args
@@ -693,7 +694,7 @@ fn tuple_subclass_set_item(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let mut payload = items.to_vec();
     payload[idx as usize] = value;
-    let replacement = Object::Tuple(Rc::from(payload));
+    let replacement = Object::new_tuple(payload);
     // SAFETY: the GIL keeps this thread's access exclusive, and no
     // borrow of the `native` slot outlives a single VM operation — the
     // readers (`native.get()`) all clone the payload out. Swapping the
@@ -1053,7 +1054,7 @@ fn end_spawned_pthread(_args: &[Object]) -> Result<Object, RuntimeError> {
 /// treats as "version tag reset to 0" (test_type_cache).
 fn type_attr_version(args: &[Object]) -> Result<Object, RuntimeError> {
     match args.first() {
-        Some(Object::Type(t)) => Ok(Object::Int(i64::from(t.attr_version.get()))),
+        Some(Object::Type(t)) => Ok(Object::int_from_i128(i128::from(t.attr_version.get()))),
         _ => Err(crate::error::type_error("argument must be a type")),
     }
 }
@@ -1251,7 +1252,7 @@ fn has_inline_values(args: &[Object]) -> Result<Object, RuntimeError> {
             inst.cls().has_managed_dict()
                 && !inst.cls().has_var_sized_base()
                 && inst.inline_values.get()
-                && inst.dict.borrow().len() <= INLINE_CAPACITY
+                && inst.dict.get().map_or(0, |dict| dict.borrow().len()) <= INLINE_CAPACITY
         }
         _ => false,
     };
@@ -1287,7 +1288,7 @@ fn run_in_subinterp_with_config(args: &[Object]) -> Result<Object, RuntimeError>
         .ok_or_else(|| crate::error::type_error("run_in_subinterp_with_config: missing config"))?;
     let cfg_dict = match &config {
         Object::SimpleNamespace(d) => d.clone(),
-        Object::Instance(inst) => inst.dict.clone(),
+        Object::Instance(inst) => inst.dict.share(),
         other => {
             return Err(crate::error::type_error(format!(
                 "run_in_subinterp_with_config: config must be a namespace, not '{}'",
@@ -1571,7 +1572,7 @@ fn create_interpreter_fixture(
         Some(cfg_obj) => {
             let cfg_dict = match cfg_obj {
                 Object::SimpleNamespace(d) => d.clone(),
-                Object::Instance(inst) => inst.dict.clone(),
+                Object::Instance(inst) => inst.dict.share(),
                 other => {
                     return Err(crate::error::type_error(format!(
                         "create_interpreter: config must be a namespace, not '{}'",
@@ -1722,7 +1723,7 @@ fn encode_locale_ex(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     locale_check_handler(&errors)?;
     match crate::stdlib::codecs_engine::utf8_encode(&cps, &errors) {
-        Ok(b) => Ok(Object::Bytes(Rc::from(b.into_boxed_slice()))),
+        Ok(b) => Ok(Object::Bytes(SharedSlice::from(b.into_boxed_slice()))),
         Err(e) => {
             let pos = match exc_attr(&e, "start") {
                 Some(Object::Int(i)) => i,
@@ -2766,7 +2767,7 @@ fn pytime_as_timeval(args: &[Object]) -> Result<Object, RuntimeError> {
     let t = pytime_t_arg(args.first())?;
     let round = pytime_round_arg(args.get(1))?;
     let us = pytime_divide(t, 1_000, round);
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(us.div_euclid(1_000_000)),
         Object::Int(us.rem_euclid(1_000_000)),
     ]))
@@ -2851,12 +2852,12 @@ fn pytime_object_to_denominator(args: &[Object], denominator: i64) -> Result<Obj
                 intpart -= 1.0;
             }
             let sec = double_to_time_t(intpart)?;
-            Ok(Object::new_tuple(vec![
+            Ok(Object::new_tuple_array([
                 Object::Int(sec),
                 Object::Int(floatpart as i64),
             ]))
         }
-        other => Ok(Object::new_tuple(vec![
+        other => Ok(Object::new_tuple_array([
             Object::Int(long_as_time_t(other)?),
             Object::Int(0),
         ])),

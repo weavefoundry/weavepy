@@ -105,9 +105,18 @@ pub struct CompiledFrame {
     /// The function's own stable scalar return lane, when every return
     /// site agrees (feeds callers' `PyFunc` classification).
     pub ret_lane: Option<JitType>,
+    scalar_leaf: bool,
 }
 
 impl CompiledFrame {
+    /// Whether this frame has one bounded block of pure scalar operations.
+    /// It cannot call helpers, access pins or namespaces, or run a poll. Its
+    /// only exits are a scalar return or a side-effect-free numeric deopt.
+    #[must_use]
+    pub fn is_scalar_leaf(&self) -> bool {
+        self.scalar_leaf
+    }
+
     /// Enter the compiled frame.
     ///
     /// # Safety
@@ -230,6 +239,38 @@ impl JitEngine {
 
     /// Compile an already-analyzed [`TFunc`] (also the unit-test entry).
     pub fn compile_tfunc(&mut self, tfunc: &TFunc) -> Result<CompiledFrame, JitVerdict> {
+        // These operations each lower to a dedicated embedder helper.
+        // Reject missing registrations before embedding an absolute address.
+        for stmt in tfunc.blocks.iter().flat_map(|block| &block.stmts) {
+            let required = match stmt.op {
+                TOp::PushConstStr { .. } => Some((
+                    runtime::const_str_helper_addr(),
+                    "str constant (no helper registered)",
+                )),
+                TOp::PushConstTuple { .. } => Some((
+                    runtime::const_tuple_helper_addr(),
+                    "tuple constant (no helper registered)",
+                )),
+                TOp::TupleLen => Some((
+                    runtime::tuple_len_helper_addr(),
+                    "tuple length (no helper registered)",
+                )),
+                TOp::UnboxInt { .. } => Some((
+                    runtime::unbox_int_helper_addr(),
+                    "integer guard (no helper registered)",
+                )),
+                TOp::CallDyn {
+                    int_result: true, ..
+                } => Some((
+                    runtime::call_dyn_int_helper_addr(),
+                    "integer call (no helper registered)",
+                )),
+                _ => None,
+            };
+            if let Some((0, reason)) = required {
+                return Err(JitVerdict::UnsupportedOpcode(reason));
+            }
+        }
         // A frame with native Python-to-Python calls needs the embedder's
         // call helper burned in (RFC 0059 WS3).
         if !tfunc.callee_spans.is_empty() && runtime::call_py_helper_addr() == 0 {
@@ -400,6 +441,82 @@ impl JitEngine {
             max_call_args: tfunc.max_call_args,
             ret_lane: tfunc.ret_lane,
             ret_none: tfunc.ret_none,
+            scalar_leaf: is_scalar_leaf(tfunc),
         })
     }
 }
+
+fn is_scalar_leaf(tfunc: &TFunc) -> bool {
+    let [block] = tfunc.blocks.as_slice() else {
+        return false;
+    };
+    tfunc.entry_block == 0
+        && block.entry_stack.is_empty()
+        && block.stmts.len() <= 64
+        && matches!(block.term, crate::ir::TTerm::Return)
+        && matches!(tfunc.ret_lane, Some(JitType::Int | JitType::Bool | JitType::Float))
+        && !tfunc.ret_none
+        && tfunc.local_types.iter().all(|ty| {
+            matches!(ty, None | Some(JitType::Int | JitType::Bool | JitType::Float))
+        })
+        && tfunc.global_guards.is_empty()
+        && tfunc.range_loops.is_empty()
+        && tfunc.list_loops.is_empty()
+        && tfunc.iter_loops.is_empty()
+        && tfunc.comp_saved.is_empty()
+        && tfunc.resume_entries.is_empty()
+        && tfunc.callee_spans.is_empty()
+        && tfunc.len_spans.is_empty()
+        && tfunc.method_spans.is_empty()
+        && tfunc.attr_sites.is_empty()
+        && tfunc.method_sites.is_empty()
+        && tfunc.str_method_sites.is_empty()
+        && tfunc.str_method_spans.is_empty()
+        && tfunc.math_guards.is_empty()
+        && tfunc.math_spans.is_empty()
+        && tfunc.null_spans.is_empty()
+        && tfunc.osr_entries.is_empty()
+        && tfunc.max_call_args == 0
+        // Keep an explicit allowlist: new operations must never silently
+        // acquire permission to execute without an embedder context.
+        && block.stmts.iter().all(|stmt| {
+            matches!(
+                stmt.op,
+                TOp::PushConstInt(_)
+                    | TOp::PushConstFloat(_)
+                    | TOp::PushConstBool(_)
+                    | TOp::LoadLocal(_)
+                    | TOp::StoreLocal(_)
+                    | TOp::IntArith(
+                        ArithKind::Add
+                            | ArithKind::Sub
+                            | ArithKind::Mul
+                            | ArithKind::FloorDiv
+                            | ArithKind::Mod
+                            | ArithKind::And
+                            | ArithKind::Or
+                            | ArithKind::Xor
+                            | ArithKind::TrueDiv
+                    )
+                    | TOp::FloatArith(
+                        ArithKind::Add | ArithKind::Sub | ArithKind::Mul | ArithKind::TrueDiv
+                    )
+                    | TOp::IntTrueDiv
+                    | TOp::IntCmp(_)
+                    | TOp::FloatCmp(_)
+                    | TOp::IntNeg
+                    | TOp::FloatNeg
+                    | TOp::IntInvert
+                    | TOp::IntNot
+                    | TOp::FloatNot
+                    | TOp::Pop
+                    | TOp::Dup { .. }
+                    | TOp::Swap2
+                    | TOp::IntToFloatTos { .. }
+                    | TOp::IntToFloatSecond { .. }
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests;

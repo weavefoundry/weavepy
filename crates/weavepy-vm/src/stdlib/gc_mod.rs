@@ -150,7 +150,7 @@ fn collect(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn get_count(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(0),
         Object::Int(0),
         Object::Int(0),
@@ -160,7 +160,7 @@ fn get_count(_args: &[Object]) -> Result<Object, RuntimeError> {
 fn get_threshold(_args: &[Object]) -> Result<Object, RuntimeError> {
     GC_THRESHOLD.with(|t| {
         let (a, b, c) = *t.borrow();
-        Ok(Object::new_tuple(vec![
+        Ok(Object::new_tuple_array([
             Object::Int(a),
             Object::Int(b),
             Object::Int(c),

@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::ptr;
+use weavepy_vm::shared_value::SharedStr;
 
 use weavepy_vm::object::{Object, PyCapsuleSoul};
 use weavepy_vm::sync::Rc;
@@ -225,7 +226,7 @@ pub unsafe fn capsule_soul(p: *mut PyObject) -> Object {
                 .ok()
                 .map(|c| c.to_string_lossy().into_owned())
                 .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
-            weavepy_vm::sync::Rc::<str>::from(text.as_str())
+            SharedStr::from(text.as_str())
         })
     });
     let before = refcnt_of(p);

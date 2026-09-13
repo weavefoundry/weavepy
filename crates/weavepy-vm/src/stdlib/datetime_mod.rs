@@ -112,7 +112,7 @@ fn now_components(_args: &[Object]) -> Result<Object, RuntimeError> {
     let offset_seconds = local_offset_secs(secs);
     let local = secs + offset_seconds;
     let (year, month, day, hour, minute, second) = utc_to_components(local);
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(year),
         Object::Int(month),
         Object::Int(day),
@@ -131,7 +131,7 @@ fn utc_components(_args: &[Object]) -> Result<Object, RuntimeError> {
     let secs = now.as_secs() as i64;
     let micros = i64::from(now.subsec_micros());
     let (year, month, day, hour, minute, second) = utc_to_components(secs);
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(year),
         Object::Int(month),
         Object::Int(day),
@@ -162,7 +162,7 @@ fn from_timestamp(args: &[Object]) -> Result<Object, RuntimeError> {
     let offset = if utc { 0 } else { local_offset_secs(secs) };
     let local_secs = secs + offset;
     let (year, month, day, hour, minute, second) = utc_to_components(local_secs);
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(year),
         Object::Int(month),
         Object::Int(day),
@@ -209,7 +209,7 @@ fn days_to_ordinal_py(args: &[Object]) -> Result<Object, RuntimeError> {
 fn ordinal_to_components_py(args: &[Object]) -> Result<Object, RuntimeError> {
     let ordinal = arg_int(args, 0)?;
     let (y, m, d) = ordinal_to_ymd(ordinal);
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(y),
         Object::Int(i64::from(m)),
         Object::Int(i64::from(d)),
@@ -231,7 +231,7 @@ fn iso_calendar_py(args: &[Object]) -> Result<Object, RuntimeError> {
     let m = arg_int(args, 1)?;
     let d = arg_int(args, 2)?;
     let (iy, iw, iwd) = iso_calendar(y, m, d);
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::Int(iy),
         Object::Int(iw),
         Object::Int(iwd),

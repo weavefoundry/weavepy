@@ -447,7 +447,7 @@ pub unsafe extern "C" fn PyObject_GenericGetDict(
     let obj = unsafe { crate::object::clone_object(o) };
     let dict = match &obj {
         Object::Module(m) => m.dict.clone(),
-        Object::Instance(inst) => inst.dict.clone(),
+        Object::Instance(inst) => inst.dict.share(),
         Object::Type(t) => t.dict.clone(),
         _ => {
             crate::errors::set_attribute_error("object has no __dict__");

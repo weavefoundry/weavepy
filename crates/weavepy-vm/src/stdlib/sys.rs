@@ -8,6 +8,7 @@
 //! `sys.stderr`) is deferred to RFC 0014, when we land the `io`
 //! module and Python file objects.
 
+use crate::shared_value::SharedStr;
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
@@ -636,7 +637,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // and its test suite read the attribute unconditionally).
         d.insert(
             DictKey(Object::from_static("_git")),
-            Object::new_tuple(vec![
+            Object::new_tuple_array([
                 Object::from_static("WeavePy"),
                 Object::from_static(""),
                 Object::from_static(""),
@@ -1416,8 +1417,8 @@ fn sys_setrecursionlimit(args: &[Object]) -> Result<Object, RuntimeError> {
 // (pickle's `load_build` inserts `sys.intern(k)` keys —
 // test_pickle test_attribute_name_interning).
 thread_local! {
-    static INTERN_POOL: RefCell<std::collections::HashMap<String, Object>> =
-        RefCell::new(std::collections::HashMap::new());
+    static INTERN_POOL: RefCell<std::collections::HashSet<SharedStr>> =
+        RefCell::new(std::collections::HashSet::new());
 }
 
 /// Canonicalize `name` through the interpreter's intern pool, seeding it
@@ -1426,11 +1427,14 @@ pub(crate) fn intern_name(name: &str) -> Object {
     INTERN_POOL.with(|pool| {
         let mut map = pool.borrow_mut();
         if let Some(existing) = map.get(name) {
-            existing.clone()
+            Object::Str(existing.clone())
         } else {
-            let obj = Object::from_str(name);
-            map.insert(name.to_owned(), obj.clone());
-            obj
+            // Preserve the ordinary constructor's empty/character identities.
+            let Object::Str(text) = Object::from_str(name) else {
+                unreachable!("UTF-8 names use ordinary string storage");
+            };
+            map.insert(text.clone());
+            Object::Str(text)
         }
     })
 }
@@ -1453,11 +1457,11 @@ pub(crate) fn cpython_interns_constant(s: &str) -> bool {
 /// writes such strings with the `*_INTERNED` type codes so a round-trip
 /// preserves the interned identity (RFC 0060, test_marshal.testIntern).
 pub(crate) fn str_is_interned(o: &Object) -> bool {
-    let Object::Str(_) = o else { return false };
+    let Object::Str(text) = o else { return false };
     INTERN_POOL.with(|pool| {
         pool.borrow()
-            .get(&o.to_str())
-            .is_some_and(|pooled| pooled.is_same(o))
+            .get(text.as_ref())
+            .is_some_and(|pooled| SharedStr::ptr_eq(pooled, text))
     })
 }
 
@@ -1500,13 +1504,12 @@ fn sys_clear_type_descriptors(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn sys_intern(args: &[Object]) -> Result<Object, RuntimeError> {
     match args.first() {
-        Some(s @ Object::Str(_)) => INTERN_POOL.with(|pool| {
-            let key = s.to_str();
+        Some(s @ Object::Str(text)) => INTERN_POOL.with(|pool| {
             let mut map = pool.borrow_mut();
-            if let Some(existing) = map.get(&key) {
-                Ok(existing.clone())
+            if let Some(existing) = map.get(text.as_ref()) {
+                Ok(Object::Str(existing.clone()))
             } else {
-                map.insert(key, s.clone());
+                map.insert(text.clone());
                 Ok(s.clone())
             }
         }),
@@ -1651,9 +1654,9 @@ fn sys_exc_info(
             Object::Instance(i) => i.slot_get("__traceback__").unwrap_or(Object::None),
             _ => Object::None,
         };
-        Ok(Object::new_tuple(vec![type_obj, inst, tb]))
+        Ok(Object::new_tuple_array([type_obj, inst, tb]))
     } else {
-        Ok(Object::new_tuple(vec![
+        Ok(Object::new_tuple_array([
             Object::None,
             Object::None,
             Object::None,
@@ -2132,7 +2135,7 @@ fn sys_getwindowsversion(_args: &[Object]) -> Result<Object, RuntimeError> {
         );
         d.insert(
             DictKey(Object::from_static("platform_version")),
-            Object::new_tuple(vec![
+            Object::new_tuple_array([
                 Object::Int(i64::from(info.dwMajorVersion)),
                 Object::Int(i64::from(info.dwMinorVersion)),
                 Object::Int(i64::from(info.dwBuildNumber)),

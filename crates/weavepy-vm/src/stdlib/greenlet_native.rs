@@ -684,7 +684,7 @@ fn normalize_switch_value(args: Vec<Object>, kwargs: Vec<(String, Object)>) -> O
     } else if args.is_empty() {
         kwdict(kwargs)
     } else {
-        Object::new_tuple(vec![Object::new_tuple(args), kwdict(kwargs)])
+        Object::new_tuple_array([Object::new_tuple(args), kwdict(kwargs)])
     }
 }
 

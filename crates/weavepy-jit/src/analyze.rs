@@ -28,8 +28,8 @@ use weavepy_compiler::{
 use crate::ir::{
     ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, CompSavedMeta, CtorFieldSrc,
     GlobalGuard, IterLoopMeta, ListLoopMeta, MathFunc, MathGuardMeta, MethodRet, MethodSiteMeta,
-    MethodSpanMeta, OsrEntry, RangeLoopMeta, ResolvedGlobal, StrMethod, TBlock, TFunc, TOp, TStmt,
-    TTerm,
+    MethodSpanMeta, OsrEntry, RangeLoopMeta, ResolvedGlobal, SliceOrigin, StrMethod, TBlock, TFunc,
+    TOp, TStmt, TTerm,
 };
 use crate::value::JitType;
 
@@ -371,7 +371,7 @@ enum PairSrc {
     /// `<local>.items()` — key/value lanes from the dict probe.
     DictItems(u32),
     /// `enumerate(<local>)` over a certified canonical `enumerate` —
-    /// `Int` index, element lane from the list probe.
+    /// `Int` index, element lane from a list or exact-bytes source.
     Enumerate(u32),
 }
 
@@ -917,6 +917,28 @@ fn analyze_once(
     let mut comp_saved: Vec<CompSavedMeta> = out.comp_saved.values().copied().collect();
     comp_saved.sort_unstable_by_key(|s| s.live_from);
 
+    // An admitted explicit error exit has no pending call markers: emission
+    // requires every operand to be a plain value (or materialized None).
+    // Conditional expressions can duplicate a consuming CALL across arms,
+    // leaving one arm's lexical span overlapping the other's raise. Exclude
+    // these known marker-free exits without changing reconstruction at the
+    // calls themselves or erasing enclosing loop iterators.
+    for block in &blocks {
+        if let TTerm::Deopt { pc } = block.term {
+            for spans in [
+                &mut out.callee_spans,
+                &mut out.len_spans,
+                &mut out.math_spans,
+                &mut out.null_spans,
+            ] {
+                exclude_span_pc(spans, pc, |s| (&mut s.live_from, &mut s.live_to));
+            }
+            for spans in [&mut out.method_spans, &mut out.str_method_spans] {
+                exclude_span_pc(spans, pc, |s| (&mut s.live_from, &mut s.live_to));
+            }
+        }
+    }
+
     Ok(TFunc {
         n_locals,
         local_types,
@@ -945,6 +967,39 @@ fn analyze_once(
         ret_lane: ret_lane.filter(|t| t.is_representable()),
         ret_none,
     })
+}
+
+/// Remove one proven inactive PC from open reconstruction intervals.
+fn exclude_span_pc<T: Copy + PartialEq>(
+    spans: &mut Vec<T>,
+    pc: u32,
+    bounds: fn(&mut T) -> (&mut u32, &mut u32),
+) {
+    for index in 0..spans.len() {
+        let mut span = spans[index];
+        let (from, to) = bounds(&mut span);
+        if *from < pc && pc < *to {
+            let original_end = *to;
+            *to = pc;
+            spans[index] = span;
+            let (from, to) = bounds(&mut span);
+            *from = pc;
+            *to = original_end;
+            spans.push(span);
+        }
+    }
+    // Splitting two arms can produce identical intervals for their shared
+    // argument prefix. The interpreter has only one marker at that depth.
+    let mut index = 0;
+    while index < spans.len() {
+        let mut span = spans[index];
+        let (from, to) = bounds(&mut span);
+        if to.saturating_sub(*from) <= 1 || spans[..index].contains(&span) {
+            spans.remove(index);
+        } else {
+            index += 1;
+        }
+    }
 }
 
 /// RFC 0069 WS1 — the function's return typing accumulated across
@@ -1737,6 +1792,19 @@ pub fn returns_self_syntactically(code: &CodeObject) -> bool {
     true
 }
 
+/// The interpreter materializes canonical exception classes at these exits.
+/// Other common constants retain their existing analysis and fallback behavior.
+fn common_error_constant(ins: weavepy_compiler::Instruction) -> bool {
+    use weavepy_compiler::bytecode::{
+        COMMON_CONSTANT_ASSERTION_ERROR, COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR,
+    };
+    ins.op == OpCode::LoadCommonConstant
+        && matches!(
+            ins.arg,
+            COMMON_CONSTANT_ASSERTION_ERROR | COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR
+        )
+}
+
 /// Build the basic blocks, resolving relative jumps to absolute indices.
 fn build_blocks(code: &CodeObject) -> Result<Vec<RawBlock>, JitVerdict> {
     let n = code.instructions.len();
@@ -1786,7 +1854,10 @@ fn build_blocks(code: &CodeObject) -> Result<Vec<RawBlock>, JitVerdict> {
                     leaders.insert(i + 1);
                 }
             }
-            OpCode::ReturnValue if i + 1 < n => {
+            OpCode::ReturnValue | OpCode::RaiseVarargs if i + 1 < n => {
+                leaders.insert(i + 1);
+            }
+            OpCode::LoadCommonConstant if common_error_constant(*ins) && i + 1 < n => {
                 leaders.insert(i + 1);
             }
             // RFC 0070 WS2 — a yield ends its block (the suspension
@@ -1812,7 +1883,8 @@ fn build_blocks(code: &CodeObject) -> Result<Vec<RawBlock>, JitVerdict> {
         let last = end - 1;
         let ins = code.instructions[last];
         let succs = match ins.op {
-            OpCode::ReturnValue => Vec::new(),
+            OpCode::ReturnValue | OpCode::RaiseVarargs => Vec::new(),
+            OpCode::LoadCommonConstant if common_error_constant(ins) => Vec::new(),
             // RFC 0070 WS2 — control leaves native code at a yield.
             // RFC 0071 WS5 — the continuation block is still a
             // *dataflow* successor (the yielded value replaced by the
@@ -1951,7 +2023,9 @@ fn entry_unassigned_reads(blocks: &[TBlock], entry: BlockId) -> Vec<u32> {
                 Some((body, [Some(var1_slot), Some(var2_slot)])),
                 Some((exit, [None, None])),
             ],
-            TTerm::Return | TTerm::ReturnNone | TTerm::Yield { .. } => [None, None],
+            TTerm::Return | TTerm::ReturnNone | TTerm::Yield { .. } | TTerm::Deopt { .. } => {
+                [None, None]
+            }
         };
         for (t, extra) in succs.into_iter().flatten() {
             let mut out = cur.clone();
@@ -2000,7 +2074,9 @@ fn has_native_cycle(blocks: &[TBlock]) -> bool {
             | TTerm::ForList { body, exit, .. }
             | TTerm::ForIter { body, exit, .. }
             | TTerm::ForIterPair { body, exit, .. } => [Some(*body), Some(*exit)],
-            TTerm::Return | TTerm::ReturnNone | TTerm::Yield { .. } => [None, None],
+            TTerm::Return | TTerm::ReturnNone | TTerm::Yield { .. } | TTerm::Deopt { .. } => {
+                [None, None]
+            }
         }
     }
     // 0 = unvisited, 1 = on the DFS stack, 2 = done.
@@ -2635,6 +2711,30 @@ fn infer_block(
             }
             Vec::new()
         }
+        OpCode::RaiseVarargs | OpCode::LoadCommonConstant
+            if ins.op == OpCode::RaiseVarargs || common_error_constant(ins) =>
+        {
+            if ins.op == OpCode::RaiseVarargs {
+                if ins.arg > 2 {
+                    return Err(JitVerdict::UnsupportedOpcode("RAISE_VARARGS (arity)"));
+                }
+                if stack.len() < ins.arg as usize {
+                    return Err(JitVerdict::StackUnderflow);
+                }
+            }
+            // No operand is consumed before the interpreter resumes. A top
+            // None (raise None, or raise exc from None) can be materialized;
+            // deeper None markers retain the existing interpreted path.
+            for (index, value) in stack.iter().enumerate() {
+                if value.none_const && index + 1 == stack.len() {
+                    continue;
+                }
+                if !value.is_plain() {
+                    return Err(escape_verdict(code, &[value], "error exit (operand shape)"));
+                }
+            }
+            Vec::new()
+        }
         OpCode::JumpForward | OpCode::JumpBackward => {
             vec![(b.succs[0], boundary_stack(stack)?)]
         }
@@ -3113,6 +3213,23 @@ fn step_abstract(
                                     };
                                     ctor.pair_lanes.insert(seq_slot, (JitType::Int, elem));
                                 }
+                            } else {
+                                // Retry with observed parameter lanes if the
+                                // unseeded pass has no source information.
+                                // Exact bytes always yield ints. The pair
+                                // helper still validates each consumed value
+                                // before storing it in an unboxed local.
+                                let source = match local_types.get(s as usize) {
+                                    Some(Some(source)) => *source,
+                                    _ => (probes.param)(s).ok_or(JitVerdict::TypeUnknown)?,
+                                };
+                                let elem = if source == JitType::Bytes {
+                                    set_local(local_types, s, JitType::Bytes, changed)?;
+                                    JitType::Int
+                                } else {
+                                    JitType::Obj
+                                };
+                                ctor.pair_lanes.insert(seq_slot, (JitType::Int, elem));
                             }
                         }
                     }
@@ -3299,7 +3416,13 @@ fn step_abstract(
                 });
                 return Ok(());
             }
-            let ty = const_type(c).ok_or(JitVerdict::UnsupportedConst)?;
+            let ty = if matches!(c, Constant::Tuple(_)) {
+                // A tuple constant is immutable and can share its code
+                // object's materialized value on the generic pin lane.
+                JitType::Obj
+            } else {
+                const_type(c).ok_or(JitVerdict::UnsupportedConst)?
+            };
             stack.push(SE::known(ty));
         }
         // CPython 3.14 LOAD_SMALL_INT: the constant rides in the oparg.
@@ -3829,7 +3952,10 @@ fn step_abstract(
                 // pinned `str`/`bytes`) → an `int`, no real call.
                 let arg = &args[0];
                 if arg.ty.is_list()
-                    || matches!(arg.ty, JitType::Str | JitType::Bytes | JitType::Dict)
+                    || matches!(
+                        arg.ty,
+                        JitType::Str | JitType::Bytes | JitType::Dict | JitType::Obj
+                    )
                 {
                     // fine
                 } else if !arg.ty.is_representable() {
@@ -3917,7 +4043,16 @@ fn step_abstract(
                 stack.push(SE::known(JitType::Obj));
                 return Ok(());
             };
-            resolve_kw_perm(&mark, &names, argc, probes.kw_slot)?;
+            match resolve_kw_perm(&mark, &names, argc, probes.kw_slot) {
+                Ok(_) => {}
+                Err(JitVerdict::UnsupportedOpcode("CALL_KW (keyword gap)")) => {
+                    // A positional prefix can't represent a skipped default.
+                    // Re-plan this global as a real object and let CallDyn
+                    // bind the original keyword names and current defaults.
+                    return Err(escape_verdict(code, &[&f], "CALL_KW (keyword gap)"));
+                }
+                Err(error) => return Err(error),
+            }
             let ret = if mark.is_self { ret_lane } else { mark.ret };
             stack.push(SE::known(ret.unwrap_or(JitType::Unknown)));
         }
@@ -4732,9 +4867,16 @@ fn infer_load_attr(
     Ok(())
 }
 
-/// RFC 0065 WS5 — infer one `list.append(v)` call: the value lane must
-/// match the pinned element lane exactly; an untyped receiver (empty
-/// list) is pinned *by* the value's lane.
+/// A generic list can box native scalars on append. Typed lists keep
+/// their exact element lane so later reads retain their existing guards.
+fn append_lane_matches(elem: JitType, value: JitType) -> bool {
+    elem == value
+        || (elem == JitType::Obj && matches!(value, JitType::Int | JitType::Float | JitType::Bool))
+}
+
+/// Infer one `list.append(v)` call. An untyped receiver (an empty
+/// parameter list) is pinned by the value's lane; a fresh generic list
+/// keeps its object element lane across scalar appends.
 fn infer_append(
     recv: &SE,
     val: &SE,
@@ -4743,7 +4885,7 @@ fn infer_append(
 ) -> Result<(), JitVerdict> {
     if let Some(elem) = recv.ty.elem_lane() {
         if val.ty.is_representable() {
-            if val.ty != elem {
+            if !append_lane_matches(elem, val.ty) {
                 return Err(JitVerdict::UnsupportedOpcode("append (value lane)"));
             }
         } else if let Some(vs) = val.src {
@@ -4816,6 +4958,15 @@ fn bin_result_type(kind: ArithKind, a: JitType, b: JitType) -> Result<JitType, J
     if !a.is_representable() || !b.is_representable() {
         return Ok(JitType::Unknown);
     }
+    if let Some(depth) = integer_operand_guard(a, b) {
+        // The generic operand must be an exact machine-sized integer.
+        // Emission guards it at BINARY_OP, after any producing call.
+        return bin_result_type(
+            kind,
+            if depth == 1 { JitType::Int } else { a },
+            if depth == 0 { JitType::Int } else { b },
+        );
+    }
     let a_int = a.is_integral();
     let b_int = b.is_integral();
     if a_int && b_int {
@@ -4869,6 +5020,19 @@ fn bin_result_type(kind: ArithKind, a: JitType, b: JitType) -> Result<JitType, J
         }
     } else {
         Err(JitVerdict::MixedArithTypes)
+    }
+}
+
+/// An integral peer provides a useful speculative lane for an opaque
+/// operand. Two opaque operands have no such evidence and stay generic.
+/// The depth is measured from TOS, so only 0 and 1 can be returned.
+fn integer_operand_guard(a: JitType, b: JitType) -> Option<u8> {
+    if a.is_integral() && b == JitType::Obj {
+        Some(0)
+    } else if a == JitType::Obj && b.is_integral() {
+        Some(1)
+    } else {
+        None
     }
 }
 
@@ -5400,6 +5564,22 @@ fn emit_block(
             }
             TTerm::Yield { pc: last as u32 }
         }
+        OpCode::RaiseVarargs | OpCode::LoadCommonConstant
+            if ins.op == OpCode::RaiseVarargs || common_error_constant(ins) =>
+        {
+            for (index, value) in stack.iter().enumerate() {
+                if value.none_const && index + 1 == stack.len() {
+                    stmts.push(TStmt {
+                        pc: last as u32,
+                        op: TOp::PushNone,
+                    });
+                } else if !value.is_plain() || !value.ty.is_representable() {
+                    return Err(JitVerdict::TypeUnknown);
+                }
+            }
+            out.max_stack = out.max_stack.max(stack.len() as u32);
+            TTerm::Deopt { pc: last as u32 }
+        }
         _ => {
             emit_instr(
                 code,
@@ -5718,6 +5898,7 @@ fn emit_instr(
                 // the memoizing helper (one pin per constant per
                 // activation).
                 Constant::Str(_) => (TOp::PushConstStr { idx: ins.arg }, JitType::Str),
+                Constant::Tuple(_) => (TOp::PushConstTuple { idx: ins.arg }, JitType::Obj),
                 _ => return Err(JitVerdict::UnsupportedConst),
             };
             push(op, Some(ty), stack, stmts);
@@ -5791,8 +5972,37 @@ fn emit_instr(
         }
         OpCode::BinaryOp => {
             let kind = bin_kind(ins.arg)?;
-            let b = pop_val(stack)?;
-            let a = pop_val(stack)?;
+            let mut b = pop_val(stack)?;
+            let mut a = pop_val(stack)?;
+            if let Some(depth) = integer_operand_guard(a, b) {
+                let fused = depth == 0
+                    && stmts.last_mut().is_some_and(|previous| {
+                        if previous.pc.checked_add(1) != Some(pc) {
+                            return false;
+                        }
+                        if let TOp::CallDyn { int_result, .. } = &mut previous.op {
+                            *int_result = true;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                // Re-model both original operands for the guard. A miss
+                // restores the boxed value at this BINARY_OP, never its
+                // producer, so calls and callbacks aren't repeated.
+                if !fused {
+                    stack.push(ESlot::val(a));
+                    stack.push(ESlot::val(b));
+                    push(TOp::UnboxInt { depth }, None, stack, stmts);
+                    stack.pop();
+                    stack.pop();
+                }
+                if depth == 0 {
+                    b = JitType::Int;
+                } else {
+                    a = JitType::Int;
+                }
+            }
             // RFC 0071 WS4 — `list * int` repeats the pinned list on
             // the same lane through `wpjit_list_repeat`.
             if matches!(kind, ArithKind::Mul) && a.is_list() {
@@ -6427,7 +6637,7 @@ fn emit_instr(
                 let elem =
                     f.ty.elem_lane()
                         .ok_or(JitVerdict::UnsupportedOpcode("append (receiver lane)"))?;
-                if arg_tys[0] != elem {
+                if !append_lane_matches(elem, arg_tys[0]) {
                     return Err(JitVerdict::UnsupportedOpcode("append (value lane)"));
                 }
                 // The receiver's bottom-based native-stack index equals
@@ -6443,7 +6653,7 @@ fn emit_instr(
                 // Re-model the operands for the statement, then emit:
                 // `ListAppend` pops the value and the pin natively.
                 stack.push(ESlot::val(f.ty));
-                stack.push(ESlot::val(elem));
+                stack.push(ESlot::val(arg_tys[0]));
                 push(TOp::ListAppend, None, stack, stmts);
                 stack.pop();
                 stack.pop();
@@ -6617,6 +6827,7 @@ fn emit_instr(
                         argc: argc as u8,
                         kwc: 0,
                         names: 0,
+                        int_result: false,
                     },
                     None,
                     stack,
@@ -6672,6 +6883,10 @@ fn emit_instr(
                 } else if arg_tys[0] == JitType::Dict {
                     // RFC 0073 WS2 — `len(d)` on a pinned exact dict.
                     TOp::DictLen
+                } else if arg_tys[0] == JitType::Obj {
+                    // The helper guards the exact tuple shape. Other
+                    // objects resume at CALL for ordinary __len__ dispatch.
+                    TOp::TupleLen
                 } else {
                     return Err(JitVerdict::UnsupportedOpcode("len (argument lane)"));
                 };
@@ -6795,6 +7010,7 @@ fn emit_instr(
                         argc: argc as u8,
                         kwc: kwc as u8,
                         names: cidx,
+                        int_result: false,
                     },
                     None,
                     stack,
@@ -7227,7 +7443,15 @@ fn emit_instr(
                     if i == 0 || code.instructions[i - 1].op != producer {
                         return Err(JitVerdict::UnsupportedOpcode("slice (non-adjacent)"));
                     }
-                    let konst = marker.const_slice;
+                    let origin = if marker.const_slice {
+                        SliceOrigin::Constant
+                    } else {
+                        match code.instructions[i - 1].arg {
+                            2 => SliceOrigin::TwoBounds,
+                            3 => SliceOrigin::ThreeBounds,
+                            _ => return Err(JitVerdict::UnsupportedOpcode("slice producer arity")),
+                        }
+                    };
                     stack.pop();
                     if has_stop {
                         pop_val(stack)?;
@@ -7245,7 +7469,7 @@ fn emit_instr(
                             op: TOp::StrSlice {
                                 start: has_start,
                                 stop: has_stop,
-                                konst,
+                                origin,
                             },
                         });
                         stack.push(ESlot::val(JitType::Str));
@@ -7260,7 +7484,7 @@ fn emit_instr(
                         op: TOp::ListSlice {
                             start: has_start,
                             stop: has_stop,
-                            konst,
+                            origin,
                         },
                     });
                     stack.push(ESlot::val(cont));

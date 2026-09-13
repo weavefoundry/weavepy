@@ -29,6 +29,7 @@
 //! - `source_hash(source_bytes)` — siphash13-derived 8-byte
 //!   digest (matches `importlib.util.source_hash`).
 
+use crate::shared_value::SharedSlice;
 use std::path::PathBuf;
 
 use crate::sync::Rc;
@@ -835,7 +836,7 @@ fn imp_find_frozen(args: &[Object]) -> Result<Object, RuntimeError> {
             None => Object::from_str(n),
         },
     };
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::from_static(frozen.source),
         Object::Bool(frozen.is_package),
         origname,
@@ -876,7 +877,9 @@ fn imp_get_magic(_args: &[Object]) -> Result<Object, RuntimeError> {
     // *cache tag* (`weavepy-314`) so its `.pyc` files never collide
     // with CPython's `cpython-314` artifacts, which lets us adopt the
     // real magic number for tool interop without ambiguity.
-    Ok(Object::Bytes(Rc::from(crate::pycache::MAGIC.as_slice())))
+    Ok(Object::Bytes(SharedSlice::from(
+        crate::pycache::MAGIC.as_slice(),
+    )))
 }
 
 /// `_imp.pyc_magic_number_token`: 3.14 moved the magic constant into
@@ -914,7 +917,7 @@ fn imp_source_hash(args: &[Object]) -> Result<Object, RuntimeError> {
         h ^= u64::from(*b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    Ok(Object::Bytes(Rc::from(h.to_le_bytes().as_slice())))
+    Ok(Object::Bytes(SharedSlice::from(h.to_le_bytes().as_slice())))
 }
 
 /// `_imp._fix_co_filename(code, source_path)` — CPython's

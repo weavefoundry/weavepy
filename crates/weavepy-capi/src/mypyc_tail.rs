@@ -24,6 +24,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ptr;
 use std::sync::Mutex;
+use weavepy_vm::shared_value::SharedSlice;
 
 use weavepy_vm::builtin_types::{builtin_types, make_exception_with_class};
 use weavepy_vm::object::{DictKey, Object};
@@ -884,9 +885,7 @@ pub unsafe extern "C" fn _PyBytes_Join(sep: *mut PyObject, x: *mut PyObject) -> 
             if crate::errors::pending().is_some() {
                 return ptr::null_mut();
             }
-            return into_owned(Object::Bytes(weavepy_vm::sync::Rc::from(
-                out.into_boxed_slice(),
-            )));
+            return into_owned(Object::Bytes(SharedSlice::from(out.into_boxed_slice())));
         }
         let chunk = match unsafe { clone_object_value(item) } {
             Object::Bytes(b) => b.to_vec(),

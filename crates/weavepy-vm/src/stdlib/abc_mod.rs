@@ -208,14 +208,14 @@ fn abc_get_dump(args: &[Object]) -> Result<Object, RuntimeError> {
             .get(&DictKey(Object::from_static("_abc_registry")))
             .cloned()
             .unwrap_or(Object::new_set());
-        return Ok(Object::new_tuple(vec![
+        return Ok(Object::new_tuple_array([
             reg,
             Object::new_set(),
             Object::new_set(),
             Object::Int(0),
         ]));
     }
-    Ok(Object::new_tuple(vec![
+    Ok(Object::new_tuple_array([
         Object::new_set(),
         Object::new_set(),
         Object::new_set(),

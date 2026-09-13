@@ -8,6 +8,7 @@
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
+use weavepy_vm::shared_value::{SharedSlice, SharedStr, ThinArc, WeakSlice, WeakStr};
 use weavepy_vm::sync::Rc;
 
 use weavepy_vm::object::Object;
@@ -102,8 +103,8 @@ const UTF8_CACHE_BYTE_HWM: usize = 512 * 1024;
 
 /// Liveness handle for one cached buffer: the owning VM allocation.
 enum CStrOwner {
-    Str(weavepy_vm::sync::Weak<str>),
-    Bytes(weavepy_vm::sync::Weak<[u8]>),
+    Str(WeakStr),
+    Bytes(WeakSlice<u8>),
 }
 
 impl CStrOwner {
@@ -182,13 +183,13 @@ impl CStrCache {
 /// The canonical NUL-terminated UTF-8 buffer for `s`, valid while the
 /// string is alive. On a poisoned lock, leak a copy instead — never hand
 /// back a pointer that dies with `s` at the end of the caller's scope.
-fn cache_cstr(s: &Rc<str>) -> *const c_char {
-    let key = Rc::as_ptr(s) as *const u8 as usize;
+fn cache_cstr(s: &SharedStr) -> *const c_char {
+    let key = SharedStr::as_ptr(s) as *const u8 as usize;
     match UTF8_CACHE.lock() {
         Ok(mut g) => g.get_or_insert_with(CStrCache::default).get_or_insert(
             key,
             s.as_bytes(),
-            CStrOwner::Str(Rc::downgrade(s)),
+            CStrOwner::Str(SharedStr::downgrade(s)),
         ),
         Err(_) => {
             let mut bytes: Vec<u8> = s.as_bytes().to_vec();
@@ -200,13 +201,13 @@ fn cache_cstr(s: &Rc<str>) -> *const c_char {
 
 /// [`cache_cstr`]'s bytes twin (the `PyBytes_AsString` value-crossing
 /// path).
-fn cache_bytes_cstr(b: &Rc<[u8]>) -> *const c_char {
-    let key = Rc::as_ptr(b) as *const u8 as usize;
+fn cache_bytes_cstr(b: &SharedSlice<u8>) -> *const c_char {
+    let key = ThinArc::as_ptr(b) as *const u8 as usize;
     match UTF8_CACHE.lock() {
         Ok(mut g) => g.get_or_insert_with(CStrCache::default).get_or_insert(
             key,
             b,
-            CStrOwner::Bytes(Rc::downgrade(b)),
+            CStrOwner::Bytes(ThinArc::downgrade(b)),
         ),
         Err(_) => {
             let mut bytes: Vec<u8> = b.to_vec();
@@ -406,7 +407,7 @@ pub unsafe extern "C" fn PyUnicode_AsEncodedString(
     // `encoding_errors`).
     match weavepy_vm::stdlib::codecs_mod::encode_obj(&obj, &enc_s, &errors_s) {
         Ok(bytes) => {
-            let rc: Rc<[u8]> = bytes.into();
+            let rc: SharedSlice<u8> = bytes.into();
             crate::object::into_owned(Object::Bytes(rc))
         }
         Err(e) => {
@@ -423,7 +424,7 @@ pub unsafe extern "C" fn PyUnicode_AsUTF8String(o: *mut PyObject) -> *mut PyObje
     }
     match unsafe { crate::object::clone_object_value(o) } {
         Object::Str(s) => {
-            let bytes: Rc<[u8]> = s.as_bytes().into();
+            let bytes: SharedSlice<u8> = s.as_bytes().into();
             crate::object::into_owned(Object::Bytes(bytes))
         }
         Object::WStr(cps) => {
@@ -447,7 +448,7 @@ pub unsafe extern "C" fn PyBytes_FromString(s: *const c_char) -> *mut PyObject {
         return ptr::null_mut();
     }
     let bytes = unsafe { CStr::from_ptr(s) }.to_bytes();
-    let rc: Rc<[u8]> = bytes.into();
+    let rc: SharedSlice<u8> = bytes.into();
     crate::object::into_owned(Object::Bytes(rc))
 }
 
@@ -461,7 +462,7 @@ pub unsafe extern "C" fn PyBytes_FromStringAndSize(s: *const c_char, n: PySsizeT
         // outside the scalar-pin cache, see `mirror_out_unpinned` — and
         // mark it buffer-authoritative so the C-side writes to `ob_sval`
         // are adopted when the object crosses back into the VM.
-        let rc: Rc<[u8]> = vec![0u8; len].into();
+        let rc: SharedSlice<u8> = vec![0u8; len].into();
         let p = crate::mirror::mirror_out_unpinned(Object::Bytes(rc));
         if !p.is_null() && unsafe { crate::mirror::is_mirror(p) } {
             unsafe { (*crate::mirror::prefix_of(p)).bytes_buffer = true };
@@ -469,7 +470,7 @@ pub unsafe extern "C" fn PyBytes_FromStringAndSize(s: *const c_char, n: PySsizeT
         return p;
     }
     let slice = unsafe { std::slice::from_raw_parts(s as *const u8, len).to_vec() };
-    let rc: Rc<[u8]> = slice.into();
+    let rc: SharedSlice<u8> = slice.into();
     crate::object::into_owned(Object::Bytes(rc))
 }
 
@@ -1482,7 +1483,7 @@ pub unsafe extern "C" fn PyUnicode_AsLatin1String(o: *mut PyObject) -> *mut PyOb
                     return ptr::null_mut();
                 }
             }
-            let rc: Rc<[u8]> = bytes.into();
+            let rc: SharedSlice<u8> = bytes.into();
             crate::object::into_owned(Object::Bytes(rc))
         }
         _ => {
@@ -1508,11 +1509,11 @@ pub unsafe extern "C" fn PyBytes_FromObject(o: *mut PyObject) -> *mut PyObject {
         },
         Object::ByteArray(b) => {
             let snapshot = b.borrow().clone();
-            let rc: Rc<[u8]> = snapshot.into();
+            let rc: SharedSlice<u8> = snapshot.into();
             crate::object::into_owned(Object::Bytes(rc))
         }
         Object::Str(s) => {
-            let bytes: Rc<[u8]> = s.as_bytes().into();
+            let bytes: SharedSlice<u8> = s.as_bytes().into();
             crate::object::into_owned(Object::Bytes(bytes))
         }
         Object::List(rc) => {
@@ -1524,7 +1525,7 @@ pub unsafe extern "C" fn PyBytes_FromObject(o: *mut PyObject) -> *mut PyObject {
                     _ => 0,
                 })
                 .collect();
-            let arr: Rc<[u8]> = inner.into();
+            let arr: SharedSlice<u8> = inner.into();
             crate::object::into_owned(Object::Bytes(arr))
         }
         Object::Tuple(items) => {
@@ -1535,7 +1536,7 @@ pub unsafe extern "C" fn PyBytes_FromObject(o: *mut PyObject) -> *mut PyObject {
                     _ => 0,
                 })
                 .collect();
-            let arr: Rc<[u8]> = inner.into();
+            let arr: SharedSlice<u8> = inner.into();
             crate::object::into_owned(Object::Bytes(arr))
         }
         _ => {
@@ -1560,7 +1561,7 @@ pub unsafe extern "C" fn PyBytes_Concat(p: *mut *mut PyObject, w: *mut PyObject)
         (Object::Bytes(a), Object::Bytes(b)) => {
             let mut out = a.to_vec();
             out.extend_from_slice(&b);
-            let rc: Rc<[u8]> = out.into();
+            let rc: SharedSlice<u8> = out.into();
             let new_p = crate::object::into_owned(Object::Bytes(rc));
             unsafe {
                 crate::object::Py_DecRef(left);
@@ -1632,4 +1633,61 @@ pub unsafe extern "C" fn PyByteArray_Concat(a: *mut PyObject, b: *mut PyObject) 
     }
     let inner = Rc::new(weavepy_vm::sync::RefCell::new(out));
     crate::object::into_owned(Object::ByteArray(inner))
+}
+
+#[cfg(test)]
+mod cache_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn exported_buffers_survive_shared_owners_without_retaining_values() {
+        let mut cache = CStrCache::default();
+        let text = SharedStr::from("retained 日本語 🧶");
+        let bytes = SharedSlice::from(&[0_u8, 1, 127, 255]);
+        let text_key = text.as_ptr() as usize;
+        let bytes_key = bytes.as_ptr() as usize;
+        let text_ptr = cache.get_or_insert(
+            text_key,
+            text.as_bytes(),
+            CStrOwner::Str(SharedStr::downgrade(&text)),
+        );
+        let bytes_ptr = cache.get_or_insert(
+            bytes_key,
+            &bytes,
+            CStrOwner::Bytes(ThinArc::downgrade(&bytes)),
+        );
+        assert_eq!(SharedStr::strong_count(&text), 1);
+        assert_eq!(ThinArc::strong_count(&bytes), 1);
+        let text_clone = text.clone();
+        let bytes_clone = bytes.clone();
+        drop(text);
+        drop(bytes);
+        cache.sweep();
+        assert_eq!(cache.map.len(), 2);
+        // SAFETY: both values remain strongly owned. Sweeping preserves their
+        // buffers, which contain the original bytes followed by a NUL byte.
+        unsafe {
+            assert_eq!(CStr::from_ptr(text_ptr).to_bytes(), text_clone.as_bytes());
+            assert_eq!(
+                std::slice::from_raw_parts(bytes_ptr.cast::<u8>(), bytes_clone.len() + 1),
+                &[0, 1, 127, 255, 0],
+            );
+        }
+        assert_eq!(
+            cache.get_or_insert(
+                text_key,
+                text_clone.as_bytes(),
+                CStrOwner::Str(SharedStr::downgrade(&text_clone)),
+            ),
+            text_ptr,
+        );
+        drop(text_clone);
+        cache.sweep();
+        assert_eq!(cache.map.len(), 1);
+        assert_eq!(cache.bytes, 5);
+        drop(bytes_clone);
+        cache.sweep();
+        assert!(cache.map.is_empty());
+        assert_eq!(cache.bytes, 0);
+    }
 }

@@ -13,6 +13,7 @@
 //! `madvise`, subscripting with extended slices, the `closed`
 //! property, and CPython's `__repr__` format.
 
+use crate::shared_value::SharedSlice;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
@@ -807,7 +808,7 @@ fn mm_read(args: &[Object]) -> Result<Object, RuntimeError> {
     let start = st.pos.min(buf.len());
     let out = buf[start..start + num].to_vec();
     st.pos = start + num;
-    Ok(Object::Bytes(Rc::from(out.into_boxed_slice())))
+    Ok(Object::Bytes(SharedSlice::from(out.into_boxed_slice())))
 }
 
 fn mm_read_byte(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -840,7 +841,7 @@ fn mm_readline(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let line = buf[start..end].to_vec();
     st.pos = end;
-    Ok(Object::Bytes(Rc::from(line.into_boxed_slice())))
+    Ok(Object::Bytes(SharedSlice::from(line.into_boxed_slice())))
 }
 
 fn writable_or_err(access: i64) -> Result<(), RuntimeError> {
@@ -1433,11 +1434,13 @@ fn mm_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
         let buf = region.as_slice();
         let adj = adjust_slice(buf.len() as i64, start, stop, step);
         if adj.len <= 0 {
-            return Ok(Object::Bytes(Rc::from(Vec::new().into_boxed_slice())));
+            return Ok(Object::Bytes(SharedSlice::from(
+                Vec::new().into_boxed_slice(),
+            )));
         }
         if adj.step == 1 {
             let s = adj.start as usize;
-            return Ok(Object::Bytes(Rc::from(
+            return Ok(Object::Bytes(SharedSlice::from(
                 buf[s..s + adj.len as usize].to_vec().into_boxed_slice(),
             )));
         }
@@ -1449,7 +1452,7 @@ fn mm_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
             // overflows i64 but is never read again.
             cur = cur.saturating_add(adj.step);
         }
-        return Ok(Object::Bytes(Rc::from(out.into_boxed_slice())));
+        return Ok(Object::Bytes(SharedSlice::from(out.into_boxed_slice())));
     }
     match try_coerce_index_i64(&key) {
         None => Err(type_error("mmap indices must be integers")),

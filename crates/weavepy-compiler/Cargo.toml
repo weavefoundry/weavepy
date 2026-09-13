@@ -16,6 +16,7 @@ weavepy-lexer  = { workspace = true }
 weavepy-parser = { workspace = true }
 indexmap       = { workspace = true }
 thiserror      = { workspace = true }
+portable-atomic = { workspace = true }
 
 # RFC 0019 — numerics and serialization.
 num-bigint     = { workspace = true }

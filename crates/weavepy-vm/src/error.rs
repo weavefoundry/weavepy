@@ -379,7 +379,7 @@ pub fn stop_iteration_with(value: Object) -> RuntimeError {
         let args = if matches!(value, Object::None) {
             Object::new_tuple(Vec::new())
         } else {
-            Object::new_tuple(vec![value])
+            Object::new_tuple_array([value])
         };
         inst.slot_set("args", args);
     }
@@ -447,7 +447,7 @@ pub fn syntax_error_located_as(
         let line_obj = lineno.map_or(Object::None, |n| Object::Int(i64::from(n)));
         let off_obj = offset.map_or(Object::None, |n| Object::Int(i64::from(n)));
         let text_obj = text.map_or(Object::None, Object::from_str);
-        let detail = Object::new_tuple(vec![
+        let detail = Object::new_tuple_array([
             file_obj.clone(),
             line_obj.clone(),
             off_obj.clone(),
@@ -458,7 +458,7 @@ pub fn syntax_error_located_as(
         inst.slot_set("lineno", line_obj);
         inst.slot_set("offset", off_obj);
         inst.slot_set("text", text_obj);
-        inst.slot_set("args", Object::new_tuple(vec![msg_obj, detail]));
+        inst.slot_set("args", Object::new_tuple_array([msg_obj, detail]));
     }
     RuntimeError::PyException(pe)
 }
@@ -496,10 +496,7 @@ pub fn oserror_subclass_with_errno(
         inst.slot_set("strerror", Object::from_str(strerror.clone()));
         inst.slot_set(
             "args",
-            Object::new_tuple(vec![
-                Object::Int(i64::from(errno)),
-                Object::from_str(strerror),
-            ]),
+            Object::new_tuple_array([Object::Int(i64::from(errno)), Object::from_str(strerror)]),
         );
     }
     RuntimeError::PyException(pe)
@@ -527,7 +524,7 @@ pub fn blocking_io_error_written(
         inst.slot_set("characters_written", Object::Int(characters_written));
         inst.slot_set(
             "args",
-            Object::new_tuple(vec![
+            Object::new_tuple_array([
                 Object::Int(i64::from(errno)),
                 Object::from_str(strerror.to_owned()),
                 Object::Int(characters_written),
@@ -630,7 +627,7 @@ pub fn os_error_from_parts(
             inst.slot_set("errno", Object::Int(i64::from(errno)));
             inst.slot_set(
                 "args",
-                Object::new_tuple(vec![
+                Object::new_tuple_array([
                     Object::Int(i64::from(errno)),
                     Object::from_str(strerror.clone()),
                 ]),
@@ -794,7 +791,7 @@ pub fn io_error_to_py_named2(
                 // reconstructed by `OSError.__str__` from these fields.
                 inst.slot_set(
                     "args",
-                    Object::new_tuple(vec![
+                    Object::new_tuple_array([
                         Object::Int(i64::from(errno)),
                         Object::from_str(strerror.clone()),
                     ]),

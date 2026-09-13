@@ -29,6 +29,7 @@
 use std::alloc::{alloc, dealloc, Layout};
 use std::os::raw::c_void;
 use std::ptr;
+use weavepy_vm::shared_value::{SharedSlice, SharedStr, ThinArc};
 
 use num_bigint::BigInt;
 use weavepy_vm::object::Object;
@@ -1035,7 +1036,7 @@ pub unsafe fn native_of(p: *mut PyObject) -> Object {
                 != 0
         {
             if let Some(b) = unsafe { read_bytes_value(p) } {
-                let rc: weavepy_vm::sync::Rc<[u8]> = b.into();
+                let rc: SharedSlice<u8> = b.into();
                 let _ = inst.native.set(Object::Bytes(rc));
             }
         }
@@ -1183,7 +1184,7 @@ pub unsafe fn native_of(p: *mut PyObject) -> Object {
     // adopted value stays authoritative afterwards.
     if unsafe { (*pre).bytes_buffer } {
         if let Some(v) = unsafe { read_bytes_value(p) } {
-            let rc: weavepy_vm::sync::Rc<[u8]> = v.into();
+            let rc: SharedSlice<u8> = v.into();
             unsafe {
                 (*pre).obj = Object::Bytes(rc);
                 (*pre).bytes_buffer = false;
@@ -2215,9 +2216,9 @@ fn scalar_pin_key(obj: &Object) -> Option<ScalarPinKey> {
         Object::Float(f) => ScalarPinKey::FloatBits(f.to_bits()),
         Object::Long(rc) => ScalarPinKey::Rc(1, VmRc::as_ptr(rc) as usize),
         Object::Complex(rc) => ScalarPinKey::Rc(2, VmRc::as_ptr(rc) as usize),
-        Object::Str(rc) => ScalarPinKey::Rc(3, VmRc::as_ptr(rc) as *const u8 as usize),
-        Object::Bytes(rc) => ScalarPinKey::Rc(5, VmRc::as_ptr(rc) as *const u8 as usize),
-        Object::Tuple(rc) => ScalarPinKey::Rc(6, VmRc::as_ptr(rc) as *const Object as usize),
+        Object::Str(rc) => ScalarPinKey::Rc(3, SharedStr::as_ptr(rc) as *const u8 as usize),
+        Object::Bytes(rc) => ScalarPinKey::Rc(5, ThinArc::as_ptr(rc) as *const u8 as usize),
+        Object::Tuple(rc) => ScalarPinKey::Rc(6, ThinArc::as_ptr(rc) as *const Object as usize),
         _ => return None,
     })
 }
@@ -2359,7 +2360,7 @@ pub(crate) fn dead_pin_clones_of(target: &Object) -> usize {
             // Only when the pin is the tuple's sole owner — otherwise the
             // program can still reach the tuple and the element reference
             // is genuinely visible.
-            if weavepy_vm::sync::Rc::strong_count(t) == 1
+            if ThinArc::strong_count(t) == 1
                 && t.iter()
                     .any(|e| crate::object::same_native_identity(e, target))
             {
@@ -2699,9 +2700,9 @@ fn fingerprint(o: &Object) -> u64 {
         Float(f) => mix(4, f.to_bits()),
         Long(rc) => mix(5, rc_id(rc)),
         Complex(rc) => mix(6, rc_id(rc)),
-        Str(rc) => mix(7, rc_id(rc)),
-        WStr(rc) => mix(8, rc_id(rc)),
-        Tuple(rc) => mix(9, rc_id(rc)),
+        Str(rc) => mix(7, SharedStr::as_ptr(rc) as *const () as u64),
+        WStr(rc) => mix(8, ThinArc::as_ptr(rc) as *const () as u64),
+        Tuple(rc) => mix(9, ThinArc::as_ptr(rc) as *const () as u64),
         List(rc) => mix(10, rc_id(rc)),
         Dict(rc) => mix(11, rc_id(rc)),
         Range(rc) => mix(12, rc_id(rc)),
@@ -2719,7 +2720,7 @@ fn fingerprint(o: &Object) -> u64 {
         Coroutine(rc) => mix(24, rc_id(rc)),
         AsyncGenerator(rc) => mix(25, rc_id(rc)),
         AsyncGenAwait(rc) => mix(26, rc_id(rc)),
-        Bytes(rc) => mix(27, rc_id(rc)),
+        Bytes(rc) => mix(27, ThinArc::as_ptr(rc) as *const () as u64),
         ByteArray(rc) => mix(28, rc_id(rc)),
         Set(rc) => mix(29, rc_id(rc)),
         FrozenSet(rc) => mix(30, rc_id(rc)),
@@ -3211,7 +3212,7 @@ pub(crate) unsafe fn reconcile_nested_lists(p: *mut PyObject, depth: u32) {
 // ---------------------------------------------------------------------------
 // Faithful mutable unicode (RFC 0047, wave 5).
 //
-// WeavePy's native string is an immutable `Rc<str>`, but macro-heavy
+// WeavePy's native string is an immutable `SharedStr`, but macro-heavy
 // Cython mutates a string's character buffer *in place*: the f-string /
 // `repr` codegen builds a result by `PyUnicode_New(n, maxchar)` followed by
 // the inlined `PyUnicode_WRITE` macro (a direct store at `PyUnicode_DATA(o)
@@ -4957,7 +4958,6 @@ const fn round_up(n: usize, align: usize) -> usize {
 mod tests {
     use super::*;
     use crate::interp::ensure_initialised;
-    use weavepy_vm::sync::Rc as VmRc;
 
     /// Read a `T` at byte offset `off` from a body pointer, the way a
     /// stock inlined macro would.
@@ -5024,7 +5024,7 @@ mod tests {
     #[test]
     fn bytes_body_is_faithful() {
         ensure_initialised();
-        let p = mirror_out(Object::Bytes(VmRc::from(&b"hi"[..])));
+        let p = mirror_out(Object::Bytes(SharedSlice::from(&b"hi"[..])));
         unsafe {
             // ob_size at +16.
             assert_eq!(read_at::<isize>(p, 16), 2);
@@ -5039,7 +5039,7 @@ mod tests {
     #[test]
     fn str_ascii_body_is_faithful() {
         ensure_initialised();
-        let p = mirror_out(Object::Str(VmRc::from("abc")));
+        let p = mirror_out(Object::Str(SharedStr::from("abc")));
         unsafe {
             // length at +16.
             assert_eq!(read_at::<isize>(p, 16), 3);
