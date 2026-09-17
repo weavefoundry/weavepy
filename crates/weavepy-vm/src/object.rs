@@ -951,19 +951,82 @@ pub struct FrameShell {
     pub materialized: RefCell<Option<Rc<PyFrame>>>,
 }
 
-/// Owned metadata in a live frame shell. Recycled shells leave these slots
+/// Metadata in a live frame shell. Recycled shells leave these slots
 /// empty so recycling doesn't clone and later drop shared placeholders.
 /// Only a live shell may be read; the pool is private to the interpreter.
-#[derive(Debug)]
-pub struct FrameSlot<T>(Option<T>);
+///
+/// A slot either *owns* its value or *borrows* the executing frame's own
+/// copy. An ordinary call's shell is popped and parked before its frame
+/// dies, and almost no activation is ever introspected, so taking (and
+/// later releasing) five atomic reference counts per call bought
+/// nothing. A borrowed slot is a bitwise copy of the frame's handle
+/// without a count of its own; [`FrameSlot::upgrade`] converts it to an
+/// owning one in place. The interpreter upgrades a popped shell that
+/// anything else still references, so a slot never outlives the frame it
+/// borrows from while still borrowed.
+pub struct FrameSlot<T> {
+    value: Option<std::mem::ManuallyDrop<T>>,
+    owned: std::sync::atomic::AtomicBool,
+}
+
+impl<T: fmt::Debug> fmt::Debug for FrameSlot<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("FrameSlot")
+            .field(&self.value.as_deref())
+            .finish()
+    }
+}
 
 impl<T> FrameSlot<T> {
     pub(crate) fn new(value: T) -> Self {
-        Self(Some(value))
+        Self {
+            value: Some(std::mem::ManuallyDrop::new(value)),
+            owned: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// A slot that reads through `value` without owning a count.
+    ///
+    /// # Safety
+    ///
+    /// `*value` must stay alive until this slot is cleared, dropped, or
+    /// [upgraded](Self::upgrade).
+    pub(crate) unsafe fn borrowed(value: &T) -> Self {
+        Self {
+            // SAFETY: the copy is never dropped while `owned` is false, and
+            // the caller keeps the original alive for as long as it is read.
+            value: Some(std::mem::ManuallyDrop::new(unsafe { std::ptr::read(value) })),
+            owned: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     pub(crate) fn clear(&mut self) {
-        self.0 = None;
+        if let Some(mut value) = self.value.take() {
+            if *self.owned.get_mut() {
+                // SAFETY: an owned slot holds its own count, released once.
+                unsafe { std::mem::ManuallyDrop::drop(&mut value) };
+            }
+        }
+        *self.owned.get_mut() = true;
+    }
+}
+
+impl<T: Clone> FrameSlot<T> {
+    /// Turn a borrowed slot into an owning one. Idempotent.
+    pub(crate) fn upgrade(&self) {
+        if let Some(value) = &self.value {
+            if !self.owned.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                // The slot's bitwise copy becomes a real handle by taking
+                // the count it never had.
+                std::mem::forget(T::clone(value));
+            }
+        }
+    }
+}
+
+impl<T> Drop for FrameSlot<T> {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 
@@ -971,11 +1034,20 @@ impl<T> std::ops::Deref for FrameSlot<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        self.0.as_ref().expect("live frame shell metadata")
+        self.value.as_deref().expect("live frame shell metadata")
     }
 }
 
 impl FrameShell {
+    /// Make every borrowed slot own its value (see [`FrameSlot`]).
+    pub(crate) fn upgrade_slots(&self) {
+        self.code.upgrade();
+        self.locals.upgrade();
+        self.cells.upgrade();
+        self.globals.upgrade();
+        self.builtins.upgrade();
+    }
+
     /// Wrap an already-materialised frame (generator resume, event
     /// dispatch around throw/unwind) in a shell for the spine.
     pub fn from_py_frame(py: &Rc<PyFrame>) -> Self {
@@ -3831,7 +3903,15 @@ pub fn is_function_slot(name: &str) -> bool {
 impl PyFunction {
     /// The current code object (honours `f.__code__ = …` rebinding).
     pub fn code(&self) -> Rc<CodeObject> {
-        self.code.borrow().clone()
+        if crate::gil::free_threading_enabled() {
+            return self.code.borrow().clone();
+        }
+        // SAFETY: with the GIL enabled every reader and the one writer
+        // (`f.__code__ = …`) run GIL-serialized, the reference does not
+        // outlive this expression, and an `Arc` clone cannot re-enter the
+        // interpreter. The cell lock this skips is two thread-local reads
+        // and a compare-exchange on every Python call.
+        unsafe { (*self.code.as_ptr()).clone() }
     }
 
     /// The live `__dict__` payload (honours `f.__dict__ = d` swapping).

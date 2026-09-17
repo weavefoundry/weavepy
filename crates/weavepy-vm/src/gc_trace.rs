@@ -3797,6 +3797,15 @@ thread_local! {
     static MAYBE_DEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// A pointer to the calling thread's maybe-dead flag, for a dispatch
+/// loop that polls it after every instruction: one thread-local lookup
+/// per loop entry instead of one per poll. Valid for the life of the
+/// calling thread; only ever dereferenced on that thread.
+#[inline]
+pub(crate) fn maybe_dead_flag() -> *const std::cell::Cell<bool> {
+    MAYBE_DEAD.with(std::ptr::from_ref)
+}
+
 /// Note that the current thread just executed a reference-dropping opcode, so a
 /// finalizable object may now be dead. Cheap (a thread-local `Cell` store); the
 /// actual sweep is deferred to the next eval-loop safe point.

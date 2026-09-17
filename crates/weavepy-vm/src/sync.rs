@@ -626,6 +626,12 @@ impl<T: ?Sized> GilCell<T> {
         })
     }
 
+    /// Exclusive access through an exclusive reference: no lock, no
+    /// borrow bookkeeping (matches `std::cell::RefCell::get_mut`).
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
+    }
+
     /// Returns a raw pointer to the inner data. Doesn't claim any
     /// borrow; the caller is responsible for ensuring the pointer
     /// isn't dereferenced concurrently with another borrow.

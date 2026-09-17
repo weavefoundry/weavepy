@@ -2969,6 +2969,37 @@ impl Interpreter {
             return;
         }
         let _ = retval;
+        // Fast path: no local can be at its dead line. A candidate the
+        // cascade below could reap has nothing but this frame's slots, its
+        // collector handle, and weakref clones holding it, so its strong
+        // count is at most `nlocals + 1` when no weakref watches it.
+        // Every candidate above that (the usual `self`, an argument the
+        // caller still holds) is plainly escaped, which the passes below
+        // would conclude too, one allocation and two scans later. Grading
+        // each slot is all that is left to do.
+        // (An escaped `PyFrame` sharing the locals storage keeps the
+        // slot-clearing passes below.)
+        if frame.code.cellvars.is_empty() && Rc::strong_count(&frame.locals) == 1 {
+            // SAFETY: RFC 0065 (WS3) — see `load_fast_value`; nothing in
+            // this block runs Python code or touches the locals storage
+            // through another path.
+            let locals: &Vec<Object> = unsafe { &*frame.locals.as_ptr() };
+            let escaped = |v: &Object| {
+                gc_trace::strong_count_for(v) > nlocals + 1
+                    && !crate::weakref_registry::may_have_weakrefs(
+                        crate::weakref_registry::id_of(v),
+                    )
+            };
+            if locals.iter().all(|v| {
+                !(Self::local_needs_prompt_reap(v) || matches!(v, Object::Function(_)))
+                    || escaped(v)
+            }) {
+                for v in locals {
+                    gc_trace::note_dropped(v);
+                }
+                return;
+            }
+        }
         // Pass 1: move every candidate local out of its slot. A *closure
         // function* local is a candidate too: it is GC-tracked
         // (`MakeFunction`), so merely dropping the frame's `Rc` leaves it
@@ -4956,8 +4987,12 @@ impl Interpreter {
     ) -> Rc<RefCell<Vec<Object>>> {
         debug_assert!(args.len() <= n);
         if let Some(rc) = self.frame_locals_pool.borrow_mut().pop() {
+            debug_assert_eq!(Rc::strong_count(&rc), 1);
             {
-                let mut v = rc.borrow_mut();
+                // SAFETY: the pool only ever holds sole-owner vectors (see
+                // `recycle_frame_allocs`), so nothing else can reach this
+                // one; the cell lock would guard against no one.
+                let v = unsafe { &mut *rc.as_ptr() };
                 debug_assert!(v.is_empty());
                 v.append(args);
                 v.resize(n, Object::Unbound);
@@ -5020,7 +5055,9 @@ impl Interpreter {
             // Clear before touching the pool: dropping the leftover
             // values runs arbitrary Rust `Drop` glue (file handles, GC
             // bookkeeping), which must not observe a held pool borrow.
-            frame.locals.borrow_mut().clear();
+            // SAFETY: sole owner (checked above) — no other path can
+            // reach this vector, including the drop glue of its elements.
+            unsafe { (*frame.locals.as_ptr()).clear() };
             let mut pool = self.frame_locals_pool.borrow_mut();
             if pool.len() < POOL_CAP {
                 pool.push(frame.locals.clone());
@@ -5527,6 +5564,11 @@ impl Interpreter {
         let mut loop_snap_gen: u64 = 0; // stale → first iteration derives
         let mut loop_quiet = false;
         let mut loop_fin_quiet = false;
+        // Within fin-quiet mode: is a finalizable object live (the coarse
+        // stack-shrink drop heuristic applies), or only active suspects
+        // (which the full prologue probes at marked safe points without
+        // it)?
+        let mut loop_coarse = false;
         let result = loop {
             // RFC 0039 (WS2) / RFC 0059 (WS2): cooperative GIL hand-off.
             // A plain interpreter-local countdown — one register
@@ -5544,7 +5586,10 @@ impl Interpreter {
                 // dormant-stride admission, so a dormant-only
                 // population pays two relaxed loads here and a real
                 // probe only every DORMANT_STRIDE-th checkpoint.
-                if (loop_quiet || loop_fin_quiet) && gc_trace::has_suspects() {
+                if (loop_quiet || loop_fin_quiet)
+                    && !gc_trace::active_suspects_present()
+                    && gc_trace::has_suspects()
+                {
                     for obj in gc_trace::take_dead_suspects() {
                         self.reap_dead_subgraph(obj);
                     }
@@ -5561,7 +5606,6 @@ impl Interpreter {
                 self.fuse_off = obs.any;
                 let base_quiet = !quiet_off
                     && crate::hot_gates::load() == 0
-                    && !gc_trace::active_suspects_present()
                     && !obs.any
                     && !shell
                         .has_materialized
@@ -5574,8 +5618,18 @@ impl Interpreter {
                 // ABC machinery keeps a weakref-callback-enrolled type
                 // alive for the process lifetime).
                 let fin_live = gc_trace::has_any_finalizable();
-                loop_quiet = base_quiet && !fin_live;
-                loop_fin_quiet = base_quiet && fin_live;
+                // An *active* suspect (one still inside its probe budget)
+                // is the same kind of input: it is re-probed at every
+                // marked drop safe point, which is exactly the fin-quiet
+                // path's `take_maybe_dead` gate. Pinning the loop to the
+                // full prologue for it instead made every instruction of
+                // a drop-free hot loop pay that prologue for as long as
+                // the suspect's budget lasted, since nothing there probes
+                // it.
+                let suspects_live = gc_trace::active_suspects_present();
+                loop_quiet = base_quiet && !fin_live && !suspects_live;
+                loop_fin_quiet = base_quiet && (fin_live || suspects_live);
+                loop_coarse = fin_live;
             }
             // The leaf burst: while the loop is quiet, run the straight
             // run of leaf instructions at `frame.pc` in one tight loop
@@ -5597,46 +5651,58 @@ impl Interpreter {
                 // producer bumps the loop generation before its gate
                 // can read hot, so the full prologue resumes on the
                 // very next instruction.
-                if loop_fin_quiet {
-                    // The one live subsystem: prompt finalization. Same
-                    // probe order and cadence as the full prologue's
-                    // finalizable arm (`take_maybe_dead` gate, then the
-                    // finalizer drain, then the stride-gated suspect
-                    // re-probe), and the same drop-watch bookkeeping in
-                    // the shared tail below.
-                    let mut drained = self.drain_if_maybe_dead();
-                    if !drained && burst_ok {
-                        // Nothing pending: the burst may run. It ends at
-                        // the first instruction whose discard marks, so
-                        // the drain it scheduled still runs before the
-                        // next instruction, exactly as when single-stepping.
-                        // (After a drain the finalizers may have changed
-                        // any loop input, so that iteration single-steps.)
-                        if let Some(last) = self.leaf_burst(frame, loop_snap_gen) {
-                            prev_pc = Some(last as usize);
-                            drained = self.drain_if_maybe_dead();
-                        }
-                    }
-                    let _ = drained;
-                    watch_drops = true;
-                    stack_before = frame.stack.len();
-                    op_before = frame.code.instructions.get(frame.pc as usize).map(|i| i.op);
+                // The one live subsystem in fin-quiet mode: prompt
+                // finalization. Same probe order and cadence as the full
+                // prologue's finalizable arm (`take_maybe_dead` gate, then
+                // the finalizer drain, then the stride-gated suspect
+                // re-probe), and the same drop-watch bookkeeping in the
+                // shared tail below.
+                let drained = loop_fin_quiet && self.drain_if_maybe_dead();
+                // Nothing pending: hand the frame to the quiet loop proper.
+                // (After a drain the finalizers may have changed any loop
+                // input, so that iteration single-steps.)
+                let quiet_exit = if burst_ok && !drained {
+                    Some(self.quiet_run(
+                        frame,
+                        &shell,
+                        loop_snap_gen,
+                        loop_fin_quiet,
+                        loop_coarse,
+                        &mut prev_pc,
+                    ))
                 } else {
-                    if burst_ok {
-                        if let Some(last) = self.leaf_burst(frame, loop_snap_gen) {
-                            prev_pc = Some(last as usize);
-                        }
+                    None
+                };
+                match quiet_exit {
+                    Some(QuietExit::Yield) => continue,
+                    Some(QuietExit::Outcome { stepped, cur_pc: at }) => {
+                        // `quiet_run` already applied the drop heuristic.
+                        watch_drops = false;
+                        stack_before = 0;
+                        op_before = None;
+                        cur_pc = at;
+                        instruction_ran = true;
+                        stepped
                     }
-                    watch_drops = false;
-                    stack_before = 0;
-                    op_before = None;
+                    None => {
+                        if loop_fin_quiet && loop_coarse {
+                            watch_drops = true;
+                            stack_before = frame.stack.len();
+                            op_before =
+                                frame.code.instructions.get(frame.pc as usize).map(|i| i.op);
+                        } else {
+                            watch_drops = false;
+                            stack_before = 0;
+                            op_before = None;
+                        }
+                        cur_pc = frame.pc as usize;
+                        shell
+                            .lasti
+                            .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
+                        instruction_ran = true;
+                        self.step_hot(frame)
+                    }
                 }
-                cur_pc = frame.pc as usize;
-                shell
-                    .lasti
-                    .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
-                instruction_ran = true;
-                self.step_hot(frame)
             } else {
                 // RFC 0059 (WS2): the unified eval-breaker word. One relaxed
                 // load answers "is *any* deferred work pending?" for the six
@@ -6557,19 +6623,46 @@ impl Interpreter {
         // correct fallback.
         if let Some(mut pooled) = self.frame_shell_pool.borrow_mut().pop() {
             if let Some(m) = Rc::get_mut(&mut pooled) {
-                m.code = crate::object::FrameSlot::new(frame.code.clone());
-                m.locals = crate::object::FrameSlot::new(frame.locals.clone());
-                m.cells = crate::object::FrameSlot::new(frame.cells.clone());
-                m.globals = crate::object::FrameSlot::new(frame.globals.clone());
-                m.builtins = crate::object::FrameSlot::new(frame.builtins.clone());
+                if is_gen {
+                    // A generator's shell outlives this activation inside
+                    // the generator object: its slots own their values.
+                    m.code = crate::object::FrameSlot::new(frame.code.clone());
+                    m.locals = crate::object::FrameSlot::new(frame.locals.clone());
+                    m.cells = crate::object::FrameSlot::new(frame.cells.clone());
+                    m.globals = crate::object::FrameSlot::new(frame.globals.clone());
+                    m.builtins = crate::object::FrameSlot::new(frame.builtins.clone());
+                } else {
+                    // SAFETY: the frame owns these handles for the whole
+                    // activation, never rebinds them, and outlives the
+                    // shell's stay on the spine; `pop_frame_shell`
+                    // upgrades the slots of a shell anything else still
+                    // holds before the frame can die.
+                    unsafe {
+                        m.code = crate::object::FrameSlot::borrowed(&frame.code);
+                        m.locals = crate::object::FrameSlot::borrowed(&frame.locals);
+                        m.globals = crate::object::FrameSlot::borrowed(&frame.globals);
+                        m.builtins = crate::object::FrameSlot::borrowed(&frame.builtins);
+                    }
+                    // The one handle an activation *can* rebind: the PEP 709
+                    // cell restore goes through `Rc::make_mut`, which swaps
+                    // in a fresh vector when the old one is shared. Only
+                    // the shared empty vector (never indexed, never
+                    // rebound) is borrowed.
+                    m.cells = if frame.cells.is_empty() {
+                        // SAFETY: as above.
+                        unsafe { crate::object::FrameSlot::borrowed(&frame.cells) }
+                    } else {
+                        crate::object::FrameSlot::new(frame.cells.clone())
+                    };
+                }
                 m.builtins_obj = frame.builtins_obj.clone();
                 m.class_namespace = frame.class_namespace.clone();
                 m.class_namespace_obj = frame.class_namespace_obj.clone();
                 m.is_gen = is_gen;
-                *m.gen_owner.borrow_mut() = gen_owner;
+                *m.gen_owner.get_mut() = gen_owner;
                 m.lasti = std::sync::atomic::AtomicU32::new(frame.pc);
                 m.has_materialized = std::sync::atomic::AtomicBool::new(materialized.is_some());
-                *m.materialized.borrow_mut() = materialized;
+                *m.materialized.get_mut() = materialized;
                 self.frame_stack.borrow_mut().push(pooled.clone());
                 return pooled;
             }
@@ -7102,6 +7195,19 @@ impl Interpreter {
     fn pop_frame_shell(&self) -> Option<Rc<crate::object::FrameShell>> {
         let popped = self.frame_stack.borrow_mut().pop();
         if let Some(shell) = &popped {
+            // Borrowed slots (see `FrameSlot`) read through the frame,
+            // which dies once its activation unwinds. The spine's handle
+            // (`popped`) and the activation's own are the only ones in the
+            // common case; anything beyond them may read the shell later.
+            if !shell.is_gen && Rc::strong_count(shell) > 2 {
+                shell.upgrade_slots();
+            }
+            if !shell
+                .has_materialized
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return popped;
+            }
             if let Some(py) = shell.materialized.borrow().as_ref() {
                 py.on_stack.set(py.on_stack.get().saturating_sub(1));
                 // A generator-family frame that just suspended (yielded)
@@ -8436,6 +8542,90 @@ impl Interpreter {
         Ok(StepOutcome::Continue)
     }
 
+    /// The quiet loop proper: run instructions back to back until one
+    /// produces an outcome the dispatch loop must see (return, yield,
+    /// generator start, error) or an eval-breaker input needs the outer
+    /// prologue. Leaf runs go through [`Self::leaf_burst`]; every other
+    /// instruction executes through the same `step_hot` front door as the
+    /// single-step quiet path, wrapped in the same per-instruction
+    /// protocol: the `lasti` mirror is current before the handler runs,
+    /// the coarse stack-shrink drop heuristic follows it (fin-quiet
+    /// mode), and the GIL countdown, the loop generation, and the
+    /// maybe-dead flag are consulted, in the outer loop's order, before
+    /// the next instruction.
+    #[inline(never)]
+    fn quiet_run(
+        &mut self,
+        frame: &mut Frame,
+        shell: &crate::object::FrameShell,
+        snap_gen: u64,
+        fin: bool,
+        coarse: bool,
+        prev_pc: &mut Option<usize>,
+    ) -> QuietExit {
+        let mut last = usize::MAX;
+        // SAFETY (for the reads below): the flag is this thread's own
+        // thread-local, which outlives this call; a greenlet switch moves
+        // stacks, never OS threads.
+        let maybe_dead = gc_trace::maybe_dead_flag();
+        let exit = loop {
+            match self.leaf_burst(frame, snap_gen, &mut last) {
+                LeafStop::Breaker => break QuietExit::Yield,
+                LeafStop::Marked => {
+                    if fin {
+                        self.drain_if_maybe_dead();
+                        if crate::hot_gates::loop_gen() != snap_gen {
+                            break QuietExit::Yield;
+                        }
+                    }
+                    continue;
+                }
+                LeafStop::Step => {}
+            }
+            let cur_pc = frame.pc as usize;
+            let op_before = frame.code.instructions.get(cur_pc).map(|i| i.op);
+            let stack_before = frame.stack.len();
+            shell
+                .lasti
+                .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
+            let stepped = self.step_hot(frame);
+            if coarse {
+                let drop_class = match op_before {
+                    Some(op) => COARSE_DROP_CLASS[op as u8 as usize],
+                    None => 0,
+                };
+                if drop_class & COARSE_EXEMPT == 0
+                    && (frame.stack.len() < stack_before || drop_class & COARSE_DELETE != 0)
+                {
+                    gc_trace::mark_maybe_dead();
+                }
+            }
+            if !matches!(stepped, Ok(StepOutcome::Continue)) {
+                return QuietExit::Outcome { stepped, cur_pc };
+            }
+            last = cur_pc;
+            // The outer loop's per-instruction prologue, in its order.
+            if self.gil_countdown <= 2 {
+                break QuietExit::Yield;
+            }
+            self.gil_countdown -= 1;
+            if crate::hot_gates::loop_gen() != snap_gen {
+                break QuietExit::Yield;
+            }
+            if fin
+                && unsafe { (*maybe_dead).get() }
+                && self.drain_if_maybe_dead()
+                && crate::hot_gates::loop_gen() != snap_gen
+            {
+                break QuietExit::Yield;
+            }
+        };
+        if last != usize::MAX {
+            *prev_pc = Some(last);
+        }
+        exit
+    }
+
     /// The fin-quiet prologue's prompt-finalization probe: if the previous
     /// instruction marked a possible death, drain the finalizers and
     /// re-probe the suspects. Returns whether a drain ran.
@@ -8444,7 +8634,9 @@ impl Interpreter {
         if !gc_trace::take_maybe_dead() {
             return false;
         }
-        self.drain_prompt_finalizers();
+        if gc_trace::has_any_finalizable() {
+            self.drain_prompt_finalizers();
+        }
         if gc_trace::has_suspects() {
             for obj in gc_trace::take_dead_suspects() {
                 self.reap_dead_subgraph(obj);
@@ -8474,8 +8666,8 @@ impl Interpreter {
     /// loop generation that verdict was derived from.
     ///
     /// Returns the pc of the last instruction executed, if any.
-    #[inline(never)]
-    fn leaf_burst(&mut self, frame: &mut Frame, snap_gen: u64) -> Option<u32> {
+    #[inline(always)]
+    fn leaf_burst(&mut self, frame: &mut Frame, snap_gen: u64, last_pc: &mut usize) -> LeafStop {
         use weavepy_compiler::InlineCache as IC;
         let Frame {
             code: code_rc,
@@ -8494,8 +8686,8 @@ impl Interpreter {
         // vector is not resized during an activation.
         let locals: &mut Vec<Object> = unsafe { &mut *locals.as_ptr() };
         let mut pc = frame.pc as usize;
-        let start_pc = pc;
-        let mut last = usize::MAX;
+        let mut last = *last_pc;
+        let mut stop = LeafStop::Step;
         loop {
             let Some(&ins) = instrs.get(pc) else { break };
             match ins.op {
@@ -8538,6 +8730,7 @@ impl Interpreter {
                     if gc_trace::note_dropped_marks(&old) {
                         gc_trace::mark_maybe_dead();
                         drop(old);
+                        stop = LeafStop::Marked;
                         break;
                     }
                 }
@@ -8686,6 +8879,7 @@ impl Interpreter {
                     if gc_trace::note_dropped_marks(&v) {
                         gc_trace::mark_maybe_dead();
                         drop(v);
+                        stop = LeafStop::Marked;
                         break;
                     }
                 }
@@ -8693,7 +8887,7 @@ impl Interpreter {
                     last = pc;
                     pc += 1 + ins.arg as usize;
                 }
-                OpCode::Nop | OpCode::NotTaken => {
+                OpCode::Nop | OpCode::NotTaken | OpCode::Resume => {
                     last = pc;
                     pc += 1;
                 }
@@ -8703,6 +8897,7 @@ impl Interpreter {
                     // (signals, async exceptions, observers, pending
                     // finalizers), and tier-2 heat are all polled here.
                     if self.gil_countdown <= 1 || crate::hot_gates::loop_gen() != snap_gen {
+                        stop = LeafStop::Breaker;
                         break;
                     }
                     #[cfg(feature = "jit")]
@@ -8843,17 +9038,16 @@ impl Interpreter {
                     if gc_trace::note_dropped_marks(&container) {
                         gc_trace::mark_maybe_dead();
                         drop(container);
+                        stop = LeafStop::Marked;
                         break;
                     }
                 }
                 _ => break,
             }
         }
-        if pc == start_pc && last == usize::MAX {
-            return None;
-        }
         frame.pc = pc as u32;
-        (last != usize::MAX).then_some(last as u32)
+        *last_pc = last;
+        stop
     }
 
     /// Float arithmetic the leaf burst may run inline: the operators that
@@ -36883,7 +37077,7 @@ impl Interpreter {
                             combined.append(&mut args);
                             self.recycle_scratch(args);
                             drop(callable);
-                            let r = self.run_py_exact_nofree(&f, combined)?;
+                            let r = self.run_py_exact_nofree_with(&f, code, combined)?;
                             frame.push(r);
                             return Ok(());
                         }
@@ -36963,8 +37157,10 @@ impl Interpreter {
                             && f.closure.is_empty()
                         {
                             specialize::record_hit(op_idx);
-                            let f = f.clone();
-                            let r = self.run_py_exact_nofree(&f, std::mem::take(&mut args))?;
+                            // `callable` (a local) keeps the function alive
+                            // for the call; no second handle is needed.
+                            let r =
+                                self.run_py_exact_nofree_with(f, code, std::mem::take(&mut args))?;
                             frame.push(r);
                             took_fast = true;
                         }
@@ -37250,9 +37446,19 @@ impl Interpreter {
     fn run_py_exact_nofree(
         &mut self,
         f: &Rc<PyFunction>,
+        args: Vec<Object>,
+    ) -> Result<Object, RuntimeError> {
+        self.run_py_exact_nofree_with(f, f.code(), args)
+    }
+
+    /// [`Self::run_py_exact_nofree`] for a caller that already holds the
+    /// function's current code object (its inline-cache guard read it).
+    fn run_py_exact_nofree_with(
+        &mut self,
+        f: &Rc<PyFunction>,
+        code: Rc<CodeObject>,
         mut args: Vec<Object>,
     ) -> Result<Object, RuntimeError> {
-        let code = f.code();
         // RFC 0069 WS3b — a callee that is already tier-2 compiled and
         // native-enterable runs frameless, straight from the argument
         // objects (falls through on any ineligibility).
@@ -44327,6 +44533,28 @@ static COARSE_DROP_CLASS: [u8; 256] = {
     }
     t
 };
+
+/// Why [`Interpreter::leaf_burst`] stopped.
+enum LeafStop {
+    /// The instruction at `frame.pc` needs its full handler.
+    Step,
+    /// A back edge found the GIL countdown spent or the loop generation
+    /// changed: the outer prologue must run.
+    Breaker,
+    /// The last leaf instruction's discard scheduled a finalization sweep.
+    Marked,
+}
+
+/// How [`Interpreter::quiet_run`] handed control back.
+enum QuietExit {
+    /// An eval-breaker input needs the outer loop's prologue.
+    Yield,
+    /// The instruction at `cur_pc` produced a non-`Continue` outcome.
+    Outcome {
+        stepped: Result<StepOutcome, RuntimeError>,
+        cur_pc: usize,
+    },
+}
 
 /// Outcome of executing a single instruction.
 enum StepOutcome {

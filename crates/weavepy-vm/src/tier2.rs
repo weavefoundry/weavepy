@@ -411,20 +411,54 @@ struct JitState {
     compile_gen: u64,
 }
 
+/// Process-wide "could any thread's JIT be on?" gate: `0` not yet
+/// derived, `1` possibly on, `2` off for the whole run. Whether the JIT
+/// runs is settled by the environment and the free-threading mode, both
+/// fixed before the first Python call, so every per-thread [`JitState`]
+/// agrees. The tier-up hooks sit on every Python call and loop back
+/// edge; with the JIT off they answer from this one relaxed load instead
+/// of a thread-local borrow.
+static JIT_PROCESS_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The `WEAVEPY_JIT` / free-threading verdict shared by every thread.
+fn jit_enabled_by_config() -> bool {
+    // RFC 0067 WS3 — the tier-2 JIT is on by default; `WEAVEPY_JIT=0`
+    // (or `off`, or an empty value) restores the pure interpreter.
+    let enabled = match std::env::var("WEAVEPY_JIT") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("off") && !v.is_empty(),
+        Err(_) => true,
+    };
+    // RFC 0076 WS11 — tier-2 native code assumes the GIL's
+    // single-writer discipline (unsynchronized inline-cache and
+    // guard-table reads); the free-threaded mode pins execution
+    // to tiers 0/1 for the whole run, even if an extension later
+    // re-enables the GIL.
+    enabled && !crate::gil::free_threading_requested()
+}
+
+/// True when no thread's JIT can be enabled (see [`JIT_PROCESS_GATE`]).
+#[inline]
+pub(crate) fn jit_off_for_process() -> bool {
+    match JIT_PROCESS_GATE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => jit_process_gate_init(),
+    }
+}
+
+#[cold]
+fn jit_process_gate_init() -> bool {
+    let on = jit_enabled_by_config();
+    JIT_PROCESS_GATE.store(
+        if on { 1 } else { 2 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    !on
+}
+
 impl JitState {
     fn new() -> JitState {
-        // RFC 0067 WS3 — the tier-2 JIT is on by default; `WEAVEPY_JIT=0`
-        // (or `off`, or an empty value) restores the pure interpreter.
-        let enabled = match std::env::var("WEAVEPY_JIT") {
-            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("off") && !v.is_empty(),
-            Err(_) => true,
-        };
-        // RFC 0076 WS11 — tier-2 native code assumes the GIL's
-        // single-writer discipline (unsynchronized inline-cache and
-        // guard-table reads); the free-threaded mode pins execution
-        // to tiers 0/1 for the whole run, even if an extension later
-        // re-enables the GIL.
-        let enabled = enabled && !crate::gil::free_threading_requested();
+        let enabled = jit_enabled_by_config();
         let threshold = std::env::var("WEAVEPY_JIT_THRESHOLD")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -2417,7 +2451,7 @@ pub(crate) fn gc_sweep() {
 pub(crate) fn note_backedge(code: &Rc<CodeObject>) -> bool {
     // RFC 0067 — same fast-out as `try_enter`: rejected code pays one
     // relaxed load per back edge, not a thread-local + map lookup.
-    if code.jit_hint.is_not_jitable() {
+    if code.jit_hint.is_not_jitable() || jit_off_for_process() {
         return false;
     }
     JIT.with(|cell| cell.borrow_mut().note_backedge(code))
@@ -6893,7 +6927,7 @@ pub(crate) fn try_call_native_direct(
     args: &[Object],
 ) -> Option<Result<Object, RuntimeError>> {
     // One relaxed load gates every never-compilable callee.
-    if code.jit_hint.is_not_jitable() {
+    if code.jit_hint.is_not_jitable() || jit_off_for_process() {
         return None;
     }
     // Pending interpreter work and active observers (which need the
@@ -7107,7 +7141,7 @@ pub(crate) fn try_enter(interp: &mut super::Interpreter, frame: &mut super::Fram
     // relaxed load; with the JIT on by default this is the per-call
     // tax on every never-compilable function (kwargs/defaults/
     // generator shapes), so it must stay off the map lookup.
-    if frame.code.jit_hint.is_not_jitable() {
+    if frame.code.jit_hint.is_not_jitable() || jit_off_for_process() {
         return JitEntry::Skip;
     }
     // RFC 0070 WS2 — generator bodies compile, but a fresh pc-0
@@ -7438,7 +7472,7 @@ pub(crate) fn try_enter_resume(
     if frame.parked_native.is_some() {
         return resume_parked(interp, frame);
     }
-    if frame.code.jit_hint.is_not_jitable() {
+    if frame.code.jit_hint.is_not_jitable() || jit_off_for_process() {
         return JitEntry::Skip;
     }
     let entry = JIT.with(|cell| {
@@ -8649,6 +8683,7 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
 /// test builds so it never reaches release binaries.
 #[cfg(test)]
 pub(crate) fn force_enable_for_test(threshold: u32) {
+    JIT_PROCESS_GATE.store(1, std::sync::atomic::Ordering::Relaxed);
     JIT.with(|cell| {
         let mut st = cell.borrow_mut();
         st.enabled = true;

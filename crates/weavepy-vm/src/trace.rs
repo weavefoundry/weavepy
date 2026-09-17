@@ -108,7 +108,14 @@ impl ObserverSnapshot {
         if g != self.gen {
             self.gen = g;
             self.any = any_observers_active();
-            self.mon_mask = monitoring_union_mask();
+            // A tool with a non-empty event mask is itself an observer, so
+            // without one the union is empty; skip the thread-local fold
+            // every fresh activation would otherwise pay.
+            self.mon_mask = if self.any {
+                monitoring_union_mask()
+            } else {
+                0
+            };
         }
     }
 }
