@@ -995,7 +995,9 @@ impl<T> FrameSlot<T> {
         Self {
             // SAFETY: the copy is never dropped while `owned` is false, and
             // the caller keeps the original alive for as long as it is read.
-            value: Some(std::mem::ManuallyDrop::new(unsafe { std::ptr::read(value) })),
+            value: Some(std::mem::ManuallyDrop::new(unsafe {
+                std::ptr::read(value)
+            })),
             owned: std::sync::atomic::AtomicBool::new(false),
         }
     }

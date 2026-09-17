@@ -449,10 +449,7 @@ pub(crate) fn jit_off_for_process() -> bool {
 #[cold]
 fn jit_process_gate_init() -> bool {
     let on = jit_enabled_by_config();
-    JIT_PROCESS_GATE.store(
-        if on { 1 } else { 2 },
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    JIT_PROCESS_GATE.store(if on { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
     !on
 }
 

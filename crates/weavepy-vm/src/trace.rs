@@ -111,11 +111,7 @@ impl ObserverSnapshot {
             // A tool with a non-empty event mask is itself an observer, so
             // without one the union is empty; skip the thread-local fold
             // every fresh activation would otherwise pay.
-            self.mon_mask = if self.any {
-                monitoring_union_mask()
-            } else {
-                0
-            };
+            self.mon_mask = if self.any { monitoring_union_mask() } else { 0 };
         }
     }
 }
