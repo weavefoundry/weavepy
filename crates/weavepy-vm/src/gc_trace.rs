@@ -3869,6 +3869,18 @@ pub(crate) fn take_force_cold_tick() -> bool {
 /// costs one scan, never correctness.
 #[inline]
 pub fn note_dropped(obj: &crate::object::Object) {
+    if note_dropped_marks(obj) {
+        mark_maybe_dead();
+    }
+}
+
+/// The grading half of [`note_dropped`]: would dropping `obj` right now
+/// schedule a prompt-finalization sweep? Split out so the leaf burst
+/// (`Interpreter::leaf_burst`) can end its run at exactly the
+/// instruction that marks, handing the very next safe point back to the
+/// full eval-loop prologue.
+#[inline]
+pub fn note_dropped_marks(obj: &crate::object::Object) -> bool {
     use crate::object::Object as O;
     match obj {
         O::None
@@ -3882,28 +3894,28 @@ pub fn note_dropped(obj: &crate::object::Object) {
         | O::WStr(_)
         | O::Bytes(_)
         | O::Range(_)
-        | O::Code(_) => {}
+        | O::Code(_) => false,
         // A dying bound method (the `obj.m(...)` call temporary, freed at
         // every method call) owns exactly one object: its receiver. Grade
         // that instead of marking on the method's own count of one.
         O::BoundMethod(bm) if crate::sync::Rc::strong_count(bm) <= 1 => {
-            note_dropped(&bm.receiver);
+            note_dropped_marks(&bm.receiver)
         }
         _ => {
             floor_stats::bump(&floor_stats::DROP_NOTES, 1);
             let sc = strong_count_for(obj);
             if sc <= 1 {
                 floor_stats::bump(&floor_stats::DROP_NOTES_MARKED, 1);
-                mark_maybe_dead();
-                return;
+                return true;
             }
             let id = crate::weakref_registry::id_of(obj);
             if TRACKED_FILTER.may_contain(id)
                 && (sc == 2 || crate::weakref_registry::may_have_weakrefs(id))
             {
                 floor_stats::bump(&floor_stats::DROP_NOTES_MARKED, 1);
-                mark_maybe_dead();
+                return true;
             }
+            false
         }
     }
 }

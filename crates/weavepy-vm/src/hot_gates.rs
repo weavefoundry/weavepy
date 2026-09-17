@@ -145,6 +145,11 @@ pub mod env_flags {
         "WEAVEPY_NO_QUIET"
     );
     once_flag!(
+        /// `WEAVEPY_NO_BURST`: disable the leaf burst (bisection aid).
+        no_burst,
+        "WEAVEPY_NO_BURST"
+    );
+    once_flag!(
         /// `WP_DBG_SAMPLE`: periodic frame-entry sampling to stderr.
         dbg_sample,
         "WP_DBG_SAMPLE"

@@ -906,6 +906,10 @@ pub struct Interpreter {
     /// prologue (RFC 0065 bisection aid). Read once at construction so a
     /// frame entry does not pay a `OnceLock` probe for it (RFC 0077 WS3).
     quiet_off: bool,
+    /// Whether the quiet loop may run leaf bursts ([`Self::leaf_burst`]).
+    /// Off under `WEAVEPY_NO_BURST`, `WEAVEPY_NO_QUIET`, and
+    /// `WEAVEPY_NO_LOCALS_FAST` (the burst reads locals raw).
+    burst_on: bool,
     /// `WP_DBG_SAMPLE`: periodic frame-entry sampling to stderr.
     dbg_sample: bool,
 }
@@ -1114,6 +1118,9 @@ impl Default for Interpreter {
             gil_countdown: crate::gil::GIL_CHECK_INTERVAL,
             fuse_off: false,
             quiet_off: crate::hot_gates::env_flags::no_quiet(),
+            burst_on: !crate::hot_gates::env_flags::no_burst()
+                && !crate::hot_gates::env_flags::no_quiet()
+                && !Self::locals_fast_off(),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
         };
         // RFC 0025: publish the shared parts of this interpreter
@@ -1229,6 +1236,9 @@ impl Interpreter {
             gil_countdown: crate::gil::GIL_CHECK_INTERVAL,
             fuse_off: false,
             quiet_off: crate::hot_gates::env_flags::no_quiet(),
+            burst_on: !crate::hot_gates::env_flags::no_burst()
+                && !crate::hot_gates::env_flags::no_quiet()
+                && !Self::locals_fast_off(),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
         }
     }
@@ -5567,6 +5577,14 @@ impl Interpreter {
                 loop_quiet = base_quiet && !fin_live;
                 loop_fin_quiet = base_quiet && fin_live;
             }
+            // The leaf burst: while the loop is quiet, run the straight
+            // run of leaf instructions at `frame.pc` in one tight loop
+            // (see `leaf_burst`). Whatever instruction stopped it executes
+            // below through the ordinary single-step path, prologue and
+            // all.
+            let burst_ok = self.burst_on
+                && !crate::specialize::stats_enabled()
+                && !crate::gil::free_threading_enabled();
             let cur_pc: usize;
             let mut instruction_ran = false;
             let watch_drops: bool;
@@ -5586,18 +5604,29 @@ impl Interpreter {
                     // finalizer drain, then the stride-gated suspect
                     // re-probe), and the same drop-watch bookkeeping in
                     // the shared tail below.
-                    if gc_trace::take_maybe_dead() {
-                        self.drain_prompt_finalizers();
-                        if gc_trace::has_suspects() {
-                            for obj in gc_trace::take_dead_suspects() {
-                                self.reap_dead_subgraph(obj);
-                            }
+                    let mut drained = self.drain_if_maybe_dead();
+                    if !drained && burst_ok {
+                        // Nothing pending: the burst may run. It ends at
+                        // the first instruction whose discard marks, so
+                        // the drain it scheduled still runs before the
+                        // next instruction, exactly as when single-stepping.
+                        // (After a drain the finalizers may have changed
+                        // any loop input, so that iteration single-steps.)
+                        if let Some(last) = self.leaf_burst(frame, loop_snap_gen) {
+                            prev_pc = Some(last as usize);
+                            drained = self.drain_if_maybe_dead();
                         }
                     }
+                    let _ = drained;
                     watch_drops = true;
                     stack_before = frame.stack.len();
                     op_before = frame.code.instructions.get(frame.pc as usize).map(|i| i.op);
                 } else {
+                    if burst_ok {
+                        if let Some(last) = self.leaf_burst(frame, loop_snap_gen) {
+                            prev_pc = Some(last as usize);
+                        }
+                    }
                     watch_drops = false;
                     stack_before = 0;
                     op_before = None;
@@ -8405,6 +8434,440 @@ impl Interpreter {
             }
         }
         Ok(StepOutcome::Continue)
+    }
+
+    /// The fin-quiet prologue's prompt-finalization probe: if the previous
+    /// instruction marked a possible death, drain the finalizers and
+    /// re-probe the suspects. Returns whether a drain ran.
+    #[inline]
+    fn drain_if_maybe_dead(&mut self) -> bool {
+        if !gc_trace::take_maybe_dead() {
+            return false;
+        }
+        self.drain_prompt_finalizers();
+        if gc_trace::has_suspects() {
+            for obj in gc_trace::take_dead_suspects() {
+                self.reap_dead_subgraph(obj);
+            }
+        }
+        true
+    }
+
+    /// The leaf burst: run a straight run of *leaf* instructions in one
+    /// tight loop, without the per-instruction eval-loop protocol.
+    ///
+    /// A leaf instruction, as executed here, (a) cannot raise, (b) cannot
+    /// run Python code or any finalizer, (c) cannot be observed mid-way by
+    /// frame introspection, and (d) grades every heap value it discards
+    /// through [`gc_trace::note_dropped_marks`], ending the burst at the
+    /// first drop that schedules a prompt-finalization sweep. Anything
+    /// else (an unusual operand, a possible error, a call, an exhausted
+    /// iterator) stops the burst *before* the instruction with no state
+    /// touched, and the caller's ordinary single-step path executes it.
+    /// The burst is therefore purely an accelerator: the quiet loop with
+    /// the burst behaves exactly like the quiet loop without it, except
+    /// that GIL hand-off and eval-breaker inputs are polled at loop back
+    /// edges (CPython's cadence) instead of at every instruction.
+    ///
+    /// The caller guarantees the loop is in a quiet mode (no observers, no
+    /// pending work, frame not materialized) and that `snap_gen` is the
+    /// loop generation that verdict was derived from.
+    ///
+    /// Returns the pc of the last instruction executed, if any.
+    #[inline(never)]
+    fn leaf_burst(&mut self, frame: &mut Frame, snap_gen: u64) -> Option<u32> {
+        use weavepy_compiler::InlineCache as IC;
+        let Frame {
+            code: code_rc,
+            locals,
+            stack,
+            globals,
+            builtins_obj,
+            ..
+        } = frame;
+        let code: &CodeObject = code_rc;
+        let instrs: &[weavepy_compiler::Instruction] = &code.instructions;
+        let consts = code_const_objects(code);
+        // SAFETY: RFC 0065 (WS3) — see `load_fast_value`. The burst runs
+        // under the GIL (it is disabled in free-threaded mode), executes no
+        // Python code, and never lets the reference escape; the locals
+        // vector is not resized during an activation.
+        let locals: &mut Vec<Object> = unsafe { &mut *locals.as_ptr() };
+        let mut pc = frame.pc as usize;
+        let start_pc = pc;
+        let mut last = usize::MAX;
+        loop {
+            let Some(&ins) = instrs.get(pc) else { break };
+            match ins.op {
+                OpCode::LoadFast => {
+                    match locals.get(ins.arg as usize) {
+                        Some(v) if !matches!(v, Object::Unbound) => {
+                            stack.push(Self::clone_operand(v));
+                        }
+                        _ => break,
+                    }
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::LoadConst => {
+                    let Some(v) = consts.get(ins.arg as usize) else {
+                        break;
+                    };
+                    stack.push(Self::clone_operand(v));
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::StoreFast => {
+                    let slot = ins.arg as usize;
+                    let (Some(new), Some(old)) = (stack.last(), locals.get(slot)) else {
+                        break;
+                    };
+                    // The PEP 709 cell restore stays on the full path.
+                    if matches!(new, Object::Cell(_)) {
+                        break;
+                    }
+                    // A displaced value the full handler would run through
+                    // the prompt-reap cascade stays there too.
+                    if Self::local_needs_prompt_reap(old) && Self::looks_reapable_temporary(old) {
+                        break;
+                    }
+                    let Some(v) = stack.pop() else { break };
+                    let old = std::mem::replace(&mut locals[slot], v);
+                    last = pc;
+                    pc += 1;
+                    if gc_trace::note_dropped_marks(&old) {
+                        gc_trace::mark_maybe_dead();
+                        drop(old);
+                        break;
+                    }
+                }
+                OpCode::PopTop => {
+                    // Only pure leaves: every other discard runs the full
+                    // handler's prompt-reap gate.
+                    match stack.last() {
+                        Some(
+                            Object::None
+                            | Object::Bool(_)
+                            | Object::Int(_)
+                            | Object::Float(_)
+                            | Object::Str(_),
+                        ) => {
+                            stack.pop();
+                        }
+                        _ => break,
+                    }
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::BinaryOp => {
+                    let n = stack.len();
+                    if n < 2 {
+                        break;
+                    }
+                    // SAFETY: `BinOpKind` is `repr(u8)` and the compiler only
+                    // emits valid kinds (same transmute as `binary_op_step`).
+                    let kind: BinOpKind = unsafe { std::mem::transmute(ins.arg as u8) };
+                    let r = match (&stack[n - 2], &stack[n - 1]) {
+                        (Object::Int(a), Object::Int(b)) => {
+                            let (a, b) = (*a, *b);
+                            match kind {
+                                BinOpKind::Add => match a.checked_add(b) {
+                                    Some(r) => Object::Int(r),
+                                    None => break,
+                                },
+                                BinOpKind::Sub => match a.checked_sub(b) {
+                                    Some(r) => Object::Int(r),
+                                    None => break,
+                                },
+                                BinOpKind::Mult => match a.checked_mul(b) {
+                                    Some(r) => Object::Int(r),
+                                    None => break,
+                                },
+                                BinOpKind::BitAnd => Object::Int(a & b),
+                                BinOpKind::BitOr => Object::Int(a | b),
+                                BinOpKind::BitXor => Object::Int(a ^ b),
+                                BinOpKind::RShift if (0..64).contains(&b) => Object::Int(a >> b),
+                                BinOpKind::LShift
+                                    if (0..63).contains(&b) && ((a << b) >> b) == a =>
+                                {
+                                    Object::Int(a << b)
+                                }
+                                BinOpKind::Div | BinOpKind::FloorDiv | BinOpKind::Mod if b != 0 => {
+                                    match i64_op(a, b, kind) {
+                                        Ok(Some(r)) => r,
+                                        _ => break,
+                                    }
+                                }
+                                _ => break,
+                            }
+                        }
+                        (Object::Float(a), Object::Float(b)) => {
+                            match Self::leaf_float_op(*a, *b, kind) {
+                                Some(r) => r,
+                                None => break,
+                            }
+                        }
+                        (Object::Int(a), Object::Float(b)) => {
+                            match Self::leaf_float_op(*a as f64, *b, kind) {
+                                Some(r) => r,
+                                None => break,
+                            }
+                        }
+                        (Object::Float(a), Object::Int(b)) => {
+                            match Self::leaf_float_op(*a, *b as f64, kind) {
+                                Some(r) => r,
+                                None => break,
+                            }
+                        }
+                        _ => break,
+                    };
+                    // Both operands are unboxed scalars: nothing to grade.
+                    stack.truncate(n - 1);
+                    stack[n - 2] = r;
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::CompareOp => {
+                    let n = stack.len();
+                    if n < 2 {
+                        break;
+                    }
+                    // SAFETY: as in `compare_op_step`.
+                    let kind: CompareKind =
+                        unsafe { std::mem::transmute((ins.arg & !COMPARE_OP_TO_BOOL_FLAG) as u8) };
+                    let ord = match (&stack[n - 2], &stack[n - 1]) {
+                        (Object::Int(a), Object::Int(b)) => a.partial_cmp(b),
+                        (Object::Float(a), Object::Float(b)) => {
+                            if a.is_nan() || b.is_nan() {
+                                break;
+                            }
+                            a.partial_cmp(b)
+                        }
+                        (Object::Str(a), Object::Str(b)) => Some(a.as_bytes().cmp(b.as_bytes())),
+                        _ => break,
+                    };
+                    let Some(ord) = ord else { break };
+                    let r = match kind {
+                        CompareKind::Lt => ord.is_lt(),
+                        CompareKind::LtE => ord.is_le(),
+                        CompareKind::Eq => ord.is_eq(),
+                        CompareKind::NotEq => ord.is_ne(),
+                        CompareKind::Gt => ord.is_gt(),
+                        CompareKind::GtE => ord.is_ge(),
+                    };
+                    // Operands are pure leaves (`str` owns no objects).
+                    stack.truncate(n - 1);
+                    stack[n - 2] = Object::Bool(r);
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => {
+                    let truthy = match stack.last() {
+                        Some(Object::Bool(b)) => *b,
+                        Some(Object::None) => false,
+                        Some(Object::Int(i)) => *i != 0,
+                        _ => break,
+                    };
+                    stack.pop();
+                    last = pc;
+                    pc += 1;
+                    if truthy == (ins.op == OpCode::PopJumpIfTrue) {
+                        pc += ins.arg as usize;
+                    }
+                }
+                OpCode::PopJumpIfNone | OpCode::PopJumpIfNotNone => {
+                    let Some(v) = stack.pop() else { break };
+                    let is_none = matches!(v, Object::None);
+                    last = pc;
+                    pc += 1;
+                    if is_none == (ins.op == OpCode::PopJumpIfNone) {
+                        pc += ins.arg as usize;
+                    }
+                    if gc_trace::note_dropped_marks(&v) {
+                        gc_trace::mark_maybe_dead();
+                        drop(v);
+                        break;
+                    }
+                }
+                OpCode::JumpForward => {
+                    last = pc;
+                    pc += 1 + ins.arg as usize;
+                }
+                OpCode::Nop | OpCode::NotTaken => {
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::JumpBackward => {
+                    // The back edge is the burst's eval-breaker: GIL
+                    // hand-off cadence, every loop-generation input
+                    // (signals, async exceptions, observers, pending
+                    // finalizers), and tier-2 heat are all polled here.
+                    if self.gil_countdown <= 1 || crate::hot_gates::loop_gen() != snap_gen {
+                        break;
+                    }
+                    #[cfg(feature = "jit")]
+                    if crate::tier2::note_backedge(code_rc) {
+                        break;
+                    }
+                    self.gil_countdown -= 1;
+                    last = pc;
+                    pc = (pc + 1).saturating_sub(ins.arg as usize);
+                }
+                OpCode::ForIter => {
+                    let next = {
+                        let Some(Object::Iter(it)) = stack.last() else {
+                            break;
+                        };
+                        let Ok(mut it) = it.try_borrow_mut() else {
+                            break;
+                        };
+                        match &mut *it {
+                            crate::object::PyIterator::Range {
+                                current,
+                                stop,
+                                step,
+                            } => {
+                                let live = if *step > 0 {
+                                    *current < *stop
+                                } else {
+                                    *step < 0 && *current > *stop
+                                };
+                                if live {
+                                    let v = *current;
+                                    *current = current.wrapping_add(*step);
+                                    Some(Object::Int(v))
+                                } else {
+                                    None
+                                }
+                            }
+                            crate::object::PyIterator::List { items, index, .. } => {
+                                let v = match items.try_borrow() {
+                                    Ok(xs) => xs.get(*index).cloned(),
+                                    Err(_) => None,
+                                };
+                                if v.is_some() {
+                                    *index += 1;
+                                }
+                                v
+                            }
+                            crate::object::PyIterator::Tuple { items, index } => {
+                                let v = items.get(*index).cloned();
+                                if v.is_some() {
+                                    *index += 1;
+                                }
+                                v
+                            }
+                            _ => None,
+                        }
+                    };
+                    // Exhaustion (and every other iterator kind) runs the
+                    // full handler: it pops and retires the iterator.
+                    let Some(v) = next else { break };
+                    stack.push(v);
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::CopyTop => {
+                    let n = (ins.arg as usize).max(1);
+                    let len = stack.len();
+                    if n > len {
+                        break;
+                    }
+                    let v = stack[len - n].clone();
+                    stack.push(v);
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::Swap => {
+                    let depth = ins.arg as usize;
+                    let n = stack.len();
+                    if depth >= 2 && depth <= n {
+                        stack.swap(n - 1, n - depth);
+                    }
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::LoadGlobal => {
+                    if builtins_obj.is_some() {
+                        break;
+                    }
+                    let Some(name) = code.names.get(ins.arg as usize) else {
+                        break;
+                    };
+                    let v = match code.caches.get(pc as u32) {
+                        IC::LoadGlobalModule {
+                            globals_id,
+                            key_idx,
+                        } if specialize::rc_id(globals) == globals_id => {
+                            let Ok(g) = globals.try_borrow() else { break };
+                            match g.get_index(key_idx as usize) {
+                                Some((DictKey(Object::Str(k)), v)) if **k == **name => v.clone(),
+                                _ => break,
+                            }
+                        }
+                        _ => break,
+                    };
+                    stack.push(v);
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::BinarySubscr => {
+                    let n = stack.len();
+                    if n < 2 {
+                        break;
+                    }
+                    let r = match (&stack[n - 2], &stack[n - 1]) {
+                        (Object::List(xs), Object::Int(i)) => {
+                            let Ok(xs) = xs.try_borrow() else { break };
+                            let len = xs.len() as i64;
+                            let i = if *i < 0 { *i + len } else { *i };
+                            if i < 0 || i >= len {
+                                break;
+                            }
+                            xs[i as usize].clone()
+                        }
+                        (Object::Tuple(t), Object::Int(i)) => {
+                            let len = t.len() as i64;
+                            let i = if *i < 0 { *i + len } else { *i };
+                            if i < 0 || i >= len {
+                                break;
+                            }
+                            t[i as usize].clone()
+                        }
+                        _ => break,
+                    };
+                    stack.truncate(n - 1);
+                    let container = std::mem::replace(&mut stack[n - 2], r);
+                    last = pc;
+                    pc += 1;
+                    if gc_trace::note_dropped_marks(&container) {
+                        gc_trace::mark_maybe_dead();
+                        drop(container);
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        if pc == start_pc && last == usize::MAX {
+            return None;
+        }
+        frame.pc = pc as u32;
+        (last != usize::MAX).then_some(last as u32)
+    }
+
+    /// Float arithmetic the leaf burst may run inline: the operators that
+    /// cannot raise for the given operands. Same results as the generic
+    /// `binary_op` float arms (`fresh_float` NaN identity included).
+    #[inline(always)]
+    fn leaf_float_op(a: f64, b: f64, kind: BinOpKind) -> Option<Object> {
+        Some(crate::object::fresh_float(match kind {
+            BinOpKind::Add => a + b,
+            BinOpKind::Sub => a - b,
+            BinOpKind::Mult => a * b,
+            BinOpKind::Div if b != 0.0 => a / b,
+            _ => return None,
+        }))
     }
 
     /// RFC 0077 (WS3): the dispatch loop's front door. The handful of
