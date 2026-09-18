@@ -500,6 +500,12 @@ fn is_tracked(args: &[Object]) -> Result<Object, RuntimeError> {
 fn object_is_tracked(target: &Object) -> bool {
     match target {
         Object::Tuple(items) => items.iter().any(object_is_tracked),
+        // Deferred tracking is an implementation detail: the instance
+        // answers as CPython's (always tracked) and is tracked from here on.
+        Object::Instance(inst) => {
+            inst.ensure_gc_tracked();
+            gc_trace::with_state(|s| s.is_tracked(id_of(target)))
+        }
         other => {
             let id = id_of(other);
             gc_trace::with_state(|s| s.is_tracked(id))

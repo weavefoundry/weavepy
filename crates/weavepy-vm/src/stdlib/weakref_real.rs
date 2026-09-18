@@ -1082,6 +1082,12 @@ fn make_ref_object_with_class(
     class_override: Option<Rc<TypeObject>>,
 ) -> Object {
     let target_id = id_of(&target);
+    // The registry's strong clone keeps the referent alive until the
+    // collector's prompt reap clears it, so a deferred instance is
+    // tracked from here on.
+    if let Object::Instance(inst) = &target {
+        inst.ensure_gc_tracked();
+    }
     let slot = Arc::new(WeakRefSlot::new(
         target_id,
         target.clone(),

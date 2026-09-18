@@ -1326,6 +1326,19 @@ impl GcState {
     /// Callers must be at a safe point (no outstanding container
     /// borrows); the interpreter invokes this from its allocation
     /// sites.
+    /// Whether the next [`Self::maybe_auto_collect`] would run a
+    /// collection (the young-generation counter has reached its
+    /// threshold). Lets an allocation site that cannot run finalizers
+    /// hand the allocation to one that can.
+    pub fn auto_collect_due(&self) -> bool {
+        if !self.is_enabled() || self.collecting.load(Ordering::Acquire) {
+            return false;
+        }
+        let counts = self.counts.borrow();
+        let thresholds = self.thresholds.borrow();
+        thresholds[0] != 0 && counts[0] >= thresholds[0]
+    }
+
     pub fn maybe_auto_collect(&self) -> bool {
         if !self.is_enabled() || self.collecting.load(Ordering::Acquire) {
             return false;
@@ -1749,7 +1762,12 @@ impl GcState {
                         // exceptions so their `__context__`/`__cause__`/
                         // traceback edges are subtracted (RFC 0054,
                         // test_taskgroups.test_exception_refcycles_*).
-                        Object::Instance(i) => i.cls().flags.is_exception,
+                        // An instance whose tracking is still deferred
+                        // (`track_deferred_owner`) holds only atomic values,
+                        // but its edge to its class can still close a cycle
+                        // (`A.a = A(); del A`): promote it so that edge is
+                        // subtracted, like CPython's always-tracked instance.
+                        Object::Instance(i) => i.cls().flags.is_exception || i.is_gc_deferred(),
                         // A frame's `f_locals` cache is an internal,
                         // untracked dict; it carries the frame's only
                         // object-graph edges to the locals (the `eg` in the
@@ -2712,39 +2730,52 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
 /// Sync` and lives in a `OnceLock`. Each thread sees the same
 /// table — registrations are a global, additive operation.
 fn run_external_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
-    let Some(table) = TRAVERSE_TABLE.get() else {
-        return;
-    };
-    // Snapshot the matching traverse fns, then *release* the table lock
-    // before invoking them. A C extension's `tp_traverse` calls our
-    // visitproc, which recurses back through the collector
-    // (`exc_has_finalizable` → `traverse_object`) and can re-enter
-    // `run_external_traverse` for a *nested* foreign object on the same
-    // thread — e.g. collecting a cycle through pandas' `BaseOffset`.
-    // `parking_lot::Mutex` is not reentrant, so holding the lock across the
-    // callback self-deadlocks. The table is registration-only and its
-    // entries are plain `fn` pointers, so a cheap snapshot is sound.
-    let matched: Vec<fn(&Object, &mut dyn FnMut(&Object))> = {
-        let entries = table.lock();
-        entries
-            .iter()
-            .filter(|e| (e.matches)(obj))
-            .map(|e| e.traverse)
-            .collect()
-    };
-    for traverse in matched {
-        traverse(obj, visit);
+    // The table is append-only and read lock-free (see `HookTable`); a
+    // hook may re-enter the collector, and this function, on the same
+    // thread.
+    for (matches, traverse) in TRAVERSE_TABLE.iter() {
+        if matches(obj) {
+            traverse(obj, visit);
+        }
     }
 }
 
-#[allow(missing_debug_implementations)]
-struct TraverseEntry {
-    matches: fn(&Object) -> bool,
-    traverse: fn(&Object, &mut dyn FnMut(&Object)),
+/// A small append-only registry of `(matches, hook)` function-pointer
+/// pairs with lock-free reads: hooks are registered at interpreter
+/// init and polled on every prompt-reap cascade and collection walk,
+/// so readers must not take a lock (nor allocate) per object.
+const HOOK_TABLE_CAP: usize = 16;
+
+struct HookTable<H: Copy> {
+    len: std::sync::atomic::AtomicUsize,
+    slots: [std::sync::OnceLock<(fn(&Object) -> bool, H)>; HOOK_TABLE_CAP],
 }
 
-static TRAVERSE_TABLE: std::sync::OnceLock<parking_lot::Mutex<Vec<TraverseEntry>>> =
-    std::sync::OnceLock::new();
+impl<H: Copy> HookTable<H> {
+    const CAP: usize = HOOK_TABLE_CAP;
+
+    const fn new() -> Self {
+        Self {
+            len: std::sync::atomic::AtomicUsize::new(0),
+            slots: [const { std::sync::OnceLock::new() }; HOOK_TABLE_CAP],
+        }
+    }
+
+    fn push(&self, matches: fn(&Object) -> bool, hook: H) {
+        let i = self.len.fetch_add(1, Ordering::AcqRel);
+        assert!(i < Self::CAP, "too many GC hook registrations");
+        let _ = self.slots[i].set((matches, hook));
+    }
+
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = (fn(&Object) -> bool, H)> + '_ {
+        let n = self.len.load(Ordering::Acquire).min(Self::CAP);
+        // A slot past a registration in flight is still unset; skip it.
+        self.slots[..n].iter().filter_map(|s| s.get().copied())
+    }
+}
+
+static TRAVERSE_TABLE: HookTable<fn(&Object, &mut dyn FnMut(&Object))> = HookTable::new();
 
 /// Register a traverse callback. Called once per Object variant
 /// whose fields are not directly visible to `traverse_object`.
@@ -2752,41 +2783,20 @@ pub fn register_traverse(
     matches: fn(&Object) -> bool,
     traverse: fn(&Object, &mut dyn FnMut(&Object)),
 ) {
-    let table = TRAVERSE_TABLE.get_or_init(|| parking_lot::Mutex::new(Vec::new()));
-    table.lock().push(TraverseEntry { matches, traverse });
+    TRAVERSE_TABLE.push(matches, traverse);
 }
 
-#[allow(missing_debug_implementations)]
-struct ClearEntry {
-    matches: fn(&Object) -> bool,
-    clear: fn(&Object),
-}
-
-static CLEAR_TABLE: std::sync::OnceLock<parking_lot::Mutex<Vec<ClearEntry>>> =
-    std::sync::OnceLock::new();
+static CLEAR_TABLE: HookTable<fn(&Object)> = HookTable::new();
 
 /// Called from `clear_object_fields` to let a type whose child
 /// references live in module-private (or C-managed) memory break its
 /// cycles during the collector's clear phase. The companion of
 /// [`register_traverse`] (RFC 0044, WS4).
 fn run_external_clear(obj: &Object) {
-    let Some(table) = CLEAR_TABLE.get() else {
-        return;
-    };
-    // Snapshot then release the lock before invoking, mirroring
-    // `run_external_traverse`: a C extension's `tp_clear` can re-enter the
-    // collector and thus this function for a nested foreign object on the
-    // same thread, which would self-deadlock on the non-reentrant mutex.
-    let matched: Vec<fn(&Object)> = {
-        let entries = table.lock();
-        entries
-            .iter()
-            .filter(|e| (e.matches)(obj))
-            .map(|e| e.clear)
-            .collect()
-    };
-    for clear in matched {
-        clear(obj);
+    for (matches, clear) in CLEAR_TABLE.iter() {
+        if matches(obj) {
+            clear(obj);
+        }
     }
 }
 
@@ -2794,8 +2804,7 @@ fn run_external_clear(obj: &Object) {
 /// during the collector's clear phase so a matching object can drop the
 /// child references it holds outside the VM's view.
 pub fn register_clear(matches: fn(&Object) -> bool, clear: fn(&Object)) {
-    let table = CLEAR_TABLE.get_or_init(|| parking_lot::Mutex::new(Vec::new()));
-    table.lock().push(ClearEntry { matches, clear });
+    CLEAR_TABLE.push(matches, clear);
 }
 
 /// Drain a container's child references in place. Used during
@@ -3074,6 +3083,11 @@ pub fn zombie_memoryview_refs_to(target: ObjectId) -> usize {
 
 /// Convenience: track `obj` in the shared, process-global GC.
 pub fn track(obj: Object) {
+    if let Object::Instance(inst) = &obj {
+        // The instance may have been born with deferred tracking; its
+        // `__dict__` no longer needs to guard it.
+        inst.clear_deferred_tracking();
+    }
     // A module's namespace dict outlives the module object whenever
     // functions defined in it survive (their `__globals__`), so it must
     // be a collection candidate in its own right — a
@@ -3096,6 +3110,42 @@ pub fn track(obj: Object) {
         with_state(|s| s.track(dict));
     }
     with_state(|s| s.track(obj));
+}
+
+/// Deferred instance tracking.
+///
+/// CPython tracks every instance of a Python-defined class at
+/// allocation. A tracked object here costs an index entry, a strong
+/// handle and, on its death, the prompt-reap cascade — several hundred
+/// nanoseconds for a temporary whose dict only ever holds ints. An
+/// instance that holds only atomic values ([`Object::is_gc_atomic`])
+/// cannot take part in a cycle, so a fresh plain instance starts
+/// *untracked* and its `__dict__` records the instance address as its
+/// deferred owner. The first store that could put a non-atomic value
+/// into the instance — any generic dict mutation (`DictData`'s
+/// `DerefMut`), a slot store of a non-atomic value, a `__dict__`
+/// replacement — tracks it through this function; so do `gc.is_tracked`
+/// and weakref creation (the registry's strong clone would otherwise
+/// keep it alive with no collector to reap it). An instance whose owner
+/// record is still set when it dies is freed by its last `Arc` drop.
+///
+/// `owner` is the address recorded by [`crate::object::DictData`]; it is
+/// 0 when the record was already taken. The instance is alive: it clears
+/// the record from its `Drop` before its memory is released.
+pub fn track_deferred_owner(owner: usize) {
+    if owner == 0 {
+        return;
+    }
+    let ptr = owner as *const crate::types::PyInstance;
+    // SAFETY: `owner` was recorded from `Rc::as_ptr` of a live instance
+    // by `PyInstance::new_deferred`, and every path that could release
+    // the instance clears the record first (`PyInstance::drop`), so the
+    // allocation is live and the strong count can be bumped.
+    let inst = unsafe {
+        crate::Rc::increment_strong_count(ptr);
+        crate::Rc::from_raw(ptr)
+    };
+    track(Object::Instance(inst));
 }
 
 /// Track `obj` *and* enroll it in the prompt-finalization index even though
@@ -3248,6 +3298,12 @@ pub fn track_if_cyclic(obj: &Object) -> bool {
 /// thread's GC (see [`GcState::maybe_auto_collect`]). Returns the
 /// number of objects reclaimed; the caller should drain pending
 /// finalizers when this is non-zero.
+/// See [`GcState::auto_collect_due`].
+#[inline]
+pub fn auto_collect_due() -> bool {
+    with_state(GcState::auto_collect_due)
+}
+
 pub fn maybe_auto_collect() -> bool {
     let ran = with_state(GcState::maybe_auto_collect);
     if ran {
@@ -3266,7 +3322,7 @@ pub fn find_handle(id: ObjectId) -> Option<Arc<TrackedHandle>> {
 /// by refcount-emulation paths to discount the registry's own
 /// strong handle.
 pub fn is_tracked(id: ObjectId) -> bool {
-    find_handle(id).is_some()
+    with_state(|s| s.is_tracked(id))
 }
 
 /// Convenience: claim `id`'s finalizer (so a later collection
@@ -3904,6 +3960,49 @@ pub fn note_dropped_marks(obj: &crate::object::Object) -> bool {
         | O::Bytes(_)
         | O::Range(_)
         | O::Code(_) => false,
+        // The common heap operands, with their count and identity read
+        // inline (no variant dispatch).
+        O::Instance(i) => note_dropped_counted(
+            crate::sync::Rc::strong_count(i),
+            crate::sync::Rc::as_ptr(i) as usize as u64,
+        ),
+        O::List(l) => note_dropped_counted(
+            crate::sync::Rc::strong_count(l),
+            crate::sync::Rc::as_ptr(l) as usize as u64,
+        ),
+        O::Dict(d) => note_dropped_counted(
+            crate::sync::Rc::strong_count(d),
+            crate::sync::Rc::as_ptr(d) as usize as u64,
+        ),
+        O::Function(f) => note_dropped_counted(
+            crate::sync::Rc::strong_count(f),
+            crate::sync::Rc::as_ptr(f) as usize as u64,
+        ),
+        _ => note_dropped_marks_other(obj),
+    }
+}
+
+/// The grade for an object with strong count `sc` and identity `id`
+/// (the identity is the one [`crate::weakref_registry::id_of`] yields).
+#[inline]
+fn note_dropped_counted(sc: usize, id: ObjectId) -> bool {
+    floor_stats::bump(&floor_stats::DROP_NOTES, 1);
+    if sc <= 1 {
+        floor_stats::bump(&floor_stats::DROP_NOTES_MARKED, 1);
+        return true;
+    }
+    if TRACKED_FILTER.may_contain(id) && (sc == 2 || crate::weakref_registry::may_have_weakrefs(id))
+    {
+        floor_stats::bump(&floor_stats::DROP_NOTES_MARKED, 1);
+        return true;
+    }
+    false
+}
+
+#[inline(never)]
+fn note_dropped_marks_other(obj: &crate::object::Object) -> bool {
+    use crate::object::Object as O;
+    match obj {
         // A dying bound method (the `obj.m(...)` call temporary, freed at
         // every method call) owns exactly one object: its receiver. Grade
         // that instead of marking on the method's own count of one.
@@ -3911,20 +4010,9 @@ pub fn note_dropped_marks(obj: &crate::object::Object) -> bool {
             note_dropped_marks(&bm.receiver)
         }
         _ => {
-            floor_stats::bump(&floor_stats::DROP_NOTES, 1);
             let sc = strong_count_for(obj);
-            if sc <= 1 {
-                floor_stats::bump(&floor_stats::DROP_NOTES_MARKED, 1);
-                return true;
-            }
             let id = crate::weakref_registry::id_of(obj);
-            if TRACKED_FILTER.may_contain(id)
-                && (sc == 2 || crate::weakref_registry::may_have_weakrefs(id))
-            {
-                floor_stats::bump(&floor_stats::DROP_NOTES_MARKED, 1);
-                return true;
-            }
-            false
+            note_dropped_counted(sc, id)
         }
     }
 }

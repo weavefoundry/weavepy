@@ -523,20 +523,22 @@ pub fn attempt_specialize_call_kw(
     kw_names: &[(String, crate::object::Object)],
 ) -> InlineCache {
     let code = f.code();
-    let total = code.arg_count as usize;
+    // Positional parameters, then the keyword-only ones.
+    let npos = code.arg_count as usize;
+    let total = npos + code.kwonly_count as usize;
     let kwc = kw_names.len();
     if code.is_generator
         || code.is_coroutine
         || code.is_async_generator
         || code.has_varargs
         || code.has_varkeywords
-        || code.kwonly_count != 0
         || !(code.cellvars.is_empty() && code.freevars.is_empty() && f.closure.is_empty())
         || f.slot("__defaults__").is_some()
+        || f.slot("__kwdefaults__").is_some()
         || total > 16
         || kwc == 0
         || kwc > 8
-        || argc > total
+        || argc > npos
     {
         return InlineCache::Cooldown(COOLDOWN);
     }
@@ -552,12 +554,7 @@ pub fn attempt_specialize_call_kw(
         perm |= (slot as u32) << (4 * j);
         covered |= 1 << slot;
     }
-    // Every slot not covered by a positional or keyword must carry a
-    // trailing default (right-aligned, like the generic fill).
-    let d_start = total - f.defaults.len().min(total);
-    let full = (1u32 << total) - 1;
-    let uncovered = !covered & full;
-    if (uncovered.trailing_zeros() as usize) < d_start {
+    if !kw_uncovered_have_defaults(f, &code, covered) {
         return InlineCache::Cooldown(COOLDOWN);
     }
     InlineCache::CallPyKwNames {
@@ -566,6 +563,29 @@ pub fn attempt_specialize_call_kw(
         argc: argc as u8,
         kwc: kwc as u8,
     }
+}
+
+/// Every parameter slot `covered` leaves unbound carries a default:
+/// trailing positionals right-aligned in `__defaults__` (like the
+/// generic fill), keyword-only ones by name in `__kwdefaults__`.
+pub fn kw_uncovered_have_defaults(
+    f: &Rc<crate::object::PyFunction>,
+    code: &weavepy_compiler::CodeObject,
+    covered: u32,
+) -> bool {
+    let npos = code.arg_count as usize;
+    let total = npos + code.kwonly_count as usize;
+    let d_start = npos - f.defaults.len().min(npos);
+    let uncovered_pos = !covered & ((1u32 << npos) - 1);
+    if (uncovered_pos.trailing_zeros() as usize) < d_start {
+        return false;
+    }
+    (npos..total).all(|slot| {
+        covered & (1 << slot) != 0
+            || f.kw_defaults
+                .iter()
+                .any(|(n, _)| Some(n.as_str()) == code.varnames.get(slot).map(String::as_str))
+    })
 }
 
 /// Decide on a `CALL` specialization for a bound method whose target is

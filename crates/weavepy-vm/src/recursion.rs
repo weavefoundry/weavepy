@@ -102,12 +102,27 @@ pub enum Enter {
 /// decrement are always balanced.
 #[derive(Debug)]
 pub struct Guard {
-    _private: (),
+    /// This thread's depth cell, resolved once at [`enter`]: the guard
+    /// is dropped on the thread that created it (activations never
+    /// migrate), so the drop needs no second thread-local lookup.
+    depth: *const Cell<usize>,
+}
+
+impl Guard {
+    /// The depth this activation runs at (1 for the outermost).
+    #[inline]
+    pub fn depth(&self) -> usize {
+        // SAFETY: see the field doc.
+        unsafe { &*self.depth }.get()
+    }
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        // SAFETY: the cell is this thread's own thread-local, alive for
+        // the thread; see the field doc.
+        let d = unsafe { &*self.depth };
+        d.set(d.get().saturating_sub(1));
     }
 }
 
@@ -120,16 +135,15 @@ impl Drop for Guard {
 /// See the module docs for why there is no extra-frame headroom.
 pub fn enter() -> Enter {
     let limit = recursion_limit();
-    let depth = DEPTH.with(|d| {
-        let n = d.get() + 1;
-        d.set(n);
-        n
-    });
-    if depth > limit {
-        DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    let cell = DEPTH.with(std::ptr::from_ref);
+    // SAFETY: this thread's own thread-local, alive for the thread.
+    let d = unsafe { &*cell };
+    let n = d.get() + 1;
+    if n > limit {
         return Enter::Overflow;
     }
-    Enter::Ok(Guard { _private: () })
+    d.set(n);
+    Enter::Ok(Guard { depth: cell })
 }
 
 #[cfg(test)]

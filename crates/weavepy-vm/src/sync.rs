@@ -314,12 +314,67 @@ impl CellTls {
     }
 }
 
+/// Whether more than one OS thread has ever run VM code (a second
+/// thread acquired the GIL, or free-threading is on). Until then every
+/// cell is touched by exactly one thread, and a borrow skips the lock
+/// word: no compare-exchange to take it, no release store to drop it.
+/// Set by [`note_vm_thread`] *before* the second thread touches any
+/// cell; the first thread cannot hold a borrow across a GIL release
+/// (the hand-off refuses while guards are live), so no guard taken
+/// lock-free is ever live once another thread runs. A guard remembers
+/// whether it took the lock, so a flip while one is live (impossible
+/// per the invariant) still releases correctly.
+static CELLS_SHARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn cells_shared() -> bool {
+    CELLS_SHARED.load(Ordering::Relaxed)
+}
+
+/// Record that `thread_id` is about to run VM code. Called from the GIL
+/// acquire path (and free-threading start-up); the first thread to
+/// register is the sole owner of every cell until a second one appears.
+pub fn note_vm_thread(thread_id: u64) {
+    static FIRST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if CELLS_SHARED.load(Ordering::Relaxed) {
+        return;
+    }
+    match FIRST.compare_exchange(0, thread_id, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {}
+        Err(first) if first == thread_id => {}
+        Err(first) => {
+            CELLS_SHARED.store(true, Ordering::SeqCst);
+            if std::env::var_os("WEAVEPY_CELLS_TRACE").is_some() {
+                eprintln!("[cells] shared: thread {thread_id:#x} joins {first:#x}");
+            }
+        }
+    }
+}
+
+/// Every cell is shared from now on (free-threading, a foreign thread
+/// that may touch objects without the GIL).
+pub fn mark_cells_shared() {
+    if !CELLS_SHARED.swap(true, Ordering::SeqCst)
+        && std::env::var_os("WEAVEPY_CELLS_TRACE").is_some()
+    {
+        eprintln!("[cells] shared: marked");
+    }
+}
+
 // `try_with`, not `with`, throughout: guards can be dropped from TLS
 // destructors at thread teardown, where the counter cell itself may
 // already be gone — the count is then irrelevant, so a no-op is right.
 #[inline]
-fn note_cell_guard_released() {
-    let _ = CELL_TLS.try_with(|t| t.live_guards.set(t.live_guards.get().saturating_sub(1)));
+fn note_cell_guard_released(tls: *const CellTls) {
+    if tls.is_null() {
+        return;
+    }
+    // SAFETY: the pointer was taken from this thread's live TLS block
+    // when the guard was created; guards are `!Send`, so this runs on
+    // the same thread, and the block outlives every guard created from
+    // it (a guard dropped from a TLS destructor took a null pointer).
+    let t = unsafe { &*tls };
+    t.live_guards.set(t.live_guards.get().saturating_sub(1));
 }
 
 /// True iff the calling thread holds at least one live [`GilCell`]
@@ -535,19 +590,24 @@ impl<T: ?Sized> GilCell<T> {
         // the live-guard count. If the block is already torn down (a
         // guard taken from a TLS destructor) fall back to the uncached
         // id and skip the count, which is irrelevant by then.
-        let ok = CELL_TLS
+        let locked = cells_shared();
+        let (ok, tls) = CELL_TLS
             .try_with(|t| {
-                self.lock_acquire_as(t.thread_id());
-                if self.borrow_shared() {
+                if locked {
+                    self.lock_acquire_as(t.thread_id());
+                }
+                if self.borrow_shared(locked) {
                     t.live_guards.set(t.live_guards.get() + 1);
-                    true
+                    (true, std::ptr::from_ref(t))
                 } else {
-                    false
+                    (false, std::ptr::null())
                 }
             })
             .unwrap_or_else(|_| {
-                self.lock_acquire();
-                self.borrow_shared()
+                if locked {
+                    self.lock_acquire();
+                }
+                (self.borrow_shared(locked), std::ptr::null())
             });
         if !ok {
             return Err(BorrowError);
@@ -561,6 +621,8 @@ impl<T: ?Sized> GilCell<T> {
         Ok(Ref {
             cell: self,
             value,
+            tls,
+            locked,
             _not_send: std::marker::PhantomData,
         })
     }
@@ -569,13 +631,15 @@ impl<T: ?Sized> GilCell<T> {
     /// negative value (a mutable borrow is live on this thread — the
     /// reentrant lock let us in), unwind, release, and report failure.
     #[inline]
-    fn borrow_shared(&self) -> bool {
+    fn borrow_shared(&self, locked: bool) -> bool {
         // The owner lock already serializes access across threads. The
         // counter only checks same-thread reentry, so it needs no atomic
         // read-modify-write or second acquire/release barrier.
         let prev = self.borrow.load(Ordering::Relaxed);
         if prev < 0 || prev == isize::MAX {
-            self.lock_release();
+            if locked {
+                self.lock_release();
+            }
             return false;
         }
         self.borrow.store(prev + 1, Ordering::Relaxed);
@@ -586,9 +650,11 @@ impl<T: ?Sized> GilCell<T> {
     /// the counter is exactly zero (no shared borrow and no nested
     /// mutable borrow); releases the lock and reports failure otherwise.
     #[inline]
-    fn borrow_exclusive(&self) -> bool {
+    fn borrow_exclusive(&self, locked: bool) -> bool {
         if self.borrow.load(Ordering::Relaxed) != 0 {
-            self.lock_release();
+            if locked {
+                self.lock_release();
+            }
             return false;
         }
         self.borrow.store(-1, Ordering::Relaxed);
@@ -598,19 +664,24 @@ impl<T: ?Sized> GilCell<T> {
     /// Non-panicking variant of [`borrow_mut`](Self::borrow_mut).
     /// Returns [`BorrowMutError`] if any borrow is live.
     pub fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
-        let ok = CELL_TLS
+        let locked = cells_shared();
+        let (ok, tls) = CELL_TLS
             .try_with(|t| {
-                self.lock_acquire_as(t.thread_id());
-                if self.borrow_exclusive() {
+                if locked {
+                    self.lock_acquire_as(t.thread_id());
+                }
+                if self.borrow_exclusive(locked) {
                     t.live_guards.set(t.live_guards.get() + 1);
-                    true
+                    (true, std::ptr::from_ref(t))
                 } else {
-                    false
+                    (false, std::ptr::null())
                 }
             })
             .unwrap_or_else(|_| {
-                self.lock_acquire();
-                self.borrow_exclusive()
+                if locked {
+                    self.lock_acquire();
+                }
+                (self.borrow_exclusive(locked), std::ptr::null())
             });
         if !ok {
             return Err(BorrowMutError);
@@ -622,6 +693,8 @@ impl<T: ?Sized> GilCell<T> {
         Ok(RefMut {
             cell: self,
             value,
+            tls,
+            locked,
             _not_send: std::marker::PhantomData,
         })
     }
@@ -804,6 +877,11 @@ impl<T: Hash> Hash for GilCell<T> {
 pub struct Ref<'a, T: ?Sized + 'a> {
     cell: &'a GilCell<T>,
     value: &'a T,
+    /// This thread's [`CELL_TLS`] block (null when unavailable), for
+    /// the live-guard count at release without a second lookup.
+    tls: *const CellTls,
+    /// Whether the cell's lock word was taken (see [`CELLS_SHARED`]).
+    locked: bool,
     _not_send: std::marker::PhantomData<*mut ()>,
 }
 
@@ -830,8 +908,10 @@ impl<T: ?Sized> Drop for Ref<'_, T> {
     fn drop(&mut self) {
         let count = self.cell.borrow.load(Ordering::Relaxed);
         self.cell.borrow.store(count - 1, Ordering::Relaxed);
-        self.cell.lock_release();
-        note_cell_guard_released();
+        if self.locked {
+            self.cell.lock_release();
+        }
+        note_cell_guard_released(self.tls);
     }
 }
 
@@ -841,6 +921,8 @@ impl<T: ?Sized> Drop for Ref<'_, T> {
 pub struct RefMut<'a, T: ?Sized + 'a> {
     cell: &'a GilCell<T>,
     value: &'a mut T,
+    tls: *const CellTls,
+    locked: bool,
     _not_send: std::marker::PhantomData<*mut ()>,
 }
 
@@ -868,8 +950,10 @@ impl<T: ?Sized> Drop for RefMut<'_, T> {
         // From -1 back to 0 — there's only ever one outstanding
         // mutable borrow at a time.
         self.cell.borrow.store(0, Ordering::Relaxed);
-        self.cell.lock_release();
-        note_cell_guard_released();
+        if self.locked {
+            self.cell.lock_release();
+        }
+        note_cell_guard_released(self.tls);
     }
 }
 

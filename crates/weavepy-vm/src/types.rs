@@ -332,7 +332,7 @@ pub struct LeafAttrCache(std::cell::UnsafeCell<[LeafAttrEntry; 32]>);
 unsafe impl Send for LeafAttrCache {}
 unsafe impl Sync for LeafAttrCache {}
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LeafAttrEntry {
     /// Interned name object address; `0` = empty.
     pub name: usize,
@@ -341,7 +341,7 @@ pub struct LeafAttrEntry {
 }
 
 /// The cached answer (see [`LeafAttrCache`]).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum LeafAttrKind {
     /// Not on the class MRO: instances resolve it from their own dict.
     InstanceOnly,
@@ -356,6 +356,9 @@ pub enum LeafAttrKind {
     BuiltinMethod(crate::sync::Rc<crate::object::BuiltinFn>),
     /// A plain scalar/string class value (instance dict still wins).
     Value(Object),
+    /// A `property` on the MRO (a data descriptor: it wins over the
+    /// instance dict); its getter is read at access time.
+    Property(crate::sync::Weak<crate::object::PyProperty>),
     /// Anything else: the full path decides.
     Other,
 }
@@ -581,6 +584,15 @@ pub struct InstancePlan {
     /// The MRO beyond the class itself is just `object` — the strict
     /// "takes no arguments" arity check applies when no `__init__` exists.
     pub only_object_init: bool,
+    /// The plain-construction shape (`Interpreter::instantiate_plain_lean`)
+    /// holds for this class as far as the class-level facts go, and
+    /// `__init__` is this plain function with this code object (the
+    /// per-call check re-verifies the code identity and its lean
+    /// eligibility, which can change under the class).
+    pub lean_init: Option<(
+        Rc<crate::object::PyFunction>,
+        Rc<weavepy_compiler::CodeObject>,
+    )>,
 }
 
 /// How a fresh instance's `native` payload is provisioned (see
@@ -2090,6 +2102,15 @@ pub struct PyInstance {
     pub c_body: CBody,
 }
 
+/// Per-thread freelist of retired deferred-tracking instances (see
+/// [`PyInstance::try_recycle`]).
+const INSTANCE_POOL_CAP: usize = 128;
+
+thread_local! {
+    static INSTANCE_POOL: std::cell::RefCell<Vec<Rc<PyInstance>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl PyInstance {
     pub fn new(class: Rc<TypeObject>) -> Self {
         Self {
@@ -2119,10 +2140,152 @@ impl PyInstance {
         }
     }
 
+    /// A plain instance whose cycle-collector tracking is deferred until
+    /// it could hold a non-atomic value (see
+    /// [`crate::gc_trace::track_deferred_owner`]). Its `__dict__` is
+    /// published eagerly to carry the owner record.
+    pub fn new_deferred(class: Rc<TypeObject>) -> Rc<Self> {
+        if let Some(mut inst) = INSTANCE_POOL.with(|p| p.borrow_mut().pop()) {
+            // Recycled: the dict (cleared, owner record set) and every
+            // other field were reset by `try_recycle`; only the class
+            // changes.
+            if let Some(m) = Rc::get_mut(&mut inst) {
+                *m.class.get_mut() = class;
+                return inst;
+            }
+        }
+        let inst = Rc::new(Self::new(class));
+        let owner = Rc::as_ptr(&inst) as usize;
+        inst.dict
+            .get_or_init(|| Rc::new(RefCell::new(DictData::deferred_for(owner))));
+        inst
+    }
+
+    /// Retire a dying deferred-tracking instance into the per-thread
+    /// pool for `new_deferred` (CPython's per-type freelist), or drop it.
+    /// The caller established that `obj` is its only reference, the
+    /// instance is still deferred and owns no C body.
+    pub fn try_recycle(mut inst: Rc<Self>) {
+        let Some(m) = Rc::get_mut(&mut inst) else {
+            return;
+        };
+        let owner = std::ptr::from_ref(&*m) as usize;
+        // The dict must be private too: `vars(obj)` / `obj.__dict__` hand
+        // out the same `Arc`, and a holder must keep seeing the dead
+        // instance's attributes, not the next tenant's.
+        if m.dict.strong_count() != 1 {
+            return;
+        }
+        let Some(dict) = m.dict.get() else {
+            return;
+        };
+        if m.native.get().is_some() || m.finalize_ran.get() || m.c_body.get() != 0 {
+            return;
+        }
+        // Reset in place: values are atomic, so clearing runs no code
+        // that could observe the instance.
+        {
+            let Ok(mut d) = dict.try_borrow_mut() else {
+                return;
+            };
+            if d.capacity() > 32 {
+                return;
+            }
+            d.map_mut_atomic_store().clear();
+            d.reset_deferred_owner(owner);
+        }
+        *m.slots.get_mut() = SlotStorage::default();
+        m.inline_values.set(true);
+        m.hash_cache = crate::sync::CachedHash::new(None);
+        // A pooled instance must not keep its class alive (a transient
+        // class is collected as soon as its last instance dies).
+        *m.class.get_mut() = crate::builtin_types::builtin_types().object_.clone();
+        INSTANCE_POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() < INSTANCE_POOL_CAP {
+                p.push(inst);
+            }
+        });
+    }
+
+    /// Whether tracking is still deferred (the `__dict__` carries the
+    /// owner record).
+    #[inline]
+    pub fn is_gc_deferred(&self) -> bool {
+        match self.dict.get() {
+            Some(d) => d.try_borrow().is_ok_and(|d| d.has_deferred_owner()),
+            None => false,
+        }
+    }
+
+    /// Whether the last reference to this instance may simply be
+    /// dropped (or the instance recycled): tracking is still deferred,
+    /// so it holds only atomic values and has no weakref or collector
+    /// handle; it owns no C body; and its class gained no `__del__`
+    /// since it was born.
+    #[inline]
+    pub fn dies_by_plain_drop(&self) -> bool {
+        self.c_body.get() == 0
+            && self.is_gc_deferred()
+            && self
+                .class
+                .try_borrow()
+                .is_ok_and(|c| !c.instances_need_finalize())
+    }
+
+    /// Drop the deferred-tracking record without tracking (the instance
+    /// is being tracked by other means, or is dying).
+    #[inline]
+    pub(crate) fn clear_deferred_tracking(&self) {
+        if let Some(d) = self.dict.get() {
+            match d.try_borrow() {
+                Ok(d) => {
+                    d.take_deferred_owner();
+                }
+                // A live mutable borrow: the mutator has already taken
+                // the record through `DerefMut`; nothing else sets it.
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Track a deferred instance now (no-op otherwise).
+    pub fn ensure_gc_tracked(&self) {
+        let owner = match self.dict.get() {
+            Some(d) => match d.try_borrow() {
+                Ok(d) => d.take_deferred_owner(),
+                Err(_) => 0,
+            },
+            None => 0,
+        };
+        crate::gc_trace::track_deferred_owner(owner);
+    }
+
+    /// A value is about to be stored outside the `__dict__` (a slot):
+    /// track a deferred instance unless the value is atomic.
+    #[inline]
+    pub fn note_slot_store(&self, value: &Object) {
+        if !value.is_gc_atomic() {
+            self.ensure_gc_tracked();
+        }
+    }
+
     /// The instance's current class (honours `__class__` assignment).
     #[inline]
     pub fn cls(&self) -> Rc<TypeObject> {
         self.class.borrow().clone()
+    }
+
+    /// The class, read without the cell's borrow bookkeeping: for the
+    /// leaf burst, which runs under the GIL (it is off in free-threaded
+    /// mode) with no Python code in flight — `__class__` assignment, the
+    /// cell's only writer, is a plain store between bytecodes. The
+    /// reference must not outlive the current instruction.
+    #[inline]
+    pub(crate) fn cls_raw(&self) -> &TypeObject {
+        debug_assert!(!crate::gil::free_threading_enabled());
+        // SAFETY: see above — no writer can run while the burst reads.
+        unsafe { &*self.class.as_ptr() }
     }
 
     /// Re-point the instance at a new class (`obj.__class__ = C`).
@@ -2139,6 +2302,7 @@ impl PyInstance {
 
     /// Write slot `name` into the side table.
     pub fn slot_set(&self, name: &str, value: Object) {
+        self.note_slot_store(&value);
         self.slots.borrow_mut().insert(name, value);
     }
 
@@ -2176,6 +2340,21 @@ impl Drop for PyInstance {
     /// a shallow copy that shares the dying instance's `__dict__`/slots/native
     /// value onto the VM's pending-finalizer queue so `__del__` still runs.
     fn drop(&mut self) {
+        // A deferred-tracking record names this instance; the dict may
+        // outlive it (`d = obj.__dict__`), so retire the record first.
+        if let Some(d) = self.dict.get() {
+            match d.try_borrow() {
+                Ok(d) => {
+                    d.take_deferred_owner();
+                }
+                Err(_) => {
+                    // SAFETY: only the atomic record is touched; a mutable
+                    // borrow elsewhere already took it through `DerefMut`,
+                    // so this store is a no-op that races with nothing.
+                    unsafe { (*d.as_ptr()).take_deferred_owner() };
+                }
+            }
+        }
         if crate::hot_gates::env_flags::reap_trace() {
             let name = self.cls().name.clone();
             if name.contains("Block") || name.contains("DataFrame") {

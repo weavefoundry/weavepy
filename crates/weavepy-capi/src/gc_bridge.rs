@@ -45,7 +45,12 @@ type InquiryProc = unsafe extern "C" fn(*mut PyObject) -> c_int;
 /// classes, which never appear as `Object::Instance` over a C type.)
 fn instance_type_ptr(obj: &Object) -> Option<*mut PyTypeObject> {
     match obj {
-        Object::Instance(i) => crate::types::type_ptr_for_class(&i.cls()),
+        // An instance that never crossed into C (no box, no inline body)
+        // has no C-held edges for `tp_traverse`/`tp_clear` to report or
+        // drop: the VM traverses its own fields. This keeps the bridge —
+        // a mint, a C call and a free per node — off the prompt-reap
+        // cascade of every native exception instance.
+        Object::Instance(i) if i.c_body.get() != 0 => crate::types::type_ptr_for_class(&i.cls()),
         _ => None,
     }
 }

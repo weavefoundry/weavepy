@@ -1424,6 +1424,7 @@ impl<'a> Sink<'a> for Objects {
         }
         if let Some(slots) = slots {
             // `setattr(inst, key, value)` on a verified member descriptor.
+            instance.ensure_gc_tracked();
             let mut storage = instance.slots.borrow_mut();
             if movable.slots.is_some() {
                 let data = std::mem::take(&mut *slots.borrow_mut());

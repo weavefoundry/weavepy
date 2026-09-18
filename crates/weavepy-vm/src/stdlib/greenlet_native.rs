@@ -281,9 +281,17 @@ fn chain_contains(id: u64) -> bool {
 /// mmap'd stack, so those probes must fall back to their counted
 /// budgets here.
 pub fn on_greenlet_stack() -> bool {
+    // Nothing has ever created a greenlet: skip the thread-local reads
+    // (this is polled on every lean Python call).
+    if !GREENLETS_EVER.load(Ordering::Relaxed) {
+        return false;
+    }
     let main = MAIN_ID.with(|m| m.get());
     main != 0 && CURRENT.with(|c| c.get()) != main
 }
+
+/// Set once the first greenlet main is created on any thread.
+static GREENLETS_EVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn stack_size() -> usize {
     static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -512,6 +520,7 @@ fn ensure_main() -> Rc<GreenletBody> {
         Object::Int(b.id as i64),
     );
     *b.instance.borrow_mut() = InstanceRef::Strong(inst);
+    GREENLETS_EVER.store(true, Ordering::Relaxed);
     MAIN_ID.with(|m| m.set(b.id));
     CURRENT.with(|c| c.set(b.id));
     CHAIN.with(|c| c.borrow_mut().push(b.id));

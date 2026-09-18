@@ -255,6 +255,7 @@ impl GilState {
         // per-acquire (not cached) so an extension re-enabling the
         // GIL mid-run takes effect on the next acquire.
         if free_threading_enabled() {
+            crate::sync::mark_cells_shared();
             return GilGuard {
                 state: Arc::clone(self),
                 _lock_guard: None,
@@ -277,6 +278,7 @@ impl GilState {
         self.breaker.remove_waiter();
         self.note_acquired();
         let me = current_thread_id();
+        crate::sync::note_vm_thread(me);
         self.holder.store(me, Ordering::Release);
         self.depth.fetch_add(1, Ordering::AcqRel);
         // We must hold the parking_lot guard for the lifetime
@@ -308,6 +310,7 @@ impl GilState {
         let lock_guard = self.lock.try_lock()?;
         self.note_acquired();
         let me = current_thread_id();
+        crate::sync::note_vm_thread(me);
         self.holder.store(me, Ordering::Release);
         self.depth.fetch_add(1, Ordering::AcqRel);
         let static_guard: parking_lot::ReentrantMutexGuard<'static, ()> =

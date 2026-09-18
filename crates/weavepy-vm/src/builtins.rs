@@ -10434,6 +10434,7 @@ fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
         // both, matching CPython where the function object is the same.
         attrs: RefCell::new(f.attrs()),
         slots: RefCell::new(f.slots.borrow().clone()),
+        closure_cells: std::sync::OnceLock::new(),
     };
     Ok(Object::Function(Rc::new(marked)))
 }

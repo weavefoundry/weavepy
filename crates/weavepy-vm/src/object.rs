@@ -2959,6 +2959,47 @@ impl indexmap::Equivalent<DictKey> for StrKeyHashed<'_> {
     }
 }
 
+/// A dict probe for the leaf burst: a `str` or `int` key that matches a
+/// stored key only by exact native equality. It never runs Python — an
+/// exotic stored key sharing the bucket (a `__eq__` that could equate)
+/// reads as a miss, and the burst leaves every miss to the full path.
+#[derive(Debug, Clone, Copy)]
+pub struct LeafProbe<'a> {
+    pub key: &'a Object,
+    pub hash: i64,
+}
+
+impl<'a> LeafProbe<'a> {
+    /// `None` unless `key` is a `str` or a machine `int`.
+    #[inline]
+    pub fn new(key: &'a Object) -> Option<Self> {
+        let hash = match key {
+            Object::Str(s) => SharedStr::hash_cached(s),
+            Object::Int(_) => py_hash_value(key)?,
+            _ => return None,
+        };
+        Some(Self { key, hash })
+    }
+}
+
+impl Hash for LeafProbe<'_> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+    }
+}
+
+impl indexmap::Equivalent<DictKey> for LeafProbe<'_> {
+    #[inline]
+    fn equivalent(&self, key: &DictKey) -> bool {
+        match (self.key, &key.0) {
+            (Object::Str(a), Object::Str(b)) => a.as_bytes() == b.as_bytes(),
+            (Object::Int(a), Object::Int(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 /// Count of "exotic" keys ever inserted into a *class* dict: any key
 /// that is not a plain `Object::Str`. While zero (every real-world
 /// program), `TypeObject::lookup`'s native [`StrKey`] walk is
@@ -3864,10 +3905,26 @@ fn next_dict_stamp() -> u64 {
 /// advances on mutable accesses that change nothing — and it is not the
 /// PEP 509 version tag (which counts effective changes only; see
 /// [`dict_version_get`]).
-#[derive(Clone)]
 pub struct DictData {
     map: DictMap,
     stamp: u64,
+    /// Deferred cycle-collector tracking (see
+    /// [`crate::gc_trace::track_deferred_owner`]): the address of the
+    /// `PyInstance` whose `__dict__` this is while that instance is not
+    /// yet tracked, else 0. Any mutation that could store a non-atomic
+    /// value (every `DerefMut`) tracks the owner first; the owner clears
+    /// it when it is tracked by other means or dies.
+    deferred_owner: std::sync::atomic::AtomicUsize,
+}
+
+impl Clone for DictData {
+    fn clone(&self) -> Self {
+        Self {
+            map: self.map.clone(),
+            stamp: self.stamp,
+            deferred_owner: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
 }
 
 impl DictData {
@@ -3876,7 +3933,58 @@ impl DictData {
         Self {
             map: DictMap::with_capacity_and_hasher(n, h),
             stamp: next_dict_stamp(),
+            deferred_owner: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// An empty instance `__dict__` guarding the deferred tracking of the
+    /// instance at `owner`.
+    pub(crate) fn deferred_for(owner: usize) -> Self {
+        Self {
+            map: DictMap::default(),
+            stamp: next_dict_stamp(),
+            deferred_owner: std::sync::atomic::AtomicUsize::new(owner),
+        }
+    }
+
+    /// Re-arm the owner record on a recycled (empty) instance dict.
+    #[inline]
+    pub(crate) fn reset_deferred_owner(&mut self, owner: usize) {
+        *self.deferred_owner.get_mut() = owner;
+    }
+
+    /// Whether this dict still guards a deferred-tracking owner.
+    #[inline]
+    pub(crate) fn has_deferred_owner(&self) -> bool {
+        self.deferred_owner
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0
+    }
+
+    /// Take the deferred owner (0 when none). The caller tracks it.
+    #[inline]
+    pub(crate) fn take_deferred_owner(&self) -> usize {
+        if !self.has_deferred_owner() {
+            return 0;
+        }
+        self.deferred_owner
+            .swap(0, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Mutable access for a store whose value is atomic (cannot take part
+    /// in a reference cycle): stamps the dict but leaves a deferred owner
+    /// untracked.
+    #[inline]
+    pub fn map_mut_atomic_store(&mut self) -> &mut DictMap {
+        self.stamp = next_dict_stamp();
+        &mut self.map
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn track_deferred_owner(&mut self) {
+        let owner = std::mem::replace(self.deferred_owner.get_mut(), 0);
+        crate::gc_trace::track_deferred_owner(owner);
     }
 
     /// The stamp of the dict's current state (see the type docs).
@@ -3900,6 +4008,7 @@ impl Default for DictData {
         Self {
             map: DictMap::default(),
             stamp: next_dict_stamp(),
+            deferred_owner: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -3916,6 +4025,9 @@ impl std::ops::Deref for DictData {
 impl std::ops::DerefMut for DictData {
     #[inline]
     fn deref_mut(&mut self) -> &mut DictMap {
+        if *self.deferred_owner.get_mut() != 0 {
+            self.track_deferred_owner();
+        }
         self.stamp = next_dict_stamp();
         &mut self.map
     }
@@ -3932,6 +4044,7 @@ impl From<DictMap> for DictData {
         Self {
             map,
             stamp: next_dict_stamp(),
+            deferred_owner: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -3944,8 +4057,7 @@ impl FromIterator<(DictKey, Object)> for DictData {
 
 impl Extend<(DictKey, Object)> for DictData {
     fn extend<I: IntoIterator<Item = (DictKey, Object)>>(&mut self, iter: I) {
-        self.stamp = next_dict_stamp();
-        self.map.extend(iter);
+        std::ops::DerefMut::deref_mut(self).extend(iter);
     }
 }
 
@@ -3972,8 +4084,7 @@ impl<'a> IntoIterator for &'a mut DictData {
     type IntoIter = indexmap::map::IterMut<'a, DictKey, Object>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.stamp = next_dict_stamp();
-        self.map.iter_mut()
+        std::ops::DerefMut::deref_mut(self).iter_mut()
     }
 }
 
@@ -4013,6 +4124,43 @@ pub struct PyFunction {
     /// copies `__dict__` and asserts the wrapper's annotations are
     /// untouched by the wrapped function's slots).
     pub slots: RefCell<DictData>,
+    /// The frame `cells` vector for a function whose code has free
+    /// variables but no cell variables: exactly `closure`'s cells, built
+    /// once (the closure is immutable) for the lean call paths.
+    pub closure_cells: std::sync::OnceLock<Rc<Vec<Rc<RefCell<Object>>>>>,
+}
+
+impl PyFunction {
+    /// The frame `cells` for a lean activation of this function: the
+    /// shared empty vector when the code closes over nothing, the cached
+    /// closure cells when it has free variables only, `None` when it
+    /// defines cell variables of its own (fresh cells per call) or a
+    /// closure entry is not a cell.
+    pub fn lean_cells(&self, code: &CodeObject) -> Option<Rc<Vec<Rc<RefCell<Object>>>>> {
+        if !code.cellvars.is_empty() {
+            return None;
+        }
+        if code.freevars.is_empty() && self.closure.is_empty() {
+            return Some(empty_cells());
+        }
+        if let Some(c) = self.closure_cells.get() {
+            return Some(c.clone());
+        }
+        if self.closure.len() != code.freevars.len()
+            || !self.closure.iter().all(|c| matches!(c, Object::Cell(_)))
+        {
+            return None;
+        }
+        let cells: Vec<Rc<RefCell<Object>>> = self
+            .closure
+            .iter()
+            .map(|c| match c {
+                Object::Cell(c) => c.clone(),
+                _ => unreachable!("checked above"),
+            })
+            .collect();
+        Some(self.closure_cells.get_or_init(|| Rc::new(cells)).clone())
+    }
 }
 
 /// Attribute names backed by function slots rather than `__dict__`.
@@ -8440,6 +8588,28 @@ impl PyIterator {
 // ---------- behavior ----------
 
 impl Object {
+    /// Whether the value can never (transitively) reference another
+    /// object — so a container holding only such values cannot be part
+    /// of a reference cycle. Used by deferred instance tracking.
+    #[inline]
+    pub fn is_gc_atomic(&self) -> bool {
+        matches!(
+            self,
+            Object::None
+                | Object::Unbound
+                | Object::Bool(_)
+                | Object::Int(_)
+                | Object::Long(_)
+                | Object::Float(_)
+                | Object::Complex(_)
+                | Object::Str(_)
+                | Object::WStr(_)
+                | Object::Bytes(_)
+                | Object::ByteArray(_)
+                | Object::Range(_)
+        )
+    }
+
     /// Python truthiness.
     pub fn is_truthy(&self) -> bool {
         match self {
@@ -11335,7 +11505,7 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
     }
     match obj {
         Object::None => Some(PY_HASH_NONE),
-        Object::Str(s) => Some(py_str_hash(s)),
+        Object::Str(s) => Some(SharedStr::hash_cached(s)),
         // Code objects compare by value (`code_value_eq`), so they must
         // also hash by value or value-equal codes land in different
         // set/dict buckets (CPython `code_hash`).
@@ -11345,7 +11515,10 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
         // (disjoint by invariant), so cross-representation hash agreement is
         // unnecessary; collisions only cost a probe, never correctness.
         Object::WStr(cps) => Some(py_wstr_hash(cps)),
-        Object::Bytes(b) => Some(py_hash_bytes_slice(b)),
+        Object::Bytes(b) => Some(crate::shared_value::SharedSlice::hash_cached(
+            b,
+            py_hash_bytes_slice,
+        )),
         // A read-only byte-format view hashes as its contents — equal to the
         // hash of `tobytes()` regardless of alignment or strides (CPython
         // `memory_hash`; test_hash.test_unaligned_buffers). The value is
