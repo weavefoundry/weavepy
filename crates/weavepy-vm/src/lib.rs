@@ -862,6 +862,9 @@ pub struct Interpreter {
     /// no traceback) hands the allocation back here instead. CPython's
     /// analogue is the `_PyFreeListState` frame/object freelists.
     frame_locals_pool: ThreadCell<Vec<Rc<RefCell<Vec<Object>>>>>,
+    /// Parked inline activations (see [`InlineAct`]), reused so an
+    /// inline call allocates nothing.
+    inline_pool: Vec<Box<InlineAct>>,
     /// RFC 0068 (WS9) — recycled tuple allocations, CPython's tuple
     /// freelist analogue (one LIFO bucket per length 1..=16, like
     /// CPython's per-size freelists). A refcount-dead, untracked,
@@ -1129,6 +1132,7 @@ impl Default for Interpreter {
             globals_missing_any: Cell::new(false),
             internal_import_depth: 0,
             frame_locals_pool: ThreadCell::new(Vec::new()),
+            inline_pool: Vec::new(),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
             frame_shell_pool: ThreadCell::new(Vec::new()),
             frame_stack_pool: ThreadCell::new(Vec::new()),
@@ -1251,6 +1255,7 @@ impl Interpreter {
             globals_missing_any: Cell::new(false),
             internal_import_depth: 0,
             frame_locals_pool: ThreadCell::new(Vec::new()),
+            inline_pool: Vec::new(),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
             frame_shell_pool: ThreadCell::new(Vec::new()),
             frame_stack_pool: ThreadCell::new(Vec::new()),
@@ -8686,6 +8691,13 @@ impl Interpreter {
     /// mode), and the GIL countdown, the loop generation, and the
     /// maybe-dead flag are consulted, in the outer loop's order, before
     /// the next instruction.
+    ///
+    /// A plain Python-to-Python call runs *inline* (see [`InlineAct`]):
+    /// the loop switches to the callee's frame at the `CALL` and back to
+    /// the caller's at the callee's return, with no nested native
+    /// activation. Only the root activation's exit leaves this function;
+    /// an inline activation's exit is finished here (see
+    /// [`Self::inline_finish`]) and its result handed to its caller.
     #[inline(never)]
     fn quiet_run(
         &mut self,
@@ -8696,218 +8708,646 @@ impl Interpreter {
         coarse: bool,
         prev_pc: &mut Option<usize>,
     ) -> QuietExit {
-        let mut last = usize::MAX;
-        // SAFETY (for the reads below): the flag is this thread's own
-        // thread-local, which outlives this call; a greenlet switch moves
-        // stacks, never OS threads.
+        // SAFETY (for the reads in `quiet_frame`): the flag is this
+        // thread's own thread-local, which outlives this call; a greenlet
+        // switch moves stacks, never OS threads.
         let maybe_dead = gc_trace::maybe_dead_flag();
-        let exit = loop {
-            match self.leaf_burst(frame, snap_gen, &mut last) {
-                LeafStop::Breaker => break QuietExit::Yield,
-                LeafStop::Raised(err) => {
-                    // The `CALL` arm of `step` marks on the raise path.
-                    gc_trace::mark_maybe_dead();
-                    self.flush_lean(frame, &mut shell);
-                    let cur_pc = frame.pc as usize - 1;
-                    if last != usize::MAX {
-                        *prev_pc = Some(last);
+        // The root activation's last executed pc (its `prev_pc` feed).
+        let mut last = usize::MAX;
+        // The inline activations, innermost last.
+        let mut inl: Vec<Box<InlineAct>> = Vec::new();
+        let mut entry = QuietEntry::Fresh;
+        loop {
+            let ev = match inl.last_mut() {
+                None => self.quiet_frame(
+                    frame, &mut shell, snap_gen, fin, coarse, maybe_dead, prev_pc, &mut last, entry,
+                ),
+                Some(top) => {
+                    let top = &mut **top;
+                    let mut top_shell = QuietShell::Lazy(&mut top.act);
+                    let mut top_prev = None;
+                    let mut top_last = usize::MAX;
+                    self.quiet_frame(
+                        &mut top.frame,
+                        &mut top_shell,
+                        snap_gen,
+                        fin,
+                        coarse,
+                        maybe_dead,
+                        &mut top_prev,
+                        &mut top_last,
+                        entry,
+                    )
+                }
+            };
+            entry = match ev {
+                FrameEv::Call(act) => {
+                    inl.push(act);
+                    QuietEntry::Fresh
+                }
+                FrameEv::Exit(exit) => {
+                    let Some(mut done) = inl.pop() else {
+                        return exit;
+                    };
+                    let result = self.inline_finish(&mut done, exit);
+                    match inl.last_mut() {
+                        None => self.inline_deliver(frame, &mut shell, done, result),
+                        Some(caller) => {
+                            let caller = &mut **caller;
+                            let mut caller_shell = QuietShell::Lazy(&mut caller.act);
+                            self.inline_deliver(&mut caller.frame, &mut caller_shell, done, result)
+                        }
                     }
-                    return QuietExit::Outcome {
+                }
+            };
+        }
+    }
+
+    /// One activation's stretch of the quiet loop (see
+    /// [`Self::quiet_run`]): runs `frame` from `entry` until it makes an
+    /// inline call or exits.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn quiet_frame(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        snap_gen: u64,
+        fin: bool,
+        coarse: bool,
+        maybe_dead: *const std::cell::Cell<bool>,
+        prev_pc: &mut Option<usize>,
+        last: &mut usize,
+        entry: QuietEntry,
+    ) -> FrameEv {
+        let exit = 'run: {
+            match entry {
+                QuietEntry::Fresh => {}
+                // Back from an inline call: the per-call protocol of the
+                // lean paths below.
+                QuietEntry::Returned { cur_pc } => {
+                    *last = cur_pc;
+                    if self.gil_countdown <= 2 {
+                        break 'run QuietExit::Yield;
+                    }
+                    self.gil_countdown -= 1;
+                    if crate::hot_gates::loop_gen() != snap_gen {
+                        break 'run QuietExit::Yield;
+                    }
+                    // SAFETY: see `quiet_run`.
+                    if fin && unsafe { (*maybe_dead).get() } {
+                        self.flush_lean(frame, shell);
+                        if self.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != snap_gen {
+                            break 'run QuietExit::Yield;
+                        }
+                    }
+                }
+                QuietEntry::Raised { err, cur_pc } => {
+                    // The raise path drops the staged operands wholesale
+                    // (see the `CALL` arm of `step`).
+                    gc_trace::mark_maybe_dead();
+                    self.flush_lean(frame, shell);
+                    if *last != usize::MAX {
+                        *prev_pc = Some(*last);
+                    }
+                    return FrameEv::Exit(QuietExit::Outcome {
                         stepped: Err(err),
                         cur_pc,
-                    };
-                }
-                LeafStop::Marked => {
-                    if fin {
-                        // Finalizers are arbitrary code: the spine must be
-                        // complete before they run.
-                        self.flush_lean(frame, &mut shell);
-                        self.drain_if_maybe_dead();
-                        if crate::hot_gates::loop_gen() != snap_gen {
-                            break QuietExit::Yield;
-                        }
-                    }
-                    continue;
-                }
-                LeafStop::Step => {}
-            }
-            let cur_pc = frame.pc as usize;
-            let op_before = frame.code.instructions.get(cur_pc).map(|i| i.op);
-            // Returning observes nothing: a shell-less activation finishes
-            // without ever pushing one.
-            if op_before == Some(OpCode::ReturnValue) {
-                if let Some(v) = frame.stack.pop() {
-                    frame.pc = cur_pc as u32 + 1;
-                    if last != usize::MAX {
-                        *prev_pc = Some(last);
-                    }
-                    return QuietExit::Outcome {
-                        stepped: Ok(StepOutcome::Return(v)),
-                        cur_pc,
-                    };
+                    });
                 }
             }
-            // Likewise a yield from a lean generator resume: the full
-            // handler's only other effect is the async-generator tag.
-            if op_before == Some(OpCode::YieldValue)
-                && matches!(&shell, QuietShell::Lazy(act) if act.shell.is_none())
-            {
-                if let Some(v) = frame.stack.pop() {
-                    frame.agen_yielded_value = frame.code.instructions[cur_pc].arg == 0;
-                    frame.pc = cur_pc as u32 + 1;
-                    if last != usize::MAX {
-                        *prev_pc = Some(last);
-                    }
-                    return QuietExit::Outcome {
-                        stepped: Ok(StepOutcome::Yield(v)),
-                        cur_pc,
-                    };
-                }
-            }
-            // A plain Python-to-Python call stays lean: no shell for this
-            // frame yet, none for the callee unless it needs one.
-            if matches!(op_before, Some(OpCode::Call | OpCode::CallKw)) {
-                let called = if op_before == Some(OpCode::Call) {
-                    self.try_lean_call(frame, &mut shell, snap_gen, cur_pc)
-                } else {
-                    self.try_lean_call_kw(frame, &mut shell, snap_gen, cur_pc)
-                };
-                if let Some(called) = called {
-                    if let Err(err) = called {
-                        // The raise path drops the staged operands
-                        // wholesale (see the `CALL` arm of `step`).
+            loop {
+                match self.leaf_burst(frame, snap_gen, last) {
+                    LeafStop::Breaker => break 'run QuietExit::Yield,
+                    LeafStop::Raised(err) => {
+                        // The `CALL` arm of `step` marks on the raise path.
                         gc_trace::mark_maybe_dead();
-                        self.flush_lean(frame, &mut shell);
-                        if last != usize::MAX {
-                            *prev_pc = Some(last);
+                        self.flush_lean(frame, shell);
+                        let cur_pc = frame.pc as usize - 1;
+                        if *last != usize::MAX {
+                            *prev_pc = Some(*last);
                         }
-                        return QuietExit::Outcome {
+                        return FrameEv::Exit(QuietExit::Outcome {
                             stepped: Err(err),
                             cur_pc,
-                        };
+                        });
                     }
-                    last = cur_pc;
-                    if self.gil_countdown <= 2 {
-                        break QuietExit::Yield;
-                    }
-                    self.gil_countdown -= 1;
-                    if crate::hot_gates::loop_gen() != snap_gen {
-                        break QuietExit::Yield;
-                    }
-                    // SAFETY: see `maybe_dead` above.
-                    if fin && unsafe { (*maybe_dead).get() } {
-                        self.flush_lean(frame, &mut shell);
-                        if self.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != snap_gen {
-                            break QuietExit::Yield;
+                    LeafStop::Marked => {
+                        if fin {
+                            // Finalizers are arbitrary code: the spine must be
+                            // complete before they run.
+                            self.flush_lean(frame, shell);
+                            self.drain_if_maybe_dead();
+                            if crate::hot_gates::loop_gen() != snap_gen {
+                                break 'run QuietExit::Yield;
+                            }
                         }
+                        continue;
                     }
-                    continue;
+                    LeafStop::Step | LeafStop::Core => {}
                 }
-            }
-            // `inst.prop` for a plain `property`: its getter runs as a
-            // lean activation, like a lean call; `for x in gen` resumes
-            // the generator as one.
-            if matches!(op_before, Some(OpCode::LoadAttr | OpCode::ForIter)) {
-                let loaded = if op_before == Some(OpCode::LoadAttr) {
-                    self.try_lean_property(frame, &mut shell, snap_gen, cur_pc)
-                } else {
-                    self.try_lean_for_iter(frame, &mut shell, cur_pc)
-                };
-                if let Some(loaded) = loaded {
-                    if let Err(err) = loaded {
-                        gc_trace::mark_maybe_dead();
-                        self.flush_lean(frame, &mut shell);
-                        if last != usize::MAX {
-                            *prev_pc = Some(last);
+                let cur_pc = frame.pc as usize;
+                let op_before = frame.code.instructions.get(cur_pc).map(|i| i.op);
+                // Returning observes nothing: a shell-less activation finishes
+                // without ever pushing one.
+                if op_before == Some(OpCode::ReturnValue) {
+                    if let Some(v) = frame.stack.pop() {
+                        frame.pc = cur_pc as u32 + 1;
+                        if *last != usize::MAX {
+                            *prev_pc = Some(*last);
                         }
-                        return QuietExit::Outcome {
-                            stepped: Err(err),
+                        return FrameEv::Exit(QuietExit::Outcome {
+                            stepped: Ok(StepOutcome::Return(v)),
                             cur_pc,
-                        };
+                        });
                     }
-                    last = cur_pc;
-                    if self.gil_countdown <= 2 {
-                        break QuietExit::Yield;
-                    }
-                    self.gil_countdown -= 1;
-                    if crate::hot_gates::loop_gen() != snap_gen {
-                        break QuietExit::Yield;
-                    }
-                    // SAFETY: see `maybe_dead` above.
-                    if fin && unsafe { (*maybe_dead).get() } {
-                        self.flush_lean(frame, &mut shell);
-                        if self.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != snap_gen {
-                            break QuietExit::Yield;
-                        }
-                    }
-                    continue;
                 }
-            }
-            // Any other instruction may raise, run arbitrary code, or walk
-            // the spine.
-            if burst_stats::enabled() {
-                burst_stats::note_slow(op_before);
-                if matches!(op_before, Some(OpCode::LoadAttr | OpCode::LoadMethodAttr)) {
-                    let arg = frame.code.instructions[cur_pc].arg;
-                    let recv = frame.stack.last().map_or("?", |o| o.type_name());
-                    burst_stats::note_attr(
-                        frame
-                            .code
-                            .names
-                            .get(arg as usize)
-                            .map_or("?", String::as_str),
-                        recv,
-                    );
-                }
-            }
-            let live_shell = self.flush_lean(frame, &mut shell);
-            let stack_before = frame.stack.len();
-            live_shell
-                .lasti
-                .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
-            let stepped = self.step_hot(frame);
-            if coarse {
-                let drop_class = match op_before {
-                    Some(op) => COARSE_DROP_CLASS[op as u8 as usize],
-                    None => 0,
-                };
-                if drop_class & COARSE_EXEMPT == 0
-                    && (frame.stack.len() < stack_before || drop_class & COARSE_DELETE != 0)
+                // Likewise a yield from a lean generator resume: the full
+                // handler's only other effect is the async-generator tag.
+                if op_before == Some(OpCode::YieldValue)
+                    && matches!(&*shell, QuietShell::Lazy(act) if act.shell.is_none())
                 {
-                    gc_trace::mark_maybe_dead();
+                    if let Some(v) = frame.stack.pop() {
+                        frame.agen_yielded_value = frame.code.instructions[cur_pc].arg == 0;
+                        frame.pc = cur_pc as u32 + 1;
+                        if *last != usize::MAX {
+                            *prev_pc = Some(*last);
+                        }
+                        return FrameEv::Exit(QuietExit::Outcome {
+                            stepped: Ok(StepOutcome::Yield(v)),
+                            cur_pc,
+                        });
+                    }
                 }
-            }
-            if !matches!(stepped, Ok(StepOutcome::Continue)) {
-                return QuietExit::Outcome { stepped, cur_pc };
-            }
-            last = cur_pc;
-            // The outer loop's per-instruction prologue, in its order.
-            if self.gil_countdown <= 2 {
-                break QuietExit::Yield;
-            }
-            self.gil_countdown -= 1;
-            if crate::hot_gates::loop_gen() != snap_gen {
-                break QuietExit::Yield;
-            }
-            if fin
-                && unsafe { (*maybe_dead).get() }
-                && self.drain_if_maybe_dead()
-                && crate::hot_gates::loop_gen() != snap_gen
-            {
-                break QuietExit::Yield;
+                // A plain Python-to-Python call stays lean: inline when it
+                // can (the callee's frame becomes this loop's), else on a
+                // nested lean activation; no shell for this frame yet, none
+                // for the callee unless it needs one.
+                if matches!(op_before, Some(OpCode::Call | OpCode::CallKw)) {
+                    if self.inline_calls_ok() {
+                        let inline = if op_before == Some(OpCode::Call) {
+                            self.try_inline_call(frame, shell, cur_pc)
+                        } else {
+                            self.try_inline_call_kw(frame, shell, cur_pc)
+                        };
+                        if let Some(act) = inline {
+                            return FrameEv::Call(act);
+                        }
+                    }
+                    let called = if op_before == Some(OpCode::Call) {
+                        self.try_lean_call(frame, shell, snap_gen, cur_pc)
+                    } else {
+                        self.try_lean_call_kw(frame, shell, snap_gen, cur_pc)
+                    };
+                    if let Some(called) = called {
+                        if let Err(err) = called {
+                            // The raise path drops the staged operands
+                            // wholesale (see the `CALL` arm of `step`).
+                            gc_trace::mark_maybe_dead();
+                            self.flush_lean(frame, shell);
+                            if *last != usize::MAX {
+                                *prev_pc = Some(*last);
+                            }
+                            return FrameEv::Exit(QuietExit::Outcome {
+                                stepped: Err(err),
+                                cur_pc,
+                            });
+                        }
+                        *last = cur_pc;
+                        if self.gil_countdown <= 2 {
+                            break 'run QuietExit::Yield;
+                        }
+                        self.gil_countdown -= 1;
+                        if crate::hot_gates::loop_gen() != snap_gen {
+                            break 'run QuietExit::Yield;
+                        }
+                        // SAFETY: see `quiet_run`.
+                        if fin && unsafe { (*maybe_dead).get() } {
+                            self.flush_lean(frame, shell);
+                            if self.drain_if_maybe_dead()
+                                && crate::hot_gates::loop_gen() != snap_gen
+                            {
+                                break 'run QuietExit::Yield;
+                            }
+                        }
+                        continue;
+                    }
+                }
+                // `inst.prop` for a plain `property`: its getter runs as a
+                // lean activation, like a lean call; `for x in gen` resumes
+                // the generator as one.
+                if matches!(op_before, Some(OpCode::LoadAttr | OpCode::ForIter)) {
+                    let loaded = if op_before == Some(OpCode::LoadAttr) {
+                        self.try_lean_property(frame, shell, snap_gen, cur_pc)
+                    } else {
+                        self.try_lean_for_iter(frame, shell, cur_pc)
+                    };
+                    if let Some(loaded) = loaded {
+                        if let Err(err) = loaded {
+                            gc_trace::mark_maybe_dead();
+                            self.flush_lean(frame, shell);
+                            if *last != usize::MAX {
+                                *prev_pc = Some(*last);
+                            }
+                            return FrameEv::Exit(QuietExit::Outcome {
+                                stepped: Err(err),
+                                cur_pc,
+                            });
+                        }
+                        *last = cur_pc;
+                        if self.gil_countdown <= 2 {
+                            break 'run QuietExit::Yield;
+                        }
+                        self.gil_countdown -= 1;
+                        if crate::hot_gates::loop_gen() != snap_gen {
+                            break 'run QuietExit::Yield;
+                        }
+                        // SAFETY: see `quiet_run`.
+                        if fin && unsafe { (*maybe_dead).get() } {
+                            self.flush_lean(frame, shell);
+                            if self.drain_if_maybe_dead()
+                                && crate::hot_gates::loop_gen() != snap_gen
+                            {
+                                break 'run QuietExit::Yield;
+                            }
+                        }
+                        continue;
+                    }
+                }
+                // Any other instruction may raise, run arbitrary code, or walk
+                // the spine.
+                if burst_stats::enabled() {
+                    burst_stats::note_slow(op_before);
+                    if matches!(op_before, Some(OpCode::LoadAttr | OpCode::LoadMethodAttr)) {
+                        let arg = frame.code.instructions[cur_pc].arg;
+                        let recv = frame.stack.last().map_or("?", |o| o.type_name());
+                        burst_stats::note_attr(
+                            frame
+                                .code
+                                .names
+                                .get(arg as usize)
+                                .map_or("?", String::as_str),
+                            recv,
+                        );
+                    }
+                }
+                let live_shell = self.flush_lean(frame, shell);
+                let stack_before = frame.stack.len();
+                live_shell
+                    .lasti
+                    .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
+                let stepped = self.step_hot(frame);
+                if coarse {
+                    let drop_class = match op_before {
+                        Some(op) => COARSE_DROP_CLASS[op as u8 as usize],
+                        None => 0,
+                    };
+                    if drop_class & COARSE_EXEMPT == 0
+                        && (frame.stack.len() < stack_before || drop_class & COARSE_DELETE != 0)
+                    {
+                        gc_trace::mark_maybe_dead();
+                    }
+                }
+                if !matches!(stepped, Ok(StepOutcome::Continue)) {
+                    return FrameEv::Exit(QuietExit::Outcome { stepped, cur_pc });
+                }
+                *last = cur_pc;
+                // The outer loop's per-instruction prologue, in its order.
+                if self.gil_countdown <= 2 {
+                    break 'run QuietExit::Yield;
+                }
+                self.gil_countdown -= 1;
+                if crate::hot_gates::loop_gen() != snap_gen {
+                    break 'run QuietExit::Yield;
+                }
+                // SAFETY: see `quiet_run`.
+                if fin
+                    && unsafe { (*maybe_dead).get() }
+                    && self.drain_if_maybe_dead()
+                    && crate::hot_gates::loop_gen() != snap_gen
+                {
+                    break 'run QuietExit::Yield;
+                }
             }
         };
         // The outer loop's prologue can run anything (signal handlers,
         // pending calls, a GIL hand-off to a thread that inspects this
         // one's frames): the spine must be whole and this frame's `lasti`
         // current (leaf runs don't maintain it).
-        self.flush_lean(frame, &mut shell)
+        self.flush_lean(frame, shell)
             .lasti
             .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
-        if last != usize::MAX {
-            *prev_pc = Some(last);
+        if *last != usize::MAX {
+            *prev_pc = Some(*last);
         }
-        exit
+        FrameEv::Exit(exit)
+    }
+
+    /// Whether a call may run inline right now: the nested lean path's
+    /// own bail-outs (see `run_frame_lean`) all decline it.
+    #[inline]
+    fn inline_calls_ok(&self) -> bool {
+        !self.dbg_sample
+            && !crate::trace::eval_frame_record_active()
+            && !crate::stdlib::greenlet_native::on_greenlet_stack()
+    }
+
+    /// Bind a parked inline slot (see [`InlineAct`]) to a call of
+    /// `callable` — a shape-checked plain function whose code is `code`
+    /// and whose arguments are already in the slot's locals — from the
+    /// caller `frame` suspended at the `CALL` at `pc` (its `pc` already
+    /// past it): registers the caller as pending and runs the lean
+    /// prologue (`run_frame_lean_impl`'s warm compile).
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn inline_bind(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+        mut act: Box<InlineAct>,
+        code: Rc<CodeObject>,
+        callable: Object,
+        guard: crate::recursion::Guard,
+    ) -> Box<InlineAct> {
+        let Object::Function(f) = &callable else {
+            unreachable!("inline callees are plain functions")
+        };
+        let cells = f.lean_cells_ref(&code).expect("checked by the shape");
+        // SAFETY: the slot is parked: its code, cells, globals and
+        // builtins fields hold stale non-owning copies, overwritten here
+        // without a drop. The new handles are `f`'s (borrowed: the slot
+        // holds `callable`, so `f` outlives the activation) and the code
+        // (owned).
+        unsafe {
+            let fr: &mut Frame = &mut act.frame;
+            std::ptr::write(&mut fr.code, code);
+            std::ptr::write(&mut fr.cells, borrowed_rc(cells));
+            std::ptr::write(&mut fr.globals, borrowed_rc(&f.globals));
+            std::ptr::write(&mut fr.builtins, borrowed_rc(&f.builtins));
+            std::ptr::write(&mut act.callable, callable);
+        }
+        act.frame.pc = 0;
+        act.parked = false;
+        act.call_pc = pc;
+        act.caller_pending = self.lean_pending_enter(frame, shell, pc);
+        act.exc_depth = self.exc_info_len();
+        act.guard = Some(guard);
+        // A loop-free body stays interpreted here, but a hot one is still
+        // compiled once so native callers can take the direct lanes.
+        #[cfg(feature = "jit")]
+        if act.frame.code.jit_hint.bump_lean_entries() == LEAN_WARM_COMPILE_THRESHOLD
+            && !crate::tier2::jit_off_for_process()
+            && !act.frame.code.jit_hint.is_not_jitable()
+        {
+            crate::tier2::warm_compile(self, &mut act.frame);
+        }
+        act
+    }
+
+    /// A parked inline slot, from the pool or fresh.
+    #[inline]
+    fn inline_slot(&mut self) -> Box<InlineAct> {
+        match self.inline_pool.pop() {
+            Some(act) => act,
+            None => InlineAct::parked(),
+        }
+    }
+
+    /// Park a finished inline slot (its callable already taken): release
+    /// what the activation owned and return the slot to the pool.
+    fn inline_park(&mut self, mut act: Box<InlineAct>) {
+        const POOL_CAP: usize = 64;
+        debug_assert!(!act.parked);
+        let fr: &mut Frame = &mut act.frame;
+        // Leftover operands drop before anything is reused (their drop
+        // glue is arbitrary Rust code).
+        fr.stack.clear();
+        if Rc::strong_count(&fr.locals) == 1 {
+            // SAFETY: sole owner — no other path reaches this vector.
+            let v = unsafe { &mut *fr.locals.as_ptr() };
+            if v.iter().all(|o| {
+                matches!(
+                    o,
+                    Object::Int(_)
+                        | Object::Float(_)
+                        | Object::Bool(_)
+                        | Object::None
+                        | Object::Unbound
+                )
+            }) {
+                // SAFETY: scalars own nothing; no drop glue is skipped.
+                unsafe { v.set_len(0) };
+            } else {
+                v.clear();
+            }
+        } else {
+            // The storage escaped (a materialized frame shares it): the
+            // slot takes fresh storage.
+            let fresh = match self.frame_locals_pool.borrow_mut().pop() {
+                Some(rc) => rc,
+                None => Rc::new(RefCell::new(Vec::new())),
+            };
+            drop(std::mem::replace(&mut fr.locals, fresh));
+        }
+        // Everything the general loop may have set on the way (a clean
+        // activation never left the quiet loop's leaf paths).
+        if !act.clean {
+            fr.exc_handlers.clear();
+            fr.saved_exc_info.clear();
+            fr.builtins_obj = None;
+            fr.class_namespace = None;
+            fr.class_namespace_obj = None;
+            fr.py_frame = None;
+            fr.gen_owner = None;
+            fr.cleanup_lasti = None;
+            fr.pending_lasti = None;
+            fr.shell_cache = None;
+            fr.agen_yielded_value = true;
+            fr.suppress_call_event = false;
+            fr.gen_first_resume = false;
+            #[cfg(feature = "jit")]
+            {
+                fr.parked_native = None;
+            }
+        }
+        // SAFETY: the code handle is owned while active; release it and
+        // leave the stale copy (never read again until `inline_bind`
+        // overwrites it; `InlineAct::drop` restores an owned one).
+        unsafe { drop(std::ptr::read(&fr.code)) };
+        act.parked = true;
+        act.clean = false;
+        act.act.shell = None;
+        act.guard = None;
+        act.caller_pending = None;
+        if self.inline_pool.len() < POOL_CAP {
+            self.inline_pool.push(act);
+        }
+    }
+
+    /// Finish an inline activation that left the quiet loop with `exit`
+    /// (the `run_frame_lean_impl` epilogue): a return is done; anything
+    /// else runs the rest of the activation in the general loop.
+    fn inline_finish(
+        &mut self,
+        done: &mut InlineAct,
+        exit: QuietExit,
+    ) -> Result<Object, RuntimeError> {
+        let exc_depth = done.exc_depth;
+        let frame: &mut Frame = &mut done.frame;
+        let outcome = match (exit, done.act.shell.take()) {
+            // The whole activation ran without ever needing its shell.
+            (
+                QuietExit::Outcome {
+                    stepped: Ok(StepOutcome::Return(v)),
+                    ..
+                },
+                None,
+            ) => {
+                // Only leaf instructions and inline calls ran here, so the
+                // frame's other fields are untouched. Scalar-only locals
+                // (and no leftover operands or cells) owe the exit reap
+                // nothing: they die here with no drop glue.
+                done.clean = true;
+                if frame.stack.is_empty()
+                    && frame.code.cellvars.is_empty()
+                    && Rc::strong_count(&frame.locals) == 1
+                {
+                    // SAFETY: sole owner; nothing else reaches the vector.
+                    let locals = unsafe { &mut *frame.locals.as_ptr() };
+                    if locals.iter().all(|o| {
+                        matches!(
+                            o,
+                            Object::Int(_)
+                                | Object::Float(_)
+                                | Object::Bool(_)
+                                | Object::None
+                                | Object::Unbound
+                        )
+                    }) {
+                        // SAFETY: scalars own nothing (no drop skipped).
+                        unsafe { locals.set_len(0) };
+                        drop(done.guard.take());
+                        return Ok(v);
+                    }
+                }
+                Ok(FrameOutcome::Returned(v))
+            }
+            // A shell, but nothing the full epilogue would act on.
+            (
+                QuietExit::Outcome {
+                    stepped: Ok(StepOutcome::Return(v)),
+                    ..
+                },
+                Some(shell),
+            ) if !shell
+                .has_materialized
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && self.exc_info_len() <= exc_depth =>
+            {
+                self.pop_frame_shell();
+                self.recycle_frame_shell(shell);
+                Ok(FrameOutcome::Returned(v))
+            }
+            // Everything else finishes in the general loop, which takes
+            // over exactly where the quiet loop stopped.
+            (exit, shell) => {
+                let shell = match shell {
+                    Some(shell) => shell,
+                    // Unreachable in practice (every non-return exit
+                    // flushes), kept total.
+                    None => {
+                        self.flush_pending_callers();
+                        self.push_lean_shell(frame, frame.pc)
+                    }
+                };
+                let pending = match exit {
+                    QuietExit::Yield => None,
+                    QuietExit::Outcome { stepped, cur_pc } => Some((stepped, cur_pc)),
+                };
+                stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+                    self.run_activation(frame, shell, None, exc_depth, false, pending)
+                })
+            }
+        };
+        let result = match outcome {
+            Ok(FrameOutcome::Returned(v)) => {
+                self.reap_frame_locals_on_exit(frame, Some(&v));
+                Ok(v)
+            }
+            Ok(FrameOutcome::Yielded(_)) => Err(RuntimeError::Internal(
+                "lean frame yielded to a non-generator caller".to_owned(),
+            )),
+            Ok(FrameOutcome::StartGenerator) => Err(RuntimeError::Internal(
+                "generator start in a lean frame".to_owned(),
+            )),
+            Err(e) => Err(e),
+        };
+        drop(done.guard.take());
+        result
+    }
+
+    /// Hand a finished inline activation's result to its caller `frame`
+    /// (the lean call epilogue: see `try_lean_call`) and retire the
+    /// activation. Returns how the caller resumes.
+    fn inline_deliver(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        done: Box<InlineAct>,
+        result: Result<Object, RuntimeError>,
+    ) -> QuietEntry {
+        let done = done;
+        let call_pc = done.call_pc;
+        self.lean_pending_exit(done.caller_pending);
+        // SAFETY: the callable is moved out exactly once; the parked slot
+        // treats the field as stale until `inline_bind` rewrites it.
+        let callable = unsafe { std::ptr::read(&done.callable) };
+        self.inline_park(done);
+        match result {
+            Ok(v) => {
+                frame.stack.push(v);
+                self.drop_lean_callable(frame, shell, callable);
+                QuietEntry::Returned { cur_pc: call_pc }
+            }
+            Err(err) => {
+                drop(callable);
+                QuietEntry::Raised {
+                    err,
+                    cur_pc: call_pc,
+                }
+            }
+        }
+    }
+
+    /// Release a lean call's callable after a normal return
+    /// (`reap_call_receiver`'s function arm): a function that was only a
+    /// call temporary goes through the cascade (which can run arbitrary
+    /// code); a bound one is just graded. The usual callee — a function
+    /// its namespace still holds (our clone, that binding, its collector
+    /// handle: three or more) with no weakref — needs neither.
+    #[inline]
+    fn drop_lean_callable(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        callable: Object,
+    ) {
+        let alive_elsewhere = match &callable {
+            Object::Function(f) => {
+                Rc::strong_count(f) > 2
+                    && !crate::weakref_registry::may_have_weakrefs(Rc::as_ptr(f) as usize as u64)
+            }
+            _ => false,
+        };
+        if alive_elsewhere {
+            drop(callable);
+        } else if Self::looks_reapable_temporary(&callable) {
+            self.flush_lean(frame, shell);
+            self.prompt_reap_dropped(callable);
+        } else {
+            gc_trace::note_dropped(&callable);
+        }
     }
 
     /// Push the frame shells of every pending lean activation, outermost
@@ -9088,81 +9528,11 @@ impl Interpreter {
             let Object::Function(f) = &frame.stack[callee_slot] else {
                 return None;
             };
-            let code = f.code();
-            let total = code.arg_count as usize;
-            let with_defaults = eff_argc < total;
-            // The same shape re-verification as the `dispatch_call` arms,
-            // plus what a lean activation assumes.
-            if code.is_generator
-                || code.is_coroutine
-                || code.is_async_generator
-                || code.has_varargs
-                || code.has_varkeywords
-                || code.kwonly_count != 0
-                || !Self::lean_code_ok(&code)
-            {
-                return None;
-            }
-            f.lean_cells_ref(&code)?;
-            let missing = if with_defaults {
-                if eff_argc >= total || f.defaults.len() < total - eff_argc {
-                    return None;
-                }
-                // A later `f.__defaults__ = …` override lives in the slot
-                // store and replaces the compiled tuple in the generic
-                // binder. SAFETY: GIL-serialized raw read of the slot
-                // store's emptiness (the burst is off in free-threaded
-                // mode); the common empty store settles it without a probe.
-                if !unsafe { (*f.slots.as_ptr()).is_empty() } && f.slot("__defaults__").is_some() {
-                    return None;
-                }
-                total - eff_argc
-            } else {
-                if total != eff_argc {
-                    return None;
-                }
-                0
-            };
-            (code, missing)
+            Self::lean_call_shape(f, eff_argc)?
         };
         // Committed: nothing below can decline.
-        let nlocals = code.varnames.len();
-        let first_arg = if has_self { self_slot } else { self_slot + 1 };
-        let locals = {
-            let rc = match self.frame_locals_pool.borrow_mut().pop() {
-                Some(rc) => {
-                    debug_assert_eq!(Rc::strong_count(&rc), 1);
-                    // SAFETY: see `pooled_locals_from_args`.
-                    let v = unsafe { &mut *rc.as_ptr() };
-                    debug_assert!(v.is_empty());
-                    v.extend(frame.stack.drain(first_arg..));
-                    rc
-                }
-                None => {
-                    let mut v = Vec::with_capacity(nlocals);
-                    v.extend(frame.stack.drain(first_arg..));
-                    Rc::new(RefCell::new(v))
-                }
-            };
-            if missing > 0 {
-                let Object::Function(f) = &frame.stack[callee_slot] else {
-                    unreachable!("callee variant checked above")
-                };
-                // Defaults align right-to-left with the declared
-                // positionals, exactly like the generic binder's
-                // missing-tail fill.
-                // SAFETY: as above — sole owner.
-                let v = unsafe { &mut *rc.as_ptr() };
-                v.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
-            }
-            // SAFETY: as above.
-            unsafe { (*rc.as_ptr()).resize(nlocals, Object::Unbound) };
-            rc
-        };
-        if !has_self {
-            frame.stack.pop(); // the NULL self slot
-        }
-        let callable = frame.stack.pop().expect("callee slot checked above");
+        let (callable, locals) =
+            self.lean_call_take(frame, &code, has_self, self_slot, callee_slot, missing);
         let Object::Function(f) = &callable else {
             unreachable!("callee variant checked above")
         };
@@ -9180,33 +9550,189 @@ impl Interpreter {
         Some(match result {
             Ok(v) => {
                 frame.stack.push(v);
-                // `reap_call_receiver`'s function arm: a function that was
-                // only a call temporary goes through the cascade (which
-                // can run arbitrary code); a bound one is just graded.
-                // The usual callee — a function its namespace still holds
-                // (our clone, that binding, its collector handle: three or
-                // more) with no weakref — needs neither.
-                let alive_elsewhere = match &callable {
-                    Object::Function(f) => {
-                        Rc::strong_count(f) > 2
-                            && !crate::weakref_registry::may_have_weakrefs(
-                                Rc::as_ptr(f) as usize as u64
-                            )
-                    }
-                    _ => false,
-                };
-                if alive_elsewhere {
-                    drop(callable);
-                } else if Self::looks_reapable_temporary(&callable) {
-                    self.flush_lean(frame, shell);
-                    self.prompt_reap_dropped(callable);
-                } else {
-                    gc_trace::note_dropped(&callable);
-                }
+                self.drop_lean_callable(frame, shell, callable);
                 Ok(())
             }
             Err(e) => Err(e),
         })
+    }
+
+    /// The plain-function shape a lean call admits for `f` called with
+    /// `eff_argc` positionals (the same re-verification as the
+    /// `dispatch_call` arms, plus what a lean activation assumes): its
+    /// code, and how many trailing parameters its compiled defaults fill.
+    #[inline]
+    fn lean_call_shape(f: &PyFunction, eff_argc: usize) -> Option<(Rc<CodeObject>, usize)> {
+        let code = f.code();
+        let total = code.arg_count as usize;
+        if code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || code.has_varargs
+            || code.has_varkeywords
+            || code.kwonly_count != 0
+            || !Self::lean_code_ok(&code)
+        {
+            return None;
+        }
+        f.lean_cells_ref(&code)?;
+        let missing = if eff_argc < total {
+            if f.defaults.len() < total - eff_argc {
+                return None;
+            }
+            // A later `f.__defaults__ = …` override lives in the slot
+            // store and replaces the compiled tuple in the generic
+            // binder. SAFETY: GIL-serialized raw read of the slot
+            // store's emptiness (the burst is off in free-threaded
+            // mode); the common empty store settles it without a probe.
+            if !unsafe { (*f.slots.as_ptr()).is_empty() } && f.slot("__defaults__").is_some() {
+                return None;
+            }
+            total - eff_argc
+        } else {
+            if total != eff_argc {
+                return None;
+            }
+            0
+        };
+        Some((code, missing))
+    }
+
+    /// Move a shape-checked lean call's operands off `frame`'s stack: the
+    /// arguments (a real self first) into fresh locals for `code`, the
+    /// `missing` trailing parameters from the compiled defaults, the rest
+    /// unbound. Returns the callable and the locals.
+    #[inline]
+    fn lean_call_take(
+        &self,
+        frame: &mut Frame,
+        code: &CodeObject,
+        has_self: bool,
+        self_slot: usize,
+        callee_slot: usize,
+        missing: usize,
+    ) -> (Object, Rc<RefCell<Vec<Object>>>) {
+        let rc = match self.frame_locals_pool.borrow_mut().pop() {
+            Some(rc) => rc,
+            None => Rc::new(RefCell::new(Vec::with_capacity(code.varnames.len()))),
+        };
+        debug_assert_eq!(Rc::strong_count(&rc), 1);
+        // SAFETY: sole owner (see `pooled_locals_from_args`).
+        let v = unsafe { &mut *rc.as_ptr() };
+        let callable =
+            Self::lean_call_fill(frame, code, has_self, self_slot, callee_slot, missing, v);
+        (callable, rc)
+    }
+
+    /// [`Self::lean_call_take`] into the empty locals vector `v`; returns
+    /// the callable.
+    #[inline]
+    fn lean_call_fill(
+        frame: &mut Frame,
+        code: &CodeObject,
+        has_self: bool,
+        self_slot: usize,
+        callee_slot: usize,
+        missing: usize,
+        v: &mut Vec<Object>,
+    ) -> Object {
+        debug_assert!(v.is_empty());
+        let nlocals = code.varnames.len();
+        let first_arg = if has_self { self_slot } else { self_slot + 1 };
+        v.reserve(nlocals);
+        v.extend(frame.stack.drain(first_arg..));
+        if missing > 0 {
+            let Object::Function(f) = &frame.stack[callee_slot] else {
+                unreachable!("callee variant checked by the caller")
+            };
+            // Defaults align right-to-left with the declared
+            // positionals, exactly like the generic binder's
+            // missing-tail fill.
+            v.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
+        }
+        v.resize(nlocals, Object::Unbound);
+        if !has_self {
+            frame.stack.pop(); // the NULL self slot
+        }
+        frame
+            .stack
+            .pop()
+            .expect("callee slot checked by the caller")
+    }
+
+    /// The inline half of `CALL`: `try_lean_call`'s plain-function shapes
+    /// with the callee's frame boxed for the quiet loop to run in place
+    /// (see [`InlineAct`]). `None` leaves everything untouched.
+    #[inline]
+    fn try_inline_call(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+    ) -> Option<Box<InlineAct>> {
+        use weavepy_compiler::InlineCache as IC;
+        let argc = frame.code.instructions.get(pc)?.arg as usize;
+        let n = frame.stack.len();
+        let self_slot = n.checked_sub(argc + 1)?;
+        let callee_slot = self_slot.checked_sub(1)?;
+        // A first execution still specializes the site (the JIT and the
+        // full paths read that state).
+        if matches!(frame.code.caches.get(pc as u32), IC::Empty) {
+            return None;
+        }
+        // A bound method over a plain function with an empty self slot is
+        // that function with the receiver as self (CPython's
+        // `CALL_BOUND_METHOD_EXACT_ARGS`): unpacked in place once the
+        // shape is known to fit.
+        let bound = match &frame.stack[callee_slot] {
+            Object::BoundMethod(bm) if matches!(frame.stack[self_slot], Object::Unbound) => {
+                match &bm.function {
+                    Object::Function(f) => Some((f.clone(), bm.receiver.clone())),
+                    _ => return None,
+                }
+            }
+            _ => None,
+        };
+        let (code, missing) = match &bound {
+            Some((f, _)) => Self::lean_call_shape(f, argc + 1)?,
+            None => {
+                let Object::Function(f) = &frame.stack[callee_slot] else {
+                    return None;
+                };
+                let has_self = !matches!(frame.stack[self_slot], Object::Unbound);
+                Self::lean_call_shape(f, argc + usize::from(has_self))?
+            }
+        };
+        // Past the recursion limit the nested lean path raises.
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
+            return None;
+        };
+        // Committed.
+        if let Some((f, receiver)) = bound {
+            let bm = std::mem::replace(&mut frame.stack[callee_slot], Object::Function(f));
+            frame.stack[self_slot] = receiver;
+            // The bound method was a call temporary (or is still held
+            // elsewhere): grade its release like any dropped operand.
+            if gc_trace::note_dropped_marks(&bm) {
+                gc_trace::mark_maybe_dead();
+            }
+            drop(bm);
+        }
+        let has_self = !matches!(frame.stack[self_slot], Object::Unbound);
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let callable = Self::lean_call_fill(
+            frame,
+            &code,
+            has_self,
+            self_slot,
+            callee_slot,
+            missing,
+            locals,
+        );
+        frame.pc = pc as u32 + 1;
+        Some(self.inline_bind(frame, shell, pc, act, code, callable, guard))
     }
 
     /// Re-verify a `CallPyKwNames` site against the live function (its
@@ -9319,6 +9845,37 @@ impl Interpreter {
         snap_gen: u64,
         pc: usize,
     ) -> Option<Result<(), RuntimeError>> {
+        let shape = Self::lean_call_kw_shape(frame, pc)?;
+        // Committed.
+        let code = shape.code.clone();
+        let (callable, locals) = self.lean_call_kw_take(frame, shape);
+        let Object::Function(f) = &callable else {
+            unreachable!("callee variant checked above")
+        };
+        let cells = f.lean_cells_ref(&code).expect("checked above");
+        // SAFETY: `f` outlives the frame (held across the call), and
+        // `cells` is its lean cells handle.
+        let mut callee = unsafe { self.lean_frame(f, code, locals, cells) };
+        frame.pc = pc as u32 + 1;
+        let pending_self = self.lean_pending_enter(frame, shell, pc);
+        let result = self.run_frame_lean(&mut callee, snap_gen);
+        self.lean_pending_exit(pending_self);
+        self.retire_lean_frame(callee);
+        Some(match result {
+            Ok(v) => {
+                frame.stack.push(v);
+                self.drop_lean_callable(frame, shell, callable);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        })
+    }
+
+    /// The `CallPyKwNames` shape at the `CALL_KW` at `pc`, verified
+    /// against the live callee (see `kw_names_bind_check`) and the lean
+    /// activation's own requirements.
+    #[inline]
+    fn lean_call_kw_shape(frame: &Frame, pc: usize) -> Option<LeanKwShape> {
         use weavepy_compiler::InlineCache as IC;
         let IC::CallPyKwNames {
             func_id,
@@ -9354,69 +9911,84 @@ impl Interpreter {
             return None;
         }
         f.lean_cells_ref(&code)?;
-        // Committed.
-        let f = f.clone();
+        Some(LeanKwShape {
+            code,
+            perm,
+            covered,
+            kwc,
+            eff_argc,
+            has_self,
+        })
+    }
+
+    /// Move a verified `CALL_KW` call's operands off `frame`'s stack into
+    /// fresh locals (see `kw_names_fill_locals`). Returns the callable and
+    /// the locals.
+    #[inline]
+    fn lean_call_kw_take(
+        &self,
+        frame: &mut Frame,
+        shape: LeanKwShape,
+    ) -> (Object, Rc<RefCell<Vec<Object>>>) {
+        let rc = match self.frame_locals_pool.borrow_mut().pop() {
+            Some(rc) => rc,
+            None => Rc::new(RefCell::new(Vec::with_capacity(shape.code.varnames.len()))),
+        };
+        debug_assert_eq!(Rc::strong_count(&rc), 1);
+        // SAFETY: sole owner (see `pooled_locals_from_args`).
+        let v = unsafe { &mut *rc.as_ptr() };
+        let callable = Self::lean_call_kw_fill(frame, shape, v);
+        (callable, rc)
+    }
+
+    /// [`Self::lean_call_kw_take`] into the locals vector `v`; returns the
+    /// callable.
+    #[inline]
+    fn lean_call_kw_fill(frame: &mut Frame, shape: LeanKwShape, v: &mut Vec<Object>) -> Object {
+        let LeanKwShape {
+            code,
+            perm,
+            covered,
+            kwc,
+            eff_argc,
+            has_self,
+        } = shape;
         let names = frame.stack.pop();
         drop(names);
-        let locals = {
-            let rc = match self.frame_locals_pool.borrow_mut().pop() {
-                Some(rc) => rc,
-                None => Rc::new(RefCell::new(Vec::with_capacity(code.varnames.len()))),
-            };
-            {
-                debug_assert_eq!(Rc::strong_count(&rc), 1);
-                // SAFETY: sole owner (see `pooled_locals_from_args`).
-                let v = unsafe { &mut *rc.as_ptr() };
-                Self::kw_names_fill_locals(
-                    v,
-                    &mut frame.stack,
-                    &f,
-                    &code,
-                    perm,
-                    covered,
-                    kwc,
-                    eff_argc,
-                );
-            }
-            rc
+        let callee_at = frame.stack.len() - kwc - eff_argc - usize::from(!has_self) - 1;
+        let f = match &frame.stack[callee_at] {
+            Object::Function(f) => f.clone(),
+            _ => unreachable!("callee variant checked by the shape"),
         };
+        Self::kw_names_fill_locals(v, &mut frame.stack, &f, &code, perm, covered, kwc, eff_argc);
         if !has_self {
             frame.stack.pop(); // the NULL self slot
         }
-        let callable = frame.stack.pop().expect("callee slot checked above");
-        let cells = f.lean_cells_ref(&code).expect("checked above");
-        // SAFETY: `f` outlives the frame (held across the call), and
-        // `cells` is its lean cells handle.
-        let mut callee = unsafe { self.lean_frame(&f, code, locals, cells) };
+        frame.stack.pop().expect("callee slot checked above")
+    }
+
+    /// The inline half of `CALL_KW`: `try_lean_call_kw`'s shape, run in
+    /// place (see [`InlineAct`]).
+    #[inline]
+    fn try_inline_call_kw(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+    ) -> Option<Box<InlineAct>> {
+        let shape = Self::lean_call_kw_shape(frame, pc)?;
+        // Past the recursion limit the nested lean path raises.
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
+            return None;
+        };
+        // Committed.
+        let code = shape.code.clone();
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let callable = Self::lean_call_kw_fill(frame, shape, locals);
         frame.pc = pc as u32 + 1;
-        let pending_self = self.lean_pending_enter(frame, shell, pc);
-        let result = self.run_frame_lean(&mut callee, snap_gen);
-        self.lean_pending_exit(pending_self);
-        self.retire_lean_frame(callee);
-        Some(match result {
-            Ok(v) => {
-                frame.stack.push(v);
-                let alive_elsewhere = match &callable {
-                    Object::Function(f) => {
-                        Rc::strong_count(f) > 2
-                            && !crate::weakref_registry::may_have_weakrefs(
-                                Rc::as_ptr(f) as usize as u64
-                            )
-                    }
-                    _ => false,
-                };
-                if alive_elsewhere {
-                    drop(callable);
-                } else if Self::looks_reapable_temporary(&callable) {
-                    self.flush_lean(frame, shell);
-                    self.prompt_reap_dropped(callable);
-                } else {
-                    gc_trace::note_dropped(&callable);
-                }
-                Ok(())
-            }
-            Err(e) => Err(e),
-        })
+        Some(self.inline_bind(frame, shell, pc, act, code, callable, guard))
     }
 
     /// `LOAD_ATTR` of a `property` on a plain instance, from the quiet
@@ -10000,8 +10572,664 @@ impl Interpreter {
     /// loop generation that verdict was derived from.
     ///
     /// Returns the pc of the last instruction executed, if any.
-    #[inline(always)]
+    ///
+    /// The hottest leaf instructions over scalar operands run in a small
+    /// core loop that keeps the frame's pc and operand stack in registers;
+    /// everything else (another opcode, or an operand shape the core arms
+    /// don't settle) goes to [`Self::leaf_burst_slow`], which runs it with
+    /// the full leaf arms and hands back at the next core instruction.
+    #[inline(never)]
     fn leaf_burst(&mut self, frame: &mut Frame, snap_gen: u64, last_pc: &mut usize) -> LeafStop {
+        loop {
+            let stop = self.leaf_core(frame, snap_gen, last_pc);
+            if let Some(stop) = stop {
+                return stop;
+            }
+            match self.leaf_burst_slow(frame, snap_gen, last_pc) {
+                LeafStop::Core => {}
+                stop => return stop,
+            }
+        }
+    }
+
+    /// The core loop of [`Self::leaf_burst`]. Returns `Some` to end the
+    /// burst, `None` when the instruction at `frame.pc` needs the full
+    /// leaf arms. The operand stack is manipulated through raw pointers
+    /// between capacity-checked pushes; its length is written back before
+    /// returning, and no arm here can panic or run drop glue (every
+    /// discarded value is an unboxed scalar).
+    #[inline(always)]
+    fn leaf_core(
+        &mut self,
+        frame: &mut Frame,
+        snap_gen: u64,
+        last_pc: &mut usize,
+    ) -> Option<LeafStop> {
+        #[inline(always)]
+        fn scalar(v: &Object) -> bool {
+            matches!(
+                v,
+                Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+            )
+        }
+        let code: &CodeObject = &frame.code;
+        let instrs = code.instructions.as_ptr();
+        let ninstrs = code.instructions.len();
+        let consts = code_const_objects(code);
+        let (cbase, nconsts) = (consts.as_ptr(), consts.len());
+        // SAFETY: as in `leaf_burst_slow` (the locals vector is not resized
+        // during an activation, and nothing here runs Python code).
+        let locals: &mut Vec<Object> = unsafe { &mut *frame.locals.as_ptr() };
+        let (lbase, nlocals) = (locals.as_mut_ptr(), locals.len());
+        let stack = &mut frame.stack;
+        let mut base = stack.as_mut_ptr();
+        let mut cap = stack.capacity();
+        let mut len = stack.len();
+        let mut pc = frame.pc as usize;
+        let mut last = *last_pc;
+        let stop = loop {
+            if pc >= ninstrs {
+                break Some(LeafStop::Step);
+            }
+            // SAFETY: bounds checked just above.
+            let ins = unsafe { *instrs.add(pc) };
+            match ins.op {
+                OpCode::LoadFast => {
+                    let i = ins.arg as usize;
+                    if i >= nlocals || len == cap {
+                        break None;
+                    }
+                    // SAFETY: `i < nlocals`, `len < cap`.
+                    unsafe {
+                        let v = &*lbase.add(i);
+                        let c = match v {
+                            Object::Int(x) => Object::Int(*x),
+                            Object::Float(x) => Object::Float(*x),
+                            Object::Bool(x) => Object::Bool(*x),
+                            Object::None => Object::None,
+                            Object::Unbound => break None,
+                            other => other.clone(),
+                        };
+                        base.add(len).write(c);
+                    }
+                    len += 1;
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::LoadConst => {
+                    let i = ins.arg as usize;
+                    if i >= nconsts || len == cap {
+                        break None;
+                    }
+                    // SAFETY: `i < nconsts`, `len < cap`.
+                    unsafe {
+                        let v = &*cbase.add(i);
+                        let c = match v {
+                            Object::Int(x) => Object::Int(*x),
+                            Object::Float(x) => Object::Float(*x),
+                            Object::Bool(x) => Object::Bool(*x),
+                            Object::None => Object::None,
+                            other => other.clone(),
+                        };
+                        base.add(len).write(c);
+                    }
+                    len += 1;
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::LoadSmallInt => {
+                    if len == cap {
+                        break None;
+                    }
+                    // SAFETY: `len < cap`.
+                    unsafe { base.add(len).write(Object::Int(i64::from(ins.arg))) };
+                    len += 1;
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::PushNull => {
+                    if len == cap {
+                        break None;
+                    }
+                    // SAFETY: `len < cap`.
+                    unsafe { base.add(len).write(Object::Unbound) };
+                    len += 1;
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::StoreFast => {
+                    let i = ins.arg as usize;
+                    if i >= nlocals || len == 0 {
+                        break None;
+                    }
+                    // SAFETY: `i < nlocals`, `len > 0`.
+                    unsafe {
+                        let slot = lbase.add(i);
+                        // The PEP 709 cell restore stays on the full path.
+                        if matches!(*base.add(len - 1), Object::Cell(_)) {
+                            break None;
+                        }
+                        if scalar(&*slot) || matches!(*slot, Object::Unbound) {
+                            // Overwriting a scalar needs no drop.
+                            len -= 1;
+                            slot.write(base.add(len).read());
+                        } else {
+                            // A displaced heap value the full arm would
+                            // reap stays there; any other is graded like
+                            // every burst drop.
+                            if Self::local_needs_prompt_reap(&*slot)
+                                && Self::looks_reapable_temporary(&*slot)
+                            {
+                                break None;
+                            }
+                            len -= 1;
+                            let old = std::mem::replace(&mut *slot, base.add(len).read());
+                            let marked = gc_trace::note_dropped_marks(&old);
+                            drop(old);
+                            if marked {
+                                gc_trace::mark_maybe_dead();
+                                last = pc;
+                                pc += 1;
+                                break Some(LeafStop::Marked);
+                            }
+                        }
+                    }
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::PopTop => {
+                    // SAFETY: `len > 0` checked; a scalar needs no drop.
+                    if len == 0 || !scalar(unsafe { &*base.add(len - 1) }) {
+                        break None;
+                    }
+                    len -= 1;
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::BinaryOp => {
+                    if len < 2 {
+                        break None;
+                    }
+                    // SAFETY: `BinOpKind` is `repr(u8)` and the compiler only
+                    // emits valid kinds (same transmute as `binary_op_step`).
+                    let kind: BinOpKind = unsafe { std::mem::transmute(ins.arg as u8) };
+                    // SAFETY: `len >= 2`.
+                    let (a, b) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
+                    let r = match (a, b) {
+                        (Object::Int(a), Object::Int(b)) => {
+                            let (a, b) = (*a, *b);
+                            match kind {
+                                BinOpKind::Add => match a.checked_add(b) {
+                                    Some(r) => Object::Int(r),
+                                    None => break None,
+                                },
+                                BinOpKind::Sub => match a.checked_sub(b) {
+                                    Some(r) => Object::Int(r),
+                                    None => break None,
+                                },
+                                BinOpKind::Mult => match a.checked_mul(b) {
+                                    Some(r) => Object::Int(r),
+                                    None => break None,
+                                },
+                                BinOpKind::BitAnd => Object::Int(a & b),
+                                BinOpKind::BitOr => Object::Int(a | b),
+                                BinOpKind::BitXor => Object::Int(a ^ b),
+                                BinOpKind::RShift if (0..64).contains(&b) => Object::Int(a >> b),
+                                BinOpKind::LShift
+                                    if (0..63).contains(&b) && ((a << b) >> b) == a =>
+                                {
+                                    Object::Int(a << b)
+                                }
+                                BinOpKind::FloorDiv | BinOpKind::Mod if b > 0 && a >= 0 => {
+                                    Object::Int(if kind == BinOpKind::FloorDiv {
+                                        a / b
+                                    } else {
+                                        a % b
+                                    })
+                                }
+                                _ => break None,
+                            }
+                        }
+                        (Object::Float(a), Object::Float(b)) => {
+                            match Self::leaf_float_op(*a, *b, kind) {
+                                Some(r) => r,
+                                None => break None,
+                            }
+                        }
+                        (Object::Int(a), Object::Float(b)) => {
+                            match Self::leaf_float_op(*a as f64, *b, kind) {
+                                Some(r) => r,
+                                None => break None,
+                            }
+                        }
+                        (Object::Float(a), Object::Int(b)) => {
+                            match Self::leaf_float_op(*a, *b as f64, kind) {
+                                Some(r) => r,
+                                None => break None,
+                            }
+                        }
+                        _ => break None,
+                    };
+                    // SAFETY: both operands are scalars (no drop owed).
+                    len -= 1;
+                    unsafe { base.add(len - 1).write(r) };
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::CompareOp => {
+                    if len < 2 {
+                        break None;
+                    }
+                    // SAFETY: as in `compare_op_step`.
+                    let kind: CompareKind =
+                        unsafe { std::mem::transmute((ins.arg & !COMPARE_OP_TO_BOOL_FLAG) as u8) };
+                    // SAFETY: `len >= 2`.
+                    let (a, b) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
+                    let ord = match (a, b) {
+                        (Object::Int(a), Object::Int(b)) => a.cmp(b),
+                        (Object::Float(a), Object::Float(b)) => match a.partial_cmp(b) {
+                            Some(o) => o,
+                            None => break None,
+                        },
+                        _ => break None,
+                    };
+                    let r = match kind {
+                        CompareKind::Lt => ord.is_lt(),
+                        CompareKind::LtE => ord.is_le(),
+                        CompareKind::Eq => ord.is_eq(),
+                        CompareKind::NotEq => ord.is_ne(),
+                        CompareKind::Gt => ord.is_gt(),
+                        CompareKind::GtE => ord.is_ge(),
+                    };
+                    // SAFETY: both operands are scalars (no drop owed).
+                    len -= 1;
+                    unsafe { base.add(len - 1).write(Object::Bool(r)) };
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => {
+                    if len == 0 {
+                        break None;
+                    }
+                    // SAFETY: `len > 0`; a scalar needs no drop.
+                    let truthy = match unsafe { &*base.add(len - 1) } {
+                        Object::Bool(b) => *b,
+                        Object::None => false,
+                        Object::Int(i) => *i != 0,
+                        _ => break None,
+                    };
+                    len -= 1;
+                    last = pc;
+                    pc += 1;
+                    if truthy == (ins.op == OpCode::PopJumpIfTrue) {
+                        pc += ins.arg as usize;
+                    }
+                }
+                OpCode::JumpForward => {
+                    last = pc;
+                    pc += 1 + ins.arg as usize;
+                }
+                OpCode::Nop | OpCode::NotTaken | OpCode::Resume | OpCode::CopyFreeVars => {
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::CopyTop => {
+                    let n = (ins.arg as usize).max(1);
+                    if n > len || len == cap {
+                        break None;
+                    }
+                    // SAFETY: `n <= len < cap`.
+                    unsafe {
+                        let c = (*base.add(len - n)).clone();
+                        base.add(len).write(c);
+                    }
+                    len += 1;
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::Swap => {
+                    let depth = ins.arg as usize;
+                    if depth >= 2 && depth <= len {
+                        // SAFETY: both indices are below `len`.
+                        unsafe { std::ptr::swap(base.add(len - 1), base.add(len - depth)) };
+                    }
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::JumpBackward => {
+                    // The back edge is the burst's eval-breaker (see
+                    // `leaf_burst_slow`).
+                    if self.gil_countdown <= 1 || crate::hot_gates::loop_gen() != snap_gen {
+                        break Some(LeafStop::Breaker);
+                    }
+                    #[cfg(feature = "jit")]
+                    if crate::tier2::backedge_due(&frame.code) {
+                        break Some(LeafStop::Step);
+                    }
+                    self.gil_countdown -= 1;
+                    last = pc;
+                    pc = (pc + 1).saturating_sub(ins.arg as usize);
+                }
+                OpCode::ForIter => {
+                    // A range iterator's next value; anything else (another
+                    // iterator kind, exhaustion) takes the full arms.
+                    if len == 0 || len == cap {
+                        break None;
+                    }
+                    // SAFETY: `len > 0`.
+                    let Object::Iter(it) = (unsafe { &*base.add(len - 1) }) else {
+                        break None;
+                    };
+                    let Ok(mut it) = it.try_borrow_mut() else {
+                        break None;
+                    };
+                    let v = match &mut *it {
+                        crate::object::PyIterator::Range {
+                            current,
+                            stop,
+                            step,
+                        } => {
+                            let live = if *step > 0 {
+                                *current < *stop
+                            } else {
+                                *step < 0 && *current > *stop
+                            };
+                            if !live {
+                                break None;
+                            }
+                            let v = *current;
+                            *current = current.wrapping_add(*step);
+                            Object::Int(v)
+                        }
+                        crate::object::PyIterator::List { items, index, .. } => {
+                            let v = match items.try_borrow() {
+                                Ok(xs) => xs.get(*index).cloned(),
+                                Err(_) => None,
+                            };
+                            let Some(v) = v else { break None };
+                            *index += 1;
+                            v
+                        }
+                        crate::object::PyIterator::Tuple { items, index } => {
+                            let Some(v) = items.get(*index).cloned() else {
+                                break None;
+                            };
+                            *index += 1;
+                            v
+                        }
+                        _ => break None,
+                    };
+                    drop(it);
+                    // SAFETY: `len < cap`.
+                    unsafe { base.add(len).write(v) };
+                    len += 1;
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::ReturnValue => break Some(LeafStop::Step),
+                // A Python callee is the quiet loop's (an inline or lean
+                // call); only a builtin or type callee has leaf arms.
+                OpCode::Call => {
+                    let argc = ins.arg as usize;
+                    if len < argc + 2 {
+                        break None;
+                    }
+                    // SAFETY: `len >= argc + 2`.
+                    match unsafe { &*base.add(len - argc - 2) } {
+                        Object::Function(_) => break Some(LeafStop::Step),
+                        Object::BoundMethod(bm) if matches!(bm.function, Object::Function(_)) => {
+                            break Some(LeafStop::Step);
+                        }
+                        _ => break None,
+                    }
+                }
+                OpCode::LoadGlobal
+                | OpCode::LoadAttr
+                | OpCode::StoreAttr
+                | OpCode::LoadMethodAttr
+                | OpCode::GetIter => {
+                    // SAFETY: as at the exit below; the helper works on the
+                    // synced vector, and the loop reloads it afterwards.
+                    unsafe { frame.stack.set_len(len) };
+                    let done = self.leaf_core_attr(frame, ins, pc);
+                    let stack = &mut frame.stack;
+                    base = stack.as_mut_ptr();
+                    cap = stack.capacity();
+                    len = stack.len();
+                    match done {
+                        CoreAttr::Done => {
+                            last = pc;
+                            pc += 1;
+                        }
+                        CoreAttr::Marked => {
+                            last = pc;
+                            pc += 1;
+                            break Some(LeafStop::Marked);
+                        }
+                        CoreAttr::Decline => break None,
+                        CoreAttr::Full => break Some(LeafStop::Step),
+                    }
+                }
+                _ => break None,
+            }
+        };
+        // SAFETY: `len <= cap`, and every slot below `len` is initialized
+        // (pushes wrote them; pops moved scalars out).
+        unsafe { frame.stack.set_len(len) };
+        frame.pc = pc as u32;
+        *last_pc = last;
+        stop
+    }
+
+    /// The core loop's global and attribute arms (the cache-hit halves of
+    /// the full leaf arms), out of line: runs the instruction `ins` at
+    /// `pc` against `frame`'s (synced) operand stack. `Decline` touches
+    /// nothing.
+    #[inline(never)]
+    fn leaf_core_attr(
+        &mut self,
+        frame: &mut Frame,
+        ins: weavepy_compiler::Instruction,
+        pc: usize,
+    ) -> CoreAttr {
+        use weavepy_compiler::InlineCache as IC;
+        let code: &CodeObject = &frame.code;
+        let stack = &mut frame.stack;
+        // A first execution belongs to the full handler, which specializes
+        // the site (the leaf fallbacks would serve it without ever doing
+        // so, leaving every later execution on the class-cache path).
+        if !matches!(ins.op, OpCode::LoadGlobal | OpCode::GetIter)
+            && matches!(code.caches.get(pc as u32), IC::Empty)
+        {
+            return CoreAttr::Full;
+        }
+        match ins.op {
+            OpCode::GetIter => {
+                // A list, tuple or range: its native iterator (as the full
+                // leaf arm).
+                let it = match stack.last() {
+                    Some(v @ (Object::List(_) | Object::Tuple(_) | Object::Range(_))) => {
+                        match v.make_iter() {
+                            Ok(it) => it,
+                            Err(_) => return CoreAttr::Decline,
+                        }
+                    }
+                    _ => return CoreAttr::Decline,
+                };
+                let it = Object::Iter(Rc::new(RefCell::new(it)));
+                let Some(top) = stack.last_mut() else {
+                    return CoreAttr::Decline;
+                };
+                let v = std::mem::replace(top, it);
+                if gc_trace::note_dropped_marks(&v) {
+                    gc_trace::mark_maybe_dead();
+                    drop(v);
+                    return CoreAttr::Marked;
+                }
+                drop(v);
+                CoreAttr::Done
+            }
+            OpCode::LoadGlobal => {
+                if frame.builtins_obj.is_some() {
+                    return CoreAttr::Decline;
+                }
+                let Some(v) = self.leaf_global(code, &frame.globals, &frame.builtins, pc, ins.arg)
+                else {
+                    return CoreAttr::Decline;
+                };
+                stack.push(v);
+                CoreAttr::Done
+            }
+            OpCode::LoadAttr => {
+                let v = match stack.last() {
+                    Some(Object::Instance(i)) if i.cls_raw().native_kind.get() == 0 => {
+                        Self::leaf_load_attr(code, stack, pc as u32, ins.arg)
+                    }
+                    Some(Object::Module(_)) => {
+                        Self::leaf_load_attr(code, stack, pc as u32, ins.arg)
+                    }
+                    _ => None,
+                };
+                let Some(v) = v else {
+                    return CoreAttr::Decline;
+                };
+                let Some(top) = stack.last_mut() else {
+                    return CoreAttr::Decline;
+                };
+                let receiver = std::mem::replace(top, v);
+                if gc_trace::note_dropped_marks(&receiver) {
+                    gc_trace::mark_maybe_dead();
+                    drop(receiver);
+                    return CoreAttr::Marked;
+                }
+                drop(receiver);
+                CoreAttr::Done
+            }
+            OpCode::StoreAttr => {
+                // As the full leaf arm.
+                let n = stack.len();
+                if n < 2 || crate::capi_watchers::dicts_active() {
+                    return CoreAttr::Decline;
+                }
+                if matches!(stack[n - 2], Object::BoundMethod(_)) {
+                    return CoreAttr::Decline;
+                }
+                let Some(old) = Self::leaf_store_attr(code, stack, pc as u32, ins.arg) else {
+                    return CoreAttr::Decline;
+                };
+                let receiver = stack.pop().expect("receiver checked above");
+                let marked = gc_trace::note_dropped_marks(&receiver)
+                    | old.as_ref().is_some_and(gc_trace::note_dropped_marks);
+                drop(receiver);
+                drop(old);
+                if marked {
+                    gc_trace::mark_maybe_dead();
+                    return CoreAttr::Marked;
+                }
+                CoreAttr::Done
+            }
+            OpCode::LoadMethodAttr => {
+                // The instance receiver's method-cache hit (the full leaf
+                // arm's first case): the plain function under the receiver.
+                if !matches!(stack.last(), Some(Object::Instance(_))) {
+                    return CoreAttr::Decline;
+                }
+                let Some(f) = Self::leaf_load_method(code, stack, pc as u32, ins.arg) else {
+                    return CoreAttr::Decline;
+                };
+                let n = stack.len();
+                stack.push(f);
+                stack.swap(n - 1, n);
+                CoreAttr::Done
+            }
+            _ => CoreAttr::Decline,
+        }
+    }
+
+    /// `LOAD_GLOBAL`'s cache-hit halves (module global, or builtin with
+    /// the name unshadowed), as the full leaf arm resolves them.
+    #[inline]
+    fn leaf_global(
+        &self,
+        code: &CodeObject,
+        globals: &Rc<RefCell<DictData>>,
+        builtins: &Rc<RefCell<DictData>>,
+        pc: usize,
+        arg: u32,
+    ) -> Option<Object> {
+        use weavepy_compiler::InlineCache as IC;
+        let name = code.names.get(arg as usize)?;
+        // SAFETY (raw dict reads below): see the full leaf arm.
+        let gid = specialize::rc_id(globals);
+        let g_stamp = unsafe { (*globals.as_ptr()).mutation_stamp() };
+        let slot = code_stamp_slot(code, pc as u32);
+        match code.caches.get(pc as u32) {
+            IC::LoadGlobalModule {
+                globals_id,
+                key_idx,
+            } if gid == globals_id => {
+                if slot.is_some_and(|s| s.get() == [gid, g_stamp, 0]) {
+                    // SAFETY: see above.
+                    unsafe { (*globals.as_ptr()).get_index(key_idx as usize) }
+                        .map(|(_, v)| v.clone())
+                } else {
+                    let g = globals.try_borrow().ok()?;
+                    match g.get_index(key_idx as usize) {
+                        Some((DictKey(Object::Str(k)), v)) if **k == **name => {
+                            if let Some(s) = slot {
+                                s.set([gid, g_stamp, 0]);
+                            }
+                            Some(v.clone())
+                        }
+                        _ => None,
+                    }
+                }
+            }
+            IC::LoadGlobalBuiltin {
+                builtins_id,
+                key_idx,
+            } if specialize::rc_id(builtins) == builtins_id => {
+                // SAFETY: see above.
+                let b_stamp = unsafe { (*builtins.as_ptr()).mutation_stamp() };
+                if self.globals_missing_any.get() && self.globals_missing_owner(globals).is_some() {
+                    return None;
+                }
+                if slot.is_some_and(|s| s.get() == [gid, g_stamp, b_stamp]) {
+                    // SAFETY: see above.
+                    unsafe { (*builtins.as_ptr()).get_index(key_idx as usize) }
+                        .map(|(_, v)| v.clone())
+                } else {
+                    let probe = code_name_key(code, arg)?;
+                    match globals.try_borrow() {
+                        Ok(g) if !g.contains_key(&probe) => {}
+                        _ => return None,
+                    }
+                    let b = builtins.try_borrow().ok()?;
+                    match b.get_index(key_idx as usize) {
+                        Some((DictKey(Object::Str(k)), v)) if **k == **name => {
+                            if let Some(s) = slot {
+                                s.set([gid, g_stamp, b_stamp]);
+                            }
+                            Some(v.clone())
+                        }
+                        _ => None,
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The full leaf arms of [`Self::leaf_burst`]: runs the instruction at
+    /// `frame.pc` and any further ones outside the core loop's set,
+    /// returning [`LeafStop::Core`] at the next core instruction.
+    #[inline(never)]
+    fn leaf_burst_slow(
+        &mut self,
+        frame: &mut Frame,
+        snap_gen: u64,
+        last_pc: &mut usize,
+    ) -> LeafStop {
         use weavepy_compiler::InlineCache as IC;
         let Frame {
             code: code_rc,
@@ -10025,8 +11253,20 @@ impl Interpreter {
         let mut pc = frame.pc as usize;
         let mut last = *last_pc;
         let mut stop = LeafStop::Step;
+        let first_pc = pc;
+        if burst_stats::enabled() {
+            if let Some(ins) = instrs.get(pc) {
+                burst_stats::note_leaf_slow(ins.op);
+            }
+        }
         loop {
             let Some(&ins) = instrs.get(pc) else { break };
+            // Hand back to the core loop at its next instruction (the
+            // first one here is the one it declined).
+            if pc != first_pc && CORE_LEAF_OPS[ins.op as u8 as usize] {
+                stop = LeafStop::Core;
+                break;
+            }
             match ins.op {
                 OpCode::LoadFast => {
                     match locals.get(ins.arg as usize) {
@@ -40185,6 +41425,43 @@ impl Interpreter {
         Ok(positional)
     }
 
+    /// Run `f` (its code `code`) over the bound fast locals `positional`
+    /// as a lean activation, from native code (a builtin's callback, a
+    /// dunder dispatch, a JIT generic call). The locals move into pooled
+    /// storage (`positional` is left empty). `None` leaves everything to
+    /// the framed path: a shape a lean activation cannot run, or a loop
+    /// that is not quiet.
+    fn try_call_lean(
+        &mut self,
+        f: &Rc<PyFunction>,
+        code: &Rc<CodeObject>,
+        positional: &mut Vec<Object>,
+    ) -> Option<Result<Object, RuntimeError>> {
+        if code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || !Self::lean_code_ok(code)
+            || positional.len() > code.varnames.len()
+        {
+            return None;
+        }
+        let cells = f.lean_cells_ref(code)?;
+        let snap_gen = self.lean_snapshot()?;
+        // Native callers reach here with every lean activation above them
+        // already flushed (a slow step flushes before it runs).
+        if !self.lean_pending.is_empty() {
+            return None;
+        }
+        let nlocals = code.varnames.len();
+        let locals = self.pooled_locals_from_args(positional, nlocals);
+        // SAFETY: `f` outlives the frame (the caller holds it across the
+        // call), and `cells` is its lean cells handle.
+        let mut frame = unsafe { self.lean_frame(f, code.clone(), locals, cells) };
+        let result = self.run_frame_lean(&mut frame, snap_gen);
+        self.retire_lean_frame(frame);
+        Some(result)
+    }
+
     fn call_python_owned(
         &mut self,
         f: &Rc<PyFunction>,
@@ -40246,6 +41523,23 @@ impl Interpreter {
         // values need not stay live across keyword and default processing.
         #[cfg(feature = "jit")]
         if let Some(result) = crate::tier2::try_call_native_bound(self, f, &code, &positional) {
+            // The native activation pinned its own clones of the
+            // arguments; these are the caller's references, released
+            // here as a returning frame releases its locals (a dying
+            // temporary container is reaped now, not at the next
+            // collection).
+            let mut positional = positional;
+            for v in positional.drain(..) {
+                self.maybe_prompt_reap_replaced(v);
+            }
+            self.recycle_scratch(positional);
+            return result;
+        }
+        // A cell-free, non-generator body runs as a lean activation when
+        // the loop is quiet: no frame build, no eager shell, no general
+        // prologue (see `run_frame_lean`).
+        let mut positional = positional;
+        if let Some(result) = self.try_call_lean(f, &code, &mut positional) {
             self.recycle_scratch(positional);
             return result;
         }
@@ -48167,6 +49461,154 @@ struct LeanAct {
     shell: Option<Rc<crate::object::FrameShell>>,
 }
 
+/// A lean activation the quiet loop runs *inline*: its frame lives in
+/// this box instead of on a nested native activation, and
+/// `Interpreter::quiet_run` switches to it at the caller's `CALL` and
+/// back at its return. It is otherwise an ordinary lean activation: its
+/// shell is pushed lazily through `act` (its caller waits on the pending
+/// list meanwhile), and an exit the quiet loop cannot finish (a raise, an
+/// eval-breaker) completes it in the general loop, exactly as
+/// `run_frame_lean_impl` would.
+///
+/// Slots are recycled through `Interpreter::inline_pool`: a *parked*
+/// slot keeps its operand-stack and locals buffers, and its `code`,
+/// `cells`, `globals`, `builtins` and `callable` fields hold stale
+/// non-owning copies that `Interpreter::inline_bind` overwrites without
+/// dropping (and `Drop` never releases).
+struct InlineAct {
+    frame: LeanFrame,
+    act: LeanAct,
+    /// The called function, held for the activation (the frame borrows
+    /// its handles).
+    callable: Object,
+    /// The caller's `CALL` pc.
+    call_pc: usize,
+    /// The caller's pending-list entry (see `lean_pending_enter`).
+    caller_pending: Option<usize>,
+    /// `exc_info_len` at entry.
+    exc_depth: usize,
+    /// The activation's recursion depth, released when it finishes.
+    guard: Option<crate::recursion::Guard>,
+    /// Whether the slot is parked (see above).
+    parked: bool,
+    /// The finished activation never left the quiet loop's leaf paths
+    /// (see `Interpreter::inline_finish`).
+    clean: bool,
+}
+
+impl InlineAct {
+    /// A fresh parked slot.
+    fn parked() -> Box<InlineAct> {
+        let placeholder = inline_placeholder();
+        let mut act = Box::new(InlineAct {
+            frame: LeanFrame(std::mem::ManuallyDrop::new(Frame {
+                code: placeholder.code.clone(),
+                locals: Rc::new(RefCell::new(Vec::new())),
+                cells: borrowed_rc(&placeholder.cells),
+                stack: Vec::with_capacity(16),
+                globals: borrowed_rc(&placeholder.dict),
+                builtins: borrowed_rc(&placeholder.dict),
+                builtins_obj: None,
+                class_namespace: None,
+                class_namespace_obj: None,
+                exc_handlers: Vec::new(),
+                saved_exc_info: Vec::new(),
+                agen_yielded_value: true,
+                pc: 0,
+                py_frame: None,
+                gen_owner: None,
+                cleanup_lasti: None,
+                pending_lasti: None,
+                suppress_call_event: false,
+                gen_first_resume: false,
+                shell_cache: None,
+                #[cfg(feature = "jit")]
+                parked_native: None,
+            })),
+            act: LeanAct {
+                frame: std::ptr::null_mut(),
+                shell: None,
+            },
+            callable: Object::Unbound,
+            call_pc: 0,
+            caller_pending: None,
+            exc_depth: 0,
+            guard: None,
+            parked: true,
+            clean: false,
+        });
+        act.act.frame = std::ptr::from_mut::<Frame>(&mut act.frame);
+        // SAFETY: parked slots hold a stale code copy (see the type docs):
+        // release the owned placeholder reference it was built with.
+        unsafe { drop(std::ptr::read(&act.frame.code)) };
+        act
+    }
+}
+
+// SAFETY: an interpreter (and with it its slot pool) moves to another
+// thread only while idle, when every pooled slot is parked: no recursion
+// guard, no shell, and `act.frame` pointing into the slot's own box.
+unsafe impl Send for InlineAct {}
+
+impl Drop for InlineAct {
+    fn drop(&mut self) {
+        if self.parked {
+            // SAFETY: the stale copies are overwritten without a drop, so
+            // the frame's and callable's own drops release valid values.
+            unsafe {
+                std::ptr::write(&mut self.frame.code, inline_placeholder().code.clone());
+                std::ptr::write(&mut self.callable, Object::Unbound);
+            }
+        }
+    }
+}
+
+/// The handles a parked [`InlineAct`] starts from.
+struct InlinePlaceholder {
+    code: Rc<CodeObject>,
+    cells: Rc<Vec<Rc<RefCell<Object>>>>,
+    dict: Rc<RefCell<DictData>>,
+}
+
+fn inline_placeholder() -> &'static InlinePlaceholder {
+    static PLACEHOLDER: std::sync::OnceLock<InlinePlaceholder> = std::sync::OnceLock::new();
+    PLACEHOLDER.get_or_init(|| InlinePlaceholder {
+        code: Rc::new(CodeObject::default()),
+        cells: Rc::new(Vec::new()),
+        dict: Rc::new(RefCell::new(DictData::default())),
+    })
+}
+
+/// How one activation's stretch of the quiet loop ended (see
+/// `Interpreter::quiet_frame`).
+enum FrameEv {
+    /// The activation called a function that runs inline.
+    Call(Box<InlineAct>),
+    /// The activation left the quiet loop.
+    Exit(QuietExit),
+}
+
+/// Where an activation's stretch of the quiet loop starts.
+enum QuietEntry {
+    /// At `frame.pc`.
+    Fresh,
+    /// Back from the inline call at `cur_pc`, whose result is pushed.
+    Returned { cur_pc: usize },
+    /// The inline call at `cur_pc` raised.
+    Raised { err: RuntimeError, cur_pc: usize },
+}
+
+/// A verified `CallPyKwNames` call (see
+/// `Interpreter::lean_call_kw_shape`).
+struct LeanKwShape {
+    code: Rc<CodeObject>,
+    perm: u32,
+    covered: u32,
+    kwc: usize,
+    eff_argc: usize,
+    has_self: bool,
+}
+
 /// A lean activation's frame. Its `globals`, `builtins` and `cells`
 /// handles are *borrowed* from the callee function — which the caller
 /// keeps alive for the whole activation, and whose handles are
@@ -48353,6 +49795,13 @@ mod burst_stats {
         }
     }
 
+    static LEAF_SLOW: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+
+    /// An instruction the core loop handed to the full leaf arms.
+    pub(crate) fn note_leaf_slow(op: weavepy_compiler::OpCode) {
+        LEAF_SLOW[op as u8 as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn markdown() -> String {
         use std::fmt::Write;
         let mut rows: Vec<(u64, u8)> = SLOW
@@ -48364,6 +49813,20 @@ mod burst_stats {
         rows.sort_unstable_by(|a, b| b.cmp(a));
         let mut out = String::from("## Quiet-loop slow steps by opcode\n\n");
         for (count, op) in rows.iter().take(40) {
+            let name = weavepy_compiler::OpCode::name(unsafe {
+                std::mem::transmute::<u8, weavepy_compiler::OpCode>(*op)
+            });
+            let _ = writeln!(out, "- {name}: {count}");
+        }
+        let mut rows: Vec<(u64, u8)> = LEAF_SLOW
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.load(Ordering::Relaxed), i as u8))
+            .filter(|(c, _)| *c > 0)
+            .collect();
+        rows.sort_unstable_by(|a, b| b.cmp(a));
+        out.push_str("\n## Core-loop handoffs to the full leaf arms\n\n");
+        for (count, op) in rows.iter().take(30) {
             let name = weavepy_compiler::OpCode::name(unsafe {
                 std::mem::transmute::<u8, weavepy_compiler::OpCode>(*op)
             });
@@ -48457,7 +49920,59 @@ enum LeafStop {
     Marked,
     /// A leaf builtin raised; `frame.pc` is past the call.
     Raised(RuntimeError),
+    /// (`leaf_burst_slow` only) The next instruction is the core loop's.
+    Core,
 }
+
+/// How [`Interpreter::leaf_core_attr`] ran its instruction.
+enum CoreAttr {
+    /// Executed.
+    Done,
+    /// Executed, and a discard scheduled a finalization sweep.
+    Marked,
+    /// Not a cache hit: nothing touched.
+    Decline,
+    /// The site's first execution: the full handler must run (and
+    /// specialize) it.
+    Full,
+}
+
+/// The opcodes [`Interpreter::leaf_core`] runs (for some operand shapes).
+static CORE_LEAF_OPS: [bool; 256] = {
+    let mut t = [false; 256];
+    let ops = [
+        OpCode::LoadFast,
+        OpCode::LoadConst,
+        OpCode::LoadSmallInt,
+        OpCode::PushNull,
+        OpCode::StoreFast,
+        OpCode::PopTop,
+        OpCode::BinaryOp,
+        OpCode::CompareOp,
+        OpCode::PopJumpIfFalse,
+        OpCode::PopJumpIfTrue,
+        OpCode::JumpForward,
+        OpCode::Nop,
+        OpCode::NotTaken,
+        OpCode::Resume,
+        OpCode::CopyFreeVars,
+        OpCode::JumpBackward,
+        OpCode::ForIter,
+        OpCode::LoadGlobal,
+        OpCode::LoadAttr,
+        OpCode::StoreAttr,
+        OpCode::LoadMethodAttr,
+        OpCode::CopyTop,
+        OpCode::Swap,
+        OpCode::GetIter,
+    ];
+    let mut i = 0;
+    while i < ops.len() {
+        t[ops[i] as u8 as usize] = true;
+        i += 1;
+    }
+    t
+};
 
 /// How [`Interpreter::quiet_run`] handed control back.
 enum QuietExit {

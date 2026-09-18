@@ -615,15 +615,15 @@ impl<T: ?Sized> GilCell<T> {
 
     /// Non-panicking variant of [`borrow`](Self::borrow). Returns
     /// [`BorrowError`] if a mutable borrow is live.
+    #[inline]
     pub fn try_borrow(&self) -> Result<Ref<'_, T>, BorrowError> {
-        let locked = cells_shared();
-        if !locked {
+        if !cells_shared() {
             // The sole VM thread: no lock word, no thread-local access.
             if !self.borrow_shared(false) {
                 return Err(BorrowError);
             }
-            // SAFETY: as below; the only thread touching cells holds a
-            // shared borrow count on this one.
+            // SAFETY: as in `try_borrow_locked`; the only thread touching
+            // cells holds a shared borrow count on this one.
             let value: &T = unsafe { &*self.data.get() };
             return Ok(Ref {
                 cell: self,
@@ -633,6 +633,16 @@ impl<T: ?Sized> GilCell<T> {
                 _not_send: std::marker::PhantomData,
             });
         }
+        self.try_borrow_locked()
+    }
+
+    /// [`Self::try_borrow`] once cells are shared: out of line, so the
+    /// thread-local address it needs is never hoisted into a caller's
+    /// hot loop.
+    #[cold]
+    #[inline(never)]
+    fn try_borrow_locked(&self) -> Result<Ref<'_, T>, BorrowError> {
+        let locked = true;
         // One thread-local access covers the lock word's owner id and
         // the live-guard count. If the block is already torn down (a
         // guard taken from a TLS destructor) fall back to the uncached
@@ -709,14 +719,15 @@ impl<T: ?Sized> GilCell<T> {
 
     /// Non-panicking variant of [`borrow_mut`](Self::borrow_mut).
     /// Returns [`BorrowMutError`] if any borrow is live.
+    #[inline]
     pub fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
-        let locked = cells_shared();
-        if !locked {
+        if !cells_shared() {
             // The sole VM thread: no lock word, no thread-local access.
             if !self.borrow_exclusive(false) {
                 return Err(BorrowMutError);
             }
-            // SAFETY: as below; the exclusive count is ours.
+            // SAFETY: as in `try_borrow_mut_locked`; the exclusive count
+            // is ours.
             let value: &mut T = unsafe { &mut *self.data.get() };
             return Ok(RefMut {
                 cell: self,
@@ -726,6 +737,15 @@ impl<T: ?Sized> GilCell<T> {
                 _not_send: std::marker::PhantomData,
             });
         }
+        self.try_borrow_mut_locked()
+    }
+
+    /// [`Self::try_borrow_mut`] once cells are shared (see
+    /// [`Self::try_borrow_locked`]).
+    #[cold]
+    #[inline(never)]
+    fn try_borrow_mut_locked(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
+        let locked = true;
         let (ok, tls) = CELL_TLS
             .try_with(|t| {
                 if locked {
