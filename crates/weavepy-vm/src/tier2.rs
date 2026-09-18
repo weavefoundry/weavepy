@@ -356,7 +356,7 @@ pub(crate) const GENERIC_CALL_RETIRE_RATIO: u32 = 4;
 /// activation that keeps coming back here is a loop around calls the
 /// JIT cannot run natively, so the interpreter finishes it (and runs
 /// every later activation).
-pub(crate) const INTERP_CALL_RETIRE_BUDGET: u32 = 48;
+pub(crate) const INTERP_CALL_RETIRE_BUDGET: u32 = 0;
 
 /// Minimum framed entries before the generic-call ratio is judged —
 /// avoids retiring on a cold first activation (e.g. a setup call that
@@ -955,6 +955,19 @@ impl JitState {
                             cf.is_scalar_leaf()
                         );
                     }
+                    // The interpreter's lean paths hand a self-recursive
+                    // compiled body's calls to the native entry from now
+                    // on: it reaches its native self through the direct
+                    // lanes. Any other loop-free body is cheaper to
+                    // interpret than to frame (and an OO body's calls
+                    // would bounce back through the interpreter).
+                    if entry_pc == 0
+                        && callees
+                            .iter()
+                            .any(|(_, c)| std::ptr::eq(Rc::as_ptr(c), std::ptr::from_ref(&**code)))
+                    {
+                        code.jit_hint.mark_compiled();
+                    }
                     let artifacts = StdRc::new(Artifacts {
                         cf: StdRc::new(cf),
                         snap: StdRc::new(GuardSnapshot::new(snap)),
@@ -1240,11 +1253,24 @@ impl JitState {
         });
         match entry.tier {
             Tier::Cold => {
-                entry.counter = entry.counter.saturating_add(1);
+                // One consultation stands for a stride of back edges.
+                entry.counter = entry
+                    .counter
+                    .saturating_add(u32::from(weavepy_compiler::JitHint::BACKEDGE_STRIDE));
                 entry.counter >= self.threshold
             }
-            Tier::Compiled(..) => entry.osr_failures < OSR_FAILURE_BUDGET,
-            Tier::NotJitable => false,
+            Tier::Compiled(..) => {
+                if entry.osr_failures < OSR_FAILURE_BUDGET {
+                    true
+                } else {
+                    code.jit_hint.set_backedge_quiet();
+                    false
+                }
+            }
+            Tier::NotJitable => {
+                code.jit_hint.mark_not_jitable();
+                false
+            }
         }
     }
 
@@ -2484,10 +2510,20 @@ pub(crate) fn gc_sweep() {
 /// Bump the back-edge hot counter for a code object. Returns `true`
 /// when the caller should attempt an OSR entry (RFC 0059 WS3b); always
 /// `false` when the JIT is disabled.
+/// The leaf burst's back-edge hook: whether the next back edge's
+/// consultation of the tier-2 state is due. The burst then hands the
+/// edge to the full `JUMP_BACKWARD` handler, whose [`note_backedge`]
+/// ticks, consults, and attempts the OSR entry.
+#[inline]
+pub(crate) fn backedge_due(code: &Rc<CodeObject>) -> bool {
+    !code.jit_hint.is_not_jitable() && !jit_off_for_process() && code.jit_hint.backedge_pending()
+}
+
 pub(crate) fn note_backedge(code: &Rc<CodeObject>) -> bool {
     // RFC 0067 — same fast-out as `try_enter`: rejected code pays one
-    // relaxed load per back edge, not a thread-local + map lookup.
-    if code.jit_hint.is_not_jitable() || jit_off_for_process() {
+    // relaxed load per back edge, not a thread-local + map lookup. The
+    // state itself is consulted only every `BACKEDGE_STRIDE` back edges.
+    if code.jit_hint.is_not_jitable() || jit_off_for_process() || !code.jit_hint.backedge_tick() {
         return false;
     }
     JIT.with(|cell| cell.borrow_mut().note_backedge(code))
@@ -3334,7 +3370,9 @@ unsafe fn try_native_call(
     // callee context, a recursion tick): a loop of them is call-shaped
     // too. Past the budget the interpreter path takes it (and retires
     // the code through `finish_interp_call`).
-    if ctx.interp_calls.saturating_add(1) >= INTERP_CALL_RETIRE_BUDGET {
+    if INTERP_CALL_RETIRE_BUDGET != 0
+        && ctx.interp_calls.saturating_add(1) >= INTERP_CALL_RETIRE_BUDGET
+    {
         drop(recursion_guard);
         return None;
     }
@@ -3654,7 +3692,9 @@ unsafe fn try_native_ctor(
     // A native construction is a framed call plus allocation and
     // tracking: charged like any other heavy round-trip, and past the
     // budget left to the interpreter (see `charge_roundtrip`).
-    if ctx.interp_calls.saturating_add(1) >= INTERP_CALL_RETIRE_BUDGET {
+    if INTERP_CALL_RETIRE_BUDGET != 0
+        && ctx.interp_calls.saturating_add(1) >= INTERP_CALL_RETIRE_BUDGET
+    {
         return None;
     }
     ctx.interp_calls = ctx.interp_calls.saturating_add(1);
@@ -4065,7 +4105,14 @@ fn finish_interp_call(
 /// the caller should deopt the activation into the interpreter.
 fn charge_roundtrip(ctx: &mut CallCtx) -> bool {
     ctx.interp_calls = ctx.interp_calls.saturating_add(1);
-    if ctx.interp_calls < INTERP_CALL_RETIRE_BUDGET || ctx.code_ptr.is_null() {
+    // Measured (attr_access): a native loop that calls interpreted
+    // methods still beats interpreting the loop — the round trip is no
+    // dearer than the interpreter's own call — so a plain interpreter
+    // call never retires the caller; only the deopt backoff does.
+    if INTERP_CALL_RETIRE_BUDGET == 0
+        || ctx.interp_calls < INTERP_CALL_RETIRE_BUDGET
+        || ctx.code_ptr.is_null()
+    {
         return false;
     }
     JIT.with(|cell| {

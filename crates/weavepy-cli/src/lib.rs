@@ -36,6 +36,12 @@ use tracing_subscriber::EnvFilter;
 
 use weavepy::{InterpreterFlags, RunOptions};
 
+/// The process allocator: the system allocator behind per-thread
+/// small-block caches (see `weavepy_vm::tcache`), enabled on the VM's
+/// own threads.
+#[global_allocator]
+static GLOBAL_ALLOC: weavepy::vm::tcache::ThreadCacheAlloc = weavepy::vm::tcache::ThreadCacheAlloc;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Recognised subcommands. We thread them through manually instead of
@@ -529,6 +535,7 @@ fn run_on_large_stack(entry: fn() -> i32) -> i32 {
     weavepy::vm::stdlib::signal_mod::block_async_signals_current_thread();
 
     let vm_entry = move || -> i32 {
+        weavepy::vm::tcache::enable_for_current_thread();
         // Opt-in (`WEAVEPY_CRASH_BT`): register the native crash handler +
         // per-thread sigaltstack on the VM thread itself so a stack-overflow
         // SIGSEGV can be caught and reported (no-op stub on Windows).

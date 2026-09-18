@@ -3298,6 +3298,14 @@ pub fn track_if_cyclic(obj: &Object) -> bool {
 /// thread's GC (see [`GcState::maybe_auto_collect`]). Returns the
 /// number of objects reclaimed; the caller should drain pending
 /// finalizers when this is non-zero.
+/// Whether `id` may be tracked: the miss-filter probe (no false
+/// negatives — every tracked object's bits are set at track time; a bit
+/// left by an untracked object is a harmless false positive).
+#[inline]
+pub fn maybe_tracked(id: ObjectId) -> bool {
+    TRACKED_FILTER.may_contain(id)
+}
+
 /// See [`GcState::auto_collect_due`].
 #[inline]
 pub fn auto_collect_due() -> bool {

@@ -331,11 +331,28 @@ fn cells_shared() -> bool {
     CELLS_SHARED.load(Ordering::Relaxed)
 }
 
+/// The first thread to run VM code (see [`note_vm_thread`]).
+static FIRST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Live borrow guards taken lock-free (while cells were unshared). Only
+/// the first VM thread takes such guards, so it is that thread's count —
+/// kept outside thread-local storage so the unshared borrow path touches
+/// no TLS. Written with plain load/store pairs by its single writer.
+static SOLE_GUARDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The `tls` tag of a guard counted in [`SOLE_GUARDS`].
+const SOLE_TAG: *const CellTls = std::ptr::dangling();
+
+#[inline]
+fn sole_guard_acquired() -> *const CellTls {
+    SOLE_GUARDS.store(SOLE_GUARDS.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    SOLE_TAG
+}
+
 /// Record that `thread_id` is about to run VM code. Called from the GIL
 /// acquire path (and free-threading start-up); the first thread to
 /// register is the sole owner of every cell until a second one appears.
 pub fn note_vm_thread(thread_id: u64) {
-    static FIRST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if CELLS_SHARED.load(Ordering::Relaxed) {
         return;
     }
@@ -369,6 +386,14 @@ fn note_cell_guard_released(tls: *const CellTls) {
     if tls.is_null() {
         return;
     }
+    if tls == SOLE_TAG {
+        // Only the first VM thread takes (and so releases) these.
+        SOLE_GUARDS.store(
+            SOLE_GUARDS.load(Ordering::Relaxed).saturating_sub(1),
+            Ordering::Relaxed,
+        );
+        return;
+    }
     // SAFETY: the pointer was taken from this thread's live TLS block
     // when the guard was created; guards are `!Send`, so this runs on
     // the same thread, and the block outlives every guard created from
@@ -382,6 +407,11 @@ fn note_cell_guard_released(tls: *const CellTls) {
 /// this is true (see [`CELL_TLS`]).
 #[inline]
 pub fn cell_guards_live() -> bool {
+    if SOLE_GUARDS.load(Ordering::Relaxed) > 0
+        && FIRST.load(Ordering::Relaxed) == crate::gil::current_thread_id()
+    {
+        return true;
+    }
     CELL_TLS
         .try_with(|t| t.live_guards.get() > 0)
         .unwrap_or(false)
@@ -586,11 +616,27 @@ impl<T: ?Sized> GilCell<T> {
     /// Non-panicking variant of [`borrow`](Self::borrow). Returns
     /// [`BorrowError`] if a mutable borrow is live.
     pub fn try_borrow(&self) -> Result<Ref<'_, T>, BorrowError> {
+        let locked = cells_shared();
+        if !locked {
+            // The sole VM thread: no lock word, no thread-local access.
+            if !self.borrow_shared(false) {
+                return Err(BorrowError);
+            }
+            // SAFETY: as below; the only thread touching cells holds a
+            // shared borrow count on this one.
+            let value: &T = unsafe { &*self.data.get() };
+            return Ok(Ref {
+                cell: self,
+                value,
+                tls: sole_guard_acquired(),
+                locked: false,
+                _not_send: std::marker::PhantomData,
+            });
+        }
         // One thread-local access covers the lock word's owner id and
         // the live-guard count. If the block is already torn down (a
         // guard taken from a TLS destructor) fall back to the uncached
         // id and skip the count, which is irrelevant by then.
-        let locked = cells_shared();
         let (ok, tls) = CELL_TLS
             .try_with(|t| {
                 if locked {
@@ -665,6 +711,21 @@ impl<T: ?Sized> GilCell<T> {
     /// Returns [`BorrowMutError`] if any borrow is live.
     pub fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
         let locked = cells_shared();
+        if !locked {
+            // The sole VM thread: no lock word, no thread-local access.
+            if !self.borrow_exclusive(false) {
+                return Err(BorrowMutError);
+            }
+            // SAFETY: as below; the exclusive count is ours.
+            let value: &mut T = unsafe { &mut *self.data.get() };
+            return Ok(RefMut {
+                cell: self,
+                value,
+                tls: sole_guard_acquired(),
+                locked: false,
+                _not_send: std::marker::PhantomData,
+            });
+        }
         let (ok, tls) = CELL_TLS
             .try_with(|t| {
                 if locked {

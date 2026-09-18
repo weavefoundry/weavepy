@@ -73,6 +73,7 @@ pub mod specialize;
 pub mod stdlib;
 pub mod stdlib_tree;
 pub mod sync;
+pub mod tcache;
 pub mod thread_registry;
 /// RFC 0032 — tier-2 Cranelift JIT integration. Present only under the
 /// `jit` feature; the dispatch loop calls into it behind `#[cfg]` gates.
@@ -3039,8 +3040,10 @@ impl Interpreter {
                 } else {
                     nlocals
                 };
-                // A tracked object's collector handle is one more holder.
-                let handle = usize::from(gc_trace::is_tracked(id));
+                // A tracked object's collector handle is one more holder
+                // (the miss-filter answer: a false positive only sends
+                // the value down the careful path below).
+                let handle = usize::from(gc_trace::maybe_tracked(id));
                 sc > held_here + handle && !crate::weakref_registry::may_have_weakrefs(id)
             };
             if locals.iter().all(|v| {
@@ -3490,13 +3493,22 @@ impl Interpreter {
         }
     }
 
+    /// Whether the caller's reference to `o` may be its last program
+    /// reference: nothing holds it beyond the caller, its collector
+    /// handle (when tracked), and weakref-registry clones.
+    #[inline]
     fn looks_reapable_temporary(o: &Object) -> bool {
         let sc = gc_trace::strong_count_for(o);
-        if sc <= 2 {
+        if sc <= 1 {
             return true;
         }
         let id = crate::weakref_registry::id_of(o);
-        sc <= 2 + crate::weakref_registry::strong_clone_count(id)
+        let handle = usize::from(gc_trace::maybe_tracked(id));
+        if sc <= 1 + handle {
+            return true;
+        }
+        crate::weakref_registry::may_have_weakrefs(id)
+            && sc <= 1 + handle + crate::weakref_registry::strong_clone_count(id)
     }
 
     /// Whether a frame local is worth running through the prompt-reap
@@ -9072,7 +9084,7 @@ impl Interpreter {
         // fact is re-verified from the function itself, so the site's
         // inline cache is not consulted: a polymorphic call site (one
         // receiver class per iteration) stays lean too.
-        let (code, missing, cells) = {
+        let (code, missing) = {
             let Object::Function(f) = &frame.stack[callee_slot] else {
                 return None;
             };
@@ -9091,7 +9103,7 @@ impl Interpreter {
             {
                 return None;
             }
-            let cells = f.lean_cells(&code)?;
+            f.lean_cells_ref(&code)?;
             let missing = if with_defaults {
                 if eff_argc >= total || f.defaults.len() < total - eff_argc {
                     return None;
@@ -9111,7 +9123,7 @@ impl Interpreter {
                 }
                 0
             };
-            (code, missing, cells)
+            (code, missing)
         };
         // Committed: nothing below can decline.
         let nlocals = code.varnames.len();
@@ -9154,37 +9166,17 @@ impl Interpreter {
         let Object::Function(f) = &callable else {
             unreachable!("callee variant checked above")
         };
-        let mut callee = Frame {
-            code,
-            locals,
-            cells,
-            stack: self.pooled_stack(),
-            globals: f.globals.clone(),
-            builtins: f.builtins.clone(),
-            builtins_obj: None,
-            class_namespace: None,
-            class_namespace_obj: None,
-            exc_handlers: Vec::new(),
-            saved_exc_info: Vec::new(),
-            agen_yielded_value: true,
-            pc: 0,
-            py_frame: None,
-            gen_owner: None,
-            cleanup_lasti: None,
-            pending_lasti: None,
-            suppress_call_event: false,
-            gen_first_resume: false,
-            shell_cache: None,
-            #[cfg(feature = "jit")]
-            parked_native: None,
-        };
+        let cells = f.lean_cells_ref(&code).expect("checked above");
+        // SAFETY: `f` outlives the frame (held across the call), and
+        // `cells` is its lean cells handle.
+        let mut callee = unsafe { self.lean_frame(f, code, locals, cells) };
         // `frame.pc` moves past the `CALL` before the callee runs, like
         // every handler (the `pc - 1` raise-attribution convention).
         frame.pc = pc as u32 + 1;
         let pending_self = self.lean_pending_enter(frame, shell, pc);
         let result = self.run_frame_lean(&mut callee, snap_gen);
         self.lean_pending_exit(pending_self);
-        drop(callee);
+        self.retire_lean_frame(callee);
         Some(match result {
             Ok(v) => {
                 frame.stack.push(v);
@@ -9361,7 +9353,7 @@ impl Interpreter {
         if !Self::lean_code_ok(&code) {
             return None;
         }
-        let cells = f.lean_cells(&code)?;
+        f.lean_cells_ref(&code)?;
         // Committed.
         let f = f.clone();
         let names = frame.stack.pop();
@@ -9392,35 +9384,15 @@ impl Interpreter {
             frame.stack.pop(); // the NULL self slot
         }
         let callable = frame.stack.pop().expect("callee slot checked above");
-        let mut callee = Frame {
-            code,
-            locals,
-            cells,
-            stack: self.pooled_stack(),
-            globals: f.globals.clone(),
-            builtins: f.builtins.clone(),
-            builtins_obj: None,
-            class_namespace: None,
-            class_namespace_obj: None,
-            exc_handlers: Vec::new(),
-            saved_exc_info: Vec::new(),
-            agen_yielded_value: true,
-            pc: 0,
-            py_frame: None,
-            gen_owner: None,
-            cleanup_lasti: None,
-            pending_lasti: None,
-            suppress_call_event: false,
-            gen_first_resume: false,
-            shell_cache: None,
-            #[cfg(feature = "jit")]
-            parked_native: None,
-        };
+        let cells = f.lean_cells_ref(&code).expect("checked above");
+        // SAFETY: `f` outlives the frame (held across the call), and
+        // `cells` is its lean cells handle.
+        let mut callee = unsafe { self.lean_frame(&f, code, locals, cells) };
         frame.pc = pc as u32 + 1;
         let pending_self = self.lean_pending_enter(frame, shell, pc);
         let result = self.run_frame_lean(&mut callee, snap_gen);
         self.lean_pending_exit(pending_self);
-        drop(callee);
+        self.retire_lean_frame(callee);
         Some(match result {
             Ok(v) => {
                 frame.stack.push(v);
@@ -9493,12 +9465,12 @@ impl Interpreter {
             {
                 return None;
             }
-            let cells = f.lean_cells(&code)?;
-            (f, code, cells)
+            f.lean_cells_ref(&code)?;
+            (f, code)
         };
-        let (getter, code, cells) = (getter.0, getter.1, getter.2);
+        let (getter, code) = (getter.0, getter.1);
         let receiver = frame.stack.last()?.clone();
-        let result = self.run_lean_fn(frame, shell, snap_gen, pc, &getter, code, cells, receiver);
+        let result = self.run_lean_fn(frame, shell, snap_gen, pc, &getter, code, receiver);
         Some(result.map(|v| {
             if let Some(top) = frame.stack.last_mut() {
                 let old = std::mem::replace(top, v);
@@ -9562,9 +9534,13 @@ impl Interpreter {
         pc: usize,
         f: &Rc<PyFunction>,
         code: Rc<CodeObject>,
-        cells: Rc<Vec<Rc<RefCell<Object>>>>,
         arg: Object,
     ) -> Result<Object, RuntimeError> {
+        let Some(cells) = f.lean_cells_ref(&code) else {
+            return Err(RuntimeError::Internal(
+                "lean callee without lean cells".to_owned(),
+            ));
+        };
         let nlocals = code.varnames.len();
         let locals = {
             let rc = match self.frame_locals_pool.borrow_mut().pop() {
@@ -9580,13 +9556,39 @@ impl Interpreter {
             }
             rc
         };
-        let mut callee = Frame {
+        // SAFETY: `f` outlives the frame (held across the call), and
+        // `cells` is its lean cells handle.
+        let mut callee = unsafe { self.lean_frame(f, code, locals, cells) };
+        frame.pc = pc as u32 + 1;
+        let pending_self = self.lean_pending_enter(frame, shell, pc);
+        let result = self.run_frame_lean(&mut callee, snap_gen);
+        self.lean_pending_exit(pending_self);
+        self.retire_lean_frame(callee);
+        result
+    }
+
+    /// A lean activation's frame for `f` running `code` over `locals`
+    /// (see [`LeanFrame`]).
+    ///
+    /// # Safety
+    ///
+    /// `f` must outlive the returned frame, and `cells` must be
+    /// `f.lean_cells_ref(&code)` (or the shared empty vector).
+    #[inline]
+    unsafe fn lean_frame(
+        &self,
+        f: &PyFunction,
+        code: Rc<CodeObject>,
+        locals: Rc<RefCell<Vec<Object>>>,
+        cells: &Rc<Vec<Rc<RefCell<Object>>>>,
+    ) -> LeanFrame {
+        LeanFrame(std::mem::ManuallyDrop::new(Frame {
             code,
             locals,
-            cells,
+            cells: borrowed_rc(cells),
             stack: self.pooled_stack(),
-            globals: f.globals.clone(),
-            builtins: f.builtins.clone(),
+            globals: borrowed_rc(&f.globals),
+            builtins: borrowed_rc(&f.builtins),
             builtins_obj: None,
             class_namespace: None,
             class_namespace_obj: None,
@@ -9603,13 +9605,33 @@ impl Interpreter {
             shell_cache: None,
             #[cfg(feature = "jit")]
             parked_native: None,
-        };
-        frame.pc = pc as u32 + 1;
-        let pending_self = self.lean_pending_enter(frame, shell, pc);
-        let result = self.run_frame_lean(&mut callee, snap_gen);
-        self.lean_pending_exit(pending_self);
-        drop(callee);
-        result
+        }))
+    }
+
+    /// Retire a finished lean frame: its operand stack and (when it was
+    /// their sole owner) its locals storage go back to the frame pools,
+    /// by move — the pooled handles are never cloned.
+    #[inline]
+    fn retire_lean_frame(&self, lf: LeanFrame) {
+        const POOL_CAP: usize = 64;
+        let (locals, mut stack) = lf.into_parts();
+        if stack.capacity() > 0 {
+            // Leftover values drop before any pool borrow is taken (their
+            // drop glue is arbitrary Rust code).
+            stack.clear();
+            let mut pool = self.frame_stack_pool.borrow_mut();
+            if pool.len() < POOL_CAP {
+                pool.push(stack);
+            }
+        }
+        if Rc::strong_count(&locals) == 1 {
+            // SAFETY: sole owner — no other path reaches this vector.
+            unsafe { (*locals.as_ptr()).clear() };
+            let mut pool = self.frame_locals_pool.borrow_mut();
+            if pool.len() < POOL_CAP {
+                pool.push(locals);
+            }
+        }
     }
 
     /// While a lean callee runs, a shell-less caller activation is
@@ -9687,7 +9709,7 @@ impl Interpreter {
         {
             return None;
         }
-        let cells = init.lean_cells(code)?;
+        let cells = init.lean_cells_ref(code)?;
         let snap_gen = self.lean_snapshot()?;
         let code = code.clone();
         // Committed.
@@ -9711,32 +9733,11 @@ impl Interpreter {
             }
             rc
         };
-        let mut frame = Frame {
-            code,
-            locals,
-            cells,
-            stack: self.pooled_stack(),
-            globals: init.globals.clone(),
-            builtins: init.builtins.clone(),
-            builtins_obj: None,
-            class_namespace: None,
-            class_namespace_obj: None,
-            exc_handlers: Vec::new(),
-            saved_exc_info: Vec::new(),
-            agen_yielded_value: true,
-            pc: 0,
-            py_frame: None,
-            gen_owner: None,
-            cleanup_lasti: None,
-            pending_lasti: None,
-            suppress_call_event: false,
-            gen_first_resume: false,
-            shell_cache: None,
-            #[cfg(feature = "jit")]
-            parked_native: None,
-        };
+        // SAFETY: `init` outlives the frame (held across the call), and
+        // `cells` is its lean cells handle.
+        let mut frame = unsafe { self.lean_frame(init, code, locals, cells) };
         let result = self.run_frame_lean(&mut frame, snap_gen);
-        drop(frame);
+        self.retire_lean_frame(frame);
         Some(match result {
             Ok(Object::None) => Ok(inst),
             Ok(other) => Err(type_error(format!(
@@ -9764,9 +9765,10 @@ impl Interpreter {
     /// the general prologue (an undecodable `co_code` raises there), and
     /// the tier-2 JIT has no claim on it (the general prologue is where
     /// compiled code is entered and cold code heats up). A loop-free body
-    /// is the interpreter's regardless: a framed native entry costs more
-    /// than interpreting its bounded instruction count (native callers
-    /// still reach its compiled form through the direct call lanes).
+    /// is the interpreter's until the JIT has compiled it (the lean path
+    /// warms that compile after a few entries): a native entry is then
+    /// worth its framing — a recursive body calls its native self
+    /// directly from there.
     #[inline]
     fn lean_code_ok(code: &CodeObject) -> bool {
         if code.wire.as_ref().is_some_and(|w| w.exec_error.is_some()) {
@@ -9775,7 +9777,7 @@ impl Interpreter {
         #[cfg(feature = "jit")]
         if !(crate::tier2::jit_off_for_process()
             || code.jit_hint.is_not_jitable()
-            || code.jit_hint.loop_free(code))
+            || (code.jit_hint.loop_free(code) && !code.jit_hint.is_compiled()))
         {
             return false;
         }
@@ -9945,8 +9947,8 @@ impl Interpreter {
         };
         match outcome {
             FrameOutcome::Returned(v) => {
+                // The owner retires the frame (`retire_lean_frame`).
                 self.reap_frame_locals_on_exit(frame, Some(&v));
-                self.recycle_frame_allocs(frame);
                 Ok(v)
             }
             FrameOutcome::Yielded(_) => Err(RuntimeError::Internal(
@@ -10054,9 +10056,23 @@ impl Interpreter {
                         break;
                     }
                     // A displaced value the full handler would run through
-                    // the prompt-reap cascade stays there too.
+                    // the prompt-reap cascade stays there too — except a
+                    // deferred-tracking instance, whose teardown is its
+                    // plain drop (recycled when this was its last ref).
                     if Self::local_needs_prompt_reap(old) && Self::looks_reapable_temporary(old) {
-                        break;
+                        match old {
+                            Object::Instance(i) if i.dies_by_plain_drop() => {
+                                let Some(v) = stack.pop() else { break };
+                                if let Object::Instance(i) = std::mem::replace(&mut locals[slot], v)
+                                {
+                                    PyInstance::try_recycle(i);
+                                }
+                                last = pc;
+                                pc += 1;
+                                continue;
+                            }
+                            _ => break,
+                        }
                     }
                     let Some(v) = stack.pop() else { break };
                     let old = std::mem::replace(&mut locals[slot], v);
@@ -10331,7 +10347,7 @@ impl Interpreter {
                         break;
                     }
                     #[cfg(feature = "jit")]
-                    if crate::tier2::note_backedge(code_rc) {
+                    if crate::tier2::backedge_due(code_rc) {
                         break;
                     }
                     self.gil_countdown -= 1;
@@ -10386,6 +10402,9 @@ impl Interpreter {
                         let Some(Object::Iter(it)) = stack.last() else {
                             break;
                         };
+                        // Only the loop sees an iterator it holds alone: an
+                        // exhausted one it retires here needs no detaching.
+                        let it_unique = Rc::strong_count(it) == 1;
                         let Ok(mut it) = it.try_borrow_mut() else {
                             break;
                         };
@@ -10409,13 +10428,28 @@ impl Interpreter {
                                     None
                                 }
                             }
-                            crate::object::PyIterator::List { items, index, .. } => {
+                            crate::object::PyIterator::List {
+                                items,
+                                index,
+                                owner,
+                            } => {
                                 let v = match items.try_borrow() {
                                     Ok(xs) => xs.get(*index).cloned(),
                                     Err(_) => None,
                                 };
                                 if v.is_some() {
                                     *index += 1;
+                                } else {
+                                    // Exhausted, with the list held by
+                                    // someone besides this iterator: its
+                                    // elements survive the iterator (no
+                                    // harvest), so the retirement is a
+                                    // plain drop.
+                                    range_done = it_unique
+                                        && owner.is_none()
+                                        && items.try_borrow().is_ok_and(|xs| *index >= xs.len())
+                                        && Rc::strong_count(items) >= 2
+                                        && !Self::iter_backing_list_dead(items);
                                 }
                                 v
                             }
@@ -10439,6 +10473,11 @@ impl Interpreter {
                             break;
                         }
                         let it = stack.pop().expect("checked");
+                        // An untracked iterator holds nothing whose death it
+                        // could cause (its list survives, see above); any
+                        // other is graded like every burst drop.
+                        let marked = gc_trace::maybe_tracked(crate::weakref_registry::id_of(&it))
+                            && gc_trace::note_dropped_marks(&it);
                         drop(it);
                         last = pc;
                         pc += 1 + ins.arg as usize;
@@ -10450,6 +10489,11 @@ impl Interpreter {
                             ) {
                                 pc += 1;
                             }
+                        }
+                        if marked {
+                            gc_trace::mark_maybe_dead();
+                            stop = LeafStop::Marked;
+                            break;
                         }
                         continue;
                     };
@@ -11784,10 +11828,14 @@ impl Interpreter {
             other => Some(other),
         };
         if let Some(dict) = inst.dict.get() {
-            let probe = code_name_key(code, name_idx)?;
+            let probe = code_name_leaf_probe(code, name_idx)?;
             let d = dict.try_borrow().ok()?;
             if let Some(v) = d.get(&probe) {
                 return Some(LeafAttr::Value(Self::clone_operand(v)));
+            }
+            // A key only a user `__eq__` could compare: the full path.
+            if probe.saw_exotic() {
+                return None;
             }
         }
         on_class
@@ -12031,8 +12079,11 @@ impl Interpreter {
         }
         if let Some(dict) = inst.dict.get() {
             let d = dict.try_borrow().ok()?;
-            if !d.is_empty() && d.contains_key(&code_name_key(code, name_idx)?) {
-                return None;
+            if !d.is_empty() {
+                let probe = code_name_leaf_probe(code, name_idx)?;
+                if d.contains_key(&probe) || probe.saw_exotic() {
+                    return None;
+                }
             }
         }
         let slot = code_method_slot(code, cache_pc);
@@ -12163,10 +12214,22 @@ impl Interpreter {
                         Some(std::mem::replace(slot, val))
                     }
                     IC::StoreAttrNewKey { .. } => {
-                        let probe = code_name_key(code, name_idx)?;
+                        let probe = code_name_leaf_probe(code, name_idx)?;
                         let dict = inst
                             .dict
                             .get_or_init(|| Rc::new(RefCell::new(DictData::default())));
+                        // Probe first, without mutating: a key only a user
+                        // `__eq__` could compare sends the store to the
+                        // full path (the insert below then meets only
+                        // `str` keys in its bucket).
+                        let found = {
+                            let d = dict.try_borrow().ok()?;
+                            let idx = d.get_index_of(&probe);
+                            if probe.saw_exotic() {
+                                return None;
+                            }
+                            idx
+                        };
                         let mut d = dict.try_borrow_mut().ok()?;
                         let d = &mut *d;
                         let d = if value_slot.is_gc_atomic() {
@@ -12174,7 +12237,7 @@ impl Interpreter {
                         } else {
                             &mut **d
                         };
-                        if let Some(slot) = d.get_mut(&probe) {
+                        if let Some((_, slot)) = found.and_then(|i| d.get_index_mut(i)) {
                             if Self::local_needs_prompt_reap(slot)
                                 && Self::looks_reapable_temporary(slot)
                             {
@@ -48018,6 +48081,81 @@ struct LeanAct {
     shell: Option<Rc<crate::object::FrameShell>>,
 }
 
+/// A lean activation's frame. Its `globals`, `builtins` and `cells`
+/// handles are *borrowed* from the callee function — which the caller
+/// keeps alive for the whole activation, and whose handles are
+/// immutable (a lean frame has no cell variables, so nothing rebinds
+/// `cells`) — so building one costs no reference-count traffic. The
+/// borrowed handles are forgotten, never dropped; the rest is released
+/// on drop, or recycled by [`Interpreter::retire_lean_frame`]. Anything
+/// that keeps one of these handles beyond the activation (a shell or a
+/// materialized frame) clones it, which counts normally.
+struct LeanFrame(std::mem::ManuallyDrop<Frame>);
+
+impl std::ops::Deref for LeanFrame {
+    type Target = Frame;
+    #[inline]
+    fn deref(&self) -> &Frame {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for LeanFrame {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Frame {
+        &mut self.0
+    }
+}
+
+impl LeanFrame {
+    /// Take the frame apart: the borrowed handles are forgotten, the
+    /// locals and operand stack returned for recycling, and everything
+    /// else released.
+    #[inline]
+    fn into_parts(self) -> (Rc<RefCell<Vec<Object>>>, Vec<Object>) {
+        let mut this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is never used again (and never dropped).
+        let frame = unsafe { std::mem::ManuallyDrop::take(&mut this.0) };
+        let Frame {
+            globals,
+            builtins,
+            cells,
+            locals,
+            stack,
+            ..
+        } = frame;
+        std::mem::forget(globals);
+        std::mem::forget(builtins);
+        std::mem::forget(cells);
+        (locals, stack)
+    }
+}
+
+impl Drop for LeanFrame {
+    fn drop(&mut self) {
+        // SAFETY: taken exactly once, here.
+        let frame = unsafe { std::mem::ManuallyDrop::take(&mut self.0) };
+        let Frame {
+            globals,
+            builtins,
+            cells,
+            ..
+        } = frame;
+        std::mem::forget(globals);
+        std::mem::forget(builtins);
+        std::mem::forget(cells);
+    }
+}
+
+/// An `Rc` sharing `r`'s allocation *without* a count of its own: it must
+/// be forgotten, never dropped, and must not outlive `r`'s owner.
+#[inline]
+fn borrowed_rc<T>(r: &Rc<T>) -> Rc<T> {
+    // SAFETY: `as_ptr` yields the pointer `from_raw` expects; the caller
+    // upholds the no-drop contract.
+    unsafe { Rc::from_raw(Rc::as_ptr(r)) }
+}
+
 /// The shell a quiet loop runs against: pushed at activation entry (the
 /// general path), or on demand (a lean activation).
 enum QuietShell<'a> {
@@ -52512,6 +52650,17 @@ fn slot_name_matches(code: &CodeObject, name_idx: u32, key: &DictKey) -> bool {
 #[inline]
 fn code_name_obj(code: &CodeObject, name_idx: u32) -> Option<&Object> {
     code_vm_ext(code).and_then(|t| t.name_objs.get(name_idx as usize))
+}
+
+/// A pre-hashed, Python-free probe for `co_names[name_idx]` (see
+/// [`crate::object::LeafNameProbe`]).
+#[inline]
+fn code_name_leaf_probe(
+    code: &CodeObject,
+    name_idx: u32,
+) -> Option<crate::object::LeafNameProbe<'_>> {
+    let k = code_name_key(code, name_idx)?;
+    Some(crate::object::LeafNameProbe::new(k.s, k.hash))
 }
 
 /// A pre-hashed probe key for `co_names[name_idx]` (see

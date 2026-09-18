@@ -1147,8 +1147,13 @@ pub type FrameStack = Rc<RefCell<Vec<Rc<FrameShell>>>>;
 /// overwhelming majority) share one allocation instead of building a
 /// fresh `Rc<Vec>` each.
 pub fn empty_cells() -> Rc<Vec<Rc<RefCell<Object>>>> {
+    empty_cells_ref().clone()
+}
+
+/// The shared empty cells vector, by reference (see [`empty_cells`]).
+pub fn empty_cells_ref() -> &'static Rc<Vec<Rc<RefCell<Object>>>> {
     static EMPTY: std::sync::OnceLock<Rc<Vec<Rc<RefCell<Object>>>>> = std::sync::OnceLock::new();
-    EMPTY.get_or_init(|| Rc::new(Vec::new())).clone()
+    EMPTY.get_or_init(|| Rc::new(Vec::new()))
 }
 
 /// Materialise the frame at `idx` (0 = outermost) together with
@@ -2919,7 +2924,9 @@ impl indexmap::Equivalent<DictKey> for StrKey<'_> {
     #[inline]
     fn equivalent(&self, key: &DictKey) -> bool {
         match &key.0 {
-            Object::Str(s) => &**s == self.0,
+            // Interned names probe with the stored key's own bytes: the
+            // pointer settles it before any byte compare.
+            Object::Str(s) => std::ptr::eq(s.as_ptr(), self.0.as_ptr()) || &**s == self.0,
             // A `WStr` always carries a lone surrogate (module invariant),
             // so it can never equal a valid `&str`.
             Object::WStr(_) => false,
@@ -2956,6 +2963,57 @@ impl indexmap::Equivalent<DictKey> for StrKeyHashed<'_> {
     #[inline]
     fn equivalent(&self, key: &DictKey) -> bool {
         indexmap::Equivalent::equivalent(&StrKey(self.s), key)
+    }
+}
+
+/// A probe for a `str` attribute name that never runs Python: a stored
+/// key in the probed bucket that is not a plain `str` (one that could
+/// equate only through a user `__eq__`) is skipped and recorded, and the
+/// caller declines when [`LeafNameProbe::saw_exotic`] reports it.
+#[derive(Debug)]
+pub struct LeafNameProbe<'a> {
+    pub s: &'a str,
+    pub hash: i64,
+    exotic: std::cell::Cell<bool>,
+}
+
+impl<'a> LeafNameProbe<'a> {
+    /// `hash` must be `py_str_hash(s)`.
+    #[inline]
+    pub fn new(s: &'a str, hash: i64) -> Self {
+        Self {
+            s,
+            hash,
+            exotic: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Whether a probe met a key it could not compare natively.
+    #[inline]
+    pub fn saw_exotic(&self) -> bool {
+        self.exotic.get()
+    }
+}
+
+impl Hash for LeafNameProbe<'_> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+    }
+}
+
+impl indexmap::Equivalent<DictKey> for LeafNameProbe<'_> {
+    #[inline]
+    fn equivalent(&self, key: &DictKey) -> bool {
+        match &key.0 {
+            Object::Str(k) => std::ptr::eq(k.as_ptr(), self.s.as_ptr()) || &**k == self.s,
+            // A lone surrogate never equals a valid `&str`.
+            Object::WStr(_) => false,
+            _ => {
+                self.exotic.set(true);
+                false
+            }
+        }
     }
 }
 
@@ -4137,14 +4195,21 @@ impl PyFunction {
     /// defines cell variables of its own (fresh cells per call) or a
     /// closure entry is not a cell.
     pub fn lean_cells(&self, code: &CodeObject) -> Option<Rc<Vec<Rc<RefCell<Object>>>>> {
+        self.lean_cells_ref(code).cloned()
+    }
+
+    /// [`Self::lean_cells`] by reference: the handle lives as long as
+    /// this function (the cached closure cells) or forever (the shared
+    /// empty vector).
+    pub fn lean_cells_ref(&self, code: &CodeObject) -> Option<&Rc<Vec<Rc<RefCell<Object>>>>> {
         if !code.cellvars.is_empty() {
             return None;
         }
         if code.freevars.is_empty() && self.closure.is_empty() {
-            return Some(empty_cells());
+            return Some(empty_cells_ref());
         }
         if let Some(c) = self.closure_cells.get() {
-            return Some(c.clone());
+            return Some(c);
         }
         if self.closure.len() != code.freevars.len()
             || !self.closure.iter().all(|c| matches!(c, Object::Cell(_)))
@@ -4159,7 +4224,7 @@ impl PyFunction {
                 _ => unreachable!("checked above"),
             })
             .collect();
-        Some(self.closure_cells.get_or_init(|| Rc::new(cells)).clone())
+        Some(self.closure_cells.get_or_init(|| Rc::new(cells)))
     }
 }
 

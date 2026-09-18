@@ -1347,6 +1347,7 @@ fn spawn_python_worker(
         .name(format!("weavepy-worker-{}", synth_id))
         .stack_size(WORKER_STACK_BYTES)
         .spawn(move || {
+            crate::tcache::enable_for_current_thread();
             crate::vm_singletons::install_worker_thread_id(synth_id);
             // RFC 0040 WS4: record this worker's pthread_t so
             // `signal.pthread_kill(ident, sig)` can target it.
