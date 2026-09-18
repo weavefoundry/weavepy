@@ -316,6 +316,100 @@ pub(crate) mod type_cache {
 /// The dict stores methods and class attributes — the same dict you
 /// see as `cls.__dict__`. The MRO is precomputed at construction
 /// time so attribute lookups are linear in the depth of inheritance.
+/// How a class resolves one attribute name for the leaf burst's
+/// instance-attribute paths, keyed by the *interned* name object's
+/// address and the class's attribute version. A small direct-mapped
+/// cache per class: polymorphic sites (one receiver class per iteration)
+/// find every class's answer here with no site cache at all.
+///
+/// Read and written only from the dispatch loop with the GIL held (the
+/// burst is off in free-threaded mode), like the dispatch loop's other
+/// side caches.
+pub struct LeafAttrCache(std::cell::UnsafeCell<[LeafAttrEntry; 32]>);
+
+// SAFETY: see the type docs — GIL-serialized access from one thread at a
+// time, never across a Python call.
+unsafe impl Send for LeafAttrCache {}
+unsafe impl Sync for LeafAttrCache {}
+
+#[derive(Clone)]
+pub struct LeafAttrEntry {
+    /// Interned name object address; `0` = empty.
+    pub name: usize,
+    pub ver: u64,
+    pub kind: LeafAttrKind,
+}
+
+/// The cached answer (see [`LeafAttrCache`]).
+#[derive(Clone)]
+pub enum LeafAttrKind {
+    /// Not on the class MRO: instances resolve it from their own dict.
+    InstanceOnly,
+    /// A plain function on the MRO (a non-data descriptor: the instance
+    /// dict still wins when it has the name).
+    Method(crate::sync::Weak<crate::object::PyFunction>),
+    /// A static method's function: read through a class or an instance,
+    /// it is the function itself, never bound.
+    StaticFn(crate::sync::Weak<crate::object::PyFunction>),
+    /// A native method on the MRO that binds the instance as its first
+    /// argument (a non-data descriptor: the instance dict still wins).
+    BuiltinMethod(crate::sync::Rc<crate::object::BuiltinFn>),
+    /// A plain scalar/string class value (instance dict still wins).
+    Value(Object),
+    /// Anything else: the full path decides.
+    Other,
+}
+
+impl LeafAttrCache {
+    pub fn new() -> Self {
+        Self(std::cell::UnsafeCell::new(std::array::from_fn(|_| {
+            LeafAttrEntry {
+                name: 0,
+                ver: 0,
+                kind: LeafAttrKind::Other,
+            }
+        })))
+    }
+
+    #[inline]
+    fn index(name: usize) -> usize {
+        ((name >> 4) ^ (name >> 9) ^ (name >> 14)) & 31
+    }
+
+    /// The cached kind for `name` under `ver`, if present.
+    #[inline]
+    pub fn get(&self, name: usize, ver: u64) -> Option<&LeafAttrKind> {
+        // SAFETY: GIL-serialized; no `&mut` escapes `set`.
+        let e = unsafe { &(*self.0.get())[Self::index(name)] };
+        (e.name == name && e.ver == ver).then_some(&e.kind)
+    }
+
+    #[inline]
+    pub fn set(&self, name: usize, ver: u64, kind: LeafAttrKind) {
+        // SAFETY: GIL-serialized; the exclusive reference lives only for
+        // the assignment.
+        unsafe { (*self.0.get())[Self::index(name)] = LeafAttrEntry { name, ver, kind } };
+    }
+}
+
+impl Default for LeafAttrCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for LeafAttrCache {
+    fn clone(&self) -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for LeafAttrCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LeafAttrCache")
+    }
+}
+
 pub struct TypeObject {
     pub name: String,
     /// PEP 3155 `__qualname__`. CPython's `type_new` *pops* the
@@ -394,6 +488,9 @@ pub struct TypeObject {
     /// in `__dict__` is seen by already-specialised call sites. Also keys
     /// the per-thread [`type_cache`] (RFC 0077 WS4).
     pub attr_version: AttrVersion,
+    /// The leaf burst's per-class attribute-kind cache (see
+    /// [`LeafAttrCache`]).
+    pub leaf_attrs: LeafAttrCache,
     /// Cached "do instances of this type carry a `__del__` finalizer
     /// anywhere in their MRO?" answer, so [`crate::object::PyInstance`]'s
     /// `Drop` safety net can skip an MRO walk on the hot per-instance drop
@@ -767,6 +864,7 @@ impl TypeObject {
             dict: Rc::new(RefCell::new(dict)),
             flags,
             metaclass: RefCell::new(None),
+            leaf_attrs: LeafAttrCache::new(),
             slot_names: RefCell::new(Vec::new()),
             declares_slots: Cell::new(false),
             forbids_dict: false,
@@ -1705,6 +1803,47 @@ impl SlotStorage {
         }
     }
 
+    /// `get(name)` with a position hint: one key compare when the slot
+    /// sits at `idx` (the usual layout for a class whose `__init__`
+    /// assigns its slots in a fixed order), the name scan otherwise.
+    #[inline]
+    pub fn get_hinted(&self, idx: usize, name: &str) -> Option<&Object> {
+        if let Some((DictKey(Object::Str(stored)), value)) = self.get_index(idx) {
+            if stored.as_ref() == name {
+                return Some(value);
+            }
+        }
+        self.get(name)
+    }
+
+    /// `get_mut(name)` with a position hint (see [`Self::get_hinted`]).
+    #[inline]
+    pub fn get_hinted_mut(&mut self, idx: usize, name: &str) -> Option<&mut Object> {
+        let at_hint = matches!(
+            self.get_index(idx),
+            Some((DictKey(Object::Str(stored)), _)) if stored.as_ref() == name
+        );
+        if at_hint {
+            return self.get_index_mut(idx).map(|(_, v)| v);
+        }
+        self.get_mut(name)
+    }
+
+    /// Mutable access to a populated slot's value, by name.
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut Object> {
+        match &mut self.data {
+            SlotData::Single {
+                key: Some(DictKey(Object::Str(stored))),
+                value,
+            } if stored.as_ref() == name => Some(value),
+            SlotData::Small(entries) => entries.iter_mut().find_map(|(key, value)| {
+                matches!(&key.0, Object::Str(stored) if stored.as_ref() == name).then_some(value)
+            }),
+            SlotData::Many(table) => table.get_mut(&crate::object::StrKey(name)),
+            _ => None,
+        }
+    }
+
     pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {
         self.insert_with_key(name, value, || {
             DictKey(Object::Str(crate::shared_value::SharedStr::from(name)))
@@ -1832,6 +1971,10 @@ impl SlotStorage {
     #[inline]
     pub fn get_index_mut(&mut self, index: usize) -> Option<(&DictKey, &mut Object)> {
         self.0.get_index_mut(index)
+    }
+
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut Object> {
+        self.0.get_mut(&crate::object::StrKey(name))
     }
 
     pub fn get(&self, name: &str) -> Option<&Object> {

@@ -191,16 +191,57 @@ impl std::fmt::Debug for VmExt {
 /// not follow clones (a `replace()`d code object may change shape),
 /// never participates in equality, and is not serialized.
 #[derive(Default)]
-pub struct JitHint(std::sync::atomic::AtomicBool);
+pub struct JitHint {
+    not_jitable: std::sync::atomic::AtomicBool,
+    /// Whether the code has a loop back edge: `0` not yet derived, `1`
+    /// has one, `2` loop-free. A loop-free body runs a bounded number
+    /// of instructions per activation, so a framed native entry (guard
+    /// validation, marshaling) cannot amortize; callers that enter code
+    /// from the interpreter prefer to interpret such bodies.
+    loops: std::sync::atomic::AtomicU8,
+    /// Lean (interpreted, loop-free) activations so far; the VM warms
+    /// the tier-2 compile from it so native callers can still reach a
+    /// compiled form.
+    lean_entries: std::sync::atomic::AtomicU32,
+}
 
 impl JitHint {
     #[must_use]
     pub fn is_not_jitable(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Relaxed)
+        self.not_jitable.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn mark_not_jitable(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.not_jitable
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Count one lean activation; returns the new count.
+    pub fn bump_lean_entries(&self) -> u32 {
+        self.lean_entries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1)
+    }
+
+    /// Whether `code` (the owner of this hint) has no loop back edge
+    /// (see the field docs), derived on first use.
+    #[must_use]
+    pub fn loop_free(&self, code: &CodeObject) -> bool {
+        match self.loops.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let has_loop = code
+                    .instructions
+                    .iter()
+                    .any(|i| i.op == OpCode::JumpBackward);
+                self.loops.store(
+                    if has_loop { 1 } else { 2 },
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                !has_loop
+            }
+        }
     }
 }
 

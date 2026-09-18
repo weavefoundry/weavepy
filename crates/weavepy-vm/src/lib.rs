@@ -923,6 +923,9 @@ pub struct Interpreter {
     /// The builtins the leaf burst may call directly (see [`LeafFns`]),
     /// resolved on first use.
     leaf_fns: std::cell::OnceCell<LeafFns>,
+    /// The registered leaf builtins (see [`leaf_builtins`]) as last
+    /// snapshotted, with the registry generation they reflect.
+    leaf_opaque: ThreadCell<(u64, leaf_builtins::LeafMap)>,
     /// `WP_DBG_SAMPLE`: periodic frame-entry sampling to stderr.
     dbg_sample: bool,
 }
@@ -1137,6 +1140,7 @@ impl Default for Interpreter {
                 && !Self::locals_fast_off(),
             lean_pending: Vec::new(),
             leaf_fns: std::cell::OnceCell::new(),
+            leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
         };
         // RFC 0025: publish the shared parts of this interpreter
@@ -1258,6 +1262,7 @@ impl Interpreter {
                 && !Self::locals_fast_off(),
             lean_pending: Vec::new(),
             leaf_fns: std::cell::OnceCell::new(),
+            leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
         }
     }
@@ -4296,6 +4301,9 @@ impl Interpreter {
         // specialization counters plus the tier-2 JIT block (native
         // entries, deopts, and the WS1 call-path counters). Emitted
         // here because the stats are thread-local to the VM thread.
+        if burst_stats::enabled() {
+            eprint!("{}", burst_stats::markdown());
+        }
         if std::env::var_os("WEAVEPY_VM_STATS").is_some() {
             let snap = crate::specialize::snapshot();
             eprint!("{}", crate::specialize::format_stats_markdown(&snap));
@@ -8715,6 +8723,21 @@ impl Interpreter {
             }
             // Any other instruction may raise, run arbitrary code, or walk
             // the spine.
+            if burst_stats::enabled() {
+                burst_stats::note_slow(op_before);
+                if matches!(op_before, Some(OpCode::LoadAttr | OpCode::LoadMethodAttr)) {
+                    let arg = frame.code.instructions[cur_pc].arg;
+                    let recv = frame.stack.last().map_or("?", |o| o.type_name());
+                    burst_stats::note_attr(
+                        frame
+                            .code
+                            .names
+                            .get(arg as usize)
+                            .map_or("?", String::as_str),
+                        recv,
+                    );
+                }
+            }
             let live_shell = self.flush_lean(frame, &mut shell);
             let stack_before = frame.stack.len();
             live_shell
@@ -8889,24 +8912,27 @@ impl Interpreter {
         let callee_slot = self_slot.checked_sub(1)?;
         let has_self = !matches!(frame.stack[self_slot], Object::Unbound);
         let eff_argc = argc + usize::from(has_self);
-        let IC::CallPyExactNoFree { func_id, argc: ca } = frame.code.caches.get(pc as u32) else {
-            return None;
-        };
-        if ca as usize != eff_argc {
+        // A first execution still specializes the site (the JIT and the
+        // full paths read that state).
+        if matches!(frame.code.caches.get(pc as u32), IC::Empty) {
             return None;
         }
-        let code = {
+        // Exact arity, or an under-arity call whose missing trailing
+        // parameters the compiled defaults fill (the `CallPyExactNoFree`
+        // and `CallPyDefaults` shapes of `dispatch_call`). Every shape
+        // fact is re-verified from the function itself, so the site's
+        // inline cache is not consulted: a polymorphic call site (one
+        // receiver class per iteration) stays lean too.
+        let (code, missing) = {
             let Object::Function(f) = &frame.stack[callee_slot] else {
                 return None;
             };
-            if specialize::rc_id(f) != func_id {
-                return None;
-            }
             let code = f.code();
-            // The same shape re-verification as the `CallPyExactNoFree` arm
-            // of `dispatch_call`, plus what a lean activation assumes.
-            if code.arg_count as usize != eff_argc
-                || code.is_generator
+            let total = code.arg_count as usize;
+            let with_defaults = eff_argc < total;
+            // The same shape re-verification as the `dispatch_call` arms,
+            // plus what a lean activation assumes.
+            if code.is_generator
                 || code.is_coroutine
                 || code.is_async_generator
                 || code.has_varargs
@@ -8919,31 +8945,59 @@ impl Interpreter {
             {
                 return None;
             }
-            code
+            let missing = if with_defaults {
+                if eff_argc >= total || f.defaults.len() < total - eff_argc {
+                    return None;
+                }
+                // A later `f.__defaults__ = …` override lives in the slot
+                // store and replaces the compiled tuple in the generic
+                // binder. SAFETY: GIL-serialized raw read of the slot
+                // store's emptiness (the burst is off in free-threaded
+                // mode); the common empty store settles it without a probe.
+                if !unsafe { (*f.slots.as_ptr()).is_empty() } && f.slot("__defaults__").is_some() {
+                    return None;
+                }
+                total - eff_argc
+            } else {
+                if total != eff_argc {
+                    return None;
+                }
+                0
+            };
+            (code, missing)
         };
         // Committed: nothing below can decline.
         let nlocals = code.varnames.len();
         let first_arg = if has_self { self_slot } else { self_slot + 1 };
         let locals = {
-            let mut args = frame.stack.drain(first_arg..);
             let rc = match self.frame_locals_pool.borrow_mut().pop() {
                 Some(rc) => {
                     debug_assert_eq!(Rc::strong_count(&rc), 1);
                     // SAFETY: see `pooled_locals_from_args`.
                     let v = unsafe { &mut *rc.as_ptr() };
                     debug_assert!(v.is_empty());
-                    v.extend(&mut args);
-                    v.resize(nlocals, Object::Unbound);
+                    v.extend(frame.stack.drain(first_arg..));
                     rc
                 }
                 None => {
                     let mut v = Vec::with_capacity(nlocals);
-                    v.extend(&mut args);
-                    v.resize(nlocals, Object::Unbound);
+                    v.extend(frame.stack.drain(first_arg..));
                     Rc::new(RefCell::new(v))
                 }
             };
-            drop(args);
+            if missing > 0 {
+                let Object::Function(f) = &frame.stack[callee_slot] else {
+                    unreachable!("callee variant checked above")
+                };
+                // Defaults align right-to-left with the declared
+                // positionals, exactly like the generic binder's
+                // missing-tail fill.
+                // SAFETY: as above — sole owner.
+                let v = unsafe { &mut *rc.as_ptr() };
+                v.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
+            }
+            // SAFETY: as above.
+            unsafe { (*rc.as_ptr()).resize(nlocals, Object::Unbound) };
             rc
         };
         if !has_self {
@@ -9150,14 +9204,20 @@ impl Interpreter {
     /// Whether `code` may run as a lean activation: nothing about it needs
     /// the general prologue (an undecodable `co_code` raises there), and
     /// the tier-2 JIT has no claim on it (the general prologue is where
-    /// compiled code is entered and cold code heats up).
+    /// compiled code is entered and cold code heats up). A loop-free body
+    /// is the interpreter's regardless: a framed native entry costs more
+    /// than interpreting its bounded instruction count (native callers
+    /// still reach its compiled form through the direct call lanes).
     #[inline]
     fn lean_code_ok(code: &CodeObject) -> bool {
         if code.wire.as_ref().is_some_and(|w| w.exec_error.is_some()) {
             return false;
         }
         #[cfg(feature = "jit")]
-        if !(crate::tier2::jit_off_for_process() || code.jit_hint.is_not_jitable()) {
+        if !(crate::tier2::jit_off_for_process()
+            || code.jit_hint.is_not_jitable()
+            || code.jit_hint.loop_free(code))
+        {
             return false;
         }
         true
@@ -9214,6 +9274,15 @@ impl Interpreter {
         frame: &mut Frame,
         snap_gen: u64,
     ) -> Result<Object, RuntimeError> {
+        // A loop-free body stays interpreted here, but a hot one is still
+        // compiled once so native callers can take the direct lanes.
+        #[cfg(feature = "jit")]
+        if frame.code.jit_hint.bump_lean_entries() == LEAN_WARM_COMPILE_THRESHOLD
+            && !crate::tier2::jit_off_for_process()
+            && !frame.code.jit_hint.is_not_jitable()
+        {
+            crate::tier2::warm_compile(self, frame);
+        }
         let _recursion_guard = match crate::recursion::enter() {
             crate::recursion::Enter::Ok(g) => g,
             crate::recursion::Enter::Overflow => {
@@ -9568,6 +9637,16 @@ impl Interpreter {
                     last = pc;
                     pc += 1;
                 }
+                OpCode::LoadSmallInt => {
+                    stack.push(Object::Int(i64::from(ins.arg)));
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::PushNull => {
+                    stack.push(Object::Unbound);
+                    last = pc;
+                    pc += 1;
+                }
                 OpCode::JumpBackward => {
                     // The back edge is the burst's eval-breaker: GIL
                     // hand-off cadence, every loop-generation input
@@ -9584,6 +9663,48 @@ impl Interpreter {
                     self.gil_countdown -= 1;
                     last = pc;
                     pc = (pc + 1).saturating_sub(ins.arg as usize);
+                }
+                OpCode::ForIter if matches!(stack.last(), Some(Object::Instance(_))) => {
+                    // An instance iterator whose `__next__` is a registered
+                    // leaf builtin: call it; `StopIteration` ends the loop
+                    // exactly as the full handler does.
+                    let Some(top) = stack.last() else { break };
+                    let Some(r) = self.leaf_instance_next(top) else {
+                        break;
+                    };
+                    match r {
+                        Ok(Some(v)) => {
+                            stack.push(v);
+                            last = pc;
+                            pc += 1;
+                        }
+                        Ok(None) => {
+                            let it = stack.pop().expect("checked");
+                            last = pc;
+                            pc += 1 + ins.arg as usize;
+                            // `skip_end_for`
+                            if instrs.get(pc).map(|i| i.op) == Some(OpCode::EndFor) {
+                                pc += 1;
+                                if matches!(
+                                    instrs.get(pc).map(|i| i.op),
+                                    Some(OpCode::PopIter | OpCode::PopTop)
+                                ) {
+                                    pc += 1;
+                                }
+                            }
+                            // The iterator leaves the stack (a full handler
+                            // takes the coarse mark for it).
+                            gc_trace::mark_maybe_dead();
+                            drop(it);
+                            stop = LeafStop::Marked;
+                            break;
+                        }
+                        Err(e) => {
+                            pc += 1;
+                            stop = LeafStop::Raised(e);
+                            break;
+                        }
+                    }
                 }
                 OpCode::ForIter => {
                     let next = {
@@ -9771,6 +9892,25 @@ impl Interpreter {
                             }
                             t[i as usize].clone()
                         }
+                        (recv @ Object::Instance(_), idx) => {
+                            // A registered leaf `__getitem__` (a native
+                            // container class), with a leaf index.
+                            if !matches!(idx, Object::Int(_) | Object::Str(_)) {
+                                break;
+                            }
+                            match self.leaf_instance_dunder(recv, "__getitem__") {
+                                Some(b) => match (b.call)(&stack[n - 2..]) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        stack.truncate(n - 2);
+                                        pc += 1;
+                                        stop = LeafStop::Raised(e);
+                                        break;
+                                    }
+                                },
+                                None => break,
+                            }
+                        }
                         _ => break,
                     };
                     stack.truncate(n - 1);
@@ -9786,9 +9926,21 @@ impl Interpreter {
                 }
                 OpCode::LoadAttr => {
                     // The instance-dict, slot, and module cache hits: a
-                    // guarded indexed read, no descriptor can run.
-                    let Some(v) = Self::leaf_load_attr(code, stack, pc as u32, ins.arg) else {
-                        break;
+                    // guarded indexed read, no descriptor can run. A class
+                    // receiver resolves a plain function (or a static
+                    // method's) through a per-site slot keyed by the
+                    // class's attribute version.
+                    let v = match stack.last() {
+                        Some(Object::Type(cls)) => {
+                            match Self::leaf_load_type_attr(code, cls, pc as u32, ins.arg) {
+                                Some(v) => v,
+                                None => break,
+                            }
+                        }
+                        _ => match Self::leaf_load_attr(code, stack, pc as u32, ins.arg) {
+                            Some(v) => v,
+                            None => break,
+                        },
                     };
                     let Some(top) = stack.last_mut() else { break };
                     let receiver = std::mem::replace(top, v);
@@ -9801,6 +9953,43 @@ impl Interpreter {
                         break;
                     }
                 }
+                OpCode::LoadSuperAttr => {
+                    // Zero-argument `super().name` where the name resolves
+                    // to a plain function later in the receiver's MRO:
+                    // pushed in the elided-method shape (function, self)
+                    // — the `CALL` folds `self` in — or bound, without the
+                    // super proxy the full handler builds. Stack (top-
+                    // down): self, class, global `super`.
+                    if ins.arg & 2 != 0 {
+                        break;
+                    }
+                    let n = stack.len();
+                    if n < 3 || !is_super_callable(&stack[n - 3]) {
+                        break;
+                    }
+                    let Some(f) = Self::leaf_load_super_attr(
+                        code,
+                        &stack[n - 2],
+                        &stack[n - 1],
+                        pc as u32,
+                        ins.arg >> 2,
+                    ) else {
+                        break;
+                    };
+                    let self_obj = stack.pop().expect("checked");
+                    stack.truncate(n - 3);
+                    if ins.arg & 1 != 0 {
+                        stack.push(Object::Function(f));
+                        stack.push(self_obj);
+                    } else {
+                        stack.push(Object::BoundMethod(Rc::new(BoundMethod::new(
+                            self_obj,
+                            Object::Function(f),
+                        ))));
+                    }
+                    last = pc;
+                    pc += 1;
+                }
                 OpCode::LoadMethodAttr => {
                     // The method cache hit (bound-method elision shape):
                     // pushes the plain function under the receiver. A
@@ -9809,8 +9998,26 @@ impl Interpreter {
                     let f = match stack.last() {
                         Some(Object::Instance(_)) => {
                             match Self::leaf_load_method(code, stack, pc as u32, ins.arg) {
-                                Some(f) => Object::Function(f),
+                                Some(f) => f,
                                 None => break,
+                            }
+                        }
+                        // `Cls.f(...)`: the attribute itself is the callable,
+                        // with an empty self slot.
+                        Some(Object::Type(cls)) => {
+                            match Self::leaf_load_type_attr(code, cls, pc as u32, ins.arg) {
+                                Some(v @ Object::Function(_)) => {
+                                    let n = stack.len();
+                                    stack.push(v);
+                                    stack.swap(n - 1, n);
+                                    // Receiver slot becomes NULL: the class
+                                    // object leaves the stack (a leaf drop).
+                                    stack[n] = Object::Unbound;
+                                    last = pc;
+                                    pc += 1;
+                                    continue;
+                                }
+                                _ => break,
                             }
                         }
                         Some(recv) => {
@@ -9876,7 +10083,9 @@ impl Interpreter {
                     match r {
                         Ok(v) => {
                             // The operands leave the stack: grade each one
-                            // (the callee is a builtin: a leaf).
+                            // (the callee is a builtin: a leaf). A registered
+                            // native body marks for any reference it
+                            // releases itself (its registration contract).
                             let mut marked = false;
                             for arg in stack.drain(self_slot..) {
                                 marked |= gc_trace::note_dropped_marks(&arg);
@@ -10040,6 +10249,19 @@ impl Interpreter {
                         Some(Object::None) => false,
                         Some(Object::Str(s)) => !s.is_empty(),
                         Some(Object::Float(f)) => *f != 0.0,
+                        Some(Object::List(l)) => match l.try_borrow() {
+                            Ok(l) => !l.is_empty(),
+                            Err(_) => break,
+                        },
+                        Some(Object::Tuple(t)) => !t.is_empty(),
+                        Some(Object::Dict(d)) => match d.try_borrow() {
+                            Ok(d) => !d.is_empty(),
+                            Err(_) => break,
+                        },
+                        Some(v @ Object::Instance(_)) => match self.leaf_instance_truth(v) {
+                            Some(b) => b,
+                            None => break,
+                        },
                         _ => break,
                     };
                     *stack.last_mut().expect("operand checked above") = Object::Bool(b);
@@ -10114,6 +10336,93 @@ impl Interpreter {
         frame.pc = pc as u32;
         *last_pc = last;
         stop
+    }
+
+    /// The truth of an instance when it is settled natively: a class with
+    /// default attribute access whose `__bool__` (else `__len__`) is a
+    /// registered leaf builtin, or neither is defined (always true).
+    #[inline]
+    fn leaf_instance_truth(&self, v: &Object) -> Option<bool> {
+        let Object::Instance(inst) = v else {
+            return None;
+        };
+        let cls = inst.class.try_borrow().ok()?;
+        if !Self::default_getattribute(&cls) || crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        for name in ["__bool__", "__len__"] {
+            match cls.lookup(name) {
+                None => continue,
+                Some(Object::Builtin(b))
+                    if b.binds_instance && self.leaf_call_kind(&b) == Some(LeafKind::Opaque) =>
+                {
+                    let r = match b.call_kw.as_ref() {
+                        Some(ckw) => ckw(std::slice::from_ref(v), &[]),
+                        None => (b.call)(std::slice::from_ref(v)),
+                    };
+                    return match r.ok()? {
+                        Object::Bool(b) => Some(b),
+                        Object::Int(n) if name == "__len__" && n >= 0 => Some(n != 0),
+                        _ => None,
+                    };
+                }
+                Some(_) => return None,
+            }
+        }
+        Some(true)
+    }
+
+    /// A registered leaf builtin method `name` on the instance's class
+    /// (default attribute access, native class surface), if any.
+    #[inline]
+    fn leaf_instance_dunder(&self, v: &Object, name: &str) -> Option<Rc<crate::object::BuiltinFn>> {
+        let Object::Instance(inst) = v else {
+            return None;
+        };
+        let cls = inst.class.try_borrow().ok()?;
+        if !Self::default_getattribute(&cls) || crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        match cls.lookup(name)? {
+            Object::Builtin(b)
+                if b.binds_instance
+                    && b.call_kw.is_none()
+                    && self.leaf_call_kind(&b) == Some(LeafKind::Opaque) =>
+            {
+                Some(b)
+            }
+            _ => None,
+        }
+    }
+
+    /// One `__next__` step of an instance iterator with a registered leaf
+    /// `__next__`: `Some(Ok(None))` on `StopIteration`.
+    #[inline]
+    fn leaf_instance_next(&self, it: &Object) -> Option<Result<Option<Object>, RuntimeError>> {
+        let b = self.leaf_instance_dunder(it, "__next__")?;
+        Some(match (b.call)(std::slice::from_ref(it)) {
+            Ok(v) => Ok(Some(v)),
+            Err(RuntimeError::PyException(e)) if e.type_name() == "StopIteration" => Ok(None),
+            Err(e) => Err(e),
+        })
+    }
+
+    /// Whether `cls` keeps `object.__getattribute__` (the cached
+    /// `getattribute_kind` answer, computed on first sight).
+    #[inline]
+    fn default_getattribute(cls: &Rc<TypeObject>) -> bool {
+        match cls.getattribute_kind.get() {
+            1 => true,
+            2 => false,
+            _ => {
+                let default = matches!(
+                    cls.lookup("__getattribute__"),
+                    Some(Object::Builtin(b)) if b.name == ".object_getattribute"
+                );
+                cls.getattribute_kind.set(if default { 1 } else { 2 });
+                default
+            }
+        }
     }
 
     /// The resolved leaf builtins, built on first use (the builtins dict
@@ -10215,10 +10524,22 @@ impl Interpreter {
     /// Which leaf builtin `b` is, if any (pointer identity).
     #[inline]
     fn leaf_call_kind(&self, b: &Rc<crate::object::BuiltinFn>) -> Option<LeafKind> {
-        self.leaf_fns()
-            .calls
-            .get(&(Rc::as_ptr(b) as usize))
-            .copied()
+        let p = Rc::as_ptr(b) as usize;
+        if let Some(k) = self.leaf_fns().calls.get(&p) {
+            return Some(*k);
+        }
+        let gen = leaf_builtins::generation();
+        let mut opaque = self.leaf_opaque.borrow_mut();
+        if opaque.0 != gen {
+            opaque.1 = leaf_builtins::snapshot();
+            opaque.0 = gen;
+        }
+        // The registered builtin must still be *this* allocation: a
+        // recycled address (a torn-down interpreter's module surface)
+        // fails the upgrade or the identity check.
+        let w = opaque.1.get(&p)?;
+        let live = w.upgrade()?;
+        Rc::ptr_eq(&live, b).then_some(LeafKind::Opaque)
     }
 
     /// Call a leaf builtin if `args` (receiver first for methods) has an
@@ -10378,6 +10699,7 @@ impl Interpreter {
                         _ => false,
                     }
             }
+            K::Opaque => true,
         };
         if !admitted {
             return None;
@@ -10431,30 +10753,248 @@ impl Interpreter {
                 let (k, v) = dict.get_index(key_idx as usize)?;
                 slot_name_matches(code, name_idx, k).then(|| Self::clone_operand(v))
             }
+            // No usable site cache (a polymorphic site, typically): resolve
+            // through the class's own cache instead.
+            (_, Object::Instance(inst)) => {
+                match Self::leaf_resolve_instance_attr(code, inst, name_idx)? {
+                    LeafAttr::Value(v) => Some(v),
+                    LeafAttr::Method(f) => Some(Object::BoundMethod(Rc::new(BoundMethod::new(
+                        receiver.clone(),
+                        Object::Function(f),
+                    )))),
+                    LeafAttr::InstanceOnly | LeafAttr::BuiltinMethod(_) => None,
+                }
+            }
             _ => None,
         }
     }
 
-    /// The leaf half of `load_method_ic_hit`: the plain function a warm
-    /// method cache resolves for the instance at TOS.
+    /// `inst.name` resolved the way `object.__getattribute__` does for a
+    /// class with default attribute access, using the type cache rather
+    /// than a site cache: the instance-dict value when the class MRO has
+    /// no data descriptor for the name, a plain function off the MRO (not
+    /// shadowed by the instance dict) as a method, a non-descriptor class
+    /// value otherwise. `None` for anything the full path must decide
+    /// (descriptors, overrides, a miss that raises).
+    #[inline]
+    fn leaf_resolve_instance_attr(
+        code: &CodeObject,
+        inst: &PyInstance,
+        name_idx: u32,
+    ) -> Option<LeafAttr> {
+        let cls = inst.class.try_borrow().ok()?;
+        if !Self::default_getattribute(&cls) {
+            return None;
+        }
+        let on_class = match Self::leaf_class_attr(code, &cls, name_idx)? {
+            LeafAttr::InstanceOnly => None,
+            other => Some(other),
+        };
+        if let Some(dict) = inst.dict.get() {
+            let probe = code_name_key(code, name_idx)?;
+            let d = dict.try_borrow().ok()?;
+            if let Some(v) = d.get(&probe) {
+                return Some(LeafAttr::Value(Self::clone_operand(v)));
+            }
+        }
+        on_class
+    }
+
+    /// How `cls` resolves `co_names[name_idx]` on its MRO, from the
+    /// class's [`crate::types::LeafAttrCache`] (filled through the type
+    /// cache on a miss). `None` for the shapes the full path must decide.
+    #[inline]
+    fn leaf_class_attr(code: &CodeObject, cls: &TypeObject, name_idx: u32) -> Option<LeafAttr> {
+        use crate::types::LeafAttrKind as K;
+        let Some(Object::Str(name_obj)) = code_name_obj(code, name_idx) else {
+            return None;
+        };
+        let name_key = SharedStr::as_ptr(name_obj) as *const u8 as usize;
+        let ver = cls.attr_version.get();
+        if let Some(k) = cls.leaf_attrs.get(name_key, ver) {
+            return match k {
+                K::InstanceOnly => Some(LeafAttr::InstanceOnly),
+                K::Method(w) => Some(LeafAttr::Method(w.upgrade()?)),
+                K::StaticFn(w) => Some(LeafAttr::Value(Object::Function(w.upgrade()?))),
+                K::BuiltinMethod(b) => Some(LeafAttr::BuiltinMethod(b.clone())),
+                K::Value(v) => Some(LeafAttr::Value(Self::clone_operand(v))),
+                K::Other => None,
+            };
+        }
+        if crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let name = code.names.get(name_idx as usize)?.as_str();
+        let kind = if name.starts_with("__") {
+            K::Other
+        } else {
+            match cls.lookup(name) {
+                None => K::InstanceOnly,
+                Some(Object::Function(f)) => K::Method(Rc::downgrade(&f)),
+                // A static method reads as its function through both a
+                // class and an instance, never bound.
+                Some(Object::StaticMethod(w)) => match w.func() {
+                    Object::Function(f) => K::StaticFn(Rc::downgrade(&f)),
+                    _ => K::Other,
+                },
+                // A native method on the class (a non-data descriptor that
+                // binds the instance as its first argument).
+                Some(Object::Builtin(b)) if b.binds_instance => K::BuiltinMethod(b),
+                Some(
+                    v @ (Object::None
+                    | Object::Bool(_)
+                    | Object::Int(_)
+                    | Object::Float(_)
+                    | Object::Str(_)),
+                ) => K::Value(v),
+                Some(_) => K::Other,
+            }
+        };
+        let out = match &kind {
+            K::InstanceOnly => Some(LeafAttr::InstanceOnly),
+            K::Method(w) => w.upgrade().map(LeafAttr::Method),
+            K::StaticFn(w) => w.upgrade().map(|f| LeafAttr::Value(Object::Function(f))),
+            K::BuiltinMethod(b) => Some(LeafAttr::BuiltinMethod(b.clone())),
+            K::Value(v) => Some(LeafAttr::Value(Self::clone_operand(v))),
+            K::Other => None,
+        };
+        cls.leaf_attrs.set(name_key, ver, kind);
+        out
+    }
+
+    /// `cls.name` for a class with a plain metaclass, when the name is a
+    /// plain function, a static method's function, or a plain class value
+    /// on the class's MRO. Functions are cached per site by the class's
+    /// attribute version; a value's shape is remembered in the stamp slot
+    /// and re-read through the type cache. Dunder names (which `type`'s
+    /// own descriptors may intercept) and every other value shape go to
+    /// the full handler.
+    #[inline]
+    fn leaf_load_type_attr(
+        code: &CodeObject,
+        cls: &Rc<TypeObject>,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Option<Object> {
+        let ver = cls.attr_version.get();
+        let slot = code_method_slot(code, cache_pc);
+        if let Some(f) = slot.and_then(|s| s.get(ver)) {
+            return Some(Object::Function(f));
+        }
+        // A plain `type` metaclass has nothing that could intercept a
+        // non-dunder class attribute (the class cache never answers for
+        // dunders).
+        if cls.c_ext_ptr.get() != 0 || !Self::plain_metaclass(cls) {
+            return None;
+        }
+        match Self::leaf_class_attr(code, cls, name_idx)? {
+            LeafAttr::Method(f) => {
+                if let Some(s) = slot {
+                    s.set(ver, &f);
+                }
+                Some(Object::Function(f))
+            }
+            LeafAttr::Value(v) => Some(v),
+            // A native method read through the class stays on the full
+            // path (it reports as a method descriptor, not a function).
+            LeafAttr::InstanceOnly | LeafAttr::BuiltinMethod(_) => None,
+        }
+    }
+
+    /// Whether `cls`'s metaclass is `type` itself.
+    #[inline]
+    fn plain_metaclass(cls: &TypeObject) -> bool {
+        // SAFETY: GIL-serialized raw read (the burst is off in
+        // free-threaded mode); the reference does not outlive the compare.
+        unsafe { (*cls.metaclass.as_ptr()).as_ref() }
+            .is_none_or(|m| Rc::ptr_eq(m, &builtin_types().type_))
+    }
+
+    /// `super().name` for the zero-argument form: the plain function the
+    /// name resolves to on the receiver class's MRO past `cls`, cached
+    /// per site by the receiver class's attribute version (the class
+    /// identity rides along in the stamp slot).
+    #[inline]
+    fn leaf_load_super_attr(
+        code: &CodeObject,
+        class_obj: &Object,
+        self_obj: &Object,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Option<Rc<crate::object::PyFunction>> {
+        let Object::Type(cls) = class_obj else {
+            return None;
+        };
+        let Object::Instance(inst) = self_obj else {
+            return None;
+        };
+        let recv_cls = inst.class.try_borrow().ok()?;
+        let ver = recv_cls.attr_version.get();
+        let cls_id = Rc::as_ptr(cls) as usize as u64;
+        let slot = code_method_slot(code, cache_pc);
+        let stamp = code_stamp_slot(code, cache_pc);
+        if stamp.is_some_and(|s| s.get() == [cls_id, ver, 1]) {
+            if let Some(f) = slot.and_then(|s| s.get(ver)) {
+                return Some(f);
+            }
+        }
+        let name = code.names.get(name_idx as usize)?;
+        if name.starts_with("__") && name != "__init__" {
+            return None;
+        }
+        if !Self::plain_metaclass(&recv_cls) {
+            return None;
+        }
+        let mro = recv_cls.mro.try_borrow().ok()?;
+        let start = mro.iter().position(|t| Rc::ptr_eq(t, cls))? + 1;
+        let key = crate::object::StrKey(name.as_str());
+        let mut found = None;
+        for owner in &mro[start..] {
+            if owner.c_ext_ptr.get() != 0 {
+                return None;
+            }
+            let d = owner.dict.try_borrow().ok()?;
+            if let Some(v) = d.get(&key) {
+                found = Some(v.clone());
+                break;
+            }
+        }
+        let Object::Function(f) = found? else {
+            return None;
+        };
+        if let (Some(s), Some(st)) = (slot, stamp) {
+            s.set(ver, &f);
+            st.set([cls_id, ver, 1]);
+        }
+        Some(f)
+    }
+
+    /// The leaf half of `load_method_ic_hit`: the plain function (or the
+    /// native method) a warm method cache — or the class cache — resolves
+    /// for the instance at TOS.
     #[inline]
     fn leaf_load_method(
         code: &CodeObject,
         stack: &[Object],
         cache_pc: u32,
         name_idx: u32,
-    ) -> Option<Rc<crate::object::PyFunction>> {
+    ) -> Option<Object> {
         use weavepy_compiler::InlineCache as IC;
+        let Some(Object::Instance(inst)) = stack.last() else {
+            return None;
+        };
         let IC::LoadAttrMethod {
             ver,
             mro_idx,
             key_idx,
         } = code.caches.get(cache_pc)
         else {
-            return None;
-        };
-        let Some(Object::Instance(inst)) = stack.last() else {
-            return None;
+            // No usable site cache: the class's own cache decides.
+            return match Self::leaf_resolve_instance_attr(code, inst, name_idx)? {
+                LeafAttr::Method(f) => Some(Object::Function(f)),
+                LeafAttr::BuiltinMethod(b) => Some(Object::Builtin(b)),
+                LeafAttr::Value(_) | LeafAttr::InstanceOnly => None,
+            };
         };
         let cls = inst.class.try_borrow().ok()?;
         if cls.attr_version.get() != ver {
@@ -10468,13 +11008,13 @@ impl Interpreter {
         }
         let slot = code_method_slot(code, cache_pc);
         if let Some(f) = slot.and_then(|s| s.get(ver)) {
-            return Some(f);
+            return Some(Object::Function(f));
         }
         let f = Self::load_method_ic_resolve(&cls, code, name_idx, mro_idx, key_idx)?;
         if let Some(s) = slot {
             s.set(ver, &f);
         }
-        Some(f)
+        Some(Object::Function(f))
     }
 
     /// The leaf half of `specialized_store_attr`'s instance-dict hits.
@@ -10492,20 +11032,41 @@ impl Interpreter {
         use weavepy_compiler::InlineCache as IC;
         let n = stack.len();
         let cache = code.caches.get(cache_pc);
-        let ver = match cache {
-            IC::StoreAttrInstance { ver, .. } | IC::StoreAttrNewKey { ver } => ver,
-            _ => return None,
-        };
         let name = code.names.get(name_idx as usize)?;
         let displaced = {
             let (below, top) = stack.split_at_mut(n - 1);
             let Object::Instance(inst) = &top[0] else {
                 return None;
             };
-            if inst.class.try_borrow().ok()?.attr_version.get() != ver {
-                return None;
-            }
             let value_slot = &mut below[n - 2];
+            let cache = match cache {
+                IC::StoreAttrInstance { ver, .. } | IC::StoreAttrNewKey { ver }
+                    if inst.class.try_borrow().ok()?.attr_version.get() == ver =>
+                {
+                    cache
+                }
+                // No usable site cache: a plain instance-dict store when
+                // the class has default attribute setting and no
+                // descriptor for the name (the same facts the specializer
+                // establishes, read from the class's own caches).
+                _ => {
+                    let cls = inst.class.try_borrow().ok()?;
+                    if !Self::default_getattribute(&cls)
+                        || cls.flags.is_builtin
+                        || !cls.setattr_is_default()
+                        || cls.forbids_dict
+                        || crate::object::exotic_str_keys_possible()
+                        || name.starts_with("__")
+                        || name == "args"
+                        || inst.c_body.get() != 0
+                        || !matches!(cls.lookup(name), None | Some(Object::Function(_)))
+                        || crate::capi_watchers::dicts_active()
+                    {
+                        return None;
+                    }
+                    IC::StoreAttrNewKey { ver: 0 }
+                }
+            };
             match cache {
                 IC::StoreAttrInstance { key_idx, .. } => {
                     let dict = inst.dict.get()?;
@@ -46048,6 +46609,18 @@ static COARSE_DROP_CLASS: [u8; 256] = {
     t
 };
 
+/// What [`Interpreter::leaf_resolve_instance_attr`] found.
+enum LeafAttr {
+    /// A plain value: the instance's own, or a non-descriptor class value.
+    Value(Object),
+    /// A plain function off the class MRO, to bind to the receiver.
+    Method(Rc<crate::object::PyFunction>),
+    /// Not on the class MRO at all (only `leaf_class_attr` reports it).
+    InstanceOnly,
+    /// A native method on the class MRO, to bind to the receiver.
+    BuiltinMethod(Rc<crate::object::BuiltinFn>),
+}
+
 /// A builtin the leaf burst knows how to call without leaving the quiet
 /// loop: for the argument shapes its predicate admits, the call runs no
 /// Python code, walks no frames, releases no reference the interpreter
@@ -46082,6 +46655,8 @@ enum LeafKind {
     StrSplit,
     StrJoin,
     StrReplace,
+    /// A registered leaf builtin (see [`leaf_builtins`]): any arguments.
+    Opaque,
 }
 
 /// A receiver's builtin variant, for the method table.
@@ -46130,6 +46705,123 @@ enum QuietShell<'a> {
     Ready(&'a crate::object::FrameShell),
     Lazy(&'a mut LeanAct),
 }
+
+/// Builtins that native modules vouch for as *leaf*: for every argument,
+/// the body runs no Python code, walks no frames, and calls
+/// [`gc_trace::mark_maybe_dead`] itself whenever it releases a reference
+/// beyond what it returns (the full `CALL` marks after every native call;
+/// the leaf burst relies on the body instead). The leaf burst may call
+/// them directly.
+pub(crate) mod leaf_builtins {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::sync::{Rc, Weak};
+
+    /// Weak handles: a registration must never pin a builtin (module
+    /// surfaces die with their interpreter), and a dead entry must never
+    /// vouch for whatever now lives at its address.
+    static REGISTRY: parking_lot::Mutex<Vec<Weak<crate::object::BuiltinFn>>> =
+        parking_lot::Mutex::new(Vec::new());
+    static GENERATION: AtomicU64 = AtomicU64::new(1);
+
+    /// Vouch for `b` (by identity).
+    pub fn register(b: &Rc<crate::object::BuiltinFn>) {
+        let mut reg = REGISTRY.lock();
+        reg.retain(|w| w.strong_count() > 0);
+        reg.push(Rc::downgrade(b));
+        GENERATION.fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn generation() -> u64 {
+        GENERATION.load(Ordering::Acquire)
+    }
+
+    /// The live registrations, keyed by address.
+    pub(crate) fn snapshot() -> LeafMap {
+        REGISTRY
+            .lock()
+            .iter()
+            .filter(|w| w.strong_count() > 0)
+            .map(|w| (w.as_ptr() as usize, w.clone()))
+            .collect()
+    }
+
+    pub(crate) type LeafMap = std::collections::HashMap<
+        usize,
+        Weak<crate::object::BuiltinFn>,
+        crate::fasthash::FxBuildHasher,
+    >;
+}
+
+/// `WEAVEPY_BURST_STATS=1`: which opcodes the quiet loop still runs
+/// through the full handlers (that is, outside the leaf burst), printed
+/// at shutdown. A tuning aid: the counts say where the burst's coverage
+/// ends.
+mod burst_stats {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+    static ENABLED: AtomicU8 = AtomicU8::new(2);
+    static SLOW: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+
+    #[inline]
+    pub fn enabled() -> bool {
+        match ENABLED.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let on = std::env::var_os("WEAVEPY_BURST_STATS").is_some();
+                ENABLED.store(u8::from(on), Ordering::Relaxed);
+                on
+            }
+        }
+    }
+
+    static ATTRS: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+
+    pub fn note_attr(name: &str, recv: &str) {
+        let key = format!("{name} on {recv}");
+        let mut a = ATTRS.lock().unwrap();
+        match a.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, c)) => *c += 1,
+            None => a.push((key, 1)),
+        }
+    }
+
+    pub fn note_slow(op: Option<weavepy_compiler::OpCode>) {
+        if let Some(op) = op {
+            SLOW[op as u8 as usize].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn markdown() -> String {
+        use std::fmt::Write;
+        let mut rows: Vec<(u64, u8)> = SLOW
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.load(Ordering::Relaxed), i as u8))
+            .filter(|(c, _)| *c > 0)
+            .collect();
+        rows.sort_unstable_by(|a, b| b.cmp(a));
+        let mut out = String::from("## Quiet-loop slow steps by opcode\n\n");
+        for (count, op) in rows.iter().take(40) {
+            let name = weavepy_compiler::OpCode::name(unsafe {
+                std::mem::transmute::<u8, weavepy_compiler::OpCode>(*op)
+            });
+            let _ = writeln!(out, "- {name}: {count}");
+        }
+        let mut attrs = ATTRS.lock().unwrap().clone();
+        attrs.sort_by(|a, b| b.1.cmp(&a.1));
+        for (k, c) in attrs.iter().take(25) {
+            let _ = writeln!(out, "  attr {k}: {c}");
+        }
+        out
+    }
+}
+
+/// Lean activations of a loop-free code object before it is compiled
+/// for native callers (see `run_frame_lean_impl`).
+#[cfg(feature = "jit")]
+const LEAN_WARM_COMPILE_THRESHOLD: u32 = 24;
 
 /// Why [`Interpreter::leaf_burst`] stopped.
 enum LeafStop {

@@ -319,6 +319,16 @@ pub(crate) const DEOPT_BUDGET: u32 = 64;
 /// Retire it to tier-1.
 pub(crate) const GENERIC_CALL_RETIRE_RATIO: u32 = 4;
 
+/// Retire a compiled code object — and deopt the running activation —
+/// once one activation has made this many interpreter round-trips
+/// through the call helpers. Each such call pays activation-shell
+/// setup, a generic call, and a full `guards_hold` re-validation; the
+/// interpreter's own call path is several times cheaper. A native
+/// activation that keeps coming back here is a loop around calls the
+/// JIT cannot run natively, so the interpreter finishes it (and runs
+/// every later activation).
+pub(crate) const INTERP_CALL_RETIRE_BUDGET: u32 = 48;
+
 /// Minimum framed entries before the generic-call ratio is judged —
 /// avoids retiring on a cold first activation (e.g. a setup call that
 /// makes a burst of generic calls once and then loops natively).
@@ -2454,6 +2464,88 @@ pub(crate) fn note_backedge(code: &Rc<CodeObject>) -> bool {
     JIT.with(|cell| cell.borrow_mut().note_backedge(code))
 }
 
+/// Compile `frame`'s code if it is hot, without entering it: the lean
+/// interpreter path runs a loop-free body itself (a framed native entry
+/// would cost more than the body), but a native caller can still take
+/// the direct call lanes into the compiled form, and those resolve only
+/// once the code has been compiled. Called on the lean path's threshold.
+pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::Frame) {
+    if frame.code.jit_hint.is_not_jitable() || jit_off_for_process() {
+        return;
+    }
+    JIT.with(|cell| {
+        let mut st = cell.borrow_mut();
+        if !st.enabled {
+            return;
+        }
+        // Pull the counter to the threshold so `get_compiled` compiles now.
+        let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
+        let threshold = st.threshold;
+        if let Some(entry) = st.cache.get_mut(&key) {
+            if let Tier::Cold = entry.tier {
+                entry.counter = entry.counter.max(threshold);
+            }
+        } else {
+            st.cache.insert(
+                key,
+                CacheEntry {
+                    counter: threshold,
+                    tier: Tier::Cold,
+                    osr_failures: 0,
+                    deopts: 0,
+                    native_entries: 0,
+                    generic_dyn_calls: 0,
+                    probe_misses: Vec::new(),
+                    native: None,
+                    method_native: None,
+                    direct: None,
+                    code: frame.code.clone(),
+                },
+            );
+        }
+        let interp_ref: &super::Interpreter = interp;
+        let frame_ref: &super::Frame = frame;
+        let mut resolve = |name: &str| resolve_plain_global(interp_ref, frame_ref, name);
+        let mut ret_of = |f: &Rc<PyFunction>, c: &Rc<CodeObject>| callee_ret_lane(interp_ref, f, c);
+        let mut probe = |slot: u32| probe_list_lane(frame_ref, slot);
+        let mut probe_dict = |slot: u32| probe_dict_lane(frame_ref, slot);
+        let mut probe_attr = |slot: u32, path: &[String], name: &str, store: bool| {
+            probe_attr_lane(frame_ref, slot, path, name, store)
+        };
+        let mut attr_guard = |site: &AttrSiteMeta| attr_site_guard(interp_ref, frame_ref, site);
+        let mut probe_method = |slot: u32, path: &[String], name: &str| {
+            probe_method_entry(interp_ref, frame_ref, slot, path, name)
+        };
+        let mut math_attr =
+            |name: &str, attr: &str| math_attr_object(interp_ref, frame_ref, name, attr);
+        let mut probe_param = |slot: u32| probe_param_lane(frame_ref, slot);
+        let mut probe_class = |cls: &Rc<TypeObject>| probe_class_ctor(interp_ref, cls);
+        let mut probe_ctor_fld =
+            |cls: &str, attr: &str| probe_ctor_field(interp_ref, frame_ref, cls, attr);
+        let mut probe_cell = |idx: u32| probe_cell_lane(frame_ref, idx);
+        let mut probe_obj = |slot: u32| probe_obj_live(frame_ref, slot);
+        let _ = st.get_compiled(
+            &frame.code,
+            0,
+            &mut VmProbes {
+                resolve_obj: &mut resolve,
+                ret_lane_of: &mut ret_of,
+                list: &mut probe,
+                dict: &mut probe_dict,
+                attr: &mut probe_attr,
+                attr_guard_of: &mut attr_guard,
+                method: &mut probe_method,
+                math_attr: &mut math_attr,
+                param: &mut probe_param,
+                class_ctor: &mut probe_class,
+                ctor_field: &mut probe_ctor_fld,
+                cell: &mut probe_cell,
+                obj_live: &mut probe_obj,
+            },
+        );
+    });
+}
+
 /// Resolve a global name the way `LOAD_GLOBAL`'s happy path does —
 /// globals then builtins, plain dict gets only. Returns `None` for a
 /// dict-subclass globals mapping (whose `__missing__` hook the generic
@@ -2591,6 +2683,9 @@ struct CallCtx {
     /// call tree can't rebind anything, so clean calls skip the guard
     /// lookups entirely.
     dirty: bool,
+    /// Interpreter round-trips this activation has made through the call
+    /// helpers (see [`INTERP_CALL_RETIRE_BUDGET`]).
+    interp_calls: u32,
     /// RFC 0067 WS1 — identity of this activation's code object, so a
     /// self-recursive fast call can reuse [`Self::native`] without a
     /// cache lookup.
@@ -3188,6 +3283,15 @@ unsafe fn try_native_call(
         };
     }
 
+    // The framed native call below is itself expensive (buffers, pins, a
+    // callee context, a recursion tick): a loop of them is call-shaped
+    // too. Past the budget the interpreter path takes it (and retires
+    // the code through `finish_interp_call`).
+    if ctx.interp_calls.saturating_add(1) >= INTERP_CALL_RETIRE_BUDGET {
+        drop(recursion_guard);
+        return None;
+    }
+    ctx.interp_calls = ctx.interp_calls.saturating_add(1);
     // Keep disjoint regions in one pooled owner per element width, as
     // direct native entry does. Owners stay live through every native or
     // materialized continuation; no pool borrow crosses the call.
@@ -3290,6 +3394,7 @@ unsafe fn try_native_call(
         methods: nc.methods.clone(),
         math: nc.math.clone(),
         dirty: false,
+        interp_calls: 0,
         code_ptr: callee_key,
         native,
         method_native,
@@ -3499,6 +3604,13 @@ unsafe fn try_native_ctor(
     expect_tag: u32,
 ) -> Option<i64> {
     let cls = nc.ctor.as_ref()?;
+    // A native construction is a framed call plus allocation and
+    // tracking: charged like any other heavy round-trip, and past the
+    // budget left to the interpreter (see `charge_roundtrip`).
+    if ctx.interp_calls.saturating_add(1) >= INTERP_CALL_RETIRE_BUDGET {
+        return None;
+    }
+    ctx.interp_calls = ctx.interp_calls.saturating_add(1);
     let (inst, ran_finalizers) = interp.alloc_plain_instance(cls)?;
     if ran_finalizers {
         // Threshold collection ran finalizers — arbitrary Python.
@@ -3773,6 +3885,10 @@ unsafe extern "C" fn wpjit_call_py(
             CallStatus::Raised as i64
         }
         Ok(v) => {
+            if charge_roundtrip(ctx) {
+                ctx.parked = Some(v);
+                return CallStatus::Boxed as i64;
+            }
             // The callee may have rebound a burned-in global or a
             // callee's `__code__`; the *next* burned operation would
             // then be wrong, so the caller must deopt after this call.
@@ -3840,6 +3956,13 @@ fn finish_interp_call(
             CallStatus::Raised as i64
         }
         Ok(v) => {
+            if charge_roundtrip(ctx) {
+                // Call-shaped: hand the rest of this activation, and every
+                // later one, to the interpreter (a `Boxed` exit spills the
+                // result and resumes after the call).
+                ctx.parked = Some(v);
+                return CallStatus::Boxed as i64;
+            }
             let still_valid = guards_hold(
                 interp,
                 &ctx.globals,
@@ -3885,6 +4008,32 @@ fn finish_interp_call(
             CallStatus::Boxed as i64
         }
     }
+}
+
+/// Charge one expensive round-trip (an interpreter call, a generic
+/// attribute access, or a heavy native-to-native call) to the running
+/// activation. Returns true once the activation has spent
+/// [`INTERP_CALL_RETIRE_BUDGET`]: the code object is retired to tier-1
+/// (its `jit_hint` fast-out gates every later entry and back edge) and
+/// the caller should deopt the activation into the interpreter.
+fn charge_roundtrip(ctx: &mut CallCtx) -> bool {
+    ctx.interp_calls = ctx.interp_calls.saturating_add(1);
+    if ctx.interp_calls < INTERP_CALL_RETIRE_BUDGET || ctx.code_ptr.is_null() {
+        return false;
+    }
+    JIT.with(|cell| {
+        let mut st = cell.borrow_mut();
+        if let Some(ce) = st.cache.get_mut(&ctx.code_ptr) {
+            if !matches!(ce.tier, Tier::NotJitable) {
+                ce.tier = Tier::NotJitable;
+                st.stats.generic_retires += 1;
+            }
+        }
+    });
+    // SAFETY: the activation's code object outlives the activation (see
+    // the field docs).
+    unsafe { (*ctx.code_ptr).jit_hint.mark_not_jitable() };
+    true
 }
 
 /// The `wpjit_call_method` helper (RFC 0069 WS1): native code calls
@@ -6084,6 +6233,10 @@ unsafe fn call_dyn_impl(
             CallStatus::Raised as i64
         }
         Ok(v) => {
+            if charge_roundtrip(ctx) {
+                ctx.parked = Some(v);
+                return CallStatus::Boxed as i64;
+            }
             let still_valid = guards_hold(
                 interp,
                 &ctx.globals,
@@ -6175,6 +6328,10 @@ unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i6
             1
         }
         Ok(v) => {
+            if charge_roundtrip(ctx) {
+                ctx.parked = Some(v);
+                return 2;
+            }
             let still_valid = guards_hold(
                 interp,
                 &ctx.globals,
@@ -7042,6 +7199,7 @@ pub(crate) fn try_call_native_direct(
         methods: entry.art.methods.clone(),
         math: entry.art.math.clone(),
         dirty: false,
+        interp_calls: 0,
         code_ptr: key,
         native: entry.native.clone(),
         method_native: entry.method_native.clone(),
@@ -7722,6 +7880,7 @@ fn enter_compiled(
         methods: entry.methods.clone(),
         math: entry.math.clone(),
         dirty: false,
+        interp_calls: 0,
         code_ptr: Rc::as_ptr(&frame.code).cast::<CodeObject>(),
         native: entry.native.clone(),
         method_native: entry.method_native.clone(),
@@ -7778,6 +7937,7 @@ fn enter_compiled(
                 obj_global_pins: ctx.obj_global_pins,
                 entry_pin_count,
                 dirty: ctx.dirty,
+                interp_calls: ctx.interp_calls,
                 local_types: cf.local_types.clone(),
                 plan,
             }));
@@ -8239,6 +8399,8 @@ pub(crate) struct NativeActivation {
     /// for the temporary-pin soft limit across native suspensions.
     entry_pin_count: usize,
     dirty: bool,
+    /// Interpreter round-trips so far (see `CallCtx::interp_calls`).
+    interp_calls: u32,
     /// Per-slot lanes for the locals writeback at materialization
     /// (cloned once from the compiled frame at first park).
     local_types: Vec<Option<JitType>>,
@@ -8581,6 +8743,7 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
         methods: entry.methods.clone(),
         math: entry.math.clone(),
         dirty: act.dirty,
+        interp_calls: act.interp_calls,
         code_ptr: Rc::as_ptr(&frame.code).cast::<CodeObject>(),
         native: entry.native.clone(),
         method_native: entry.method_native.clone(),
