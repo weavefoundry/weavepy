@@ -3996,24 +3996,26 @@ pub fn note_dropped_marks(obj: &crate::object::Object) -> bool {
 
 /// The grade for an object with strong count `sc` and identity `id`
 /// (the identity is the one [`crate::weakref_registry::id_of`] yields).
-#[inline]
+#[inline(always)]
 fn note_dropped_counted(sc: usize, id: ObjectId) -> bool {
     floor_stats::bump(&floor_stats::DROP_NOTES, 1);
-    if sc <= 1 {
-        floor_stats::bump(&floor_stats::DROP_NOTES_MARKED, 1);
-        return true;
-    }
     // A tracked object dies here when only its collector handle (and any
     // registry-held weakref clones) remain beside the dropped reference.
-    if TRACKED_FILTER.may_contain(id)
-        && (sc == 2
-            || (crate::weakref_registry::may_have_weakrefs(id)
-                && sc <= 2 + crate::weakref_registry::strong_clone_count(id)))
-    {
+    // Probed cheapest-first: past two references only a weakref-watched
+    // object can be at its dead line, and almost none are.
+    let marked = if sc <= 1 {
+        true
+    } else if sc == 2 {
+        TRACKED_FILTER.may_contain(id)
+    } else {
+        crate::weakref_registry::may_have_weakrefs(id)
+            && TRACKED_FILTER.may_contain(id)
+            && sc <= 2 + crate::weakref_registry::strong_clone_count(id)
+    };
+    if marked {
         floor_stats::bump(&floor_stats::DROP_NOTES_MARKED, 1);
-        return true;
     }
-    false
+    marked
 }
 
 #[inline(never)]

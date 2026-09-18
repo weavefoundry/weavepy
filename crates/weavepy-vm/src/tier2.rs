@@ -475,6 +475,26 @@ fn jit_enabled_by_config() -> bool {
     enabled && !crate::gil::free_threading_requested()
 }
 
+/// Whether interpreter start-up (the `site` import and everything it
+/// pulls in) is over. Until then compilation waits: start-up code runs
+/// once, and compiling the few helpers it calls a few dozen times costs
+/// more (time and resident memory) than interpreting them ever could.
+static STARTUP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark interpreter start-up finished (see [`STARTUP_DONE`]).
+pub(crate) fn note_startup_finished() {
+    STARTUP_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a code object whose counter reached `counter` against
+/// `threshold` may compile now: after start-up, or (for an embedder
+/// that never reports start-up) once far past the threshold.
+#[inline]
+fn compile_allowed(counter: u32, threshold: u32) -> bool {
+    STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed)
+        || counter >= threshold.saturating_mul(16)
+}
+
 /// True when no thread's JIT can be enabled (see [`JIT_PROCESS_GATE`]).
 #[inline]
 pub(crate) fn jit_off_for_process() -> bool {
@@ -637,7 +657,9 @@ impl JitState {
                 Tier::NotJitable => return None,
                 Tier::Cold => {
                     entry.counter += 1;
-                    if entry.counter < self.threshold {
+                    if entry.counter < self.threshold
+                        || !compile_allowed(entry.counter, self.threshold)
+                    {
                         return None;
                     }
                     // RFC 0073 WS1 — a probe-miss rejection is
@@ -2535,7 +2557,10 @@ pub(crate) fn note_backedge(code: &Rc<CodeObject>) -> bool {
 /// the direct call lanes into the compiled form, and those resolve only
 /// once the code has been compiled. Called on the lean path's threshold.
 pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::Frame) {
-    if frame.code.jit_hint.is_not_jitable() || jit_off_for_process() {
+    if frame.code.jit_hint.is_not_jitable()
+        || jit_off_for_process()
+        || !STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed)
+    {
         return;
     }
     JIT.with(|cell| {
@@ -2751,6 +2776,9 @@ struct CallCtx {
     /// Interpreter round-trips this activation has made through the call
     /// helpers (see [`INTERP_CALL_RETIRE_BUDGET`]).
     interp_calls: u32,
+    /// Generic calls of native callees this activation has made (see
+    /// [`charge_native_roundtrip`]).
+    native_calls: u32,
     /// RFC 0067 WS1 — identity of this activation's code object, so a
     /// self-recursive fast call can reuse [`Self::native`] without a
     /// cache lookup.
@@ -3480,6 +3508,7 @@ unsafe fn try_native_call(
         math: nc.math.clone(),
         dirty: false,
         interp_calls: 0,
+        native_calls: 0,
         code_ptr: callee_key,
         native,
         method_native,
@@ -4103,6 +4132,36 @@ fn finish_interp_call(
 /// [`INTERP_CALL_RETIRE_BUDGET`]: the code object is retired to tier-1
 /// (its `jit_hint` fast-out gates every later entry and back edge) and
 /// the caller should deopt the activation into the interpreter.
+/// A generic call of a *native* callee (a builtin function or a bound
+/// builtin method) from compiled code: the interpreter runs the same
+/// call through its leaf paths without the activation shell, guard
+/// re-validation and pin traffic, so an activation making many of them
+/// is a net loss. Past the budget the code retires to the interpreter
+/// (which takes over right after this call, through the `Boxed` exit).
+fn charge_native_roundtrip(ctx: &mut CallCtx) -> bool {
+    ctx.native_calls = ctx.native_calls.saturating_add(1);
+    if ctx.native_calls < NATIVE_CALL_RETIRE_BUDGET || ctx.code_ptr.is_null() {
+        return false;
+    }
+    JIT.with(|cell| {
+        let mut st = cell.borrow_mut();
+        if let Some(ce) = st.cache.get_mut(&ctx.code_ptr) {
+            if !matches!(ce.tier, Tier::NotJitable) {
+                ce.tier = Tier::NotJitable;
+                st.stats.generic_retires += 1;
+            }
+        }
+    });
+    // SAFETY: the activation's code object outlives the activation (see
+    // the field docs).
+    unsafe { (*ctx.code_ptr).jit_hint.mark_not_jitable() };
+    true
+}
+
+/// Generic native-callee calls one activation may make before its code
+/// retires (see [`charge_native_roundtrip`]).
+const NATIVE_CALL_RETIRE_BUDGET: u32 = 64;
+
 fn charge_roundtrip(ctx: &mut CallCtx) -> bool {
     ctx.interp_calls = ctx.interp_calls.saturating_add(1);
     // Measured (attr_access): a native loop that calls interpreted
@@ -6331,6 +6390,8 @@ unsafe fn call_dyn_impl(
     // WS1's dirtiness discipline).
     note_generic_dyn_call(ctx);
     ctx.dirty = true;
+    let native_callee = matches!(&callee, Object::Builtin(_))
+        || matches!(&callee, Object::BoundMethod(bm) if matches!(bm.function, Object::Builtin(_)));
     let called = call_with_activation_shell(interp, ctx, jf, |i| {
         i.call_object_with_globals(&callee, &args, &kwargs, &ctx.globals)
     });
@@ -6340,7 +6401,7 @@ unsafe fn call_dyn_impl(
             CallStatus::Raised as i64
         }
         Ok(v) => {
-            if charge_roundtrip(ctx) {
+            if charge_roundtrip(ctx) || (native_callee && charge_native_roundtrip(ctx)) {
                 ctx.parked = Some(v);
                 return CallStatus::Boxed as i64;
             }
@@ -7307,6 +7368,7 @@ pub(crate) fn try_call_native_direct(
         math: entry.art.math.clone(),
         dirty: false,
         interp_calls: 0,
+        native_calls: 0,
         code_ptr: key,
         native: entry.native.clone(),
         method_native: entry.method_native.clone(),
@@ -7988,6 +8050,7 @@ fn enter_compiled(
         math: entry.math.clone(),
         dirty: false,
         interp_calls: 0,
+        native_calls: 0,
         code_ptr: Rc::as_ptr(&frame.code).cast::<CodeObject>(),
         native: entry.native.clone(),
         method_native: entry.method_native.clone(),
@@ -8851,6 +8914,7 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
         math: entry.math.clone(),
         dirty: act.dirty,
         interp_calls: act.interp_calls,
+        native_calls: 0,
         code_ptr: Rc::as_ptr(&frame.code).cast::<CodeObject>(),
         native: entry.native.clone(),
         method_native: entry.method_native.clone(),

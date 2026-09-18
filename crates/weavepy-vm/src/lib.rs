@@ -1752,6 +1752,13 @@ impl Interpreter {
     /// CPython's bootstrap. We `import site` if available, then call
     /// `site.main()`. Errors are intentionally swallowed — a broken
     /// `.pth` file shouldn't kill the whole interpreter.
+    /// Report that interpreter start-up is over: user code runs next
+    /// (the JIT defers compilation until then).
+    pub fn note_startup_finished(&self) {
+        #[cfg(feature = "jit")]
+        crate::tier2::note_startup_finished();
+    }
+
     pub fn run_site(&mut self) -> Result<(), RuntimeError> {
         // Startup runs bytecode too (site/.pth imports can allocate enough
         // to trip an auto-collection), so engage the GIL here just as
@@ -10917,8 +10924,12 @@ impl Interpreter {
                         break None;
                     }
                     // SAFETY: `len > 0`.
-                    let Object::Iter(it) = (unsafe { &*base.add(len - 1) }) else {
-                        break None;
+                    let it = match unsafe { &*base.add(len - 1) } {
+                        Object::Iter(it) => it,
+                        // A generator resumes through the quiet loop's
+                        // lean path (the leaf arms never take it).
+                        Object::Generator(_) => break Some(LeafStop::Step),
+                        _ => break None,
                     };
                     let Ok(mut it) = it.try_borrow_mut() else {
                         break None;
@@ -11010,6 +11021,9 @@ impl Interpreter {
                         CoreAttr::Full => break Some(LeafStop::Step),
                     }
                 }
+                // An opcode the full leaf arms have no arm for is the quiet
+                // loop's straight away.
+                op if !SLOW_LEAF_OPS[op as u8 as usize] => break Some(LeafStop::Step),
                 _ => break None,
             }
         };
@@ -49936,6 +49950,61 @@ enum CoreAttr {
     /// specialize) it.
     Full,
 }
+
+/// The opcodes [`Interpreter::leaf_burst_slow`] has arms for.
+static SLOW_LEAF_OPS: [bool; 256] = {
+    let mut t = [false; 256];
+    let ops = [
+        OpCode::BinaryOp,
+        OpCode::BinarySubscr,
+        OpCode::BuildList,
+        OpCode::BuildString,
+        OpCode::BuildTuple,
+        OpCode::Call,
+        OpCode::CompareOp,
+        OpCode::CopyFreeVars,
+        OpCode::CopyTop,
+        OpCode::ForIter,
+        OpCode::FormatValue,
+        OpCode::GetIter,
+        OpCode::IsOp,
+        OpCode::JumpBackward,
+        OpCode::JumpForward,
+        OpCode::ListAppend,
+        OpCode::LoadAttr,
+        OpCode::LoadConst,
+        OpCode::LoadDeref,
+        OpCode::LoadFast,
+        OpCode::LoadFastAndClear,
+        OpCode::LoadGlobal,
+        OpCode::LoadMethodAttr,
+        OpCode::LoadSmallInt,
+        OpCode::LoadSuperAttr,
+        OpCode::Nop,
+        OpCode::NotTaken,
+        OpCode::PopJumpIfFalse,
+        OpCode::PopJumpIfNone,
+        OpCode::PopJumpIfNotNone,
+        OpCode::PopJumpIfTrue,
+        OpCode::PopTop,
+        OpCode::PushNull,
+        OpCode::Resume,
+        OpCode::StoreAttr,
+        OpCode::StoreDeref,
+        OpCode::StoreFast,
+        OpCode::StoreSubscr,
+        OpCode::Swap,
+        OpCode::ToBool,
+        OpCode::UnaryOp,
+        OpCode::UnpackSequence,
+    ];
+    let mut i = 0;
+    while i < ops.len() {
+        t[ops[i] as u8 as usize] = true;
+        i += 1;
+    }
+    t
+};
 
 /// The opcodes [`Interpreter::leaf_core`] runs (for some operand shapes).
 static CORE_LEAF_OPS: [bool; 256] = {

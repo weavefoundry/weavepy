@@ -2295,6 +2295,7 @@ fn run_repl(flags: InterpreterFlags, startup: Option<&Path>, argv: Vec<String>) 
     if !flags.no_site {
         let _ = interpreter.run_site();
     }
+    interpreter.note_startup_finished();
     let repl = repl::Repl::new(interpreter, flags.quiet)?;
     repl.run(startup)
 }
