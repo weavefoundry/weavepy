@@ -1439,6 +1439,21 @@ pub(crate) fn intern_name(name: &str) -> Object {
     })
 }
 
+/// `sys.intern` for an existing string: the pooled object for its value,
+/// which becomes `text` itself on first sight. The native unpickler interns
+/// attribute names this way, exactly as `load_build` does.
+pub(crate) fn intern_shared(text: &SharedStr) -> SharedStr {
+    INTERN_POOL.with(|pool| {
+        let mut map = pool.borrow_mut();
+        if let Some(existing) = map.get(text.as_ref()) {
+            existing.clone()
+        } else {
+            map.insert(text.clone());
+            text.clone()
+        }
+    })
+}
+
 /// CPython's `intern_string_constants` rule (codeobject.c): a str
 /// constant is interned when it is ASCII and every character is a name
 /// character (`Py_ISALNUM` or `_`); the empty string and every

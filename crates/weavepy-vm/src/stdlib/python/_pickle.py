@@ -489,8 +489,17 @@ except ImportError:
     _native_loads = None
     _native_dumps = None
 else:
-    _native_loads = _make_native_loads(Unpickler)
-    _native_dumps = _make_native_dumps(Pickler)
+    # The modules let the native engine check, for instances of plain
+    # classes, the state that `save_global`, `find_class`, and the default
+    # object reduction consult: `sys.modules`, `__import__`, the dispatch
+    # table, the extension registry, and the helper functions themselves.
+    import builtins as _builtins
+    import copyreg as _copyreg
+    _pickle_py = _sys.modules["pickle"]
+    _native_loads = _make_native_loads(Unpickler, _sys, _builtins, _pickle_py)
+    _native_dumps = _make_native_dumps(
+        Pickler, _sys, _builtins, _pickle_py, _copyreg)
+    del _builtins, _copyreg, _pickle_py
 
 # Importing _pickle first initializes pickle while this module is incomplete.
 # Its final accelerator import then falls back. Publish the completed entry
