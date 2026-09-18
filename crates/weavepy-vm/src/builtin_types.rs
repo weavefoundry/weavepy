@@ -1934,8 +1934,13 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // allocations join the cycle collector exactly like instances born
     // through the default `instantiate` path — otherwise they're
     // invisible to `gc.collect()` and their weakrefs never clear.
+    let native = cls.native_kind.get() != 0;
     let inst = Object::Instance(Rc::new(PyInstance::new(cls)));
-    crate::gc_trace::track(inst.clone());
+    // A natively served class's instances are never tracked (see
+    // `stdlib::datetime_native`).
+    if !native {
+        crate::gc_trace::track(inst.clone());
+    }
     Ok(inst)
 }
 

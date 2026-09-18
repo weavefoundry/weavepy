@@ -22,6 +22,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         ("date_fields", date_fields as Helper),
         ("time_fields", time_fields as Helper),
         ("format_time_parts", format_time_parts as Helper),
+        ("install_native", super::datetime_native::install as Helper),
     ] {
         let function = Object::Builtin(Rc::new(BuiltinFn {
             name,

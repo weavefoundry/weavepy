@@ -10185,6 +10185,26 @@ impl Interpreter {
                                 None => break,
                             }
                         }
+                        // A natively served left operand (see
+                        // `stdlib::datetime_native`).
+                        (Object::Instance(i), _) if i.cls_raw().native_kind.get() != 0 => {
+                            match crate::stdlib::datetime_native::leaf_binop(
+                                kind,
+                                &stack[n - 2],
+                                &stack[n - 1],
+                            ) {
+                                Some(Ok(v)) => v,
+                                Some(Err(e)) => {
+                                    // As the full handler: the operands are
+                                    // gone when the error propagates.
+                                    stack.truncate(n - 2);
+                                    pc += 1;
+                                    stop = LeafStop::Raised(e);
+                                    break;
+                                }
+                                None => break,
+                            }
+                        }
                         // `str + str` and small `str * int`: one allocation,
                         // no code can run (`str` owns no objects).
                         (Object::Str(a), Object::Str(b)) if kind == BinOpKind::Add => {
@@ -10272,6 +10292,32 @@ impl Interpreter {
                             a.partial_cmp(b)
                         }
                         (Object::Str(a), Object::Str(b)) => Some(a.as_bytes().cmp(b.as_bytes())),
+                        (Object::Instance(i), Object::Instance(_))
+                            if i.cls_raw().native_kind.get() != 0 =>
+                        {
+                            // Natively served operands (see
+                            // `stdlib::datetime_native`): the result is
+                            // already the answer.
+                            let r = match crate::stdlib::datetime_native::leaf_compare(
+                                kind,
+                                &stack[n - 2],
+                                &stack[n - 1],
+                            ) {
+                                Some(Ok(v)) => v,
+                                Some(Err(e)) => {
+                                    stack.truncate(n - 2);
+                                    pc += 1;
+                                    stop = LeafStop::Raised(e);
+                                    break;
+                                }
+                                None => break,
+                            };
+                            stack.truncate(n - 1);
+                            stack[n - 2] = r;
+                            last = pc;
+                            pc += 1;
+                            continue;
+                        }
                         _ => break,
                     };
                     let Some(ord) = ord else { break };
@@ -10823,6 +10869,24 @@ impl Interpreter {
                     let v = match stack.last() {
                         Some(Object::Type(cls)) => {
                             match Self::leaf_load_type_attr(code, cls, pc as u32, ins.arg) {
+                                Some(v) => v,
+                                None => break,
+                            }
+                        }
+                        // A natively served instance's public field (see
+                        // `stdlib::datetime_native`).
+                        Some(Object::Instance(i))
+                            if i.cls_raw().native_kind.get() != 0
+                                && matches!(
+                                    code_name_obj(code, ins.arg),
+                                    Some(Object::Str(name))
+                                        if crate::stdlib::datetime_native::leaf_field(i, name).is_some()
+                                ) =>
+                        {
+                            let Some(Object::Str(name)) = code_name_obj(code, ins.arg) else {
+                                break;
+                            };
+                            match crate::stdlib::datetime_native::leaf_field(i, name) {
                                 Some(v) => v,
                                 None => break,
                             }
@@ -11545,9 +11609,15 @@ impl Interpreter {
         // The registered builtin must still be *this* allocation: a
         // recycled address (a torn-down interpreter's module surface)
         // fails the upgrade or the identity check.
-        let w = opaque.1.get(&p)?;
+        let (w, fast) = opaque.1.get(&p)?;
         let live = w.upgrade()?;
-        Rc::ptr_eq(&live, b).then_some(LeafKind::Opaque)
+        if !Rc::ptr_eq(&live, b) {
+            return None;
+        }
+        Some(match fast {
+            Some(f) => LeafKind::Fast(*f),
+            None => LeafKind::Opaque,
+        })
     }
 
     /// Call a leaf builtin if `args` (receiver first for methods) has an
@@ -11733,6 +11803,8 @@ impl Interpreter {
                 return Some(Ok(inst));
             }
             K::Opaque => true,
+            // The fast half decides (and declines untouched).
+            K::Fast(f) => return f(args),
         };
         if !admitted {
             return None;
@@ -38453,6 +38525,14 @@ impl Interpreter {
     /// counts toward an automatic collection).
     #[inline]
     fn alloc_plain_instance_obj(&self, cls: &Rc<TypeObject>) -> (Object, bool) {
+        if cls.native_kind.get() != 0 {
+            // A natively served class's instances are never tracked
+            // (see `stdlib::datetime_native`).
+            return (
+                Object::Instance(Rc::new(PyInstance::new(cls.clone()))),
+                false,
+            );
+        }
         if !cls.flags.is_builtin && !cls.instances_need_finalize() {
             (
                 Object::Instance(PyInstance::new_deferred(cls.clone())),
@@ -48002,8 +48082,14 @@ enum LeafAttr {
 /// Python code, walks no frames, releases no reference the interpreter
 /// cannot see, and returns (or raises) purely natively. Everything else
 /// about the call — the raise path, operand grading — the burst handles.
+// `Fast` entries are never told apart by comparison (only `Opaque` is
+// tested for), so the function-pointer equality the derive brings is moot.
+#[allow(unpredictable_function_pointer_comparisons)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LeafKind {
+    /// A registered builtin's pure fast half (see
+    /// `leaf_builtins::register_fast`).
+    Fast(leaf_builtins::Fast),
     /// `object.__new__` (see `leaf_builtin_call`).
     ObjectNew,
     Len,
@@ -48177,15 +48263,32 @@ pub(crate) mod leaf_builtins {
     /// Weak handles: a registration must never pin a builtin (module
     /// surfaces die with their interpreter), and a dead entry must never
     /// vouch for whatever now lives at its address.
-    static REGISTRY: parking_lot::Mutex<Vec<Weak<crate::object::BuiltinFn>>> =
+    /// A leaf entry's pure fast half: `None` for an argument shape it
+    /// does not serve (the call then takes the full path, untouched).
+    pub(crate) type Fast = fn(
+        &[crate::object::Object],
+    )
+        -> Option<Result<crate::object::Object, crate::error::RuntimeError>>;
+
+    static REGISTRY: parking_lot::Mutex<Vec<(Weak<crate::object::BuiltinFn>, Option<Fast>)>> =
         parking_lot::Mutex::new(Vec::new());
     static GENERATION: AtomicU64 = AtomicU64::new(1);
 
-    /// Vouch for `b` (by identity).
+    /// Vouch for `b` (by identity): its whole body is a leaf.
     pub(crate) fn register(b: &Rc<crate::object::BuiltinFn>) {
+        push(b, None);
+    }
+
+    /// Vouch for `fast` as `b`'s leaf half: the dispatch loop calls it
+    /// inline and takes the full path when it declines.
+    pub(crate) fn register_fast(b: &Rc<crate::object::BuiltinFn>, fast: Fast) {
+        push(b, Some(fast));
+    }
+
+    fn push(b: &Rc<crate::object::BuiltinFn>, fast: Option<Fast>) {
         let mut reg = REGISTRY.lock();
-        reg.retain(|w| w.strong_count() > 0);
-        reg.push(Rc::downgrade(b));
+        reg.retain(|(w, _)| w.strong_count() > 0);
+        reg.push((Rc::downgrade(b), fast));
         GENERATION.fetch_add(1, Ordering::Release);
     }
 
@@ -48198,14 +48301,14 @@ pub(crate) mod leaf_builtins {
         REGISTRY
             .lock()
             .iter()
-            .filter(|w| w.strong_count() > 0)
-            .map(|w| (w.as_ptr() as usize, w.clone()))
+            .filter(|(w, _)| w.strong_count() > 0)
+            .map(|(w, f)| (w.as_ptr() as usize, (w.clone(), *f)))
             .collect()
     }
 
     pub(crate) type LeafMap = std::collections::HashMap<
         usize,
-        Weak<crate::object::BuiltinFn>,
+        (Weak<crate::object::BuiltinFn>, Option<Fast>),
         crate::fasthash::FxBuildHasher,
     >;
 }

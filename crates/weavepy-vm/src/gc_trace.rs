@@ -3970,6 +3970,10 @@ pub fn note_dropped_marks(obj: &crate::object::Object) -> bool {
         | O::Code(_) => false,
         // The common heap operands, with their count and identity read
         // inline (no variant dispatch).
+        // A natively served class's instance (never tracked, no
+        // finalizer, only ints and a `tzinfo` inside) cannot start a
+        // finalization when it dies.
+        O::Instance(i) if i.cls_raw().native_kind.get() != 0 => false,
         O::Instance(i) => note_dropped_counted(
             crate::sync::Rc::strong_count(i),
             crate::sync::Rc::as_ptr(i) as usize as u64,

@@ -2666,6 +2666,17 @@ timezone.min = timezone._create(-timedelta(hours=23, minutes=59))
 timezone.max = timezone._create(timedelta(hours=23, minutes=59))
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
+# WEAVEPY: native implementations of the hot methods (the role CPython's C
+# `_datetime` plays). They serve exact-class operands natively and call the
+# Python methods above for everything else.
+try:
+    from _weave_datetime import install_native as _install_native
+except ImportError:
+    pass
+else:
+    _install_native(timedelta, date, time, datetime, timezone)
+    del _install_native
+
 # CPython ships these as C static types whose `tp_name` carries the dotted
 # module prefix; `tp_name`-based error text ("'>' not supported between
 # instances of 'float' and 'datetime.datetime'") prints it while `__name__`

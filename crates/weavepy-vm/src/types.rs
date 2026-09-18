@@ -499,6 +499,14 @@ pub struct TypeObject {
     /// The leaf burst's per-class attribute-kind cache (see
     /// [`LeafAttrCache`]).
     pub leaf_attrs: LeafAttrCache,
+    /// Non-zero for an exact class whose hot methods have native
+    /// implementations (see `stdlib::datetime_native`): its instances
+    /// are never cycle-collector tracked (like CPython's C types without
+    /// `Py_TPFLAGS_HAVE_GC`), and the leaf guards key on the value.
+    pub native_kind: Cell<u8>,
+    /// Native-implementation state for such a class (see
+    /// `stdlib::datetime_native`), set once.
+    pub native_ext: std::sync::OnceLock<Rc<dyn std::any::Any + Send + Sync>>,
     /// Cached "do instances of this type carry a `__del__` finalizer
     /// anywhere in their MRO?" answer, so [`crate::object::PyInstance`]'s
     /// `Drop` safety net can skip an MRO walk on the hot per-instance drop
@@ -882,6 +890,8 @@ impl TypeObject {
             flags,
             metaclass: RefCell::new(None),
             leaf_attrs: LeafAttrCache::new(),
+            native_kind: Cell::new(0),
+            native_ext: std::sync::OnceLock::new(),
             slot_names: RefCell::new(Vec::new()),
             declares_slots: Cell::new(false),
             forbids_dict: false,
@@ -1754,6 +1764,39 @@ enum SlotData {
 }
 
 #[cfg(target_pointer_width = "64")]
+impl SlotStorage {
+    /// Storage holding exactly `entries` (distinct `str` keys, in slot
+    /// order), built in one step.
+    pub fn from_entries(entries: Vec<(DictKey, Object)>) -> Self {
+        let data = match entries.len() {
+            0 => SlotData::Single {
+                key: None,
+                value: Object::None,
+            },
+            1..=16 => SlotData::Small(entries),
+            n => {
+                let mut table =
+                    DictData::with_capacity_and_hasher(n, crate::fasthash::FxBuildHasher);
+                table.extend(entries);
+                SlotData::Many(table)
+            }
+        };
+        Self { data }
+    }
+}
+
+#[cfg(not(target_pointer_width = "64"))]
+impl SlotStorage {
+    /// Storage holding exactly `entries` (see the 64-bit variant).
+    pub fn from_entries(entries: Vec<(DictKey, Object)>) -> Self {
+        let mut table =
+            DictData::with_capacity_and_hasher(entries.len(), crate::fasthash::FxBuildHasher);
+        table.extend(entries);
+        Self(table)
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
 impl Default for SlotStorage {
     fn default() -> Self {
         Self {
@@ -1826,7 +1869,8 @@ impl SlotStorage {
     #[inline]
     pub fn get_hinted(&self, idx: usize, name: &str) -> Option<&Object> {
         if let Some((DictKey(Object::Str(stored)), value)) = self.get_index(idx) {
-            if stored.as_ref() == name {
+            // Interned names usually share the probe's storage.
+            if std::ptr::eq(stored.as_ptr(), name.as_ptr()) || stored.as_ref() == name {
                 return Some(value);
             }
         }
@@ -2230,12 +2274,18 @@ impl PyInstance {
     /// since it was born.
     #[inline]
     pub fn dies_by_plain_drop(&self) -> bool {
-        self.c_body.get() == 0
-            && self.is_gc_deferred()
-            && self
-                .class
-                .try_borrow()
-                .is_ok_and(|c| !c.instances_need_finalize())
+        if self.c_body.get() != 0 {
+            return false;
+        }
+        let Ok(cls) = self.class.try_borrow() else {
+            return false;
+        };
+        if cls.native_kind.get() != 0 {
+            // Never tracked; see `stdlib::datetime_native::plain_drop_ok`.
+            return !cls.instances_need_finalize()
+                && crate::stdlib::datetime_native::plain_drop_ok(self);
+        }
+        self.is_gc_deferred() && !cls.instances_need_finalize()
     }
 
     /// Drop the deferred-tracking record without tracking (the instance

@@ -32,6 +32,7 @@ pub mod codecs_mod;
 pub mod csv_mod;
 pub mod datetime_accel;
 pub mod datetime_mod;
+pub(crate) mod datetime_native;
 pub mod errno_mod;
 pub mod faulthandler_mod;
 #[cfg(unix)]
