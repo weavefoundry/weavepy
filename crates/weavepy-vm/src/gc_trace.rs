@@ -3991,7 +3991,12 @@ fn note_dropped_counted(sc: usize, id: ObjectId) -> bool {
         floor_stats::bump(&floor_stats::DROP_NOTES_MARKED, 1);
         return true;
     }
-    if TRACKED_FILTER.may_contain(id) && (sc == 2 || crate::weakref_registry::may_have_weakrefs(id))
+    // A tracked object dies here when only its collector handle (and any
+    // registry-held weakref clones) remain beside the dropped reference.
+    if TRACKED_FILTER.may_contain(id)
+        && (sc == 2
+            || (crate::weakref_registry::may_have_weakrefs(id)
+                && sc <= 2 + crate::weakref_registry::strong_clone_count(id)))
     {
         floor_stats::bump(&floor_stats::DROP_NOTES_MARKED, 1);
         return true;

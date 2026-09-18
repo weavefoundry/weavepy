@@ -356,6 +356,11 @@ pub enum LeafAttrKind {
     BuiltinMethod(crate::sync::Rc<crate::object::BuiltinFn>),
     /// A plain scalar/string class value (instance dict still wins).
     Value(Object),
+    /// A plain (non-descriptor) instance stored on the class, held
+    /// weakly: the cache must not add an edge the collector cannot see.
+    ValueInstance(crate::sync::Weak<PyInstance>),
+    /// A class stored on the class, likewise held weakly.
+    ValueType(crate::sync::Weak<TypeObject>),
     /// A `property` on the MRO (a data descriptor: it wins over the
     /// instance dict); its getter is read at access time.
     Property(crate::sync::Weak<crate::object::PyProperty>),
@@ -1894,7 +1899,7 @@ impl SlotStorage {
                 ) {
                     return Some(std::mem::replace(slot, value));
                 }
-                if entries.len() < 8 {
+                if entries.len() < 16 {
                     entries.push((make_key(), value));
                     return None;
                 }
@@ -2524,16 +2529,16 @@ mod slot_storage_tests {
     }
 
     #[test]
-    fn ninth_slot_promotes_without_replacing_existing_keys() {
+    fn seventeenth_slot_promotes_without_replacing_existing_keys() {
         let mut slots = SlotStorage::default();
         let mut keys = Vec::new();
-        for i in 0..16 {
+        for i in 0..24 {
             let name = format!("slot{i}");
             assert!(slots.insert(&name, Object::Int(i)).is_none());
             keys.push(slots.iter().last().unwrap().0 .0.clone());
             match i {
                 0 => assert!(matches!(slots.data, SlotData::Single { .. })),
-                1..=7 => assert!(matches!(slots.data, SlotData::Small(_))),
+                1..=15 => assert!(matches!(slots.data, SlotData::Small(_))),
                 _ => assert!(matches!(slots.data, SlotData::Many(_))),
             }
             for (index, (key, value)) in slots.iter().enumerate() {
@@ -2542,7 +2547,7 @@ mod slot_storage_tests {
             }
         }
         let mut cloned = slots.clone();
-        for i in (0..16).rev() {
+        for i in (0..24).rev() {
             let name = format!("slot{i}");
             assert_eq!(slots.remove(&name).and_then(|v| v.as_i64()), Some(i));
             assert!(slots.get(&name).is_none());

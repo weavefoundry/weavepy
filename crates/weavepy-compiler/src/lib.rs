@@ -203,6 +203,10 @@ pub struct JitHint {
     /// the tier-2 compile from it so native callers can still reach a
     /// compiled form.
     lean_entries: std::sync::atomic::AtomicU32,
+    /// Whether every loop in the code yields (0 unknown, 1 no, 2 yes):
+    /// a generator whose native resume could run at most one iteration
+    /// of any loop before yielding again.
+    yields_in_loops: std::sync::atomic::AtomicU8,
 }
 
 impl JitHint {
@@ -240,6 +244,37 @@ impl JitHint {
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 !has_loop
+            }
+        }
+    }
+}
+
+impl JitHint {
+    /// Whether every loop back edge in `code` spans a `YIELD_VALUE`
+    /// (see the field docs), derived on first use. Vacuously true for
+    /// loop-free code.
+    #[must_use]
+    pub fn every_loop_yields(&self, code: &CodeObject) -> bool {
+        match self
+            .yields_in_loops
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            1 => false,
+            2 => true,
+            _ => {
+                let ins = &code.instructions;
+                let all = ins.iter().enumerate().all(|(pc, i)| {
+                    if i.op != OpCode::JumpBackward {
+                        return true;
+                    }
+                    let target = (pc + 1).saturating_sub(i.arg as usize);
+                    ins[target..=pc].iter().any(|j| j.op == OpCode::YieldValue)
+                });
+                self.yields_in_loops.store(
+                    if all { 2 } else { 1 },
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                all
             }
         }
     }

@@ -127,13 +127,42 @@ type MethodTable = Vec<MethodEntry>;
 /// the snapshotted function (module dicts are mutable).
 type MathTable = Vec<(String, String, Object)>;
 
+/// The burned-in globals a compilation guards on (`name` → the object
+/// it resolved to at compile time), with the namespaces' mutation
+/// stamps from the last successful validation: while the entering
+/// frame's globals and builtins dicts are the same objects in the same
+/// state, every name still resolves identically and the per-name
+/// probes are skipped (a resume or entry then costs two stamp reads).
+struct GuardSnapshot {
+    entries: Vec<(String, Object)>,
+    /// `(globals id, globals stamp, builtins id, builtins stamp)` of the
+    /// last full validation that held; all-zero until one has.
+    last_ok: std::cell::Cell<(usize, u64, usize, u64)>,
+}
+
+impl GuardSnapshot {
+    fn new(entries: Vec<(String, Object)>) -> Self {
+        Self {
+            entries,
+            last_ok: std::cell::Cell::new((0, 0, 0, 0)),
+        }
+    }
+}
+
+impl std::ops::Deref for GuardSnapshot {
+    type Target = [(String, Object)];
+    fn deref(&self) -> &[(String, Object)] {
+        &self.entries
+    }
+}
+
 /// A compiled frame plus the globals it burned in: `snapshot[i]` is the
 /// object `guards[i].name` resolved to at compile time. Every entry
 /// re-resolves each name against the entering frame's namespaces and
 /// requires identity (`is_same`) with the snapshot (RFC 0058 WS4).
 struct CompiledEntry {
     cf: StdRc<CompiledFrame>,
-    guard_snapshot: StdRc<Vec<(String, Object)>>,
+    guard_snapshot: StdRc<GuardSnapshot>,
     callees: StdRc<CalleeTable>,
     /// RFC 0074 WS1 — the obj-global table: `obj_globals[token]` is
     /// the identity-guarded object `PushGlobalObj { token }` pins
@@ -212,7 +241,7 @@ struct DirectEntry {
 /// resolution tables its entries validate against.
 struct Artifacts {
     cf: StdRc<CompiledFrame>,
-    snap: StdRc<Vec<(String, Object)>>,
+    snap: StdRc<GuardSnapshot>,
     callees: StdRc<CalleeTable>,
     /// RFC 0074 WS1 — `obj_globals[token]` is the snapshotted object
     /// behind each `PushGlobalObj` token (identity-guarded through
@@ -928,7 +957,7 @@ impl JitState {
                     }
                     let artifacts = StdRc::new(Artifacts {
                         cf: StdRc::new(cf),
-                        snap: StdRc::new(snap),
+                        snap: StdRc::new(GuardSnapshot::new(snap)),
                         callees: StdRc::new(callees),
                         obj_globals: StdRc::new(obj_globals),
                         attr_guards: StdRc::new(attr_guards),
@@ -2634,7 +2663,7 @@ struct CallCtx {
     /// re-entrancy pattern as `vm_singletons::publish_interpreter_ptr`).
     interp: *mut super::Interpreter,
     callees: StdRc<CalleeTable>,
-    guard_snapshot: StdRc<Vec<(String, Object)>>,
+    guard_snapshot: StdRc<GuardSnapshot>,
     /// The caller frame's namespaces, for post-call guard revalidation
     /// (the caller `Frame` itself is mutably borrowed across the native
     /// call and must not be touched from here).
@@ -2746,21 +2775,39 @@ fn guards_hold(
     interp: &super::Interpreter,
     globals: &Rc<GilRefCell<DictData>>,
     builtins: &Rc<GilRefCell<DictData>>,
-    guard_snapshot: &[(String, Object)],
+    guard_snapshot: &GuardSnapshot,
     callees: &CalleeTable,
     math: &MathTable,
 ) -> bool {
-    for (name, expected) in guard_snapshot {
-        let ok = resolve_plain_dicts(interp, globals, builtins, name)
-            .is_some_and(|cur| cur.is_same(expected));
-        if !ok {
-            return false;
+    // SAFETY (stamp reads): GIL-serialized raw reads of the dicts'
+    // mutation stamps — no dict borrow is held while native code is
+    // entered or resumed (the reentrant dict paths exist so user code
+    // never runs under one).
+    let key = (
+        Rc::as_ptr(globals) as usize,
+        unsafe { (*globals.as_ptr()).mutation_stamp() },
+        Rc::as_ptr(builtins) as usize,
+        unsafe { (*builtins.as_ptr()).mutation_stamp() },
+    );
+    if guard_snapshot.last_ok.get() != key || interp.globals_missing_any.get() {
+        for (name, expected) in guard_snapshot.entries.iter() {
+            let ok = resolve_plain_dicts(interp, globals, builtins, name)
+                .is_some_and(|cur| cur.is_same(expected));
+            if !ok {
+                return false;
+            }
         }
+        guard_snapshot.last_ok.set(key);
     }
     for (f, code_snap) in callees {
         match f {
             Object::Function(pf) => {
-                if !Rc::ptr_eq(&pf.code.borrow(), code_snap) {
+                // SAFETY: GIL-serialized raw read of the code cell (see
+                // `PyFunction::code`); only the pointer is compared.
+                if !std::ptr::eq(
+                    unsafe { Rc::as_ptr(&*pf.code.as_ptr()) },
+                    Rc::as_ptr(code_snap),
+                ) {
                     return false;
                 }
             }
@@ -5856,6 +5903,7 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
         // displaced slot value, so the in-place overwrite is exactly
         // faithful.
         AttrStorage::Slot(key_idx) => {
+            inst.note_slot_store(&v);
             let old = {
                 let mut slots = inst.slots.borrow_mut();
                 match slots.get_index_mut(key_idx as usize) {
@@ -5868,6 +5916,13 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
         }
         AttrStorage::Indexed(key_idx) => {
             let mut dict = inst.dict.borrow_mut();
+            let atomic = v.is_gc_atomic();
+            let dict = &mut *dict;
+            let dict = if atomic {
+                dict.map_mut_atomic_store()
+            } else {
+                &mut **dict
+            };
             let Some((k, dst)) = dict.get_index_mut(key_idx as usize) else {
                 return 1;
             };
@@ -5890,7 +5945,6 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
                 return 1;
             }
             let old = std::mem::replace(dst, v);
-            drop(dict);
             drop(old);
             0
         }
@@ -5903,6 +5957,13 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
                 return 1;
             }
             let mut dict = inst.dict.borrow_mut();
+            let atomic = v.is_gc_atomic();
+            let dict = &mut *dict;
+            let dict = if atomic {
+                dict.map_mut_atomic_store()
+            } else {
+                &mut **dict
+            };
             let old = if let Some(dst) = dict.get_mut(&StrKey(&g.name)) {
                 // The displaced-value discipline of the indexed arm.
                 if !matches!(
@@ -5923,7 +5984,6 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
                 );
                 None
             };
-            drop(dict);
             drop(old);
             0
         }

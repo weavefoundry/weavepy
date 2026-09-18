@@ -9782,6 +9782,29 @@ impl Interpreter {
         true
     }
 
+    /// [`Self::lean_code_ok`] for a generator resume: a compiled
+    /// generator whose every loop yields runs at most one iteration per
+    /// native resume, and the native resume protocol costs more than
+    /// interpreting that iteration — such code stays the interpreter's
+    /// even when the JIT could take it.
+    #[inline]
+    fn lean_gen_code_ok(code: &CodeObject) -> bool {
+        if code.wire.as_ref().is_some_and(|w| w.exec_error.is_some()) {
+            return false;
+        }
+        #[cfg(feature = "jit")]
+        if !crate::tier2::jit_off_for_process() && !code.jit_hint.is_not_jitable() {
+            if !code.jit_hint.every_loop_yields(code) {
+                return false;
+            }
+            // Retire it from the JIT for good: a back-edge entry from the
+            // lean resume would otherwise park it natively again on every
+            // iteration (each resume then rebuilding the suspension).
+            code.jit_hint.mark_not_jitable();
+        }
+        true
+    }
+
     /// Run a fresh ordinary frame as a lean activation (see [`LeanAct`]).
     /// The caller's quiet loop vouches for `snap_gen`: the loop generation
     /// under which it found the dispatch loop quiet.
@@ -10829,12 +10852,26 @@ impl Interpreter {
                         // with an empty self slot.
                         Some(Object::Type(cls)) => {
                             match Self::leaf_load_type_attr(code, cls, pc as u32, ins.arg) {
+                                // A plain function, or a non-binding native
+                                // one (`object.__new__`): the callable, with
+                                // an empty self slot.
                                 Some(v @ Object::Function(_)) => {
                                     let n = stack.len();
                                     stack.push(v);
                                     stack.swap(n - 1, n);
                                     // Receiver slot becomes NULL: the class
                                     // object leaves the stack (a leaf drop).
+                                    stack[n] = Object::Unbound;
+                                    last = pc;
+                                    pc += 1;
+                                    continue;
+                                }
+                                Some(Object::Builtin(b))
+                                    if !b.binds_instance || is_object_new(&b) =>
+                                {
+                                    let n = stack.len();
+                                    stack.push(Object::Builtin(b));
+                                    stack.swap(n - 1, n);
                                     stack[n] = Object::Unbound;
                                     last = pc;
                                     pc += 1;
@@ -11294,6 +11331,9 @@ impl Interpreter {
                     }
                 }
             }
+            if let Some(Object::Builtin(f)) = object_dunder_new() {
+                calls.insert(Rc::as_ptr(&f) as usize, LeafKind::ObjectNew);
+            }
             let mut methods = Vec::new();
             let table: [(LeafRecv, Object, &[(&'static str, LeafKind)]); 4] = [
                 (
@@ -11623,6 +11663,31 @@ impl Interpreter {
                         _ => false,
                     }
             }
+            K::ObjectNew => {
+                // `object.__new__(cls)` for a plain user class: the
+                // default allocation (deferred tracking when the class
+                // has no finalizer), exactly what `object_new` reaches
+                // after its special cases — all excluded here.
+                let [O::Type(cls)] = args else {
+                    return None;
+                };
+                if cls.flags.is_builtin || cls.is_type_subclass() {
+                    return None;
+                }
+                let plan = self.instance_plan(cls);
+                if plan.abstract_error.is_some()
+                    || plan.seeds_exception_args
+                    || !matches!(plan.native, crate::types::NativeKind::Plain)
+                {
+                    return None;
+                }
+                let bt = builtin_types();
+                if cls.is_subclass_of(&bt.module_) || cls.is_subclass_of(&bt.generic_alias_) {
+                    return None;
+                }
+                let (inst, _tracked) = self.alloc_plain_instance_obj(cls);
+                return Some(Ok(inst));
+            }
             K::Opaque => true,
         };
         if !admitted {
@@ -11746,6 +11811,8 @@ impl Interpreter {
                 K::StaticFn(w) => Some(LeafAttr::Value(Object::Function(w.upgrade()?))),
                 K::BuiltinMethod(b) => Some(LeafAttr::BuiltinMethod(b.clone())),
                 K::Value(v) => Some(LeafAttr::Value(Self::clone_operand(v))),
+                K::ValueInstance(w) => Some(LeafAttr::Value(Object::Instance(w.upgrade()?))),
+                K::ValueType(w) => Some(LeafAttr::Value(Object::Type(w.upgrade()?))),
                 K::Property(w) => Some(LeafAttr::Property(w.upgrade()?)),
                 K::Other => None,
             };
@@ -11754,10 +11821,18 @@ impl Interpreter {
             return None;
         }
         let name = code.names.get(name_idx as usize)?.as_str();
-        let kind = if name.starts_with("__") {
+        // Dunders may be intercepted by `type`'s own descriptors; `__new__`
+        // is the exception worth knowing (`type.__new__` is not a data
+        // descriptor, so the class MRO's own wins).
+        let kind = if name.starts_with("__") && name != "__new__" {
             K::Other
         } else {
-            match cls.lookup(name) {
+            let found = if name == "__new__" {
+                class_dunder_new(cls)
+            } else {
+                cls.lookup(name)
+            };
+            match found {
                 None => K::InstanceOnly,
                 Some(Object::Function(f)) => K::Method(Rc::downgrade(&f)),
                 // A static method reads as its function through both a
@@ -11768,7 +11843,15 @@ impl Interpreter {
                 },
                 // A native method on the class (a non-data descriptor that
                 // binds the instance as its first argument).
+                // `object.__new__` itself (inherited by every plain class):
+                // the same object through a class or an instance.
+                Some(Object::Builtin(b)) if name == "__new__" && is_object_new(&b) => {
+                    K::Value(Object::Builtin(b))
+                }
                 Some(Object::Builtin(b)) if b.binds_instance => K::BuiltinMethod(b),
+                // A non-binding native function: the same object through a
+                // class or an instance.
+                Some(Object::Builtin(b)) => K::Value(Object::Builtin(b)),
                 Some(Object::Property(p)) => K::Property(Rc::downgrade(&p)),
                 Some(
                     v @ (Object::None
@@ -11777,6 +11860,16 @@ impl Interpreter {
                     | Object::Float(_)
                     | Object::Str(_)),
                 ) => K::Value(v),
+                Some(Object::Type(t)) => K::ValueType(Rc::downgrade(&t)),
+                // A plain instance stored on the class (`timezone.utc`):
+                // a value unless its class makes it a descriptor.
+                Some(Object::Instance(i)) => {
+                    if i.cls_raw().lookup("__get__").is_some() {
+                        K::Other
+                    } else {
+                        K::ValueInstance(Rc::downgrade(&i))
+                    }
+                }
                 Some(_) => K::Other,
             }
         };
@@ -11786,6 +11879,8 @@ impl Interpreter {
             K::StaticFn(w) => w.upgrade().map(|f| LeafAttr::Value(Object::Function(f))),
             K::BuiltinMethod(b) => Some(LeafAttr::BuiltinMethod(b.clone())),
             K::Value(v) => Some(LeafAttr::Value(Self::clone_operand(v))),
+            K::ValueInstance(w) => w.upgrade().map(|i| LeafAttr::Value(Object::Instance(i))),
+            K::ValueType(w) => w.upgrade().map(|t| LeafAttr::Value(Object::Type(t))),
             K::Property(w) => w.upgrade().map(LeafAttr::Property),
             K::Other => None,
         };
@@ -11815,7 +11910,10 @@ impl Interpreter {
         // A plain `type` metaclass has nothing that could intercept a
         // non-dunder class attribute (the class cache never answers for
         // dunders).
-        if cls.c_ext_ptr.get() != 0 || !Self::plain_metaclass(cls) {
+        // (A VM-native builtin class with a faithful C mirror keeps its
+        // own dict authoritative; only an extension-defined type's C
+        // attribute hooks are opaque here.)
+        if (cls.c_ext_ptr.get() != 0 && !cls.flags.is_builtin) || !Self::plain_metaclass(cls) {
             return None;
         }
         match Self::leaf_class_attr(code, cls, name_idx)? {
@@ -11970,100 +12068,132 @@ impl Interpreter {
                 return None;
             };
             let value_slot = &mut below[n - 2];
-            let cache = match cache {
-                IC::StoreAttrInstance { ver, .. } | IC::StoreAttrNewKey { ver }
-                    if inst.cls_raw().attr_version.get() == ver =>
-                {
-                    cache
+            // A validated `__slots__` member: the write goes to the slot
+            // side table (see the full handler's `StoreAttrSlot`).
+            if let IC::StoreAttrSlot { key_idx, ver } = cache {
+                if inst.cls_raw().attr_version.get() != ver {
+                    return None;
                 }
-                // No usable site cache: a plain instance-dict store when
-                // the class has default attribute setting and no
-                // descriptor for the name (the same facts the specializer
-                // establishes, read from the class's own caches).
-                _ => {
-                    let cls = inst.cls_raw();
-                    if !Self::default_getattribute(cls)
-                        || cls.flags.is_builtin
-                        || !cls.setattr_is_default()
-                        || cls.forbids_dict
-                        || crate::object::exotic_str_keys_possible()
-                        || name.starts_with("__")
-                        || name == "args"
-                        || inst.c_body.get() != 0
-                        || !matches!(cls.lookup(name), None | Some(Object::Function(_)))
-                        || crate::capi_watchers::dicts_active()
+                let mut slots = inst.slots.try_borrow_mut().ok()?;
+                let displaced = match slots.get_index_mut(key_idx as usize) {
+                    Some((key, slot)) if matches!(&key.0, Object::Str(stored) if stored.as_ref() == name.as_str()) =>
                     {
-                        return None;
-                    }
-                    // The same facts the specializer would establish:
-                    // record them so the next store takes the cached arm.
-                    if matches!(cache, IC::Empty) {
-                        code.caches.set(
-                            cache_pc,
-                            IC::StoreAttrNewKey {
-                                ver: cls.attr_version.get(),
-                            },
-                        );
-                    }
-                    IC::StoreAttrNewKey { ver: 0 }
-                }
-            };
-            match cache {
-                IC::StoreAttrInstance { key_idx, .. } => {
-                    let dict = inst.dict.get()?;
-                    {
-                        let d = dict.try_borrow().ok()?;
-                        let (k, old) = d.get_index(key_idx as usize)?;
-                        if !slot_name_matches(code, name_idx, k) {
-                            return None;
-                        }
-                        if Self::local_needs_prompt_reap(old) && Self::looks_reapable_temporary(old)
-                        {
-                            return None;
-                        }
-                    }
-                    let mut d = dict.try_borrow_mut().ok()?;
-                    let d = &mut *d;
-                    let d = if value_slot.is_gc_atomic() {
-                        d.map_mut_atomic_store()
-                    } else {
-                        &mut **d
-                    };
-                    let (_, slot) = d.get_index_mut(key_idx as usize)?;
-                    let val = std::mem::replace(value_slot, Object::Unbound);
-                    Some(std::mem::replace(slot, val))
-                }
-                IC::StoreAttrNewKey { .. } => {
-                    let probe = code_name_key(code, name_idx)?;
-                    let dict = inst
-                        .dict
-                        .get_or_init(|| Rc::new(RefCell::new(DictData::default())));
-                    let mut d = dict.try_borrow_mut().ok()?;
-                    let d = &mut *d;
-                    let d = if value_slot.is_gc_atomic() {
-                        d.map_mut_atomic_store()
-                    } else {
-                        &mut **d
-                    };
-                    if let Some(slot) = d.get_mut(&probe) {
                         if Self::local_needs_prompt_reap(slot)
                             && Self::looks_reapable_temporary(slot)
                         {
                             return None;
                         }
                         let val = std::mem::replace(value_slot, Object::Unbound);
+                        inst.note_slot_store(&val);
                         Some(std::mem::replace(slot, val))
-                    } else {
-                        let key = match code_name_obj(code, name_idx) {
-                            Some(k) => k.clone(),
-                            None => crate::stdlib::sys::intern_name(name.as_str()),
-                        };
-                        let val = std::mem::replace(value_slot, Object::Unbound);
-                        d.insert(DictKey(key), val);
-                        None
                     }
+                    _ => {
+                        let val = std::mem::replace(value_slot, Object::Unbound);
+                        inst.note_slot_store(&val);
+                        match code_name_obj(code, name_idx) {
+                            Some(Object::Str(shared)) => slots.insert_shared(shared, val),
+                            _ => slots.insert(name, val),
+                        }
+                    }
+                };
+                displaced
+            } else {
+                let cache = match cache {
+                    IC::StoreAttrInstance { ver, .. } | IC::StoreAttrNewKey { ver }
+                        if inst.cls_raw().attr_version.get() == ver =>
+                    {
+                        cache
+                    }
+                    // No usable site cache: a plain instance-dict store when
+                    // the class has default attribute setting and no
+                    // descriptor for the name (the same facts the specializer
+                    // establishes, read from the class's own caches).
+                    _ => {
+                        let cls = inst.cls_raw();
+                        if !Self::default_getattribute(cls)
+                            || cls.flags.is_builtin
+                            || !cls.setattr_is_default()
+                            || cls.forbids_dict
+                            || crate::object::exotic_str_keys_possible()
+                            || name.starts_with("__")
+                            || name == "args"
+                            || inst.c_body.get() != 0
+                            || !matches!(cls.lookup(name), None | Some(Object::Function(_)))
+                            || crate::capi_watchers::dicts_active()
+                        {
+                            return None;
+                        }
+                        // The same facts the specializer would establish:
+                        // record them so the next store takes the cached arm.
+                        if matches!(cache, IC::Empty) {
+                            code.caches.set(
+                                cache_pc,
+                                IC::StoreAttrNewKey {
+                                    ver: cls.attr_version.get(),
+                                },
+                            );
+                        }
+                        IC::StoreAttrNewKey { ver: 0 }
+                    }
+                };
+                match cache {
+                    IC::StoreAttrInstance { key_idx, .. } => {
+                        let dict = inst.dict.get()?;
+                        {
+                            let d = dict.try_borrow().ok()?;
+                            let (k, old) = d.get_index(key_idx as usize)?;
+                            if !slot_name_matches(code, name_idx, k) {
+                                return None;
+                            }
+                            if Self::local_needs_prompt_reap(old)
+                                && Self::looks_reapable_temporary(old)
+                            {
+                                return None;
+                            }
+                        }
+                        let mut d = dict.try_borrow_mut().ok()?;
+                        let d = &mut *d;
+                        let d = if value_slot.is_gc_atomic() {
+                            d.map_mut_atomic_store()
+                        } else {
+                            &mut **d
+                        };
+                        let (_, slot) = d.get_index_mut(key_idx as usize)?;
+                        let val = std::mem::replace(value_slot, Object::Unbound);
+                        Some(std::mem::replace(slot, val))
+                    }
+                    IC::StoreAttrNewKey { .. } => {
+                        let probe = code_name_key(code, name_idx)?;
+                        let dict = inst
+                            .dict
+                            .get_or_init(|| Rc::new(RefCell::new(DictData::default())));
+                        let mut d = dict.try_borrow_mut().ok()?;
+                        let d = &mut *d;
+                        let d = if value_slot.is_gc_atomic() {
+                            d.map_mut_atomic_store()
+                        } else {
+                            &mut **d
+                        };
+                        if let Some(slot) = d.get_mut(&probe) {
+                            if Self::local_needs_prompt_reap(slot)
+                                && Self::looks_reapable_temporary(slot)
+                            {
+                                return None;
+                            }
+                            let val = std::mem::replace(value_slot, Object::Unbound);
+                            Some(std::mem::replace(slot, val))
+                        } else {
+                            let key = match code_name_obj(code, name_idx) {
+                                Some(k) => k.clone(),
+                                None => crate::stdlib::sys::intern_name(name.as_str()),
+                            };
+                            let val = std::mem::replace(value_slot, Object::Unbound);
+                            d.insert(DictKey(key), val);
+                            None
+                        }
+                    }
+                    _ => return None,
                 }
-                _ => return None,
             }
         };
         // The value slot (now `Unbound`) leaves the stack; the receiver
@@ -27685,16 +27815,12 @@ impl Interpreter {
             if frame.py_frame.is_some()
                 || !frame.saved_exc_info.is_empty()
                 || frame.pc == 0
-                || !Self::lean_code_ok(&frame.code)
+                || !Self::lean_gen_code_ok(&frame.code)
                 || frame.shell_cache.as_ref().is_some_and(|c| {
                     c.has_materialized
                         .load(std::sync::atomic::Ordering::Relaxed)
                 })
             {
-                return None;
-            }
-            #[cfg(feature = "jit")]
-            if frame.parked_native.is_some() {
                 return None;
             }
         }
@@ -27717,6 +27843,11 @@ impl Interpreter {
             let frame = boxed
                 .downcast_mut::<Frame>()
                 .expect("checked by the downcast_ref above");
+            // A native activation parked at the yield (the generator's
+            // first run entered compiled code) is rebuilt into the
+            // interpreted suspension this path resumes.
+            #[cfg(feature = "jit")]
+            crate::tier2::materialize_parked(frame);
             frame.gen_first_resume = false;
             frame.push(sent.clone());
             let exc_depth_on_entry = self.exc_info_len();
@@ -47810,6 +47941,8 @@ enum LeafAttr {
 /// about the call — the raise path, operand grading — the burst handles.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LeafKind {
+    /// `object.__new__` (see `leaf_builtin_call`).
+    ObjectNew,
     Len,
     Isinstance,
     ListAppend,
@@ -48008,6 +48141,55 @@ mod burst_stats {
 /// for native callers (see `run_frame_lean_impl`).
 #[cfg(feature = "jit")]
 const LEAN_WARM_COMPILE_THRESHOLD: u32 = 24;
+
+/// `object.__dict__['__new__']`: the entry `TypeObject::lookup` skips as
+/// introspection-only, which is nevertheless the object a `__new__` read
+/// through any plain class yields and the default allocator it calls.
+fn object_dunder_new() -> Option<Object> {
+    builtin_types()
+        .object_
+        .dict
+        .borrow()
+        .get(&crate::object::StrKey("__new__"))
+        .cloned()
+}
+
+/// `cls.__new__` as the class's own MRO dicts hold it (no surface
+/// filtering): the first dict entry along the MRO.
+fn class_dunder_new(cls: &TypeObject) -> Option<Object> {
+    let mro = cls.mro.try_borrow().ok()?;
+    for ty in mro.iter() {
+        if let Some(v) = ty
+            .dict
+            .try_borrow()
+            .ok()?
+            .get(&crate::object::StrKey("__new__"))
+        {
+            return Some(v.clone());
+        }
+    }
+    None
+}
+
+/// Whether `b` is `object.__new__` (the process-wide builtin).
+fn is_object_new(b: &Rc<crate::object::BuiltinFn>) -> bool {
+    thread_local! {
+        static OBJECT_NEW: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    let want = OBJECT_NEW.with(|c| {
+        let p = c.get();
+        if p != 0 {
+            return p;
+        }
+        let p = match object_dunder_new() {
+            Some(Object::Builtin(f)) => Rc::as_ptr(&f) as usize,
+            _ => usize::MAX,
+        };
+        c.set(p);
+        p
+    });
+    Rc::as_ptr(b) as usize == want
+}
 
 /// Release an operand the burst is done with: an unboxed scalar has no
 /// heap and `Object` has no `Drop` of its own, so it needs no drop glue.
