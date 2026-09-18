@@ -844,6 +844,9 @@ pub struct Interpreter {
     /// native dict alive (CPython's function keeps the mapping itself),
     /// so a weak owner would die with the caller's last direct reference.
     globals_missing_hooks: RefCell<Vec<(usize, Rc<PyInstance>)>>,
+    /// Whether `globals_missing_hooks` has ever been non-empty: the leaf
+    /// paths' one-load gate before the cell borrow.
+    globals_missing_any: Cell<bool>,
     /// Non-zero while the VM is lazily loading one of its own machinery
     /// modules (e.g. `importlib._bootstrap` for `module.__repr__`). In
     /// CPython those are frozen and fully initialized before user code
@@ -917,6 +920,9 @@ pub struct Interpreter {
     /// ever dereferenced on the thread that pushed them, while the
     /// activations they name are live.
     lean_pending: Vec<usize>,
+    /// The builtins the leaf burst may call directly (see [`LeafFns`]),
+    /// resolved on first use.
+    leaf_fns: std::cell::OnceCell<LeafFns>,
     /// `WP_DBG_SAMPLE`: periodic frame-entry sampling to stderr.
     dbg_sample: bool,
 }
@@ -1116,6 +1122,7 @@ impl Default for Interpreter {
             atfork_handlers: crate::stdlib::os_process::AtForkRegistry::default(),
             unraisable_hook,
             globals_missing_hooks: RefCell::new(Vec::new()),
+            globals_missing_any: Cell::new(false),
             internal_import_depth: 0,
             frame_locals_pool: ThreadCell::new(Vec::new()),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
@@ -1129,6 +1136,7 @@ impl Default for Interpreter {
                 && !crate::hot_gates::env_flags::no_quiet()
                 && !Self::locals_fast_off(),
             lean_pending: Vec::new(),
+            leaf_fns: std::cell::OnceCell::new(),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
         };
         // RFC 0025: publish the shared parts of this interpreter
@@ -1235,6 +1243,7 @@ impl Interpreter {
             atfork_handlers: self.atfork_handlers.clone(),
             unraisable_hook: self.unraisable_hook.clone(),
             globals_missing_hooks: RefCell::new(Vec::new()),
+            globals_missing_any: Cell::new(false),
             internal_import_depth: 0,
             frame_locals_pool: ThreadCell::new(Vec::new()),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
@@ -1248,6 +1257,7 @@ impl Interpreter {
                 && !crate::hot_gates::env_flags::no_quiet()
                 && !Self::locals_fast_off(),
             lean_pending: Vec::new(),
+            leaf_fns: std::cell::OnceCell::new(),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
         }
     }
@@ -8625,6 +8635,19 @@ impl Interpreter {
         let exit = loop {
             match self.leaf_burst(frame, snap_gen, &mut last) {
                 LeafStop::Breaker => break QuietExit::Yield,
+                LeafStop::Raised(err) => {
+                    // The `CALL` arm of `step` marks on the raise path.
+                    gc_trace::mark_maybe_dead();
+                    self.flush_lean(frame, &mut shell);
+                    let cur_pc = frame.pc as usize - 1;
+                    if last != usize::MAX {
+                        *prev_pc = Some(last);
+                    }
+                    return QuietExit::Outcome {
+                        stepped: Err(err),
+                        cur_pc,
+                    };
+                }
                 LeafStop::Marked => {
                     if fin {
                         // Finalizers are arbitrary code: the spine must be
@@ -9643,39 +9666,80 @@ impl Interpreter {
                     let Some(name) = code.names.get(ins.arg as usize) else {
                         break;
                     };
+                    // SAFETY (raw dict reads below): under the GIL (the
+                    // burst is off in free-threaded mode) no dict borrow is
+                    // held while bytecode runs — the reentrant dict paths
+                    // exist exactly so user code never runs under one — so
+                    // reading the stamp and an indexed entry races nothing.
+                    let gid = specialize::rc_id(globals);
+                    let g_stamp = unsafe { (*globals.as_ptr()).mutation_stamp() };
+                    let slot = code_stamp_slot(code, pc as u32);
                     let v = match code.caches.get(pc as u32) {
                         IC::LoadGlobalModule {
                             globals_id,
                             key_idx,
-                        } if specialize::rc_id(globals) == globals_id => {
-                            let Ok(g) = globals.try_borrow() else { break };
-                            match g.get_index(key_idx as usize) {
-                                Some((DictKey(Object::Str(k)), v)) if **k == **name => v.clone(),
-                                _ => break,
+                        } if gid == globals_id => {
+                            // Stamped: the dict is as it was when the key at
+                            // `key_idx` was last verified.
+                            if slot.is_some_and(|s| s.get() == [gid, g_stamp, 0]) {
+                                // SAFETY: see above.
+                                match unsafe { (*globals.as_ptr()).get_index(key_idx as usize) } {
+                                    Some((_, v)) => v.clone(),
+                                    None => break,
+                                }
+                            } else {
+                                let Ok(g) = globals.try_borrow() else { break };
+                                match g.get_index(key_idx as usize) {
+                                    Some((DictKey(Object::Str(k)), v)) if **k == **name => {
+                                        if let Some(s) = slot {
+                                            s.set([gid, g_stamp, 0]);
+                                        }
+                                        v.clone()
+                                    }
+                                    _ => break,
+                                }
                             }
                         }
                         // The builtin hit, with `specialized_load_global`'s
                         // guards: the frame's builtins are the cached dict,
                         // the name is not shadowed in globals, and globals
-                        // has no `__missing__` owner.
+                        // has no `__missing__` owner. Once proved, the
+                        // stamps of both dicts stand in for the probe.
                         IC::LoadGlobalBuiltin {
                             builtins_id,
                             key_idx,
                         } if specialize::rc_id(builtins) == builtins_id => {
-                            let Some(probe) = code_name_key(code, ins.arg) else {
-                                break;
-                            };
-                            match globals.try_borrow() {
-                                Ok(g) if !g.contains_key(&probe) => {}
-                                _ => break,
-                            }
-                            if self.globals_missing_owner(globals).is_some() {
+                            // SAFETY: see above.
+                            let b_stamp = unsafe { (*builtins.as_ptr()).mutation_stamp() };
+                            if self.globals_missing_any.get()
+                                && self.globals_missing_owner(globals).is_some()
+                            {
                                 break;
                             }
-                            let Ok(b) = builtins.try_borrow() else { break };
-                            match b.get_index(key_idx as usize) {
-                                Some((DictKey(Object::Str(k)), v)) if **k == **name => v.clone(),
-                                _ => break,
+                            if slot.is_some_and(|s| s.get() == [gid, g_stamp, b_stamp]) {
+                                // SAFETY: see above.
+                                match unsafe { (*builtins.as_ptr()).get_index(key_idx as usize) } {
+                                    Some((_, v)) => v.clone(),
+                                    None => break,
+                                }
+                            } else {
+                                let Some(probe) = code_name_key(code, ins.arg) else {
+                                    break;
+                                };
+                                match globals.try_borrow() {
+                                    Ok(g) if !g.contains_key(&probe) => {}
+                                    _ => break,
+                                }
+                                let Ok(b) = builtins.try_borrow() else { break };
+                                match b.get_index(key_idx as usize) {
+                                    Some((DictKey(Object::Str(k)), v)) if **k == **name => {
+                                        if let Some(s) = slot {
+                                            s.set([gid, g_stamp, b_stamp]);
+                                        }
+                                        v.clone()
+                                    }
+                                    _ => break,
+                                }
                             }
                         }
                         _ => break,
@@ -9739,15 +9803,103 @@ impl Interpreter {
                 }
                 OpCode::LoadMethodAttr => {
                     // The method cache hit (bound-method elision shape):
-                    // pushes the plain function under the receiver.
-                    let Some(f) = Self::leaf_load_method(code, stack, pc as u32, ins.arg) else {
-                        break;
+                    // pushes the plain function under the receiver. A
+                    // builtin receiver resolves through the leaf method
+                    // table instead, in the same shape.
+                    let f = match stack.last() {
+                        Some(Object::Instance(_)) => {
+                            match Self::leaf_load_method(code, stack, pc as u32, ins.arg) {
+                                Some(f) => Object::Function(f),
+                                None => break,
+                            }
+                        }
+                        Some(recv) => {
+                            let tag = match recv {
+                                Object::List(_) => 1,
+                                Object::Dict(_) => 2,
+                                Object::Set(_) => 3,
+                                Object::Str(_) => 4,
+                                _ => break,
+                            };
+                            let slot = code_method_slot(code, pc as u32);
+                            match slot.and_then(|s| s.get_builtin(tag)) {
+                                Some(b) => Object::Builtin(b),
+                                None => {
+                                    let Some(name) = code.names.get(ins.arg as usize) else {
+                                        break;
+                                    };
+                                    match self.leaf_builtin_method(recv, name) {
+                                        Some(b) => {
+                                            if let Some(s) = slot {
+                                                s.set_builtin(tag, &b);
+                                            }
+                                            Object::Builtin(b)
+                                        }
+                                        None => break,
+                                    }
+                                }
+                            }
+                        }
+                        None => break,
                     };
                     let n = stack.len();
-                    stack.push(Object::Function(f));
+                    stack.push(f);
                     stack.swap(n - 1, n);
                     last = pc;
                     pc += 1;
+                }
+                OpCode::Call => {
+                    // A leaf builtin (see `LeafFns`) called with an admitted
+                    // argument shape; Python callees are the quiet loop's.
+                    let argc = ins.arg as usize;
+                    let n = stack.len();
+                    let Some(self_slot) = n.checked_sub(argc + 1) else {
+                        break;
+                    };
+                    let Some(callee_slot) = self_slot.checked_sub(1) else {
+                        break;
+                    };
+                    let Object::Builtin(b) = &stack[callee_slot] else {
+                        break;
+                    };
+                    let first = if matches!(stack[self_slot], Object::Unbound) {
+                        self_slot + 1
+                    } else {
+                        self_slot
+                    };
+                    let Some(kind) = self.leaf_call_kind(b) else {
+                        break;
+                    };
+                    let Some(r) = self.leaf_builtin_call(kind, b, &stack[first..]) else {
+                        break;
+                    };
+                    match r {
+                        Ok(v) => {
+                            // The operands leave the stack: grade each one
+                            // (the callee is a builtin: a leaf).
+                            let mut marked = false;
+                            for arg in stack.drain(self_slot..) {
+                                marked |= gc_trace::note_dropped_marks(&arg);
+                            }
+                            stack.pop(); // the callee
+                            stack.push(v);
+                            last = pc;
+                            pc += 1;
+                            if marked {
+                                gc_trace::mark_maybe_dead();
+                                stop = LeafStop::Marked;
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            // As the full handler: the staged operands drop
+                            // wholesale before the exception propagates.
+                            stack.truncate(callee_slot);
+                            pc += 1;
+                            stop = LeafStop::Raised(e);
+                            break;
+                        }
+                    }
                 }
                 OpCode::StoreAttr => {
                     // Stack: value, receiver (TOS). The instance-dict hits
@@ -9962,6 +10114,278 @@ impl Interpreter {
         frame.pc = pc as u32;
         *last_pc = last;
         stop
+    }
+
+    /// The resolved leaf builtins, built on first use (the builtins dict
+    /// and the builtin type surfaces are complete long before any quiet
+    /// loop runs).
+    fn leaf_fns(&self) -> &LeafFns {
+        self.leaf_fns.get_or_init(|| {
+            let mut calls = std::collections::HashMap::default();
+            {
+                let b = self.builtins.borrow();
+                for (name, kind) in [("len", LeafKind::Len), ("isinstance", LeafKind::Isinstance)] {
+                    if let Some(Object::Builtin(f)) = b.get(&crate::object::StrKey(name)) {
+                        calls.insert(Rc::as_ptr(f) as usize, kind);
+                    }
+                }
+            }
+            let mut methods = Vec::new();
+            let table: [(LeafRecv, Object, &[(&'static str, LeafKind)]); 4] = [
+                (
+                    LeafRecv::List,
+                    Object::new_list(Vec::new()),
+                    &[
+                        ("append", LeafKind::ListAppend),
+                        ("pop", LeafKind::ListPop),
+                        ("insert", LeafKind::ListInsert),
+                        ("reverse", LeafKind::ListReverse),
+                        ("copy", LeafKind::ListCopy),
+                    ],
+                ),
+                (
+                    LeafRecv::Dict,
+                    Object::new_dict(),
+                    &[
+                        ("get", LeafKind::DictGet),
+                        ("keys", LeafKind::DictKeys),
+                        ("values", LeafKind::DictValues),
+                        ("items", LeafKind::DictItems),
+                    ],
+                ),
+                (
+                    LeafRecv::Set,
+                    Object::new_set(),
+                    &[("add", LeafKind::SetAdd), ("discard", LeafKind::SetDiscard)],
+                ),
+                (
+                    LeafRecv::Str,
+                    Object::from_static(""),
+                    &[
+                        ("startswith", LeafKind::StrStartswith),
+                        ("endswith", LeafKind::StrEndswith),
+                        ("lower", LeafKind::StrLower),
+                        ("upper", LeafKind::StrUpper),
+                        ("strip", LeafKind::StrStrip),
+                        ("lstrip", LeafKind::StrLstrip),
+                        ("rstrip", LeafKind::StrRstrip),
+                        ("find", LeafKind::StrFind),
+                        ("isdigit", LeafKind::StrIsdigit),
+                        ("isalpha", LeafKind::StrIsalpha),
+                        ("isspace", LeafKind::StrIsspace),
+                        ("split", LeafKind::StrSplit),
+                        ("join", LeafKind::StrJoin),
+                        ("replace", LeafKind::StrReplace),
+                    ],
+                ),
+            ];
+            for (recv, probe, names) in table {
+                for (name, kind) in names.iter().copied() {
+                    if let Some(Object::Builtin(f)) = crate::builtins::lookup_method(&probe, name) {
+                        calls.insert(Rc::as_ptr(&f) as usize, kind);
+                        methods.push((recv, name, f));
+                    }
+                }
+            }
+            LeafFns { calls, methods }
+        })
+    }
+
+    /// The leaf method table entry for `name` on a builtin receiver.
+    #[inline]
+    fn leaf_builtin_method(
+        &self,
+        recv: &Object,
+        name: &str,
+    ) -> Option<Rc<crate::object::BuiltinFn>> {
+        let kind = match recv {
+            Object::List(_) => LeafRecv::List,
+            Object::Dict(_) => LeafRecv::Dict,
+            Object::Set(_) => LeafRecv::Set,
+            Object::Str(_) => LeafRecv::Str,
+            _ => return None,
+        };
+        self.leaf_fns()
+            .methods
+            .iter()
+            .find(|(r, n, _)| *r == kind && *n == name)
+            .map(|(_, _, f)| f.clone())
+    }
+
+    /// Which leaf builtin `b` is, if any (pointer identity).
+    #[inline]
+    fn leaf_call_kind(&self, b: &Rc<crate::object::BuiltinFn>) -> Option<LeafKind> {
+        self.leaf_fns()
+            .calls
+            .get(&(Rc::as_ptr(b) as usize))
+            .copied()
+    }
+
+    /// Call a leaf builtin if `args` (receiver first for methods) has an
+    /// admitted shape; `None` sends the call down the full path.
+    fn leaf_builtin_call(
+        &mut self,
+        kind: LeafKind,
+        b: &Rc<crate::object::BuiltinFn>,
+        args: &[Object],
+    ) -> Option<Result<Object, RuntimeError>> {
+        use LeafKind as K;
+        use Object as O;
+        // Pure leaves as method arguments: hashing, comparison, and
+        // conversion never reach user code.
+        let leaf_key = |o: &Object| matches!(o, O::Str(_) | O::Int(_) | O::Bool(_) | O::None);
+        let leaf_str = |o: &Object| matches!(o, O::Str(_));
+        let leaf_int = |o: &Object| matches!(o, O::Int(_) | O::Bool(_));
+        let admitted = match kind {
+            K::Len => {
+                args.len() == 1
+                    && matches!(
+                        args[0],
+                        O::List(_)
+                            | O::Tuple(_)
+                            | O::Dict(_)
+                            | O::Str(_)
+                            | O::Bytes(_)
+                            | O::ByteArray(_)
+                            | O::Set(_)
+                            | O::FrozenSet(_)
+                    )
+            }
+            K::Isinstance => {
+                if args.len() != 2 {
+                    return None;
+                }
+                let O::Type(cls) = &args[1] else {
+                    return None;
+                };
+                // A plain metaclass: no `__instancecheck__` hook.
+                if !Rc::ptr_eq(&cls.metaclass_or_type(), &builtin_types().type_) {
+                    return None;
+                }
+                // Only a positive MRO answer settles an instance without
+                // consulting `__class__` (see `recursive_isinstance_type`);
+                // every other object's type is its `__class__`.
+                let r = match &args[0] {
+                    O::Instance(inst) => {
+                        if inst.class.try_borrow().ok()?.is_subclass_of(cls) {
+                            true
+                        } else {
+                            return None;
+                        }
+                    }
+                    O::File(_) => return None,
+                    obj => builtins::class_of(obj).is_subclass_of(cls),
+                };
+                return Some(Ok(O::Bool(r)));
+            }
+            K::ListAppend => args.len() == 2 && matches!(args[0], O::List(_)),
+            K::ListPop => {
+                (args.len() == 1 || (args.len() == 2 && leaf_int(&args[1])))
+                    && matches!(args[0], O::List(_))
+            }
+            K::ListInsert => args.len() == 3 && matches!(args[0], O::List(_)) && leaf_int(&args[1]),
+            K::ListReverse | K::ListCopy => args.len() == 1 && matches!(args[0], O::List(_)),
+            K::DictGet => {
+                if !((args.len() == 2 || args.len() == 3)
+                    && matches!(args[0], O::Dict(_))
+                    && leaf_key(&args[1]))
+                {
+                    return None;
+                }
+                let O::Dict(d) = &args[0] else { return None };
+                // The probe may need a Python comparison against a stored
+                // key: deferred, and settled by the full path.
+                let (found, deferred) = crate::object::with_key_eq_deferred(|| {
+                    crate::object::key_cmp_scope(|| {
+                        d.try_borrow()
+                            .ok()
+                            .map(|m| m.get(&DictKey(args[1].clone())).cloned())
+                    })
+                });
+                if deferred {
+                    return None;
+                }
+                return match found {
+                    Ok(Some(Some(v))) => Some(Ok(v)),
+                    Ok(Some(None)) => Some(Ok(args.get(2).cloned().unwrap_or(O::None))),
+                    Ok(None) => None,
+                    Err(e) => Some(Err(e)),
+                };
+            }
+            K::DictKeys | K::DictValues | K::DictItems => {
+                args.len() == 1 && matches!(args[0], O::Dict(_))
+            }
+            K::SetAdd | K::SetDiscard => {
+                if !(args.len() == 2 && matches!(args[0], O::Set(_)) && leaf_key(&args[1])) {
+                    return None;
+                }
+                // A stored key may need a Python comparison; the set body
+                // runs it inline, so only admit when no stored key can
+                // (every key a pure leaf is the common case — checked by
+                // sampling is unsound, so probe through the same deferral).
+                let O::Set(st) = &args[0] else { return None };
+                let (_, deferred) = crate::object::with_key_eq_deferred(|| {
+                    crate::object::key_cmp_scope(|| {
+                        st.try_borrow()
+                            .ok()
+                            .map(|m| m.contains(&DictKey(args[1].clone())))
+                    })
+                });
+                !deferred
+            }
+            K::StrStartswith | K::StrEndswith => {
+                (args.len() == 2 && leaf_str(&args[0]) && leaf_str(&args[1]))
+                    || (args.len() == 3
+                        && leaf_str(&args[0])
+                        && leaf_str(&args[1])
+                        && leaf_int(&args[2]))
+            }
+            K::StrLower | K::StrUpper | K::StrIsdigit | K::StrIsalpha | K::StrIsspace => {
+                args.len() == 1 && leaf_str(&args[0])
+            }
+            K::StrStrip | K::StrLstrip | K::StrRstrip => {
+                leaf_str(&args[0])
+                    && (args.len() == 1
+                        || (args.len() == 2 && matches!(args[1], O::Str(_) | O::None)))
+            }
+            K::StrFind => {
+                (args.len() == 2 || args.len() == 3)
+                    && leaf_str(&args[0])
+                    && leaf_str(&args[1])
+                    && args.get(2).is_none_or(leaf_int)
+            }
+            K::StrSplit => {
+                leaf_str(&args[0])
+                    && match args.len() {
+                        1 => true,
+                        2 => matches!(args[1], O::Str(_) | O::None),
+                        3 => matches!(args[1], O::Str(_) | O::None) && leaf_int(&args[2]),
+                        _ => false,
+                    }
+            }
+            K::StrReplace => {
+                (args.len() == 3 || (args.len() == 4 && leaf_int(&args[3])))
+                    && leaf_str(&args[0])
+                    && leaf_str(&args[1])
+                    && leaf_str(&args[2])
+            }
+            K::StrJoin => {
+                args.len() == 2
+                    && leaf_str(&args[0])
+                    && match &args[1] {
+                        O::List(l) => l.try_borrow().is_ok_and(|l| l.iter().all(leaf_str)),
+                        O::Tuple(t) => t.iter().all(leaf_str),
+                        _ => false,
+                    }
+            }
+        };
+        if !admitted {
+            return None;
+        }
+        Some(match b.call_kw.as_ref() {
+            Some(ckw) => ckw(args, &[]),
+            None => (b.call)(args),
+        })
     }
 
     /// The leaf half of `specialized_load_attr`: the value a warm
@@ -15088,6 +15512,7 @@ impl Interpreter {
         if hooks.iter().any(|(p, _)| *p == ptr) {
             return;
         }
+        self.globals_missing_any.set(true);
         hooks.push((ptr, inst.clone()));
     }
 
@@ -45623,6 +46048,64 @@ static COARSE_DROP_CLASS: [u8; 256] = {
     t
 };
 
+/// A builtin the leaf burst knows how to call without leaving the quiet
+/// loop: for the argument shapes its predicate admits, the call runs no
+/// Python code, walks no frames, releases no reference the interpreter
+/// cannot see, and returns (or raises) purely natively. Everything else
+/// about the call — the raise path, operand grading — the burst handles.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeafKind {
+    Len,
+    Isinstance,
+    ListAppend,
+    ListPop,
+    ListInsert,
+    ListReverse,
+    ListCopy,
+    DictGet,
+    DictKeys,
+    DictValues,
+    DictItems,
+    SetAdd,
+    SetDiscard,
+    StrStartswith,
+    StrEndswith,
+    StrLower,
+    StrUpper,
+    StrStrip,
+    StrLstrip,
+    StrRstrip,
+    StrFind,
+    StrIsdigit,
+    StrIsalpha,
+    StrIsspace,
+    StrSplit,
+    StrJoin,
+    StrReplace,
+}
+
+/// A receiver's builtin variant, for the method table.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeafRecv {
+    List,
+    Dict,
+    Set,
+    Str,
+}
+
+/// The resolved leaf builtins (see [`LeafKind`]): the interpreter-wide
+/// `len`/`isinstance` function objects, and the *inner* method bodies
+/// of the builtin types (the same bodies a bound method calls, without
+/// the type-dict descriptor's receiver check, which the burst's variant
+/// match makes redundant).
+struct LeafFns {
+    /// Function address → kind, for pointer-identity dispatch at `CALL`.
+    calls: std::collections::HashMap<usize, LeafKind, crate::fasthash::FxBuildHasher>,
+    /// `(receiver variant, name, method)` for `LOAD_METHOD_ATTR` on a
+    /// builtin receiver.
+    methods: Vec<(LeafRecv, &'static str, Rc<crate::object::BuiltinFn>)>,
+}
+
 /// A *lean* activation: a plain Python-to-Python call made from the quiet
 /// loop, whose frame shell is pushed lazily.
 ///
@@ -45657,6 +46140,8 @@ enum LeafStop {
     Breaker,
     /// The last leaf instruction's discard scheduled a finalization sweep.
     Marked,
+    /// A leaf builtin raised; `frame.pc` is past the call.
+    Raised(RuntimeError),
 }
 
 /// How [`Interpreter::quiet_run`] handed control back.
@@ -49718,6 +50203,54 @@ struct CodeConstObjects {
     /// [`MethodSlot`]). Allocated on the first method-shape hit in this
     /// code object, one slot per instruction so `cache_pc` indexes it.
     method_slots: std::sync::OnceLock<Box<[MethodSlot]>>,
+    /// The dict stamps a `LOAD_GLOBAL` site last validated against (see
+    /// [`StampSlot`]); allocated on the first global hit in this code
+    /// object, one slot per instruction.
+    stamp_slots: std::sync::OnceLock<Box<[StampSlot]>>,
+}
+
+/// The state a `LOAD_GLOBAL` site last proved its cached slot against:
+/// the globals dict's identity and [`crate::object::DictData::mutation_stamp`],
+/// and (for a builtin hit) the builtins dict's stamp. While all three
+/// match, the dicts are exactly as they were when the site last ran its
+/// full guards, so the cached index can be read straight away.
+struct StampSlot(std::cell::UnsafeCell<[u64; 3]>);
+
+// SAFETY: as `MethodSlot`: read and written only from the dispatch loop
+// with the GIL held.
+unsafe impl Send for StampSlot {}
+unsafe impl Sync for StampSlot {}
+
+impl StampSlot {
+    const fn empty() -> Self {
+        Self(std::cell::UnsafeCell::new([0; 3]))
+    }
+
+    #[inline]
+    fn get(&self) -> [u64; 3] {
+        // SAFETY: GIL-serialized; no `&mut` escapes `set`.
+        unsafe { *self.0.get() }
+    }
+
+    #[inline]
+    fn set(&self, v: [u64; 3]) {
+        // SAFETY: GIL-serialized; the exclusive reference lives only for
+        // the assignment.
+        unsafe { *self.0.get() = v };
+    }
+}
+
+/// The stamp slot for `cache_pc`, allocating the table on first use.
+#[inline]
+fn code_stamp_slot(code: &CodeObject, cache_pc: u32) -> Option<&StampSlot> {
+    let ext = code_vm_ext(code)?;
+    ext.stamp_slots
+        .get_or_init(|| {
+            (0..code.instructions.len())
+                .map(|_| StampSlot::empty())
+                .collect()
+        })
+        .get(cache_pc as usize)
 }
 
 /// The function a `LoadAttrMethod` site resolved to, keyed by the
@@ -49729,7 +50262,15 @@ struct CodeConstObjects {
 /// the name compare that the `InlineCache` shape needs. The reference
 /// is weak (CPython's `_PyType_Lookup` cache is a borrowed pointer for
 /// the same reason): a site must not keep a class or module alive.
-struct MethodSlot(std::cell::UnsafeCell<(u64, crate::sync::Weak<crate::object::PyFunction>)>);
+struct MethodSlot(std::cell::UnsafeCell<(u64, MethodSlotFn)>);
+
+/// What a [`MethodSlot`] resolved: a Python function off a class (keyed
+/// by the class's attribute version), or a builtin type's method body
+/// (keyed by [`MethodSlot::BUILTIN_TAG`] plus the receiver's variant).
+enum MethodSlotFn {
+    Py(crate::sync::Weak<crate::object::PyFunction>),
+    Builtin(Rc<crate::object::BuiltinFn>),
+}
 
 // SAFETY: read and written only from the dispatch loop with the GIL
 // held (the same invariant `weavepy_compiler::CacheSlot` documents).
@@ -49737,19 +50278,25 @@ unsafe impl Send for MethodSlot {}
 unsafe impl Sync for MethodSlot {}
 
 impl MethodSlot {
+    /// High bit of the key for builtin-receiver entries; the low bits are
+    /// the receiver variant. Class attribute versions are counters that
+    /// never reach it.
+    const BUILTIN_TAG: u64 = 1 << 63;
+
     const fn empty() -> Self {
-        Self(std::cell::UnsafeCell::new((0, crate::sync::Weak::new())))
+        Self(std::cell::UnsafeCell::new((
+            0,
+            MethodSlotFn::Py(crate::sync::Weak::new()),
+        )))
     }
 
     /// The cached function if the slot was filled under `ver`.
     #[inline]
     fn get(&self, ver: u64) -> Option<Rc<crate::object::PyFunction>> {
         // SAFETY: GIL-serialized; no `&mut` escapes `set`.
-        let (v, w) = unsafe { &*self.0.get() };
-        if *v == ver {
-            w.upgrade()
-        } else {
-            None
+        match unsafe { &*self.0.get() } {
+            (v, MethodSlotFn::Py(w)) if *v == ver => w.upgrade(),
+            _ => None,
         }
     }
 
@@ -49757,7 +50304,23 @@ impl MethodSlot {
     fn set(&self, ver: u64, f: &Rc<crate::object::PyFunction>) {
         // SAFETY: GIL-serialized; the exclusive reference lives only for
         // the assignment.
-        unsafe { *self.0.get() = (ver, Rc::downgrade(f)) };
+        unsafe { *self.0.get() = (ver, MethodSlotFn::Py(Rc::downgrade(f))) };
+    }
+
+    /// The cached builtin method body for receiver variant `tag`.
+    #[inline]
+    fn get_builtin(&self, tag: u64) -> Option<Rc<crate::object::BuiltinFn>> {
+        // SAFETY: as `get`.
+        match unsafe { &*self.0.get() } {
+            (v, MethodSlotFn::Builtin(f)) if *v == Self::BUILTIN_TAG | tag => Some(f.clone()),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn set_builtin(&self, tag: u64, f: &Rc<crate::object::BuiltinFn>) {
+        // SAFETY: as `set`.
+        unsafe { *self.0.get() = (Self::BUILTIN_TAG | tag, MethodSlotFn::Builtin(f.clone())) };
     }
 }
 
@@ -49806,6 +50369,7 @@ fn code_vm_ext(code: &CodeObject) -> Option<&CodeConstObjects> {
                 .map(|n| crate::stdlib::sys::intern_name(n))
                 .collect(),
             method_slots: std::sync::OnceLock::new(),
+            stamp_slots: std::sync::OnceLock::new(),
         })
     });
     // RFC 0077 (WS5): the slot has exactly one producer (the initializer

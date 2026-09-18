@@ -3844,7 +3844,138 @@ impl Hash for DictKey {
 /// (one multiply) instead of SipHash, which profiled as a top-ten CPU
 /// consumer under pandas. Not attacker-relevant: collision resistance
 /// comes from the Python-level hash, exactly as in CPython's own tables.
-pub type DictData = indexmap::IndexMap<DictKey, Object, crate::fasthash::FxBuildHasher>;
+pub type DictMap = indexmap::IndexMap<DictKey, Object, crate::fasthash::FxBuildHasher>;
+
+/// The global source of [`DictData::mutation_stamp`] values: one
+/// monotonically increasing counter for every dict in the process, so a
+/// stamp names one state of one dict and is never reused, even by a dict
+/// replaced in place.
+static DICT_STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[inline]
+fn next_dict_stamp() -> u64 {
+    DICT_STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A [`DictMap`] with a mutation stamp: every mutable access (any
+/// `DerefMut`) draws a fresh process-unique stamp, so an inline cache can
+/// guard "this dict is exactly as I last saw it" with one integer compare
+/// instead of re-probing the table. The stamp is conservative — it also
+/// advances on mutable accesses that change nothing — and it is not the
+/// PEP 509 version tag (which counts effective changes only; see
+/// [`dict_version_get`]).
+#[derive(Clone)]
+pub struct DictData {
+    map: DictMap,
+    stamp: u64,
+}
+
+impl DictData {
+    #[inline]
+    pub fn with_capacity_and_hasher(n: usize, h: crate::fasthash::FxBuildHasher) -> Self {
+        Self {
+            map: DictMap::with_capacity_and_hasher(n, h),
+            stamp: next_dict_stamp(),
+        }
+    }
+
+    /// The stamp of the dict's current state (see the type docs).
+    #[inline]
+    pub fn mutation_stamp(&self) -> u64 {
+        self.stamp
+    }
+
+    /// Mutable access that does *not* advance the stamp: for callers that
+    /// change a value in place without adding or removing a key and whose
+    /// caches are keyed on keys alone. Use with care.
+    #[inline]
+    pub fn map_mut_unstamped(&mut self) -> &mut DictMap {
+        &mut self.map
+    }
+}
+
+impl Default for DictData {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            map: DictMap::default(),
+            stamp: next_dict_stamp(),
+        }
+    }
+}
+
+impl std::ops::Deref for DictData {
+    type Target = DictMap;
+
+    #[inline]
+    fn deref(&self) -> &DictMap {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for DictData {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut DictMap {
+        self.stamp = next_dict_stamp();
+        &mut self.map
+    }
+}
+
+impl fmt::Debug for DictData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.map.fmt(f)
+    }
+}
+
+impl From<DictMap> for DictData {
+    fn from(map: DictMap) -> Self {
+        Self {
+            map,
+            stamp: next_dict_stamp(),
+        }
+    }
+}
+
+impl FromIterator<(DictKey, Object)> for DictData {
+    fn from_iter<I: IntoIterator<Item = (DictKey, Object)>>(iter: I) -> Self {
+        Self::from(DictMap::from_iter(iter))
+    }
+}
+
+impl Extend<(DictKey, Object)> for DictData {
+    fn extend<I: IntoIterator<Item = (DictKey, Object)>>(&mut self, iter: I) {
+        self.stamp = next_dict_stamp();
+        self.map.extend(iter);
+    }
+}
+
+impl IntoIterator for DictData {
+    type Item = (DictKey, Object);
+    type IntoIter = indexmap::map::IntoIter<DictKey, Object>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a DictData {
+    type Item = (&'a DictKey, &'a Object);
+    type IntoIter = indexmap::map::Iter<'a, DictKey, Object>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut DictData {
+    type Item = (&'a DictKey, &'a mut Object);
+    type IntoIter = indexmap::map::IterMut<'a, DictKey, Object>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.stamp = next_dict_stamp();
+        self.map.iter_mut()
+    }
+}
 
 #[derive(Clone)]
 pub struct PyFunction {
