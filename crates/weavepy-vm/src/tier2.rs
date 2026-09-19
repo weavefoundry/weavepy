@@ -562,6 +562,7 @@ impl JitState {
             wpjit_dict_contains,
             wpjit_dict_len,
         );
+        weavepy_jit::register_dict_del_helper(wpjit_dict_del);
         weavepy_jit::register_build_map_helper(wpjit_build_map);
         weavepy_jit::register_const_str_helper(wpjit_const_str);
         weavepy_jit::register_tuple_read_helpers(wpjit_const_tuple, wpjit_tuple_len);
@@ -5273,6 +5274,57 @@ unsafe extern "C" fn wpjit_dict_set(
     match crate::builtins::dict_insert(&d, key, v) {
         Ok(_) => 0,
         Err(_) => 1,
+    }
+}
+
+/// The `wpjit_dict_del` helper: `del d[k]` on a pinned exact dict,
+/// through the interpreter's own [`crate::builtins::dict_remove`]
+/// chokepoint (and its removed-entry queue, as `delete_subscr`). Returns
+/// `0`, or `1` to deopt *before* the delete: a missing key (the
+/// interpreter raises the exact `KeyError`), a comparison that would
+/// need Python, a displaced value the prompt-reap cascade would take
+/// (the `wpjit_dict_set` discipline), or active C-API dict watchers.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe extern "C" fn wpjit_dict_del(
+    frame: *mut JitFrame,
+    pin: i64,
+    key_bits: i64,
+    key_tag: i64,
+    _val_tag: i64,
+) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    if crate::capi_watchers::dicts_active() {
+        return 1;
+    }
+    let Some((d, key)) = dict_pin_and_key(ctx, pin, key_bits, key_tag) else {
+        return 1;
+    };
+    let old = match dict_probe_native(&d, &key) {
+        Ok(Some(v)) => v,
+        _ => return 1,
+    };
+    if !matches!(
+        old,
+        Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+    ) && super::Interpreter::local_needs_prompt_reap(&old)
+        && super::Interpreter::looks_reapable_temporary(&old)
+    {
+        return 1;
+    }
+    drop(old);
+    match crate::builtins::dict_remove(&d, &key) {
+        Ok(Some((k, v))) => {
+            crate::vm_singletons::queue_container_removed(&k);
+            crate::vm_singletons::queue_container_removed(&v);
+            0
+        }
+        _ => 1,
     }
 }
 

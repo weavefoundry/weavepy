@@ -340,6 +340,14 @@ pub enum TOp {
     /// discipline), as do active C-API dict watchers and any key-lane
     /// surprise.
     DictSet { key: JitType, val: JitType },
+    /// `del d[k]` on a pinned exact `dict`: pops the key (`key` lane)
+    /// and the dict pin, and calls the registered `wpjit_dict_del`
+    /// helper — the interpreter's own `dict_remove` chokepoint. A
+    /// missing key, a displaced value that would run the prompt-reap
+    /// cascade, active C-API dict watchers, or any key-lane surprise
+    /// deopts *before* the delete, and the interpreter re-executes it
+    /// (raising the exact `KeyError`).
+    DictDel { key: JitType },
     /// RFC 0073 WS2 — `k in d` / `k not in d` on a pinned exact
     /// `dict`: pops the dict pin and the key, calls the registered
     /// `wpjit_dict_contains` helper, and pushes the `bool` (inverted
@@ -1482,6 +1490,7 @@ impl TOp {
                 | TOp::BytesGetItem
                 | TOp::DictGet { .. }
                 | TOp::DictSet { .. }
+                | TOp::DictDel { .. }
                 | TOp::DictContains { .. }
                 | TOp::DictLen
                 | TOp::BuildMap { .. }

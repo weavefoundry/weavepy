@@ -479,6 +479,19 @@ static DICT_SET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 static DICT_CONTAINS_HELPER: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static DICT_LEN_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DICT_DEL_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the `DictDel` helper (same shape as the other dict-lane
+/// helpers; the value tag is unused). Must precede the first compile of
+/// a frame containing `DictDel` ops.
+pub fn register_dict_del_helper(del: DictAccessHelper) {
+    DICT_DEL_HELPER.store(del as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn dict_del_helper_addr() -> usize {
+    DICT_DEL_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// Register the process-wide dict-lane helpers (RFC 0073 WS2). Must
 /// precede the first compile of a frame containing `DictGet`,

@@ -617,32 +617,37 @@ fn jump_targets(code: &CodeObject) -> HashSet<usize> {
 /// any loop (native entry would buy nothing).
 fn cold_point(code: &CodeObject, p: usize) -> Option<usize> {
     let ins = &code.instructions;
+    let loops: Vec<(usize, usize)> = ins
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| x.op == OpCode::JumpBackward)
+        .filter_map(|(j, x)| backward_target(j, x.arg).map(|t| (t, j)))
+        .collect();
+    // A point inside a loop moves to the start of its outermost loop: a
+    // `for` statement's iterable setup (the instructions on its line
+    // before the `FOR_ITER` head), or a `while` loop's head.
+    let (p, for_setup) = match loops.iter().filter(|&&(t, j)| t <= p && p <= j).map(|&(t, _)| t).min() {
+        Some(t) if ins[t].op == OpCode::ForIter => (t.checked_sub(1)?, true),
+        Some(t) => (t, false),
+        None => (p, false),
+    };
     // Worth it only after native work: a loop completed before the exit.
     // A loop-free body would enter native code just to leave it (short
     // methods with an unsupported statement near the top, every call).
-    let mut loop_before = false;
-    for (j, x) in ins.iter().enumerate() {
-        if x.op == OpCode::JumpBackward {
-            if let Some(t) = backward_target(j, x.arg) {
-                if t <= p && p <= j {
-                    return None;
-                }
-                if j < p {
-                    loop_before = true;
-                }
-            }
-        }
-    }
-    if !loop_before {
+    if !loops.iter().any(|&(_, j)| j < p) {
         return None;
     }
     let line = code.linetable.get(p).copied()?;
     let targets = jump_targets(code);
     let mut q = p;
-    while q > 0 && code.linetable.get(q - 1) == Some(&line) && !targets.contains(&q) {
+    while q > 0
+        && code.linetable.get(q - 1) == Some(&line)
+        && (for_setup || !targets.contains(&q))
+        && !targets.contains(&(q - 1).max(1))
+    {
         q -= 1;
     }
-    (q > 0).then_some(q)
+    (q > 0 && !loops.iter().any(|&(t, j)| t < q && q <= j)).then_some(q)
 }
 
 fn analyze_impl(
@@ -683,7 +688,8 @@ fn analyze_impl(
             Err(
                 e @ (JitVerdict::UnsupportedOpcode(_)
                 | JitVerdict::UnsupportedConst
-                | JitVerdict::MixedArithTypes),
+                | JitVerdict::MixedArithTypes
+                | JitVerdict::NonUniformLocal(_)),
             ) if cold.len() < 4
                 && FAIL_PC
                     .with(std::cell::Cell::get)
@@ -813,7 +819,16 @@ fn analyze_once(
                 &mut changed,
                 probes,
                 &mut ctor,
-            )?;
+            )
+            .inspect_err(|_| {
+                // A failure in the block's terminator (a loop header's
+                // variable lane, say) names the terminator.
+                FAIL_PC.with(|c| {
+                    if c.get().is_none() {
+                        c.set(Some(raw[bi].end - 1));
+                    }
+                });
+            })?;
             for (succ, stack) in outs {
                 if succ == entry_raw && !stack.is_empty() {
                     return Err(JitVerdict::NonEmptyBoundaryStack);
@@ -4838,6 +4853,18 @@ fn step_abstract(
                 }
             }
         }
+        // `del d[k]` on an exact dict (the key lane as a store's).
+        OpCode::DeleteSubscr => {
+            let idx = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let cont = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if !idx.is_plain() || !cont.is_plain() {
+                return Err(escape_verdict(code, &[&idx, &cont], "CALL (callee escapes)"));
+            }
+            let Some((pk, _)) = resolve_dict_container(&cont, local_types, changed, probes)? else {
+                return Err(JitVerdict::UnsupportedOpcode("DELETE_SUBSCR"));
+            };
+            check_dict_key(&idx, pk, local_types, changed)?;
+        }
         // RFC 0073 WS2 — `k in d` / `k not in d` on an exact dict.
         // RFC 0076 WS8 — any other *pinned* container (a set through
         // the object lane, a list, a str, an instance) rides the
@@ -7999,6 +8026,14 @@ fn emit_instr(
                 return Err(JitVerdict::UnsupportedOpcode("STORE_SUBSCR (value lane)"));
             }
             push(TOp::ListSet, None, stack, stmts);
+        }
+        OpCode::DeleteSubscr => {
+            let idx = pop_val(stack)?;
+            let cont = pop_val(stack)?;
+            if cont != JitType::Dict || !matches!(idx, JitType::Int | JitType::Str) {
+                return Err(JitVerdict::UnsupportedOpcode("DELETE_SUBSCR"));
+            }
+            push(TOp::DictDel { key: idx }, None, stack, stmts);
         }
         // RFC 0073 WS2 — `k in d` / `k not in d` on a pinned exact
         // dict. RFC 0076 WS8 — any other pinned container rides the
