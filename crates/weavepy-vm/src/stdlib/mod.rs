@@ -20,6 +20,23 @@ pub(crate) mod frozen_sources;
 pub(crate) mod tree_manifest;
 pub(crate) use frozen_sources::frozen_sources;
 
+mod frozen_index {
+    include!(concat!(env!("OUT_DIR"), "/frozen_index.rs"));
+}
+
+/// The row of [`frozen_sources`] registered under `name`, found through
+/// the generated sorted name index (see build.rs) so a lookup never
+/// reads the name literals laid out beside each module's source text.
+pub(crate) fn frozen_lookup(name: &str) -> Option<frozen_sources::FrozenSource> {
+    use frozen_index::{FROZEN_INDEX, FROZEN_NAMES};
+    let at = FROZEN_INDEX
+        .binary_search_by(|&(off, len, _)| {
+            FROZEN_NAMES[off as usize..off as usize + len as usize].cmp(name)
+        })
+        .ok()?;
+    frozen_sources().get(FROZEN_INDEX[at].2 as usize).copied()
+}
+
 pub mod ast_convert;
 pub mod ast_mod;
 pub mod asyncio_mod;
@@ -369,21 +386,19 @@ pub fn register_all(cache: &ModuleCache) {
     // development — the same idea as the two shims above, but for arbitrary
     // modules while iterating on their pure-Python source without a rebuild.
     let suppress_list = std::env::var("WEAVEPY_SUPPRESS_FROZEN").unwrap_or_default();
-    let suppressed: std::collections::HashSet<&str> = suppress_list
+    let mut suppressed: Vec<Box<str>> = suppress_list
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
+        .map(Box::from)
         .collect();
-    for src in frozen_sources() {
-        if suppress_numpy_shim && matches!(src.name, "numpy" | "_numpy_pure") {
-            continue;
-        }
-        if suppress_pytest_shim && matches!(src.name, "pytest" | "pluggy" | "iniconfig") {
-            continue;
-        }
-        if suppressed.contains(src.name) {
-            continue;
-        }
-        cache.register_frozen(*src);
+    if suppress_numpy_shim {
+        suppressed.extend(["numpy", "_numpy_pure"].map(Box::from));
     }
+    if suppress_pytest_shim {
+        suppressed.extend(["pytest", "pluggy", "iniconfig"].map(Box::from));
+    }
+    // The table itself is static (see `frozen_lookup`); installing it
+    // only records the suppressed names.
+    cache.install_frozen_table(suppressed);
 }

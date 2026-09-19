@@ -44,7 +44,7 @@ pub struct ModuleCache {
     /// Pure-Python modules baked into the binary. Looked up after
     /// Rust-defined built-ins so a host can override frozen stdlib by
     /// registering a builtin with the same name.
-    pub frozen: Rc<RefCell<HashMap<&'static str, FrozenSource>>>,
+    pub frozen: Rc<FrozenRegistry>,
     /// RFC 0057 WS3 — `_imp._override_frozen_modules_for_tests` state:
     /// `0` default, `1` force-enabled, `-1` force-disabled. CPython's
     /// override disables every *non-essential* frozen module (imports
@@ -93,6 +93,20 @@ pub struct ModuleCache {
     pub os_native_done: Rc<crate::sync::Cell<bool>>,
 }
 
+/// The frozen-module registry: the stdlib's static table (looked up
+/// through a generated name index, see `stdlib::frozen_lookup`) once
+/// installed, plus sources registered one by one.
+#[derive(Debug, Default)]
+pub struct FrozenRegistry {
+    /// Whether the static table is installed.
+    table: crate::sync::Cell<bool>,
+    /// Table names hidden by the environment at install time.
+    suppressed: RefCell<Vec<Box<str>>>,
+    /// Sources registered through [`ModuleCache::register_frozen`];
+    /// they shadow the table.
+    extra: RefCell<HashMap<&'static str, FrozenSource>>,
+}
+
 impl Default for ModuleCache {
     fn default() -> Self {
         Self {
@@ -100,7 +114,7 @@ impl Default for ModuleCache {
             path: Rc::new(RefCell::new(Vec::new())),
             argv: Rc::new(RefCell::new(Vec::new())),
             builtins: Rc::new(RefCell::new(HashMap::new())),
-            frozen: Rc::new(RefCell::new(HashMap::new())),
+            frozen: Rc::new(FrozenRegistry::default()),
             frozen_tests_override: Rc::new(crate::sync::Cell::new(0)),
             initializing: Rc::new(RefCell::new(std::collections::HashMap::new())),
             loading: Rc::new(RefCell::new(std::collections::HashMap::new())),
@@ -251,7 +265,30 @@ impl ModuleCache {
     /// Register a Python-source module that ships inside the binary.
     /// The loader compiles and executes it lazily on first import.
     pub fn register_frozen(&self, source: FrozenSource) {
-        self.frozen.borrow_mut().insert(source.name, source);
+        self.frozen.extra.borrow_mut().insert(source.name, source);
+    }
+
+    /// Make the stdlib's static frozen table visible to imports, minus
+    /// the `suppressed` names (see `stdlib::register_all`).
+    pub fn install_frozen_table(&self, suppressed: Vec<Box<str>>) {
+        *self.frozen.suppressed.borrow_mut() = suppressed;
+        self.frozen.table.set(true);
+    }
+
+    /// The frozen source registered under `name`, ignoring the test
+    /// override (see [`Self::frozen_source`]).
+    fn frozen_entry(&self, name: &str) -> Option<FrozenSource> {
+        if let Some(src) = self.frozen.extra.borrow().get(name) {
+            return Some(*src);
+        }
+        if !self.frozen.table.get() {
+            return None;
+        }
+        let suppressed = self.frozen.suppressed.borrow();
+        if !suppressed.is_empty() && suppressed.iter().any(|s| &**s == name) {
+            return None;
+        }
+        crate::stdlib::frozen_lookup(name)
     }
 
     pub fn frozen_source(&self, name: &str) -> Option<FrozenSource> {
@@ -264,7 +301,7 @@ impl ModuleCache {
         if self.frozen_tests_override.get() < 0 && is_test_frozen_name(name) {
             return None;
         }
-        self.frozen.borrow().get(name).copied()
+        self.frozen_entry(name)
     }
 
     /// Set the `_imp._override_frozen_modules_for_tests` knob
@@ -408,7 +445,7 @@ impl ModuleCache {
         // fallback below.
         if self.frozen_tests_override.get() >= 0
             && is_test_frozen_name(full_name)
-            && self.frozen.borrow().contains_key(full_name)
+            && self.frozen_entry(full_name).is_some()
         {
             return None;
         }
@@ -440,7 +477,7 @@ impl ModuleCache {
         // so resolve the same fallback against the tree explicitly —
         // it holds byte-identical projections of the frozen sources.
         if self.frozen_tests_override.get() < 0 && is_test_frozen_name(full_name) {
-            if let Some(frozen) = self.frozen.borrow().get(full_name) {
+            if let Some(frozen) = self.frozen_entry(full_name) {
                 if let Some(path) =
                     crate::stdlib_tree::test_frozen_disk_path(full_name, frozen.is_package)
                 {

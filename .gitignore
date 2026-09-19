@@ -72,3 +72,6 @@ node_modules/
 /vendor/*
 !/vendor/lzma-sys/
 !/vendor/expat-sys/
+
+# Instrumented build for scripts/gen-order-file.sh
+target-order/
