@@ -10156,12 +10156,12 @@ impl Interpreter {
         let total = npos + code.kwonly_count as usize;
         if specialize::rc_id(f) != func_id
             || total > 16
+            || (code.has_varkeywords && (total > 15 || code.varnames.len() <= total))
             || eff_argc > npos
             || code.is_generator
             || code.is_coroutine
             || code.is_async_generator
             || code.has_varargs
-            || code.has_varkeywords
             || !code.cellvars.is_empty()
             || code.freevars.len() != f.closure.len()
             // SAFETY: GIL-serialized raw read of the slot store's
@@ -10173,7 +10173,23 @@ impl Interpreter {
         }
         let mut covered: u32 = (1u32 << eff_argc) - 1;
         for (j, name) in name_items.iter().enumerate() {
-            let slot = ((perm >> (4 * j)) & 0xF) as usize;
+            let nibble = (perm >> (4 * j)) & 0xF;
+            if nibble == specialize::KW_TO_VARKW {
+                // Collected by `**kwargs`: the callee has one, and still
+                // has no keyword-bindable parameter of that name.
+                let Object::Str(s) = name else {
+                    return None;
+                };
+                if !code.has_varkeywords
+                    || code.varnames[code.posonly_count as usize..total]
+                        .iter()
+                        .any(|v| v.as_str() == &**s)
+                {
+                    return None;
+                }
+                continue;
+            }
+            let slot = nibble as usize;
             let name_ok = matches!(
                 name, Object::Str(s) if code.varnames.get(slot).is_some_and(|v| v.as_str() == &**s)
             );
@@ -10201,6 +10217,7 @@ impl Interpreter {
     fn kw_names_fill_locals(
         locals: &mut Vec<Object>,
         stack: &mut Vec<Object>,
+        names: &[Object],
         f: &PyFunction,
         code: &CodeObject,
         perm: u32,
@@ -10213,12 +10230,25 @@ impl Interpreter {
         locals.clear();
         locals.resize(code.varnames.len().max(total), Object::Unbound);
         let len = stack.len();
+        // A `**kwargs` callee's dict: the keywords it collects, in call
+        // order (always a fresh dict, empty when none).
+        let mut varkw: Option<DictData> = code.has_varkeywords.then(DictData::default);
         for (j, v) in stack.drain(len - kwc..).enumerate() {
-            locals[((perm >> (4 * j)) & 0xF) as usize] = v;
+            let nibble = (perm >> (4 * j)) & 0xF;
+            if nibble == specialize::KW_TO_VARKW {
+                if let (Some(d), Some(name)) = (varkw.as_mut(), names.get(j)) {
+                    d.insert(DictKey(name.clone()), v);
+                }
+                continue;
+            }
+            locals[nibble as usize] = v;
         }
         let plen = stack.len();
         for (slot, v) in stack.drain(plen - eff_argc..).enumerate() {
             locals[slot] = v;
+        }
+        if let Some(d) = varkw {
+            locals[total] = Object::Dict(Rc::new(RefCell::new(d)));
         }
         #[allow(clippy::needless_range_loop)]
         for slot in eff_argc..total {
@@ -10357,13 +10387,26 @@ impl Interpreter {
             has_self,
         } = shape;
         let names = frame.stack.pop();
-        drop(names);
+        let names: &[Object] = match &names {
+            Some(Object::Tuple(t)) => t,
+            _ => &[],
+        };
         let callee_at = frame.stack.len() - kwc - eff_argc - usize::from(!has_self) - 1;
         let f = match &frame.stack[callee_at] {
             Object::Function(f) => f.clone(),
             _ => unreachable!("callee variant checked by the shape"),
         };
-        Self::kw_names_fill_locals(v, &mut frame.stack, &f, &code, perm, covered, kwc, eff_argc);
+        Self::kw_names_fill_locals(
+            v,
+            &mut frame.stack,
+            names,
+            &f,
+            &code,
+            perm,
+            covered,
+            kwc,
+            eff_argc,
+        );
         if !has_self {
             frame.stack.pop(); // the NULL self slot
         }
@@ -17983,6 +18026,7 @@ impl Interpreter {
                                 Self::kw_names_fill_locals(
                                     &mut locals,
                                     &mut frame.stack,
+                                    name_items,
                                     &f,
                                     &code,
                                     perm,

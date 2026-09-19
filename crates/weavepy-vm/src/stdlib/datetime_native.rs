@@ -145,6 +145,12 @@ struct State {
     timezone: Weak<TypeObject>,
     utc: Weak<PyInstance>,
     names: Names,
+    /// The slot layouts natively built instances share (see
+    /// `SlotStorage::from_layout`), in the order `new_td` / `new_date` /
+    /// `new_dt` fill them.
+    td_layout: Rc<[DictKey]>,
+    date_layout: Rc<[DictKey]>,
+    dt_layout: Rc<[DictKey]>,
     /// `(kind, name)` → the replaced Python implementation.
     orig: HashMap<(u8, &'static str), Object>,
     /// The `attr_version` at which each exact class was last verified to
@@ -406,6 +412,13 @@ fn instance(cls: Rc<TypeObject>, entries: Vec<(DictKey, Object)>) -> Object {
     Object::Instance(Rc::new(i))
 }
 
+/// [`instance`] over one of the shared layouts (see `State`).
+fn instance_fixed(cls: Rc<TypeObject>, layout: &Rc<[DictKey]>, values: Vec<Object>) -> Object {
+    let mut i = PyInstance::new(cls);
+    i.slots = RefCell::new(SlotStorage::from_layout(layout.clone(), values));
+    Object::Instance(Rc::new(i))
+}
+
 /// A normalized exact `timedelta` from unnormalized components.
 fn new_td(st: &State, d: i128, s: i128, us: i128) -> Option<Result<Object, RuntimeError>> {
     let total = d * US_PER_DAY + s * 1_000_000 + us;
@@ -422,52 +435,47 @@ fn new_td(st: &State, d: i128, s: i128, us: i128) -> Option<Result<Object, Runti
         (rest % 1_000_000) as i64,
     );
     let cls = st.timedelta.upgrade()?;
-    let n = &st.names;
-    Some(Ok(instance(
+    Some(Ok(instance_fixed(
         cls,
+        &st.td_layout,
         vec![
-            entry(&n.days, Object::Int(days)),
-            entry(&n.seconds, Object::Int(secs)),
-            entry(&n.microseconds, Object::Int(us)),
-            entry(&n.hashcode, Object::Int(-1)),
-            entry(&n.pub_days, Object::Int(days)),
-            entry(&n.pub_seconds, Object::Int(secs)),
-            entry(&n.pub_microseconds, Object::Int(us)),
+            Object::Int(days),
+            Object::Int(secs),
+            Object::Int(us),
+            Object::Int(-1),
+            Object::Int(days),
+            Object::Int(secs),
+            Object::Int(us),
         ],
     )))
 }
 
 fn new_date(st: &State, y: i64, m: i64, d: i64) -> Option<Object> {
     let cls = st.date.upgrade()?;
-    let n = &st.names;
-    Some(instance(
+    Some(instance_fixed(
         cls,
-        vec![
-            entry(&n.year, Object::Int(y)),
-            entry(&n.month, Object::Int(m)),
-            entry(&n.day, Object::Int(d)),
-            entry(&n.hashcode, Object::Int(-1)),
-        ],
+        &st.date_layout,
+        vec![Object::Int(y), Object::Int(m), Object::Int(d), Object::Int(-1)],
     ))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn new_dt(st: &State, f: &Dt) -> Option<Object> {
     let cls = st.datetime.upgrade()?;
-    let n = &st.names;
-    Some(instance(
+    Some(instance_fixed(
         cls,
+        &st.dt_layout,
         vec![
-            entry(&n.year, Object::Int(f.y)),
-            entry(&n.month, Object::Int(f.m)),
-            entry(&n.day, Object::Int(f.d)),
-            entry(&n.hour, Object::Int(f.hh)),
-            entry(&n.minute, Object::Int(f.mm)),
-            entry(&n.second, Object::Int(f.ss)),
-            entry(&n.microsecond, Object::Int(f.us)),
-            entry(&n.tzinfo, f.tz.clone()),
-            entry(&n.hashcode, Object::Int(-1)),
-            entry(&n.fold, Object::Int(f.fold)),
+            Object::Int(f.y),
+            Object::Int(f.m),
+            Object::Int(f.d),
+            Object::Int(f.hh),
+            Object::Int(f.mm),
+            Object::Int(f.ss),
+            Object::Int(f.us),
+            f.tz.clone(),
+            Object::Int(-1),
+            Object::Int(f.fold),
         ],
     ))
 }
@@ -1612,13 +1620,45 @@ pub(crate) fn install(args: &[Object]) -> Result<Object, RuntimeError> {
         };
         orig.insert((spec.kind, spec.name), v);
     }
+    let names = Names::new();
+    let layout = |keys: &[&SharedStr]| -> Rc<[DictKey]> {
+        keys.iter()
+            .map(|k| DictKey(Object::Str((*k).clone())))
+            .collect::<Vec<_>>()
+            .into()
+    };
+    let td_layout = layout(&[
+        &names.days,
+        &names.seconds,
+        &names.microseconds,
+        &names.hashcode,
+        &names.pub_days,
+        &names.pub_seconds,
+        &names.pub_microseconds,
+    ]);
+    let date_layout = layout(&[&names.year, &names.month, &names.day, &names.hashcode]);
+    let dt_layout = layout(&[
+        &names.year,
+        &names.month,
+        &names.day,
+        &names.hour,
+        &names.minute,
+        &names.second,
+        &names.microsecond,
+        &names.tzinfo,
+        &names.hashcode,
+        &names.fold,
+    ]);
     let state = Rc::new(State {
         timedelta: Rc::downgrade(td),
         date: Rc::downgrade(date),
         datetime: Rc::downgrade(dt),
         timezone: Rc::downgrade(tz),
         utc,
-        names: Names::new(),
+        names,
+        td_layout,
+        date_layout,
+        dt_layout,
         orig,
         sealed: Default::default(),
         expect: std::sync::OnceLock::new(),

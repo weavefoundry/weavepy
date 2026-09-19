@@ -506,6 +506,10 @@ pub fn attempt_specialize_call(callable: &Object, argc: usize) -> InlineCache {
     }
 }
 
+/// The `CallPyKwNames` permutation nibble of a keyword a `**kwargs`
+/// callee collects into its dict (parameter slots stay below 15 there).
+pub const KW_TO_VARKW: u32 = 0xF;
+
 /// Decide on a `CALL_KW` specialization (RFC 0069 WS3): a plain Python
 /// function (no `*args`/`**kwargs`/kw-only, cell-free, no
 /// `__defaults__` override) where every keyword name resolves to a
@@ -531,11 +535,14 @@ pub fn attempt_specialize_call_kw(
         || code.is_coroutine
         || code.is_async_generator
         || code.has_varargs
-        || code.has_varkeywords
         || !(code.cellvars.is_empty() && code.freevars.is_empty() && f.closure.is_empty())
         || (f.defaults_maybe_overridden()
             && (f.slot("__defaults__").is_some() || f.slot("__kwdefaults__").is_some()))
         || total > 16
+        // A `**kwargs` callee reserves nibble 15 for the keywords it
+        // collects (see `KW_TO_VARKW`), and its dict slot follows the
+        // parameters.
+        || (code.has_varkeywords && (total > 15 || code.varnames.len() <= total))
         || kwc == 0
         || kwc > 8
         || argc > npos
@@ -545,10 +552,22 @@ pub fn attempt_specialize_call_kw(
     let mut perm: u32 = 0;
     let mut covered: u32 = (1u32 << argc) - 1;
     for (j, (name, _)) in kw_names.iter().enumerate() {
-        let Some(slot) = code.varnames[..total].iter().position(|v| v == name) else {
-            return InlineCache::Cooldown(COOLDOWN);
+        let bindable = code.varnames[..total]
+            .iter()
+            .position(|v| v == name)
+            .filter(|&slot| slot >= code.posonly_count as usize);
+        let slot = match bindable {
+            Some(slot) => slot,
+            // No keyword-bindable parameter of that name (a
+            // positional-only one's name included): the `**kwargs` dict
+            // collects it.
+            None if code.has_varkeywords => {
+                perm |= KW_TO_VARKW << (4 * j);
+                continue;
+            }
+            None => return InlineCache::Cooldown(COOLDOWN),
         };
-        if slot < code.posonly_count as usize || covered & (1 << slot) != 0 {
+        if covered & (1 << slot) != 0 {
             return InlineCache::Cooldown(COOLDOWN);
         }
         perm |= (slot as u32) << (4 * j);

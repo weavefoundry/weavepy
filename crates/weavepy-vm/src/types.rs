@@ -1786,6 +1786,14 @@ enum SlotData {
     Single { key: Option<DictKey>, value: Object },
     Small(Vec<(DictKey, Object)>),
     Many(DictData),
+    /// Every slot of a layout shared across instances (one `Rc` for the
+    /// names instead of a key per slot per instance), all populated —
+    /// the natively built instances of `datetime`'s classes. Adding or
+    /// removing a key converts to [`Self::Small`] / [`Self::Many`].
+    Fixed {
+        layout: crate::sync::Rc<[DictKey]>,
+        values: Box<[Object]>,
+    },
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -1807,6 +1815,42 @@ impl SlotStorage {
             }
         };
         Self { data }
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+impl SlotStorage {
+    /// Storage holding `values` under the shared slot names `layout`
+    /// (distinct `str` keys, in slot order; one value per name).
+    pub fn from_layout(layout: crate::sync::Rc<[DictKey]>, values: Vec<Object>) -> Self {
+        if layout.len() != values.len() {
+            return Self::from_entries(layout.iter().cloned().zip(values).collect());
+        }
+        Self {
+            data: SlotData::Fixed {
+                layout,
+                values: values.into_boxed_slice(),
+            },
+        }
+    }
+
+    /// Turn a [`SlotData::Fixed`] storage into the per-key form (before
+    /// a key is added or removed).
+    fn unfix(&mut self) {
+        if let SlotData::Fixed { layout, values } = &mut self.data {
+            let values = std::mem::take(values);
+            let entries: Vec<(DictKey, Object)> =
+                layout.iter().cloned().zip(values.into_vec()).collect();
+            *self = Self::from_entries(entries);
+        }
+    }
+}
+
+#[cfg(not(target_pointer_width = "64"))]
+impl SlotStorage {
+    /// Storage holding `values` under `layout` (see the 64-bit variant).
+    pub fn from_layout(layout: crate::sync::Rc<[DictKey]>, values: Vec<Object>) -> Self {
+        Self::from_entries(layout.iter().cloned().zip(values).collect())
     }
 }
 
@@ -1849,6 +1893,12 @@ impl SlotStorage {
             SlotData::Many(table) => table
                 .get_index_of(&crate::object::StrKey(name))
                 .and_then(|index| u32::try_from(index).ok()),
+            SlotData::Fixed { layout, .. } => layout
+                .iter()
+                .position(
+                    |key| matches!(&key.0, Object::Str(stored) if stored.as_ref() == name),
+                )
+                .map(|index| index as u32),
         }
     }
 
@@ -1860,6 +1910,7 @@ impl SlotStorage {
             SlotData::Single { key, value } if index == 0 => key.as_ref().map(|key| (key, value)),
             SlotData::Small(entries) => entries.get(index).map(|(key, value)| (key, value)),
             SlotData::Many(table) => table.get_index(index),
+            SlotData::Fixed { layout, values } => layout.get(index).zip(values.get(index)),
             _ => None,
         }
     }
@@ -1870,6 +1921,7 @@ impl SlotStorage {
             SlotData::Single { key, value } if index == 0 => key.as_ref().map(|key| (key, value)),
             SlotData::Small(entries) => entries.get_mut(index).map(|(key, value)| (&*key, value)),
             SlotData::Many(table) => table.get_index_mut(index),
+            SlotData::Fixed { layout, values } => layout.get(index).zip(values.get_mut(index)),
             _ => None,
         }
     }
@@ -1884,6 +1936,12 @@ impl SlotStorage {
                 matches!(&key.0, Object::Str(stored) if stored.as_ref() == name).then_some(value)
             }),
             SlotData::Many(table) => table.get(&crate::object::StrKey(name)),
+            SlotData::Fixed { layout, values } => layout
+                .iter()
+                .position(
+                    |key| matches!(&key.0, Object::Str(stored) if stored.as_ref() == name),
+                )
+                .and_then(|i| values.get(i)),
             _ => None,
         }
     }
@@ -1926,6 +1984,12 @@ impl SlotStorage {
                 matches!(&key.0, Object::Str(stored) if stored.as_ref() == name).then_some(value)
             }),
             SlotData::Many(table) => table.get_mut(&crate::object::StrKey(name)),
+            SlotData::Fixed { layout, values } => layout
+                .iter()
+                .position(
+                    |key| matches!(&key.0, Object::Str(stored) if stored.as_ref() == name),
+                )
+                .and_then(|i| values.get_mut(i)),
             _ => None,
         }
     }
@@ -1952,6 +2016,12 @@ impl SlotStorage {
         value: Object,
         make_key: impl FnOnce() -> DictKey,
     ) -> Option<Object> {
+        if let SlotData::Fixed { .. } = &self.data {
+            if let Some(slot) = self.get_mut(name) {
+                return Some(std::mem::replace(slot, value));
+            }
+            self.unfix();
+        }
         match &mut self.data {
             SlotData::Single { key, value: slot } if key.is_none() => {
                 *key = Some(make_key());
@@ -2005,6 +2075,7 @@ impl SlotStorage {
     }
 
     pub fn remove(&mut self, name: &str) -> Option<Object> {
+        self.unfix();
         match &mut self.data {
             SlotData::Single { key, value } if matches!(key.as_ref(), Some(DictKey(Object::Str(stored))) if stored.as_ref() == name) =>
             {
@@ -2023,15 +2094,23 @@ impl SlotStorage {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&DictKey, &Object)> {
-        let (single, small, many) = match &self.data {
-            SlotData::Single { key, value } => (key.as_ref().map(|key| (key, value)), None, None),
-            SlotData::Small(entries) => (None, Some(entries), None),
-            SlotData::Many(table) => (None, None, Some(table)),
+        let (single, small, many, fixed) = match &self.data {
+            SlotData::Single { key, value } => {
+                (key.as_ref().map(|key| (key, value)), None, None, None)
+            }
+            SlotData::Small(entries) => (None, Some(entries), None, None),
+            SlotData::Many(table) => (None, None, Some(table), None),
+            SlotData::Fixed { layout, values } => (None, None, None, Some((layout, values))),
         };
         single
             .into_iter()
             .chain(small.into_iter().flatten().map(|(key, value)| (key, value)))
             .chain(many.into_iter().flat_map(|table| table.iter()))
+            .chain(
+                fixed
+                    .into_iter()
+                    .flat_map(|(layout, values)| layout.iter().zip(values.iter())),
+            )
     }
 }
 
