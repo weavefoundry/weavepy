@@ -512,6 +512,17 @@ impl JitEngine {
 /// interpreter's generic object protocol (dynamic calls and attribute
 /// accesses) against all statements (see [`CompiledFrame::op_mix`]).
 fn op_mix(tfunc: &TFunc) -> OpMix {
+    if std::env::var_os("WEAVEPY_JIT_OPS").is_some() {
+        let mut hist: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        for b in &tfunc.blocks {
+            for st in &b.stmts {
+                let name = format!("{:?}", st.op);
+                let name = name.split(['(', ' ', '{']).next().unwrap_or("").to_owned();
+                *hist.entry(name).or_default() += 1;
+            }
+        }
+        eprintln!("jit ops {hist:?}");
+    }
     let mut mix = OpMix::default();
     for b in &tfunc.blocks {
         for st in &b.stmts {

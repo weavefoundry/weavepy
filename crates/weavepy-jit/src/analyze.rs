@@ -6507,6 +6507,9 @@ fn emit_instr(
                 stack.pop();
                 push(TOp::FloatArith(kind), Some(JitType::Float), stack, stmts);
             } else {
+                if matches!(kind, ArithKind::Add) && a == JitType::Str && str_accumulator(code, i) {
+                    return Err(JitVerdict::UnsupportedOpcode("str accumulator"));
+                }
                 let (op, ty) = lower_bin(kind, a, b)?;
                 push(op, Some(ty), stack, stmts);
             }
@@ -8100,6 +8103,20 @@ fn emit_instr(
         other => return Err(JitVerdict::UnsupportedOpcode(other.name())),
     }
     Ok(())
+}
+
+/// `s = s + t` / `s += t` rebinding the local it read: the interpreter
+/// grows such a string in place (the local lets go of its lone
+/// reference), where the pinned result here would be copied every time —
+/// a loop building a string this way is left interpreted.
+fn str_accumulator(code: &CodeObject, i: usize) -> bool {
+    let Some(next) = code.instructions.get(i + 1) else {
+        return false;
+    };
+    next.op == OpCode::StoreFast
+        && code.instructions[i.saturating_sub(16)..i]
+            .iter()
+            .any(|p| p.op == OpCode::LoadFast && p.arg == next.arg)
 }
 
 /// Choose the IR op + result lane for a binary arithmetic op at emission
