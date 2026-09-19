@@ -3179,6 +3179,78 @@ pub(crate) fn instance_has_custom_dunder(obj: &Object, name: &str) -> bool {
     }
 }
 
+/// [`instance_has_custom_dunder`]`(obj, "__eq__")`, memoised per class:
+/// membership tests and `list.remove`/`index`/`count` ask it for every
+/// element they compare.
+pub(crate) fn instance_has_custom_eq(obj: &Object) -> bool {
+    let Object::Instance(inst) = obj else {
+        return false;
+    };
+    if crate::gil::free_threading_enabled() {
+        return custom_eq_of(&inst.cls(), inst);
+    }
+    // Under the GIL nothing reassigns `__class__` while this reads it
+    // (the lookup below runs no Python code).
+    custom_eq_of(inst.cls_raw(), inst)
+}
+
+fn custom_eq_of(cls: &crate::types::TypeObject, inst: &crate::types::PyInstance) -> bool {
+    let ver = cls.attr_version.get();
+    let memo = cls.eq_kind.get();
+    let kind = if memo != 0 && memo >> 2 == ver {
+        memo & 3
+    } else {
+        let kind = match cls.lookup_with_owner("__eq__") {
+            Some((Object::Function(_) | Object::BoundMethod(_), _)) => 2,
+            Some((Object::None, _)) | None => 1,
+            Some((_, owner)) if !owner.flags.is_builtin => 2,
+            Some((_, owner))
+                if Rc::ptr_eq(&owner, &crate::builtin_types::builtin_types().object_) =>
+            {
+                1
+            }
+            Some(_) => 3,
+        };
+        cls.eq_kind.set(ver << 2 | kind);
+        kind
+    };
+    match kind {
+        1 => false,
+        2 => true,
+        _ => inst.native.get().is_none(),
+    }
+}
+
+/// `a == b` can only be `object`'s identity default: each side is a
+/// plain instance (no native payload, no `__eq__` override) or a native
+/// scalar, and at least one is such an instance, so every `__eq__` the
+/// protocol would try returns `NotImplemented` for the pair.
+pub(crate) fn eq_is_identity(a: &Object, b: &Object) -> bool {
+    fn plain(o: &Object) -> bool {
+        matches!(o, Object::Instance(i) if i.native.get().is_none()) && !instance_has_custom_eq(o)
+    }
+    fn scalar(o: &Object) -> bool {
+        matches!(
+            o,
+            Object::None
+                | Object::Bool(_)
+                | Object::Int(_)
+                | Object::Long(_)
+                | Object::Float(_)
+                | Object::Complex(_)
+                | Object::Str(_)
+                | Object::WStr(_)
+                | Object::Bytes(_)
+        )
+    }
+    match (plain(a), plain(b)) {
+        (true, true) => true,
+        (true, false) => scalar(b),
+        (false, true) => scalar(a),
+        (false, false) => false,
+    }
+}
+
 /// True when a `set`/`dict` key needs Python-level `__eq__` dispatch rather
 /// than the native [`Object::eq_value`] fast path: a foreign extension
 /// scalar (numpy `int64`/`float64`/…), a user instance with a custom
@@ -3242,8 +3314,8 @@ pub(crate) fn member_eq(a: &Object, b: &Object) -> Result<bool, RuntimeError> {
             Object::Tuple(_) | Object::List(_) | Object::Dict(_) | Object::Slice(_)
         )
     }
-    if instance_has_custom_dunder(a, "__eq__")
-        || instance_has_custom_dunder(b, "__eq__")
+    if instance_has_custom_eq(a)
+        || instance_has_custom_eq(b)
         || matches!(a, Object::Foreign(_))
         || matches!(b, Object::Foreign(_))
         || (deep_dispatch(a) && deep_dispatch(b))
@@ -4092,6 +4164,19 @@ impl DictData {
     #[inline]
     pub fn mutation_stamp(&self) -> u64 {
         self.stamp
+    }
+
+    /// Mutable access for replacing an existing key's value in place: the
+    /// keys do not move, and only key layout is what the stamp's readers
+    /// (the global/builtin load caches) watch, so it stays put. A
+    /// deferred-tracking owner still starts tracking, as for any heap
+    /// value stored into it.
+    #[inline]
+    pub fn map_mut_value_store(&mut self) -> &mut DictMap {
+        if *self.deferred_owner.get_mut() != 0 {
+            self.track_deferred_owner();
+        }
+        &mut self.map
     }
 
     /// Mutable access that does *not* advance the stamp: for callers that

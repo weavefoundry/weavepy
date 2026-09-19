@@ -178,4 +178,20 @@ pub mod env_flags {
         trace_init,
         "WEAVEPY_TRACE_INIT"
     );
+    once_flag!(
+        /// `WEAVEPY_JIT_TRACE`: tier-2 compile/deopt tracing.
+        jit_trace,
+        "WEAVEPY_JIT_TRACE"
+    );
+
+    /// `WEAVEPY_TE_BT=<needle>`: backtrace every `TypeError` whose
+    /// message contains the needle.
+    pub fn te_bt() -> Option<&'static str> {
+        static NEEDLE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        NEEDLE
+            .get_or_init(|| {
+                std::env::var_os("WEAVEPY_TE_BT").map(|v| v.to_string_lossy().into_owned())
+            })
+            .as_deref()
+    }
 }

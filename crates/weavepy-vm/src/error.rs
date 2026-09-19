@@ -216,8 +216,8 @@ pub fn set_exception_attr(err: &RuntimeError, key: &'static str, value: Object) 
 
 pub fn type_error(message: impl Into<String>) -> RuntimeError {
     let message = message.into();
-    if let Some(needle) = std::env::var_os("WEAVEPY_TE_BT") {
-        if message.contains(needle.to_string_lossy().as_ref()) {
+    if let Some(needle) = crate::hot_gates::env_flags::te_bt() {
+        if message.contains(needle) {
             eprintln!(
                 "[TE_BT] TypeError({message})\n{}",
                 std::backtrace::Backtrace::force_capture()

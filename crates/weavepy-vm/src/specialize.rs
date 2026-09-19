@@ -894,7 +894,7 @@ pub fn format_stats_markdown(snap: &Stats) -> String {
 
 // ---------- dict helpers used by the specializer ----------
 
-trait DictDataExt {
+pub(crate) trait DictDataExt {
     /// Lookup the integer slot index of `key_str` in the dict.
     /// Returns `None` if the key isn't present.
     fn index_of_key_str(&self, key_str: &str) -> Option<u32>;

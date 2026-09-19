@@ -539,6 +539,13 @@ pub struct TypeObject {
     /// `__del__` is assigned to / deleted from a type's dict or the MRO is
     /// recomputed (`__bases__` assignment).
     pub has_del: Cell<u8>,
+    /// Memoised `__eq__` resolution for instances of this type, packed
+    /// as `attr_version << 2 | kind` (`0` = not yet computed): kind `1` =
+    /// `object`'s identity default (or no `__eq__`), `2` = a Python-level
+    /// override, `3` = a built-in type's own override (Python dispatch
+    /// only for instances without a native payload). A stale version
+    /// recomputes. See `object::instance_has_custom_eq`.
+    pub eq_kind: Cell<u64>,
     /// Memoised instantiation plan (`type(…)` call protocol resolution:
     /// `__new__`/`__init__`/native-payload classification), stamped with
     /// the [`Self::attr_version`] observed when it was built. Rebuilt
@@ -926,6 +933,7 @@ impl TypeObject {
             mro_kind: std::sync::atomic::AtomicU8::new(0),
             attr_version: AttrVersion::fresh(),
             has_del: Cell::new(0),
+            eq_kind: Cell::new(0),
             instance_plan: RefCell::new(None),
             c_tp_name: crate::sync::RefCell::new(None),
             c_sq_item: Cell::new(false),

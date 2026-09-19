@@ -11574,6 +11574,25 @@ impl Interpreter {
                                             continue;
                                         }
                                     }
+                                    // `x.attr = v` on a local receiver:
+                                    // store straight into it, so the
+                                    // receiver is never pushed, cloned and
+                                    // dropped (a drop the collector grades).
+                                    if next.op == OpCode::StoreAttr
+                                        && len > 0
+                                        && Self::core_store_local_attr(
+                                            code,
+                                            other,
+                                            pc + 1,
+                                            next.arg,
+                                            &*base.add(len - 1),
+                                        )
+                                    {
+                                        len -= 1;
+                                        last = pc + 1;
+                                        pc += 2;
+                                        continue;
+                                    }
                                 }
                                 clone_hot(other)
                             }
@@ -11730,6 +11749,29 @@ impl Interpreter {
                     let r = if ins.arg == 1 { !same } else { same };
                     // SAFETY: both operands leave the stack (checked
                     // droppable above); the result takes the lower slot.
+                    unsafe {
+                        drop_hot(base.add(len - 1).read());
+                        drop_hot(base.add(len - 2).read());
+                        base.add(len - 2).write(Object::Bool(r));
+                    }
+                    len -= 1;
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::ContainsOp => {
+                    if len < 2 {
+                        break None;
+                    }
+                    // SAFETY: `len >= 2`; TOS is the container.
+                    let (item, container) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
+                    if !Self::core_droppable(item) || !Self::core_droppable(container) {
+                        break None;
+                    }
+                    let Some(found) = Self::leaf_contains(container, item) else {
+                        break None;
+                    };
+                    let r = if ins.arg == 1 { !found } else { found };
+                    // SAFETY: as `IS_OP`.
                     unsafe {
                         drop_hot(base.add(len - 1).read());
                         drop_hot(base.add(len - 2).read());
@@ -12771,7 +12813,6 @@ impl Interpreter {
                 // An instance-dict cache hit storing an atomic value over a
                 // droppable one (the helper's `leaf_store_attr` first case).
                 OpCode::StoreAttr => {
-                    use weavepy_compiler::InlineCache as IC;
                     if len < 2 {
                         break Some(CoreExit::Helper);
                     }
@@ -12780,45 +12821,15 @@ impl Interpreter {
                     let Object::Instance(inst) = recv else {
                         break Some(CoreExit::Helper);
                     };
-                    let IC::StoreAttrInstance { key_idx, ver } = code.caches.get(pc as u32) else {
-                        break Some(CoreExit::Helper);
-                    };
-                    let atomic = val.is_gc_atomic();
-                    if inst.cls_raw().attr_version.get() != ver
-                        || crate::capi_watchers::dicts_active()
-                        || !Self::core_droppable(recv)
+                    if !Self::core_droppable(recv)
+                        || !Self::core_store_attr(code, inst, pc, ins.arg, val)
                     {
                         break Some(CoreExit::Helper);
                     }
-                    // SAFETY: as above; nothing below runs code until the
-                    // store is done.
-                    let Some(d) = inst.dict.get().and_then(|d| unsafe { d.peek_mut() }) else {
-                        break Some(CoreExit::Helper);
-                    };
-                    match d.get_index(key_idx as usize) {
-                        Some((k, old))
-                            if slot_name_matches(code, ins.arg, k) && Self::core_droppable(old) => {}
-                        _ => break Some(CoreExit::Helper),
-                    }
-                    // A heap value takes the dict's ordinary mutable access
-                    // (which starts a deferred owner's tracking), as the
-                    // helper's store does.
-                    let map = if atomic {
-                        d.map_mut_atomic_store()
-                    } else {
-                        &mut **d
-                    };
-                    let Some((_, slot)) = map.get_index_mut(key_idx as usize) else {
-                        break Some(CoreExit::Helper);
-                    };
-                    // SAFETY: the value moves into the dict and the
-                    // receiver (droppable) leaves the stack; the displaced
-                    // value was checked droppable.
-                    unsafe {
-                        let old = std::mem::replace(slot, base.add(len - 2).read());
-                        drop_hot(base.add(len - 1).read());
-                        drop(old);
-                    }
+                    // SAFETY: the value moved into the dict (its slot is a
+                    // stand-in now) and the receiver leaves the stack by a
+                    // plain decrement (checked droppable above).
+                    unsafe { drop_hot(base.add(len - 1).read()) };
                     len -= 2;
                     last = pc;
                     pc += 1;
@@ -13767,8 +13778,16 @@ impl Interpreter {
                             };
                             match hit {
                                 Some(v) => norm(v),
-                                None => own(Self::leaf_load_attr_recv(
-                                    code, recv, pc as u32, ins.arg,
+                                // A stale or absent site cache resolves
+                                // through the site's own entries — the
+                                // full handler never sees this body, so
+                                // there is nothing to deopt to.
+                                None => own(Self::leaf_attr_resolve_site(
+                                    code,
+                                    inst,
+                                    recv,
+                                    pc as u32,
+                                    ins.arg,
                                 )?)?,
                             }
                         }
@@ -14470,6 +14489,171 @@ impl Interpreter {
             return slot_name_matches(code, name_idx, k).then(|| Self::clone_operand(v));
         }
         Self::leaf_fused_local_attr(code, local, attr_pc, name_idx)
+    }
+
+    /// The core loop's fused `LOAD_FAST x; STORE_ATTR name`: the value at
+    /// TOS replaces the receiver's existing attribute in place, with the
+    /// receiver read straight off the local. `false` leaves both
+    /// instructions to run one by one.
+    ///
+    /// The caller pops the value slot on `true`: the value *moved* into
+    /// the dict (the slot is left as the displaced value's stand-in and
+    /// must not be dropped again).
+    #[inline(always)]
+    fn core_store_local_attr(
+        code: &CodeObject,
+        local: &Object,
+        attr_pc: usize,
+        name_idx: u32,
+        value: &Object,
+    ) -> bool {
+        let Object::Instance(inst) = local else {
+            return false;
+        };
+        Self::core_store_attr(code, inst, attr_pc, name_idx, value)
+    }
+
+    /// The core loop's `STORE_ATTR` into an instance: an indexed store
+    /// into the receiver's `__dict__` (the warm shape), or the single
+    /// probe a `StoreAttrNewKey` site's insert-or-overwrite needs — the
+    /// constructor shape, which would otherwise leave the loop for the
+    /// helper on every `self.x = …`. Nothing here runs Python code.
+    ///
+    /// On `true` the value *moved* into the dict: the caller drops its
+    /// stack slot without dropping the value.
+    #[inline(always)]
+    fn core_store_attr(
+        code: &CodeObject,
+        inst: &Rc<PyInstance>,
+        attr_pc: usize,
+        name_idx: u32,
+        value: &Object,
+    ) -> bool {
+        use weavepy_compiler::InlineCache as IC;
+        let cls = inst.cls_raw();
+        match code.caches.get(attr_pc as u32) {
+            IC::StoreAttrInstance { key_idx, ver } => {
+                if cls.native_kind.get() != 0
+                    || cls.attr_version.get() != ver
+                    || crate::capi_watchers::dicts_active()
+                {
+                    return false;
+                }
+                // SAFETY: a read between two instructions (see `peek`).
+                let Some(d) = inst.dict.get().and_then(|d| unsafe { d.peek_mut() }) else {
+                    return false;
+                };
+                match d.get_index(key_idx as usize) {
+                    Some((k, old))
+                        if slot_name_matches(code, name_idx, k) && Self::core_droppable(old) => {}
+                    _ => return false,
+                }
+                // Replacing a value leaves the keys (and so the stamp) alone.
+                let map = if value.is_gc_atomic() {
+                    d.map_mut_unstamped()
+                } else {
+                    d.map_mut_value_store()
+                };
+                let Some((_, slot)) = map.get_index_mut(key_idx as usize) else {
+                    return false;
+                };
+                // SAFETY: the value moves out of the caller's stack slot
+                // (the caller drops the slot without dropping the value)
+                // and the displaced value was checked droppable above.
+                let old = std::mem::replace(slot, unsafe { std::ptr::read(value) });
+                drop(old);
+                true
+            }
+            IC::StoreAttrNewKey { ver } => {
+                Self::core_store_new_attr(code, inst, cls, attr_pc, name_idx, ver, value)
+            }
+            _ => false,
+        }
+    }
+
+    /// The constructor shape of [`Self::core_store_attr`]: a
+    /// `StoreAttrNewKey` site's insert-or-overwrite, in one probe. Out of
+    /// line so the warm indexed store stays small.
+    #[inline(never)]
+    fn core_store_new_attr(
+        code: &CodeObject,
+        inst: &Rc<PyInstance>,
+        cls: &TypeObject,
+        attr_pc: usize,
+        name_idx: u32,
+        ver: u64,
+        value: &Object,
+    ) -> bool {
+        use weavepy_compiler::InlineCache as IC;
+        if cls.native_kind.get() != 0
+            || cls.attr_version.get() != ver
+            || crate::capi_watchers::dicts_active()
+        {
+            return false;
+        }
+        let atomic = value.is_gc_atomic();
+        // The class facts were validated when the site specialized and
+        // `ver` guards them since.
+        let Some(probe) = code_name_leaf_probe(code, name_idx) else {
+            return false;
+        };
+        let dict = inst
+            .dict
+            .get_or_init(|| Rc::new(RefCell::new(DictData::default())));
+        // SAFETY: as above.
+        let Some(d) = (unsafe { dict.peek_mut() }) else {
+            return false;
+        };
+        let found = d.get_index_of(&probe);
+        if probe.saw_exotic() {
+            return false;
+        }
+        match found {
+            Some(i) => {
+                match d.get_index(i) {
+                    Some((_, old)) if Self::core_droppable(old) => {}
+                    _ => return false,
+                }
+                let map = if atomic {
+                    d.map_mut_unstamped()
+                } else {
+                    d.map_mut_value_store()
+                };
+                let Some((_, slot)) = map.get_index_mut(i) else {
+                    return false;
+                };
+                // SAFETY: as above.
+                let old = std::mem::replace(slot, unsafe { std::ptr::read(value) });
+                drop(old);
+                // The name is in the dict: the indexed shape serves every
+                // later store without a probe at all.
+                if let Ok(key_idx) = u32::try_from(i) {
+                    code.caches
+                        .set(attr_pc as u32, IC::StoreAttrInstance { key_idx, ver });
+                }
+                true
+            }
+            None => {
+                let Some(key) = code_name_obj(code, name_idx).cloned() else {
+                    return false;
+                };
+                // A new key moves the layout: the dict's ordinary mutable
+                // access (stamp, and a deferred owner's tracking).
+                let map = if atomic {
+                    d.map_mut_atomic_store()
+                } else {
+                    &mut **d
+                };
+                // SAFETY: as above.
+                map.insert(DictKey(key), unsafe { std::ptr::read(value) });
+                let n = map.len().min(32) as u32;
+                let hint = &cls.inst_dict_hint;
+                if n > hint.load(std::sync::atomic::Ordering::Relaxed) {
+                    hint.store(n, std::sync::atomic::Ordering::Relaxed);
+                }
+                true
+            }
+        }
     }
 
     /// The core loop's fused `LOAD_FAST x; LOAD_ATTR name`: the attribute
@@ -15936,6 +16120,29 @@ impl Interpreter {
                         break;
                     }
                 }
+                OpCode::ContainsOp => {
+                    let n = stack.len();
+                    if n < 2 {
+                        break;
+                    }
+                    let Some(found) = Self::leaf_contains(&stack[n - 1], &stack[n - 2]) else {
+                        break;
+                    };
+                    let r = if ins.arg == 1 { !found } else { found };
+                    let container = stack.pop().expect("checked");
+                    let item = std::mem::replace(&mut stack[n - 2], Object::Bool(r));
+                    last = pc;
+                    pc += 1;
+                    let marked = gc_trace::note_dropped_marks(&item)
+                        | gc_trace::note_dropped_marks(&container);
+                    drop(item);
+                    drop(container);
+                    if marked {
+                        gc_trace::mark_maybe_dead();
+                        stop = LeafStop::Marked;
+                        break;
+                    }
+                }
                 OpCode::LoadDeref => {
                     let v = match cells.get(ins.arg as usize) {
                         Some(cell) => match cell.try_borrow() {
@@ -15989,6 +16196,82 @@ impl Interpreter {
     /// default attribute access whose `__bool__` (else `__len__`) is a
     /// registered leaf builtin, or neither is defined (always true).
     #[inline]
+    /// `item in container` for the leaf loops, when deciding it runs no
+    /// Python code: a list/tuple scan whose every comparison is identity,
+    /// a native-scalar pair, or an `object`-default pair
+    /// ([`crate::object::eq_is_identity`]), or a dict/set probe with a
+    /// plain scalar key whose bucket needs no Python `__eq__`. `None`
+    /// hands the instruction to the full handler (which restarts the scan:
+    /// nothing observable happened here).
+    fn leaf_contains(container: &Object, item: &Object) -> Option<bool> {
+        let member = Self::leaf_member_eq;
+        match container {
+            Object::List(l) => {
+                let items = l.try_borrow().ok()?;
+                for x in items.iter() {
+                    if member(x, item)? {
+                        return Some(true);
+                    }
+                }
+                Some(false)
+            }
+            Object::Tuple(t) => {
+                for x in t.iter() {
+                    if member(x, item)? {
+                        return Some(true);
+                    }
+                }
+                Some(false)
+            }
+            Object::Dict(_) | Object::Set(_) | Object::FrozenSet(_)
+                if matches!(item, Object::Str(_) | Object::Int(_) | Object::Bool(_) | Object::None) =>
+            {
+                let key = DictKey(item.clone());
+                let (found, deferred) = crate::object::with_key_eq_deferred(|| {
+                    crate::object::key_cmp_scope(|| match container {
+                        Object::Dict(d) => d.try_borrow().ok().map(|m| m.get(&key).is_some()),
+                        Object::Set(st) => st.try_borrow().ok().map(|m| m.contains(&key)),
+                        Object::FrozenSet(fs) => Some(fs.contains(&key)),
+                        _ => None,
+                    })
+                });
+                if deferred {
+                    return None;
+                }
+                found.ok().flatten()
+            }
+            _ => None,
+        }
+    }
+
+    /// `PyObject_RichCompareBool(x, item, Py_EQ)` when it runs no Python
+    /// code (identity, a native-scalar pair, or an `object`-default pair);
+    /// `None` when a Python `__eq__` could be involved.
+    #[inline]
+    fn leaf_member_eq(x: &Object, item: &Object) -> Option<bool> {
+        fn scalar(o: &Object) -> bool {
+            matches!(
+                o,
+                Object::None
+                    | Object::Bool(_)
+                    | Object::Int(_)
+                    | Object::Float(_)
+                    | Object::Str(_)
+                    | Object::Bytes(_)
+            )
+        }
+        if x.is_same(item) {
+            return Some(true);
+        }
+        if scalar(x) && scalar(item) {
+            return Some(x.eq_value(item));
+        }
+        if crate::object::eq_is_identity(x, item) {
+            return Some(false);
+        }
+        None
+    }
+
     fn leaf_instance_truth(&self, v: &Object) -> Option<bool> {
         let Object::Instance(inst) = v else {
             return None;
@@ -16112,6 +16395,7 @@ impl Interpreter {
                         ("insert", LeafKind::ListInsert),
                         ("reverse", LeafKind::ListReverse),
                         ("copy", LeafKind::ListCopy),
+                        ("remove", LeafKind::ListRemove),
                     ],
                 ),
                 (
@@ -16344,6 +16628,20 @@ impl Interpreter {
             }
             K::ListInsert => args.len() == 3 && matches!(args[0], O::List(_)) && leaf_int(&args[1]),
             K::ListReverse | K::ListCopy => args.len() == 1 && matches!(args[0], O::List(_)),
+            // Admitted when every comparison `list.remove` makes up to its
+            // match (or to the end: the ValueError) runs no Python code.
+            K::ListRemove => {
+                let [O::List(l), item] = args else {
+                    return None;
+                };
+                let items = l.try_borrow().ok()?;
+                for x in items.iter() {
+                    if Self::leaf_member_eq(x, item)? {
+                        break;
+                    }
+                }
+                true
+            }
             K::DictGet => {
                 if !((args.len() == 2 || args.len() == 3)
                     && matches!(args[0], O::Dict(_))
@@ -16532,28 +16830,53 @@ impl Interpreter {
             // site's own polymorphic entries first, then the class's cache
             // (which refills them on an instance-dict hit).
             (_, Object::Instance(inst)) => {
-                let poly = code_attr_poly(code, cache_pc);
-                let ver = inst.cls_raw().attr_version.get();
-                if let Some(v) = poly.and_then(|p| p.hit(code, inst, ver, name_idx)) {
-                    return Some(v);
-                }
-                match Self::leaf_resolve_instance_attr_ix(code, inst, name_idx)? {
-                    (LeafAttr::Value(v), ix) => {
-                        if let (Some(p), Some(ix)) = (poly, ix) {
-                            p.record(ver, ix);
-                        }
-                        Some(v)
-                    }
-                    (LeafAttr::Method(f), _) => Some(Object::BoundMethod(Rc::new(
-                        BoundMethod::new(receiver.clone(), Object::Function(f)),
-                    ))),
-                    (
-                        LeafAttr::InstanceOnly | LeafAttr::BuiltinMethod(_) | LeafAttr::Property(_),
-                        _,
-                    ) => None,
-                }
+                Self::leaf_attr_resolve_site(code, inst, receiver, cache_pc, name_idx)
             }
             _ => None,
+        }
+    }
+
+    /// The cache-free half of [`Self::leaf_load_attr_recv`]: the site's
+    /// own polymorphic entries, then the class cache. A site that has
+    /// never been specialized — every attribute site of a body only ever
+    /// run by [`Self::pure_leaf_eval`], which the full handler never sees
+    /// — takes the indexed shape from its first instance-dict hit, the
+    /// same one the specializer would install.
+    fn leaf_attr_resolve_site(
+        code: &CodeObject,
+        inst: &Rc<PyInstance>,
+        receiver: &Object,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Option<Object> {
+        use weavepy_compiler::InlineCache as IC;
+        let poly = code_attr_poly(code, cache_pc);
+        let ver = inst.cls_raw().attr_version.get();
+        // A never-specialized site resolves once and takes the indexed
+        // shape; the polymorphic entries serve it from the second class on.
+        let unspecialized = matches!(code.caches.get(cache_pc), IC::Empty);
+        if !unspecialized {
+            if let Some(v) = poly.and_then(|p| p.hit(code, inst, ver, name_idx)) {
+                return Some(v);
+            }
+        }
+        match Self::leaf_resolve_instance_attr_ix(code, inst, name_idx)? {
+            (LeafAttr::Value(v), ix) => {
+                if let Some(ix) = ix {
+                    if unspecialized {
+                        code.caches
+                            .set(cache_pc, IC::LoadAttrInstance { key_idx: ix, ver });
+                    } else if let Some(p) = poly {
+                        p.record(ver, ix);
+                    }
+                }
+                Some(v)
+            }
+            (LeafAttr::Method(f), _) => Some(Object::BoundMethod(Rc::new(BoundMethod::new(
+                receiver.clone(),
+                Object::Function(f),
+            )))),
+            (LeafAttr::InstanceOnly | LeafAttr::BuiltinMethod(_) | LeafAttr::Property(_), _) => None,
         }
     }
 
@@ -16964,11 +17287,25 @@ impl Interpreter {
                         }
                         // The same facts the specializer would establish:
                         // record them so the next store takes the cached arm.
+                        // An existing key takes the *indexed* shape, which
+                        // the core loop's own arm serves without a hash
+                        // probe (the specializer's choice, made here
+                        // because the site never reaches it).
                         if matches!(cache, IC::Empty) {
+                            let ver = cls.attr_version.get();
+                            let indexed = inst
+                                .dict
+                                .get()
+                                .and_then(|d| d.try_borrow().ok())
+                                .and_then(|d| {
+                                    use crate::specialize::DictDataExt;
+                                    d.index_of_key_str(name)
+                                });
                             code.caches.set(
                                 cache_pc,
-                                IC::StoreAttrNewKey {
-                                    ver: cls.attr_version.get(),
+                                match indexed {
+                                    Some(key_idx) => IC::StoreAttrInstance { key_idx, ver },
+                                    None => IC::StoreAttrNewKey { ver },
                                 },
                             );
                         }
@@ -16992,10 +17329,11 @@ impl Interpreter {
                         }
                         let mut d = dict.try_borrow_mut().ok()?;
                         let d = &mut *d;
+                        // As the core loop's arm: an in-place value store.
                         let d = if value_slot.is_gc_atomic() {
-                            d.map_mut_atomic_store()
+                            d.map_mut_unstamped()
                         } else {
-                            &mut **d
+                            d.map_mut_value_store()
                         };
                         let (_, slot) = d.get_index_mut(key_idx as usize)?;
                         let val = std::mem::replace(value_slot, Object::Unbound);
@@ -17032,7 +17370,19 @@ impl Interpreter {
                                 return None;
                             }
                             let val = std::mem::replace(value_slot, Object::Unbound);
-                            Some(std::mem::replace(slot, val))
+                            let old = std::mem::replace(slot, val);
+                            // The name is in the dict: the indexed shape
+                            // serves every later store from the core loop.
+                            if let Some(key_idx) = found {
+                                code.caches.set(
+                                    cache_pc,
+                                    IC::StoreAttrInstance {
+                                        key_idx: key_idx as u32,
+                                        ver: inst.cls_raw().attr_version.get(),
+                                    },
+                                );
+                            }
+                            Some(old)
                         } else {
                             let key = match code_name_obj(code, name_idx) {
                                 Some(k) => k.clone(),
@@ -30010,13 +30360,34 @@ impl Interpreter {
                 // *rich* `==` — a user `__eq__` (e.g. `datetime.date`
                 // values inside an enum's `_hashable_values_` list)
                 // must be dispatched, not just the native eq.
+                // CPython's `list_contains` walks the live list by index
+                // (a comparison may mutate it): one element handle at a
+                // time, the borrow released before each comparison.
                 Object::List(items) => {
-                    let snapshot: Vec<Object> = items.borrow().clone();
-                    self.seq_contains_rich(&snapshot, item, globals)?
+                    let mut i = 0usize;
+                    loop {
+                        let x = {
+                            let b = items.borrow();
+                            match b.get(i) {
+                                Some(x) => x.clone(),
+                                None => break false,
+                            }
+                        };
+                        if self.seq_member_eq(&x, item, globals)? {
+                            break true;
+                        }
+                        i += 1;
+                    }
                 }
                 Object::Tuple(items) => {
-                    let snapshot: Vec<Object> = items.to_vec();
-                    self.seq_contains_rich(&snapshot, item, globals)?
+                    let mut found = false;
+                    for x in items.iter() {
+                        if self.seq_member_eq(x, item, globals)? {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
                 }
                 // `x in <iterator/generator>`: CPython consumes the
                 // iterator, comparing each yielded value with `==`
@@ -30042,6 +30413,22 @@ impl Interpreter {
     /// native equality is used unless a user-defined `__eq__` could be
     /// involved (either side wraps an `Instance`), keeping the common
     /// primitive case cheap.
+    fn seq_member_eq(
+        &mut self,
+        x: &Object,
+        item: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<bool, RuntimeError> {
+        if x.is_same(item) {
+            return Ok(true);
+        }
+        // The identity check just decided an `object`-default pair.
+        if crate::object::eq_is_identity(x, item) {
+            return Ok(false);
+        }
+        self.seq_contains_rich(std::slice::from_ref(x), item, globals)
+    }
+
     fn seq_contains_rich(
         &mut self,
         items: &[Object],
@@ -35774,6 +36161,10 @@ impl Interpreter {
                             } else {
                                 None
                             };
+                            // Set when the store overwrote an existing key:
+                            // the site takes the indexed shape from here on
+                            // (the core loop's `STORE_ATTR` arm serves it).
+                            let mut upgrade_idx = false;
                             let old = {
                                 let mut dict = inst.dict.borrow_mut();
                                 let dict = &mut *dict;
@@ -35788,7 +36179,9 @@ impl Interpreter {
                                     None => dict.get_mut(&crate::object::StrKey(name.as_str())),
                                 };
                                 if let Some(slot) = slot {
-                                    Some(std::mem::replace(slot, val))
+                                    let old = std::mem::replace(slot, val);
+                                    upgrade_idx = true;
+                                    Some(old)
                                 } else {
                                     // Same interning contract as the slow
                                     // path (`generic_setattr_instance`),
@@ -35814,6 +36207,20 @@ impl Interpreter {
                                 );
                             }
                             specialize::record_hit(op_idx);
+                            if upgrade_idx {
+                                use crate::specialize::DictDataExt;
+                                let idx = inst
+                                    .dict
+                                    .borrow()
+                                    .index_of_key_str(name.as_str())
+                                    .map(|i| (i, inst.class.borrow().attr_version.get()));
+                                if let Some((key_idx, ver)) = idx {
+                                    frame
+                                        .code
+                                        .caches
+                                        .set(cache_pc, IC::StoreAttrInstance { key_idx, ver });
+                                }
+                            }
                             if let Some(old) = old {
                                 self.maybe_prompt_reap_replaced(old);
                             }
@@ -53092,6 +53499,7 @@ enum LeafKind {
     ListInsert,
     ListReverse,
     ListCopy,
+    ListRemove,
     DictGet,
     DictKeys,
     DictValues,
@@ -54014,6 +54422,7 @@ static SLOW_LEAF_OPS: [bool; 256] = {
     let mut t = [false; 256];
     let ops = [
         OpCode::BinaryOp,
+        OpCode::ContainsOp,
         OpCode::BinarySubscr,
         OpCode::BuildList,
         OpCode::BuildString,
