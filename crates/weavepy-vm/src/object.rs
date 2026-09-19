@@ -4558,6 +4558,28 @@ impl PyGenerator {
         }
     }
 
+    /// [`Self::new`] with the name objects already built (a function's
+    /// pinned `__name__`/`__qualname__`, shared rather than copied).
+    pub fn with_names(
+        name: Object,
+        qualname: Object,
+        kind: CoroutineKind,
+        code: Object,
+        frame: Box<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            name: RefCell::new(name),
+            qualname: RefCell::new(qualname),
+            kind,
+            code,
+            state: RefCell::new(GeneratorState::Created(frame)),
+            origin: RefCell::new(Object::None),
+            hooks_inited: crate::sync::Cell::new(false),
+            finalizer: RefCell::new(Object::None),
+            finalize_ran: crate::sync::Cell::new(false),
+        }
+    }
+
     pub fn is_finished(&self) -> bool {
         matches!(&*self.state.borrow(), GeneratorState::Finished)
     }

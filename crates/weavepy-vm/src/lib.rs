@@ -8734,11 +8734,18 @@ impl Interpreter {
                 ),
                 Some(top) => {
                     let top = &mut **top;
+                    // SAFETY: a generator activation's frame lives in its
+                    // `gen_box`, owned by the activation for its duration.
+                    let top_frame: &mut Frame = if top.gen.is_some() {
+                        unsafe { &mut *top.gen_frame }
+                    } else {
+                        &mut top.frame
+                    };
                     let mut top_shell = QuietShell::Lazy(&mut top.act);
                     let mut top_prev = None;
                     let mut top_last = usize::MAX;
                     self.quiet_frame(
-                        &mut top.frame,
+                        top_frame,
                         &mut top_shell,
                         snap_gen,
                         fin,
@@ -8759,13 +8766,37 @@ impl Interpreter {
                     let Some(mut done) = inl.pop() else {
                         return exit;
                     };
-                    let result = self.inline_finish(&mut done, exit);
-                    match inl.last_mut() {
-                        None => self.inline_deliver(frame, &mut shell, done, result),
-                        Some(caller) => {
-                            let caller = &mut **caller;
-                            let mut caller_shell = QuietShell::Lazy(&mut caller.act);
-                            self.inline_deliver(&mut caller.frame, &mut caller_shell, done, result)
+                    if done.gen.is_some() {
+                        let result = self.inline_gen_finish(&mut done, exit);
+                        match inl.last_mut() {
+                            None => self.inline_gen_deliver(frame, &mut shell, done, result),
+                            Some(caller) => {
+                                let caller = &mut **caller;
+                                // SAFETY: as above.
+                                let caller_frame: &mut Frame = if caller.gen.is_some() {
+                                    unsafe { &mut *caller.gen_frame }
+                                } else {
+                                    &mut caller.frame
+                                };
+                                let mut caller_shell = QuietShell::Lazy(&mut caller.act);
+                                self.inline_gen_deliver(caller_frame, &mut caller_shell, done, result)
+                            }
+                        }
+                    } else {
+                        let result = self.inline_finish(&mut done, exit);
+                        match inl.last_mut() {
+                            None => self.inline_deliver(frame, &mut shell, done, result),
+                            Some(caller) => {
+                                let caller = &mut **caller;
+                                // SAFETY: as above.
+                                let caller_frame: &mut Frame = if caller.gen.is_some() {
+                                    unsafe { &mut *caller.gen_frame }
+                                } else {
+                                    &mut caller.frame
+                                };
+                                let mut caller_shell = QuietShell::Lazy(&mut caller.act);
+                                self.inline_deliver(caller_frame, &mut caller_shell, done, result)
+                            }
                         }
                     }
                 }
@@ -8941,6 +8972,16 @@ impl Interpreter {
                             }
                         }
                         continue;
+                    }
+                }
+                // `for x in gen` over a suspended generator resumes it
+                // inline, like an inline call.
+                if op_before == Some(OpCode::ForIter)
+                    && matches!(frame.stack.last(), Some(Object::Generator(_)))
+                    && self.inline_calls_ok()
+                {
+                    if let Some(act) = self.try_inline_gen(frame, shell, cur_pc) {
+                        return FrameEv::Call(act);
                     }
                 }
                 // `inst.prop` for a plain `property`: its getter runs as a
@@ -9195,6 +9236,218 @@ impl Interpreter {
         }
     }
 
+    /// `FOR_ITER` over a suspended generator at `pc` of `frame`, as an
+    /// inline activation: the generator's boxed frame runs in place (the
+    /// `generator_send_lean` shape, without a nested native activation).
+    /// `None` leaves everything untouched.
+    fn try_inline_gen(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+    ) -> Option<Box<InlineAct>> {
+        let arg = frame.code.instructions.get(pc)?.arg;
+        let Some(Object::Generator(g)) = frame.stack.last() else {
+            return None;
+        };
+        let first_resume;
+        {
+            let state = g.state.try_borrow().ok()?;
+            let boxed = match &*state {
+                GeneratorState::Suspended(boxed) => {
+                    first_resume = false;
+                    boxed
+                }
+                GeneratorState::Created(boxed) => {
+                    first_resume = true;
+                    boxed
+                }
+                _ => return None,
+            };
+            let gf = boxed.downcast_ref::<Frame>()?;
+            if gf.py_frame.is_some()
+                || !gf.saved_exc_info.is_empty()
+                || gf.pc == 0
+                || !Self::lean_gen_code_ok(&gf.code)
+                || gf.shell_cache.as_ref().is_some_and(|c| {
+                    c.has_materialized
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                })
+            {
+                return None;
+            }
+        }
+        // Past the recursion limit the lean path raises.
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
+            return None;
+        };
+        // Committed.
+        let g = g.clone();
+        let prev_state = std::mem::replace(&mut *g.state.borrow_mut(), GeneratorState::Running);
+        let (GeneratorState::Suspended(mut boxed) | GeneratorState::Created(mut boxed)) =
+            prev_state
+        else {
+            unreachable!("checked above");
+        };
+        let gf = boxed
+            .downcast_mut::<Frame>()
+            .expect("checked by the downcast_ref above");
+        // A native activation parked at the yield is rebuilt into the
+        // interpreted suspension resumed here.
+        #[cfg(feature = "jit")]
+        crate::tier2::materialize_parked(gf);
+        gf.gen_first_resume = first_resume;
+        gf.push(Object::None);
+        let gen_frame: *mut Frame = gf;
+        frame.pc = pc as u32 + 1;
+        let mut act = self.inline_slot();
+        act.gen = Some(g);
+        act.gen_box = Some(boxed);
+        act.gen_frame = gen_frame;
+        act.exhaust_arg = arg;
+        act.act.frame = gen_frame;
+        act.act.shell = None;
+        act.call_pc = pc;
+        act.caller_pending = self.lean_pending_enter(frame, shell, pc);
+        act.exc_depth = self.exc_info_len();
+        act.guard = Some(guard);
+        Some(act)
+    }
+
+    /// Finish an inline generator resume that left the quiet loop with
+    /// `exit` (the `generator_send_lean` epilogue): a yield parks the
+    /// generator again, a return finishes it; anything else runs the
+    /// rest of the resume in the general loop first.
+    fn inline_gen_finish(
+        &mut self,
+        done: &mut InlineAct,
+        exit: QuietExit,
+    ) -> Result<GenStep, RuntimeError> {
+        let exc_depth = done.exc_depth;
+        // SAFETY: the frame lives in `done.gen_box`, still owned here.
+        let frame: &mut Frame = unsafe { &mut *done.gen_frame };
+        let outcome = match (exit, done.act.shell.take()) {
+            (
+                QuietExit::Outcome {
+                    stepped: Ok(StepOutcome::Yield(v)),
+                    ..
+                },
+                None,
+            ) => Ok(FrameOutcome::Yielded(v)),
+            (
+                QuietExit::Outcome {
+                    stepped: Ok(StepOutcome::Return(v)),
+                    ..
+                },
+                None,
+            ) => Ok(FrameOutcome::Returned(v)),
+            // Everything else finishes in the general loop (which saves a
+            // suspended generator's handler state, as the general
+            // prologue's twin epilogue does).
+            (exit, shell) => {
+                let shell = match shell {
+                    Some(shell) => shell,
+                    None => {
+                        self.flush_pending_callers();
+                        let shell = self.push_frame_shell(frame);
+                        if frame.shell_cache.is_none() {
+                            frame.shell_cache = Some(shell.clone());
+                        }
+                        shell
+                    }
+                };
+                let pending = match exit {
+                    QuietExit::Yield => None,
+                    QuietExit::Outcome { stepped, cur_pc } => Some((stepped, cur_pc)),
+                };
+                stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+                    self.run_activation(frame, shell, None, exc_depth, false, pending)
+                })
+            }
+        };
+        drop(done.guard.take());
+        let gen = done.gen.take().expect("a generator activation");
+        let mut boxed = done.gen_box.take().expect("a generator activation");
+        done.gen_frame = std::ptr::null_mut();
+        match outcome {
+            Ok(FrameOutcome::Yielded(v)) => {
+                Self::park_suspended_boxed(&gen, boxed);
+                Ok(GenStep::Yielded(v))
+            }
+            Ok(FrameOutcome::Returned(_)) => {
+                *gen.state.borrow_mut() = GeneratorState::Finished;
+                let frame = boxed
+                    .downcast_mut::<Frame>()
+                    .expect("a generator activation's frame");
+                self.reap_dead_frame(frame);
+                self.recycle_frame_allocs(frame);
+                Self::release_finished_gen(&gen);
+                Ok(GenStep::Exhausted)
+            }
+            Ok(FrameOutcome::StartGenerator) => {
+                *gen.state.borrow_mut() = GeneratorState::Finished;
+                Err(RuntimeError::Internal(
+                    "RETURN_GENERATOR in already-running generator".to_owned(),
+                ))
+            }
+            Err(err) => {
+                *gen.state.borrow_mut() = GeneratorState::Finished;
+                let escaped = self.pep479_escape(&gen, err);
+                let frame = boxed
+                    .downcast_mut::<Frame>()
+                    .expect("a generator activation's frame");
+                self.reap_dead_frame(frame);
+                self.recycle_frame_allocs(frame);
+                Self::release_finished_gen(&gen);
+                Err(escaped)
+            }
+        }
+    }
+
+    /// Hand a finished inline generator resume's result to the caller
+    /// `frame`'s `FOR_ITER` (`try_lean_for_iter`'s epilogue) and return
+    /// the slot to the pool. Returns how the caller resumes.
+    fn inline_gen_deliver(
+        &mut self,
+        frame: &mut Frame,
+        _shell: &mut QuietShell<'_>,
+        mut done: Box<InlineAct>,
+        result: Result<GenStep, RuntimeError>,
+    ) -> QuietEntry {
+        const POOL_CAP: usize = 64;
+        let call_pc = done.call_pc;
+        let arg = done.exhaust_arg;
+        self.lean_pending_exit(done.caller_pending);
+        // The slot never left its parked state (the generator's own frame
+        // ran); only the activation bookkeeping resets.
+        done.act.shell = None;
+        done.act.frame = std::ptr::from_mut::<Frame>(&mut done.frame);
+        done.caller_pending = None;
+        if self.inline_pool.len() < POOL_CAP {
+            self.inline_pool.push(done);
+        }
+        match result {
+            Ok(GenStep::Yielded(v)) => {
+                frame.stack.push(v);
+                QuietEntry::Returned { cur_pc: call_pc }
+            }
+            Ok(GenStep::Exhausted) => {
+                let it = frame.stack.pop();
+                frame.pc += arg;
+                frame.skip_end_for();
+                // The exhausted generator leaves the stack (a full handler
+                // takes the coarse mark for it).
+                drop(it);
+                gc_trace::mark_maybe_dead();
+                QuietEntry::Returned { cur_pc: call_pc }
+            }
+            Err(err) => QuietEntry::Raised {
+                err,
+                cur_pc: call_pc,
+            },
+        }
+    }
+
     /// Finish an inline activation that left the quiet loop with `exit`
     /// (the `run_frame_lean_impl` epilogue): a return is done; anything
     /// else runs the rest of the activation in the general loop.
@@ -9394,14 +9647,11 @@ impl Interpreter {
             // `run_frame_lean_impl` activation further up this thread's
             // native stack, suspended inside the lean call that leads
             // here; entries are removed before their activation returns.
-            // Its frame is only read, and nothing else touches either
-            // until that call returns.
+            // Nothing else touches it or its frame until that call
+            // returns.
             let caller = unsafe { &mut *(*addr as *mut LeanAct) };
             if caller.shell.is_none() {
-                // SAFETY: as above.
-                let caller_frame = unsafe { &*caller.frame };
-                let lasti = caller_frame.pc.saturating_sub(1);
-                caller.shell = Some(self.push_lean_shell(caller_frame, lasti));
+                caller.shell = Some(self.push_pending_caller_shell(caller));
             }
         }
         // Keep the (now empty) allocation.
@@ -9422,6 +9672,31 @@ impl Interpreter {
         } else {
             self.push_lean_shell(frame, frame.pc)
         });
+    }
+
+    /// The spine entry for a suspended lean caller (at its call, `pc`
+    /// already past it). A generator-family frame — a lean resume —
+    /// gets the shell the general prologue would give it: owned slots,
+    /// cached on the frame for the generator's remaining life (its pop
+    /// then drops the resumer link, as for any generator frame).
+    fn push_pending_caller_shell(&self, caller: &mut LeanAct) -> Rc<crate::object::FrameShell> {
+        // SAFETY: the caller is suspended in the call that leads here (see
+        // `flush_lean_cold`); nothing else touches its frame meanwhile.
+        let caller_frame = unsafe { &mut *caller.frame };
+        let lasti = caller_frame.pc.saturating_sub(1);
+        let code = &caller_frame.code;
+        if code.is_generator || code.is_coroutine || code.is_async_generator {
+            let shell = self.push_frame_shell(caller_frame);
+            shell
+                .lasti
+                .store(lasti, std::sync::atomic::Ordering::Relaxed);
+            if caller_frame.shell_cache.is_none() {
+                caller_frame.shell_cache = Some(shell.clone());
+            }
+            shell
+        } else {
+            self.push_lean_shell(caller_frame, lasti)
+        }
     }
 
     /// [`Self::push_frame_shell`] for a lean activation: an ordinary
@@ -10443,10 +10718,7 @@ impl Interpreter {
             // SAFETY: see `flush_lean_cold`.
             let caller = unsafe { &mut *(*addr as *mut LeanAct) };
             if caller.shell.is_none() {
-                // SAFETY: as above.
-                let caller_frame = unsafe { &*caller.frame };
-                let lasti = caller_frame.pc.saturating_sub(1);
-                caller.shell = Some(self.push_lean_shell(caller_frame, lasti));
+                caller.shell = Some(self.push_pending_caller_shell(caller));
             }
         }
         pending.clear();
@@ -19044,21 +19316,20 @@ impl Interpreter {
                         // The code object backing the generator.
                         "code" => return Ok(self.gen_code_object(g)),
                         // Currently executing (illegal to re-enter)?
-                        // CPython exposes these as 0/1 ints.
                         "running" => {
-                            return Ok(Object::Int(i64::from(matches!(
+                            return Ok(Object::Bool(matches!(
                                 &*g.state.borrow(),
                                 GeneratorState::Running
-                            ))))
+                            )))
                         }
                         // The (stable) Python-visible frame, or None once
                         // the generator has finished.
                         "frame" => return Ok(self.gen_py_frame(g)),
                         "suspended" => {
-                            return Ok(Object::Int(i64::from(matches!(
+                            return Ok(Object::Bool(matches!(
                                 &*g.state.borrow(),
                                 GeneratorState::Suspended(_)
-                            ))))
+                            )))
                         }
                         // The sub-iterator a `yield from` / `await` is
                         // currently delegating to (CPython `gi_yieldfrom`:
@@ -19804,10 +20075,32 @@ impl Interpreter {
                 "f_lasti" => Ok(Object::Int(i64::from(
                     fr.code.cpython_lasti(fr.lasti.get()),
                 ))),
-                "f_back" => match fr.back.borrow().as_ref() {
-                    Some(parent) => Ok(Object::Frame(parent.clone())),
-                    None => Ok(Object::None),
-                },
+                "f_back" => {
+                    // A generator-family frame drops its resumer link when
+                    // it suspends (see `pop_frame_shell`); a later resume
+                    // re-derives it here, from the live spine.
+                    if fr.back.borrow().is_none()
+                        && fr.on_stack.get() > 0
+                        && (fr.code.is_generator
+                            || fr.code.is_coroutine
+                            || fr.code.is_async_generator)
+                    {
+                        let idx = self.frame_stack.borrow().iter().rposition(|shell| {
+                            shell
+                                .materialized
+                                .borrow()
+                                .as_ref()
+                                .is_some_and(|py| Rc::ptr_eq(py, fr))
+                        });
+                        if let Some(idx) = idx {
+                            crate::object::materialize_stack_at(&self.frame_stack, idx);
+                        }
+                    }
+                    match fr.back.borrow().as_ref() {
+                        Some(parent) => Ok(Object::Frame(parent.clone())),
+                        None => Ok(Object::None),
+                    }
+                }
                 "f_trace" => Ok(fr.trace.borrow().clone()),
                 "f_trace_lines" => Ok(Object::Bool(fr.trace_lines.get())),
                 "f_trace_opcodes" => Ok(Object::Bool(fr.trace_opcodes.get())),
@@ -29105,6 +29398,11 @@ impl Interpreter {
     /// `finally` blocks run; we mirror that by routing through
     /// `generator_throw` and absorbing the resulting StopIteration.
     fn gen_method_close(&mut self, receiver: &Object) -> Result<Object, RuntimeError> {
+        if let Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) = receiver {
+            if self.gen_close_quiet(g) {
+                return Ok(Object::None);
+            }
+        }
         // Snapshot reapable locals/stack before the frame is torn down:
         // CPython's refcounting runs their `__del__` (and clears their
         // weakrefs) the moment `close()` drops the frame (gh-142766),
@@ -29120,6 +29418,67 @@ impl Interpreter {
             self.prompt_reap_dropped(cap);
         }
         result
+    }
+
+    /// CPython `gen_close`'s fast paths: a never-started generator, or
+    /// one suspended at a yield whose only active handler is the
+    /// implicit PEP 479 wrap (the `RESUME` after it carries the depth-1
+    /// flag) and not delegating, has no cleanup to run — it finishes
+    /// without a `GeneratorExit` (and, like CPython's, without unwind
+    /// events while no tool observes them). Returns whether it did.
+    fn gen_close_quiet(&mut self, g: &Rc<PyGenerator>) -> bool {
+        const RESUME_DEPTH1_MASK: u32 = 4;
+        let Ok(mut state) = g.state.try_borrow_mut() else {
+            return false;
+        };
+        let (created, boxed) = match &mut *state {
+            GeneratorState::Created(boxed) => (true, boxed),
+            GeneratorState::Suspended(boxed) => (false, boxed),
+            GeneratorState::Finished | GeneratorState::Running => return false,
+        };
+        if !created && crate::trace::any_observers_active() {
+            return false;
+        }
+        let Some(frame) = boxed.downcast_mut::<Frame>() else {
+            return false;
+        };
+        // A Python-visible frame keeps showing the locals (the general
+        // path leaves them to it).
+        if frame.py_frame.is_some()
+            || frame.shell_cache.as_ref().is_some_and(|c| {
+                c.has_materialized
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+        {
+            return false;
+        }
+        if !created {
+            // A parked native activation's pc/stack are stale until
+            // written back.
+            #[cfg(feature = "jit")]
+            crate::tier2::materialize_parked(frame);
+            let depth1 = frame
+                .code
+                .instructions
+                .get(frame.pc as usize)
+                .is_some_and(|i| i.op == OpCode::Resume && i.arg & RESUME_DEPTH1_MASK != 0);
+            if !depth1 || detect_yield_from_subiter(frame).is_some() {
+                return false;
+            }
+        }
+        let prev = std::mem::replace(&mut *state, GeneratorState::Finished);
+        drop(state);
+        let (GeneratorState::Created(mut boxed) | GeneratorState::Suspended(mut boxed)) = prev
+        else {
+            unreachable!("checked above");
+        };
+        if let Some(frame) = boxed.downcast_mut::<Frame>() {
+            self.reap_dead_frame(frame);
+            self.recycle_frame_allocs(frame);
+        }
+        Self::release_finished_gen(g);
+        drop(boxed);
+        true
     }
 
     fn gen_method_close_inner(&mut self, receiver: &Object) -> Result<Object, RuntimeError> {
@@ -29504,10 +29863,21 @@ impl Interpreter {
         {
             return None;
         }
+        // A never-started generator runs its first activation here too
+        // (only a `None` may be sent into it; the general path raises).
+        let first_resume;
         {
             let state = gen.state.try_borrow().ok()?;
-            let GeneratorState::Suspended(boxed) = &*state else {
-                return None;
+            let boxed = match &*state {
+                GeneratorState::Suspended(boxed) => {
+                    first_resume = false;
+                    boxed
+                }
+                GeneratorState::Created(boxed) if matches!(sent, Object::None) => {
+                    first_resume = true;
+                    boxed
+                }
+                _ => return None,
             };
             let frame = boxed.downcast_ref::<Frame>()?;
             if frame.py_frame.is_some()
@@ -29534,7 +29904,9 @@ impl Interpreter {
             }
         };
         let prev_state = std::mem::replace(&mut *gen.state.borrow_mut(), GeneratorState::Running);
-        let GeneratorState::Suspended(mut boxed) = prev_state else {
+        let (GeneratorState::Suspended(mut boxed) | GeneratorState::Created(mut boxed)) =
+            prev_state
+        else {
             unreachable!("checked above");
         };
         let outcome = {
@@ -29546,7 +29918,7 @@ impl Interpreter {
             // interpreted suspension this path resumes.
             #[cfg(feature = "jit")]
             crate::tier2::materialize_parked(frame);
-            frame.gen_first_resume = false;
+            frame.gen_first_resume = first_resume;
             frame.push(sent.clone());
             let exc_depth_on_entry = self.exc_info_len();
             let fin_live = gc_trace::has_any_finalizable();
@@ -29628,6 +30000,7 @@ impl Interpreter {
                     .expect("checked by the downcast_ref above");
                 self.reap_dead_frame(frame);
                 self.recycle_frame_allocs(frame);
+                Self::release_finished_gen(gen);
                 Err(stop_iteration_with(v))
             }
             Ok(FrameOutcome::StartGenerator) => {
@@ -29644,9 +30017,28 @@ impl Interpreter {
                     .expect("checked by the downcast_ref above");
                 self.reap_dead_frame(frame);
                 self.recycle_frame_allocs(frame);
+                Self::release_finished_gen(gen);
                 Err(escaped)
             }
         })
+    }
+
+    /// A generator that just finished holds no frame, so it can neither
+    /// take part in a cycle nor need finalizing: the collector lets go
+    /// of it now, and its last program reference frees it outright
+    /// instead of through the prompt-finalization probe (whose cascade
+    /// rescans the tracked index). An async generator keeps its
+    /// finalizer hook (which may close a cycle) and a weakref-watched
+    /// one its prompt callback path.
+    fn release_finished_gen(gen: &Rc<PyGenerator>) {
+        if gen.kind == crate::object::CoroutineKind::AsyncGenerator {
+            return;
+        }
+        let id = Rc::as_ptr(gen) as usize as u64;
+        if !gc_trace::maybe_tracked(id) || crate::weakref_registry::count_for(id) > 0 {
+            return;
+        }
+        gc_trace::untrack_id(id);
     }
 
     fn park_suspended_boxed(gen: &Rc<PyGenerator>, boxed: Box<dyn std::any::Any + Send + Sync>) {
@@ -29768,6 +30160,7 @@ impl Interpreter {
                 // RFC 0059 WS4: the exhausted frame's storage is dead —
                 // donate it back to the frame pools.
                 self.recycle_frame_allocs(frame);
+                Self::release_finished_gen(gen);
                 Err(stop_iteration_with(v))
             }
             Ok(FrameOutcome::StartGenerator) => {
@@ -29784,6 +30177,7 @@ impl Interpreter {
                     .expect("checked by the downcast_ref above");
                 self.reap_dead_frame(frame);
                 self.recycle_frame_allocs(frame);
+                Self::release_finished_gen(gen);
                 Err(escaped)
             }
         }
@@ -41906,10 +42300,23 @@ impl Interpreter {
             } else {
                 None
             };
-            // Run the bootstrap so the frame is past
-            // `RETURN_GENERATOR; POP_TOP; RESUME`. We then wrap the
-            // frame in a PyGenerator and hand it back to the caller.
-            match self.run_until_yield_or_return(&mut frame, None)? {
+            // Run the bootstrap so the frame is past `RETURN_GENERATOR`.
+            // We then wrap the frame in a PyGenerator and hand it back to
+            // the caller. A prologue-free body's bootstrap is that one
+            // instruction at pc 0: it runs no user code and nothing
+            // observes it (tracers and monitoring skip the bootstrap; an
+            // eval-frame probe records it), so the frame just steps past.
+            let bootstrap = if frame.code.instructions.first().map(|i| i.op)
+                == Some(OpCode::ReturnGenerator)
+                && !crate::trace::eval_frame_record_active()
+                && !crate::trace::any_observers_active()
+            {
+                frame.pc = 1;
+                FrameOutcome::StartGenerator
+            } else {
+                self.run_until_yield_or_return(&mut frame, None)?
+            };
+            match bootstrap {
                 FrameOutcome::StartGenerator => {
                     let kind = if code.is_coroutine {
                         crate::object::CoroutineKind::Coroutine
@@ -41922,17 +42329,23 @@ impl Interpreter {
                     // `__name__`/`__qualname__` (which user code may have
                     // reassigned; overrides live in `f.slots`) into
                     // `gi_name`/`gi_qualname` at call time.
-                    let attr_str = |attr: &'static str| -> Option<String> {
-                        match f.slot(attr) {
-                            Some(Object::Str(s)) => Some(s.to_string()),
+                    // The pinned slot objects are shared, as CPython's
+                    // `gi_name` shares the function's `__name__`.
+                    let (gen_name, gen_qualname) = {
+                        let slots = f.slots.borrow();
+                        let attr_str = |attr: &'static str| match slots.get(&crate::object::StrKey(attr)) {
+                            Some(o @ Object::Str(_)) => Some(o.clone()),
                             _ => None,
-                        }
+                        };
+                        (
+                            attr_str("__name__")
+                                .unwrap_or_else(|| Object::from_str(f.name.clone())),
+                            attr_str("__qualname__")
+                                .unwrap_or_else(|| Object::from_str(code.qualname.clone())),
+                        )
                     };
-                    let gen_name = attr_str("__name__").unwrap_or_else(|| f.name.clone());
-                    let gen_qualname =
-                        attr_str("__qualname__").unwrap_or_else(|| code.qualname.clone());
                     let gen_code = Object::Code(frame.code.clone());
-                    let gen = Rc::new(PyGenerator::new(
+                    let gen = Rc::new(PyGenerator::with_names(
                         gen_name,
                         gen_qualname,
                         kind,
@@ -49825,6 +50238,14 @@ struct InlineAct {
     /// The finished activation never left the quiet loop's leaf paths
     /// (see `Interpreter::inline_finish`).
     clean: bool,
+    /// A generator resumed inline (see `Interpreter::try_inline_gen`):
+    /// its own boxed frame runs instead of the slot's (which stays
+    /// parked); `gen_frame` points into `gen_box`.
+    gen: Option<Rc<PyGenerator>>,
+    gen_box: Option<Box<dyn std::any::Any + Send + Sync>>,
+    gen_frame: *mut Frame,
+    /// The resuming `FOR_ITER`'s jump distance (the exhaustion exit).
+    exhaust_arg: u32,
 }
 
 impl InlineAct {
@@ -49867,6 +50288,10 @@ impl InlineAct {
             guard: None,
             parked: true,
             clean: false,
+            gen: None,
+            gen_box: None,
+            gen_frame: std::ptr::null_mut(),
+            exhaust_arg: 0,
         });
         act.act.frame = std::ptr::from_mut::<Frame>(&mut act.frame);
         // SAFETY: parked slots hold a stale code copy (see the type docs):
@@ -49917,6 +50342,14 @@ enum FrameEv {
     Call(Box<InlineAct>),
     /// The activation left the quiet loop.
     Exit(QuietExit),
+}
+
+/// How an inline generator resume concluded.
+enum GenStep {
+    /// The generator yielded this value.
+    Yielded(Object),
+    /// The generator returned: the loop is exhausted.
+    Exhausted,
 }
 
 /// Where an activation's stretch of the quiet loop starts.
@@ -54685,8 +55118,21 @@ fn code_name_leaf_probe(
 /// [`crate::object::StrKeyHashed`]).
 #[inline]
 fn code_name_key(code: &CodeObject, name_idx: u32) -> Option<crate::object::StrKeyHashed<'_>> {
-    let s = code.names.get(name_idx as usize)?.as_str();
-    let hash = match code_vm_ext(code).and_then(|t| t.name_hashes.get(name_idx as usize)) {
+    let Some(t) = code_vm_ext(code) else {
+        let s = code.names.get(name_idx as usize)?.as_str();
+        return Some(crate::object::StrKeyHashed {
+            s,
+            hash: crate::object::py_str_hash(s),
+        });
+    };
+    // The interned name's own bytes: instance-dict keys are interned on
+    // insert, so a probe hit settles on pointer identity (the probes
+    // compare byte pointers before contents).
+    let s: &str = match t.name_objs.get(name_idx as usize) {
+        Some(Object::Str(n)) => n,
+        _ => code.names.get(name_idx as usize)?.as_str(),
+    };
+    let hash = match t.name_hashes.get(name_idx as usize) {
         Some(h) => *h,
         None => crate::object::py_str_hash(s),
     };

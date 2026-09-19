@@ -3221,6 +3221,11 @@ pub fn untrack(obj: &Object) {
     with_state(|s| s.untrack_id(id));
 }
 
+/// [`untrack`] by identity.
+pub fn untrack_id(id: ObjectId) {
+    with_state(|s| s.untrack_id(id));
+}
+
 /// Reinitialise the process-global cycle collector's locks in a `fork(2)`
 /// child. See [`GcState::reinit_after_fork_in_child`].
 ///
