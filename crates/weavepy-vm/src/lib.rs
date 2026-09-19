@@ -13821,18 +13821,29 @@ impl Interpreter {
                 let (k, v) = dict.get_index(key_idx as usize)?;
                 slot_name_matches(code, name_idx, k).then(|| Self::clone_operand(v))
             }
-            // No usable site cache (a polymorphic site, typically): resolve
-            // through the class's own cache instead.
+            // No usable site cache (a polymorphic site, typically): the
+            // site's own polymorphic entries first, then the class's cache
+            // (which refills them on an instance-dict hit).
             (_, Object::Instance(inst)) => {
-                match Self::leaf_resolve_instance_attr(code, inst, name_idx)? {
-                    LeafAttr::Value(v) => Some(v),
-                    LeafAttr::Method(f) => Some(Object::BoundMethod(Rc::new(BoundMethod::new(
-                        receiver.clone(),
-                        Object::Function(f),
-                    )))),
-                    LeafAttr::InstanceOnly | LeafAttr::BuiltinMethod(_) | LeafAttr::Property(_) => {
-                        None
+                let poly = code_attr_poly(code, cache_pc);
+                let ver = inst.cls_raw().attr_version.get();
+                if let Some(v) = poly.and_then(|p| p.hit(code, inst, ver, name_idx)) {
+                    return Some(v);
+                }
+                match Self::leaf_resolve_instance_attr_ix(code, inst, name_idx)? {
+                    (LeafAttr::Value(v), ix) => {
+                        if let (Some(p), Some(ix)) = (poly, ix) {
+                            p.record(ver, ix);
+                        }
+                        Some(v)
                     }
+                    (LeafAttr::Method(f), _) => Some(Object::BoundMethod(Rc::new(
+                        BoundMethod::new(receiver.clone(), Object::Function(f)),
+                    ))),
+                    (
+                        LeafAttr::InstanceOnly | LeafAttr::BuiltinMethod(_) | LeafAttr::Property(_),
+                        _,
+                    ) => None,
                 }
             }
             _ => None,
@@ -13852,6 +13863,17 @@ impl Interpreter {
         inst: &PyInstance,
         name_idx: u32,
     ) -> Option<LeafAttr> {
+        Self::leaf_resolve_instance_attr_ix(code, inst, name_idx).map(|(a, _)| a)
+    }
+
+    /// [`Self::leaf_resolve_instance_attr`], plus the instance-dict index
+    /// of a value found there (for the site's polymorphic entries).
+    #[inline]
+    fn leaf_resolve_instance_attr_ix(
+        code: &CodeObject,
+        inst: &PyInstance,
+        name_idx: u32,
+    ) -> Option<(LeafAttr, Option<u32>)> {
         let cls = inst.cls_raw();
         if !Self::default_getattribute(cls) {
             return None;
@@ -13859,21 +13881,24 @@ impl Interpreter {
         let on_class = match Self::leaf_class_attr(code, &cls, name_idx)? {
             LeafAttr::InstanceOnly => None,
             // A data descriptor: the instance dict never shadows it.
-            prop @ LeafAttr::Property(_) => return Some(prop),
+            prop @ LeafAttr::Property(_) => return Some((prop, None)),
             other => Some(other),
         };
         if let Some(dict) = inst.dict.get() {
             let probe = code_name_leaf_probe(code, name_idx)?;
             let d = dict.try_borrow().ok()?;
-            if let Some(v) = d.get(&probe) {
-                return Some(LeafAttr::Value(Self::clone_operand(v)));
+            if let Some((ix, _, v)) = d.get_full(&probe) {
+                return Some((
+                    LeafAttr::Value(Self::clone_operand(v)),
+                    u32::try_from(ix).ok(),
+                ));
             }
             // A key only a user `__eq__` could compare: the full path.
             if probe.saw_exotic() {
                 return None;
             }
         }
-        on_class
+        on_class.map(|a| (a, None))
     }
 
     /// How `cls` resolves `co_names[name_idx]` on its MRO, from the
@@ -54999,6 +55024,65 @@ struct CodeConstObjects {
     /// [`StampSlot`]); allocated on the first global hit in this code
     /// object, one slot per instruction.
     stamp_slots: std::sync::OnceLock<Box<[StampSlot]>>,
+    /// Polymorphic instance-attribute entries per `LOAD_ATTR` site (see
+    /// [`AttrPoly`]); allocated on the first polymorphic resolution in
+    /// this code object, one slot per instruction.
+    attr_poly: std::sync::OnceLock<Box<[AttrPoly]>>,
+}
+
+/// A `LOAD_ATTR` site's polymorphic instance-attribute cache: up to two
+/// `(class attr_version, instance-dict index)` pairs. Versions are
+/// process-unique and never reused, so a match names exactly one class
+/// in one state — the state in which the class cache resolved the name
+/// to the instance dict (no data descriptor, default
+/// `__getattribute__`); the index is a hint the name check validates.
+struct AttrPoly(std::cell::UnsafeCell<[(u64, u32); 2]>);
+
+// SAFETY: read and written only from the dispatch loop with the GIL held
+// (the `MethodSlot` invariant).
+unsafe impl Send for AttrPoly {}
+unsafe impl Sync for AttrPoly {}
+
+impl AttrPoly {
+    const fn empty() -> Self {
+        Self(std::cell::UnsafeCell::new([(0, 0); 2]))
+    }
+
+    /// The instance-dict value an entry for `ver` points at, when its
+    /// index still holds the name.
+    #[inline]
+    fn hit(&self, code: &CodeObject, inst: &PyInstance, ver: u64, name_idx: u32) -> Option<Object> {
+        // SAFETY: see the type docs.
+        let entries = unsafe { &*self.0.get() };
+        let &(_, ix) = entries.iter().find(|e| e.0 == ver && ver != 0)?;
+        let dict = inst.dict.get()?;
+        // SAFETY: a read between two instructions (see `GilCell::peek`).
+        let d = unsafe { dict.peek() }?;
+        let (k, v) = d.get_index(ix as usize)?;
+        slot_name_matches(code, name_idx, k).then(|| Interpreter::clone_operand(v))
+    }
+
+    /// Remember `ver` → `ix` (the older of two full entries yields).
+    #[inline]
+    fn record(&self, ver: u64, ix: u32) {
+        // SAFETY: see the type docs.
+        let entries = unsafe { &mut *self.0.get() };
+        if let Some(e) = entries.iter_mut().find(|e| e.0 == ver || e.0 == 0) {
+            *e = (ver, ix);
+        } else {
+            entries[0] = entries[1];
+            entries[1] = (ver, ix);
+        }
+    }
+}
+
+/// The polymorphic attribute entries of the `LOAD_ATTR` at `cache_pc`.
+#[inline]
+fn code_attr_poly(code: &CodeObject, cache_pc: u32) -> Option<&AttrPoly> {
+    let ext = code_vm_ext(code)?;
+    ext.attr_poly
+        .get_or_init(|| (0..code.instructions.len()).map(|_| AttrPoly::empty()).collect())
+        .get(cache_pc as usize)
 }
 
 /// The state a `LOAD_GLOBAL` site last proved its cached slot against:
@@ -55181,6 +55265,7 @@ fn code_vm_ext(code: &CodeObject) -> Option<&CodeConstObjects> {
                 .collect(),
             method_slots: std::sync::OnceLock::new(),
             stamp_slots: std::sync::OnceLock::new(),
+            attr_poly: std::sync::OnceLock::new(),
         })
     });
     // RFC 0077 (WS5): the slot has exactly one producer (the initializer
