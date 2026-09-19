@@ -7307,14 +7307,7 @@ impl Interpreter {
     /// object clone in the JIT, builtins, and collection implementations.
     #[inline(always)]
     fn clone_operand(value: &Object) -> Object {
-        match value {
-            Object::None => Object::None,
-            Object::Unbound => Object::Unbound,
-            Object::Bool(value) => Object::Bool(*value),
-            Object::Int(value) => Object::Int(*value),
-            Object::Float(value) => Object::Float(*value),
-            other => other.clone(),
-        }
+        clone_hot(value)
     }
 
     /// Error for reading/deleting an empty cell. Cellvars are still
@@ -9715,7 +9708,7 @@ impl Interpreter {
             _ => false,
         };
         if alive_elsewhere {
-            drop(callable);
+            drop_hot(callable);
         } else if Self::looks_reapable_temporary(&callable) {
             self.flush_lean(frame, shell);
             self.prompt_reap_dropped(callable);
@@ -11131,8 +11124,11 @@ impl Interpreter {
             )
         }
         'reload: loop {
-        if let Some(exit) = sw.pending.take() {
-            return exit;
+        // (A discriminant test first: `take` would copy the whole exit.)
+        if sw.pending.is_some() {
+            if let Some(exit) = sw.pending.take() {
+                return exit;
+            }
         }
         // SAFETY: see `CoreSwitch` (the running activation's handles; the
         // borrows below end at the next reload).
@@ -11198,6 +11194,39 @@ impl Interpreter {
                                     && pc + 1 < ninstrs
                                 {
                                     let next = *instrs.add(pc + 1);
+                                    // `x.m(...)` of a pure leaf method with
+                                    // simple arguments: its result,
+                                    // evaluated on the borrowed operands.
+                                    if next.op == OpCode::LoadMethodAttr
+                                        && len < cap
+                                        && simple_args_prefix(&code.instructions, pc + 2)
+                                    {
+                                        let pure_site = match (other, mslots.get(pc + 1)) {
+                                            (Object::Instance(i), Some(ms)) => ms
+                                                .peek_fn(i.cls_raw().attr_version.get())
+                                                .is_some_and(|fp| fn_is_pure_leaf(&*fp)),
+                                            _ => false,
+                                        };
+                                        if pure_site {
+                                            if let Some((v, call_pc)) = self.core_pure_method(
+                                                code,
+                                                other,
+                                                pc + 1,
+                                                next.arg,
+                                                mslots,
+                                                lbase,
+                                                nlocals,
+                                                consts,
+                                                sw.depth_cell,
+                                            ) {
+                                                base.add(len).write(v);
+                                                len += 1;
+                                                last = call_pc;
+                                                pc = call_pc + 1;
+                                                continue;
+                                            }
+                                        }
+                                    }
                                     if next.op == OpCode::LoadAttr {
                                         if let Some(v) =
                                             Self::core_local_attr(code, other, pc + 1, next.arg)
@@ -11210,7 +11239,7 @@ impl Interpreter {
                                         }
                                     }
                                 }
-                                other.clone()
+                                clone_hot(other)
                             }
                         };
                         base.add(len).write(c);
@@ -11346,7 +11375,7 @@ impl Interpreter {
                     }
                     len -= 1;
                     // SAFETY: the slot is initialized and leaves the stack.
-                    unsafe { drop(base.add(len).read()) };
+                    unsafe { drop_hot(base.add(len).read()) };
                     last = pc;
                     pc += 1;
                 }
@@ -11366,8 +11395,8 @@ impl Interpreter {
                     // SAFETY: both operands leave the stack (checked
                     // droppable above); the result takes the lower slot.
                     unsafe {
-                        drop(base.add(len - 1).read());
-                        drop(base.add(len - 2).read());
+                        drop_hot(base.add(len - 1).read());
+                        drop_hot(base.add(len - 2).read());
                         base.add(len - 2).write(Object::Bool(r));
                     }
                     len -= 1;
@@ -11421,7 +11450,7 @@ impl Interpreter {
                     let is_none = matches!(v, Object::None);
                     len -= 1;
                     // SAFETY: the operand leaves the stack (droppable).
-                    unsafe { drop(base.add(len).read()) };
+                    unsafe { drop_hot(base.add(len).read()) };
                     last = pc;
                     pc += 1;
                     if is_none == (ins.op == OpCode::PopJumpIfNone) {
@@ -11743,6 +11772,32 @@ impl Interpreter {
                         Object::Type(ty) if !ty.flags.is_builtin => 2,
                         _ => 0,
                     };
+                    // A pure leaf callee: evaluated in place, no
+                    // activation (see `core_pure_call`).
+                    if python == 1 && argc < 8 {
+                        // SAFETY: `len >= argc + 2`: the call's operands.
+                        let ops = unsafe {
+                            std::slice::from_raw_parts(base.add(len - argc - 2), argc + 2)
+                        };
+                        if matches!(&ops[0], Object::Function(f) if fn_is_pure_leaf(f)) {
+                            if let Some(r) = self.core_pure_call(code, pc, ops, sw.depth_cell) {
+                                let start = len - argc - 2;
+                                // SAFETY: every operand was checked to leave
+                                // by a plain decrement; the result takes the
+                                // callee's slot.
+                                unsafe {
+                                    for k in start..len {
+                                        drop_hot(base.add(k).read());
+                                    }
+                                    base.add(start).write(r);
+                                }
+                                len = start + 1;
+                                last = pc;
+                                pc += 1;
+                                continue;
+                            }
+                        }
+                    }
                     if python != 0 {
                         // SAFETY: as above.
                         unsafe { frame.stack.set_len(len) };
@@ -11800,8 +11855,8 @@ impl Interpreter {
                             // (count above one) leave by plain decrements;
                             // the result takes the callee's slot.
                             unsafe {
-                                drop(base.add(len - 1).read());
-                                drop(base.add(len - 2).read());
+                                drop_hot(base.add(len - 1).read());
+                                drop_hot(base.add(len - 2).read());
                                 base.add(len - 2).write(result);
                             }
                             len -= 1;
@@ -11889,6 +11944,71 @@ impl Interpreter {
                         Object::Float(x) => Object::Float(*x),
                         Object::Bool(x) => Object::Bool(*x),
                         Object::None => Object::None,
+                        // `f(...)` of a pure leaf global function with
+                        // simple arguments (see `core_pure_global_call`).
+                        Object::Function(f)
+                            if pc + 1 < ninstrs
+                                // SAFETY: `pc + 1 < ninstrs`.
+                                && unsafe { (*instrs.add(pc + 1)).op } == OpCode::PushNull
+                                && simple_args_prefix(&code.instructions, pc + 2)
+                                && fn_is_pure_leaf(f) =>
+                        {
+                            match self.core_pure_global_call(
+                                code,
+                                Rc::as_ptr(f),
+                                pc + 2,
+                                lbase,
+                                nlocals,
+                                consts,
+                                sw.depth_cell,
+                            ) {
+                                Some((r, call_pc)) => {
+                                    // SAFETY: `len < cap`.
+                                    unsafe { base.add(len).write(r) };
+                                    len += 1;
+                                    last = call_pc;
+                                    pc = call_pc + 1;
+                                    continue;
+                                }
+                                None => Object::Function(f.clone()),
+                            }
+                        }
+                        // `C.m(...)` of a class's pure leaf plain or static
+                        // function, called unbound.
+                        Object::Type(cls)
+                            if pc + 1 < ninstrs
+                                // SAFETY: `pc + 1 < ninstrs`.
+                                && unsafe { (*instrs.add(pc + 1)).op } == OpCode::LoadMethodAttr
+                                && simple_args_prefix(&code.instructions, pc + 2)
+                                && mslots
+                                    .get(pc + 1)
+                                    .and_then(|ms| ms.peek_unbound(cls.attr_version.get()))
+                                    .is_some_and(|fp| fn_is_pure_leaf(unsafe { &*fp })) =>
+                        {
+                            let fp = mslots
+                                .get(pc + 1)
+                                .and_then(|ms| ms.peek_unbound(cls.attr_version.get()))
+                                .expect("checked by the guard");
+                            match self.core_pure_global_call(
+                                code,
+                                fp,
+                                pc + 2,
+                                lbase,
+                                nlocals,
+                                consts,
+                                sw.depth_cell,
+                            ) {
+                                Some((r, call_pc)) => {
+                                    // SAFETY: `len < cap`.
+                                    unsafe { base.add(len).write(r) };
+                                    len += 1;
+                                    last = call_pc;
+                                    pc = call_pc + 1;
+                                    continue;
+                                }
+                                None => Object::Type(cls.clone()),
+                            }
+                        }
                         // `Cls.CONST`: a plain class's scalar attribute
                         // straight off the `LOAD_ATTR` site's stamp (no
                         // class reference pushed and released).
@@ -12019,7 +12139,7 @@ impl Interpreter {
                     // SAFETY: `len < cap`; the class (count above one) is
                     // released in place of an empty self slot.
                     unsafe {
-                        drop(top.read());
+                        drop_hot(top.read());
                         top.write(Object::Function(f));
                         base.add(len).write(Object::Unbound);
                     }
@@ -12046,7 +12166,7 @@ impl Interpreter {
                             match stamps.get(pc).and_then(|s| class_attr_hit(s, cls)) {
                                 Some(v) if Rc::strong_count(cls) > 1 => {
                                     // SAFETY: the receiver is replaced in place.
-                                    unsafe { drop(std::mem::replace(&mut *top, v)) };
+                                    unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
                                     last = pc;
                                     pc += 1;
                                     continue;
@@ -12079,7 +12199,7 @@ impl Interpreter {
                     }
                     let v = Self::clone_operand(v);
                     // SAFETY: the receiver (droppable) is replaced in place.
-                    unsafe { drop(std::mem::replace(&mut *top, v)) };
+                    unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
                     last = pc;
                     pc += 1;
                 }
@@ -12131,7 +12251,7 @@ impl Interpreter {
                     // value was checked droppable.
                     unsafe {
                         let old = std::mem::replace(slot, base.add(len - 2).read());
-                        drop(base.add(len - 1).read());
+                        drop_hot(base.add(len - 1).read());
                         drop(old);
                     }
                     len -= 2;
@@ -12157,7 +12277,7 @@ impl Interpreter {
                     };
                     let it = Object::Iter(Rc::new(RefCell::new(it)));
                     // SAFETY: the iterable (droppable) is replaced in place.
-                    unsafe { drop(std::mem::replace(&mut *top, it)) };
+                    unsafe { drop_hot(std::mem::replace(&mut *top, it)) };
                     last = pc;
                     pc += 1;
                 }
@@ -12475,7 +12595,6 @@ impl Interpreter {
         pc: usize,
         depth_cell: *const std::cell::Cell<usize>,
     ) -> Option<Box<InlineAct>> {
-        use weavepy_compiler::InlineCache as IC;
         let slot = code_call_slot(&frame.code, pc)?;
         let argc = frame.code.instructions.get(pc)?.arg as usize;
         let n = frame.stack.len();
@@ -12485,9 +12604,9 @@ impl Interpreter {
             return None;
         };
         let has_self = !matches!(frame.stack[self_slot], Object::Unbound);
-        if crate::gil::free_threading_enabled()
-            || matches!(frame.code.caches.get(pc as u32), IC::Empty)
-        {
+        // (A filled slot means the site already ran its first, specializing
+        // execution.)
+        if crate::gil::free_threading_enabled() {
             return None;
         }
         // SAFETY: GIL-serialized raw read of the function's code cell (see
@@ -12547,6 +12666,633 @@ impl Interpreter {
         // The cells handle is `f`'s (now `callable`'s) or the shared empty
         // vector: moving the callable leaves it where it was.
         Some(self.inline_bind_cells(frame, shell, pc, act, code, callable, guard, cells))
+    }
+
+    /// The operands of a simple call whose argument loads start at
+    /// `pc`: plain `LOAD_FAST` / `LOAD_CONST` / `LOAD_SMALL_INT`s up to
+    /// the `CALL k` that consumes exactly them, appended to `args` from
+    /// index `first` as borrowed pointers (small ints staged in
+    /// `scratch`). Returns the argument count and the `CALL`'s pc.
+    ///
+    /// # Safety
+    ///
+    /// `lbase`/`nlocals` and `consts` describe the running activation's
+    /// locals and constants, which outlive every use of the pointers
+    /// (nothing that could rebind a local runs while they are in use).
+    #[inline(always)]
+    unsafe fn core_simple_args(
+        instrs: &[weavepy_compiler::Instruction],
+        mut pc: usize,
+        lbase: *const Object,
+        nlocals: usize,
+        consts: &[Object],
+        scratch: &mut [Object; 8],
+        args: &mut [*const Object; 8],
+        first: usize,
+    ) -> Option<(usize, usize)> {
+        let mut n = first;
+        loop {
+            let ins = *instrs.get(pc)?;
+            match ins.op {
+                OpCode::LoadFast => {
+                    let i = ins.arg as usize;
+                    if i >= nlocals || n == 8 {
+                        return None;
+                    }
+                    // SAFETY: `i < nlocals` (see the function docs).
+                    let p = unsafe { lbase.add(i) };
+                    if matches!(unsafe { &*p }, Object::Unbound) {
+                        return None;
+                    }
+                    args[n] = p;
+                }
+                OpCode::LoadConst => {
+                    if n == 8 {
+                        return None;
+                    }
+                    args[n] = consts.get(ins.arg as usize)?;
+                }
+                OpCode::LoadSmallInt => {
+                    if n == 8 {
+                        return None;
+                    }
+                    scratch[n] = Object::Int(i64::from(ins.arg));
+                    args[n] = &raw const scratch[n];
+                }
+                OpCode::Call if ins.arg as usize == n - first => return Some((n - first, pc)),
+                _ => return None,
+            }
+            n += 1;
+            pc += 1;
+        }
+    }
+
+    /// A fused simple call of pure leaf `fp` (see [`code_is_pure_leaf`]):
+    /// `args[..nargs]` are the borrowed operands (the receiver first for a
+    /// bound call, `has_self`), and `call_pc` the `CALL` whose site slot
+    /// must name this function in this shape. The result, or `None`
+    /// (nothing touched) for the ordinary instructions to run.
+    #[inline(always)]
+    fn core_pure_fused_eval(
+        &self,
+        code: &CodeObject,
+        fp: *const crate::object::PyFunction,
+        call_pc: usize,
+        has_self: bool,
+        args: &mut [*const Object; 8],
+        nargs: usize,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<Object> {
+        // SAFETY: the caller's contract — nothing runs code while `fp` is
+        // in use, and a class, namespace, or local holds it.
+        let f = unsafe { &*fp };
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        if !code_is_pure_leaf(code_rc) {
+            return None;
+        }
+        let (missing, slot_self) = code_call_slot(code, call_pc)?.hit(fp, Rc::as_ptr(code_rc))?;
+        if slot_self != has_self || !Self::lean_code_ok(code_rc) {
+            return None;
+        }
+        let missing = missing as usize;
+        if missing > 0
+            && (f.defaults.len() < missing
+                || (f.defaults_maybe_overridden() && f.slot("__defaults__").is_some()))
+        {
+            return None;
+        }
+        // The ordinary call's `RecursionError` check.
+        // SAFETY: this thread's own depth cell.
+        if unsafe { (*depth_cell).get() } >= crate::recursion::recursion_limit() {
+            return None;
+        }
+        let total = nargs + missing;
+        if total != code_rc.arg_count as usize || total > 8 {
+            return None;
+        }
+        for (k, o) in f.defaults[f.defaults.len() - missing..].iter().enumerate() {
+            args[nargs + k] = o;
+        }
+        self.pure_leaf_eval(code_rc, f, &args[..total])
+    }
+
+    /// The core loop's fused `LOAD_FAST x; LOAD_ATTR m (method); <simple
+    /// argument loads>; CALL k` on a local instance `recv` whose method is
+    /// a *pure leaf*: the method's result, evaluated on the borrowed local
+    /// and arguments with no reference taken on them or the function
+    /// (nothing runs code while they are in use: the locals and the class
+    /// hold them). Returns the result and the `CALL`'s pc; `None`
+    /// (nothing touched) runs the instructions one by one.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn core_pure_method(
+        &self,
+        code: &CodeObject,
+        recv: &Object,
+        attr_pc: usize,
+        name_idx: u32,
+        mslots: &[MethodSlot],
+        lbase: *const Object,
+        nlocals: usize,
+        consts: &[Object],
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<(Object, usize)> {
+        let Object::Instance(inst) = recv else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        if !Self::default_getattribute(&cls) {
+            return None;
+        }
+        let fp = mslots.get(attr_pc)?.peek_fn(cls.attr_version.get())?;
+        // Scalars only (small ints): nothing to drop on the way out.
+        let mut scratch = std::mem::ManuallyDrop::new([const { Object::None }; 8]);
+        let mut args: [*const Object; 8] = [std::ptr::null(); 8];
+        args[0] = recv;
+        // SAFETY: the core loop's own locals and constants.
+        let (nargs, call_pc) = unsafe {
+            Self::core_simple_args(
+                &code.instructions,
+                attr_pc + 1,
+                lbase,
+                nlocals,
+                consts,
+                &mut *scratch,
+                &mut args,
+                1,
+            )
+        }?;
+        // The instance dict must not shadow the method.
+        if let Some(dict) = inst.dict.get() {
+            // SAFETY: a read with nothing running (see `GilCell::peek`).
+            let d = unsafe { dict.peek() }?;
+            if !d.is_empty() {
+                let probe = code_name_leaf_probe(code, name_idx)?;
+                if d.contains_key(&probe) || probe.saw_exotic() {
+                    return None;
+                }
+            }
+        }
+        let r = self.core_pure_fused_eval(code, fp, call_pc, true, &mut args, nargs + 1, depth_cell)?;
+        Some((r, call_pc))
+    }
+
+    /// The core loop's fused `LOAD_GLOBAL f; PUSH_NULL; <simple argument
+    /// loads>; CALL k` (`fp` the global function), or `LOAD_GLOBAL C;
+    /// LOAD_ATTR m (method); ...` (`fp` the class's plain or static
+    /// function, called unbound), of a *pure leaf*: as
+    /// [`Self::core_pure_method`], with `args_pc` the first argument load.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn core_pure_global_call(
+        &self,
+        code: &CodeObject,
+        fp: *const crate::object::PyFunction,
+        args_pc: usize,
+        lbase: *const Object,
+        nlocals: usize,
+        consts: &[Object],
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<(Object, usize)> {
+        // Scalars only (small ints): nothing to drop on the way out.
+        let mut scratch = std::mem::ManuallyDrop::new([const { Object::None }; 8]);
+        let mut args: [*const Object; 8] = [std::ptr::null(); 8];
+        // SAFETY: the core loop's own locals and constants.
+        let (nargs, call_pc) = unsafe {
+            Self::core_simple_args(
+                &code.instructions,
+                args_pc,
+                lbase,
+                nlocals,
+                consts,
+                &mut *scratch,
+                &mut args,
+                0,
+            )
+        }?;
+        let r = self.core_pure_fused_eval(code, fp, call_pc, false, &mut args, nargs, depth_cell)?;
+        Some((r, call_pc))
+    }
+
+    /// The core loop's `CALL` at `pc` of a *pure leaf* callee (see
+    /// [`code_is_pure_leaf`]) whose site slot matches, with `ops` the
+    /// call's operands (callee, self-or-null, arguments): the callee's
+    /// result, computed by [`Self::pure_leaf_eval`] without an
+    /// activation. Every operand is checked to leave by a plain decrement
+    /// afterwards. `None` (nothing touched) runs the ordinary call.
+    #[inline(never)]
+    fn core_pure_call(
+        &self,
+        code: &CodeObject,
+        pc: usize,
+        ops: &[Object],
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<Object> {
+        let Object::Function(f) = ops.first()? else {
+            return None;
+        };
+        // SAFETY: GIL-serialized raw read of the function's code cell (see
+        // `PyFunction::code`); only compared and borrowed below, while the
+        // caller's stack keeps the function alive.
+        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        if !code_is_pure_leaf(code_rc) {
+            return None;
+        }
+        let slot = code_call_slot(code, pc)?;
+        let (missing, slot_self) = slot.hit(Rc::as_ptr(f), Rc::as_ptr(code_rc))?;
+        let has_self = !matches!(ops.get(1)?, Object::Unbound);
+        if slot_self != has_self || !Self::lean_code_ok(code_rc) {
+            return None;
+        }
+        let missing = missing as usize;
+        if missing > 0
+            && (f.defaults.len() < missing
+                || (f.defaults_maybe_overridden() && f.slot("__defaults__").is_some()))
+        {
+            return None;
+        }
+        // The ordinary call's `RecursionError` check.
+        // SAFETY: this thread's own depth cell.
+        if unsafe { (*depth_cell).get() } >= crate::recursion::recursion_limit() {
+            return None;
+        }
+        if !ops
+            .iter()
+            .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
+        {
+            return None;
+        }
+        let first = if has_self { 1 } else { 2 };
+        let nargs = ops.len() - first;
+        let total = nargs + missing;
+        if total != code_rc.arg_count as usize || total > 8 {
+            return None;
+        }
+        let mut args: [*const Object; 8] = [std::ptr::null(); 8];
+        for (k, o) in ops[first..].iter().enumerate() {
+            args[k] = o;
+        }
+        for (k, o) in f.defaults[f.defaults.len() - missing..].iter().enumerate() {
+            args[nargs + k] = o;
+        }
+        self.pure_leaf_eval(code_rc, f, &args[..total])
+    }
+
+    /// Evaluate a pure leaf's body (see [`code_is_pure_leaf`]) on borrowed
+    /// arguments: operands are scalars or pointers to objects that stay
+    /// put (nothing here stores, calls, or runs Python code), so no
+    /// reference is taken until the returned value's. Loads take the core
+    /// loop's cache-hit paths; anything else — a miss, an operand shape
+    /// the scalar arms don't settle, an operation that could raise —
+    /// abandons the evaluation with `None`, having done nothing
+    /// observable.
+    #[inline(never)]
+    fn pure_leaf_eval(
+        &self,
+        code: &CodeObject,
+        f: &crate::object::PyFunction,
+        args: &[*const Object],
+    ) -> Option<Object> {
+        use weavepy_compiler::InlineCache as IC;
+        #[derive(Clone, Copy)]
+        enum V {
+            /// A heap object, borrowed.
+            R(*const Object),
+            I(i64),
+            F(f64),
+            B(bool),
+            N,
+        }
+        #[inline(always)]
+        fn norm(p: *const Object) -> V {
+            // SAFETY: `p` names a live object (see the method docs).
+            match unsafe { &*p } {
+                Object::Int(i) => V::I(*i),
+                Object::Float(x) => V::F(*x),
+                Object::Bool(b) => V::B(*b),
+                Object::None => V::N,
+                _ => V::R(p),
+            }
+        }
+        #[inline(always)]
+        fn truth(v: V) -> Option<bool> {
+            Some(match v {
+                V::B(b) => b,
+                V::I(i) => i != 0,
+                V::F(x) => x != 0.0,
+                V::N => false,
+                // SAFETY: as `norm`.
+                V::R(p) => match unsafe { &*p } {
+                    Object::Str(s) => !s.is_empty(),
+                    Object::Tuple(t) => !t.is_empty(),
+                    // SAFETY: a read with nothing running (see `peek`).
+                    Object::List(l) => !unsafe { l.peek() }?.is_empty(),
+                    Object::Dict(d) => !unsafe { d.peek() }?.is_empty(),
+                    _ => return None,
+                },
+            })
+        }
+        let ext = code_vm_ext(code)?;
+        let consts: &[Object] = &ext.objects;
+        let stamps: &[StampSlot] = ext.stamp_slots.get().map_or(&[], |s| &s[..]);
+        let instrs = &code.instructions;
+        let mut st = [V::N; 8];
+        let mut sp = 0usize;
+        // Values a leaf path hands back owned (a polymorphic or class
+        // read) stay here until the evaluation ends; the stack points in.
+        struct Owned {
+            buf: [std::mem::MaybeUninit<Object>; 4],
+            n: usize,
+        }
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                for k in 0..self.n {
+                    // SAFETY: the first `n` entries are initialized.
+                    drop_hot(unsafe { self.buf[k].assume_init_read() });
+                }
+            }
+        }
+        let mut owned = Owned {
+            buf: [const { std::mem::MaybeUninit::uninit() }; 4],
+            n: 0,
+        };
+        let op: *mut Owned = &raw mut owned;
+        let own = |v: Object| -> Option<V> {
+            match v {
+                Object::Int(i) => Some(V::I(i)),
+                Object::Float(x) => Some(V::F(x)),
+                Object::Bool(b) => Some(V::B(b)),
+                Object::None => Some(V::N),
+                v => {
+                    // SAFETY: `owned` outlives every use of `op`, and is
+                    // not otherwise touched while the evaluation runs.
+                    let o = unsafe { &mut *op };
+                    if o.n == 4 {
+                        return None;
+                    }
+                    let slot = &mut o.buf[o.n];
+                    slot.write(v);
+                    o.n += 1;
+                    Some(V::R(slot.as_ptr()))
+                }
+            }
+        };
+        macro_rules! push {
+            ($v:expr) => {{
+                if sp == 8 {
+                    return None;
+                }
+                st[sp] = $v;
+                sp += 1;
+            }};
+        }
+        macro_rules! pop {
+            () => {{
+                if sp == 0 {
+                    return None;
+                }
+                sp -= 1;
+                st[sp]
+            }};
+        }
+        let mut pc = 0usize;
+        loop {
+            let ins = *instrs.get(pc)?;
+            match ins.op {
+                OpCode::Resume | OpCode::Nop | OpCode::NotTaken => {}
+                OpCode::LoadFast | OpCode::LoadFastBorrow | OpCode::LoadFastCheck => {
+                    push!(norm(*args.get(ins.arg as usize)?));
+                }
+                OpCode::LoadFastLoadFast | OpCode::LoadFastBorrowLoadFastBorrow => {
+                    push!(norm(*args.get((ins.arg >> 4) as usize)?));
+                    push!(norm(*args.get((ins.arg & 15) as usize)?));
+                }
+                OpCode::LoadConst => push!(norm(consts.get(ins.arg as usize)?)),
+                OpCode::LoadSmallInt => push!(V::I(i64::from(ins.arg))),
+                OpCode::LoadGlobal => {
+                    // The callee's own namespaces, stamp-validated as the
+                    // core loop's `LOAD_GLOBAL` arm.
+                    let slot = stamps.get(pc)?;
+                    let (gdict, bdict) = (f.globals.as_ptr(), f.builtins.as_ptr());
+                    let gid = specialize::rc_id(&f.globals);
+                    // SAFETY (raw dict reads): nothing runs code here.
+                    let g_stamp = unsafe { (*gdict).mutation_stamp() };
+                    let hit = match code.caches.get(pc as u32) {
+                        IC::LoadGlobalModule {
+                            globals_id,
+                            key_idx,
+                        } if globals_id == gid && slot.get() == [gid, g_stamp, 0] => {
+                            unsafe { (*gdict).get_index(key_idx as usize) }
+                        }
+                        IC::LoadGlobalBuiltin {
+                            builtins_id,
+                            key_idx,
+                        } if builtins_id == specialize::rc_id(&f.builtins)
+                            && !self.globals_missing_any.get()
+                            && slot.get()
+                                == [gid, g_stamp, unsafe { (*bdict).mutation_stamp() }] =>
+                        {
+                            unsafe { (*bdict).get_index(key_idx as usize) }
+                        }
+                        _ => return None,
+                    };
+                    push!(norm(hit?.1));
+                }
+                OpCode::LoadAttr => {
+                    let V::R(p) = pop!() else {
+                        return None;
+                    };
+                    // SAFETY: as `norm`.
+                    let recv = unsafe { &*p };
+                    let v = match recv {
+                        Object::Instance(inst) => {
+                            let cls = inst.cls_raw();
+                            let hit = match code.caches.get(pc as u32) {
+                                IC::LoadAttrInstance { key_idx, ver }
+                                    if cls.attr_version.get() == ver
+                                        && cls.native_kind.get() == 0 =>
+                                {
+                                    // SAFETY: a read with nothing running.
+                                    inst.dict
+                                        .get()
+                                        .and_then(|d| unsafe { d.peek() })
+                                        .and_then(|d| d.get_index(key_idx as usize))
+                                        .filter(|(k, _)| slot_name_matches(code, ins.arg, k))
+                                        .map(|(_, v)| std::ptr::from_ref(v))
+                                }
+                                _ => None,
+                            };
+                            match hit {
+                                Some(v) => norm(v),
+                                None => own(Self::leaf_load_attr_recv(
+                                    code, recv, pc as u32, ins.arg,
+                                )?)?,
+                            }
+                        }
+                        Object::Type(cls) => {
+                            match stamps.get(pc).and_then(|s| class_attr_hit(s, cls)) {
+                                Some(v) => own(v)?,
+                                None => own(Self::leaf_load_type_attr(
+                                    code, cls, pc as u32, ins.arg,
+                                )?)?,
+                            }
+                        }
+                        Object::Module(_) => {
+                            own(Self::leaf_load_attr_recv(code, recv, pc as u32, ins.arg)?)?
+                        }
+                        _ => return None,
+                    };
+                    push!(v);
+                }
+                OpCode::CompareOp => {
+                    let b = pop!();
+                    let a = pop!();
+                    // SAFETY: as in `compare_op_step`.
+                    let kind: CompareKind =
+                        unsafe { std::mem::transmute((ins.arg & !COMPARE_OP_TO_BOOL_FLAG) as u8) };
+                    const EXACT: u64 = 1 << 53;
+                    let ord = match (a, b) {
+                        (V::I(x), V::I(y)) => x.cmp(&y),
+                        (V::F(x), V::F(y)) => x.partial_cmp(&y)?,
+                        (V::I(x), V::F(y)) if x.unsigned_abs() < EXACT => (x as f64).partial_cmp(&y)?,
+                        (V::F(x), V::I(y)) if y.unsigned_abs() < EXACT => x.partial_cmp(&(y as f64))?,
+                        (V::B(x), V::B(y)) => x.cmp(&y),
+                        (V::B(x), V::I(y)) => i64::from(x).cmp(&y),
+                        (V::I(x), V::B(y)) => x.cmp(&i64::from(y)),
+                        (V::N, V::N) if matches!(kind, CompareKind::Eq | CompareKind::NotEq) => {
+                            std::cmp::Ordering::Equal
+                        }
+                        // SAFETY: as `norm`.
+                        (V::R(p), V::R(q)) => match (unsafe { &*p }, unsafe { &*q }) {
+                            (Object::Str(s), Object::Str(t)) => (**s).cmp(&**t),
+                            _ => return None,
+                        },
+                        _ => return None,
+                    };
+                    push!(V::B(match kind {
+                        CompareKind::Lt => ord.is_lt(),
+                        CompareKind::LtE => ord.is_le(),
+                        CompareKind::Eq => ord.is_eq(),
+                        CompareKind::NotEq => ord.is_ne(),
+                        CompareKind::Gt => ord.is_gt(),
+                        CompareKind::GtE => ord.is_ge(),
+                    }));
+                }
+                OpCode::IsOp => {
+                    let b = pop!();
+                    let a = pop!();
+                    let same = match (a, b) {
+                        (V::N, V::N) => true,
+                        (V::B(x), V::B(y)) => x == y,
+                        (V::I(x), V::I(y)) => Object::Int(x).is_same(&Object::Int(y)),
+                        (V::F(x), V::F(y)) => Object::Float(x).is_same(&Object::Float(y)),
+                        // SAFETY: as `norm`.
+                        (V::R(p), V::R(q)) => unsafe { (*p).is_same(&*q) },
+                        _ => false,
+                    };
+                    push!(V::B(same != (ins.arg == 1)));
+                }
+                OpCode::ToBool => {
+                    let v = pop!();
+                    push!(V::B(truth(v)?));
+                }
+                OpCode::UnaryOp => {
+                    let v = pop!();
+                    // SAFETY: as in the full handler.
+                    let kind: UnaryKind = unsafe { std::mem::transmute(ins.arg as u8) };
+                    push!(match (v, kind) {
+                        (v, UnaryKind::Not) => V::B(!truth(v)?),
+                        (V::I(i), UnaryKind::Neg) => V::I(i.checked_neg()?),
+                        (V::F(x), UnaryKind::Neg) => V::F(-x),
+                        (V::I(i), UnaryKind::Pos) => V::I(i),
+                        (V::F(x), UnaryKind::Pos) => V::F(x),
+                        (V::I(i), UnaryKind::Invert) => V::I(!i),
+                        _ => return None,
+                    });
+                }
+                OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => {
+                    let v = pop!();
+                    if truth(v)? == (ins.op == OpCode::PopJumpIfTrue) {
+                        pc += ins.arg as usize;
+                    }
+                }
+                OpCode::PopJumpIfNone | OpCode::PopJumpIfNotNone => {
+                    let v = pop!();
+                    if matches!(v, V::N) == (ins.op == OpCode::PopJumpIfNone) {
+                        pc += ins.arg as usize;
+                    }
+                }
+                OpCode::JumpForward => pc += ins.arg as usize,
+                OpCode::BinaryOp => {
+                    let b = pop!();
+                    let a = pop!();
+                    // SAFETY: as the core loop's `BINARY_OP` arm.
+                    let kind: BinOpKind = unsafe { std::mem::transmute(ins.arg as u8) };
+                    let r = match (a, b) {
+                        (V::I(a), V::I(b)) => V::I(match kind {
+                            BinOpKind::Add => a.checked_add(b)?,
+                            BinOpKind::Sub => a.checked_sub(b)?,
+                            BinOpKind::Mult => a.checked_mul(b)?,
+                            BinOpKind::BitAnd => a & b,
+                            BinOpKind::BitOr => a | b,
+                            BinOpKind::BitXor => a ^ b,
+                            BinOpKind::RShift if (0..64).contains(&b) => a >> b,
+                            BinOpKind::LShift if (0..63).contains(&b) && ((a << b) >> b) == a => {
+                                a << b
+                            }
+                            BinOpKind::FloorDiv if b > 0 && a >= 0 => a / b,
+                            BinOpKind::Mod if b > 0 && a >= 0 => a % b,
+                            _ => return None,
+                        }),
+                        (V::F(a), V::F(b)) => match Self::leaf_float_op(a, b, kind)? {
+                            Object::Float(x) => V::F(x),
+                            _ => return None,
+                        },
+                        (V::I(a), V::F(b)) => match Self::leaf_float_op(a as f64, b, kind)? {
+                            Object::Float(x) => V::F(x),
+                            _ => return None,
+                        },
+                        (V::F(a), V::I(b)) => match Self::leaf_float_op(a, b as f64, kind)? {
+                            Object::Float(x) => V::F(x),
+                            _ => return None,
+                        },
+                        _ => return None,
+                    };
+                    push!(r);
+                }
+                OpCode::CopyTop => {
+                    let n = (ins.arg as usize).max(1);
+                    if n > sp {
+                        return None;
+                    }
+                    push!(st[sp - n]);
+                }
+                OpCode::Swap => {
+                    let n = ins.arg as usize;
+                    if n < 2 || n > sp {
+                        return None;
+                    }
+                    st.swap(sp - 1, sp - n);
+                }
+                OpCode::PopTop => {
+                    let _ = pop!();
+                }
+                OpCode::ReturnValue => {
+                    return Some(match pop!() {
+                        // SAFETY: as `norm` (an owned value is cloned before
+                        // its holder drops).
+                        V::R(p) => clone_hot(unsafe { &*p }),
+                        V::I(i) => Object::Int(i),
+                        V::F(x) => Object::Float(x),
+                        V::B(b) => Object::Bool(b),
+                        V::N => Object::None,
+                    });
+                }
+                _ => return None,
+            }
+            pc += 1;
+        }
     }
 
     /// The core loop's `FOR_ITER` over a generator at `pc` of `sw`'s
@@ -12720,7 +13466,9 @@ impl Interpreter {
             done.clean = true;
             // SAFETY: as above; the values drop by plain decrements (or
             // own nothing).
-            unsafe { (*frame.locals.as_ptr()).clear() };
+            for v in unsafe { (*frame.locals.as_ptr()).drain(..) } {
+                drop_hot(v);
+            }
             drop(done.guard.take());
             Ok(v)
         } else {
@@ -14666,20 +15414,23 @@ impl Interpreter {
 
     /// Whether `cls` keeps `object.__getattribute__` (the cached
     /// `getattribute_kind` answer, computed on first sight).
-    #[inline]
+    #[inline(always)]
     fn default_getattribute(cls: &TypeObject) -> bool {
         match cls.getattribute_kind.get() {
             1 => true,
             2 => false,
-            _ => {
-                let default = matches!(
-                    cls.lookup("__getattribute__"),
-                    Some(Object::Builtin(b)) if b.name == ".object_getattribute"
-                );
-                cls.getattribute_kind.set(if default { 1 } else { 2 });
-                default
-            }
+            _ => Self::default_getattribute_slow(cls),
         }
+    }
+
+    #[inline(never)]
+    fn default_getattribute_slow(cls: &TypeObject) -> bool {
+        let default = matches!(
+            cls.lookup("__getattribute__"),
+            Some(Object::Builtin(b)) if b.name == ".object_getattribute"
+        );
+        cls.getattribute_kind.set(if default { 1 } else { 2 });
+        default
     }
 
     /// The resolved leaf builtins, built on first use (the builtins dict
@@ -56573,6 +57324,9 @@ struct CodeConstObjects {
     /// Inline-call shapes per `CALL` site (see [`CallSlot`]); allocated
     /// on the first inline call in this code object.
     call_slots: std::sync::OnceLock<Box<[CallSlot]>>,
+    /// Whether this code is a *pure leaf* (see [`code_is_pure_leaf`]):
+    /// `0` not yet decided, `1` no, `2` yes.
+    pure_leaf: std::sync::atomic::AtomicU8,
 }
 
 /// A `CALL` site's inline-call shape (see `Interpreter::core_call`): the
@@ -56715,6 +57469,44 @@ impl StampSlot {
         // SAFETY: GIL-serialized; the exclusive reference lives only for
         // the assignment.
         unsafe { *self.0.get() = v };
+    }
+}
+
+/// `v.clone()` with the scalars copied and the common heap variants'
+/// increments in line (the enum's `Clone` is an out-of-line call and a
+/// variant switch per clone).
+#[inline(always)]
+fn clone_hot(v: &Object) -> Object {
+    match v {
+        Object::None => Object::None,
+        Object::Unbound => Object::Unbound,
+        Object::Bool(b) => Object::Bool(*b),
+        Object::Int(i) => Object::Int(*i),
+        Object::Float(f) => Object::Float(*f),
+        Object::Instance(i) => Object::Instance(i.clone()),
+        Object::Function(f) => Object::Function(f.clone()),
+        Object::List(l) => Object::List(l.clone()),
+        Object::Dict(d) => Object::Dict(d.clone()),
+        Object::Type(t) => Object::Type(t.clone()),
+        Object::Str(s) => Object::Str(s.clone()),
+        other => other.clone(),
+    }
+}
+
+/// `drop(v)` with the scalars skipped and the common heap variants'
+/// decrements in line (the enum's drop glue is an out-of-line call and
+/// a variant switch per drop).
+#[inline(always)]
+fn drop_hot(v: Object) {
+    match v {
+        Object::None | Object::Unbound | Object::Bool(_) | Object::Int(_) | Object::Float(_) => {}
+        Object::Instance(i) => drop(i),
+        Object::Function(f) => drop(f),
+        Object::List(l) => drop(l),
+        Object::Dict(d) => drop(d),
+        Object::Type(t) => drop(t),
+        Object::Str(s) => drop(s),
+        other => drop(other),
     }
 }
 
@@ -56879,6 +57671,33 @@ impl MethodSlot {
         }
     }
 
+    /// The plain function the slot names under `ver`, without a
+    /// reference: for a caller that runs no code while it uses it (the
+    /// class holds it for as long as it reads `ver`; see `get_held`).
+    #[inline]
+    fn peek_fn(&self, ver: u64) -> Option<*const crate::object::PyFunction> {
+        // SAFETY: GIL-serialized; no `&mut` escapes `set`.
+        match unsafe { &*self.0.get() } {
+            (v, MethodSlotFn::Py(w)) if *v == ver && w.strong_count() > 0 => Some(w.as_ptr()),
+            _ => None,
+        }
+    }
+
+    /// [`Self::peek_fn`] for a class receiver: a plain function or a
+    /// static method's function, either called with an empty self slot.
+    #[inline]
+    fn peek_unbound(&self, ver: u64) -> Option<*const crate::object::PyFunction> {
+        // SAFETY: GIL-serialized; no `&mut` escapes `set`.
+        match unsafe { &*self.0.get() } {
+            (v, MethodSlotFn::Py(w) | MethodSlotFn::Static(w))
+                if *v == ver && w.strong_count() > 0 =>
+            {
+                Some(w.as_ptr())
+            }
+            _ => None,
+        }
+    }
+
     /// Remember a static method's function read through a class at `ver`.
     #[inline]
     fn set_static(&self, ver: u64, f: &Rc<crate::object::PyFunction>) {
@@ -56978,6 +57797,108 @@ fn class_cached_method_held(
     }
 }
 
+/// Whether `code` is a *pure leaf*: a short, loop-free body of operand
+/// loads, attribute and global reads, comparisons, scalar arithmetic,
+/// and forward branches ending in returns — nothing that stores, calls,
+/// raises by design, or could observe its own frame, over positional
+/// parameters only. Such a callee can be evaluated on borrowed operands
+/// with no activation at all (`Interpreter::pure_leaf_eval`), and
+/// abandoned for an ordinary call at the first operation off the leaf
+/// fast paths: nothing it did before that is observable. Decided once
+/// per code object.
+#[inline(always)]
+fn code_is_pure_leaf(code: &CodeObject) -> bool {
+    let Some(ext) = code_vm_ext(code) else {
+        return false;
+    };
+    match ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => code_pure_leaf_decide(code, ext),
+    }
+}
+
+/// [`code_is_pure_leaf`]'s first answer for `code`, recorded in `ext`.
+#[cold]
+#[inline(never)]
+fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let ok = !code.is_generator
+        && !code.is_coroutine
+        && !code.is_async_generator
+        && !code.is_iterable_coroutine
+        && !code.is_class_body
+        && code.cellvars.is_empty()
+        && code.freevars.is_empty()
+        && !code.has_varargs
+        && !code.has_varkeywords
+        && code.kwonly_count == 0
+        && code.arg_count <= 8
+        && code.varnames.len() == code.arg_count as usize
+        && code.exception_table.is_empty()
+        && code.instructions.len() <= 64
+        && code.instructions.iter().all(|i| {
+            matches!(
+                i.op,
+                OpCode::Resume
+                    | OpCode::Nop
+                    | OpCode::NotTaken
+                    | OpCode::LoadFast
+                    | OpCode::LoadFastBorrow
+                    | OpCode::LoadFastCheck
+                    | OpCode::LoadFastLoadFast
+                    | OpCode::LoadFastBorrowLoadFastBorrow
+                    | OpCode::LoadConst
+                    | OpCode::LoadSmallInt
+                    | OpCode::LoadGlobal
+                    | OpCode::LoadAttr
+                    | OpCode::CompareOp
+                    | OpCode::IsOp
+                    | OpCode::ToBool
+                    | OpCode::UnaryOp
+                    | OpCode::PopJumpIfFalse
+                    | OpCode::PopJumpIfTrue
+                    | OpCode::PopJumpIfNone
+                    | OpCode::PopJumpIfNotNone
+                    | OpCode::JumpForward
+                    | OpCode::BinaryOp
+                    | OpCode::CopyTop
+                    | OpCode::Swap
+                    | OpCode::PopTop
+                    | OpCode::ReturnValue
+            )
+        });
+    ext.pure_leaf.store(if ok { 2 } else { 1 }, Relaxed);
+    ok
+}
+
+/// Whether the instructions from `pc` could open a simple call's
+/// argument run (see `Interpreter::core_simple_args`): each of the first
+/// two is a plain operand load or the `CALL` itself. A cheap filter for
+/// the fused pure-call paths, which then scan the whole run.
+#[inline(always)]
+fn simple_args_prefix(instrs: &[weavepy_compiler::Instruction], pc: usize) -> bool {
+    let simple = |i: Option<&weavepy_compiler::Instruction>| {
+        i.is_some_and(|i| {
+            matches!(
+                i.op,
+                OpCode::LoadFast | OpCode::LoadConst | OpCode::LoadSmallInt | OpCode::Call
+            )
+        })
+    };
+    let first = instrs.get(pc);
+    simple(first) && (first.is_some_and(|i| i.op == OpCode::Call) || simple(instrs.get(pc + 1)))
+}
+
+/// Whether function `f`'s current code is a pure leaf (see
+/// [`code_is_pure_leaf`]).
+#[inline(always)]
+fn fn_is_pure_leaf(f: &crate::object::PyFunction) -> bool {
+    // SAFETY: GIL-serialized raw read of the function's code cell (see
+    // `PyFunction::code`); only inspected.
+    code_is_pure_leaf(unsafe { &*f.code.as_ptr() })
+}
+
 /// Slot layout of a Python function's fast locals, precomputed once per
 /// call by `call_python_owned` and handed to the full binder.
 #[derive(Clone, Copy)]
@@ -57013,6 +57934,7 @@ fn code_vm_ext(code: &CodeObject) -> Option<&CodeConstObjects> {
             stamp_slots: std::sync::OnceLock::new(),
             attr_poly: std::sync::OnceLock::new(),
             call_slots: std::sync::OnceLock::new(),
+            pure_leaf: std::sync::atomic::AtomicU8::new(0),
         })
     });
     // RFC 0077 (WS5): the slot has exactly one producer (the initializer
