@@ -499,6 +499,10 @@ pub struct TypeObject {
     /// The leaf burst's per-class attribute-kind cache (see
     /// [`LeafAttrCache`]).
     pub leaf_attrs: LeafAttrCache,
+    /// The most attributes an instance's `__dict__` was seen to hold
+    /// (capped): new instances' dicts are presized to it, so `__init__`'s
+    /// stores do not regrow them.
+    pub inst_dict_hint: std::sync::atomic::AtomicU32,
     /// Non-zero for an exact class whose hot methods have native
     /// implementations (see `stdlib::datetime_native`): its instances
     /// are never cycle-collector tracked (like CPython's C types without
@@ -890,6 +894,7 @@ impl TypeObject {
             flags,
             metaclass: RefCell::new(None),
             leaf_attrs: LeafAttrCache::new(),
+            inst_dict_hint: std::sync::atomic::AtomicU32::new(0),
             native_kind: Cell::new(0),
             native_ext: std::sync::OnceLock::new(),
             slot_names: RefCell::new(Vec::new()),
@@ -2194,19 +2199,32 @@ impl PyInstance {
     /// [`crate::gc_trace::track_deferred_owner`]). Its `__dict__` is
     /// published eagerly to carry the owner record.
     pub fn new_deferred(class: Rc<TypeObject>) -> Rc<Self> {
+        let hint = class
+            .inst_dict_hint
+            .load(std::sync::atomic::Ordering::Relaxed) as usize;
         if let Some(mut inst) = INSTANCE_POOL.with(|p| p.borrow_mut().pop()) {
             // Recycled: the dict (cleared, owner record set) and every
             // other field were reset by `try_recycle`; only the class
             // changes.
             if let Some(m) = Rc::get_mut(&mut inst) {
                 *m.class.get_mut() = class;
+                if hint > 0 {
+                    if let Some(dict) = m.dict.get() {
+                        if let Ok(mut d) = dict.try_borrow_mut() {
+                            if d.capacity() < hint {
+                                d.map_mut_atomic_store().reserve(hint);
+                            }
+                        }
+                    }
+                }
                 return inst;
             }
         }
         let inst = Rc::new(Self::new(class));
         let owner = Rc::as_ptr(&inst) as usize;
-        inst.dict
-            .get_or_init(|| Rc::new(RefCell::new(DictData::deferred_for(owner))));
+        inst.dict.get_or_init(|| {
+            Rc::new(RefCell::new(DictData::deferred_for_capacity(owner, hint)))
+        });
         inst
     }
 

@@ -4005,6 +4005,18 @@ impl DictData {
         }
     }
 
+    /// [`Self::deferred_for`] with room for `n` keys.
+    pub(crate) fn deferred_for_capacity(owner: usize, n: usize) -> Self {
+        if n == 0 {
+            return Self::deferred_for(owner);
+        }
+        Self {
+            map: DictMap::with_capacity_and_hasher(n, Default::default()),
+            stamp: next_dict_stamp(),
+            deferred_owner: std::sync::atomic::AtomicUsize::new(owner),
+        }
+    }
+
     /// Re-arm the owner record on a recycled (empty) instance dict.
     #[inline]
     pub(crate) fn reset_deferred_owner(&mut self, owner: usize) {

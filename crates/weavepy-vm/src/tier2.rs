@@ -1490,6 +1490,29 @@ fn ctor_field_plan(icode: &CodeObject) -> Option<Vec<(String, CtorFieldSrc)>> {
 /// [`TypeObject::instance_plan`]'s `attr_version` key, so revalidation
 /// is a version check in the common case).
 fn probe_class_ctor(interp: &super::Interpreter, cls: &Rc<TypeObject>) -> Option<ClassCtorEntry> {
+    let (icode, arg_count, min_args) = probe_class_ctor_shape(interp, cls)?;
+    // RFC 0073 WS1 — the canonical shape additionally requires the
+    // instance to actually keep a dict for the indexed fingerprint.
+    let fields = if cls.forbids_dict || cls.declares_slots.get() {
+        Vec::new()
+    } else {
+        ctor_field_plan(&icode).unwrap_or_default()
+    };
+    Some(ClassCtorEntry {
+        init_code: icode,
+        arg_count,
+        min_args,
+        fields,
+    })
+}
+
+/// [`probe_class_ctor`] without the field plan (the guard predicate only
+/// needs the constructor's `__init__` code): `(init code, arg_count,
+/// min_args)`.
+fn probe_class_ctor_shape(
+    interp: &super::Interpreter,
+    cls: &Rc<TypeObject>,
+) -> Option<(Rc<CodeObject>, u32, u32)> {
     let bt = crate::builtin_types::builtin_types();
     // `type` subclasses (metaclasses) construct *classes* through the
     // three-argument form, never plain instances.
@@ -1518,19 +1541,7 @@ fn probe_class_ctor(interp: &super::Interpreter, cls: &Rc<TypeObject>) -> Option
     }
     let arg_count = icode.arg_count - 1;
     let min_args = arg_count.saturating_sub(u32::try_from(init.defaults.len()).unwrap_or(u32::MAX));
-    // RFC 0073 WS1 — the canonical shape additionally requires the
-    // instance to actually keep a dict for the indexed fingerprint.
-    let fields = if cls.forbids_dict || cls.declares_slots.get() {
-        Vec::new()
-    } else {
-        ctor_field_plan(&icode).unwrap_or_default()
-    };
-    Some(ClassCtorEntry {
-        init_code: icode,
-        arg_count,
-        min_args,
-        fields,
-    })
+    Some((icode, arg_count, min_args))
 }
 
 /// RFC 0073 WS1 — the constructor-shape fallback probe: resolve the
@@ -2915,8 +2926,8 @@ fn guards_hold(
             // revalidates with a version compare.
             Object::Type(t) => {
                 let ok = matches!(
-                    probe_class_ctor(interp, t),
-                    Some(cc) if Rc::ptr_eq(&cc.init_code, code_snap)
+                    probe_class_ctor_shape(interp, t),
+                    Some((init_code, ..)) if Rc::ptr_eq(&init_code, code_snap)
                 );
                 if !ok {
                     return false;

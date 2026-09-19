@@ -11143,6 +11143,8 @@ impl Interpreter {
         } else {
             &[]
         };
+        // The method-form `LOAD_ATTR` arm's per-site functions.
+        let mslots: &[MethodSlot] = ext.and_then(|e| e.method_slots.get()).map_or(&[], |s| &s[..]);
         let (gdict, bdict) = (frame.globals.as_ptr(), frame.builtins.as_ptr());
         let (gid, bid) = (
             specialize::rc_id(&frame.globals),
@@ -11262,6 +11264,12 @@ impl Interpreter {
                             // Overwriting a scalar needs no drop.
                             len -= 1;
                             slot.write(base.add(len).read());
+                        } else if Self::core_shared_instance(&*slot) {
+                            // A shared instance: the grading below would
+                            // answer "escaped, no mark"; its release is a
+                            // bare decrement.
+                            len -= 1;
+                            drop(std::mem::replace(&mut *slot, base.add(len).read()));
                         } else {
                             // A displaced heap value the full arm would
                             // reap stays there — except a deferred-tracking
@@ -11318,13 +11326,95 @@ impl Interpreter {
                     pc += 1;
                 }
                 OpCode::PopTop => {
-                    // SAFETY: `len > 0` checked; a scalar needs no drop.
-                    if len == 0 || !scalar(unsafe { &*base.add(len - 1) }) {
+                    // A scalar needs no drop; a shared heap value is a
+                    // plain decrement (see `core_droppable`).
+                    // SAFETY: `len > 0` checked.
+                    if len == 0 || !Self::core_droppable(unsafe { &*base.add(len - 1) }) {
                         break None;
+                    }
+                    len -= 1;
+                    // SAFETY: the slot is initialized and leaves the stack.
+                    unsafe { drop(base.add(len).read()) };
+                    last = pc;
+                    pc += 1;
+                }
+                // Identity, truth, and `None` tests, with shared operands
+                // released by plain decrements (the leaf arms' shapes).
+                OpCode::IsOp => {
+                    if len < 2 {
+                        break None;
+                    }
+                    // SAFETY: `len >= 2`.
+                    let (a, b) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
+                    if !Self::core_droppable(a) || !Self::core_droppable(b) {
+                        break None;
+                    }
+                    let same = a.is_same(b);
+                    let r = if ins.arg == 1 { !same } else { same };
+                    // SAFETY: both operands leave the stack (checked
+                    // droppable above); the result takes the lower slot.
+                    unsafe {
+                        drop(base.add(len - 1).read());
+                        drop(base.add(len - 2).read());
+                        base.add(len - 2).write(Object::Bool(r));
                     }
                     len -= 1;
                     last = pc;
                     pc += 1;
+                }
+                OpCode::ToBool => {
+                    if len == 0 {
+                        break None;
+                    }
+                    // SAFETY: `len > 0`.
+                    let top = unsafe { base.add(len - 1) };
+                    let v = unsafe { &*top };
+                    let b = match v {
+                        Object::Bool(_) => {
+                            last = pc;
+                            pc += 1;
+                            continue;
+                        }
+                        Object::Int(i) => *i != 0,
+                        Object::None => false,
+                        Object::Float(f) => *f != 0.0,
+                        _ if !Self::core_droppable(v) => break None,
+                        Object::Str(s) => !s.is_empty(),
+                        Object::Tuple(t) => !t.is_empty(),
+                        // SAFETY: a read between two instructions.
+                        Object::List(l) => match unsafe { l.peek() } {
+                            Some(l) => !l.is_empty(),
+                            None => break None,
+                        },
+                        Object::Dict(d) => match unsafe { d.peek() } {
+                            Some(d) => !d.is_empty(),
+                            None => break None,
+                        },
+                        _ => break None,
+                    };
+                    // SAFETY: the operand (droppable) is replaced in place.
+                    unsafe { drop(std::mem::replace(&mut *top, Object::Bool(b))) };
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::PopJumpIfNone | OpCode::PopJumpIfNotNone => {
+                    if len == 0 {
+                        break None;
+                    }
+                    // SAFETY: `len > 0`.
+                    let v = unsafe { &*base.add(len - 1) };
+                    if !Self::core_droppable(v) {
+                        break None;
+                    }
+                    let is_none = matches!(v, Object::None);
+                    len -= 1;
+                    // SAFETY: the operand leaves the stack (droppable).
+                    unsafe { drop(base.add(len).read()) };
+                    last = pc;
+                    pc += 1;
+                    if is_none == (ins.op == OpCode::PopJumpIfNone) {
+                        pc += ins.arg as usize;
+                    }
                 }
                 OpCode::BinaryOp => {
                     if len < 2 {
@@ -11504,10 +11594,12 @@ impl Interpreter {
                         Object::Generator(_) => break Some(CoreExit::Stop(LeafStop::Step)),
                         _ => break None,
                     };
-                    let Ok(mut it) = it.try_borrow_mut() else {
+                    // SAFETY: nothing below runs code until `it`'s last use
+                    // (the guard-free reads of `GilCell::peek`).
+                    let Some(it) = (unsafe { it.peek_mut() }) else {
                         break None;
                     };
-                    let v = match &mut *it {
+                    let v = match it {
                         crate::object::PyIterator::Range {
                             current,
                             stop,
@@ -11526,9 +11618,10 @@ impl Interpreter {
                             Object::Int(v)
                         }
                         crate::object::PyIterator::List { items, index, .. } => {
-                            let v = match items.try_borrow() {
-                                Ok(xs) => xs.get(*index).cloned(),
-                                Err(_) => None,
+                            // SAFETY: as above.
+                            let v = match unsafe { items.peek() } {
+                                Some(xs) => xs.get(*index).map(Self::clone_operand),
+                                None => None,
                             };
                             let Some(v) = v else { break None };
                             *index += 1;
@@ -11543,7 +11636,6 @@ impl Interpreter {
                         }
                         _ => break None,
                     };
-                    drop(it);
                     // SAFETY: `len < cap`.
                     unsafe { base.add(len).write(v) };
                     len += 1;
@@ -11719,12 +11811,169 @@ impl Interpreter {
                     last = pc;
                     pc += 1;
                 }
-                // The attribute cache hits and native iterators run out of
-                // line (`leaf_core_helper`), off this loop.
-                OpCode::LoadAttr
-                | OpCode::StoreAttr
-                | OpCode::LoadMethodAttr
-                | OpCode::GetIter => break Some(CoreExit::Helper),
+                // The method-form load's per-site function (the helper's
+                // `leaf_load_method` / class-receiver hits): an instance
+                // receiver moves up into the self slot under the function;
+                // a class receiver leaves an empty self slot.
+                OpCode::LoadMethodAttr => {
+                    use weavepy_compiler::InlineCache as IC;
+                    let Some(ms) = mslots.get(pc) else {
+                        break Some(CoreExit::Helper);
+                    };
+                    if len == 0 || len == cap {
+                        break Some(CoreExit::Helper);
+                    }
+                    // SAFETY: `len > 0`.
+                    let top = unsafe { base.add(len - 1) };
+                    let f = match unsafe { &*top } {
+                        Object::Instance(inst) => {
+                            let IC::LoadAttrMethod { ver, .. } = code.caches.get(pc as u32) else {
+                                break Some(CoreExit::Helper);
+                            };
+                            if inst.cls_raw().attr_version.get() != ver {
+                                break Some(CoreExit::Helper);
+                            }
+                            // The instance dict must not shadow the method.
+                            if let Some(dict) = inst.dict.get() {
+                                // SAFETY: a read between two instructions
+                                // (see `GilCell::peek`).
+                                let Some(d) = (unsafe { dict.peek() }) else {
+                                    break Some(CoreExit::Helper);
+                                };
+                                if !d.is_empty() {
+                                    let Some(probe) = code_name_leaf_probe(code, ins.arg) else {
+                                        break Some(CoreExit::Helper);
+                                    };
+                                    if d.contains_key(&probe) || probe.saw_exotic() {
+                                        break Some(CoreExit::Helper);
+                                    }
+                                }
+                            }
+                            let Some(f) = ms.get_held(ver) else {
+                                break Some(CoreExit::Helper);
+                            };
+                            // SAFETY: `len < cap`; the receiver moves up.
+                            unsafe {
+                                let recv = top.read();
+                                top.write(Object::Function(f));
+                                base.add(len).write(recv);
+                            }
+                            len += 1;
+                            last = pc;
+                            pc += 1;
+                            continue;
+                        }
+                        // The class leaves through a plain decrement: its
+                        // count stays above one (no drop glue here).
+                        Object::Type(cls) if Rc::strong_count(cls) > 1 => {
+                            match ms.get_held(cls.attr_version.get()) {
+                                Some(f) => f,
+                                None => break Some(CoreExit::Helper),
+                            }
+                        }
+                        _ => break Some(CoreExit::Helper),
+                    };
+                    // SAFETY: `len < cap`; the class (count above one) is
+                    // released in place of an empty self slot.
+                    unsafe {
+                        drop(top.read());
+                        top.write(Object::Function(f));
+                        base.add(len).write(Object::Unbound);
+                    }
+                    len += 1;
+                    last = pc;
+                    pc += 1;
+                }
+                // An instance-dict cache hit on a stack receiver (the
+                // helper's `leaf_load_attr` first case), read without a
+                // borrow guard; the receiver leaves by a plain decrement.
+                OpCode::LoadAttr => {
+                    use weavepy_compiler::InlineCache as IC;
+                    if len == 0 {
+                        break Some(CoreExit::Helper);
+                    }
+                    // SAFETY: `len > 0`.
+                    let top = unsafe { base.add(len - 1) };
+                    let Object::Instance(inst) = (unsafe { &*top }) else {
+                        break Some(CoreExit::Helper);
+                    };
+                    let IC::LoadAttrInstance { key_idx, ver } = code.caches.get(pc as u32) else {
+                        break Some(CoreExit::Helper);
+                    };
+                    let cls = inst.cls_raw();
+                    if cls.attr_version.get() != ver
+                        || cls.native_kind.get() != 0
+                        || !Self::core_droppable(unsafe { &*top })
+                    {
+                        break Some(CoreExit::Helper);
+                    }
+                    // SAFETY: a read between two instructions (see
+                    // `GilCell::peek`).
+                    let Some(d) = inst.dict.get().and_then(|d| unsafe { d.peek() }) else {
+                        break Some(CoreExit::Helper);
+                    };
+                    let Some((k, v)) = d.get_index(key_idx as usize) else {
+                        break Some(CoreExit::Helper);
+                    };
+                    if !slot_name_matches(code, ins.arg, k) {
+                        break Some(CoreExit::Helper);
+                    }
+                    let v = Self::clone_operand(v);
+                    // SAFETY: the receiver (droppable) is replaced in place.
+                    unsafe { drop(std::mem::replace(&mut *top, v)) };
+                    last = pc;
+                    pc += 1;
+                }
+                // An instance-dict cache hit storing an atomic value over a
+                // droppable one (the helper's `leaf_store_attr` first case).
+                OpCode::StoreAttr => {
+                    use weavepy_compiler::InlineCache as IC;
+                    if len < 2 {
+                        break Some(CoreExit::Helper);
+                    }
+                    // SAFETY: `len >= 2`.
+                    let (recv, val) = unsafe { (&*base.add(len - 1), &*base.add(len - 2)) };
+                    let Object::Instance(inst) = recv else {
+                        break Some(CoreExit::Helper);
+                    };
+                    let IC::StoreAttrInstance { key_idx, ver } = code.caches.get(pc as u32) else {
+                        break Some(CoreExit::Helper);
+                    };
+                    if !val.is_gc_atomic()
+                        || inst.cls_raw().attr_version.get() != ver
+                        || crate::capi_watchers::dicts_active()
+                        || !Self::core_droppable(recv)
+                    {
+                        break Some(CoreExit::Helper);
+                    }
+                    // SAFETY: as above; nothing below runs code until the
+                    // store is done.
+                    let Some(d) = inst.dict.get().and_then(|d| unsafe { d.peek_mut() }) else {
+                        break Some(CoreExit::Helper);
+                    };
+                    match d.get_index(key_idx as usize) {
+                        Some((k, old))
+                            if slot_name_matches(code, ins.arg, k) && Self::core_droppable(old) => {}
+                        _ => break Some(CoreExit::Helper),
+                    }
+                    let Some((_, slot)) = d.map_mut_atomic_store().get_index_mut(key_idx as usize)
+                    else {
+                        break Some(CoreExit::Helper);
+                    };
+                    // SAFETY: the value moves into the dict and the
+                    // receiver (droppable) leaves the stack; the displaced
+                    // value was checked droppable.
+                    unsafe {
+                        let old = std::mem::replace(slot, base.add(len - 2).read());
+                        drop(base.add(len - 1).read());
+                        drop(old);
+                    }
+                    len -= 2;
+                    last = pc;
+                    pc += 1;
+                }
+                // Native iterators run out of line (`leaf_core_helper`).
+                OpCode::GetIter => break Some(CoreExit::Helper),
                 // An opcode the full leaf arms have no arm for is the quiet
                 // loop's straight away.
                 op if !SLOW_LEAF_OPS[op as u8 as usize] => {
@@ -11930,6 +12179,43 @@ impl Interpreter {
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
         true
+    }
+
+    /// Whether the core loop may release `v` with a plain drop: a scalar,
+    /// a string (freeing one runs no code), or a shared heap value whose
+    /// release is a bare decrement the collector need not hear about (the
+    /// leaf arms' `note_dropped_marks` grade answers no).
+    #[inline(always)]
+    fn core_droppable(v: &Object) -> bool {
+        match v {
+            Object::Int(_)
+            | Object::Float(_)
+            | Object::Bool(_)
+            | Object::None
+            | Object::Str(_) => true,
+            Object::Instance(i) => Rc::strong_count(i) > 1 && !gc_trace::note_dropped_marks(v),
+            Object::List(l) => Rc::strong_count(l) > 1 && !gc_trace::note_dropped_marks(v),
+            Object::Dict(d) => Rc::strong_count(d) > 1 && !gc_trace::note_dropped_marks(v),
+            Object::Tuple(t) => ThinArc::strong_count(t) > 1 && !gc_trace::note_dropped_marks(v),
+            Object::Function(f) => Rc::strong_count(f) > 1 && !gc_trace::note_dropped_marks(v),
+            Object::Type(t) => Rc::strong_count(t) > 1 && !gc_trace::note_dropped_marks(v),
+            _ => false,
+        }
+    }
+
+    /// Whether `v` is an instance the frame-slot and drop graders would
+    /// both pass over (`looks_reapable_temporary` false and
+    /// `note_dropped_marks` false): held elsewhere beyond the collector's
+    /// handle and watched by no weakref — its release is a bare decrement.
+    #[inline(always)]
+    fn core_shared_instance(v: &Object) -> bool {
+        let Object::Instance(i) = v else {
+            return false;
+        };
+        let sc = Rc::strong_count(i);
+        let id = Rc::as_ptr(i) as usize as u64;
+        (sc >= 3 || (sc == 2 && !gc_trace::maybe_tracked(id)))
+            && !crate::weakref_registry::may_have_weakrefs(id)
     }
 
     /// The `(function, has_self, effective argc)` of a plain-function
@@ -12226,6 +12512,10 @@ impl Interpreter {
                     Some(Object::Module(_)) => {
                         Self::leaf_load_attr(code, stack, pc as u32, ins.arg)
                     }
+                    // A class attribute (the slow arm's first case).
+                    Some(Object::Type(cls)) => {
+                        Self::leaf_load_type_attr(code, cls, pc as u32, ins.arg)
+                    }
                     _ => None,
                 };
                 let Some(v) = v else {
@@ -12276,6 +12566,27 @@ impl Interpreter {
                         match Self::leaf_load_method(code, stack, pc as u32, ins.arg) {
                             Some(f) => f,
                             None => return CoreAttr::Decline,
+                        }
+                    }
+                    // `Cls.f(...)`: a plain function (or a static method's)
+                    // with an empty self slot, as the slow arm.
+                    Some(Object::Type(cls)) => {
+                        match Self::leaf_load_type_attr(code, cls, pc as u32, ins.arg) {
+                            Some(v @ Object::Function(_)) => {
+                                let Some(top) = stack.last_mut() else {
+                                    return CoreAttr::Decline;
+                                };
+                                let cls = std::mem::replace(top, v);
+                                stack.push(Object::Unbound);
+                                if gc_trace::note_dropped_marks(&cls) {
+                                    gc_trace::mark_maybe_dead();
+                                    drop(cls);
+                                    return CoreAttr::Marked;
+                                }
+                                drop(cls);
+                                return CoreAttr::Done;
+                            }
+                            _ => return CoreAttr::Decline,
                         }
                     }
                     Some(recv) => {
@@ -14963,6 +15274,13 @@ impl Interpreter {
                             };
                             let val = std::mem::replace(value_slot, Object::Unbound);
                             d.insert(DictKey(key), val);
+                            // The class's instance-dict size hint (see
+                            // `TypeObject::inst_dict_hint`).
+                            let hint = &inst.cls_raw().inst_dict_hint;
+                            let n = d.len().min(32) as u32;
+                            if n > hint.load(std::sync::atomic::Ordering::Relaxed) {
+                                hint.store(n, std::sync::atomic::Ordering::Relaxed);
+                            }
                             None
                         }
                     }
@@ -51752,6 +52070,10 @@ static CORE_LEAF_OPS: [bool; 256] = {
         OpCode::Swap,
         OpCode::GetIter,
         OpCode::BuildTuple,
+        OpCode::IsOp,
+        OpCode::ToBool,
+        OpCode::PopJumpIfNone,
+        OpCode::PopJumpIfNotNone,
     ];
     let mut i = 0;
     while i < ops.len() {
@@ -56035,6 +56357,28 @@ impl MethodSlot {
         // SAFETY: GIL-serialized; no `&mut` escapes `set`.
         match unsafe { &*self.0.get() } {
             (v, MethodSlotFn::Py(w)) if *v == ver => w.upgrade(),
+            _ => None,
+        }
+    }
+
+    /// [`Self::get`] without the weak upgrade's compare-exchange: a slot
+    /// filled under `ver` names a function found in a dict on the class's
+    /// MRO, and versions are process-unique and move on every change to
+    /// those dicts, so while the receiver's class still reads `ver` it
+    /// still holds the function and a plain strong increment is sound.
+    #[inline]
+    fn get_held(&self, ver: u64) -> Option<Rc<crate::object::PyFunction>> {
+        // SAFETY: GIL-serialized; no `&mut` escapes `set`.
+        match unsafe { &*self.0.get() } {
+            // (The count probe excludes the empty slot's dangling handle.)
+            (v, MethodSlotFn::Py(w)) if *v == ver && w.strong_count() > 0 => {
+                let p = w.as_ptr();
+                // SAFETY: see above — the class holds a strong reference.
+                unsafe {
+                    Rc::increment_strong_count(p);
+                    Some(Rc::from_raw(p))
+                }
+            }
             _ => None,
         }
     }

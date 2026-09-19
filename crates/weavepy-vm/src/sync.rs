@@ -808,6 +808,25 @@ impl<T: ?Sized> GilCell<T> {
         Some(unsafe { &*self.data.get() })
     }
 
+    /// [`Self::peek`]'s exclusive form: the value, without a guard, when
+    /// cells are unshared and no borrow at all is live.
+    ///
+    /// # Safety
+    ///
+    /// The caller keeps the reference from outliving any code that could
+    /// borrow this cell (nothing between the check and the last use may
+    /// run code that reaches it).
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn peek_mut(&self) -> Option<&mut T> {
+        if cells_shared() || self.borrow.load(Ordering::Relaxed) != 0 {
+            return None;
+        }
+        // SAFETY: no borrow is live (checked above) and the caller keeps
+        // this view from outliving any code that could take one.
+        Some(unsafe { &mut *self.data.get() })
+    }
+
     pub fn as_ptr(&self) -> *mut T {
         self.data.get()
     }
