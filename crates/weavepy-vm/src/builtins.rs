@@ -9528,17 +9528,17 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
             // bypass — so modules natively imported looked spec-less
             // (test_decimal's CheckAttributes diffs `dir(C)` against
             // `dir(P)`, and P is the natively imported `_pydecimal`).
-            // Trigger the synthesis first; harmless no-op once done.
+            // List both names without resolving them: the first attribute
+            // read synthesizes the pair (`ensure_module_spec`), and doing
+            // it here would import `importlib` from a bare `dir()` — the
+            // `posix` shim's `dir(_os)` at interpreter start-up did.
             let missing_spec = !m
                 .dict
                 .borrow()
                 .contains_key(&crate::object::DictKey(Object::from_static("__spec__")));
             if missing_spec {
-                if let Some(p) = crate::vm_singletons::current_interpreter_ptr() {
-                    // SAFETY: published by the enclosing VM dispatch
-                    // frame on this thread; the GIL keeps it exclusive.
-                    let _ = unsafe { &mut *p }.ensure_module_spec(m);
-                }
+                names.insert("__spec__".to_owned());
+                names.insert("__loader__".to_owned());
             }
             for k in m.dict.borrow().keys() {
                 if let Object::Str(s) = &k.0 {

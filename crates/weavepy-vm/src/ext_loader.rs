@@ -43,6 +43,26 @@ pub fn install_extension_loader(loader: ExtensionLoader) {
     *REGISTRY.lock().unwrap() = Some(loader);
 }
 
+/// The C-API layer's one-time initialisation (static type bridges,
+/// singleton and exception mirrors), registered by the layer and run on
+/// demand: extension loading runs it itself, and native code that could
+/// call into the C API through another door (`ctypes`) asks first — so a
+/// process that never touches the C API never pays for it at startup.
+static CAPI_INIT: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Register the C-API layer's initialiser (see [`ensure_capi_ready`]).
+pub fn install_capi_init(init: fn()) {
+    let _ = CAPI_INIT.set(init);
+}
+
+/// Make the C-API layer ready before running native code that may call
+/// into it (a no-op without one, and after the first call).
+pub fn ensure_capi_ready() {
+    if let Some(init) = CAPI_INIT.get() {
+        init();
+    }
+}
+
 /// Remove the loader hook (if any). Used by tests that need to
 /// isolate from extension side effects.
 pub fn clear_extension_loader() {

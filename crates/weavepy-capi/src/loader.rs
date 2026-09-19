@@ -611,6 +611,7 @@ pub fn install_vm_extension_loader() {
     INIT.call_once(|| {
         crate::force_link();
         weavepy_vm::ext_loader::install_extension_loader(vm_load_extension);
+        weavepy_vm::ext_loader::install_capi_init(crate::interp::ensure_initialised);
         // RFC 0075 WS8: serve bridged types' *current* C `tp_doc`
         // through `type.__doc__`/`__text_signature__` (numpy's
         // add_newdoc writes it post-ready).
