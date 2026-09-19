@@ -11910,7 +11910,10 @@ impl Interpreter {
                         // call): the operand moves in, or the item out,
                         // with no reference traffic.
                         Object::Builtin(b)
-                            if argc <= 1 && Rc::strong_count(b) > 1 =>
+                            if argc <= 1
+                                && Rc::strong_count(b) > 1
+                                // SAFETY: `len >= argc + 2`: the self slot.
+                                && matches!(unsafe { &*base.add(len - argc - 1) }, Object::List(_)) =>
                         {
                             let kind = mslots.get(pc).and_then(|s| s.get_leaf(b));
                             // SAFETY: `len >= argc + 2`: the self slot.
@@ -11952,6 +11955,73 @@ impl Interpreter {
                             len -= 1;
                             last = pc;
                             pc += 1;
+                        }
+                        // A registered leaf builtin (its whole body, or its
+                        // fast half, runs no Python code: the site's leaf
+                        // kind, filled by the helper's first call) with
+                        // operands that all leave by plain decrements:
+                        // called right here (the helper's
+                        // `leaf_builtin_call` for these kinds).
+                        Object::Builtin(b)
+                            if Rc::strong_count(b) > 1
+                                && matches!(
+                                    mslots.get(pc).and_then(|s| s.get_leaf(b)),
+                                    Some(LeafKind::Opaque | LeafKind::Fast(_))
+                                ) =>
+                        {
+                            let kind = mslots.get(pc).and_then(|s| s.get_leaf(b));
+                            let callee_at = len - argc - 2;
+                            // SAFETY: `len >= argc + 2`: the self slot.
+                            let first = if matches!(unsafe { &*base.add(callee_at + 1) }, Object::Unbound)
+                            {
+                                callee_at + 2
+                            } else {
+                                callee_at + 1
+                            };
+                            // SAFETY: the operands above the callee.
+                            let ops = unsafe { std::slice::from_raw_parts(base.add(first), len - first) };
+                            if !ops.iter().all(Self::core_droppable) {
+                                break Some(CoreExit::Helper);
+                            }
+                            let r = match kind {
+                                Some(LeafKind::Fast(f)) => f(ops),
+                                _ => Some(match b.call_kw.as_ref() {
+                                    Some(ckw) => ckw(ops, &[]),
+                                    None => (b.call)(ops),
+                                }),
+                            };
+                            match r {
+                                // A fast half declined, untouched.
+                                None => break Some(CoreExit::Helper),
+                                Some(Ok(v)) => {
+                                    // SAFETY: every operand (checked) and
+                                    // the builtin (count above one) leave
+                                    // by plain decrements; the result takes
+                                    // the callee's slot.
+                                    unsafe {
+                                        for k in callee_at..len {
+                                            drop_hot(base.add(k).read());
+                                        }
+                                        base.add(callee_at).write(v);
+                                    }
+                                    len = callee_at + 1;
+                                    last = pc;
+                                    pc += 1;
+                                }
+                                // As the helper's raise: the operands drop
+                                // wholesale and the pc moves past the call.
+                                Some(Err(e)) => {
+                                    // SAFETY: as above.
+                                    unsafe {
+                                        for k in callee_at..len {
+                                            drop_hot(base.add(k).read());
+                                        }
+                                    }
+                                    len = callee_at;
+                                    pc += 1;
+                                    break Some(CoreExit::Stop(LeafStop::Raised(e)));
+                                }
+                            }
                         }
                         // A leaf builtin or directly constructible type: out
                         // of line.

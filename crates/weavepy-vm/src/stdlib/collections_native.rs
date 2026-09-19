@@ -55,38 +55,98 @@ const SLOT_HEAD: usize = 1;
 const SLOT_MAXLEN: usize = 2;
 const SLOT_STATE: usize = 3;
 
+fn head_of(slots: &crate::types::SlotStorage) -> usize {
+    match slots.get_hinted(SLOT_HEAD, "_head") {
+        Some(Object::Int(h)) if *h >= 0 => *h as usize,
+        _ => 0,
+    }
+}
+
+fn set_head_of(slots: &mut crate::types::SlotStorage, h: usize) {
+    match slots.get_hinted_mut(SLOT_HEAD, "_head") {
+        Some(slot) => *slot = Object::Int(h as i64),
+        None => slots.insert("_head", Object::Int(h as i64)).map_or((), drop),
+    }
+}
+
+fn maxlen_of(slots: &crate::types::SlotStorage) -> Option<usize> {
+    match slots.get_hinted(SLOT_MAXLEN, "_maxlen") {
+        Some(Object::Int(m)) if *m >= 0 => Some(*m as usize),
+        _ => None,
+    }
+}
+
+fn bump_state_of(slots: &mut crate::types::SlotStorage) {
+    match slots.get_hinted_mut(SLOT_STATE, "_state") {
+        Some(Object::Int(s)) => *s = s.wrapping_add(1),
+        Some(slot) => *slot = Object::Int(1),
+        None => slots.insert("_state", Object::Int(1)).map_or((), drop),
+    }
+}
+
 impl DequeState<'_> {
     fn head(&self) -> usize {
-        match self.slots.get_hinted(SLOT_HEAD, "_head") {
-            Some(Object::Int(h)) if *h >= 0 => *h as usize,
-            _ => 0,
-        }
+        head_of(&self.slots)
     }
 
     fn set_head(&mut self, h: usize) {
-        match self.slots.get_hinted_mut(SLOT_HEAD, "_head") {
-            Some(slot) => *slot = Object::Int(h as i64),
-            None => self
-                .slots
-                .insert("_head", Object::Int(h as i64))
-                .map_or((), drop),
-        }
+        set_head_of(&mut self.slots, h);
     }
 
     fn maxlen(&self) -> Option<usize> {
-        match self.slots.get_hinted(SLOT_MAXLEN, "_maxlen") {
-            Some(Object::Int(m)) if *m >= 0 => Some(*m as usize),
-            _ => None,
-        }
+        maxlen_of(&self.slots)
     }
 
     fn bump_state(&mut self) {
-        match self.slots.get_hinted_mut(SLOT_STATE, "_state") {
-            Some(Object::Int(s)) => *s = s.wrapping_add(1),
-            Some(slot) => *slot = Object::Int(1),
-            None => self.slots.insert("_state", Object::Int(1)).map_or((), drop),
-        }
+        bump_state_of(&mut self.slots);
     }
+}
+
+/// A deque's slot storage and backing list, borrowed without guards
+/// when nothing holds either (the end operations run no Python code
+/// while they use them; the free-threaded build's shared cells always
+/// take the guarded path). `None` sends the operation to that path.
+fn fast_parts(
+    args: &[Object],
+) -> Option<(&mut crate::types::SlotStorage, &mut Vec<Object>)> {
+    let Object::Instance(inst) = args.first()? else {
+        return None;
+    };
+    // SAFETY: see above — no guard is live on either cell (`peek_mut`
+    // checks), and neither reference outlives the native call.
+    let slots = unsafe { inst.slots.peek_mut() }?;
+    let Some(Object::List(data)) = slots.get_hinted(SLOT_DATA, "_data") else {
+        return None;
+    };
+    // The list lives in its own allocation, held by the `_data` slot,
+    // which the operations never rebind.
+    let data: *const RefCell<Vec<Object>> = Rc::as_ptr(data);
+    // SAFETY: as above.
+    let d = unsafe { (*data).peek_mut() }?;
+    Some((slots, d))
+}
+
+/// [`popleft_locked`] over the unguarded parts (see [`fast_parts`]).
+fn popleft_fast(
+    slots: &mut crate::types::SlotStorage,
+    d: &mut Vec<Object>,
+) -> Result<Object, RuntimeError> {
+    let mut h = head_of(slots);
+    if h >= d.len() {
+        return Err(index_error("pop from an empty deque"));
+    }
+    bump_state_of(slots);
+    let x = std::mem::replace(&mut d[h], Object::None);
+    h += 1;
+    if h >= d.len() {
+        d.clear();
+        h = 0;
+    } else if h >= 32 && h * 2 >= d.len() {
+        d.drain(..h);
+        h = 0;
+    }
+    set_head_of(slots, h);
+    Ok(x)
 }
 
 fn receiver<'a>(args: &'a [Object], method: &str) -> Result<DequeState<'a>, RuntimeError> {
@@ -135,6 +195,21 @@ fn popleft_locked(st: &mut DequeState<'_>, d: &mut Vec<Object>) -> Result<Object
 }
 
 fn deque_append(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let [_, x] = args {
+        if let Some((slots, d)) = fast_parts(args) {
+            bump_state_of(slots);
+            d.push(x.clone());
+            let trimmed = match maxlen_of(slots) {
+                Some(m) if d.len() - head_of(slots) > m => Some(popleft_fast(slots, d)?),
+                _ => None,
+            };
+            if trimmed.is_some() {
+                crate::gc_trace::mark_maybe_dead();
+            }
+            drop(trimmed);
+            return Ok(Object::None);
+        }
+    }
     let mut st = receiver(args, "append")?;
     let x = match args {
         [_, x] => x.clone(),
@@ -208,6 +283,20 @@ fn deque_appendleft(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn deque_pop(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() == 1 {
+        if let Some((slots, d)) = fast_parts(args) {
+            let h = head_of(slots);
+            if d.len() > h {
+                bump_state_of(slots);
+                let x = d.pop().expect("len checked");
+                if d.len() == h && h != 0 {
+                    d.clear();
+                    set_head_of(slots, 0);
+                }
+                return Ok(x);
+            }
+        }
+    }
     let mut st = receiver(args, "pop")?;
     if args.len() != 1 {
         return Err(type_error(format!(
@@ -231,6 +320,13 @@ fn deque_pop(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn deque_popleft(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() == 1 {
+        if let Some((slots, d)) = fast_parts(args) {
+            if head_of(slots) < d.len() {
+                return popleft_fast(slots, d);
+            }
+        }
+    }
     let mut st = receiver(args, "popleft")?;
     if args.len() != 1 {
         return Err(type_error(format!(
@@ -244,6 +340,11 @@ fn deque_popleft(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn deque_len(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() == 1 {
+        if let Some((slots, d)) = fast_parts(args) {
+            return Ok(Object::Int(d.len().saturating_sub(head_of(slots)) as i64));
+        }
+    }
     let st = receiver(args, "__len__")?;
     if args.len() != 1 {
         return Err(type_error("deque.__len__() takes no arguments"));
@@ -253,6 +354,11 @@ fn deque_len(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn deque_bool(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() == 1 {
+        if let Some((slots, d)) = fast_parts(args) {
+            return Ok(Object::Bool(d.len() > head_of(slots)));
+        }
+    }
     let st = receiver(args, "__bool__")?;
     if args.len() != 1 {
         return Err(type_error("deque.__bool__() takes no arguments"));
