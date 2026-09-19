@@ -1265,21 +1265,29 @@ try:
     from _thread import (_excepthook as excepthook,
                          _ExceptHookArgs as ExceptHookArgs)
 except ImportError:
-    # Simple Python implementation if _thread._excepthook() is not available
-    from traceback import print_exception as _print_exception
-    from collections import namedtuple
-
-    _ExceptHookArgs = namedtuple(
-        'ExceptHookArgs',
-        'exc_type exc_value exc_traceback thread')
+    # Simple Python implementation if _thread._excepthook() is not available.
+    # WeavePy: `traceback` and `collections` load on first use — importing
+    # them here pulled ~50 modules (re, inspect, dataclasses, ...) into
+    # every `import threading`.
+    _ExceptHookArgs = None
+    _print_exception = None
 
     def ExceptHookArgs(args):
+        global _ExceptHookArgs
+        if _ExceptHookArgs is None:
+            from collections import namedtuple
+            _ExceptHookArgs = namedtuple(
+                'ExceptHookArgs',
+                'exc_type exc_value exc_traceback thread')
         return _ExceptHookArgs(*args)
 
     def excepthook(args, /):
         """
         Handle uncaught Thread.run() exception.
         """
+        global _print_exception
+        if _print_exception is None:
+            from traceback import print_exception as _print_exception
         if args.exc_type == SystemExit:
             # silently ignore SystemExit
             return
