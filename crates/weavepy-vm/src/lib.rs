@@ -903,6 +903,16 @@ pub struct Interpreter {
     /// chains keep the ~[`crate::gil::GIL_CHECK_INTERVAL`]-opcode
     /// checkpoint cadence.
     gil_countdown: u32,
+    /// `sum(generator)`'s accumulator (its address), offered to the next
+    /// lean generator resume (see `generator_send_lean`), which pairs it
+    /// with the generator's frame in [`Self::sum_fold`].
+    sum_fold_acc: Option<usize>,
+    /// While a lean resume runs on behalf of `sum()`: the generator's
+    /// frame and the accumulator (addresses). The core loop folds that
+    /// frame's scalar yields into the accumulator and resumes in place
+    /// (see the `YIELD_VALUE` arm) instead of leaving the quiet loop per
+    /// item.
+    sum_fold: Option<(usize, usize)>,
     /// RFC 0061 (WS2b) — set while any observer (trace/profile/PEP 669
     /// tool) is active on this thread. Fused-dispatch arms check it and
     /// fall back to single-step semantics, so instrumentation sees the
@@ -1138,6 +1148,8 @@ impl Default for Interpreter {
             frame_stack_pool: ThreadCell::new(Vec::new()),
             scratch_pool: ThreadCell::new(Vec::new()),
             gil_countdown: crate::gil::GIL_CHECK_INTERVAL,
+            sum_fold_acc: None,
+            sum_fold: None,
             fuse_off: false,
             quiet_off: crate::hot_gates::env_flags::no_quiet(),
             burst_on: !crate::hot_gates::env_flags::no_burst()
@@ -1261,6 +1273,8 @@ impl Interpreter {
             frame_stack_pool: ThreadCell::new(Vec::new()),
             scratch_pool: ThreadCell::new(Vec::new()),
             gil_countdown: crate::gil::GIL_CHECK_INTERVAL,
+            sum_fold_acc: None,
+            sum_fold: None,
             fuse_off: false,
             quiet_off: crate::hot_gates::env_flags::no_quiet(),
             burst_on: !crate::hot_gates::env_flags::no_burst()
@@ -11731,6 +11745,39 @@ impl Interpreter {
                 OpCode::YieldValue => {
                     // SAFETY: see `CoreSwitch`.
                     if unsafe { (*sw.inl).is_empty() } {
+                        // `sum()` driving this frame: a scalar yield folds
+                        // into the accumulator and the frame resumes as if
+                        // sent `None` (what `sum` does next), in place.
+                        if let Some((ff, acc)) = self.sum_fold {
+                            if ff == sw.cur as usize && len > 0 {
+                                let acc = acc as *mut Object;
+                                // SAFETY: the accumulator is `do_sum_call`'s
+                                // local, alive and untouched while the
+                                // resume runs; `len > 0`.
+                                let top = unsafe { base.add(len - 1) };
+                                let r = match unsafe { (&*acc, &*top) } {
+                                    (Object::Int(a), Object::Int(b)) => {
+                                        a.checked_add(*b).map(Object::Int)
+                                    }
+                                    (Object::Float(a), Object::Float(b)) => {
+                                        Some(Object::Float(a + b))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(r) = r {
+                                    // SAFETY: both are scalars (no drop glue);
+                                    // the sent `None` takes the yielded
+                                    // value's slot.
+                                    unsafe {
+                                        acc.write(r);
+                                        top.write(Object::None);
+                                    }
+                                    last = pc;
+                                    pc += 1;
+                                    continue;
+                                }
+                            }
+                        }
                         break Some(CoreExit::Stop(LeafStop::Step));
                     }
                     // SAFETY: `len <= cap`, every slot initialized.
@@ -27192,7 +27239,13 @@ impl Interpreter {
         // `builtin_sum_impl` is exactly this drive loop.
         if let Object::Generator(g) = &args[0] {
             loop {
-                let x = match self.generator_send(g, Object::None) {
+                // A lean resume folds scalar yields straight into `acc`
+                // (see `Interpreter::sum_fold`); it returns at the first
+                // yield it cannot fold, or when the generator ends.
+                self.sum_fold_acc = Some(std::ptr::from_mut(&mut acc) as usize);
+                let sent = self.generator_send(g, Object::None);
+                self.sum_fold_acc = None;
+                let x = match sent {
                     Ok(v) => v,
                     Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
                         self.fire_caught_stop_iteration(&exc)?;
@@ -32170,6 +32223,13 @@ impl Interpreter {
             crate::tier2::materialize_parked(frame);
             frame.gen_first_resume = first_resume;
             frame.push(sent.clone());
+            // `sum()`'s accumulator, folded at this frame's yields.
+            let prev_fold = std::mem::replace(
+                &mut self.sum_fold,
+                self.sum_fold_acc
+                    .take()
+                    .map(|acc| (std::ptr::from_mut(frame) as usize, acc)),
+            );
             let exc_depth_on_entry = self.exc_info_len();
             let fin_live = gc_trace::has_any_finalizable();
             let fin = fin_live || gc_trace::active_suspects_present();
@@ -32199,6 +32259,7 @@ impl Interpreter {
                     &mut prev_pc,
                 )
             };
+            self.sum_fold = prev_fold;
             match (run, act.shell) {
                 (
                     QuietExit::Outcome {
