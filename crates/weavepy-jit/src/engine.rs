@@ -20,7 +20,7 @@ use crate::analyze::{JitVerdict, Probes};
 use crate::ir::{
     ArithKind, AttrSiteMeta, CalleeSpanMeta, CompSavedMeta, GlobalGuard, IterLoopMeta,
     ListLoopMeta, MathFunc, MathGuardMeta, MethodSiteMeta, MethodSpanMeta, OsrEntry, RangeLoopMeta,
-    ResolvedGlobal, StrMethod, TFunc, TOp,
+    ResolvedGlobal, StrMethod, TFunc, TOp, TTerm,
 };
 use crate::lower::build_function;
 use crate::runtime::{self, JitFrame, JitStatus};
@@ -66,6 +66,12 @@ pub struct CompiledFrame {
     pub comp_target_slots: Vec<u32>,
     /// Cold-exit pcs (see [`crate::ir::TFunc::cold_exits`]).
     pub cold_exits: Vec<u32>,
+    /// Whether the interpreter should enter this body directly: a
+    /// loop-free body that round-trips into the interpreter (generic
+    /// calls, dynamic attributes or membership) gains nothing native
+    /// over its interpreted leaf paths and pays the entry/exit on top.
+    /// Native callers use it regardless.
+    pub interp_entry: bool,
     /// Erased Python callees (RFC 0059 WS3), for rebuilding the callee
     /// object on the interpreter stack after a mid-arguments deopt.
     pub callee_spans: Vec<CalleeSpanMeta>,
@@ -171,6 +177,11 @@ impl JitEngine {
         flag_builder.set("is_pic", "false").ok()?;
         // Favour fast compiles over the last few percent of codegen.
         flag_builder.set("opt_level", "speed").ok()?;
+        // The IR verifier re-checks every function it compiles: a debug
+        // aid whose cost lands on every warm-up in release builds.
+        if !cfg!(debug_assertions) {
+            flag_builder.set("enable_verifier", "false").ok()?;
+        }
         let isa_builder = cranelift_native::builder().ok()?;
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
@@ -420,6 +431,32 @@ impl JitEngine {
         // keeps the code alive for the engine's lifetime.
         let func: NativeFn = unsafe { mem::transmute::<*const u8, NativeFn>(code_ptr) };
 
+        let has_loop = tfunc.blocks.iter().enumerate().any(|(bi, b)| match b.term {
+            TTerm::ForRange { .. }
+            | TTerm::ForList { .. }
+            | TTerm::ForIter { .. }
+            | TTerm::ForIterPair { .. } => true,
+            TTerm::Jump(t) => t <= bi,
+            TTerm::BranchFalse {
+                target,
+                fallthrough,
+            }
+            | TTerm::BranchTrue {
+                target,
+                fallthrough,
+            } => target <= bi || fallthrough <= bi,
+            _ => false,
+        });
+        let round_trips = tfunc.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+            matches!(
+                s.op,
+                TOp::CallDyn { .. }
+                    | TOp::DynAttrGet { .. }
+                    | TOp::DynAttrSet { .. }
+                    | TOp::ContainsDyn { .. }
+            )
+        });
+        let interp_entry = has_loop || !round_trips;
         Ok(CompiledFrame {
             func,
             livein: tfunc.livein_locals.clone(),
@@ -433,6 +470,7 @@ impl JitEngine {
             comp_saved: tfunc.comp_saved.clone(),
             comp_target_slots: tfunc.comp_target_slots.clone(),
             cold_exits: tfunc.cold_exits.clone(),
+            interp_entry,
             callee_spans: tfunc.callee_spans.clone(),
             len_spans: tfunc.len_spans.clone(),
             method_spans: tfunc.method_spans.clone(),

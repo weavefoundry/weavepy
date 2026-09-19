@@ -610,20 +610,31 @@ fn jump_targets(code: &CodeObject) -> HashSet<usize> {
 
 /// Where an unsupported instruction at `p` can become a *cold exit*: the
 /// start of its statement (its source line, back to the nearest jump
-/// target), when that lies outside every loop — native code then runs
-/// up to it and hands the rest of the activation to the interpreter, at
-/// most once per activation. `None` inside a loop body (a side exit
-/// there would deopt every iteration).
+/// target), when that lies outside every loop and after at least one —
+/// native code then runs the loop and hands the rest of the activation
+/// to the interpreter, at most once per activation. `None` inside a
+/// loop body (a side exit there would deopt every iteration) or ahead of
+/// any loop (native entry would buy nothing).
 fn cold_point(code: &CodeObject, p: usize) -> Option<usize> {
     let ins = &code.instructions;
+    // Worth it only after native work: a loop completed before the exit.
+    // A loop-free body would enter native code just to leave it (short
+    // methods with an unsupported statement near the top, every call).
+    let mut loop_before = false;
     for (j, x) in ins.iter().enumerate() {
         if x.op == OpCode::JumpBackward {
             if let Some(t) = backward_target(j, x.arg) {
                 if t <= p && p <= j {
                     return None;
                 }
+                if j < p {
+                    loop_before = true;
+                }
             }
         }
+    }
+    if !loop_before {
+        return None;
     }
     let line = code.linetable.get(p).copied()?;
     let targets = jump_targets(code);

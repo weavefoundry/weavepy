@@ -7499,6 +7499,9 @@ pub(crate) fn try_call_native_direct(
         st.direct_entry_for(key)
     })?;
     let cf = &entry.art.cf;
+    if !cf.interp_entry {
+        return None;
+    }
     let method_shape = entry.method_shape;
     if method_shape && !matches!(args[0], Object::Instance(_)) {
         return None;
@@ -7761,6 +7764,11 @@ pub(crate) fn try_enter(interp: &mut super::Interpreter, frame: &mut super::Fram
     let Some(entry) = entry else {
         return JitEntry::Skip;
     };
+    // A loop-free body that round-trips into the interpreter runs no
+    // faster natively (see `CompiledFrame::interp_entry`).
+    if !entry.cf.interp_entry {
+        return JitEntry::Skip;
+    }
 
     // Phase 2a: global identity + callee code guards.
     if !guards_hold(
