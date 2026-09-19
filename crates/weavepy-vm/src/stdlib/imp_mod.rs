@@ -282,6 +282,13 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             builtin("exec_builtin", imp_exec_builtin),
         );
         d.insert(
+            DictKey(Object::from_static("_weave_clear_dir_listings")),
+            builtin("_weave_clear_dir_listings", |_args| {
+                crate::import::clear_dir_listings();
+                Ok(Object::None)
+            }),
+        );
+        d.insert(
             DictKey(Object::from_static("is_builtin")),
             builtin("is_builtin", imp_is_builtin),
         );

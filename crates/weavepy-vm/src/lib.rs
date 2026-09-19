@@ -49365,12 +49365,18 @@ impl Interpreter {
                     return Ok(v.clone());
                 }
                 // Submodule that we deferred loading: try loading it
-                // on demand. Matches CPython's `_handle_fromlist`.
+                // on demand. Matches CPython's `_handle_fromlist`, which
+                // only searches for one under a package (`__path__`): a
+                // plain module's missing name never touches the disk.
                 let candidate = format!("{}.{}", m.name, name);
+                let is_package = m
+                    .dict
+                    .borrow()
+                    .contains_key(&crate::object::StrKey("__path__"));
                 if self.cache.get(&candidate).is_some()
                     || self.cache.builtin_factory(&candidate).is_some()
                     || self.cache.frozen_source(&candidate).is_some()
-                    || self.cache.find_source(&candidate).is_some()
+                    || (is_package && self.cache.find_source(&candidate).is_some())
                 {
                     let sub = self.load_one(&candidate)?;
                     m.dict

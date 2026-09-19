@@ -544,17 +544,39 @@ pub fn find_extension_on_path(
 ) -> Option<std::path::PathBuf> {
     let leaf = module_name.rsplit('.').next().unwrap_or(module_name);
     let exts = extension_suffixes();
+    // The nested form (`<dir>/pkg/leaf.<ext>`) is a distinct probe only
+    // for a dotted name; candidates are checked against the cached
+    // directory listings (one `stat` per directory, not per candidate).
+    let nested_dir = module_name
+        .rsplit_once('.')
+        .map(|(parent, _)| std::path::PathBuf::from(parent.replace('.', "/")));
     for dir in interp.module_cache().search_dirs() {
+        let top = weavepy_vm::import::dir_listing(&dir);
+        let nested = nested_dir
+            .as_ref()
+            .map(|p| dir.join(p))
+            .and_then(|d| weavepy_vm::import::dir_listing(&d).map(|names| (d, names)));
+        if top.is_none() && nested.is_none() {
+            continue;
+        }
         for ext in exts {
-            let candidate = dir.join(format!("{leaf}{ext}"));
-            if candidate.is_file() {
-                return Some(candidate);
+            let file = format!("{leaf}{ext}");
+            if top
+                .as_ref()
+                .is_some_and(|names| names.contains(std::ffi::OsStr::new(&file)))
+            {
+                let candidate = dir.join(&file);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
             }
-            let nested = dir
-                .join(module_name.replace('.', "/"))
-                .with_extension(&ext[1..]);
-            if nested.is_file() {
-                return Some(nested);
+            if let Some((d, names)) = &nested {
+                if names.contains(std::ffi::OsStr::new(&file)) {
+                    let candidate = d.join(&file);
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
             }
         }
     }
