@@ -384,11 +384,24 @@ impl LeafAttrCache {
         ((name >> 4) ^ (name >> 9) ^ (name >> 14)) & 31
     }
 
+    /// The second slot a name may live in (two-choice placement: two
+    /// names sharing their first slot, used alternately, would otherwise
+    /// evict each other on every lookup).
+    #[inline]
+    fn alt(name: usize) -> usize {
+        Self::index(name) ^ (1 + ((name >> 7) & 15))
+    }
+
     /// The cached kind for `name` under `ver`, if present.
     #[inline]
     pub fn get(&self, name: usize, ver: u64) -> Option<&LeafAttrKind> {
         // SAFETY: GIL-serialized; no `&mut` escapes `set`.
-        let e = unsafe { &(*self.0.get())[Self::index(name)] };
+        let t = unsafe { &*self.0.get() };
+        let e = &t[Self::index(name)];
+        if e.name == name && e.ver == ver {
+            return Some(&e.kind);
+        }
+        let e = &t[Self::alt(name)];
         (e.name == name && e.ver == ver).then_some(&e.kind)
     }
 
@@ -396,7 +409,14 @@ impl LeafAttrCache {
     pub fn set(&self, name: usize, ver: u64, kind: LeafAttrKind) {
         // SAFETY: GIL-serialized; the exclusive reference lives only for
         // the assignment.
-        unsafe { (*self.0.get())[Self::index(name)] = LeafAttrEntry { name, ver, kind } };
+        let t = unsafe { &mut *self.0.get() };
+        let (i, j) = (Self::index(name), Self::alt(name));
+        // The first slot unless it holds another name that is still
+        // current; then the second, unless that one is too (evict the
+        // first).
+        let busy = |e: &LeafAttrEntry| e.name != 0 && e.name != name && e.ver == ver;
+        let k = if !busy(&t[i]) || busy(&t[j]) { i } else { j };
+        t[k] = LeafAttrEntry { name, ver, kind };
     }
 }
 

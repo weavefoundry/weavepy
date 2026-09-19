@@ -11853,8 +11853,11 @@ impl Interpreter {
                     let top = unsafe { base.add(len - 1) };
                     let f = match unsafe { &*top } {
                         Object::Instance(inst) => {
-                            let IC::LoadAttrMethod { ver, .. } = code.caches.get(pc as u32) else {
-                                break Some(CoreExit::Helper);
+                            let ver = match code.caches.get(pc as u32) {
+                                IC::LoadAttrMethod { ver, .. } => ver,
+                                // A native method's slot is keyed by the
+                                // class version alone.
+                                _ => inst.cls_raw().attr_version.get(),
                             };
                             if inst.cls_raw().attr_version.get() != ver {
                                 break Some(CoreExit::Helper);
@@ -11875,13 +11878,17 @@ impl Interpreter {
                                     }
                                 }
                             }
-                            let Some(f) = ms.get_held(ver) else {
-                                break Some(CoreExit::Helper);
+                            let f = match ms.get_held(ver) {
+                                Some(f) => Object::Function(f),
+                                None => match ms.get_inst_builtin(ver) {
+                                    Some(b) => Object::Builtin(b),
+                                    None => break Some(CoreExit::Helper),
+                                },
                             };
                             // SAFETY: `len < cap`; the receiver moves up.
                             unsafe {
                                 let recv = top.read();
-                                top.write(Object::Function(f));
+                                top.write(f);
                                 base.add(len).write(recv);
                             }
                             len += 1;
@@ -15269,10 +15276,17 @@ impl Interpreter {
             key_idx,
         } = code.caches.get(cache_pc)
         else {
-            // No usable site cache: the class's own cache decides.
+            // No usable site cache: the class's own cache decides (a
+            // native method is remembered per site by the class version,
+            // for the core loop's method-form arm).
             return match Self::leaf_resolve_instance_attr(code, inst, name_idx)? {
                 LeafAttr::Method(f) => Some(Object::Function(f)),
-                LeafAttr::BuiltinMethod(b) => Some(Object::Builtin(b)),
+                LeafAttr::BuiltinMethod(b) => {
+                    if let Some(s) = code_method_slot(code, cache_pc) {
+                        s.set_inst_builtin(inst.cls_raw().attr_version.get(), &b);
+                    }
+                    Some(Object::Builtin(b))
+                }
                 LeafAttr::Value(_) | LeafAttr::InstanceOnly | LeafAttr::Property(_) => None,
             };
         };
@@ -56580,6 +56594,26 @@ impl MethodSlot {
         // SAFETY: GIL-serialized; the exclusive reference lives only for
         // the assignment.
         unsafe { *self.0.get() = (ver, MethodSlotFn::Py(Rc::downgrade(f))) };
+    }
+
+    /// The native method a plain class (at version `ver`) resolves for its
+    /// instances (a binding builtin on the MRO, as `_collections.deque`
+    /// adopts its native end operations).
+    #[inline]
+    fn get_inst_builtin(&self, ver: u64) -> Option<Rc<crate::object::BuiltinFn>> {
+        // SAFETY: as `get` (class versions never carry `BUILTIN_TAG`).
+        match unsafe { &*self.0.get() } {
+            (v, MethodSlotFn::Builtin(f)) if *v == ver && ver & Self::BUILTIN_TAG == 0 => {
+                Some(f.clone())
+            }
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn set_inst_builtin(&self, ver: u64, f: &Rc<crate::object::BuiltinFn>) {
+        // SAFETY: as `set`.
+        unsafe { *self.0.get() = (ver, MethodSlotFn::Builtin(f.clone())) };
     }
 
     /// The cached builtin method body for receiver variant `tag`.
