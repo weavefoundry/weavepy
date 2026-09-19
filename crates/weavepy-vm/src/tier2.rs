@@ -542,6 +542,7 @@ impl JitState {
             wpjit_list_repeat,
             wpjit_list_slice,
         );
+        weavepy_jit::register_list_from_range_helper(wpjit_list_from_range);
         // RFC 0071 WS6 — the string/bytes read helpers.
         weavepy_jit::register_str_helpers(
             wpjit_str_eq,
@@ -1681,9 +1682,15 @@ fn callee_ret_info(
         }
         classify_global(obj.as_ref())
     };
-    let (lane, ret_none) = match weavepy_jit::analyze(fcode, &mut classify) {
+    let mut obj_global = |name: &str| resolve(name).map(|o| grade_obj_global(&o));
+    let (lane, ret_none) = match weavepy_jit::analyze_for_ret(fcode, &mut classify, &mut obj_global) {
         Ok(tf) => (tf.ret_lane, tf.ret_none),
-        Err(_) => (None, weavepy_jit::returns_none_syntactically(fcode)),
+        Err(e) => {
+            if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+                eprintln!("jit ret-lane {:?}: {:?}", fcode.name, e);
+            }
+            (None, weavepy_jit::returns_none_syntactically(fcode))
+        }
     };
     RET_LANE_CACHE.with(|c| c.borrow_mut().insert(key, (lane, ret_none, fcode.clone())));
     (lane, ret_none)
@@ -2698,6 +2705,12 @@ fn classify_global(obj: Option<&Object>) -> ResolvedGlobal {
         // Builtins reject attribute mutation, so identity (the entry
         // guard) implies unmodified call semantics.
         Some(Object::Builtin(b)) if b.name == "len" => ResolvedGlobal::LenBuiltin,
+        // The canonical `list` type (builtins may hold the function
+        // flavour): `list(range(...))` builds natively.
+        Some(Object::Builtin(b)) if b.name == "list" => ResolvedGlobal::ListBuiltin,
+        Some(Object::Type(t)) if Rc::ptr_eq(t, &crate::builtin_types::builtin_types().list_) => {
+            ResolvedGlobal::ListBuiltin
+        }
         // RFC 0074 WS3 — canonical `enumerate` (builtins hold the
         // function flavour; module globals may hold the type object).
         // Certifies the tuple-target recognizer's lane training; the
@@ -2779,6 +2792,11 @@ struct CallCtx {
     /// Generic calls of native callees this activation has made (see
     /// [`charge_native_roundtrip`]).
     native_calls: u32,
+    /// Native loop polls this activation made (one per
+    /// `JIT_POLL_STRIDE` loop-header iterations): the native work that
+    /// earns generic native-callee calls their keep (see
+    /// [`charge_native_roundtrip`]).
+    polls: u32,
     /// The context of this activation's most recent native callee, kept
     /// for reuse by its next call of the same callee (see
     /// `try_native_call`). Owns its handles; taken out while in use.
@@ -3102,6 +3120,23 @@ mod scratch_pool_tests {
 /// Same contract as [`wpjit_call_py`], except this helper never runs
 /// Python code and never touches the frame's exchange buffers.
 unsafe extern "C" fn wpjit_poll(frame: *mut JitFrame) -> i64 {
+    {
+        // SAFETY: as below.
+        let jf = unsafe { &*frame };
+        if !jf.ctx.is_null() {
+            #[allow(clippy::cast_ptr_alignment)]
+            let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+            ctx.polls = ctx.polls.saturating_add(1);
+            // A poll interval dense with generic native-callee calls:
+            // retire the code and leave for the interpreter.
+            let dense = ctx.native_calls > NATIVE_CALLS_PER_POLL && !ctx.code_ptr.is_null();
+            ctx.native_calls = 0;
+            if dense {
+                retire_native_driver(ctx);
+                return 1;
+            }
+        }
+    }
     crate::gil::yield_checkpoint();
     if crate::hot_gates::load() != 0 || crate::trace::any_observers_active() {
         return 1;
@@ -3567,6 +3602,7 @@ unsafe fn try_native_call(
         c.dirty = false;
         c.interp_calls = 0;
         c.native_calls = 0;
+        c.polls = 0;
         c
     } else {
         // Self-recursion reuses this activation's own tables. An immutable
@@ -3616,6 +3652,7 @@ unsafe fn try_native_call(
             dirty: false,
             interp_calls: 0,
             native_calls: 0,
+            polls: 0,
             child: None,
             depth_cell: ctx.depth_cell,
             code_ptr: callee_key,
@@ -4264,9 +4301,18 @@ fn finish_interp_call(
 /// (which takes over right after this call, through the `Boxed` exit).
 fn charge_native_roundtrip(ctx: &mut CallCtx) -> bool {
     ctx.native_calls = ctx.native_calls.saturating_add(1);
+    // The density check runs at each loop poll (see `wpjit_poll`); this
+    // cap only catches calls piling up between polls.
     if ctx.native_calls < NATIVE_CALL_RETIRE_BUDGET || ctx.code_ptr.is_null() {
         return false;
     }
+    retire_native_driver(ctx);
+    true
+}
+
+/// Retire the activation's code as a thin native driver around native
+/// callees (the interpreter's leaf calls serve such a loop better).
+fn retire_native_driver(ctx: &CallCtx) {
     JIT.with(|cell| {
         let mut st = cell.borrow_mut();
         if let Some(ce) = st.cache.get_mut(&ctx.code_ptr) {
@@ -4279,12 +4325,15 @@ fn charge_native_roundtrip(ctx: &mut CallCtx) -> bool {
     // SAFETY: the activation's code object outlives the activation (see
     // the field docs).
     unsafe { (*ctx.code_ptr).jit_hint.mark_not_jitable() };
-    true
 }
 
-/// Generic native-callee calls one activation may make before its code
-/// retires (see [`charge_native_roundtrip`]).
-const NATIVE_CALL_RETIRE_BUDGET: u32 = 64;
+/// Generic native-callee calls one activation may make between two
+/// loop polls before its code retires (see [`charge_native_roundtrip`]).
+const NATIVE_CALL_RETIRE_BUDGET: u32 = 4096;
+/// Generic native-callee calls one poll interval (`JIT_POLL_STRIDE`
+/// loop-header iterations) may make: more than one per four native
+/// iterations and the loop is a driver around its calls.
+const NATIVE_CALLS_PER_POLL: u32 = (weavepy_jit::JIT_POLL_STRIDE / 4) as u32;
 
 fn charge_roundtrip(ctx: &mut CallCtx) -> bool {
     ctx.interp_calls = ctx.interp_calls.saturating_add(1);
@@ -5913,6 +5962,41 @@ unsafe extern "C" fn wpjit_list_repeat(frame: *mut JitFrame, pin: i64, count: i6
     idx
 }
 
+/// The `wpjit_list_from_range` helper: `list(range(start, stop))` —
+/// the fresh `int` list pins on the `int` lane and is GC-tracked like
+/// every list the interpreter builds. Negative deopts (cap pressure,
+/// or a length past what the fast path builds — the interpreter then
+/// raises exactly or builds it itself). Never runs Python code.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe extern "C" fn wpjit_list_from_range(frame: *mut JitFrame, start: i64, stop: i64) -> i64 {
+    // Far past any sane fast-path build; the interpreter handles the rest.
+    const MAX_LEN: i64 = 1 << 28;
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    if ctx.pins.len() >= RUNTIME_PIN_CAP {
+        return -1;
+    }
+    let len = stop.saturating_sub(start).max(0);
+    if len > MAX_LEN {
+        return -1;
+    }
+    let items: Vec<Object> = (start..start + len).map(Object::Int).collect();
+    let list = Rc::new(crate::sync::RefCell::new(items));
+    let obj = Object::List(list.clone());
+    crate::gc_trace::track(obj.clone());
+    if crate::stdlib::tracemalloc_real::is_tracking() {
+        crate::stdlib::tracemalloc_real::track_new_object(&obj);
+    }
+    let idx = ctx.pins.len() as i64;
+    ctx.pins.push(Pin::List(list, JitType::Int));
+    idx
+}
+
 /// The `wpjit_list_slice` helper (RFC 0071 WS4): `xs[a:b]` (unit
 /// step) on a pinned list. Bounds clamp CPython-style (negative
 /// bounds add `len`, then clamp to `[0, len]`); `i64::MIN` marks an
@@ -7493,6 +7577,7 @@ pub(crate) fn try_call_native_direct(
         dirty: false,
         interp_calls: 0,
         native_calls: 0,
+        polls: 0,
         child: None,
         depth_cell: crate::recursion::depth_cell(),
         code_ptr: key,
@@ -7781,8 +7866,25 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
                         || (ty == JitType::Obj
                             && matches!(o, Object::Unbound)
                             && !osr.unassigned_reads.contains(&(slot as u32)))
+                        // An inlined comprehension's target: unbound
+                        // outside its body, written there before any
+                        // read (the packed placeholder is never read).
+                        || (matches!(o, Object::Unbound)
+                            && matches!(ty, JitType::Int | JitType::Float | JitType::Bool)
+                            && cf.comp_target_slots.contains(&(slot as u32))
+                            && !osr.unassigned_reads.contains(&(slot as u32)))
                 });
                 if !ok {
+                    if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+                        eprintln!(
+                            "jit osr refuse {:?} pc {}: local {} {:?} holds {}",
+                            frame.code.name,
+                            pc,
+                            slot,
+                            ty,
+                            locals.get(slot).map_or("?".to_owned(), |o| o.type_name_owned())
+                        );
+                    }
                     drop(locals);
                     return fail(&frame.code);
                 }
@@ -7795,6 +7897,9 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
     // Decompose them into the synthetic slots the compiled loops run
     // on; the headers re-check their bounds on entry.
     let Some(synth) = decompose_live_loops(cf, pc, &frame.stack) else {
+        if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+            eprintln!("jit osr refuse {:?} pc {}: live loops", frame.code.name, pc);
+        }
         return fail(&frame.code);
     };
     // The iterators are consumed by the decomposition: native code owns
@@ -8177,6 +8282,7 @@ fn enter_compiled(
         dirty: false,
         interp_calls: 0,
         native_calls: 0,
+        polls: 0,
         child: None,
         depth_cell: crate::recursion::depth_cell(),
         code_ptr: Rc::as_ptr(&frame.code).cast::<CodeObject>(),
@@ -9043,6 +9149,7 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
         dirty: act.dirty,
         interp_calls: act.interp_calls,
         native_calls: 0,
+        polls: 0,
         child: None,
         depth_cell: crate::recursion::depth_cell(),
         code_ptr: Rc::as_ptr(&frame.code).cast::<CodeObject>(),

@@ -2490,6 +2490,17 @@ impl Interpreter {
             self.prompt_reap_dropped(cur);
             return;
         }
+        // A tuple of scalars anchors nothing, is never GC-tracked at
+        // birth (the filter has no false negatives) and can't be weakly
+        // referenced: the freelist (or the plain drop) is its teardown.
+        if let Object::Tuple(t) = &dropped {
+            if t.iter().all(Object::is_gc_atomic)
+                && !gc_trace::maybe_tracked(crate::weakref_registry::id_of(&dropped))
+            {
+                self.maybe_donate_tuple(dropped);
+                return;
+            }
+        }
         // A deferred-tracking instance holds only atomic values, has no
         // weakref (creating one tracks it) and no collector handle: the
         // plain `Rc` drop is its whole teardown.
@@ -3419,7 +3430,16 @@ impl Interpreter {
         let mut t = t;
         if let Some(slots) = ThinArc::get_mut(&mut t) {
             for s in slots.iter_mut() {
-                *s = Object::Unbound;
+                let old = std::mem::replace(s, Object::Unbound);
+                // Scalars have no drop glue; skip the out-of-line call.
+                if matches!(
+                    old,
+                    Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+                ) {
+                    std::mem::forget(old);
+                } else {
+                    drop(old);
+                }
             }
             let mut pool = self.tuple_pool.borrow_mut();
             let bucket = &mut pool[t.len() - 1];
@@ -3460,7 +3480,11 @@ impl Interpreter {
             if let Some(mut tuple) = popped {
                 if let Some(slots) = ThinArc::get_mut(&mut tuple) {
                     for (slot, value) in slots.iter_mut().zip(items) {
-                        *slot = value;
+                        // SAFETY: a pooled tuple's slots were cleared to
+                        // `Unbound` (see `maybe_donate_tuple`), which has
+                        // no drop glue.
+                        debug_assert!(matches!(slot, Object::Unbound));
+                        unsafe { std::ptr::write(slot, value) };
                     }
                     return Object::Tuple(tuple);
                 }
@@ -3677,7 +3701,8 @@ impl Interpreter {
             }
             let mut found = false;
             crate::gc_trace::traverse_object(obj, &mut |c| {
-                if found || *budget == 0 {
+                // Scalars are never tracked and hold nothing.
+                if found || *budget == 0 || c.is_gc_atomic() {
                     return;
                 }
                 *budget -= 1;
@@ -11033,14 +11058,25 @@ impl Interpreter {
                             Object::None => Object::None,
                             Object::Unbound => break None,
                             other => {
-                                // `x.attr` on a local receiver: the helper reads
-                                // the attribute off the local directly (no
-                                // receiver clone pushed and released).
+                                // `x.attr` on a local receiver: read straight
+                                // off the local (no receiver clone pushed and
+                                // released); a miss loads the receiver and
+                                // leaves `LOAD_ATTR` to its own arm.
                                 if matches!(other, Object::Instance(_) | Object::Module(_))
                                     && pc + 1 < ninstrs
-                                    && (*instrs.add(pc + 1)).op == OpCode::LoadAttr
                                 {
-                                    break Some(CoreExit::Helper);
+                                    let next = *instrs.add(pc + 1);
+                                    if next.op == OpCode::LoadAttr {
+                                        if let Some(v) =
+                                            Self::core_local_attr(code, other, pc + 1, next.arg)
+                                        {
+                                            base.add(len).write(v);
+                                            len += 1;
+                                            last = pc + 1;
+                                            pc += 2;
+                                            continue;
+                                        }
+                                    }
                                 }
                                 other.clone()
                             }
@@ -11125,6 +11161,22 @@ impl Interpreter {
                                         {
                                             PyInstance::try_recycle(i);
                                         }
+                                        last = pc;
+                                        pc += 1;
+                                        continue;
+                                    }
+                                    // A tuple of scalars: the freelist is
+                                    // its teardown (see `prompt_reap_dropped`).
+                                    Object::Tuple(t)
+                                        if t.iter().all(Object::is_gc_atomic)
+                                            && !gc_trace::maybe_tracked(
+                                                crate::weakref_registry::id_of(&*slot),
+                                            ) =>
+                                    {
+                                        len -= 1;
+                                        let old =
+                                            std::mem::replace(&mut *slot, base.add(len).read());
+                                        self.maybe_donate_tuple(old);
                                         last = pc;
                                         pc += 1;
                                         continue;
@@ -11380,6 +11432,39 @@ impl Interpreter {
                     last = pc;
                     pc += 1;
                 }
+                // Tuples are never collector-tracked at build time and the
+                // items move in (the slow arm's shape; only the
+                // tracemalloc/reftrace fixtures need the full handler).
+                OpCode::BuildTuple => {
+                    let n = ins.arg as usize;
+                    if n == 0
+                        || n > 3
+                        || n > len
+                        || crate::stdlib::tracemalloc_real::is_tracking()
+                        || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+                    {
+                        break None;
+                    }
+                    len -= n;
+                    // SAFETY: the `n` items below the old `len` move into
+                    // the tuple; its slot is the lowest of them.
+                    unsafe {
+                        let top = base.add(len);
+                        let t = match n {
+                            1 => self.alloc_tuple_array([top.read()]),
+                            2 => self.alloc_tuple_array([top.read(), top.add(1).read()]),
+                            _ => self.alloc_tuple_array([
+                                top.read(),
+                                top.add(1).read(),
+                                top.add(2).read(),
+                            ]),
+                        };
+                        top.write(t);
+                    }
+                    len += 1;
+                    last = pc;
+                    pc += 1;
+                }
                 OpCode::ReturnValue => break Some(CoreExit::Stop(LeafStop::Step)),
                 // A Python callee is the quiet loop's (an inline or lean
                 // call); only a builtin or type callee has leaf arms.
@@ -11532,12 +11617,30 @@ impl Interpreter {
             }
             OpCode::LoadMethodAttr => {
                 // The instance receiver's method-cache hit (the full leaf
-                // arm's first case): the plain function under the receiver.
-                if !matches!(stack.last(), Some(Object::Instance(_))) {
-                    return CoreAttr::Decline;
-                }
-                let Some(f) = Self::leaf_load_method(code, stack, pc as u32, ins.arg) else {
-                    return CoreAttr::Decline;
+                // arm's first case): the plain function under the receiver;
+                // a native container's site-cached builtin method likewise
+                // (the full leaf arm fills that cache on a miss).
+                let f = match stack.last() {
+                    Some(Object::Instance(_)) => {
+                        match Self::leaf_load_method(code, stack, pc as u32, ins.arg) {
+                            Some(f) => f,
+                            None => return CoreAttr::Decline,
+                        }
+                    }
+                    Some(recv) => {
+                        let tag = match recv {
+                            Object::List(_) => 1,
+                            Object::Dict(_) => 2,
+                            Object::Set(_) => 3,
+                            Object::Str(_) => 4,
+                            _ => return CoreAttr::Decline,
+                        };
+                        match code_method_slot(code, pc as u32).and_then(|s| s.get_builtin(tag)) {
+                            Some(b) => Object::Builtin(b),
+                            None => return CoreAttr::Decline,
+                        }
+                    }
+                    None => return CoreAttr::Decline,
                 };
                 let n = stack.len();
                 stack.push(f);
@@ -11642,6 +11745,32 @@ impl Interpreter {
                 CoreAttr::Raised(e)
             }
         }
+    }
+
+    /// The core loop's `x.attr` on a local receiver: the cached
+    /// instance-dict hit read in place (no borrow guard; nothing here runs
+    /// code), anything else through [`Self::leaf_fused_local_attr`].
+    #[inline(never)]
+    fn core_local_attr(
+        code: &CodeObject,
+        local: &Object,
+        attr_pc: usize,
+        name_idx: u32,
+    ) -> Option<Object> {
+        use weavepy_compiler::InlineCache as IC;
+        if let (IC::LoadAttrInstance { key_idx, ver }, Object::Instance(inst)) =
+            (code.caches.get(attr_pc as u32), local)
+        {
+            let cls = inst.cls_raw();
+            if cls.native_kind.get() != 0 || cls.attr_version.get() != ver {
+                return None;
+            }
+            // SAFETY: a read between two instructions (see `peek`).
+            let d = unsafe { inst.dict.get()?.peek() }?;
+            let (k, v) = d.get_index(key_idx as usize)?;
+            return slot_name_matches(code, name_idx, k).then(|| Self::clone_operand(v));
+        }
+        Self::leaf_fused_local_attr(code, local, attr_pc, name_idx)
     }
 
     /// The core loop's fused `LOAD_FAST x; LOAD_ATTR name`: the attribute
@@ -50798,6 +50927,7 @@ static CORE_LEAF_OPS: [bool; 256] = {
         OpCode::CopyTop,
         OpCode::Swap,
         OpCode::GetIter,
+        OpCode::BuildTuple,
     ];
     let mut i = 0;
     while i < ops.len() {

@@ -789,6 +789,25 @@ impl<T: ?Sized> GilCell<T> {
     /// Returns a raw pointer to the inner data. Doesn't claim any
     /// borrow; the caller is responsible for ensuring the pointer
     /// isn't dereferenced concurrently with another borrow.
+    /// A shared view that registers no guard: `None` while the cell is
+    /// exclusively borrowed or cells are shared across threads.
+    ///
+    /// # Safety
+    ///
+    /// The reference must be dropped before anything that could borrow
+    /// this cell mutably runs (no Python code, no nested `borrow_mut`):
+    /// a read-only peek between two instructions.
+    #[inline]
+    pub unsafe fn peek(&self) -> Option<&T> {
+        if cells_shared() || self.borrow.load(Ordering::Relaxed) < 0 {
+            return None;
+        }
+        // SAFETY: no exclusive borrow is live (checked above) and the
+        // caller keeps this view from outliving any code that could take
+        // one.
+        Some(unsafe { &*self.data.get() })
+    }
+
     pub fn as_ptr(&self) -> *mut T {
         self.data.get()
     }

@@ -61,6 +61,9 @@ pub struct CompiledFrame {
     /// RFC 0073 WS1 — inlined-comprehension saved-target spans (the
     /// parked `Unbound` re-inserted at its depth on a mid-span deopt).
     pub comp_saved: Vec<CompSavedMeta>,
+    /// Inlined-comprehension target slots (see
+    /// [`crate::ir::TFunc::comp_target_slots`]).
+    pub comp_target_slots: Vec<u32>,
     /// Erased Python callees (RFC 0059 WS3), for rebuilding the callee
     /// object on the interpreter stack after a mid-arguments deopt.
     pub callee_spans: Vec<CalleeSpanMeta>,
@@ -426,6 +429,7 @@ impl JitEngine {
             list_loops: tfunc.list_loops.clone(),
             iter_loops: tfunc.iter_loops.clone(),
             comp_saved: tfunc.comp_saved.clone(),
+            comp_target_slots: tfunc.comp_target_slots.clone(),
             callee_spans: tfunc.callee_spans.clone(),
             len_spans: tfunc.len_spans.clone(),
             method_spans: tfunc.method_spans.clone(),

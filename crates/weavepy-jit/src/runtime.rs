@@ -588,6 +588,26 @@ static BUILD_LIST_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 static BUILD_TUPLE_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static LIST_REPEAT_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static LIST_SLICE_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LIST_FROM_RANGE_HELPER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The embedder's `list(range(start, stop))` helper: build the fresh
+/// `int` list, pin it, and return the pin index — or a negative value
+/// to deopt (cap pressure, or a length the interpreter should refuse).
+/// Never runs Python code; shares the [`ListRepeatHelper`] shape.
+pub type ListFromRangeHelper =
+    unsafe extern "C" fn(frame: *mut JitFrame, start: i64, stop: i64) -> i64;
+
+/// Register the `list(range(...))` helper. Must precede the first
+/// compile of a frame containing `ListFromRange`.
+pub fn register_list_from_range_helper(f: ListFromRangeHelper) {
+    LIST_FROM_RANGE_HELPER.store(f as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn list_from_range_helper_addr() -> usize {
+    LIST_FROM_RANGE_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// Register the process-wide opaque-iterator and list/tuple
 /// construction helpers (RFC 0071 WS4 / RFC 0073 WS1). Must precede

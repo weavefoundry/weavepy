@@ -861,6 +861,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::StrGetItem => self.emit_str_get(stmt.pc),
             TOp::BuildString { n } => self.emit_build_string(n, stmt.pc),
             TOp::ListRepeat => self.emit_list_repeat(stmt.pc),
+            TOp::ListFromRange { pops, deopt_pc } => self.emit_list_from_range(pops, deopt_pc),
             TOp::ListSlice {
                 start,
                 stop,
@@ -1751,6 +1752,34 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
         self.vstack.push((res, lane));
+    }
+
+    /// `list(range(...))` through `wpjit_list_from_range`. The bounds
+    /// pop first, so the deopt snapshot is the stack the erased
+    /// `LOAD_GLOBAL list` (`deopt_pc`) saw: the interpreter re-runs the
+    /// whole expression.
+    fn emit_list_from_range(&mut self, pops: u8, deopt_pc: u32) {
+        let (stop, _) = self.pop();
+        let start = if pops == 2 {
+            self.pop().0
+        } else {
+            self.b.ins().iconst(types::I64, 0)
+        };
+        let snapshot = self.vstack.clone();
+        let sig = self.list_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::list_from_range_helper_addr() as i64);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, start, stop]);
+        let res = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
+        let cont = self.guard(bad, deopt_pc, &snapshot);
+        self.b.switch_to_block(cont);
+        self.vstack.push((res, JitType::ListInt));
     }
 
     /// RFC 0071 WS4 — `xs[a:b]` (unit step) through

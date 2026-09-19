@@ -477,6 +477,15 @@ pub enum TOp {
     /// CPython's aliasing), and pushes the fresh pinned list on the
     /// same lane. Cap pressure deopts at this pc.
     ListRepeat,
+    /// `list(range(stop))` / `list(range(start, stop))` with the whole
+    /// call shape erased: pops the bounds (`stop` above `start`; one
+    /// bound seeds `start` with 0), calls the registered
+    /// `wpjit_list_from_range` helper, and pushes the fresh pinned
+    /// `int` list. A failed build (cap pressure, an absurd length)
+    /// deopts at `deopt_pc` — the erased `LOAD_GLOBAL list` — with the
+    /// bounds dropped, so the interpreter re-executes the whole
+    /// expression (its argument loads are side-effect free).
+    ListFromRange { pops: u8, deopt_pc: u32 },
     /// RFC 0071 WS4 — `xs[a:b]` on a pinned list (an erased
     /// `BUILD_SLICE 3` whose step is the `None` constant followed by
     /// `BINARY_SUBSCR`): pops the present bounds (`stop` above
@@ -777,6 +786,11 @@ pub enum ResolvedGlobal {
     /// pinned-list length callee (lowered to [`TOp::ListLen`], never a
     /// real call).
     LenBuiltin,
+    /// The canonical builtin `list`: `list(range(...))` over simple
+    /// integer bounds lowers to [`TOp::ListFromRange`] (a fresh pinned
+    /// `int` list, never a real call). Any other use burns as an
+    /// ordinary obj-global.
+    ListBuiltin,
     /// RFC 0074 WS3 — the canonical builtin `enumerate`. Burns like any
     /// obj-global (the plan gate routes it through the obj-global
     /// probe, so its `LOAD_GLOBAL` pushes an identity-guarded pin and
@@ -1351,6 +1365,10 @@ pub struct TFunc {
     /// recorded interpreter depth (the parked prior value of the
     /// comprehension target, proven unbound at admission).
     pub comp_saved: Vec<CompSavedMeta>,
+    /// Local slots of recognized inlined-comprehension targets: accessed
+    /// only inside their comprehension bodies (and written there before
+    /// any read), so an OSR entry admits them unbound on any lane.
+    pub comp_target_slots: Vec<u32>,
     /// Erased Python callees (RFC 0059 WS3), ascending `live_from`, for
     /// deopt stack reconstruction during argument computation.
     pub callee_spans: Vec<CalleeSpanMeta>,
@@ -1476,6 +1494,7 @@ impl TOp {
                 | TOp::BuildList { .. }
                 | TOp::BuildTuple { .. }
                 | TOp::ListRepeat
+                | TOp::ListFromRange { .. }
                 | TOp::ListSlice { .. }
                 | TOp::PushGlobalObj { .. }
                 | TOp::CallDyn { .. }
