@@ -1369,6 +1369,10 @@ pub struct TFunc {
     /// only inside their comprehension bodies (and written there before
     /// any read), so an OSR entry admits them unbound on any lane.
     pub comp_target_slots: Vec<u32>,
+    /// Cold-exit pcs (see the analyzer's `cold_point`): an expected
+    /// hand-off to the interpreter, at most once per activation — never
+    /// charged as a deopt.
+    pub cold_exits: Vec<u32>,
     /// Erased Python callees (RFC 0059 WS3), ascending `live_from`, for
     /// deopt stack reconstruction during argument computation.
     pub callee_spans: Vec<CalleeSpanMeta>,

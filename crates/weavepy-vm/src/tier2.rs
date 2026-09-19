@@ -106,6 +106,8 @@ struct MethodEntry {
     code: Rc<CodeObject>,
     /// The method name (for the shadow check and the span rebuild).
     name: String,
+    /// `hash(name)`, so the per-call shadow probe hashes nothing.
+    name_hash: i64,
     /// Positional arity, `self` included.
     arg_count: u32,
     /// Arity minus trailing defaults, `self` included.
@@ -374,6 +376,8 @@ pub(crate) struct JitStats {
     /// Fully reconstructed exits requested to release native temporary pins.
     /// These do not spend the speculative-deopt budget.
     pub pin_pressure_exits: u64,
+    /// Expected hand-offs at cold exits (see `CompiledFrame::cold_exits`).
+    pub cold_exits: u64,
     pub entry_guard_failures: u64,
     /// Mid-loop (OSR) native entries, a subset of `native_entries`
     /// (RFC 0059 WS3b).
@@ -2388,6 +2392,7 @@ fn probe_method_entry(
         func: f,
         code: fcode,
         name: name.to_owned(),
+        name_hash: crate::object::py_str_hash(name),
         arg_count,
         min_args,
         ret,
@@ -4417,15 +4422,19 @@ unsafe extern "C" fn wpjit_call_method(
     };
     let guard_ok = match &recv {
         Object::Instance(inst) => {
-            let cls_ok = {
-                let cls = inst.class.borrow();
-                cls.attr_version.get() == entry.ver
+            let probe = crate::object::StrKeyHashed {
+                s: &entry.name,
+                hash: entry.name_hash,
             };
-            cls_ok
-                && inst
-                    .dict
-                    .get()
-                    .is_none_or(|dict| dict.borrow().get(&StrKey(&entry.name)).is_none())
+            attr_class_ok(inst, entry.ver)
+                && inst.dict.get().is_none_or(|dict| {
+                    // SAFETY: a read between two native ops; nothing
+                    // here runs code (see `GilCell::peek`).
+                    match unsafe { dict.peek() } {
+                        Some(d) => d.get(&probe).is_none(),
+                        None => dict.borrow().get(&probe).is_none(),
+                    }
+                })
                 && Rc::ptr_eq(&entry.func.code.borrow(), &entry.code)
         }
         _ => false,
@@ -5466,10 +5475,14 @@ unsafe extern "C" fn wpjit_list_next(frame: *mut JitFrame, pin: i64, idx: i64) -
         let Some(Pin::List(list, elem)) = ctx.pins.get(pin as usize) else {
             return 2;
         };
-        let items = list.borrow();
         if idx < 0 {
             return 2;
         }
+        // SAFETY: a read between two native ops; nothing here runs code
+        // (see `GilCell::peek`).
+        let Some(items) = (unsafe { list.peek() }) else {
+            return 2;
+        };
         let Some(v) = items.get(idx as usize) else {
             return 1;
         };
@@ -6053,8 +6066,21 @@ unsafe extern "C" fn wpjit_list_slice(
 /// `true` when a dict key is the string `name` (the per-access name
 /// re-check that makes an indexed hit safe against `del`-driven index
 /// shifts, mirroring the tier-1 caches).
-fn key_is(key: &DictKey, name: &str) -> bool {
-    matches!(&key.0, Object::Str(s) if &**s == name)
+fn key_is(key: &DictKey, name: &SharedStr) -> bool {
+    // Instance-dict keys are interned on insert and the guard holds the
+    // interned name: identity usually settles it.
+    matches!(&key.0, Object::Str(s) if SharedStr::ptr_eq(s, name) || **s == **name)
+}
+
+/// A site guard's class check: the receiver's class still carries the
+/// compiled `attr_version` (read without a borrow guard when only one
+/// thread runs Python; nothing here runs code).
+#[inline]
+fn attr_class_ok(inst: &crate::types::PyInstance, ver: u64) -> bool {
+    if crate::gil::free_threading_enabled() {
+        return inst.class.borrow().attr_version.get() == ver;
+    }
+    inst.cls_raw().attr_version.get() == ver
 }
 
 /// The `wpjit_attr_get` helper (RFC 0065 WS5): read one scalar
@@ -6082,11 +6108,7 @@ unsafe extern "C" fn wpjit_attr_get(frame: *mut JitFrame, pin: i64, site: i64) -
         let Some(g) = ctx.attr_guards.get(site as usize) else {
             return 1;
         };
-        let guard_ok = {
-            let cls = inst.class.borrow();
-            cls.attr_version.get() == g.ver
-        };
-        if !guard_ok {
+        if !attr_class_ok(inst, g.ver) {
             return 1;
         }
         // RFC 0070 WS1 — the nullable object lane: `None` is the
@@ -6128,7 +6150,11 @@ unsafe extern "C" fn wpjit_attr_get(frame: *mut JitFrame, pin: i64, site: i64) -
                 let Some(dict) = inst.dict.get() else {
                     return 1;
                 };
-                let dict = dict.borrow();
+                // SAFETY: a read between two native ops; nothing here
+                // runs code (see `GilCell::peek`).
+                let Some(dict) = (unsafe { dict.peek() }) else {
+                    return 1;
+                };
                 match dict.get_index(key_idx as usize) {
                     Some((k, v)) if key_is(k, &g.name) => match classify(v) {
                         Some(o) => o,
@@ -6203,11 +6229,7 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
     let Some(Pin::Obj(Object::Instance(inst))) = ctx.pins.get(pin as usize) else {
         return 1;
     };
-    let guard_ok = {
-        let cls = inst.class.borrow();
-        cls.attr_version.get() == g.ver
-    };
-    if !guard_ok {
+    if !attr_class_ok(inst, g.ver) {
         return 1;
     }
     match g.storage {
@@ -7866,12 +7888,13 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
                         || (ty == JitType::Obj
                             && matches!(o, Object::Unbound)
                             && !osr.unassigned_reads.contains(&(slot as u32)))
-                        // An inlined comprehension's target: unbound
-                        // outside its body, written there before any
-                        // read (the packed placeholder is never read).
+                        // An unbound scalar-lane local written before
+                        // any native read from this entry (an inlined
+                        // comprehension's target, an accumulator bound
+                        // after the loop): the packed placeholder is
+                        // never read.
                         || (matches!(o, Object::Unbound)
                             && matches!(ty, JitType::Int | JitType::Float | JitType::Bool)
-                            && cf.comp_target_slots.contains(&(slot as u32))
                             && !osr.unassigned_reads.contains(&(slot as u32)))
                 });
                 if !ok {
@@ -8317,7 +8340,9 @@ fn enter_compiled(
     // call and is only touched by the `wpjit_call_py` helper.
     let status = unsafe { cf.enter(&raw mut jf) };
 
-    note_native_exit(frame, &jf, status, ctx.pin_pressure_exit);
+    // A cold exit is an expected hand-off, never a deopt charge.
+    let cold_exit = matches!(status, JitStatus::Deopt) && cf.cold_exits.contains(&jf.deopt_pc);
+    note_native_exit(frame, &jf, status, ctx.pin_pressure_exit, cold_exit);
 
     // RFC 0073 WS4 — a healthy yield whose continuation is a
     // registered resume entry parks the *whole* activation on the
@@ -8390,10 +8415,15 @@ fn note_native_exit(
     jf: &JitFrame,
     status: JitStatus,
     pin_pressure_exit: bool,
+    cold_exit: bool,
 ) {
     JIT.with(|cell| {
         let mut st = cell.borrow_mut();
         st.stats.native_entries += 1;
+        if cold_exit {
+            st.stats.cold_exits += 1;
+            return;
+        }
         if pin_pressure_exit {
             debug_assert_eq!(status, JitStatus::Deopt);
             st.stats.pin_pressure_exits += 1;
@@ -9185,7 +9215,8 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
     // call; the engine backing `cf` lives in this thread's `JIT`
     // thread-local for the process lifetime; `ctx` outlives the call.
     let status = unsafe { cf.enter(&raw mut jf) };
-    note_native_exit(frame, &jf, status, ctx.pin_pressure_exit);
+    let cold_exit = matches!(status, JitStatus::Deopt) && cf.cold_exits.contains(&jf.deopt_pc);
+    note_native_exit(frame, &jf, status, ctx.pin_pressure_exit, cold_exit);
     if matches!(status, JitStatus::Yielded) {
         if let Some(plan) = park_plan(frame, &entry, &jf) {
             // Re-park in place: same box, same buffers, zero moves.
@@ -9356,6 +9387,7 @@ pub(crate) fn format_stats_markdown() -> Option<String> {
              - parked materializations: **{}**\n\
              - deopts: **{}**\n\
              - pin-pressure exits: **{}**\n\
+             - cold exits: **{}**\n\
              - entry-guard failures: **{}**\n\
              - native-to-native calls: **{}**\n\
              - scalar leaf calls: **{}**\n\
@@ -9379,6 +9411,7 @@ pub(crate) fn format_stats_markdown() -> Option<String> {
             s.gen_materialized,
             s.deopts,
             s.pin_pressure_exits,
+            s.cold_exits,
             s.entry_guard_failures,
             ncalls,
             leaves,

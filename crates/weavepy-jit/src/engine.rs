@@ -64,6 +64,8 @@ pub struct CompiledFrame {
     /// Inlined-comprehension target slots (see
     /// [`crate::ir::TFunc::comp_target_slots`]).
     pub comp_target_slots: Vec<u32>,
+    /// Cold-exit pcs (see [`crate::ir::TFunc::cold_exits`]).
+    pub cold_exits: Vec<u32>,
     /// Erased Python callees (RFC 0059 WS3), for rebuilding the callee
     /// object on the interpreter stack after a mid-arguments deopt.
     pub callee_spans: Vec<CalleeSpanMeta>,
@@ -430,6 +432,7 @@ impl JitEngine {
             iter_loops: tfunc.iter_loops.clone(),
             comp_saved: tfunc.comp_saved.clone(),
             comp_target_slots: tfunc.comp_target_slots.clone(),
+            cold_exits: tfunc.cold_exits.clone(),
             callee_spans: tfunc.callee_spans.clone(),
             len_spans: tfunc.len_spans.clone(),
             method_spans: tfunc.method_spans.clone(),

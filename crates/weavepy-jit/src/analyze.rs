@@ -360,6 +360,14 @@ struct Plan {
     /// element's lane, so a surprise deopts at the erased
     /// `UNPACK_SEQUENCE`, never miscompiles.
     pair_src: HashMap<usize, PairSrc>,
+    /// `LOAD_GLOBAL` pcs of builtins that read their *caller's frame*
+    /// (`eval`/`exec`/`locals`/`vars`/`dir` without arguments, the
+    /// zero-argument `super`, `breakpoint`): native locals live in the
+    /// JIT's buffer, not the interpreter frame those builtins inspect.
+    frame_readers: HashSet<usize>,
+    /// Cold exits: statement-start pcs where native code hands the rest of
+    /// the activation to the interpreter (see `cold_point`).
+    cold: HashSet<usize>,
     /// Typed `[]` accumulators: a `BUILD_LIST 0` pc → the local it is
     /// stored into. When that local is assigned nothing but empty-list
     /// literals, its list lane is the lane its appends pin (see
@@ -570,6 +578,62 @@ pub fn analyze_frame(
     analyze_impl(code, resolve, probes)
 }
 
+thread_local! {
+    /// The instruction the last failed inference/emission step stopped
+    /// at (see `cold_point`).
+    static FAIL_PC: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Every jump-landing pc of `code`.
+fn jump_targets(code: &CodeObject) -> HashSet<usize> {
+    let mut targets = HashSet::new();
+    for (i, item) in code.instructions.iter().enumerate() {
+        match item.op {
+            OpCode::PopJumpIfFalse
+            | OpCode::PopJumpIfTrue
+            | OpCode::PopJumpIfNone
+            | OpCode::PopJumpIfNotNone
+            | OpCode::JumpForward
+            | OpCode::ForIter => {
+                targets.insert(forward_target(i, item.arg));
+            }
+            OpCode::JumpBackward => {
+                if let Some(t) = backward_target(i, item.arg) {
+                    targets.insert(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    targets
+}
+
+/// Where an unsupported instruction at `p` can become a *cold exit*: the
+/// start of its statement (its source line, back to the nearest jump
+/// target), when that lies outside every loop — native code then runs
+/// up to it and hands the rest of the activation to the interpreter, at
+/// most once per activation. `None` inside a loop body (a side exit
+/// there would deopt every iteration).
+fn cold_point(code: &CodeObject, p: usize) -> Option<usize> {
+    let ins = &code.instructions;
+    for (j, x) in ins.iter().enumerate() {
+        if x.op == OpCode::JumpBackward {
+            if let Some(t) = backward_target(j, x.arg) {
+                if t <= p && p <= j {
+                    return None;
+                }
+            }
+        }
+    }
+    let line = code.linetable.get(p).copied()?;
+    let targets = jump_targets(code);
+    let mut q = p;
+    while q > 0 && code.linetable.get(q - 1) == Some(&line) && !targets.contains(&q) {
+        q -= 1;
+    }
+    (q > 0).then_some(q)
+}
+
 fn analyze_impl(
     code: &CodeObject,
     resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
@@ -586,8 +650,12 @@ fn analyze_impl(
     // Typed `[]` accumulators are a prediction: any failure under them
     // re-analyzes with the literal on the object lane, as before.
     let mut lane_lists = has_empty_list_store(code);
+    // Cold exits (see `cold_point`), grown one unsupported statement at
+    // a time.
+    let mut cold: HashSet<usize> = HashSet::new();
     loop {
-        match analyze_once(code, resolve, probes, &demote, lane_lists) {
+        FAIL_PC.with(|c| c.set(None));
+        match analyze_once(code, resolve, probes, &demote, lane_lists, &cold) {
             Err(JitVerdict::CalleeEscapes(name_idx)) => {
                 if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
                     eprintln!(
@@ -600,6 +668,25 @@ fn analyze_impl(
                 if demote.len() >= 8 || !demote.insert(name_idx) {
                     return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
                 }
+            }
+            Err(
+                e @ (JitVerdict::UnsupportedOpcode(_)
+                | JitVerdict::UnsupportedConst
+                | JitVerdict::MixedArithTypes),
+            ) if cold.len() < 4
+                && FAIL_PC
+                    .with(std::cell::Cell::get)
+                    .and_then(|p| cold_point(code, p))
+                    .is_some_and(|q| !cold.contains(&q)) =>
+            {
+                let q = FAIL_PC
+                    .with(std::cell::Cell::get)
+                    .and_then(|p| cold_point(code, p))
+                    .expect("checked by the guard");
+                if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+                    eprintln!("jit cold exit {:?} pc {}: {:?}", code.name, q, e);
+                }
+                cold.insert(q);
             }
             Err(e) if lane_lists => {
                 if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
@@ -626,6 +713,7 @@ fn analyze_once(
     probes: &mut Probes<'_>,
     demote: &HashSet<u32>,
     lane_lists: bool,
+    cold: &HashSet<usize>,
 ) -> Result<TFunc, JitVerdict> {
     // RFC 0070 WS2 — sync generator bodies are admitted (yields become
     // `Yielded` side exits; entry is OSR-only). Coroutines and async
@@ -641,9 +729,10 @@ fn analyze_once(
         return Err(JitVerdict::Trivial);
     }
 
-    let plan = plan_rewrite(code, resolve, probes.obj_global, demote, lane_lists)?;
+    let mut plan = plan_rewrite(code, resolve, probes.obj_global, demote, lane_lists)?;
+    plan.cold = cold.clone();
 
-    let raw = build_blocks(code)?;
+    let raw = build_blocks(code, &plan.cold)?;
     let reachable = reachable_blocks(&raw);
     if reachable.is_empty() {
         return Err(JitVerdict::Trivial);
@@ -980,6 +1069,10 @@ fn analyze_once(
     // calls themselves or erasing enclosing loop iterators.
     for block in &blocks {
         if let TTerm::Deopt { pc } = block.term {
+            // A cold exit rebuilds every open span like any deopt.
+            if plan.cold.contains(&(pc as usize)) {
+                continue;
+            }
             for spans in [
                 &mut out.callee_spans,
                 &mut out.len_spans,
@@ -1006,6 +1099,11 @@ fn analyze_once(
         list_loops,
         iter_loops,
         comp_saved,
+        cold_exits: {
+            let mut v: Vec<u32> = plan.cold.iter().map(|&pc| pc as u32).collect();
+            v.sort_unstable();
+            v
+        },
         comp_target_slots: {
             let mut v: Vec<u32> = plan.comp_headers.values().map(|c| c.saved_slot).collect();
             v.sort_unstable();
@@ -1572,6 +1670,17 @@ fn plan_rewrite(
         plan.nop.insert(i + 2);
     }
 
+    for (i, item) in ins.iter().enumerate() {
+        if matches!(item.op, OpCode::LoadGlobal)
+            && matches!(
+                code.names.get(item.arg as usize).map(String::as_str),
+                Some("eval" | "exec" | "locals" | "vars" | "dir" | "super" | "breakpoint")
+            )
+        {
+            plan.frame_readers.insert(i);
+        }
+    }
+
     // Typed `[]` accumulators: a local assigned only empty-list literals
     // (`BUILD_LIST 0; STORE_FAST s` everywhere it is stored, never a
     // parameter, never deleted).
@@ -1998,10 +2107,16 @@ fn common_error_constant(ins: weavepy_compiler::Instruction) -> bool {
 }
 
 /// Build the basic blocks, resolving relative jumps to absolute indices.
-fn build_blocks(code: &CodeObject) -> Result<Vec<RawBlock>, JitVerdict> {
+fn build_blocks(code: &CodeObject, cold: &HashSet<usize>) -> Result<Vec<RawBlock>, JitVerdict> {
     let n = code.instructions.len();
     let mut leaders: BTreeSet<usize> = BTreeSet::new();
     leaders.insert(0);
+    // A cold exit starts its own block, which ends native control.
+    for &pc in cold {
+        if pc < n {
+            leaders.insert(pc);
+        }
+    }
     for (i, ins) in code.instructions.iter().enumerate() {
         match ins.op {
             OpCode::PopJumpIfFalse
@@ -2074,6 +2189,14 @@ fn build_blocks(code: &CodeObject) -> Result<Vec<RawBlock>, JitVerdict> {
         let end = leader_vec.get(bi + 1).copied().unwrap_or(n);
         let last = end - 1;
         let ins = code.instructions[last];
+        if cold.contains(&start) {
+            blocks.push(RawBlock {
+                start,
+                end,
+                succs: Vec::new(),
+            });
+            continue;
+        }
         let succs = match ins.op {
             OpCode::ReturnValue | OpCode::RaiseVarargs => Vec::new(),
             OpCode::LoadCommonConstant if common_error_constant(ins) => Vec::new(),
@@ -2864,6 +2987,16 @@ fn infer_block(
     probes: &mut Probes<'_>,
     ctor: &mut CtorState,
 ) -> Result<Vec<(usize, Vec<SE>)>, JitVerdict> {
+    // A cold exit: the entry stack spills as-is (plain values only).
+    if plan.cold.contains(&b.start) {
+        if entry
+            .iter()
+            .any(|v| !v.is_plain() || !v.ty.is_representable())
+        {
+            return Err(JitVerdict::TypeUnknown);
+        }
+        return Ok(Vec::new());
+    }
     let mut stack: Vec<SE> = entry;
     for i in b.start..(b.end - 1) {
         step_abstract(
@@ -2878,6 +3011,7 @@ fn infer_block(
             ctor,
         )
         .inspect_err(|e| {
+            FAIL_PC.with(|c| c.set(Some(i)));
             if std::env::var_os("WEAVEPY_JIT_TRACE_PC").is_some() {
                 eprintln!(
                     "jit infer fail {:?} pc {} {:?}: {:?}",
@@ -3297,6 +3431,9 @@ fn step_abstract(
     // RFC 0058 WS4 — rewritten range-loop pcs.
     if plan.nop.contains(&i) {
         return Ok(());
+    }
+    if plan.frame_readers.contains(&i) {
+        return Err(JitVerdict::UnsupportedOpcode("LOAD_GLOBAL (frame-reading builtin)"));
     }
     if let Some(&(pops, cur, stop)) = plan.calls.get(&i) {
         for _ in 0..pops {
@@ -5556,6 +5693,16 @@ fn emit_block(
             entry_stack.push(s.ty);
         }
     }
+    if plan.cold.contains(&b.start) {
+        out.max_stack = out.max_stack.max(entry.len() as u32);
+        return Ok(TBlock {
+            entry_stack,
+            stmts: Vec::new(),
+            term: TTerm::Deopt {
+                pc: b.start as u32,
+            },
+        });
+    }
     let mut stack: Vec<ESlot> = entry;
     let mut stmts: Vec<TStmt> = Vec::new();
     out.max_stack = out.max_stack.max(stack.len() as u32);
@@ -5574,6 +5721,7 @@ fn emit_block(
             ctor,
         )
         .inspect_err(|e| {
+            FAIL_PC.with(|c| c.set(Some(i)));
             if std::env::var_os("WEAVEPY_JIT_TRACE_PC").is_some() {
                 eprintln!(
                     "jit emit fail {:?} pc {} {:?}: {:?}",

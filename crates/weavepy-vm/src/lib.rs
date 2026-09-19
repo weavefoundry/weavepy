@@ -15522,68 +15522,12 @@ impl Interpreter {
             OpCode::ContainsOp => {
                 let container = frame.pop()?;
                 let item = frame.pop()?;
-                // Object-backed `mappingproxy`: delegate wholesale (the
-                // wrapped mapping's own `__contains__` must win).
+                let found = self.contains_full(&container, &item, &frame.globals.clone())?;
+                // An object-backed `mappingproxy` stood for its mapping.
                 let container = if let Object::MappingProxyObj(inner) = &container {
                     (**inner).clone()
                 } else {
                     container
-                };
-                let found = if let Some(method) = instance_method(&container, "__contains__")
-                    .or_else(|| metaclass_method(&container, "__contains__"))
-                {
-                    let r = self.call(
-                        &method,
-                        std::slice::from_ref(&item),
-                        &[],
-                        &frame.globals.clone(),
-                    )?;
-                    r.is_truthy()
-                } else if let Object::Instance(inst) = &container {
-                    if let Some(native) = inst.native.get().cloned() {
-                        // Subclass of a built-in container (`class C(dict)`,
-                        // `class C(list)`, …) without a Python `__contains__`:
-                        // CPython inherits the native C membership test. Use the
-                        // wrapped payload directly — crucially this avoids the
-                        // legacy `__getitem__` iteration path, which would loop
-                        // forever for a mapping subclass whose `__getitem__`
-                        // never raises `IndexError`.
-                        native.contains(&item)?
-                    } else {
-                        // Pure-Python class: CPython falls back to iteration
-                        // (`_PySequence_IterSearch`), dispatching `__iter__` /
-                        // `__getitem__` and comparing each element with `==`.
-                        // Exceptions raised while iterating propagate.
-                        self.contains_via_iter(&container, &item, &frame.globals.clone())?
-                    }
-                } else if matches!(&container, Object::File(_)) {
-                    // A file has no native `contains`; CPython tests
-                    // membership by iterating its lines (`line in f`).
-                    self.contains_via_iter(&container, &item, &frame.globals.clone())?
-                } else {
-                    match &container {
-                        // `PySequence_Contains` compares each element with a
-                        // *rich* `==` — a user `__eq__` (e.g. `datetime.date`
-                        // values inside an enum's `_hashable_values_` list)
-                        // must be dispatched, not just the native eq.
-                        Object::List(items) => {
-                            let snapshot: Vec<Object> = items.borrow().clone();
-                            self.seq_contains_rich(&snapshot, &item, &frame.globals.clone())?
-                        }
-                        Object::Tuple(items) => {
-                            let snapshot: Vec<Object> = items.to_vec();
-                            self.seq_contains_rich(&snapshot, &item, &frame.globals.clone())?
-                        }
-                        // `x in <iterator/generator>`: CPython consumes the
-                        // iterator, comparing each yielded value with `==`
-                        // (`argparse._check_value` relies on `value in
-                        // iter(choices)`). Drive it through the VM so a
-                        // Python generator / user `__next__` works too.
-                        Object::Iter(_) | Object::Generator(_) => {
-                            self.contains_via_iter(&container, &item, &frame.globals.clone())?
-                        }
-                        _ => container.contains(&item)?,
-                    }
                 };
                 // The popped container may be a call temporary (`'x' in
                 // C()`); CPython decrefs it as CONTAINS_OP completes, so a
@@ -27241,30 +27185,85 @@ impl Interpreter {
     /// handful of container shapes and returned a silent `-1` (error with no
     /// exception) for everything else — a dict in particular, which is how
     /// Cython compiles `val in module_global_dict` (pandas' `_try_infer_map`).
-    pub fn py_contains(&mut self, container: &Object, item: &Object) -> Result<bool, RuntimeError> {
-        // An object-backed `mappingproxy` tests membership as the wrapped
-        // mapping — overridden `__contains__` included (test_customdict).
-        if let Object::MappingProxyObj(inner) = container {
-            let inner = (**inner).clone();
-            return self.py_contains(&inner, item);
-        }
-        if let Some(method) = instance_method(container, "__contains__")
-            .or_else(|| metaclass_method(container, "__contains__"))
+    /// `item in container` with the full `CONTAINS_OP` protocol:
+    /// `__contains__`, a native container subclass's payload, then the
+    /// iteration fallback (files, iterators, pure-Python classes), with
+    /// rich `==` for list/tuple elements.
+    pub(crate) fn contains_full(
+        &mut self,
+        container: &Object,
+        item: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<bool, RuntimeError> {
+        // Object-backed `mappingproxy`: delegate wholesale (the
+        // wrapped mapping's own `__contains__` must win).
+        let container: Object = if let Object::MappingProxyObj(inner) = container {
+            (**inner).clone()
+        } else {
+            container.clone()
+        };
+        let found = if let Some(method) = instance_method(&container, "__contains__")
+            .or_else(|| metaclass_method(&container, "__contains__"))
         {
-            let g = self.builtins.clone();
-            let r = self.call(&method, std::slice::from_ref(item), &[], &g)?;
-            return Ok(r.is_truthy());
-        }
-        if let Object::Instance(inst) = container {
-            return match inst.native.get().cloned() {
-                Some(native) => native.contains(item),
-                None => {
-                    let g = self.builtins.clone();
-                    self.contains_via_iter(container, item, &g)
+            let r = self.call(
+                &method,
+                std::slice::from_ref(item),
+                &[],
+                globals,
+            )?;
+            r.is_truthy()
+        } else if let Object::Instance(inst) = &container {
+            if let Some(native) = inst.native.get().cloned() {
+                // Subclass of a built-in container (`class C(dict)`,
+                // `class C(list)`, …) without a Python `__contains__`:
+                // CPython inherits the native C membership test. Use the
+                // wrapped payload directly — crucially this avoids the
+                // legacy `__getitem__` iteration path, which would loop
+                // forever for a mapping subclass whose `__getitem__`
+                // never raises `IndexError`.
+                native.contains(item)?
+            } else {
+                // Pure-Python class: CPython falls back to iteration
+                // (`_PySequence_IterSearch`), dispatching `__iter__` /
+                // `__getitem__` and comparing each element with `==`.
+                // Exceptions raised while iterating propagate.
+                self.contains_via_iter(&container, item, globals)?
+            }
+        } else if matches!(&container, Object::File(_)) {
+            // A file has no native `contains`; CPython tests
+            // membership by iterating its lines (`line in f`).
+            self.contains_via_iter(&container, item, globals)?
+        } else {
+            match &container {
+                // `PySequence_Contains` compares each element with a
+                // *rich* `==` — a user `__eq__` (e.g. `datetime.date`
+                // values inside an enum's `_hashable_values_` list)
+                // must be dispatched, not just the native eq.
+                Object::List(items) => {
+                    let snapshot: Vec<Object> = items.borrow().clone();
+                    self.seq_contains_rich(&snapshot, item, globals)?
                 }
-            };
-        }
-        container.contains(item)
+                Object::Tuple(items) => {
+                    let snapshot: Vec<Object> = items.to_vec();
+                    self.seq_contains_rich(&snapshot, item, globals)?
+                }
+                // `x in <iterator/generator>`: CPython consumes the
+                // iterator, comparing each yielded value with `==`
+                // (`argparse._check_value` relies on `value in
+                // iter(choices)`). Drive it through the VM so a
+                // Python generator / user `__next__` works too.
+                Object::Iter(_) | Object::Generator(_) => {
+                    self.contains_via_iter(&container, item, globals)?
+                }
+                _ => container.contains(item)?,
+            }
+        };
+        Ok(found)
+    }
+
+    pub fn py_contains(&mut self, container: &Object, item: &Object) -> Result<bool, RuntimeError> {
+        let g = self.builtins.clone();
+        self.contains_full(container, item, &g)
     }
 
     /// `item in <list/tuple>` with CPython `PySequence_Contains`
