@@ -333,13 +333,22 @@ impl JitHint {
             2 => true,
             _ => {
                 let ins = &code.instructions;
-                let all = ins.iter().enumerate().all(|(pc, i)| {
-                    if i.op != OpCode::JumpBackward {
-                        return true;
+                // A loop is everything from its head to the furthest back
+                // edge targeting it: a conditional yield's loop has a
+                // second back edge (the not-taken branch's) whose own span
+                // holds no yield, yet the loop still yields.
+                let mut extent: std::collections::HashMap<usize, usize> =
+                    std::collections::HashMap::new();
+                for (pc, i) in ins.iter().enumerate() {
+                    if i.op == OpCode::JumpBackward {
+                        let target = (pc + 1).saturating_sub(i.arg as usize);
+                        let e = extent.entry(target).or_insert(pc);
+                        *e = (*e).max(pc);
                     }
-                    let target = (pc + 1).saturating_sub(i.arg as usize);
-                    ins[target..=pc].iter().any(|j| j.op == OpCode::YieldValue)
-                });
+                }
+                let all = extent
+                    .iter()
+                    .all(|(&target, &end)| ins[target..=end].iter().any(|j| j.op == OpCode::YieldValue));
                 self.yields_in_loops.store(
                     if all { 2 } else { 1 },
                     std::sync::atomic::Ordering::Relaxed,

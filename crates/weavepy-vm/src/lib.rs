@@ -11589,9 +11589,18 @@ impl Interpreter {
                     // SAFETY: `len > 0`.
                     let it = match unsafe { &*base.add(len - 1) } {
                         Object::Iter(it) => it,
-                        // A generator resumes through the quiet loop's
-                        // lean path (the leaf arms never take it).
-                        Object::Generator(_) => break Some(CoreExit::Stop(LeafStop::Step)),
+                        // A generator resumes inline, switched to in place
+                        // (the quiet loop's lean path when it declines).
+                        Object::Generator(_) => {
+                            // SAFETY: `len <= cap`, every slot initialized.
+                            unsafe { frame.stack.set_len(len) };
+                            frame.pc = pc as u32;
+                            *last_pc = last;
+                            if !self.core_gen_resume(sw, pc) {
+                                sw.pending = Some(CoreExit::Stop(LeafStop::Step));
+                            }
+                            break Some(CoreExit::Reload);
+                        }
                         _ => break None,
                     };
                     // SAFETY: nothing below runs code until `it`'s last use
@@ -11674,6 +11683,23 @@ impl Interpreter {
                     len += 1;
                     last = pc;
                     pc += 1;
+                }
+                // An inline generator resume's yield switches back to the
+                // consumer in place; any other leaves through the quiet
+                // loop.
+                OpCode::YieldValue => {
+                    // SAFETY: see `CoreSwitch`.
+                    if unsafe { (*sw.inl).is_empty() } {
+                        break Some(CoreExit::Stop(LeafStop::Step));
+                    }
+                    // SAFETY: `len <= cap`, every slot initialized.
+                    unsafe { frame.stack.set_len(len) };
+                    frame.pc = pc as u32;
+                    *last_pc = last;
+                    if !self.core_gen_yield(sw, snap_gen) {
+                        sw.pending = Some(CoreExit::Stop(LeafStop::Step));
+                    }
+                    break Some(CoreExit::Reload);
                 }
                 // An inline activation's return switches back to its caller
                 // in place; the root's leaves through the quiet loop.
@@ -12203,6 +12229,48 @@ impl Interpreter {
         }
     }
 
+    /// Whether a returning frame's `locals` owe the exit reap
+    /// (`reap_frame_locals_on_exit`) nothing: scalars and strings, and
+    /// instances or containers held beyond every slot of the frame that
+    /// could name them plus the collector's handle, with no weakref
+    /// watching — the reap's own "escaped" verdict, and a grade of no mark
+    /// for each release.
+    #[inline]
+    fn core_escaped_locals(locals: &[Object]) -> bool {
+        let mut heap = 0usize;
+        for o in locals {
+            match o {
+                Object::Int(_)
+                | Object::Float(_)
+                | Object::Bool(_)
+                | Object::None
+                | Object::Unbound
+                | Object::Str(_) => {}
+                Object::Instance(_) | Object::List(_) | Object::Dict(_) | Object::Tuple(_) => {
+                    heap += 1;
+                }
+                _ => return false,
+            }
+        }
+        if heap == 0 {
+            return true;
+        }
+        locals.iter().all(|o| {
+            let (sc, id) = match o {
+                Object::Instance(i) => (Rc::strong_count(i), Rc::as_ptr(i) as usize as u64),
+                Object::List(l) => (Rc::strong_count(l), Rc::as_ptr(l) as usize as u64),
+                Object::Dict(d) => (Rc::strong_count(d), Rc::as_ptr(d) as usize as u64),
+                Object::Tuple(t) => (
+                    ThinArc::strong_count(t),
+                    ThinArc::as_ptr(t).cast::<()>() as usize as u64,
+                ),
+                _ => return true,
+            };
+            sc > heap + usize::from(gc_trace::maybe_tracked(id))
+                && !crate::weakref_registry::may_have_weakrefs(id)
+        })
+    }
+
     /// Whether `v` is an instance the frame-slot and drop graders would
     /// both pass over (`looks_reapable_temporary` false and
     /// `note_dropped_marks` false): held elsewhere beyond the collector's
@@ -12320,6 +12388,128 @@ impl Interpreter {
         Some(self.inline_bind_cells(frame, shell, pc, act, code, callable, guard, cells))
     }
 
+    /// The core loop's `FOR_ITER` over a generator at `pc` of `sw`'s
+    /// (synced) running activation: the quiet loop's inline resume
+    /// ([`Self::try_inline_gen`]), with the generator's activation pushed
+    /// and made the running one here. `false` touches nothing.
+    #[inline(never)]
+    fn core_gen_resume(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+        if !self.inline_calls_ok() {
+            return false;
+        }
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch` (as in `core_call`).
+        let act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            self.try_inline_gen(&mut *frame, &mut *shell.cast::<QuietShell<'_>>(), pc)
+        };
+        let Some(act) = act else {
+            return false;
+        };
+        let gen_frame = act.gen_frame;
+        // SAFETY: as above.
+        unsafe { (*sw.inl).push(act) };
+        sw.cur = gen_frame;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
+    }
+
+    /// The core loop's `YIELD_VALUE` of `sw`'s running activation, an
+    /// inline generator resume (synced, `pc` at the yield): the quiet
+    /// loop's yield exit, `inline_gen_finish` (the generator parks again)
+    /// and `inline_gen_deliver`, then the consumer's `Returned` protocol,
+    /// with the consumer made the running activation. `false` touches
+    /// nothing.
+    #[inline(never)]
+    fn core_gen_yield(&mut self, sw: &mut CoreSwitch, snap_gen: u64) -> bool {
+        // SAFETY: see `CoreSwitch`.
+        let inl = unsafe { &mut *sw.inl };
+        let depth = inl.len();
+        let Some(top) = inl.last_mut() else {
+            return false;
+        };
+        if top.gen.is_none()
+            || top.act.shell.is_some()
+            || self.gil_countdown <= 2
+            || crate::hot_gates::loop_gen() != snap_gen
+        {
+            return false;
+        }
+        // SAFETY: the running activation is `top`'s generator frame.
+        let frame = unsafe { &mut *sw.cur };
+        let Some(v) = frame.stack.pop() else {
+            return false;
+        };
+        let cur_pc = frame.pc as usize;
+        frame.agen_yielded_value = frame.code.instructions[cur_pc].arg == 0;
+        frame.pc = cur_pc as u32 + 1;
+        let mut done = inl.pop().expect("checked above");
+        if depth == sw.entry_depth {
+            sw.entry_dead = true;
+        }
+        let result = self.inline_gen_finish(
+            &mut done,
+            QuietExit::Outcome {
+                stepped: Ok(StepOutcome::Yield(v)),
+                cur_pc,
+            },
+        );
+        let mut tmp = None;
+        // SAFETY: the consumer is the innermost remaining activation.
+        let (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
+        // SAFETY: as above.
+        let entry = unsafe {
+            self.inline_gen_deliver(
+                &mut *cframe,
+                &mut *cshell.cast::<QuietShell<'_>>(),
+                done,
+                result,
+            )
+        };
+        sw.cur = cframe;
+        sw.last = if clast == &raw mut sw.scratch {
+            sw.scratch = usize::MAX;
+            &raw mut sw.scratch
+        } else {
+            clast
+        };
+        match entry {
+            QuietEntry::Returned { cur_pc } => {
+                // SAFETY: as above.
+                unsafe { *sw.last = cur_pc };
+                // The consumer's `Returned` entry protocol (`quiet_frame`).
+                if self.gil_countdown <= 2 {
+                    sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
+                    return true;
+                }
+                self.gil_countdown -= 1;
+                if crate::hot_gates::loop_gen() != snap_gen {
+                    sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
+                    return true;
+                }
+                // SAFETY: see `quiet_run`.
+                if sw.fin && unsafe { (*sw.maybe_dead).get() } {
+                    // SAFETY: as above.
+                    unsafe {
+                        self.flush_lean(&mut *cframe, &mut *cshell.cast::<QuietShell<'_>>());
+                    }
+                    if self.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != snap_gen {
+                        sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
+                    }
+                }
+            }
+            QuietEntry::Raised { err, .. } => {
+                sw.pending = Some(CoreExit::Stop(LeafStop::Raised(err)));
+            }
+            QuietEntry::Fresh | QuietEntry::Stop(_) => {
+                unreachable!("inline_gen_deliver returns or raises")
+            }
+        }
+        true
+    }
+
     /// The core loop's `RETURN_VALUE` of `sw`'s running activation, the
     /// innermost inline one (synced, `pc` at the return): `quiet_run`'s
     /// finish and delivery of an inline activation that never needed its
@@ -12357,28 +12547,19 @@ impl Interpreter {
             sw.entry_dead = true;
         }
         // `inline_finish`'s shell-less return, its common case in line: no
-        // leftover operands or cells, and scalar-only locals that die here
-        // with no drop glue.
+        // leftover operands or cells, and locals that die here with no drop
+        // glue (scalars) or whose release the exit reap would pass over
+        // (see `core_escaped_locals`).
         let result = if frame.stack.is_empty()
             && frame.code.cellvars.is_empty()
             && Rc::strong_count(&frame.locals) == 1
-            && {
-                // SAFETY: sole owner; nothing else reaches the vector.
-                let locals = unsafe { &*frame.locals.as_ptr() };
-                locals.iter().all(|o| {
-                    matches!(
-                        o,
-                        Object::Int(_)
-                            | Object::Float(_)
-                            | Object::Bool(_)
-                            | Object::None
-                            | Object::Unbound
-                    )
-                })
-            } {
+            // SAFETY: sole owner; nothing else reaches the vector.
+            && Self::core_escaped_locals(unsafe { &*frame.locals.as_ptr() })
+        {
             done.clean = true;
-            // SAFETY: as above; scalars own nothing.
-            unsafe { (*frame.locals.as_ptr()).set_len(0) };
+            // SAFETY: as above; the values drop by plain decrements (or
+            // own nothing).
+            unsafe { (*frame.locals.as_ptr()).clear() };
             drop(done.guard.take());
             Ok(v)
         } else {
@@ -26081,7 +26262,16 @@ impl Interpreter {
                     }
                     Err(e) => return Err(e),
                 };
-                acc = self.op_binary(&acc, &x, BinOpKind::Add)?;
+                // The exact-`int`/`float` sums (no reflected operand can
+                // run); anything else, or an overflow, dispatches.
+                acc = match (&acc, &x) {
+                    (Object::Int(a), Object::Int(b)) => match a.checked_add(*b) {
+                        Some(r) => Object::Int(r),
+                        None => self.op_binary(&acc, &x, BinOpKind::Add)?,
+                    },
+                    (Object::Float(a), Object::Float(b)) => Object::Float(a + b),
+                    _ => self.op_binary(&acc, &x, BinOpKind::Add)?,
+                };
             }
             return Ok(acc);
         }
@@ -51200,6 +51390,8 @@ static COARSE_DROP_CLASS: [u8; 256] = {
         OpCode::PopJumpIfNone,
         OpCode::PopJumpIfNotNone,
         OpCode::IsOp,
+        // The yielded value moves to the consumer; nothing is released.
+        OpCode::YieldValue,
     ];
     let mut i = 0;
     while i < exempt.len() {
