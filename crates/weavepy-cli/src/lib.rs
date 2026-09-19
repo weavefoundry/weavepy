@@ -45,7 +45,7 @@ static GLOBAL_ALLOC: weavepy::vm::tcache::ThreadCacheAlloc = weavepy::vm::tcache
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Opt-in in-process PC sampler (`WEAVEPY_PCPROF=<file>`): a `SIGPROF`
-/// timer records the interrupted program counter every 100µs of CPU time,
+/// handler records the interrupted program counter every 100µs,
 /// and the samples (slide-adjusted to link-time addresses, one hex
 /// address per line) are written to `<file>` when the program finishes.
 /// A development aid for instruction-level profiling of the dispatch
@@ -62,6 +62,7 @@ mod pcprof {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     static STACK_LO: AtomicUsize = AtomicUsize::new(0);
     static STACK_HI: AtomicUsize = AtomicUsize::new(0);
+    static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     extern "C" {
         fn _dyld_get_image_vmaddr_slide(image_index: u32) -> isize;
@@ -132,34 +133,38 @@ mod pcprof {
             sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
             libc::sigemptyset(&mut sa.sa_mask);
             libc::sigaction(libc::SIGPROF, &sa, std::ptr::null_mut());
-            let tv = libc::timeval {
-                tv_sec: 0,
-                tv_usec: 100,
-            };
-            let it = libc::itimerval {
-                it_interval: tv,
-                it_value: tv,
-            };
-            libc::setitimer(libc::ITIMER_PROF, &it, std::ptr::null_mut());
         }
+        // `ITIMER_PROF` fires at the scheduler tick (~100 Hz) however
+        // short the interval asked for, so a helper thread signals the VM
+        // thread itself: wall-clock paced (a benchmark is CPU-bound, so
+        // this is CPU time in practice), every `WEAVEPY_PCPROF_US`
+        // microseconds (default 100).
+        let us: u64 = std::env::var("WEAVEPY_PCPROF_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        // SAFETY: plain pthread query.
+        let target = unsafe { libc::pthread_self() } as usize;
+        let _ = std::thread::Builder::new()
+            .name("pcprof".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_micros(us));
+                if STOP.load(Ordering::Relaxed) {
+                    break;
+                }
+                // SAFETY: the VM thread outlives the sampler (the main
+                // thread stops it in `finish` before exiting).
+                unsafe { libc::pthread_kill(target as libc::pthread_t, libc::SIGPROF) };
+            });
     }
 
     pub(crate) fn finish() {
         let Some(path) = std::env::var_os("WEAVEPY_PCPROF") else {
             return;
         };
-        // SAFETY: stop the timer before reading the buffer.
-        unsafe {
-            let zero = libc::timeval {
-                tv_sec: 0,
-                tv_usec: 0,
-            };
-            let it = libc::itimerval {
-                it_interval: zero,
-                it_value: zero,
-            };
-            libc::setitimer(libc::ITIMER_PROF, &it, std::ptr::null_mut());
-        }
+        // Stop sampling before reading the buffer: a signal still in
+        // flight only appends past the snapshot below.
+        STOP.store(true, Ordering::Relaxed);
         let buf = BUF.load(Ordering::Relaxed);
         if buf.is_null() {
             return;
