@@ -367,6 +367,26 @@ impl ModuleCache {
             .collect()
     }
 
+    /// Whether a sourceless `full` could be on the path: a
+    /// `<leaf>.pyc` module, or a package directory with only an
+    /// `__init__.pyc`, under some search directory (read from the cached
+    /// directory listings). The native loader imports neither; the
+    /// Python `SourcelessFileLoader` does.
+    pub fn sourceless_candidate(&self, full: &str) -> bool {
+        let rel: PathBuf = full.split('.').collect();
+        let Some(leaf) = rel.file_name().and_then(|l| l.to_str()) else {
+            return false;
+        };
+        let pyc = format!("{leaf}.pyc");
+        self.search_dirs().iter().any(|dir| {
+            let parent = match rel.parent() {
+                Some(p) if !p.as_os_str().is_empty() => dir.join(p),
+                _ => dir.clone(),
+            };
+            dir_has(&parent, &pyc) || dir_has(&parent.join(leaf), "__init__.pyc")
+        })
+    }
+
     /// CPython `FileFinder`'s case check (`_relax_case`): the on-disk
     /// spelling of `path`'s final component must match the requested
     /// name byte-for-byte, even on case-insensitive filesystems —

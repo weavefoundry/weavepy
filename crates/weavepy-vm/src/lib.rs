@@ -2355,12 +2355,22 @@ impl Interpreter {
         // the lazy `__spec__`/`__loader__` synthesis). Install it eagerly
         // for that case; `-c`/`<stdin>`/`<frozen …>` entry points keep no
         // loader, exactly as CPython.
+        //
+        // Building the loader imports the whole `importlib` package, so
+        // it is installed here only for a script whose code names
+        // `__loader__` (the dict reads a script can make itself). Library
+        // code finds it through `__main__.__loader__` — an attribute read,
+        // which synthesizes it on demand like any module's (see
+        // `ensure_module_spec`) — and `linecache` needs it only for a
+        // script whose source is gone from disk.
         if file.is_some_and(|f| !f.starts_with('<')) {
-            if let Some(loader) = self.main_source_loader(name, file) {
-                globals
-                    .borrow_mut()
-                    .entry(DictKey(Object::from_static("__loader__")))
-                    .or_insert(loader);
+            if code_names_anywhere(code, "__loader__") {
+                if let Some(loader) = self.main_source_loader(name, file) {
+                    globals
+                        .borrow_mut()
+                        .entry(DictKey(Object::from_static("__loader__")))
+                        .or_insert(loader);
+                }
             }
             // CPython's `PyRun_SimpleFileExFlags` seeds
             // `__main__.__cached__ = None` for a directly-run script
@@ -2648,6 +2658,69 @@ impl Interpreter {
         Ok(())
     }
 
+    /// A dead function (a rebound lambda or closure — CPython frees it by
+    /// refcount on the spot) whose death strands nothing: no weakref, and
+    /// every edge it releases — namespaces, defaults, closure cells, its
+    /// `__dict__` and getset slots — either outlives it or holds only
+    /// scalars. Untracking and dropping it is then the whole teardown.
+    fn plain_function_dies_alone(obj: &Object) -> bool {
+        let Object::Function(f) = obj else {
+            return false;
+        };
+        if crate::vm_singletons::cext_call_active()
+            || crate::vm_singletons::has_pending_cext_drops()
+            || crate::weakref_registry::may_have_weakrefs(crate::weakref_registry::id_of(obj))
+        {
+            return false;
+        }
+        // A value this function held: fine when it holds nothing a cascade
+        // would visit, or when another reference keeps it alive past the
+        // suspect band (a collector handle is one of the references).
+        fn released_ok(v: &Object) -> bool {
+            if gc_trace::is_atomic(v) {
+                return true;
+            }
+            let id = crate::weakref_registry::id_of(v);
+            if crate::weakref_registry::may_have_weakrefs(id) {
+                return false;
+            }
+            let sc = gc_trace::strong_count_for(v);
+            if gc_trace::is_tracked(id) {
+                sc > 4
+            } else {
+                sc >= 2
+            }
+        }
+        // The namespaces are module-owned in every ordinary case.
+        let namespaces = [&f.globals, &f.builtins];
+        if namespaces.iter().any(|d| Rc::strong_count(d) < 3) {
+            return false;
+        }
+        if !f.defaults.iter().all(released_ok) || !f.kw_defaults.iter().all(|(_, v)| released_ok(v)) {
+            return false;
+        }
+        // A closure cell only this function holds dies with it.
+        if !f.closure.iter().all(|c| match c {
+            Object::Cell(cell) => {
+                Rc::strong_count(cell) >= 2
+                    || cell.try_borrow().is_ok_and(|v| gc_trace::is_atomic(&v))
+            }
+            other => released_ok(other),
+        }) {
+            return false;
+        }
+        let Ok(attrs) = f.attrs.try_borrow() else {
+            return false;
+        };
+        if Rc::strong_count(&attrs) == 1 && !attrs.try_borrow().is_ok_and(|d| d.is_empty()) {
+            return false;
+        }
+        let Ok(slots) = f.slots.try_borrow() else {
+            return false;
+        };
+        slots.iter().all(|(k, v)| gc_trace::is_atomic(&k.0) && released_ok(v))
+    }
+
     /// [`Self::reap_plain_instance`]'s test: the tracked scalar-leaf
     /// containers `obj` alone holds (ids, count), or `None` when the
     /// general cascade must run.
@@ -2737,6 +2810,14 @@ impl Interpreter {
         let Err(dropped) = Self::reap_plain_instance(dropped) else {
             return;
         };
+        if Self::plain_function_dies_alone(&dropped) {
+            let id = crate::weakref_registry::id_of(&dropped);
+            if gc_trace::is_tracked(id) {
+                gc_trace::with_state(|s| s.untrack_id(id));
+            }
+            drop(dropped);
+            return;
+        }
         // RFC 0045 (wave 5): if the dead subgraph contains any instance
         // that has escaped into a C extension (owns a faithful inline
         // body), reclaiming it is only safe when no extension frame is
@@ -3698,6 +3779,10 @@ impl Interpreter {
                 // collector handle. See the `BoundMethod` arm of
                 // `prompt_reap_dropped`.
                 | Object::BoundMethod(_)
+                // A function is GC-tracked: a rebound lambda or closure must
+                // shed its collector handle (and whatever it alone holds)
+                // now, as CPython frees it by refcount.
+                | Object::Function(_)
                 // An escaped frame owns locals after its activation exits.
                 // Releasing the last frame alias must retire those locals,
                 // including tracked containers and weakly held instances.
@@ -3813,8 +3898,14 @@ impl Interpreter {
             }
             let mut found = false;
             crate::gc_trace::traverse_object(obj, &mut |c| {
-                // Scalars are never tracked and hold nothing.
-                if found || *budget == 0 || c.is_gc_atomic() {
+                // Scalars are never tracked and hold nothing; a frame still
+                // on the stack keeps its locals whatever dies here (a
+                // traceback leads to the very frame that is handling it).
+                if found
+                    || *budget == 0
+                    || c.is_gc_atomic()
+                    || matches!(c, Object::Frame(f) if f.on_stack.get() > 0)
+                {
                     return;
                 }
                 *budget -= 1;
@@ -5622,10 +5713,21 @@ impl Interpreter {
                     frame.code.instructions.get(pc).map(|i| i.op),
                     Some(OpCode::Resume)
                 ) {
+                    // The shell too: re-fetching the object (an `f_back`
+                    // walk from the tracer) refreshes it from the shell.
+                    shell
+                        .lasti
+                        .store(pc as u32, std::sync::atomic::Ordering::Relaxed);
                     py_frame.lasti.set(pc as u32);
                 }
             }
-            self.fire_call_event(&py_frame, mon_event, Object::None)?;
+            if let Err(e) = self.fire_call_event(&py_frame, mon_event, Object::None) {
+                // The hook raised before the body ran: unwind what this
+                // activation pushed, or its shell outlives it on the spine.
+                self.exc_info_stack.borrow_mut().truncate(exc_depth_on_entry);
+                self.pop_frame_shell();
+                return Err(e);
+            }
             // On a resume, line tracing must continue from the line
             // where the frame suspended — CPython reports the `call`
             // event at the suspension line and only emits the next
@@ -5822,7 +5924,12 @@ impl Interpreter {
         // (which the full prologue probes at marked safe points without
         // it)?
         let mut loop_coarse = false;
-        let result = loop {
+        // The loops are off only because a frame object is observed (see
+        // `frame_object_observed`): re-derive once nothing outside the
+        // activation holds it any more (an `except` clause dropped the
+        // traceback).
+        let mut frame_blocks_quiet = false;
+        let result = 'activation: loop {
             // RFC 0039 (WS2) / RFC 0059 (WS2): cooperative GIL hand-off.
             // A plain interpreter-local countdown — one register
             // decrement + predictable branch per instruction; drops and
@@ -5853,16 +5960,16 @@ impl Interpreter {
             // a prologue input changed. The observer snapshot refresh
             // rides the same generation (observer mutation bumps it).
             let lgen = crate::hot_gates::loop_gen();
-            if lgen != loop_snap_gen {
+            let rederive = frame_blocks_quiet
+                && !Self::frame_object_observed(&shell, &py_frame_slot, frame);
+            if lgen != loop_snap_gen || rederive {
                 loop_snap_gen = lgen;
                 obs.refresh();
                 self.fuse_off = obs.any;
-                let base_quiet = !quiet_off
-                    && crate::hot_gates::load() == 0
-                    && !obs.any
-                    && !shell
-                        .has_materialized
-                        .load(std::sync::atomic::Ordering::Relaxed);
+                let unobserved = !quiet_off && crate::hot_gates::load() == 0 && !obs.any;
+                let frame_observed = Self::frame_object_observed(&shell, &py_frame_slot, frame);
+                frame_blocks_quiet = unobserved && frame_observed;
+                let base_quiet = unobserved && !frame_observed;
                 // Graded: fully quiet when no finalizable object exists
                 // anywhere; "fin-quiet" — everything cold except the
                 // CPython-timing-bearing prompt-finalization probe —
@@ -5936,6 +6043,23 @@ impl Interpreter {
                 } else {
                     None
                 };
+                // A frame object only this activation holds skipped the
+                // per-instruction `lasti` sync: bring it current before the
+                // prologue (or a raise's traceback) reads it.
+                if quiet_exit.is_some()
+                    && shell.has_materialized.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    // The instruction that just ran (or raised), as the
+                    // per-instruction sync would have left it; after a
+                    // yield back to the prologue, the next one.
+                    let at = match &quiet_exit {
+                        Some(QuietExit::Outcome { cur_pc, .. }) => *cur_pc as u32,
+                        _ => frame.pc,
+                    };
+                    if let Some(py) = shell.materialized.borrow().as_ref() {
+                        py.lasti.set(at);
+                    }
+                }
                 match quiet_exit {
                     Some(QuietExit::Yield) => continue,
                     Some(QuietExit::Outcome {
@@ -5965,6 +6089,11 @@ impl Interpreter {
                         shell
                             .lasti
                             .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
+                        if shell.has_materialized.load(std::sync::atomic::Ordering::Relaxed) {
+                            if let Some(py) = shell.materialized.borrow().as_ref() {
+                                py.lasti.set(frame.pc);
+                            }
+                        }
                         instruction_ran = true;
                         self.step_hot(frame)
                     }
@@ -6015,6 +6144,14 @@ impl Interpreter {
                     // timing (`test_dict.test_oob_indexing_dictiter_iternextitem`
                     // clears the dict from such a `__del__` mid-iteration).
                     self.run_pending_finalizers();
+                }
+                // A tracking site crossed the young threshold without polling
+                // the collector itself (see `gc_trace::GcState::track`).
+                if hot & crate::hot_gates::GC_DUE != 0 {
+                    crate::hot_gates::clear(crate::hot_gates::GC_DUE);
+                    if gc_trace::maybe_auto_collect() {
+                        self.run_pending_finalizers();
+                    }
                 }
                 // RFC 0047 (wave 5): reap objects whose last C-side reference
                 // was dropped *inside* an extension call since the previous
@@ -6518,12 +6655,14 @@ impl Interpreter {
                             {
                                 dest += 1;
                             }
-                            self.fire_branch_jump_event(
+                            if let Err(e) = self.fire_branch_jump_event(
                                 &frame.code,
                                 ev,
                                 src_pc as u32,
                                 dest as u32,
-                            )?;
+                            ) {
+                                break 'activation Err(e);
+                            }
                             // A BRANCH/JUMP callback may set `f_lineno`
                             // (CPython `_Py_call_instrumentation_jump`:
                             // "the callback has caused a jump" — execution
@@ -6542,14 +6681,20 @@ impl Interpreter {
                 Ok(StepOutcome::Return(v)) => {
                     if crate::trace::any_observers_active() {
                         let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
-                        self.fire_return_event(&py_frame, &v)?;
+                        // A raising hook replaces the return value with its
+                        // exception; the epilogue below still runs.
+                        if let Err(e) = self.fire_return_event(&py_frame, &v) {
+                            break 'activation Err(e);
+                        }
                     }
                     break Ok(FrameOutcome::Returned(v));
                 }
                 Ok(StepOutcome::Yield(v)) => {
                     if crate::trace::any_observers_active() {
                         let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
-                        self.fire_yield_event(&py_frame, &v)?;
+                        if let Err(e) = self.fire_yield_event(&py_frame, &v) {
+                            break 'activation Err(e);
+                        }
                         // A jump set from the yield's 'return' trace event
                         // *abandons the yield*: CPython's
                         // `INSTRUMENTED_YIELD_VALUE` sees `frame->instr_ptr
@@ -6687,7 +6832,9 @@ impl Interpreter {
                                         RuntimeError::PyException(pe) => pe.instance.clone(),
                                         _ => Object::None,
                                     };
-                                    self.fire_unwind_event(&py_frame, exc_obj)?;
+                                    if let Err(e) = self.fire_unwind_event(&py_frame, exc_obj) {
+                                        break 'activation Err(e);
+                                    }
                                 }
                                 // The frame's locals and operands drop
                                 // wholesale below; see `mark_bulk_drop`.
@@ -6735,6 +6882,9 @@ impl Interpreter {
             None
         };
         if let Some(py_frame) = materialized_at_exit.as_ref() {
+            // The object may outlive the activation (a traceback, a
+            // retained handle): leave it at the last executed instruction.
+            shell.refresh_materialized(py_frame);
             if matches!(result, Ok(FrameOutcome::Returned(_))) {
                 // The pop above dropped the call stack's shell (the loop
                 // slot and the shell's own cell are the bookkeeping refs
@@ -7050,6 +7200,30 @@ impl Interpreter {
 
     /// Dispatch-loop helper: materialise the current activation's
     /// `PyFrame` once and cache it in the loop-local slot.
+    /// Whether this activation's frame object (if one was materialized)
+    /// is reachable from anything but the activation's own bookkeeping —
+    /// the shell's cell, the loop's slot, the frame's link: a traceback
+    /// or a Python reference that may read `f_lineno` at any moment, so
+    /// the loop keeps its `lasti` current instruction by instruction.
+    /// Otherwise the quiet loops may run, syncing it whenever they hand
+    /// back and whenever the object is fetched again (see
+    /// `FrameShell::materialize`).
+    fn frame_object_observed(
+        shell: &crate::object::FrameShell,
+        slot: &Option<Rc<PyFrame>>,
+        frame: &Frame,
+    ) -> bool {
+        if !shell.has_materialized.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        let Some(py) = shell.materialized.borrow().clone() else {
+            return false;
+        };
+        let own = 2 + usize::from(slot.as_ref().is_some_and(|s| Rc::ptr_eq(s, &py)))
+            + usize::from(frame.py_frame.as_ref().is_some_and(|p| Rc::ptr_eq(p, &py)));
+        Rc::strong_count(&py) > own
+    }
+
     fn ensure_top_py_frame(&self, slot: &mut Option<Rc<PyFrame>>) -> Rc<PyFrame> {
         if let Some(py) = slot {
             return py.clone();
@@ -11313,6 +11487,13 @@ impl Interpreter {
             specialize::rc_id(&frame.globals),
             specialize::rc_id(&frame.builtins),
         );
+        // Module scope (names resolve in the globals, then the builtins,
+        // both exact dicts): the `LOAD_NAME` / `STORE_NAME` arms below.
+        let name_scope = frame.class_namespace.is_none()
+            && frame.class_namespace_obj.is_none()
+            && frame.builtins_obj.is_none()
+            && !frame.code.is_class_body
+            && !self.globals_missing_any.get();
         let stack = &mut frame.stack;
         let base = stack.as_mut_ptr();
         let cap = stack.capacity();
@@ -11619,6 +11800,48 @@ impl Interpreter {
                     // SAFETY: `BinOpKind` is `repr(u8)` and the compiler only
                     // emits valid kinds (same transmute as `binary_op_step`).
                     let kind: BinOpKind = unsafe { std::mem::transmute(ins.arg as u8) };
+                    // `s = s + t` / `s += t` on str rebinding local `s` (the
+                    // next instruction stores it back): the local lets go of
+                    // the string, which then grows in place when nothing else
+                    // holds it (CPython's `BINARY_OP_INPLACE_ADD_UNICODE`).
+                    if kind == BinOpKind::Add && pc + 1 < ninstrs {
+                        // SAFETY: `pc + 1 < ninstrs`.
+                        let next = unsafe { *instrs.add(pc + 1) };
+                        let li = next.arg as usize;
+                        // SAFETY: `len >= 2`; `li < nlocals` is checked first.
+                        let same_local = next.op == OpCode::StoreFast
+                            && li < nlocals
+                            && matches!(
+                                unsafe { (&*lbase.add(li), &*base.add(len - 2), &*base.add(len - 1)) },
+                                (Object::Str(x), Object::Str(y), Object::Str(_))
+                                    if SharedStr::ptr_eq(x, y)
+                            );
+                        if same_local {
+                            // SAFETY: the local and the operand are the same
+                            // string, so the local's release is a plain
+                            // decrement; nothing below runs code.
+                            unsafe {
+                                drop_hot(std::ptr::replace(lbase.add(li), Object::Unbound));
+                                let grown = match (&mut *base.add(len - 2), &*base.add(len - 1)) {
+                                    (Object::Str(s), Object::Str(t)) => SharedStr::try_append(s, t),
+                                    _ => false,
+                                };
+                                if grown {
+                                    // The suffix leaves; the grown string is the
+                                    // `STORE_FAST` (its local is now empty).
+                                    drop_hot(base.add(len - 1).read());
+                                    lbase.add(li).write(base.add(len - 2).read());
+                                    len -= 2;
+                                    last = pc + 1;
+                                    pc += 2;
+                                    continue;
+                                }
+                                // Shared elsewhere: the local takes its value
+                                // back and the ordinary concatenation runs.
+                                lbase.add(li).write(Self::clone_operand(&*base.add(len - 2)));
+                            }
+                        }
+                    }
                     // SAFETY: `len >= 2`.
                     let (a, b) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
                     let r = match (a, b) {
@@ -11936,6 +12159,69 @@ impl Interpreter {
                 }
                 // A Python callee runs inline, switched to in place; only a
                 // builtin or type callee has leaf arms.
+                // Module-scope names: the globals, then the builtins, probed
+                // with the interned name's hash (no per-read name object).
+                OpCode::LoadName if name_scope => {
+                    if len == cap {
+                        break None;
+                    }
+                    let Some(probe) = code_name_leaf_probe(code, ins.arg) else {
+                        break None;
+                    };
+                    // SAFETY (raw dict reads): as in the `LOAD_GLOBAL` arm.
+                    let v = unsafe {
+                        match (*gdict).get_index_of(&probe) {
+                            Some(i) => (*gdict).get_index(i),
+                            None => (*bdict)
+                                .get_index_of(&probe)
+                                .and_then(|i| (*bdict).get_index(i)),
+                        }
+                    };
+                    // A miss (the full handler's `NameError`) or a key the
+                    // probe could not compare natively.
+                    let (Some((_, v)), false) = (v, probe.saw_exotic()) else {
+                        break None;
+                    };
+                    let v = clone_hot(v);
+                    // SAFETY: `len < cap`.
+                    unsafe { base.add(len).write(v) };
+                    len += 1;
+                    last = pc;
+                    pc += 1;
+                }
+                // Rebinding an existing module-scope name whose old value
+                // leaves by a plain drop; a new name, a finalizer's
+                // candidate or a watched dict takes the full handler.
+                OpCode::StoreName if name_scope => {
+                    if len == 0 || crate::capi_watchers::dicts_active() {
+                        break None;
+                    }
+                    let Some(probe) = code_name_leaf_probe(code, ins.arg) else {
+                        break None;
+                    };
+                    // SAFETY: no guard is live on the globals (`peek_mut`
+                    // checks), and nothing below runs code.
+                    let Some(g) = (unsafe { frame.globals.peek_mut() }) else {
+                        break None;
+                    };
+                    let i = match g.get_index_of(&probe) {
+                        Some(i) if !probe.saw_exotic() => i,
+                        _ => break None,
+                    };
+                    if !g.get_index(i).is_some_and(|(_, old)| Self::core_droppable(old)) {
+                        break None;
+                    }
+                    let Some((_, slot)) = (**g).get_index_mut(i) else {
+                        break None;
+                    };
+                    // SAFETY: `len > 0`; the value moves into the binding and
+                    // the displaced one was checked droppable.
+                    let old = std::mem::replace(slot, unsafe { base.add(len - 1).read() });
+                    len -= 1;
+                    drop_hot(old);
+                    last = pc;
+                    pc += 1;
+                }
                 // A keyword call of a pure leaf through the site's cached
                 // keyword permutation (the full handler's `CallPyKwNames`
                 // hit), evaluated in place like `CALL`'s pure leaves.
@@ -15707,6 +15993,11 @@ impl Interpreter {
         let Object::Instance(inst) = v else {
             return None;
         };
+        // `NotImplemented` has neither method yet refuses a boolean
+        // context (a TypeError since 3.14): the full path raises it.
+        if v.is_same(&crate::vm_singletons::not_implemented()) {
+            return None;
+        }
         let cls = inst.cls_raw();
         if !Self::default_getattribute(cls) || crate::object::exotic_str_keys_possible() {
             return None;
@@ -17608,14 +17899,17 @@ impl Interpreter {
                     }
                     // Class-body and module/top-level bindings both land in a
                     // plain dict; rebinding one that uniquely held a finalizable
-                    // runs its `__del__` now (CPython decref-on-store).
+                    // runs its `__del__` now (CPython decref-on-store). The
+                    // key is the code's interned name (CPython's `co_names`
+                    // object) unless mangling renamed it.
+                    let key = match code_name_obj(&frame.code, ins.arg) {
+                        Some(n @ Object::Str(s)) if **s == *name => n.clone(),
+                        _ => Object::from_str(name),
+                    };
                     let old = if let Some(ns) = &frame.class_namespace {
-                        ns.borrow_mut().insert(DictKey(Object::from_str(name)), v)
+                        ns.borrow_mut().insert(DictKey(key), v)
                     } else {
-                        frame
-                            .globals
-                            .borrow_mut()
-                            .insert(DictKey(Object::from_str(name)), v)
+                        frame.globals.borrow_mut().insert(DictKey(key), v)
                     };
                     if let Some(old) = old {
                         if Self::local_needs_prompt_reap(&old) {
@@ -17626,11 +17920,11 @@ impl Interpreter {
             }
             OpCode::StoreGlobal => {
                 let v = frame.pop()?;
-                let name = self.name_at(&frame.code, ins.arg)?;
-                let old = frame
-                    .globals
-                    .borrow_mut()
-                    .insert(DictKey(Object::from_str(name)), v);
+                let key = match code_name_obj(&frame.code, ins.arg) {
+                    Some(n @ Object::Str(_)) => n.clone(),
+                    _ => Object::from_str(self.name_at(&frame.code, ins.arg)?),
+                };
+                let old = frame.globals.borrow_mut().insert(DictKey(key), v);
                 // Rebinding a global that uniquely held a finalizable runs its
                 // `__del__` now, matching the `DeleteGlobal` path and CPython's
                 // decref-on-store (module-scope `handle = None`).
@@ -44222,7 +44516,29 @@ impl Interpreter {
         // FileNotFoundError, …), mirroring CPython's `oserror_new` errnomap
         // dispatch. User subclasses of OSError are left untouched.
         let cls = remap_oserror_to_subclass(cls, args);
-        let mro_has = |name: &str| cls.mro.borrow().iter().any(|t| t.name == name);
+        // The exception families that shape construction, found in one
+        // pass over the MRO.
+        let families: Vec<&'static str> = cls
+            .mro
+            .borrow()
+            .iter()
+            .filter_map(|t| {
+                [
+                    "StopIteration",
+                    "OSError",
+                    "BlockingIOError",
+                    "SystemExit",
+                    "SyntaxError",
+                    "ImportError",
+                    "UnicodeEncodeError",
+                    "UnicodeDecodeError",
+                    "UnicodeTranslateError",
+                ]
+                .into_iter()
+                .find(|n| *n == t.name)
+            })
+            .collect();
+        let mro_has = |name: &str| families.contains(&name);
         let is_stop_iteration = mro_has("StopIteration");
         let inst = PyInstance::new(cls.clone());
         // `OSError(errno, strerror, ...)` keeps only the first two
@@ -49018,6 +49334,13 @@ impl Interpreter {
         // the meta-path machinery; this bridges WeavePy's Rust loader to it
         // (RFC 0040 WS5: `python app.zip`, `-m pkg.mod` from a zip, and the
         // `multiprocessing` spawn re-import of a zip/`.pyc` `__main__`).
+        //
+        // `sys.meta_path` stays empty until something imports `importlib`,
+        // whose finders include the `SourcelessFileLoader`; a sourceless
+        // candidate on the path installs them first.
+        if self.meta_path_is_empty() && self.cache.sourceless_candidate(full) {
+            let _ = self.import_path("importlib.machinery");
+        }
         if let Some(module) = self.try_meta_path_import(full)? {
             return Ok(module);
         }
@@ -49039,6 +49362,19 @@ impl Interpreter {
         let err = module_not_found_error(msg);
         crate::error::set_exception_attr(&err, "name", Object::from_str(full.to_owned()));
         Err(err)
+    }
+
+    /// Whether `sys.meta_path` is an empty list (nothing has imported
+    /// `importlib` or installed a finder).
+    fn meta_path_is_empty(&self) -> bool {
+        let Some(Object::Module(sys_mod)) = self.cache.get("sys") else {
+            return false;
+        };
+        let d = sys_mod.dict.borrow();
+        matches!(
+            d.get(&DictKey(Object::from_static("meta_path"))),
+            Some(Object::List(l)) if l.borrow().is_empty()
+        )
     }
 
     /// Resolve `full` through the Python `sys.meta_path` finders, loading the
@@ -58509,6 +58845,23 @@ fn slot_name_matches(code: &CodeObject, name_idx: u32, key: &DictKey) -> bool {
     code.names
         .get(name_idx as usize)
         .is_some_and(|n| n.as_str() == &**s)
+}
+
+/// Whether `code` or a code object nested in its constants mentions
+/// `name` as a name or a string constant.
+fn code_names_anywhere(code: &CodeObject, name: &str) -> bool {
+    fn constant_mentions(c: &Constant, name: &str) -> bool {
+        match c {
+            Constant::Str(s) => s == name,
+            Constant::Tuple(items) | Constant::FrozenSet(items) => {
+                items.iter().any(|c| constant_mentions(c, name))
+            }
+            Constant::Code(inner) => code_names_anywhere(inner, name),
+            _ => false,
+        }
+    }
+    code.names.iter().any(|n| n == name)
+        || code.constants.iter().any(|c| constant_mentions(c, name))
 }
 
 /// The interned `Object::Str` for `co_names[name_idx]`, if the code

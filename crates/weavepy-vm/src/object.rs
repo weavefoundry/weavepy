@@ -1079,8 +1079,24 @@ impl FrameShell {
     /// `back` pointer, caching it. Bumps `on_stack` exactly once per
     /// materialisation — the pop path decrements it for shells whose
     /// `materialized` is set.
+    /// Bring an existing frame object's `lasti` up to this live shell's.
+    /// The executing frame's quiet loops sync only the shell while nothing
+    /// else holds the object (see `Interpreter::frame_object_observed`);
+    /// every path that hands the object out calls this first. A trace
+    /// function's pending line jump owns the value and is left alone.
+    pub fn refresh_materialized(&self, py: &PyFrame) {
+        if py.pending_jump.borrow().is_none() && py.override_lineno.get().is_none() {
+            py.lasti
+                .set(self.lasti.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
+
     pub fn materialize(&self, back: Option<Rc<PyFrame>>) -> Rc<PyFrame> {
         if let Some(existing) = self.materialized.borrow().as_ref() {
+            self.refresh_materialized(existing);
+            // The new holder may keep it: a quiet loop running this
+            // activation re-derives, and finds it observed if so.
+            crate::hot_gates::bump_loop_gen();
             return existing.clone();
         }
         let py = Rc::new(PyFrame {
@@ -1132,7 +1148,14 @@ impl FrameShell {
         // where a panic on a live mutable borrow would be fatal.
         if let Ok(m) = self.materialized.try_borrow() {
             if let Some(py) = m.as_ref() {
-                return py.current_lineno();
+                // A trace function's `f_lineno` override or pending
+                // jump owns the value. Otherwise the shell's mirror is
+                // the current one: a quiet loop syncs only the shell.
+                let traced = py.override_lineno.get().is_some()
+                    || py.pending_jump.try_borrow().map_or(true, |j| j.is_some());
+                if traced {
+                    return py.current_lineno();
+                }
             }
         }
         let pc = self.current_lasti() as usize;
@@ -1169,10 +1192,13 @@ pub fn materialize_stack_at(stack: &FrameStack, idx: usize) -> Option<Rc<PyFrame
         s[..=idx].to_vec()
     };
     let mut back: Option<Rc<PyFrame>> = None;
+    let mut refreshed = false;
     for shell in &shells {
         let existing = shell.materialized.borrow().clone();
         let py = match existing {
             Some(py) => {
+                shell.refresh_materialized(&py);
+                refreshed = true;
                 *py.back.borrow_mut() = back;
                 py
             }
@@ -1184,6 +1210,11 @@ pub fn materialize_stack_at(stack: &FrameStack, idx: usize) -> Option<Rc<PyFrame
             }
         };
         back = Some(py);
+    }
+    if refreshed {
+        // See `FrameShell::materialize`: the objects handed out (the
+        // frame and its `f_back` chain) may be kept.
+        crate::hot_gates::bump_loop_gen();
     }
     back
 }

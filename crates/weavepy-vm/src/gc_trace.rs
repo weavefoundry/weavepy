@@ -703,6 +703,17 @@ impl GcState {
         self.tracked_count.fetch_add(1, Ordering::AcqRel);
         self.tracked_version.fetch_add(1, Ordering::AcqRel);
         self.bump_count(0);
+        // Crossing the young threshold schedules the automatic collection
+        // for the next safe point: not every allocation site polls
+        // `maybe_auto_collect` itself (`MAKE_FUNCTION`, `list(it)`, …).
+        let crossed = {
+            let counts = self.counts.borrow();
+            let thresholds = self.thresholds.borrow();
+            thresholds[0] != 0 && counts[0] == thresholds[0]
+        };
+        if crossed && self.is_enabled() {
+            crate::hot_gates::set(crate::hot_gates::GC_DUE);
+        }
     }
 
     /// Stop tracking `obj`. Used by the cycle-clearing path
@@ -2672,6 +2683,11 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
                             visit(&bm.function);
                             visit(&bm.receiver);
                         }
+                    }
+                    // The plain-construction fast path's own handle on the
+                    // same `__init__` is one more such edge.
+                    if let Some((init, _)) = &plan.lean_init {
+                        visit(&Object::Function(init.clone()));
                     }
                 }
             }

@@ -345,7 +345,63 @@ impl SharedSlice<u8> {
     }
 }
 
+impl SharedSlice<u8> {
+    /// Append `extra` in place when this handle is the slice's only owner
+    /// (no other strong or weak reference): the allocation is resized
+    /// rather than copied, so repeated appends cost what `realloc` does
+    /// (CPython's `PyUnicode_Append` on a lone reference). `false` leaves
+    /// `this` untouched.
+    fn try_extend_unique(this: &mut Self, extra: &[u8]) -> bool {
+        if ThinArc::get_mut(this).is_none() {
+            return false;
+        }
+        // SAFETY: a live strong owner's length word.
+        let old_len = unsafe { this.data.as_ptr().read() };
+        let Some(new_len) = old_len.checked_add(extra.len()) else {
+            return false;
+        };
+        // The `Arc` allocation is its two counters followed by the payload
+        // (`ArcInner` is `repr(C)`, and std sizes it from the value layout
+        // exactly this way), so the payload's offset and both sizes follow.
+        let counters = Layout::new::<[usize; 2]>();
+        let (Ok((old_inner, offset)), Ok((new_inner, _))) = (
+            counters.extend(Self::layout(old_len)),
+            counters.extend(Self::layout(new_len)),
+        ) else {
+            return false;
+        };
+        let (old_inner, new_inner) = (old_inner.pad_to_align(), new_inner.pad_to_align());
+        // SAFETY: the sole owner (checked above) moves the allocation it owns
+        // through the global allocator with the layout it was allocated
+        // with; the new length word and hash are written before any reader
+        // can exist, and the handle then points at the moved payload, whose
+        // eventual `Arc` drop computes the new layout from the new length.
+        unsafe {
+            let base = this.data.as_ptr().cast::<u8>().sub(offset);
+            let grown = std::alloc::realloc(base, old_inner, new_inner.size());
+            if grown.is_null() {
+                return false;
+            }
+            let data = grown.add(offset).cast::<usize>();
+            let raw = ptr::slice_from_raw_parts_mut(data.cast::<u8>(), new_len) as *mut SliceStorage<u8>;
+            ptr::addr_of_mut!((*raw).len).write(new_len);
+            (*raw).hash.store(-1, Ordering::Relaxed);
+            let dst = ptr::addr_of_mut!((*raw).items).cast::<u8>();
+            ptr::copy_nonoverlapping(extra.as_ptr(), dst.add(old_len), extra.len());
+            this.data = NonNull::new_unchecked(data);
+        }
+        true
+    }
+}
+
 impl SharedStr {
+    /// Append `suffix` in place when this handle is the string's only
+    /// owner (see `SharedSlice::try_extend_unique`); `false` leaves it
+    /// untouched.
+    pub fn try_append(this: &mut Self, suffix: &str) -> bool {
+        SharedSlice::try_extend_unique(&mut this.0, suffix.as_bytes())
+    }
+
     /// The concatenation of `parts`, in one allocation.
     pub fn concat(parts: &[&str]) -> Self {
         let len = parts.iter().map(|p| p.len()).sum();

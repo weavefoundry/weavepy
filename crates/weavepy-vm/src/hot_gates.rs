@@ -52,6 +52,10 @@ pub const PENDING_PYCALLS: u32 = 1 << 6;
 /// (test_capi.test_misc TestPendingCalls.test_isolated_subinterpreter):
 /// armed while a `_testinternalcapi.pending_identify` waiter is queued.
 pub const PENDING_IDENTIFY: u32 = 1 << 7;
+/// The young generation reached its collection threshold: the next safe
+/// point runs the automatic collection (`gc_trace::maybe_auto_collect`),
+/// whichever allocation site tracked the object that crossed it.
+pub const GC_DUE: u32 = 1 << 8;
 
 /// The word itself. Process-global, like the granular gates it fuses
 /// (all of them were process-wide statics; per-thread queues keep
