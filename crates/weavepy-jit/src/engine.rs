@@ -117,6 +117,7 @@ pub struct CompiledFrame {
     /// site agrees (feeds callers' `PyFunc` classification).
     pub ret_lane: Option<JitType>,
     scalar_leaf: bool,
+    op_mix: (u32, u32),
 }
 
 impl CompiledFrame {
@@ -126,6 +127,14 @@ impl CompiledFrame {
     #[must_use]
     pub fn is_scalar_leaf(&self) -> bool {
         self.scalar_leaf
+    }
+
+    /// `(generic, total)` statement counts: how many of the compiled
+    /// statements go through the interpreter's generic object protocol
+    /// (dynamic calls and attribute accesses).
+    #[must_use]
+    pub fn op_mix(&self) -> (u32, u32) {
+        self.op_mix
     }
 
     /// Enter the compiled frame.
@@ -487,8 +496,29 @@ impl JitEngine {
             ret_lane: tfunc.ret_lane,
             ret_none: tfunc.ret_none,
             scalar_leaf: is_scalar_leaf(tfunc),
+            op_mix: op_mix(tfunc),
         })
     }
+}
+
+/// `(generic, total)`: statements that hand an operation to the
+/// interpreter's generic object protocol (dynamic calls and attribute
+/// accesses) against all statements (see [`CompiledFrame::op_mix`]).
+fn op_mix(tfunc: &TFunc) -> (u32, u32) {
+    let mut generic = 0u32;
+    let mut total = 0u32;
+    for b in &tfunc.blocks {
+        for st in &b.stmts {
+            total += 1;
+            if matches!(
+                st.op,
+                TOp::CallDyn { .. } | TOp::DynAttrGet { .. } | TOp::DynAttrSet { .. } | TOp::ContainsDyn { .. }
+            ) {
+                generic += 1;
+            }
+        }
+    }
+    (generic, total)
 }
 
 fn is_scalar_leaf(tfunc: &TFunc) -> bool {

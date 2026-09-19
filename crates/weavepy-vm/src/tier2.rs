@@ -979,9 +979,10 @@ impl JitState {
                 } else {
                     if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
                         eprintln!(
-                            "jit compile {:?} (entry pc {entry_pc}, scalar leaf {})",
+                            "jit compile {:?} (entry pc {entry_pc}, scalar leaf {}, generic/total ops {:?})",
                             code.name,
-                            cf.is_scalar_leaf()
+                            cf.is_scalar_leaf(),
+                            cf.op_mix()
                         );
                     }
                     // The interpreter's lean paths hand a self-recursive

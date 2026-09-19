@@ -283,6 +283,12 @@ impl JitHint {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Lean activations counted so far (see [`Self::bump_lean_entries`]).
+    #[must_use]
+    pub fn lean_entries(&self) -> u32 {
+        self.lean_entries.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Count one lean activation; returns the new count.
     pub fn bump_lean_entries(&self) -> u32 {
         // A heuristic counter: a plain load/store pair (a lost update under

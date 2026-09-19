@@ -12795,7 +12795,7 @@ impl Interpreter {
         let f = unsafe { &*fp };
         // SAFETY: GIL-serialized raw read of the function's code cell.
         let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
-        if !code_is_pure_leaf(code_rc) {
+        if !code_is_pure_leaf(code_rc) || !pure_leaf_warm(code_rc) {
             return None;
         }
         let (missing, slot_self) = code_call_slot(code, call_pc)?.hit(fp, Rc::as_ptr(code_rc))?;
@@ -12943,7 +12943,7 @@ impl Interpreter {
         // `PyFunction::code`); only compared and borrowed below, while the
         // caller's stack keeps the function alive.
         let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
-        if !code_is_pure_leaf(code_rc) {
+        if !code_is_pure_leaf(code_rc) || !pure_leaf_warm(code_rc) {
             return None;
         }
         let slot = code_call_slot(code, pc)?;
@@ -57949,6 +57949,23 @@ fn simple_args_prefix(instrs: &[weavepy_compiler::Instruction], pc: usize) -> bo
     };
     let first = instrs.get(pc);
     simple(first) && (first.is_some_and(|i| i.op == OpCode::Call) || simple(instrs.get(pc + 1)))
+}
+
+/// Whether a pure leaf's calls may skip the lean activation now: with
+/// the JIT on, a jittable body's first calls still take it, so the warm
+/// compile (`LEAN_WARM_COMPILE_THRESHOLD` lean entries) gives compiled
+/// callers their direct native lane to it.
+#[inline(always)]
+fn pure_leaf_warm(code: &CodeObject) -> bool {
+    #[cfg(feature = "jit")]
+    if code.jit_hint.lean_entries() < LEAN_WARM_COMPILE_THRESHOLD
+        && !crate::tier2::jit_off_for_process()
+        && !code.jit_hint.is_not_jitable()
+    {
+        return false;
+    }
+    let _ = code;
+    true
 }
 
 /// Whether function `f`'s current code is a pure leaf (see
