@@ -145,7 +145,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             JitType::Int => SlotTag::Int as i64,
             JitType::Float => SlotTag::Float as i64,
             JitType::Bool => SlotTag::Bool as i64,
-            JitType::ListInt | JitType::ListFloat | JitType::ListObj => SlotTag::ListPin as i64,
+            JitType::ListInt | JitType::ListFloat | JitType::ListObj | JitType::ListListFloat => {
+                SlotTag::ListPin as i64
+            }
             // RFC 0071 WS6 — `Str`/`Bytes` pins spill like object pins
             // (the rebuild resolves the pin to the real payload).
             // RFC 0073 WS2 — `Dict` pins ride the same tag.
@@ -759,6 +761,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::Swap2 => {
                 let len = self.vstack.len();
                 self.vstack.swap(len - 1, len - 2);
+            }
+            TOp::SwapN { depth } => {
+                let len = self.vstack.len();
+                self.vstack.swap(len - 1, len - depth as usize);
             }
             TOp::IntToFloatTos { guarded } => {
                 let depth = self.vstack.len() - 1;
@@ -2906,6 +2912,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             ArithKind::Or => self.emit_int_bitop(BitOp::Or),
             ArithKind::Xor => self.emit_int_bitop(BitOp::Xor),
             ArithKind::TrueDiv => self.emit_int_truediv(pc),
+            ArithKind::Pow => unreachable!("int pow is never admitted"),
         }
     }
 
@@ -2931,6 +2938,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             self.emit_float_divmod_helper(kind, pc);
             return;
         }
+        if matches!(kind, ArithKind::Pow) {
+            self.emit_float_pow(pc);
+            return;
+        }
         let (b, _) = self.pop();
         let (a, _) = self.pop();
         let r = match kind {
@@ -2939,6 +2950,35 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             ArithKind::Mul => self.b.ins().fmul(a, b),
             _ => unreachable!("non-jitable float arith reached lowering"),
         };
+        self.vstack.push((r, JitType::Float));
+    }
+
+    /// Float `**` through the registered libm `pow` helper — the same
+    /// function the interpreter's `float_pow` calls — for a positive
+    /// base only, with a finite result: a zero, negative, or NaN base
+    /// (division by zero, complex results) and any non-finite result
+    /// (an overflow raises; an infinite exponent is the interpreter's
+    /// to judge) deopt, and the interpreter re-executes the operation.
+    fn emit_float_pow(&mut self, pc: u32) {
+        let snapshot = self.vstack.clone();
+        let (b, _) = self.pop();
+        let (a, _) = self.pop();
+        let z = self.b.ins().f64const(0.0);
+        let not_pos = self.b.ins().fcmp(FloatCC::UnorderedOrLessThanOrEqual, a, z);
+        let cont = self.guard(not_pos, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        let sig = self.math_binary_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::float_pow_helper_addr() as i64);
+        let call = self.b.ins().call_indirect(sig, helper, &[a, b]);
+        let r = self.b.inst_results(call)[0];
+        // `|r| == inf` or NaN: `r - r` is NaN exactly then.
+        let d = self.b.ins().fsub(r, r);
+        let bad = self.b.ins().fcmp(FloatCC::Unordered, d, d);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
         self.vstack.push((r, JitType::Float));
     }
 

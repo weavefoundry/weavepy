@@ -44,6 +44,8 @@ pub enum ArithKind {
     And,
     Or,
     Xor,
+    /// Float `**` (float lanes only; an integral operand promotes).
+    Pow,
 }
 
 /// Comparison operators (six-way), matching `CompareKind`.
@@ -150,6 +152,9 @@ pub enum TOp {
     Dup { depth: u32 },
     /// Swap the top two stack entries (`SWAP 2`).
     Swap2,
+    /// `SWAP n` for `n > 2`: exchange the top entry with the `n`-th
+    /// (a free lowering-stack rotation, like [`Self::Swap2`]).
+    SwapN { depth: u32 },
     /// Convert the integral value at TOS to `float` (RFC 0058 WS4 mixed
     /// arithmetic promotion, matching the interpreter's `as f64` cast).
     /// When `guarded`, deopt unless `|v| <= 2^53` — the range where the
@@ -1473,7 +1478,7 @@ impl TOp {
                 | TOp::CallPyKw { .. }
                 | TOp::CallMethod { .. }
                 | TOp::MathIntrinsic(_)
-                | TOp::FloatArith(ArithKind::FloorDiv | ArithKind::Mod)
+                | TOp::FloatArith(ArithKind::FloorDiv | ArithKind::Mod | ArithKind::Pow)
                 | TOp::ListGet { .. }
                 | TOp::ListSet
                 | TOp::ListLen

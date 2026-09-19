@@ -46,6 +46,7 @@ pub use runtime::{
     register_call_dyn_helper, register_call_dyn_int_helper, register_call_method_helper,
     register_call_py_helper, register_cell_helpers, register_const_str_helper,
     register_contains_dyn_helper, register_dict_del_helper, register_dict_helpers,
+    register_float_pow_helper,
     register_dict_iter_helper,
     register_dyn_attr_helpers, register_global_obj_helper, register_iter_helpers,
     register_iter_new_helper, register_iter_next_pair_helper, register_list_extra_helpers,

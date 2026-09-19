@@ -3136,11 +3136,20 @@ fn infer_block(
                         // re-validates each element; a malformed
                         // element or lane surprise deopts at the
                         // erased `UNPACK_SEQUENCE`).
+                        // Without a trained source, a variable already
+                        // on a scalar lane (an index reused from a
+                        // `while` counter, say) keeps it: the step
+                        // helper validates each unpacked element
+                        // against it and deopts on a surprise.
+                        let settled = |slot: u32| match local_types.get(slot as usize) {
+                            Some(Some(t @ (JitType::Int | JitType::Float))) => *t,
+                            _ => JitType::Obj,
+                        };
                         let (e1, e2) = ctor
                             .pair_lanes
                             .get(&seq_slot)
                             .copied()
-                            .unwrap_or((JitType::Obj, JitType::Obj));
+                            .unwrap_or_else(|| (settled(var), settled(var2)));
                         set_local(local_types, var, e1, changed)?;
                         set_local(local_types, var2, e2, changed)?;
                     } else if lane == JitType::Obj {
@@ -4472,20 +4481,22 @@ fn step_abstract(
             stack.push(v);
         }
         OpCode::Swap => {
-            if ins.arg != 2 {
-                return Err(JitVerdict::UnsupportedOpcode("SWAP n!=2"));
+            let n = ins.arg as usize;
+            if !(2..=8).contains(&n) {
+                return Err(JitVerdict::UnsupportedOpcode("SWAP n"));
             }
             let len = stack.len();
-            if len < 2 {
+            if len < n {
                 return Err(JitVerdict::StackUnderflow);
             }
             // A marker's recorded interp-stack position must stay fixed
-            // between load and call; reordering it disqualifies.
-            if !stack[len - 1].is_plain() || !stack[len - 2].is_plain() {
-                let (a, b) = (stack[len - 1], stack[len - 2]);
+            // between load and call; reordering it disqualifies (the
+            // entries between the swapped pair stay put).
+            if !stack[len - 1].is_plain() || !stack[len - n].is_plain() {
+                let (a, b) = (stack[len - 1], stack[len - n]);
                 return Err(escape_verdict(code, &[&a, &b], "CALL (callee escapes)"));
             }
-            stack.swap(len - 1, len - 2);
+            stack.swap(len - 1, len - n);
         }
         // RFC 0061 WS5 — pinned-list element read. The container must
         // be (or probe as) a homogeneous int/float list local; the
@@ -5382,6 +5393,8 @@ fn bin_result_type(kind: ArithKind, a: JitType, b: JitType) -> Result<JitType, J
     let b_int = b.is_integral();
     if a_int && b_int {
         match kind {
+            // `int ** int` can go big or float: interpreted.
+            ArithKind::Pow => Err(JitVerdict::UnsupportedOpcode("int pow")),
             ArithKind::TrueDiv => Ok(JitType::Float),
             ArithKind::And | ArithKind::Or | ArithKind::Xor => {
                 // bool∘bool stays bool in Python; we bail on that rare
@@ -5404,7 +5417,8 @@ fn bin_result_type(kind: ArithKind, a: JitType, b: JitType) -> Result<JitType, J
             | ArithKind::Mul
             | ArithKind::TrueDiv
             | ArithKind::FloorDiv
-            | ArithKind::Mod => Ok(JitType::Float),
+            | ArithKind::Mod
+            | ArithKind::Pow => Ok(JitType::Float),
             _ => Err(JitVerdict::UnsupportedOpcode("float bitop")),
         }
     } else if (a.is_integral() && b == JitType::Float) || (a == JitType::Float && b.is_integral()) {
@@ -5412,9 +5426,11 @@ fn bin_result_type(kind: ArithKind, a: JitType, b: JitType) -> Result<JitType, J
         // promoted with the same `as f64` cast the interpreter
         // applies, so only the unguarded-promotion op set is legal.
         match kind {
-            ArithKind::Add | ArithKind::Sub | ArithKind::Mul | ArithKind::TrueDiv => {
-                Ok(JitType::Float)
-            }
+            ArithKind::Add
+            | ArithKind::Sub
+            | ArithKind::Mul
+            | ArithKind::TrueDiv
+            | ArithKind::Pow => Ok(JitType::Float),
             _ => Err(JitVerdict::UnsupportedOpcode("mixed floordiv/mod/bitop")),
         }
     } else if a == JitType::Str {
@@ -5509,6 +5525,7 @@ fn bin_kind(arg: u32) -> Result<ArithKind, JitVerdict> {
         x if x == BinOpKind::BitOr as u32 => ArithKind::Or,
         x if x == BinOpKind::BitXor as u32 => ArithKind::Xor,
         x if x == BinOpKind::BitAnd as u32 => ArithKind::And,
+        x if x == BinOpKind::Pow as u32 => ArithKind::Pow,
         _ => return Err(JitVerdict::UnsupportedOpcode("BINARY_OP kind")),
     };
     Ok(k)
@@ -6468,7 +6485,11 @@ fn emit_instr(
                 // float-supported op set is legal.
                 if !matches!(
                     kind,
-                    ArithKind::Add | ArithKind::Sub | ArithKind::Mul | ArithKind::TrueDiv
+                    ArithKind::Add
+                        | ArithKind::Sub
+                        | ArithKind::Mul
+                        | ArithKind::TrueDiv
+                        | ArithKind::Pow
                 ) {
                     return Err(JitVerdict::UnsupportedOpcode("mixed floordiv/mod/bitop"));
                 }
@@ -7553,18 +7574,23 @@ fn emit_instr(
             *max_stack = (*max_stack).max(stack.len() as u32);
         }
         OpCode::Swap => {
-            if ins.arg != 2 {
-                return Err(JitVerdict::UnsupportedOpcode("SWAP n!=2"));
+            let n = ins.arg as usize;
+            if !(2..=8).contains(&n) {
+                return Err(JitVerdict::UnsupportedOpcode("SWAP n"));
             }
             let len = stack.len();
-            if len < 2 {
+            if len < n {
                 return Err(JitVerdict::StackUnderflow);
             }
-            if !stack[len - 1].is_plain() || !stack[len - 2].is_plain() {
+            if !stack[len - 1].is_plain() || !stack[len - n].is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
-            stack.swap(len - 1, len - 2);
-            push(TOp::Swap2, None, stack, stmts);
+            stack.swap(len - 1, len - n);
+            if n == 2 {
+                push(TOp::Swap2, None, stack, stmts);
+            } else {
+                push(TOp::SwapN { depth: n as u32 }, None, stack, stmts);
+            }
         }
         // RFC 0071 WS4 — `BUILD_LIST k` (uniform lane or all-`None`).
         OpCode::BuildList => {
@@ -8081,6 +8107,7 @@ fn emit_instr(
 fn lower_bin(kind: ArithKind, a: JitType, b: JitType) -> Result<(TOp, JitType), JitVerdict> {
     if a.is_integral() && b.is_integral() {
         match kind {
+            ArithKind::Pow => Err(JitVerdict::UnsupportedOpcode("int pow")),
             ArithKind::TrueDiv => Ok((TOp::IntTrueDiv, JitType::Float)),
             ArithKind::And | ArithKind::Or | ArithKind::Xor => {
                 if a == JitType::Bool && b == JitType::Bool {
@@ -8098,7 +8125,8 @@ fn lower_bin(kind: ArithKind, a: JitType, b: JitType) -> Result<(TOp, JitType), 
             | ArithKind::Mul
             | ArithKind::TrueDiv
             | ArithKind::FloorDiv
-            | ArithKind::Mod => Ok((TOp::FloatArith(kind), JitType::Float)),
+            | ArithKind::Mod
+            | ArithKind::Pow => Ok((TOp::FloatArith(kind), JitType::Float)),
             _ => Err(JitVerdict::UnsupportedOpcode("float bitop")),
         }
     } else if a == JitType::Str {

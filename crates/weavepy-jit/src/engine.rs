@@ -557,6 +557,7 @@ fn is_scalar_leaf(tfunc: &TFunc) -> bool {
                     | TOp::Pop
                     | TOp::Dup { .. }
                     | TOp::Swap2
+                    | TOp::SwapN { .. }
                     | TOp::IntToFloatTos { .. }
                     | TOp::IntToFloatSecond { .. }
             )

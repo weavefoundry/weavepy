@@ -588,6 +588,7 @@ impl JitState {
             wpjit_float_floordiv,
             wpjit_float_mod,
         );
+        weavepy_jit::register_float_pow_helper(wpjit_float_pow);
         // RFC 0074 — the frame-coverage lanes: obj globals, the
         // opaque-call lane, dynamic attributes, generic/pair
         // iteration, str %-format and slice.
@@ -1574,7 +1575,9 @@ fn scalar_lane_ty(t: JitType) -> bool {
 /// travels as an `ObjPin` entry that the callee re-pins in its own
 /// table).
 fn marshalable_lane_ty(t: JitType) -> bool {
-    scalar_lane_ty(t) || t == JitType::Obj
+    // A pinned list crosses as its pin too (re-pinned on the callee side
+    // with the same element lane).
+    scalar_lane_ty(t) || t == JitType::Obj || t.is_list()
 }
 
 /// RFC 0067 WS1 — whether a *compiled* callee can be entered directly
@@ -1946,6 +1949,7 @@ fn unpack_ty(bits: u64, ty: JitType, pins: &PinTable) -> Object {
         JitType::ListInt
         | JitType::ListFloat
         | JitType::ListObj
+        | JitType::ListListFloat
         | JitType::Obj
         | JitType::Str
         | JitType::Bytes
@@ -2003,16 +2007,22 @@ fn entry_local_ok(obj: &Object, ty: JitType) -> bool {
     let Object::List(l) = obj else {
         return false;
     };
-    matches!(
-        (l.borrow().first(), elem),
-        (None, _)
-            | (Some(Object::Int(_)), JitType::Int)
-            | (Some(Object::Float(_)), JitType::Float)
-            | (
-                Some(Object::Instance(_) | Object::Str(_) | Object::None),
-                JitType::Obj
-            )
-    )
+    match (l.borrow().first(), elem) {
+        // A float-list element: its own first element is the proxy.
+        (Some(Object::List(inner)), JitType::ListFloat) => {
+            matches!(inner.borrow().first(), None | Some(Object::Float(_)))
+        }
+        (first, elem) => matches!(
+            (first, elem),
+            (None, _)
+                | (Some(Object::Int(_)), JitType::Int)
+                | (Some(Object::Float(_)), JitType::Float)
+                | (
+                    Some(Object::Instance(_) | Object::Str(_) | Object::None | Object::Tuple(_)),
+                    JitType::Obj
+                )
+        ),
+    }
 }
 
 /// The compile-time shape probe (RFC 0061 WS5): report the element lane
@@ -2036,7 +2046,16 @@ fn probe_list_lane(frame: &super::Frame, slot: u32) -> Option<JitType> {
             Object::Float(_) => JitType::Float,
             // RFC 0071 WS4 — instances (and `None`) ride the object
             // element lane; the access helpers re-validate per element.
-            Object::Instance(_) | Object::None => JitType::Obj,
+            // Tuples too (a list of pairs a `for a, b in` loop unpacks).
+            Object::Instance(_) | Object::None | Object::Tuple(_) => JitType::Obj,
+            // A non-empty all-`float` list element: the nested lane.
+            Object::List(inner) => {
+                let inner = inner.borrow();
+                if inner.is_empty() || !inner.iter().all(|x| matches!(x, Object::Float(_))) {
+                    return None;
+                }
+                JitType::ListFloat
+            }
             _ => return None,
         };
         match lane {
@@ -3199,6 +3218,9 @@ fn lane_tag(t: JitType) -> u32 {
         JitType::Bool => SlotTag::Bool as u32,
         // RFC 0071 WS1 — the nullable object lane crosses as a pin.
         JitType::Obj => SlotTag::ObjPin as u32,
+        JitType::ListInt | JitType::ListFloat | JitType::ListObj | JitType::ListListFloat => {
+            SlotTag::ListPin as u32
+        }
         _ => u32::MAX,
     }
 }
@@ -3405,6 +3427,12 @@ unsafe fn try_native_call(
         {
             return None;
         }
+        // A list argument's pin must carry the callee's element lane.
+        if tag == SlotTag::ListPin as u32
+            && !matches!(ctx.pins.get(bits as usize), Some(Pin::List(_, e)) if Some(*e) == lane.elem_lane())
+        {
+            return None;
+        }
     }
     // The callee's burned-in resolutions must hold before entry. A
     // self-call (same snapshot, same namespaces) is covered by the
@@ -3560,6 +3588,16 @@ unsafe fn try_native_call(
                 }
                 // Unreachable per the validation pass; the nullable
                 // `None` is the safe stand-in.
+                _ => u64::MAX,
+            }
+        } else if tag == SlotTag::ListPin as u32 {
+            match ctx.pins.get(bits as usize) {
+                Some(Pin::List(l, e)) => {
+                    let idx = pins.len() as u64;
+                    pins.push(Pin::List(l.clone(), *e));
+                    idx
+                }
+                // Unreachable per the validation pass.
                 _ => u64::MAX,
             }
         } else {
@@ -4725,6 +4763,13 @@ extern "C" fn wpjit_math_cos(x: f64) -> f64 {
     x.cos()
 }
 
+/// The float `**` helper: libm `pow`, exactly as the interpreter's
+/// `float_pow` computes it (native code admits only a positive base and
+/// deopts on a non-finite result).
+extern "C" fn wpjit_float_pow(a: f64, b: f64) -> f64 {
+    a.powf(b)
+}
+
 /// Python-semantics `float` floor division (RFC 0069 WS2): CPython's
 /// `float_divmod` quotient, sign discipline included. The compiled
 /// guard deopts the zero-divisor case *before* the call (the
@@ -4757,11 +4802,15 @@ unsafe extern "C" fn wpjit_list_get(frame: *mut JitFrame, pin: i64, idx: i64) ->
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     // Scoped so the list borrow (through `ctx.pins`) ends before an
     // object element appends a fresh pin (RFC 0071 WS4).
-    let outcome: Result<u64, Object> = {
+    let outcome: Result<u64, Pin> = {
         let Some(Pin::List(list, elem)) = ctx.pins.get(pin as usize) else {
             return 1;
         };
-        let items = list.borrow();
+        // SAFETY: a read between two native ops; nothing here runs code
+        // (see `GilCell::peek`).
+        let Some(items) = (unsafe { list.peek() }) else {
+            return 1;
+        };
         let len = items.len() as i64;
         let i = if idx < 0 { idx + len } else { idx };
         if i < 0 || i >= len {
@@ -4775,7 +4824,14 @@ unsafe extern "C" fn wpjit_list_get(frame: *mut JitFrame, pin: i64, idx: i64) ->
             (Object::None, JitType::Obj) => Ok(u64::MAX),
             // RFC 0073 WS3 — exact-`str` elements pin on the object
             // lane (indexing into a `split` result).
-            (v @ (Object::Instance(_) | Object::Str(_)), JitType::Obj) => Err(v.clone()),
+            (v @ (Object::Instance(_) | Object::Str(_) | Object::Tuple(_)), JitType::Obj) => {
+                Err(Pin::Obj(v.clone()))
+            }
+            // The nested lane: a list element pins on the float-list
+            // lane (its reads re-validate each float).
+            (Object::List(inner), JitType::ListFloat) => {
+                Err(Pin::List(inner.clone(), JitType::Float))
+            }
             _ => return 1,
         }
     };
@@ -4784,12 +4840,12 @@ unsafe extern "C" fn wpjit_list_get(frame: *mut JitFrame, pin: i64, idx: i64) ->
             jf.ret_bits = bits;
             0
         }
-        Err(obj) => {
+        Err(p) => {
             if ctx.pins.len() >= RUNTIME_PIN_CAP {
                 return 1;
             }
             jf.ret_bits = ctx.pins.len() as u64;
-            ctx.pins.push(Pin::Obj(obj));
+            ctx.pins.push(p);
             0
         }
     }
@@ -4838,7 +4894,11 @@ unsafe extern "C" fn wpjit_list_set(frame: *mut JitFrame, pin: i64, idx: i64) ->
         },
         _ => return 1,
     };
-    let mut items = list.borrow_mut();
+    // SAFETY: as `wpjit_list_get` — nothing below runs code (the
+    // displaced value is a scalar, checked before the store).
+    let Some(items) = (unsafe { list.peek_mut() }) else {
+        return 1;
+    };
     let len = items.len() as i64;
     let i = if idx < 0 { idx + len } else { idx };
     if i < 0 || i >= len {
@@ -5534,7 +5594,7 @@ unsafe extern "C" fn wpjit_list_next(frame: *mut JitFrame, pin: i64, idx: i64) -
     #[allow(clippy::cast_ptr_alignment)]
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     // Scoped so the list borrow ends before an object element pins.
-    let outcome: Result<u64, Object> = {
+    let outcome: Result<u64, Pin> = {
         let Some(Pin::List(list, elem)) = ctx.pins.get(pin as usize) else {
             return 2;
         };
@@ -5556,7 +5616,14 @@ unsafe extern "C" fn wpjit_list_next(frame: *mut JitFrame, pin: i64, idx: i64) -
             (Object::None, JitType::Obj) => Ok(u64::MAX),
             // RFC 0073 WS3 — exact-`str` elements pin on the object
             // lane (a `split` result's `ForList` consumer).
-            (v @ (Object::Instance(_) | Object::Str(_)), JitType::Obj) => Err(v.clone()),
+            (v @ (Object::Instance(_) | Object::Str(_) | Object::Tuple(_)), JitType::Obj) => {
+                Err(Pin::Obj(v.clone()))
+            }
+            // The nested lane: a list element pins on the float-list
+            // lane (see `wpjit_list_get`).
+            (Object::List(inner), JitType::ListFloat) => {
+                Err(Pin::List(inner.clone(), JitType::Float))
+            }
             _ => return 2,
         }
     };
@@ -5565,12 +5632,12 @@ unsafe extern "C" fn wpjit_list_next(frame: *mut JitFrame, pin: i64, idx: i64) -
             jf.ret_bits = bits;
             0
         }
-        Err(obj) => {
+        Err(p) => {
             if ctx.pins.len() >= RUNTIME_PIN_CAP {
                 return 2;
             }
             jf.ret_bits = ctx.pins.len() as u64;
-            ctx.pins.push(Pin::Obj(obj));
+            ctx.pins.push(p);
             0
         }
     }

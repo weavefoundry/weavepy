@@ -949,6 +949,19 @@ static MATH_COS_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 static FLOAT_FLOORDIV_HELPER: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static FLOAT_MOD_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FLOAT_POW_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the float `**` helper (libm `pow`, as the interpreter's
+/// `float_pow`). Must precede the first compile of a frame containing
+/// float `**` ops.
+pub fn register_float_pow_helper(pow: MathBinaryHelper) {
+    FLOAT_POW_HELPER.store(pow as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn float_pow_helper_addr() -> usize {
+    FLOAT_POW_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// Register the process-wide math helpers (RFC 0069 WS2): the libm
 /// `sin`/`cos` intrinsics and the Python-semantics float floor-div /

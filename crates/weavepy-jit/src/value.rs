@@ -37,6 +37,11 @@ pub enum JitType {
     /// re-validate the element shape per access and deopt on any
     /// surprise, exactly as the scalar list lanes do.
     ListObj,
+    /// A pinned `list` of `float` lists (a row-major matrix, a list of
+    /// particle states). An element read validates the element is a
+    /// list and pins it on the [`JitType::ListFloat`] lane, whose own
+    /// accesses re-validate every float (the scalar list discipline).
+    ListListFloat,
     /// RFC 0065 WS5 — a *pinned* instance receiver. Like the list pins,
     /// the machine value is an `i64` index into the embedder's
     /// per-entry pinned-object table; attribute access goes through the
@@ -96,7 +101,7 @@ impl JitType {
     pub fn is_list(self) -> bool {
         matches!(
             self,
-            JitType::ListInt | JitType::ListFloat | JitType::ListObj
+            JitType::ListInt | JitType::ListFloat | JitType::ListObj | JitType::ListListFloat
         )
     }
 
@@ -114,6 +119,7 @@ impl JitType {
             JitType::ListInt
                 | JitType::ListFloat
                 | JitType::ListObj
+                | JitType::ListListFloat
                 | JitType::Obj
                 | JitType::Str
                 | JitType::Bytes
@@ -129,6 +135,7 @@ impl JitType {
             JitType::ListInt => Some(JitType::Int),
             JitType::ListFloat => Some(JitType::Float),
             JitType::ListObj => Some(JitType::Obj),
+            JitType::ListListFloat => Some(JitType::ListFloat),
             _ => None,
         }
     }
@@ -142,6 +149,7 @@ impl JitType {
             JitType::Int => Some(JitType::ListInt),
             JitType::Float => Some(JitType::ListFloat),
             JitType::Obj => Some(JitType::ListObj),
+            JitType::ListFloat => Some(JitType::ListListFloat),
             _ => None,
         }
     }
