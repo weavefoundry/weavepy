@@ -134,8 +134,20 @@ impl Drop for Guard {
 /// whenever the new depth would exceed the limit, on *every* such call.
 /// See the module docs for why there is no extra-frame headroom.
 pub fn enter() -> Enter {
+    enter_with(depth_cell())
+}
+
+/// This thread's depth cell, for callers that enter many activations
+/// in a row on the same thread (see [`enter_with`]).
+#[inline]
+pub fn depth_cell() -> *const Cell<usize> {
+    DEPTH.with(std::ptr::from_ref)
+}
+
+/// [`enter`] with the calling thread's [`depth_cell`] already in hand.
+#[inline]
+pub fn enter_with(cell: *const Cell<usize>) -> Enter {
     let limit = recursion_limit();
-    let cell = DEPTH.with(std::ptr::from_ref);
     // SAFETY: this thread's own thread-local, alive for the thread.
     let d = unsafe { &*cell };
     let n = d.get() + 1;

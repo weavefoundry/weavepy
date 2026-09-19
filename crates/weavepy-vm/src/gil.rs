@@ -519,9 +519,16 @@ pub fn gil_reenabled_by_extension() -> bool {
 /// invariant ("mutations on `list` visible across threads") sound
 /// without atomic refcounts.
 pub fn global_gil() -> Arc<GilState> {
+    global_gil_ref().clone()
+}
+
+/// [`global_gil`] by reference: no count traffic on the shared handle
+/// (the hand-off checkpoints read it constantly).
+#[inline]
+pub fn global_gil_ref() -> &'static Arc<GilState> {
     use std::sync::OnceLock;
     static GLOBAL: OnceLock<Arc<GilState>> = OnceLock::new();
-    GLOBAL.get_or_init(|| Arc::new(GilState::new())).clone()
+    GLOBAL.get_or_init(|| Arc::new(GilState::new()))
 }
 
 /// CPython `_PyEval_ReInitThreads` / `PyOS_AfterFork_Child`: rebuild the
@@ -824,10 +831,18 @@ fn waiter_interval_elapsed() -> bool {
         Some(since) => since.elapsed() >= global_gil().breaker.switch_interval(),
         None => {
             c.set(Some(std::time::Instant::now()));
+            WAITER_CLOCK_ARMED.store(true, Ordering::Relaxed);
             false
         }
     })
 }
+
+/// Whether some thread's [`WAITER_SEEN_SINCE`] clock may be running, so
+/// the no-waiter fast path of [`maybe_yield_gil`] knows when a reset is
+/// owed without reading thread-local state. (A thread's clock is also
+/// reset whenever it re-acquires the GIL, see [`note_gil_acquired`].)
+static WAITER_CLOCK_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Whether this thread has held the GIL long enough (≥ the configured
 /// `sys.setswitchinterval`) that a cooperative hand-off to a waiter is due.
@@ -879,6 +894,16 @@ pub fn yield_checkpoint() {
 /// waiter can take it, then re-acquires. No-op when nobody is
 /// waiting or when this thread doesn't hold the GIL via the stack.
 fn maybe_yield_gil() {
+    // The overwhelmingly common case — nobody is waiting — decided on
+    // one atomic load, before any thread-local state is touched.
+    let gil = global_gil_ref();
+    if gil.breaker.waiter_count() == 0 {
+        if WAITER_CLOCK_ARMED.load(Ordering::Relaxed) {
+            WAITER_CLOCK_ARMED.store(false, Ordering::Relaxed);
+            WAITER_SEEN_SINCE.with(|c| c.set(None));
+        }
+        return;
+    }
     // RFC 0076 WS11: free-threaded mode has nothing to hand off —
     // every thread already runs concurrently on lock-free guards.
     if free_threading_enabled() {
@@ -903,11 +928,6 @@ fn maybe_yield_gil() {
     // checkpoint no borrows are live, so normal preemption is
     // unaffected.
     if crate::sync::cell_guards_live() {
-        return;
-    }
-    let gil = global_gil();
-    if gil.breaker.waiter_count() == 0 {
-        WAITER_SEEN_SINCE.with(|c| c.set(None));
         return;
     }
     // CPython hands the GIL off on a wall-clock interval, not an opcode

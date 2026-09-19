@@ -2779,6 +2779,14 @@ struct CallCtx {
     /// Generic calls of native callees this activation has made (see
     /// [`charge_native_roundtrip`]).
     native_calls: u32,
+    /// The context of this activation's most recent native callee, kept
+    /// for reuse by its next call of the same callee (see
+    /// `try_native_call`). Owns its handles; taken out while in use.
+    child: Option<Box<CallCtx>>,
+    /// The executing thread's recursion-depth cell (see
+    /// `crate::recursion::depth_cell`), resolved once per entry into
+    /// native code and inherited by nested native calls.
+    depth_cell: *const std::cell::Cell<usize>,
     /// RFC 0067 WS1 — identity of this activation's code object, so a
     /// self-recursive fast call can reuse [`Self::native`] without a
     /// cache lookup.
@@ -3175,6 +3183,16 @@ fn current_compile_gen() -> u64 {
     JIT.with(|cell| cell.borrow().compile_gen)
 }
 
+/// Bump a native-call diagnostic counter. The counters only feed the
+/// VM stats report (and unit tests), so they stay off the call path
+/// otherwise: each is a thread-local access.
+#[inline(always)]
+fn native_stat(f: impl FnOnce(&NativeCallStats)) {
+    if cfg!(test) || crate::specialize::stats_enabled() {
+        NATIVE_CALL_STATS.with(f);
+    }
+}
+
 const SCALAR_LEAF_SLOTS: usize = 32;
 
 /// Enter a certified scalar leaf with bounded stack storage. The caller
@@ -3187,6 +3205,8 @@ const SCALAR_LEAF_SLOTS: usize = 32;
 /// are initialized, and all missing trailing arguments have scalar defaults.
 #[inline(never)]
 unsafe fn enter_scalar_leaf(nc: &NativeCallee, jf: &JitFrame, argc: usize) -> Option<(u64, u32)> {
+    // Only the locals need initializing: the operand spill and its tags
+    // are written by native code before anything reads them.
     let mut locals = [0u64; SCALAR_LEAF_SLOTS];
     for (j, slot) in locals.iter_mut().enumerate().take(argc) {
         // SAFETY: the caller validated the marshaled argument prefix.
@@ -3201,8 +3221,8 @@ unsafe fn enter_scalar_leaf(nc: &NativeCallee, jf: &JitFrame, argc: usize) -> Op
         let default = &nc.func.defaults[nc.func.defaults.len() - (nc.code.arg_count as usize - k)];
         *slot = pack(default, nc.cf.local_types[k]?)?;
     }
-    let mut spill = [0u64; SCALAR_LEAF_SLOTS];
-    let mut tags = [0u32; SCALAR_LEAF_SLOTS];
+    let mut spill = std::mem::MaybeUninit::<[u64; SCALAR_LEAF_SLOTS]>::uninit();
+    let mut tags = std::mem::MaybeUninit::<[u32; SCALAR_LEAF_SLOTS]>::uninit();
     let mut frame = JitFrame {
         locals: locals.as_mut_ptr(),
         n_locals: nc.cf.n_locals,
@@ -3210,8 +3230,8 @@ unsafe fn enter_scalar_leaf(nc: &NativeCallee, jf: &JitFrame, argc: usize) -> Op
         ret_bits: 0,
         ret_tag: 0,
         deopt_pc: 0,
-        stack_spill: spill.as_mut_ptr(),
-        stack_tags: tags.as_mut_ptr(),
+        stack_spill: spill.as_mut_ptr().cast::<u64>(),
+        stack_tags: tags.as_mut_ptr().cast::<u32>(),
         stack_len: 0,
         stack_cap: SCALAR_LEAF_SLOTS as u32,
         ctx: std::ptr::null_mut(),
@@ -3255,7 +3275,11 @@ unsafe fn try_native_call(
     // point (RFC 0067 WS2): hand the GIL off inline; route pending
     // interpreter work — and active observers, which need the callee's
     // trace events fired — through the interpreter path.
-    crate::gil::yield_checkpoint();
+    interp.gil_countdown = interp.gil_countdown.wrapping_sub(1);
+    if interp.gil_countdown == 0 {
+        interp.gil_countdown = crate::gil::GIL_CHECK_INTERVAL;
+        crate::gil::yield_checkpoint();
+    }
     if crate::hot_gates::load() != 0 || crate::trace::any_observers_active() {
         return None;
     }
@@ -3351,11 +3375,11 @@ unsafe fn try_native_call(
     // The same recursion tick the interpreter path charges, so
     // `RecursionError` fires at the same depth in both tiers. On
     // overflow the interpreter path raises it with full fidelity.
-    let recursion_guard = match crate::recursion::enter() {
+    let recursion_guard = match crate::recursion::enter_with(ctx.depth_cell) {
         crate::recursion::Enter::Ok(g) => g,
         crate::recursion::Enter::Overflow => return None,
     };
-    NATIVE_CALL_STATS.with(|s| s.calls.set(s.calls.get() + 1));
+    native_stat(|s| s.calls.set(s.calls.get() + 1));
 
     if recv.is_none()
         && nc.cf.is_scalar_leaf()
@@ -3364,7 +3388,7 @@ unsafe fn try_native_call(
     {
         // Grow before entering the separate function that owns the fixed
         // arrays, preserving the ordinary native call's stack discipline.
-        NATIVE_CALL_STATS.with(|s| s.scalar_leaf_calls.set(s.scalar_leaf_calls.get() + 1));
+        native_stat(|s| s.scalar_leaf_calls.set(s.scalar_leaf_calls.get() + 1));
         // SAFETY: the checks above establish the helper's size, scalar
         // lane, default-binding, code-lifetime, and recursion invariants.
         let enter = || unsafe { enter_scalar_leaf(nc, jf, argc_usize) };
@@ -3388,7 +3412,7 @@ unsafe fn try_native_call(
                 // can restart to compute a bignum or raise with a complete
                 // interpreter frame. This return releases the recursion
                 // guard before that path charges its own tick.
-                NATIVE_CALL_STATS.with(|s| s.deopts.set(s.deopts.get() + 1));
+                native_stat(|s| s.deopts.set(s.deopts.get() + 1));
                 None
             }
         };
@@ -3411,12 +3435,60 @@ unsafe fn try_native_call(
     let n_locals = nc.cf.n_locals as usize;
     let cap = nc.cf.max_stack as usize + 1;
     let call_cap = (nc.cf.max_call_args as usize).max(1);
-    let mut u64_buf = take_u64(n_locals + cap + call_cap);
-    let (locals_buf, rest) = u64_buf.split_at_mut(n_locals);
+    // Small frames keep their buffers on this native frame (zeroed prefix
+    // only); larger ones take pooled owners.
+    const INLINE_WORDS: usize = 64;
+    let words = n_locals + cap + call_cap;
+    let halfs = cap + call_cap;
+    let inline_bufs = words <= INLINE_WORDS;
+    let mut inline_u64 = std::mem::MaybeUninit::<[u64; INLINE_WORDS]>::uninit();
+    let mut inline_u32 = std::mem::MaybeUninit::<[u32; INLINE_WORDS]>::uninit();
+    let mut u64_buf: Vec<u64> = if inline_bufs {
+        Vec::new()
+    } else {
+        take_u64(words)
+    };
+    let mut u32_buf: Vec<u32> = if inline_bufs {
+        Vec::new()
+    } else {
+        take_u32(halfs)
+    };
+    let (u64s, u32s): (&mut [u64], &mut [u32]) = if inline_bufs {
+        // SAFETY: both prefixes fit the arrays and are zeroed before any
+        // slice over them exists; the arrays outlive every use below.
+        unsafe {
+            // A fixed-size prefix zeroes with inline stores (no `memset`
+            // call); larger frames finish the tail.
+            const QUICK: usize = 16;
+            let p = inline_u64.as_mut_ptr().cast::<u64>();
+            p.cast::<[u64; QUICK]>().write([0; QUICK]);
+            for k in QUICK..words {
+                p.add(k).write(0);
+            }
+            let q = inline_u32.as_mut_ptr().cast::<u32>();
+            q.cast::<[u32; QUICK]>().write([0; QUICK]);
+            for k in QUICK..halfs {
+                q.add(k).write(0);
+            }
+            (
+                std::slice::from_raw_parts_mut(p, words),
+                std::slice::from_raw_parts_mut(q, halfs),
+            )
+        }
+    } else {
+        (&mut u64_buf[..], &mut u32_buf[..])
+    };
+    let (locals_buf, rest) = u64s.split_at_mut(n_locals);
     let (spill, call_args) = rest.split_at_mut(cap);
-    let mut u32_buf = take_u32(cap + call_cap);
-    let (tags, call_tags) = u32_buf.split_at_mut(cap);
-    let mut pins: PinTable = Vec::new();
+    let (tags, call_tags) = u32s.split_at_mut(cap);
+    // The cached child's (drained) pin table keeps its capacity.
+    let mut pins: PinTable = match ctx.child.as_deref_mut() {
+        Some(c) => std::mem::take(&mut c.pins),
+        None => Vec::new(),
+    };
+    if !pins.is_empty() {
+        pins.clear();
+    }
     if let Some(r) = recv {
         // The receiver slot carries pin index 0 (`take_u64` zeroed it).
         pins.push(Pin::Obj(r.clone()));
@@ -3467,56 +3539,96 @@ unsafe fn try_native_call(
     }
     let entry_pin_count = pins.len();
     let callee_key = Rc::as_ptr(&nc.code).cast::<CodeObject>();
-    // Self-recursion reuses this activation's own tables. An immutable
-    // compilation with no call tokens needs no resolution, even when
-    // another function compiles and advances the cache generation.
-    // Nonempty tables retain the generation-checked cache lookup.
-    let (native, method_native) = if callee_key == ctx.code_ptr {
-        (ctx.native.clone(), ctx.method_native.clone())
+    // The callee's context: this activation's cached child when it was
+    // built for this very callee (same code, artifact tables and
+    // namespaces — the child holds those handles, so pointer identity
+    // is sound), else a fresh one. Reuse resets only the per-activation
+    // state; the handles and resolved tables carry over (stale tables
+    // re-resolve on demand, as for any long-lived activation).
+    let reusable = ctx.child.as_deref().is_some_and(|c| {
+        c.code_ptr == callee_key
+            && StdRc::ptr_eq(&c.callees, &nc.callees)
+            && StdRc::ptr_eq(&c.guard_snapshot, &nc.snap)
+            && Rc::ptr_eq(&c.globals, &nc.func.globals)
+            && Rc::ptr_eq(&c.builtins, &nc.func.builtins)
+    });
+    let mut child: Box<CallCtx> = if reusable {
+        let mut c = ctx.child.take().expect("checked above");
+        // (A previous call left `parked`/`raised` empty.)
+        if !c.const_pins.is_empty() {
+            c.const_pins.clear();
+        }
+        c.pins = pins;
+        c.entry_pin_count = entry_pin_count;
+        c.pin_pressure_exit = false;
+        if !c.obj_global_pins.is_empty() {
+            c.obj_global_pins.clear();
+        }
+        c.dirty = false;
+        c.interp_calls = 0;
+        c.native_calls = 0;
+        c
     } else {
-        (
-            if nc.callees.is_empty() {
-                None
-            } else {
-                resolved_native_table(callee_key)
-            },
-            if nc.methods.is_empty() {
-                None
-            } else {
-                resolved_method_native_table(callee_key)
-            },
-        )
+        // Self-recursion reuses this activation's own tables. An immutable
+        // compilation with no call tokens needs no resolution, even when
+        // another function compiles and advances the cache generation.
+        // Nonempty tables retain the generation-checked cache lookup.
+        let (native, method_native) = if callee_key == ctx.code_ptr {
+            (ctx.native.clone(), ctx.method_native.clone())
+        } else {
+            (
+                if nc.callees.is_empty() {
+                    None
+                } else {
+                    resolved_native_table(callee_key)
+                },
+                if nc.methods.is_empty() {
+                    None
+                } else {
+                    resolved_method_native_table(callee_key)
+                },
+            )
+        };
+        let table_gen = if callee_key == ctx.code_ptr {
+            ctx.table_gen
+        } else {
+            current_compile_gen()
+        };
+        Box::new(CallCtx {
+            interp: ctx.interp,
+            callees: nc.callees.clone(),
+            guard_snapshot: nc.snap.clone(),
+            globals: nc.func.globals.clone(),
+            builtins: nc.func.builtins.clone(),
+            // Native callees are cell-free by `py_callee_ok`.
+            cells: crate::object::empty_cells(),
+            parked: None,
+            raised: None,
+            const_pins: Vec::new(),
+            pins,
+            entry_pin_count,
+            pin_pressure_exit: false,
+            obj_globals: nc.obj_globals.clone(),
+            obj_global_pins: Vec::new(),
+            attr_guards: nc.attr_guards.clone(),
+            methods: nc.methods.clone(),
+            math: nc.math.clone(),
+            dirty: false,
+            interp_calls: 0,
+            native_calls: 0,
+            child: None,
+            depth_cell: ctx.depth_cell,
+            code_ptr: callee_key,
+            native,
+            method_native,
+            table_gen,
+            // The native call lanes push no interpreter frame for the
+            // callee — keep it observable to callee-side stack walkers.
+            frameless_code: Some(nc.code.clone()),
+        })
     };
-    let mut nctx = CallCtx {
-        interp: ctx.interp,
-        callees: nc.callees.clone(),
-        guard_snapshot: nc.snap.clone(),
-        globals: nc.func.globals.clone(),
-        builtins: nc.func.builtins.clone(),
-        // Native callees are cell-free by `py_callee_ok`.
-        cells: crate::object::empty_cells(),
-        parked: None,
-        raised: None,
-        const_pins: Vec::new(),
-        pins,
-        entry_pin_count,
-        pin_pressure_exit: false,
-        obj_globals: nc.obj_globals.clone(),
-        obj_global_pins: Vec::new(),
-        attr_guards: nc.attr_guards.clone(),
-        methods: nc.methods.clone(),
-        math: nc.math.clone(),
-        dirty: false,
-        interp_calls: 0,
-        native_calls: 0,
-        code_ptr: callee_key,
-        native,
-        method_native,
-        table_gen: current_compile_gen(),
-        // The native call lanes push no interpreter frame for the
-        // callee — keep it observable to callee-side stack walkers.
-        frameless_code: Some(nc.code.clone()),
-    };
+    child.interp = ctx.interp;
+    let nctx: &mut CallCtx = &mut child;
     let mut njf = JitFrame {
         locals: locals_buf.as_mut_ptr(),
         n_locals: nc.cf.n_locals,
@@ -3528,7 +3640,7 @@ unsafe fn try_native_call(
         stack_tags: tags.as_mut_ptr(),
         stack_len: 0,
         stack_cap: cap as u32,
-        ctx: std::ptr::from_mut(&mut nctx).cast::<u8>(),
+        ctx: std::ptr::from_mut::<CallCtx>(nctx).cast::<u8>(),
         call_args: call_args.as_mut_ptr(),
         call_tags: call_tags.as_mut_ptr(),
     };
@@ -3536,9 +3648,13 @@ unsafe fn try_native_call(
     // (the same invariants `enter_compiled` documents); the engine
     // backing `nc.cf` lives in this thread's `JIT` state for the
     // process lifetime; `nctx` outlives the call. The stack-growth
-    // discipline mirrors `run_until_yield_or_return`: grow in segments,
-    // except on a greenlet's dedicated (large, non-growable) stack.
-    let status = if crate::stdlib::greenlet_native::on_greenlet_stack() {
+    // discipline mirrors `run_until_yield_or_return`: grow in segments
+    // (probed every few nested levels — a native call level is far
+    // smaller than the red zone divided by the probe interval), except
+    // on a greenlet's dedicated (large, non-growable) stack.
+    let status = if recursion_guard.depth() % 4 != 0
+        || crate::stdlib::greenlet_native::on_greenlet_stack()
+    {
         unsafe { nc.cf.enter(&raw mut njf) }
     } else {
         stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || unsafe {
@@ -3570,7 +3686,7 @@ unsafe fn try_native_call(
                 debug_assert_eq!(status, JitStatus::Deopt);
                 JIT.with(|cell| cell.borrow_mut().stats.pin_pressure_exits += 1);
             } else {
-                NATIVE_CALL_STATS.with(|s| s.deopts.set(s.deopts.get() + 1));
+                native_stat(|s| s.deopts.set(s.deopts.get() + 1));
             }
             nctx.dirty = true;
             // The materialized continuation is a full interpreter
@@ -3584,20 +3700,28 @@ unsafe fn try_native_call(
             } else {
                 None
             };
-            match finish_deopted_callee(
-                interp, nc, &mut nctx, locals_buf, spill, tags, &njf, pending,
-            ) {
+            match finish_deopted_callee(interp, nc, nctx, locals_buf, spill, tags, &njf, pending) {
                 Ok(v) => Done::Obj(v),
                 Err(e) => Done::Raised(e),
             }
         }
     };
-    put_u64(u64_buf);
-    put_u32(u32_buf);
+    if !inline_bufs {
+        put_u64(u64_buf);
+        put_u32(u32_buf);
+    }
     // Reap the callee's pins (after every
     // pin-based rebuild above); a reap cascade runs Python, so it
     // dirties the call like any interpreter-path work.
-    let child_dirty = nctx.dirty | drain_activation_pins(interp, &mut nctx.pins);
+    let child_dirty =
+        nctx.dirty | (!nctx.pins.is_empty() && drain_activation_pins(interp, &mut nctx.pins));
+    if nctx.parked.is_some() {
+        nctx.parked = None;
+    }
+    if nctx.raised.is_some() {
+        nctx.raised = None;
+    }
+    ctx.child = Some(child);
     ctx.dirty |= child_dirty;
 
     Some(match done {
@@ -3961,7 +4085,7 @@ unsafe extern "C" fn wpjit_call_py(
             match attempted {
                 Some(status) => return status,
                 None => {
-                    NATIVE_CALL_STATS.with(|s| s.fallbacks.set(s.fallbacks.get() + 1));
+                    native_stat(|s| s.fallbacks.set(s.fallbacks.get() + 1));
                     break;
                 }
             }
@@ -4225,9 +4349,9 @@ unsafe extern "C" fn wpjit_call_method(
     // SAFETY: the `&mut Interpreter` that entered native code is dormant
     // while the helper runs; this is the only live path to it.
     let interp = unsafe { &mut *ctx.interp };
-    NATIVE_CALL_STATS.with(|s| s.method_calls.set(s.method_calls.get() + 1));
+    native_stat(|s| s.method_calls.set(s.method_calls.get() + 1));
     let guard_miss = || {
-        NATIVE_CALL_STATS.with(|s| s.method_guard_misses.set(s.method_guard_misses.get() + 1));
+        native_stat(|s| s.method_guard_misses.set(s.method_guard_misses.get() + 1));
         CallStatus::Reject as i64
     };
 
@@ -4263,7 +4387,7 @@ unsafe extern "C" fn wpjit_call_method(
         // `__code__`, or a non-instance receiver). Resolve and call
         // generically instead of deopting: a missing attribute raises
         // here exactly as the interpreter's `LOAD_ATTR` would.
-        NATIVE_CALL_STATS.with(|s| s.method_guard_misses.set(s.method_guard_misses.get() + 1));
+        native_stat(|s| s.method_guard_misses.set(s.method_guard_misses.get() + 1));
         ctx.dirty = true;
         let bound = match interp.load_attr_public(&recv, &entry.name) {
             Err(err) => {
@@ -4306,7 +4430,7 @@ unsafe extern "C" fn wpjit_call_method(
                 {
                     Some(status) => return status,
                     None => {
-                        NATIVE_CALL_STATS.with(|s| s.fallbacks.set(s.fallbacks.get() + 1));
+                        native_stat(|s| s.fallbacks.set(s.fallbacks.get() + 1));
                         break;
                     }
                 }
@@ -7369,6 +7493,8 @@ pub(crate) fn try_call_native_direct(
         dirty: false,
         interp_calls: 0,
         native_calls: 0,
+        child: None,
+        depth_cell: crate::recursion::depth_cell(),
         code_ptr: key,
         native: entry.native.clone(),
         method_native: entry.method_native.clone(),
@@ -7405,7 +7531,7 @@ pub(crate) fn try_call_native_direct(
         })
     };
 
-    NATIVE_CALL_STATS.with(|s| s.direct_calls.set(s.direct_calls.get() + 1));
+    native_stat(|s| s.direct_calls.set(s.direct_calls.get() + 1));
 
     let out = match status {
         JitStatus::Returned => Ok(unpack_pins(jf.ret_bits, jf.ret_tag, &ctx.pins)),
@@ -8051,6 +8177,8 @@ fn enter_compiled(
         dirty: false,
         interp_calls: 0,
         native_calls: 0,
+        child: None,
+        depth_cell: crate::recursion::depth_cell(),
         code_ptr: Rc::as_ptr(&frame.code).cast::<CodeObject>(),
         native: entry.native.clone(),
         method_native: entry.method_native.clone(),
@@ -8915,6 +9043,8 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
         dirty: act.dirty,
         interp_calls: act.interp_calls,
         native_calls: 0,
+        child: None,
+        depth_cell: crate::recursion::depth_cell(),
         code_ptr: Rc::as_ptr(&frame.code).cast::<CodeObject>(),
         native: entry.native.clone(),
         method_native: entry.method_native.clone(),

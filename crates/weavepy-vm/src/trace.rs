@@ -437,11 +437,17 @@ pub fn audit_hooks() -> Vec<Object> {
 /// some thread has registered something. (The count is a process-wide
 /// over-approximation — a hook on thread A makes thread B take the slow
 /// re-check — but observers are vanishingly rare outside debuggers.)
-#[inline]
+#[inline(always)]
 pub fn any_observers_active() -> bool {
     if OBSERVER_COUNT.load(Ordering::Relaxed) == 0 {
         return false;
     }
+    any_observers_active_slow()
+}
+
+#[cold]
+#[inline(never)]
+fn any_observers_active_slow() -> bool {
     TRACE_HOOK.with(|cell| cell.borrow().is_some())
         || PROFILE_HOOK.with(|cell| cell.borrow().is_some())
         || ALL_TRACE_SET.load(Ordering::Acquire)
