@@ -983,7 +983,7 @@ impl JitState {
                     self.stats.frames_notjitable += 1;
                     (Tier::NotJitable, None)
                 } else {
-                    if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+                    if crate::hot_gates::env_flags::jit_trace() {
                         eprintln!(
                             "jit compile {:?} (entry pc {entry_pc}, scalar leaf {}, generic/total ops {:?}, kinds {:?})",
                             code.name,
@@ -1037,7 +1037,7 @@ impl JitState {
                 }
             }
             Err(v) => {
-                if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+                if crate::hot_gates::env_flags::jit_trace() {
                     eprintln!("jit reject {:?} (entry pc {entry_pc}): {v:?}", code.name);
                 }
                 if matches!(v, weavepy_jit::JitVerdict::ProbeMiss(_)) {
@@ -1637,7 +1637,10 @@ fn native_method_callable(cf: &CompiledFrame, code: &CodeObject) -> bool {
     if argc == 0 {
         return false;
     }
-    if cf.local_types.first().copied().flatten() != Some(JitType::Obj) {
+    // A receiver the body never touches (`def nop(self): pass`) has no
+    // lane of its own; it rides as pin 0 all the same, and a deopt
+    // rebuilds the slot from there (see `finish_deopted_callee`).
+    if !matches!(cf.local_types.first().copied().flatten(), Some(JitType::Obj) | None) {
         return false;
     }
     for j in 1..argc {
@@ -1713,7 +1716,7 @@ fn callee_ret_info(
     let (lane, ret_none) = match weavepy_jit::analyze_for_ret(fcode, &mut classify, &mut obj_global) {
         Ok(tf) => (tf.ret_lane, tf.ret_none),
         Err(e) => {
-            if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+            if crate::hot_gates::env_flags::jit_trace() {
                 eprintln!("jit ret-lane {:?}: {:?}", fcode.name, e);
             }
             (None, weavepy_jit::returns_none_syntactically(fcode))
@@ -3171,10 +3174,19 @@ unsafe extern "C" fn wpjit_poll(frame: *mut JitFrame) -> i64 {
             #[allow(clippy::cast_ptr_alignment)]
             let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
             ctx.polls = ctx.polls.saturating_add(1);
-            // A poll interval dense with generic native-callee calls:
-            // retire the code and leave for the interpreter.
-            let dense = ctx.native_calls > NATIVE_CALLS_PER_POLL && !ctx.code_ptr.is_null();
+            // A poll interval dense with generic calls — of a native
+            // callee, or of an interpreted one the callee tables could
+            // not enter natively: the loop is a native driver around
+            // interpreter calls, each paying an activation shell, a
+            // generic call and a full `guards_hold` revalidation. The
+            // interpreter's own inline call path serves such a loop
+            // several times better (measured on OO call loops: a
+            // one-call-per-iteration loop ran 3x slower compiled).
+            let dense = (ctx.native_calls > NATIVE_CALLS_PER_POLL
+                || ctx.interp_calls > INTERP_CALLS_PER_POLL)
+                && !ctx.code_ptr.is_null();
             ctx.native_calls = 0;
+            ctx.interp_calls = 0;
             if dense {
                 retire_native_driver(ctx);
                 return 1;
@@ -3413,7 +3425,9 @@ unsafe fn try_native_call(
     // The receiver slot must be the object-pin lane the eligibility
     // check admitted (defensive — `native_method_callable` verified
     // this at resolution).
-    if recv.is_some() && nc.cf.local_types.first().copied().flatten() != Some(JitType::Obj) {
+    if recv.is_some()
+        && !matches!(nc.cf.local_types.first().copied().flatten(), Some(JitType::Obj) | None)
+    {
         return None;
     }
     // Argument lanes must match the callee's compiled parameter lanes
@@ -4023,6 +4037,12 @@ fn finish_deopted_callee(
                 ty,
                 &nctx.pins,
             )),
+            // A laneless parameter can only be a method-shaped entry's
+            // unused receiver (every other parameter needs a lane to be
+            // entered natively): it is pin 0.
+            None if slot == 0 && code.arg_count >= 1 => {
+                locals_v.push(unpack_ty(0, JitType::Obj, &nctx.pins));
+            }
             None => locals_v.push(Object::Unbound),
         }
     }
@@ -4397,6 +4417,12 @@ const NATIVE_CALL_RETIRE_BUDGET: u32 = 4096;
 /// loop-header iterations) may make: more than one per four native
 /// iterations and the loop is a driver around its calls.
 const NATIVE_CALLS_PER_POLL: u32 = (weavepy_jit::JIT_POLL_STRIDE / 4) as u32;
+
+/// Generic *interpreter* calls one poll interval may make before the
+/// same judgment applies (see [`wpjit_poll`]). A call every fourth
+/// native iteration is the break-even measured against the
+/// interpreter's inline-activation call path.
+const INTERP_CALLS_PER_POLL: u32 = (weavepy_jit::JIT_POLL_STRIDE / 4) as u32;
 
 fn charge_roundtrip(ctx: &mut CallCtx) -> bool {
     ctx.interp_calls = ctx.interp_calls.saturating_add(1);
@@ -8151,7 +8177,7 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
                             && !osr.unassigned_reads.contains(&(slot as u32)))
                 });
                 if !ok {
-                    if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+                    if crate::hot_gates::env_flags::jit_trace() {
                         eprintln!(
                             "jit osr refuse {:?} pc {}: local {} {:?} holds {}",
                             frame.code.name,
@@ -8173,7 +8199,7 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
     // Decompose them into the synthetic slots the compiled loops run
     // on; the headers re-check their bounds on entry.
     let Some(synth) = decompose_live_loops(cf, pc, &frame.stack) else {
-        if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+        if crate::hot_gates::env_flags::jit_trace() {
             eprintln!("jit osr refuse {:?} pc {}: live loops", frame.code.name, pc);
         }
         return fail(&frame.code);
@@ -8716,7 +8742,7 @@ fn note_native_exit(
         }
         if matches!(status, JitStatus::Deopt) {
             st.stats.deopts += 1;
-            if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+            if crate::hot_gates::env_flags::jit_trace() {
                 eprintln!("jit deopt {:?} pc {}", frame.code.name, jf.deopt_pc);
             }
             // Deopt backoff: a compiled frame whose activations keep
@@ -8959,7 +8985,7 @@ fn rebuild_stack(
                 (s.native_index, name)
             }),
     );
-    if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+    if crate::hot_gates::env_flags::jit_trace() {
         eprintln!(
             "jit rebuild {:?} deopt_pc {} stack_len {} inserts {:?} null_spans {:?} callee_spans {:?}",
             frame.code.name,
@@ -9273,7 +9299,7 @@ pub(crate) fn materialize_parked(frame: &mut super::Frame) {
     let Some(mut act) = frame.parked_native.take() else {
         return;
     };
-    if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+    if crate::hot_gates::env_flags::jit_trace() {
         eprintln!(
             "jit gen materialize {:?} yield pc {}",
             frame.code.name, act.yield_pc
