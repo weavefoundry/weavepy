@@ -2622,6 +2622,101 @@ impl Interpreter {
         self.reap_dead_subgraph(dropped);
     }
 
+    /// The cascade's commonest root, settled without it: a refcount-dead
+    /// plain instance (no `__del__`, no weakref, no C body or native
+    /// value, no `__slots__` values) whose every attribute is a scalar
+    /// leaf, a value that outlives it, or a scalar-leaf container only it
+    /// holds. Nothing in that subgraph finalizes, clears a weakref or
+    /// anchors a tracked object the drop would strand, so untracking the
+    /// instance and those containers (the cascade's next links, which it
+    /// would retire the same way) and dropping it is the whole teardown.
+    /// A tracked attribute value near its dead line (the cascade enrolls
+    /// those as suspects) or anything else the cascade walks into hands
+    /// `dropped` back in `Err`.
+    fn reap_plain_instance(dropped: Object) -> Result<(), Object> {
+        let Some((leaves, n)) = Self::plain_instance_leaves(&dropped) else {
+            return Err(dropped);
+        };
+        for cid in &leaves[..n] {
+            gc_trace::with_state(|s| s.untrack_id(*cid));
+        }
+        let id = crate::weakref_registry::id_of(&dropped);
+        if gc_trace::is_tracked(id) {
+            gc_trace::with_state(|s| s.untrack_id(id));
+        }
+        drop(dropped);
+        Ok(())
+    }
+
+    /// [`Self::reap_plain_instance`]'s test: the tracked scalar-leaf
+    /// containers `obj` alone holds (ids, count), or `None` when the
+    /// general cascade must run.
+    fn plain_instance_leaves(obj: &Object) -> Option<([crate::weakref_registry::ObjectId; 4], usize)> {
+        let Object::Instance(inst) = obj else {
+            return None;
+        };
+        if inst.c_body.get() != 0
+            || inst.native.get().is_some()
+            || crate::vm_singletons::cext_call_active()
+            || crate::vm_singletons::has_pending_cext_drops()
+            || crate::weakref_registry::may_have_weakrefs(crate::weakref_registry::id_of(obj))
+        {
+            return None;
+        }
+        match inst.class.try_borrow() {
+            Ok(cls) if cls.native_kind.get() == 0 && !cls.instances_need_finalize() => {}
+            _ => return None,
+        }
+        if !inst.slots.try_borrow().is_ok_and(|s| s.iter().next().is_none()) {
+            return None;
+        }
+        let mut leaves = [0; 4];
+        let mut n = 0;
+        // A dict shared through `vars(obj)` outlives the instance, and
+        // with it every value.
+        let Some(dict) = inst.dict.get().filter(|_| inst.dict.strong_count() == 1) else {
+            return Some((leaves, n));
+        };
+        let d = dict.try_borrow().ok()?;
+        for (k, v) in d.iter() {
+            if !gc_trace::is_atomic(&k.0) {
+                return None;
+            }
+            if gc_trace::is_atomic(v) {
+                continue;
+            }
+            let cid = crate::weakref_registry::id_of(v);
+            if crate::weakref_registry::may_have_weakrefs(cid) {
+                return None;
+            }
+            let sc = gc_trace::strong_count_for(v);
+            if gc_trace::is_tracked(cid) {
+                // Past the cascade's suspect band: stays alive.
+                if sc > 4 {
+                    continue;
+                }
+                // Its handle and this dict: it dies here, and a container
+                // of scalars is retired by untracking.
+                if sc == 2 && n < leaves.len() && Self::is_scalar_leaf_container(v) {
+                    leaves[n] = cid;
+                    n += 1;
+                    continue;
+                }
+                return None;
+            }
+            // Untracked: another holder keeps it alive, or it dies by
+            // plain drop holding nothing but scalars.
+            if sc >= 2
+                || Self::is_scalar_leaf_container(v)
+                || matches!(v, Object::Tuple(t) if t.iter().all(gc_trace::is_atomic))
+            {
+                continue;
+            }
+            return None;
+        }
+        Some((leaves, n))
+    }
+
     /// The dead-acyclic-subgraph cascade — the shared tail of
     /// [`Self::prompt_reap_dropped`], split out so a call site that has
     /// already established `dropped` is refcount-dead and anchors
@@ -2639,6 +2734,9 @@ impl Interpreter {
         if !Self::is_refcount_dead(&dropped, 1) {
             return;
         }
+        let Err(dropped) = Self::reap_plain_instance(dropped) else {
+            return;
+        };
         // RFC 0045 (wave 5): if the dead subgraph contains any instance
         // that has escaped into a C extension (owns a faithful inline
         // body), reclaiming it is only safe when no extension frame is
@@ -11793,28 +11891,16 @@ impl Interpreter {
                         // sent `None` (what `sum` does next), in place.
                         if let Some((ff, acc)) = self.sum_fold {
                             if ff == sw.cur as usize && len > 0 {
-                                let acc = acc as *mut Object;
-                                // SAFETY: the accumulator is `do_sum_call`'s
+                                let acc = acc as *mut SumState;
+                                // SAFETY: the running total is `do_sum_call`'s
                                 // local, alive and untouched while the
                                 // resume runs; `len > 0`.
                                 let top = unsafe { base.add(len - 1) };
-                                let r = match unsafe { (&*acc, &*top) } {
-                                    (Object::Int(a), Object::Int(b)) => {
-                                        a.checked_add(*b).map(Object::Int)
-                                    }
-                                    (Object::Float(a), Object::Float(b)) => {
-                                        Some(Object::Float(a + b))
-                                    }
-                                    _ => None,
-                                };
-                                if let Some(r) = r {
-                                    // SAFETY: both are scalars (no drop glue);
-                                    // the sent `None` takes the yielded
-                                    // value's slot.
-                                    unsafe {
-                                        acc.write(r);
-                                        top.write(Object::None);
-                                    }
+                                if unsafe { (*acc).add_scalar(&*top) } {
+                                    // SAFETY: the yielded value is a scalar
+                                    // (no drop glue); the sent `None` takes
+                                    // its slot.
+                                    unsafe { top.write(Object::None) };
                                     last = pc;
                                     pc += 1;
                                     continue;
@@ -11850,6 +11936,39 @@ impl Interpreter {
                 }
                 // A Python callee runs inline, switched to in place; only a
                 // builtin or type callee has leaf arms.
+                // A keyword call of a pure leaf through the site's cached
+                // keyword permutation (the full handler's `CallPyKwNames`
+                // hit), evaluated in place like `CALL`'s pure leaves.
+                OpCode::CallKw => {
+                    let argc = ins.arg as usize;
+                    // SAFETY: `len > 0` is checked first; the operands of
+                    // the call sit below the names tuple.
+                    let Some(Object::Tuple(names)) = (len > 0).then(|| unsafe { &*base.add(len - 1) })
+                    else {
+                        break None;
+                    };
+                    let kwc = names.len();
+                    if len < kwc + argc + 3 {
+                        break None;
+                    }
+                    let start = len - kwc - argc - 3;
+                    // SAFETY: `start + kwc + argc + 3 == len`.
+                    let ops = unsafe { std::slice::from_raw_parts(base.add(start), len - start) };
+                    let Some(r) = self.core_pure_kw_call(code, pc, ops, argc, sw.depth_cell) else {
+                        break None;
+                    };
+                    // SAFETY: every operand was checked to leave by a plain
+                    // decrement; the result takes the callee's slot.
+                    unsafe {
+                        for k in start..len {
+                            drop_hot(base.add(k).read());
+                        }
+                        base.add(start).write(r);
+                    }
+                    len = start + 1;
+                    last = pc;
+                    pc += 1;
+                }
                 OpCode::Call => {
                     let argc = ins.arg as usize;
                     if len < argc + 2 {
@@ -13095,6 +13214,83 @@ impl Interpreter {
         }
         for (k, o) in f.defaults[f.defaults.len() - missing..].iter().enumerate() {
             args[nargs + k] = o;
+        }
+        self.pure_leaf_eval(code_rc, f, &args[..total])
+    }
+
+    /// [`Self::core_pure_call`] for a `CALL_KW` at `pc`: `ops` is the
+    /// callee, its self slot, `argc` positionals, the keyword values and
+    /// the names tuple. The site's cached `CallPyKwNames` permutation
+    /// (re-verified against the live function) places each keyword on
+    /// its parameter, and uncovered parameters take their defaults.
+    fn core_pure_kw_call(
+        &self,
+        code: &CodeObject,
+        pc: usize,
+        ops: &[Object],
+        argc: usize,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<Object> {
+        use weavepy_compiler::InlineCache as IC;
+        let IC::CallPyKwNames {
+            func_id,
+            perm,
+            argc: ca,
+            kwc: ck,
+        } = code.caches.get(pc as u32)
+        else {
+            return None;
+        };
+        let (Object::Function(f), Object::Tuple(names)) = (ops.first()?, ops.last()?) else {
+            return None;
+        };
+        let kwc = names.len();
+        let has_self = !matches!(ops.get(1)?, Object::Unbound);
+        let eff_argc = argc + usize::from(has_self);
+        if ca as usize != eff_argc || ck as usize != kwc || !fn_is_pure_leaf(f) {
+            return None;
+        }
+        // SAFETY: GIL-serialized raw read of the function's code cell (see
+        // `PyFunction::code`); only compared and borrowed below, while the
+        // caller's stack keeps the function alive.
+        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        if !code_is_pure_leaf(code_rc) || !pure_leaf_warm(code_rc) || !Self::lean_code_ok(code_rc) {
+            return None;
+        }
+        let (_, covered) = Self::kw_names_bind_check(f, func_id, perm, names, eff_argc)?;
+        // The ordinary call's `RecursionError` check.
+        // SAFETY: this thread's own depth cell.
+        if unsafe { (*depth_cell).get() } >= crate::recursion::recursion_limit() {
+            return None;
+        }
+        if !ops
+            .iter()
+            .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
+        {
+            return None;
+        }
+        // A pure leaf has no keyword-only parameters and no `**kwargs`.
+        let total = code_rc.arg_count as usize;
+        if total > 8 {
+            return None;
+        }
+        let mut args: [*const Object; 8] = [std::ptr::null(); 8];
+        let first = if has_self { 1 } else { 2 };
+        for (k, o) in ops[first..first + eff_argc].iter().enumerate() {
+            args[k] = o;
+        }
+        let kw_vals = &ops[first + eff_argc..ops.len() - 1];
+        for (j, o) in kw_vals.iter().enumerate() {
+            let slot = ((perm >> (4 * j)) & 0xF) as usize;
+            if slot >= total || slot == specialize::KW_TO_VARKW as usize {
+                return None;
+            }
+            args[slot] = o;
+        }
+        for (slot, arg) in args.iter_mut().enumerate().take(total).skip(eff_argc) {
+            if covered & (1 << slot) == 0 {
+                *arg = f.defaults.get(f.defaults.len().checked_sub(total - slot)?)?;
+            }
         }
         self.pure_leaf_eval(code_rc, f, &args[..total])
     }
@@ -27312,7 +27508,7 @@ impl Interpreter {
                 )));
             }
         }
-        let mut acc = acc.unwrap_or(Object::Int(0));
+        let acc = acc.unwrap_or(Object::Int(0));
         // CPython forbids the concatenating types as `start`, steering callers
         // to the dedicated `join` fast paths (`builtin_sum_impl`).
         match &acc {
@@ -27351,12 +27547,13 @@ impl Interpreter {
         // dominant `sum(x for x in …)` shape) stream item-by-item
         // instead of materializing the whole sequence first; CPython's
         // `builtin_sum_impl` is exactly this drive loop.
+        let mut total = SumState::new(acc);
         if let Object::Generator(g) = &args[0] {
             loop {
-                // A lean resume folds scalar yields straight into `acc`
+                // A lean resume folds scalar yields straight into `total`
                 // (see `Interpreter::sum_fold`); it returns at the first
                 // yield it cannot fold, or when the generator ends.
-                self.sum_fold_acc = Some(std::ptr::from_mut(&mut acc) as usize);
+                self.sum_fold_acc = Some(std::ptr::from_mut(&mut total) as usize);
                 let sent = self.generator_send(g, Object::None);
                 self.sum_fold_acc = None;
                 let x = match sent {
@@ -27367,26 +27564,17 @@ impl Interpreter {
                     }
                     Err(e) => return Err(e),
                 };
-                // The exact-`int`/`float` sums (no reflected operand can
-                // run); anything else, or an overflow, dispatches.
-                acc = match (&acc, &x) {
-                    (Object::Int(a), Object::Int(b)) => match a.checked_add(*b) {
-                        Some(r) => Object::Int(r),
-                        None => self.op_binary(&acc, &x, BinOpKind::Add)?,
-                    },
-                    (Object::Float(a), Object::Float(b)) => Object::Float(a + b),
-                    _ => self.op_binary(&acc, &x, BinOpKind::Add)?,
-                };
+                total.add(self, x)?;
             }
-            return Ok(acc);
+            return Ok(total.finish());
         }
         // Stream the live iterator. Addition can mutate the source or
         // raise, so don't consume later elements or request a length hint.
         let iter = self.make_iter(&args[0], globals)?;
         while let Some(x) = self.iter_next(&iter, globals)? {
-            acc = self.op_binary(&acc, &x, BinOpKind::Add)?;
+            total.add(self, x)?;
         }
-        Ok(acc)
+        Ok(total.finish())
     }
 
     fn do_min_max_call(
@@ -52938,6 +53126,153 @@ impl CoreSwitch {
         let shell = tmp.as_mut().expect("just set");
         self.scratch = usize::MAX;
         (frame, &raw mut self.scratch, shell)
+    }
+}
+
+/// `sum()`'s running total in CPython's `builtin_sum_impl` shape: an
+/// exact machine-integer phase, then — once the total is a float — a
+/// compensated float phase taking floats and ints alike, then — once it
+/// is a complex — compensated real and imaginary sums, then generic `+`
+/// for everything after (each phase is left for good).
+enum SumState {
+    Int(i64),
+    Float(CompensatedSum),
+    Complex(CompensatedSum, CompensatedSum),
+    Generic(Object),
+}
+
+/// CPython's `CompensatedSum`: Neumaier's improved Kahan–Babuška sum.
+#[derive(Clone, Copy)]
+struct CompensatedSum {
+    hi: f64,
+    lo: f64,
+}
+
+impl CompensatedSum {
+    fn new(x: f64) -> Self {
+        CompensatedSum { hi: x, lo: 0.0 }
+    }
+
+    #[inline(always)]
+    fn add(&mut self, x: f64) {
+        let t = self.hi + x;
+        self.lo += if self.hi.abs() >= x.abs() {
+            (self.hi - t) + x
+        } else {
+            (x - t) + self.hi
+        };
+        self.hi = t;
+    }
+
+    /// The sum, with the correction folded in unless it is zero (keeping
+    /// a negative zero) or nonfinite (an infinite or overflowed sum).
+    fn value(self) -> f64 {
+        if self.lo != 0.0 && self.lo.is_finite() {
+            self.hi + self.lo
+        } else {
+            self.hi
+        }
+    }
+}
+
+impl SumState {
+    fn new(start: Object) -> Self {
+        Self::entered(start)
+    }
+
+    /// The phase a total of this type (re)enters.
+    fn entered(total: Object) -> Self {
+        match total {
+            Object::Int(i) => SumState::Int(i),
+            Object::Float(x) => SumState::Float(CompensatedSum::new(x)),
+            Object::Complex(c) => {
+                SumState::Complex(CompensatedSum::new(c.real), CompensatedSum::new(c.imag))
+            }
+            other => SumState::Generic(other),
+        }
+    }
+
+    /// The scalar additions that run no Python code and cannot fail:
+    /// `true` when `x` was folded in.
+    #[inline(always)]
+    fn add_scalar(&mut self, x: &Object) -> bool {
+        match self {
+            SumState::Int(a) => {
+                let b = match x {
+                    Object::Int(b) => *b,
+                    Object::Bool(b) => i64::from(*b),
+                    _ => return false,
+                };
+                match a.checked_add(b) {
+                    Some(r) => {
+                        *a = r;
+                        true
+                    }
+                    None => false,
+                }
+            }
+            SumState::Float(sum) | SumState::Complex(sum, _) => {
+                let value = match x {
+                    Object::Float(v) => *v,
+                    Object::Int(v) => *v as f64,
+                    Object::Bool(v) => f64::from(*v),
+                    _ => return false,
+                };
+                sum.add(value);
+                true
+            }
+            SumState::Generic(_) => false,
+        }
+    }
+
+    fn add(&mut self, interp: &mut Interpreter, x: Object) -> Result<(), RuntimeError> {
+        if self.add_scalar(&x) {
+            return Ok(());
+        }
+        // A big int in a compensated phase converts (or overflows).
+        if let (SumState::Float(re) | SumState::Complex(re, _), Object::Long(v)) = (&mut *self, &x) {
+            return match v.to_f64() {
+                Some(value) if value.is_finite() => {
+                    re.add(value);
+                    Ok(())
+                }
+                _ => Err(crate::error::overflow_error("int too large to convert to float")),
+            };
+        }
+        if let (SumState::Complex(re, im), Object::Complex(c)) = (&mut *self, &x) {
+            re.add(c.real);
+            im.add(c.imag);
+            return Ok(());
+        }
+        let total = match std::mem::replace(self, SumState::Int(0)) {
+            // Overflow or another type: the integer phase is over; a float
+            // or complex result starts the matching compensated phase.
+            SumState::Int(a) => {
+                *self = Self::entered(interp.op_binary(&Object::Int(a), &x, BinOpKind::Add)?);
+                return Ok(());
+            }
+            SumState::Float(re) => {
+                let r = interp.op_binary(&crate::object::fresh_float(re.value()), &x, BinOpKind::Add)?;
+                *self = match r {
+                    Object::Complex(_) => Self::entered(r),
+                    other => SumState::Generic(other),
+                };
+                return Ok(());
+            }
+            SumState::Complex(re, im) => Object::new_complex(re.value(), im.value()),
+            SumState::Generic(t) => t,
+        };
+        *self = SumState::Generic(interp.op_binary(&total, &x, BinOpKind::Add)?);
+        Ok(())
+    }
+
+    fn finish(self) -> Object {
+        match self {
+            SumState::Int(i) => Object::Int(i),
+            SumState::Float(re) => crate::object::fresh_float(re.value()),
+            SumState::Complex(re, im) => Object::new_complex(re.value(), im.value()),
+            SumState::Generic(t) => t,
+        }
     }
 }
 

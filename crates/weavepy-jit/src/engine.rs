@@ -117,7 +117,7 @@ pub struct CompiledFrame {
     /// site agrees (feeds callers' `PyFunc` classification).
     pub ret_lane: Option<JitType>,
     scalar_leaf: bool,
-    op_mix: (u32, u32),
+    op_mix: OpMix,
 }
 
 impl CompiledFrame {
@@ -134,6 +134,13 @@ impl CompiledFrame {
     /// (dynamic calls and attribute accesses).
     #[must_use]
     pub fn op_mix(&self) -> (u32, u32) {
+        let m = self.op_mix;
+        (m.dyn_calls + m.dyn_attrs + m.dyn_other, m.total)
+    }
+
+    /// The statement counts by kind behind [`Self::op_mix`].
+    #[must_use]
+    pub fn op_kinds(&self) -> OpMix {
         self.op_mix
     }
 
@@ -504,21 +511,40 @@ impl JitEngine {
 /// `(generic, total)`: statements that hand an operation to the
 /// interpreter's generic object protocol (dynamic calls and attribute
 /// accesses) against all statements (see [`CompiledFrame::op_mix`]).
-fn op_mix(tfunc: &TFunc) -> (u32, u32) {
-    let mut generic = 0u32;
-    let mut total = 0u32;
+fn op_mix(tfunc: &TFunc) -> OpMix {
+    let mut mix = OpMix::default();
     for b in &tfunc.blocks {
         for st in &b.stmts {
-            total += 1;
-            if matches!(
-                st.op,
-                TOp::CallDyn { .. } | TOp::DynAttrGet { .. } | TOp::DynAttrSet { .. } | TOp::ContainsDyn { .. }
-            ) {
-                generic += 1;
+            mix.total += 1;
+            match st.op {
+                TOp::CallDyn { .. } => mix.dyn_calls += 1,
+                TOp::DynAttrGet { .. } | TOp::DynAttrSet { .. } => mix.dyn_attrs += 1,
+                TOp::ContainsDyn { .. } => mix.dyn_other += 1,
+                TOp::CallPy { .. } | TOp::CallPyKw { .. } | TOp::CallMethod { .. } => {
+                    mix.guarded_calls += 1;
+                }
+                _ => {}
             }
         }
     }
-    (generic, total)
+    mix
+}
+
+/// Statement counts by how the compiled code runs them (see
+/// [`CompiledFrame::op_kinds`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OpMix {
+    /// `CallDyn`: the interpreter's generic call protocol.
+    pub dyn_calls: u32,
+    /// `DynAttrGet` / `DynAttrSet`: generic attribute access.
+    pub dyn_attrs: u32,
+    /// Other generic protocol statements (`ContainsDyn`).
+    pub dyn_other: u32,
+    /// Calls through guarded direct lanes (`CallPy`, `CallPyKw`,
+    /// `CallMethod`).
+    pub guarded_calls: u32,
+    /// Every statement.
+    pub total: u32,
 }
 
 fn is_scalar_leaf(tfunc: &TFunc) -> bool {

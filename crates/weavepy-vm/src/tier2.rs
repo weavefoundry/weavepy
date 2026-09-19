@@ -915,7 +915,13 @@ impl JitState {
                 obj: &mut **obj_live,
                 paths: &mut path_arena,
             };
+            let t0 = std::env::var_os("WEAVEPY_JIT_TRACE")
+                .is_some()
+                .then(std::time::Instant::now);
             let r = engine.compile_frame(code, &mut classify, &mut jit_probes);
+            if let Some(t0) = t0 {
+                eprintln!("jit compile-time {:?} {:?}", code.name, t0.elapsed());
+            }
             let obj_names = obj_names.into_inner().into_iter().map(|(n, _)| n).collect();
             (r, callees.into_inner(), methods, obj_names)
         };
@@ -979,10 +985,11 @@ impl JitState {
                 } else {
                     if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
                         eprintln!(
-                            "jit compile {:?} (entry pc {entry_pc}, scalar leaf {}, generic/total ops {:?})",
+                            "jit compile {:?} (entry pc {entry_pc}, scalar leaf {}, generic/total ops {:?}, kinds {:?})",
                             code.name,
                             cf.is_scalar_leaf(),
-                            cf.op_mix()
+                            cf.op_mix(),
+                            cf.op_kinds()
                         );
                     }
                     // The interpreter's lean paths hand a self-recursive
@@ -6718,6 +6725,20 @@ unsafe fn call_dyn_impl(
             return status;
         }
     }
+    // A keyword call of a plain function whose site carries the
+    // interpreter's `CallPyKwNames` permutation binds through it, as the
+    // `CALL_KW` handler's hit does: no name strings, no generic binder.
+    // SAFETY: per the function contract — same live buffers.
+    if let Some((f, locals)) = (kwc > 0)
+        .then(|| unsafe { dyn_kw_site_bind(jf, ctx, &callee, argc, kwc, names) })
+        .flatten()
+    {
+        note_generic_dyn_call(ctx);
+        ctx.dirty = true;
+        let called = call_with_activation_shell(interp, ctx, jf, |i| i.run_py_exact_nofree(&f, locals));
+        // SAFETY: as above.
+        return unsafe { dyn_call_result(jf, ctx, called, false, int_result) };
+    }
     let n = (argc + kwc) as usize;
     let mut args: Vec<Object> = Vec::with_capacity(n);
     for j in 0..n {
@@ -6756,6 +6777,27 @@ unsafe fn call_dyn_impl(
     let called = call_with_activation_shell(interp, ctx, jf, |i| {
         i.call_object_with_globals(&callee, &args, &kwargs, &ctx.globals)
     });
+    // SAFETY: as above.
+    unsafe { dyn_call_result(jf, ctx, called, native_callee, int_result) }
+}
+
+/// `call_dyn_impl`'s result protocol: park a raise, or deliver the
+/// result unboxed (`int_result`) or pinned, parking it (`Boxed`) when a
+/// round-trip charge or an invalidated guard ends the activation.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe fn dyn_call_result(
+    jf: &mut JitFrame,
+    ctx: &mut CallCtx,
+    called: Result<Object, RuntimeError>,
+    native_callee: bool,
+    int_result: bool,
+) -> i64 {
+    // SAFETY: the `&mut Interpreter` that entered native code is
+    // dormant while the helper runs.
+    let interp = unsafe { &mut *ctx.interp };
     match called {
         Err(err) => {
             ctx.raised = Some(err);
@@ -6791,6 +6833,78 @@ unsafe fn call_dyn_impl(
             CallStatus::Boxed as i64
         }
     }
+}
+
+/// Bind a dynamic keyword call's marshaled operands for a plain function
+/// (or a bound method over one) through the call site's cached
+/// `CallPyKwNames` permutation, re-verified against the live function
+/// (`Interpreter::kw_names_bind_check`). Returns the function and its
+/// bound locals, or `None` (nothing consumed) for the generic binder.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`]; the call site's pc is in
+/// `jf.deopt_pc` (stored before every call helper runs).
+unsafe fn dyn_kw_site_bind(
+    jf: &mut JitFrame,
+    ctx: &CallCtx,
+    callee: &Object,
+    argc: u32,
+    kwc: u32,
+    names: u32,
+) -> Option<(Rc<crate::object::PyFunction>, Vec<Object>)> {
+    use weavepy_compiler::InlineCache as IC;
+    // SAFETY: per the function contract, the activation keeps its code
+    // object alive.
+    let code = unsafe { &*ctx.code_ptr };
+    let IC::CallPyKwNames {
+        func_id,
+        perm,
+        argc: ca,
+        kwc: ck,
+    } = code.caches.get(jf.deopt_pc)
+    else {
+        return None;
+    };
+    let Some(Object::Tuple(name_items)) = crate::code_const_objects(code).get(names as usize) else {
+        return None;
+    };
+    let (f, recv) = match callee {
+        Object::Function(f) => (f, None),
+        Object::BoundMethod(bm) => match &bm.function {
+            Object::Function(f) => (f, Some(&bm.receiver)),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let (argc, kwc) = (argc as usize, kwc as usize);
+    let eff_argc = argc + usize::from(recv.is_some());
+    if ca as usize != eff_argc || ck as usize != kwc || name_items.len() != kwc {
+        return None;
+    }
+    let (fcode, covered) =
+        crate::Interpreter::kw_names_bind_check(f, func_id, perm, name_items, eff_argc)?;
+    let mut staged: Vec<Object> = Vec::with_capacity(eff_argc + kwc);
+    staged.extend(recv.cloned());
+    for j in 0..argc + kwc {
+        // SAFETY: native code wrote `argc + kwc` entries, and the
+        // buffers are `max_call_args` wide.
+        let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
+        staged.push(unpack_pins(bits, tag, &ctx.pins));
+    }
+    let mut locals = Vec::new();
+    crate::Interpreter::kw_names_fill_locals(
+        &mut locals,
+        &mut staged,
+        name_items,
+        f,
+        &fcode,
+        perm,
+        covered,
+        kwc,
+        eff_argc,
+    );
+    Some((f.clone(), locals))
 }
 
 /// RFC 0076 WS7 follow-up — charge one generic interpreter round-trip

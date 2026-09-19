@@ -34,7 +34,7 @@ pub use analyze::{
     returns_none_syntactically,
     returns_self_syntactically, JitVerdict, MethodResolution, PathArena, Probes, ELEM_SENTINEL,
 };
-pub use engine::{CompiledFrame, JitEngine};
+pub use engine::{CompiledFrame, JitEngine, OpMix};
 pub use ir::{
     ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, CompSavedMeta, CtorFieldSrc,
     GlobalGuard, IterLoopMeta, ListLoopMeta, MathFunc, MathGuardMeta, MethodRet, MethodSiteMeta,
