@@ -8751,14 +8751,39 @@ impl Interpreter {
         let mut last = usize::MAX;
         // The inline activations, innermost last.
         let mut inl: Vec<Box<InlineAct>> = Vec::new();
+        // Every access below goes through these handles (see
+        // `CoreSwitch`): the core loop's in-loop calls and returns move
+        // the running activation through the same ones.
+        let roots = SwitchRoots {
+            inl: &mut inl,
+            root: frame,
+            root_shell: (&raw mut shell).cast(),
+            root_last: &mut last,
+            fin,
+            maybe_dead,
+        };
         let mut entry = QuietEntry::Fresh;
         loop {
-            let ev = match inl.last_mut() {
-                None => self.quiet_frame(
-                    frame, &mut shell, snap_gen, fin, coarse, maybe_dead, prev_pc, &mut last, entry,
-                ),
+            // SAFETY: see `CoreSwitch`; an activation's box outlives its
+            // stretch of the loop (the vector only moves the boxes).
+            let top: Option<*mut InlineAct> =
+                unsafe { (*roots.inl).last_mut().map(|t| &raw mut **t) };
+            let ev = match top {
+                None => unsafe {
+                    self.quiet_frame(
+                        &mut *roots.root,
+                        &mut *roots.root_shell.cast::<QuietShell<'_>>(),
+                        snap_gen,
+                        coarse,
+                        prev_pc,
+                        &mut *roots.root_last,
+                        entry,
+                        &roots,
+                    )
+                },
                 Some(top) => {
-                    let top = &mut **top;
+                    // SAFETY: as above.
+                    let top = unsafe { &mut *top };
                     // SAFETY: a generator activation's frame lives in its
                     // `gen_box`, owned by the activation for its duration.
                     let top_frame: &mut Frame = if top.gen.is_some() {
@@ -8773,20 +8798,27 @@ impl Interpreter {
                         top_frame,
                         &mut top_shell,
                         snap_gen,
-                        fin,
                         coarse,
-                        maybe_dead,
                         &mut top_prev,
                         &mut top_last,
                         entry,
+                        &roots,
                     )
                 }
             };
+            // SAFETY: as above (no activation's borrow outlives its
+            // `quiet_frame` call).
+            let inl = unsafe { &mut *roots.inl };
+            let (frame, shell) =
+                unsafe { (&mut *roots.root, &mut *roots.root_shell.cast::<QuietShell<'_>>()) };
             entry = match ev {
                 FrameEv::Call(act) => {
                     inl.push(act);
                     QuietEntry::Fresh
                 }
+                // The core loop moved the running activation: the new
+                // one's stretch starts by handling how the burst ended.
+                FrameEv::Switched(stop) => QuietEntry::Stop(stop),
                 FrameEv::Exit(exit) => {
                     let Some(mut done) = inl.pop() else {
                         return exit;
@@ -8794,7 +8826,7 @@ impl Interpreter {
                     if done.gen.is_some() {
                         let result = self.inline_gen_finish(&mut done, exit);
                         match inl.last_mut() {
-                            None => self.inline_gen_deliver(frame, &mut shell, done, result),
+                            None => self.inline_gen_deliver(frame, shell, done, result),
                             Some(caller) => {
                                 let caller = &mut **caller;
                                 // SAFETY: as above.
@@ -8810,7 +8842,7 @@ impl Interpreter {
                     } else {
                         let result = self.inline_finish(&mut done, exit);
                         match inl.last_mut() {
-                            None => self.inline_deliver(frame, &mut shell, done, result),
+                            None => self.inline_deliver(frame, shell, done, result),
                             Some(caller) => {
                                 let caller = &mut **caller;
                                 // SAFETY: as above.
@@ -8839,16 +8871,20 @@ impl Interpreter {
         frame: &mut Frame,
         shell: &mut QuietShell<'_>,
         snap_gen: u64,
-        fin: bool,
         coarse: bool,
-        maybe_dead: *const std::cell::Cell<bool>,
         prev_pc: &mut Option<usize>,
         last: &mut usize,
         entry: QuietEntry,
+        roots: &SwitchRoots,
     ) -> FrameEv {
+        let (fin, maybe_dead) = (roots.fin, roots.maybe_dead);
+        // A burst's stop handed over from the activation it moved away
+        // from (see `FrameEv::Switched`).
+        let mut pending: Option<LeafStop> = None;
         let exit = 'run: {
             match entry {
                 QuietEntry::Fresh => {}
+                QuietEntry::Stop(stop) => pending = Some(stop),
                 // Back from an inline call: the per-call protocol of the
                 // lean paths below.
                 QuietEntry::Returned { cur_pc } => {
@@ -8883,7 +8919,18 @@ impl Interpreter {
                 }
             }
             loop {
-                match self.leaf_burst(frame, snap_gen, last) {
+                let stop = match pending.take() {
+                    Some(stop) => stop,
+                    None => {
+                        let mut sw = CoreSwitch::enter(roots, frame, shell, last);
+                        let stop = self.leaf_burst(&mut sw, snap_gen);
+                        if sw.switched() {
+                            return FrameEv::Switched(stop);
+                        }
+                        stop
+                    }
+                };
+                match stop {
                     LeafStop::Breaker => break 'run QuietExit::Yield,
                     LeafStop::Raised(err) => {
                         // The `CALL` arm of `step` marks on the raise path.
@@ -9141,7 +9188,7 @@ impl Interpreter {
         frame: &mut Frame,
         shell: &mut QuietShell<'_>,
         pc: usize,
-        mut act: Box<InlineAct>,
+        act: Box<InlineAct>,
         code: Rc<CodeObject>,
         callable: Object,
         guard: crate::recursion::Guard,
@@ -9149,7 +9196,32 @@ impl Interpreter {
         let Object::Function(f) = &callable else {
             unreachable!("inline callees are plain functions")
         };
-        let cells = f.lean_cells_ref(&code).expect("checked by the shape");
+        let cells: *const Rc<Vec<Rc<RefCell<Object>>>> =
+            f.lean_cells_ref(&code).expect("checked by the shape");
+        self.inline_bind_cells(frame, shell, pc, act, code, callable, guard, cells)
+    }
+
+    /// [`Self::inline_bind`] with the callee's lean cells in hand (a
+    /// handle `callable` owns, or the shared empty vector).
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn inline_bind_cells(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+        mut act: Box<InlineAct>,
+        code: Rc<CodeObject>,
+        callable: Object,
+        guard: crate::recursion::Guard,
+        cells: *const Rc<Vec<Rc<RefCell<Object>>>>,
+    ) -> Box<InlineAct> {
+        let Object::Function(f) = &callable else {
+            unreachable!("inline callees are plain functions")
+        };
+        // SAFETY: the caller's contract — `callable` (moved into the
+        // slot below) or the process keeps it alive.
+        let cells = unsafe { &*cells };
         // SAFETY: the slot is parked: its code, cells, globals and
         // builtins fields hold stale non-owning copies, overwritten here
         // without a drop. The new handles are `f`'s (borrowed: the slot
@@ -9256,6 +9328,7 @@ impl Interpreter {
         act.act.shell = None;
         act.guard = None;
         act.caller_pending = None;
+        act.init_inst = None;
         if self.inline_pool.len() < POOL_CAP {
             self.inline_pool.push(act);
         }
@@ -9585,7 +9658,20 @@ impl Interpreter {
         done: Box<InlineAct>,
         result: Result<Object, RuntimeError>,
     ) -> QuietEntry {
-        let done = done;
+        let mut done = done;
+        // A constructor's `__init__` result becomes the instance (the
+        // `instantiate_plain_lean` epilogue).
+        let result = match done.init_inst.take() {
+            None => result,
+            Some(inst) => match result {
+                Ok(Object::None) => Ok(inst),
+                Ok(other) => Err(type_error(format!(
+                    "__init__() should return None, not '{}'",
+                    other.type_name()
+                ))),
+                Err(e) => Err(e),
+            },
+        };
         let call_pc = done.call_pc;
         self.lean_pending_exit(done.caller_pending);
         // SAFETY: the callable is moved out exactly once; the parked slot
@@ -10886,19 +10972,27 @@ impl Interpreter {
     /// don't settle) goes to [`Self::leaf_burst_slow`], which runs it with
     /// the full leaf arms and hands back at the next core instruction.
     #[inline(never)]
-    fn leaf_burst(&mut self, frame: &mut Frame, snap_gen: u64, last_pc: &mut usize) -> LeafStop {
+    fn leaf_burst(&mut self, sw: &mut CoreSwitch, snap_gen: u64) -> LeafStop {
         loop {
-            match self.leaf_core(frame, snap_gen, last_pc) {
+            match self.leaf_core(sw, snap_gen) {
                 CoreExit::Stop(stop) => return stop,
-                CoreExit::Helper => match self.leaf_core_helper(frame, last_pc) {
-                    CoreAttr::Done => continue,
-                    CoreAttr::Marked => return LeafStop::Marked,
-                    CoreAttr::Raised(e) => return LeafStop::Raised(e),
-                    CoreAttr::Full => return LeafStop::Step,
-                    CoreAttr::Decline => {}
-                },
+                CoreExit::Helper => {
+                    // SAFETY: see `CoreSwitch` (the running activation's
+                    // handles; nothing else borrows them here).
+                    let (frame, last_pc) = unsafe { (&mut *sw.cur, &mut *sw.last) };
+                    match self.leaf_core_helper(frame, last_pc) {
+                        CoreAttr::Done => continue,
+                        CoreAttr::Marked => return LeafStop::Marked,
+                        CoreAttr::Raised(e) => return LeafStop::Raised(e),
+                        CoreAttr::Full => return LeafStop::Step,
+                        CoreAttr::Decline => {}
+                    }
+                }
                 CoreExit::Slow => {}
+                CoreExit::Reload => unreachable!("handled inside the core loop"),
             }
+            // SAFETY: as above.
+            let (frame, last_pc) = unsafe { (&mut *sw.cur, &mut *sw.last) };
             match self.leaf_burst_slow(frame, snap_gen, last_pc) {
                 LeafStop::Core => {}
                 stop => return stop,
@@ -11006,14 +11100,17 @@ impl Interpreter {
         )
     }
 
-    /// The core loop of [`Self::leaf_burst`]. Returns `Some` to end the
-    /// burst, `None` when the instruction at `frame.pc` needs the full
-    /// leaf arms. The operand stack is manipulated through raw pointers
-    /// between capacity-checked pushes; its length is written back before
-    /// returning, and no arm here can panic or run drop glue (every
-    /// discarded value is an unboxed scalar).
+    /// The core loop of [`Self::leaf_burst`], on `sw`'s running
+    /// activation. Returns `Some` to end the burst, `None` when the
+    /// instruction at `frame.pc` needs the full leaf arms. The operand
+    /// stack is manipulated through raw pointers between capacity-checked
+    /// pushes; its length is written back before returning, and no arm
+    /// here can panic or run drop glue (every discarded value is an
+    /// unboxed scalar) — except the in-loop calls and returns, which sync
+    /// the frame first and reload everything after (see
+    /// [`Self::core_call`], [`Self::core_return`]).
     #[inline(always)]
-    fn leaf_core(&mut self, frame: &mut Frame, snap_gen: u64, last_pc: &mut usize) -> CoreExit {
+    fn leaf_core(&mut self, sw: &mut CoreSwitch, snap_gen: u64) -> CoreExit {
         #[inline(always)]
         fn scalar(v: &Object) -> bool {
             matches!(
@@ -11021,15 +11118,36 @@ impl Interpreter {
                 Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
             )
         }
+        'reload: loop {
+        if let Some(exit) = sw.pending.take() {
+            return exit;
+        }
+        // SAFETY: see `CoreSwitch` (the running activation's handles; the
+        // borrows below end at the next reload).
+        let (frame, last_pc): (&mut Frame, &mut usize) = unsafe { (&mut *sw.cur, &mut *sw.last) };
         let code: &CodeObject = &frame.code;
         let instrs = code.instructions.as_ptr();
         let ninstrs = code.instructions.len();
-        let consts = code_const_objects(code);
+        let ext = code_vm_ext(code);
+        let consts: &[Object] = ext.map_or(&[], |t| &t.objects);
         let (cbase, nconsts) = (consts.as_ptr(), consts.len());
         // SAFETY: as in `leaf_burst_slow` (the locals vector is not resized
         // during an activation, and nothing here runs Python code).
         let locals: &mut Vec<Object> = unsafe { &mut *frame.locals.as_ptr() };
         let (lbase, nlocals) = (locals.as_mut_ptr(), locals.len());
+        // The `LOAD_GLOBAL` arm's cache-hit state (see `leaf_global`): the
+        // site stamps exist once any global hit filled one, and a custom
+        // `__builtins__` mapping keeps every load on the full path.
+        let stamps: &[StampSlot] = if frame.builtins_obj.is_none() {
+            ext.and_then(|e| e.stamp_slots.get()).map_or(&[], |s| &s[..])
+        } else {
+            &[]
+        };
+        let (gdict, bdict) = (frame.globals.as_ptr(), frame.builtins.as_ptr());
+        let (gid, bid) = (
+            specialize::rc_id(&frame.globals),
+            specialize::rc_id(&frame.builtins),
+        );
         let stack = &mut frame.stack;
         let base = stack.as_mut_ptr();
         let cap = stack.capacity();
@@ -11465,30 +11583,145 @@ impl Interpreter {
                     last = pc;
                     pc += 1;
                 }
-                OpCode::ReturnValue => break Some(CoreExit::Stop(LeafStop::Step)),
-                // A Python callee is the quiet loop's (an inline or lean
-                // call); only a builtin or type callee has leaf arms.
+                // An inline activation's return switches back to its caller
+                // in place; the root's leaves through the quiet loop.
+                OpCode::ReturnValue => {
+                    // SAFETY: see `CoreSwitch`.
+                    if unsafe { (*sw.inl).is_empty() } {
+                        break Some(CoreExit::Stop(LeafStop::Step));
+                    }
+                    // SAFETY: `len <= cap`, every slot below it initialized.
+                    unsafe { frame.stack.set_len(len) };
+                    frame.pc = pc as u32;
+                    *last_pc = last;
+                    if !self.core_return(sw, snap_gen) {
+                        sw.pending = Some(CoreExit::Stop(LeafStop::Step));
+                    }
+                    break Some(CoreExit::Reload);
+                }
+                // A Python callee runs inline, switched to in place; only a
+                // builtin or type callee has leaf arms.
                 OpCode::Call => {
                     let argc = ins.arg as usize;
                     if len < argc + 2 {
                         break None;
                     }
                     // SAFETY: `len >= argc + 2`.
-                    match unsafe { &*base.add(len - argc - 2) } {
-                        Object::Function(_) => break Some(CoreExit::Stop(LeafStop::Step)),
-                        Object::BoundMethod(bm) if matches!(bm.function, Object::Function(_)) => {
-                            break Some(CoreExit::Stop(LeafStop::Step));
+                    let python = match unsafe { &*base.add(len - argc - 2) } {
+                        Object::Function(_) => 1,
+                        Object::BoundMethod(bm) => u8::from(matches!(bm.function, Object::Function(_))),
+                        Object::Type(ty) if !ty.flags.is_builtin => 2,
+                        _ => 0,
+                    };
+                    if python != 0 {
+                        // SAFETY: as above.
+                        unsafe { frame.stack.set_len(len) };
+                        frame.pc = pc as u32;
+                        *last_pc = last;
+                        let switched = if python == 1 {
+                            self.core_call(sw, pc)
+                        } else {
+                            self.core_new(sw, pc, snap_gen)
+                        };
+                        if !switched && sw.pending.is_none() {
+                            sw.pending = Some(CoreExit::Stop(LeafStop::Step));
                         }
+                        break Some(CoreExit::Reload);
+                    }
+                    // SAFETY: `len >= argc + 2`.
+                    match unsafe { &*base.add(len - argc - 2) } {
                         // A leaf builtin or directly constructible type: out
                         // of line.
                         Object::Builtin(_) | Object::Type(_) => break Some(CoreExit::Helper),
                         _ => break None,
                     }
                 }
-                // The global/attribute cache hits and native iterators run
-                // out of line (`leaf_core_helper`), off this loop.
-                OpCode::LoadGlobal
-                | OpCode::LoadAttr
+                // A global cache hit (`leaf_global`'s stamp-validated halves),
+                // with `len(local)` fused as `leaf_fused_len_at` does.
+                OpCode::LoadGlobal => {
+                    use weavepy_compiler::InlineCache as IC;
+                    let Some(slot) = stamps.get(pc) else {
+                        break Some(CoreExit::Helper);
+                    };
+                    if len == cap {
+                        break None;
+                    }
+                    // SAFETY (raw dict reads): as in `leaf_global` — no dict
+                    // borrow is held while bytecode runs, and nothing here
+                    // runs code.
+                    let g_stamp = unsafe { (*gdict).mutation_stamp() };
+                    let hit = match code.caches.get(pc as u32) {
+                        IC::LoadGlobalModule {
+                            globals_id,
+                            key_idx,
+                        } if globals_id == gid && slot.get() == [gid, g_stamp, 0] => {
+                            unsafe { (*gdict).get_index(key_idx as usize) }
+                        }
+                        IC::LoadGlobalBuiltin {
+                            builtins_id,
+                            key_idx,
+                        } if builtins_id == bid
+                            && !self.globals_missing_any.get()
+                            && slot.get() == [gid, g_stamp, unsafe { (*bdict).mutation_stamp() }] =>
+                        {
+                            let hit = unsafe { (*bdict).get_index(key_idx as usize) };
+                            // `len(local)`: the length straight off the local.
+                            if let Some((_, Object::Builtin(f))) = hit {
+                                if Rc::as_ptr(f) as usize == self.leaf_fns().len_ptr
+                                    && pc + 3 < ninstrs
+                                {
+                                    // SAFETY: `pc + 3 < ninstrs`.
+                                    let (null, load, call) = unsafe {
+                                        (*instrs.add(pc + 1), *instrs.add(pc + 2), *instrs.add(pc + 3))
+                                    };
+                                    if null.op == OpCode::PushNull
+                                        && load.op == OpCode::LoadFast
+                                        && call.op == OpCode::Call
+                                        && call.arg == 1
+                                        && (load.arg as usize) < nlocals
+                                    {
+                                        // SAFETY: `load.arg < nlocals`.
+                                        let n = match unsafe { &*lbase.add(load.arg as usize) } {
+                                            Object::List(l) => l.try_borrow().ok().map(|l| l.len()),
+                                            Object::Tuple(t) => Some(t.len()),
+                                            Object::Str(s) => Some(crate::object::str_char_len(s)),
+                                            Object::Dict(d) => d.try_borrow().ok().map(|d| d.len()),
+                                            _ => None,
+                                        };
+                                        if let Some(n) = n.and_then(|n| i64::try_from(n).ok()) {
+                                            // SAFETY: `len < cap`.
+                                            unsafe { base.add(len).write(Object::Int(n)) };
+                                            len += 1;
+                                            last = pc + 3;
+                                            pc += 4;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                            hit
+                        }
+                        _ => break Some(CoreExit::Helper),
+                    };
+                    let Some((_, v)) = hit else {
+                        break Some(CoreExit::Helper);
+                    };
+                    let v = match v {
+                        Object::Int(x) => Object::Int(*x),
+                        Object::Float(x) => Object::Float(*x),
+                        Object::Bool(x) => Object::Bool(*x),
+                        Object::None => Object::None,
+                        other => other.clone(),
+                    };
+                    // SAFETY: `len < cap`.
+                    unsafe { base.add(len).write(v) };
+                    len += 1;
+                    last = pc;
+                    pc += 1;
+                }
+                // The attribute cache hits and native iterators run out of
+                // line (`leaf_core_helper`), off this loop.
+                OpCode::LoadAttr
                 | OpCode::StoreAttr
                 | OpCode::LoadMethodAttr
                 | OpCode::GetIter => break Some(CoreExit::Helper),
@@ -11500,12 +11733,430 @@ impl Interpreter {
                 _ => break None,
             }
         };
+        if matches!(stop, Some(CoreExit::Reload)) {
+            // Synced before the switch; the handles above are stale.
+            continue 'reload;
+        }
         // SAFETY: `len <= cap`, and every slot below `len` is initialized
         // (pushes wrote them; pops moved scalars out).
         unsafe { frame.stack.set_len(len) };
         frame.pc = pc as u32;
         *last_pc = last;
-        stop.unwrap_or(CoreExit::Slow)
+        return stop.unwrap_or(CoreExit::Slow);
+        }
+    }
+
+    /// The core loop's `CALL` of a Python callee at `pc` of `sw`'s
+    /// (synced) running activation: the quiet loop's inline call
+    /// ([`Self::try_inline_call`]), with the callee's activation pushed
+    /// and made the running one here instead of in `quiet_run`. `false`
+    /// touches nothing (the quiet loop's own `CALL` paths take it).
+    #[inline(never)]
+    fn core_call(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+        if !self.inline_calls_ok() {
+            return false;
+        }
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch`: the running activation is the
+        // innermost; its handles are live and unborrowed here.
+        let act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            let (frame, shell) = (&mut *frame, &mut *shell.cast::<QuietShell<'_>>());
+            match self.core_call_cached(frame, shell, pc, sw.depth_cell) {
+                Some(act) => Some(act),
+                None => {
+                    // The site's shape for next time: what the general
+                    // inline call is about to bind.
+                    let shape = Self::core_call_probe(frame, pc);
+                    let act = self.try_inline_call(frame, shell, pc);
+                    if let (Some(act), Some((func, has_self, eff_argc))) = (&act, shape) {
+                        let code = &act.frame.code;
+                        if let Some(slot) = code_call_slot(&frame.code, pc) {
+                            slot.set(CallShape {
+                                func,
+                                code: Rc::downgrade(code),
+                                missing: (code.arg_count as usize).saturating_sub(eff_argc) as u32,
+                                has_self,
+                            });
+                        }
+                    }
+                    act
+                }
+            }
+        };
+        let Some(mut act) = act else {
+            return false;
+        };
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { (*sw.inl).push(act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
+    }
+
+    /// The core loop's `CALL` of a plain class at `pc` of `sw`'s (synced)
+    /// running activation: `try_lean_call`'s construction shape, with the
+    /// `__init__` activation run inline and switched to here (the caller
+    /// receives the instance when it returns: see `InlineAct::init_inst`).
+    /// A class whose `__init__` is `object.__init__` and a no-argument call
+    /// just allocates (and the same activation keeps running). `false`
+    /// touches nothing.
+    #[inline(never)]
+    fn core_new(&mut self, sw: &mut CoreSwitch, pc: usize, snap_gen: u64) -> bool {
+        use weavepy_compiler::InlineCache as IC;
+        if !self.inline_calls_ok()
+            || crate::stdlib::tracemalloc_real::is_tracking()
+            || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+            || crate::stdlib::testinternalcapi_mod::nomem_alloc_fails()
+            || self.lean_snapshot() != Some(snap_gen)
+        {
+            return false;
+        }
+        // SAFETY: see `CoreSwitch`.
+        let frame = unsafe { &mut *sw.cur };
+        let Some(argc) = frame.code.instructions.get(pc).map(|i| i.arg as usize) else {
+            return false;
+        };
+        let n = frame.stack.len();
+        let Some(self_slot) = n.checked_sub(argc + 1) else {
+            return false;
+        };
+        let Some(callee_slot) = self_slot.checked_sub(1) else {
+            return false;
+        };
+        let Object::Type(ty) = &frame.stack[callee_slot] else {
+            return false;
+        };
+        if !matches!(frame.stack[self_slot], Object::Unbound)
+            || ty.flags.is_builtin
+            || !Self::plain_metaclass(ty)
+            || matches!(frame.code.caches.get(pc as u32), IC::Empty)
+        {
+            return false;
+        }
+        let ty = ty.clone();
+        let plan = self.instance_plan(&ty);
+        let Some((init, code)) = plan.lean_init.as_ref() else {
+            // `C()` for a class with the default `__new__` and
+            // `object.__init__`: the allocation is the whole call.
+            if argc == 0
+                && plan.is_object_new
+                && plan.init_from_object
+                && plan.user_new.is_none()
+                && plan.abstract_error.is_none()
+                && !plan.seeds_exception_args
+                && matches!(plan.native, crate::types::NativeKind::Plain)
+                && ty.native_kind.get() == 0
+            {
+                let bt = builtin_types();
+                if ty.is_subclass_of(&bt.module_) || ty.is_subclass_of(&bt.generic_alias_) {
+                    return false;
+                }
+                let (inst, tracked) = self.alloc_plain_instance_obj(&ty);
+                frame.stack.truncate(callee_slot);
+                frame.stack.push(inst);
+                frame.pc = pc as u32 + 1;
+                if tracked && gc_trace::maybe_auto_collect() {
+                    self.run_pending_finalizers();
+                }
+                // Done: the core loop reloads and resumes after the `CALL`
+                // in the same activation.
+                return true;
+            }
+            return false;
+        };
+        // SAFETY: GIL-serialized raw read of the function's code cell;
+        // only the pointer is compared.
+        if !std::ptr::eq(unsafe { Rc::as_ptr(&*init.code.as_ptr()) }, Rc::as_ptr(code))
+            || code.arg_count as usize != argc + 1
+            || !Self::lean_code_ok(code)
+        {
+            return false;
+        }
+        let Some(cells) = init.lean_cells_ref(code) else {
+            return false;
+        };
+        let cells: *const Rc<Vec<Rc<RefCell<Object>>>> = cells;
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(sw.depth_cell) else {
+            return false;
+        };
+        let (init, code) = (init.clone(), code.clone());
+        drop(plan);
+        // Committed.
+        let (inst, tracked) = self.alloc_plain_instance_obj(&ty);
+        if tracked && gc_trace::maybe_auto_collect() {
+            self.run_pending_finalizers();
+        }
+        // SAFETY: as above (finalizers ran against the synced frame).
+        let frame = unsafe { &mut *sw.cur };
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let nlocals = code.varnames.len();
+        locals.reserve(nlocals.max(argc + 1));
+        locals.push(inst.clone());
+        locals.extend(frame.stack.drain(self_slot + 1..));
+        if locals.len() < nlocals {
+            locals.resize(nlocals, Object::Unbound);
+        }
+        // The NULL self slot and the class.
+        frame.stack.truncate(callee_slot);
+        drop(ty);
+        frame.pc = pc as u32 + 1;
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch`.
+        let mut act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            self.inline_bind_cells(
+                &mut *frame,
+                &mut *shell.cast::<QuietShell<'_>>(),
+                pc,
+                act,
+                code,
+                Object::Function(init),
+                guard,
+                cells,
+            )
+        };
+        act.init_inst = Some(inst);
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { (*sw.inl).push(act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
+    }
+
+    /// The `(function, has_self, effective argc)` of a plain-function
+    /// `CALL` at `pc` (the shapes [`Self::core_call_cached`] serves).
+    #[inline]
+    fn core_call_probe(
+        frame: &Frame,
+        pc: usize,
+    ) -> Option<(crate::sync::Weak<crate::object::PyFunction>, bool, usize)> {
+        let argc = frame.code.instructions.get(pc)?.arg as usize;
+        let n = frame.stack.len();
+        let self_slot = n.checked_sub(argc + 1)?;
+        let Object::Function(f) = &frame.stack[self_slot.checked_sub(1)?] else {
+            return None;
+        };
+        let has_self = !matches!(frame.stack[self_slot], Object::Unbound);
+        Some((Rc::downgrade(f), has_self, argc + usize::from(has_self)))
+    }
+
+    /// [`Self::try_inline_call`] for a site whose [`CallSlot`] names the
+    /// callee: the shape checks settled by the slot, the arguments moved
+    /// in bulk. `None` touches nothing.
+    #[inline]
+    fn core_call_cached(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<Box<InlineAct>> {
+        use weavepy_compiler::InlineCache as IC;
+        let slot = code_call_slot(&frame.code, pc)?;
+        let argc = frame.code.instructions.get(pc)?.arg as usize;
+        let n = frame.stack.len();
+        let self_slot = n.checked_sub(argc + 1)?;
+        let callee_slot = self_slot.checked_sub(1)?;
+        let Object::Function(f) = &frame.stack[callee_slot] else {
+            return None;
+        };
+        let has_self = !matches!(frame.stack[self_slot], Object::Unbound);
+        if crate::gil::free_threading_enabled()
+            || matches!(frame.code.caches.get(pc as u32), IC::Empty)
+        {
+            return None;
+        }
+        // SAFETY: GIL-serialized raw read of the function's code cell (see
+        // `PyFunction::code`); only compared, then cloned below.
+        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        let (missing, slot_self) = slot.hit(Rc::as_ptr(f), Rc::as_ptr(code_rc))?;
+        if slot_self != has_self || !Self::lean_code_ok(code_rc) {
+            return None;
+        }
+        let missing = missing as usize;
+        if missing > 0
+            && (f.defaults.len() < missing
+                || (f.defaults_maybe_overridden() && f.slot("__defaults__").is_some()))
+        {
+            return None;
+        }
+        let cells: *const Rc<Vec<Rc<RefCell<Object>>>> = f.lean_cells_ref(code_rc)?;
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(depth_cell) else {
+            return None;
+        };
+        // Committed.
+        let code = code_rc.clone();
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let nlocals = code.varnames.len();
+        let first_arg = if has_self { self_slot } else { self_slot + 1 };
+        let nargs = n - first_arg;
+        locals.reserve(nlocals.max(nargs + missing));
+        // SAFETY: the `nargs` operands above `first_arg` move into the
+        // (empty, large enough) locals; the stack forgets them.
+        unsafe {
+            let (src, dst) = (frame.stack.as_ptr().add(first_arg), locals.as_mut_ptr());
+            for k in 0..nargs {
+                dst.add(k).write(src.add(k).read());
+            }
+            frame.stack.set_len(first_arg);
+            locals.set_len(nargs);
+        }
+        let callable = {
+            // The NULL self slot (unbound: no drop glue), then the callee.
+            if !has_self {
+                frame.stack.pop();
+            }
+            frame.stack.pop().expect("callee slot checked above")
+        };
+        if missing > 0 {
+            let Object::Function(f) = &callable else {
+                unreachable!("checked above")
+            };
+            locals.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
+        }
+        if locals.len() < nlocals {
+            locals.resize(nlocals, Object::Unbound);
+        }
+        frame.pc = pc as u32 + 1;
+        // The cells handle is `f`'s (now `callable`'s) or the shared empty
+        // vector: moving the callable leaves it where it was.
+        Some(self.inline_bind_cells(frame, shell, pc, act, code, callable, guard, cells))
+    }
+
+    /// The core loop's `RETURN_VALUE` of `sw`'s running activation, the
+    /// innermost inline one (synced, `pc` at the return): `quiet_run`'s
+    /// finish and delivery of an inline activation that never needed its
+    /// shell, then the caller's `QuietEntry::Returned` protocol, with the
+    /// caller made the running activation. A protocol stop (a yield, or
+    /// a raise) is left in `sw.pending`. `false` touches nothing (the
+    /// quiet loop's own return path takes it).
+    #[inline(never)]
+    fn core_return(&mut self, sw: &mut CoreSwitch, snap_gen: u64) -> bool {
+        // SAFETY: see `CoreSwitch`.
+        let inl = unsafe { &mut *sw.inl };
+        let depth = inl.len();
+        let Some(top) = inl.last_mut() else {
+            return false;
+        };
+        // A generator resume, or an activation that needed its shell,
+        // finishes through `quiet_run`; so does a return into a caller
+        // whose protocol would yield straight away.
+        if top.gen.is_some()
+            || top.act.shell.is_some()
+            || self.gil_countdown <= 2
+            || crate::hot_gates::loop_gen() != snap_gen
+        {
+            return false;
+        }
+        // SAFETY: the running activation is `top`.
+        let frame = unsafe { &mut *sw.cur };
+        let Some(v) = frame.stack.pop() else {
+            return false;
+        };
+        let cur_pc = frame.pc as usize;
+        frame.pc = cur_pc as u32 + 1;
+        let mut done = inl.pop().expect("checked above");
+        if depth == sw.entry_depth {
+            sw.entry_dead = true;
+        }
+        // `inline_finish`'s shell-less return, its common case in line: no
+        // leftover operands or cells, and scalar-only locals that die here
+        // with no drop glue.
+        let result = if frame.stack.is_empty()
+            && frame.code.cellvars.is_empty()
+            && Rc::strong_count(&frame.locals) == 1
+            && {
+                // SAFETY: sole owner; nothing else reaches the vector.
+                let locals = unsafe { &*frame.locals.as_ptr() };
+                locals.iter().all(|o| {
+                    matches!(
+                        o,
+                        Object::Int(_)
+                            | Object::Float(_)
+                            | Object::Bool(_)
+                            | Object::None
+                            | Object::Unbound
+                    )
+                })
+            } {
+            done.clean = true;
+            // SAFETY: as above; scalars own nothing.
+            unsafe { (*frame.locals.as_ptr()).set_len(0) };
+            drop(done.guard.take());
+            Ok(v)
+        } else {
+            self.inline_finish(
+                &mut done,
+                QuietExit::Outcome {
+                    stepped: Ok(StepOutcome::Return(v)),
+                    cur_pc,
+                },
+            )
+        };
+        let mut tmp = None;
+        // SAFETY: the caller is the innermost remaining activation.
+        let (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
+        // SAFETY: as above.
+        let entry = unsafe {
+            self.inline_deliver(
+                &mut *cframe,
+                &mut *cshell.cast::<QuietShell<'_>>(),
+                done,
+                result,
+            )
+        };
+        sw.cur = cframe;
+        sw.last = if clast == &raw mut sw.scratch {
+            sw.scratch = usize::MAX;
+            &raw mut sw.scratch
+        } else {
+            clast
+        };
+        match entry {
+            QuietEntry::Returned { cur_pc } => {
+                // SAFETY: as above.
+                unsafe { *sw.last = cur_pc };
+                // The caller's `Returned` entry protocol (`quiet_frame`).
+                if self.gil_countdown <= 2 {
+                    sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
+                    return true;
+                }
+                self.gil_countdown -= 1;
+                if crate::hot_gates::loop_gen() != snap_gen {
+                    sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
+                    return true;
+                }
+                // SAFETY: see `quiet_run`.
+                if sw.fin && unsafe { (*sw.maybe_dead).get() } {
+                    // SAFETY: as above.
+                    unsafe {
+                        self.flush_lean(&mut *cframe, &mut *cshell.cast::<QuietShell<'_>>());
+                    }
+                    if self.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != snap_gen {
+                        sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
+                    }
+                }
+            }
+            // The caller's `pc` is past its `CALL`: the leaf raise shape.
+            QuietEntry::Raised { err, .. } => {
+                sw.pending = Some(CoreExit::Stop(LeafStop::Raised(err)));
+            }
+            QuietEntry::Fresh | QuietEntry::Stop(_) => {
+                unreachable!("inline_deliver returns or raises")
+            }
+        }
+        true
     }
 
     /// The core loop's global and attribute arms (the cache-hit halves of
@@ -50399,6 +51050,10 @@ struct InlineAct {
     gen_frame: *mut Frame,
     /// The resuming `FOR_ITER`'s jump distance (the exhaustion exit).
     exhaust_arg: u32,
+    /// A constructor call's fresh instance (see `Interpreter::core_new`):
+    /// the activation runs its `__init__`, and the caller receives the
+    /// instance instead of the (`None`) result.
+    init_inst: Option<Object>,
 }
 
 impl InlineAct {
@@ -50445,6 +51100,7 @@ impl InlineAct {
             gen_box: None,
             gen_frame: std::ptr::null_mut(),
             exhaust_arg: 0,
+            init_inst: None,
         });
         act.act.frame = std::ptr::from_mut::<Frame>(&mut act.frame);
         // SAFETY: parked slots hold a stale code copy (see the type docs):
@@ -50495,6 +51151,10 @@ enum FrameEv {
     Call(Box<InlineAct>),
     /// The activation left the quiet loop.
     Exit(QuietExit),
+    /// The core loop's in-loop calls and returns left another activation
+    /// running (the innermost of `quiet_run`'s), whose burst ended with
+    /// this stop.
+    Switched(LeafStop),
 }
 
 /// How an inline generator resume concluded.
@@ -50513,6 +51173,143 @@ enum QuietEntry {
     Returned { cur_pc: usize },
     /// The inline call at `cur_pc` raised.
     Raised { err: RuntimeError, cur_pc: usize },
+    /// The burst that switched to this activation (see
+    /// `FrameEv::Switched`) ended with this stop, not yet handled.
+    Stop(LeafStop),
+}
+
+/// `quiet_run`'s handles on its activations, shared with every burst (see
+/// [`CoreSwitch`]).
+struct SwitchRoots {
+    /// The inline activations, innermost last.
+    inl: *mut Vec<Box<InlineAct>>,
+    /// The root activation's frame, shell, and last-executed-pc slot.
+    root: *mut Frame,
+    root_shell: *mut QuietShell<'static>,
+    root_last: *mut usize,
+    fin: bool,
+    maybe_dead: *const std::cell::Cell<bool>,
+}
+
+/// The core loop's view of the quiet loop's activations: the one running,
+/// and how to reach the others when an in-loop call pushes an inline
+/// activation or an in-loop return pops one (see
+/// `Interpreter::core_call` / `Interpreter::core_return`).
+///
+/// Every handle is a raw pointer from `quiet_run`'s roots or from the
+/// burst's entry activation (whose own borrows `quiet_frame` holds and
+/// never touches again once the burst moved away: see
+/// [`Self::switched`]). The running activation is always the innermost
+/// inline one, or the root when there is none.
+struct CoreSwitch {
+    /// The running activation's frame and last-executed-pc slot.
+    cur: *mut Frame,
+    last: *mut usize,
+    inl: *mut Vec<Box<InlineAct>>,
+    /// The root's handles (the entry's own when the burst started there).
+    root: *mut Frame,
+    root_shell: *mut QuietShell<'static>,
+    root_last: *mut usize,
+    /// The burst's entry activation: its depth in `inl` (0: the root),
+    /// its handles, and whether an in-loop return finished it.
+    entry_depth: usize,
+    entry_frame: *mut Frame,
+    entry_shell: *mut QuietShell<'static>,
+    entry_last: *mut usize,
+    entry_dead: bool,
+    /// How to end the core loop once it reloads (an in-loop return whose
+    /// caller's protocol yields or raises, or a declined switch).
+    pending: Option<CoreExit>,
+    /// The last-executed-pc slot of inline activations other than the
+    /// entry (never read back).
+    scratch: usize,
+    fin: bool,
+    maybe_dead: *const std::cell::Cell<bool>,
+    /// This thread's recursion-depth cell (see `recursion::depth_cell`).
+    depth_cell: *const std::cell::Cell<usize>,
+}
+
+impl CoreSwitch {
+    #[inline(always)]
+    fn enter(
+        roots: &SwitchRoots,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        last: &mut usize,
+    ) -> Self {
+        let frame: *mut Frame = frame;
+        let shell: *mut QuietShell<'static> = std::ptr::from_mut(shell).cast();
+        let last: *mut usize = last;
+        // SAFETY: `quiet_run`'s vector, alive for the loop.
+        let entry_depth = unsafe { (*roots.inl).len() };
+        let at_root = entry_depth == 0;
+        CoreSwitch {
+            cur: frame,
+            last,
+            inl: roots.inl,
+            root: if at_root { frame } else { roots.root },
+            root_shell: if at_root { shell } else { roots.root_shell },
+            root_last: if at_root { last } else { roots.root_last },
+            entry_depth,
+            entry_frame: frame,
+            entry_shell: shell,
+            entry_last: last,
+            entry_dead: false,
+            pending: None,
+            scratch: usize::MAX,
+            fin: roots.fin,
+            maybe_dead: roots.maybe_dead,
+            depth_cell: crate::recursion::depth_cell(),
+        }
+    }
+
+    /// Whether the running activation is no longer the burst's entry.
+    #[inline(always)]
+    fn switched(&self) -> bool {
+        // SAFETY: see the type docs.
+        self.entry_dead || unsafe { (*self.inl).len() } != self.entry_depth
+    }
+
+    /// The handles of the activation at `depth` (0: the root) — the
+    /// innermost one when `depth` is `inl`'s length: its frame, its
+    /// last-pc slot, and its shell (a fresh lazy one for an inline
+    /// activation other than the entry, stored in `tmp`).
+    ///
+    /// # Safety
+    ///
+    /// `depth` names a live activation; see the type docs.
+    #[inline(always)]
+    unsafe fn activation(
+        &mut self,
+        depth: usize,
+        tmp: &mut Option<QuietShell<'static>>,
+    ) -> (*mut Frame, *mut usize, *mut QuietShell<'static>) {
+        if depth == 0 {
+            return (self.root, self.root_last, self.root_shell);
+        }
+        if depth == self.entry_depth && !self.entry_dead {
+            return (self.entry_frame, self.entry_last, self.entry_shell);
+        }
+        // SAFETY: the caller's contract.
+        let act: *mut InlineAct = unsafe {
+            let inl: &mut Vec<Box<InlineAct>> = &mut *self.inl;
+            &raw mut *inl[depth - 1]
+        };
+        // SAFETY: as in `quiet_run`.
+        let frame: *mut Frame = unsafe {
+            let act: &mut InlineAct = &mut *act;
+            if act.gen.is_some() {
+                act.gen_frame
+            } else {
+                &raw mut *act.frame
+            }
+        };
+        // SAFETY: the activation outlives the burst's use of its shell.
+        *tmp = Some(QuietShell::Lazy(unsafe { &mut (*act).act }));
+        let shell = tmp.as_mut().expect("just set");
+        self.scratch = usize::MAX;
+        (frame, &raw mut self.scratch, shell)
+    }
 }
 
 /// A verified `CallPyKwNames` call (see
@@ -50850,6 +51647,9 @@ enum CoreExit {
     Helper,
     /// The instruction at `frame.pc` needs the full leaf arms.
     Slow,
+    /// (Inside [`Interpreter::leaf_core`] only.) An in-loop call or
+    /// return synced and moved the running activation: reload.
+    Reload,
 }
 
 /// How [`Interpreter::leaf_core_attr`] ran its instruction.
@@ -55028,6 +55828,66 @@ struct CodeConstObjects {
     /// [`AttrPoly`]); allocated on the first polymorphic resolution in
     /// this code object, one slot per instruction.
     attr_poly: std::sync::OnceLock<Box<[AttrPoly]>>,
+    /// Inline-call shapes per `CALL` site (see [`CallSlot`]); allocated
+    /// on the first inline call in this code object.
+    call_slots: std::sync::OnceLock<Box<[CallSlot]>>,
+}
+
+/// A `CALL` site's inline-call shape (see `Interpreter::core_call`): the
+/// function and code object the site last bound inline, and what
+/// `lean_call_shape` found for them. The handles are weak (a site must
+/// not keep a function alive), which also pins both allocations: a hit
+/// by pointer can never be a recycled function or code object. Everything
+/// that can change under a fixed code object — the defaults, the
+/// closure's cells, the JIT's claim on the code — is re-validated per
+/// call.
+struct CallSlot(std::cell::UnsafeCell<Option<CallShape>>);
+
+struct CallShape {
+    func: crate::sync::Weak<crate::object::PyFunction>,
+    code: crate::sync::Weak<CodeObject>,
+    /// Trailing parameters the compiled defaults fill.
+    missing: u32,
+    /// Whether the self slot carries a receiver (the method form).
+    has_self: bool,
+}
+
+// SAFETY: read and written only from the dispatch loop with the GIL held
+// (the `MethodSlot` invariant); a hit's borrow ends before anything that
+// could refill the slot runs.
+unsafe impl Send for CallSlot {}
+unsafe impl Sync for CallSlot {}
+
+impl CallSlot {
+    const fn empty() -> Self {
+        Self(std::cell::UnsafeCell::new(None))
+    }
+
+    /// The shape recorded for `func` running `code` (by identity).
+    #[inline]
+    fn hit(&self, func: *const crate::object::PyFunction, code: *const CodeObject) -> Option<(u32, bool)> {
+        // SAFETY: see the type docs.
+        let shape = unsafe { &*self.0.get() }.as_ref()?;
+        (std::ptr::eq(shape.func.as_ptr(), func) && std::ptr::eq(shape.code.as_ptr(), code))
+            .then_some((shape.missing, shape.has_self))
+    }
+
+    #[inline]
+    fn set(&self, shape: CallShape) {
+        // SAFETY: see the type docs (the old handles drop after the
+        // store; dropping a weak handle runs no code).
+        let old = unsafe { std::mem::replace(&mut *self.0.get(), Some(shape)) };
+        drop(old);
+    }
+}
+
+/// The inline-call shape slot of the `CALL` at `pc`.
+#[inline]
+fn code_call_slot(code: &CodeObject, pc: usize) -> Option<&CallSlot> {
+    let ext = code_vm_ext(code)?;
+    ext.call_slots
+        .get_or_init(|| (0..code.instructions.len()).map(|_| CallSlot::empty()).collect())
+        .get(pc)
 }
 
 /// A `LOAD_ATTR` site's polymorphic instance-attribute cache: up to two
@@ -55266,6 +56126,7 @@ fn code_vm_ext(code: &CodeObject) -> Option<&CodeConstObjects> {
             method_slots: std::sync::OnceLock::new(),
             stamp_slots: std::sync::OnceLock::new(),
             attr_poly: std::sync::OnceLock::new(),
+            call_slots: std::sync::OnceLock::new(),
         })
     });
     // RFC 0077 (WS5): the slot has exactly one producer (the initializer
