@@ -1583,8 +1583,24 @@ impl GcState {
                 counts[gen + 1] = counts[gen + 1].saturating_add(1);
             }
         }
+        // The tracked-id filter only ever gains bits; once most of them
+        // name objects long gone, rebuild it from the live index (a full
+        // collection has just walked everything anyway).
+        let live = self.index.borrow().len();
+        let stale = TRACKED_FILTER.inserts_since_rebuild();
+        if gen == N_GENERATIONS - 1 || stale > 4096.max(live.saturating_mul(4)) {
+            self.rebuild_tracked_filter();
+        }
         self.collecting.store(false, Ordering::Release);
         collected
+    }
+
+    /// Rebuild the tracked-id miss filter from the live index (see
+    /// [`crate::hot_filter::RebuildableBloom`]). Holding the index borrow
+    /// serializes it against every `track`.
+    pub fn rebuild_tracked_filter(&self) {
+        let index = self.index.borrow();
+        TRACKED_FILTER.rebuild(index.keys().copied());
     }
 
     /// Collect a specific generation. Used by [`Self::collect`].
@@ -2990,7 +3006,8 @@ static GC_STATE: std::sync::LazyLock<GcState> = std::sync::LazyLock::new(GcState
 /// usually-miss `is_tracked`/`handle_for` probes on the drop paths.
 /// Process-global like the state it mirrors; survives fork (bits for
 /// vanished objects are harmless false positives).
-static TRACKED_FILTER: crate::hot_filter::AtomicBloom = crate::hot_filter::AtomicBloom::new();
+static TRACKED_FILTER: crate::hot_filter::RebuildableBloom =
+    crate::hot_filter::RebuildableBloom::new();
 
 /// Run a closure with the shared, process-global GC state.
 pub fn with_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
@@ -3404,6 +3421,12 @@ pub fn reap_dead_acyclic_amortized() -> usize {
 #[inline]
 pub fn has_any_finalizable() -> bool {
     with_state(GcState::has_any_finalizable)
+}
+
+/// Rebuild the tracked-id miss filter from the live tracked set (see
+/// [`GcState::rebuild_tracked_filter`]).
+pub fn rebuild_tracked_filter() {
+    with_state(GcState::rebuild_tracked_filter);
 }
 
 /// Prompt-reap *suspects* (RFC 0054): tracked, non-finalizable objects a
@@ -3989,6 +4012,10 @@ pub fn note_dropped_marks(obj: &crate::object::Object) -> bool {
         O::Function(f) => note_dropped_counted(
             crate::sync::Rc::strong_count(f),
             crate::sync::Rc::as_ptr(f) as usize as u64,
+        ),
+        O::Tuple(t) => note_dropped_counted(
+            ThinArc::strong_count(t),
+            ThinArc::as_ptr(t).cast::<()>() as usize as u64,
         ),
         _ => note_dropped_marks_other(obj),
     }

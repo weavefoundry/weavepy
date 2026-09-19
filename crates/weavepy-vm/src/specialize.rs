@@ -464,7 +464,7 @@ pub fn attempt_specialize_call(callable: &Object, argc: usize) -> InlineCache {
             if argc < code.arg_count as usize
                 && f.defaults.len() >= code.arg_count as usize - argc
                 && cell_free
-                && f.slot("__defaults__").is_none()
+                && !(f.defaults_maybe_overridden() && f.slot("__defaults__").is_some())
             {
                 return InlineCache::CallPyDefaults {
                     func_id,
@@ -533,8 +533,8 @@ pub fn attempt_specialize_call_kw(
         || code.has_varargs
         || code.has_varkeywords
         || !(code.cellvars.is_empty() && code.freevars.is_empty() && f.closure.is_empty())
-        || f.slot("__defaults__").is_some()
-        || f.slot("__kwdefaults__").is_some()
+        || (f.defaults_maybe_overridden()
+            && (f.slot("__defaults__").is_some() || f.slot("__kwdefaults__").is_some()))
         || total > 16
         || kwc == 0
         || kwc > 8

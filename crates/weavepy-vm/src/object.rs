@@ -4186,9 +4186,39 @@ pub struct PyFunction {
     /// variables but no cell variables: exactly `closure`'s cells, built
     /// once (the closure is immutable) for the lean call paths.
     pub closure_cells: std::sync::OnceLock<Rc<Vec<Rc<RefCell<Object>>>>>,
+    /// Set (never cleared) once `__defaults__` or `__kwdefaults__` has
+    /// been stored into [`Self::slots`], so the call paths can skip the
+    /// slot-store probe for the overwhelmingly common function that never
+    /// had them overridden.
+    pub defaults_override: OverrideFlag,
+}
+
+/// A clonable set-once flag (see [`PyFunction::defaults_override`]).
+#[derive(Debug, Default)]
+pub struct OverrideFlag(std::sync::atomic::AtomicBool);
+
+impl OverrideFlag {
+    pub const fn new(v: bool) -> Self {
+        Self(std::sync::atomic::AtomicBool::new(v))
+    }
+}
+
+impl Clone for OverrideFlag {
+    fn clone(&self) -> Self {
+        Self::new(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
 }
 
 impl PyFunction {
+    /// Whether `__defaults__`/`__kwdefaults__` may have been overridden
+    /// (see [`Self::defaults_override`]).
+    #[inline]
+    pub fn defaults_maybe_overridden(&self) -> bool {
+        self.defaults_override
+            .0
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The frame `cells` for a lean activation of this function: the
     /// shared empty vector when the code closes over nothing, the cached
     /// closure cells when it has free variables only, `None` when it
@@ -4276,6 +4306,11 @@ impl PyFunction {
     }
 
     pub fn set_slot(&self, name: &str, value: Object) {
+        if matches!(name, "__defaults__" | "__kwdefaults__") {
+            self.defaults_override
+                .0
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         self.slots
             .borrow_mut()
             .insert(DictKey(Object::from_str(name)), value);

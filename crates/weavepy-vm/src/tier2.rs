@@ -3300,7 +3300,7 @@ unsafe fn try_native_call(
     }
     let first_default = n_params - nc.func.defaults.len().min(n_params);
     if supplied < n_params {
-        if nc.func.slot("__defaults__").is_some() {
+        if nc.func.defaults_maybe_overridden() && nc.func.slot("__defaults__").is_some() {
             return None;
         }
         if supplied < first_default {

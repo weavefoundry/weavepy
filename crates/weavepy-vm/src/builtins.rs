@@ -10435,6 +10435,8 @@ fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
         attrs: RefCell::new(f.attrs()),
         slots: RefCell::new(f.slots.borrow().clone()),
         closure_cells: std::sync::OnceLock::new(),
+        // The copied slot store carries any override along.
+        defaults_override: crate::object::OverrideFlag::new(f.defaults_maybe_overridden()),
     };
     Ok(Object::Function(Rc::new(marked)))
 }

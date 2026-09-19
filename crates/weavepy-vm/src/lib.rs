@@ -1757,6 +1757,9 @@ impl Interpreter {
     pub fn note_startup_finished(&self) {
         #[cfg(feature = "jit")]
         crate::tier2::note_startup_finished();
+        // Start-up registers and drops thousands of short-lived tracked
+        // objects; drop their stale bits from the miss filter.
+        gc_trace::rebuild_tracked_filter();
     }
 
     pub fn run_site(&mut self) -> Result<(), RuntimeError> {
@@ -9592,7 +9595,7 @@ impl Interpreter {
             // binder. SAFETY: GIL-serialized raw read of the slot
             // store's emptiness (the burst is off in free-threaded
             // mode); the common empty store settles it without a probe.
-            if !unsafe { (*f.slots.as_ptr()).is_empty() } && f.slot("__defaults__").is_some() {
+            if f.defaults_maybe_overridden() && f.slot("__defaults__").is_some() {
                 return None;
             }
             total - eff_argc
@@ -9770,7 +9773,7 @@ impl Interpreter {
             || code.freevars.len() != f.closure.len()
             // SAFETY: GIL-serialized raw read of the slot store's
             // emptiness (the burst is off in free-threaded mode).
-            || (!unsafe { (*f.slots.as_ptr()).is_empty() }
+            || (f.defaults_maybe_overridden()
                 && (f.slot("__defaults__").is_some() || f.slot("__kwdefaults__").is_some()))
         {
             return None;
@@ -10588,15 +10591,122 @@ impl Interpreter {
     #[inline(never)]
     fn leaf_burst(&mut self, frame: &mut Frame, snap_gen: u64, last_pc: &mut usize) -> LeafStop {
         loop {
-            let stop = self.leaf_core(frame, snap_gen, last_pc);
-            if let Some(stop) = stop {
-                return stop;
+            match self.leaf_core(frame, snap_gen, last_pc) {
+                CoreExit::Stop(stop) => return stop,
+                CoreExit::Helper => match self.leaf_core_helper(frame, last_pc) {
+                    CoreAttr::Done => continue,
+                    CoreAttr::Marked => return LeafStop::Marked,
+                    CoreAttr::Raised(e) => return LeafStop::Raised(e),
+                    CoreAttr::Full => return LeafStop::Step,
+                    CoreAttr::Decline => {}
+                },
+                CoreExit::Slow => {}
             }
             match self.leaf_burst_slow(frame, snap_gen, last_pc) {
                 LeafStop::Core => {}
                 stop => return stop,
             }
         }
+    }
+
+    /// Run the core loop's out-of-line instruction at `frame.pc` (the
+    /// ones [`Self::leaf_core`] hands over as [`CoreExit::Helper`]): the
+    /// fused `len(x)` and `x.attr` shapes, the global/attribute cache hits,
+    /// and leaf builtin/type calls. Advances `frame.pc` past what ran;
+    /// `Decline` touches nothing.
+    #[inline(never)]
+    fn leaf_core_helper(&mut self, frame: &mut Frame, last_pc: &mut usize) -> CoreAttr {
+        let pc = frame.pc as usize;
+        let Some(&ins) = frame.code.instructions.get(pc) else {
+            return CoreAttr::Decline;
+        };
+        match ins.op {
+            OpCode::LoadGlobal => {
+                if let Some(n) = self.leaf_fused_len_at(frame, pc, ins.arg) {
+                    frame.stack.push(Object::Int(n));
+                    *last_pc = pc + 3;
+                    frame.pc = pc as u32 + 4;
+                    return CoreAttr::Done;
+                }
+            }
+            OpCode::LoadFast => {
+                // A local receiver followed by `LOAD_ATTR` (the core loop
+                // only hands those over).
+                let next = frame.code.instructions.get(pc + 1).copied();
+                // SAFETY: see `leaf_burst_slow` (locals are never resized
+                // during an activation; nothing here runs Python code).
+                let locals: &Vec<Object> = unsafe { &*frame.locals.as_ptr() };
+                let Some(local) = locals.get(ins.arg as usize) else {
+                    return CoreAttr::Decline;
+                };
+                if let Some(next) = next.filter(|n| n.op == OpCode::LoadAttr) {
+                    if let Some(v) =
+                        Self::leaf_fused_local_attr(&frame.code, local, pc + 1, next.arg)
+                    {
+                        frame.stack.push(v);
+                        *last_pc = pc + 1;
+                        frame.pc = pc as u32 + 2;
+                        return CoreAttr::Done;
+                    }
+                }
+                // The plain load (the fusion declined).
+                if matches!(local, Object::Unbound) {
+                    return CoreAttr::Decline;
+                }
+                frame.stack.push(local.clone());
+                *last_pc = pc;
+                frame.pc = pc as u32 + 1;
+                return CoreAttr::Done;
+            }
+            _ => {}
+        }
+        let done = match ins.op {
+            OpCode::Call => self.leaf_core_call(frame, ins, pc),
+            _ => self.leaf_core_attr(frame, ins, pc),
+        };
+        match done {
+            CoreAttr::Done | CoreAttr::Marked => {
+                *last_pc = pc;
+                frame.pc = pc as u32 + 1;
+            }
+            CoreAttr::Raised(_) => {
+                frame.pc = pc as u32 + 1;
+            }
+            CoreAttr::Decline | CoreAttr::Full => {}
+        }
+        done
+    }
+
+    /// [`Self::leaf_fused_len`] for the `LOAD_GLOBAL` at `pc` of `frame`,
+    /// when the four-instruction `len(x)` shape is there.
+    #[inline]
+    fn leaf_fused_len_at(&self, frame: &Frame, pc: usize, name_idx: u32) -> Option<i64> {
+        let instrs = &frame.code.instructions;
+        let (null, load, call) = (
+            instrs.get(pc + 1)?,
+            instrs.get(pc + 2)?,
+            instrs.get(pc + 3)?,
+        );
+        if null.op != OpCode::PushNull
+            || load.op != OpCode::LoadFast
+            || call.op != OpCode::Call
+            || call.arg != 1
+            || frame.builtins_obj.is_some()
+            || frame.code.names.get(name_idx as usize).map(String::as_str) != Some("len")
+        {
+            return None;
+        }
+        // SAFETY: as in `leaf_core_helper`.
+        let locals: &Vec<Object> = unsafe { &*frame.locals.as_ptr() };
+        let local = locals.get(load.arg as usize)?;
+        self.leaf_fused_len(
+            &frame.code,
+            &frame.globals,
+            &frame.builtins,
+            pc,
+            name_idx,
+            local,
+        )
     }
 
     /// The core loop of [`Self::leaf_burst`]. Returns `Some` to end the
@@ -10606,12 +10716,7 @@ impl Interpreter {
     /// returning, and no arm here can panic or run drop glue (every
     /// discarded value is an unboxed scalar).
     #[inline(always)]
-    fn leaf_core(
-        &mut self,
-        frame: &mut Frame,
-        snap_gen: u64,
-        last_pc: &mut usize,
-    ) -> Option<LeafStop> {
+    fn leaf_core(&mut self, frame: &mut Frame, snap_gen: u64, last_pc: &mut usize) -> CoreExit {
         #[inline(always)]
         fn scalar(v: &Object) -> bool {
             matches!(
@@ -10629,14 +10734,14 @@ impl Interpreter {
         let locals: &mut Vec<Object> = unsafe { &mut *frame.locals.as_ptr() };
         let (lbase, nlocals) = (locals.as_mut_ptr(), locals.len());
         let stack = &mut frame.stack;
-        let mut base = stack.as_mut_ptr();
-        let mut cap = stack.capacity();
+        let base = stack.as_mut_ptr();
+        let cap = stack.capacity();
         let mut len = stack.len();
         let mut pc = frame.pc as usize;
         let mut last = *last_pc;
         let stop = loop {
             if pc >= ninstrs {
-                break Some(LeafStop::Step);
+                break Some(CoreExit::Stop(LeafStop::Step));
             }
             // SAFETY: bounds checked just above.
             let ins = unsafe { *instrs.add(pc) };
@@ -10655,7 +10760,18 @@ impl Interpreter {
                             Object::Bool(x) => Object::Bool(*x),
                             Object::None => Object::None,
                             Object::Unbound => break None,
-                            other => other.clone(),
+                            other => {
+                                // `x.attr` on a local receiver: the helper reads
+                                // the attribute off the local directly (no
+                                // receiver clone pushed and released).
+                                if matches!(other, Object::Instance(_) | Object::Module(_))
+                                    && pc + 1 < ninstrs
+                                    && (*instrs.add(pc + 1)).op == OpCode::LoadAttr
+                                {
+                                    break Some(CoreExit::Helper);
+                                }
+                                other.clone()
+                            }
                         };
                         base.add(len).write(c);
                     }
@@ -10722,12 +10838,27 @@ impl Interpreter {
                             slot.write(base.add(len).read());
                         } else {
                             // A displaced heap value the full arm would
-                            // reap stays there; any other is graded like
-                            // every burst drop.
+                            // reap stays there — except a deferred-tracking
+                            // instance, whose teardown is its plain drop
+                            // (recycled when this was its last reference);
+                            // any other is graded like every burst drop.
                             if Self::local_needs_prompt_reap(&*slot)
                                 && Self::looks_reapable_temporary(&*slot)
                             {
-                                break None;
+                                match &*slot {
+                                    Object::Instance(i) if i.dies_by_plain_drop() => {
+                                        len -= 1;
+                                        if let Object::Instance(i) =
+                                            std::mem::replace(&mut *slot, base.add(len).read())
+                                        {
+                                            PyInstance::try_recycle(i);
+                                        }
+                                        last = pc;
+                                        pc += 1;
+                                        continue;
+                                    }
+                                    _ => break None,
+                                }
                             }
                             len -= 1;
                             let old = std::mem::replace(&mut *slot, base.add(len).read());
@@ -10737,7 +10868,7 @@ impl Interpreter {
                                 gc_trace::mark_maybe_dead();
                                 last = pc;
                                 pc += 1;
-                                break Some(LeafStop::Marked);
+                                break Some(CoreExit::Stop(LeafStop::Marked));
                             }
                         }
                     }
@@ -10907,11 +11038,11 @@ impl Interpreter {
                     // The back edge is the burst's eval-breaker (see
                     // `leaf_burst_slow`).
                     if self.gil_countdown <= 1 || crate::hot_gates::loop_gen() != snap_gen {
-                        break Some(LeafStop::Breaker);
+                        break Some(CoreExit::Stop(LeafStop::Breaker));
                     }
                     #[cfg(feature = "jit")]
                     if crate::tier2::backedge_due(&frame.code) {
-                        break Some(LeafStop::Step);
+                        break Some(CoreExit::Stop(LeafStop::Step));
                     }
                     self.gil_countdown -= 1;
                     last = pc;
@@ -10928,7 +11059,7 @@ impl Interpreter {
                         Object::Iter(it) => it,
                         // A generator resumes through the quiet loop's
                         // lean path (the leaf arms never take it).
-                        Object::Generator(_) => break Some(LeafStop::Step),
+                        Object::Generator(_) => break Some(CoreExit::Stop(LeafStop::Step)),
                         _ => break None,
                     };
                     let Ok(mut it) = it.try_borrow_mut() else {
@@ -10977,7 +11108,7 @@ impl Interpreter {
                     last = pc;
                     pc += 1;
                 }
-                OpCode::ReturnValue => break Some(LeafStop::Step),
+                OpCode::ReturnValue => break Some(CoreExit::Stop(LeafStop::Step)),
                 // A Python callee is the quiet loop's (an inline or lean
                 // call); only a builtin or type callee has leaf arms.
                 OpCode::Call => {
@@ -10987,43 +11118,28 @@ impl Interpreter {
                     }
                     // SAFETY: `len >= argc + 2`.
                     match unsafe { &*base.add(len - argc - 2) } {
-                        Object::Function(_) => break Some(LeafStop::Step),
+                        Object::Function(_) => break Some(CoreExit::Stop(LeafStop::Step)),
                         Object::BoundMethod(bm) if matches!(bm.function, Object::Function(_)) => {
-                            break Some(LeafStop::Step);
+                            break Some(CoreExit::Stop(LeafStop::Step));
                         }
+                        // A leaf builtin or directly constructible type: out
+                        // of line.
+                        Object::Builtin(_) | Object::Type(_) => break Some(CoreExit::Helper),
                         _ => break None,
                     }
                 }
+                // The global/attribute cache hits and native iterators run
+                // out of line (`leaf_core_helper`), off this loop.
                 OpCode::LoadGlobal
                 | OpCode::LoadAttr
                 | OpCode::StoreAttr
                 | OpCode::LoadMethodAttr
-                | OpCode::GetIter => {
-                    // SAFETY: as at the exit below; the helper works on the
-                    // synced vector, and the loop reloads it afterwards.
-                    unsafe { frame.stack.set_len(len) };
-                    let done = self.leaf_core_attr(frame, ins, pc);
-                    let stack = &mut frame.stack;
-                    base = stack.as_mut_ptr();
-                    cap = stack.capacity();
-                    len = stack.len();
-                    match done {
-                        CoreAttr::Done => {
-                            last = pc;
-                            pc += 1;
-                        }
-                        CoreAttr::Marked => {
-                            last = pc;
-                            pc += 1;
-                            break Some(LeafStop::Marked);
-                        }
-                        CoreAttr::Decline => break None,
-                        CoreAttr::Full => break Some(LeafStop::Step),
-                    }
-                }
+                | OpCode::GetIter => break Some(CoreExit::Helper),
                 // An opcode the full leaf arms have no arm for is the quiet
                 // loop's straight away.
-                op if !SLOW_LEAF_OPS[op as u8 as usize] => break Some(LeafStop::Step),
+                op if !SLOW_LEAF_OPS[op as u8 as usize] => {
+                    break Some(CoreExit::Stop(LeafStop::Step))
+                }
                 _ => break None,
             }
         };
@@ -11032,7 +11148,7 @@ impl Interpreter {
         unsafe { frame.stack.set_len(len) };
         frame.pc = pc as u32;
         *last_pc = last;
-        stop
+        stop.unwrap_or(CoreExit::Slow)
     }
 
     /// The core loop's global and attribute arms (the cache-hit halves of
@@ -11158,6 +11274,183 @@ impl Interpreter {
             }
             _ => CoreAttr::Decline,
         }
+    }
+
+    /// The core loop's `CALL` of a leaf builtin or a directly
+    /// constructible type (the full leaf arm's two cases), out of line:
+    /// runs the call against `frame`'s (synced) operand stack. `Decline`
+    /// touches nothing.
+    #[inline(never)]
+    fn leaf_core_call(
+        &mut self,
+        frame: &mut Frame,
+        ins: weavepy_compiler::Instruction,
+        pc: usize,
+    ) -> CoreAttr {
+        let code: &CodeObject = &frame.code;
+        let stack = &mut frame.stack;
+        let argc = ins.arg as usize;
+        let n = stack.len();
+        let Some(self_slot) = n.checked_sub(argc + 1) else {
+            return CoreAttr::Decline;
+        };
+        let Some(callee_slot) = self_slot.checked_sub(1) else {
+            return CoreAttr::Decline;
+        };
+        let first = if matches!(stack[self_slot], Object::Unbound) {
+            self_slot + 1
+        } else {
+            self_slot
+        };
+        if let Object::Type(ty) = &stack[callee_slot] {
+            // `range(...)` / `list(...)`: constructed directly.
+            let Some(v) = self.leaf_type_call(ty, &stack[first..]) else {
+                return CoreAttr::Decline;
+            };
+            let mut marked = false;
+            for arg in stack.drain(self_slot..) {
+                marked |= gc_trace::note_dropped_marks(&arg);
+            }
+            stack.pop(); // the callee
+            stack.push(v);
+            if marked {
+                gc_trace::mark_maybe_dead();
+                return CoreAttr::Marked;
+            }
+            return CoreAttr::Done;
+        }
+        let r = {
+            let stack: &Vec<Object> = &frame.stack;
+            let Object::Builtin(b) = &stack[callee_slot] else {
+                return CoreAttr::Decline;
+            };
+            // The site remembers its leaf builtin and kind.
+            let slot = code_method_slot(code, pc as u32);
+            let kind = match slot.and_then(|s| s.get_leaf(b)) {
+                Some(k) => k,
+                None => {
+                    let Some(k) = self.leaf_call_kind(b) else {
+                        return CoreAttr::Decline;
+                    };
+                    if let Some(s) = slot {
+                        s.set_leaf(b, k);
+                    }
+                    k
+                }
+            };
+            let Some(r) = self.leaf_builtin_call(kind, b, &stack[first..]) else {
+                return CoreAttr::Decline;
+            };
+            r
+        };
+        let stack = &mut frame.stack;
+        match r {
+            Ok(v) => {
+                // The operands leave the stack: grade each one (the callee
+                // is a builtin: a leaf). A registered native body marks for
+                // any reference it releases itself (its registration
+                // contract).
+                let mut marked = false;
+                for arg in stack.drain(self_slot..) {
+                    marked |= gc_trace::note_dropped_marks(&arg);
+                    drop_operand(arg);
+                }
+                stack.pop(); // the callee
+                stack.push(v);
+                if marked {
+                    gc_trace::mark_maybe_dead();
+                    return CoreAttr::Marked;
+                }
+                CoreAttr::Done
+            }
+            Err(e) => {
+                // As the full handler: the staged operands drop wholesale
+                // before the exception propagates.
+                stack.truncate(callee_slot);
+                CoreAttr::Raised(e)
+            }
+        }
+    }
+
+    /// The core loop's fused `LOAD_FAST x; LOAD_ATTR name`: the attribute
+    /// read straight off the local (no receiver clone to push and then
+    /// release), for the receivers and cache hits the leaf arm serves.
+    /// `None` leaves both instructions to run one by one (including a
+    /// site's first execution, which the full handler specializes).
+    #[inline(never)]
+    fn leaf_fused_local_attr(
+        code: &CodeObject,
+        local: &Object,
+        attr_pc: usize,
+        name_idx: u32,
+    ) -> Option<Object> {
+        use weavepy_compiler::InlineCache as IC;
+        if matches!(code.caches.get(attr_pc as u32), IC::Empty) {
+            return None;
+        }
+        match local {
+            Object::Instance(i) if i.cls_raw().native_kind.get() == 0 => {}
+            Object::Module(_) => {}
+            _ => return None,
+        }
+        Self::leaf_load_attr_recv(code, local, attr_pc as u32, name_idx)
+    }
+
+    /// The core loop's fused `len(x)` for a local `x` (`LOAD_GLOBAL len;
+    /// PUSH_NULL; LOAD_FAST x; CALL 1`): when the global's stamped cache
+    /// hit is the builtin `len` and `x` is a native container, its
+    /// length, with no operand traffic at all. `None` runs the four
+    /// instructions one by one.
+    #[inline(never)]
+    fn leaf_fused_len(
+        &self,
+        code: &CodeObject,
+        globals: &Rc<RefCell<DictData>>,
+        builtins: &Rc<RefCell<DictData>>,
+        pc: usize,
+        name_idx: u32,
+        local: &Object,
+    ) -> Option<i64> {
+        use weavepy_compiler::InlineCache as IC;
+        let IC::LoadGlobalBuiltin {
+            builtins_id,
+            key_idx,
+        } = code.caches.get(pc as u32)
+        else {
+            return None;
+        };
+        if specialize::rc_id(builtins) != builtins_id {
+            return None;
+        }
+        if self.globals_missing_any.get() && self.globals_missing_owner(globals).is_some() {
+            return None;
+        }
+        let gid = specialize::rc_id(globals);
+        // SAFETY (raw dict reads): as in the full leaf arm — no dict
+        // borrow is held while bytecode runs, and nothing here runs code.
+        let g_stamp = unsafe { (*globals.as_ptr()).mutation_stamp() };
+        let b_stamp = unsafe { (*builtins.as_ptr()).mutation_stamp() };
+        if !code_stamp_slot(code, pc as u32).is_some_and(|s| s.get() == [gid, g_stamp, b_stamp]) {
+            return None;
+        }
+        // SAFETY: see above.
+        let (_, f) = unsafe { (*builtins.as_ptr()).get_index(key_idx as usize) }?;
+        let Object::Builtin(f) = f else {
+            return None;
+        };
+        if Rc::as_ptr(f) as usize != self.leaf_fns().len_ptr
+            || code.names.get(name_idx as usize).map(String::as_str) != Some("len")
+        {
+            return None;
+        }
+        let n = match local {
+            Object::List(l) => l.try_borrow().ok()?.len(),
+            Object::Tuple(t) => t.len(),
+            Object::Str(s) => crate::object::str_char_len(s),
+            Object::Dict(d) => d.try_borrow().ok()?.len(),
+            _ => return None,
+        };
+        i64::try_from(n).ok()
     }
 
     /// `LOAD_GLOBAL`'s cache-hit halves (module global, or builtin with
@@ -12685,11 +12978,15 @@ impl Interpreter {
     fn leaf_fns(&self) -> &LeafFns {
         self.leaf_fns.get_or_init(|| {
             let mut calls = std::collections::HashMap::default();
+            let mut len_ptr = 0usize;
             {
                 let b = self.builtins.borrow();
                 for (name, kind) in [("len", LeafKind::Len), ("isinstance", LeafKind::Isinstance)] {
                     if let Some(Object::Builtin(f)) = b.get(&crate::object::StrKey(name)) {
                         calls.insert(Rc::as_ptr(f) as usize, kind);
+                        if name == "len" {
+                            len_ptr = Rc::as_ptr(f) as usize;
+                        }
                     }
                 }
             }
@@ -12756,6 +13053,7 @@ impl Interpreter {
             let bt = builtin_types();
             LeafFns {
                 calls,
+                len_ptr,
                 methods,
                 range_ty: bt.range_.clone(),
                 list_ty: bt.list_.clone(),
@@ -13079,8 +13377,18 @@ impl Interpreter {
         cache_pc: u32,
         name_idx: u32,
     ) -> Option<Object> {
+        Self::leaf_load_attr_recv(code, stack.last()?, cache_pc, name_idx)
+    }
+
+    /// [`Self::leaf_load_attr`] for a receiver given by reference.
+    #[inline]
+    fn leaf_load_attr_recv(
+        code: &CodeObject,
+        receiver: &Object,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Option<Object> {
         use weavepy_compiler::InlineCache as IC;
-        let receiver = stack.last()?;
         match (code.caches.get(cache_pc), receiver) {
             (IC::LoadAttrInstance { key_idx, ver }, Object::Instance(inst)) => {
                 if inst.cls_raw().attr_version.get() != ver {
@@ -16457,6 +16765,7 @@ impl Interpreter {
                     attrs: RefCell::new(Rc::new(RefCell::new(DictData::default()))),
                     slots,
                     closure_cells: std::sync::OnceLock::new(),
+                    defaults_override: crate::object::OverrideFlag::new(false),
                 };
                 // A function participates in cycles through its globals
                 // (`exec(src, d)` builds `d -> f -> d`), its `__dict__`, and
@@ -37623,6 +37932,7 @@ impl Interpreter {
             attrs: RefCell::new(Rc::new(RefCell::new(DictData::default()))),
             slots: RefCell::new(DictData::default()),
             closure_cells: std::sync::OnceLock::new(),
+            defaults_override: crate::object::OverrideFlag::new(false),
         })))
     }
 
@@ -41319,7 +41629,11 @@ impl Interpreter {
         // store — `namedtuple` relies on `__new__.__defaults__ = …`)
         // replaces the compiled tuple wholesale; `None` clears it.
         if filled.iter().take(total_args).any(|x| !x) {
-            let def_override = f.slot("__defaults__");
+            let def_override = if f.defaults_maybe_overridden() {
+                f.slot("__defaults__")
+            } else {
+                None
+            };
             // Keep the override tuple alive while borrowing its elements.
             // Only values that fill missing arguments need another owner.
             let defaults: &[Object] = match &def_override {
@@ -42058,7 +42372,8 @@ impl Interpreter {
                             // A later `f.__defaults__ = …` override lives in
                             // the slot store and replaces the compiled tuple
                             // in the generic binder — deopt to honour it.
-                            && f.slot("__defaults__").is_none()
+                            && !(f.defaults_maybe_overridden()
+                                && f.slot("__defaults__").is_some())
                         {
                             specialize::record_hit(op_idx);
                             let f = f.clone();
@@ -49448,6 +49763,8 @@ enum LeafRecv {
 struct LeafFns {
     /// Function address → kind, for pointer-identity dispatch at `CALL`.
     calls: std::collections::HashMap<usize, LeafKind, crate::fasthash::FxBuildHasher>,
+    /// The builtin `len`'s address (for the fused `len(x)`), or 0.
+    len_ptr: usize,
     /// The builtin `range` and `list` types, whose calls with leaf
     /// argument shapes construct directly.
     range_ty: Rc<TypeObject>,
@@ -49938,6 +50255,17 @@ enum LeafStop {
     Core,
 }
 
+/// Why [`Interpreter::leaf_core`] handed control back.
+enum CoreExit {
+    /// End the burst.
+    Stop(LeafStop),
+    /// The instruction at `frame.pc` runs out of line
+    /// (`leaf_core_helper`).
+    Helper,
+    /// The instruction at `frame.pc` needs the full leaf arms.
+    Slow,
+}
+
 /// How [`Interpreter::leaf_core_attr`] ran its instruction.
 enum CoreAttr {
     /// Executed.
@@ -49949,6 +50277,9 @@ enum CoreAttr {
     /// The site's first execution: the full handler must run (and
     /// specialize) it.
     Full,
+    /// Executed, and it raised: the operands are gone, the error
+    /// propagates from the instruction.
+    Raised(RuntimeError),
 }
 
 /// The opcodes [`Interpreter::leaf_burst_slow`] has arms for.
