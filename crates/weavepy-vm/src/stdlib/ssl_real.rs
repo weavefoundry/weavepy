@@ -933,11 +933,18 @@ impl ServerCertVerifier for PinnedAnchorVerifier {
 fn native_root_store() -> RootCertStore {
     let mut roots = RootCertStore::empty();
     let mut added = 0usize;
+    #[cfg(not(target_os = "macos"))]
     if let Ok(certs) = rustls_native_certs::load_native_certs() {
         for c in certs {
             if roots.add(CertificateDer::from(c.as_ref().to_vec())).is_ok() {
                 added += 1;
             }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    for c in macos_pem_roots() {
+        if roots.add(c).is_ok() {
+            added += 1;
         }
     }
     if added == 0 {
@@ -946,6 +953,45 @@ fn native_root_store() -> RootCertStore {
             .extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
     roots
+}
+
+/// The macOS default roots, read the way OpenSSL-based CPython finds its
+/// own: `SSL_CERT_FILE` when set (as `rustls-native-certs` honours it),
+/// else the system bundle Apple maintains at `/etc/ssl/cert.pem`, plus any
+/// PEM files under `SSL_CERT_DIR`. (The keychain itself is not consulted —
+/// CPython's `ssl` never reads it either, and reaching it would link
+/// Security.framework into every launch.)
+#[cfg(target_os = "macos")]
+fn macos_pem_roots() -> Vec<CertificateDer<'static>> {
+    fn read_pem(path: &std::path::Path, out: &mut Vec<CertificateDer<'static>>) {
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let mut rd = std::io::BufReader::new(&bytes[..]);
+        for cert in rustls_pemfile::certs(&mut rd).flatten() {
+            out.push(cert);
+        }
+    }
+    let mut out = Vec::new();
+    match std::env::var_os("SSL_CERT_FILE") {
+        Some(file) => read_pem(std::path::Path::new(&file), &mut out),
+        None => {
+            for p in ["/etc/ssl/cert.pem", "/private/etc/ssl/cert.pem"] {
+                read_pem(std::path::Path::new(p), &mut out);
+                if !out.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(dir) = std::env::var_os("SSL_CERT_DIR") {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                read_pem(&e.path(), &mut out);
+            }
+        }
+    }
+    out
 }
 
 /// Resolve the context's `protocol` constant plus min/max `TLSVersion` codes

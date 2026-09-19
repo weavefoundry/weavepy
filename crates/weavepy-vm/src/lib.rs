@@ -10980,6 +10980,18 @@ impl Interpreter {
                     // SAFETY: see `CoreSwitch` (the running activation's
                     // handles; nothing else borrows them here).
                     let (frame, last_pc) = unsafe { (&mut *sw.cur, &mut *sw.last) };
+                    if burst_stats::enabled() {
+                        if let Some(ins) = frame.code.instructions.get(frame.pc as usize) {
+                            burst_stats::note_helper(ins.op);
+                            let recv = frame.stack.last().map_or("-", |v| v.type_name());
+                            burst_stats::note_site(
+                                &frame.code.qualname,
+                                frame.pc,
+                                ins.op,
+                                recv,
+                            );
+                        }
+                    }
                     match self.leaf_core_helper(frame, last_pc) {
                         CoreAttr::Done => continue,
                         CoreAttr::Marked => return LeafStop::Marked,
@@ -11748,6 +11760,54 @@ impl Interpreter {
                     }
                     // SAFETY: `len >= argc + 2`.
                     match unsafe { &*base.add(len - argc - 2) } {
+                        // `lst.append(x)` / `lst.pop()` on an exact list (the
+                        // site's leaf kind, filled by the helper's first
+                        // call): the operand moves in, or the item out,
+                        // with no reference traffic.
+                        Object::Builtin(b)
+                            if argc <= 1 && Rc::strong_count(b) > 1 =>
+                        {
+                            let kind = mslots.get(pc).and_then(|s| s.get_leaf(b));
+                            // SAFETY: `len >= argc + 2`: the self slot.
+                            let recv = unsafe { &*base.add(len - argc - 1) };
+                            let Object::List(l) = recv else {
+                                break Some(CoreExit::Helper);
+                            };
+                            if !Self::core_droppable(recv) {
+                                break Some(CoreExit::Helper);
+                            }
+                            // SAFETY: nothing below runs code while the
+                            // items are borrowed (see `GilCell::peek_mut`).
+                            let Some(items) = (unsafe { l.peek_mut() }) else {
+                                break Some(CoreExit::Helper);
+                            };
+                            let result = match (kind, argc) {
+                                (Some(LeafKind::ListAppend), 1) => {
+                                    // SAFETY: the operand moves into the list.
+                                    items.push(unsafe { base.add(len - 1).read() });
+                                    len -= 1;
+                                    Object::None
+                                }
+                                (Some(LeafKind::ListPop), 0) => match items.pop() {
+                                    Some(v) => v,
+                                    // `pop from empty list` raises: the
+                                    // helper's path.
+                                    None => break Some(CoreExit::Helper),
+                                },
+                                _ => break Some(CoreExit::Helper),
+                            };
+                            // SAFETY: the list (droppable) and the builtin
+                            // (count above one) leave by plain decrements;
+                            // the result takes the callee's slot.
+                            unsafe {
+                                drop(base.add(len - 1).read());
+                                drop(base.add(len - 2).read());
+                                base.add(len - 2).write(result);
+                            }
+                            len -= 1;
+                            last = pc;
+                            pc += 1;
+                        }
                         // A leaf builtin or directly constructible type: out
                         // of line.
                         Object::Builtin(_) | Object::Type(_) => break Some(CoreExit::Helper),
@@ -11829,6 +11889,26 @@ impl Interpreter {
                         Object::Float(x) => Object::Float(*x),
                         Object::Bool(x) => Object::Bool(*x),
                         Object::None => Object::None,
+                        // `Cls.CONST`: a plain class's scalar attribute
+                        // straight off the `LOAD_ATTR` site's stamp (no
+                        // class reference pushed and released).
+                        Object::Type(cls)
+                            if pc + 1 < ninstrs
+                                // SAFETY: `pc + 1 < ninstrs`.
+                                && unsafe { (*instrs.add(pc + 1)).op } == OpCode::LoadAttr =>
+                        {
+                            match stamps.get(pc + 1).and_then(|s| class_attr_hit(s, cls)) {
+                                Some(c) => {
+                                    // SAFETY: `len < cap`.
+                                    unsafe { base.add(len).write(c) };
+                                    len += 1;
+                                    last = pc + 1;
+                                    pc += 2;
+                                    continue;
+                                }
+                                None => Object::Type(cls.clone()),
+                            }
+                        }
                         other => other.clone(),
                     };
                     // SAFETY: `len < cap`.
@@ -11842,7 +11922,6 @@ impl Interpreter {
                 // receiver moves up into the self slot under the function;
                 // a class receiver leaves an empty self slot.
                 OpCode::LoadMethodAttr => {
-                    use weavepy_compiler::InlineCache as IC;
                     let Some(ms) = mslots.get(pc) else {
                         break Some(CoreExit::Helper);
                     };
@@ -11853,13 +11932,13 @@ impl Interpreter {
                     let top = unsafe { base.add(len - 1) };
                     let f = match unsafe { &*top } {
                         Object::Instance(inst) => {
-                            let ver = match code.caches.get(pc as u32) {
-                                IC::LoadAttrMethod { ver, .. } => ver,
-                                // A native method's slot is keyed by the
-                                // class version alone.
-                                _ => inst.cls_raw().attr_version.get(),
-                            };
-                            if inst.cls_raw().attr_version.get() != ver {
+                            // The site slot and the class cache are keyed
+                            // by the class's (process-unique) attribute
+                            // version, and answer only for default
+                            // attribute access.
+                            let cls = inst.cls_raw();
+                            let ver = cls.attr_version.get();
+                            if !Self::default_getattribute(&cls) {
                                 break Some(CoreExit::Helper);
                             }
                             // The instance dict must not shadow the method.
@@ -11882,7 +11961,21 @@ impl Interpreter {
                                 Some(f) => Object::Function(f),
                                 None => match ms.get_inst_builtin(ver) {
                                     Some(b) => Object::Builtin(b),
-                                    None => break Some(CoreExit::Helper),
+                                    // A polymorphic site: the receiver
+                                    // class's own cache.
+                                    None => match ext
+                                        .and_then(|e| e.name_objs.get(ins.arg as usize))
+                                        .and_then(|n| match n {
+                                            Object::Str(n) => class_cached_method_held(
+                                                &cls,
+                                                SharedStr::as_ptr(n) as *const u8 as usize,
+                                                ver,
+                                            ),
+                                            _ => None,
+                                        }) {
+                                        Some(f) => Object::Function(f),
+                                        None => break Some(CoreExit::Helper),
+                                    },
                                 },
                             };
                             // SAFETY: `len < cap`; the receiver moves up.
@@ -11899,10 +11992,27 @@ impl Interpreter {
                         // The class leaves through a plain decrement: its
                         // count stays above one (no drop glue here).
                         Object::Type(cls) if Rc::strong_count(cls) > 1 => {
-                            match ms.get_held(cls.attr_version.get()) {
+                            match ms.get_held_unbound(cls.attr_version.get()) {
                                 Some(f) => f,
                                 None => break Some(CoreExit::Helper),
                             }
+                        }
+                        // A list's site-cached native method (the helper's
+                        // builtin-receiver case, which fills the slot).
+                        Object::List(_) => {
+                            let Some(b) = ms.get_builtin(1) else {
+                                break Some(CoreExit::Helper);
+                            };
+                            // SAFETY: `len < cap`; the receiver moves up.
+                            unsafe {
+                                let recv = top.read();
+                                top.write(Object::Builtin(b));
+                                base.add(len).write(recv);
+                            }
+                            len += 1;
+                            last = pc;
+                            pc += 1;
+                            continue;
                         }
                         _ => break Some(CoreExit::Helper),
                     };
@@ -11927,8 +12037,24 @@ impl Interpreter {
                     }
                     // SAFETY: `len > 0`.
                     let top = unsafe { base.add(len - 1) };
-                    let Object::Instance(inst) = (unsafe { &*top }) else {
-                        break Some(CoreExit::Helper);
+                    let inst = match unsafe { &*top } {
+                        Object::Instance(inst) => inst,
+                        // A plain class's scalar attribute (the site's
+                        // stamp); the class (count above one) leaves by a
+                        // plain decrement.
+                        Object::Type(cls) => {
+                            match stamps.get(pc).and_then(|s| class_attr_hit(s, cls)) {
+                                Some(v) if Rc::strong_count(cls) > 1 => {
+                                    // SAFETY: the receiver is replaced in place.
+                                    unsafe { drop(std::mem::replace(&mut *top, v)) };
+                                    last = pc;
+                                    pc += 1;
+                                    continue;
+                                }
+                                _ => break Some(CoreExit::Helper),
+                            }
+                        }
+                        _ => break Some(CoreExit::Helper),
                     };
                     let IC::LoadAttrInstance { key_idx, ver } = code.caches.get(pc as u32) else {
                         break Some(CoreExit::Helper);
@@ -11972,8 +12098,8 @@ impl Interpreter {
                     let IC::StoreAttrInstance { key_idx, ver } = code.caches.get(pc as u32) else {
                         break Some(CoreExit::Helper);
                     };
-                    if !val.is_gc_atomic()
-                        || inst.cls_raw().attr_version.get() != ver
+                    let atomic = val.is_gc_atomic();
+                    if inst.cls_raw().attr_version.get() != ver
                         || crate::capi_watchers::dicts_active()
                         || !Self::core_droppable(recv)
                     {
@@ -11989,8 +12115,15 @@ impl Interpreter {
                             if slot_name_matches(code, ins.arg, k) && Self::core_droppable(old) => {}
                         _ => break Some(CoreExit::Helper),
                     }
-                    let Some((_, slot)) = d.map_mut_atomic_store().get_index_mut(key_idx as usize)
-                    else {
+                    // A heap value takes the dict's ordinary mutable access
+                    // (which starts a deferred owner's tracking), as the
+                    // helper's store does.
+                    let map = if atomic {
+                        d.map_mut_atomic_store()
+                    } else {
+                        &mut **d
+                    };
+                    let Some((_, slot)) = map.get_index_mut(key_idx as usize) else {
                         break Some(CoreExit::Helper);
                     };
                     // SAFETY: the value moves into the dict and the
@@ -12005,8 +12138,29 @@ impl Interpreter {
                     last = pc;
                     pc += 1;
                 }
-                // Native iterators run out of line (`leaf_core_helper`).
-                OpCode::GetIter => break Some(CoreExit::Helper),
+                // A list, tuple or range's native iterator (the helper's
+                // arm), when the iterable leaves by a plain decrement.
+                OpCode::GetIter => {
+                    if len == 0 {
+                        break Some(CoreExit::Helper);
+                    }
+                    // SAFETY: `len > 0`.
+                    let top = unsafe { base.add(len - 1) };
+                    let v = unsafe { &*top };
+                    if !matches!(v, Object::List(_) | Object::Tuple(_) | Object::Range(_))
+                        || !Self::core_droppable(v)
+                    {
+                        break Some(CoreExit::Helper);
+                    }
+                    let Ok(it) = v.make_iter() else {
+                        break Some(CoreExit::Helper);
+                    };
+                    let it = Object::Iter(Rc::new(RefCell::new(it)));
+                    // SAFETY: the iterable (droppable) is replaced in place.
+                    unsafe { drop(std::mem::replace(&mut *top, it)) };
+                    last = pc;
+                    pc += 1;
+                }
                 // An opcode the full leaf arms have no arm for is the quiet
                 // loop's straight away.
                 op if !SLOW_LEAF_OPS[op as u8 as usize] => {
@@ -12700,9 +12854,14 @@ impl Interpreter {
                     Some(Object::Module(_)) => {
                         Self::leaf_load_attr(code, stack, pc as u32, ins.arg)
                     }
-                    // A class attribute (the slow arm's first case).
+                    // A class attribute (the slow arm's first case); a
+                    // scalar one is remembered for the core loop's arm.
                     Some(Object::Type(cls)) => {
-                        Self::leaf_load_type_attr(code, cls, pc as u32, ins.arg)
+                        let v = Self::leaf_load_type_attr(code, cls, pc as u32, ins.arg);
+                        if let Some(v) = &v {
+                            class_attr_fill(code, cls, pc, v);
+                        }
+                        v
                     }
                     _ => None,
                 };
@@ -15162,7 +15321,7 @@ impl Interpreter {
     ) -> Option<Object> {
         let ver = cls.attr_version.get();
         let slot = code_method_slot(code, cache_pc);
-        if let Some(f) = slot.and_then(|s| s.get(ver)) {
+        if let Some(f) = slot.and_then(|s| s.get_held_unbound(ver)) {
             return Some(Object::Function(f));
         }
         // A plain `type` metaclass has nothing that could intercept a
@@ -15178,6 +15337,14 @@ impl Interpreter {
             LeafAttr::Method(f) => {
                 if let Some(s) = slot {
                     s.set(ver, &f);
+                }
+                Some(Object::Function(f))
+            }
+            // A function value read through the class is a static
+            // method's (the only function-valued `Value`).
+            LeafAttr::Value(Object::Function(f)) => {
+                if let Some(s) = slot {
+                    s.set_static(ver, &f);
                 }
                 Some(Object::Function(f))
             }
@@ -15292,7 +15459,13 @@ impl Interpreter {
         };
         let cls = inst.cls_raw();
         if cls.attr_version.get() != ver {
-            return None;
+            // Another class than the site specialized for (a polymorphic
+            // site): the class's own cache decides, and remembers the
+            // answer for the core loop's method-form arm.
+            return match Self::leaf_resolve_instance_attr(code, inst, name_idx)? {
+                LeafAttr::Method(f) => Some(Object::Function(f)),
+                _ => None,
+            };
         }
         if let Some(dict) = inst.dict.get() {
             let d = dict.try_borrow().ok()?;
@@ -52034,6 +52207,22 @@ mod burst_stats {
     }
 
     static LEAF_SLOW: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+    static HELPER: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+
+    static SITES: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+        std::sync::Mutex::new(None);
+
+    /// A helper step's site (code, pc, opcode, top-of-stack type).
+    pub(crate) fn note_site(code: &str, pc: u32, op: weavepy_compiler::OpCode, recv: &str) {
+        let key = format!("{code}@{pc} {} {:?} [{recv}]", op.name(), op);
+        let mut a = SITES.lock().unwrap();
+        *a.get_or_insert_with(Default::default).entry(key).or_insert(0) += 1;
+    }
+
+    /// An instruction the core loop ran out of line (`leaf_core_helper`).
+    pub(crate) fn note_helper(op: weavepy_compiler::OpCode) {
+        HELPER[op as u8 as usize].fetch_add(1, Ordering::Relaxed);
+    }
 
     /// An instruction the core loop handed to the full leaf arms.
     pub(crate) fn note_leaf_slow(op: weavepy_compiler::OpCode) {
@@ -52069,6 +52258,31 @@ mod burst_stats {
                 std::mem::transmute::<u8, weavepy_compiler::OpCode>(*op)
             });
             let _ = writeln!(out, "- {name}: {count}");
+        }
+        let mut rows: Vec<(u64, u8)> = HELPER
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.load(Ordering::Relaxed), i as u8))
+            .filter(|(c, _)| *c > 0)
+            .collect();
+        rows.sort_unstable_by(|a, b| b.cmp(a));
+        out.push_str("\n## Core-loop out-of-line helper steps\n\n");
+        for (count, op) in rows.iter().take(30) {
+            let name = weavepy_compiler::OpCode::name(unsafe {
+                std::mem::transmute::<u8, weavepy_compiler::OpCode>(*op)
+            });
+            let _ = writeln!(out, "- {name}: {count}");
+        }
+        let mut sites: Vec<(String, u64)> = SITES
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|(k, c)| (k.clone(), *c))
+            .collect();
+        sites.sort_by(|a, b| b.1.cmp(&a.1));
+        for (k, c) in sites.iter().take(40) {
+            let _ = writeln!(out, "  site {k}: {c}");
         }
         let mut attrs = ATTRS.lock().unwrap().clone();
         attrs.sort_by(|a, b| b.1.cmp(&a.1));
@@ -56517,6 +56731,49 @@ fn code_stamp_slot(code: &CodeObject, cache_pc: u32) -> Option<&StampSlot> {
         .get(cache_pc as usize)
 }
 
+/// Tags of a `LOAD_ATTR` site's class-attribute stamp (`[attr_version,
+/// tag, bits]`): the scalar value a plain class's attribute resolved to
+/// at that (process-unique) version.
+const CLASS_ATTR_INT: u64 = 0x5ca1_a770_0000_0001;
+const CLASS_ATTR_FLOAT: u64 = 0x5ca1_a770_0000_0002;
+const CLASS_ATTR_BOOL: u64 = 0x5ca1_a770_0000_0003;
+const CLASS_ATTR_NONE: u64 = 0x5ca1_a770_0000_0004;
+
+/// The scalar class attribute a `LOAD_ATTR` site's stamp remembers for
+/// `cls`'s current version (see [`class_attr_fill`]).
+#[inline(always)]
+fn class_attr_hit(slot: &StampSlot, cls: &crate::types::TypeObject) -> Option<Object> {
+    let [ver, tag, bits] = slot.get();
+    if ver != cls.attr_version.get() {
+        return None;
+    }
+    match tag {
+        CLASS_ATTR_INT => Some(Object::Int(bits as i64)),
+        CLASS_ATTR_FLOAT => Some(Object::Float(f64::from_bits(bits))),
+        CLASS_ATTR_BOOL => Some(Object::Bool(bits != 0)),
+        CLASS_ATTR_NONE => Some(Object::None),
+        _ => None,
+    }
+}
+
+/// Remember at a `LOAD_ATTR` site that plain class `cls` (a leaf class
+/// read, so no metaclass or extension hook intercepts it) answered the
+/// scalar `v`. Versions are process-unique and bumped by every change
+/// that could alter the resolution, so an equal version later means the
+/// same value.
+fn class_attr_fill(code: &CodeObject, cls: &crate::types::TypeObject, pc: usize, v: &Object) {
+    let (tag, bits) = match v {
+        Object::Int(x) => (CLASS_ATTR_INT, *x as u64),
+        Object::Float(x) => (CLASS_ATTR_FLOAT, x.to_bits()),
+        Object::Bool(b) => (CLASS_ATTR_BOOL, u64::from(*b)),
+        Object::None => (CLASS_ATTR_NONE, 0),
+        _ => return,
+    };
+    if let Some(slot) = code_stamp_slot(code, pc as u32) {
+        slot.set([cls.attr_version.get(), tag, bits]);
+    }
+}
+
 /// The function a `LoadAttrMethod` site resolved to, keyed by the
 /// receiver class's [`AttrVersion`](crate::types::AttrVersion) at the
 /// time. Versions are process-unique, so an equal version means the
@@ -56533,6 +56790,10 @@ struct MethodSlot(std::cell::UnsafeCell<(u64, MethodSlotFn)>);
 /// (keyed by [`MethodSlot::BUILTIN_TAG`] plus the receiver's variant).
 enum MethodSlotFn {
     Py(crate::sync::Weak<crate::object::PyFunction>),
+    /// A static method's function read through the class (keyed by the
+    /// class's attribute version): called unbound, never with the
+    /// receiver — an instance at the same site must not take it.
+    Static(crate::sync::Weak<crate::object::PyFunction>),
     Builtin(Rc<crate::object::BuiltinFn>),
     /// A `CALL` site's leaf builtin and its kind (the identity check is
     /// the pointer compare on read).
@@ -56594,6 +56855,35 @@ impl MethodSlot {
         // SAFETY: GIL-serialized; the exclusive reference lives only for
         // the assignment.
         unsafe { *self.0.get() = (ver, MethodSlotFn::Py(Rc::downgrade(f))) };
+    }
+
+    /// [`Self::get_held`] for a class receiver: a plain function or a
+    /// static method's function, either one called with an empty self
+    /// slot.
+    #[inline]
+    fn get_held_unbound(&self, ver: u64) -> Option<Rc<crate::object::PyFunction>> {
+        // SAFETY: GIL-serialized; no `&mut` escapes `set`.
+        match unsafe { &*self.0.get() } {
+            (v, MethodSlotFn::Py(w) | MethodSlotFn::Static(w))
+                if *v == ver && w.strong_count() > 0 =>
+            {
+                let p = w.as_ptr();
+                // SAFETY: as `get_held` — the class holds the function
+                // (or its static method wrapper, which holds it).
+                unsafe {
+                    Rc::increment_strong_count(p);
+                    Some(Rc::from_raw(p))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Remember a static method's function read through a class at `ver`.
+    #[inline]
+    fn set_static(&self, ver: u64, f: &Rc<crate::object::PyFunction>) {
+        // SAFETY: as `set`.
+        unsafe { *self.0.get() = (ver, MethodSlotFn::Static(Rc::downgrade(f))) };
     }
 
     /// The native method a plain class (at version `ver`) resolves for its
@@ -56660,6 +56950,32 @@ fn code_method_slot(code: &CodeObject, cache_pc: u32) -> Option<&MethodSlot> {
                 .collect()
         })
         .get(cache_pc as usize)
+}
+
+/// The plain function class `cls` (at attribute version `ver`) resolves
+/// the interned name at `name_key` to on its MRO, from the class's leaf
+/// attribute cache, as a new strong handle: the method-form load of a
+/// polymorphic site, whose one site slot names another class. Sound for
+/// the reason [`MethodSlot::get_held`] is — the entry was resolved under
+/// `ver`, so while the class still reads `ver` a dict on its MRO holds
+/// the function.
+#[inline]
+fn class_cached_method_held(
+    cls: &crate::types::TypeObject,
+    name_key: usize,
+    ver: u64,
+) -> Option<Rc<crate::object::PyFunction>> {
+    match cls.leaf_attrs.get(name_key, ver)? {
+        crate::types::LeafAttrKind::Method(w) if w.strong_count() > 0 => {
+            let p = w.as_ptr();
+            // SAFETY: see above.
+            unsafe {
+                Rc::increment_strong_count(p);
+                Some(Rc::from_raw(p))
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Slot layout of a Python function's fast locals, precomputed once per

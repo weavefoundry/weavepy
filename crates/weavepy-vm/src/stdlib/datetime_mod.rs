@@ -391,6 +391,21 @@ fn components_to_utc(y: i64, m: i64, d: i64, hh: i64, mm: i64, ss: i64) -> i64 {
 }
 
 /// Get the local UTC offset in seconds for a given Unix timestamp.
+#[cfg(unix)]
+fn local_offset_secs(unix_secs: i64) -> i64 {
+    // libc `localtime_r` (as `time.localtime`): it honours a `TZ` change
+    // applied by `time.tzset()`.
+    let t = unix_secs as libc::time_t;
+    // SAFETY: `tm` is a plain C struct; `localtime_r` fills it or fails.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&raw const t, &raw mut tm) }.is_null() {
+        return 0;
+    }
+    tm.tm_gmtoff as i64
+}
+
+/// Get the local UTC offset in seconds for a given Unix timestamp.
+#[cfg(not(unix))]
 fn local_offset_secs(unix_secs: i64) -> i64 {
     use chrono::{Local, TimeZone, Utc};
     let utc = match Utc.timestamp_opt(unix_secs, 0).single() {

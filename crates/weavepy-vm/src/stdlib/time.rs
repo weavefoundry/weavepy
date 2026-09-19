@@ -11,6 +11,7 @@ use crate::sync::RefCell;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(not(unix))]
+#[cfg(not(unix))]
 use chrono::Local;
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 
