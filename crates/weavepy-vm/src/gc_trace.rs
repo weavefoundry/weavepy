@@ -412,7 +412,7 @@ pub struct GcState {
     /// collection or teardown. Persists past the point where the handle
     /// leaves the tracked set so `gc.is_finalized()` still answers `True`
     /// for an object its finalizer resurrected (PEP 442 / `test_is_finalized`).
-    finalized_ids: RefCell<std::collections::HashSet<ObjectId>>,
+    finalized_ids: RefCell<crate::fasthash::FxHashSet<ObjectId>>,
     /// Dedicated index over just the *finalizable* tracked objects —
     /// instances whose class defines `__del__` and unfinished
     /// generator-family objects. CPython runs `__del__` the instant an
@@ -526,7 +526,7 @@ impl GcState {
             enabled: AtomicBool::new(true),
             tracked_version: AtomicUsize::new(0),
             tracked_count: AtomicUsize::new(0),
-            finalized_ids: RefCell::new(std::collections::HashSet::new()),
+            finalized_ids: RefCell::new(crate::fasthash::FxHashSet::default()),
             finalizable: RefCell::new(std::collections::BTreeMap::new()),
             finalizable_count: AtomicUsize::new(0),
             fin_scan_cursor: std::sync::atomic::AtomicU64::new(0),
@@ -3159,7 +3159,16 @@ fn has_finalizer(obj: &Object) -> bool {
         // path win (236ms → 314ms). Left as-is per the RFC's fallback
         // clause; the split would need an active-suspect exemption
         // co-designed with the suspects machinery first.
-        Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => !g.is_finished(),
+        // A generator that has never been started has nothing to clean
+        // up: `close()` on it runs no Python, and neither does its drop.
+        // Enrolling it cost the prompt-finalization index a pair of
+        // inserts and removals per generator born, which is most of what
+        // a short-lived generator costs. A *coroutine* still enrolls
+        // unstarted — finalizing one that was never awaited emits the
+        // RuntimeWarning, which is exactly the observable cleanup this
+        // index exists to run promptly.
+        Object::Generator(g) => !g.is_finished() && !g.is_unstarted(),
+        Object::Coroutine(g) | Object::AsyncGenerator(g) => !g.is_finished(),
         _ => false,
     }
 }

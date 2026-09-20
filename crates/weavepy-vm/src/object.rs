@@ -4712,6 +4712,16 @@ impl PyGenerator {
     pub fn is_finished(&self) -> bool {
         matches!(&*self.state.borrow(), GeneratorState::Finished)
     }
+
+    /// Has the body run at all? A generator still in `Created` has
+    /// executed nothing, so closing it runs nothing either — CPython's
+    /// `gen_close` marks such a generator closed without throwing
+    /// `GeneratorExit` at it, and `gen_dealloc` frees it outright.
+    pub fn is_unstarted(&self) -> bool {
+        self.state
+            .try_borrow()
+            .is_ok_and(|s| matches!(&*s, GeneratorState::Created(_)))
+    }
 }
 
 impl fmt::Debug for PyGenerator {

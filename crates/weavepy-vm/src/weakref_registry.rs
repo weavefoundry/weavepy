@@ -301,6 +301,13 @@ impl WeakRefRegistry {
     pub fn notify_clear(&self, id: ObjectId) -> Vec<(Arc<WeakRefSlot>, Option<Object>)> {
         let entries = {
             let mut g = self.inner.borrow_mut();
+            // Hot path: this runs for every object the prompt reaper
+            // frees, and almost none of them was ever weakly referenced.
+            // Skip the tree removal on the miss-filter's say-so, exactly
+            // as `count` does.
+            if g.slots.is_empty() || !g.filter.may_contain(id) {
+                return Vec::new();
+            }
             g.slots.remove(&id).unwrap_or_default()
         };
         let mut out = Vec::with_capacity(entries.len());

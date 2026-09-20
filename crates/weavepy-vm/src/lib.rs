@@ -3808,9 +3808,11 @@ impl Interpreter {
             // `lookup("__del__")` walk clones the MRO on every reaped
             // instance and dominated the prompt-reap path.
             Object::Instance(i) => i.cls().instances_need_finalize(),
-            Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
-                !g.is_finished()
-            }
+            // An unstarted generator has nothing to finalize: closing it
+            // runs no Python (see `gc_trace::has_finalizer`). A coroutine
+            // still does — the never-awaited RuntimeWarning.
+            Object::Generator(g) => !g.is_finished() && !g.is_unstarted(),
+            Object::Coroutine(g) | Object::AsyncGenerator(g) => !g.is_finished(),
             _ => false,
         }
     }
