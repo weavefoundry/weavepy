@@ -4456,6 +4456,13 @@ fn retire_native_driver(ctx: &CallCtx) {
 /// Generic native-callee calls one activation may make between two
 /// loop polls before its code retires (see [`charge_native_roundtrip`]).
 const NATIVE_CALL_RETIRE_BUDGET: u32 = 4096;
+
+/// `str`-method calls one activation may make before its code retires.
+/// Lower than the generic budget: tier-1 calls the very same bodies
+/// through its leaf table with no argument marshaling, and a body that
+/// side-exits every few hundred iterations never reaches a poll for the
+/// density check to judge it.
+const STR_METHOD_RETIRE_BUDGET: u32 = 256;
 /// Generic native-callee calls one poll interval (`JIT_POLL_STRIDE`
 /// loop-header iterations) may make: more than one per four native
 /// iterations and the loop is a driver around its calls.
@@ -4780,6 +4787,18 @@ unsafe extern "C" fn wpjit_str_method(
             CallStatus::Raised as i64
         }
         Ok(v) => {
+            // A loop of `str` methods belongs to tier-1 (its leaf table
+            // calls the same bodies without marshaling): past the budget
+            // the activation hands back here, like the generic call
+            // helpers' round-trip charge. The poll's density check only
+            // sees loops that reach a poll; a body that side-exits more
+            // often than that never does.
+            ctx.native_calls = ctx.native_calls.saturating_add(1);
+            if ctx.native_calls >= STR_METHOD_RETIRE_BUDGET && !ctx.code_ptr.is_null() {
+                retire_native_driver(ctx);
+                ctx.parked = Some(v);
+                return CallStatus::Boxed as i64;
+            }
             match SlotTag::from_raw(expect_tag) {
                 SlotTag::Int | SlotTag::Bool => {
                     let expect = if SlotTag::from_raw(expect_tag) == SlotTag::Int {
