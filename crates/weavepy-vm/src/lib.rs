@@ -16609,6 +16609,38 @@ impl Interpreter {
                         ("join", LeafKind::StrJoin),
                         ("replace", LeafKind::StrReplace),
                         ("format", LeafKind::StrFormat),
+                        // Pure `str` bodies (no codec registry, no user
+                        // mapping): resolved once here, so the call site
+                        // neither rebuilds the method object nor leaves
+                        // the core loop.
+                        ("count", LeafKind::Opaque),
+                        ("rfind", LeafKind::Opaque),
+                        ("index", LeafKind::Opaque),
+                        ("rindex", LeafKind::Opaque),
+                        ("partition", LeafKind::Opaque),
+                        ("rpartition", LeafKind::Opaque),
+                        ("splitlines", LeafKind::Opaque),
+                        ("rsplit", LeafKind::Opaque),
+                        ("casefold", LeafKind::Opaque),
+                        ("capitalize", LeafKind::Opaque),
+                        ("swapcase", LeafKind::Opaque),
+                        ("title", LeafKind::Opaque),
+                        ("zfill", LeafKind::Opaque),
+                        ("center", LeafKind::Opaque),
+                        ("ljust", LeafKind::Opaque),
+                        ("rjust", LeafKind::Opaque),
+                        ("expandtabs", LeafKind::Opaque),
+                        ("removeprefix", LeafKind::Opaque),
+                        ("removesuffix", LeafKind::Opaque),
+                        ("isalnum", LeafKind::Opaque),
+                        ("isascii", LeafKind::Opaque),
+                        ("isdecimal", LeafKind::Opaque),
+                        ("isidentifier", LeafKind::Opaque),
+                        ("islower", LeafKind::Opaque),
+                        ("isnumeric", LeafKind::Opaque),
+                        ("isprintable", LeafKind::Opaque),
+                        ("istitle", LeafKind::Opaque),
+                        ("isupper", LeafKind::Opaque),
                     ],
                 ),
             ];
@@ -55938,10 +55970,24 @@ pub(crate) fn str_format_impl(
     positional: &[Object],
     keyword: &[(String, Object)],
 ) -> Result<String, RuntimeError> {
+    let mut auto_idx = 0usize;
+    str_format_auto(template, positional, keyword, &mut auto_idx)
+}
+
+/// [`str_format_impl`] continuing an automatic-numbering counter: a
+/// nested format spec shares the outer template's (CPython's
+/// `do_markup` threads one `auto_number` through both), so
+/// `'{:0{}x}'.format(v, w)` takes `v` for the field and `w` for the
+/// width.
+fn str_format_auto(
+    template: &str,
+    positional: &[Object],
+    keyword: &[(String, Object)],
+    auto_idx: &mut usize,
+) -> Result<String, RuntimeError> {
     let mut out = String::new();
     let bytes = template.as_bytes();
     let mut i = 0;
-    let mut auto_idx = 0usize;
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'{' {
@@ -55952,7 +55998,7 @@ pub(crate) fn str_format_impl(
             }
             let (field, end) = scan_format_field(bytes, i + 1)?;
             i = end;
-            let rendered = render_format_field(&field, positional, keyword, &mut auto_idx, None)?;
+            let rendered = render_format_field(&field, positional, keyword, auto_idx, None)?;
             out.push_str(&rendered);
         } else if b == b'}' {
             if i + 1 < bytes.len() && bytes[i + 1] == b'}' {
@@ -56077,8 +56123,9 @@ fn render_format_field(
     };
     let spec_str = match spec_part {
         Some(s) if s.contains('{') => {
-            // Nested format spec — recursively interpolate.
-            str_format_impl(s, positional, keyword)?
+            // Nested format spec — interpolated with the *same*
+            // automatic numbering as the outer template.
+            str_format_auto(s, positional, keyword, auto_idx)?
         }
         Some(s) => s.to_owned(),
         None => String::new(),

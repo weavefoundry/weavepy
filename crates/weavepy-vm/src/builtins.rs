@@ -11757,7 +11757,12 @@ fn str_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
         // clamp to 0 so `*i as usize` can't wrap to a gigantic pad count.
         Some(Object::Int(i)) => (*i).max(0) as usize,
         Some(Object::Bool(b)) => usize::from(*b),
-        _ => return Err(type_error("zfill() expected int")),
+        other => {
+            let name = other.map_or_else(|| "NoneType".to_owned(), |a| class_of(a).name.clone());
+            return Err(type_error(format!(
+                "'{name}' object cannot be interpreted as an integer"
+            )));
+        }
     };
     let len = s.chars().count();
     if len >= width {
@@ -11819,7 +11824,12 @@ fn str_center(args: &[Object]) -> Result<Object, RuntimeError> {
         // underflow that would request a gigantic allocation.
         Some(Object::Int(i)) => (*i).max(0) as usize,
         Some(Object::Bool(b)) => usize::from(*b),
-        _ => return Err(type_error("center() expected int")),
+        other => {
+            let name = other.map_or_else(|| "NoneType".to_owned(), |a| class_of(a).name.clone());
+            return Err(type_error(format!(
+                "'{name}' object cannot be interpreted as an integer"
+            )));
+        }
     };
     let fill = match args.get(2).map(str_arg_bridged) {
         Some(Some(f)) if f.chars().count() == 1 => f.chars().next().unwrap(),
@@ -11875,7 +11885,12 @@ fn str_expandtabs(args: &[Object]) -> Result<Object, RuntimeError> {
         // can't wrap into a gigantic pad allocation.
         Some(Object::Int(i)) => (*i).max(0) as usize,
         None => 8,
-        _ => return Err(type_error("expandtabs() expected int")),
+        other => {
+            let name = other.map_or_else(|| "NoneType".to_owned(), |a| class_of(a).name.clone());
+            return Err(type_error(format!(
+                "'{name}' object cannot be interpreted as an integer"
+            )));
+        }
     };
     let mut out = String::new();
     let mut col = 0usize;
