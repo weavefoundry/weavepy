@@ -15090,6 +15090,13 @@ impl Interpreter {
                     // deferred-tracking instance, whose teardown is its
                     // plain drop (recycled when this was its last ref).
                     if Self::local_needs_prompt_reap(old) && Self::looks_reapable_temporary(old) {
+                        // A container of nothing but scalars, untracked and
+                        // unwatched, frees nothing that could finalize: the
+                        // plain drop below is its whole teardown, so the
+                        // burst need not end for a cascade that would find
+                        // nothing. This is the shape a `x = [i, i]` loop
+                        // displaces on every iteration.
+                        if !gc_trace::dies_inert(old) {
                         match old {
                             Object::Instance(i) if i.dies_by_plain_drop() => {
                                 let Some(v) = stack.pop() else { break };
@@ -15102,6 +15109,7 @@ impl Interpreter {
                                 continue;
                             }
                             _ => break,
+                        }
                         }
                     }
                     let Some(v) = stack.pop() else { break };

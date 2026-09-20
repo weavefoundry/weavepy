@@ -3519,26 +3519,32 @@ fn element_is_inert(obj: &Object) -> bool {
 }
 
 fn container_can_cycle(obj: &Object) -> bool {
+    // A container past this size is registered without inspection: the
+    // scan is per *element* while the registration it saves is per
+    // *container*, so beyond a point it stops paying for itself — and an
+    // unbounded scan would make `track` O(len) for `list(range(1e6))`.
+    const SCAN_CAP: usize = 32;
     match obj {
         Object::List(l) => l
             .try_borrow()
-            .map(|v| v.iter().any(|x| !element_is_inert(x)))
+            .map(|v| v.len() > SCAN_CAP || v.iter().any(|x| !element_is_inert(x)))
             .unwrap_or(true),
         Object::Set(s) => s
             .try_borrow()
-            .map(|m| m.iter().any(|k| !element_is_inert(&k.0)))
+            .map(|m| m.len() > SCAN_CAP || m.iter().any(|k| !element_is_inert(&k.0)))
             .unwrap_or(true),
         Object::Dict(d) => d
             .try_borrow()
             .map(|m| {
-                m.iter()
-                    .any(|(k, v)| !element_is_inert(&k.0) || !element_is_inert(v))
+                m.len() > SCAN_CAP
+                    || m.iter()
+                        .any(|(k, v)| !element_is_inert(&k.0) || !element_is_inert(v))
             })
             .unwrap_or(true),
         // A tuple can only anchor a cycle through a non-atomic element. An
         // empty or all-scalar tuple (the interned `()`, `(1, 2)`, …) can never
         // close one, so it stays off the GC's books.
-        Object::Tuple(t) => t.iter().any(|x| !element_is_inert(x)),
+        Object::Tuple(t) => t.len() > SCAN_CAP || t.iter().any(|x| !element_is_inert(x)),
         // Any other container kind: be conservative and track.
         _ => true,
     }
@@ -4258,14 +4264,34 @@ pub fn note_dropped_marks(obj: &crate::object::Object) -> bool {
             crate::sync::Rc::strong_count(i),
             crate::sync::Rc::as_ptr(i) as usize as u64,
         ),
-        O::List(l) => note_dropped_counted(
-            crate::sync::Rc::strong_count(l),
-            crate::sync::Rc::as_ptr(l) as usize as u64,
-        ),
-        O::Dict(d) => note_dropped_counted(
-            crate::sync::Rc::strong_count(d),
-            crate::sync::Rc::as_ptr(d) as usize as u64,
-        ),
+        O::List(l) => {
+            let (sc, id) = (
+                crate::sync::Rc::strong_count(l),
+                crate::sync::Rc::as_ptr(l) as usize as u64,
+            );
+            if inert_death(sc, id, || {
+                l.try_borrow()
+                    .is_ok_and(|v| v.len() <= INERT_SCAN_CAP && v.iter().all(is_atomic))
+            }) {
+                return false;
+            }
+            note_dropped_counted(sc, id)
+        }
+        O::Dict(d) => {
+            let (sc, id) = (
+                crate::sync::Rc::strong_count(d),
+                crate::sync::Rc::as_ptr(d) as usize as u64,
+            );
+            if inert_death(sc, id, || {
+                d.try_borrow().is_ok_and(|m| {
+                    m.len() <= INERT_SCAN_CAP
+                        && m.iter().all(|(k, v)| is_atomic(&k.0) && is_atomic(v))
+                })
+            }) {
+                return false;
+            }
+            note_dropped_counted(sc, id)
+        }
         O::Function(f) => note_dropped_counted(
             crate::sync::Rc::strong_count(f),
             crate::sync::Rc::as_ptr(f) as usize as u64,
@@ -4275,6 +4301,54 @@ pub fn note_dropped_marks(obj: &crate::object::Object) -> bool {
             ThinArc::as_ptr(t).cast::<()>() as usize as u64,
         ),
         _ => note_dropped_marks_other(obj),
+    }
+}
+
+/// How many elements a dying container may hold and still be graded by
+/// inspection (see [`inert_death`]). Capped so the grade stays O(1) on a
+/// path that runs for every discarded heap value.
+const INERT_SCAN_CAP: usize = 32;
+
+/// Does this death need no prompt handling at all? A container dying at
+/// its last reference, with no collector handle and no weakref, whose
+/// every element is atomic, frees nothing that could finalize — so the
+/// burst need not end to run a sweep that would find nothing. Grading it
+/// `true` is what keeps a `x = [i, i]` loop inside the burst: the store
+/// that displaces the previous list ended it on every iteration.
+#[inline]
+fn inert_death(sc: usize, id: ObjectId, all_atomic: impl FnOnce() -> bool) -> bool {
+    sc <= 1
+        && !TRACKED_FILTER.may_contain(id)
+        && !crate::weakref_registry::may_have_weakrefs(id)
+        && all_atomic()
+}
+
+/// [`inert_death`] for a value the caller still holds the last reference
+/// to: dropping it frees nothing that could finalize, clear a weakref or
+/// need untracking, so the plain `Rc` drop is its whole teardown and no
+/// prompt-reap cascade has to run.
+pub fn dies_inert(obj: &crate::object::Object) -> bool {
+    use crate::object::Object as O;
+    match obj {
+        O::List(l) => inert_death(
+            crate::sync::Rc::strong_count(l),
+            crate::sync::Rc::as_ptr(l) as usize as u64,
+            || {
+                l.try_borrow()
+                    .is_ok_and(|v| v.len() <= INERT_SCAN_CAP && v.iter().all(is_atomic))
+            },
+        ),
+        O::Dict(d) => inert_death(
+            crate::sync::Rc::strong_count(d),
+            crate::sync::Rc::as_ptr(d) as usize as u64,
+            || {
+                d.try_borrow().is_ok_and(|m| {
+                    m.len() <= INERT_SCAN_CAP
+                        && m.iter().all(|(k, v)| is_atomic(&k.0) && is_atomic(v))
+                })
+            },
+        ),
+        _ => false,
     }
 }
 
