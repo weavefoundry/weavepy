@@ -11458,25 +11458,6 @@ impl Interpreter {
     /// [`Self::core_call`], [`Self::core_return`]).
     #[inline(always)]
     fn leaf_core(&mut self, sw: &mut CoreSwitch, snap_gen: u64) -> CoreExit {
-        /// The conditional branch immediately after `pc`, when the
-        /// instruction there consumes a boolean the arm just computed.
-        ///
-        /// # Safety
-        ///
-        /// `instrs` names `ninstrs` instructions.
-        #[inline(always)]
-        unsafe fn branch_after(
-            instrs: *const weavepy_compiler::Instruction,
-            ninstrs: usize,
-            pc: usize,
-        ) -> Option<weavepy_compiler::Instruction> {
-            if pc + 1 >= ninstrs {
-                return None;
-            }
-            // SAFETY: bounds checked just above.
-            let next = unsafe { *instrs.add(pc + 1) };
-            matches!(next.op, OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue).then_some(next)
-        }
         #[inline(always)]
         fn scalar(v: &Object) -> bool {
             matches!(
@@ -11539,18 +11520,6 @@ impl Interpreter {
         let mut len = stack.len();
         let mut pc = frame.pc as usize;
         let mut last = *last_pc;
-        /// Take the fused branch with result `$r`: the operands are
-        /// already off the stack.
-        macro_rules! len_jump {
-            ($r:expr, $next:expr) => {{
-                last = pc + 1;
-                pc += 2;
-                if $r == ($next.op == OpCode::PopJumpIfTrue) {
-                    pc += $next.arg as usize;
-                }
-                continue;
-            }};
-        }
         let stop = loop {
             if pc >= ninstrs {
                 break Some(CoreExit::Stop(LeafStop::Step));
@@ -11883,20 +11852,13 @@ impl Interpreter {
                     let same = a.is_same(b);
                     let r = if ins.arg == 1 { !same } else { same };
                     // SAFETY: both operands leave the stack (checked
-                    // droppable above).
+                    // droppable above); the result takes the lower slot.
                     unsafe {
                         drop_hot(base.add(len - 1).read());
                         drop_hot(base.add(len - 2).read());
+                        base.add(len - 2).write(Object::Bool(r));
                     }
-                    len -= 2;
-                    // `if x is None:` — the branch consumes the result.
-                    // SAFETY: the loop's own instruction buffer.
-                    if let Some(next) = unsafe { branch_after(instrs, ninstrs, pc) } {
-                        len_jump!(r, next);
-                    }
-                    // SAFETY: the result takes the lower operand's slot.
-                    unsafe { base.add(len).write(Object::Bool(r)) };
-                    len += 1;
+                    len -= 1;
                     last = pc;
                     pc += 1;
                 }
@@ -11917,15 +11879,9 @@ impl Interpreter {
                     unsafe {
                         drop_hot(base.add(len - 1).read());
                         drop_hot(base.add(len - 2).read());
+                        base.add(len - 2).write(Object::Bool(r));
                     }
-                    len -= 2;
-                    // SAFETY: the loop's own instruction buffer.
-                    if let Some(next) = unsafe { branch_after(instrs, ninstrs, pc) } {
-                        len_jump!(r, next);
-                    }
-                    // SAFETY: the result takes the lower operand's slot.
-                    unsafe { base.add(len).write(Object::Bool(r)) };
-                    len += 1;
+                    len -= 1;
                     last = pc;
                     pc += 1;
                 }
@@ -12120,18 +12076,10 @@ impl Interpreter {
                         CompareKind::Gt => ord.is_gt(),
                         CompareKind::GtE => ord.is_ge(),
                     };
-                    // SAFETY: both operands are scalars (no drop owed).
-                    len -= 2;
-                    // `while a < b:` / `if a < b:` — the branch consumes
-                    // the result where it is computed (CPython keeps the
-                    // comparison and the jump as separate instructions).
-                    // SAFETY: the loop's own instruction buffer.
-                    if let Some(next) = unsafe { branch_after(instrs, ninstrs, pc) } {
-                        len_jump!(r, next);
-                    }
-                    // SAFETY: the result takes the lower operand's slot.
-                    unsafe { base.add(len).write(Object::Bool(r)) };
-                    len += 1;
+                    // SAFETY: both operands are scalars (no drop owed);
+                    // the result takes the lower one's slot.
+                    len -= 1;
+                    unsafe { base.add(len - 1).write(Object::Bool(r)) };
                     last = pc;
                     pc += 1;
                 }
