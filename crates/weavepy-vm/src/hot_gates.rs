@@ -183,6 +183,12 @@ pub mod env_flags {
         jit_trace,
         "WEAVEPY_JIT_TRACE"
     );
+    once_flag!(
+        /// `WEAVEPY_NO_PAIRS`: disable the core loop's fused local pairs
+        /// (bisection aid).
+        no_pairs,
+        "WEAVEPY_NO_PAIRS"
+    );
 
     /// `WEAVEPY_TE_BT=<needle>`: backtrace every `TypeError` whose
     /// message contains the needle.

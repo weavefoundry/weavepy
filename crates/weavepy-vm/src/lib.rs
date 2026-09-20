@@ -11489,6 +11489,13 @@ impl Interpreter {
         );
         // Module scope (names resolve in the globals, then the builtins,
         // both exact dicts): the `LOAD_NAME` / `STORE_NAME` arms below.
+        // The fused local pairs below, one byte per instruction (empty
+        // for code that has none).
+        let fast_pairs: &[u8] = if crate::hot_gates::env_flags::no_pairs() {
+            &[]
+        } else {
+            code_fast_pairs(code, ext)
+        };
         let name_scope = frame.class_namespace.is_none()
             && frame.class_namespace_obj.is_none()
             && frame.builtins_obj.is_none()
@@ -11511,6 +11518,90 @@ impl Interpreter {
                     let i = ins.arg as usize;
                     if i >= nlocals || len == cap {
                         break None;
+                    }
+                    // CPython fuses the common local-to-local pairs into
+                    // one instruction (`LOAD_FAST_LOAD_FAST`,
+                    // `STORE_FAST_LOAD_FAST`); the decoder splits them so
+                    // every pc keeps its own unit, so the pair is fused
+                    // here instead — one dispatch, and `x = y` never
+                    // touches the stack at all.
+                    match fast_pairs.get(pc).copied().unwrap_or(0) {
+                        1 => {
+                            // SAFETY: a pair kind is only recorded where
+                            // `pc + 1` names an instruction.
+                            let next = unsafe { *instrs.add(pc + 1) };
+                            {
+                                let j = next.arg as usize;
+                                if j < nlocals && len + 1 < cap {
+                                    // SAFETY: both indices and both stack
+                                    // slots are in range.
+                                    unsafe {
+                                        let (a, b) = (&*lbase.add(i), &*lbase.add(j));
+                                        // The scalar shapes copy inline, as
+                                        // the single-load arm does.
+                                        let ca = match a {
+                                            Object::Int(x) => Object::Int(*x),
+                                            Object::Float(x) => Object::Float(*x),
+                                            Object::Bool(x) => Object::Bool(*x),
+                                            Object::None => Object::None,
+                                            Object::Unbound => break None,
+                                            other => clone_hot(other),
+                                        };
+                                        let cb = match b {
+                                            Object::Int(x) => Object::Int(*x),
+                                            Object::Float(x) => Object::Float(*x),
+                                            Object::Bool(x) => Object::Bool(*x),
+                                            Object::None => Object::None,
+                                            Object::Unbound => {
+                                                drop_hot(ca);
+                                                break None;
+                                            }
+                                            other => clone_hot(other),
+                                        };
+                                        base.add(len).write(ca);
+                                        base.add(len + 1).write(cb);
+                                        len += 2;
+                                        last = pc + 1;
+                                        pc += 2;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        // `x = y`: the destination's old value is a
+                        // scalar (nothing to grade), so the copy is a
+                        // single slot write.
+                        2 => {
+                            // SAFETY: as above.
+                            let next = unsafe { *instrs.add(pc + 1) };
+                            {
+                                let j = next.arg as usize;
+                                if j < nlocals {
+                                    // SAFETY: both indices are in range.
+                                    unsafe {
+                                        let src = &*lbase.add(i);
+                                        let dst = lbase.add(j);
+                                        if !matches!(src, Object::Unbound)
+                                            && !matches!(src, Object::Cell(_))
+                                            && (scalar(&*dst) || matches!(*dst, Object::Unbound))
+                                        {
+                                            let c = match src {
+                                                Object::Int(x) => Object::Int(*x),
+                                                Object::Float(x) => Object::Float(*x),
+                                                Object::Bool(x) => Object::Bool(*x),
+                                                Object::None => Object::None,
+                                                other => clone_hot(other),
+                                            };
+                                            dst.write(c);
+                                            last = pc + 1;
+                                            pc += 2;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                     // SAFETY: `i < nlocals`, `len < cap`.
                     unsafe {
@@ -58588,6 +58679,13 @@ struct CodeConstObjects {
     /// Whether this code is a *pure leaf* (see [`code_is_pure_leaf`]):
     /// `0` not yet decided, `1` no, `2` yes.
     pure_leaf: std::sync::atomic::AtomicU8,
+    /// Per-instruction fused-pair kinds (see [`code_fast_pairs`]): `1`
+    /// at a `LOAD_FAST` whose successor is another `LOAD_FAST`, `2` when
+    /// it is a `STORE_FAST`, `0` everywhere else. CPython's compiler
+    /// fuses exactly these pairs into one instruction and the decoder
+    /// splits them back apart; the core loop reads one byte to run the
+    /// pair as a single dispatch. Empty when the code has no pair.
+    fast_pairs: std::sync::OnceLock<Box<[u8]>>,
 }
 
 /// A `CALL` site's inline-call shape (see `Interpreter::core_call`): the
@@ -59068,6 +59166,52 @@ fn class_cached_method_held(
 /// fast paths: nothing it did before that is observable. Decided once
 /// per code object.
 #[inline(always)]
+/// [`code_is_pure_leaf`] for tier-2's call-density judgment.
+pub(crate) fn code_is_pure_leaf_pub(code: &CodeObject) -> bool {
+    code_is_pure_leaf(code)
+}
+
+/// The fused-pair kind of every instruction (see
+/// [`CodeConstObjects::fast_pairs`]), built once per code object.
+/// Empty for code with no pair at all — the common shape, whose
+/// `LOAD_FAST` arm then reads nothing.
+fn code_fast_pairs<'a>(code: &CodeObject, ext: Option<&'a CodeConstObjects>) -> &'a [u8] {
+    let Some(ext) = ext else { return &[] };
+    ext.fast_pairs.get_or_init(|| {
+        let ops = &code.instructions;
+        let mut any = false;
+        let mut kinds = vec![0u8; ops.len()];
+        for pc in 0..ops.len() {
+            if ops[pc].op != OpCode::LoadFast {
+                continue;
+            }
+            let kind = match ops.get(pc + 1).map(|i| i.op) {
+                // A second load whose own successor reads an attribute
+                // off it keeps the receiver-fused arm instead.
+                Some(OpCode::LoadFast) => {
+                    if matches!(
+                        ops.get(pc + 2).map(|i| i.op),
+                        Some(OpCode::LoadAttr | OpCode::StoreAttr | OpCode::LoadMethodAttr)
+                    ) {
+                        0
+                    } else {
+                        1
+                    }
+                }
+                Some(OpCode::StoreFast) => 2,
+                _ => 0,
+            };
+            kinds[pc] = kind;
+            any |= kind != 0;
+        }
+        if any {
+            kinds.into_boxed_slice()
+        } else {
+            Box::new([])
+        }
+    })
+}
+
 fn code_is_pure_leaf(code: &CodeObject) -> bool {
     let Some(ext) = code_vm_ext(code) else {
         return false;
@@ -59213,6 +59357,7 @@ fn code_vm_ext(code: &CodeObject) -> Option<&CodeConstObjects> {
             attr_poly: std::sync::OnceLock::new(),
             call_slots: std::sync::OnceLock::new(),
             pure_leaf: std::sync::atomic::AtomicU8::new(0),
+            fast_pairs: std::sync::OnceLock::new(),
         })
     });
     // RFC 0077 (WS5): the slot has exactly one producer (the initializer

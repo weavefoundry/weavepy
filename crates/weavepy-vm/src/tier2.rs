@@ -1637,10 +1637,7 @@ fn native_method_callable(cf: &CompiledFrame, code: &CodeObject) -> bool {
     if argc == 0 {
         return false;
     }
-    // A receiver the body never touches (`def nop(self): pass`) has no
-    // lane of its own; it rides as pin 0 all the same, and a deopt
-    // rebuilds the slot from there (see `finish_deopted_callee`).
-    if !matches!(cf.local_types.first().copied().flatten(), Some(JitType::Obj) | None) {
+    if cf.local_types.first().copied().flatten() != Some(JitType::Obj) {
         return false;
     }
     for j in 1..argc {
@@ -2836,6 +2833,10 @@ struct CallCtx {
     /// Interpreter round-trips this activation has made through the call
     /// helpers (see [`INTERP_CALL_RETIRE_BUDGET`]).
     interp_calls: u32,
+    /// Generic calls of an *interpreted* callee since the last poll (the
+    /// density the poll judges: an attribute round-trip or a native
+    /// callee is charged separately).
+    dyn_py_calls: u32,
     /// Generic calls of native callees this activation has made (see
     /// [`charge_native_roundtrip`]).
     native_calls: u32,
@@ -3183,10 +3184,10 @@ unsafe extern "C" fn wpjit_poll(frame: *mut JitFrame) -> i64 {
             // several times better (measured on OO call loops: a
             // one-call-per-iteration loop ran 3x slower compiled).
             let dense = (ctx.native_calls > NATIVE_CALLS_PER_POLL
-                || ctx.interp_calls > INTERP_CALLS_PER_POLL)
+                || ctx.dyn_py_calls > INTERP_CALLS_PER_POLL)
                 && !ctx.code_ptr.is_null();
             ctx.native_calls = 0;
-            ctx.interp_calls = 0;
+            ctx.dyn_py_calls = 0;
             if dense {
                 retire_native_driver(ctx);
                 return 1;
@@ -3377,6 +3378,14 @@ unsafe fn try_native_call(
     if crate::hot_gates::load() != 0 || crate::trace::any_observers_active() {
         return None;
     }
+    // A callee retired since this activation resolved its callee table
+    // (the deopt backoff below, or another caller's) must not be entered
+    // again: the table is only re-resolved when the compile generation
+    // moves, and a chronic side-exiter would otherwise keep paying an
+    // entry plus a full frame materialization per call.
+    if nc.code.jit_hint.is_not_jitable() {
+        return None;
+    }
     // RFC 0073 WS5 — an under-arity call site splices the missing
     // *trailing* parameters from the callee's defaults right here, so
     // the native fast path admits the whole `min_args..=arg_count`
@@ -3425,9 +3434,7 @@ unsafe fn try_native_call(
     // The receiver slot must be the object-pin lane the eligibility
     // check admitted (defensive — `native_method_callable` verified
     // this at resolution).
-    if recv.is_some()
-        && !matches!(nc.cf.local_types.first().copied().flatten(), Some(JitType::Obj) | None)
-    {
+    if recv.is_some() && nc.cf.local_types.first().copied().flatten() != Some(JitType::Obj) {
         return None;
     }
     // Argument lanes must match the callee's compiled parameter lanes
@@ -3520,6 +3527,20 @@ unsafe fn try_native_call(
         };
     }
 
+    // A framed native call of a *tiny* callee (a getter, a comparison)
+    // costs more than the interpreter's own inline activation of the
+    // same body, so a loop dense with them belongs to tier-1: charge it
+    // to the poll's density judgment (see `wpjit_poll`).
+    // A body the interpreter evaluates without a frame at all (a pure
+    // leaf: a getter, a comparison, a constant return) is one such
+    // callee whatever its shape. A tiny *method* that stores — the
+    // attribute fixtures' `tick` — is not, and its loop keeps its
+    // native lane.
+    if crate::code_is_pure_leaf_pub(&nc.code)
+        || (recv.is_none() && nc.code.instructions.len() <= TINY_CALLEE_OPS)
+    {
+        ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
+    }
     // The framed native call below is itself expensive (buffers, pins, a
     // callee context, a recursion tick): a loop of them is call-shaped
     // too. Past the budget the interpreter path takes it (and retires
@@ -3678,6 +3699,7 @@ unsafe fn try_native_call(
         }
         c.dirty = false;
         c.interp_calls = 0;
+        c.dyn_py_calls = 0;
         c.native_calls = 0;
         c.polls = 0;
         c
@@ -3728,6 +3750,7 @@ unsafe fn try_native_call(
             math: nc.math.clone(),
             dirty: false,
             interp_calls: 0,
+            dyn_py_calls: 0,
             native_calls: 0,
             polls: 0,
             child: None,
@@ -3801,6 +3824,24 @@ unsafe fn try_native_call(
                 JIT.with(|cell| cell.borrow_mut().stats.pin_pressure_exits += 1);
             } else {
                 native_stat(|s| s.deopts.set(s.deopts.get() + 1));
+                // The same deopt backoff the framed and frameless entries
+                // charge: a callee that side-exits on most calls (a
+                // burned-in attribute shape a second receiver class
+                // misses) must retire, or every call keeps paying a
+                // native entry plus a full frame materialization.
+                if matches!(status, JitStatus::Deopt) {
+                    let callee_key = Rc::as_ptr(&nc.code).cast::<CodeObject>();
+                    JIT.with(|cell| {
+                        let mut st = cell.borrow_mut();
+                        if let Some(ce) = st.cache.get_mut(&callee_key) {
+                            ce.deopts += 1;
+                            if ce.deopts >= DEOPT_BUDGET {
+                                ce.tier = Tier::NotJitable;
+                                nc.code.jit_hint.mark_not_jitable();
+                            }
+                        }
+                    });
+                }
             }
             nctx.dirty = true;
             // The materialized continuation is a full interpreter
@@ -4037,12 +4078,6 @@ fn finish_deopted_callee(
                 ty,
                 &nctx.pins,
             )),
-            // A laneless parameter can only be a method-shaped entry's
-            // unused receiver (every other parameter needs a lane to be
-            // entered natively): it is pin 0.
-            None if slot == 0 && code.arg_count >= 1 => {
-                locals_v.push(unpack_ty(0, JitType::Obj, &nctx.pins));
-            }
             None => locals_v.push(Object::Unbound),
         }
     }
@@ -4245,6 +4280,7 @@ unsafe extern "C" fn wpjit_call_py(
             CallStatus::Raised as i64
         }
         Ok(v) => {
+            ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
             if charge_roundtrip(ctx) {
                 ctx.parked = Some(v);
                 return CallStatus::Boxed as i64;
@@ -4316,6 +4352,7 @@ fn finish_interp_call(
             CallStatus::Raised as i64
         }
         Ok(v) => {
+            ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
             if charge_roundtrip(ctx) {
                 // Call-shaped: hand the rest of this activation, and every
                 // later one, to the interpreter (a `Boxed` exit spills the
@@ -4417,6 +4454,12 @@ const NATIVE_CALL_RETIRE_BUDGET: u32 = 4096;
 /// loop-header iterations) may make: more than one per four native
 /// iterations and the loop is a driver around its calls.
 const NATIVE_CALLS_PER_POLL: u32 = (weavepy_jit::JIT_POLL_STRIDE / 4) as u32;
+
+/// A compiled callee this size or smaller is served better by the
+/// interpreter's inline activation than by a framed native call: its
+/// body is a getter, a comparison or a constant return, and the call's
+/// own buffers, pins, context and recursion tick dominate it.
+const TINY_CALLEE_OPS: usize = 12;
 
 /// Generic *interpreter* calls one poll interval may make before the
 /// same judgment applies (see [`wpjit_poll`]). A call every fourth
@@ -6830,6 +6873,9 @@ unsafe fn dyn_call_result(
             CallStatus::Raised as i64
         }
         Ok(v) => {
+            if !native_callee {
+                ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
+            }
             if charge_roundtrip(ctx) || (native_callee && charge_native_roundtrip(ctx)) {
                 ctx.parked = Some(v);
                 return CallStatus::Boxed as i64;
@@ -7872,6 +7918,7 @@ pub(crate) fn try_call_native_direct(
         math: entry.art.math.clone(),
         dirty: false,
         interp_calls: 0,
+        dyn_py_calls: 0,
         native_calls: 0,
         polls: 0,
         child: None,
@@ -8583,6 +8630,7 @@ fn enter_compiled(
         math: entry.math.clone(),
         dirty: false,
         interp_calls: 0,
+        dyn_py_calls: 0,
         native_calls: 0,
         polls: 0,
         child: None,
@@ -8646,6 +8694,7 @@ fn enter_compiled(
                 entry_pin_count,
                 dirty: ctx.dirty,
                 interp_calls: ctx.interp_calls,
+                dyn_py_calls: ctx.dyn_py_calls,
                 local_types: cf.local_types.clone(),
                 plan,
             }));
@@ -9114,6 +9163,8 @@ pub(crate) struct NativeActivation {
     dirty: bool,
     /// Interpreter round-trips so far (see `CallCtx::interp_calls`).
     interp_calls: u32,
+    /// See `CallCtx::dyn_py_calls`.
+    dyn_py_calls: u32,
     /// Per-slot lanes for the locals writeback at materialization
     /// (cloned once from the compiled frame at first park).
     local_types: Vec<Option<JitType>>,
@@ -9457,6 +9508,7 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
         math: entry.math.clone(),
         dirty: act.dirty,
         interp_calls: act.interp_calls,
+        dyn_py_calls: act.dyn_py_calls,
         native_calls: 0,
         polls: 0,
         child: None,
