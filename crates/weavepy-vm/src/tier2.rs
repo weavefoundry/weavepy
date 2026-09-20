@@ -4006,6 +4006,12 @@ unsafe fn try_native_ctor(
         return None;
     }
     ctx.interp_calls = ctx.interp_calls.saturating_add(1);
+    // A constructor whose `__init__` is tiny is dominated by the call
+    // and the allocation, which the interpreter's own `instantiate`
+    // does with less ceremony: charge the poll's density judgment.
+    if nc.code.instructions.len() <= TINY_CALLEE_OPS {
+        ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
+    }
     let (inst, ran_finalizers) = interp.alloc_plain_instance(cls)?;
     if ran_finalizers {
         // Threshold collection ran finalizers — arbitrary Python.
