@@ -45477,7 +45477,8 @@ impl Interpreter {
         // Bind positional args by *moving* them into the frame slots (the
         // caller has relinquished ownership); remainder go to *args if
         // present, else error.
-        let mut positional: Vec<Object> = vec![Object::Unbound; code.varnames.len()];
+        let mut positional: Vec<Object> = self.pooled_scratch();
+        positional.resize(code.varnames.len(), Object::Unbound);
         // Only argument slots need binding flags; body locals cannot be
         // supplied by keyword. Keep common signatures inline and retain a
         // heap fallback for arbitrary parameter counts.
@@ -45504,8 +45505,12 @@ impl Interpreter {
         // the excess-positional message here; raise it after the kw loop.
         let mut too_many_positional_err: Option<String> = None;
         if has_varargs {
-            let rest: Vec<Object> = arg_iter.collect();
-            positional[star_idx] = Object::new_tuple(rest);
+            // Straight from the argument vector's tail into the tuple's
+            // own allocation: collecting the remainder into a `Vec` first
+            // was a second allocation and a second move per call.
+            positional[star_idx] = Object::Tuple(
+                crate::tuple_storage::TupleStorage::from_exact_iter(arg_iter.by_ref()),
+            );
             filled[star_idx] = true;
         } else if provided > total_args {
             // Mirror CPython's `too_many_positional`: when the callable
