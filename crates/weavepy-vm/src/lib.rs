@@ -2600,7 +2600,14 @@ impl Interpreter {
                     | Object::FrozenSet(_)
                     | Object::Instance(_)
                     | Object::Frame(_)
-            ) && Self::is_refcount_dead(&dropped, 1)
+            )
+                // A container of nothing but scalars anchors no tracked
+                // child by inspection, so it can skip both the deadness
+                // test and the traversal — the shape most temporaries
+                // have, and (since tracking such a container is deferred)
+                // the one that reaches here most.
+                && !Self::is_scalar_leaf_container(&dropped)
+                && Self::is_refcount_dead(&dropped, 1)
                 && Self::anchors_tracked_child(&dropped, 6))
             {
                 // A dead plain tuple's allocation is recycled (CPython's
@@ -3815,20 +3822,26 @@ impl Interpreter {
     /// match. A container that is currently borrowed reports `false` so
     /// the caller takes the general path.
     fn is_scalar_leaf_container(obj: &Object) -> bool {
+        // Capped like `anchors_tracked_child`'s node budget: the answer is
+        // an optimisation, never a correctness input, and an unbounded
+        // scan would make dropping a large container O(len) on a path that
+        // runs for every displaced binding.
+        const SCAN_CAP: usize = 64;
         match obj {
             Object::List(l) => l
                 .try_borrow()
-                .map(|v| v.iter().all(gc_trace::is_atomic))
+                .map(|v| v.len() <= SCAN_CAP && v.iter().all(gc_trace::is_atomic))
                 .unwrap_or(false),
             Object::Set(s) => s
                 .try_borrow()
-                .map(|m| m.iter().all(|k| gc_trace::is_atomic(&k.0)))
+                .map(|m| m.len() <= SCAN_CAP && m.iter().all(|k| gc_trace::is_atomic(&k.0)))
                 .unwrap_or(false),
             Object::Dict(d) => d
                 .try_borrow()
                 .map(|m| {
-                    m.iter()
-                        .all(|(k, v)| gc_trace::is_atomic(&k.0) && gc_trace::is_atomic(v))
+                    m.len() <= SCAN_CAP
+                        && m.iter()
+                            .all(|(k, v)| gc_trace::is_atomic(&k.0) && gc_trace::is_atomic(v))
                 })
                 .unwrap_or(false),
             _ => false,

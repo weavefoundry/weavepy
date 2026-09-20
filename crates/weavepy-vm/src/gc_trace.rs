@@ -367,6 +367,26 @@ pub struct GcState {
     /// have happened since the last collection of each
     /// generation.
     counts: RefCell<[usize; N_GENERATIONS]>,
+    /// Lock-free mirror of `counts[0]` and `thresholds[0]`, packed as
+    /// `count << 32 | threshold`. `auto_collect_due` is polled by the
+    /// burst loop's allocation opcodes, where two `RefCell` borrows and
+    /// their guards cost more than the test they guard; both halves are
+    /// small enough that a `u64` holds them without loss on the
+    /// allocation counts any real program reaches.
+    gen0_gauge: AtomicU64,
+    /// Containers born holding only atomic values (see
+    /// [`container_can_cycle`]). They cannot take part in a cycle while
+    /// that holds, so they are not registered with the collector — only
+    /// weakly remembered here, so that a collection can re-examine them
+    /// and promote any that has since acquired a non-atomic element.
+    /// A weak reference never keeps its container alive, so a deferred
+    /// container still dies by refcount exactly when CPython's would.
+    deferred: RefCell<Vec<DeferredContainer>>,
+    /// Length at which [`GcState::sweep_deferred`] compacts `deferred`.
+    /// Re-armed to twice the surviving population after each sweep, so
+    /// the O(live) scan stays amortized O(1) per deferred birth even for
+    /// a program holding millions of scalar lists.
+    deferred_limit: AtomicUsize,
     /// Frozen handles. `gc.freeze()` moves all tracked objects
     /// here; they are skipped by future collections until
     /// `gc.unfreeze()` runs.
@@ -495,6 +515,9 @@ impl GcState {
             collecting: AtomicBool::new(false),
             thresholds: RefCell::new(DEFAULT_THRESHOLDS),
             counts: RefCell::new([0; N_GENERATIONS]),
+            gen0_gauge: AtomicU64::new(DEFAULT_THRESHOLDS[0] as u64),
+            deferred: RefCell::new(Vec::new()),
+            deferred_limit: AtomicUsize::new(DEFERRED_FLOOR),
             frozen: RefCell::new(Vec::new()),
             garbage: RefCell::new(Vec::new()),
             callbacks: RefCell::new(Vec::new()),
@@ -663,6 +686,101 @@ impl GcState {
     /// Track `obj` for cycle detection. Idempotent — if `obj`
     /// is already tracked, this is a no-op.
     pub fn track(&self, obj: Object) {
+        // A container holding only atomic values cannot anchor a cycle
+        // yet, so it stays off the GC's books (and out of the prompt-reap
+        // cascade that every tracked death pays) until it holds something
+        // that could close one. `defer_container` keeps a weak reference
+        // so the next collection can promote it first.
+        if !container_can_cycle(&obj) && self.defer_container(&obj) {
+            return;
+        }
+        self.track_now(obj);
+    }
+
+    /// Remember `obj` weakly instead of tracking it. Returns `false` when
+    /// the kind has no weak form (the caller tracks it as before).
+    ///
+    /// A deferred birth does not advance the gen-0 allocation counter.
+    /// That counter paces automatic collections against the rate cyclic
+    /// garbage can appear, and nothing deferred here can be part of a
+    /// cycle. Counting the births and repaying them at the next sweep
+    /// instead made the counter sawtooth: a `[i, i]` loop under the JIT,
+    /// whose drops the native driver releases in batches, went from 1
+    /// automatic collection to 59. A population that genuinely
+    /// accumulates is paced by `DEFERRED_CAP` instead.
+    fn defer_container(&self, obj: &Object) -> bool {
+        let Some(weak) = DeferredContainer::new(obj) else {
+            return false;
+        };
+        let over = {
+            let Ok(mut deferred) = self.deferred.try_borrow_mut() else {
+                // A sweep is already walking the list (it upgrades and can
+                // re-enter through a promotion). Track eagerly rather than
+                // queue onto a list we cannot touch.
+                return false;
+            };
+            deferred.push(weak);
+            deferred.len() >= self.deferred_limit.load(Ordering::Relaxed)
+        };
+        if over {
+            self.sweep_deferred(false);
+        }
+        true
+    }
+
+    /// Re-examine the deferred containers: drop the ones that have died,
+    /// and hand the collector every one that has since acquired a
+    /// non-atomic element — `promote_all` forces the handover even for
+    /// those still holding only scalars (`gc.get_objects`, which must
+    /// enumerate them the way CPython does).
+    ///
+    /// Every edge of a reference cycle points at a container, so a cycle
+    /// member always holds a non-atomic value and is always promoted
+    /// here. Running this before a collection's mark phase is therefore
+    /// enough for the collector to see every cycle it would have seen
+    /// with eager tracking.
+    fn sweep_deferred(&self, promote_all: bool) {
+        let mut promote: Vec<Object> = Vec::new();
+        {
+            let Ok(mut deferred) = self.deferred.try_borrow_mut() else {
+                return;
+            };
+            deferred.retain(|entry| {
+                let Some(obj) = entry.upgrade() else {
+                    return false;
+                };
+                if promote_all || container_can_cycle(&obj) {
+                    promote.push(obj);
+                    return false;
+                }
+                true
+            });
+            let live = deferred.len();
+            if live >= DEFERRED_CAP {
+                // The set has stopped being a churn buffer: hand it all
+                // over, so these allocations resume pacing collections.
+                promote.extend(deferred.drain(..).filter_map(|e| e.upgrade()));
+            }
+            self.deferred_limit.store(
+                DEFERRED_FLOOR.max(deferred.len().saturating_mul(2)),
+                Ordering::Relaxed,
+            );
+        }
+        for obj in promote {
+            self.track_now(obj);
+        }
+    }
+
+    /// Hand every deferred container to the collector. For the reflective
+    /// APIs, which must enumerate the same population CPython does.
+    pub fn promote_all_deferred(&self) {
+        self.sweep_deferred(true);
+    }
+
+    /// [`Self::track`] without the deferral filter: register `obj` with the
+    /// collector unconditionally. For objects the caller has already decided
+    /// must be tracked (a promoted deferral, `gc.is_tracked`, `gc.get_objects`).
+    pub fn track_now(&self, obj: Object) {
         let new_id = id_of(&obj);
         {
             let mut index = self.index.borrow_mut();
@@ -710,18 +828,7 @@ impl GcState {
         }
         self.tracked_count.fetch_add(1, Ordering::AcqRel);
         self.tracked_version.fetch_add(1, Ordering::AcqRel);
-        self.bump_count(0);
-        // Crossing the young threshold schedules the automatic collection
-        // for the next safe point: not every allocation site polls
-        // `maybe_auto_collect` itself (`MAKE_FUNCTION`, `list(it)`, …).
-        let crossed = {
-            let counts = self.counts.borrow();
-            let thresholds = self.thresholds.borrow();
-            thresholds[0] != 0 && counts[0] == thresholds[0]
-        };
-        if crossed && self.is_enabled() {
-            crate::hot_gates::set(crate::hot_gates::GC_DUE);
-        }
+        self.note_gen0_alloc();
     }
 
     /// Stop tracking `obj`. Used by the cycle-clearing path
@@ -757,6 +864,7 @@ impl GcState {
         {
             let mut counts = self.counts.borrow_mut();
             counts[0] = counts[0].saturating_sub(1);
+            self.sync_gen0_gauge(counts[0], None);
         }
         // Drop the finalizable-index entry in lock-step with the main index so
         // the cheap prompt-finalization scan never sees a reclaimed object.
@@ -1310,7 +1418,15 @@ impl GcState {
 
     /// Number of tracked objects in each generation.
     pub fn counts(&self) -> [usize; N_GENERATIONS] {
-        *self.counts.borrow()
+        // A deferred container is an allocation an eagerly-tracking build
+        // would have counted, so report it as one: drop the ones that have
+        // died, then add those still live. `gc.get_count()` and
+        // `_testinternalcapi.get_tracked_heap_size()` then read exactly as
+        // they would have (`test_gc.test_heap_size`).
+        self.sweep_deferred(false);
+        let mut counts = *self.counts.borrow();
+        counts[0] = counts[0].saturating_add(self.deferred.borrow().len());
+        counts
     }
 
     pub fn thresholds(&self) -> [usize; N_GENERATIONS] {
@@ -1319,6 +1435,7 @@ impl GcState {
 
     pub fn set_thresholds(&self, t: [usize; N_GENERATIONS]) {
         *self.thresholds.borrow_mut() = t;
+        self.sync_gen0_gauge(self.counts.borrow()[0], Some(t[0]));
     }
 
     pub fn enable(&self) {
@@ -1336,6 +1453,34 @@ impl GcState {
     pub fn bump_count(&self, gen: usize) {
         let mut counts = self.counts.borrow_mut();
         counts[gen] = counts[gen].saturating_add(1);
+        if gen == 0 {
+            self.sync_gen0_gauge(counts[0], None);
+        }
+    }
+
+    /// Account one gen-0 allocation and, on crossing `threshold0`,
+    /// schedule the automatic collection for the next safe point — not
+    /// every allocation site polls `maybe_auto_collect` itself
+    /// (`MAKE_FUNCTION`, `list(it)`, …).
+    fn note_gen0_alloc(&self) {
+        self.bump_count(0);
+        let gauge = self.gen0_gauge.load(Ordering::Relaxed);
+        let threshold = gauge & 0xffff_ffff;
+        if threshold != 0 && (gauge >> 32) == threshold && self.is_enabled() {
+            crate::hot_gates::set(crate::hot_gates::GC_DUE);
+        }
+    }
+
+    /// Republish the gen-0 gauge after a write to `counts[0]` or
+    /// `thresholds[0]` (see the field docs).
+    #[inline]
+    fn sync_gen0_gauge(&self, count: usize, threshold: Option<usize>) {
+        let th = match threshold {
+            Some(t) => t as u64,
+            None => self.gen0_gauge.load(Ordering::Relaxed) & 0xffff_ffff,
+        };
+        self.gen0_gauge
+            .store(((count as u64) << 32) | th, Ordering::Relaxed);
     }
 
     /// Threshold-driven automatic collection (CPython's `gc_alloc`
@@ -1353,9 +1498,9 @@ impl GcState {
         if !self.is_enabled() || self.collecting.load(Ordering::Acquire) {
             return false;
         }
-        let counts = self.counts.borrow();
-        let thresholds = self.thresholds.borrow();
-        thresholds[0] != 0 && counts[0] >= thresholds[0]
+        let gauge = self.gen0_gauge.load(Ordering::Relaxed);
+        let threshold = gauge & 0xffff_ffff;
+        threshold != 0 && (gauge >> 32) >= threshold
     }
 
     pub fn maybe_auto_collect(&self) -> bool {
@@ -1402,6 +1547,9 @@ impl GcState {
     /// Snapshot all tracked objects. Used by
     /// `gc.get_objects(generation=...)`.
     pub fn snapshot(&self, generation: Option<usize>) -> Vec<Object> {
+        // `gc.get_objects()` enumerates every container CPython tracks,
+        // including the all-scalar ones whose tracking we defer.
+        self.promote_all_deferred();
         let gens = self.generations.borrow();
         let mut out = Vec::new();
         match generation {
@@ -1484,6 +1632,11 @@ impl GcState {
     /// [`Self::collect_generation`]'s `weakref_only` discussion. The
     /// re-entrancy guard applies, so this is a no-op inside a collection.
     pub fn fire_dead_weakrefs(&self) {
+        // Promote any deferred container that can now anchor a cycle, so
+        // the mark phase below sees the whole candidate population
+        // (see `sweep_deferred`). Before the re-entrancy claim: promotion
+        // calls `track_now`, which a collection in progress must not see.
+        self.sweep_deferred(false);
         // Atomic claim (see `collect_impl`): even a mark-only pass mutates
         // the shared `gc_refs` counters, so it must not overlap a real
         // collection on another thread.
@@ -1514,6 +1667,11 @@ impl GcState {
     ///   suite (`test_set`'s mutation stress) re-scanned the entire accumulated
     ///   tracked set several times per trigger and blew the time budget.
     fn collect_impl(&self, upto: usize, exact: bool) -> usize {
+        // Promote any deferred container that can now anchor a cycle, so
+        // the mark phase below sees the whole candidate population
+        // (see `sweep_deferred`). Before the re-entrancy claim: promotion
+        // calls `track_now`, which a collection in progress must not see.
+        self.sweep_deferred(false);
         // Atomic claim — a plain load-then-store gate let two threads both
         // observe `false` and run *overlapping* collections over the shared
         // heap. Each phase-3 walk then subtracted the same internal edges
@@ -1601,6 +1759,7 @@ impl GcState {
             if gen + 1 < N_GENERATIONS {
                 counts[gen + 1] = counts[gen + 1].saturating_add(1);
             }
+            self.sync_gen0_gauge(counts[0], None);
         }
         // The tracked-id filter only ever gains bits; once most of them
         // name objects long gone, rebuild it from the live index (a full
@@ -3293,6 +3452,49 @@ pub fn is_atomic(obj: &Object) -> bool {
 /// this is CPython's container-untracking optimization applied at
 /// construction time, and it keeps numeric/string-heavy workloads off
 /// the GC's books entirely.
+/// The smallest deferral population worth compacting: below this, the
+/// sweep's fixed cost outweighs what it reclaims.
+const DEFERRED_FLOOR: usize = 4096;
+
+/// How many containers may stay deferred at once. Past this the sweep
+/// hands the whole set to the collector, which both bounds the weak
+/// references parked here and restores the allocation pacing a program
+/// that *accumulates* scalar containers would otherwise lose:
+/// `test_gc.test_bug1055820c` grows a list of empty lists and requires a
+/// collection to trigger within 10000 appends.
+const DEFERRED_CAP: usize = 4096;
+
+/// A weak reference to a container whose tracking is deferred (see
+/// [`GcState::deferred`]). One variant per container kind rather than a
+/// weak `Object`, because `Object`'s payload `Arc` is what has to stay
+/// weak — holding the `Object` itself would pin the container alive.
+enum DeferredContainer {
+    List(std::sync::Weak<crate::RefCell<Vec<Object>>>),
+    Dict(std::sync::Weak<crate::RefCell<crate::object::DictData>>),
+    Set(std::sync::Weak<crate::RefCell<crate::object::SetData>>),
+}
+
+impl DeferredContainer {
+    /// A weak handle on `obj`, or `None` for a kind that is never deferred.
+    fn new(obj: &Object) -> Option<Self> {
+        match obj {
+            Object::List(l) => Some(Self::List(crate::Rc::downgrade(l))),
+            Object::Dict(d) => Some(Self::Dict(crate::Rc::downgrade(d))),
+            Object::Set(s) => Some(Self::Set(crate::Rc::downgrade(s))),
+            _ => None,
+        }
+    }
+
+    /// The container, if it is still alive.
+    fn upgrade(&self) -> Option<Object> {
+        match self {
+            Self::List(w) => w.upgrade().map(Object::List),
+            Self::Dict(w) => w.upgrade().map(Object::Dict),
+            Self::Set(w) => w.upgrade().map(Object::Set),
+        }
+    }
+}
+
 fn container_can_cycle(obj: &Object) -> bool {
     match obj {
         Object::List(l) => l

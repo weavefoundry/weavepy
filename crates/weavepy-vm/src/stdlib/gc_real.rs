@@ -506,6 +506,18 @@ fn object_is_tracked(target: &Object) -> bool {
             inst.ensure_gc_tracked();
             gc_trace::with_state(|s| s.is_tracked(id_of(target)))
         }
+        // A list/dict/set born holding only scalars has its tracking
+        // deferred; CPython tracks it from birth, so answer as CPython
+        // does and hand it to the collector from here on.
+        Object::List(_) | Object::Dict(_) | Object::Set(_) => {
+            let id = id_of(target);
+            gc_trace::with_state(|s| {
+                if !s.is_tracked(id) {
+                    s.track_now(target.clone());
+                }
+                s.is_tracked(id)
+            })
+        }
         other => {
             let id = id_of(other);
             gc_trace::with_state(|s| s.is_tracked(id))
