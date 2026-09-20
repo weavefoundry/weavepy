@@ -56554,9 +56554,6 @@ pub(crate) fn percent_format_with(
     mode: PercentMode,
     resolve: &mut dyn FnMut(&Object, char) -> Result<Option<String>, RuntimeError>,
 ) -> Result<String, RuntimeError> {
-    // Presized: the result is the template plus the rendered arguments,
-    // and growing from empty memmoved it two or three times per format.
-    let mut out = String::with_capacity(template.len() + 16);
     let bytes = template.as_bytes();
     let mut i = 0;
     let mut idx = 0usize;
@@ -56587,6 +56584,21 @@ pub(crate) fn percent_format_with(
             &scratch
         }
     };
+    // Presized from the arguments actually supplied. A fixed guess
+    // (`template.len() + 16`) still reallocated for anything with a
+    // string argument of its own — `"%s #%d" % (s[:40], i)` grew twice —
+    // and each growth memmoves what is already there.
+    let mut out = String::with_capacity(
+        template.len()
+            + positional
+                .iter()
+                .map(|o| match o {
+                    Object::Str(s) => s.len(),
+                    Object::Float(_) => 24,
+                    _ => 20,
+                })
+                .sum::<usize>(),
+    );
     while i < bytes.len() {
         if bytes[i] == b'%' {
             i += 1;
@@ -56717,6 +56729,13 @@ pub(crate) fn percent_format_with(
                 || precision.is_some();
             if kind == '%' {
                 if had_modifier {
+                    // CPython fetches the argument before it judges the
+                    // conversion character, so a modified `%` with the
+                    // arguments already exhausted reports the shortage
+                    // (`'%+%' % ()` is a TypeError, not a ValueError).
+                    if mapping_key.is_none() && idx >= positional.len() {
+                        return Err(type_error("not enough arguments for format string"));
+                    }
                     return Err(unsupported_format_char('%', kind_index));
                 }
                 out.push('%');
@@ -56831,8 +56850,12 @@ pub(crate) fn percent_format_with(
                 spec.push_str(&width);
             }
             if let Some(p) = precision {
-                spec.push('.');
-                spec.push_str(&p);
+                // `%c` ignores a precision, as CPython's does
+                // (`'%5.0c' % (66,)` is `'    B'`); width still applies.
+                if kind != 'c' {
+                    spec.push('.');
+                    spec.push_str(&p);
+                }
             }
             spec.push(kind);
             let rendered = match kind {
@@ -57480,7 +57503,18 @@ fn apply_format_spec_inner(
     // 'X'." before the type switch would report an unknown code
     // (test_long.test__format__ checks `,s`).
     if let Some(sep) = parsed.grouping {
-        let ty = parsed.type_char;
+        // A `str` value's *default* presentation type is `s`, which groups
+        // with neither separator — CPython's `unicode__format__` passes
+        // `'s'` as the default type, so `'{:,}'.format('abc')` is rejected
+        // exactly like `'{:,s}'` is.
+        let ty = parsed.type_char.or_else(|| {
+            let str_valued = matches!(value, Object::Str(_) | Object::WStr(_))
+                || matches!(
+                    value.native_value(),
+                    Some(Object::Str(_) | Object::WStr(_))
+                );
+            str_valued.then_some('s')
+        });
         let rejected = match sep {
             ',' => !matches!(
                 ty,

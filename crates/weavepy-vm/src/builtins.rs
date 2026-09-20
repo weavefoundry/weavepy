@@ -11218,25 +11218,28 @@ fn str_replace_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
     if count == 0 {
         return Ok(str_result(args, s.into_owned()));
     }
-    let out = if count < 0 {
-        s.replace(from, to)
-    } else if from.is_empty() {
-        // `str::replacen` with an empty pattern matches between every
-        // char and at both ends, same as CPython.
-        let mut out = String::new();
+    let out = if from.is_empty() {
+        // An empty pattern matches between every char and at both ends,
+        // same as CPython.
+        let limit = if count < 0 { i64::MAX } else { count };
+        let mut out = String::with_capacity(s.len() + to.len() * (s.len() + 1));
         let mut done = 0i64;
-        for (i, ch) in s.chars().enumerate() {
-            let _ = i;
-            if done < count {
+        for ch in s.chars() {
+            if done < limit {
                 out.push_str(to);
                 done += 1;
             }
             out.push(ch);
         }
-        if done < count {
+        if done < limit {
             out.push_str(to);
         }
         out
+    } else if count < 0 {
+        // Not `substr_find`'s loop: `replace` scans the whole haystack,
+        // where the two-way searcher's one-off preprocessing amortizes
+        // and beats a memchr candidate scan (measured: 3385 -> 3631).
+        s.replace(from, to)
     } else {
         s.replacen(from, to, count as usize)
     };
