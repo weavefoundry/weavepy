@@ -3495,24 +3495,41 @@ impl DeferredContainer {
     }
 }
 
+/// An element that cannot route a cycle back out of the container
+/// holding it: an atomic value, or an instance whose own tracking is
+/// still deferred — which by that deferral's invariant holds nothing but
+/// atomic values itself, so `container -> instance -> scalars` is as far
+/// as the chain goes. The first non-atomic store into such an instance
+/// tracks it, and the sweep then re-reads its holders and promotes them.
+#[inline]
+fn element_is_inert(obj: &Object) -> bool {
+    match obj {
+        Object::Instance(i) => i.is_gc_deferred(),
+        other => is_atomic(other),
+    }
+}
+
 fn container_can_cycle(obj: &Object) -> bool {
     match obj {
         Object::List(l) => l
             .try_borrow()
-            .map(|v| v.iter().any(|x| !is_atomic(x)))
+            .map(|v| v.iter().any(|x| !element_is_inert(x)))
             .unwrap_or(true),
         Object::Set(s) => s
             .try_borrow()
-            .map(|m| m.iter().any(|k| !is_atomic(&k.0)))
+            .map(|m| m.iter().any(|k| !element_is_inert(&k.0)))
             .unwrap_or(true),
         Object::Dict(d) => d
             .try_borrow()
-            .map(|m| m.iter().any(|(k, v)| !is_atomic(&k.0) || !is_atomic(v)))
+            .map(|m| {
+                m.iter()
+                    .any(|(k, v)| !element_is_inert(&k.0) || !element_is_inert(v))
+            })
             .unwrap_or(true),
         // A tuple can only anchor a cycle through a non-atomic element. An
         // empty or all-scalar tuple (the interned `()`, `(1, 2)`, …) can never
         // close one, so it stays off the GC's books.
-        Object::Tuple(t) => t.iter().any(|x| !is_atomic(x)),
+        Object::Tuple(t) => t.iter().any(|x| !element_is_inert(x)),
         // Any other container kind: be conservative and track.
         _ => true,
     }
