@@ -10530,7 +10530,14 @@ impl Interpreter {
         let len = stack.len();
         // A `**kwargs` callee's dict: the keywords it collects, in call
         // order (always a fresh dict, empty when none).
-        let mut varkw: Option<DictData> = code.has_varkeywords.then(DictData::default);
+        let mut varkw: Option<DictData> = code.has_varkeywords.then(|| {
+            // One slot per keyword that actually lands in `**kwargs`, so
+            // the table never rehashes while the call fills it.
+            let collected = (0..kwc)
+                .filter(|j| (perm >> (4 * j)) & 0xF == specialize::KW_TO_VARKW)
+                .count();
+            DictData::with_capacity_and_hasher(collected, Default::default())
+        });
         for (j, v) in stack.drain(len - kwc..).enumerate() {
             let nibble = (perm >> (4 * j)) & 0xF;
             if nibble == specialize::KW_TO_VARKW {
@@ -15624,6 +15631,42 @@ impl Interpreter {
                     last = pc;
                     pc += 1;
                 }
+                OpCode::BuildMap => {
+                    // Like the full handler's dict, but only for keys whose
+                    // hash and equality are native: anything else could run
+                    // Python from inside the table probe, which the burst
+                    // forbids. That covers the literal shapes — `str` and
+                    // `int` keys — which is what a dict literal almost
+                    // always is.
+                    let n = ins.arg as usize;
+                    let Some(split) = stack.len().checked_sub(2 * n) else {
+                        break;
+                    };
+                    if crate::stdlib::tracemalloc_real::is_tracking()
+                        || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+                        || gc_trace::auto_collect_due()
+                        || !(0..n).all(|j| {
+                            matches!(
+                                stack[split + 2 * j],
+                                Object::Str(_) | Object::Int(_) | Object::Bool(_) | Object::None
+                            )
+                        })
+                    {
+                        break;
+                    }
+                    let mut d = DictData::with_capacity_and_hasher(n, Default::default());
+                    for j in 0..n {
+                        let k = std::mem::replace(&mut stack[split + 2 * j], Object::Unbound);
+                        let v = std::mem::replace(&mut stack[split + 2 * j + 1], Object::Unbound);
+                        d.insert(DictKey(k), v);
+                    }
+                    stack.truncate(split);
+                    let obj = Object::Dict(Rc::new(RefCell::new(d)));
+                    gc_trace::track(obj.clone());
+                    stack.push(obj);
+                    last = pc;
+                    pc += 1;
+                }
                 OpCode::CopyTop => {
                     let n = (ins.arg as usize).max(1);
                     let len = stack.len();
@@ -19922,19 +19965,25 @@ impl Interpreter {
             OpCode::BuildMap => {
                 let n = ins.arg as usize;
                 let split = frame.stack.len().saturating_sub(2 * n);
-                let pairs = frame.stack.split_off(split);
-                let mut d = DictData::default();
-                let mut it = pairs.into_iter();
-                for _ in 0..n {
-                    let k = it.next().ok_or_else(|| {
-                        RuntimeError::Internal("BUILD_MAP missing key".to_owned())
-                    })?;
-                    let v = it.next().ok_or_else(|| {
-                        RuntimeError::Internal("BUILD_MAP missing value".to_owned())
-                    })?;
-                    builtins::ensure_dict_key(&k)?;
-                    crate::object::key_cmp_scope(|| d.insert(DictKey(k), v))?;
+                // Sized for the literal's own keys: a table grown from
+                // empty rehashes on the way to `n`, which was a fifth of
+                // the cost of building a one-key dict. The pairs are moved
+                // off the stack in place — `split_off`'s vector was a
+                // second allocation per literal.
+                let mut d = DictData::with_capacity_and_hasher(n, Default::default());
+                let mut outcome = Ok(());
+                for j in 0..n {
+                    let k = std::mem::replace(&mut frame.stack[split + 2 * j], Object::Unbound);
+                    let v = std::mem::replace(&mut frame.stack[split + 2 * j + 1], Object::Unbound);
+                    outcome = builtins::ensure_dict_key(&k)
+                        .and_then(|()| crate::object::key_cmp_scope(|| d.insert(DictKey(k), v)))
+                        .map(|_| ());
+                    if outcome.is_err() {
+                        break;
+                    }
                 }
+                frame.stack.truncate(split);
+                outcome?;
                 let obj = Object::Dict(Rc::new(RefCell::new(d)));
                 self.record_alloc(&obj);
                 // CPython tracks dicts at creation; track unconditionally so a
@@ -54692,6 +54741,7 @@ static SLOW_LEAF_OPS: [bool; 256] = {
         OpCode::ContainsOp,
         OpCode::BinarySubscr,
         OpCode::BuildList,
+        OpCode::BuildMap,
         OpCode::BuildString,
         OpCode::BuildTuple,
         OpCode::Call,

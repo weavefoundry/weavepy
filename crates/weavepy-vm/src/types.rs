@@ -1812,6 +1812,32 @@ enum SlotData {
 }
 
 #[cfg(target_pointer_width = "64")]
+/// `stored == name` for a slot name, without the call into `memcmp`.
+/// Slot names are short (`_data`, `_head`, `x`) and almost always differ
+/// in the first byte or the length, so the libc call — a PLT stub, a
+/// dispatch on size and a return — costs more than the comparison it
+/// performs. `collections.deque` reads three slots per operation, which
+/// put `memcmp` at 8% of `deque_ops`.
+#[inline(always)]
+fn slot_name_eq(stored: &str, name: &str) -> bool {
+    let (a, b) = (stored.as_bytes(), name.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    if a.len() > 16 {
+        // Past a couple of words the library routine's vector loop wins.
+        return a == b;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 impl SlotStorage {
     /// Storage holding exactly `entries` (distinct `str` keys, in slot
     /// order), built in one step.
@@ -1902,7 +1928,7 @@ impl SlotStorage {
             SlotData::Small(entries) => entries
                 .iter()
                 .position(
-                    |(key, _)| matches!(&key.0, Object::Str(stored) if stored.as_ref() == name),
+                    |(key, _)| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
                 )
                 .map(|index| index as u32),
             SlotData::Many(table) => table
@@ -1911,7 +1937,7 @@ impl SlotStorage {
             SlotData::Fixed { layout, .. } => layout
                 .iter()
                 .position(
-                    |key| matches!(&key.0, Object::Str(stored) if stored.as_ref() == name),
+                    |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
                 )
                 .map(|index| index as u32),
         }
@@ -1946,15 +1972,15 @@ impl SlotStorage {
             SlotData::Single {
                 key: Some(DictKey(Object::Str(stored))),
                 value,
-            } if stored.as_ref() == name => Some(value),
+            } if slot_name_eq(stored.as_ref(), name) => Some(value),
             SlotData::Small(entries) => entries.iter().find_map(|(key, value)| {
-                matches!(&key.0, Object::Str(stored) if stored.as_ref() == name).then_some(value)
+                matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)).then_some(value)
             }),
             SlotData::Many(table) => table.get(&crate::object::StrKey(name)),
             SlotData::Fixed { layout, values } => layout
                 .iter()
                 .position(
-                    |key| matches!(&key.0, Object::Str(stored) if stored.as_ref() == name),
+                    |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
                 )
                 .and_then(|i| values.get(i)),
             _ => None,
@@ -1968,7 +1994,7 @@ impl SlotStorage {
     pub fn get_hinted(&self, idx: usize, name: &str) -> Option<&Object> {
         if let Some((DictKey(Object::Str(stored)), value)) = self.get_index(idx) {
             // Interned names usually share the probe's storage.
-            if std::ptr::eq(stored.as_ptr(), name.as_ptr()) || stored.as_ref() == name {
+            if std::ptr::eq(stored.as_ptr(), name.as_ptr()) || slot_name_eq(stored.as_ref(), name) {
                 return Some(value);
             }
         }
@@ -1980,7 +2006,7 @@ impl SlotStorage {
     pub fn get_hinted_mut(&mut self, idx: usize, name: &str) -> Option<&mut Object> {
         let at_hint = matches!(
             self.get_index(idx),
-            Some((DictKey(Object::Str(stored)), _)) if stored.as_ref() == name
+            Some((DictKey(Object::Str(stored)), _)) if slot_name_eq(stored.as_ref(), name)
         );
         if at_hint {
             return self.get_index_mut(idx).map(|(_, v)| v);
@@ -1994,15 +2020,15 @@ impl SlotStorage {
             SlotData::Single {
                 key: Some(DictKey(Object::Str(stored))),
                 value,
-            } if stored.as_ref() == name => Some(value),
+            } if slot_name_eq(stored.as_ref(), name) => Some(value),
             SlotData::Small(entries) => entries.iter_mut().find_map(|(key, value)| {
-                matches!(&key.0, Object::Str(stored) if stored.as_ref() == name).then_some(value)
+                matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)).then_some(value)
             }),
             SlotData::Many(table) => table.get_mut(&crate::object::StrKey(name)),
             SlotData::Fixed { layout, values } => layout
                 .iter()
                 .position(
-                    |key| matches!(&key.0, Object::Str(stored) if stored.as_ref() == name),
+                    |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
                 )
                 .and_then(|i| values.get_mut(i)),
             _ => None,
@@ -2046,10 +2072,10 @@ impl SlotStorage {
             SlotData::Single {
                 key: Some(DictKey(Object::Str(stored))),
                 value: slot,
-            } if stored.as_ref() == name => return Some(std::mem::replace(slot, value)),
+            } if slot_name_eq(stored.as_ref(), name) => return Some(std::mem::replace(slot, value)),
             SlotData::Small(entries) => {
                 if let Some((_, slot)) = entries.iter_mut().find(
-                    |(key, _)| matches!(&key.0, Object::Str(stored) if stored.as_ref() == name),
+                    |(key, _)| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
                 ) {
                     return Some(std::mem::replace(slot, value));
                 }
@@ -2092,7 +2118,7 @@ impl SlotStorage {
     pub fn remove(&mut self, name: &str) -> Option<Object> {
         self.unfix();
         match &mut self.data {
-            SlotData::Single { key, value } if matches!(key.as_ref(), Some(DictKey(Object::Str(stored))) if stored.as_ref() == name) =>
+            SlotData::Single { key, value } if matches!(key.as_ref(), Some(DictKey(Object::Str(stored))) if slot_name_eq(stored.as_ref(), name)) =>
             {
                 *key = None;
                 Some(std::mem::replace(value, Object::None))
@@ -2100,7 +2126,7 @@ impl SlotStorage {
             SlotData::Small(entries) => entries
                 .iter()
                 .position(
-                    |(key, _)| matches!(&key.0, Object::Str(stored) if stored.as_ref() == name),
+                    |(key, _)| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
                 )
                 .map(|index| entries.remove(index).1),
             SlotData::Many(table) => table.shift_remove(&crate::object::StrKey(name)),
@@ -2779,7 +2805,7 @@ mod slot_storage_tests {
             let name = format!("slot{}", 2 * index + 1);
             assert_eq!(slots.index_of(&name), Some(index));
             let (key, value) = slots.get_index_mut(index as usize).unwrap();
-            assert!(matches!(&key.0, Object::Str(stored) if stored.as_ref() == name));
+            assert!(matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)));
             *value = Object::Int(100 + i64::from(index));
             assert_eq!(
                 slots.get(&name).and_then(Object::as_i64),
