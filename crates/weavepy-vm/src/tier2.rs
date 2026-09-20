@@ -4721,6 +4721,10 @@ unsafe extern "C" fn wpjit_str_method(
     let Some(m) = weavepy_jit::StrMethod::from_raw(method) else {
         return CallStatus::Reject as i64;
     };
+    // The interpreter calls the same builtin body through its own leaf
+    // table, with no argument marshaling: a loop whose work is `str`
+    // methods belongs to tier-1 (see `wpjit_poll`'s density judgment).
+    ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
     let recv = match ctx.pins.get(recv_pin as usize) {
         Some(Pin::Obj(o @ Object::Str(_))) => o.clone(),
         _ => return CallStatus::Reject as i64,

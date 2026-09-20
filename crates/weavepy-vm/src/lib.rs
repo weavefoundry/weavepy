@@ -16626,6 +16626,7 @@ impl Interpreter {
                 methods,
                 range_ty: bt.range_.clone(),
                 list_ty: bt.list_.clone(),
+                str_ty: bt.str_.clone(),
             }
         })
     }
@@ -16637,6 +16638,19 @@ impl Interpreter {
     #[inline]
     fn leaf_type_call(&self, ty: &Rc<TypeObject>, args: &[Object]) -> Option<Object> {
         let fns = self.leaf_fns();
+        if Rc::ptr_eq(ty, &fns.str_ty) {
+            // `str(x)` of a native scalar is its text: no `__str__`
+            // lookup, no instance, no constructor protocol.
+            return match args {
+                [Object::Str(_)] => Some(args[0].clone()),
+                [Object::Int(n)] => {
+                    Some(Object::from_str(itoa::Buffer::new().format(*n)))
+                }
+                [Object::Bool(b)] => Some(Object::from_static(if *b { "True" } else { "False" })),
+                [Object::None] => Some(Object::from_static("None")),
+                _ => None,
+            };
+        }
         if Rc::ptr_eq(ty, &fns.range_ty) {
             let (start, stop, step) = match args {
                 [Object::Int(stop)] => (0, *stop as i128, 1),
@@ -53735,6 +53749,9 @@ struct LeafFns {
     /// argument shapes construct directly.
     range_ty: Rc<TypeObject>,
     list_ty: Rc<TypeObject>,
+    /// The builtin `str` type: `str(x)` of a native scalar renders
+    /// without the constructor protocol.
+    str_ty: Rc<TypeObject>,
     /// `(receiver variant, name, method)` for `LOAD_METHOD_ATTR` on a
     /// builtin receiver.
     methods: Vec<(LeafRecv, &'static str, Rc<crate::object::BuiltinFn>)>,
@@ -56394,26 +56411,38 @@ pub(crate) fn percent_format_with(
     mode: PercentMode,
     resolve: &mut dyn FnMut(&Object, char) -> Result<Option<String>, RuntimeError>,
 ) -> Result<String, RuntimeError> {
-    let mut out = String::new();
+    // Presized: the result is the template plus the rendered arguments,
+    // and growing from empty memmoved it two or three times per format.
+    let mut out = String::with_capacity(template.len() + 16);
     let bytes = template.as_bytes();
     let mut i = 0;
     let mut idx = 0usize;
-    let positional: Vec<Object> = match value {
-        Object::Tuple(items) => items.to_vec(),
+    // The common case borrows the argument tuple; everything else owns a
+    // one-element pack (`scratch`).
+    let scratch: Vec<Object>;
+    let positional: &[Object] = match value {
+        Object::Tuple(items) => &items[..],
         // A mapping serves dual duty (CPython `PyUnicode_Format`): `%(k)s`
         // subscripts it, while a bare `%s` consumes the mapping itself as
         // the single positional argument (`'%s' % {'a': 1}` renders the
         // dict).
-        Object::Dict(_) => vec![value.clone()],
+        Object::Dict(_) => {
+            scratch = vec![value.clone()];
+            &scratch
+        }
         // A *tuple subclass* spreads as the argument pack too (CPython
         // PyTuple_Check) — namedtuple's `repr_fmt % self` depends on it.
         Object::Instance(_) if matches!(value.native_value(), Some(Object::Tuple(_))) => {
-            match value.native_value() {
+            scratch = match value.native_value() {
                 Some(Object::Tuple(items)) => items.to_vec(),
                 _ => unreachable!(),
-            }
+            };
+            &scratch
         }
-        other => vec![other.clone()],
+        other => {
+            scratch = vec![other.clone()];
+            &scratch
+        }
     };
     while i < bytes.len() {
         if bytes[i] == b'%' {
@@ -56598,6 +56627,24 @@ pub(crate) fn percent_format_with(
                 idx += 1;
                 v
             };
+            // The plain conversions — no flags, no width, no precision —
+            // render straight into the output: `'%s #%d'` would otherwise
+            // build a format spec, run the `str.format` engine and copy
+            // the rendered piece twice.
+            if flags.is_empty() && width.is_empty() && precision.is_none() {
+                match (kind, &item) {
+                    ('s', Object::Str(text)) if mode == PercentMode::Str => {
+                        out.push_str(text);
+                        continue;
+                    }
+                    ('d' | 'i' | 'u', Object::Int(n)) => {
+                        let mut buf = itoa::Buffer::new();
+                        out.push_str(buf.format(*n));
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             let mut spec = String::new();
             // `%`-formatting right-aligns by default for *every* type — even
             // strings, unlike the `str.format` mini-language implemented by
