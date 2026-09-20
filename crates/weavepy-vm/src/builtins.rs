@@ -10850,24 +10850,53 @@ fn split_maxsplit(o: Option<&Object>) -> Result<i64, RuntimeError> {
 /// `maxsplit`. Leading/trailing whitespace is stripped and empty fields
 /// are dropped, matching CPython (Py_UNICODE_ISSPACE, which covers
 /// U+001C..U+001F unlike Rust's `char::is_whitespace`).
+/// Which ASCII bytes [`crate::unicode_case::is_space`] accepts, derived
+/// from it so the two can never disagree. The byte scan below is what
+/// makes whitespace splitting cheap on the ASCII text it almost always
+/// gets: `str::split(char_predicate)` decodes every character.
+fn ascii_space_table() -> &'static [bool; 128] {
+    static TABLE: std::sync::OnceLock<[bool; 128]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|i| crate::unicode_case::is_space(i as u8 as char)))
+}
+
 fn str_split_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
     use crate::unicode_case::is_space;
-    if maxsplit < 0 {
-        return s
-            .split(is_space)
-            .filter(|f| !f.is_empty())
-            .map(|s| Object::Str(SharedStr::from(s)))
-            .collect();
+    // Presized: `collect()` over a filtered split carries no size hint,
+    // so the vector grew several times for a sentence-length string.
+    let mut out = Vec::with_capacity((s.len() / 8).min(64) + 1);
+    let limit = if maxsplit < 0 { i64::MAX } else { maxsplit };
+    let mut splits = 0i64;
+    if str_is_ascii_cached(s) {
+        let table = ascii_space_table();
+        let b = s.as_bytes();
+        let mut i = 0;
+        loop {
+            while i < b.len() && table[b[i] as usize] {
+                i += 1;
+            }
+            if i == b.len() {
+                break;
+            }
+            if splits >= limit {
+                out.push(Object::Str(SharedStr::from(&s[i..])));
+                break;
+            }
+            let start = i;
+            while i < b.len() && !table[b[i] as usize] {
+                i += 1;
+            }
+            out.push(Object::Str(SharedStr::from(&s[start..i])));
+            splits += 1;
+        }
+        return out;
     }
-    let mut out = Vec::new();
     let mut rest = s;
-    let mut splits = 0;
     loop {
         rest = rest.trim_start_matches(is_space);
         if rest.is_empty() {
             break;
         }
-        if splits >= maxsplit {
+        if splits >= limit {
             out.push(Object::Str(SharedStr::from(rest)));
             break;
         }
@@ -11352,6 +11381,40 @@ pub(crate) fn substr_rfind(hay: &str, needle: &str) -> Option<usize> {
     }
 }
 
+/// Non-overlapping occurrences of `needle` in `hay` (`str.count`), with
+/// [`substr_find`]'s memchr-backed candidate scan. The two-way
+/// searcher's *scan* — not just its setup — was 46% of an
+/// `s.count("fox")` loop.
+pub(crate) fn substr_count(hay: &str, needle: &str) -> usize {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    if n.is_empty() || n.len() > 16 || h.len() < n.len() {
+        return hay.matches(needle).count();
+    }
+    let last_start = h.len() - n.len();
+    let Some(first) = needle.chars().next() else {
+        return 0;
+    };
+    let step = first.len_utf8();
+    let mut count = 0;
+    let mut i = 0;
+    while i <= last_start {
+        let Some(off) = hay[i..].find(first) else {
+            break;
+        };
+        let at = i + off;
+        if at > last_start {
+            break;
+        }
+        if h[at..at + n.len()] == *n {
+            count += 1;
+            i = at + n.len();
+        } else {
+            i = at + step;
+        }
+    }
+    count
+}
+
 fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("find", args, 1, 3)?;
     let s = str_self(args)?;
@@ -11680,17 +11743,25 @@ fn str_count(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(p) => p,
         None => return Err(type_error("count() expected str")),
     };
-    let total_chars = str_char_len(s) as i64;
+    // One ASCII probe for the whole call, as `str.find` does.
+    let ascii = str_is_ascii_cached(s);
+    let total_chars = if ascii { s.len() as i64 } else { str_char_len(s) as i64 };
     let Some((start, end)) = str_search_window(args, total_chars) else {
         return Ok(Object::Int(0));
     };
-    let start_byte = char_offset_to_byte(s, start as usize);
-    let end_byte = char_offset_to_byte(s, end as usize);
+    let (start_byte, end_byte) = if ascii {
+        ((start as usize).min(s.len()), (end as usize).min(s.len()))
+    } else {
+        (
+            char_offset_to_byte(s, start as usize),
+            char_offset_to_byte(s, end as usize),
+        )
+    };
     // An empty needle matches at every code-point boundary (CPython counts
     // `len+1`); Rust's `matches("")` already yields that, but on the bridged
     // string each PUA char is one boundary, matching code-point semantics.
     Ok(Object::Int(
-        s[start_byte..end_byte].matches(&*sub).count() as i64
+        substr_count(&s[start_byte..end_byte], &sub) as i64
     ))
 }
 
