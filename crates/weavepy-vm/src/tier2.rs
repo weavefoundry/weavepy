@@ -2529,7 +2529,12 @@ fn attr_fingerprint_obj(
     // resolve the staged pin); RFC 0071 WS6 — exact `str`/`bytes`
     // values take the read lanes; anything else must be a scalar.
     let lane = match v {
-        Object::Instance(_) | Object::None => JitType::Obj,
+        // A `list`/`dict` attribute pins exactly like an instance one —
+        // the value is pinned at the load and the guard re-validates the
+        // lane per access — and an object-holding attribute is very
+        // common (`self.constraints`, `self.cache`). Without this the
+        // site stayed fully dynamic.
+        Object::Instance(_) | Object::None | Object::List(_) | Object::Dict(_) => JitType::Obj,
         Object::Str(_) => JitType::Str,
         Object::Bytes(_) => JitType::Bytes,
         _ => scalar_lane(v)?,
