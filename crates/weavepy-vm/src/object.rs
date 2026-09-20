@@ -1184,16 +1184,17 @@ pub fn empty_cells_ref() -> &'static Rc<Vec<Rc<RefCell<Object>>>> {
 /// it. Refreshes `back` on already-materialised entries too, so a
 /// generator frame re-pushed with a stale link is corrected.
 pub fn materialize_stack_at(stack: &FrameStack, idx: usize) -> Option<Rc<PyFrame>> {
-    let shells: Vec<Rc<FrameShell>> = {
-        let s = stack.borrow();
-        if idx >= s.len() {
-            return None;
-        }
-        s[..=idx].to_vec()
-    };
+    // Walked under the spine's own borrow: nothing below runs Python or
+    // touches the stack, and copying the shells out (a `Vec` plus one
+    // reference count per level) was paid by every raise, `sys._getframe`
+    // and traceback entry.
+    let s = stack.borrow();
+    if idx >= s.len() {
+        return None;
+    }
     let mut back: Option<Rc<PyFrame>> = None;
     let mut refreshed = false;
-    for shell in &shells {
+    for shell in &s[..=idx] {
         let existing = shell.materialized.borrow().clone();
         let py = match existing {
             Some(py) => {

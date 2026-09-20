@@ -546,6 +546,11 @@ pub struct TypeObject {
     /// only for instances without a native payload). A stale version
     /// recomputes. See `object::instance_has_custom_eq`.
     pub eq_kind: Cell<u64>,
+    /// Memoised exception-family membership for this type's MRO (see
+    /// `Interpreter::build_exception_instance`), packed as
+    /// `attr_version << 10 | flags << 1 | 1`; `0` = not yet computed.
+    /// Every exception construction asked the MRO for nine names.
+    pub exc_families: Cell<u64>,
     /// Memoised instantiation plan (`type(…)` call protocol resolution:
     /// `__new__`/`__init__`/native-payload classification), stamped with
     /// the [`Self::attr_version`] observed when it was built. Rebuilt
@@ -934,6 +939,7 @@ impl TypeObject {
             attr_version: AttrVersion::fresh(),
             has_del: Cell::new(0),
             eq_kind: Cell::new(0),
+            exc_families: Cell::new(0),
             instance_plan: RefCell::new(None),
             c_tp_name: crate::sync::RefCell::new(None),
             c_sq_item: Cell::new(false),

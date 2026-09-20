@@ -666,15 +666,18 @@ impl GcState {
         let new_id = id_of(&obj);
         {
             let mut index = self.index.borrow_mut();
-            if index.contains_key(&new_id) {
-                return;
-            }
+            // One probe decides the dedupe and the insert (this runs for
+            // every function, list and dict born).
+            let entry = match index.entry(new_id) {
+                std::collections::hash_map::Entry::Occupied(_) => return,
+                std::collections::hash_map::Entry::Vacant(e) => e,
+            };
             // RFC 0065 (WS4): publish to the miss-filter *before* the
             // insert becomes observable (we hold the index borrow, so
             // no prober can race past a fresh registration).
             TRACKED_FILTER.insert(new_id);
             let handle = Arc::new(TrackedHandle::new(obj, 0));
-            index.insert(new_id, handle.clone());
+            entry.insert(handle.clone());
             // Enroll finalizable objects in the dedicated prompt-finalization
             // index so the per-safe-point sweep scans only them, not the whole
             // tracked population.
@@ -699,7 +702,12 @@ impl GcState {
         // must start *un*-finalized, so drop any stale entry — otherwise
         // `gc.is_finalized(new_obj)` would inherit the previous tenant's
         // finalized flag (`test_is_finalized`).
-        self.finalized_ids.borrow_mut().remove(&new_id);
+        // Almost always empty (only `__del__`-bearing objects ever land
+        // there), and the borrow plus hash would otherwise be paid by
+        // every tracked birth.
+        if !self.finalized_ids.borrow().is_empty() {
+            self.finalized_ids.borrow_mut().remove(&new_id);
+        }
         self.tracked_count.fetch_add(1, Ordering::AcqRel);
         self.tracked_version.fetch_add(1, Ordering::AcqRel);
         self.bump_count(0);

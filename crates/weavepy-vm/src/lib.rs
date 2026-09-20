@@ -5960,7 +5960,14 @@ impl Interpreter {
             // a prologue input changed. The observer snapshot refresh
             // rides the same generation (observer mutation bumps it).
             let lgen = crate::hot_gates::loop_gen();
+            // The frame object's holder (a live traceback, a
+            // `sys._getframe` handle) is re-probed on a stride, not per
+            // instruction: the probe reads a cell and a reference count,
+            // and an exception handler paid it for every instruction it
+            // ran. A few extra instructions on the full path after the
+            // holder goes away cost far less.
             let rederive = frame_blocks_quiet
+                && self.gil_countdown & 0xF == 0
                 && !Self::frame_object_observed(&shell, &py_frame_slot, frame);
             if lgen != loop_snap_gen || rederive {
                 loop_snap_gen = lgen;
@@ -7216,12 +7223,18 @@ impl Interpreter {
         if !shell.has_materialized.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
         }
-        let Some(py) = shell.materialized.borrow().clone() else {
+        // Borrowed, not cloned: this runs per instruction while a
+        // traceback holds the frame object, and the clone's own count
+        // would be two more atomics each time.
+        let Ok(cell) = shell.materialized.try_borrow() else {
+            return true;
+        };
+        let Some(py) = cell.as_ref() else {
             return false;
         };
-        let own = 2 + usize::from(slot.as_ref().is_some_and(|s| Rc::ptr_eq(s, &py)))
-            + usize::from(frame.py_frame.as_ref().is_some_and(|p| Rc::ptr_eq(p, &py)));
-        Rc::strong_count(&py) > own
+        let own = 1 + usize::from(slot.as_ref().is_some_and(|s| Rc::ptr_eq(s, py)))
+            + usize::from(frame.py_frame.as_ref().is_some_and(|p| Rc::ptr_eq(p, py)));
+        Rc::strong_count(py) > own
     }
 
     fn ensure_top_py_frame(&self, slot: &mut Option<Rc<PyFrame>>) -> Rc<PyFrame> {
@@ -12788,6 +12801,78 @@ impl Interpreter {
                     last = pc;
                     pc += 1;
                 }
+                // A closure read (`__class__` for zero-argument `super()`,
+                // any captured name): the cell's value, cloned.
+                OpCode::LoadDeref => {
+                    if len == cap {
+                        break None;
+                    }
+                    let Some(cell) = frame.cells.get(ins.arg as usize) else {
+                        break Some(CoreExit::Helper);
+                    };
+                    let Ok(v) = cell.try_borrow() else {
+                        break Some(CoreExit::Helper);
+                    };
+                    if matches!(*v, Object::Unbound) {
+                        break Some(CoreExit::Helper);
+                    }
+                    let c = Self::clone_operand(&v);
+                    drop(v);
+                    // SAFETY: `len < cap`.
+                    unsafe { base.add(len).write(c) };
+                    len += 1;
+                    last = pc;
+                    pc += 1;
+                }
+                // Zero-argument `super().name` of a plain method later in
+                // the receiver's MRO, in the elided-method shape the
+                // `CALL` folds `self` into (the helper's arm, without
+                // leaving the core loop). Stack (top-down): self, class,
+                // the `super` global.
+                OpCode::LoadSuperAttr => {
+                    if ins.arg & 2 != 0 || len < 3 {
+                        break Some(CoreExit::Helper);
+                    }
+                    // SAFETY: `len >= 3`.
+                    let (g, cls_obj, self_obj) = unsafe {
+                        (
+                            &*base.add(len - 3),
+                            &*base.add(len - 2),
+                            &*base.add(len - 1),
+                        )
+                    };
+                    if !is_super_callable(g)
+                        || !Self::core_droppable(g)
+                        || !Self::core_droppable(cls_obj)
+                    {
+                        break Some(CoreExit::Helper);
+                    }
+                    let Some(f) =
+                        Self::leaf_load_super_attr(code, cls_obj, self_obj, pc as u32, ins.arg >> 2)
+                    else {
+                        break Some(CoreExit::Helper);
+                    };
+                    // SAFETY: all three operands leave the stack; the two
+                    // released ones were checked droppable, and `self`
+                    // moves into the shape the `CALL` expects.
+                    unsafe {
+                        let self_v = base.add(len - 1).read();
+                        drop_hot(base.add(len - 2).read());
+                        drop_hot(base.add(len - 3).read());
+                        if ins.arg & 1 != 0 {
+                            base.add(len - 3).write(Object::Function(f));
+                            base.add(len - 2).write(self_v);
+                            len -= 1;
+                        } else {
+                            base.add(len - 3).write(Object::BoundMethod(Rc::new(
+                                BoundMethod::new(self_v, Object::Function(f)),
+                            )));
+                            len -= 2;
+                        }
+                    }
+                    last = pc;
+                    pc += 1;
+                }
                 // The method-form load's per-site function (the helper's
                 // `leaf_load_method` / class-receiver hits): an instance
                 // receiver moves up into the self slot under the function;
@@ -17052,6 +17137,16 @@ impl Interpreter {
         if !Self::default_getattribute(cls) {
             return None;
         }
+        // A dunder read *through an instance* stays on the full path:
+        // some builtin receivers intercept attribute access below
+        // `__getattribute__` (a `super` proxy resolves `__init__` in the
+        // MRO *after* its own class), where the class-MRO answer the
+        // class cache holds would be wrong. `__new__` keeps its historic
+        // exception.
+        let name = code.names.get(name_idx as usize)?;
+        if name.len() > 4 && name.starts_with("__") && name != "__new__" {
+            return None;
+        }
         let on_class = match Self::leaf_class_attr(code, &cls, name_idx)? {
             LeafAttr::InstanceOnly => None,
             // A data descriptor: the instance dict never shadows it.
@@ -17103,10 +17198,15 @@ impl Interpreter {
             return None;
         }
         let name = code.names.get(name_idx as usize)?.as_str();
-        // Dunders may be intercepted by `type`'s own descriptors; `__new__`
-        // is the exception worth knowing (`type.__new__` is not a data
-        // descriptor, so the class MRO's own wins).
-        let kind = if name.starts_with("__") && name != "__new__" {
+        // Dunders may be intercepted by `type`'s own descriptors — but
+        // only the ones `type` carries as *data* descriptors (`__dict__`,
+        // `__name__`, `__mro__`, …). Where its entry is a plain method
+        // (`type.__init__`) or absent, the class MRO's own resolution
+        // wins, exactly as `__new__` does.
+        let kind = if name.starts_with("__")
+            && name != "__new__"
+            && !Self::type_dunder_transparent(name)
+        {
             K::Other
         } else {
             let found = if name == "__new__" {
@@ -17218,6 +17318,17 @@ impl Interpreter {
             // path (it reports as a method descriptor, not a function).
             LeafAttr::InstanceOnly | LeafAttr::BuiltinMethod(_) | LeafAttr::Property(_) => None,
         }
+    }
+
+    /// Whether a class attribute read of dunder `name` resolves in the
+    /// class's own MRO rather than the metaclass. Deliberately a short
+    /// list: `type` carries data descriptors for most dunders
+    /// (`__dict__`, `__name__`, `__text_signature__`, …), and the full
+    /// path serves several more from outside its dict, so only the one
+    /// the explicit-base-call idiom needs is admitted here (`__new__`
+    /// keeps its own exception at the call site).
+    fn type_dunder_transparent(name: &str) -> bool {
+        name == "__init__"
     }
 
     /// Whether `cls`'s metaclass is `type` itself.
@@ -20321,15 +20432,16 @@ impl Interpreter {
                 // Stamp __module__ from globals['__name__'] (mirrors CPython's
                 // function dispatch). Pickle relies on this to serialise the
                 // function by qualified name.
+                let keys = fn_slot_keys();
                 if let Some(name_obj) = frame
                     .globals
                     .borrow()
-                    .get(&DictKey(Object::from_static("__name__")))
+                    .get(&DictKey(keys[1].clone()))
                     .cloned()
                 {
                     slots
                         .borrow_mut()
-                        .insert(DictKey(Object::from_static("__module__")), name_obj);
+                        .insert(DictKey(keys[0].clone()), name_obj);
                 }
                 // Pin __name__ and __qualname__ as stable objects so
                 // repeated `func.__name__` reads (and delegated reads
@@ -20337,21 +20449,26 @@ impl Interpreter {
                 // *same* object — CPython exposes these as slots with
                 // stable identity, which `assertIs(wrapper.__name__,
                 // func.__name__)` in test_decorators relies on.
-                let name_obj = Object::from_str(name.clone());
-                slots
-                    .borrow_mut()
-                    .insert(DictKey(Object::from_static("__name__")), name_obj.clone());
-                // `__qualname__` is the code object's PEP 3155 dotted name
-                // (computed at compile time from lexical nesting), not the
-                // bare `__name__`. Pinned as a stable object like `__name__`.
-                slots.borrow_mut().insert(
-                    DictKey(Object::from_static("__qualname__")),
-                    Object::from_str(code.qualname.clone()),
-                );
-                if let Some(ann) = annotations_obj {
-                    slots
-                        .borrow_mut()
-                        .insert(DictKey(Object::from_static("__annotations__")), ann);
+                // Both come from the code object (see
+                // `CodeConstObjects::fn_names`), so two functions made
+                // from one `def` share them exactly as CPython's do.
+                let (name_obj, qualname_obj) = match code_vm_ext(&code) {
+                    Some(t) => (t.fn_names.0.clone(), t.fn_names.1.clone()),
+                    None => (
+                        Object::from_str(name.clone()),
+                        Object::from_str(code.qualname.clone()),
+                    ),
+                };
+                {
+                    let mut sl = slots.borrow_mut();
+                    sl.insert(DictKey(keys[1].clone()), name_obj);
+                    // `__qualname__` is the code object's PEP 3155 dotted
+                    // name (computed at compile time from lexical
+                    // nesting), not the bare `__name__`.
+                    sl.insert(DictKey(keys[2].clone()), qualname_obj);
+                    if let Some(ann) = annotations_obj {
+                        sl.insert(DictKey(keys[3].clone()), ann);
+                    }
                 }
                 let f = PyFunction {
                     name,
@@ -43388,7 +43505,7 @@ impl Interpreter {
         // paths already prepend `cls` explicitly, so unwrapping the
         // staticmethod there keeps them working unchanged.
         {
-            let key = DictKey(Object::from_static("__new__"));
+            let key = DictKey(dunder_key(1).clone());
             let current = ty.dict.borrow().get(&key).cloned();
             if let Some(Object::Function(f)) = current {
                 ty.dict.borrow_mut().insert(
@@ -44039,7 +44156,7 @@ impl Interpreter {
                 if ty
                     .dict
                     .borrow()
-                    .contains_key(&DictKey(Object::from_static("__new__")))
+                    .contains_key(&DictKey(dunder_key(1).clone()))
                 {
                     trusted = ty.name == "object" || ty.flags.is_builtin;
                     break;
@@ -45067,29 +45184,11 @@ impl Interpreter {
         // FileNotFoundError, …), mirroring CPython's `oserror_new` errnomap
         // dispatch. User subclasses of OSError are left untouched.
         let cls = remap_oserror_to_subclass(cls, args);
-        // The exception families that shape construction, found in one
-        // pass over the MRO.
-        let families: Vec<&'static str> = cls
-            .mro
-            .borrow()
-            .iter()
-            .filter_map(|t| {
-                [
-                    "StopIteration",
-                    "OSError",
-                    "BlockingIOError",
-                    "SystemExit",
-                    "SyntaxError",
-                    "ImportError",
-                    "UnicodeEncodeError",
-                    "UnicodeDecodeError",
-                    "UnicodeTranslateError",
-                ]
-                .into_iter()
-                .find(|n| *n == t.name)
-            })
-            .collect();
-        let mro_has = |name: &str| families.contains(&name);
+        // The exception families that shape construction, memoised per
+        // class against its attribute version (the MRO walk compared
+        // nine names per entry on every construction).
+        let families = exc_family_flags(&cls);
+        let mro_has = |name: &str| families & exc_family_bit(name) != 0;
         let is_stop_iteration = mro_has("StopIteration");
         let inst = PyInstance::new(cls.clone());
         // `OSError(errno, strerror, ...)` keeps only the first two
@@ -55032,6 +55131,19 @@ fn is_stop_async_iteration_obj(o: &Object) -> bool {
     false
 }
 
+/// A dunder key interned once: `Object::from_static` allocates its text
+/// and leaves the hash to be recomputed at every probe, which the MRO
+/// walks below pay per class.
+fn dunder_key(which: usize) -> &'static Object {
+    static KEYS: std::sync::OnceLock<[Object; 2]> = std::sync::OnceLock::new();
+    &KEYS.get_or_init(|| {
+        [
+            crate::stdlib::sys::intern_name("__init__"),
+            crate::stdlib::sys::intern_name("__new__"),
+        ]
+    })[which]
+}
+
 /// Walk `cls`'s MRO until we hit `BaseException` (exclusive). If any
 /// class in that prefix carries its own `__init__`, return it.
 /// Otherwise the caller can stick with the cheap `args`-only setup.
@@ -55042,7 +55154,7 @@ fn lookup_exception_init(cls: &Rc<TypeObject>) -> Option<Object> {
             return None;
         }
         let dict = ty.dict.borrow();
-        if let Some(init) = dict.get(&DictKey(Object::from_static("__init__"))) {
+        if let Some(init) = dict.get(&DictKey(dunder_key(0).clone())) {
             // Introspection-only default `__init__` entries (the docs
             // surface pass mirrors `BaseException.__init__` into every
             // built-in exception dict, RFC 0056 WS4) don't count as a
@@ -55064,7 +55176,7 @@ fn init_is_from_object(cls: &Rc<TypeObject>) -> bool {
     let mro = cls.mro.borrow();
     for ty in mro.iter() {
         let dict = ty.dict.borrow();
-        if let Some(init) = dict.get(&DictKey(Object::from_static("__init__"))) {
+        if let Some(init) = dict.get(&DictKey(dunder_key(0).clone())) {
             // Surface-only mirrors of the default `__init__` don't count
             // as overrides (RFC 0056 WS4).
             if crate::descr_registry::is_surface_only(init) {
@@ -58732,6 +58844,11 @@ struct CodeConstObjects {
     /// Whether this code is a *pure leaf* (see [`code_is_pure_leaf`]):
     /// `0` not yet decided, `1` no, `2` yes.
     pure_leaf: std::sync::atomic::AtomicU8,
+    /// The code object's own `__name__` / `__qualname__` as Python
+    /// strings, built once: every function made from this code shares
+    /// them, as CPython's `PyFunction_New` shares `co_name` and
+    /// `co_qualname`.
+    fn_names: (Object, Object),
     /// Per-instruction fused-pair kinds (see [`code_fast_pairs`]): `1`
     /// at a `LOAD_FAST` whose successor is another `LOAD_FAST`, `2` when
     /// it is a `STORE_FAST`, `0` everywhere else. CPython's compiler
@@ -59405,6 +59522,10 @@ fn code_vm_ext(code: &CodeObject) -> Option<&CodeConstObjects> {
                 .iter()
                 .map(|n| crate::stdlib::sys::intern_name(n))
                 .collect(),
+            fn_names: (
+                crate::stdlib::sys::intern_name(&code.name),
+                Object::from_str(code.qualname.clone()),
+            ),
             method_slots: std::sync::OnceLock::new(),
             stamp_slots: std::sync::OnceLock::new(),
             attr_poly: std::sync::OnceLock::new(),
@@ -59469,6 +59590,62 @@ fn code_names_anywhere(code: &CodeObject, name: &str) -> bool {
     }
     code.names.iter().any(|n| n == name)
         || code.constants.iter().any(|c| constant_mentions(c, name))
+}
+
+/// The function getset-slot keys, interned once: a fresh
+/// `Object::from_static` would allocate the text and recompute its hash
+/// at every `MAKE_FUNCTION`.
+fn fn_slot_keys() -> &'static [Object; 4] {
+    static KEYS: std::sync::OnceLock<[Object; 4]> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        [
+            crate::stdlib::sys::intern_name("__module__"),
+            crate::stdlib::sys::intern_name("__name__"),
+            crate::stdlib::sys::intern_name("__qualname__"),
+            crate::stdlib::sys::intern_name("__annotations__"),
+        ]
+    })
+}
+
+/// The exception families `build_exception_instance` branches on, as
+/// bits (see [`exc_family_flags`]).
+const EXC_FAMILIES: [&str; 9] = [
+    "StopIteration",
+    "OSError",
+    "BlockingIOError",
+    "SystemExit",
+    "SyntaxError",
+    "ImportError",
+    "UnicodeEncodeError",
+    "UnicodeDecodeError",
+    "UnicodeTranslateError",
+];
+
+/// `name`'s bit in an [`exc_family_flags`] set (`0` for a name that is
+/// not a family — never asked in practice).
+#[inline]
+fn exc_family_bit(name: &str) -> u16 {
+    match EXC_FAMILIES.iter().position(|n| *n == name) {
+        Some(i) => 1 << i,
+        None => 0,
+    }
+}
+
+/// Which exception families `cls` inherits from, memoised on the type
+/// against its attribute version (an MRO reshape bumps it).
+fn exc_family_flags(cls: &crate::types::TypeObject) -> u16 {
+    let ver = cls.attr_version.get();
+    let memo = cls.exc_families.get();
+    if memo & 1 != 0 && memo >> 10 == ver {
+        return ((memo >> 1) & 0x1FF) as u16;
+    }
+    let mut flags = 0u16;
+    for t in cls.mro.borrow().iter() {
+        flags |= exc_family_bit(&t.name);
+    }
+    cls.exc_families
+        .set(ver << 10 | u64::from(flags) << 1 | 1);
+    flags
 }
 
 /// The interned `Object::Str` for `co_names[name_idx]`, if the code
