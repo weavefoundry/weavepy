@@ -20400,13 +20400,10 @@ impl Interpreter {
                 // Both come from the code object (see
                 // `CodeConstObjects::fn_names`), so two functions made
                 // from one `def` share them exactly as CPython's do.
-                let (name_obj, qualname_obj) = match code_vm_ext(&code) {
-                    Some(t) => (t.fn_names.0.clone(), t.fn_names.1.clone()),
-                    None => (
-                        Object::from_str(name.clone()),
-                        Object::from_str(code.qualname.clone()),
-                    ),
-                };
+                let (name_obj, qualname_obj) = (
+                    Object::from_str(name.clone()),
+                    Object::from_str(code.qualname.clone()),
+                );
                 {
                     let mut sl = slots.borrow_mut();
                     sl.insert(DictKey(keys[1].clone()), name_obj);
@@ -58792,11 +58789,6 @@ struct CodeConstObjects {
     /// Whether this code is a *pure leaf* (see [`code_is_pure_leaf`]):
     /// `0` not yet decided, `1` no, `2` yes.
     pure_leaf: std::sync::atomic::AtomicU8,
-    /// The code object's own `__name__` / `__qualname__` as Python
-    /// strings, built once: every function made from this code shares
-    /// them, as CPython's `PyFunction_New` shares `co_name` and
-    /// `co_qualname`.
-    fn_names: (Object, Object),
     /// Per-instruction fused-pair kinds (see [`code_fast_pairs`]): `1`
     /// at a `LOAD_FAST` whose successor is another `LOAD_FAST`, `2` when
     /// it is a `STORE_FAST`, `0` everywhere else. CPython's compiler
@@ -59453,7 +59445,36 @@ struct BinderLayout {
 
 #[inline]
 fn code_vm_ext(code: &CodeObject) -> Option<&CodeConstObjects> {
-    let arc = code.vm_ext.0.get_or_init(|| {
+    // The warm read — one acquire load and a cast — is what the dispatch
+    // loop pays per activation, so the table's construction lives out of
+    // line: inlining it here cost 4-7% on call-heavy fixtures.
+    let arc = match code.vm_ext.0.get() {
+        Some(arc) => arc,
+        None => code_vm_ext_init(code),
+    };
+    // RFC 0077 (WS5): the slot has exactly one producer (the initializer
+    // above; `marshal` only ever creates the empty default), so the
+    // `Any::type_id` vtable probe on every constant/name lookup is
+    // replaced by a direct cast. The debug build keeps the checked
+    // downcast as the assertion that the invariant still holds.
+    debug_assert!(arc.downcast_ref::<CodeConstObjects>().is_some());
+    // SAFETY: `get_or_init` only ever stores an `Arc<CodeConstObjects>`
+    // here (no other code writes `vm_ext`), so the erased pointer is a
+    // pointer to a live `CodeConstObjects` for as long as `code` is.
+    // The cast from the erased `dyn Any` pointer to the concrete type is
+    // the whole point (the alignment lint cannot see the invariant).
+    #[allow(clippy::cast_ptr_alignment)]
+    let table = unsafe { &*(std::sync::Arc::as_ptr(arc).cast::<CodeConstObjects>()) };
+    Some(table)
+}
+
+/// [`code_vm_ext`]'s first call for a code object: build the table.
+#[cold]
+#[inline(never)]
+fn code_vm_ext_init(
+    code: &CodeObject,
+) -> &std::sync::Arc<dyn std::any::Any + Send + Sync + 'static> {
+    code.vm_ext.0.get_or_init(|| {
         std::sync::Arc::new(CodeConstObjects {
             objects: code
                 .constants
@@ -59470,10 +59491,6 @@ fn code_vm_ext(code: &CodeObject) -> Option<&CodeConstObjects> {
                 .iter()
                 .map(|n| crate::stdlib::sys::intern_name(n))
                 .collect(),
-            fn_names: (
-                crate::stdlib::sys::intern_name(&code.name),
-                Object::from_str(code.qualname.clone()),
-            ),
             method_slots: std::sync::OnceLock::new(),
             stamp_slots: std::sync::OnceLock::new(),
             attr_poly: std::sync::OnceLock::new(),
@@ -59481,21 +59498,7 @@ fn code_vm_ext(code: &CodeObject) -> Option<&CodeConstObjects> {
             pure_leaf: std::sync::atomic::AtomicU8::new(0),
             fast_pairs: std::sync::OnceLock::new(),
         })
-    });
-    // RFC 0077 (WS5): the slot has exactly one producer (the initializer
-    // above; `marshal` only ever creates the empty default), so the
-    // `Any::type_id` vtable probe on every constant/name lookup is
-    // replaced by a direct cast. The debug build keeps the checked
-    // downcast as the assertion that the invariant still holds.
-    debug_assert!(arc.downcast_ref::<CodeConstObjects>().is_some());
-    // SAFETY: `get_or_init` only ever stores an `Arc<CodeConstObjects>`
-    // here (no other code writes `vm_ext`), so the erased pointer is a
-    // pointer to a live `CodeConstObjects` for as long as `code` is.
-    // The cast from the erased `dyn Any` pointer to the concrete type is
-    // the whole point (the alignment lint cannot see the invariant).
-    #[allow(clippy::cast_ptr_alignment)]
-    let table = unsafe { &*(std::sync::Arc::as_ptr(arc).cast::<CodeConstObjects>()) };
-    Some(table)
+    })
 }
 
 /// The materialized constants for `code`, built on first use. The
