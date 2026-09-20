@@ -32,7 +32,7 @@ use std::cell::UnsafeCell;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -81,7 +81,11 @@ pub struct GilCell<T: ?Sized> {
     /// cross-thread access exclusive, but within a single OS thread
     /// the lock is reentrant — the counter prevents undefined
     /// behaviour on nested `borrow_mut()`.
-    borrow: AtomicIsize,
+    /// 32-bit, and placed next to the 32-bit `depth` below, so the two
+    /// share one word: `GilCell` is embedded by value in every
+    /// instance, list, dict and set, where each word of header is a
+    /// word per object on the heap.
+    borrow: AtomicI32,
     /// The cross-thread reentrant lock, hand-rolled for the hot path.
     /// `0` means unowned; otherwise it holds the owning thread's id
     /// ([`crate::gil::current_thread_id`]). The uncontended borrow —
@@ -91,10 +95,11 @@ pub struct GilCell<T: ?Sized> {
     /// thread-local bookkeeping this replaced, which dominated
     /// interpreter profiles (RFC 0047 wave 5: every `Cell::get` on an
     /// object field paid ~10× the cost of the field read itself).
-    owner: AtomicU64,
     /// Recursion depth. Only ever touched by the thread that owns
-    /// [`Self::owner`], so a plain (unsafe) cell is sound.
+    /// [`Self::owner`], so a plain (unsafe) cell is sound. Declared
+    /// next to `borrow` so the two 32-bit fields share one word.
     depth: UnsafeCell<u32>,
+    owner: AtomicU64,
     /// The guarded payload. Access is gated by holding the owner
     /// lock; the borrow counter rules out aliasing `&mut T` within a
     /// thread. Last field so `T: ?Sized` cells stay layout-legal.
@@ -450,7 +455,7 @@ impl<T> GilCell<T> {
     #[must_use]
     pub const fn new(value: T) -> Self {
         Self {
-            borrow: AtomicIsize::new(0),
+            borrow: AtomicI32::new(0),
             owner: AtomicU64::new(0),
             depth: UnsafeCell::new(0),
             data: UnsafeCell::new(value),
@@ -692,7 +697,7 @@ impl<T: ?Sized> GilCell<T> {
         // counter only checks same-thread reentry, so it needs no atomic
         // read-modify-write or second acquire/release barrier.
         let prev = self.borrow.load(Ordering::Relaxed);
-        if prev < 0 || prev == isize::MAX {
+        if prev < 0 || prev == i32::MAX {
             if locked {
                 self.lock_release();
             }

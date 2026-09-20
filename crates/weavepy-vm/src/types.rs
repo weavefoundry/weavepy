@@ -1800,7 +1800,11 @@ pub struct SlotStorage {
 enum SlotData {
     Single { key: Option<DictKey>, value: Object },
     Small(Vec<(DictKey, Object)>),
-    Many(DictData),
+    /// Boxed: this variant is for instances with more than eight slots,
+    /// and inline it would set the size of *every* instance's slot field
+    /// (a `DictData` is 72 bytes) — `SlotStorage` sits in `PyInstance`
+    /// by value.
+    Many(Box<DictData>),
     /// Every slot of a layout shared across instances (one `Rc` for the
     /// names instead of a key per slot per instance), all populated —
     /// the natively built instances of `datetime`'s classes. Adding or
@@ -1852,7 +1856,7 @@ impl SlotStorage {
                 let mut table =
                     DictData::with_capacity_and_hasher(n, crate::fasthash::FxBuildHasher);
                 table.extend(entries);
-                SlotData::Many(table)
+                SlotData::Many(Box::new(table))
             }
         };
         Self { data }
@@ -2108,7 +2112,7 @@ impl SlotStorage {
                     table.insert(key, previous);
                 }
                 table.insert(make_key(), value);
-                SlotData::Many(table)
+                SlotData::Many(Box::new(table))
             }
             _ => unreachable!("only populated single or small slots need promotion"),
         };
