@@ -16608,6 +16608,7 @@ impl Interpreter {
                         ("split", LeafKind::StrSplit),
                         ("join", LeafKind::StrJoin),
                         ("replace", LeafKind::StrReplace),
+                        ("format", LeafKind::StrFormat),
                     ],
                 ),
             ];
@@ -16910,6 +16911,19 @@ impl Interpreter {
                         3 => matches!(args[1], O::Str(_) | O::None) && leaf_int(&args[2]),
                         _ => false,
                     }
+            }
+            // `"…{}…".format(x, …)`: admitted when every argument
+            // renders without Python dispatch (a `__format__` of an
+            // instance, a subclass's `__str__`) — the template engine
+            // then runs no code at all.
+            K::StrFormat => {
+                leaf_str(&args[0])
+                    && args[1..].iter().all(|a| {
+                        matches!(
+                            a,
+                            O::Str(_) | O::Int(_) | O::Bool(_) | O::Float(_) | O::None
+                        )
+                    })
             }
             K::StrReplace => {
                 (args.len() == 3 || (args.len() == 4 && leaf_int(&args[3])))
@@ -26285,7 +26299,9 @@ impl Interpreter {
             let idx = state.auto_next;
             state.auto_next += 1;
             positional.get(idx).cloned().ok_or_else(|| {
-                index_error("Replacement index out of range for positional args tuple".to_string())
+                index_error(format!(
+                    "Replacement index {idx} out of range for positional args tuple"
+                ))
             })?
         } else if let Ok(idx) = base.parse::<usize>() {
             if state.auto_used {
@@ -53722,6 +53738,7 @@ enum LeafKind {
     StrSplit,
     StrJoin,
     StrReplace,
+    StrFormat,
     /// A registered leaf builtin (see [`leaf_builtins`]): any arguments.
     Opaque,
 }
@@ -56127,7 +56144,7 @@ fn resolve_field_name(
         positional
             .get(idx)
             .cloned()
-            .ok_or_else(|| index_error("Replacement index out of range"))?
+            .ok_or_else(|| index_error(format!("Replacement index {idx} out of range")))?
     } else if let Ok(idx) = base.parse::<usize>() {
         positional
             .get(idx)
@@ -57387,54 +57404,79 @@ fn apply_format_spec_inner(
             Object::Int(i) => format_int(*i, &parsed),
             Object::Bool(b) => format_int(i64::from(*b), &parsed),
             Object::Long(b) => format_bigint(b, &parsed),
-            _ => return Err(value_error("Unknown format code 'd' for non-integer")),
+            _ => {
+                return Err(value_error(format!(
+                    "Unknown format code 'd' for object of type '{}'",
+                    crate::builtins::class_of(value).name
+                )))
+            }
         },
         Some('b') => match value {
             Object::Int(i) => format_int_base(*i, 2, &parsed),
             Object::Bool(b) => format_int_base(i64::from(*b), 2, &parsed),
             Object::Long(b) => format_bigint_base(b, 2, &parsed),
-            _ => return Err(value_error("Unknown format code 'b' for non-integer")),
+            _ => {
+                return Err(value_error(format!(
+                    "Unknown format code 'b' for object of type '{}'",
+                    crate::builtins::class_of(value).name
+                )))
+            }
         },
         Some('o') => match value {
             Object::Int(i) => format_int_base(*i, 8, &parsed),
             Object::Bool(b) => format_int_base(i64::from(*b), 8, &parsed),
             Object::Long(b) => format_bigint_base(b, 8, &parsed),
-            _ => return Err(value_error("Unknown format code 'o' for non-integer")),
+            _ => {
+                return Err(value_error(format!(
+                    "Unknown format code 'o' for object of type '{}'",
+                    crate::builtins::class_of(value).name
+                )))
+            }
         },
         Some('x') => match value {
             Object::Int(i) => format_int_hex(*i, false, &parsed),
             Object::Bool(b) => format_int_hex(i64::from(*b), false, &parsed),
             Object::Long(b) => format_bigint_hex(b, false, &parsed),
-            _ => return Err(value_error("Unknown format code 'x' for non-integer")),
+            _ => {
+                return Err(value_error(format!(
+                    "Unknown format code 'x' for object of type '{}'",
+                    crate::builtins::class_of(value).name
+                )))
+            }
         },
         Some('X') => match value {
             Object::Int(i) => format_int_hex(*i, true, &parsed),
             Object::Bool(b) => format_int_hex(i64::from(*b), true, &parsed),
             Object::Long(b) => format_bigint_hex(b, true, &parsed),
-            _ => return Err(value_error("Unknown format code 'X' for non-integer")),
+            _ => {
+                return Err(value_error(format!(
+                    "Unknown format code 'X' for object of type '{}'",
+                    crate::builtins::class_of(value).name
+                )))
+            }
         },
         Some('f') | Some('F') => {
-            let f = obj_as_float(value)?;
+            let f = obj_as_float(value, parsed.type_char.unwrap_or('f'))?;
             let prec = parsed.precision.unwrap_or(6);
             format_float_fixed(f, prec, parsed.type_char == Some('F'), &parsed)
         }
         Some('e') => {
-            let f = obj_as_float(value)?;
+            let f = obj_as_float(value, parsed.type_char.unwrap_or('f'))?;
             let prec = parsed.precision.unwrap_or(6);
             format_float_scientific(f, prec, false, &parsed)
         }
         Some('E') => {
-            let f = obj_as_float(value)?;
+            let f = obj_as_float(value, parsed.type_char.unwrap_or('f'))?;
             let prec = parsed.precision.unwrap_or(6);
             format_float_scientific(f, prec, true, &parsed)
         }
         Some('g') | Some('G') => {
-            let f = obj_as_float(value)?;
+            let f = obj_as_float(value, parsed.type_char.unwrap_or('f'))?;
             let prec = parsed.precision.unwrap_or(6).max(1);
             format_float_general(f, prec, parsed.type_char == Some('G'), &parsed)
         }
         Some('%') => {
-            let f = obj_as_float(value)?;
+            let f = obj_as_float(value, parsed.type_char.unwrap_or('f'))?;
             let prec = parsed.precision.unwrap_or(6);
             let body = format_float_fixed(f * 100.0, prec, false, &parsed);
             format!("{body}%")
@@ -57763,11 +57805,19 @@ fn parse_format_spec(spec: &str, type_name: &str) -> Result<ParsedSpec, RuntimeE
     Ok(p)
 }
 
-fn obj_as_float(v: &Object) -> Result<f64, RuntimeError> {
+fn obj_as_float(v: &Object, code: char) -> Result<f64, RuntimeError> {
     match v {
         Object::Float(f) => Ok(*f),
         Object::Int(i) => Ok(*i as f64),
         Object::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
+        // `str.__format__` rejects a numeric code itself, with the same
+        // wording as the integer codes above (CPython
+        // `unicode__format__`); the printf engine's own message for a
+        // non-number is raised by its caller.
+        Object::Str(_) | Object::WStr(_) => Err(value_error(format!(
+            "Unknown format code '{code}' for object of type '{}'",
+            crate::builtins::class_of(v).name
+        ))),
         _ => Err(type_error(format!(
             "unsupported format string passed to {}",
             v.type_name()
