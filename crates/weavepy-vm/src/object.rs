@@ -9427,13 +9427,18 @@ impl Object {
                 Ok(false)
             }
             Object::Str(haystack) => match item {
-                Object::Str(needle) => Ok(haystack.contains(&**needle)),
+                // Short-needle search without the two-way searcher's
+                // per-call preprocessing (see `builtins::substr_find`).
+                Object::Str(needle) => {
+                    Ok(crate::builtins::substr_find(haystack, needle).is_some())
+                }
                 // `"..." in wstr`: a surrogate-bearing needle can never be a
                 // substring of a pure-UTF-8 haystack, so this is always false.
                 Object::WStr(_) => Ok(false),
-                _ => Err(type_error(
-                    "'in <string>' requires string as left operand".to_owned(),
-                )),
+                _ => Err(type_error(format!(
+                    "'in <string>' requires string as left operand, not {}",
+                    item.type_name_owned()
+                ))),
             },
             // Substring search over a surrogate-bearing haystack works on code
             // points so a lone surrogate matches itself.
@@ -9443,9 +9448,10 @@ impl Object {
                     let needle = item.str_codepoints().unwrap();
                     Ok(codepoint_subslice_contains(&hay, &needle))
                 }
-                _ => Err(type_error(
-                    "'in <string>' requires string as left operand".to_owned(),
-                )),
+                _ => Err(type_error(format!(
+                    "'in <string>' requires string as left operand, not {}",
+                    item.type_name_owned()
+                ))),
             },
             Object::Dict(d) => {
                 // `unhashable in {…}` raises TypeError, exactly like a

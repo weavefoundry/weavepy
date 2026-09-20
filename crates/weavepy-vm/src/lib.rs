@@ -16458,6 +16458,15 @@ impl Interpreter {
                 }
                 Some(false)
             }
+            // `sub in s`: a substring search runs no Python — the
+            // needle must be a `str`, and a non-`str` needle's TypeError
+            // belongs to the full handler.
+            Object::Str(hay) => match item {
+                Object::Str(needle) => {
+                    Some(crate::builtins::substr_find(hay, needle).is_some())
+                }
+                _ => None,
+            },
             Object::Dict(_) | Object::Set(_) | Object::FrozenSet(_)
                 if matches!(item, Object::Str(_) | Object::Int(_) | Object::Bool(_) | Object::None) =>
             {

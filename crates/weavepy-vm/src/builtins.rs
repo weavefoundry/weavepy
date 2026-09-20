@@ -11271,6 +11271,84 @@ fn str_search_window(args: &[Object], total_chars: i64) -> Option<(i64, i64)> {
     }
 }
 
+/// `haystack[from..].find(needle)` without the two-way searcher's
+/// preprocessing. `str::find(&str)` builds a critical factorization of
+/// the needle on *every* call — `StrSearcher::new` was 11% of a
+/// `s.find("lazy")` loop — and that only pays for itself on a long
+/// needle or a long search. For a short one, scanning for the first
+/// byte and comparing is what CPython's `stringlib` does.
+///
+/// The naive scan's worst case is quadratic, so a run of failed
+/// candidates that has already cost more than the haystack hands the
+/// rest to the two-way searcher.
+pub(crate) fn substr_find(hay: &str, needle: &str) -> Option<usize> {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    if n.is_empty() {
+        return Some(0);
+    }
+    if n.len() > 16 || h.len() < n.len() {
+        return hay.find(needle);
+    }
+    let last_start = h.len() - n.len();
+    // `str::find(char)` is memchr-backed, so the candidate scan runs at
+    // vector width; the manual byte loop it replaced did not.
+    let first = needle.chars().next()?;
+    let step = first.len_utf8();
+    let mut i = 0;
+    let mut budget = h.len() / n.len() + 32;
+    while i <= last_start {
+        // `i` is always a char boundary — it starts at 0 and advances by
+        // whole characters — but `last_start` is a byte count and need
+        // not be one, so the scan runs to the end and rejects a
+        // candidate with no room for the needle after it.
+        let Some(off) = hay[i..].find(first) else {
+            return None;
+        };
+        let at = i + off;
+        if at > last_start {
+            return None;
+        }
+        if h[at..at + n.len()] == *n {
+            return Some(at);
+        }
+        budget -= 1;
+        if budget == 0 {
+            return hay[at + step..].find(needle).map(|k| k + at + step);
+        }
+        i = at + step;
+    }
+    None
+}
+
+/// [`substr_find`] from the right.
+pub(crate) fn substr_rfind(hay: &str, needle: &str) -> Option<usize> {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    if n.is_empty() {
+        return Some(h.len());
+    }
+    if n.len() > 16 || h.len() < n.len() {
+        return hay.rfind(needle);
+    }
+    let first = n[0];
+    let mut end = h.len() - n.len();
+    let mut budget = h.len() / n.len() + 32;
+    loop {
+        let Some(at) = h[..=end].iter().rposition(|&b| b == first) else {
+            return None;
+        };
+        if at + n.len() <= h.len() && h[at..at + n.len()] == *n {
+            return Some(at);
+        }
+        budget -= 1;
+        if budget == 0 || at == 0 {
+            // Everything right of `at` has been ruled out, so the
+            // rightmost match overall is the rightmost below it.
+            return hay.rfind(needle);
+        }
+        end = at - 1;
+    }
+}
+
 fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("find", args, 1, 3)?;
     let s = str_self(args)?;
@@ -11279,17 +11357,31 @@ fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(p) => p,
         None => return Err(type_error("find() expected str")),
     };
-    let total_chars = str_char_len(s) as i64;
+    // One ASCII probe for the whole call: each of the char/byte
+    // conversions below consults the same thread-local cache, and the
+    // TLS access costs more than the work it guards.
+    let ascii = str_is_ascii_cached(s);
+    let total_chars = if ascii { s.len() as i64 } else { str_char_len(s) as i64 };
     let Some((start, end)) = str_search_window(args, total_chars) else {
         return Ok(Object::Int(-1));
     };
-    let start_byte = char_offset_to_byte(s, start as usize);
-    let end_byte = char_offset_to_byte(s, end as usize);
+    let (start_byte, end_byte) = if ascii {
+        ((start as usize).min(s.len()), (end as usize).min(s.len()))
+    } else {
+        (
+            char_offset_to_byte(s, start as usize),
+            char_offset_to_byte(s, end as usize),
+        )
+    };
     let hay = &s[start_byte..end_byte];
-    match hay.find(&*sub) {
+    match substr_find(hay, &sub) {
         Some(byte_idx) => {
             let abs_byte = byte_idx + start_byte;
-            Ok(Object::Int(byte_offset_to_char(s, abs_byte) as i64))
+            Ok(Object::Int(if ascii {
+                abs_byte as i64
+            } else {
+                byte_offset_to_char(s, abs_byte) as i64
+            }))
         }
         None => Ok(Object::Int(-1)),
     }
@@ -11547,7 +11639,7 @@ fn str_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
     let start_byte = char_offset_to_byte(s, start as usize);
     let end_byte = char_offset_to_byte(s, end as usize);
     let hay = &s[start_byte..end_byte];
-    match hay.rfind(&*sub) {
+    match substr_rfind(hay, &sub) {
         Some(byte_idx) => {
             let abs_byte = byte_idx + start_byte;
             Ok(Object::Int(byte_offset_to_char(s, abs_byte) as i64))
@@ -11609,7 +11701,7 @@ fn str_partition(args: &[Object]) -> Result<Object, RuntimeError> {
     if sep.is_empty() {
         return Err(value_error("empty separator"));
     }
-    let (head, tail) = match s.find(&*sep) {
+    let (head, tail) = match substr_find(s, &sep) {
         Some(i) => (s[..i].to_owned(), s[i + sep.len()..].to_owned()),
         None => {
             return Ok(Object::new_tuple_array([
