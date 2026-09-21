@@ -336,6 +336,24 @@ fn cells_shared() -> bool {
     CELLS_SHARED.load(Ordering::Relaxed)
 }
 
+/// Cells may be reached by a thread that does **not** hold the GIL:
+/// free-threading, or a watchdog that reads interpreter state from
+/// outside it (`faulthandler.dump_traceback_later`).
+///
+/// Deliberately distinct from [`CELLS_SHARED`]. A second *Python* thread
+/// revokes the borrow bias, because two threads then take borrows of the
+/// same cell — but the GIL still serialises them, so a guardless read
+/// between two native operations (see [`GilCell::peek`]) cannot race and
+/// stays available. Conflating the two cost tier-2 every attribute read
+/// in any program that ever started a thread: `peek` returned `None`,
+/// each read deopted, and the compiled code retired on its deopt budget.
+static CELLS_UNGUARDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn cells_unguarded() -> bool {
+    CELLS_UNGUARDED.load(Ordering::Relaxed)
+}
+
 /// The first thread to run VM code (see [`note_vm_thread`]).
 static FIRST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -425,6 +443,9 @@ pub fn note_vm_thread(thread_id: u64) {
 /// Every cell is shared from now on (free-threading, a foreign thread
 /// that may touch objects without the GIL).
 pub fn mark_cells_shared() {
+    // Ordered before the revocation: a thread that observes the bias
+    // gone must also observe that guardless reads are off.
+    CELLS_UNGUARDED.store(true, Ordering::SeqCst);
     revoke_bias();
 }
 
@@ -885,7 +906,7 @@ impl<T: ?Sized> GilCell<T> {
     /// a read-only peek between two instructions.
     #[inline]
     pub unsafe fn peek(&self) -> Option<&T> {
-        if cells_shared() || self.borrow.load(Ordering::Relaxed) < 0 {
+        if cells_unguarded() || self.borrow.load(Ordering::Relaxed) < 0 {
             return None;
         }
         // SAFETY: no exclusive borrow is live (checked above) and the
@@ -905,7 +926,7 @@ impl<T: ?Sized> GilCell<T> {
     #[inline]
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn peek_mut(&self) -> Option<&mut T> {
-        if cells_shared() || self.borrow.load(Ordering::Relaxed) != 0 {
+        if cells_unguarded() || self.borrow.load(Ordering::Relaxed) != 0 {
             return None;
         }
         // SAFETY: no borrow is live (checked above) and the caller keeps
