@@ -4503,7 +4503,8 @@ mod tests {
             .map(|_| Object::Dict(Rc::new(RefCell::new(DictData::default()))))
             .collect();
         for root in &roots {
-            state.track(root.clone());
+            // See `track_and_untrack` on `track_now`.
+            state.track_now(root.clone());
         }
         for (collection, expected) in [(0, 1), (1, 2), (2, 2), (2, 2)] {
             assert_eq!(state.collect(collection), 0);
@@ -4552,7 +4553,10 @@ mod tests {
     fn track_and_untrack() {
         let s = GcState::new();
         let d = Object::Dict(Rc::new(RefCell::new(DictData::default())));
-        s.track(d.clone());
+        // `track_now`, not `track`: an empty dict holds nothing that could
+        // close a cycle, so `track` would defer it (see `defer_container`).
+        // This test is about the index's bookkeeping, not that policy.
+        s.track_now(d.clone());
         assert!(s.is_tracked(id_of(&d)));
         s.untrack_id(id_of(&d));
         assert!(!s.is_tracked(id_of(&d)));
@@ -4585,7 +4589,8 @@ mod tests {
     fn freeze_unfreeze_round_trip() {
         let s = GcState::new();
         let d = Object::Dict(Rc::new(RefCell::new(DictData::default())));
-        s.track(d.clone());
+        // See `track_and_untrack` on `track_now`.
+        s.track_now(d.clone());
         s.freeze_all();
         assert_eq!(s.freeze_count(), 1);
         s.unfreeze_all();
