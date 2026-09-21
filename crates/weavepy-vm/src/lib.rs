@@ -951,6 +951,16 @@ pub struct Interpreter {
 
 impl Default for Interpreter {
     fn default() -> Self {
+        // Register this thread before touching any cell. Construction
+        // populates the *process-global* collector and module cache, and
+        // `GilCell`'s lock-free path is only sound while a single thread
+        // owns every cell — a second thread building its own interpreter
+        // (an embedder, or `cargo test`'s parallel harness) has to flip
+        // cells to shared first, or both take the unlocked path over the
+        // same `GcState` and one loses with `BorrowMutError`. The GIL
+        // acquire path registers for every *later* entry; this covers the
+        // window before a thread has ever held it.
+        crate::sync::note_vm_thread(crate::gil::current_thread_id());
         install_parser_unicode_hook();
         // The UCRT's default response to an invalid parameter (e.g. a CRT
         // call on a stale fd) is a *silent* process fast-fail (exit
@@ -5327,12 +5337,29 @@ impl Interpreter {
         n: usize,
     ) -> Rc<RefCell<Vec<Object>>> {
         debug_assert!(args.len() <= n);
-        if let Some(rc) = self.frame_locals_pool.borrow_mut().pop() {
-            debug_assert_eq!(Rc::strong_count(&rc), 1);
+        // `recycle_frame_allocs` donates a *clone*, so an entry is only
+        // sole-owned once the donating frame is gone — and a generator's
+        // frame outlives its donation, living in the generator's state box
+        // until the generator itself dies. Skip (and drop) any entry still
+        // shared rather than handing out an aliased vector: the write
+        // below goes through a raw pointer and needs sole ownership.
+        let pooled = {
+            let mut pool = self.frame_locals_pool.borrow_mut();
+            loop {
+                match pool.pop() {
+                    Some(rc) if Rc::strong_count(&rc) == 1 => break Some(rc),
+                    // Still shared: our clone is the only thing dropped
+                    // here, so no element destructor runs under the borrow.
+                    Some(_) => (),
+                    None => break None,
+                }
+            }
+        };
+        if let Some(rc) = pooled {
             {
-                // SAFETY: the pool only ever holds sole-owner vectors (see
-                // `recycle_frame_allocs`), so nothing else can reach this
-                // one; the cell lock would guard against no one.
+                // SAFETY: sole owner, re-checked at the pop above, so
+                // nothing else can reach this vector; the cell lock would
+                // guard against no one.
                 let v = unsafe { &mut *rc.as_ptr() };
                 debug_assert!(v.is_empty());
                 v.append(args);
@@ -15670,7 +15697,11 @@ impl Interpreter {
                         break;
                     }
                     let v = stack.pop().expect("length checked above");
-                    let Object::List(lst) = &stack[n - 2 - depth + 1] else {
+                    // `n - 1 - depth`, not `n - 2 - depth + 1`: the latter
+                    // underflows for the smallest admitted shape (`n == 2`,
+                    // `depth == 1`) and only wraps back to the right index
+                    // by accident when overflow checks are off.
+                    let Object::List(lst) = &stack[n - 1 - depth] else {
                         stack.push(v);
                         break;
                     };
