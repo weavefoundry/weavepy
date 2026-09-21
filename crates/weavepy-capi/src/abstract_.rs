@@ -792,12 +792,12 @@ fn do_setattr(o: *mut PyObject, key: &str, value: *mut PyObject) -> c_int {
         }
         Object::Instance(inst) => {
             if value.is_null() {
-                inst.dict
+                inst.dict_cell()
                     .borrow_mut()
                     .shift_remove(&DictKey(Object::from_str(key)));
             } else {
                 let v = unsafe { crate::object::clone_object(value) };
-                inst.dict
+                inst.dict_cell()
                     .borrow_mut()
                     .insert(DictKey(Object::from_str(key)), v);
             }

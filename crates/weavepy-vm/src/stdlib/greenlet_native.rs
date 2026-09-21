@@ -515,7 +515,7 @@ fn ensure_main() -> Rc<GreenletBody> {
     });
     let cls = greenlet_class();
     let inst = Rc::new(PyInstance::new(cls));
-    inst.dict.borrow_mut().insert(
+    inst.dict_cell().borrow_mut().insert(
         DictKey(Object::from_static("_greenlet_id")),
         Object::Int(b.id as i64),
     );
@@ -732,7 +732,7 @@ fn extract_self(args: &[Object]) -> Result<Rc<PyInstance>, RuntimeError> {
 
 fn body_of(inst: &Rc<PyInstance>) -> Result<Rc<GreenletBody>, RuntimeError> {
     let id = {
-        let d = inst.dict.borrow();
+        let d = inst.dict_cell().borrow();
         match d.get(&DictKey(Object::from_static("_greenlet_id"))) {
             Some(Object::Int(i)) => *i as u64,
             _ => return Err(green_error("greenlet was not initialised")),
@@ -742,7 +742,7 @@ fn body_of(inst: &Rc<PyInstance>) -> Result<Rc<GreenletBody>, RuntimeError> {
 }
 
 fn instance_id(inst: &Rc<PyInstance>) -> Option<u64> {
-    let d = inst.dict.borrow();
+    let d = inst.dict_cell().borrow();
     match d.get(&DictKey(Object::from_static("_greenlet_id"))) {
         Some(Object::Int(i)) => Some(*i as u64),
         _ => None,
@@ -805,7 +805,7 @@ fn green_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
         Some(r) => Some(r),
     };
     *b.instance.borrow_mut() = InstanceRef::Weak(Rc::downgrade(&inst));
-    inst.dict.borrow_mut().insert(
+    inst.dict_cell().borrow_mut().insert(
         DictKey(Object::from_static("_greenlet_id")),
         Object::Int(b.id as i64),
     );

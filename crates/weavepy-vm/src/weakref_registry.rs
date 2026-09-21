@@ -173,7 +173,7 @@ impl WeakRefSlot {
             return None;
         }
         let inst = self.py_ref.borrow().as_ref().and_then(Weak::upgrade)?;
-        let mut d = inst.dict.try_borrow_mut().ok()?;
+        let mut d = inst.dict_cell().try_borrow_mut().ok()?;
         match d.get(&StrKey("__callback__")).cloned() {
             None | Some(Object::None) => None,
             Some(cb) => {
@@ -190,7 +190,11 @@ impl WeakRefSlot {
             return None;
         }
         let inst = self.py_ref.borrow().as_ref().and_then(Weak::upgrade)?;
-        let v = inst.dict.borrow().get(&StrKey("__callback__")).cloned();
+        let v = inst
+            .dict_cell()
+            .borrow()
+            .get(&StrKey("__callback__"))
+            .cloned();
         match v {
             None | Some(Object::None) => None,
             v => v,

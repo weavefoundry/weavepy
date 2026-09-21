@@ -1291,6 +1291,11 @@ impl Objects {
         movable: bool,
     ) -> Option<()> {
         if movable && instance.dict.get().is_none() {
+            // The unpickled state holds arbitrary objects, so the
+            // instance can no longer be left untracked; track it before
+            // publishing a dictionary that would bypass the write
+            // barrier (the record is retired with it).
+            instance.ensure_gc_tracked();
             let data = std::mem::take(&mut *state.borrow_mut());
             let interned = data.keys().all(|key| match &key.0 {
                 Object::Str(name) => {
@@ -1302,7 +1307,7 @@ impl Objects {
                 instance.dict.get_or_init(|| Rc::new(RefCell::new(data)));
                 return Some(());
             }
-            let mut attributes = instance.dict.borrow_mut();
+            let mut attributes = instance.dict_cell().borrow_mut();
             attributes.try_reserve(data.len()).ok()?;
             for (key, value) in data {
                 let Object::Str(name) = &key.0 else {
@@ -1314,7 +1319,7 @@ impl Objects {
             return Some(());
         }
         let state = state.borrow();
-        let mut attributes = instance.dict.borrow_mut();
+        let mut attributes = instance.dict_cell().borrow_mut();
         attributes.try_reserve(state.len()).ok()?;
         for (key, value) in state.iter() {
             let Object::Str(name) = &key.0 else {

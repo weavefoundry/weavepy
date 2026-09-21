@@ -10198,7 +10198,7 @@ impl Object {
                     Object::Instance(i) => {
                         let pick = |key: &str| -> Option<String> {
                             if let Some(Object::Str(s)) =
-                                i.dict.borrow().get(&crate::object::StrKey(key))
+                                i.dict_cell().borrow().get(&crate::object::StrKey(key))
                             {
                                 return Some(s.to_string());
                             }

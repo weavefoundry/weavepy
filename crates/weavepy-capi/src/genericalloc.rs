@@ -479,7 +479,7 @@ pub unsafe extern "C" fn PyObject_GenericSetDict(
         Object::Instance(inst) => {
             // Replace contents (we can't replace the Rc since
             // PyInstance::dict is borrowed by reference elsewhere).
-            let mut g = inst.dict.borrow_mut();
+            let mut g = inst.dict_cell().borrow_mut();
             g.clear();
             for (k, v) in new_dict.borrow().iter() {
                 g.insert(k.clone(), v.clone());

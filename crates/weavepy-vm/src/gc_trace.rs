@@ -3354,6 +3354,10 @@ pub fn track_deferred_owner(owner: usize) {
         crate::Rc::increment_strong_count(ptr);
         crate::Rc::from_raw(ptr)
     };
+    // The dict's copy of the record was taken by the caller; clear the
+    // instance's so `is_gc_deferred` stops claiming the collector has
+    // never seen it.
+    inst.deferred.set(false);
     track(Object::Instance(inst));
 }
 

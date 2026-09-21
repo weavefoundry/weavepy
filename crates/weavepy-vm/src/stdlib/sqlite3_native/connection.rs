@@ -245,7 +245,7 @@ fn conn_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
     // the connection unusable rather than pointing at the old database.
     {
         let old = inst
-            .dict
+            .dict_cell()
             .borrow_mut()
             .shift_remove(&DictKey(Object::from_static(HANDLE_KEY)));
         if let Some(Object::Int(h)) = old {
@@ -351,7 +351,7 @@ fn conn_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
 
     let handle = next_handle();
     conn_registry().lock().insert(handle, state);
-    inst.dict.borrow_mut().insert(
+    inst.dict_cell().borrow_mut().insert(
         DictKey(Object::from_static(HANDLE_KEY)),
         Object::Int(handle),
     );
@@ -484,7 +484,7 @@ fn conn_del(args: &[Object]) -> Result<Object, RuntimeError> {
             close_state(&state);
             if let Object::Instance(inst) = obj {
                 let handle = inst
-                    .dict
+                    .dict_cell()
                     .borrow()
                     .get(&DictKey(Object::from_static(HANDLE_KEY)))
                     .cloned();

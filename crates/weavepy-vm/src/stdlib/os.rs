@@ -2695,7 +2695,7 @@ fn os_lstat_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
 fn stat_seq_finish(inst: &crate::types::PyInstance) {
     let mut seq: Vec<Object> = Vec::with_capacity(10);
     {
-        let d = inst.dict.borrow();
+        let d = inst.dict_cell().borrow();
         let get = |f: &'static str| d.get(&DictKey(Object::from_static(f))).cloned();
         for f in [
             "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size",
@@ -2713,7 +2713,7 @@ fn stat_seq_finish(inst: &crate::types::PyInstance) {
     let _ = inst.native.set(Object::new_tuple(seq));
     #[cfg(target_os = "macos")]
     {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         for f in ["st_flags", "st_gen"] {
             let k = DictKey(Object::from_static(f));
             if d.get(&k).is_none() {
@@ -2735,7 +2735,7 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
     use crate::types::PyInstance;
     let ty = stat_result_type();
     let inst = PyInstance::new(ty);
-    let mut d = inst.dict.borrow_mut();
+    let mut d = inst.dict_cell().borrow_mut();
     // On Unix the OS already encodes the full `st_mode` — file-type bits
     // (S_IFREG / S_IFDIR / S_IFCHR / S_IFBLK / S_IFLNK / S_IFIFO / S_IFSOCK)
     // *and* permissions — so use it verbatim; otherwise char/block devices,
@@ -2935,7 +2935,7 @@ fn stat_result_from_libc_stat(st: &libc::stat) -> Object {
     let ty = stat_result_type();
     let inst = PyInstance::new(ty);
     {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         let ns = |s: i64, n: i64| (s as f64) + (n as f64) * 1e-9;
         let atime = ns(st.st_atime as i64, st.st_atime_nsec as i64);
         let mtime = ns(st.st_mtime as i64, st.st_mtime_nsec as i64);
@@ -3558,7 +3558,7 @@ fn scandir_exit(args: &[Object]) -> Result<Object, RuntimeError> {
 const SCANDIR_CLOSED_KEY: &str = "__weavepy_scandir_closed__";
 
 fn scandir_mark_closed(inst: &crate::types::PyInstance) {
-    inst.dict.borrow_mut().insert(
+    inst.dict_cell().borrow_mut().insert(
         DictKey(Object::from_static(SCANDIR_CLOSED_KEY)),
         Object::Bool(true),
     );
@@ -3566,7 +3566,7 @@ fn scandir_mark_closed(inst: &crate::types::PyInstance) {
 
 fn scandir_is_closed(inst: &crate::types::PyInstance) -> bool {
     matches!(
-        inst.dict
+        inst.dict_cell()
             .borrow()
             .get(&DictKey(Object::from_static(SCANDIR_CLOSED_KEY))),
         Some(Object::Bool(true))
@@ -3667,7 +3667,7 @@ pub(crate) fn dir_entry_type() -> Rc<crate::types::TypeObject> {
                 call: Box::new(|args| {
                     let name = match args.first() {
                         Some(Object::Instance(i)) => i
-                            .dict
+                            .dict_cell()
                             .borrow()
                             .get(&DictKey(Object::from_static("name")))
                             .cloned()
@@ -3731,7 +3731,7 @@ fn build_dir_entry(
     let class = dir_entry_type();
     let inst = PyInstance::new(class);
     {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         // `name`/`path` carry the *type* of the `scandir` argument: `str`
         // entries for a `str` directory, `bytes` entries for a `bytes` one —
         // the CPython invariant the verbatim `glob` relies on for bytes globs.
@@ -3963,7 +3963,7 @@ fn build_dir_entry_fd(name: String, dir_fd: libc::c_int, cached_inode: Option<i6
     let inst = PyInstance::new(class);
     let name_obj = Object::from_str(name.clone());
     {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(DictKey(Object::from_static("name")), name_obj.clone());
         // For an fd-relative scandir CPython sets `.path` to the bare entry name
         // (there is no directory path to join onto).
@@ -6450,7 +6450,7 @@ fn added_dll_directory_type() -> Rc<crate::types::TypeObject> {
     }
     fn self_dict(args: &[Object]) -> Option<Rc<RefCell<DictData>>> {
         match args.first() {
-            Some(Object::Instance(i)) => Some(i.dict.share()),
+            Some(Object::Instance(i)) => Some(i.dict_shared()),
             _ => None,
         }
     }
@@ -7218,7 +7218,7 @@ pub(crate) fn struct_seq_type_layout(
                             "descriptor '{field}' for '{type_name}' objects doesn't apply to another object"
                         )));
                     };
-                    inst.dict
+                    inst.dict_cell()
                         .borrow()
                         .get(&crate::object::StrKey(field))
                         .cloned()
@@ -7382,7 +7382,7 @@ fn struct_seq_init(
         )));
     }
     {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         for (i, v) in values.iter().enumerate() {
             if let Some(f) = layout.slots[i] {
                 d.insert(DictKey(Object::from_static(f)), v.clone());
@@ -7418,7 +7418,7 @@ fn struct_seq_init(
     // the integer-seconds sequence slots so `os.stat_result(range(10)).st_atime`
     // is `7`, like CPython.
     if name == "stat_result" {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         for (slot, f) in [(7usize, "st_atime"), (8, "st_mtime"), (9, "st_ctime")] {
             let key = DictKey(Object::from_static(f));
             if matches!(d.get(&key), None | Some(Object::None)) {
@@ -7459,7 +7459,7 @@ fn struct_seq_replace(
     // No unnamed fields, so named members and slots line up one-to-one.
     let named = layout.named();
     let mut vals: Vec<Object> = {
-        let d = inst.dict.borrow();
+        let d = inst.dict_cell().borrow();
         named
             .iter()
             .map(|f| {
@@ -7486,7 +7486,7 @@ fn struct_seq_replace(
         .ok_or_else(|| type_error(format!("unknown struct sequence type '{name}'")))?;
     let new_inst = crate::types::PyInstance::new(ty);
     {
-        let mut d = new_inst.dict.borrow_mut();
+        let mut d = new_inst.dict_cell().borrow_mut();
         for (f, v) in named.iter().zip(vals.iter()) {
             d.insert(DictKey(Object::from_static(f)), v.clone());
         }
@@ -7542,7 +7542,7 @@ fn struct_seq_values(
     if let Some(Object::Tuple(t)) = inst.native.get() {
         return t.to_vec();
     }
-    let d = inst.dict.borrow();
+    let d = inst.dict_cell().borrow();
     layout.slots[..layout.n_sequence]
         .iter()
         .map(|slot| match slot {
@@ -7601,7 +7601,7 @@ fn struct_seq_reduce(
     let visible = Object::new_tuple(struct_seq_values(layout, inst));
     let extra = Rc::new(RefCell::new(DictData::default()));
     {
-        let d = inst.dict.borrow();
+        let d = inst.dict_cell().borrow();
         let mut e = extra.borrow_mut();
         for slot in &layout.slots[layout.n_sequence..] {
             let f = slot.expect("hidden struct-seq slots are named");
@@ -7675,7 +7675,7 @@ pub(crate) fn struct_seq_instance(
 ) -> Object {
     let inst = crate::types::PyInstance::new(ty);
     {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         for (field, value) in fields.iter().zip(values.iter()) {
             d.insert(DictKey(Object::from_static(field)), value.clone());
         }

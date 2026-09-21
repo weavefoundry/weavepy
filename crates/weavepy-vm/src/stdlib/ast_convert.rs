@@ -177,7 +177,7 @@ impl PosCollector {
         }
         match obj {
             Object::Instance(inst) => {
-                let d = inst.dict.borrow();
+                let d = inst.dict_cell().borrow();
                 let int_of = |name: &str| -> Option<i64> {
                     match d.get(&StrKey(name)) {
                         Some(Object::Int(i)) => Some(*i),
@@ -284,7 +284,7 @@ impl PosMap {
 // ---------------------------------------------------------------------------
 
 fn field(inst: &Rc<PyInstance>, name: &str) -> Option<Object> {
-    if let Some(v) = inst.dict.borrow().get(&StrKey(name)) {
+    if let Some(v) = inst.dict_cell().borrow().get(&StrKey(name)) {
         return Some(v.clone());
     }
     // Class-level defaults (CPython's obj2ast reads through

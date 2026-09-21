@@ -145,7 +145,7 @@ fn instance_handle(args: &[Object]) -> Result<i64, RuntimeError> {
         _ => return Err(type_error("expected hmac instance")),
     };
     let handle_obj = inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static("_handle")))
         .cloned()
@@ -162,7 +162,7 @@ fn make_mac_instance(state: AnyMac, key: Vec<u8>, digest_name: String) -> Object
     let cls = hmac_class();
     let inst = PyInstance::new(cls);
     {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(DictKey(Object::from_static("_handle")), Object::Int(id));
         d.insert(
             DictKey(Object::from_static("name")),

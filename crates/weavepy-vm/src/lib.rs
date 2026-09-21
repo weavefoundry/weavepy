@@ -1551,7 +1551,7 @@ impl Interpreter {
                 // values live in `inst.dict`, which we mutate directly (the
                 // struct-sequence `__setattr__` guard is bypassed, exactly as
                 // the Rust-side builders do).
-                Some(Object::Instance(inst)) => Some(inst.dict.share()),
+                Some(Object::Instance(inst)) => Some(inst.dict_shared()),
                 _ => None,
             };
             if let Some(fl) = flags_inner {
@@ -14899,9 +14899,10 @@ impl Interpreter {
         let Some(probe) = code_name_leaf_probe(code, name_idx) else {
             return false;
         };
-        let dict = inst
-            .dict
-            .get_or_init(|| Rc::new(RefCell::new(DictData::default())));
+        // `dict_cell`, not a bare `get_or_init`: a dictionary born here
+        // for a still-deferred instance must carry the owner record, or
+        // the store below leaves the instance untracked forever.
+        let dict = inst.dict_cell();
         // SAFETY: as above.
         let Some(d) = (unsafe { dict.peek_mut() }) else {
             return false;
@@ -17790,9 +17791,9 @@ impl Interpreter {
                     }
                     IC::StoreAttrNewKey { .. } => {
                         let probe = code_name_leaf_probe(code, name_idx)?;
-                        let dict = inst
-                            .dict
-                            .get_or_init(|| Rc::new(RefCell::new(DictData::default())));
+                        // `dict_cell`, not a bare `get_or_init`: see
+                        // `core_store_new_attr`.
+                        let dict = inst.dict_cell();
                         // Probe first, without mutating: a key only a user
                         // `__eq__` could compare sends the store to the
                         // full path (the insert below then meets only
@@ -24737,7 +24738,7 @@ impl Interpreter {
             && name != "__class__"
             && matches!(&owner, Object::Type(t) if t.is_super_proxy_type())
         {
-            let d = inst.dict.borrow();
+            let d = inst.dict_cell().borrow();
             match (
                 d.get(&DictKey(Object::from_static("__self_class__")))
                     .cloned(),
@@ -25040,7 +25041,7 @@ impl Interpreter {
                         inst.cls().name
                     )));
                 }
-                return Ok(Object::Dict(inst.dict.share()));
+                return Ok(Object::Dict(inst.dict_shared()));
             }
             "__class__" => {
                 // A weakproxy lies about its class: CPython forwards the
@@ -25800,7 +25801,7 @@ impl Interpreter {
                                 inst.cls().name
                             )));
                         }
-                        return Ok(Object::Dict(inst.dict.share()));
+                        return Ok(Object::Dict(inst.dict_shared()));
                     }
                     match inst.slot_get(&slot.name) {
                         Some(v) => Ok(v),
@@ -28356,7 +28357,7 @@ impl Interpreter {
         // how `_MappingMixin` subclasses (defaultdict, Counter, …)
         // get their mapping API.
         let keys_attr = inst
-            .dict
+            .dict_cell()
             .borrow()
             .get(&DictKey(Object::from_str("keys")))
             .cloned()
@@ -32260,7 +32261,7 @@ impl Interpreter {
                                 // (and other branches created from it)
                                 // observe `source is None`.
                                 if let Object::Instance(inst) = &data {
-                                    inst.dict.borrow_mut().insert(
+                                    inst.dict_cell().borrow_mut().insert(
                                         crate::object::DictKey(Object::from_static("source")),
                                         Object::None,
                                     );
@@ -36547,7 +36548,7 @@ impl Interpreter {
                         // a `del` on an earlier attribute shift-renumbers
                         // every later slot (same guard as LOAD_ATTR).
                         let name_ok = {
-                            let dict = inst.dict.borrow();
+                            let dict = inst.dict_cell().borrow();
                             dict.get_index(key_idx as usize).is_some_and(|(k, _)| {
                                 self.cached_slot_name_matches(&frame.code, name_idx, k)
                             })
@@ -36567,7 +36568,7 @@ impl Interpreter {
                             // scope it tightly so it is released before the
                             // prompt-reap cascade (which can run `__del__`).
                             let old = inst
-                                .dict
+                                .dict_cell()
                                 .borrow_mut()
                                 .get_index_mut(key_idx as usize)
                                 .map(|(_, slot)| std::mem::replace(slot, val));
@@ -36621,7 +36622,7 @@ impl Interpreter {
                             // (the core loop's `STORE_ATTR` arm serves it).
                             let mut upgrade_idx = false;
                             let old = {
-                                let mut dict = inst.dict.borrow_mut();
+                                let mut dict = inst.dict_cell().borrow_mut();
                                 let dict = &mut *dict;
                                 let dict = if val.is_gc_atomic() {
                                     dict.map_mut_atomic_store()
@@ -36656,7 +36657,7 @@ impl Interpreter {
                                 let event = if old.is_some() { "MODIFIED" } else { "ADDED" };
                                 crate::capi_watchers::dict_event(
                                     event,
-                                    &inst.dict,
+                                    inst.dict_cell(),
                                     Some(&Object::from_str(name.as_str())),
                                     Some(&v),
                                 );
@@ -36665,7 +36666,7 @@ impl Interpreter {
                             if upgrade_idx {
                                 use crate::specialize::DictDataExt;
                                 let idx = inst
-                                    .dict
+                                    .dict_cell()
                                     .borrow()
                                     .index_of_key_str(name.as_str())
                                     .map(|i| (i, inst.class.borrow().attr_version.get()));
@@ -38514,7 +38515,7 @@ impl Interpreter {
             };
             let copied = src.borrow().clone();
             inst.ensure_gc_tracked();
-            *inst.dict.borrow_mut() = copied;
+            *inst.dict_cell().borrow_mut() = copied;
             inst.inline_values.set(false);
             return Ok(());
         }
@@ -38627,7 +38628,7 @@ impl Interpreter {
             None
         };
         let old = {
-            let mut dict = inst.dict.borrow_mut();
+            let mut dict = inst.dict_cell().borrow_mut();
             let dict = &mut *dict;
             let dict = if value.is_gc_atomic() {
                 dict.map_mut_atomic_store()
@@ -38643,7 +38644,7 @@ impl Interpreter {
             let event = if old.is_some() { "MODIFIED" } else { "ADDED" };
             crate::capi_watchers::dict_event(
                 event,
-                &inst.dict,
+                inst.dict_cell(),
                 Some(&Object::from_str(name)),
                 Some(&v),
             );
@@ -38991,7 +38992,7 @@ impl Interpreter {
                     "attribute '__dict__' of 'module' objects is not writable".to_owned(),
                 ));
             }
-            inst.dict.borrow_mut().clear();
+            inst.dict_cell().borrow_mut().clear();
             inst.inline_values.set(false);
             return Ok(());
         }
@@ -39042,7 +39043,7 @@ impl Interpreter {
             }
         }
         let removed = inst
-            .dict
+            .dict_cell()
             .borrow_mut()
             .shift_remove(&DictKey(Object::from_str(name)));
         // Watched instance `__dict__` observes attribute deletion as
@@ -39050,7 +39051,7 @@ impl Interpreter {
         if removed.is_some() && crate::capi_watchers::dicts_active() {
             crate::capi_watchers::dict_event(
                 "DELETED",
-                &inst.dict,
+                inst.dict_cell(),
                 Some(&Object::from_str(name)),
                 None,
             );
@@ -47662,7 +47663,7 @@ impl Interpreter {
                 // obj._file_reduce` to forbid pickling file-born zones).
                 if let Object::Instance(inst) = recv {
                     let per_instance = inst
-                        .dict
+                        .dict_cell()
                         .borrow()
                         .get(&DictKey(Object::from_static("__reduce__")))
                         .cloned();
@@ -49220,7 +49221,7 @@ impl Interpreter {
                         m.dict.borrow().get(&crate::object::StrKey(name)).cloned()
                     }
                     Some(Object::Instance(inst)) => inst
-                        .dict
+                        .dict_cell()
                         .borrow()
                         .get(&DictKey(Object::from_str(name)))
                         .cloned(),
@@ -49556,7 +49557,7 @@ impl Interpreter {
                     .get(&crate::object::StrKey("__spec__"))
                     .cloned(),
                 Some(Object::Instance(i)) => i
-                    .dict
+                    .dict_cell()
                     .borrow()
                     .get(&crate::object::StrKey("__spec__"))
                     .cloned(),
@@ -50756,7 +50757,7 @@ impl Interpreter {
                 .cloned()?;
             let fl = match flags {
                 Object::Dict(fl) | Object::SimpleNamespace(fl) => fl,
-                Object::Instance(inst) => inst.dict.share(),
+                Object::Instance(inst) => inst.dict_shared(),
                 _ => return None,
             };
             let v = fl
@@ -51029,11 +51030,15 @@ impl Interpreter {
         let (ns, mod_display): (Rc<RefCell<DictData>>, String) = match module {
             Object::Module(m) => (m.dict.clone(), m.name.clone()),
             Object::Instance(inst) => {
-                let name = match inst.dict.borrow().get(&crate::object::StrKey("__name__")) {
+                let name = match inst
+                    .dict_cell()
+                    .borrow()
+                    .get(&crate::object::StrKey("__name__"))
+                {
                     Some(Object::Str(s)) => s.to_string(),
                     _ => inst.cls().name.clone(),
                 };
-                (inst.dict.share(), name)
+                (inst.dict_shared(), name)
             }
             other => {
                 return Err(type_error(format!(
@@ -52866,7 +52871,7 @@ fn spec_parent_of(dict: &DictData) -> Option<String> {
     let Some(Object::Instance(inst)) = dict.get(&DictKey(Object::from_static("__spec__"))) else {
         return None;
     };
-    let spec_dict = inst.dict.borrow();
+    let spec_dict = inst.dict_cell().borrow();
     if let Some(Object::Str(p)) = spec_dict.get(&DictKey(Object::from_static("parent"))) {
         return Some(p.to_string());
     }
@@ -55477,7 +55482,7 @@ fn make_coroutine_wrapper(coro: &Object) -> Object {
         let Some(Object::Instance(inst)) = args.first() else {
             return Err(type_error("expected coroutine_wrapper instance"));
         };
-        inst.dict
+        inst.dict_cell()
             .borrow()
             .get(&DictKey(Object::from_static("__wrapped_coro__")))
             .cloned()
@@ -55565,7 +55570,7 @@ fn make_coroutine_wrapper(coro: &Object) -> Object {
         t
     });
     let inst = Rc::new(crate::types::PyInstance::new(ty));
-    inst.dict.borrow_mut().insert(
+    inst.dict_cell().borrow_mut().insert(
         DictKey(Object::from_static("__wrapped_coro__")),
         coro.clone(),
     );
@@ -55627,7 +55632,7 @@ fn instance_has_nonnull_attr(instance: &Object, name: &str) -> bool {
         Object::Instance(i) => {
             matches!(i.slot_get(name), Some(v) if !matches!(v, Object::None))
                 || matches!(
-                    i.dict.borrow().get(&crate::object::StrKey(name)),
+                    i.dict_cell().borrow().get(&crate::object::StrKey(name)),
                     Some(v) if !matches!(v, Object::None)
                 )
         }
@@ -56475,7 +56480,7 @@ fn apply_trailer(value: Object, trailer: &str) -> Result<Object, RuntimeError> {
                 .cloned()
                 .ok_or_else(|| attribute_error(format!("module has no attribute '{attr}'"))),
             Object::Instance(inst) => inst
-                .dict
+                .dict_cell()
                 .borrow()
                 .get(&crate::object::StrKey(attr))
                 .cloned()
@@ -61607,7 +61612,7 @@ fn is_typevar_object(o: &Object) -> bool {
     matches!(o, Object::Instance(inst)
         if inst.cls().lookup("__typing_subst__").is_some()
             || inst
-                .dict
+                .dict_cell()
                 .borrow()
                 .get(&crate::object::StrKey("__typing_subst__"))
                 .is_some())
@@ -61620,7 +61625,7 @@ fn alias_args_of(o: &Object) -> Option<Vec<Object>> {
     let key = DictKey(Object::from_static("__args__"));
     let args = match o {
         Object::SimpleNamespace(d) => d.borrow().get(&key).cloned(),
-        Object::Instance(inst) => inst.dict.borrow().get(&key).cloned(),
+        Object::Instance(inst) => inst.dict_cell().borrow().get(&key).cloned(),
         _ => None,
     }?;
     match args {
@@ -61669,7 +61674,7 @@ fn collect_type_parameters(x: &Object, out: &mut Vec<Object>) {
     // `__parameters__` is `(T,)` (test_parameter_detection).
     if let Object::Instance(inst) = x {
         let params = inst
-            .dict
+            .dict_cell()
             .borrow()
             .get(&crate::object::StrKey("__parameters__"))
             .cloned()

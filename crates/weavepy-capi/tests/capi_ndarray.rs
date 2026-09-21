@@ -163,7 +163,7 @@ fn ndarray_dict_inspection() {
         _ => panic!("not instance"),
     };
     let keys: Vec<String> = inst
-        .dict
+        .dict_cell()
         .borrow()
         .iter()
         .filter_map(|(k, _)| match &k.0 {
@@ -288,7 +288,7 @@ fn ndarray_addition_via_dunder() {
         eprintln!("__add__ error: {:?}", err);
         if let weavepy_vm::error::RuntimeError::PyException(pe) = err {
             if let Object::Instance(inst) = &pe.instance {
-                let dict = inst.dict.borrow();
+                let dict = inst.dict_cell().borrow();
                 for (k, v) in dict.iter() {
                     eprintln!("  err.{:?} = {:?}", k.0, v);
                 }

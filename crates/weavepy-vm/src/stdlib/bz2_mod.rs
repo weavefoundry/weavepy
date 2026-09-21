@@ -185,7 +185,7 @@ fn handle_of(args: &[Object]) -> Result<i64, RuntimeError> {
         _ => return Err(type_error("expected bz2 compressor/decompressor object")),
     };
     match inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static("_handle")))
         .cloned()
@@ -401,7 +401,7 @@ fn compressor_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
             })),
         );
     }
-    inst.dict
+    inst.dict_cell()
         .borrow_mut()
         .insert(DictKey(Object::from_static("_handle")), Object::Int(id));
     Ok(Object::None)
@@ -451,7 +451,7 @@ fn decompressor_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obj
             })),
         );
     }
-    let mut d = inst.dict.borrow_mut();
+    let mut d = inst.dict_cell().borrow_mut();
     d.insert(DictKey(Object::from_static("_handle")), Object::Int(id));
     d.insert(DictKey(Object::from_static("eof")), Object::Bool(false));
     d.insert(
@@ -502,7 +502,7 @@ fn decompressor_decompress(
             st.errored = true;
             st.needs_input = false;
             if let Some(Object::Instance(inst)) = args.first() {
-                inst.dict.borrow_mut().insert(
+                inst.dict_cell().borrow_mut().insert(
                     DictKey(Object::from_static("needs_input")),
                     Object::Bool(false),
                 );
@@ -521,7 +521,7 @@ fn decompressor_decompress(
         st.input = leftover;
     }
     if let Some(Object::Instance(inst)) = args.first() {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(DictKey(Object::from_static("eof")), Object::Bool(st.eof));
         d.insert(
             DictKey(Object::from_static("needs_input")),

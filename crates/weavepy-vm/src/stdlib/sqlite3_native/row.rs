@@ -80,7 +80,7 @@ pub(crate) fn make_row(cursor_obj: &Object, st: &Rc<RefCell<CursorState>>, data:
     let inst = PyInstance::new(row_class());
     let desc = st.borrow().description.clone();
     {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(DictKey(Object::from_static(ROW_DATA_KEY)), data);
         d.insert(DictKey(Object::from_static(ROW_DESC_KEY)), desc);
     }
@@ -117,7 +117,7 @@ fn row_init(args: &[Object]) -> Result<Object, RuntimeError> {
     let desc = ip
         .load_attr_public(&cursor, "description")
         .unwrap_or(Object::None);
-    let mut d = inst.dict.borrow_mut();
+    let mut d = inst.dict_cell().borrow_mut();
     d.insert(DictKey(Object::from_static(ROW_DATA_KEY)), data);
     d.insert(DictKey(Object::from_static(ROW_DESC_KEY)), desc);
     Ok(Object::None)
@@ -125,7 +125,7 @@ fn row_init(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn row_parts(args: &[Object]) -> Result<(Object, Object), RuntimeError> {
     let inst = self_instance(args)?;
-    let d = inst.dict.borrow();
+    let d = inst.dict_cell().borrow();
     let data = d
         .get(&DictKey(Object::from_static(ROW_DATA_KEY)))
         .cloned()
@@ -236,7 +236,7 @@ fn row_eq(args: &[Object]) -> Result<Object, RuntimeError> {
     if !other_inst.cls().is_subclass_of(&row_class()) {
         return Ok(crate::vm_singletons::not_implemented());
     }
-    let od = other_inst.dict.borrow();
+    let od = other_inst.dict_cell().borrow();
     let other_data = od
         .get(&DictKey(Object::from_static(ROW_DATA_KEY)))
         .cloned()
@@ -416,7 +416,7 @@ pub(crate) fn blob_open(
     let handle = next_handle();
     blob_registry().lock().insert(handle, state);
     let inst = PyInstance::new(blob_class());
-    inst.dict.borrow_mut().insert(
+    inst.dict_cell().borrow_mut().insert(
         DictKey(Object::from_static(BLOB_HANDLE_KEY)),
         Object::Int(handle),
     );
@@ -426,7 +426,7 @@ pub(crate) fn blob_open(
 fn raw_blob_state(args: &[Object]) -> Result<Rc<RefCell<BlobState>>, RuntimeError> {
     let inst = self_instance(args)?;
     let handle = inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static(BLOB_HANDLE_KEY)))
         .cloned();

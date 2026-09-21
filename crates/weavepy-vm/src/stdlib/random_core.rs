@@ -182,7 +182,7 @@ fn self_instance(args: &[Object], what: &str) -> Result<Rc<PyInstance>, RuntimeE
 }
 
 fn load_mt(inst: &Rc<PyInstance>) -> Result<Mt, RuntimeError> {
-    let dict = inst.dict.borrow();
+    let dict = inst.dict_cell().borrow();
     let bytes = match dict.get(&DictKey(Object::from_static(STATE_KEY))) {
         Some(Object::ByteArray(b)) => b.clone(),
         _ => {
@@ -211,7 +211,7 @@ fn store_mt(inst: &Rc<PyInstance>, mt: &Mt) {
     for w in &mt.key {
         buf.extend_from_slice(&w.to_le_bytes());
     }
-    let mut dict = inst.dict.borrow_mut();
+    let mut dict = inst.dict_cell().borrow_mut();
     dict.insert(
         DictKey(Object::from_static(STATE_KEY)),
         Object::ByteArray(Rc::new(RefCell::new(buf))),

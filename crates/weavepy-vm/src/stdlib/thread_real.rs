@@ -370,7 +370,7 @@ fn instance_dunder_trampoline(name: &'static str) -> Object {
                 return Err(type_error(format!("{name}() requires an instance")));
             };
             let closure = inst
-                .dict
+                .dict_cell()
                 .borrow()
                 .get(&DictKey(Object::from_static(name)))
                 .cloned();
@@ -398,7 +398,7 @@ fn instance_method_trampoline(name: &'static str) -> Object {
                 )));
             };
             let closure = inst
-                .dict
+                .dict_cell()
                 .borrow()
                 .get(&DictKey(Object::from_static(name)))
                 .cloned();
@@ -490,7 +490,7 @@ fn lock_repr(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(type_error("__repr__ requires a lock instance"));
     };
     let locked_fn = inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static("locked")))
         .cloned();
@@ -577,7 +577,7 @@ fn rlock_repr(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(type_error("__repr__ requires an RLock instance"));
     };
     let state_fn = inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static("_weave_repr_state")))
         .cloned();
@@ -713,6 +713,7 @@ fn make_lock_object(lock: Arc<RealLock>) -> Object {
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
         hash_cache: crate::sync::CachedHash::new(None),
         finalize_ran: crate::sync::Cell::new(false),
+        deferred: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
     });
     Object::Instance(inst)
@@ -897,6 +898,7 @@ fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
         hash_cache: crate::sync::CachedHash::new(None),
         finalize_ran: crate::sync::Cell::new(false),
+        deferred: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
     });
     Object::Instance(inst)
@@ -1833,6 +1835,7 @@ fn make_thread_handle_object(state: Arc<ThreadHandleState>, ident: Object) -> Ob
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
         hash_cache: crate::sync::CachedHash::new(None),
         finalize_ran: crate::sync::Cell::new(false),
+        deferred: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
     });
     Object::Instance(inst)
@@ -1844,7 +1847,7 @@ fn handle_state_of(obj: &Object) -> Option<Arc<ThreadHandleState>> {
         return None;
     };
     let hid = {
-        let d = inst.dict.borrow();
+        let d = inst.dict_cell().borrow();
         match d.get(&DictKey(Object::from_static("_wp_hid"))) {
             Some(Object::Int(i)) => *i as u64,
             _ => return None,
@@ -1945,7 +1948,7 @@ fn start_joinable_thread(
     // Publish the assigned ident on the handle object.
     if let Object::Instance(inst) = &handle_obj {
         let id = state.ident.load(Ordering::Acquire);
-        inst.dict.borrow_mut().insert(
+        inst.dict_cell().borrow_mut().insert(
             DictKey(Object::from_static("ident")),
             Object::Int(id as i64),
         );

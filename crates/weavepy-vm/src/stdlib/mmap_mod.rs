@@ -384,7 +384,7 @@ fn alloc_state(state: MmapState) -> usize {
 
 fn state_id(inst: &Rc<PyInstance>) -> Result<usize, RuntimeError> {
     match inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static("_id")))
         .cloned()
@@ -674,7 +674,7 @@ fn mm_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runtim
             trackfd,
         });
         let inst = Rc::new(PyInstance::new(cls.clone()));
-        inst.dict
+        inst.dict_cell()
             .borrow_mut()
             .insert(DictKey(Object::from_static("_id")), Object::Int(id as i64));
         Ok(Object::Instance(inst))
@@ -1056,7 +1056,7 @@ fn mm_close(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         #[cfg(not(unix))]
         drop(removed);
-        inst.dict
+        inst.dict_cell()
             .borrow_mut()
             .insert(DictKey(Object::from_static("_id")), Object::Int(0));
     }

@@ -2233,7 +2233,7 @@ fn sys_flags_value() -> Object {
         .collect();
     let flags = crate::stdlib::os::struct_seq_instance(ty, SYS_FLAGS_FIELDS, values);
     if let Object::Instance(inst) = &flags {
-        let mut dict = inst.dict.borrow_mut();
+        let mut dict = inst.dict_cell().borrow_mut();
         // This build always runs with the GIL (no free-threading), and
         // the two PEP 649-era context flags take their 3.14 GIL-build
         // defaults (both off; `-X thread_inherit_context=1` /

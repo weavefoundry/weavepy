@@ -184,7 +184,7 @@ fn self_inst(args: &[Object]) -> Result<Rc<PyInstance>, RuntimeError> {
 fn state_of_args(args: &[Object]) -> Result<StateRef, RuntimeError> {
     let inst = self_inst(args)?;
     let handle = inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static("_handle")))
         .cloned();
@@ -947,7 +947,7 @@ fn set_error_with(st: &StateRef, code: c_int, errmsg: Option<&str>) -> RuntimeEr
     // `code`/`lineno`/`offset` are plain instance attributes in CPython's
     // pyexpat (`PyObject_SetAttrString`), so they stay in the dict.
     {
-        let mut d = einst.dict.borrow_mut();
+        let mut d = einst.dict_cell().borrow_mut();
         d.insert(
             DictKey(Object::from_static("code")),
             Object::Int(i64::from(code)),
@@ -1449,7 +1449,7 @@ fn setattr_method(args: &[Object]) -> Result<Object, RuntimeError> {
 fn del_method(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = self_inst(args)?;
     let handle = inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static("_handle")))
         .cloned();
@@ -1499,7 +1499,7 @@ fn register_parser(
     }));
     parser_reg().lock().insert(id, state);
     let inst = PyInstance::new(parser_type());
-    inst.dict
+    inst.dict_cell()
         .borrow_mut()
         .insert(DictKey(Object::from_static("_handle")), Object::Int(id));
     Object::Instance(Rc::new(inst))
@@ -1647,7 +1647,7 @@ fn external_entity_parser_create(args: &[Object]) -> Result<Object, RuntimeError
     // (pyexpat.c ExternalEntityParserCreate).
     if let Object::Instance(inst) = &obj {
         let handle = inst
-            .dict
+            .dict_cell()
             .borrow()
             .get(&DictKey(Object::from_static("_handle")))
             .cloned();

@@ -578,7 +578,7 @@ fn zlib_compressobj(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obje
         );
     });
     let inst = PyInstance::new(compress_class());
-    inst.dict
+    inst.dict_cell()
         .borrow_mut()
         .insert(DictKey(Object::from_static("_handle")), Object::Int(id));
     Ok(Object::Instance(Rc::new(inst)))
@@ -605,7 +605,7 @@ fn zlib_decompressobj(
     });
     let inst = PyInstance::new(decompress_class());
     {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(DictKey(Object::from_static("_handle")), Object::Int(id));
         d.insert(
             DictKey(Object::from_static("unused_data")),
@@ -626,7 +626,7 @@ fn handle_of(args: &[Object]) -> Result<i64, RuntimeError> {
         _ => return Err(type_error("expected zlib compress/decompress object")),
     };
     match inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static("_handle")))
         .cloned()
@@ -746,7 +746,7 @@ fn compress_flush(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn store_decompress_attrs(args: &[Object], unused: &[u8], unconsumed: &[u8], eof: bool) {
     if let Some(Object::Instance(inst)) = args.first() {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(
             DictKey(Object::from_static("unused_data")),
             Object::new_bytes(unused.to_vec()),
@@ -848,7 +848,7 @@ fn decompress_flush(args: &[Object]) -> Result<Object, RuntimeError> {
 fn read_bytes_attr(args: &[Object], name: &str) -> Vec<u8> {
     if let Some(Object::Instance(inst)) = args.first() {
         if let Some(Object::Bytes(b)) = inst
-            .dict
+            .dict_cell()
             .borrow()
             .get(&crate::object::StrKey(name))
             .cloned()
@@ -922,7 +922,7 @@ fn zlibdecompressor_no_pickle(_args: &[Object]) -> Result<Object, RuntimeError> 
 
 fn store_zd_attrs(args: &[Object], unused: &[u8], eof: bool, needs_input: bool) {
     if let Some(Object::Instance(inst)) = args.first() {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(
             DictKey(Object::from_static("unused_data")),
             Object::new_bytes(unused.to_vec()),
@@ -988,7 +988,7 @@ fn zlib_zlibdecompressor(
     });
     let inst = PyInstance::new(zlibdecompressor_class());
     {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(DictKey(Object::from_static("_handle")), Object::Int(id));
         d.insert(
             DictKey(Object::from_static("unused_data")),

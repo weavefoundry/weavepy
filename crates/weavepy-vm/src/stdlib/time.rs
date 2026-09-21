@@ -375,7 +375,7 @@ fn time_get_clock_info(args: &[Object]) -> Result<Object, RuntimeError> {
     });
     let inst = Rc::new(crate::types::PyInstance::new(cls));
     {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(
             DictKey(Object::from_static("implementation")),
             Object::from_static(implementation),
@@ -677,7 +677,7 @@ fn gettmarg(arg: Option<&Object>, func: &str) -> Result<TmFields, RuntimeError> 
     let items: Vec<Object> = match arg {
         Some(Object::Tuple(t)) => t.to_vec(),
         Some(Object::Instance(inst)) => {
-            let d = inst.dict.borrow();
+            let d = inst.dict_cell().borrow();
             let mut v = Vec::with_capacity(9);
             for f in STRUCT_TIME_FIELDS {
                 v.push(
@@ -719,7 +719,7 @@ fn gettmarg(arg: Option<&Object>, func: &str) -> Result<TmFields, RuntimeError> 
     }
     let (zone, gmtoff) = match arg {
         Some(Object::Instance(inst)) => {
-            let d = inst.dict.borrow();
+            let d = inst.dict_cell().borrow();
             let zone = match d.get(&DictKey(Object::from_static("tm_zone"))) {
                 Some(z @ (Object::Str(_) | Object::WStr(_))) => Some(z.to_str()),
                 _ => None,
@@ -1102,7 +1102,7 @@ fn utc_from_timestamp(secs: i64) -> Result<DateTime<Utc>, RuntimeError> {
 /// off the `localtime()` result (`test_subclass_alternate_constructors_*`).
 fn with_tz_extras(obj: Object, gmtoff: i64, zone: &str) -> Object {
     if let Object::Instance(inst) = &obj {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(
             DictKey(Object::from_static("tm_gmtoff")),
             Object::Int(gmtoff),
@@ -1223,7 +1223,7 @@ fn time_mktime(args: &[Object]) -> Result<Object, RuntimeError> {
                 Some(Object::Tuple(t)) => t.get(i).cloned(),
                 Some(Object::List(items)) => items.borrow().get(i).cloned(),
                 Some(Object::Instance(inst)) => inst
-                    .dict
+                    .dict_cell()
                     .borrow()
                     .get(&DictKey(Object::from_static(STRUCT_TIME_FIELDS[i])))
                     .cloned(),

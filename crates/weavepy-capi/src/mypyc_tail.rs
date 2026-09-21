@@ -298,7 +298,7 @@ pub unsafe extern "C" fn PyErr_GetExcInfo(
     let tb = match &obj {
         Object::Instance(inst) => {
             let key = DictKey(Object::from_static("__traceback__"));
-            match inst.dict.borrow().get(&key) {
+            match inst.dict_cell().borrow().get(&key) {
                 Some(t @ Object::Traceback(_)) => into_owned(t.clone()),
                 _ => ptr::null_mut(),
             }
@@ -412,7 +412,7 @@ pub unsafe extern "C" fn PyErr_SetImportError(
         } else {
             unsafe { clone_object(path) }
         };
-        let mut d = i.dict.borrow_mut();
+        let mut d = i.dict_cell().borrow_mut();
         d.insert(DictKey(Object::from_static("name")), name_o);
         d.insert(DictKey(Object::from_static("path")), path_o);
     }
@@ -442,7 +442,7 @@ pub unsafe extern "C" fn _PyErr_ChainExceptions1(exc: *mut PyObject) {
         let ctx = unsafe { clone_object(exc) };
         if let Some(p) = crate::errors::pending() {
             if let Object::Instance(inst) = &p.value {
-                inst.dict
+                inst.dict_cell()
                     .borrow_mut()
                     .insert(DictKey(Object::from_static("__context__")), ctx);
             }
@@ -470,7 +470,7 @@ pub unsafe extern "C" fn _PyGen_FetchStopIterationValue(pvalue: *mut *mut PyObje
     let taken = crate::errors::take_pending().map(|p| p.value);
     let value = match taken {
         Some(Object::Instance(inst)) => inst
-            .dict
+            .dict_cell()
             .borrow()
             .get(&DictKey(Object::from_static("value")))
             .cloned()
@@ -502,7 +502,7 @@ pub unsafe extern "C" fn _WeavePy_ApplyCause(cause: *mut PyObject) {
     let cause_o = unsafe { clone_object(cause) };
     if let Some(p) = crate::errors::pending() {
         if let Object::Instance(inst) = &p.value {
-            let mut d = inst.dict.borrow_mut();
+            let mut d = inst.dict_cell().borrow_mut();
             d.insert(DictKey(Object::from_static("__cause__")), cause_o.clone());
             d.insert(DictKey(Object::from_static("__context__")), cause_o);
         }

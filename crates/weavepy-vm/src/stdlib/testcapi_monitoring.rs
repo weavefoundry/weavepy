@@ -22,7 +22,7 @@ use crate::sync::{Rc, RefCell};
 /// Extract the `_active` state list from a CodeLike instance.
 fn codelike_active(cl: &Object) -> Result<Rc<RefCell<Vec<Object>>>, RuntimeError> {
     if let Object::Instance(inst) = cl {
-        if let Some(Object::List(l)) = inst.dict.borrow().get(&StrKey("_active")) {
+        if let Some(Object::List(l)) = inst.dict_cell().borrow().get(&StrKey("_active")) {
             return Ok(l.clone());
         }
     }

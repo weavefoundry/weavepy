@@ -2199,7 +2199,7 @@ fn exit_with_system_exit(code: weavepy::vm::object::Object) -> ! {
             // `args` is a real slot on exceptions (RFC 0057); older
             // plain instances may still carry it in the dict.
             let args = inst.slot_get("args").or_else(|| {
-                inst.dict
+                inst.dict_cell()
                     .borrow()
                     .get(&weavepy::vm::object::DictKey(Object::from_static("args")))
                     .cloned()

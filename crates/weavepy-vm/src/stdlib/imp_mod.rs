@@ -513,7 +513,7 @@ fn extract_spec(spec: &Object) -> Result<(String, String), RuntimeError> {
             // test_import.test_create_dynamic_null builds carry `name` /
             // `origin` as plain class attributes.
             let lookup = |keys: &[&'static str]| -> Object {
-                let dict = inst.dict.borrow();
+                let dict = inst.dict_cell().borrow();
                 for k in keys {
                     if let Some(v) = dict.get(&DictKey(Object::from_static(k))) {
                         return v.clone();

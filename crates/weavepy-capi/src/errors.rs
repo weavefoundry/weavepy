@@ -311,7 +311,7 @@ pub(crate) fn message_for(o: &Object) -> String {
             // in the instance dict for others — check both.
             let key = DictKey(Object::from_static("args"));
             let args = inst
-                .dict
+                .dict_cell()
                 .borrow()
                 .get(&key)
                 .cloned()

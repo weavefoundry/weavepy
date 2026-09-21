@@ -6501,7 +6501,7 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
             0
         }
         AttrStorage::Indexed(key_idx) => {
-            let mut dict = inst.dict.borrow_mut();
+            let mut dict = inst.dict_cell().borrow_mut();
             let atomic = v.is_gc_atomic();
             let dict = &mut *dict;
             let dict = if atomic {
@@ -6542,7 +6542,7 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
             if crate::capi_watchers::dicts_active() {
                 return 1;
             }
-            let mut dict = inst.dict.borrow_mut();
+            let mut dict = inst.dict_cell().borrow_mut();
             let atomic = v.is_gc_atomic();
             let dict = &mut *dict;
             let dict = if atomic {

@@ -6,7 +6,6 @@
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
-use std::ops::Deref;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
@@ -129,14 +128,12 @@ impl<T> From<Arc<T>> for LazyArc<T> {
     }
 }
 
-impl<T: Default> Deref for LazyArc<T> {
-    type Target = T;
-
-    #[inline]
-    fn deref(&self) -> &T {
-        self.get_or_init(|| Arc::new(T::default()))
-    }
-}
+// No `Deref`: an implicit materialisation publishes a default value,
+// which for an instance `__dict__` means one with no deferred-tracking
+// owner record — and a store through it then leaves the instance
+// untracked forever. Callers name the accessor they want
+// (`PyInstance::dict_cell` for the instance dictionary), so every
+// creator is visible at the call site.
 
 impl<T: Default> Clone for LazyArc<T> {
     fn clone(&self) -> Self {
@@ -212,8 +209,8 @@ mod tests {
     fn empty_clone_shares_later_mutations() {
         let lazy = LazyArc::<AtomicUsize>::new();
         let other = lazy.clone();
-        lazy.store(12, Ordering::Relaxed);
-        assert_eq!(other.load(Ordering::Relaxed), 12);
+        lazy.share().store(12, Ordering::Relaxed);
+        assert_eq!(other.share().load(Ordering::Relaxed), 12);
         assert!(Arc::ptr_eq(&lazy.share(), &other.share()));
         assert_eq!(lazy.strong_count(), 2);
     }

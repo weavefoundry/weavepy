@@ -158,7 +158,7 @@ fn vc_class_call(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(type_error("expected instance"));
     };
     let set = inst
-        .dict
+        .dict_cell()
         .borrow()
         .contains_key(&DictKey(Object::from_static(VECTORCALL_SET_KEY)));
     Ok(Object::from_static(if set {
@@ -175,7 +175,7 @@ fn vc_set_vectorcall(args: &[Object]) -> Result<Object, RuntimeError> {
     let Some(Object::Instance(inst)) = args.first() else {
         return Err(type_error("expected instance"));
     };
-    inst.dict.borrow_mut().insert(
+    inst.dict_cell().borrow_mut().insert(
         DictKey(Object::from_static(VECTORCALL_SET_KEY)),
         Object::Bool(true),
     );

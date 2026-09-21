@@ -2296,6 +2296,17 @@ pub struct PyInstance {
     /// `test_multiprocessing_*` `test_release_task_refs` leaked one
     /// `CountedObject` per race).
     pub finalize_ran: Cell<bool>,
+    /// Cycle-collector tracking is still deferred: the collector has
+    /// never seen this instance, and it holds only atomic values (see
+    /// [`crate::gc_trace::track_deferred_owner`]).
+    ///
+    /// The state lives here rather than in the `__dict__` so that an
+    /// instance which never grows one can stay deferred — an attribute
+    /// read or a method call must not conjure a dictionary. While a
+    /// `__dict__` does exist it carries the owner record as well, so a
+    /// mutation reached through the dict alone (`vars(obj)['x'] = y`)
+    /// still starts tracking; the two are set and cleared together.
+    pub deferred: Cell<bool>,
     /// The stable C "inline body" this instance owns once it has crossed
     /// into a C extension that reads its fields at fixed `tp_basicsize`
     /// offsets (RFC 0045, wave 3). `0` for the overwhelmingly common case
@@ -2324,6 +2335,7 @@ impl PyInstance {
             slots: RefCell::new(SlotStorage::default()),
             hash_cache: crate::sync::CachedHash::new(None),
             finalize_ran: Cell::new(false),
+            deferred: Cell::new(false),
             c_body: CBody::default(),
         }
     }
@@ -2339,24 +2351,30 @@ impl PyInstance {
             slots: RefCell::new(SlotStorage::default()),
             hash_cache: crate::sync::CachedHash::new(None),
             finalize_ran: Cell::new(false),
+            deferred: Cell::new(false),
             c_body: CBody::default(),
         }
     }
 
     /// A plain instance whose cycle-collector tracking is deferred until
     /// it could hold a non-atomic value (see
-    /// [`crate::gc_trace::track_deferred_owner`]). Its `__dict__` is
-    /// published eagerly to carry the owner record.
+    /// [`crate::gc_trace::track_deferred_owner`]).
+    ///
+    /// No `__dict__` is published: an instance that only ever reads class
+    /// attributes or calls methods keeps CPython's cold-instance shape,
+    /// and [`Self::dict_shared`] installs the owner record if and when a
+    /// dictionary is actually needed.
     pub fn new_deferred(class: Rc<TypeObject>) -> Rc<Self> {
         let hint = class
             .inst_dict_hint
             .load(std::sync::atomic::Ordering::Relaxed) as usize;
         if let Some(mut inst) = INSTANCE_POOL.with(|p| p.borrow_mut().pop()) {
-            // Recycled: the dict (cleared, owner record set) and every
-            // other field were reset by `try_recycle`; only the class
-            // changes.
+            // Recycled: every field was reset by `try_recycle`; only the
+            // class changes. A pooled instance keeps whatever dict it
+            // was retired with, already cleared and carrying the record.
             if let Some(m) = Rc::get_mut(&mut inst) {
                 *m.class.get_mut() = class;
+                m.deferred.set(true);
                 if hint > 0 {
                     if let Some(dict) = m.dict.get() {
                         if let Ok(mut d) = dict.try_borrow_mut() {
@@ -2370,10 +2388,44 @@ impl PyInstance {
             }
         }
         let inst = Rc::new(Self::new(class));
-        let owner = Rc::as_ptr(&inst) as usize;
-        inst.dict
-            .get_or_init(|| Rc::new(RefCell::new(DictData::deferred_for_capacity(owner, hint))));
+        inst.deferred.set(true);
         inst
+    }
+
+    /// The instance `__dict__`, created on demand.
+    ///
+    /// A dictionary born while tracking is still deferred carries the
+    /// owner record, so a mutation that reaches it without going through
+    /// the instance — `vars(obj)['x'] = y`, or a handle kept from
+    /// `obj.__dict__` — still starts tracking through the write barrier
+    /// on [`crate::object::DictData`]'s `DerefMut`.
+    pub fn dict_shared(&self) -> Rc<RefCell<DictData>> {
+        self.dict_cell();
+        self.dict.share()
+    }
+
+    /// The instance `__dict__` cell, created on demand and carrying the
+    /// owner record while tracking is deferred.
+    ///
+    /// Every path in the core VM that may materialise a *user* instance's
+    /// dictionary goes through here rather than through `LazyArc`'s
+    /// `Deref`, which would publish one with no record and leave the
+    /// write barrier unable to find the owner. (The stdlib's
+    /// native-backed objects are never deferred, so a record-free
+    /// dictionary is the right answer for them.)
+    pub fn dict_cell(&self) -> &RefCell<DictData> {
+        if self.deferred.get() {
+            let owner = std::ptr::from_ref(self) as usize;
+            let hint = self
+                .cls()
+                .inst_dict_hint
+                .load(std::sync::atomic::Ordering::Relaxed) as usize;
+            return self.dict.get_or_init(|| {
+                Rc::new(RefCell::new(DictData::deferred_for_capacity(owner, hint)))
+            });
+        }
+        self.dict
+            .get_or_init(|| Rc::new(RefCell::new(DictData::default())))
     }
 
     /// Retire a dying deferred-tracking instance into the per-thread
@@ -2385,21 +2437,21 @@ impl PyInstance {
             return;
         };
         let owner = std::ptr::from_ref(&*m) as usize;
-        // The dict must be private too: `vars(obj)` / `obj.__dict__` hand
-        // out the same `Arc`, and a holder must keep seeing the dead
-        // instance's attributes, not the next tenant's.
-        if m.dict.strong_count() != 1 {
-            return;
-        }
-        let Some(dict) = m.dict.get() else {
-            return;
-        };
         if m.native.get().is_some() || m.finalize_ran.get() || m.c_body.get() != 0 {
             return;
         }
-        // Reset in place: values are atomic, so clearing runs no code
-        // that could observe the instance.
-        {
+        // An instance that never grew a `__dict__` is the common case
+        // now and needs no reset; one that did keeps it for the next
+        // tenant, cleared and carrying a fresh owner record.
+        if let Some(dict) = m.dict.get() {
+            // The dict must be private too: `vars(obj)` / `obj.__dict__`
+            // hand out the same `Arc`, and a holder must keep seeing the
+            // dead instance's attributes, not the next tenant's.
+            if m.dict.strong_count() != 1 {
+                return;
+            }
+            // Reset in place: values are atomic, so clearing runs no code
+            // that could observe the instance.
             let Ok(mut d) = dict.try_borrow_mut() else {
                 return;
             };
@@ -2411,6 +2463,7 @@ impl PyInstance {
         }
         *m.slots.get_mut() = SlotStorage::default();
         m.inline_values.set(true);
+        m.deferred.set(true);
         m.hash_cache = crate::sync::CachedHash::new(None);
         // A pooled instance must not keep its class alive (a transient
         // class is collected as soon as its last instance dies).
@@ -2427,10 +2480,7 @@ impl PyInstance {
     /// owner record).
     #[inline]
     pub fn is_gc_deferred(&self) -> bool {
-        match self.dict.get() {
-            Some(d) => d.try_borrow().is_ok_and(|d| d.has_deferred_owner()),
-            None => false,
-        }
+        self.deferred.get()
     }
 
     /// Whether the last reference to this instance may simply be
@@ -2458,6 +2508,7 @@ impl PyInstance {
     /// is being tracked by other means, or is dying).
     #[inline]
     pub(crate) fn clear_deferred_tracking(&self) {
+        self.deferred.set(false);
         if let Some(d) = self.dict.get() {
             match d.try_borrow() {
                 Ok(d) => {
@@ -2472,14 +2523,19 @@ impl PyInstance {
 
     /// Track a deferred instance now (no-op otherwise).
     pub fn ensure_gc_tracked(&self) {
-        let owner = match self.dict.get() {
-            Some(d) => match d.try_borrow() {
-                Ok(d) => d.take_deferred_owner(),
-                Err(_) => 0,
-            },
-            None => 0,
-        };
-        crate::gc_trace::track_deferred_owner(owner);
+        if !self.deferred.get() {
+            return;
+        }
+        // Retire the dict's copy of the record so the write barrier does
+        // not track a second time, then track from the instance itself —
+        // which works whether or not a `__dict__` was ever created.
+        if let Some(d) = self.dict.get() {
+            if let Ok(d) = d.try_borrow() {
+                d.take_deferred_owner();
+            }
+        }
+        self.deferred.set(false);
+        crate::gc_trace::track_deferred_owner(std::ptr::from_ref(self) as usize);
     }
 
     /// A value is about to be stored outside the `__dict__` (a slot):
@@ -2628,6 +2684,7 @@ impl Drop for PyInstance {
             finalize_ran: Cell::new(true),
             // The resurrected copy is a distinct object that owns no C
             // body (the dying `self` already freed its own above).
+            deferred: crate::sync::Cell::new(false),
             c_body: CBody::default(),
         }));
         crate::vm_singletons::try_push_pending_finalizer(resurrected);

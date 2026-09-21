@@ -1673,14 +1673,14 @@ fn tw_self(args: &[Object]) -> Result<Rc<crate::types::PyInstance>, RuntimeError
 }
 
 fn tw_get(inst: &crate::types::PyInstance, name: &str) -> Option<Object> {
-    inst.dict
+    inst.dict_cell()
         .borrow()
         .get(&crate::object::StrKey(name))
         .cloned()
 }
 
 fn tw_set(inst: &crate::types::PyInstance, name: &'static str, value: Object) {
-    inst.dict
+    inst.dict_cell()
         .borrow_mut()
         .insert(DictKey(Object::from_static(name)), value);
 }
@@ -3591,7 +3591,7 @@ fn tw_dec_output(inst: &crate::types::PyInstance, s: String) -> Object {
 /// Drop the decoded-snapshot cache so the next read re-materialises from the
 /// (newly repositioned) underlying buffer.
 fn tw_reset_decoded(inst: &crate::types::PyInstance) {
-    let mut d = inst.dict.borrow_mut();
+    let mut d = inst.dict_cell().borrow_mut();
     for k in [
         "_dec_buf",
         "_dec_pos",
@@ -4154,7 +4154,7 @@ fn tw_detach(args: &[Object]) -> Result<Object, RuntimeError> {
     let buffer = tw_get(&inst, "buffer")
         .ok_or_else(|| value_error("underlying buffer has been detached"))?;
     tw_set(&inst, "_detached", Object::Bool(true));
-    inst.dict
+    inst.dict_cell()
         .borrow_mut()
         .shift_remove(&DictKey(Object::from_static("buffer")));
     Ok(buffer)
@@ -5894,7 +5894,7 @@ fn bw_detach(args: &[Object]) -> Result<Object, RuntimeError> {
             bw_flush_unlocked(&inst, &wt)?;
         }
     }
-    inst.dict
+    inst.dict_cell()
         .borrow_mut()
         .shift_remove(&DictKey(Object::from_static("raw")));
     Ok(raw)

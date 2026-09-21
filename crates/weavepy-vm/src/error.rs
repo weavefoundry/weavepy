@@ -91,7 +91,7 @@ impl PyException {
         use crate::object::DictKey;
         if let Object::Instance(inst) = &self.instance {
             let key = DictKey(Object::from_static("__notes__"));
-            let mut dict = inst.dict.borrow_mut();
+            let mut dict = inst.dict_cell().borrow_mut();
             let mut notes = match dict.get(&key) {
                 Some(Object::List(l)) => l.borrow().clone(),
                 _ => Vec::new(),
@@ -139,7 +139,7 @@ impl PyException {
         // subclass assigning `self.code = …` without the descriptor
         // (plain instance attribute) lands in the dict — honour both.
         let code = inst.slot_get("code").or_else(|| {
-            inst.dict
+            inst.dict_cell()
                 .borrow()
                 .get(&crate::object::StrKey("code"))
                 .cloned()

@@ -2702,7 +2702,7 @@ fn slot_getstate(args: &[Object]) -> Result<Object, RuntimeError> {
         let dict_state = if dict_is_empty {
             Object::None
         } else {
-            Object::Dict(inst.dict.share())
+            Object::Dict(inst.dict_shared())
         };
         if !slots.is_empty() {
             let mut slot_dict = crate::object::DictData::default();
@@ -3812,7 +3812,7 @@ fn property_dunder_delete(args: &[Object]) -> Result<Object, RuntimeError> {
 pub(crate) fn wstr_attr_dict(obj: &Object) -> Option<Rc<RefCell<crate::object::DictData>>> {
     match obj {
         Object::Module(m) => Some(m.dict.clone()),
-        Object::Instance(inst) => Some(inst.dict.share()),
+        Object::Instance(inst) => Some(inst.dict_shared()),
         _ => None,
     }
 }
@@ -3938,7 +3938,7 @@ fn b_vars(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Instance(inst)) if inst.cls().forbids_dict => {
             Err(type_error("vars() argument must have __dict__ attribute"))
         }
-        Some(Object::Instance(inst)) => Ok(Object::Dict(inst.dict.share())),
+        Some(Object::Instance(inst)) => Ok(Object::Dict(inst.dict_shared())),
         Some(Object::Module(m)) => Ok(Object::Dict(m.dict.clone())),
         Some(Object::Type(t)) => Ok(Object::Dict(t.dict.clone())),
         Some(other) => Err(type_error(format!(
@@ -4045,7 +4045,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
     match obj {
         Object::Instance(inst) => {
             if let Some(v) = inst
-                .dict
+                .dict_cell()
                 .borrow()
                 .get(&crate::object::DictKey(Object::from_str(name)))
                 .cloned()
@@ -4059,7 +4059,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                 return Some(bind_descriptor(&v, obj));
             }
             match name {
-                "__dict__" => Some(Object::Dict(inst.dict.share())),
+                "__dict__" => Some(Object::Dict(inst.dict_shared())),
                 "__class__" => Some(Object::Type(inst.cls())),
                 _ => None,
             }
@@ -5210,7 +5210,7 @@ pub fn code_flags(c: &weavepy_compiler::CodeObject) -> u32 {
 fn attr_set(obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError> {
     match obj {
         Object::Instance(inst) => {
-            inst.dict
+            inst.dict_cell()
                 .borrow_mut()
                 .insert(crate::object::DictKey(Object::from_str(name)), value);
             Ok(())
@@ -5264,7 +5264,7 @@ fn attr_set(obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError>
 fn attr_delete(obj: &Object, name: &str) -> Result<(), RuntimeError> {
     match obj {
         Object::Instance(inst) => {
-            inst.dict
+            inst.dict_cell()
                 .borrow_mut()
                 .shift_remove(&crate::object::DictKey(Object::from_str(name)));
             Ok(())
@@ -8567,6 +8567,7 @@ pub(crate) fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object 
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
         hash_cache: crate::sync::CachedHash::new(None),
         finalize_ran: crate::sync::Cell::new(false),
+        deferred: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
     };
     Object::Instance(Rc::new(inst))
@@ -8645,6 +8646,7 @@ pub(crate) fn build_super_proxy(
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
         hash_cache: crate::sync::CachedHash::new(None),
         finalize_ran: crate::sync::Cell::new(false),
+        deferred: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
     };
     Object::Instance(Rc::new(inst))
@@ -8682,7 +8684,7 @@ pub fn super_init_impl(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(_) => return Err(type_error("super() argument 1 must be a type")),
     };
     let receiver = args.get(2).cloned().unwrap_or(Object::None);
-    let mut d = target.dict.borrow_mut();
+    let mut d = target.dict_cell().borrow_mut();
     d.insert(
         DictKey(Object::from_static("__thisclass__")),
         Object::Type(class.clone()),
@@ -8710,7 +8712,7 @@ pub fn super_descr_get_impl(args: &[Object]) -> Result<Object, RuntimeError> {
     // Already bound (has a non-None __self__) → return self unchanged.
     if let Object::Instance(i) = &this {
         let (bound, class) = {
-            let d = i.dict.borrow();
+            let d = i.dict_cell().borrow();
             let bound = d
                 .get(&DictKey(Object::from_static("__self__")))
                 .map(|v| !matches!(v, Object::None))
@@ -9482,7 +9484,7 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     match obj {
         Object::Instance(inst) => {
-            for k in inst.dict.borrow().keys() {
+            for k in inst.dict_cell().borrow().keys() {
                 if let Object::Str(s) = &k.0 {
                     names.insert(s.to_string());
                 }
@@ -16807,7 +16809,7 @@ fn mem_dict_slot(receiver: &Object) -> Object {
 fn mem_apply_dict(receiver: &Object, dict: &Rc<RefCell<DictData>>) {
     match receiver {
         Object::Instance(inst) => {
-            let mut inst_dict = inst.dict.borrow_mut();
+            let mut inst_dict = inst.dict_cell().borrow_mut();
             for (k, v) in dict.borrow().iter() {
                 inst_dict.insert(k.clone(), v.clone());
             }
@@ -17911,7 +17913,7 @@ fn ns_dict_of(recv: &Object) -> Option<Rc<RefCell<crate::object::DictData>>> {
     match recv {
         Object::SimpleNamespace(d) => Some(d.clone()),
         Object::Instance(i) if matches!(i.native.get(), Some(Object::SimpleNamespace(_))) => {
-            Some(i.dict.share())
+            Some(i.dict_shared())
         }
         _ => None,
     }

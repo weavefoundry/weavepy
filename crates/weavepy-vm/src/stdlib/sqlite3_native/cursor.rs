@@ -161,7 +161,7 @@ fn state_of(obj: &Object) -> Result<Rc<RefCell<CursorState>>, RuntimeError> {
         return Err(type_error("expected a sqlite3.Cursor instance"));
     };
     let handle = inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static(CURSOR_HANDLE_KEY)))
         .cloned();
@@ -201,7 +201,7 @@ fn cur_init(args: &[Object]) -> Result<Object, RuntimeError> {
     // `cur.__init__(con)`) hits CPython's `self->locked` gate.
     {
         let handle = inst
-            .dict
+            .dict_cell()
             .borrow()
             .get(&DictKey(Object::from_static(CURSOR_HANDLE_KEY)))
             .cloned();
@@ -257,7 +257,7 @@ fn cur_init(args: &[Object]) -> Result<Object, RuntimeError> {
     }));
     let handle = next_handle();
     cursor_registry().lock().insert(handle, state);
-    inst.dict.borrow_mut().insert(
+    inst.dict_cell().borrow_mut().insert(
         DictKey(Object::from_static(CURSOR_HANDLE_KEY)),
         Object::Int(handle),
     );
@@ -698,7 +698,7 @@ fn cur_del(args: &[Object]) -> Result<Object, RuntimeError> {
             drop(s);
             if let Object::Instance(inst) = obj {
                 let handle = inst
-                    .dict
+                    .dict_cell()
                     .borrow()
                     .get(&DictKey(Object::from_static(CURSOR_HANDLE_KEY)))
                     .cloned();

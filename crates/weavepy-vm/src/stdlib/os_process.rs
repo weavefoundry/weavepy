@@ -392,7 +392,7 @@ fn env_mapping_dict(env: &Object) -> Option<Rc<RefCell<DictData>>> {
         Object::Dict(d) => Some(d.clone()),
         Object::Instance(inst) => {
             match inst
-                .dict
+                .dict_cell()
                 .borrow()
                 .get(&DictKey(Object::from_static("_data")))
                 .cloned()

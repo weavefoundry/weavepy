@@ -296,7 +296,7 @@ fn attach_state(inst: &Rc<PyInstance>) -> Rc<RefCell<FutState>> {
     let handle = NEXT.fetch_add(1, Ordering::Relaxed);
     let st = Rc::new(RefCell::new(FutState::default()));
     registry().lock().insert(handle, st.clone());
-    inst.dict.borrow_mut().insert(
+    inst.dict_cell().borrow_mut().insert(
         DictKey(Object::from_static(HANDLE_KEY)),
         Object::Int(handle),
     );
@@ -307,7 +307,7 @@ fn attach_state(inst: &Rc<PyInstance>) -> Rc<RefCell<FutState>> {
 /// creating one. Safe to call from GC callbacks.
 fn existing_state_of(inst: &PyInstance) -> Option<Rc<RefCell<FutState>>> {
     let existing = inst
-        .dict
+        .dict_cell()
         .try_borrow()
         .ok()?
         .get(&DictKey(Object::from_static(HANDLE_KEY)))
@@ -394,7 +394,7 @@ fn awaited_by_discard(fut: &Object, waiter: &Object) {
 /// futures — bounded by the same lifetime CPython gives them.
 fn release_state(inst: &Rc<PyInstance>) {
     let existing = inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static(HANDLE_KEY)))
         .cloned();
@@ -414,7 +414,7 @@ fn release_state(inst: &Rc<PyInstance>) {
 fn fut_gc_matches(obj: &Object) -> bool {
     match obj {
         Object::Instance(i) => i
-            .dict
+            .dict_cell()
             .try_borrow()
             .is_ok_and(|d| d.get(&DictKey(Object::from_static(HANDLE_KEY))).is_some()),
         _ => false,
@@ -1329,10 +1329,10 @@ fn future_iter_class() -> Rc<TypeObject> {
 
 fn future_iter_new(fut: &Object) -> Object {
     let inst = Rc::new(PyInstance::new(future_iter_class()));
-    inst.dict
+    inst.dict_cell()
         .borrow_mut()
         .insert(DictKey(Object::from_static(FI_FUT_KEY)), fut.clone());
-    inst.dict.borrow_mut().insert(
+    inst.dict_cell().borrow_mut().insert(
         DictKey(Object::from_static(FI_DONE_KEY)),
         Object::Bool(false),
     );
@@ -1362,7 +1362,7 @@ fn fi_iter(args: &[Object]) -> Result<Object, RuntimeError> {
 fn fi_next(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = fi_self(args)?;
     let (fut, done) = {
-        let d = inst.dict.borrow();
+        let d = inst.dict_cell().borrow();
         (
             d.get(&DictKey(Object::from_static(FI_FUT_KEY)))
                 .cloned()
@@ -1388,7 +1388,7 @@ fn fi_next(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         return Err(runtime_err("await wasn't used with future"));
     }
-    inst.dict.borrow_mut().insert(
+    inst.dict_cell().borrow_mut().insert(
         DictKey(Object::from_static(FI_DONE_KEY)),
         Object::Bool(true),
     );
@@ -1459,7 +1459,7 @@ fn fi_throw(args: &[Object]) -> Result<Object, RuntimeError> {
             )))
         }
     };
-    inst.dict.borrow_mut().insert(
+    inst.dict_cell().borrow_mut().insert(
         DictKey(Object::from_static(FI_DONE_KEY)),
         Object::Bool(true),
     );
@@ -1468,7 +1468,7 @@ fn fi_throw(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn fi_close(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = fi_self(args)?;
-    inst.dict.borrow_mut().insert(
+    inst.dict_cell().borrow_mut().insert(
         DictKey(Object::from_static(FI_DONE_KEY)),
         Object::Bool(true),
     );
@@ -1960,7 +1960,7 @@ fn set_future_blocking_false(interp: &mut Interp, fut: &Object) -> Result<(), Ru
     // Fast path for native futures; foreign future-likes get a setattr.
     if let Object::Instance(inst) = fut {
         if inst
-            .dict
+            .dict_cell()
             .borrow()
             .get(&DictKey(Object::from_static(HANDLE_KEY)))
             .is_some()
