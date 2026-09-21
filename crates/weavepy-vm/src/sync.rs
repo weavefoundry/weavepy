@@ -339,19 +339,68 @@ fn cells_shared() -> bool {
 /// The first thread to run VM code (see [`note_vm_thread`]).
 static FIRST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Live borrow guards taken lock-free (while cells were unshared). Only
-/// the first VM thread takes such guards, so it is that thread's count —
-/// kept outside thread-local storage so the unshared borrow path touches
-/// no TLS. Written with plain load/store pairs by its single writer.
+/// Live borrow guards taken lock-free (while the bias held). Only the
+/// biased thread takes such guards, but [`revoke_bias`] reads the count
+/// from another thread, so both sides are sequentially consistent: the
+/// drain below and the re-check in the borrow fast paths must not miss
+/// each other.
 static SOLE_GUARDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The `tls` tag of a guard counted in [`SOLE_GUARDS`].
 const SOLE_TAG: *const CellTls = std::ptr::dangling();
 
+/// True while the calling thread may borrow without taking the lock
+/// word: a bias exists, it has not been revoked, and it is ours.
+///
+/// The thread-local read is what makes the fast path *safe* rather than
+/// merely fast: a thread that never registered (a raw `std::thread`, a
+/// pool worker, a C-API caller) has a different id and so is steered to
+/// the locked path instead of silently racing the biased thread.
 #[inline]
-fn sole_guard_acquired() -> *const CellTls {
-    SOLE_GUARDS.store(SOLE_GUARDS.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
-    SOLE_TAG
+fn biased_here() -> bool {
+    let first = FIRST.load(Ordering::Relaxed);
+    first != 0
+        && !CELLS_SHARED.load(Ordering::Relaxed)
+        && CELL_TLS.try_with(|t| t.thread_id.get()).unwrap_or(0) == first
+}
+
+/// Publish a lock-free guard and re-check that the bias still holds.
+/// Both accesses are `SeqCst`, so this and [`revoke_bias`] linearise:
+/// whichever runs second observes the other's write, and a borrow is
+/// therefore never held lock-free once a revoker has moved on.
+#[inline]
+#[must_use]
+fn publish_sole_guard() -> bool {
+    SOLE_GUARDS.fetch_add(1, Ordering::SeqCst);
+    if CELLS_SHARED.load(Ordering::SeqCst) {
+        return false;
+    }
+    true
+}
+
+/// Drop a guard published by [`publish_sole_guard`]. Callers undo their
+/// borrow-counter claim *before* this, so that a revoker which observes
+/// the count at zero also observes every undone claim.
+#[inline]
+fn retract_sole_guard() {
+    SOLE_GUARDS.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// Take every cell off the biased path, then wait for the biased
+/// thread's lock-free guards to drain. Only the thread that performs
+/// the transition drains, so a thread that already sees cells shared —
+/// including the biased thread backing out of its own fast path — never
+/// waits on a guard it is itself holding.
+fn revoke_bias() {
+    if CELLS_SHARED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if std::env::var_os("WEAVEPY_CELLS_TRACE").is_some() {
+        eprintln!("[cells] shared: bias revoked");
+    }
+    while SOLE_GUARDS.load(Ordering::SeqCst) > 0 {
+        std::hint::spin_loop();
+    }
 }
 
 /// Record that `thread_id` is about to run VM code. Called from the GIL
@@ -365,10 +414,10 @@ pub fn note_vm_thread(thread_id: u64) {
         Ok(_) => {}
         Err(first) if first == thread_id => {}
         Err(first) => {
-            CELLS_SHARED.store(true, Ordering::SeqCst);
             if std::env::var_os("WEAVEPY_CELLS_TRACE").is_some() {
                 eprintln!("[cells] shared: thread {thread_id:#x} joins {first:#x}");
             }
+            revoke_bias();
         }
     }
 }
@@ -376,11 +425,7 @@ pub fn note_vm_thread(thread_id: u64) {
 /// Every cell is shared from now on (free-threading, a foreign thread
 /// that may touch objects without the GIL).
 pub fn mark_cells_shared() {
-    if !CELLS_SHARED.swap(true, Ordering::SeqCst)
-        && std::env::var_os("WEAVEPY_CELLS_TRACE").is_some()
-    {
-        eprintln!("[cells] shared: marked");
-    }
+    revoke_bias();
 }
 
 // `try_with`, not `with`, throughout: guards can be dropped from TLS
@@ -392,11 +437,9 @@ fn note_cell_guard_released(tls: *const CellTls) {
         return;
     }
     if tls == SOLE_TAG {
-        // Only the first VM thread takes (and so releases) these.
-        SOLE_GUARDS.store(
-            SOLE_GUARDS.load(Ordering::Relaxed).saturating_sub(1),
-            Ordering::Relaxed,
-        );
+        // Only the biased thread takes (and so releases) these, but a
+        // revoker drains the count from another thread.
+        retract_sole_guard();
         return;
     }
     // SAFETY: the pointer was taken from this thread's live TLS block
@@ -622,21 +665,30 @@ impl<T: ?Sized> GilCell<T> {
     /// [`BorrowError`] if a mutable borrow is live.
     #[inline]
     pub fn try_borrow(&self) -> Result<Ref<'_, T>, BorrowError> {
-        if !cells_shared() {
-            // The sole VM thread: no lock word, no thread-local access.
+        if biased_here() {
+            // The biased thread: no lock word.
             if !self.borrow_shared(false) {
                 return Err(BorrowError);
             }
-            // SAFETY: as in `try_borrow_locked`; the only thread touching
-            // cells holds a shared borrow count on this one.
-            let value: &T = unsafe { &*self.data.get() };
-            return Ok(Ref {
-                cell: self,
-                value,
-                tls: sole_guard_acquired(),
-                locked: false,
-                _not_send: std::marker::PhantomData,
-            });
+            if publish_sole_guard() {
+                // SAFETY: the counter is `>= 1`, so no `&mut T` to the
+                // data exists, and the bias was still ours after the
+                // guard was published — no other thread can be inside
+                // the locked path for this cell.
+                let value: &T = unsafe { &*self.data.get() };
+                return Ok(Ref {
+                    cell: self,
+                    value,
+                    tls: SOLE_TAG,
+                    locked: false,
+                    _not_send: std::marker::PhantomData,
+                });
+            }
+            // Revoked while we were claiming. Undo the claim first, so a
+            // revoker that sees the guard count reach zero also sees the
+            // counter restored, then fall through to the locked path.
+            self.borrow.fetch_sub(1, Ordering::Release);
+            retract_sole_guard();
         }
         self.try_borrow_locked()
     }
@@ -654,6 +706,12 @@ impl<T: ?Sized> GilCell<T> {
         // id and skip the count, which is irrelevant by then.
         let (ok, tls) = CELL_TLS
             .try_with(|t| {
+                // Every thread that borrows through the lock registers
+                // here, so the bias is only ever held while its owner
+                // really is the one thread touching cells — a raw
+                // thread, a pool worker or a C-API caller revokes it
+                // before it can reach the data.
+                note_vm_thread(t.thread_id());
                 if locked {
                     self.lock_acquire_as(t.thread_id());
                 }
@@ -693,18 +751,29 @@ impl<T: ?Sized> GilCell<T> {
     /// reentrant lock let us in), unwind, release, and report failure.
     #[inline]
     fn borrow_shared(&self, locked: bool) -> bool {
-        // The owner lock already serializes access across threads. The
-        // counter only checks same-thread reentry, so it needs no atomic
-        // read-modify-write or second acquire/release barrier.
-        let prev = self.borrow.load(Ordering::Relaxed);
-        if prev < 0 || prev == i32::MAX {
-            if locked {
-                self.lock_release();
+        // A real read-modify-write, on both the locked and the biased
+        // path. The lock word serializes the locked path against itself,
+        // but the biased thread borrows without it, so a plain
+        // load/store pair here would let the two lose each other's
+        // updates and hand out a `&mut T` alongside a live `&T`.
+        let mut prev = self.borrow.load(Ordering::Relaxed);
+        loop {
+            if prev < 0 || prev == i32::MAX {
+                if locked {
+                    self.lock_release();
+                }
+                return false;
             }
-            return false;
+            match self.borrow.compare_exchange_weak(
+                prev,
+                prev + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(cur) => prev = cur,
+            }
         }
-        self.borrow.store(prev + 1, Ordering::Relaxed);
-        true
     }
 
     /// Claim the exclusive borrow under the held lock: only succeeds if
@@ -712,13 +781,16 @@ impl<T: ?Sized> GilCell<T> {
     /// mutable borrow); releases the lock and reports failure otherwise.
     #[inline]
     fn borrow_exclusive(&self, locked: bool) -> bool {
-        if self.borrow.load(Ordering::Relaxed) != 0 {
+        if self
+            .borrow
+            .compare_exchange(0, -1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             if locked {
                 self.lock_release();
             }
             return false;
         }
-        self.borrow.store(-1, Ordering::Relaxed);
         true
     }
 
@@ -726,18 +798,25 @@ impl<T: ?Sized> GilCell<T> {
     /// Returns [`BorrowMutError`] if any borrow is live.
     #[inline]
     pub fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
-        if !cells_shared() {
-            // The sole VM thread: no lock word, no thread-local access.
+        if biased_here() {
+            // The biased thread: no lock word.
             if !self.borrow_exclusive(false) {
                 return Err(BorrowMutError);
             }
+            if !publish_sole_guard() {
+                // Revoked mid-claim; undo before dropping the guard
+                // count (see `try_borrow`) and take the locked path.
+                self.borrow.store(0, Ordering::Release);
+                retract_sole_guard();
+                return self.try_borrow_mut_locked();
+            }
             // SAFETY: as in `try_borrow_mut_locked`; the exclusive count
-            // is ours.
+            // is ours and the bias still held after publishing.
             let value: &mut T = unsafe { &mut *self.data.get() };
             return Ok(RefMut {
                 cell: self,
                 value,
-                tls: sole_guard_acquired(),
+                tls: SOLE_TAG,
                 locked: false,
                 _not_send: std::marker::PhantomData,
             });
@@ -753,6 +832,8 @@ impl<T: ?Sized> GilCell<T> {
         let locked = true;
         let (ok, tls) = CELL_TLS
             .try_with(|t| {
+                // Registers the caller — see `try_borrow_locked`.
+                note_vm_thread(t.thread_id());
                 if locked {
                     self.lock_acquire_as(t.thread_id());
                 }
@@ -1030,8 +1111,9 @@ impl<T: ?Sized + fmt::Display> fmt::Display for Ref<'_, T> {
 
 impl<T: ?Sized> Drop for Ref<'_, T> {
     fn drop(&mut self) {
-        let count = self.cell.borrow.load(Ordering::Relaxed);
-        self.cell.borrow.store(count - 1, Ordering::Relaxed);
+        // Atomic for the same reason as the claim in `borrow_shared`:
+        // the biased thread releases without the lock word.
+        self.cell.borrow.fetch_sub(1, Ordering::Release);
         if self.locked {
             self.cell.lock_release();
         }
@@ -1073,7 +1155,7 @@ impl<T: ?Sized> Drop for RefMut<'_, T> {
     fn drop(&mut self) {
         // From -1 back to 0 — there's only ever one outstanding
         // mutable borrow at a time.
-        self.cell.borrow.store(0, Ordering::Relaxed);
+        self.cell.borrow.store(0, Ordering::Release);
         if self.locked {
             self.cell.lock_release();
         }
