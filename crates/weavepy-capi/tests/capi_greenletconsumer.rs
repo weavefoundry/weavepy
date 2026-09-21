@@ -71,11 +71,24 @@ fn run_with_consumer(driver_body: &str) {
     std::fs::copy(&ext, &staged).expect("staging extension");
     let p_dir = py_quote(&tmp.path().display().to_string());
     let driver = format!("import sys\nsys.path.insert(0, {p_dir})\n{driver_body}");
-    let opts = RunOptions::new("<greenletconsumer-test>").with_flags(InterpreterFlags::default());
-    if let Err(err) = run_source_with_options(&driver, &opts) {
-        let formatted = err.format(&driver, "<greenletconsumer-test>");
-        panic!("_greenletconsumer driver failed:\n{formatted}");
-    }
+    // Rust's 2 MiB test thread is not enough for `site` initialization
+    // plus a greenlet switch in an unoptimized build — the interpreter's
+    // dispatch frames are enormous when nothing is inlined, and the
+    // harness thread (not the greenlet's own mmap'd stack) is what
+    // overflows. Mirror `capi_wheel_endtoend` and the fixture harness.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let opts =
+                RunOptions::new("<greenletconsumer-test>").with_flags(InterpreterFlags::default());
+            if let Err(err) = run_source_with_options(&driver, &opts) {
+                let formatted = err.format(&driver, "<greenletconsumer-test>");
+                panic!("_greenletconsumer driver failed:\n{formatted}");
+            }
+        })
+        .expect("spawn test thread")
+        .join()
+        .expect("test thread panicked");
 }
 
 #[test]
