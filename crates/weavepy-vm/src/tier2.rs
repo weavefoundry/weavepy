@@ -358,6 +358,11 @@ pub(crate) const GENERIC_CALL_RETIRE_RATIO: u32 = 4;
 /// activation that keeps coming back here is a loop around calls the
 /// JIT cannot run natively, so the interpreter finishes it (and runs
 /// every later activation).
+/// Zero disables the backoff (its `!= 0` guards then short-circuit, and
+/// clippy reads the `>=` behind them as vacuous — hence the allows at
+/// the three sites). Kept as a constant rather than deleted: the
+/// measurement that zeroed it is recorded above, and re-arming it is a
+/// one-line change.
 pub(crate) const INTERP_CALL_RETIRE_BUDGET: u32 = 0;
 
 /// Minimum framed entries before the generic-call ratio is judged —
@@ -1710,7 +1715,8 @@ fn callee_ret_info(
         classify_global(obj.as_ref())
     };
     let mut obj_global = |name: &str| resolve(name).map(|o| grade_obj_global(&o));
-    let (lane, ret_none) = match weavepy_jit::analyze_for_ret(fcode, &mut classify, &mut obj_global) {
+    let (lane, ret_none) = match weavepy_jit::analyze_for_ret(fcode, &mut classify, &mut obj_global)
+    {
         Ok(tf) => (tf.ret_lane, tf.ret_none),
         Err(e) => {
             if crate::hot_gates::env_flags::jit_trace() {
@@ -3550,6 +3556,7 @@ unsafe fn try_native_call(
     // callee context, a recursion tick): a loop of them is call-shaped
     // too. Past the budget the interpreter path takes it (and retires
     // the code through `finish_interp_call`).
+    #[allow(clippy::absurd_extreme_comparisons)] // budget currently 0 — see the constant
     if INTERP_CALL_RETIRE_BUDGET != 0
         && ctx.interp_calls.saturating_add(1) >= INTERP_CALL_RETIRE_BUDGET
     {
@@ -4005,6 +4012,7 @@ unsafe fn try_native_ctor(
     // A native construction is a framed call plus allocation and
     // tracking: charged like any other heavy round-trip, and past the
     // budget left to the interpreter (see `charge_roundtrip`).
+    #[allow(clippy::absurd_extreme_comparisons)] // budget currently 0 — see the constant
     if INTERP_CALL_RETIRE_BUDGET != 0
         && ctx.interp_calls.saturating_add(1) >= INTERP_CALL_RETIRE_BUDGET
     {
@@ -4491,6 +4499,7 @@ fn charge_roundtrip(ctx: &mut CallCtx) -> bool {
     // methods still beats interpreting the loop — the round trip is no
     // dearer than the interpreter's own call — so a plain interpreter
     // call never retires the caller; only the deopt backoff does.
+    #[allow(clippy::absurd_extreme_comparisons)] // budget currently 0 — see the constant
     if INTERP_CALL_RETIRE_BUDGET == 0
         || ctx.interp_calls < INTERP_CALL_RETIRE_BUDGET
         || ctx.code_ptr.is_null()
@@ -6838,7 +6847,8 @@ unsafe fn call_dyn_impl(
     {
         note_generic_dyn_call(ctx);
         ctx.dirty = true;
-        let called = call_with_activation_shell(interp, ctx, jf, |i| i.run_py_exact_nofree(&f, locals));
+        let called =
+            call_with_activation_shell(interp, ctx, jf, |i| i.run_py_exact_nofree(&f, locals));
         // SAFETY: as above.
         return unsafe { dyn_call_result(jf, ctx, called, false, int_result) };
     }
@@ -6972,7 +6982,8 @@ unsafe fn dyn_kw_site_bind(
     else {
         return None;
     };
-    let Some(Object::Tuple(name_items)) = crate::code_const_objects(code).get(names as usize) else {
+    let Some(Object::Tuple(name_items)) = crate::code_const_objects(code).get(names as usize)
+    else {
         return None;
     };
     let (f, recv) = match callee {
@@ -8265,7 +8276,9 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
                             pc,
                             slot,
                             ty,
-                            locals.get(slot).map_or("?".to_owned(), |o| o.type_name_owned())
+                            locals
+                                .get(slot)
+                                .map_or("?".to_owned(), |o| o.type_name_owned())
                         );
                     }
                     drop(locals);

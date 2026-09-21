@@ -238,6 +238,10 @@ cast_precision_loss     = "allow"
 # Stylistic preferences that fight legitimate manual patterns:
 manual_assert           = "allow"
 too_many_lines          = "allow"
+# The eval loop's helpers thread the frame, shell, pc, caches and the
+# activation's own state through by hand; splitting them into structs
+# to satisfy an arity count costs a load on the hottest paths.
+too_many_arguments      = "allow"
 similar_names           = "allow"
 match_same_arms         = "allow"
 single_match_else       = "allow"

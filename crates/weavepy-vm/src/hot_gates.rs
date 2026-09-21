@@ -190,7 +190,6 @@ pub mod env_flags {
         "WEAVEPY_NO_PAIRS"
     );
 
-
     /// `WEAVEPY_TE_BT=<needle>`: backtrace every `TypeError` whose
     /// message contains the needle.
     pub fn te_bt() -> Option<&'static str> {

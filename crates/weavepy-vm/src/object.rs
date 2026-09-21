@@ -4115,7 +4115,7 @@ impl DictData {
             return Self::deferred_for(owner);
         }
         Self {
-            map: DictMap::with_capacity_and_hasher(n, Default::default()),
+            map: DictMap::with_capacity_and_hasher(n, crate::fasthash::FxBuildHasher),
             stamp: next_dict_stamp(),
             deferred_owner: std::sync::atomic::AtomicUsize::new(owner),
         }
@@ -4244,7 +4244,7 @@ impl FromIterator<(DictKey, Object)> for DictData {
 
 impl Extend<(DictKey, Object)> for DictData {
     fn extend<I: IntoIterator<Item = (DictKey, Object)>>(&mut self, iter: I) {
-        std::ops::DerefMut::deref_mut(self).extend(iter);
+        (**self).extend(iter);
     }
 }
 
@@ -4271,7 +4271,7 @@ impl<'a> IntoIterator for &'a mut DictData {
     type IntoIter = indexmap::map::IterMut<'a, DictKey, Object>;
 
     fn into_iter(self) -> Self::IntoIter {
-        std::ops::DerefMut::deref_mut(self).iter_mut()
+        (**self).iter_mut()
     }
 }
 
@@ -9429,9 +9429,7 @@ impl Object {
             Object::Str(haystack) => match item {
                 // Short-needle search without the two-way searcher's
                 // per-call preprocessing (see `builtins::substr_find`).
-                Object::Str(needle) => {
-                    Ok(crate::builtins::substr_find(haystack, needle).is_some())
-                }
+                Object::Str(needle) => Ok(crate::builtins::substr_find(haystack, needle).is_some()),
                 // `"..." in wstr`: a surrogate-bearing needle can never be a
                 // substring of a pure-UTF-8 haystack, so this is always false.
                 Object::WStr(_) => Ok(false),

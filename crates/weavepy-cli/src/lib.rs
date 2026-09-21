@@ -68,6 +68,10 @@ mod pcprof {
         fn _dyld_get_image_vmaddr_slide(image_index: u32) -> isize;
     }
 
+    // The kernel hands the handler an 8-byte-aligned `ucontext_t`, and
+    // every offset walked below is ABI-fixed, so each reinterpretation is
+    // aligned by construction (see the SAFETY note inside).
+    #[allow(clippy::cast_ptr_alignment)]
     extern "C" fn on_prof(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
         let buf = BUF.load(Ordering::Relaxed);
         if buf.is_null() || ctx.is_null() {
@@ -78,11 +82,11 @@ mod pcprof {
         // context the thread state follows the 16-byte exception state:
         // x0-x28, then fp (x29), lr, sp and pc.
         let (pc, lr, mut fp) = unsafe {
-            let mctx = *((ctx as *const u8).add(48) as *const *const u8);
+            let mctx = *(ctx as *const u8).add(48).cast::<*const u8>();
             if mctx.is_null() {
                 return;
             }
-            let ss = mctx.add(16) as *const u64;
+            let ss = mctx.add(16).cast::<u64>();
             (*ss.add(32), *ss.add(30), *ss.add(29) as usize)
         };
         let i = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -131,8 +135,8 @@ mod pcprof {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = on_prof as *const () as usize;
             sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
-            libc::sigemptyset(&mut sa.sa_mask);
-            libc::sigaction(libc::SIGPROF, &sa, std::ptr::null_mut());
+            libc::sigemptyset(&raw mut sa.sa_mask);
+            libc::sigaction(libc::SIGPROF, &raw const sa, std::ptr::null_mut());
         }
         // `ITIMER_PROF` fires at the scheduler tick (~100 Hz) however
         // short the interval asked for, so a helper thread signals the VM
@@ -175,7 +179,7 @@ mod pcprof {
         let main_base = {
             // SAFETY: `dladdr` on one of this image's own functions.
             let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
-            unsafe { libc::dladdr(finish as *const libc::c_void, &mut info) };
+            unsafe { libc::dladdr(finish as *const libc::c_void, &raw mut info) };
             info.dli_fbase as usize
         };
         // Addresses outside the executable (system libraries) are named
@@ -196,7 +200,8 @@ mod pcprof {
                 let name = names.entry(a).or_insert_with(|| {
                     // SAFETY: `dladdr` only reads the loader's tables.
                     let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
-                    let ok = unsafe { libc::dladdr(a as usize as *const libc::c_void, &mut info) };
+                    let ok =
+                        unsafe { libc::dladdr(a as usize as *const libc::c_void, &raw mut info) };
                     if ok != 0 && info.dli_fbase as usize == main_base {
                         return String::new();
                     }

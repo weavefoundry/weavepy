@@ -352,9 +352,9 @@ impl JitHint {
                         *e = (*e).max(pc);
                     }
                 }
-                let all = extent
-                    .iter()
-                    .all(|(&target, &end)| ins[target..=end].iter().any(|j| j.op == OpCode::YieldValue));
+                let all = extent.iter().all(|(&target, &end)| {
+                    ins[target..=end].iter().any(|j| j.op == OpCode::YieldValue)
+                });
                 self.yields_in_loops.store(
                     if all { 2 } else { 1 },
                     std::sync::atomic::Ordering::Relaxed,

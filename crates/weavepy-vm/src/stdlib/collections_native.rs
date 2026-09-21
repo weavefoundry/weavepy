@@ -65,7 +65,9 @@ fn head_of(slots: &crate::types::SlotStorage) -> usize {
 fn set_head_of(slots: &mut crate::types::SlotStorage, h: usize) {
     match slots.get_hinted_mut(SLOT_HEAD, "_head") {
         Some(slot) => *slot = Object::Int(h as i64),
-        None => slots.insert("_head", Object::Int(h as i64)).map_or((), drop),
+        None => slots
+            .insert("_head", Object::Int(h as i64))
+            .map_or((), drop),
     }
 }
 
@@ -106,9 +108,11 @@ impl DequeState<'_> {
 /// when nothing holds either (the end operations run no Python code
 /// while they use them; the free-threaded build's shared cells always
 /// take the guarded path). `None` sends the operation to that path.
-fn fast_parts(
-    args: &[Object],
-) -> Option<(&mut crate::types::SlotStorage, &mut Vec<Object>)> {
+// The `&mut` out of `&[Object]` is the point: both cells are checked
+// unguarded (`peek_mut` returns `None` if any guard is live) and neither
+// reference outlives the native call, which runs no Python.
+#[allow(clippy::mut_from_ref)]
+fn fast_parts(args: &[Object]) -> Option<(&mut crate::types::SlotStorage, &mut Vec<Object>)> {
     let Object::Instance(inst) = args.first()? else {
         return None;
     };

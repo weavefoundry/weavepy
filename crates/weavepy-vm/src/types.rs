@@ -1798,7 +1798,10 @@ pub struct SlotStorage {
 #[cfg(target_pointer_width = "64")]
 #[derive(Debug, Clone)]
 enum SlotData {
-    Single { key: Option<DictKey>, value: Object },
+    Single {
+        key: Option<DictKey>,
+        value: Object,
+    },
     Small(Vec<(DictKey, Object)>),
     /// Boxed: this variant is for instances with more than eight slots,
     /// and inline it would set the size of *every* instance's slot field
@@ -2076,7 +2079,9 @@ impl SlotStorage {
             SlotData::Single {
                 key: Some(DictKey(Object::Str(stored))),
                 value: slot,
-            } if slot_name_eq(stored.as_ref(), name) => return Some(std::mem::replace(slot, value)),
+            } if slot_name_eq(stored.as_ref(), name) => {
+                return Some(std::mem::replace(slot, value))
+            }
             SlotData::Small(entries) => {
                 if let Some((_, slot)) = entries.iter_mut().find(
                     |(key, _)| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
@@ -2366,9 +2371,8 @@ impl PyInstance {
         }
         let inst = Rc::new(Self::new(class));
         let owner = Rc::as_ptr(&inst) as usize;
-        inst.dict.get_or_init(|| {
-            Rc::new(RefCell::new(DictData::deferred_for_capacity(owner, hint)))
-        });
+        inst.dict
+            .get_or_init(|| Rc::new(RefCell::new(DictData::deferred_for_capacity(owner, hint))));
         inst
     }
 
@@ -2809,7 +2813,7 @@ mod slot_storage_tests {
             let name = format!("slot{}", 2 * index + 1);
             assert_eq!(slots.index_of(&name), Some(index));
             let (key, value) = slots.get_index_mut(index as usize).unwrap();
-            assert!(matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)));
+            assert!(matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), &name)));
             *value = Object::Int(100 + i64::from(index));
             assert_eq!(
                 slots.get(&name).and_then(Object::as_i64),

@@ -15,6 +15,8 @@ fn function(ops: &[TOp]) -> TFunc {
         list_loops: vec![],
         iter_loops: vec![],
         comp_saved: vec![],
+        comp_target_slots: vec![],
+        cold_exits: vec![],
         resume_entries: vec![],
         callee_spans: vec![],
         len_spans: vec![],

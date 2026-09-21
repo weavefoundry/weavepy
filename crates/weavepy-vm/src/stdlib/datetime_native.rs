@@ -455,7 +455,12 @@ fn new_date(st: &State, y: i64, m: i64, d: i64) -> Option<Object> {
     Some(instance_fixed(
         cls,
         &st.date_layout,
-        vec![Object::Int(y), Object::Int(m), Object::Int(d), Object::Int(-1)],
+        vec![
+            Object::Int(y),
+            Object::Int(m),
+            Object::Int(d),
+            Object::Int(-1),
+        ],
     ))
 }
 

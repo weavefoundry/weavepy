@@ -630,7 +630,9 @@ impl DirStamp {
 /// removing an entry moves the directory's mtime; `importlib
 /// .invalidate_caches()` also drops every listing (see
 /// [`clear_dir_listings`]), as CPython's finders do.
-pub fn dir_listing(dir: &Path) -> Option<std::rc::Rc<std::collections::HashSet<std::ffi::OsString>>> {
+pub fn dir_listing(
+    dir: &Path,
+) -> Option<std::rc::Rc<std::collections::HashSet<std::ffi::OsString>>> {
     // An empty entry (`sys.path[0]` under `-c` / the REPL) is the current
     // directory, as CPython's `FileFinder('')` makes it `'.'`.
     let dir = if dir.as_os_str().is_empty() {

@@ -326,6 +326,10 @@ impl SharedSlice<u8> {
     /// A byte slice of `len` bytes written by `fill` (which receives a
     /// zeroed buffer of exactly that length): one allocation, no
     /// intermediate `Vec`.
+    // The backing allocation comes from `Arc::<[usize]>::new_zeroed_slice`,
+    // so it carries `usize` alignment by construction; the casts below
+    // reinterpret it as the `usize`-headed DST it was sized for.
+    #[allow(clippy::cast_ptr_alignment)]
     pub fn build(len: usize, fill: impl FnOnce(&mut [u8])) -> Self {
         let layout = Self::layout(len);
         let words = layout.size() / size_of::<usize>();
@@ -351,6 +355,10 @@ impl SharedSlice<u8> {
     /// rather than copied, so repeated appends cost what `realloc` does
     /// (CPython's `PyUnicode_Append` on a lone reference). `false` leaves
     /// `this` untouched.
+    // The backing allocation comes from `Arc::<[usize]>::new_zeroed_slice`,
+    // so it carries `usize` alignment by construction; the casts below
+    // reinterpret it as the `usize`-headed DST it was sized for.
+    #[allow(clippy::cast_ptr_alignment)]
     fn try_extend_unique(this: &mut Self, extra: &[u8]) -> bool {
         if ThinArc::get_mut(this).is_none() {
             return false;
@@ -383,7 +391,8 @@ impl SharedSlice<u8> {
                 return false;
             }
             let data = grown.add(offset).cast::<usize>();
-            let raw = ptr::slice_from_raw_parts_mut(data.cast::<u8>(), new_len) as *mut SliceStorage<u8>;
+            let raw =
+                ptr::slice_from_raw_parts_mut(data.cast::<u8>(), new_len) as *mut SliceStorage<u8>;
             ptr::addr_of_mut!((*raw).len).write(new_len);
             (*raw).hash.store(-1, Ordering::Relaxed);
             let dst = ptr::addr_of_mut!((*raw).items).cast::<u8>();

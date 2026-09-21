@@ -21,6 +21,11 @@
 //! that never opt in (and a thread past its exit flush) go straight to the
 //! system allocator.
 
+// Every cached block is at least `QUANTUM`-aligned (16 bytes, the class
+// granularity), so threading the free-list link through a `*mut *mut u8`
+// is aligned by construction.
+#![allow(clippy::cast_ptr_alignment)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::UnsafeCell;
 use std::ptr;
@@ -68,7 +73,7 @@ impl Drop for ExitGuard {
                 while !p.is_null() {
                     // SAFETY: every listed block is a live system block
                     // whose first word holds the next link.
-                    let next = unsafe { *(p as *mut *mut u8) };
+                    let next = unsafe { *p.cast::<*mut u8>() };
                     unsafe { libc_free(p) };
                     p = next;
                 }
@@ -135,7 +140,7 @@ unsafe impl GlobalAlloc for ThreadCacheAlloc {
                     let head = lists.heads[class];
                     if !head.is_null() {
                         // SAFETY: a listed block's first word links on.
-                        lists.heads[class] = unsafe { *(head as *mut *mut u8) };
+                        lists.heads[class] = unsafe { *head.cast::<*mut u8>() };
                         lists.counts[class] -= 1;
                     }
                     head
@@ -166,7 +171,7 @@ unsafe impl GlobalAlloc for ThreadCacheAlloc {
                         return false;
                     }
                     // SAFETY: the block is ours now and at least 16 bytes.
-                    unsafe { *(ptr as *mut *mut u8) = lists.heads[class] };
+                    unsafe { *ptr.cast::<*mut u8>() = lists.heads[class] };
                     lists.heads[class] = ptr;
                     lists.counts[class] += 1;
                     true

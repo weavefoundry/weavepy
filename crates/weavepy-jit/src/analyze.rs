@@ -626,7 +626,12 @@ fn cold_point(code: &CodeObject, p: usize) -> Option<usize> {
     // A point inside a loop moves to the start of its outermost loop: a
     // `for` statement's iterable setup (the instructions on its line
     // before the `FOR_ITER` head), or a `while` loop's head.
-    let (p, for_setup) = match loops.iter().filter(|&&(t, j)| t <= p && p <= j).map(|&(t, _)| t).min() {
+    let (p, for_setup) = match loops
+        .iter()
+        .filter(|&&(t, j)| t <= p && p <= j)
+        .map(|&(t, _)| t)
+        .min()
+    {
         Some(t) if ins[t].op == OpCode::ForIter => (t.checked_sub(1)?, true),
         Some(t) => (t, false),
         None => (p, false),
@@ -720,7 +725,9 @@ fn analyze_impl(
 /// (a candidate typed accumulator, see `Plan::lane_lists`).
 fn has_empty_list_store(code: &CodeObject) -> bool {
     code.instructions.windows(2).any(|w| {
-        matches!(w[0].op, OpCode::BuildList) && w[0].arg == 0 && matches!(w[1].op, OpCode::StoreFast)
+        matches!(w[0].op, OpCode::BuildList)
+            && w[0].arg == 0
+            && matches!(w[1].op, OpCode::StoreFast)
     })
 }
 
@@ -1768,10 +1775,9 @@ fn plan_rewrite(
         let args_start = c - 1 - k;
         let simple = ins[args_start..c - 1].iter().all(|a| match a.op {
             OpCode::LoadFast | OpCode::LoadSmallInt => true,
-            OpCode::LoadConst => matches!(
-                code.constants.get(a.arg as usize),
-                Some(Constant::Int(_))
-            ),
+            OpCode::LoadConst => {
+                matches!(code.constants.get(a.arg as usize), Some(Constant::Int(_)))
+            }
             _ => false,
         });
         if !simple {
@@ -3468,7 +3474,9 @@ fn step_abstract(
         return Ok(());
     }
     if plan.frame_readers.contains(&i) {
-        return Err(JitVerdict::UnsupportedOpcode("LOAD_GLOBAL (frame-reading builtin)"));
+        return Err(JitVerdict::UnsupportedOpcode(
+            "LOAD_GLOBAL (frame-reading builtin)",
+        ));
     }
     if let Some(&(pops, cur, stop)) = plan.calls.get(&i) {
         for _ in 0..pops {
@@ -4869,7 +4877,11 @@ fn step_abstract(
             let idx = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let cont = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             if !idx.is_plain() || !cont.is_plain() {
-                return Err(escape_verdict(code, &[&idx, &cont], "CALL (callee escapes)"));
+                return Err(escape_verdict(
+                    code,
+                    &[&idx, &cont],
+                    "CALL (callee escapes)",
+                ));
             }
             let Some((pk, _)) = resolve_dict_container(&cont, local_types, changed, probes)? else {
                 return Err(JitVerdict::UnsupportedOpcode("DELETE_SUBSCR"));
@@ -5753,9 +5765,7 @@ fn emit_block(
         return Ok(TBlock {
             entry_stack,
             stmts: Vec::new(),
-            term: TTerm::Deopt {
-                pc: b.start as u32,
-            },
+            term: TTerm::Deopt { pc: b.start as u32 },
         });
     }
     let mut stack: Vec<ESlot> = entry;

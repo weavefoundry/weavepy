@@ -108,7 +108,7 @@ impl std::fmt::Debug for RebuildableBloom {
                 "active",
                 &self.filters[self.active.load(Ordering::Relaxed) & 1],
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

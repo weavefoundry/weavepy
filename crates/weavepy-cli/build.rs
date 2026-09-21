@@ -46,10 +46,14 @@ fn main() {
         println!("cargo:rustc-link-arg-bins=-Wl,--export-dynamic");
     }
     if target_os == "macos" {
-        let order = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap_or_default()).join("weavepy.order");
+        let order =
+            Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap_or_default()).join("weavepy.order");
         println!("cargo:rerun-if-changed={}", order.display());
         if order.exists() && env::var_os("WEAVEPY_NO_ORDER_FILE").is_none() {
-            println!("cargo:rustc-link-arg-bin=weavepy=-Wl,-order_file,{}", order.display());
+            println!(
+                "cargo:rustc-link-arg-bin=weavepy=-Wl,-order_file,{}",
+                order.display()
+            );
         }
     }
     if target_os == "windows" {

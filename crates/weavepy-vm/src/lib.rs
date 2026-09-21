@@ -863,7 +863,12 @@ pub struct Interpreter {
     /// analogue is the `_PyFreeListState` frame/object freelists.
     frame_locals_pool: ThreadCell<Vec<Rc<RefCell<Vec<Object>>>>>,
     /// Parked inline activations (see [`InlineAct`]), reused so an
-    /// inline call allocates nothing.
+    /// inline call allocates nothing. The `Box` is load-bearing, not
+    /// indirection for its own sake: a parked activation keeps a stable
+    /// heap address that `SwitchRoots`/`CoreSwitch` hold raw pointers
+    /// into across a burst, which a bare `Vec<InlineAct>` would
+    /// invalidate on every growth.
+    #[allow(clippy::vec_box)]
     inline_pool: Vec<Box<InlineAct>>,
     /// RFC 0068 (WS9) — recycled tuple allocations, CPython's tuple
     /// freelist analogue (one LIFO bucket per length 1..=16, like
@@ -2703,7 +2708,8 @@ impl Interpreter {
         if namespaces.iter().any(|d| Rc::strong_count(d) < 3) {
             return false;
         }
-        if !f.defaults.iter().all(released_ok) || !f.kw_defaults.iter().all(|(_, v)| released_ok(v)) {
+        if !f.defaults.iter().all(released_ok) || !f.kw_defaults.iter().all(|(_, v)| released_ok(v))
+        {
             return false;
         }
         // A closure cell only this function holds dies with it.
@@ -2725,13 +2731,17 @@ impl Interpreter {
         let Ok(slots) = f.slots.try_borrow() else {
             return false;
         };
-        slots.iter().all(|(k, v)| gc_trace::is_atomic(&k.0) && released_ok(v))
+        slots
+            .iter()
+            .all(|(k, v)| gc_trace::is_atomic(&k.0) && released_ok(v))
     }
 
     /// [`Self::reap_plain_instance`]'s test: the tracked scalar-leaf
     /// containers `obj` alone holds (ids, count), or `None` when the
     /// general cascade must run.
-    fn plain_instance_leaves(obj: &Object) -> Option<([crate::weakref_registry::ObjectId; 4], usize)> {
+    fn plain_instance_leaves(
+        obj: &Object,
+    ) -> Option<([crate::weakref_registry::ObjectId; 4], usize)> {
         let Object::Instance(inst) = obj else {
             return None;
         };
@@ -2747,7 +2757,11 @@ impl Interpreter {
             Ok(cls) if cls.native_kind.get() == 0 && !cls.instances_need_finalize() => {}
             _ => return None,
         }
-        if !inst.slots.try_borrow().is_ok_and(|s| s.iter().next().is_none()) {
+        if !inst
+            .slots
+            .try_borrow()
+            .is_ok_and(|s| s.iter().next().is_none())
+        {
             return None;
         }
         let mut leaves = [0; 4];
@@ -5739,7 +5753,9 @@ impl Interpreter {
             if let Err(e) = self.fire_call_event(&py_frame, mon_event, Object::None) {
                 // The hook raised before the body ran: unwind what this
                 // activation pushed, or its shell outlives it on the spine.
-                self.exc_info_stack.borrow_mut().truncate(exc_depth_on_entry);
+                self.exc_info_stack
+                    .borrow_mut()
+                    .truncate(exc_depth_on_entry);
                 self.pop_frame_shell();
                 return Err(e);
             }
@@ -5982,14 +5998,15 @@ impl Interpreter {
             // ran. A few extra instructions on the full path after the
             // holder goes away cost far less.
             let rederive = frame_blocks_quiet
-                && self.gil_countdown & 0xF == 0
-                && !Self::frame_object_observed(&shell, &py_frame_slot, frame);
+                && self.gil_countdown.trailing_zeros() >= 4
+                && !Self::frame_object_observed(&shell, py_frame_slot.as_ref(), frame);
             if lgen != loop_snap_gen || rederive {
                 loop_snap_gen = lgen;
                 obs.refresh();
                 self.fuse_off = obs.any;
                 let unobserved = !quiet_off && crate::hot_gates::load() == 0 && !obs.any;
-                let frame_observed = Self::frame_object_observed(&shell, &py_frame_slot, frame);
+                let frame_observed =
+                    Self::frame_object_observed(&shell, py_frame_slot.as_ref(), frame);
                 frame_blocks_quiet = unobserved && frame_observed;
                 let base_quiet = unobserved && !frame_observed;
                 // Graded: fully quiet when no finalizable object exists
@@ -6069,7 +6086,9 @@ impl Interpreter {
                 // per-instruction `lasti` sync: bring it current before the
                 // prologue (or a raise's traceback) reads it.
                 if quiet_exit.is_some()
-                    && shell.has_materialized.load(std::sync::atomic::Ordering::Relaxed)
+                    && shell
+                        .has_materialized
+                        .load(std::sync::atomic::Ordering::Relaxed)
                 {
                     // The instruction that just ran (or raised), as the
                     // per-instruction sync would have left it; after a
@@ -6111,7 +6130,10 @@ impl Interpreter {
                         shell
                             .lasti
                             .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
-                        if shell.has_materialized.load(std::sync::atomic::Ordering::Relaxed) {
+                        if shell
+                            .has_materialized
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
                             if let Some(py) = shell.materialized.borrow().as_ref() {
                                 py.lasti.set(frame.pc);
                             }
@@ -7232,10 +7254,13 @@ impl Interpreter {
     /// `FrameShell::materialize`).
     fn frame_object_observed(
         shell: &crate::object::FrameShell,
-        slot: &Option<Rc<PyFrame>>,
+        slot: Option<&Rc<PyFrame>>,
         frame: &Frame,
     ) -> bool {
-        if !shell.has_materialized.load(std::sync::atomic::Ordering::Relaxed) {
+        if !shell
+            .has_materialized
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return false;
         }
         // Borrowed, not cloned: this runs per instruction while a
@@ -7247,7 +7272,8 @@ impl Interpreter {
         let Some(py) = cell.as_ref() else {
             return false;
         };
-        let own = 1 + usize::from(slot.as_ref().is_some_and(|s| Rc::ptr_eq(s, py)))
+        let own = 1
+            + usize::from(slot.is_some_and(|s| Rc::ptr_eq(s, py)))
             + usize::from(frame.py_frame.as_ref().is_some_and(|p| Rc::ptr_eq(p, py)));
         Rc::strong_count(py) > own
     }
@@ -9062,10 +9088,10 @@ impl Interpreter {
         // `CoreSwitch`): the core loop's in-loop calls and returns move
         // the running activation through the same ones.
         let roots = SwitchRoots {
-            inl: &mut inl,
+            inl: &raw mut inl,
             root: frame,
             root_shell: (&raw mut shell).cast(),
-            root_last: &mut last,
+            root_last: &raw mut last,
             fin,
             maybe_dead,
         };
@@ -9116,8 +9142,12 @@ impl Interpreter {
             // SAFETY: as above (no activation's borrow outlives its
             // `quiet_frame` call).
             let inl = unsafe { &mut *roots.inl };
-            let (frame, shell) =
-                unsafe { (&mut *roots.root, &mut *roots.root_shell.cast::<QuietShell<'_>>()) };
+            let (frame, shell) = unsafe {
+                (
+                    &mut *roots.root,
+                    &mut *roots.root_shell.cast::<QuietShell<'_>>(),
+                )
+            };
             entry = match ev {
                 FrameEv::Call(act) => {
                     inl.push(act);
@@ -9143,7 +9173,12 @@ impl Interpreter {
                                     &mut caller.frame
                                 };
                                 let mut caller_shell = QuietShell::Lazy(&mut caller.act);
-                                self.inline_gen_deliver(caller_frame, &mut caller_shell, done, result)
+                                self.inline_gen_deliver(
+                                    caller_frame,
+                                    &mut caller_shell,
+                                    done,
+                                    result,
+                                )
                             }
                         }
                     } else {
@@ -9536,11 +9571,11 @@ impl Interpreter {
         // (owned).
         unsafe {
             let fr: &mut Frame = &mut act.frame;
-            std::ptr::write(&mut fr.code, code);
-            std::ptr::write(&mut fr.cells, borrowed_rc(cells));
-            std::ptr::write(&mut fr.globals, borrowed_rc(&f.globals));
-            std::ptr::write(&mut fr.builtins, borrowed_rc(&f.builtins));
-            std::ptr::write(&mut act.callable, callable);
+            std::ptr::write(&raw mut fr.code, code);
+            std::ptr::write(&raw mut fr.cells, borrowed_rc(cells));
+            std::ptr::write(&raw mut fr.globals, borrowed_rc(&f.globals));
+            std::ptr::write(&raw mut fr.builtins, borrowed_rc(&f.builtins));
+            std::ptr::write(&raw mut act.callable, callable);
         }
         act.frame.pc = 0;
         act.parked = false;
@@ -9629,7 +9664,7 @@ impl Interpreter {
         // SAFETY: the code handle is owned while active; release it and
         // leave the stale copy (never read again until `inline_bind`
         // overwrites it; `InlineAct::drop` restores an owned one).
-        unsafe { drop(std::ptr::read(&fr.code)) };
+        unsafe { drop(std::ptr::read(&raw const fr.code)) };
         act.parked = true;
         act.clean = false;
         act.act.shell = None;
@@ -9983,7 +10018,7 @@ impl Interpreter {
         self.lean_pending_exit(done.caller_pending);
         // SAFETY: the callable is moved out exactly once; the parked slot
         // treats the field as stale until `inline_bind` rewrites it.
-        let callable = unsafe { std::ptr::read(&done.callable) };
+        let callable = unsafe { std::ptr::read(&raw const done.callable) };
         self.inline_park(done);
         match result {
             Ok(v) => {
@@ -10538,7 +10573,7 @@ impl Interpreter {
             let collected = (0..kwc)
                 .filter(|j| (perm >> (4 * j)) & 0xF == specialize::KW_TO_VARKW)
                 .count();
-            DictData::with_capacity_and_hasher(collected, Default::default())
+            DictData::with_capacity_and_hasher(collected, crate::fasthash::FxBuildHasher)
         });
         for (j, v) in stack.drain(len - kwc..).enumerate() {
             let nibble = (perm >> (4 * j)) & 0xF;
@@ -11341,12 +11376,7 @@ impl Interpreter {
                         if let Some(ins) = frame.code.instructions.get(frame.pc as usize) {
                             burst_stats::note_helper(ins.op);
                             let recv = frame.stack.last().map_or("-", |v| v.type_name());
-                            burst_stats::note_site(
-                                &frame.code.qualname,
-                                frame.pc,
-                                ins.op,
-                                recv,
-                            );
+                            burst_stats::note_site(&frame.code.qualname, frame.pc, ins.op, recv);
                         }
                     }
                     match self.leaf_core_helper(frame, last_pc) {
@@ -11488,146 +11518,118 @@ impl Interpreter {
             )
         }
         'reload: loop {
-        // (A discriminant test first: `take` would copy the whole exit.)
-        if sw.pending.is_some() {
-            if let Some(exit) = sw.pending.take() {
-                return exit;
+            // (A discriminant test first: `take` would copy the whole exit.)
+            if sw.pending.is_some() {
+                if let Some(exit) = sw.pending.take() {
+                    return exit;
+                }
             }
-        }
-        // SAFETY: see `CoreSwitch` (the running activation's handles; the
-        // borrows below end at the next reload).
-        let (frame, last_pc): (&mut Frame, &mut usize) = unsafe { (&mut *sw.cur, &mut *sw.last) };
-        let code: &CodeObject = &frame.code;
-        let instrs = code.instructions.as_ptr();
-        let ninstrs = code.instructions.len();
-        let ext = code_vm_ext(code);
-        let consts: &[Object] = ext.map_or(&[], |t| &t.objects);
-        let (cbase, nconsts) = (consts.as_ptr(), consts.len());
-        // SAFETY: as in `leaf_burst_slow` (the locals vector is not resized
-        // during an activation, and nothing here runs Python code).
-        let locals: &mut Vec<Object> = unsafe { &mut *frame.locals.as_ptr() };
-        let (lbase, nlocals) = (locals.as_mut_ptr(), locals.len());
-        // The `LOAD_GLOBAL` arm's cache-hit state (see `leaf_global`): the
-        // site stamps exist once any global hit filled one, and a custom
-        // `__builtins__` mapping keeps every load on the full path.
-        let stamps: &[StampSlot] = if frame.builtins_obj.is_none() {
-            ext.and_then(|e| e.stamp_slots.get()).map_or(&[], |s| &s[..])
-        } else {
-            &[]
-        };
-        // The method-form `LOAD_ATTR` arm's per-site functions.
-        let mslots: &[MethodSlot] = ext.and_then(|e| e.method_slots.get()).map_or(&[], |s| &s[..]);
-        let (gdict, bdict) = (frame.globals.as_ptr(), frame.builtins.as_ptr());
-        let (gid, bid) = (
-            specialize::rc_id(&frame.globals),
-            specialize::rc_id(&frame.builtins),
-        );
-        // Module scope (names resolve in the globals, then the builtins,
-        // both exact dicts): the `LOAD_NAME` / `STORE_NAME` arms below.
-        // The fused local pairs below, one byte per instruction (empty
-        // for code that has none).
-        let fast_pairs: &[u8] = if crate::hot_gates::env_flags::no_pairs() {
-            &[]
-        } else {
-            code_fast_pairs(code, ext)
-        };
-        let name_scope = frame.class_namespace.is_none()
-            && frame.class_namespace_obj.is_none()
-            && frame.builtins_obj.is_none()
-            && !frame.code.is_class_body
-            && !self.globals_missing_any.get();
-        let stack = &mut frame.stack;
-        let base = stack.as_mut_ptr();
-        let cap = stack.capacity();
-        let mut len = stack.len();
-        let mut pc = frame.pc as usize;
-        let mut last = *last_pc;
-        let stop = loop {
-            if pc >= ninstrs {
-                break Some(CoreExit::Stop(LeafStop::Step));
-            }
-            // SAFETY: bounds checked just above.
-            let ins = unsafe { *instrs.add(pc) };
-            match ins.op {
-                OpCode::LoadFast => {
-                    let i = ins.arg as usize;
-                    if i >= nlocals || len == cap {
-                        break None;
-                    }
-                    // CPython fuses the common local-to-local pairs into
-                    // one instruction (`LOAD_FAST_LOAD_FAST`,
-                    // `STORE_FAST_LOAD_FAST`); the decoder splits them so
-                    // every pc keeps its own unit, so the pair is fused
-                    // here instead — one dispatch, and `x = y` never
-                    // touches the stack at all.
-                    match fast_pairs.get(pc).copied().unwrap_or(0) {
-                        1 => {
-                            // SAFETY: a pair kind is only recorded where
-                            // `pc + 1` names an instruction.
-                            let next = unsafe { *instrs.add(pc + 1) };
-                            {
-                                let j = next.arg as usize;
-                                if j < nlocals && len + 1 < cap {
-                                    // SAFETY: both indices and both stack
-                                    // slots are in range.
-                                    unsafe {
-                                        let (a, b) = (&*lbase.add(i), &*lbase.add(j));
-                                        // The scalar shapes copy inline, as
-                                        // the single-load arm does.
-                                        let ca = match a {
-                                            Object::Int(x) => Object::Int(*x),
-                                            Object::Float(x) => Object::Float(*x),
-                                            Object::Bool(x) => Object::Bool(*x),
-                                            Object::None => Object::None,
-                                            Object::Unbound => break None,
-                                            other => clone_hot(other),
-                                        };
-                                        let cb = match b {
-                                            Object::Int(x) => Object::Int(*x),
-                                            Object::Float(x) => Object::Float(*x),
-                                            Object::Bool(x) => Object::Bool(*x),
-                                            Object::None => Object::None,
-                                            Object::Unbound => {
-                                                drop_hot(ca);
-                                                break None;
-                                            }
-                                            other => clone_hot(other),
-                                        };
-                                        base.add(len).write(ca);
-                                        base.add(len + 1).write(cb);
-                                        len += 2;
-                                        last = pc + 1;
-                                        pc += 2;
-                                        continue;
-                                    }
-                                }
-                            }
+            // SAFETY: see `CoreSwitch` (the running activation's handles; the
+            // borrows below end at the next reload).
+            let (frame, last_pc): (&mut Frame, &mut usize) =
+                unsafe { (&mut *sw.cur, &mut *sw.last) };
+            let code: &CodeObject = &frame.code;
+            let instrs = code.instructions.as_ptr();
+            let ninstrs = code.instructions.len();
+            let ext = code_vm_ext(code);
+            let consts: &[Object] = ext.map_or(&[], |t| &t.objects);
+            let (cbase, nconsts) = (consts.as_ptr(), consts.len());
+            // SAFETY: as in `leaf_burst_slow` (the locals vector is not resized
+            // during an activation, and nothing here runs Python code).
+            let locals: &mut Vec<Object> = unsafe { &mut *frame.locals.as_ptr() };
+            let (lbase, nlocals) = (locals.as_mut_ptr(), locals.len());
+            // The `LOAD_GLOBAL` arm's cache-hit state (see `leaf_global`): the
+            // site stamps exist once any global hit filled one, and a custom
+            // `__builtins__` mapping keeps every load on the full path.
+            let stamps: &[StampSlot] = if frame.builtins_obj.is_none() {
+                ext.and_then(|e| e.stamp_slots.get())
+                    .map_or(&[], |s| &s[..])
+            } else {
+                &[]
+            };
+            // The method-form `LOAD_ATTR` arm's per-site functions.
+            let mslots: &[MethodSlot] = ext
+                .and_then(|e| e.method_slots.get())
+                .map_or(&[], |s| &s[..]);
+            let (gdict, bdict) = (frame.globals.as_ptr(), frame.builtins.as_ptr());
+            let (gid, bid) = (
+                specialize::rc_id(&frame.globals),
+                specialize::rc_id(&frame.builtins),
+            );
+            // Module scope (names resolve in the globals, then the builtins,
+            // both exact dicts): the `LOAD_NAME` / `STORE_NAME` arms below.
+            // The fused local pairs below, one byte per instruction (empty
+            // for code that has none).
+            let fast_pairs: &[u8] = if crate::hot_gates::env_flags::no_pairs() {
+                &[]
+            } else {
+                code_fast_pairs(code, ext)
+            };
+            let name_scope = frame.class_namespace.is_none()
+                && frame.class_namespace_obj.is_none()
+                && frame.builtins_obj.is_none()
+                && !frame.code.is_class_body
+                && !self.globals_missing_any.get();
+            let stack = &mut frame.stack;
+            let base = stack.as_mut_ptr();
+            let cap = stack.capacity();
+            let mut len = stack.len();
+            let mut pc = frame.pc as usize;
+            let mut last = *last_pc;
+            let stop = loop {
+                if pc >= ninstrs {
+                    break Some(CoreExit::Stop(LeafStop::Step));
+                }
+                // SAFETY: bounds checked just above.
+                let ins = unsafe { *instrs.add(pc) };
+                match ins.op {
+                    OpCode::LoadFast => {
+                        let i = ins.arg as usize;
+                        if i >= nlocals || len == cap {
+                            break None;
                         }
-                        // `x = y`: the destination's old value is a
-                        // scalar (nothing to grade), so the copy is a
-                        // single slot write.
-                        2 => {
-                            // SAFETY: as above.
-                            let next = unsafe { *instrs.add(pc + 1) };
-                            {
-                                let j = next.arg as usize;
-                                if j < nlocals {
-                                    // SAFETY: both indices are in range.
-                                    unsafe {
-                                        let src = &*lbase.add(i);
-                                        let dst = lbase.add(j);
-                                        if !matches!(src, Object::Unbound)
-                                            && !matches!(src, Object::Cell(_))
-                                            && (scalar(&*dst) || matches!(*dst, Object::Unbound))
-                                        {
-                                            let c = match src {
+                        // CPython fuses the common local-to-local pairs into
+                        // one instruction (`LOAD_FAST_LOAD_FAST`,
+                        // `STORE_FAST_LOAD_FAST`); the decoder splits them so
+                        // every pc keeps its own unit, so the pair is fused
+                        // here instead — one dispatch, and `x = y` never
+                        // touches the stack at all.
+                        match fast_pairs.get(pc).copied().unwrap_or(0) {
+                            1 => {
+                                // SAFETY: a pair kind is only recorded where
+                                // `pc + 1` names an instruction.
+                                let next = unsafe { *instrs.add(pc + 1) };
+                                {
+                                    let j = next.arg as usize;
+                                    if j < nlocals && len + 1 < cap {
+                                        // SAFETY: both indices and both stack
+                                        // slots are in range.
+                                        unsafe {
+                                            let (a, b) = (&*lbase.add(i), &*lbase.add(j));
+                                            // The scalar shapes copy inline, as
+                                            // the single-load arm does.
+                                            let ca = match a {
                                                 Object::Int(x) => Object::Int(*x),
                                                 Object::Float(x) => Object::Float(*x),
                                                 Object::Bool(x) => Object::Bool(*x),
                                                 Object::None => Object::None,
+                                                Object::Unbound => break None,
                                                 other => clone_hot(other),
                                             };
-                                            dst.write(c);
+                                            let cb = match b {
+                                                Object::Int(x) => Object::Int(*x),
+                                                Object::Float(x) => Object::Float(*x),
+                                                Object::Bool(x) => Object::Bool(*x),
+                                                Object::None => Object::None,
+                                                Object::Unbound => {
+                                                    drop_hot(ca);
+                                                    break None;
+                                                }
+                                                other => clone_hot(other),
+                                            };
+                                            base.add(len).write(ca);
+                                            base.add(len + 1).write(cb);
+                                            len += 2;
                                             last = pc + 1;
                                             pc += 2;
                                             continue;
@@ -11635,1082 +11637,1148 @@ impl Interpreter {
                                     }
                                 }
                             }
-                        }
-                        _ => {}
-                    }
-                    // SAFETY: `i < nlocals`, `len < cap`.
-                    unsafe {
-                        let v = &*lbase.add(i);
-                        let c = match v {
-                            Object::Int(x) => Object::Int(*x),
-                            Object::Float(x) => Object::Float(*x),
-                            Object::Bool(x) => Object::Bool(*x),
-                            Object::None => Object::None,
-                            Object::Unbound => break None,
-                            other => {
-                                // `x.attr` on a local receiver: read straight
-                                // off the local (no receiver clone pushed and
-                                // released); a miss loads the receiver and
-                                // leaves `LOAD_ATTR` to its own arm.
-                                if matches!(other, Object::Instance(_) | Object::Module(_))
-                                    && pc + 1 < ninstrs
+                            // `x = y`: the destination's old value is a
+                            // scalar (nothing to grade), so the copy is a
+                            // single slot write.
+                            2 => {
+                                // SAFETY: as above.
+                                let next = unsafe { *instrs.add(pc + 1) };
                                 {
-                                    let next = *instrs.add(pc + 1);
-                                    // `x.m(...)` of a pure leaf method with
-                                    // simple arguments: its result,
-                                    // evaluated on the borrowed operands.
-                                    if next.op == OpCode::LoadMethodAttr
-                                        && len < cap
-                                        && simple_args_prefix(&code.instructions, pc + 2)
-                                    {
-                                        let pure_site = match (other, mslots.get(pc + 1)) {
-                                            (Object::Instance(i), Some(ms)) => ms
-                                                .peek_fn(i.cls_raw().attr_version.get())
-                                                .is_some_and(|fp| fn_is_pure_leaf(&*fp)),
-                                            _ => false,
-                                        };
-                                        if pure_site {
-                                            if let Some((v, call_pc)) = self.core_pure_method(
-                                                code,
-                                                other,
-                                                pc + 1,
-                                                next.arg,
-                                                mslots,
-                                                lbase,
-                                                nlocals,
-                                                consts,
-                                                sw.depth_cell,
-                                            ) {
-                                                base.add(len).write(v);
-                                                len += 1;
-                                                last = call_pc;
-                                                pc = call_pc + 1;
+                                    let j = next.arg as usize;
+                                    if j < nlocals {
+                                        // SAFETY: both indices are in range.
+                                        unsafe {
+                                            let src = &*lbase.add(i);
+                                            let dst = lbase.add(j);
+                                            if !matches!(src, Object::Unbound)
+                                                && !matches!(src, Object::Cell(_))
+                                                && (scalar(&*dst)
+                                                    || matches!(*dst, Object::Unbound))
+                                            {
+                                                let c = match src {
+                                                    Object::Int(x) => Object::Int(*x),
+                                                    Object::Float(x) => Object::Float(*x),
+                                                    Object::Bool(x) => Object::Bool(*x),
+                                                    Object::None => Object::None,
+                                                    other => clone_hot(other),
+                                                };
+                                                dst.write(c);
+                                                last = pc + 1;
+                                                pc += 2;
                                                 continue;
                                             }
                                         }
                                     }
-                                    if next.op == OpCode::LoadAttr {
-                                        if let Some(v) =
-                                            Self::core_local_attr(code, other, pc + 1, next.arg)
+                                }
+                            }
+                            _ => {}
+                        }
+                        // SAFETY: `i < nlocals`, `len < cap`.
+                        unsafe {
+                            let v = &*lbase.add(i);
+                            let c = match v {
+                                Object::Int(x) => Object::Int(*x),
+                                Object::Float(x) => Object::Float(*x),
+                                Object::Bool(x) => Object::Bool(*x),
+                                Object::None => Object::None,
+                                Object::Unbound => break None,
+                                other => {
+                                    // `x.attr` on a local receiver: read straight
+                                    // off the local (no receiver clone pushed and
+                                    // released); a miss loads the receiver and
+                                    // leaves `LOAD_ATTR` to its own arm.
+                                    if matches!(other, Object::Instance(_) | Object::Module(_))
+                                        && pc + 1 < ninstrs
+                                    {
+                                        let next = *instrs.add(pc + 1);
+                                        // `x.m(...)` of a pure leaf method with
+                                        // simple arguments: its result,
+                                        // evaluated on the borrowed operands.
+                                        if next.op == OpCode::LoadMethodAttr
+                                            && len < cap
+                                            && simple_args_prefix(&code.instructions, pc + 2)
                                         {
-                                            base.add(len).write(v);
-                                            len += 1;
+                                            let pure_site = match (other, mslots.get(pc + 1)) {
+                                                (Object::Instance(i), Some(ms)) => ms
+                                                    .peek_fn(i.cls_raw().attr_version.get())
+                                                    .is_some_and(|fp| fn_is_pure_leaf(&*fp)),
+                                                _ => false,
+                                            };
+                                            if pure_site {
+                                                if let Some((v, call_pc)) = self.core_pure_method(
+                                                    code,
+                                                    other,
+                                                    pc + 1,
+                                                    next.arg,
+                                                    mslots,
+                                                    lbase,
+                                                    nlocals,
+                                                    consts,
+                                                    sw.depth_cell,
+                                                ) {
+                                                    base.add(len).write(v);
+                                                    len += 1;
+                                                    last = call_pc;
+                                                    pc = call_pc + 1;
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        if next.op == OpCode::LoadAttr {
+                                            if let Some(v) =
+                                                Self::core_local_attr(code, other, pc + 1, next.arg)
+                                            {
+                                                base.add(len).write(v);
+                                                len += 1;
+                                                last = pc + 1;
+                                                pc += 2;
+                                                continue;
+                                            }
+                                        }
+                                        // `x.attr = v` on a local receiver:
+                                        // store straight into it, so the
+                                        // receiver is never pushed, cloned and
+                                        // dropped (a drop the collector grades).
+                                        if next.op == OpCode::StoreAttr
+                                            && len > 0
+                                            && Self::core_store_local_attr(
+                                                code,
+                                                other,
+                                                pc + 1,
+                                                next.arg,
+                                                &*base.add(len - 1),
+                                            )
+                                        {
+                                            len -= 1;
                                             last = pc + 1;
                                             pc += 2;
                                             continue;
                                         }
                                     }
-                                    // `x.attr = v` on a local receiver:
-                                    // store straight into it, so the
-                                    // receiver is never pushed, cloned and
-                                    // dropped (a drop the collector grades).
-                                    if next.op == OpCode::StoreAttr
-                                        && len > 0
-                                        && Self::core_store_local_attr(
-                                            code,
-                                            other,
-                                            pc + 1,
-                                            next.arg,
-                                            &*base.add(len - 1),
-                                        )
-                                    {
-                                        len -= 1;
-                                        last = pc + 1;
-                                        pc += 2;
-                                        continue;
-                                    }
+                                    clone_hot(other)
                                 }
-                                clone_hot(other)
-                            }
-                        };
-                        base.add(len).write(c);
+                            };
+                            base.add(len).write(c);
+                        }
+                        len += 1;
+                        last = pc;
+                        pc += 1;
                     }
-                    len += 1;
-                    last = pc;
-                    pc += 1;
-                }
-                OpCode::LoadConst => {
-                    let i = ins.arg as usize;
-                    if i >= nconsts || len == cap {
-                        break None;
-                    }
-                    // SAFETY: `i < nconsts`, `len < cap`.
-                    unsafe {
-                        let v = &*cbase.add(i);
-                        let c = match v {
-                            Object::Int(x) => Object::Int(*x),
-                            Object::Float(x) => Object::Float(*x),
-                            Object::Bool(x) => Object::Bool(*x),
-                            Object::None => Object::None,
-                            other => other.clone(),
-                        };
-                        base.add(len).write(c);
-                    }
-                    len += 1;
-                    last = pc;
-                    pc += 1;
-                }
-                OpCode::LoadSmallInt => {
-                    if len == cap {
-                        break None;
-                    }
-                    // SAFETY: `len < cap`.
-                    unsafe { base.add(len).write(Object::Int(i64::from(ins.arg))) };
-                    len += 1;
-                    last = pc;
-                    pc += 1;
-                }
-                OpCode::PushNull => {
-                    if len == cap {
-                        break None;
-                    }
-                    // SAFETY: `len < cap`.
-                    unsafe { base.add(len).write(Object::Unbound) };
-                    len += 1;
-                    last = pc;
-                    pc += 1;
-                }
-                OpCode::StoreFast => {
-                    let i = ins.arg as usize;
-                    if i >= nlocals || len == 0 {
-                        break None;
-                    }
-                    // SAFETY: `i < nlocals`, `len > 0`.
-                    unsafe {
-                        let slot = lbase.add(i);
-                        // The PEP 709 cell restore stays on the full path.
-                        if matches!(*base.add(len - 1), Object::Cell(_)) {
+                    OpCode::LoadConst => {
+                        let i = ins.arg as usize;
+                        if i >= nconsts || len == cap {
                             break None;
                         }
-                        if scalar(&*slot) || matches!(*slot, Object::Unbound) {
-                            // Overwriting a scalar needs no drop.
-                            len -= 1;
-                            slot.write(base.add(len).read());
-                        } else if Self::core_shared_instance(&*slot) {
-                            // A shared instance: the grading below would
-                            // answer "escaped, no mark"; its release is a
-                            // bare decrement.
-                            len -= 1;
-                            drop(std::mem::replace(&mut *slot, base.add(len).read()));
-                        } else {
-                            // A displaced heap value the full arm would
-                            // reap stays there — except a deferred-tracking
-                            // instance, whose teardown is its plain drop
-                            // (recycled when this was its last reference);
-                            // any other is graded like every burst drop.
-                            if Self::local_needs_prompt_reap(&*slot)
-                                && Self::looks_reapable_temporary(&*slot)
-                            {
-                                match &*slot {
-                                    Object::Instance(i) if i.dies_by_plain_drop() => {
-                                        len -= 1;
-                                        if let Object::Instance(i) =
-                                            std::mem::replace(&mut *slot, base.add(len).read())
-                                        {
-                                            PyInstance::try_recycle(i);
-                                        }
-                                        last = pc;
-                                        pc += 1;
-                                        continue;
-                                    }
-                                    // A tuple of scalars: the freelist is
-                                    // its teardown (see `prompt_reap_dropped`).
-                                    Object::Tuple(t)
-                                        if t.iter().all(Object::is_gc_atomic)
-                                            && !gc_trace::maybe_tracked(
-                                                crate::weakref_registry::id_of(&*slot),
-                                            ) =>
-                                    {
-                                        len -= 1;
-                                        let old =
-                                            std::mem::replace(&mut *slot, base.add(len).read());
-                                        self.maybe_donate_tuple(old);
-                                        last = pc;
-                                        pc += 1;
-                                        continue;
-                                    }
-                                    _ => break None,
-                                }
-                            }
-                            len -= 1;
-                            let old = std::mem::replace(&mut *slot, base.add(len).read());
-                            let marked = gc_trace::note_dropped_marks(&old);
-                            drop(old);
-                            if marked {
-                                gc_trace::mark_maybe_dead();
-                                last = pc;
-                                pc += 1;
-                                break Some(CoreExit::Stop(LeafStop::Marked));
-                            }
+                        // SAFETY: `i < nconsts`, `len < cap`.
+                        unsafe {
+                            let v = &*cbase.add(i);
+                            let c = match v {
+                                Object::Int(x) => Object::Int(*x),
+                                Object::Float(x) => Object::Float(*x),
+                                Object::Bool(x) => Object::Bool(*x),
+                                Object::None => Object::None,
+                                other => other.clone(),
+                            };
+                            base.add(len).write(c);
                         }
+                        len += 1;
+                        last = pc;
+                        pc += 1;
                     }
-                    last = pc;
-                    pc += 1;
-                }
-                OpCode::PopTop => {
-                    // A scalar needs no drop; a shared heap value is a
-                    // plain decrement (see `core_droppable`).
-                    // SAFETY: `len > 0` checked.
-                    if len == 0 || !Self::core_droppable(unsafe { &*base.add(len - 1) }) {
-                        break None;
-                    }
-                    len -= 1;
-                    // SAFETY: the slot is initialized and leaves the stack.
-                    unsafe { drop_hot(base.add(len).read()) };
-                    last = pc;
-                    pc += 1;
-                }
-                // Identity, truth, and `None` tests, with shared operands
-                // released by plain decrements (the leaf arms' shapes).
-                OpCode::IsOp => {
-                    if len < 2 {
-                        break None;
-                    }
-                    // SAFETY: `len >= 2`.
-                    let (a, b) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
-                    if !Self::core_droppable(a) || !Self::core_droppable(b) {
-                        break None;
-                    }
-                    let same = a.is_same(b);
-                    let r = if ins.arg == 1 { !same } else { same };
-                    // SAFETY: both operands leave the stack (checked
-                    // droppable above); the result takes the lower slot.
-                    unsafe {
-                        drop_hot(base.add(len - 1).read());
-                        drop_hot(base.add(len - 2).read());
-                        base.add(len - 2).write(Object::Bool(r));
-                    }
-                    len -= 1;
-                    last = pc;
-                    pc += 1;
-                }
-                OpCode::ContainsOp => {
-                    if len < 2 {
-                        break None;
-                    }
-                    // SAFETY: `len >= 2`; TOS is the container.
-                    let (item, container) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
-                    if !Self::core_droppable(item) || !Self::core_droppable(container) {
-                        break None;
-                    }
-                    let Some(found) = Self::leaf_contains(container, item) else {
-                        break None;
-                    };
-                    let r = if ins.arg == 1 { !found } else { found };
-                    // SAFETY: as `IS_OP`.
-                    unsafe {
-                        drop_hot(base.add(len - 1).read());
-                        drop_hot(base.add(len - 2).read());
-                        base.add(len - 2).write(Object::Bool(r));
-                    }
-                    len -= 1;
-                    last = pc;
-                    pc += 1;
-                }
-                OpCode::ToBool => {
-                    if len == 0 {
-                        break None;
-                    }
-                    // SAFETY: `len > 0`.
-                    let top = unsafe { base.add(len - 1) };
-                    let v = unsafe { &*top };
-                    let b = match v {
-                        Object::Bool(_) => {
-                            last = pc;
-                            pc += 1;
-                            continue;
+                    OpCode::LoadSmallInt => {
+                        if len == cap {
+                            break None;
                         }
-                        Object::Int(i) => *i != 0,
-                        Object::None => false,
-                        Object::Float(f) => *f != 0.0,
-                        _ if !Self::core_droppable(v) => break None,
-                        Object::Str(s) => !s.is_empty(),
-                        Object::Tuple(t) => !t.is_empty(),
-                        // SAFETY: a read between two instructions.
-                        Object::List(l) => match unsafe { l.peek() } {
-                            Some(l) => !l.is_empty(),
-                            None => break None,
-                        },
-                        Object::Dict(d) => match unsafe { d.peek() } {
-                            Some(d) => !d.is_empty(),
-                            None => break None,
-                        },
-                        _ => break None,
-                    };
-                    // SAFETY: the operand (droppable) is replaced in place.
-                    unsafe { drop(std::mem::replace(&mut *top, Object::Bool(b))) };
-                    last = pc;
-                    pc += 1;
-                }
-                OpCode::PopJumpIfNone | OpCode::PopJumpIfNotNone => {
-                    if len == 0 {
-                        break None;
+                        // SAFETY: `len < cap`.
+                        unsafe { base.add(len).write(Object::Int(i64::from(ins.arg))) };
+                        len += 1;
+                        last = pc;
+                        pc += 1;
                     }
-                    // SAFETY: `len > 0`.
-                    let v = unsafe { &*base.add(len - 1) };
-                    if !Self::core_droppable(v) {
-                        break None;
+                    OpCode::PushNull => {
+                        if len == cap {
+                            break None;
+                        }
+                        // SAFETY: `len < cap`.
+                        unsafe { base.add(len).write(Object::Unbound) };
+                        len += 1;
+                        last = pc;
+                        pc += 1;
                     }
-                    let is_none = matches!(v, Object::None);
-                    len -= 1;
-                    // SAFETY: the operand leaves the stack (droppable).
-                    unsafe { drop_hot(base.add(len).read()) };
-                    last = pc;
-                    pc += 1;
-                    if is_none == (ins.op == OpCode::PopJumpIfNone) {
-                        pc += ins.arg as usize;
-                    }
-                }
-                OpCode::BinaryOp => {
-                    if len < 2 {
-                        break None;
-                    }
-                    // SAFETY: `BinOpKind` is `repr(u8)` and the compiler only
-                    // emits valid kinds (same transmute as `binary_op_step`).
-                    let kind: BinOpKind = unsafe { std::mem::transmute(ins.arg as u8) };
-                    // `s = s + t` / `s += t` on str rebinding local `s` (the
-                    // next instruction stores it back): the local lets go of
-                    // the string, which then grows in place when nothing else
-                    // holds it (CPython's `BINARY_OP_INPLACE_ADD_UNICODE`).
-                    if kind == BinOpKind::Add && pc + 1 < ninstrs {
-                        // SAFETY: `pc + 1 < ninstrs`.
-                        let next = unsafe { *instrs.add(pc + 1) };
-                        let li = next.arg as usize;
-                        // SAFETY: `len >= 2`; `li < nlocals` is checked first.
-                        let same_local = next.op == OpCode::StoreFast
-                            && li < nlocals
-                            && matches!(
-                                unsafe { (&*lbase.add(li), &*base.add(len - 2), &*base.add(len - 1)) },
-                                (Object::Str(x), Object::Str(y), Object::Str(_))
-                                    if SharedStr::ptr_eq(x, y)
-                            );
-                        if same_local {
-                            // SAFETY: the local and the operand are the same
-                            // string, so the local's release is a plain
-                            // decrement; nothing below runs code.
-                            unsafe {
-                                drop_hot(std::ptr::replace(lbase.add(li), Object::Unbound));
-                                let grown = match (&mut *base.add(len - 2), &*base.add(len - 1)) {
-                                    (Object::Str(s), Object::Str(t)) => SharedStr::try_append(s, t),
-                                    _ => false,
-                                };
-                                if grown {
-                                    // The suffix leaves; the grown string is the
-                                    // `STORE_FAST` (its local is now empty).
-                                    drop_hot(base.add(len - 1).read());
-                                    lbase.add(li).write(base.add(len - 2).read());
-                                    len -= 2;
-                                    last = pc + 1;
-                                    pc += 2;
-                                    continue;
-                                }
-                                // Shared elsewhere: the local takes its value
-                                // back and the ordinary concatenation runs.
-                                lbase.add(li).write(Self::clone_operand(&*base.add(len - 2)));
+                    OpCode::StoreFast => {
+                        let i = ins.arg as usize;
+                        if i >= nlocals || len == 0 {
+                            break None;
+                        }
+                        // SAFETY: `i < nlocals`, `len > 0`.
+                        unsafe {
+                            let slot = lbase.add(i);
+                            // The PEP 709 cell restore stays on the full path.
+                            if matches!(*base.add(len - 1), Object::Cell(_)) {
+                                break None;
                             }
-                        }
-                    }
-                    // SAFETY: `len >= 2`.
-                    let (a, b) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
-                    let r = match (a, b) {
-                        (Object::Int(a), Object::Int(b)) => {
-                            let (a, b) = (*a, *b);
-                            match kind {
-                                BinOpKind::Add => match a.checked_add(b) {
-                                    Some(r) => Object::Int(r),
-                                    None => break None,
-                                },
-                                BinOpKind::Sub => match a.checked_sub(b) {
-                                    Some(r) => Object::Int(r),
-                                    None => break None,
-                                },
-                                BinOpKind::Mult => match a.checked_mul(b) {
-                                    Some(r) => Object::Int(r),
-                                    None => break None,
-                                },
-                                BinOpKind::BitAnd => Object::Int(a & b),
-                                BinOpKind::BitOr => Object::Int(a | b),
-                                BinOpKind::BitXor => Object::Int(a ^ b),
-                                BinOpKind::RShift if (0..64).contains(&b) => Object::Int(a >> b),
-                                BinOpKind::LShift
-                                    if (0..63).contains(&b) && ((a << b) >> b) == a =>
-                                {
-                                    Object::Int(a << b)
-                                }
-                                BinOpKind::FloorDiv | BinOpKind::Mod if b > 0 && a >= 0 => {
-                                    Object::Int(if kind == BinOpKind::FloorDiv {
-                                        a / b
-                                    } else {
-                                        a % b
-                                    })
-                                }
-                                _ => break None,
-                            }
-                        }
-                        (Object::Float(a), Object::Float(b)) => {
-                            match Self::leaf_float_op(*a, *b, kind) {
-                                Some(r) => r,
-                                None => break None,
-                            }
-                        }
-                        (Object::Int(a), Object::Float(b)) => {
-                            match Self::leaf_float_op(*a as f64, *b, kind) {
-                                Some(r) => r,
-                                None => break None,
-                            }
-                        }
-                        (Object::Float(a), Object::Int(b)) => {
-                            match Self::leaf_float_op(*a, *b as f64, kind) {
-                                Some(r) => r,
-                                None => break None,
-                            }
-                        }
-                        _ => break None,
-                    };
-                    // SAFETY: both operands are scalars (no drop owed).
-                    len -= 1;
-                    unsafe { base.add(len - 1).write(r) };
-                    last = pc;
-                    pc += 1;
-                }
-                OpCode::CompareOp => {
-                    if len < 2 {
-                        break None;
-                    }
-                    // SAFETY: as in `compare_op_step`.
-                    let kind: CompareKind =
-                        unsafe { std::mem::transmute((ins.arg & !COMPARE_OP_TO_BOOL_FLAG) as u8) };
-                    // SAFETY: `len >= 2`.
-                    let (a, b) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
-                    let ord = match (a, b) {
-                        (Object::Int(a), Object::Int(b)) => a.cmp(b),
-                        (Object::Float(a), Object::Float(b)) => match a.partial_cmp(b) {
-                            Some(o) => o,
-                            None => break None,
-                        },
-                        _ => break None,
-                    };
-                    let r = match kind {
-                        CompareKind::Lt => ord.is_lt(),
-                        CompareKind::LtE => ord.is_le(),
-                        CompareKind::Eq => ord.is_eq(),
-                        CompareKind::NotEq => ord.is_ne(),
-                        CompareKind::Gt => ord.is_gt(),
-                        CompareKind::GtE => ord.is_ge(),
-                    };
-                    // SAFETY: both operands are scalars (no drop owed);
-                    // the result takes the lower one's slot.
-                    len -= 1;
-                    unsafe { base.add(len - 1).write(Object::Bool(r)) };
-                    last = pc;
-                    pc += 1;
-                }
-                OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => {
-                    if len == 0 {
-                        break None;
-                    }
-                    // SAFETY: `len > 0`; a scalar needs no drop.
-                    let truthy = match unsafe { &*base.add(len - 1) } {
-                        Object::Bool(b) => *b,
-                        Object::None => false,
-                        Object::Int(i) => *i != 0,
-                        _ => break None,
-                    };
-                    len -= 1;
-                    last = pc;
-                    pc += 1;
-                    if truthy == (ins.op == OpCode::PopJumpIfTrue) {
-                        pc += ins.arg as usize;
-                    }
-                }
-                OpCode::JumpForward => {
-                    last = pc;
-                    pc += 1 + ins.arg as usize;
-                }
-                OpCode::Nop | OpCode::NotTaken | OpCode::Resume | OpCode::CopyFreeVars => {
-                    last = pc;
-                    pc += 1;
-                }
-                OpCode::CopyTop => {
-                    let n = (ins.arg as usize).max(1);
-                    if n > len || len == cap {
-                        break None;
-                    }
-                    // SAFETY: `n <= len < cap`.
-                    unsafe {
-                        let c = (*base.add(len - n)).clone();
-                        base.add(len).write(c);
-                    }
-                    len += 1;
-                    last = pc;
-                    pc += 1;
-                }
-                OpCode::Swap => {
-                    let depth = ins.arg as usize;
-                    if depth >= 2 && depth <= len {
-                        // SAFETY: both indices are below `len`.
-                        unsafe { std::ptr::swap(base.add(len - 1), base.add(len - depth)) };
-                    }
-                    last = pc;
-                    pc += 1;
-                }
-                OpCode::JumpBackward => {
-                    // The back edge is the burst's eval-breaker (see
-                    // `leaf_burst_slow`).
-                    if self.gil_countdown <= 1 || crate::hot_gates::loop_gen() != snap_gen {
-                        break Some(CoreExit::Stop(LeafStop::Breaker));
-                    }
-                    #[cfg(feature = "jit")]
-                    if crate::tier2::backedge_due(&frame.code) {
-                        break Some(CoreExit::Stop(LeafStop::Step));
-                    }
-                    self.gil_countdown -= 1;
-                    last = pc;
-                    pc = (pc + 1).saturating_sub(ins.arg as usize);
-                }
-                OpCode::ForIter => {
-                    // A range iterator's next value; anything else (another
-                    // iterator kind, exhaustion) takes the full arms.
-                    if len == 0 || len == cap {
-                        break None;
-                    }
-                    // SAFETY: `len > 0`.
-                    let it = match unsafe { &*base.add(len - 1) } {
-                        Object::Iter(it) => it,
-                        // A generator resumes inline, switched to in place
-                        // (the quiet loop's lean path when it declines).
-                        Object::Generator(_) => {
-                            // SAFETY: `len <= cap`, every slot initialized.
-                            unsafe { frame.stack.set_len(len) };
-                            frame.pc = pc as u32;
-                            *last_pc = last;
-                            if !self.core_gen_resume(sw, pc) {
-                                sw.pending = Some(CoreExit::Stop(LeafStop::Step));
-                            }
-                            break Some(CoreExit::Reload);
-                        }
-                        _ => break None,
-                    };
-                    // SAFETY: nothing below runs code until `it`'s last use
-                    // (the guard-free reads of `GilCell::peek`).
-                    let Some(it) = (unsafe { it.peek_mut() }) else {
-                        break None;
-                    };
-                    let v = match it {
-                        crate::object::PyIterator::Range {
-                            current,
-                            stop,
-                            step,
-                        } => {
-                            let live = if *step > 0 {
-                                *current < *stop
+                            if scalar(&*slot) || matches!(*slot, Object::Unbound) {
+                                // Overwriting a scalar needs no drop.
+                                len -= 1;
+                                slot.write(base.add(len).read());
+                            } else if Self::core_shared_instance(&*slot) {
+                                // A shared instance: the grading below would
+                                // answer "escaped, no mark"; its release is a
+                                // bare decrement.
+                                len -= 1;
+                                drop(std::mem::replace(&mut *slot, base.add(len).read()));
                             } else {
-                                *step < 0 && *current > *stop
-                            };
-                            if !live {
-                                break None;
-                            }
-                            let v = *current;
-                            *current = current.wrapping_add(*step);
-                            Object::Int(v)
-                        }
-                        crate::object::PyIterator::List { items, index, .. } => {
-                            // SAFETY: as above.
-                            let v = match unsafe { items.peek() } {
-                                Some(xs) => xs.get(*index).map(Self::clone_operand),
-                                None => None,
-                            };
-                            let Some(v) = v else { break None };
-                            *index += 1;
-                            v
-                        }
-                        crate::object::PyIterator::Tuple { items, index } => {
-                            let Some(v) = items.get(*index).cloned() else {
-                                break None;
-                            };
-                            *index += 1;
-                            v
-                        }
-                        _ => break None,
-                    };
-                    // SAFETY: `len < cap`.
-                    unsafe { base.add(len).write(v) };
-                    len += 1;
-                    last = pc;
-                    pc += 1;
-                }
-                // Tuples are never collector-tracked at build time and the
-                // items move in (the slow arm's shape; only the
-                // tracemalloc/reftrace fixtures need the full handler).
-                OpCode::BuildTuple => {
-                    let n = ins.arg as usize;
-                    if n == 0
-                        || n > 3
-                        || n > len
-                        || crate::stdlib::tracemalloc_real::is_tracking()
-                        || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
-                    {
-                        break None;
-                    }
-                    len -= n;
-                    // SAFETY: the `n` items below the old `len` move into
-                    // the tuple; its slot is the lowest of them.
-                    unsafe {
-                        let top = base.add(len);
-                        let t = match n {
-                            1 => self.alloc_tuple_array([top.read()]),
-                            2 => self.alloc_tuple_array([top.read(), top.add(1).read()]),
-                            _ => self.alloc_tuple_array([
-                                top.read(),
-                                top.add(1).read(),
-                                top.add(2).read(),
-                            ]),
-                        };
-                        top.write(t);
-                    }
-                    len += 1;
-                    last = pc;
-                    pc += 1;
-                }
-                // An inline generator resume's yield switches back to the
-                // consumer in place; any other leaves through the quiet
-                // loop.
-                OpCode::YieldValue => {
-                    // SAFETY: see `CoreSwitch`.
-                    if unsafe { (*sw.inl).is_empty() } {
-                        // `sum()` driving this frame: a scalar yield folds
-                        // into the accumulator and the frame resumes as if
-                        // sent `None` (what `sum` does next), in place.
-                        if let Some((ff, acc)) = self.sum_fold {
-                            if ff == sw.cur as usize && len > 0 {
-                                let acc = acc as *mut SumState;
-                                // SAFETY: the running total is `do_sum_call`'s
-                                // local, alive and untouched while the
-                                // resume runs; `len > 0`.
-                                let top = unsafe { base.add(len - 1) };
-                                if unsafe { (*acc).add_scalar(&*top) } {
-                                    // SAFETY: the yielded value is a scalar
-                                    // (no drop glue); the sent `None` takes
-                                    // its slot.
-                                    unsafe { top.write(Object::None) };
+                                // A displaced heap value the full arm would
+                                // reap stays there — except a deferred-tracking
+                                // instance, whose teardown is its plain drop
+                                // (recycled when this was its last reference);
+                                // any other is graded like every burst drop.
+                                if Self::local_needs_prompt_reap(&*slot)
+                                    && Self::looks_reapable_temporary(&*slot)
+                                {
+                                    match &*slot {
+                                        Object::Instance(i) if i.dies_by_plain_drop() => {
+                                            len -= 1;
+                                            if let Object::Instance(i) =
+                                                std::mem::replace(&mut *slot, base.add(len).read())
+                                            {
+                                                PyInstance::try_recycle(i);
+                                            }
+                                            last = pc;
+                                            pc += 1;
+                                            continue;
+                                        }
+                                        // A tuple of scalars: the freelist is
+                                        // its teardown (see `prompt_reap_dropped`).
+                                        Object::Tuple(t)
+                                            if t.iter().all(Object::is_gc_atomic)
+                                                && !gc_trace::maybe_tracked(
+                                                    crate::weakref_registry::id_of(&*slot),
+                                                ) =>
+                                        {
+                                            len -= 1;
+                                            let old =
+                                                std::mem::replace(&mut *slot, base.add(len).read());
+                                            self.maybe_donate_tuple(old);
+                                            last = pc;
+                                            pc += 1;
+                                            continue;
+                                        }
+                                        _ => break None,
+                                    }
+                                }
+                                len -= 1;
+                                let old = std::mem::replace(&mut *slot, base.add(len).read());
+                                let marked = gc_trace::note_dropped_marks(&old);
+                                drop(old);
+                                if marked {
+                                    gc_trace::mark_maybe_dead();
                                     last = pc;
                                     pc += 1;
-                                    continue;
+                                    break Some(CoreExit::Stop(LeafStop::Marked));
                                 }
                             }
                         }
-                        break Some(CoreExit::Stop(LeafStop::Step));
+                        last = pc;
+                        pc += 1;
                     }
-                    // SAFETY: `len <= cap`, every slot initialized.
-                    unsafe { frame.stack.set_len(len) };
-                    frame.pc = pc as u32;
-                    *last_pc = last;
-                    if !self.core_gen_yield(sw, snap_gen) {
-                        sw.pending = Some(CoreExit::Stop(LeafStop::Step));
-                    }
-                    break Some(CoreExit::Reload);
-                }
-                // An inline activation's return switches back to its caller
-                // in place; the root's leaves through the quiet loop.
-                OpCode::ReturnValue => {
-                    // SAFETY: see `CoreSwitch`.
-                    if unsafe { (*sw.inl).is_empty() } {
-                        break Some(CoreExit::Stop(LeafStop::Step));
-                    }
-                    // SAFETY: `len <= cap`, every slot below it initialized.
-                    unsafe { frame.stack.set_len(len) };
-                    frame.pc = pc as u32;
-                    *last_pc = last;
-                    if !self.core_return(sw, snap_gen) {
-                        sw.pending = Some(CoreExit::Stop(LeafStop::Step));
-                    }
-                    break Some(CoreExit::Reload);
-                }
-                // A Python callee runs inline, switched to in place; only a
-                // builtin or type callee has leaf arms.
-                // Module-scope names: the globals, then the builtins, probed
-                // with the interned name's hash (no per-read name object).
-                OpCode::LoadName if name_scope => {
-                    if len == cap {
-                        break None;
-                    }
-                    let Some(probe) = code_name_leaf_probe(code, ins.arg) else {
-                        break None;
-                    };
-                    // SAFETY (raw dict reads): as in the `LOAD_GLOBAL` arm.
-                    let v = unsafe {
-                        match (*gdict).get_index_of(&probe) {
-                            Some(i) => (*gdict).get_index(i),
-                            None => (*bdict)
-                                .get_index_of(&probe)
-                                .and_then(|i| (*bdict).get_index(i)),
+                    OpCode::PopTop => {
+                        // A scalar needs no drop; a shared heap value is a
+                        // plain decrement (see `core_droppable`).
+                        // SAFETY: `len > 0` checked.
+                        if len == 0 || !Self::core_droppable(unsafe { &*base.add(len - 1) }) {
+                            break None;
                         }
-                    };
-                    // A miss (the full handler's `NameError`) or a key the
-                    // probe could not compare natively.
-                    let (Some((_, v)), false) = (v, probe.saw_exotic()) else {
-                        break None;
-                    };
-                    let v = clone_hot(v);
-                    // SAFETY: `len < cap`.
-                    unsafe { base.add(len).write(v) };
-                    len += 1;
-                    last = pc;
-                    pc += 1;
-                }
-                // Rebinding an existing module-scope name whose old value
-                // leaves by a plain drop; a new name, a finalizer's
-                // candidate or a watched dict takes the full handler.
-                OpCode::StoreName if name_scope => {
-                    if len == 0 || crate::capi_watchers::dicts_active() {
-                        break None;
+                        len -= 1;
+                        // SAFETY: the slot is initialized and leaves the stack.
+                        unsafe { drop_hot(base.add(len).read()) };
+                        last = pc;
+                        pc += 1;
                     }
-                    let Some(probe) = code_name_leaf_probe(code, ins.arg) else {
-                        break None;
-                    };
-                    // SAFETY: no guard is live on the globals (`peek_mut`
-                    // checks), and nothing below runs code.
-                    let Some(g) = (unsafe { frame.globals.peek_mut() }) else {
-                        break None;
-                    };
-                    let i = match g.get_index_of(&probe) {
-                        Some(i) if !probe.saw_exotic() => i,
-                        _ => break None,
-                    };
-                    if !g.get_index(i).is_some_and(|(_, old)| Self::core_droppable(old)) {
-                        break None;
-                    }
-                    let Some((_, slot)) = (**g).get_index_mut(i) else {
-                        break None;
-                    };
-                    // SAFETY: `len > 0`; the value moves into the binding and
-                    // the displaced one was checked droppable.
-                    let old = std::mem::replace(slot, unsafe { base.add(len - 1).read() });
-                    len -= 1;
-                    drop_hot(old);
-                    last = pc;
-                    pc += 1;
-                }
-                // A keyword call of a pure leaf through the site's cached
-                // keyword permutation (the full handler's `CallPyKwNames`
-                // hit), evaluated in place like `CALL`'s pure leaves.
-                OpCode::CallKw => {
-                    let argc = ins.arg as usize;
-                    // SAFETY: `len > 0` is checked first; the operands of
-                    // the call sit below the names tuple.
-                    let Some(Object::Tuple(names)) = (len > 0).then(|| unsafe { &*base.add(len - 1) })
-                    else {
-                        break None;
-                    };
-                    let kwc = names.len();
-                    if len < kwc + argc + 3 {
-                        break None;
-                    }
-                    let start = len - kwc - argc - 3;
-                    // SAFETY: `start + kwc + argc + 3 == len`.
-                    let ops = unsafe { std::slice::from_raw_parts(base.add(start), len - start) };
-                    let Some(r) = self.core_pure_kw_call(code, pc, ops, argc, sw.depth_cell) else {
-                        break None;
-                    };
-                    // SAFETY: every operand was checked to leave by a plain
-                    // decrement; the result takes the callee's slot.
-                    unsafe {
-                        for k in start..len {
-                            drop_hot(base.add(k).read());
+                    // Identity, truth, and `None` tests, with shared operands
+                    // released by plain decrements (the leaf arms' shapes).
+                    OpCode::IsOp => {
+                        if len < 2 {
+                            break None;
                         }
-                        base.add(start).write(r);
+                        // SAFETY: `len >= 2`.
+                        let (a, b) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
+                        if !Self::core_droppable(a) || !Self::core_droppable(b) {
+                            break None;
+                        }
+                        let same = a.is_same(b);
+                        let r = if ins.arg == 1 { !same } else { same };
+                        // SAFETY: both operands leave the stack (checked
+                        // droppable above); the result takes the lower slot.
+                        unsafe {
+                            drop_hot(base.add(len - 1).read());
+                            drop_hot(base.add(len - 2).read());
+                            base.add(len - 2).write(Object::Bool(r));
+                        }
+                        len -= 1;
+                        last = pc;
+                        pc += 1;
                     }
-                    len = start + 1;
-                    last = pc;
-                    pc += 1;
-                }
-                OpCode::Call => {
-                    let argc = ins.arg as usize;
-                    if len < argc + 2 {
-                        break None;
-                    }
-                    // SAFETY: `len >= argc + 2`.
-                    let python = match unsafe { &*base.add(len - argc - 2) } {
-                        Object::Function(_) => 1,
-                        Object::BoundMethod(bm) => u8::from(matches!(bm.function, Object::Function(_))),
-                        Object::Type(ty) if !ty.flags.is_builtin => 2,
-                        _ => 0,
-                    };
-                    // A pure leaf callee: evaluated in place, no
-                    // activation (see `core_pure_call`).
-                    if python == 1 && argc < 8 {
-                        // SAFETY: `len >= argc + 2`: the call's operands.
-                        let ops = unsafe {
-                            std::slice::from_raw_parts(base.add(len - argc - 2), argc + 2)
+                    OpCode::ContainsOp => {
+                        if len < 2 {
+                            break None;
+                        }
+                        // SAFETY: `len >= 2`; TOS is the container.
+                        let (item, container) =
+                            unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
+                        if !Self::core_droppable(item) || !Self::core_droppable(container) {
+                            break None;
+                        }
+                        let Some(found) = Self::leaf_contains(container, item) else {
+                            break None;
                         };
-                        if matches!(&ops[0], Object::Function(f) if fn_is_pure_leaf(f)) {
-                            if let Some(r) = self.core_pure_call(code, pc, ops, sw.depth_cell) {
-                                let start = len - argc - 2;
-                                // SAFETY: every operand was checked to leave
-                                // by a plain decrement; the result takes the
-                                // callee's slot.
-                                unsafe {
-                                    for k in start..len {
-                                        drop_hot(base.add(k).read());
-                                    }
-                                    base.add(start).write(r);
-                                }
-                                len = start + 1;
+                        let r = if ins.arg == 1 { !found } else { found };
+                        // SAFETY: as `IS_OP`.
+                        unsafe {
+                            drop_hot(base.add(len - 1).read());
+                            drop_hot(base.add(len - 2).read());
+                            base.add(len - 2).write(Object::Bool(r));
+                        }
+                        len -= 1;
+                        last = pc;
+                        pc += 1;
+                    }
+                    OpCode::ToBool => {
+                        if len == 0 {
+                            break None;
+                        }
+                        // SAFETY: `len > 0`.
+                        let top = unsafe { base.add(len - 1) };
+                        let v = unsafe { &*top };
+                        let b = match v {
+                            Object::Bool(_) => {
                                 last = pc;
                                 pc += 1;
                                 continue;
                             }
+                            Object::Int(i) => *i != 0,
+                            Object::None => false,
+                            Object::Float(f) => *f != 0.0,
+                            _ if !Self::core_droppable(v) => break None,
+                            Object::Str(s) => !s.is_empty(),
+                            Object::Tuple(t) => !t.is_empty(),
+                            // SAFETY: a read between two instructions.
+                            Object::List(l) => match unsafe { l.peek() } {
+                                Some(l) => !l.is_empty(),
+                                None => break None,
+                            },
+                            Object::Dict(d) => match unsafe { d.peek() } {
+                                Some(d) => !d.is_empty(),
+                                None => break None,
+                            },
+                            _ => break None,
+                        };
+                        // SAFETY: the operand (droppable) is replaced in place.
+                        unsafe { drop(std::mem::replace(&mut *top, Object::Bool(b))) };
+                        last = pc;
+                        pc += 1;
+                    }
+                    OpCode::PopJumpIfNone | OpCode::PopJumpIfNotNone => {
+                        if len == 0 {
+                            break None;
+                        }
+                        // SAFETY: `len > 0`.
+                        let v = unsafe { &*base.add(len - 1) };
+                        if !Self::core_droppable(v) {
+                            break None;
+                        }
+                        let is_none = matches!(v, Object::None);
+                        len -= 1;
+                        // SAFETY: the operand leaves the stack (droppable).
+                        unsafe { drop_hot(base.add(len).read()) };
+                        last = pc;
+                        pc += 1;
+                        if is_none == (ins.op == OpCode::PopJumpIfNone) {
+                            pc += ins.arg as usize;
                         }
                     }
-                    if python != 0 {
-                        // SAFETY: as above.
+                    OpCode::BinaryOp => {
+                        if len < 2 {
+                            break None;
+                        }
+                        // SAFETY: `BinOpKind` is `repr(u8)` and the compiler only
+                        // emits valid kinds (same transmute as `binary_op_step`).
+                        let kind: BinOpKind = unsafe { std::mem::transmute(ins.arg as u8) };
+                        // `s = s + t` / `s += t` on str rebinding local `s` (the
+                        // next instruction stores it back): the local lets go of
+                        // the string, which then grows in place when nothing else
+                        // holds it (CPython's `BINARY_OP_INPLACE_ADD_UNICODE`).
+                        if kind == BinOpKind::Add && pc + 1 < ninstrs {
+                            // SAFETY: `pc + 1 < ninstrs`.
+                            let next = unsafe { *instrs.add(pc + 1) };
+                            let li = next.arg as usize;
+                            // SAFETY: `len >= 2`; `li < nlocals` is checked first.
+                            let same_local = next.op == OpCode::StoreFast
+                                && li < nlocals
+                                && matches!(
+                                    unsafe { (&*lbase.add(li), &*base.add(len - 2), &*base.add(len - 1)) },
+                                    (Object::Str(x), Object::Str(y), Object::Str(_))
+                                        if SharedStr::ptr_eq(x, y)
+                                );
+                            if same_local {
+                                // SAFETY: the local and the operand are the same
+                                // string, so the local's release is a plain
+                                // decrement; nothing below runs code.
+                                unsafe {
+                                    drop_hot(std::ptr::replace(lbase.add(li), Object::Unbound));
+                                    let grown = match (&mut *base.add(len - 2), &*base.add(len - 1))
+                                    {
+                                        (Object::Str(s), Object::Str(t)) => {
+                                            SharedStr::try_append(s, t)
+                                        }
+                                        _ => false,
+                                    };
+                                    if grown {
+                                        // The suffix leaves; the grown string is the
+                                        // `STORE_FAST` (its local is now empty).
+                                        drop_hot(base.add(len - 1).read());
+                                        lbase.add(li).write(base.add(len - 2).read());
+                                        len -= 2;
+                                        last = pc + 1;
+                                        pc += 2;
+                                        continue;
+                                    }
+                                    // Shared elsewhere: the local takes its value
+                                    // back and the ordinary concatenation runs.
+                                    lbase
+                                        .add(li)
+                                        .write(Self::clone_operand(&*base.add(len - 2)));
+                                }
+                            }
+                        }
+                        // SAFETY: `len >= 2`.
+                        let (a, b) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
+                        let r = match (a, b) {
+                            (Object::Int(a), Object::Int(b)) => {
+                                let (a, b) = (*a, *b);
+                                match kind {
+                                    BinOpKind::Add => match a.checked_add(b) {
+                                        Some(r) => Object::Int(r),
+                                        None => break None,
+                                    },
+                                    BinOpKind::Sub => match a.checked_sub(b) {
+                                        Some(r) => Object::Int(r),
+                                        None => break None,
+                                    },
+                                    BinOpKind::Mult => match a.checked_mul(b) {
+                                        Some(r) => Object::Int(r),
+                                        None => break None,
+                                    },
+                                    BinOpKind::BitAnd => Object::Int(a & b),
+                                    BinOpKind::BitOr => Object::Int(a | b),
+                                    BinOpKind::BitXor => Object::Int(a ^ b),
+                                    BinOpKind::RShift if (0..64).contains(&b) => {
+                                        Object::Int(a >> b)
+                                    }
+                                    BinOpKind::LShift
+                                        if (0..63).contains(&b) && ((a << b) >> b) == a =>
+                                    {
+                                        Object::Int(a << b)
+                                    }
+                                    BinOpKind::FloorDiv | BinOpKind::Mod if b > 0 && a >= 0 => {
+                                        Object::Int(if kind == BinOpKind::FloorDiv {
+                                            a / b
+                                        } else {
+                                            a % b
+                                        })
+                                    }
+                                    _ => break None,
+                                }
+                            }
+                            (Object::Float(a), Object::Float(b)) => {
+                                match Self::leaf_float_op(*a, *b, kind) {
+                                    Some(r) => r,
+                                    None => break None,
+                                }
+                            }
+                            (Object::Int(a), Object::Float(b)) => {
+                                match Self::leaf_float_op(*a as f64, *b, kind) {
+                                    Some(r) => r,
+                                    None => break None,
+                                }
+                            }
+                            (Object::Float(a), Object::Int(b)) => {
+                                match Self::leaf_float_op(*a, *b as f64, kind) {
+                                    Some(r) => r,
+                                    None => break None,
+                                }
+                            }
+                            _ => break None,
+                        };
+                        // SAFETY: both operands are scalars (no drop owed).
+                        len -= 1;
+                        unsafe { base.add(len - 1).write(r) };
+                        last = pc;
+                        pc += 1;
+                    }
+                    OpCode::CompareOp => {
+                        if len < 2 {
+                            break None;
+                        }
+                        // SAFETY: as in `compare_op_step`.
+                        let kind: CompareKind = unsafe {
+                            std::mem::transmute((ins.arg & !COMPARE_OP_TO_BOOL_FLAG) as u8)
+                        };
+                        // SAFETY: `len >= 2`.
+                        let (a, b) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
+                        let ord = match (a, b) {
+                            (Object::Int(a), Object::Int(b)) => a.cmp(b),
+                            (Object::Float(a), Object::Float(b)) => match a.partial_cmp(b) {
+                                Some(o) => o,
+                                None => break None,
+                            },
+                            _ => break None,
+                        };
+                        let r = match kind {
+                            CompareKind::Lt => ord.is_lt(),
+                            CompareKind::LtE => ord.is_le(),
+                            CompareKind::Eq => ord.is_eq(),
+                            CompareKind::NotEq => ord.is_ne(),
+                            CompareKind::Gt => ord.is_gt(),
+                            CompareKind::GtE => ord.is_ge(),
+                        };
+                        // SAFETY: both operands are scalars (no drop owed);
+                        // the result takes the lower one's slot.
+                        len -= 1;
+                        unsafe { base.add(len - 1).write(Object::Bool(r)) };
+                        last = pc;
+                        pc += 1;
+                    }
+                    OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => {
+                        if len == 0 {
+                            break None;
+                        }
+                        // SAFETY: `len > 0`; a scalar needs no drop.
+                        let truthy = match unsafe { &*base.add(len - 1) } {
+                            Object::Bool(b) => *b,
+                            Object::None => false,
+                            Object::Int(i) => *i != 0,
+                            _ => break None,
+                        };
+                        len -= 1;
+                        last = pc;
+                        pc += 1;
+                        if truthy == (ins.op == OpCode::PopJumpIfTrue) {
+                            pc += ins.arg as usize;
+                        }
+                    }
+                    OpCode::JumpForward => {
+                        last = pc;
+                        pc += 1 + ins.arg as usize;
+                    }
+                    OpCode::Nop | OpCode::NotTaken | OpCode::Resume | OpCode::CopyFreeVars => {
+                        last = pc;
+                        pc += 1;
+                    }
+                    OpCode::CopyTop => {
+                        let n = (ins.arg as usize).max(1);
+                        if n > len || len == cap {
+                            break None;
+                        }
+                        // SAFETY: `n <= len < cap`.
+                        unsafe {
+                            let c = (*base.add(len - n)).clone();
+                            base.add(len).write(c);
+                        }
+                        len += 1;
+                        last = pc;
+                        pc += 1;
+                    }
+                    OpCode::Swap => {
+                        let depth = ins.arg as usize;
+                        if depth >= 2 && depth <= len {
+                            // SAFETY: both indices are below `len`.
+                            unsafe { std::ptr::swap(base.add(len - 1), base.add(len - depth)) };
+                        }
+                        last = pc;
+                        pc += 1;
+                    }
+                    OpCode::JumpBackward => {
+                        // The back edge is the burst's eval-breaker (see
+                        // `leaf_burst_slow`).
+                        if self.gil_countdown <= 1 || crate::hot_gates::loop_gen() != snap_gen {
+                            break Some(CoreExit::Stop(LeafStop::Breaker));
+                        }
+                        #[cfg(feature = "jit")]
+                        if crate::tier2::backedge_due(&frame.code) {
+                            break Some(CoreExit::Stop(LeafStop::Step));
+                        }
+                        self.gil_countdown -= 1;
+                        last = pc;
+                        pc = (pc + 1).saturating_sub(ins.arg as usize);
+                    }
+                    OpCode::ForIter => {
+                        // A range iterator's next value; anything else (another
+                        // iterator kind, exhaustion) takes the full arms.
+                        if len == 0 || len == cap {
+                            break None;
+                        }
+                        // SAFETY: `len > 0`.
+                        let it = match unsafe { &*base.add(len - 1) } {
+                            Object::Iter(it) => it,
+                            // A generator resumes inline, switched to in place
+                            // (the quiet loop's lean path when it declines).
+                            Object::Generator(_) => {
+                                // SAFETY: `len <= cap`, every slot initialized.
+                                unsafe { frame.stack.set_len(len) };
+                                frame.pc = pc as u32;
+                                *last_pc = last;
+                                if !self.core_gen_resume(sw, pc) {
+                                    sw.pending = Some(CoreExit::Stop(LeafStop::Step));
+                                }
+                                break Some(CoreExit::Reload);
+                            }
+                            _ => break None,
+                        };
+                        // SAFETY: nothing below runs code until `it`'s last use
+                        // (the guard-free reads of `GilCell::peek`).
+                        let Some(it) = (unsafe { it.peek_mut() }) else {
+                            break None;
+                        };
+                        let v = match it {
+                            crate::object::PyIterator::Range {
+                                current,
+                                stop,
+                                step,
+                            } => {
+                                let live = if *step > 0 {
+                                    *current < *stop
+                                } else {
+                                    *step < 0 && *current > *stop
+                                };
+                                if !live {
+                                    break None;
+                                }
+                                let v = *current;
+                                *current = current.wrapping_add(*step);
+                                Object::Int(v)
+                            }
+                            crate::object::PyIterator::List { items, index, .. } => {
+                                // SAFETY: as above.
+                                let v = match unsafe { items.peek() } {
+                                    Some(xs) => xs.get(*index).map(Self::clone_operand),
+                                    None => None,
+                                };
+                                let Some(v) = v else { break None };
+                                *index += 1;
+                                v
+                            }
+                            crate::object::PyIterator::Tuple { items, index } => {
+                                let Some(v) = items.get(*index).cloned() else {
+                                    break None;
+                                };
+                                *index += 1;
+                                v
+                            }
+                            _ => break None,
+                        };
+                        // SAFETY: `len < cap`.
+                        unsafe { base.add(len).write(v) };
+                        len += 1;
+                        last = pc;
+                        pc += 1;
+                    }
+                    // Tuples are never collector-tracked at build time and the
+                    // items move in (the slow arm's shape; only the
+                    // tracemalloc/reftrace fixtures need the full handler).
+                    OpCode::BuildTuple => {
+                        let n = ins.arg as usize;
+                        if n == 0
+                            || n > 3
+                            || n > len
+                            || crate::stdlib::tracemalloc_real::is_tracking()
+                            || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+                        {
+                            break None;
+                        }
+                        len -= n;
+                        // SAFETY: the `n` items below the old `len` move into
+                        // the tuple; its slot is the lowest of them.
+                        unsafe {
+                            let top = base.add(len);
+                            let t = match n {
+                                1 => self.alloc_tuple_array([top.read()]),
+                                2 => self.alloc_tuple_array([top.read(), top.add(1).read()]),
+                                _ => self.alloc_tuple_array([
+                                    top.read(),
+                                    top.add(1).read(),
+                                    top.add(2).read(),
+                                ]),
+                            };
+                            top.write(t);
+                        }
+                        len += 1;
+                        last = pc;
+                        pc += 1;
+                    }
+                    // An inline generator resume's yield switches back to the
+                    // consumer in place; any other leaves through the quiet
+                    // loop.
+                    OpCode::YieldValue => {
+                        // SAFETY: see `CoreSwitch`.
+                        if unsafe { (*sw.inl).is_empty() } {
+                            // `sum()` driving this frame: a scalar yield folds
+                            // into the accumulator and the frame resumes as if
+                            // sent `None` (what `sum` does next), in place.
+                            if let Some((ff, acc)) = self.sum_fold {
+                                if ff == sw.cur as usize && len > 0 {
+                                    let acc = acc as *mut SumState;
+                                    // SAFETY: the running total is `do_sum_call`'s
+                                    // local, alive and untouched while the
+                                    // resume runs; `len > 0`.
+                                    let top = unsafe { base.add(len - 1) };
+                                    if unsafe { (*acc).add_scalar(&*top) } {
+                                        // SAFETY: the yielded value is a scalar
+                                        // (no drop glue); the sent `None` takes
+                                        // its slot.
+                                        unsafe { top.write(Object::None) };
+                                        last = pc;
+                                        pc += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                            break Some(CoreExit::Stop(LeafStop::Step));
+                        }
+                        // SAFETY: `len <= cap`, every slot initialized.
                         unsafe { frame.stack.set_len(len) };
                         frame.pc = pc as u32;
                         *last_pc = last;
-                        let switched = if python == 1 {
-                            self.core_call(sw, pc)
-                        } else {
-                            self.core_new(sw, pc, snap_gen)
-                        };
-                        if !switched && sw.pending.is_none() {
+                        if !self.core_gen_yield(sw, snap_gen) {
                             sw.pending = Some(CoreExit::Stop(LeafStop::Step));
                         }
                         break Some(CoreExit::Reload);
                     }
-                    // SAFETY: `len >= argc + 2`.
-                    match unsafe { &*base.add(len - argc - 2) } {
-                        // `lst.append(x)` / `lst.pop()` on an exact list (the
-                        // site's leaf kind, filled by the helper's first
-                        // call): the operand moves in, or the item out,
-                        // with no reference traffic.
-                        Object::Builtin(b)
-                            if argc <= 1
+                    // An inline activation's return switches back to its caller
+                    // in place; the root's leaves through the quiet loop.
+                    OpCode::ReturnValue => {
+                        // SAFETY: see `CoreSwitch`.
+                        if unsafe { (*sw.inl).is_empty() } {
+                            break Some(CoreExit::Stop(LeafStop::Step));
+                        }
+                        // SAFETY: `len <= cap`, every slot below it initialized.
+                        unsafe { frame.stack.set_len(len) };
+                        frame.pc = pc as u32;
+                        *last_pc = last;
+                        if !self.core_return(sw, snap_gen) {
+                            sw.pending = Some(CoreExit::Stop(LeafStop::Step));
+                        }
+                        break Some(CoreExit::Reload);
+                    }
+                    // A Python callee runs inline, switched to in place; only a
+                    // builtin or type callee has leaf arms.
+                    // Module-scope names: the globals, then the builtins, probed
+                    // with the interned name's hash (no per-read name object).
+                    OpCode::LoadName if name_scope => {
+                        if len == cap {
+                            break None;
+                        }
+                        let Some(probe) = code_name_leaf_probe(code, ins.arg) else {
+                            break None;
+                        };
+                        // SAFETY (raw dict reads): as in the `LOAD_GLOBAL` arm.
+                        let v = unsafe {
+                            match (*gdict).get_index_of(&probe) {
+                                Some(i) => (*gdict).get_index(i),
+                                None => (*bdict)
+                                    .get_index_of(&probe)
+                                    .and_then(|i| (*bdict).get_index(i)),
+                            }
+                        };
+                        // A miss (the full handler's `NameError`) or a key the
+                        // probe could not compare natively.
+                        let (Some((_, v)), false) = (v, probe.saw_exotic()) else {
+                            break None;
+                        };
+                        let v = clone_hot(v);
+                        // SAFETY: `len < cap`.
+                        unsafe { base.add(len).write(v) };
+                        len += 1;
+                        last = pc;
+                        pc += 1;
+                    }
+                    // Rebinding an existing module-scope name whose old value
+                    // leaves by a plain drop; a new name, a finalizer's
+                    // candidate or a watched dict takes the full handler.
+                    OpCode::StoreName if name_scope => {
+                        if len == 0 || crate::capi_watchers::dicts_active() {
+                            break None;
+                        }
+                        let Some(probe) = code_name_leaf_probe(code, ins.arg) else {
+                            break None;
+                        };
+                        // SAFETY: no guard is live on the globals (`peek_mut`
+                        // checks), and nothing below runs code.
+                        let Some(g) = (unsafe { frame.globals.peek_mut() }) else {
+                            break None;
+                        };
+                        let i = match g.get_index_of(&probe) {
+                            Some(i) if !probe.saw_exotic() => i,
+                            _ => break None,
+                        };
+                        if !g
+                            .get_index(i)
+                            .is_some_and(|(_, old)| Self::core_droppable(old))
+                        {
+                            break None;
+                        }
+                        let Some((_, slot)) = (**g).get_index_mut(i) else {
+                            break None;
+                        };
+                        // SAFETY: `len > 0`; the value moves into the binding and
+                        // the displaced one was checked droppable.
+                        let old = std::mem::replace(slot, unsafe { base.add(len - 1).read() });
+                        len -= 1;
+                        drop_hot(old);
+                        last = pc;
+                        pc += 1;
+                    }
+                    // A keyword call of a pure leaf through the site's cached
+                    // keyword permutation (the full handler's `CallPyKwNames`
+                    // hit), evaluated in place like `CALL`'s pure leaves.
+                    OpCode::CallKw => {
+                        let argc = ins.arg as usize;
+                        // SAFETY: `len > 0` is checked first; the operands of
+                        // the call sit below the names tuple.
+                        let Some(Object::Tuple(names)) =
+                            (len > 0).then(|| unsafe { &*base.add(len - 1) })
+                        else {
+                            break None;
+                        };
+                        let kwc = names.len();
+                        if len < kwc + argc + 3 {
+                            break None;
+                        }
+                        let start = len - kwc - argc - 3;
+                        // SAFETY: `start + kwc + argc + 3 == len`.
+                        let ops =
+                            unsafe { std::slice::from_raw_parts(base.add(start), len - start) };
+                        let Some(r) = self.core_pure_kw_call(code, pc, ops, argc, sw.depth_cell)
+                        else {
+                            break None;
+                        };
+                        // SAFETY: every operand was checked to leave by a plain
+                        // decrement; the result takes the callee's slot.
+                        unsafe {
+                            for k in start..len {
+                                drop_hot(base.add(k).read());
+                            }
+                            base.add(start).write(r);
+                        }
+                        len = start + 1;
+                        last = pc;
+                        pc += 1;
+                    }
+                    OpCode::Call => {
+                        let argc = ins.arg as usize;
+                        if len < argc + 2 {
+                            break None;
+                        }
+                        // SAFETY: `len >= argc + 2`.
+                        let python = match unsafe { &*base.add(len - argc - 2) } {
+                            Object::Function(_) => 1,
+                            Object::BoundMethod(bm) => {
+                                u8::from(matches!(bm.function, Object::Function(_)))
+                            }
+                            Object::Type(ty) if !ty.flags.is_builtin => 2,
+                            _ => 0,
+                        };
+                        // A pure leaf callee: evaluated in place, no
+                        // activation (see `core_pure_call`).
+                        if python == 1 && argc < 8 {
+                            // SAFETY: `len >= argc + 2`: the call's operands.
+                            let ops = unsafe {
+                                std::slice::from_raw_parts(base.add(len - argc - 2), argc + 2)
+                            };
+                            if matches!(&ops[0], Object::Function(f) if fn_is_pure_leaf(f)) {
+                                if let Some(r) = self.core_pure_call(code, pc, ops, sw.depth_cell) {
+                                    let start = len - argc - 2;
+                                    // SAFETY: every operand was checked to leave
+                                    // by a plain decrement; the result takes the
+                                    // callee's slot.
+                                    unsafe {
+                                        for k in start..len {
+                                            drop_hot(base.add(k).read());
+                                        }
+                                        base.add(start).write(r);
+                                    }
+                                    len = start + 1;
+                                    last = pc;
+                                    pc += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                        if python != 0 {
+                            // SAFETY: as above.
+                            unsafe { frame.stack.set_len(len) };
+                            frame.pc = pc as u32;
+                            *last_pc = last;
+                            let switched = if python == 1 {
+                                self.core_call(sw, pc)
+                            } else {
+                                self.core_new(sw, pc, snap_gen)
+                            };
+                            if !switched && sw.pending.is_none() {
+                                sw.pending = Some(CoreExit::Stop(LeafStop::Step));
+                            }
+                            break Some(CoreExit::Reload);
+                        }
+                        // SAFETY: `len >= argc + 2`.
+                        match unsafe { &*base.add(len - argc - 2) } {
+                            // `lst.append(x)` / `lst.pop()` on an exact list (the
+                            // site's leaf kind, filled by the helper's first
+                            // call): the operand moves in, or the item out,
+                            // with no reference traffic.
+                            Object::Builtin(b)
+                                if argc <= 1
                                 && Rc::strong_count(b) > 1
                                 // SAFETY: `len >= argc + 2`: the self slot.
                                 && matches!(unsafe { &*base.add(len - argc - 1) }, Object::List(_)) =>
-                        {
-                            let kind = mslots.get(pc).and_then(|s| s.get_leaf(b));
-                            // SAFETY: `len >= argc + 2`: the self slot.
-                            let recv = unsafe { &*base.add(len - argc - 1) };
-                            let Object::List(l) = recv else {
-                                break Some(CoreExit::Helper);
-                            };
-                            if !Self::core_droppable(recv) {
-                                break Some(CoreExit::Helper);
-                            }
-                            // SAFETY: nothing below runs code while the
-                            // items are borrowed (see `GilCell::peek_mut`).
-                            let Some(items) = (unsafe { l.peek_mut() }) else {
-                                break Some(CoreExit::Helper);
-                            };
-                            let result = match (kind, argc) {
-                                (Some(LeafKind::ListAppend), 1) => {
-                                    // SAFETY: the operand moves into the list.
-                                    items.push(unsafe { base.add(len - 1).read() });
-                                    len -= 1;
-                                    Object::None
-                                }
-                                (Some(LeafKind::ListPop), 0) => match items.pop() {
-                                    Some(v) => v,
-                                    // `pop from empty list` raises: the
-                                    // helper's path.
-                                    None => break Some(CoreExit::Helper),
-                                },
-                                _ => break Some(CoreExit::Helper),
-                            };
-                            // SAFETY: the list (droppable) and the builtin
-                            // (count above one) leave by plain decrements;
-                            // the result takes the callee's slot.
-                            unsafe {
-                                drop_hot(base.add(len - 1).read());
-                                drop_hot(base.add(len - 2).read());
-                                base.add(len - 2).write(result);
-                            }
-                            len -= 1;
-                            last = pc;
-                            pc += 1;
-                        }
-                        // A registered leaf builtin (its whole body, or its
-                        // fast half, runs no Python code: the site's leaf
-                        // kind, filled by the helper's first call) with
-                        // operands that all leave by plain decrements:
-                        // called right here (the helper's
-                        // `leaf_builtin_call` for these kinds).
-                        Object::Builtin(b)
-                            if Rc::strong_count(b) > 1
-                                && matches!(
-                                    mslots.get(pc).and_then(|s| s.get_leaf(b)),
-                                    Some(LeafKind::Opaque | LeafKind::Fast(_))
-                                ) =>
-                        {
-                            let kind = mslots.get(pc).and_then(|s| s.get_leaf(b));
-                            let callee_at = len - argc - 2;
-                            // SAFETY: `len >= argc + 2`: the self slot.
-                            let first = if matches!(unsafe { &*base.add(callee_at + 1) }, Object::Unbound)
                             {
-                                callee_at + 2
-                            } else {
-                                callee_at + 1
-                            };
-                            // SAFETY: the operands above the callee.
-                            let ops = unsafe { std::slice::from_raw_parts(base.add(first), len - first) };
-                            if !ops.iter().all(Self::core_droppable) {
-                                break Some(CoreExit::Helper);
-                            }
-                            let r = match kind {
-                                Some(LeafKind::Fast(f)) => f(ops),
-                                _ => Some(match b.call_kw.as_ref() {
-                                    Some(ckw) => ckw(ops, &[]),
-                                    None => (b.call)(ops),
-                                }),
-                            };
-                            match r {
-                                // A fast half declined, untouched.
-                                None => break Some(CoreExit::Helper),
-                                Some(Ok(v)) => {
-                                    // SAFETY: every operand (checked) and
-                                    // the builtin (count above one) leave
-                                    // by plain decrements; the result takes
-                                    // the callee's slot.
-                                    unsafe {
-                                        for k in callee_at..len {
-                                            drop_hot(base.add(k).read());
-                                        }
-                                        base.add(callee_at).write(v);
-                                    }
-                                    len = callee_at + 1;
-                                    last = pc;
-                                    pc += 1;
+                                let kind = mslots.get(pc).and_then(|s| s.get_leaf(b));
+                                // SAFETY: `len >= argc + 2`: the self slot.
+                                let recv = unsafe { &*base.add(len - argc - 1) };
+                                let Object::List(l) = recv else {
+                                    break Some(CoreExit::Helper);
+                                };
+                                if !Self::core_droppable(recv) {
+                                    break Some(CoreExit::Helper);
                                 }
-                                // As the helper's raise: the operands drop
-                                // wholesale and the pc moves past the call.
-                                Some(Err(e)) => {
-                                    // SAFETY: as above.
-                                    unsafe {
-                                        for k in callee_at..len {
-                                            drop_hot(base.add(k).read());
-                                        }
+                                // SAFETY: nothing below runs code while the
+                                // items are borrowed (see `GilCell::peek_mut`).
+                                let Some(items) = (unsafe { l.peek_mut() }) else {
+                                    break Some(CoreExit::Helper);
+                                };
+                                let result = match (kind, argc) {
+                                    (Some(LeafKind::ListAppend), 1) => {
+                                        // SAFETY: the operand moves into the list.
+                                        items.push(unsafe { base.add(len - 1).read() });
+                                        len -= 1;
+                                        Object::None
                                     }
-                                    len = callee_at;
-                                    pc += 1;
-                                    break Some(CoreExit::Stop(LeafStop::Raised(e)));
+                                    (Some(LeafKind::ListPop), 0) => match items.pop() {
+                                        Some(v) => v,
+                                        // `pop from empty list` raises: the
+                                        // helper's path.
+                                        None => break Some(CoreExit::Helper),
+                                    },
+                                    _ => break Some(CoreExit::Helper),
+                                };
+                                // SAFETY: the list (droppable) and the builtin
+                                // (count above one) leave by plain decrements;
+                                // the result takes the callee's slot.
+                                unsafe {
+                                    drop_hot(base.add(len - 1).read());
+                                    drop_hot(base.add(len - 2).read());
+                                    base.add(len - 2).write(result);
+                                }
+                                len -= 1;
+                                last = pc;
+                                pc += 1;
+                            }
+                            // A registered leaf builtin (its whole body, or its
+                            // fast half, runs no Python code: the site's leaf
+                            // kind, filled by the helper's first call) with
+                            // operands that all leave by plain decrements:
+                            // called right here (the helper's
+                            // `leaf_builtin_call` for these kinds).
+                            Object::Builtin(b)
+                                if Rc::strong_count(b) > 1
+                                    && matches!(
+                                        mslots.get(pc).and_then(|s| s.get_leaf(b)),
+                                        Some(LeafKind::Opaque | LeafKind::Fast(_))
+                                    ) =>
+                            {
+                                let kind = mslots.get(pc).and_then(|s| s.get_leaf(b));
+                                let callee_at = len - argc - 2;
+                                // SAFETY: `len >= argc + 2`: the self slot.
+                                let first = if matches!(
+                                    unsafe { &*base.add(callee_at + 1) },
+                                    Object::Unbound
+                                ) {
+                                    callee_at + 2
+                                } else {
+                                    callee_at + 1
+                                };
+                                // SAFETY: the operands above the callee.
+                                let ops = unsafe {
+                                    std::slice::from_raw_parts(base.add(first), len - first)
+                                };
+                                if !ops.iter().all(Self::core_droppable) {
+                                    break Some(CoreExit::Helper);
+                                }
+                                let r = match kind {
+                                    Some(LeafKind::Fast(f)) => f(ops),
+                                    _ => Some(match b.call_kw.as_ref() {
+                                        Some(ckw) => ckw(ops, &[]),
+                                        None => (b.call)(ops),
+                                    }),
+                                };
+                                match r {
+                                    // A fast half declined, untouched.
+                                    None => break Some(CoreExit::Helper),
+                                    Some(Ok(v)) => {
+                                        // SAFETY: every operand (checked) and
+                                        // the builtin (count above one) leave
+                                        // by plain decrements; the result takes
+                                        // the callee's slot.
+                                        unsafe {
+                                            for k in callee_at..len {
+                                                drop_hot(base.add(k).read());
+                                            }
+                                            base.add(callee_at).write(v);
+                                        }
+                                        len = callee_at + 1;
+                                        last = pc;
+                                        pc += 1;
+                                    }
+                                    // As the helper's raise: the operands drop
+                                    // wholesale and the pc moves past the call.
+                                    Some(Err(e)) => {
+                                        // SAFETY: as above.
+                                        unsafe {
+                                            for k in callee_at..len {
+                                                drop_hot(base.add(k).read());
+                                            }
+                                        }
+                                        len = callee_at;
+                                        pc += 1;
+                                        break Some(CoreExit::Stop(LeafStop::Raised(e)));
+                                    }
                                 }
                             }
+                            // A leaf builtin or directly constructible type: out
+                            // of line.
+                            Object::Builtin(_) | Object::Type(_) => break Some(CoreExit::Helper),
+                            _ => break None,
                         }
-                        // A leaf builtin or directly constructible type: out
-                        // of line.
-                        Object::Builtin(_) | Object::Type(_) => break Some(CoreExit::Helper),
-                        _ => break None,
                     }
-                }
-                // A global cache hit (`leaf_global`'s stamp-validated halves),
-                // with `len(local)` fused as `leaf_fused_len_at` does.
-                OpCode::LoadGlobal => {
-                    use weavepy_compiler::InlineCache as IC;
-                    let Some(slot) = stamps.get(pc) else {
-                        break Some(CoreExit::Helper);
-                    };
-                    if len == cap {
-                        break None;
-                    }
-                    // SAFETY (raw dict reads): as in `leaf_global` — no dict
-                    // borrow is held while bytecode runs, and nothing here
-                    // runs code.
-                    let g_stamp = unsafe { (*gdict).mutation_stamp() };
-                    let hit = match code.caches.get(pc as u32) {
-                        IC::LoadGlobalModule {
-                            globals_id,
-                            key_idx,
-                        } if globals_id == gid && slot.get() == [gid, g_stamp, 0] => {
-                            unsafe { (*gdict).get_index(key_idx as usize) }
+                    // A global cache hit (`leaf_global`'s stamp-validated halves),
+                    // with `len(local)` fused as `leaf_fused_len_at` does.
+                    OpCode::LoadGlobal => {
+                        use weavepy_compiler::InlineCache as IC;
+                        let Some(slot) = stamps.get(pc) else {
+                            break Some(CoreExit::Helper);
+                        };
+                        if len == cap {
+                            break None;
                         }
-                        IC::LoadGlobalBuiltin {
-                            builtins_id,
-                            key_idx,
-                        } if builtins_id == bid
-                            && !self.globals_missing_any.get()
-                            && slot.get() == [gid, g_stamp, unsafe { (*bdict).mutation_stamp() }] =>
-                        {
-                            let hit = unsafe { (*bdict).get_index(key_idx as usize) };
-                            // `len(local)`: the length straight off the local.
-                            if let Some((_, Object::Builtin(f))) = hit {
-                                if Rc::as_ptr(f) as usize == self.leaf_fns().len_ptr
-                                    && pc + 3 < ninstrs
-                                {
-                                    // SAFETY: `pc + 3 < ninstrs`.
-                                    let (null, load, call) = unsafe {
-                                        (*instrs.add(pc + 1), *instrs.add(pc + 2), *instrs.add(pc + 3))
-                                    };
-                                    if null.op == OpCode::PushNull
-                                        && load.op == OpCode::LoadFast
-                                        && call.op == OpCode::Call
-                                        && call.arg == 1
-                                        && (load.arg as usize) < nlocals
+                        // SAFETY (raw dict reads): as in `leaf_global` — no dict
+                        // borrow is held while bytecode runs, and nothing here
+                        // runs code.
+                        let g_stamp = unsafe { (*gdict).mutation_stamp() };
+                        let hit = match code.caches.get(pc as u32) {
+                            IC::LoadGlobalModule {
+                                globals_id,
+                                key_idx,
+                            } if globals_id == gid && slot.get() == [gid, g_stamp, 0] => unsafe {
+                                (*gdict).get_index(key_idx as usize)
+                            },
+                            IC::LoadGlobalBuiltin {
+                                builtins_id,
+                                key_idx,
+                            } if builtins_id == bid
+                                && !self.globals_missing_any.get()
+                                && slot.get()
+                                    == [gid, g_stamp, unsafe { (*bdict).mutation_stamp() }] =>
+                            {
+                                let hit = unsafe { (*bdict).get_index(key_idx as usize) };
+                                // `len(local)`: the length straight off the local.
+                                if let Some((_, Object::Builtin(f))) = hit {
+                                    if Rc::as_ptr(f) as usize == self.leaf_fns().len_ptr
+                                        && pc + 3 < ninstrs
                                     {
-                                        // SAFETY: `load.arg < nlocals`.
-                                        let n = match unsafe { &*lbase.add(load.arg as usize) } {
-                                            Object::List(l) => l.try_borrow().ok().map(|l| l.len()),
-                                            Object::Tuple(t) => Some(t.len()),
-                                            Object::Str(s) => Some(crate::object::str_char_len(s)),
-                                            Object::Dict(d) => d.try_borrow().ok().map(|d| d.len()),
-                                            _ => None,
+                                        // SAFETY: `pc + 3 < ninstrs`.
+                                        let (null, load, call) = unsafe {
+                                            (
+                                                *instrs.add(pc + 1),
+                                                *instrs.add(pc + 2),
+                                                *instrs.add(pc + 3),
+                                            )
                                         };
-                                        if let Some(n) = n.and_then(|n| i64::try_from(n).ok()) {
-                                            // SAFETY: `len < cap`.
-                                            unsafe { base.add(len).write(Object::Int(n)) };
-                                            len += 1;
-                                            last = pc + 3;
-                                            pc += 4;
-                                            continue;
+                                        if null.op == OpCode::PushNull
+                                            && load.op == OpCode::LoadFast
+                                            && call.op == OpCode::Call
+                                            && call.arg == 1
+                                            && (load.arg as usize) < nlocals
+                                        {
+                                            // SAFETY: `load.arg < nlocals`.
+                                            let n = match unsafe { &*lbase.add(load.arg as usize) }
+                                            {
+                                                Object::List(l) => {
+                                                    l.try_borrow().ok().map(|l| l.len())
+                                                }
+                                                Object::Tuple(t) => Some(t.len()),
+                                                Object::Str(s) => {
+                                                    Some(crate::object::str_char_len(s))
+                                                }
+                                                Object::Dict(d) => {
+                                                    d.try_borrow().ok().map(|d| d.len())
+                                                }
+                                                _ => None,
+                                            };
+                                            if let Some(n) = n.and_then(|n| i64::try_from(n).ok()) {
+                                                // SAFETY: `len < cap`.
+                                                unsafe { base.add(len).write(Object::Int(n)) };
+                                                len += 1;
+                                                last = pc + 3;
+                                                pc += 4;
+                                                continue;
+                                            }
                                         }
                                     }
                                 }
+                                hit
                             }
-                            hit
-                        }
-                        _ => break Some(CoreExit::Helper),
-                    };
-                    let Some((_, v)) = hit else {
-                        break Some(CoreExit::Helper);
-                    };
-                    let v = match v {
-                        Object::Int(x) => Object::Int(*x),
-                        Object::Float(x) => Object::Float(*x),
-                        Object::Bool(x) => Object::Bool(*x),
-                        Object::None => Object::None,
-                        // `f(...)` of a pure leaf global function with
-                        // simple arguments (see `core_pure_global_call`).
-                        Object::Function(f)
-                            if pc + 1 < ninstrs
+                            _ => break Some(CoreExit::Helper),
+                        };
+                        let Some((_, v)) = hit else {
+                            break Some(CoreExit::Helper);
+                        };
+                        let v = match v {
+                            Object::Int(x) => Object::Int(*x),
+                            Object::Float(x) => Object::Float(*x),
+                            Object::Bool(x) => Object::Bool(*x),
+                            Object::None => Object::None,
+                            // `f(...)` of a pure leaf global function with
+                            // simple arguments (see `core_pure_global_call`).
+                            Object::Function(f)
+                                if pc + 1 < ninstrs
                                 // SAFETY: `pc + 1 < ninstrs`.
                                 && unsafe { (*instrs.add(pc + 1)).op } == OpCode::PushNull
                                 && simple_args_prefix(&code.instructions, pc + 2)
                                 && fn_is_pure_leaf(f) =>
-                        {
-                            match self.core_pure_global_call(
-                                code,
-                                Rc::as_ptr(f),
-                                pc + 2,
-                                lbase,
-                                nlocals,
-                                consts,
-                                sw.depth_cell,
-                            ) {
-                                Some((r, call_pc)) => {
-                                    // SAFETY: `len < cap`.
-                                    unsafe { base.add(len).write(r) };
-                                    len += 1;
-                                    last = call_pc;
-                                    pc = call_pc + 1;
-                                    continue;
+                            {
+                                match self.core_pure_global_call(
+                                    code,
+                                    Rc::as_ptr(f),
+                                    pc + 2,
+                                    lbase,
+                                    nlocals,
+                                    consts,
+                                    sw.depth_cell,
+                                ) {
+                                    Some((r, call_pc)) => {
+                                        // SAFETY: `len < cap`.
+                                        unsafe { base.add(len).write(r) };
+                                        len += 1;
+                                        last = call_pc;
+                                        pc = call_pc + 1;
+                                        continue;
+                                    }
+                                    None => Object::Function(f.clone()),
                                 }
-                                None => Object::Function(f.clone()),
                             }
-                        }
-                        // `C.m(...)` of a class's pure leaf plain or static
-                        // function, called unbound.
-                        Object::Type(cls)
-                            if pc + 1 < ninstrs
+                            // `C.m(...)` of a class's pure leaf plain or static
+                            // function, called unbound.
+                            Object::Type(cls)
+                                if pc + 1 < ninstrs
                                 // SAFETY: `pc + 1 < ninstrs`.
                                 && unsafe { (*instrs.add(pc + 1)).op } == OpCode::LoadMethodAttr
                                 && simple_args_prefix(&code.instructions, pc + 2)
@@ -12718,362 +12786,368 @@ impl Interpreter {
                                     .get(pc + 1)
                                     .and_then(|ms| ms.peek_unbound(cls.attr_version.get()))
                                     .is_some_and(|fp| fn_is_pure_leaf(unsafe { &*fp })) =>
-                        {
-                            let fp = mslots
-                                .get(pc + 1)
-                                .and_then(|ms| ms.peek_unbound(cls.attr_version.get()))
-                                .expect("checked by the guard");
-                            match self.core_pure_global_call(
-                                code,
-                                fp,
-                                pc + 2,
-                                lbase,
-                                nlocals,
-                                consts,
-                                sw.depth_cell,
-                            ) {
-                                Some((r, call_pc)) => {
-                                    // SAFETY: `len < cap`.
-                                    unsafe { base.add(len).write(r) };
-                                    len += 1;
-                                    last = call_pc;
-                                    pc = call_pc + 1;
-                                    continue;
+                            {
+                                let fp = mslots
+                                    .get(pc + 1)
+                                    .and_then(|ms| ms.peek_unbound(cls.attr_version.get()))
+                                    .expect("checked by the guard");
+                                match self.core_pure_global_call(
+                                    code,
+                                    fp,
+                                    pc + 2,
+                                    lbase,
+                                    nlocals,
+                                    consts,
+                                    sw.depth_cell,
+                                ) {
+                                    Some((r, call_pc)) => {
+                                        // SAFETY: `len < cap`.
+                                        unsafe { base.add(len).write(r) };
+                                        len += 1;
+                                        last = call_pc;
+                                        pc = call_pc + 1;
+                                        continue;
+                                    }
+                                    None => Object::Type(cls.clone()),
                                 }
-                                None => Object::Type(cls.clone()),
                             }
-                        }
-                        // `Cls.CONST`: a plain class's scalar attribute
-                        // straight off the `LOAD_ATTR` site's stamp (no
-                        // class reference pushed and released).
-                        Object::Type(cls)
-                            if pc + 1 < ninstrs
+                            // `Cls.CONST`: a plain class's scalar attribute
+                            // straight off the `LOAD_ATTR` site's stamp (no
+                            // class reference pushed and released).
+                            Object::Type(cls)
+                                if pc + 1 < ninstrs
                                 // SAFETY: `pc + 1 < ninstrs`.
                                 && unsafe { (*instrs.add(pc + 1)).op } == OpCode::LoadAttr =>
-                        {
-                            match stamps.get(pc + 1).and_then(|s| class_attr_hit(s, cls)) {
-                                Some(c) => {
-                                    // SAFETY: `len < cap`.
-                                    unsafe { base.add(len).write(c) };
-                                    len += 1;
-                                    last = pc + 1;
-                                    pc += 2;
-                                    continue;
+                            {
+                                match stamps.get(pc + 1).and_then(|s| class_attr_hit(s, cls)) {
+                                    Some(c) => {
+                                        // SAFETY: `len < cap`.
+                                        unsafe { base.add(len).write(c) };
+                                        len += 1;
+                                        last = pc + 1;
+                                        pc += 2;
+                                        continue;
+                                    }
+                                    None => Object::Type(cls.clone()),
                                 }
-                                None => Object::Type(cls.clone()),
+                            }
+                            other => other.clone(),
+                        };
+                        // SAFETY: `len < cap`.
+                        unsafe { base.add(len).write(v) };
+                        len += 1;
+                        last = pc;
+                        pc += 1;
+                    }
+                    // A closure read (`__class__` for zero-argument `super()`,
+                    // any captured name): the cell's value, cloned.
+                    OpCode::LoadDeref => {
+                        if len == cap {
+                            break None;
+                        }
+                        let Some(cell) = frame.cells.get(ins.arg as usize) else {
+                            break Some(CoreExit::Helper);
+                        };
+                        let Ok(v) = cell.try_borrow() else {
+                            break Some(CoreExit::Helper);
+                        };
+                        if matches!(*v, Object::Unbound) {
+                            break Some(CoreExit::Helper);
+                        }
+                        let c = Self::clone_operand(&v);
+                        drop(v);
+                        // SAFETY: `len < cap`.
+                        unsafe { base.add(len).write(c) };
+                        len += 1;
+                        last = pc;
+                        pc += 1;
+                    }
+                    // Zero-argument `super().name` of a plain method later in
+                    // the receiver's MRO, in the elided-method shape the
+                    // `CALL` folds `self` into (the helper's arm, without
+                    // leaving the core loop). Stack (top-down): self, class,
+                    // the `super` global.
+                    OpCode::LoadSuperAttr => {
+                        if ins.arg & 2 != 0 || len < 3 {
+                            break Some(CoreExit::Helper);
+                        }
+                        // SAFETY: `len >= 3`.
+                        let (g, cls_obj, self_obj) = unsafe {
+                            (
+                                &*base.add(len - 3),
+                                &*base.add(len - 2),
+                                &*base.add(len - 1),
+                            )
+                        };
+                        if !is_super_callable(g)
+                            || !Self::core_droppable(g)
+                            || !Self::core_droppable(cls_obj)
+                        {
+                            break Some(CoreExit::Helper);
+                        }
+                        let Some(f) = Self::leaf_load_super_attr(
+                            code,
+                            cls_obj,
+                            self_obj,
+                            pc as u32,
+                            ins.arg >> 2,
+                        ) else {
+                            break Some(CoreExit::Helper);
+                        };
+                        // SAFETY: all three operands leave the stack; the two
+                        // released ones were checked droppable, and `self`
+                        // moves into the shape the `CALL` expects.
+                        unsafe {
+                            let self_v = base.add(len - 1).read();
+                            drop_hot(base.add(len - 2).read());
+                            drop_hot(base.add(len - 3).read());
+                            if ins.arg & 1 != 0 {
+                                base.add(len - 3).write(Object::Function(f));
+                                base.add(len - 2).write(self_v);
+                                len -= 1;
+                            } else {
+                                base.add(len - 3).write(Object::BoundMethod(Rc::new(
+                                    BoundMethod::new(self_v, Object::Function(f)),
+                                )));
+                                len -= 2;
                             }
                         }
-                        other => other.clone(),
-                    };
-                    // SAFETY: `len < cap`.
-                    unsafe { base.add(len).write(v) };
-                    len += 1;
-                    last = pc;
-                    pc += 1;
-                }
-                // A closure read (`__class__` for zero-argument `super()`,
-                // any captured name): the cell's value, cloned.
-                OpCode::LoadDeref => {
-                    if len == cap {
-                        break None;
+                        last = pc;
+                        pc += 1;
                     }
-                    let Some(cell) = frame.cells.get(ins.arg as usize) else {
-                        break Some(CoreExit::Helper);
-                    };
-                    let Ok(v) = cell.try_borrow() else {
-                        break Some(CoreExit::Helper);
-                    };
-                    if matches!(*v, Object::Unbound) {
-                        break Some(CoreExit::Helper);
-                    }
-                    let c = Self::clone_operand(&v);
-                    drop(v);
-                    // SAFETY: `len < cap`.
-                    unsafe { base.add(len).write(c) };
-                    len += 1;
-                    last = pc;
-                    pc += 1;
-                }
-                // Zero-argument `super().name` of a plain method later in
-                // the receiver's MRO, in the elided-method shape the
-                // `CALL` folds `self` into (the helper's arm, without
-                // leaving the core loop). Stack (top-down): self, class,
-                // the `super` global.
-                OpCode::LoadSuperAttr => {
-                    if ins.arg & 2 != 0 || len < 3 {
-                        break Some(CoreExit::Helper);
-                    }
-                    // SAFETY: `len >= 3`.
-                    let (g, cls_obj, self_obj) = unsafe {
-                        (
-                            &*base.add(len - 3),
-                            &*base.add(len - 2),
-                            &*base.add(len - 1),
-                        )
-                    };
-                    if !is_super_callable(g)
-                        || !Self::core_droppable(g)
-                        || !Self::core_droppable(cls_obj)
-                    {
-                        break Some(CoreExit::Helper);
-                    }
-                    let Some(f) =
-                        Self::leaf_load_super_attr(code, cls_obj, self_obj, pc as u32, ins.arg >> 2)
-                    else {
-                        break Some(CoreExit::Helper);
-                    };
-                    // SAFETY: all three operands leave the stack; the two
-                    // released ones were checked droppable, and `self`
-                    // moves into the shape the `CALL` expects.
-                    unsafe {
-                        let self_v = base.add(len - 1).read();
-                        drop_hot(base.add(len - 2).read());
-                        drop_hot(base.add(len - 3).read());
-                        if ins.arg & 1 != 0 {
-                            base.add(len - 3).write(Object::Function(f));
-                            base.add(len - 2).write(self_v);
-                            len -= 1;
-                        } else {
-                            base.add(len - 3).write(Object::BoundMethod(Rc::new(
-                                BoundMethod::new(self_v, Object::Function(f)),
-                            )));
-                            len -= 2;
+                    // The method-form load's per-site function (the helper's
+                    // `leaf_load_method` / class-receiver hits): an instance
+                    // receiver moves up into the self slot under the function;
+                    // a class receiver leaves an empty self slot.
+                    OpCode::LoadMethodAttr => {
+                        let Some(ms) = mslots.get(pc) else {
+                            break Some(CoreExit::Helper);
+                        };
+                        if len == 0 || len == cap {
+                            break Some(CoreExit::Helper);
                         }
-                    }
-                    last = pc;
-                    pc += 1;
-                }
-                // The method-form load's per-site function (the helper's
-                // `leaf_load_method` / class-receiver hits): an instance
-                // receiver moves up into the self slot under the function;
-                // a class receiver leaves an empty self slot.
-                OpCode::LoadMethodAttr => {
-                    let Some(ms) = mslots.get(pc) else {
-                        break Some(CoreExit::Helper);
-                    };
-                    if len == 0 || len == cap {
-                        break Some(CoreExit::Helper);
-                    }
-                    // SAFETY: `len > 0`.
-                    let top = unsafe { base.add(len - 1) };
-                    let f = match unsafe { &*top } {
-                        Object::Instance(inst) => {
-                            // The site slot and the class cache are keyed
-                            // by the class's (process-unique) attribute
-                            // version, and answer only for default
-                            // attribute access.
-                            let cls = inst.cls_raw();
-                            let ver = cls.attr_version.get();
-                            if !Self::default_getattribute(&cls) {
-                                break Some(CoreExit::Helper);
-                            }
-                            // The instance dict must not shadow the method.
-                            if let Some(dict) = inst.dict.get() {
-                                // SAFETY: a read between two instructions
-                                // (see `GilCell::peek`).
-                                let Some(d) = (unsafe { dict.peek() }) else {
+                        // SAFETY: `len > 0`.
+                        let top = unsafe { base.add(len - 1) };
+                        let f = match unsafe { &*top } {
+                            Object::Instance(inst) => {
+                                // The site slot and the class cache are keyed
+                                // by the class's (process-unique) attribute
+                                // version, and answer only for default
+                                // attribute access.
+                                let cls = inst.cls_raw();
+                                let ver = cls.attr_version.get();
+                                if !Self::default_getattribute(cls) {
                                     break Some(CoreExit::Helper);
-                                };
-                                if !d.is_empty() {
-                                    let Some(probe) = code_name_leaf_probe(code, ins.arg) else {
+                                }
+                                // The instance dict must not shadow the method.
+                                if let Some(dict) = inst.dict.get() {
+                                    // SAFETY: a read between two instructions
+                                    // (see `GilCell::peek`).
+                                    let Some(d) = (unsafe { dict.peek() }) else {
                                         break Some(CoreExit::Helper);
                                     };
-                                    if d.contains_key(&probe) || probe.saw_exotic() {
-                                        break Some(CoreExit::Helper);
+                                    if !d.is_empty() {
+                                        let Some(probe) = code_name_leaf_probe(code, ins.arg)
+                                        else {
+                                            break Some(CoreExit::Helper);
+                                        };
+                                        if d.contains_key(&probe) || probe.saw_exotic() {
+                                            break Some(CoreExit::Helper);
+                                        }
                                     }
                                 }
-                            }
-                            let f = match ms.get_held(ver) {
-                                Some(f) => Object::Function(f),
-                                None => match ms.get_inst_builtin(ver) {
-                                    Some(b) => Object::Builtin(b),
-                                    // A polymorphic site: the receiver
-                                    // class's own cache.
-                                    None => match ext
-                                        .and_then(|e| e.name_objs.get(ins.arg as usize))
-                                        .and_then(|n| match n {
-                                            Object::Str(n) => class_cached_method_held(
-                                                &cls,
-                                                SharedStr::as_ptr(n) as *const u8 as usize,
-                                                ver,
-                                            ),
-                                            _ => None,
-                                        }) {
-                                        Some(f) => Object::Function(f),
-                                        None => break Some(CoreExit::Helper),
+                                let f = match ms.get_held(ver) {
+                                    Some(f) => Object::Function(f),
+                                    None => match ms.get_inst_builtin(ver) {
+                                        Some(b) => Object::Builtin(b),
+                                        // A polymorphic site: the receiver
+                                        // class's own cache.
+                                        None => match ext
+                                            .and_then(|e| e.name_objs.get(ins.arg as usize))
+                                            .and_then(|n| match n {
+                                                Object::Str(n) => class_cached_method_held(
+                                                    cls,
+                                                    SharedStr::as_ptr(n).cast::<u8>() as usize,
+                                                    ver,
+                                                ),
+                                                _ => None,
+                                            }) {
+                                            Some(f) => Object::Function(f),
+                                            None => break Some(CoreExit::Helper),
+                                        },
                                     },
-                                },
-                            };
-                            // SAFETY: `len < cap`; the receiver moves up.
-                            unsafe {
-                                let recv = top.read();
-                                top.write(f);
-                                base.add(len).write(recv);
-                            }
-                            len += 1;
-                            last = pc;
-                            pc += 1;
-                            continue;
-                        }
-                        // The class leaves through a plain decrement: its
-                        // count stays above one (no drop glue here).
-                        Object::Type(cls) if Rc::strong_count(cls) > 1 => {
-                            match ms.get_held_unbound(cls.attr_version.get()) {
-                                Some(f) => f,
-                                None => break Some(CoreExit::Helper),
-                            }
-                        }
-                        // A list's site-cached native method (the helper's
-                        // builtin-receiver case, which fills the slot).
-                        Object::List(_) => {
-                            let Some(b) = ms.get_builtin(1) else {
-                                break Some(CoreExit::Helper);
-                            };
-                            // SAFETY: `len < cap`; the receiver moves up.
-                            unsafe {
-                                let recv = top.read();
-                                top.write(Object::Builtin(b));
-                                base.add(len).write(recv);
-                            }
-                            len += 1;
-                            last = pc;
-                            pc += 1;
-                            continue;
-                        }
-                        _ => break Some(CoreExit::Helper),
-                    };
-                    // SAFETY: `len < cap`; the class (count above one) is
-                    // released in place of an empty self slot.
-                    unsafe {
-                        drop_hot(top.read());
-                        top.write(Object::Function(f));
-                        base.add(len).write(Object::Unbound);
-                    }
-                    len += 1;
-                    last = pc;
-                    pc += 1;
-                }
-                // An instance-dict cache hit on a stack receiver (the
-                // helper's `leaf_load_attr` first case), read without a
-                // borrow guard; the receiver leaves by a plain decrement.
-                OpCode::LoadAttr => {
-                    use weavepy_compiler::InlineCache as IC;
-                    if len == 0 {
-                        break Some(CoreExit::Helper);
-                    }
-                    // SAFETY: `len > 0`.
-                    let top = unsafe { base.add(len - 1) };
-                    let inst = match unsafe { &*top } {
-                        Object::Instance(inst) => inst,
-                        // A plain class's scalar attribute (the site's
-                        // stamp); the class (count above one) leaves by a
-                        // plain decrement.
-                        Object::Type(cls) => {
-                            match stamps.get(pc).and_then(|s| class_attr_hit(s, cls)) {
-                                Some(v) if Rc::strong_count(cls) > 1 => {
-                                    // SAFETY: the receiver is replaced in place.
-                                    unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
-                                    last = pc;
-                                    pc += 1;
-                                    continue;
+                                };
+                                // SAFETY: `len < cap`; the receiver moves up.
+                                unsafe {
+                                    let recv = top.read();
+                                    top.write(f);
+                                    base.add(len).write(recv);
                                 }
-                                _ => break Some(CoreExit::Helper),
+                                len += 1;
+                                last = pc;
+                                pc += 1;
+                                continue;
                             }
+                            // The class leaves through a plain decrement: its
+                            // count stays above one (no drop glue here).
+                            Object::Type(cls) if Rc::strong_count(cls) > 1 => {
+                                match ms.get_held_unbound(cls.attr_version.get()) {
+                                    Some(f) => f,
+                                    None => break Some(CoreExit::Helper),
+                                }
+                            }
+                            // A list's site-cached native method (the helper's
+                            // builtin-receiver case, which fills the slot).
+                            Object::List(_) => {
+                                let Some(b) = ms.get_builtin(1) else {
+                                    break Some(CoreExit::Helper);
+                                };
+                                // SAFETY: `len < cap`; the receiver moves up.
+                                unsafe {
+                                    let recv = top.read();
+                                    top.write(Object::Builtin(b));
+                                    base.add(len).write(recv);
+                                }
+                                len += 1;
+                                last = pc;
+                                pc += 1;
+                                continue;
+                            }
+                            _ => break Some(CoreExit::Helper),
+                        };
+                        // SAFETY: `len < cap`; the class (count above one) is
+                        // released in place of an empty self slot.
+                        unsafe {
+                            drop_hot(top.read());
+                            top.write(Object::Function(f));
+                            base.add(len).write(Object::Unbound);
                         }
-                        _ => break Some(CoreExit::Helper),
-                    };
-                    let IC::LoadAttrInstance { key_idx, ver } = code.caches.get(pc as u32) else {
-                        break Some(CoreExit::Helper);
-                    };
-                    let cls = inst.cls_raw();
-                    if cls.attr_version.get() != ver
-                        || cls.native_kind.get() != 0
-                        || !Self::core_droppable(unsafe { &*top })
-                    {
-                        break Some(CoreExit::Helper);
+                        len += 1;
+                        last = pc;
+                        pc += 1;
                     }
-                    // SAFETY: a read between two instructions (see
-                    // `GilCell::peek`).
-                    let Some(d) = inst.dict.get().and_then(|d| unsafe { d.peek() }) else {
-                        break Some(CoreExit::Helper);
-                    };
-                    let Some((k, v)) = d.get_index(key_idx as usize) else {
-                        break Some(CoreExit::Helper);
-                    };
-                    if !slot_name_matches(code, ins.arg, k) {
-                        break Some(CoreExit::Helper);
+                    // An instance-dict cache hit on a stack receiver (the
+                    // helper's `leaf_load_attr` first case), read without a
+                    // borrow guard; the receiver leaves by a plain decrement.
+                    OpCode::LoadAttr => {
+                        use weavepy_compiler::InlineCache as IC;
+                        if len == 0 {
+                            break Some(CoreExit::Helper);
+                        }
+                        // SAFETY: `len > 0`.
+                        let top = unsafe { base.add(len - 1) };
+                        let inst = match unsafe { &*top } {
+                            Object::Instance(inst) => inst,
+                            // A plain class's scalar attribute (the site's
+                            // stamp); the class (count above one) leaves by a
+                            // plain decrement.
+                            Object::Type(cls) => {
+                                match stamps.get(pc).and_then(|s| class_attr_hit(s, cls)) {
+                                    Some(v) if Rc::strong_count(cls) > 1 => {
+                                        // SAFETY: the receiver is replaced in place.
+                                        unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
+                                        last = pc;
+                                        pc += 1;
+                                        continue;
+                                    }
+                                    _ => break Some(CoreExit::Helper),
+                                }
+                            }
+                            _ => break Some(CoreExit::Helper),
+                        };
+                        let IC::LoadAttrInstance { key_idx, ver } = code.caches.get(pc as u32)
+                        else {
+                            break Some(CoreExit::Helper);
+                        };
+                        let cls = inst.cls_raw();
+                        if cls.attr_version.get() != ver
+                            || cls.native_kind.get() != 0
+                            || !Self::core_droppable(unsafe { &*top })
+                        {
+                            break Some(CoreExit::Helper);
+                        }
+                        // SAFETY: a read between two instructions (see
+                        // `GilCell::peek`).
+                        let Some(d) = inst.dict.get().and_then(|d| unsafe { d.peek() }) else {
+                            break Some(CoreExit::Helper);
+                        };
+                        let Some((k, v)) = d.get_index(key_idx as usize) else {
+                            break Some(CoreExit::Helper);
+                        };
+                        if !slot_name_matches(code, ins.arg, k) {
+                            break Some(CoreExit::Helper);
+                        }
+                        let v = Self::clone_operand(v);
+                        // SAFETY: the receiver (droppable) is replaced in place.
+                        unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
+                        last = pc;
+                        pc += 1;
                     }
-                    let v = Self::clone_operand(v);
-                    // SAFETY: the receiver (droppable) is replaced in place.
-                    unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
-                    last = pc;
-                    pc += 1;
+                    // An instance-dict cache hit storing an atomic value over a
+                    // droppable one (the helper's `leaf_store_attr` first case).
+                    OpCode::StoreAttr => {
+                        if len < 2 {
+                            break Some(CoreExit::Helper);
+                        }
+                        // SAFETY: `len >= 2`.
+                        let (recv, val) = unsafe { (&*base.add(len - 1), &*base.add(len - 2)) };
+                        let Object::Instance(inst) = recv else {
+                            break Some(CoreExit::Helper);
+                        };
+                        if !Self::core_droppable(recv)
+                            || !Self::core_store_attr(code, inst, pc, ins.arg, val)
+                        {
+                            break Some(CoreExit::Helper);
+                        }
+                        // SAFETY: the value moved into the dict (its slot is a
+                        // stand-in now) and the receiver leaves the stack by a
+                        // plain decrement (checked droppable above).
+                        unsafe { drop_hot(base.add(len - 1).read()) };
+                        len -= 2;
+                        last = pc;
+                        pc += 1;
+                    }
+                    // A list, tuple or range's native iterator (the helper's
+                    // arm), when the iterable leaves by a plain decrement.
+                    OpCode::GetIter => {
+                        if len == 0 {
+                            break Some(CoreExit::Helper);
+                        }
+                        // SAFETY: `len > 0`.
+                        let top = unsafe { base.add(len - 1) };
+                        let v = unsafe { &*top };
+                        if !matches!(v, Object::List(_) | Object::Tuple(_) | Object::Range(_))
+                            || !Self::core_droppable(v)
+                        {
+                            break Some(CoreExit::Helper);
+                        }
+                        let Ok(it) = v.make_iter() else {
+                            break Some(CoreExit::Helper);
+                        };
+                        let it = Object::Iter(Rc::new(RefCell::new(it)));
+                        // SAFETY: the iterable (droppable) is replaced in place.
+                        unsafe { drop_hot(std::mem::replace(&mut *top, it)) };
+                        last = pc;
+                        pc += 1;
+                    }
+                    // An opcode the full leaf arms have no arm for is the quiet
+                    // loop's straight away.
+                    op if !SLOW_LEAF_OPS[op as u8 as usize] => {
+                        break Some(CoreExit::Stop(LeafStop::Step))
+                    }
+                    _ => break None,
                 }
-                // An instance-dict cache hit storing an atomic value over a
-                // droppable one (the helper's `leaf_store_attr` first case).
-                OpCode::StoreAttr => {
-                    if len < 2 {
-                        break Some(CoreExit::Helper);
-                    }
-                    // SAFETY: `len >= 2`.
-                    let (recv, val) = unsafe { (&*base.add(len - 1), &*base.add(len - 2)) };
-                    let Object::Instance(inst) = recv else {
-                        break Some(CoreExit::Helper);
-                    };
-                    if !Self::core_droppable(recv)
-                        || !Self::core_store_attr(code, inst, pc, ins.arg, val)
-                    {
-                        break Some(CoreExit::Helper);
-                    }
-                    // SAFETY: the value moved into the dict (its slot is a
-                    // stand-in now) and the receiver leaves the stack by a
-                    // plain decrement (checked droppable above).
-                    unsafe { drop_hot(base.add(len - 1).read()) };
-                    len -= 2;
-                    last = pc;
-                    pc += 1;
-                }
-                // A list, tuple or range's native iterator (the helper's
-                // arm), when the iterable leaves by a plain decrement.
-                OpCode::GetIter => {
-                    if len == 0 {
-                        break Some(CoreExit::Helper);
-                    }
-                    // SAFETY: `len > 0`.
-                    let top = unsafe { base.add(len - 1) };
-                    let v = unsafe { &*top };
-                    if !matches!(v, Object::List(_) | Object::Tuple(_) | Object::Range(_))
-                        || !Self::core_droppable(v)
-                    {
-                        break Some(CoreExit::Helper);
-                    }
-                    let Ok(it) = v.make_iter() else {
-                        break Some(CoreExit::Helper);
-                    };
-                    let it = Object::Iter(Rc::new(RefCell::new(it)));
-                    // SAFETY: the iterable (droppable) is replaced in place.
-                    unsafe { drop_hot(std::mem::replace(&mut *top, it)) };
-                    last = pc;
-                    pc += 1;
-                }
-                // An opcode the full leaf arms have no arm for is the quiet
-                // loop's straight away.
-                op if !SLOW_LEAF_OPS[op as u8 as usize] => {
-                    break Some(CoreExit::Stop(LeafStop::Step))
-                }
-                _ => break None,
+            };
+            if matches!(stop, Some(CoreExit::Reload)) {
+                // Synced before the switch; the handles above are stale.
+                continue 'reload;
             }
-        };
-        if matches!(stop, Some(CoreExit::Reload)) {
-            // Synced before the switch; the handles above are stale.
-            continue 'reload;
-        }
-        // SAFETY: `len <= cap`, and every slot below `len` is initialized
-        // (pushes wrote them; pops moved scalars out).
-        unsafe { frame.stack.set_len(len) };
-        frame.pc = pc as u32;
-        *last_pc = last;
-        return stop.unwrap_or(CoreExit::Slow);
+            // SAFETY: `len <= cap`, and every slot below `len` is initialized
+            // (pushes wrote them; pops moved scalars out).
+            unsafe { frame.stack.set_len(len) };
+            frame.pc = pc as u32;
+            *last_pc = last;
+            return stop.unwrap_or(CoreExit::Slow);
         }
     }
 
@@ -13201,8 +13275,10 @@ impl Interpreter {
         };
         // SAFETY: GIL-serialized raw read of the function's code cell;
         // only the pointer is compared.
-        if !std::ptr::eq(unsafe { Rc::as_ptr(&*init.code.as_ptr()) }, Rc::as_ptr(code))
-            || code.arg_count as usize != argc + 1
+        if !std::ptr::eq(
+            unsafe { Rc::as_ptr(&*init.code.as_ptr()) },
+            Rc::as_ptr(code),
+        ) || code.arg_count as usize != argc + 1
             || !Self::lean_code_ok(code)
         {
             return false;
@@ -13270,11 +13346,9 @@ impl Interpreter {
     #[inline(always)]
     fn core_droppable(v: &Object) -> bool {
         match v {
-            Object::Int(_)
-            | Object::Float(_)
-            | Object::Bool(_)
-            | Object::None
-            | Object::Str(_) => true,
+            Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None | Object::Str(_) => {
+                true
+            }
             Object::Instance(i) => Rc::strong_count(i) > 1 && !gc_trace::note_dropped_marks(v),
             Object::List(l) => Rc::strong_count(l) > 1 && !gc_trace::note_dropped_marks(v),
             Object::Dict(d) => Rc::strong_count(d) > 1 && !gc_trace::note_dropped_marks(v),
@@ -13577,7 +13651,7 @@ impl Interpreter {
             return None;
         };
         let cls = inst.cls_raw();
-        if !Self::default_getattribute(&cls) {
+        if !Self::default_getattribute(cls) {
             return None;
         }
         let fp = mslots.get(attr_pc)?.peek_fn(cls.attr_version.get())?;
@@ -13593,7 +13667,7 @@ impl Interpreter {
                 lbase,
                 nlocals,
                 consts,
-                &mut *scratch,
+                &mut scratch,
                 &mut args,
                 1,
             )
@@ -13609,7 +13683,8 @@ impl Interpreter {
                 }
             }
         }
-        let r = self.core_pure_fused_eval(code, fp, call_pc, true, &mut args, nargs + 1, depth_cell)?;
+        let r =
+            self.core_pure_fused_eval(code, fp, call_pc, true, &mut args, nargs + 1, depth_cell)?;
         Some((r, call_pc))
     }
 
@@ -13641,12 +13716,13 @@ impl Interpreter {
                 lbase,
                 nlocals,
                 consts,
-                &mut *scratch,
+                &mut scratch,
                 &mut args,
                 0,
             )
         }?;
-        let r = self.core_pure_fused_eval(code, fp, call_pc, false, &mut args, nargs, depth_cell)?;
+        let r =
+            self.core_pure_fused_eval(code, fp, call_pc, false, &mut args, nargs, depth_cell)?;
         Some((r, call_pc))
     }
 
@@ -13785,7 +13861,9 @@ impl Interpreter {
         }
         for (slot, arg) in args.iter_mut().enumerate().take(total).skip(eff_argc) {
             if covered & (1 << slot) == 0 {
-                *arg = f.defaults.get(f.defaults.len().checked_sub(total - slot)?)?;
+                *arg = f
+                    .defaults
+                    .get(f.defaults.len().checked_sub(total - slot)?)?;
             }
         }
         self.pure_leaf_eval(code_rc, f, &args[..total])
@@ -13934,9 +14012,9 @@ impl Interpreter {
                         IC::LoadGlobalModule {
                             globals_id,
                             key_idx,
-                        } if globals_id == gid && slot.get() == [gid, g_stamp, 0] => {
-                            unsafe { (*gdict).get_index(key_idx as usize) }
-                        }
+                        } if globals_id == gid && slot.get() == [gid, g_stamp, 0] => unsafe {
+                            (*gdict).get_index(key_idx as usize)
+                        },
                         IC::LoadGlobalBuiltin {
                             builtins_id,
                             key_idx,
@@ -13944,9 +14022,7 @@ impl Interpreter {
                             && !self.globals_missing_any.get()
                             && slot.get()
                                 == [gid, g_stamp, unsafe { (*bdict).mutation_stamp() }] =>
-                        {
-                            unsafe { (*bdict).get_index(key_idx as usize) }
-                        }
+                        unsafe { (*bdict).get_index(key_idx as usize) },
                         _ => return None,
                     };
                     push!(norm(hit?.1));
@@ -13982,20 +14058,16 @@ impl Interpreter {
                                 // full handler never sees this body, so
                                 // there is nothing to deopt to.
                                 None => own(Self::leaf_attr_resolve_site(
-                                    code,
-                                    inst,
-                                    recv,
-                                    pc as u32,
-                                    ins.arg,
+                                    code, inst, recv, pc as u32, ins.arg,
                                 )?)?,
                             }
                         }
                         Object::Type(cls) => {
                             match stamps.get(pc).and_then(|s| class_attr_hit(s, cls)) {
                                 Some(v) => own(v)?,
-                                None => own(Self::leaf_load_type_attr(
-                                    code, cls, pc as u32, ins.arg,
-                                )?)?,
+                                None => {
+                                    own(Self::leaf_load_type_attr(code, cls, pc as u32, ins.arg)?)?
+                                }
                             }
                         }
                         Object::Module(_) => {
@@ -14015,8 +14087,12 @@ impl Interpreter {
                     let ord = match (a, b) {
                         (V::I(x), V::I(y)) => x.cmp(&y),
                         (V::F(x), V::F(y)) => x.partial_cmp(&y)?,
-                        (V::I(x), V::F(y)) if x.unsigned_abs() < EXACT => (x as f64).partial_cmp(&y)?,
-                        (V::F(x), V::I(y)) if y.unsigned_abs() < EXACT => x.partial_cmp(&(y as f64))?,
+                        (V::I(x), V::F(y)) if x.unsigned_abs() < EXACT => {
+                            (x as f64).partial_cmp(&y)?
+                        }
+                        (V::F(x), V::I(y)) if y.unsigned_abs() < EXACT => {
+                            x.partial_cmp(&(y as f64))?
+                        }
                         (V::B(x), V::B(y)) => x.cmp(&y),
                         (V::B(x), V::I(y)) => i64::from(x).cmp(&y),
                         (V::I(x), V::B(y)) => x.cmp(&i64::from(y)),
@@ -15049,8 +15125,7 @@ impl Interpreter {
                 burst_stats::note_leaf_slow(ins.op);
             }
         }
-        loop {
-            let Some(&ins) = instrs.get(pc) else { break };
+        while let Some(&ins) = instrs.get(pc) {
             // Hand back to the core loop at its next instruction (the
             // first one here is the one it declined).
             if pc != first_pc && CORE_LEAF_OPS[ins.op as u8 as usize] {
@@ -15097,19 +15172,20 @@ impl Interpreter {
                         // nothing. This is the shape a `x = [i, i]` loop
                         // displaces on every iteration.
                         if !gc_trace::dies_inert(old) {
-                        match old {
-                            Object::Instance(i) if i.dies_by_plain_drop() => {
-                                let Some(v) = stack.pop() else { break };
-                                if let Object::Instance(i) = std::mem::replace(&mut locals[slot], v)
-                                {
-                                    PyInstance::try_recycle(i);
+                            match old {
+                                Object::Instance(i) if i.dies_by_plain_drop() => {
+                                    let Some(v) = stack.pop() else { break };
+                                    if let Object::Instance(i) =
+                                        std::mem::replace(&mut locals[slot], v)
+                                    {
+                                        PyInstance::try_recycle(i);
+                                    }
+                                    last = pc;
+                                    pc += 1;
+                                    continue;
                                 }
-                                last = pc;
-                                pc += 1;
-                                continue;
+                                _ => break,
                             }
-                            _ => break,
-                        }
                         }
                     }
                     let Some(v) = stack.pop() else { break };
@@ -15664,7 +15740,8 @@ impl Interpreter {
                     {
                         break;
                     }
-                    let mut d = DictData::with_capacity_and_hasher(n, Default::default());
+                    let mut d =
+                        DictData::with_capacity_and_hasher(n, crate::fasthash::FxBuildHasher);
                     for j in 0..n {
                         let k = std::mem::replace(&mut stack[split + 2 * j], Object::Unbound);
                         let v = std::mem::replace(&mut stack[split + 2 * j + 1], Object::Unbound);
@@ -16470,13 +16547,14 @@ impl Interpreter {
             // needle must be a `str`, and a non-`str` needle's TypeError
             // belongs to the full handler.
             Object::Str(hay) => match item {
-                Object::Str(needle) => {
-                    Some(crate::builtins::substr_find(hay, needle).is_some())
-                }
+                Object::Str(needle) => Some(crate::builtins::substr_find(hay, needle).is_some()),
                 _ => None,
             },
             Object::Dict(_) | Object::Set(_) | Object::FrozenSet(_)
-                if matches!(item, Object::Str(_) | Object::Int(_) | Object::Bool(_) | Object::None) =>
+                if matches!(
+                    item,
+                    Object::Str(_) | Object::Int(_) | Object::Bool(_) | Object::None
+                ) =>
             {
                 let key = DictKey(item.clone());
                 let (found, deferred) = crate::object::with_key_eq_deferred(|| {
@@ -16751,9 +16829,7 @@ impl Interpreter {
             // lookup, no instance, no constructor protocol.
             return match args {
                 [Object::Str(_)] => Some(args[0].clone()),
-                [Object::Int(n)] => {
-                    Some(Object::from_str(itoa::Buffer::new().format(*n)))
-                }
+                [Object::Int(n)] => Some(Object::from_str(itoa::Buffer::new().format(*n))),
                 [Object::Bool(b)] => Some(Object::from_static(if *b { "True" } else { "False" })),
                 [Object::None] => Some(Object::from_static("None")),
                 _ => None,
@@ -16761,10 +16837,12 @@ impl Interpreter {
         }
         if Rc::ptr_eq(ty, &fns.range_ty) {
             let (start, stop, step) = match args {
-                [Object::Int(stop)] => (0, *stop as i128, 1),
-                [Object::Int(start), Object::Int(stop)] => (*start as i128, *stop as i128, 1),
+                [Object::Int(stop)] => (0, i128::from(*stop), 1),
+                [Object::Int(start), Object::Int(stop)] => {
+                    (i128::from(*start), i128::from(*stop), 1)
+                }
                 [Object::Int(start), Object::Int(stop), Object::Int(step)] if *step != 0 => {
-                    (*start as i128, *stop as i128, *step as i128)
+                    (i128::from(*start), i128::from(*stop), i128::from(*step))
                 }
                 _ => return None,
             };
@@ -17188,7 +17266,9 @@ impl Interpreter {
                 receiver.clone(),
                 Object::Function(f),
             )))),
-            (LeafAttr::InstanceOnly | LeafAttr::BuiltinMethod(_) | LeafAttr::Property(_), _) => None,
+            (LeafAttr::InstanceOnly | LeafAttr::BuiltinMethod(_) | LeafAttr::Property(_), _) => {
+                None
+            }
         }
     }
 
@@ -17230,7 +17310,7 @@ impl Interpreter {
         if name.len() > 4 && name.starts_with("__") && name != "__new__" {
             return None;
         }
-        let on_class = match Self::leaf_class_attr(code, &cls, name_idx)? {
+        let on_class = match Self::leaf_class_attr(code, cls, name_idx)? {
             LeafAttr::InstanceOnly => None,
             // A data descriptor: the instance dict never shadows it.
             prop @ LeafAttr::Property(_) => return Some((prop, None)),
@@ -17262,7 +17342,7 @@ impl Interpreter {
         let Some(Object::Str(name_obj)) = code_name_obj(code, name_idx) else {
             return None;
         };
-        let name_key = SharedStr::as_ptr(name_obj) as *const u8 as usize;
+        let name_key = SharedStr::as_ptr(name_obj).cast::<u8>() as usize;
         let ver = cls.attr_version.get();
         if let Some(k) = cls.leaf_attrs.get(name_key, ver) {
             return match k {
@@ -17455,7 +17535,7 @@ impl Interpreter {
         if name.starts_with("__") && name != "__init__" {
             return None;
         }
-        if !Self::plain_metaclass(&recv_cls) {
+        if !Self::plain_metaclass(recv_cls) {
             return None;
         }
         let mro = recv_cls.mro.try_borrow().ok()?;
@@ -17539,7 +17619,7 @@ impl Interpreter {
         if let Some(f) = slot.and_then(|s| s.get(ver)) {
             return Some(Object::Function(f));
         }
-        let f = Self::load_method_ic_resolve(&cls, code, name_idx, mro_idx, key_idx)?;
+        let f = Self::load_method_ic_resolve(cls, code, name_idx, mro_idx, key_idx)?;
         if let Some(s) = slot {
             s.set(ver, &f);
         }
@@ -19989,7 +20069,7 @@ impl Interpreter {
                 // the cost of building a one-key dict. The pairs are moved
                 // off the stack in place — `split_off`'s vector was a
                 // second allocation per literal.
-                let mut d = DictData::with_capacity_and_hasher(n, Default::default());
+                let mut d = DictData::with_capacity_and_hasher(n, crate::fasthash::FxBuildHasher);
                 let mut outcome = Ok(());
                 for j in 0..n {
                     let k = std::mem::replace(&mut frame.stack[split + 2 * j], Object::Unbound);
@@ -30675,12 +30755,7 @@ impl Interpreter {
         let found = if let Some(method) = instance_method(&container, "__contains__")
             .or_else(|| metaclass_method(&container, "__contains__"))
         {
-            let r = self.call(
-                &method,
-                std::slice::from_ref(item),
-                &[],
-                globals,
-            )?;
+            let r = self.call(&method, std::slice::from_ref(item), &[], globals)?;
             r.is_truthy()
         } else if let Object::Instance(inst) = &container {
             if let Some(native) = inst.native.get().cloned() {
@@ -46005,10 +46080,11 @@ impl Interpreter {
                     // `gi_name` shares the function's `__name__`.
                     let (gen_name, gen_qualname) = {
                         let slots = f.slots.borrow();
-                        let attr_str = |attr: &'static str| match slots.get(&crate::object::StrKey(attr)) {
-                            Some(o @ Object::Str(_)) => Some(o.clone()),
-                            _ => None,
-                        };
+                        let attr_str =
+                            |attr: &'static str| match slots.get(&crate::object::StrKey(attr)) {
+                                Some(o @ Object::Str(_)) => Some(o.clone()),
+                                _ => None,
+                            };
                         (
                             attr_str("__name__")
                                 .unwrap_or_else(|| Object::from_str(f.name.clone())),
@@ -54006,7 +54082,7 @@ impl InlineAct {
         act.act.frame = std::ptr::from_mut::<Frame>(&mut act.frame);
         // SAFETY: parked slots hold a stale code copy (see the type docs):
         // release the owned placeholder reference it was built with.
-        unsafe { drop(std::ptr::read(&act.frame.code)) };
+        unsafe { drop(std::ptr::read(&raw const act.frame.code)) };
         act
     }
 }
@@ -54022,8 +54098,8 @@ impl Drop for InlineAct {
             // SAFETY: the stale copies are overwritten without a drop, so
             // the frame's and callable's own drops release valid values.
             unsafe {
-                std::ptr::write(&mut self.frame.code, inline_placeholder().code.clone());
-                std::ptr::write(&mut self.callable, Object::Unbound);
+                std::ptr::write(&raw mut self.frame.code, inline_placeholder().code.clone());
+                std::ptr::write(&raw mut self.callable, Object::Unbound);
             }
         }
     }
@@ -54082,7 +54158,9 @@ enum QuietEntry {
 /// `quiet_run`'s handles on its activations, shared with every burst (see
 /// [`CoreSwitch`]).
 struct SwitchRoots {
-    /// The inline activations, innermost last.
+    /// The inline activations, innermost last (boxed for a stable
+    /// address — see `Interpreter::inline_pool`).
+    #[allow(clippy::vec_box)]
     inl: *mut Vec<Box<InlineAct>>,
     /// The root activation's frame, shell, and last-executed-pc slot.
     root: *mut Frame,
@@ -54106,6 +54184,7 @@ struct CoreSwitch {
     /// The running activation's frame and last-executed-pc slot.
     cur: *mut Frame,
     last: *mut usize,
+    #[allow(clippy::vec_box)]
     inl: *mut Vec<Box<InlineAct>>,
     /// The root's handles (the entry's own when the burst started there).
     root: *mut Frame,
@@ -54314,13 +54393,16 @@ impl SumState {
             return Ok(());
         }
         // A big int in a compensated phase converts (or overflows).
-        if let (SumState::Float(re) | SumState::Complex(re, _), Object::Long(v)) = (&mut *self, &x) {
+        if let (SumState::Float(re) | SumState::Complex(re, _), Object::Long(v)) = (&mut *self, &x)
+        {
             return match v.to_f64() {
                 Some(value) if value.is_finite() => {
                     re.add(value);
                     Ok(())
                 }
-                _ => Err(crate::error::overflow_error("int too large to convert to float")),
+                _ => Err(crate::error::overflow_error(
+                    "int too large to convert to float",
+                )),
             };
         }
         if let (SumState::Complex(re, im), Object::Complex(c)) = (&mut *self, &x) {
@@ -54336,7 +54418,11 @@ impl SumState {
                 return Ok(());
             }
             SumState::Float(re) => {
-                let r = interp.op_binary(&crate::object::fresh_float(re.value()), &x, BinOpKind::Add)?;
+                let r = interp.op_binary(
+                    &crate::object::fresh_float(re.value()),
+                    &x,
+                    BinOpKind::Add,
+                )?;
                 *self = match r {
                     Object::Complex(_) => Self::entered(r),
                     other => SumState::Generic(other),
@@ -54567,7 +54653,9 @@ mod burst_stats {
     pub(crate) fn note_site(code: &str, pc: u32, op: weavepy_compiler::OpCode, recv: &str) {
         let key = format!("{code}@{pc} {} {:?} [{recv}]", op.name(), op);
         let mut a = SITES.lock().unwrap();
-        *a.get_or_insert_with(Default::default).entry(key).or_insert(0) += 1;
+        *a.get_or_insert_with(Default::default)
+            .entry(key)
+            .or_insert(0) += 1;
     }
 
     /// An instruction the core loop ran out of line (`leaf_core_helper`).
@@ -54631,12 +54719,12 @@ mod burst_stats {
             .flatten()
             .map(|(k, c)| (k.clone(), *c))
             .collect();
-        sites.sort_by(|a, b| b.1.cmp(&a.1));
+        sites.sort_by_key(|a| std::cmp::Reverse(a.1));
         for (k, c) in sites.iter().take(40) {
             let _ = writeln!(out, "  site {k}: {c}");
         }
         let mut attrs = ATTRS.lock().unwrap().clone();
-        attrs.sort_by(|a, b| b.1.cmp(&a.1));
+        attrs.sort_by_key(|a| std::cmp::Reverse(a.1));
         for (k, c) in attrs.iter().take(25) {
             let _ = writeln!(out, "  attr {k}: {c}");
         }
@@ -57517,10 +57605,7 @@ fn apply_format_spec_inner(
         // exactly like `'{:,s}'` is.
         let ty = parsed.type_char.or_else(|| {
             let str_valued = matches!(value, Object::Str(_) | Object::WStr(_))
-                || matches!(
-                    value.native_value(),
-                    Some(Object::Str(_) | Object::WStr(_))
-                );
+                || matches!(value.native_value(), Some(Object::Str(_) | Object::WStr(_)));
             str_valued.then_some('s')
         });
         let rejected = match sep {
@@ -59095,7 +59180,11 @@ impl CallSlot {
 
     /// The shape recorded for `func` running `code` (by identity).
     #[inline]
-    fn hit(&self, func: *const crate::object::PyFunction, code: *const CodeObject) -> Option<(u32, bool)> {
+    fn hit(
+        &self,
+        func: *const crate::object::PyFunction,
+        code: *const CodeObject,
+    ) -> Option<(u32, bool)> {
         // SAFETY: see the type docs.
         let shape = unsafe { &*self.0.get() }.as_ref()?;
         (std::ptr::eq(shape.func.as_ptr(), func) && std::ptr::eq(shape.code.as_ptr(), code))
@@ -59106,7 +59195,7 @@ impl CallSlot {
     fn set(&self, shape: CallShape) {
         // SAFETY: see the type docs (the old handles drop after the
         // store; dropping a weak handle runs no code).
-        let old = unsafe { std::mem::replace(&mut *self.0.get(), Some(shape)) };
+        let old = unsafe { (*self.0.get()).replace(shape) };
         drop(old);
     }
 }
@@ -59116,7 +59205,11 @@ impl CallSlot {
 fn code_call_slot(code: &CodeObject, pc: usize) -> Option<&CallSlot> {
     let ext = code_vm_ext(code)?;
     ext.call_slots
-        .get_or_init(|| (0..code.instructions.len()).map(|_| CallSlot::empty()).collect())
+        .get_or_init(|| {
+            (0..code.instructions.len())
+                .map(|_| CallSlot::empty())
+                .collect()
+        })
         .get(pc)
 }
 
@@ -59171,7 +59264,11 @@ impl AttrPoly {
 fn code_attr_poly(code: &CodeObject, cache_pc: u32) -> Option<&AttrPoly> {
     let ext = code_vm_ext(code)?;
     ext.attr_poly
-        .get_or_init(|| (0..code.instructions.len()).map(|_| AttrPoly::empty()).collect())
+        .get_or_init(|| {
+            (0..code.instructions.len())
+                .map(|_| AttrPoly::empty())
+                .collect()
+        })
         .get(cache_pc as usize)
 }
 
@@ -59563,16 +59660,10 @@ fn code_fast_pairs<'a>(code: &CodeObject, ext: Option<&'a CodeConstObjects>) -> 
             let kind = match ops.get(pc + 1).map(|i| i.op) {
                 // A second load whose own successor reads an attribute
                 // off it keeps the receiver-fused arm instead.
-                Some(OpCode::LoadFast) => {
-                    if matches!(
-                        ops.get(pc + 2).map(|i| i.op),
-                        Some(OpCode::LoadAttr | OpCode::StoreAttr | OpCode::LoadMethodAttr)
-                    ) {
-                        0
-                    } else {
-                        1
-                    }
-                }
+                Some(OpCode::LoadFast) => u8::from(!matches!(
+                    ops.get(pc + 2).map(|i| i.op),
+                    Some(OpCode::LoadAttr | OpCode::StoreAttr | OpCode::LoadMethodAttr)
+                )),
                 Some(OpCode::StoreFast) => 2,
                 _ => 0,
             };
@@ -59859,8 +59950,7 @@ fn exc_family_flags(cls: &crate::types::TypeObject) -> u16 {
     for t in cls.mro.borrow().iter() {
         flags |= exc_family_bit(&t.name);
     }
-    cls.exc_families
-        .set(ver << 10 | u64::from(flags) << 1 | 1);
+    cls.exc_families.set(ver << 10 | u64::from(flags) << 1 | 1);
     flags
 }
 

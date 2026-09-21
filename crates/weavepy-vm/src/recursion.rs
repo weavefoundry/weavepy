@@ -145,6 +145,12 @@ pub fn depth_cell() -> *const Cell<usize> {
 }
 
 /// [`enter`] with the calling thread's [`depth_cell`] already in hand.
+///
+/// Not an `unsafe fn`: the only pointer any caller can supply is the one
+/// [`depth_cell`] handed it, a thread-local alive for that thread's
+/// lifetime, and the eval loop threads it through hot call paths where
+/// an `unsafe` block per entry buys nothing.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[inline]
 pub fn enter_with(cell: *const Cell<usize>) -> Enter {
     let limit = recursion_limit();

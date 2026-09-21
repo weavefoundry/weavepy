@@ -2544,17 +2544,19 @@ pub fn decode_full(
     let exception_table = decode_exception_table(co_exceptiontable, &raws);
     // Recover the NO_INTERRUPT flag per decoded instruction index (the
     // internal stream folds both backward jumps into one opcode).
-    let no_interrupt_jumps: Vec<u32> =
-        if raws.iter().any(|r| r.cp_op == op::JUMP_BACKWARD_NO_INTERRUPT) {
-            let first = raw_first_instr(&raw_expansions(&raws));
-            raws.iter()
-                .enumerate()
-                .filter(|(_, r)| r.cp_op == op::JUMP_BACKWARD_NO_INTERRUPT)
-                .map(|(idx, _)| first[idx] as u32)
-                .collect()
-        } else {
-            Vec::new()
-        };
+    let no_interrupt_jumps: Vec<u32> = if raws
+        .iter()
+        .any(|r| r.cp_op == op::JUMP_BACKWARD_NO_INTERRUPT)
+    {
+        let first = raw_first_instr(&raw_expansions(&raws));
+        raws.iter()
+            .enumerate()
+            .filter(|(_, r)| r.cp_op == op::JUMP_BACKWARD_NO_INTERRUPT)
+            .map(|(idx, _)| first[idx] as u32)
+            .collect()
+    } else {
+        Vec::new()
+    };
     Some(DecodedCode {
         instructions,
         linetable,
@@ -2727,7 +2729,9 @@ fn decode_exception_table(table: &[u8], raws: &[DecodedRaw]) -> Vec<ExcHandler> 
     let total = *first.last().unwrap_or(&0) as u32;
     let map_unit = |unit: usize| -> u32 {
         // A unit no raw starts at maps past the end (the sentinel).
-        first.get(raw_at_unit(raws, unit)).map_or(total, |i| *i as u32)
+        first
+            .get(raw_at_unit(raws, unit))
+            .map_or(total, |i| *i as u32)
     };
     let mut out: Vec<ExcHandler> = Vec::new();
     let mut pos = 0usize;

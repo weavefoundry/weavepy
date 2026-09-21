@@ -11333,9 +11333,7 @@ pub(crate) fn substr_find(hay: &str, needle: &str) -> Option<usize> {
         // whole characters — but `last_start` is a byte count and need
         // not be one, so the scan runs to the end and rejects a
         // candidate with no room for the needle after it.
-        let Some(off) = hay[i..].find(first) else {
-            return None;
-        };
+        let off = hay[i..].find(first)?;
         let at = i + off;
         if at > last_start {
             return None;
@@ -11365,9 +11363,7 @@ pub(crate) fn substr_rfind(hay: &str, needle: &str) -> Option<usize> {
     let mut end = h.len() - n.len();
     let mut budget = h.len() / n.len() + 32;
     loop {
-        let Some(at) = h[..=end].iter().rposition(|&b| b == first) else {
-            return None;
-        };
+        let at = h[..=end].iter().rposition(|&b| b == first)?;
         if at + n.len() <= h.len() && h[at..at + n.len()] == *n {
             return Some(at);
         }
@@ -11427,7 +11423,11 @@ fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
     // conversions below consults the same thread-local cache, and the
     // TLS access costs more than the work it guards.
     let ascii = str_is_ascii_cached(s);
-    let total_chars = if ascii { s.len() as i64 } else { str_char_len(s) as i64 };
+    let total_chars = if ascii {
+        s.len() as i64
+    } else {
+        str_char_len(s) as i64
+    };
     let Some((start, end)) = str_search_window(args, total_chars) else {
         return Ok(Object::Int(-1));
     };
@@ -11745,7 +11745,11 @@ fn str_count(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     // One ASCII probe for the whole call, as `str.find` does.
     let ascii = str_is_ascii_cached(s);
-    let total_chars = if ascii { s.len() as i64 } else { str_char_len(s) as i64 };
+    let total_chars = if ascii {
+        s.len() as i64
+    } else {
+        str_char_len(s) as i64
+    };
     let Some((start, end)) = str_search_window(args, total_chars) else {
         return Ok(Object::Int(0));
     };
