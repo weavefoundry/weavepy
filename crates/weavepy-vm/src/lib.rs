@@ -63329,12 +63329,21 @@ assert namespace is exported.__dict__
     fn jit_list_negative_index_and_bounds_deopt() {
         // Negative indices resolve natively; an out-of-range access
         // deopts and the interpreter raises the real IndexError.
-        let src = "def pick(xs, i):\n    return xs[i]\n\
+        //
+        // The kernel carries its own loop: a loop-free body of this size
+        // runs as an inline activation of the quiet loop and never
+        // reaches native code at all (forcing it there measured ~80%
+        // worse on call-shaped fixtures), so a loop-free `pick` would
+        // leave this test asserting nothing about the native subscript
+        // path.
+        let src = "def pick(xs, i, n):\n    r = 0\n\
+                   \x20   while n > 0:\n        r = xs[i]\n        n = n - 1\n\
+                   \x20   return r\n\
                    xs = [x for x in range(10)]\n\
                    r = 0\nk = 0\n\
-                   while k < 60:\n    r = r + pick(xs, 0 - 1)\n    k = k + 1\n\
+                   while k < 60:\n    r = r + pick(xs, 0 - 1, 4)\n    k = k + 1\n\
                    print(r)\n\
-                   try:\n    pick(xs, 99)\nexcept IndexError:\n    print('bounds ok')\n";
+                   try:\n    pick(xs, 99, 4)\nexcept IndexError:\n    print('bounds ok')\n";
         let (out, compiled, deopts) = run_jit(src);
         assert!(compiled >= 1, "JIT never compiled the pick kernel");
         assert!(deopts >= 1, "out-of-range subscript must deopt");
@@ -63348,12 +63357,16 @@ assert namespace is exported.__dict__
         // The list goes heterogeneous *after* the compile: the per-
         // access lane check in `wpjit_list_get` catches the str element
         // and the interpreter finishes the concatenation-free path.
-        let src = "def pick(xs, i):\n    return xs[i]\n\
+        // The kernel carries its own loop so it reaches native code at
+        // all (see `jit_list_negative_index_and_bounds_deopt`).
+        let src = "def pick(xs, i, n):\n    r = 0\n\
+                   \x20   while n > 0:\n        r = xs[i]\n        n = n - 1\n\
+                   \x20   return r\n\
                    xs = [x for x in range(10)]\n\
                    k = 0\n\
-                   while k < 60:\n    pick(xs, 3)\n    k = k + 1\n\
+                   while k < 60:\n    pick(xs, 3, 4)\n    k = k + 1\n\
                    xs[3] = 'boom'\n\
-                   print(pick(xs, 3))\n";
+                   print(pick(xs, 3, 4))\n";
         let (out, compiled, deopts) = run_jit(src);
         assert!(compiled >= 1, "JIT never compiled the pick kernel");
         assert!(deopts >= 1, "heterogeneous element must deopt");
@@ -65280,12 +65293,14 @@ assert namespace is exported.__dict__
                    \x20       hits = hits + s.count(t) + s.find(t) + len(u)\n\
                    \x20       i = i + 1\n\
                    \x20   return hits\n\
-                   print(scan('banana', 'an', 200))\n";
+                   print(scan('banana', 'an', 60))\n";
         let (out, compiled, deopts) = run_jit(src);
         assert!(compiled >= 1, "str-method kernel never compiled");
         assert_eq!(deopts, 0, "stable str-method lanes should not deopt");
-        // Per iteration: count=2, find=1, len('BANANA')=6 → 9 × 200.
-        assert_eq!(out, "1800\n");
+        // Per iteration: count=2, find=1, len('BANANA')=6 → 9 × 60.
+        // The count stays under STR_METHOD_RETIRE_BUDGET (see
+        // `jit_str_split_iter_join_roundtrip`).
+        assert_eq!(out, "540\n");
         assert_eq!(out, run(src));
     }
 
@@ -65295,6 +65310,13 @@ assert namespace is exported.__dict__
         // RFC 0073 WS3 — `split` returns a pinned `ListObj` whose
         // `ForList` consumer hands elements out natively, and `join`
         // takes its direct list fast path on the same pin.
+        //
+        // The iteration count keeps the body under
+        // STR_METHOD_RETIRE_BUDGET (256 `str`-method calls per
+        // activation): past it the activation hands the loop back to
+        // tier-1 by design, and this test is about the lanes, not that
+        // policy. `out` is rewritten every iteration, so the result does
+        // not depend on the count.
         let src = "def rejoin(s, n):\n\
                    \x20   out = ''\n\
                    \x20   total = 0\n\
@@ -65306,7 +65328,7 @@ assert namespace is exported.__dict__
                    \x20       out = '-'.join(parts) + s.upper()\n\
                    \x20       i = i + 1\n\
                    \x20   return out\n\
-                   print(rejoin('a,b,c', 150))\n";
+                   print(rejoin('a,b,c', 80))\n";
         let (out, compiled, deopts) = run_jit(src);
         assert!(compiled >= 1, "split/join kernel never compiled");
         assert_eq!(deopts, 0, "split/iterate/join round trip should not deopt");
