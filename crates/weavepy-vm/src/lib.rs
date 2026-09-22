@@ -63856,8 +63856,16 @@ assert namespace is exported.__dict__
         // now compiles (the admission gate admits resume entries
         // without a native cycle) and each yield parks the activation
         // in place, so resumes skip the marshal/spill round trip
-        // entirely. Results stay exact.
-        let src = "def g(n):\n    for i in range(n):\n        yield i * 2\n\
+        // entirely. Results stay exact.        //
+        // The body opens with a loop that does not yield: a generator
+        // whose *every* loop yields is handed to the interpreted resume
+        // on purpose -- the native resume protocol costs more than the
+        // single iteration it would run, measured at 2.5x on the
+        // `generators` fixture -- so a yield-dense body would never reach
+        // the parking path this test is about. The extra loop does not
+        // change what is yielded.
+        let src = "def g(n):\n    j = 0\n    while j < 1:\n        j = j + 1\n\
+                   \x20   for i in range(n):\n        yield i * 2\n\
                    t = 0\nk = 0\n\
                    while k < 60:\n\
                    \x20   for v in g(20):\n        t = t + v\n\
@@ -66096,7 +66104,9 @@ print(sliced('é😀z', 2))
         // RFC 0073 WS4 — the `while`-shaped yield-dense counter now
         // compiles and parks per yield (see the `for`-shaped sibling
         // above); the park keeps the whole resume cycle native.
-        let src = "def counter(n):\n    i = 0\n\
+        // It too opens with a non-yielding loop; see the sibling.
+        let src = "def counter(n):\n    i = 0\n    j = 0\n\
+                   \x20   while j < 1:\n        j = j + 1\n\
                    \x20   while i < n:\n        yield i\n        i = i + 1\n\
                    t = 0\nk = 0\n\
                    while k < 60:\n\
