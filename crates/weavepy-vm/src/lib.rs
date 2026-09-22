@@ -65826,20 +65826,33 @@ print(combine(200))
     fn jit_extreme_slice_stop_stays_native_and_exact() {
         std::thread::spawn(|| {
             crate::tier2::force_enable_for_test(2);
+            // Each kernel carries its own loop so it reaches native
+            // code: a loop-free body this small runs as an inline
+            // activation of the quiet loop and never enters compiled
+            // code (see `jit_list_negative_index_and_bounds_deopt`). The
+            // loop recomputes the same slice, so the total is unchanged.
             let out = run(r"
-def list_size(stop):
+def list_size(stop, n):
     items = [1, 2, 3]
-    return len(items[:stop:None])
-def str_size(stop):
-    return len('abc'[:stop:None])
+    r = 0
+    while n > 0:
+        r = len(items[:stop:None])
+        n = n - 1
+    return r
+def str_size(stop, n):
+    r = 0
+    while n > 0:
+        r = len('abc'[:stop:None])
+        n = n - 1
+    return r
 total = 0
 for i in range(100):
-    total += list_size(-9223372036854775808)
-    total += list_size(-9223372036854775807)
-    total += list_size(-1) + list_size(9223372036854775807)
-    total += str_size(-9223372036854775808)
-    total += str_size(-9223372036854775807)
-    total += str_size(-1) + str_size(9223372036854775807)
+    total += list_size(-9223372036854775808, 4)
+    total += list_size(-9223372036854775807, 4)
+    total += list_size(-1, 4) + list_size(9223372036854775807, 4)
+    total += str_size(-9223372036854775808, 4)
+    total += str_size(-9223372036854775807, 4)
+    total += str_size(-1, 4) + str_size(9223372036854775807, 4)
 print(total)
 ");
             assert_eq!(out, "1000\n");
@@ -66694,6 +66707,13 @@ print("native pickle coverage: ok")
         // iteration: the materialized frame raises, the exception
         // unwinds through the native caller, and the module-level
         // handler catches the real ZeroDivisionError.
+        //
+        // `spin` needs enough back edges to heat (one tier-2
+        // consultation per BACKEDGE_STRIDE): at five iterations it never
+        // compiled, so there was no *native* caller and `div` was never
+        // reached through the native call lane. The divisor still hits
+        // zero on the last iteration whatever the count, so the expected
+        // output is unchanged.
         let src = "def div(a, b):\n    if a < 0:\n        return 0\n\
                    \x20   if b < 0:\n        return 0\n\
                    \x20   return a // b\n\
@@ -66701,7 +66721,7 @@ print("native pickle coverage: ok")
                    def spin(n):\n    t = 0\n    i = 0\n\
                    \x20   while i < n:\n        t = t + div(10, n - i - 1)\n        i = i + 1\n\
                    \x20   return t\n\
-                   try:\n    spin(5)\nexcept ZeroDivisionError:\n    print('zde ok')\n\
+                   try:\n    spin(40)\nexcept ZeroDivisionError:\n    print('zde ok')\n\
                    print(div(10, 2))\n";
         let (out, calls, _fallbacks, _deopts) = run_jit_native(src);
         assert!(calls >= 1, "div never took the native call path");
