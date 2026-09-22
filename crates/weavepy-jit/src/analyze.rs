@@ -1340,6 +1340,20 @@ fn plan_rewrite(
         if exit >= n || !matches!(ins[exit].op, OpCode::EndFor) {
             return Err(bail());
         }
+        // The iterator stays on the interpreter's operand stack across
+        // the loop epilogue: `END_FOR` leaves it and `POP_ITER` consumes
+        // it. Both are nops in the compiled plan, so a deopt landing
+        // there resumes an interpreter that still pops the iterator --
+        // the live range therefore has to end *after* its consumer, the
+        // convention every other span family records. Ending it at
+        // `END_FOR` dropped the iterator from the rebuild and the resumed
+        // `POP_ITER` underflowed the stack.
+        let iter_live_to =
+            if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopIter | OpCode::PopTop) {
+                exit + 2
+            } else {
+                exit + 1
+            };
         // RFC 0074 WS3 — the tuple-target shape (`for a, b in it:`):
         // `GET_ITER; FOR_ITER; UNPACK_SEQUENCE 2; STORE_FAST a;
         // STORE_FAST b`. The unpack and both stores erase — the
@@ -1398,7 +1412,7 @@ fn plan_rewrite(
                 seq_slot,
                 idx_slot,
                 live_from: i as u32,
-                live_to: exit as u32,
+                live_to: iter_live_to as u32,
                 interp_depth: 0,
             });
             continue;
@@ -1442,7 +1456,7 @@ fn plan_rewrite(
                 cur_slot,
                 stop_slot,
                 live_from: i as u32,
-                live_to: exit as u32,
+                live_to: iter_live_to as u32,
                 interp_depth: 0,
             });
             continue;
@@ -1475,7 +1489,7 @@ fn plan_rewrite(
                 seq_slot,
                 idx_slot,
                 live_from: i as u32,
-                live_to: exit as u32,
+                live_to: iter_live_to as u32,
                 interp_depth: 0,
             });
             continue;
@@ -1562,7 +1576,7 @@ fn plan_rewrite(
                 seq_slot,
                 idx_slot,
                 live_from: i as u32,
-                live_to: exit as u32,
+                live_to: iter_live_to as u32,
                 interp_depth: 0,
             });
             plan.comp_acc.insert(i - 2, acc_lane_slot);

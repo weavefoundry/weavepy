@@ -276,7 +276,11 @@ impl Frame {
                 let ins = self.code.instructions.get(pc);
                 eprintln!("UNDERFLOW in {} at pc={} ins={:?}", self.code.name, pc, ins);
             }
-            RuntimeError::Internal("stack underflow".to_owned())
+            RuntimeError::Internal(format!(
+                "stack underflow (len {}, capacity {})",
+                self.stack.len(),
+                self.stack.capacity()
+            ))
         })
     }
 
@@ -62395,12 +62399,17 @@ mod tests {
     // snapshot in one fixture roots objects owned by other fixtures, so tests
     // asserting prompt heap retirement must not hold competing snapshots.
     #[cfg(feature = "jit")]
+    // Guards mutual exclusion, not data: a test that panics while holding
+    // it leaves nothing inconsistent behind, so the poison is recovered
+    // rather than cascaded -- otherwise one real failure reports as five.
     static HEAP_SNAPSHOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn range_collection_preserves_python_semantics() {
         #[cfg(feature = "jit")]
-        let _guard = HEAP_SNAPSHOT_TEST_LOCK.lock().unwrap();
+        let _guard = HEAP_SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
             run(include_str!(
                 "../../../tests/regrtest/test_range_collection.py"
@@ -62438,7 +62447,9 @@ mod tests {
     #[test]
     fn sum_streaming_preserves_callbacks_and_integer_results() {
         #[cfg(feature = "jit")]
-        let _guard = HEAP_SNAPSHOT_TEST_LOCK.lock().unwrap();
+        let _guard = HEAP_SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
             run(include_str!(
                 "../../../tests/regrtest/test_sum_streaming.py"

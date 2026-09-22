@@ -498,24 +498,29 @@ static STARTUP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// direct lane into a callee that *is* compiled. Waiting for the lean
 /// constant when tier-2 would have compiled after far fewer entries left
 /// those callees interpreted and every native call site generic.
-static LEAN_WARM_AT: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(LEAN_WARM_COMPILE_THRESHOLD_CAP);
+/// Thread-local, like the tier-2 threshold it is clamped to: a process
+/// -wide cell would let one thread's threshold decide another's warm
+/// point, which in the test binary means whichever test ran last.
+thread_local! {
+    static LEAN_WARM_AT: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(LEAN_WARM_COMPILE_THRESHOLD_CAP) };
+}
 
 /// The cap the clamp above starts from.
 pub(crate) const LEAN_WARM_COMPILE_THRESHOLD_CAP: u32 = 24;
 
 #[inline]
 pub(crate) fn lean_warm_at() -> u32 {
-    LEAN_WARM_AT.load(std::sync::atomic::Ordering::Relaxed)
+    LEAN_WARM_AT
+        .try_with(std::cell::Cell::get)
+        .unwrap_or(LEAN_WARM_COMPILE_THRESHOLD_CAP)
 }
 
 /// Clamp [`LEAN_WARM_AT`] to `threshold` (called wherever the tier-2
 /// threshold is established).
 fn set_lean_warm_from_threshold(threshold: u32) {
-    LEAN_WARM_AT.store(
-        LEAN_WARM_COMPILE_THRESHOLD_CAP.min(threshold.max(1)),
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    let v = LEAN_WARM_COMPILE_THRESHOLD_CAP.min(threshold.max(1));
+    let _ = LEAN_WARM_AT.try_with(|c| c.set(v));
 }
 
 /// Mark interpreter start-up finished (see [`STARTUP_DONE`]).
