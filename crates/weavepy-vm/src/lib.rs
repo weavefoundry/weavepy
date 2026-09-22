@@ -65786,9 +65786,20 @@ for _ in range(10):
                 "../../../tests/regrtest/test_native_string_callbacks.py"
             ));
             assert_eq!(out, "ok\n");
+            // Any native entry counts, as in
+            // `jit_native_string_argument_storage_covers_arities`: the
+            // kernel with the loop compiles at its loop header, so it is
+            // entered through OSR rather than the frameless direct lane,
+            // and the loop-free one runs as an inline activation. What
+            // this test is about is that the callbacks observe current
+            // globals and caller frames while native code runs.
+            let (_, framed, _) = crate::tier2::stats_for_test();
+            let (nested, _, _) = crate::tier2::native_call_stats_for_test();
+            let direct = crate::tier2::direct_call_count_for_test();
             assert!(
-                crate::tier2::direct_call_count_for_test() >= 1,
-                "callback regression must exercise warmed native calls"
+                framed + nested + direct >= 1,
+                "callback regression must exercise warmed native calls: \
+                 {framed} framed, {nested} nested, {direct} direct"
             );
         })
         .join()

@@ -8,23 +8,42 @@ class Marker:
     pass
 
 
+# Each helper carries a counting loop: a loop-free body runs as an
+# inline activation of the quiet loop and never reaches compiled code,
+# so the native split paths this fixture probes would not run. The
+# loop only counts, so every return value is unchanged.
 def split_once(text):
+    n = 4
+    while n > 1:
+        n = n - 1
     return text.split()
 
 
 def rsplit_once(text):
+    n = 4
+    while n > 1:
+        n = n - 1
     return text.rsplit()
 
 
 def split_bounded(text):
+    n = 4
+    while n > 1:
+        n = n - 1
     return text.split(" ", 1)
 
 
 def rsplit_bounded(text):
+    n = 4
+    while n > 1:
+        n = n - 1
     return text.rsplit(" ", 1)
 
 
 def split_lines(text):
+    n = 4
+    while n > 1:
+        n = n - 1
     return text.splitlines()
 
 
