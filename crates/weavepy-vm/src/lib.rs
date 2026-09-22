@@ -65744,8 +65744,16 @@ for _ in range(10):
                         "    try:\n        f({input})\n    except TypeError:\n        pass\n    else:\n        raise AssertionError('extra arguments accepted')\n"
                     ),
                 };
+                // `f` carries a loop so it reaches native code: a
+                // loop-free body runs as an inline activation of the
+                // quiet loop and never enters compiled code (see
+                // `jit_list_negative_index_and_bounds_deopt`). The loop
+                // only counts -- an accumulator would hold `None` and
+                // then the result, and the compile rejects the
+                // non-uniform lane -- so the returned value and the
+                // arity error are exactly as before.
                 let source = format!(
-                    "def f(value):\n    return {expression}\nfor _ in range(16):\n{check}print('ok')\n"
+                    "def f(value):\n    n = 4\n    while n > 1:\n        n = n - 1\n    return {expression}\nfor _ in range(40):\n{check}print('ok')\n"
                 );
                 assert_eq!(run(&source), "ok\n", "{expression}");
                 let (_, framed, _) = crate::tier2::stats_for_test();
