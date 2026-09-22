@@ -65622,29 +65622,43 @@ assert namespace is exported.__dict__
 
     #[cfg(feature = "jit")]
     #[test]
-    fn jit_pin_pressure_reenters_without_retiring_code() {
+    fn jit_long_native_loop_reenters_without_retiring_code() {
         std::thread::spawn(|| {
             crate::tier2::force_enable_for_test(2);
             let out = run(r"
 def churn(n):
     total = 0
     for i in range(n):
-        text = 'alpha beta'.upper().lower()
-        total += len(text)
+        total += (i * 7) % 13
     return total
 print(churn(300000))
 for _ in range(10):
     print(churn(100))
 ");
-            assert_eq!(out, format!("3000000\n{}", "1000\n".repeat(10)));
-            let pressure_exits = crate::tier2::pin_pressure_exits_for_test();
+            assert_eq!(out, format!("1800000\n{}", "590\n".repeat(10)));
+            // The long activation runs natively to completion without a
+            // side exit, so nothing charges the deopt backoff and the code
+            // is not retired; each of the ten short calls afterwards then
+            // re-enters through the frameless direct lane.
+            //
+            // This used to drive a string loop past the pin table's cap
+            // and assert that *pressure* exits do not retire the code.
+            // Pins are now reaped as the loop runs, so the table never
+            // fills and that exit no longer occurs for any workload in
+            // this suite; and a string loop that long is handed back to
+            // tier-1 by the `str`-method budget by design. The property
+            // worth keeping -- a healthy long loop does not cost the
+            // function its native code -- is what this asserts instead.
+            let (compiled, entries, deopts) = crate::tier2::stats_for_test();
+            let direct = crate::tier2::direct_call_count_for_test();
             assert!(
-                pressure_exits >= 80,
-                "long native loop must cross more than the speculative exit budget: {pressure_exits} pressure exits"
+                compiled >= 1 && entries >= 1,
+                "long native loop must run natively: {compiled} compiled, {entries} entries"
             );
+            assert_eq!(deopts, 0, "a healthy long loop must not side-exit");
             assert!(
-                crate::tier2::direct_call_count_for_test() >= 1,
-                "warmed calls must still enter directly after memory-pressure exits"
+                direct >= 10,
+                "every short call afterwards must re-enter natively: {direct} direct"
             );
         })
         .join()
@@ -65663,9 +65677,20 @@ for _ in range(10):
                 "../../../tests/regrtest/test_native_pin_pressure.py"
             ));
             assert_eq!(out, "ok\n");
+            // The fixture itself holds the substance: exact totals,
+            // callback counts and exception propagation across native
+            // loops, and a `gc.get_objects()` scan proving no split
+            // result outlived its activation -- which is what "release
+            // entry pins" means. This side only needs the native loops to
+            // have run and side-exited. That exit used to be pin
+            // pressure; pins are now reaped as the loop runs, so the
+            // table never fills and the exit here is the `str`-method
+            // budget handing the activation back.
+            let (compiled, entries, deopts) = crate::tier2::stats_for_test();
             assert!(
-                crate::tier2::pin_pressure_exits_for_test() >= 1,
-                "pin lifetime regression must cross native resource exits"
+                compiled >= 1 && entries >= 1 && deopts >= 1,
+                "pin lifetime regression must run and side-exit natively: \
+                 {compiled} compiled, {entries} entries, {deopts} deopts"
             );
         })
         .join()
@@ -65708,8 +65733,21 @@ for _ in range(10):
                     "def total(n):\n    out = 0\n    for i in range(n):\n        out = out + (i + {expression})\n    return out\nprint(total(16000))\n"
                 );
                 assert_eq!(run(&source), expected);
-                let exits = crate::tier2::pin_pressure_exits_for_test();
-                assert!(exits >= 3, "expression must cross resource exits: {exits}");
+                // The exit that interrupts the expression is the `str`-
+                // method budget handing the activation back mid-addition
+                // -- `out` and `i` are on the native stack when it fires.
+                // It used to be pin pressure; pins are now reaped as the
+                // loop runs, so the table never fills and that exit no
+                // longer occurs for any workload in this suite. What the
+                // test verifies is unchanged: the expression stack is
+                // restored across a side exit taken inside the expression,
+                // which the exact totals above prove.
+                let (compiled, entries, deopts) = crate::tier2::stats_for_test();
+                assert!(
+                    compiled >= 1 && entries >= 1 && deopts >= 1,
+                    "expression must cross a native side exit: \
+                     {compiled} compiled, {entries} entries, {deopts} deopts"
+                );
             })
             .join()
             .expect("string expression pressure worker");
@@ -65909,8 +65947,17 @@ print(total)
     fn jit_two_bound_slice_fallback_restores_exact_stack() {
         std::thread::spawn(|| {
             crate::tier2::force_enable_for_test(2);
+            // `sliced` carries a counting loop so it reaches native code
+            // at all (a loop-free body runs as an inline activation and
+            // never enters compiled code; see
+            // `jit_native_string_argument_storage_covers_arities`). The
+            // surgery below locates BUILD_SLICE by opcode, so the loop
+            // does not disturb it.
             let source = r"
 def sliced(value, stop):
+    n = 4
+    while n > 1:
+        n = n - 1
     return value[:stop:None]
 for i in range(100):
     assert sliced('abcdef', 4) == 'abcd'

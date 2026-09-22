@@ -9723,12 +9723,6 @@ pub(crate) fn stats_for_test() -> (u64, u64, u64) {
     })
 }
 
-/// Test hook: pressure exits are distinct from failed native assumptions.
-#[cfg(test)]
-pub(crate) fn pin_pressure_exits_for_test() -> u64 {
-    JIT.with(|cell| cell.borrow().stats.pin_pressure_exits)
-}
-
 /// Test hook: OSR entry count for the current thread (RFC 0059 WS3b).
 #[cfg(test)]
 pub(crate) fn osr_stats_for_test() -> u64 {
