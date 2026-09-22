@@ -392,9 +392,11 @@ fn publish_sole_guard() -> bool {
     // [`CELLS_SHARED`], which one fence provides. `revoke_bias` runs the
     // mirror image (`SeqCst` store then `SeqCst` load), so the two
     // linearise: whichever publishes second observes the other.
-    let n = SOLE_GUARDS.load(Ordering::Relaxed);
-    SOLE_GUARDS.store(n + 1, Ordering::Relaxed);
-    std::sync::atomic::fence(Ordering::SeqCst);
+    // A `SeqCst` read-modify-write rather than a store plus a fence:
+    // both give the store/load ordering this needs, but the RMW is one
+    // `lock xadd` on x86 where the fence is a full `mfence`, and this
+    // runs on every borrow in the VM.
+    SOLE_GUARDS.fetch_add(1, Ordering::SeqCst);
     !CELLS_SHARED.load(Ordering::Relaxed)
 }
 
