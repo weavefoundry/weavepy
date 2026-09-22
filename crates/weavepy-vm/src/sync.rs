@@ -389,13 +389,104 @@ fn biased_here() -> bool {
 fn publish_sole_guard() -> bool {
     // Only the biased thread writes this count, so the value needs no
     // read-modify-write; what it needs is store/load ordering against
-    // [`CELLS_SHARED`], which one fence provides. `revoke_bias` runs the
-    // mirror image (`SeqCst` store then `SeqCst` load), so the two
-    // linearise: whichever publishes second observes the other.
+    // [`CELLS_SHARED`]. Where the platform can run a barrier on every
+    // thread from one thread (see [`ASYMMETRIC_BARRIER`]), the revoker
+    // pays for that ordering once and this side needs only to keep the
+    // compiler from reordering; otherwise this side fences itself and
+    // `revoke_bias` runs the mirror image (`SeqCst` store, then `SeqCst`
+    // load), so the two linearise either way: whichever publishes
+    // second observes the other.
     let n = SOLE_GUARDS.load(Ordering::Relaxed);
     SOLE_GUARDS.store(n + 1, Ordering::Relaxed);
-    std::sync::atomic::fence(Ordering::SeqCst);
+    if ASYMMETRIC_BARRIER.load(Ordering::Relaxed) {
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+    } else {
+        std::sync::atomic::fence(Ordering::SeqCst);
+    }
     !CELLS_SHARED.load(Ordering::Relaxed)
+}
+
+/// Whether [`heavy_barrier`] can make *every* thread execute a full
+/// memory barrier: `membarrier(2)` on Linux, `FlushProcessWriteBuffers`
+/// on Windows. Set once, at process start-up, only after the platform
+/// facility is confirmed to work; a thread that reads it stale (`false`)
+/// simply fences itself, which is always sound.
+///
+/// This is what keeps the biased borrow path free of barriers: the
+/// ordering the revocation handshake needs is paid by the revoker, at
+/// most once per process, instead of by every borrow in the VM. (With a
+/// per-borrow fence the bench gate read pyaes at 1.43x merge-base on
+/// x86, where the fence is a full `mfence`.)
+static ASYMMETRIC_BARRIER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Try to enable [`heavy_barrier`]. Linux needs the process registered
+/// for expedited private membarriers first (kernel 4.14+); Windows has
+/// the facility unconditionally; other platforms keep the per-borrow
+/// fence.
+fn enable_asymmetric_barrier() {
+    #[cfg(target_os = "linux")]
+    {
+        const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: libc::c_int = 1 << 4;
+        // SAFETY: a plain syscall with no pointer arguments.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_membarrier,
+                MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED,
+                0 as libc::c_int,
+            )
+        };
+        if rc == 0 {
+            ASYMMETRIC_BARRIER.store(true, Ordering::SeqCst);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        ASYMMETRIC_BARRIER.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A full memory barrier on every thread of the process, when
+/// [`ASYMMETRIC_BARRIER`] is set; otherwise a barrier on this thread
+/// only, which suffices because every other thread then fences itself.
+fn heavy_barrier() {
+    if !ASYMMETRIC_BARRIER.load(Ordering::SeqCst) {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        const MEMBARRIER_CMD_PRIVATE_EXPEDITED: libc::c_int = 1 << 3;
+        // SAFETY: a plain syscall with no pointer arguments. Registration
+        // succeeded (that is the only way the flag is set), so this
+        // cannot fail with EPERM; on any other outcome fall back to a
+        // local fence *and* keep the flag, because readers may already be
+        // relying on it -- the fence below then orders this side, and the
+        // spin in `revoke_bias` still waits for every published guard.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_membarrier,
+                MEMBARRIER_CMD_PRIVATE_EXPEDITED,
+                0 as libc::c_int,
+            )
+        };
+        if rc != 0 {
+            std::sync::atomic::fence(Ordering::SeqCst);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        extern "system" {
+            fn FlushProcessWriteBuffers();
+        }
+        // SAFETY: no arguments, no preconditions; documented for exactly
+        // this use (a one-sided barrier across all threads).
+        unsafe { FlushProcessWriteBuffers() };
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        std::sync::atomic::fence(Ordering::SeqCst);
+    }
 }
 
 /// Drop a guard published by [`publish_sole_guard`]. Callers undo their
@@ -421,6 +512,11 @@ fn revoke_bias() {
     if std::env::var_os("WEAVEPY_CELLS_TRACE").is_some() {
         eprintln!("[cells] shared: bias revoked");
     }
+    // After this every thread has executed a full barrier: a borrow that
+    // read the flag as clear did so before it, and its guard store --
+    // program-ordered before that read and compiler-fenced -- is therefore
+    // visible to the drain below.
+    heavy_barrier();
     while SOLE_GUARDS.load(Ordering::SeqCst) > 0 {
         std::hint::spin_loop();
     }
@@ -434,7 +530,7 @@ pub fn note_vm_thread(thread_id: u64) {
         return;
     }
     match FIRST.compare_exchange(0, thread_id, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => {}
+        Ok(_) => enable_asymmetric_barrier(),
         Err(first) if first == thread_id => {}
         Err(first) => {
             if std::env::var_os("WEAVEPY_CELLS_TRACE").is_some() {
