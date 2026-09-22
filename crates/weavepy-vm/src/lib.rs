@@ -62521,22 +62521,31 @@ second = Row(23)
         .to_owned();
         if typed_store {
             source.push_str(
+                // `refill` carries its own loop: a loop-free body runs
+                // as an inline activation of the quiet loop and reaches
+                // native code at most once, before the call site caches
+                // that shape (see
+                // `jit_list_negative_index_and_bounds_deopt`). The loop
+                // rewrites the same slots, so the values asserted below
+                // are unchanged.
                 r"
-def refill(row, value):
-    row.a = value
-    row.b = value
-    row.c = value
-    row.d = value
-    row.e = value
-    row.f = value
-    row.g = value
-    row.h = value
-    row.i = value
-for i in range(100):
-    refill(first, 17)
+def refill(row, value, n):
+    while n > 0:
+        row.a = value
+        row.b = value
+        row.c = value
+        row.d = value
+        row.e = value
+        row.f = value
+        row.g = value
+        row.h = value
+        row.i = value
+        n = n - 1
+for i in range(110):
+    refill(first, 17, 3)
 del second.a
 del second.c
-refill(second, 23)
+refill(second, 23, 3)
 ",
             );
         }
