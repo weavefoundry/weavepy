@@ -2619,10 +2619,7 @@ pub(crate) fn note_backedge(code: &Rc<CodeObject>) -> bool {
 /// the direct call lanes into the compiled form, and those resolve only
 /// once the code has been compiled. Called on the lean path's threshold.
 pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::Frame) {
-    if frame.code.jit_hint.is_not_jitable()
-        || jit_off_for_process()
-        || !STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed)
-    {
+    if frame.code.jit_hint.is_not_jitable() || jit_off_for_process() {
         return;
     }
     JIT.with(|cell| {
@@ -2630,18 +2627,29 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
         if !st.enabled {
             return;
         }
-        // Pull the counter to the threshold so `get_compiled` compiles now.
+        // Pull the counter to whatever `compile_allowed` asks for, so
+        // `get_compiled` compiles now. A body reached only through the
+        // lean/inline call path never gets a frame entry to count it, so
+        // this is its *only* route into tier-2: applying a stricter rule
+        // here than the frame path does (refusing outright until
+        // start-up is reported) left every such body interpreted for the
+        // life of an embedder that never reports it.
         let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
         let threshold = st.threshold;
+        let warm = if STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed) {
+            threshold
+        } else {
+            threshold.saturating_mul(16)
+        };
         if let Some(entry) = st.cache.get_mut(&key) {
             if let Tier::Cold = entry.tier {
-                entry.counter = entry.counter.max(threshold);
+                entry.counter = entry.counter.max(warm);
             }
         } else {
             st.cache.insert(
                 key,
                 CacheEntry {
-                    counter: threshold,
+                    counter: warm,
                     tier: Tier::Cold,
                     osr_failures: 0,
                     deopts: 0,
