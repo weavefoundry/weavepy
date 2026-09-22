@@ -9613,7 +9613,7 @@ impl Interpreter {
         // A loop-free body stays interpreted here, but a hot one is still
         // compiled once so native callers can take the direct lanes.
         #[cfg(feature = "jit")]
-        if act.frame.code.jit_hint.bump_lean_entries() == LEAN_WARM_COMPILE_THRESHOLD
+        if act.frame.code.jit_hint.bump_lean_entries() == crate::tier2::lean_warm_at()
             && !crate::tier2::jit_off_for_process()
             && !act.frame.code.jit_hint.is_not_jitable()
         {
@@ -11263,7 +11263,7 @@ impl Interpreter {
         // A loop-free body stays interpreted here, but a hot one is still
         // compiled once so native callers can take the direct lanes.
         #[cfg(feature = "jit")]
-        if frame.code.jit_hint.bump_lean_entries() == LEAN_WARM_COMPILE_THRESHOLD
+        if frame.code.jit_hint.bump_lean_entries() == crate::tier2::lean_warm_at()
             && !crate::tier2::jit_off_for_process()
             && !frame.code.jit_hint.is_not_jitable()
         {

@@ -490,6 +490,34 @@ fn jit_enabled_by_config() -> bool {
 /// more (time and resident memory) than interpreting them ever could.
 static STARTUP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The lean entry count at which the interpreter warms a tier-2 compile
+/// (see `LEAN_WARM_COMPILE_THRESHOLD`), clamped to the tier-2 threshold.
+///
+/// A loop-free callee never gets a frame entry to count, so this is the
+/// only thing that compiles it — and a native caller can only take a
+/// direct lane into a callee that *is* compiled. Waiting for the lean
+/// constant when tier-2 would have compiled after far fewer entries left
+/// those callees interpreted and every native call site generic.
+static LEAN_WARM_AT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(LEAN_WARM_COMPILE_THRESHOLD_CAP);
+
+/// The cap the clamp above starts from.
+pub(crate) const LEAN_WARM_COMPILE_THRESHOLD_CAP: u32 = 24;
+
+#[inline]
+pub(crate) fn lean_warm_at() -> u32 {
+    LEAN_WARM_AT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Clamp [`LEAN_WARM_AT`] to `threshold` (called wherever the tier-2
+/// threshold is established).
+fn set_lean_warm_from_threshold(threshold: u32) {
+    LEAN_WARM_AT.store(
+        LEAN_WARM_COMPILE_THRESHOLD_CAP.min(threshold.max(1)),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// Mark interpreter start-up finished (see [`STARTUP_DONE`]).
 pub(crate) fn note_startup_finished() {
     STARTUP_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -529,6 +557,7 @@ impl JitState {
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(50);
+        set_lean_warm_from_threshold(threshold);
         // RFC 0059 WS3 — must precede the first compile of a frame
         // containing calls. Registered unconditionally (it only stores a
         // fn pointer) so late enabling, e.g. via the test hook, works.
@@ -9673,6 +9702,7 @@ pub(crate) fn force_enable_for_test(threshold: u32) {
         let mut st = cell.borrow_mut();
         st.enabled = true;
         st.threshold = threshold.max(1);
+        set_lean_warm_from_threshold(st.threshold);
     });
 }
 
