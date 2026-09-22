@@ -387,11 +387,15 @@ fn biased_here() -> bool {
 #[inline]
 #[must_use]
 fn publish_sole_guard() -> bool {
-    SOLE_GUARDS.fetch_add(1, Ordering::SeqCst);
-    if CELLS_SHARED.load(Ordering::SeqCst) {
-        return false;
-    }
-    true
+    // Only the biased thread writes this count, so the value needs no
+    // read-modify-write; what it needs is store/load ordering against
+    // [`CELLS_SHARED`], which one fence provides. `revoke_bias` runs the
+    // mirror image (`SeqCst` store then `SeqCst` load), so the two
+    // linearise: whichever publishes second observes the other.
+    let n = SOLE_GUARDS.load(Ordering::Relaxed);
+    SOLE_GUARDS.store(n + 1, Ordering::Relaxed);
+    std::sync::atomic::fence(Ordering::SeqCst);
+    !CELLS_SHARED.load(Ordering::Relaxed)
 }
 
 /// Drop a guard published by [`publish_sole_guard`]. Callers undo their
@@ -399,7 +403,10 @@ fn publish_sole_guard() -> bool {
 /// the count at zero also observes every undone claim.
 #[inline]
 fn retract_sole_guard() {
-    SOLE_GUARDS.fetch_sub(1, Ordering::SeqCst);
+    // Release: a revoker that observes the count reach zero also
+    // observes the borrow counter this guard restored.
+    let n = SOLE_GUARDS.load(Ordering::Relaxed);
+    SOLE_GUARDS.store(n.saturating_sub(1), Ordering::Release);
 }
 
 /// Take every cell off the biased path, then wait for the biased
@@ -685,28 +692,28 @@ impl<T: ?Sized> GilCell<T> {
     #[inline]
     pub fn try_borrow(&self) -> Result<Ref<'_, T>, BorrowError> {
         if biased_here() {
-            // The biased thread: no lock word.
-            if !self.borrow_shared(false) {
+            // Publish the guard *before* claiming the counter: a revoker
+            // that has set `CELLS_SHARED` waits for this guard to retire
+            // before it reaches the data, so the plain claim below races
+            // nothing. Claiming first would leave a window where the
+            // revoker sees no guard while the claim is still in flight.
+            if publish_sole_guard() {
+                if self.borrow_shared(false) {
+                    // SAFETY: the counter is `>= 1`, so no `&mut T` to
+                    // the data exists, and the bias was still ours when
+                    // the guard was published.
+                    let value: &T = unsafe { &*self.data.get() };
+                    return Ok(Ref {
+                        cell: self,
+                        value,
+                        tls: SOLE_TAG,
+                        locked: false,
+                        _not_send: std::marker::PhantomData,
+                    });
+                }
+                retract_sole_guard();
                 return Err(BorrowError);
             }
-            if publish_sole_guard() {
-                // SAFETY: the counter is `>= 1`, so no `&mut T` to the
-                // data exists, and the bias was still ours after the
-                // guard was published — no other thread can be inside
-                // the locked path for this cell.
-                let value: &T = unsafe { &*self.data.get() };
-                return Ok(Ref {
-                    cell: self,
-                    value,
-                    tls: SOLE_TAG,
-                    locked: false,
-                    _not_send: std::marker::PhantomData,
-                });
-            }
-            // Revoked while we were claiming. Undo the claim first, so a
-            // revoker that sees the guard count reach zero also sees the
-            // counter restored, then fall through to the locked path.
-            self.borrow.fetch_sub(1, Ordering::Release);
             retract_sole_guard();
         }
         self.try_borrow_locked()
@@ -775,24 +782,15 @@ impl<T: ?Sized> GilCell<T> {
         // but the biased thread borrows without it, so a plain
         // load/store pair here would let the two lose each other's
         // updates and hand out a `&mut T` alongside a live `&T`.
-        let mut prev = self.borrow.load(Ordering::Relaxed);
-        loop {
-            if prev < 0 || prev == i32::MAX {
-                if locked {
-                    self.lock_release();
-                }
-                return false;
+        let prev = self.borrow.load(Ordering::Relaxed);
+        if prev < 0 || prev == i32::MAX {
+            if locked {
+                self.lock_release();
             }
-            match self.borrow.compare_exchange_weak(
-                prev,
-                prev + 1,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return true,
-                Err(cur) => prev = cur,
-            }
+            return false;
         }
+        self.borrow.store(prev + 1, Ordering::Relaxed);
+        true
     }
 
     /// Claim the exclusive borrow under the held lock: only succeeds if
@@ -800,16 +798,13 @@ impl<T: ?Sized> GilCell<T> {
     /// mutable borrow); releases the lock and reports failure otherwise.
     #[inline]
     fn borrow_exclusive(&self, locked: bool) -> bool {
-        if self
-            .borrow
-            .compare_exchange(0, -1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
+        if self.borrow.load(Ordering::Relaxed) != 0 {
             if locked {
                 self.lock_release();
             }
             return false;
         }
+        self.borrow.store(-1, Ordering::Relaxed);
         true
     }
 
@@ -818,16 +813,14 @@ impl<T: ?Sized> GilCell<T> {
     #[inline]
     pub fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
         if biased_here() {
-            // The biased thread: no lock word.
-            if !self.borrow_exclusive(false) {
-                return Err(BorrowMutError);
-            }
+            // Guard first, then claim — see `try_borrow`.
             if !publish_sole_guard() {
-                // Revoked mid-claim; undo before dropping the guard
-                // count (see `try_borrow`) and take the locked path.
-                self.borrow.store(0, Ordering::Release);
                 retract_sole_guard();
                 return self.try_borrow_mut_locked();
+            }
+            if !self.borrow_exclusive(false) {
+                retract_sole_guard();
+                return Err(BorrowMutError);
             }
             // SAFETY: as in `try_borrow_mut_locked`; the exclusive count
             // is ours and the bias still held after publishing.
@@ -1130,9 +1123,11 @@ impl<T: ?Sized + fmt::Display> fmt::Display for Ref<'_, T> {
 
 impl<T: ?Sized> Drop for Ref<'_, T> {
     fn drop(&mut self) {
-        // Atomic for the same reason as the claim in `borrow_shared`:
-        // the biased thread releases without the lock word.
-        self.cell.borrow.fetch_sub(1, Ordering::Release);
+        // Plain, like the claim: the guard published in `try_borrow`
+        // keeps any revoker out until `note_cell_guard_released` below
+        // retires it.
+        let count = self.cell.borrow.load(Ordering::Relaxed);
+        self.cell.borrow.store(count - 1, Ordering::Relaxed);
         if self.locked {
             self.cell.lock_release();
         }
@@ -1174,7 +1169,7 @@ impl<T: ?Sized> Drop for RefMut<'_, T> {
     fn drop(&mut self) {
         // From -1 back to 0 — there's only ever one outstanding
         // mutable borrow at a time.
-        self.cell.borrow.store(0, Ordering::Release);
+        self.cell.borrow.store(0, Ordering::Relaxed);
         if self.locked {
             self.cell.lock_release();
         }
