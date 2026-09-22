@@ -591,6 +591,11 @@ mod tests {
 
     #[test]
     fn list_encoding_tolerates_concurrent_resizing() {
+        // Two raw threads share a cell with no GIL between them: the
+        // contract `GilCell` documents is that such threads announce
+        // themselves before touching objects. (The bias alone is
+        // revoked -- see `revoke_bias_for_test`.)
+        crate::sync::revoke_bias_for_test();
         let items = Rc::new(crate::sync::RefCell::new(vec![Object::Int(7); 5001]));
         let value = Object::List(items.clone());
         let barrier = Rc::new(std::sync::Barrier::new(2));

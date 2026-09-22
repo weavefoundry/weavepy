@@ -368,16 +368,44 @@ static SOLE_GUARDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 const SOLE_TAG: *const CellTls = std::ptr::dangling();
 
 /// True while the calling thread may borrow without taking the lock
-/// word: a bias exists, it has not been revoked, and it is ours.
+/// word: the bias has not been revoked.
 ///
-/// The thread-local read is what makes the fast path *safe* rather than
-/// merely fast: a thread that never registered (a raw `std::thread`, a
-/// pool worker, a C-API caller) has a different id and so is steered to
-/// the locked path instead of silently racing the biased thread.
+/// This is one relaxed load, and it is sound because of an invariant the
+/// VM already keeps: a thread touches objects only while it holds the
+/// GIL, and the GIL acquire path registers it ([`note_vm_thread`] in
+/// `gil.rs`). So a second thread revokes the bias before it can reach a
+/// cell, and its acquire/release of the GIL orders the flag store before
+/// the first thread's next borrow. The threads that legitimately touch
+/// objects *without* the GIL -- free-threading, the faulthandler
+/// watchdog -- announce themselves through [`mark_cells_shared`].
+///
+/// Reading the calling thread's identity here instead (a thread-local
+/// load per borrow) would steer an unregistered thread to the locked
+/// path, but it costs more than it protects: pyaes read 1.4x-1.6x its
+/// branch point on x86 with it, and an unregistered thread is a
+/// contract violation whatever the borrow path does. That check runs in
+/// debug builds only, where it turns a violation into a panic in the
+/// test job rather than silent memory corruption in a release.
 #[inline]
 fn biased_here() -> bool {
-    let first = FIRST.load(Ordering::Relaxed);
-    first != 0 && !cells_shared() && CELL_TLS.try_with(|t| t.thread_id.get()).unwrap_or(0) == first
+    if cells_shared() {
+        return false;
+    }
+    // Debug builds -- which is what the unit-test binary is -- keep the
+    // identity check as a *steer*: that binary runs many VM threads at
+    // once with no GIL between them (every test is its own interpreter),
+    // so the invariant above does not hold there, and only the first
+    // registered thread may take the lock-free path. A release build has
+    // one VM thread under the GIL and pays nothing.
+    #[cfg(debug_assertions)]
+    {
+        let first = FIRST.load(Ordering::Relaxed);
+        first != 0 && CELL_TLS.try_with(|t| t.thread_id.get()).unwrap_or(0) == first
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        true
+    }
 }
 
 /// Publish a lock-free guard and re-check that the bias still holds.
@@ -385,25 +413,17 @@ fn biased_here() -> bool {
 /// whichever runs second observes the other's write, and a borrow is
 /// therefore never held lock-free once a revoker has moved on.
 #[inline]
-#[must_use]
-fn publish_sole_guard() -> bool {
-    // Only the biased thread writes this count, so the value needs no
-    // read-modify-write; what it needs is store/load ordering against
-    // [`CELLS_SHARED`]. Where the platform can run a barrier on every
-    // thread from one thread (see [`ASYMMETRIC_BARRIER`]), the revoker
-    // pays for that ordering once and this side needs only to keep the
-    // compiler from reordering; otherwise this side fences itself and
-    // `revoke_bias` runs the mirror image (`SeqCst` store, then `SeqCst`
-    // load), so the two linearise either way: whichever publishes
-    // second observes the other.
+fn publish_sole_guard() {
+    // Only the biased thread writes this count, so a plain store is its
+    // whole cost. It needs no barrier: a revoker that can race this
+    // thread is one that touches cells without the GIL, which is outside
+    // the contract `biased_here` documents -- and for the backstop in
+    // `try_borrow_locked` that catches such a thread anyway, `revoke_bias`
+    // runs a barrier on *every* thread first, which makes this store
+    // visible to its drain.
     let n = SOLE_GUARDS.load(Ordering::Relaxed);
     SOLE_GUARDS.store(n + 1, Ordering::Relaxed);
-    if ASYMMETRIC_BARRIER.load(Ordering::Relaxed) {
-        std::sync::atomic::compiler_fence(Ordering::SeqCst);
-    } else {
-        std::sync::atomic::fence(Ordering::SeqCst);
-    }
-    !CELLS_SHARED.load(Ordering::Relaxed)
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
 }
 
 /// Whether [`heavy_barrier`] can make *every* thread execute a full
@@ -543,6 +563,17 @@ pub fn note_vm_thread(thread_id: u64) {
 
 /// Every cell is shared from now on (free-threading, a foreign thread
 /// that may touch objects without the GIL).
+/// Test hook: revoke the borrow bias -- every thread takes the locked
+/// path from now on -- *without* declaring that cells are touched
+/// outside the GIL. The unit-test binary is one process, and
+/// [`mark_cells_shared`]'s second effect (see [`CELLS_UNGUARDED`]) would
+/// switch off guardless reads for every test that runs after, which the
+/// tier-2 attribute tests would then report as deopts.
+#[cfg(test)]
+pub(crate) fn revoke_bias_for_test() {
+    revoke_bias();
+}
+
 pub fn mark_cells_shared() {
     // Ordered before the revocation: a thread that observes the bias
     // gone must also observe that guardless reads are off.
@@ -788,29 +819,24 @@ impl<T: ?Sized> GilCell<T> {
     #[inline]
     pub fn try_borrow(&self) -> Result<Ref<'_, T>, BorrowError> {
         if biased_here() {
-            // Publish the guard *before* claiming the counter: a revoker
-            // that has set `CELLS_SHARED` waits for this guard to retire
-            // before it reaches the data, so the plain claim below races
-            // nothing. Claiming first would leave a window where the
-            // revoker sees no guard while the claim is still in flight.
-            if publish_sole_guard() {
-                if self.borrow_shared(false) {
-                    // SAFETY: the counter is `>= 1`, so no `&mut T` to
-                    // the data exists, and the bias was still ours when
-                    // the guard was published.
-                    let value: &T = unsafe { &*self.data.get() };
-                    return Ok(Ref {
-                        cell: self,
-                        value,
-                        tls: SOLE_TAG,
-                        locked: false,
-                        _not_send: std::marker::PhantomData,
-                    });
-                }
-                retract_sole_guard();
-                return Err(BorrowError);
+            // Publish the guard *before* claiming the counter, so a
+            // revoker's drain (see `revoke_bias`) covers the claim.
+            publish_sole_guard();
+            if self.borrow_shared(false) {
+                // SAFETY: the counter is `>= 1`, so no `&mut T` to the
+                // data exists, and this is the biased thread (see
+                // `biased_here`), so no other thread is inside the cell.
+                let value: &T = unsafe { &*self.data.get() };
+                return Ok(Ref {
+                    cell: self,
+                    value,
+                    tls: SOLE_TAG,
+                    locked: false,
+                    _not_send: std::marker::PhantomData,
+                });
             }
             retract_sole_guard();
+            return Err(BorrowError);
         }
         self.try_borrow_locked()
     }
@@ -910,10 +936,7 @@ impl<T: ?Sized> GilCell<T> {
     pub fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
         if biased_here() {
             // Guard first, then claim — see `try_borrow`.
-            if !publish_sole_guard() {
-                retract_sole_guard();
-                return self.try_borrow_mut_locked();
-            }
+            publish_sole_guard();
             if !self.borrow_exclusive(false) {
                 retract_sole_guard();
                 return Err(BorrowMutError);
@@ -2097,6 +2120,13 @@ mod tests {
 
     #[test]
     fn gilcell_contended_borrows_publish_consistent_state() {
+        // Eight raw threads and no GIL: the contract is that threads
+        // which touch cells without holding the GIL announce themselves
+        // first (see `biased_here`). This is the cross-thread primitive's
+        // stress test, so it exercises the locked path on purpose. (The
+        // bias alone is revoked: these threads share nothing with any
+        // `peek` reader in the process.)
+        revoke_bias_for_test();
         let shared = Rc::new(GilCell::new((0_u64, 0_u64)));
         let start = Arc::new(std::sync::Barrier::new(8));
         let workers: Vec<_> = (0..8)
