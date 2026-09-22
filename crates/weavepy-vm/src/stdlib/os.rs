@@ -2655,7 +2655,7 @@ fn stat_result_synthetic(mode: i64) -> Object {
     let ty = stat_result_type();
     let inst = PyInstance::new(ty);
     {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(DictKey(Object::from_static("st_mode")), Object::Int(mode));
         for f in [
             "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size",
@@ -6543,7 +6543,7 @@ fn build_added_dll_directory(path: String, cookie: i64) -> Object {
     use crate::types::PyInstance;
     let inst = Rc::new(PyInstance::new(added_dll_directory_type()));
     {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(
             DictKey(Object::from_static("_path")),
             Object::from_str(path),

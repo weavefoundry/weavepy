@@ -2131,7 +2131,7 @@ fn sys_getwindowsversion(_args: &[Object]) -> Result<Object, RuntimeError> {
     // straight into the instance dict, which bypasses the readonly
     // `__setattr__` guard the struct-seq type installs.
     if let Object::Instance(inst) = &obj {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(
             DictKey(Object::from_static("service_pack_major")),
             Object::Int(i64::from(info.wServicePackMajor)),

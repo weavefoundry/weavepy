@@ -566,7 +566,7 @@ fn tuple_to_dt(args: Option<&Object>) -> Result<DateTime<Local>, RuntimeError> {
             Some(Object::Tuple(t)) => t.get(i).cloned(),
             Some(Object::List(items)) => items.borrow().get(i).cloned(),
             Some(Object::Instance(inst)) => inst
-                .dict
+                .dict_cell()
                 .borrow()
                 .get(&DictKey(Object::from_static(STRUCT_TIME_FIELDS[i])))
                 .cloned(),

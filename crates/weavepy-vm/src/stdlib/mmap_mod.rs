@@ -775,7 +775,7 @@ fn mm_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runtim
             trackfd: true,
         });
         let inst = Rc::new(PyInstance::new(cls.clone()));
-        inst.dict
+        inst.dict_cell()
             .borrow_mut()
             .insert(DictKey(Object::from_static("_id")), Object::Int(id as i64));
         Ok(Object::Instance(inst))

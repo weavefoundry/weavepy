@@ -526,7 +526,7 @@ fn hkey_new_disallowed(_args: &[Object]) -> Result<Object, RuntimeError> {
 /// value `Detach()`/`int()` must return).
 fn new_pyhkey(h: reg::HKEY) -> Object {
     let inst = Rc::new(PyInstance::new(hkey_type()));
-    inst.dict.borrow_mut().insert(
+    inst.dict_cell().borrow_mut().insert(
         DictKey(Object::from_static("handle")),
         Object::int_from_i128(h as usize as i128),
     );
@@ -543,7 +543,7 @@ fn hkey_self(args: &[Object]) -> Result<Rc<PyInstance>, RuntimeError> {
 
 /// Read the wrapped handle value (0 = closed/detached).
 fn peek_handle(inst: &PyInstance) -> i128 {
-    inst.dict
+    inst.dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static("handle")))
         .and_then(as_int_i128)
@@ -556,7 +556,7 @@ fn peek_handle(inst: &PyInstance) -> i128 {
 /// unconditionally).
 fn take_handle(inst: &PyInstance) -> i128 {
     let key = DictKey(Object::from_static("handle"));
-    let mut d = inst.dict.borrow_mut();
+    let mut d = inst.dict_cell().borrow_mut();
     let h = d.get(&key).and_then(as_int_i128).unwrap_or(0);
     d.insert(key, Object::Int(0));
     h

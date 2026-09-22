@@ -807,7 +807,7 @@ fn ov_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runtim
     registry().lock().insert(address, block);
 
     let inst = Rc::new(PyInstance::new(cls.clone()));
-    inst.dict
+    inst.dict_cell()
         .borrow_mut()
         .insert(DictKey(Object::from_static("_address")), uint_obj(address));
     Ok(Object::Instance(inst))
@@ -824,7 +824,7 @@ fn self_arg(args: &[Object]) -> Result<Rc<PyInstance>, RuntimeError> {
 /// minted at construction.
 fn block_key(inst: &Rc<PyInstance>) -> Result<usize, RuntimeError> {
     let addr = inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static("_address")))
         .cloned();
@@ -956,7 +956,7 @@ fn ov_getresult(args: &[Object]) -> Result<Object, RuntimeError> {
 
     // Pull the target object (for the *Into ops) before relocking.
     let target = inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static("_ov_target")))
         .cloned();
@@ -1108,7 +1108,7 @@ fn finish_start(
 /// Pin the user buffer object on the instance for the operation
 /// lifetime (`*Into` ops) so it cannot be collected while pending.
 fn pin_target(inst: &Rc<PyInstance>, target: &Object) {
-    inst.dict
+    inst.dict_cell()
         .borrow_mut()
         .insert(DictKey(Object::from_static("_ov_target")), target.clone());
 }

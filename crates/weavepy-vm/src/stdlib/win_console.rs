@@ -295,11 +295,11 @@ fn wcio_self(args: &[Object]) -> Result<Rc<PyInstance>, RuntimeError> {
 }
 
 fn wcio_get(inst: &PyInstance, name: &str) -> Option<Object> {
-    inst.dict.borrow().get(&StrKey(name)).cloned()
+    inst.dict_cell().borrow().get(&StrKey(name)).cloned()
 }
 
 fn wcio_set(inst: &PyInstance, name: &'static str, value: Object) {
-    inst.dict
+    inst.dict_cell()
         .borrow_mut()
         .insert(DictKey(Object::from_static(name)), value);
 }
