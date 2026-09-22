@@ -377,9 +377,7 @@ const SOLE_TAG: *const CellTls = std::ptr::dangling();
 #[inline]
 fn biased_here() -> bool {
     let first = FIRST.load(Ordering::Relaxed);
-    first != 0
-        && !CELLS_SHARED.load(Ordering::Relaxed)
-        && CELL_TLS.try_with(|t| t.thread_id.get()).unwrap_or(0) == first
+    first != 0 && !cells_shared() && CELL_TLS.try_with(|t| t.thread_id.get()).unwrap_or(0) == first
 }
 
 /// Publish a lock-free guard and re-check that the bias still holds.

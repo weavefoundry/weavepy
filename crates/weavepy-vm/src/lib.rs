@@ -16893,16 +16893,26 @@ impl Interpreter {
                 [] => Vec::new(),
                 [Object::Range(r)] if r.big.is_none() => {
                     let (start, stop, step) = (r.start, r.stop, r.step);
-                    let n = if step > 0 && start < stop {
-                        ((stop - start - 1) / step + 1) as usize
+                    // Saturating, and counted in `u128`: the span of a
+                    // range whose bounds sit at opposite ends of `i128`
+                    // overflows the subtraction (and `-step` overflows
+                    // for `i128::MIN`). Such a range is far past the
+                    // element cap below, so saturating to it and
+                    // declining is exact — where wrapping would have
+                    // produced a bogus length in a release build.
+                    let n: u128 = if step > 0 && start < stop {
+                        let span = stop.saturating_sub(start).saturating_sub(1) as u128;
+                        span / step as u128 + 1
                     } else if step < 0 && start > stop {
-                        ((start - stop - 1) / (-step) + 1) as usize
+                        let span = start.saturating_sub(stop).saturating_sub(1) as u128;
+                        span / step.unsigned_abs() + 1
                     } else {
                         0
                     };
                     if n > 1 << 20 {
                         return None;
                     }
+                    let n = n as usize;
                     let mut v = Vec::with_capacity(n);
                     let mut cur = start;
                     for _ in 0..n {
