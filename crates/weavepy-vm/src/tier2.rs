@@ -490,18 +490,20 @@ fn jit_enabled_by_config() -> bool {
 /// more (time and resident memory) than interpreting them ever could.
 static STARTUP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The lean entry count at which the interpreter warms a tier-2 compile
-/// (see `LEAN_WARM_COMPILE_THRESHOLD`), clamped to the tier-2 threshold.
-///
-/// A loop-free callee never gets a frame entry to count, so this is the
-/// only thing that compiles it — and a native caller can only take a
-/// direct lane into a callee that *is* compiled. Waiting for the lean
-/// constant when tier-2 would have compiled after far fewer entries left
-/// those callees interpreted and every native call site generic.
-/// Thread-local, like the tier-2 threshold it is clamped to: a process
-/// -wide cell would let one thread's threshold decide another's warm
-/// point, which in the test binary means whichever test ran last.
 thread_local! {
+    /// The lean entry count at which the interpreter warms a tier-2
+    /// compile, clamped to the tier-2 threshold.
+    ///
+    /// A loop-free callee never gets a frame entry to count, so this is
+    /// the only thing that compiles it — and a native caller can only
+    /// take a direct lane into a callee that *is* compiled. Waiting for
+    /// the lean constant when tier-2 would have compiled after far fewer
+    /// entries left those callees interpreted and every native call site
+    /// generic.
+    ///
+    /// Thread-local, like the threshold it is clamped to: a process-wide
+    /// cell would let one thread's threshold decide another's warm
+    /// point, which in the test binary means whichever test ran last.
     static LEAN_WARM_AT: std::cell::Cell<u32> =
         const { std::cell::Cell::new(LEAN_WARM_COMPILE_THRESHOLD_CAP) };
 }

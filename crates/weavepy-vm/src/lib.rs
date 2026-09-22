@@ -65563,7 +65563,9 @@ assert namespace is exported.__dict__
     #[cfg(feature = "jit")]
     #[test]
     fn jit_side_exit_retires_temporary_pins_before_continuation() {
-        let _heap_guard = HEAP_SNAPSHOT_TEST_LOCK.lock().expect("heap snapshot lock");
+        let _heap_guard = HEAP_SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::thread::spawn(|| {
             crate::tier2::force_enable_for_test(2);
             let out = run(include_str!(
@@ -65613,7 +65615,9 @@ for _ in range(10):
     #[cfg(feature = "jit")]
     #[test]
     fn jit_completed_activations_release_entry_pins() {
-        let _heap_guard = HEAP_SNAPSHOT_TEST_LOCK.lock().expect("heap snapshot lock");
+        let _heap_guard = HEAP_SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::thread::spawn(|| {
             crate::tier2::force_enable_for_test(2);
             let out = run(include_str!(
@@ -65632,7 +65636,9 @@ for _ in range(10):
     #[cfg(feature = "jit")]
     #[test]
     fn jit_generator_materialization_retires_pins() {
-        let _heap_guard = HEAP_SNAPSHOT_TEST_LOCK.lock().expect("heap snapshot lock");
+        let _heap_guard = HEAP_SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (out, parks, resumes, materialized) = run_jit_park(include_str!(
             "../../../tests/regrtest/test_native_generator_pin_retirement.py"
         ));
@@ -65745,7 +65751,9 @@ for _ in range(10):
     #[cfg(feature = "jit")]
     #[test]
     fn jit_string_split_results_remain_collectable() {
-        let _heap_guard = HEAP_SNAPSHOT_TEST_LOCK.lock().expect("heap snapshot lock");
+        let _heap_guard = HEAP_SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::thread::spawn(|| {
             crate::tier2::force_enable_for_test(2);
             let out = run(include_str!(
@@ -66373,7 +66381,9 @@ print(sliced('é😀z', 2))
     #[test]
     fn pickle_builtin_encoder_preserves_values_and_configured_fallbacks() {
         #[cfg(feature = "jit")]
-        let _heap_guard = HEAP_SNAPSHOT_TEST_LOCK.lock().expect("heap snapshot lock");
+        let _heap_guard = HEAP_SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let source = r#"import _pickle
 import pickle
 import struct
@@ -66518,7 +66528,9 @@ print('native pickle encoding: ok')
     #[test]
     fn pickle_builtin_decoder_preserves_values_and_configured_fallbacks() {
         #[cfg(feature = "jit")]
-        let _heap_guard = HEAP_SNAPSHOT_TEST_LOCK.lock().expect("heap snapshot lock");
+        let _heap_guard = HEAP_SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut source =
             include_str!("../../../tests/regrtest/test_pickle_builtin_data.py").to_owned();
         source.push_str(
