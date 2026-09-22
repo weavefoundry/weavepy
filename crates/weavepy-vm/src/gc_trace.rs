@@ -2899,6 +2899,21 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             for cell in &f.closure {
                 visit(cell);
             }
+            // The lean call paths cache the closure's cells as a frame
+            // `cells` vector (`PyFunction::closure_cells`): a second strong
+            // handle on every cell, owned by this function. Unvisited, it
+            // made each cell of a called closure look externally held, so
+            // no cycle through one was ever collected (attrs' slotted
+            // `_ClassBuilder` pinned the class it replaced). While a live
+            // activation shares the vector, its handles are that frame's,
+            // not this function's: leave them counted as external.
+            if let Some(cells) = f.closure_cells.get() {
+                if crate::sync::Rc::strong_count(cells) == 1 {
+                    for cell in cells.iter() {
+                        visit(&Object::Cell(cell.clone()));
+                    }
+                }
+            }
             if let Ok(attrs_rc) = f.attrs.try_borrow() {
                 if let Ok(attrs) = attrs_rc.try_borrow() {
                     for (k, v) in attrs.iter() {
