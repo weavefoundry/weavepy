@@ -341,6 +341,17 @@ pub struct GcStats {
 #[allow(missing_debug_implementations)]
 pub struct GcState {
     generations: RefCell<[Generation; N_GENERATIONS]>,
+    /// RFC 0065 (WS4): insert-only miss-filter over `index`, maintained
+    /// at [`Self::track_now`] and consulted by the usually-miss
+    /// `is_tracked`/`handle_for` probes on the drop paths. Rebuilt from
+    /// `index` once most of its bits name objects long gone.
+    ///
+    /// One per state, not one per process: a rebuild takes *this*
+    /// state's index as the truth, so a shared filter let any state's
+    /// full collection erase every other state's bits, and their
+    /// `handle_for` then answered `None` for live objects. Production
+    /// runs one state, which hid it; the test binary runs many.
+    tracked_filter: crate::hot_filter::RebuildableBloom,
     /// Id → handle index over every tracked object (all generations
     /// plus the frozen set). Keeps `track` dedupe, `find_handle`, and
     /// `is_tracked` O(1) — the linear scans they replace made
@@ -511,6 +522,7 @@ impl GcState {
     pub fn new() -> Self {
         Self {
             generations: RefCell::new(Default::default()),
+            tracked_filter: crate::hot_filter::RebuildableBloom::new(),
             index: RefCell::new(GcIndex::default()),
             collecting: AtomicBool::new(false),
             thresholds: RefCell::new(DEFAULT_THRESHOLDS),
@@ -793,7 +805,7 @@ impl GcState {
             // RFC 0065 (WS4): publish to the miss-filter *before* the
             // insert becomes observable (we hold the index borrow, so
             // no prober can race past a fresh registration).
-            TRACKED_FILTER.insert(new_id);
+            self.tracked_filter.insert(new_id);
             let handle = Arc::new(TrackedHandle::new(obj, 0));
             entry.insert(handle.clone());
             // Enroll finalizable objects in the dedicated prompt-finalization
@@ -1369,7 +1381,7 @@ impl GcState {
         // RFC 0065 (WS4): usually-miss probe — two relaxed loads
         // instead of the index borrow. A stale filter bit (untracked
         // id) just takes the precise path.
-        if !TRACKED_FILTER.may_contain(id) {
+        if !self.tracked_filter.may_contain(id) {
             return false;
         }
         self.index.borrow().contains_key(&id)
@@ -1378,7 +1390,7 @@ impl GcState {
     /// O(1) handle lookup by object id (any generation or frozen).
     pub fn handle_for(&self, id: ObjectId) -> Option<Arc<TrackedHandle>> {
         // RFC 0065 (WS4): see `is_tracked`.
-        if !TRACKED_FILTER.may_contain(id) {
+        if !self.tracked_filter.may_contain(id) {
             return None;
         }
         self.index.borrow().get(&id).cloned()
@@ -1765,7 +1777,7 @@ impl GcState {
         // name objects long gone, rebuild it from the live index (a full
         // collection has just walked everything anyway).
         let live = self.index.borrow().len();
-        let stale = TRACKED_FILTER.inserts_since_rebuild();
+        let stale = self.tracked_filter.inserts_since_rebuild();
         if gen == N_GENERATIONS - 1 || stale > 4096.max(live.saturating_mul(4)) {
             self.rebuild_tracked_filter();
         }
@@ -1778,7 +1790,7 @@ impl GcState {
     /// serializes it against every `track`.
     pub fn rebuild_tracked_filter(&self) {
         let index = self.index.borrow();
-        TRACKED_FILTER.rebuild(index.keys().copied());
+        self.tracked_filter.rebuild(index.keys().copied());
     }
 
     /// Collect a specific generation. Used by [`Self::collect`].
@@ -3193,13 +3205,12 @@ fn has_finalizer(obj: &Object) -> bool {
 /// finalizes survivors via [`GcState::finalization_candidates`].
 static GC_STATE: std::sync::LazyLock<GcState> = std::sync::LazyLock::new(GcState::new);
 
-/// RFC 0065 (WS4): insert-only miss-filter over the tracked-object
-/// index. Maintained at [`GcState::track`]; consulted by the
-/// usually-miss `is_tracked`/`handle_for` probes on the drop paths.
-/// Process-global like the state it mirrors; survives fork (bits for
-/// vanished objects are harmless false positives).
-static TRACKED_FILTER: crate::hot_filter::RebuildableBloom =
-    crate::hot_filter::RebuildableBloom::new();
+/// The process-wide state's miss filter (see [`GcState::tracked_filter`]),
+/// for the drop-path probes that must not take the state's borrows.
+#[inline]
+fn process_tracked_filter() -> &'static crate::hot_filter::RebuildableBloom {
+    &GC_STATE.tracked_filter
+}
 
 /// Run a closure with the shared, process-global GC state.
 pub fn with_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
@@ -3587,7 +3598,7 @@ pub fn track_if_cyclic(obj: &Object) -> bool {
 /// left by an untracked object is a harmless false positive).
 #[inline]
 pub fn maybe_tracked(id: ObjectId) -> bool {
-    TRACKED_FILTER.may_contain(id)
+    process_tracked_filter().may_contain(id)
 }
 
 /// See [`GcState::auto_collect_due`].
@@ -4322,7 +4333,7 @@ const INERT_SCAN_CAP: usize = 32;
 #[inline]
 fn inert_death(sc: usize, id: ObjectId, all_atomic: impl FnOnce() -> bool) -> bool {
     sc <= 1
-        && !TRACKED_FILTER.may_contain(id)
+        && !process_tracked_filter().may_contain(id)
         && !crate::weakref_registry::may_have_weakrefs(id)
         && all_atomic()
 }
@@ -4368,10 +4379,10 @@ fn note_dropped_counted(sc: usize, id: ObjectId) -> bool {
     let marked = if sc <= 1 {
         true
     } else if sc == 2 {
-        TRACKED_FILTER.may_contain(id)
+        process_tracked_filter().may_contain(id)
     } else {
         crate::weakref_registry::may_have_weakrefs(id)
-            && TRACKED_FILTER.may_contain(id)
+            && process_tracked_filter().may_contain(id)
             && sc <= 2 + crate::weakref_registry::strong_clone_count(id)
     };
     if marked {
