@@ -82,6 +82,8 @@ struct AttrGuard {
     /// The attribute name (the indexed dict hit must still carry it —
     /// a `del` of an earlier attribute shift-renumbers later slots).
     name: SharedStr,
+    /// Python hash of the name, shared by every constructor-store probe.
+    name_hash: i64,
     /// The value lane the site was compiled with.
     lane: JitType,
     /// The class's `attr_version` at compile time (bumps on any class
@@ -2336,7 +2338,10 @@ fn attr_site_guard(
                 Object::Str(name) => Some(name.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| SharedStr::from(site.name.as_str()))
+            .unwrap_or_else(|| match crate::stdlib::sys::intern_name(&site.name) {
+                Object::Str(name) => name,
+                _ => unreachable!("intern_name returns a string"),
+            })
     };
     // RFC 0073 WS1 — a constructor-resolved site has no live receiver
     // to fingerprint: burn the indexed guard from the class's
@@ -2355,6 +2360,7 @@ fn attr_site_guard(
         }
         return Some(AttrGuard {
             name: shared_name(),
+            name_hash: crate::object::py_str_hash(&site.name),
             lane: site.lane,
             ver: cls.attr_version.get(),
             storage: AttrStorage::Indexed(*field_idx),
@@ -2381,6 +2387,7 @@ fn attr_site_guard(
         };
         return Some(AttrGuard {
             name: shared_name(),
+            name_hash: crate::object::py_str_hash(&site.name),
             lane: site.lane,
             ver,
             storage: AttrStorage::Indexed(field_idx),
@@ -2400,6 +2407,7 @@ fn attr_site_guard(
     }
     Some(AttrGuard {
         name: shared_name(),
+        name_hash: crate::object::py_str_hash(&site.name),
         lane: site.lane,
         ver,
         storage,
@@ -6589,6 +6597,9 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
         // execution. Watched instance dicts deopt so the generic path
         // fires the exact watcher events.
         AttrStorage::NewKey => {
+            use indexmap::map::raw_entry_v1::{RawEntryApiV1, RawEntryMut};
+            use std::hash::BuildHasher;
+
             if crate::capi_watchers::dicts_active() {
                 return 1;
             }
@@ -6600,25 +6611,36 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
             } else {
                 &mut **dict
             };
-            let old = if let Some(dst) = dict.get_mut(&StrKey(&g.name)) {
-                // The displaced-value discipline of the indexed arm.
-                if !matches!(
-                    dst,
-                    Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
-                ) && super::Interpreter::local_needs_prompt_reap(dst)
-                    && super::Interpreter::looks_reapable_temporary(dst)
-                {
-                    return 1;
+            let probe = crate::object::LeafNameProbe::new(&g.name, g.name_hash);
+            let hash = crate::fasthash::FxBuildHasher.hash_one(g.name_hash);
+            let entry = dict
+                .raw_entry_mut_v1()
+                .from_key_hashed_nocheck(hash, &probe);
+            // A hash-colliding user key could run Python during equality.
+            // Resume before the store so the interpreter owns that callback.
+            if probe.saw_exotic() {
+                return 1;
+            }
+            let old = match entry {
+                RawEntryMut::Occupied(mut entry) => {
+                    let dst = entry.get_mut();
+                    // The displaced-value discipline of the indexed arm.
+                    if !matches!(
+                        dst,
+                        Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+                    ) && super::Interpreter::local_needs_prompt_reap(dst)
+                        && super::Interpreter::looks_reapable_temporary(dst)
+                    {
+                        return 1;
+                    }
+                    Some(std::mem::replace(dst, v))
                 }
-                Some(std::mem::replace(dst, v))
-            } else {
-                // Same interning contract as the slow path
-                // (`generic_setattr_instance`) and the tier-1 cache.
-                dict.insert(
-                    crate::object::DictKey(crate::stdlib::sys::intern_name(&g.name)),
-                    v,
-                );
-                None
+                RawEntryMut::Vacant(entry) => {
+                    // The guard already owns the interned key. Reuse the
+                    // probe's hash and vacant entry instead of probing again.
+                    entry.insert_hashed_nocheck(hash, DictKey(Object::Str(g.name.clone())), v);
+                    None
+                }
             };
             drop(old);
             0
