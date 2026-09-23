@@ -5,6 +5,9 @@ CPython 3.14.5. Both WeavePy binaries use the standard release profile and
 default features. These measurements don't establish that WeavePy is faster
 than CPython across every meaningful metric.
 
+The installed CPython is configured with PGO, LTO, and the tail-call
+interpreter. Its GIL is enabled, and its experimental JIT isn't available.
+
 The initial three-sample census includes all 24 standard fixtures, including
 the library census. Over the 23 timed workloads, WeavePy's geometric mean is
 1.083 times CPython's time, with eight wins. Across all 24 processes, peak RSS

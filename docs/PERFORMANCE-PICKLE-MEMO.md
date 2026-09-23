@@ -31,13 +31,14 @@ encodings, with an untimed invocation before timing. Seven interleaved cycles
 follow a discarded cycle. These test text-heavy graphs, repeated references,
 and the longer ancestor scans in a graph with 101 list levels.
 
-| Encoding shape | JIT time | Interpreter time | JIT CPU | JIT RSS |
-| --- | ---: | ---: | ---: | ---: |
-| Text | 0.584 | 0.571 | 0.584 | 0.996 |
-| Shared children | 0.766 | 0.764 | 0.767 | 1.006 |
-| Deep containers | 0.763 | 0.759 | 0.762 | 0.998 |
+| Encoding shape | JIT time | Interpreter time | JIT CPU | JIT RSS | JIT time/CPython |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Text | 0.584 | 0.571 | 0.584 | 0.996 | 1.947 |
+| Shared children | 0.766 | 0.764 | 0.767 | 1.006 | 5.807 |
+| Deep containers | 0.763 | 0.759 | 0.762 | 0.998 | 3.904 |
 
-CPU in this table is the timed workload's CPU consumption. All binaries use
+CPU in this table is the timed workload's CPU consumption. Peak RSS for these
+probes is 2.01 to 2.06 times CPython's. All binaries use
 distinct writable frozen caches; the comparison verifies that warm cache
 contents don't change during timing. Raw results remain in
 `target/performance/pickle-direct.json` and `pickle-probes.json`.
