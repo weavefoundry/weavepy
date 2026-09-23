@@ -14080,6 +14080,48 @@ impl Interpreter {
         let consts: &[Object] = &ext.objects;
         let stamps: &[StampSlot] = ext.stamp_slots.get().map_or(&[], |s| &s[..]);
         let instrs = &code.instructions;
+        // Tiny return bodies need no operand stack or owned-value scratch.
+        // The shape is certified once, alongside the pure-leaf decision;
+        // call, observer, and recursion guards still belong to the caller.
+        let shape = ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed);
+        if shape >= 3 {
+            let start = usize::from(instrs.first()?.op == OpCode::Resume);
+            let load = instrs.get(start)?;
+            match shape {
+                3 => {
+                    // SAFETY: the argument remains live for this evaluation.
+                    return Some(clone_hot(unsafe { &**args.get(load.arg as usize)? }));
+                }
+                4 => return Some(clone_hot(consts.get(load.arg as usize)?)),
+                5 => return Some(Object::Int(i64::from(load.arg))),
+                6 => {
+                    // SAFETY: as for the argument-return case above.
+                    let recv = unsafe { &**args.get(load.arg as usize)? };
+                    if let Object::Instance(inst) = recv {
+                        let pc = start + 1;
+                        let attr = instrs.get(pc)?;
+                        if let IC::LoadAttrInstance { key_idx, ver } = code.caches.get(pc as u32) {
+                            if inst.cls_raw().attr_version.get() == ver
+                                && inst.cls_raw().native_kind.get() == 0
+                            {
+                                // SAFETY: no Python code runs during a leaf.
+                                if let Some((_, value)) = inst
+                                    .dict
+                                    .get()
+                                    .and_then(|d| unsafe { d.peek() })
+                                    .and_then(|d| d.get_index(key_idx as usize))
+                                    .filter(|(key, _)| slot_name_matches(code, attr.arg, key))
+                                {
+                                    return Some(clone_hot(value));
+                                }
+                            }
+                        }
+                        return Self::leaf_attr_resolve_site(code, inst, recv, pc as u32, attr.arg);
+                    }
+                }
+                _ => {}
+            }
+        }
         let mut st = [V::N; 8];
         let mut sp = 0usize;
         // Values a leaf path hands back owned (a polymorphic or class
@@ -59335,7 +59377,8 @@ struct CodeConstObjects {
     /// on the first inline call in this code object.
     call_slots: std::sync::OnceLock<Box<[CallSlot]>>,
     /// Whether this code is a *pure leaf* (see [`code_is_pure_leaf`]):
-    /// `0` not yet decided, `1` no, `2` yes.
+    /// `0` not yet decided, `1` no, `2` general leaf, `3` argument return,
+    /// `4` constant return, `5` small-int return, `6` attribute return.
     pure_leaf: std::sync::atomic::AtomicU8,
     /// Per-instruction fused-pair kinds (see [`code_fast_pairs`]): `1`
     /// at a `LOAD_FAST` whose successor is another `LOAD_FAST`, `2` when
@@ -59882,7 +59925,7 @@ fn code_is_pure_leaf(code: &CodeObject) -> bool {
     };
     match ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) {
         1 => false,
-        2 => true,
+        2..=6 => true,
         _ => code_pure_leaf_decide(code, ext),
     }
 }
@@ -59937,7 +59980,39 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
                     | OpCode::ReturnValue
             )
         });
-    ext.pure_leaf.store(if ok { 2 } else { 1 }, Relaxed);
+    let shape = if ok {
+        let body = code.instructions.as_slice();
+        let body = if body.first().is_some_and(|i| i.op == OpCode::Resume) {
+            &body[1..]
+        } else {
+            body
+        };
+        let argument = |op| {
+            matches!(
+                op,
+                OpCode::LoadFast | OpCode::LoadFastBorrow | OpCode::LoadFastCheck
+            )
+        };
+        match body {
+            [load, ret] if ret.op == OpCode::ReturnValue => match load.op {
+                op if argument(op) => 3,
+                OpCode::LoadConst => 4,
+                OpCode::LoadSmallInt => 5,
+                _ => 2,
+            },
+            [load, attr, ret]
+                if argument(load.op)
+                    && attr.op == OpCode::LoadAttr
+                    && ret.op == OpCode::ReturnValue =>
+            {
+                6
+            }
+            _ => 2,
+        }
+    } else {
+        1
+    };
+    ext.pure_leaf.store(shape, Relaxed);
     ok
 }
 
