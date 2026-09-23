@@ -74,17 +74,20 @@ pub const LC_MESSAGES: i64 = 5;
 
 pub const CHAR_MAX: i64 = 127;
 
-/// `setlocale(LC_CTYPE, "")` — adopt the environment's `LC_CTYPE` locale,
-/// as CPython's pre-init does (`_Py_SetLocaleFromEnv`). Called once at
-/// interpreter start so `nl_langinfo(CODESET)`/`localeconv` and the
-/// `locale` module observe the user's locale rather than plain `"C"`.
+/// Adopt the environment's `LC_CTYPE` once per process, as CPython's
+/// pre-initialization does. Later interpreters preserve explicit locale
+/// changes and never race each other inside libc's process-global setup.
 #[cfg(unix)]
 pub fn init_from_env() {
-    let empty = CString::new("").expect("static");
-    // SAFETY: `setlocale` with a valid category and NUL-terminated string.
-    unsafe {
-        libc::setlocale(libc::LC_CTYPE, empty.as_ptr());
-    }
+    static INITIALIZED: std::sync::Once = std::sync::Once::new();
+    INITIALIZED.call_once(|| {
+        let empty = CString::new("").expect("static");
+        // SAFETY: the category and string are valid. The once guard prevents
+        // concurrent interpreter initialization from entering setlocale.
+        unsafe {
+            libc::setlocale(libc::LC_CTYPE, empty.as_ptr());
+        }
+    });
 }
 
 /// Non-Unix: nothing to adopt — the shim always serves the C locale.
@@ -578,4 +581,73 @@ fn l_strxfrm(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = arg_str(args, 0, "strxfrm")?;
     reject_embedded_nul(&s)?;
     Ok(Object::from_str(s))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interpreter_locale_initialization_preserves_explicit_changes() {
+        const CHILD: &str = "WEAVEPY_TEST_LOCALE_INITIALIZATION";
+        if std::env::var_os(CHILD).is_some() {
+            init_from_env();
+            // SAFETY: this isolated child has no concurrent locale users.
+            let initial = unsafe {
+                CStr::from_ptr(libc::setlocale(libc::LC_CTYPE, std::ptr::null()))
+                    .to_bytes()
+                    .to_vec()
+            };
+            if initial == b"C" || initial == b"POSIX" {
+                // The requested UTF-8 spelling isn't installed on this host.
+                std::process::exit(77);
+            }
+            let c_locale = CString::new("C").unwrap();
+            // SAFETY: no worker has started, and the C locale always exists.
+            assert!(!unsafe { libc::setlocale(libc::LC_CTYPE, c_locale.as_ptr()) }.is_null());
+            std::thread::scope(|scope| {
+                for _ in 0..32 {
+                    scope.spawn(|| {
+                        for _ in 0..100 {
+                            init_from_env();
+                        }
+                    });
+                }
+            });
+            // SAFETY: every worker has joined; copy libc's result immediately.
+            let current = unsafe {
+                CStr::from_ptr(libc::setlocale(libc::LC_CTYPE, std::ptr::null()))
+                    .to_bytes()
+                    .to_vec()
+            };
+            assert_eq!(current, b"C", "new interpreters reset an explicit locale");
+            return;
+        }
+        // Each attempt has its own process because libc locale state is global.
+        // These names cover the installed UTF-8 locales on Linux and macOS.
+        for locale in ["C.UTF-8", "en_US.UTF-8", "UTF-8"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "stdlib::locale_mod::tests::interpreter_locale_initialization_preserves_explicit_changes",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("LC_ALL", locale)
+                .output()
+                .expect("start isolated locale test");
+            if output.status.code() == Some(77) {
+                continue;
+            }
+            assert!(
+                output.status.success(),
+                "locale child failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // Minimal Unix installations can legitimately provide only C/POSIX.
+        eprintln!("locale preservation check skipped: no UTF-8 locale installed");
+    }
 }
