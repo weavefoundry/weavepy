@@ -12306,6 +12306,128 @@ impl Interpreter {
                                 *index += 1;
                                 v
                             }
+                            crate::object::PyIterator::Bytes { data, index } => {
+                                let Some(&b) = data.get(*index) else {
+                                    break None;
+                                };
+                                *index += 1;
+                                Object::Int(i64::from(b))
+                            }
+                            crate::object::PyIterator::ByteArray { data, index } => {
+                                // SAFETY: as above.
+                                let b = match unsafe { data.peek() } {
+                                    Some(bytes) => bytes.get(*index).copied(),
+                                    None => None,
+                                };
+                                let Some(b) = b else { break None };
+                                *index += 1;
+                                Object::Int(i64::from(b))
+                            }
+                            crate::object::PyIterator::Str { s, index } => {
+                                let Some(ch) = s.get(*index..).and_then(|rest| rest.chars().next())
+                                else {
+                                    break None;
+                                };
+                                *index += ch.len_utf8();
+                                Object::from_char(ch)
+                            }
+                            // `for i, x in enumerate(xs)`: the pair goes straight
+                            // to the `UNPACK_SEQUENCE 2` that follows, which is
+                            // skipped, so no tuple is ever built.
+                            crate::object::PyIterator::Enumerate {
+                                inner,
+                                count,
+                                count_big: None,
+                            } => {
+                                if len + 2 > cap
+                                    || pc + 1 >= ninstrs
+                                    // SAFETY: `pc + 1 < ninstrs`.
+                                    || unsafe { (*instrs.add(pc + 1)).op } != OpCode::UnpackSequence
+                                    // SAFETY: as above.
+                                    || unsafe { (*instrs.add(pc + 1)).arg } != 2
+                                {
+                                    break None;
+                                }
+                                let Some(next_count) = count.checked_add(1) else {
+                                    break None;
+                                };
+                                // SAFETY: as above; the wrapped iterator is a
+                                // cell of its own.
+                                let Some(src) = (unsafe { inner.peek_mut() }) else {
+                                    break None;
+                                };
+                                let x = match src {
+                                    crate::object::PyIterator::Range {
+                                        current,
+                                        stop,
+                                        step,
+                                    } => {
+                                        let live = if *step > 0 {
+                                            *current < *stop
+                                        } else {
+                                            *step < 0 && *current > *stop
+                                        };
+                                        if !live {
+                                            break None;
+                                        }
+                                        let v = *current;
+                                        *current = current.wrapping_add(*step);
+                                        Object::Int(v)
+                                    }
+                                    crate::object::PyIterator::List { items, index, .. } => {
+                                        // SAFETY: as above.
+                                        let v = match unsafe { items.peek() } {
+                                            Some(xs) => xs.get(*index).map(Self::clone_operand),
+                                            None => None,
+                                        };
+                                        let Some(v) = v else { break None };
+                                        *index += 1;
+                                        v
+                                    }
+                                    crate::object::PyIterator::Tuple { items, index } => {
+                                        let Some(v) = items.get(*index).cloned() else {
+                                            break None;
+                                        };
+                                        *index += 1;
+                                        v
+                                    }
+                                    crate::object::PyIterator::Bytes { data, index } => {
+                                        let Some(&b) = data.get(*index) else {
+                                            break None;
+                                        };
+                                        *index += 1;
+                                        Object::Int(i64::from(b))
+                                    }
+                                    crate::object::PyIterator::ByteArray { data, index } => {
+                                        // SAFETY: as above.
+                                        let b = match unsafe { data.peek() } {
+                                            Some(bytes) => bytes.get(*index).copied(),
+                                            None => None,
+                                        };
+                                        let Some(b) = b else { break None };
+                                        *index += 1;
+                                        Object::Int(i64::from(b))
+                                    }
+                                    crate::object::PyIterator::Str { s, index } => {
+                                        let Some(ch) =
+                                            s.get(*index..).and_then(|rest| rest.chars().next())
+                                        else {
+                                            break None;
+                                        };
+                                        *index += ch.len_utf8();
+                                        Object::from_char(ch)
+                                    }
+                                    _ => break None,
+                                };
+                                let i = *count;
+                                *count = next_count;
+                                // `UNPACK_SEQUENCE` leaves the first item on top.
+                                // SAFETY: `len + 2 <= cap`.
+                                unsafe { base.add(len).write(x) };
+                                len += 1;
+                                pc += 1;
+                                Object::Int(i)
+                            }
                             _ => break None,
                         };
                         // SAFETY: `len < cap`.
@@ -15651,6 +15773,32 @@ impl Interpreter {
                                     *index += 1;
                                 }
                                 v
+                            }
+                            crate::object::PyIterator::Bytes { data, index } => {
+                                let v = data.get(*index).map(|&b| Object::Int(i64::from(b)));
+                                if v.is_some() {
+                                    *index += 1;
+                                }
+                                v
+                            }
+                            crate::object::PyIterator::ByteArray { data, index } => {
+                                let v = match data.try_borrow() {
+                                    Ok(bytes) => {
+                                        bytes.get(*index).map(|&b| Object::Int(i64::from(b)))
+                                    }
+                                    Err(_) => None,
+                                };
+                                if v.is_some() {
+                                    *index += 1;
+                                }
+                                v
+                            }
+                            crate::object::PyIterator::Str { s, index } => {
+                                let ch = s.get(*index..).and_then(|rest| rest.chars().next());
+                                ch.map(|ch| {
+                                    *index += ch.len_utf8();
+                                    Object::from_char(ch)
+                                })
                             }
                             _ => None,
                         }
@@ -39298,7 +39446,7 @@ impl Interpreter {
                     s.chars().nth(idx)
                 };
                 match ch {
-                    Some(c) => Ok(Object::from_str(c.to_string())),
+                    Some(c) => Ok(Object::from_char(c)),
                     None => Err(index_error("string index out of range")),
                 }
             }

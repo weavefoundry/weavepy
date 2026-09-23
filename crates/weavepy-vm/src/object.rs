@@ -8123,7 +8123,7 @@ impl PyIterator {
                 let ch = rest.chars().next()?;
                 let len = ch.len_utf8();
                 *index += len;
-                Some(Object::Str(SharedStr::from(ch.to_string().as_str())))
+                Some(Object::from_char(ch))
             }
             PyIterator::Range {
                 current,
@@ -8640,10 +8640,7 @@ impl PyIterator {
             }
             PyIterator::Str { s, index } => {
                 let start = (*index).min(s.len());
-                s[start..]
-                    .chars()
-                    .map(|c| Object::Str(SharedStr::from(c.to_string().as_str())))
-                    .collect()
+                s[start..].chars().map(Object::from_char).collect()
             }
             PyIterator::DictKeys {
                 kind,
@@ -12338,6 +12335,24 @@ fn seq_cmp(a: &[Object], b: &[Object]) -> Result<Ordering, RuntimeError> {
 impl Object {
     pub fn from_str(s: impl Into<String>) -> Self {
         Object::Str(SharedStr::from(s.into().as_str()))
+    }
+
+    /// A one-character `str`. Latin-1 characters come from a shared table
+    /// (CPython caches the same 256), so iterating or indexing a string
+    /// allocates nothing for them.
+    #[inline]
+    pub fn from_char(ch: char) -> Self {
+        static LATIN1: std::sync::OnceLock<Box<[SharedStr]>> = std::sync::OnceLock::new();
+        let code = ch as u32;
+        if code < 256 {
+            let table = LATIN1.get_or_init(|| {
+                (0u8..=255)
+                    .map(|b| SharedStr::from(&*char::from(b).encode_utf8(&mut [0; 4])))
+                    .collect()
+            });
+            return Object::Str(table[code as usize].clone());
+        }
+        Object::Str(SharedStr::from(&*ch.encode_utf8(&mut [0; 4])))
     }
 
     /// Build a `str` from a sequence of code points, each a Unicode scalar
