@@ -1781,10 +1781,6 @@ impl Interpreter {
         }
     }
 
-    /// Run the `site` module on first interpreter start, mirroring
-    /// CPython's bootstrap. We `import site` if available, then call
-    /// `site.main()`. Errors are intentionally swallowed — a broken
-    /// `.pth` file shouldn't kill the whole interpreter.
     /// Report that interpreter start-up is over: user code runs next
     /// (the JIT defers compilation until then).
     pub fn note_startup_finished(&self) {
@@ -1795,7 +1791,12 @@ impl Interpreter {
         gc_trace::rebuild_tracked_filter();
     }
 
+    /// Import `site` during startup. The module calls `main()` itself unless
+    /// `-S` is active; another explicit call would repeat `.pth` processing.
+    /// Startup import errors retain their best-effort handling.
     pub fn run_site(&mut self) -> Result<(), RuntimeError> {
+        #[cfg(feature = "jit")]
+        let _compile_guard = crate::tier2::defer_startup_compilation();
         // Startup runs bytecode too (site/.pth imports can allocate enough
         // to trip an auto-collection), so engage the GIL here just as
         // `run_module_as` does for the program body. The process is
@@ -1825,21 +1826,7 @@ impl Interpreter {
         // them — breaking every namedtuple built during bootstrap.
         let _interp_guard =
             crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
-        let site = match self.import_path("site") {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
-        };
-        if let Object::Module(m) = site {
-            let main_fn = m
-                .dict
-                .borrow()
-                .get(&crate::object::DictKey(Object::from_static("main")))
-                .cloned();
-            if let Some(main_fn) = main_fn {
-                let globals = m.dict.clone();
-                let _ = self.call(&main_fn, &[], &[], &globals);
-            }
-        }
+        let _ = self.import_path("site");
         Ok(())
     }
 
@@ -62836,6 +62823,70 @@ refill(second, 23, 3)
         })
         .join()
         .expect("jit worker thread");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_startup_defers_hot_code_then_compiles_the_same_functions() {
+        std::thread::spawn(|| {
+            crate::tier2::force_enable_for_test(2);
+            let module = parse_module(
+                r"
+def leaf(x):
+    return x + 1
+def loop(n):
+    total = 0
+    i = 0
+    while i < n:
+        total += i
+        i += 1
+    return total
+for i in range(200):
+    assert leaf(i) == i + 1
+assert loop(2000) == 1999000
+",
+            )
+            .expect("parse startup fixture");
+            let code = compile_module(&module).expect("compile startup fixture");
+            let mut interp = Interpreter::new();
+            let functions = |interp: &Interpreter| {
+                let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+                    panic!("missing main module");
+                };
+                let globals = main.dict.borrow();
+                ["leaf", "loop"].map(|name| {
+                    let Some(Object::Function(f)) = globals.get(&crate::object::StrKey(name))
+                    else {
+                        panic!("missing fixture function");
+                    };
+                    f.code.borrow().clone()
+                })
+            };
+            let before;
+            {
+                let _outer = crate::tier2::defer_startup_compilation();
+                {
+                    let _inner = crate::tier2::defer_startup_compilation();
+                    interp.run_module(&code).expect("nested startup");
+                }
+                interp.run_module(&code).expect("outer startup");
+                before = functions(&interp);
+                assert_eq!(crate::tier2::stats_for_test().0, 0);
+                assert!(before
+                    .iter()
+                    .all(|code| !crate::tier2::code_compiled_for_test(code)));
+            }
+            interp.run_module(&code).expect("user code after startup");
+            for (old, new) in before.iter().zip(functions(&interp)) {
+                assert!(Rc::ptr_eq(old, &new), "the deferred code must be reused");
+                assert!(
+                    crate::tier2::code_compiled_for_test(&new),
+                    "deferred function must compile later"
+                );
+            }
+        })
+        .join()
+        .expect("startup JIT worker");
     }
 
     /// RFC 0032 — run `src` with the tier-2 JIT forced on, on a fresh

@@ -555,6 +555,11 @@ fn jit_enabled_by_config() -> bool {
 static STARTUP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
+    /// Explicit, bounded startup differs from an embedder that never reports
+    /// startup completion. Such an embedder retains the hot-code escape hatch.
+    static STARTUP_COMPILATION_DEFERRED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+
     /// The lean entry count at which the interpreter warms a tier-2
     /// compile, clamped to the tier-2 threshold.
     ///
@@ -589,6 +594,30 @@ fn set_lean_warm_from_threshold(threshold: u32) {
     let _ = LEAN_WARM_AT.try_with(|c| c.set(v));
 }
 
+/// A thread-local startup scope. Nested scopes restore their predecessor, and
+/// the marker prevents moving a guard to a different thread before dropping it.
+pub(crate) struct StartupCompilationGuard {
+    previous: bool,
+    _thread: std::marker::PhantomData<*mut ()>,
+}
+
+pub(crate) fn defer_startup_compilation() -> StartupCompilationGuard {
+    StartupCompilationGuard {
+        previous: STARTUP_COMPILATION_DEFERRED.with(|flag| flag.replace(true)),
+        _thread: std::marker::PhantomData,
+    }
+}
+
+impl Drop for StartupCompilationGuard {
+    fn drop(&mut self) {
+        STARTUP_COMPILATION_DEFERRED.with(|flag| flag.set(self.previous));
+    }
+}
+
+fn startup_compilation_deferred() -> bool {
+    STARTUP_COMPILATION_DEFERRED.with(std::cell::Cell::get)
+}
+
 /// Mark interpreter start-up finished (see [`STARTUP_DONE`]).
 pub(crate) fn note_startup_finished() {
     STARTUP_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -599,8 +628,9 @@ pub(crate) fn note_startup_finished() {
 /// that never reports start-up) once far past the threshold.
 #[inline]
 fn compile_allowed(counter: u32, threshold: u32) -> bool {
-    STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed)
-        || counter >= threshold.saturating_mul(16)
+    !startup_compilation_deferred()
+        && (STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed)
+            || counter >= threshold.saturating_mul(16))
 }
 
 /// True when no thread's JIT can be enabled (see [`JIT_PROCESS_GATE`]).
@@ -2734,6 +2764,12 @@ pub(crate) fn note_backedge(code: &Rc<CodeObject>) -> bool {
 /// the direct call lanes into the compiled form, and those resolve only
 /// once the code has been compiled. Called on the lean path's threshold.
 pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::Frame) {
+    if startup_compilation_deferred() {
+        // Permit a later retry. Leaving the counter at the warm threshold
+        // would permanently bypass compilation on lean and pure-leaf paths.
+        frame.code.jit_hint.defer_lean_compile();
+        return;
+    }
     if frame.code.jit_hint.is_not_jitable() || jit_off_for_process() {
         return;
     }
@@ -9905,6 +9941,16 @@ pub(crate) fn stats_for_test() -> (u64, u64, u64) {
     })
 }
 
+#[cfg(test)]
+pub(crate) fn code_compiled_for_test(code: &Rc<CodeObject>) -> bool {
+    JIT.with(|cell| {
+        cell.borrow()
+            .cache
+            .get(&Rc::as_ptr(code))
+            .is_some_and(|entry| matches!(entry.tier, Tier::Compiled(_)))
+    })
+}
+
 /// Test hook: OSR entry count for the current thread (RFC 0059 WS3b).
 #[cfg(test)]
 pub(crate) fn osr_stats_for_test() -> u64 {
@@ -10311,5 +10357,31 @@ mod native_pair_tests {
             next_enumerated_tuple(&outer, true),
             NativeObjectPair::Value(0, Object::Int(42))
         ));
+    }
+}
+
+#[cfg(test)]
+mod startup_compilation_tests {
+    use super::{compile_allowed, defer_startup_compilation};
+
+    #[test]
+    fn explicit_startup_deferral_is_nested_and_unwinds() {
+        assert!(compile_allowed(u32::MAX, 1));
+        {
+            let _outer = defer_startup_compilation();
+            assert!(!compile_allowed(u32::MAX, 1));
+            {
+                let _inner = defer_startup_compilation();
+                assert!(!compile_allowed(u32::MAX, 1));
+            }
+            assert!(!compile_allowed(u32::MAX, 1));
+            let caught = std::panic::catch_unwind(|| {
+                let _inner = defer_startup_compilation();
+                panic!("startup failure");
+            });
+            assert!(caught.is_err());
+            assert!(!compile_allowed(u32::MAX, 1));
+        }
+        assert!(compile_allowed(u32::MAX, 1));
     }
 }

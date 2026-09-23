@@ -289,6 +289,12 @@ impl JitHint {
         self.lean_entries.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Retry a deferred lean compilation after another warm-up interval.
+    pub fn defer_lean_compile(&self) {
+        self.lean_entries
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Count one lean activation; returns the new count.
     pub fn bump_lean_entries(&self) -> u32 {
         // A heuristic counter: a plain load/store pair (a lost update under
