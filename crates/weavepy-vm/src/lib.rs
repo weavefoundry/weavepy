@@ -62937,6 +62937,36 @@ assert loop(2000) == 1999000
         );
     }
 
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_container_attributes_preserve_identity_and_lifetime() {
+        // A peer collection can make gc.collect() return without collecting.
+        // These in-loop lifetime assertions require an isolated collector.
+        const CHILD: &str = "WEAVEPY_CONTAINER_LIFETIME_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "tests::jit_container_attributes_preserve_identity_and_lifetime",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .status()
+                    .expect("spawn container-lifetime test");
+            assert!(
+                status.success(),
+                "isolated container-lifetime test failed: {status}"
+            );
+            return;
+        }
+        let (out, compiled, _) = run_jit(include_str!(
+            "../../../tests/regrtest/test_jit_container_attributes.py"
+        ));
+        assert!(out.contains("container attributes: ok"));
+        assert!(compiled > 0, "the fixture must exercise the JIT");
+    }
+
     /// RFC 0032 — run `src` with the tier-2 JIT forced on, on a fresh
     /// thread so the thread-local JIT state can't leak into other
     /// tests. Returns `(stdout, frames_compiled, deopts)`.

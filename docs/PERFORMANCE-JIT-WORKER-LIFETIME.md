@@ -83,8 +83,9 @@ reports. Thirty-eight selected Python regression scripts pass in JIT, interprete
 
 The preceding retirement test is isolated from other unit tests in bbef24b.
 Its assertions require completed collections, but the process-global collector
-can skip collection while a parallel test is collecting. A macOS CI failure
-exposed this contention; the separate-process test retains every assertion.
+can skip collection while a parallel test is collecting. A macOS CI collection
+assertion failed; isolation prevents parallel tests from occupying the collector
+while retaining every assertion.
 The baseline's broad local VM run also overflowed the default Rust test-thread
 stack in an existing pickle test. The full suite passes all 362 tests with
 RUST_MIN_STACK=8388608; no production stack setting changes.
