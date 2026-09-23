@@ -685,7 +685,7 @@ fn poll_factory(_args: &[Object]) -> Result<Object, RuntimeError> {
             polling: false,
         },
     );
-    inst.dict
+    inst.dict_cell()
         .borrow_mut()
         .insert(DictKey(Object::from_static("_handle")), Object::Int(handle));
     Ok(Object::Instance(inst))
@@ -696,7 +696,7 @@ fn poll_handle(args: &[Object]) -> Result<i64, RuntimeError> {
     match args.first() {
         Some(Object::Instance(i)) if i.cls().name == "poll" => {
             match i
-                .dict
+                .dict_cell()
                 .borrow()
                 .get(&DictKey(Object::from_static("_handle")))
             {
@@ -1001,13 +1001,13 @@ mod kqueue_impl {
     }
 
     fn set_field(inst: &Rc<PyInstance>, name: &'static str, v: i64) {
-        inst.dict
+        inst.dict_cell()
             .borrow_mut()
             .insert(DictKey(Object::from_static(name)), Object::Int(v));
     }
 
     fn get_field(inst: &PyInstance, name: &str) -> i64 {
-        match inst.dict.borrow().get(&crate::object::StrKey(name)) {
+        match inst.dict_cell().borrow().get(&crate::object::StrKey(name)) {
             Some(Object::Int(n)) => *n,
             Some(Object::Bool(b)) => i64::from(*b),
             _ => 0,
@@ -1183,7 +1183,7 @@ mod kqueue_impl {
         std::sync::Mutex::new(Vec::new());
 
     fn store_kqueue(inst: &Rc<PyInstance>, fd: libc::c_int) {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(
             DictKey(Object::from_static("_fd")),
             Object::Int(i64::from(fd)),
@@ -1213,7 +1213,7 @@ mod kqueue_impl {
         };
         for weak in drained {
             let Some(inst) = weak.upgrade() else { continue };
-            let mut d = inst.dict.borrow_mut();
+            let mut d = inst.dict_cell().borrow_mut();
             let already_closed = matches!(
                 d.get(&DictKey(Object::from_static("closed"))),
                 Some(Object::Bool(true))
@@ -1237,7 +1237,7 @@ mod kqueue_impl {
     fn kqueue_state(args: &[Object]) -> Result<(Rc<PyInstance>, libc::c_int, bool), RuntimeError> {
         match args.first() {
             Some(Object::Instance(i)) if i.cls().name == "kqueue" => {
-                let d = i.dict.borrow();
+                let d = i.dict_cell().borrow();
                 let fd = match d.get(&DictKey(Object::from_static("_fd"))) {
                     Some(Object::Int(f)) => *f as libc::c_int,
                     _ => return Err(os_error("kqueue object is uninitialised")),
@@ -1310,7 +1310,7 @@ mod kqueue_impl {
             unsafe {
                 libc::close(fd);
             }
-            inst.dict
+            inst.dict_cell()
                 .borrow_mut()
                 .insert(DictKey(Object::from_static("closed")), Object::Bool(true));
         }

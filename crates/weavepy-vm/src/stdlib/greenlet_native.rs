@@ -281,9 +281,17 @@ fn chain_contains(id: u64) -> bool {
 /// mmap'd stack, so those probes must fall back to their counted
 /// budgets here.
 pub fn on_greenlet_stack() -> bool {
+    // Nothing has ever created a greenlet: skip the thread-local reads
+    // (this is polled on every lean Python call).
+    if !GREENLETS_EVER.load(Ordering::Relaxed) {
+        return false;
+    }
     let main = MAIN_ID.with(|m| m.get());
     main != 0 && CURRENT.with(|c| c.get()) != main
 }
+
+/// Set once the first greenlet main is created on any thread.
+static GREENLETS_EVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn stack_size() -> usize {
     static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -507,11 +515,12 @@ fn ensure_main() -> Rc<GreenletBody> {
     });
     let cls = greenlet_class();
     let inst = Rc::new(PyInstance::new(cls));
-    inst.dict.borrow_mut().insert(
+    inst.dict_cell().borrow_mut().insert(
         DictKey(Object::from_static("_greenlet_id")),
         Object::Int(b.id as i64),
     );
     *b.instance.borrow_mut() = InstanceRef::Strong(inst);
+    GREENLETS_EVER.store(true, Ordering::Relaxed);
     MAIN_ID.with(|m| m.set(b.id));
     CURRENT.with(|c| c.set(b.id));
     CHAIN.with(|c| c.borrow_mut().push(b.id));
@@ -723,7 +732,7 @@ fn extract_self(args: &[Object]) -> Result<Rc<PyInstance>, RuntimeError> {
 
 fn body_of(inst: &Rc<PyInstance>) -> Result<Rc<GreenletBody>, RuntimeError> {
     let id = {
-        let d = inst.dict.borrow();
+        let d = inst.dict_cell().borrow();
         match d.get(&DictKey(Object::from_static("_greenlet_id"))) {
             Some(Object::Int(i)) => *i as u64,
             _ => return Err(green_error("greenlet was not initialised")),
@@ -733,7 +742,7 @@ fn body_of(inst: &Rc<PyInstance>) -> Result<Rc<GreenletBody>, RuntimeError> {
 }
 
 fn instance_id(inst: &Rc<PyInstance>) -> Option<u64> {
-    let d = inst.dict.borrow();
+    let d = inst.dict_cell().borrow();
     match d.get(&DictKey(Object::from_static("_greenlet_id"))) {
         Some(Object::Int(i)) => Some(*i as u64),
         _ => None,
@@ -796,7 +805,7 @@ fn green_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
         Some(r) => Some(r),
     };
     *b.instance.borrow_mut() = InstanceRef::Weak(Rc::downgrade(&inst));
-    inst.dict.borrow_mut().insert(
+    inst.dict_cell().borrow_mut().insert(
         DictKey(Object::from_static("_greenlet_id")),
         Object::Int(b.id as i64),
     );

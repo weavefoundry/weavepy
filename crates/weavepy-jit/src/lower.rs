@@ -145,7 +145,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             JitType::Int => SlotTag::Int as i64,
             JitType::Float => SlotTag::Float as i64,
             JitType::Bool => SlotTag::Bool as i64,
-            JitType::ListInt | JitType::ListFloat | JitType::ListObj => SlotTag::ListPin as i64,
+            JitType::ListInt | JitType::ListFloat | JitType::ListObj | JitType::ListListFloat => {
+                SlotTag::ListPin as i64
+            }
             // RFC 0071 WS6 — `Str`/`Bytes` pins spill like object pins
             // (the rebuild resolves the pin to the real payload).
             // RFC 0073 WS2 — `Dict` pins ride the same tag.
@@ -760,6 +762,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let len = self.vstack.len();
                 self.vstack.swap(len - 1, len - 2);
             }
+            TOp::SwapN { depth } => {
+                let len = self.vstack.len();
+                self.vstack.swap(len - 1, len - depth as usize);
+            }
             TOp::IntToFloatTos { guarded } => {
                 let depth = self.vstack.len() - 1;
                 self.emit_int_to_float(depth, guarded, stmt.pc);
@@ -822,6 +828,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::BytesGetItem => self.emit_bytes_get(stmt.pc),
             TOp::DictGet { key, val } => self.emit_dict_get(key, val, stmt.pc),
             TOp::DictSet { key, val } => self.emit_dict_set(key, val, stmt.pc),
+            TOp::DictDel { key } => self.emit_dict_del(key, stmt.pc),
             TOp::DictContains { negate, key } => self.emit_dict_contains(negate, key, stmt.pc),
             TOp::DictLen => self.emit_pin_len(runtime::dict_len_helper_addr(), stmt.pc),
             TOp::TupleLen => self.emit_pin_len(runtime::tuple_len_helper_addr(), stmt.pc),
@@ -861,6 +868,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::StrGetItem => self.emit_str_get(stmt.pc),
             TOp::BuildString { n } => self.emit_build_string(n, stmt.pc),
             TOp::ListRepeat => self.emit_list_repeat(stmt.pc),
+            TOp::ListFromRange { pops, deopt_pc } => self.emit_list_from_range(pops, deopt_pc),
             TOp::ListSlice {
                 start,
                 stop,
@@ -1753,6 +1761,34 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.vstack.push((res, lane));
     }
 
+    /// `list(range(...))` through `wpjit_list_from_range`. The bounds
+    /// pop first, so the deopt snapshot is the stack the erased
+    /// `LOAD_GLOBAL list` (`deopt_pc`) saw: the interpreter re-runs the
+    /// whole expression.
+    fn emit_list_from_range(&mut self, pops: u8, deopt_pc: u32) {
+        let (stop, _) = self.pop();
+        let start = if pops == 2 {
+            self.pop().0
+        } else {
+            self.b.ins().iconst(types::I64, 0)
+        };
+        let snapshot = self.vstack.clone();
+        let sig = self.list_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::list_from_range_helper_addr() as i64);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, start, stop]);
+        let res = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
+        let cont = self.guard(bad, deopt_pc, &snapshot);
+        self.b.switch_to_block(cont);
+        self.vstack.push((res, JitType::ListInt));
+    }
+
     /// RFC 0071 WS4 — `xs[a:b]` (unit step) through
     /// `wpjit_list_slice`. Absent bounds (the `None` markers of the
     /// erased `BUILD_SLICE`) pass as `i64::MIN`; present bounds pop
@@ -1981,6 +2017,19 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let (v, _) = self.pop();
         self.b.ins().store(trusted, v, self.frame_ptr, OFF_RET_BITS);
         let status = self.emit_dict_call(runtime::dict_set_helper_addr(), pin, k, key, val);
+        let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+    }
+
+    /// `del d[k]` on a pinned exact dict: any non-zero status deopts
+    /// with both operands spilled (the delete did not happen).
+    fn emit_dict_del(&mut self, key: JitType, pc: u32) {
+        let snapshot = self.vstack.clone();
+        let (k, _) = self.pop();
+        let (pin, _) = self.pop();
+        let status =
+            self.emit_dict_call(runtime::dict_del_helper_addr(), pin, k, key, JitType::Int);
         let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
@@ -2863,6 +2912,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             ArithKind::Or => self.emit_int_bitop(BitOp::Or),
             ArithKind::Xor => self.emit_int_bitop(BitOp::Xor),
             ArithKind::TrueDiv => self.emit_int_truediv(pc),
+            ArithKind::Pow => unreachable!("int pow is never admitted"),
         }
     }
 
@@ -2888,6 +2938,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             self.emit_float_divmod_helper(kind, pc);
             return;
         }
+        if matches!(kind, ArithKind::Pow) {
+            self.emit_float_pow(pc);
+            return;
+        }
         let (b, _) = self.pop();
         let (a, _) = self.pop();
         let r = match kind {
@@ -2896,6 +2950,35 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             ArithKind::Mul => self.b.ins().fmul(a, b),
             _ => unreachable!("non-jitable float arith reached lowering"),
         };
+        self.vstack.push((r, JitType::Float));
+    }
+
+    /// Float `**` through the registered libm `pow` helper — the same
+    /// function the interpreter's `float_pow` calls — for a positive
+    /// base only, with a finite result: a zero, negative, or NaN base
+    /// (division by zero, complex results) and any non-finite result
+    /// (an overflow raises; an infinite exponent is the interpreter's
+    /// to judge) deopt, and the interpreter re-executes the operation.
+    fn emit_float_pow(&mut self, pc: u32) {
+        let snapshot = self.vstack.clone();
+        let (b, _) = self.pop();
+        let (a, _) = self.pop();
+        let z = self.b.ins().f64const(0.0);
+        let not_pos = self.b.ins().fcmp(FloatCC::UnorderedOrLessThanOrEqual, a, z);
+        let cont = self.guard(not_pos, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        let sig = self.math_binary_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::float_pow_helper_addr() as i64);
+        let call = self.b.ins().call_indirect(sig, helper, &[a, b]);
+        let r = self.b.inst_results(call)[0];
+        // `|r| == inf` or NaN: `r - r` is NaN exactly then.
+        let d = self.b.ins().fsub(r, r);
+        let bad = self.b.ins().fcmp(FloatCC::Unordered, d, d);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
         self.vstack.push((r, JitType::Float));
     }
 

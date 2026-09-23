@@ -408,6 +408,9 @@ extern "system" {
 }
 
 fn b_dlopen(args: &[Object]) -> Result<Object, RuntimeError> {
+    // Whatever gets loaded (or `pythonapi`, the process itself) may call
+    // straight into the C API.
+    crate::ext_loader::ensure_capi_ready();
     // CPython's `_ctypes.c` ORs RTLD_NOW into every dlopen mode: ctypes'
     // DEFAULT_MODE is RTLD_LOCAL, which is 0 on Linux, and glibc rejects a
     // mode carrying neither RTLD_LAZY nor RTLD_NOW with EINVAL ("invalid

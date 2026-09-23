@@ -246,7 +246,7 @@ fn install_ro_getset(cls: &Rc<TypeObject>, name: &'static str) {
                 Some(Object::Instance(i)) => i,
                 _ => return Err(type_error("descriptor requires a Dialect instance")),
             };
-            let d = inst.dict.borrow();
+            let d = inst.dict_cell().borrow();
             Ok(d.get(&DictKey(Object::from_static(name)))
                 .cloned()
                 .unwrap_or(Object::None))
@@ -407,7 +407,7 @@ fn dialect_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
 
         let inst = PyInstance::new(dialect_type());
         {
-            let mut d = inst.dict.borrow_mut();
+            let mut d = inst.dict_cell().borrow_mut();
             d.insert(key("delimiter"), Object::from_str(delim.to_string()));
             d.insert(
                 key("quotechar"),
@@ -563,7 +563,7 @@ fn read_cfg(dialect: &Object) -> Result<DialectCfg, RuntimeError> {
         Object::Instance(i) => i,
         _ => return Err(type_error("invalid dialect")),
     };
-    let d = inst.dict.borrow();
+    let d = inst.dict_cell().borrow();
     let get = |n: &'static str| d.get(&DictKey(Object::from_static(n))).cloned();
     let as_char = |o: Option<Object>| -> Option<char> {
         match o {
@@ -862,7 +862,7 @@ fn csv_reader(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
         let dialect = call_dialect(interp, dialect_pos, kwargs)?;
         let inst = PyInstance::new(reader_type());
         {
-            let mut d = inst.dict.borrow_mut();
+            let mut d = inst.dict_cell().borrow_mut();
             d.insert(key("input_iter"), input_iter);
             d.insert(key("dialect"), dialect);
             d.insert(key("line_num"), Object::Int(0));
@@ -885,7 +885,7 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = self_inst(args)?;
     with_interp(|interp| {
         let (input_iter, dialect_obj) = {
-            let d = inst.dict.borrow();
+            let d = inst.dict_cell().borrow();
             (
                 d.get(&key("input_iter")).cloned(),
                 d.get(&key("dialect")).cloned(),
@@ -900,7 +900,7 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
         // `__next__` hands it out and leaves NULL behind. A re-entrant
         // `next(reader)` from inside the input iterator that completes
         // therefore makes the outer call see NULL and raise (gh-145105).
-        inst.dict
+        inst.dict_cell()
             .borrow_mut()
             .insert(key("_fields_live"), Object::Bool(true));
         loop {
@@ -927,7 +927,7 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
                         }
                     };
                     {
-                        let mut d = inst.dict.borrow_mut();
+                        let mut d = inst.dict_cell().borrow_mut();
                         if !matches!(d.get(&key("_fields_live")), Some(Object::Bool(true))) {
                             return Err(csv_error("iterator has already advanced the reader"));
                         }
@@ -947,7 +947,7 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
                 break;
             }
         }
-        inst.dict
+        inst.dict_cell()
             .borrow_mut()
             .insert(key("_fields_live"), Object::Bool(false));
         Ok(Object::new_list(std::mem::take(&mut p.fields)))
@@ -1019,7 +1019,7 @@ fn csv_writer(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
         let dialect = call_dialect(interp, dialect_pos, kwargs)?;
         let inst = PyInstance::new(writer_type());
         {
-            let mut d = inst.dict.borrow_mut();
+            let mut d = inst.dict_cell().borrow_mut();
             d.insert(key("write"), write);
             d.insert(key("dialect"), dialect);
         }
@@ -1125,7 +1125,7 @@ fn writer_writerow_inner(
     seq: Object,
 ) -> Result<Object, RuntimeError> {
     let (write, dialect_obj) = {
-        let d = inst.dict.borrow();
+        let d = inst.dict_cell().borrow();
         (
             d.get(&key("write")).cloned(),
             d.get(&key("dialect")).cloned(),

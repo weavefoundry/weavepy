@@ -391,6 +391,7 @@ fn run_source_with_options_impl(
         // `.pth` file can't break the interpreter outright.
         let _ = interpreter.run_site();
     }
+    interpreter.note_startup_finished();
     // `sys.path[0]` (the script's directory, `''` for `-c`/stdin, the
     // dir/zip argument itself) goes in *after* `site` runs — CPython's
     // `pymain_run_python` inserts path0 post-init, which is what keeps

@@ -917,7 +917,7 @@ pub fn queue_parked_drop(obj: &Object) {
         })
         .unwrap_or(false);
     if pushed {
-        if std::env::var_os("WEAVEPY_REAP_TRACE").is_some() {
+        if crate::hot_gates::env_flags::reap_trace() {
             eprintln!(
                 "[CEXT-DROP] queued {} id={:#x}",
                 obj.type_name_owned(),

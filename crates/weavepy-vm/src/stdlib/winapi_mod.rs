@@ -1567,7 +1567,7 @@ impl OverlappedObject {
     fn into_object(self) -> Object {
         let inst = Rc::new(crate::types::PyInstance::new(overlapped_type()));
         {
-            let mut d = inst.dict.borrow_mut();
+            let mut d = inst.dict_cell().borrow_mut();
             d.insert(DictKey(Object::from_static("_id")), Object::Int(self.id));
             // `.event` is a plain attribute here (CPython exposes it as a
             // read-only getset; the consumers only read it).
@@ -1636,7 +1636,11 @@ fn overlapped_type() -> Rc<crate::types::TypeObject> {
 fn overlapped_id(args: &[Object]) -> Result<i64, RuntimeError> {
     match args.first() {
         Some(Object::Instance(i)) => {
-            match i.dict.borrow().get(&DictKey(Object::from_static("_id"))) {
+            match i
+                .dict_cell()
+                .borrow()
+                .get(&DictKey(Object::from_static("_id")))
+            {
                 Some(Object::Int(id)) => Ok(*id),
                 _ => Err(value_error("Overlapped object is closed")),
             }

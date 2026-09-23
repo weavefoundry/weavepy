@@ -163,7 +163,10 @@ pub fn force_link() {
     let _ = singletons::none_ptr();
     let _ = singletons::true_ptr();
     let _ = singletons::false_ptr();
-    interp::ensure_initialised();
+    // Referenced, not run: the layer initialises on first use (extension
+    // loading, any C-API entry, or `ext_loader::ensure_capi_ready`), so a
+    // process that never touches the C API skips it at startup.
+    let _ = std::hint::black_box(interp::ensure_initialised as fn());
     force_link_table::touch();
     let _ = datetime_api::touch();
 }

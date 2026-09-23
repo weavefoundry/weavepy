@@ -190,7 +190,7 @@ fn handle_of(args: &[Object]) -> Result<i64, RuntimeError> {
         _ => return Err(type_error("expected a zstd compressor/decompressor object")),
     };
     match inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static("_handle")))
         .cloned()
@@ -616,7 +616,7 @@ fn zstddict_instance(obj: &Object) -> Option<Rc<PyInstance>> {
 
 /// The dictionary bytes stored by `ZstdDict.__init__`.
 fn zstddict_content(inst: &PyInstance) -> Result<Vec<u8>, RuntimeError> {
-    inst.dict
+    inst.dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static("_dict_content")))
         .and_then(Object::as_bytes_view)
@@ -832,7 +832,7 @@ fn compressor_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
     if let Ok(mut reg) = comp_reg().lock() {
         reg.insert(id, Rc::new(RefCell::new(state)));
     }
-    let mut d = inst.dict.borrow_mut();
+    let mut d = inst.dict_cell().borrow_mut();
     d.insert(DictKey(Object::from_static("_handle")), Object::Int(id));
     d.insert(
         DictKey(Object::from_static("last_mode")),
@@ -852,7 +852,7 @@ fn comp_state(id: i64) -> Result<Rc<RefCell<CState>>, RuntimeError> {
 fn note_last_mode(args: &[Object], st: &mut CState, mode: i64) {
     st.last_mode = mode;
     if let Some(Object::Instance(inst)) = args.first() {
-        inst.dict
+        inst.dict_cell()
             .borrow_mut()
             .insert(DictKey(Object::from_static("last_mode")), Object::Int(mode));
     }
@@ -1081,7 +1081,7 @@ fn compressor_class() -> Rc<TypeObject> {
 /// `unused_data`; CPython exposes them as read-only members/getters).
 fn sync_decompressor_flags(args: &[Object], st: &DState) {
     if let Some(Object::Instance(inst)) = args.first() {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(DictKey(Object::from_static("eof")), Object::Bool(st.eof));
         d.insert(
             DictKey(Object::from_static("needs_input")),
@@ -1133,7 +1133,7 @@ fn decompressor_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obj
     if let Ok(mut reg) = decomp_reg().lock() {
         reg.insert(id, Rc::new(RefCell::new(state)));
     }
-    inst.dict
+    inst.dict_cell()
         .borrow_mut()
         .insert(DictKey(Object::from_static("_handle")), Object::Int(id));
     Ok(Object::None)
@@ -1276,7 +1276,7 @@ fn zstddict_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object,
     if !is_raw && dict_id == 0 {
         return Err(value_error("invalid Zstandard dictionary"));
     }
-    let mut d = inst.dict.borrow_mut();
+    let mut d = inst.dict_cell().borrow_mut();
     d.insert(
         DictKey(Object::from_static("_dict_content")),
         Object::new_bytes(content),
@@ -1308,7 +1308,7 @@ fn zstddict_dict_content(args: &[Object]) -> Result<Object, RuntimeError> {
 fn zstddict_dict_id(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = self_instance(args)?;
     let id = inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static("_dict_id")))
         .cloned();
@@ -1318,7 +1318,7 @@ fn zstddict_dict_id(args: &[Object]) -> Result<Object, RuntimeError> {
 fn zstddict_len(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = self_instance(args)?;
     let n = inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static("_dict_content")))
         .and_then(|o| o.as_bytes_view())
@@ -1331,7 +1331,7 @@ fn zstddict_len(args: &[Object]) -> Result<Object, RuntimeError> {
 fn zstddict_repr(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = self_instance(args)?;
     let (dict_id, size) = {
-        let d = inst.dict.borrow();
+        let d = inst.dict_cell().borrow();
         let dict_id = d
             .get(&DictKey(Object::from_static("_dict_id")))
             .and_then(Object::as_i64)

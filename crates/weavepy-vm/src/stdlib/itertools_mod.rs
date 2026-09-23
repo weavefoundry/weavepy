@@ -288,7 +288,7 @@ fn tee_core(args: &[Object]) -> Result<Object, RuntimeError> {
     let shared = match registry.get(&key).and_then(Weak::upgrade) {
         Some(shared) => shared,
         None => {
-            let d = inst.dict.borrow();
+            let d = inst.dict_cell().borrow();
             let source = match d.get(&DictKey(Object::from_static("source"))) {
                 Some(Object::None) | None => None,
                 Some(src) => Some(src.clone()),
@@ -423,7 +423,7 @@ fn chain_from_iterable(args: &[Object]) -> Result<Object, RuntimeError> {
     let it = interp.make_iter(iterable, &globals)?;
     let core = chain_core(&[it, Object::None])?;
     let inst = Rc::new(crate::types::PyInstance::new(cls.clone()));
-    inst.dict
+    inst.dict_cell()
         .borrow_mut()
         .insert(DictKey(Object::from_static("_core")), core);
     Ok(Object::Instance(inst))

@@ -20,7 +20,7 @@ use crate::analyze::{JitVerdict, Probes};
 use crate::ir::{
     ArithKind, AttrSiteMeta, CalleeSpanMeta, CompSavedMeta, GlobalGuard, IterLoopMeta,
     ListLoopMeta, MathFunc, MathGuardMeta, MethodSiteMeta, MethodSpanMeta, OsrEntry, RangeLoopMeta,
-    ResolvedGlobal, StrMethod, TFunc, TOp,
+    ResolvedGlobal, StrMethod, TFunc, TOp, TTerm,
 };
 use crate::lower::build_function;
 use crate::runtime::{self, JitFrame, JitStatus};
@@ -61,6 +61,17 @@ pub struct CompiledFrame {
     /// RFC 0073 WS1 — inlined-comprehension saved-target spans (the
     /// parked `Unbound` re-inserted at its depth on a mid-span deopt).
     pub comp_saved: Vec<CompSavedMeta>,
+    /// Inlined-comprehension target slots (see
+    /// [`crate::ir::TFunc::comp_target_slots`]).
+    pub comp_target_slots: Vec<u32>,
+    /// Cold-exit pcs (see [`crate::ir::TFunc::cold_exits`]).
+    pub cold_exits: Vec<u32>,
+    /// Whether the interpreter should enter this body directly: a
+    /// loop-free body that round-trips into the interpreter (generic
+    /// calls, dynamic attributes or membership) gains nothing native
+    /// over its interpreted leaf paths and pays the entry/exit on top.
+    /// Native callers use it regardless.
+    pub interp_entry: bool,
     /// Erased Python callees (RFC 0059 WS3), for rebuilding the callee
     /// object on the interpreter stack after a mid-arguments deopt.
     pub callee_spans: Vec<CalleeSpanMeta>,
@@ -106,6 +117,7 @@ pub struct CompiledFrame {
     /// site agrees (feeds callers' `PyFunc` classification).
     pub ret_lane: Option<JitType>,
     scalar_leaf: bool,
+    op_mix: OpMix,
 }
 
 impl CompiledFrame {
@@ -115,6 +127,21 @@ impl CompiledFrame {
     #[must_use]
     pub fn is_scalar_leaf(&self) -> bool {
         self.scalar_leaf
+    }
+
+    /// `(generic, total)` statement counts: how many of the compiled
+    /// statements go through the interpreter's generic object protocol
+    /// (dynamic calls and attribute accesses).
+    #[must_use]
+    pub fn op_mix(&self) -> (u32, u32) {
+        let m = self.op_mix;
+        (m.dyn_calls + m.dyn_attrs + m.dyn_other, m.total)
+    }
+
+    /// The statement counts by kind behind [`Self::op_mix`].
+    #[must_use]
+    pub fn op_kinds(&self) -> OpMix {
+        self.op_mix
     }
 
     /// Enter the compiled frame.
@@ -166,6 +193,11 @@ impl JitEngine {
         flag_builder.set("is_pic", "false").ok()?;
         // Favour fast compiles over the last few percent of codegen.
         flag_builder.set("opt_level", "speed").ok()?;
+        // The IR verifier re-checks every function it compiles: a debug
+        // aid whose cost lands on every warm-up in release builds.
+        if !cfg!(debug_assertions) {
+            flag_builder.set("enable_verifier", "false").ok()?;
+        }
         let isa_builder = cranelift_native::builder().ok()?;
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
@@ -415,6 +447,32 @@ impl JitEngine {
         // keeps the code alive for the engine's lifetime.
         let func: NativeFn = unsafe { mem::transmute::<*const u8, NativeFn>(code_ptr) };
 
+        let has_loop = tfunc.blocks.iter().enumerate().any(|(bi, b)| match b.term {
+            TTerm::ForRange { .. }
+            | TTerm::ForList { .. }
+            | TTerm::ForIter { .. }
+            | TTerm::ForIterPair { .. } => true,
+            TTerm::Jump(t) => t <= bi,
+            TTerm::BranchFalse {
+                target,
+                fallthrough,
+            }
+            | TTerm::BranchTrue {
+                target,
+                fallthrough,
+            } => target <= bi || fallthrough <= bi,
+            _ => false,
+        });
+        let round_trips = tfunc.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+            matches!(
+                s.op,
+                TOp::CallDyn { .. }
+                    | TOp::DynAttrGet { .. }
+                    | TOp::DynAttrSet { .. }
+                    | TOp::ContainsDyn { .. }
+            )
+        });
+        let interp_entry = has_loop || !round_trips;
         Ok(CompiledFrame {
             func,
             livein: tfunc.livein_locals.clone(),
@@ -426,6 +484,9 @@ impl JitEngine {
             list_loops: tfunc.list_loops.clone(),
             iter_loops: tfunc.iter_loops.clone(),
             comp_saved: tfunc.comp_saved.clone(),
+            comp_target_slots: tfunc.comp_target_slots.clone(),
+            cold_exits: tfunc.cold_exits.clone(),
+            interp_entry,
             callee_spans: tfunc.callee_spans.clone(),
             len_spans: tfunc.len_spans.clone(),
             method_spans: tfunc.method_spans.clone(),
@@ -442,8 +503,59 @@ impl JitEngine {
             ret_lane: tfunc.ret_lane,
             ret_none: tfunc.ret_none,
             scalar_leaf: is_scalar_leaf(tfunc),
+            op_mix: op_mix(tfunc),
         })
     }
+}
+
+/// `(generic, total)`: statements that hand an operation to the
+/// interpreter's generic object protocol (dynamic calls and attribute
+/// accesses) against all statements (see [`CompiledFrame::op_mix`]).
+fn op_mix(tfunc: &TFunc) -> OpMix {
+    if std::env::var_os("WEAVEPY_JIT_OPS").is_some() {
+        let mut hist: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        for b in &tfunc.blocks {
+            for st in &b.stmts {
+                let name = format!("{:?}", st.op);
+                let name = name.split(['(', ' ', '{']).next().unwrap_or("").to_owned();
+                *hist.entry(name).or_default() += 1;
+            }
+        }
+        eprintln!("jit ops {hist:?}");
+    }
+    let mut mix = OpMix::default();
+    for b in &tfunc.blocks {
+        for st in &b.stmts {
+            mix.total += 1;
+            match st.op {
+                TOp::CallDyn { .. } => mix.dyn_calls += 1,
+                TOp::DynAttrGet { .. } | TOp::DynAttrSet { .. } => mix.dyn_attrs += 1,
+                TOp::ContainsDyn { .. } => mix.dyn_other += 1,
+                TOp::CallPy { .. } | TOp::CallPyKw { .. } | TOp::CallMethod { .. } => {
+                    mix.guarded_calls += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    mix
+}
+
+/// Statement counts by how the compiled code runs them (see
+/// [`CompiledFrame::op_kinds`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OpMix {
+    /// `CallDyn`: the interpreter's generic call protocol.
+    pub dyn_calls: u32,
+    /// `DynAttrGet` / `DynAttrSet`: generic attribute access.
+    pub dyn_attrs: u32,
+    /// Other generic protocol statements (`ContainsDyn`).
+    pub dyn_other: u32,
+    /// Calls through guarded direct lanes (`CallPy`, `CallPyKw`,
+    /// `CallMethod`).
+    pub guarded_calls: u32,
+    /// Every statement.
+    pub total: u32,
 }
 
 fn is_scalar_leaf(tfunc: &TFunc) -> bool {
@@ -512,6 +624,7 @@ fn is_scalar_leaf(tfunc: &TFunc) -> bool {
                     | TOp::Pop
                     | TOp::Dup { .. }
                     | TOp::Swap2
+                    | TOp::SwapN { .. }
                     | TOp::IntToFloatTos { .. }
                     | TOp::IntToFloatSecond { .. }
             )

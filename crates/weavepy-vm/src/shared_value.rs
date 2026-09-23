@@ -11,7 +11,10 @@ use std::marker::PhantomData;
 use std::mem::{align_of, size_of, ManuallyDrop};
 use std::ops::Deref;
 use std::ptr::{self, NonNull};
-use std::sync::{atomic::AtomicU64, Arc, Weak};
+use std::sync::{
+    atomic::{AtomicI64, AtomicU64, Ordering},
+    Arc, Weak,
+};
 
 mod sealed {
     pub trait Sealed {}
@@ -196,10 +199,14 @@ impl<T: ?Sized + ThinPayload> Clone for ThinWeak<T> {
 }
 
 /// Immutable slice payload; its length cannot be changed through safe methods.
+/// Carries a memoised Python hash (`-1` until computed), the way CPython's
+/// `str`/`bytes` objects cache theirs: a dict key hashes once per object,
+/// not once per lookup.
 #[repr(C)]
 #[derive(Debug)]
 pub struct SliceStorage<T> {
     len: usize,
+    hash: AtomicI64,
     items: [T],
 }
 impl<T> sealed::Sealed for SliceStorage<T> {}
@@ -226,10 +233,28 @@ impl<T> Borrow<[T]> for SharedSlice<T> {
 impl<T> SharedSlice<T> {
     fn layout(len: usize) -> Layout {
         Layout::new::<usize>()
+            .extend(Layout::new::<AtomicI64>())
+            .expect("slice header exceeds layout limit")
+            .0
             .extend(Layout::array::<T>(len).expect("slice elements exceed layout limit"))
             .expect("slice header exceeds layout limit")
             .0
             .pad_to_align()
+    }
+
+    /// The memoised Python hash of the contents, computing and recording
+    /// it with `compute` on first use.
+    #[inline]
+    pub fn hash_cached(this: &Self, compute: impl FnOnce(&[T]) -> i64) -> i64 {
+        // SAFETY: as in `deref` — a live payload borrowed from `this`.
+        let storage = unsafe { &*this.raw() };
+        let h = storage.hash.load(Ordering::Relaxed);
+        if h != -1 {
+            return h;
+        }
+        let h = compute(&storage.items);
+        storage.hash.store(h, Ordering::Relaxed);
+        h
     }
 
     fn from_vec_owned(items: Vec<T>) -> Self {
@@ -255,6 +280,7 @@ impl<T> SharedSlice<T> {
         // callbacks, allocation, or fallible work in this raw-ownership interval.
         unsafe {
             ptr::addr_of_mut!((*raw).len).write(len);
+            ptr::addr_of_mut!((*raw).hash).write(AtomicI64::new(-1));
             let dst = ptr::addr_of_mut!((*raw).items).cast::<T>();
             for (i, value) in items.into_iter().enumerate() {
                 dst.add(i).write(value);
@@ -289,12 +315,125 @@ impl<T> SharedSlice<T> {
         // initialized Copy elements are copied once, with no temporary Vec.
         unsafe {
             ptr::addr_of_mut!((*raw).len).write(len);
+            ptr::addr_of_mut!((*raw).hash).write(AtomicI64::new(-1));
             let dst = ptr::addr_of_mut!((*raw).items).cast::<T>();
             ptr::copy_nonoverlapping(items.as_ptr(), dst, len);
             Self::from_arc(Arc::from_raw(raw))
         }
     }
 }
+impl SharedSlice<u8> {
+    /// A byte slice of `len` bytes written by `fill` (which receives a
+    /// zeroed buffer of exactly that length): one allocation, no
+    /// intermediate `Vec`.
+    // The backing allocation comes from `Arc::<[usize]>::new_zeroed_slice`,
+    // so it carries `usize` alignment by construction; the casts below
+    // reinterpret it as the `usize`-headed DST it was sized for.
+    #[allow(clippy::cast_ptr_alignment)]
+    pub fn build(len: usize, fill: impl FnOnce(&mut [u8])) -> Self {
+        let layout = Self::layout(len);
+        let words = layout.size() / size_of::<usize>();
+        let storage = Arc::<[usize]>::new_zeroed_slice(words);
+        // SAFETY: an all-zero word slice is a valid `[usize]`; the header
+        // and bytes are (re)written below before any reader exists.
+        let storage = unsafe { storage.assume_init() };
+        let data = Arc::into_raw(storage).cast::<u8>().cast_mut();
+        let raw = ptr::slice_from_raw_parts_mut(data, len) as *mut SliceStorage<u8>;
+        unsafe {
+            ptr::addr_of_mut!((*raw).len).write(len);
+            ptr::addr_of_mut!((*raw).hash).write(AtomicI64::new(-1));
+            let dst = ptr::addr_of_mut!((*raw).items).cast::<u8>();
+            fill(std::slice::from_raw_parts_mut(dst, len));
+            Self::from_arc(Arc::from_raw(raw))
+        }
+    }
+}
+
+impl SharedSlice<u8> {
+    /// Append `extra` in place when this handle is the slice's only owner
+    /// (no other strong or weak reference): the allocation is resized
+    /// rather than copied, so repeated appends cost what `realloc` does
+    /// (CPython's `PyUnicode_Append` on a lone reference). `false` leaves
+    /// `this` untouched.
+    // The backing allocation comes from `Arc::<[usize]>::new_zeroed_slice`,
+    // so it carries `usize` alignment by construction; the casts below
+    // reinterpret it as the `usize`-headed DST it was sized for.
+    #[allow(clippy::cast_ptr_alignment)]
+    fn try_extend_unique(this: &mut Self, extra: &[u8]) -> bool {
+        if ThinArc::get_mut(this).is_none() {
+            return false;
+        }
+        // SAFETY: a live strong owner's length word.
+        let old_len = unsafe { this.data.as_ptr().read() };
+        let Some(new_len) = old_len.checked_add(extra.len()) else {
+            return false;
+        };
+        // The `Arc` allocation is its two counters followed by the payload
+        // (`ArcInner` is `repr(C)`, and std sizes it from the value layout
+        // exactly this way), so the payload's offset and both sizes follow.
+        let counters = Layout::new::<[usize; 2]>();
+        let (Ok((old_inner, offset)), Ok((new_inner, _))) = (
+            counters.extend(Self::layout(old_len)),
+            counters.extend(Self::layout(new_len)),
+        ) else {
+            return false;
+        };
+        let (old_inner, new_inner) = (old_inner.pad_to_align(), new_inner.pad_to_align());
+        // SAFETY: the sole owner (checked above) moves the allocation it owns
+        // through the global allocator with the layout it was allocated
+        // with; the new length word and hash are written before any reader
+        // can exist, and the handle then points at the moved payload, whose
+        // eventual `Arc` drop computes the new layout from the new length.
+        unsafe {
+            let base = this.data.as_ptr().cast::<u8>().sub(offset);
+            let grown = std::alloc::realloc(base, old_inner, new_inner.size());
+            if grown.is_null() {
+                return false;
+            }
+            let data = grown.add(offset).cast::<usize>();
+            let raw =
+                ptr::slice_from_raw_parts_mut(data.cast::<u8>(), new_len) as *mut SliceStorage<u8>;
+            ptr::addr_of_mut!((*raw).len).write(new_len);
+            (*raw).hash.store(-1, Ordering::Relaxed);
+            let dst = ptr::addr_of_mut!((*raw).items).cast::<u8>();
+            ptr::copy_nonoverlapping(extra.as_ptr(), dst.add(old_len), extra.len());
+            this.data = NonNull::new_unchecked(data);
+        }
+        true
+    }
+}
+
+impl SharedStr {
+    /// Append `suffix` in place when this handle is the string's only
+    /// owner (see `SharedSlice::try_extend_unique`); `false` leaves it
+    /// untouched.
+    pub fn try_append(this: &mut Self, suffix: &str) -> bool {
+        SharedSlice::try_extend_unique(&mut this.0, suffix.as_bytes())
+    }
+
+    /// The concatenation of `parts`, in one allocation.
+    pub fn concat(parts: &[&str]) -> Self {
+        let len = parts.iter().map(|p| p.len()).sum();
+        Self(SharedSlice::build(len, |buf| {
+            let mut at = 0;
+            for p in parts {
+                buf[at..at + p.len()].copy_from_slice(p.as_bytes());
+                at += p.len();
+            }
+        }))
+    }
+
+    /// `s` repeated `times` times, in one allocation.
+    pub fn repeat(s: &str, times: usize) -> Self {
+        let len = s.len() * times;
+        Self(SharedSlice::build(len, |buf| {
+            for chunk in buf.chunks_exact_mut(s.len().max(1)) {
+                chunk.copy_from_slice(s.as_bytes());
+            }
+        }))
+    }
+}
+
 impl<T> From<Vec<T>> for SharedSlice<T> {
     fn from(items: Vec<T>) -> Self {
         Self::from_vec_owned(items)
@@ -327,6 +466,14 @@ impl SharedStr {
     }
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
         ThinArc::ptr_eq(&this.0, &other.0)
+    }
+    /// The memoised `hash(s)` (see [`SharedSlice::hash_cached`]).
+    #[inline]
+    pub fn hash_cached(this: &Self) -> i64 {
+        SharedSlice::hash_cached(&this.0, |bytes| {
+            // SAFETY: the private owner is only ever built from `str`.
+            crate::object::py_str_hash(unsafe { std::str::from_utf8_unchecked(bytes) })
+        })
     }
     pub fn strong_count(this: &Self) -> usize {
         ThinArc::strong_count(&this.0)

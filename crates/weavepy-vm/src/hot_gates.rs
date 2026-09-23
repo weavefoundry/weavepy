@@ -52,6 +52,10 @@ pub const PENDING_PYCALLS: u32 = 1 << 6;
 /// (test_capi.test_misc TestPendingCalls.test_isolated_subinterpreter):
 /// armed while a `_testinternalcapi.pending_identify` waiter is queued.
 pub const PENDING_IDENTIFY: u32 = 1 << 7;
+/// The young generation reached its collection threshold: the next safe
+/// point runs the automatic collection (`gc_trace::maybe_auto_collect`),
+/// whichever allocation site tracked the object that crossed it.
+pub const GC_DUE: u32 = 1 << 8;
 
 /// The word itself. Process-global, like the granular gates it fuses
 /// (all of them were process-wide statics; per-thread queues keep
@@ -145,6 +149,11 @@ pub mod env_flags {
         "WEAVEPY_NO_QUIET"
     );
     once_flag!(
+        /// `WEAVEPY_NO_BURST`: disable the leaf burst (bisection aid).
+        no_burst,
+        "WEAVEPY_NO_BURST"
+    );
+    once_flag!(
         /// `WP_DBG_SAMPLE`: periodic frame-entry sampling to stderr.
         dbg_sample,
         "WP_DBG_SAMPLE"
@@ -169,4 +178,26 @@ pub mod env_flags {
         trace_init,
         "WEAVEPY_TRACE_INIT"
     );
+    once_flag!(
+        /// `WEAVEPY_JIT_TRACE`: tier-2 compile/deopt tracing.
+        jit_trace,
+        "WEAVEPY_JIT_TRACE"
+    );
+    once_flag!(
+        /// `WEAVEPY_NO_PAIRS`: disable the core loop's fused local pairs
+        /// (bisection aid).
+        no_pairs,
+        "WEAVEPY_NO_PAIRS"
+    );
+
+    /// `WEAVEPY_TE_BT=<needle>`: backtrace every `TypeError` whose
+    /// message contains the needle.
+    pub fn te_bt() -> Option<&'static str> {
+        static NEEDLE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        NEEDLE
+            .get_or_init(|| {
+                std::env::var_os("WEAVEPY_TE_BT").map(|v| v.to_string_lossy().into_owned())
+            })
+            .as_deref()
+    }
 }

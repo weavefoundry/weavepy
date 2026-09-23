@@ -479,6 +479,19 @@ static DICT_SET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 static DICT_CONTAINS_HELPER: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static DICT_LEN_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DICT_DEL_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the `DictDel` helper (same shape as the other dict-lane
+/// helpers; the value tag is unused). Must precede the first compile of
+/// a frame containing `DictDel` ops.
+pub fn register_dict_del_helper(del: DictAccessHelper) {
+    DICT_DEL_HELPER.store(del as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn dict_del_helper_addr() -> usize {
+    DICT_DEL_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// Register the process-wide dict-lane helpers (RFC 0073 WS2). Must
 /// precede the first compile of a frame containing `DictGet`,
@@ -588,6 +601,26 @@ static BUILD_LIST_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 static BUILD_TUPLE_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static LIST_REPEAT_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static LIST_SLICE_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LIST_FROM_RANGE_HELPER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The embedder's `list(range(start, stop))` helper: build the fresh
+/// `int` list, pin it, and return the pin index — or a negative value
+/// to deopt (cap pressure, or a length the interpreter should refuse).
+/// Never runs Python code; shares the [`ListRepeatHelper`] shape.
+pub type ListFromRangeHelper =
+    unsafe extern "C" fn(frame: *mut JitFrame, start: i64, stop: i64) -> i64;
+
+/// Register the `list(range(...))` helper. Must precede the first
+/// compile of a frame containing `ListFromRange`.
+pub fn register_list_from_range_helper(f: ListFromRangeHelper) {
+    LIST_FROM_RANGE_HELPER.store(f as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn list_from_range_helper_addr() -> usize {
+    LIST_FROM_RANGE_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// Register the process-wide opaque-iterator and list/tuple
 /// construction helpers (RFC 0071 WS4 / RFC 0073 WS1). Must precede
@@ -916,6 +949,19 @@ static MATH_COS_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 static FLOAT_FLOORDIV_HELPER: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static FLOAT_MOD_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FLOAT_POW_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the float `**` helper (libm `pow`, as the interpreter's
+/// `float_pow`). Must precede the first compile of a frame containing
+/// float `**` ops.
+pub fn register_float_pow_helper(pow: MathBinaryHelper) {
+    FLOAT_POW_HELPER.store(pow as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn float_pow_helper_addr() -> usize {
+    FLOAT_POW_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// Register the process-wide math helpers (RFC 0069 WS2): the libm
 /// `sin`/`cos` intrinsics and the Python-semantics float floor-div /

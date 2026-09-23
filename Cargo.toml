@@ -63,7 +63,11 @@ weavepy-vm          = { path = "crates/weavepy-vm",          version = "0.0.0" }
 
 # Third-party.
 anyhow      = "1.0"
-chrono      = { version = "0.4", default-features = false, features = ["clock"] }
+# `now` only: the `clock` feature's `Local` zone pulls in iana-time-zone,
+# which links CoreFoundation on macOS (a launch-time framework load that
+# costs ~4 MB of RSS and ~1 ms of startup). Unix builds read the local
+# zone through libc instead; Windows turns `clock` back on (weavepy-vm).
+chrono      = { version = "0.4", default-features = false, features = ["now"] }
 clap        = { version = "4.5", features = ["derive", "wrap_help"] }
 indexmap    = "2.5"
 itoa        = "1.0"
@@ -234,6 +238,10 @@ cast_precision_loss     = "allow"
 # Stylistic preferences that fight legitimate manual patterns:
 manual_assert           = "allow"
 too_many_lines          = "allow"
+# The eval loop's helpers thread the frame, shell, pc, caches and the
+# activation's own state through by hand; splitting them into structs
+# to satisfy an arity count costs a load on the hottest paths.
+too_many_arguments      = "allow"
 similar_names           = "allow"
 match_same_arms         = "allow"
 single_match_else       = "allow"

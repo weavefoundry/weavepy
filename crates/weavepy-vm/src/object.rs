@@ -951,19 +951,84 @@ pub struct FrameShell {
     pub materialized: RefCell<Option<Rc<PyFrame>>>,
 }
 
-/// Owned metadata in a live frame shell. Recycled shells leave these slots
+/// Metadata in a live frame shell. Recycled shells leave these slots
 /// empty so recycling doesn't clone and later drop shared placeholders.
 /// Only a live shell may be read; the pool is private to the interpreter.
-#[derive(Debug)]
-pub struct FrameSlot<T>(Option<T>);
+///
+/// A slot either *owns* its value or *borrows* the executing frame's own
+/// copy. An ordinary call's shell is popped and parked before its frame
+/// dies, and almost no activation is ever introspected, so taking (and
+/// later releasing) five atomic reference counts per call bought
+/// nothing. A borrowed slot is a bitwise copy of the frame's handle
+/// without a count of its own; [`FrameSlot::upgrade`] converts it to an
+/// owning one in place. The interpreter upgrades a popped shell that
+/// anything else still references, so a slot never outlives the frame it
+/// borrows from while still borrowed.
+pub struct FrameSlot<T> {
+    value: Option<std::mem::ManuallyDrop<T>>,
+    owned: std::sync::atomic::AtomicBool,
+}
+
+impl<T: fmt::Debug> fmt::Debug for FrameSlot<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("FrameSlot")
+            .field(&self.value.as_deref())
+            .finish()
+    }
+}
 
 impl<T> FrameSlot<T> {
     pub(crate) fn new(value: T) -> Self {
-        Self(Some(value))
+        Self {
+            value: Some(std::mem::ManuallyDrop::new(value)),
+            owned: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// A slot that reads through `value` without owning a count.
+    ///
+    /// # Safety
+    ///
+    /// `*value` must stay alive until this slot is cleared, dropped, or
+    /// [upgraded](Self::upgrade).
+    pub(crate) unsafe fn borrowed(value: &T) -> Self {
+        Self {
+            // SAFETY: the copy is never dropped while `owned` is false, and
+            // the caller keeps the original alive for as long as it is read.
+            value: Some(std::mem::ManuallyDrop::new(unsafe {
+                std::ptr::read(value)
+            })),
+            owned: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     pub(crate) fn clear(&mut self) {
-        self.0 = None;
+        if let Some(mut value) = self.value.take() {
+            if *self.owned.get_mut() {
+                // SAFETY: an owned slot holds its own count, released once.
+                unsafe { std::mem::ManuallyDrop::drop(&mut value) };
+            }
+        }
+        *self.owned.get_mut() = true;
+    }
+}
+
+impl<T: Clone> FrameSlot<T> {
+    /// Turn a borrowed slot into an owning one. Idempotent.
+    pub(crate) fn upgrade(&self) {
+        if let Some(value) = &self.value {
+            if !self.owned.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                // The slot's bitwise copy becomes a real handle by taking
+                // the count it never had.
+                std::mem::forget(T::clone(value));
+            }
+        }
+    }
+}
+
+impl<T> Drop for FrameSlot<T> {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 
@@ -971,11 +1036,20 @@ impl<T> std::ops::Deref for FrameSlot<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        self.0.as_ref().expect("live frame shell metadata")
+        self.value.as_deref().expect("live frame shell metadata")
     }
 }
 
 impl FrameShell {
+    /// Make every borrowed slot own its value (see [`FrameSlot`]).
+    pub(crate) fn upgrade_slots(&self) {
+        self.code.upgrade();
+        self.locals.upgrade();
+        self.cells.upgrade();
+        self.globals.upgrade();
+        self.builtins.upgrade();
+    }
+
     /// Wrap an already-materialised frame (generator resume, event
     /// dispatch around throw/unwind) in a shell for the spine.
     pub fn from_py_frame(py: &Rc<PyFrame>) -> Self {
@@ -1005,8 +1079,24 @@ impl FrameShell {
     /// `back` pointer, caching it. Bumps `on_stack` exactly once per
     /// materialisation — the pop path decrements it for shells whose
     /// `materialized` is set.
+    /// Bring an existing frame object's `lasti` up to this live shell's.
+    /// The executing frame's quiet loops sync only the shell while nothing
+    /// else holds the object (see `Interpreter::frame_object_observed`);
+    /// every path that hands the object out calls this first. A trace
+    /// function's pending line jump owns the value and is left alone.
+    pub fn refresh_materialized(&self, py: &PyFrame) {
+        if py.pending_jump.borrow().is_none() && py.override_lineno.get().is_none() {
+            py.lasti
+                .set(self.lasti.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
+
     pub fn materialize(&self, back: Option<Rc<PyFrame>>) -> Rc<PyFrame> {
         if let Some(existing) = self.materialized.borrow().as_ref() {
+            self.refresh_materialized(existing);
+            // The new holder may keep it: a quiet loop running this
+            // activation re-derives, and finds it observed if so.
+            crate::hot_gates::bump_loop_gen();
             return existing.clone();
         }
         let py = Rc::new(PyFrame {
@@ -1058,7 +1148,14 @@ impl FrameShell {
         // where a panic on a live mutable borrow would be fatal.
         if let Ok(m) = self.materialized.try_borrow() {
             if let Some(py) = m.as_ref() {
-                return py.current_lineno();
+                // A trace function's `f_lineno` override or pending
+                // jump owns the value. Otherwise the shell's mirror is
+                // the current one: a quiet loop syncs only the shell.
+                let traced = py.override_lineno.get().is_some()
+                    || py.pending_jump.try_borrow().map_or(true, |j| j.is_some());
+                if traced {
+                    return py.current_lineno();
+                }
             }
         }
         let pc = self.current_lasti() as usize;
@@ -1073,8 +1170,13 @@ pub type FrameStack = Rc<RefCell<Vec<Rc<FrameShell>>>>;
 /// overwhelming majority) share one allocation instead of building a
 /// fresh `Rc<Vec>` each.
 pub fn empty_cells() -> Rc<Vec<Rc<RefCell<Object>>>> {
+    empty_cells_ref().clone()
+}
+
+/// The shared empty cells vector, by reference (see [`empty_cells`]).
+pub fn empty_cells_ref() -> &'static Rc<Vec<Rc<RefCell<Object>>>> {
     static EMPTY: std::sync::OnceLock<Rc<Vec<Rc<RefCell<Object>>>>> = std::sync::OnceLock::new();
-    EMPTY.get_or_init(|| Rc::new(Vec::new())).clone()
+    EMPTY.get_or_init(|| Rc::new(Vec::new()))
 }
 
 /// Materialise the frame at `idx` (0 = outermost) together with
@@ -1082,18 +1184,22 @@ pub fn empty_cells() -> Rc<Vec<Rc<RefCell<Object>>>> {
 /// it. Refreshes `back` on already-materialised entries too, so a
 /// generator frame re-pushed with a stale link is corrected.
 pub fn materialize_stack_at(stack: &FrameStack, idx: usize) -> Option<Rc<PyFrame>> {
-    let shells: Vec<Rc<FrameShell>> = {
-        let s = stack.borrow();
-        if idx >= s.len() {
-            return None;
-        }
-        s[..=idx].to_vec()
-    };
+    // Walked under the spine's own borrow: nothing below runs Python or
+    // touches the stack, and copying the shells out (a `Vec` plus one
+    // reference count per level) was paid by every raise, `sys._getframe`
+    // and traceback entry.
+    let s = stack.borrow();
+    if idx >= s.len() {
+        return None;
+    }
     let mut back: Option<Rc<PyFrame>> = None;
-    for shell in &shells {
+    let mut refreshed = false;
+    for shell in &s[..=idx] {
         let existing = shell.materialized.borrow().clone();
         let py = match existing {
             Some(py) => {
+                shell.refresh_materialized(&py);
+                refreshed = true;
                 *py.back.borrow_mut() = back;
                 py
             }
@@ -1105,6 +1211,11 @@ pub fn materialize_stack_at(stack: &FrameStack, idx: usize) -> Option<Rc<PyFrame
             }
         };
         back = Some(py);
+    }
+    if refreshed {
+        // See `FrameShell::materialize`: the objects handed out (the
+        // frame and its `f_back` chain) may be kept.
+        crate::hot_gates::bump_loop_gen();
     }
     back
 }
@@ -2845,7 +2956,9 @@ impl indexmap::Equivalent<DictKey> for StrKey<'_> {
     #[inline]
     fn equivalent(&self, key: &DictKey) -> bool {
         match &key.0 {
-            Object::Str(s) => &**s == self.0,
+            // Interned names probe with the stored key's own bytes: the
+            // pointer settles it before any byte compare.
+            Object::Str(s) => std::ptr::eq(s.as_ptr(), self.0.as_ptr()) || &**s == self.0,
             // A `WStr` always carries a lone surrogate (module invariant),
             // so it can never equal a valid `&str`.
             Object::WStr(_) => false,
@@ -2882,6 +2995,98 @@ impl indexmap::Equivalent<DictKey> for StrKeyHashed<'_> {
     #[inline]
     fn equivalent(&self, key: &DictKey) -> bool {
         indexmap::Equivalent::equivalent(&StrKey(self.s), key)
+    }
+}
+
+/// A probe for a `str` attribute name that never runs Python: a stored
+/// key in the probed bucket that is not a plain `str` (one that could
+/// equate only through a user `__eq__`) is skipped and recorded, and the
+/// caller declines when [`LeafNameProbe::saw_exotic`] reports it.
+#[derive(Debug)]
+pub struct LeafNameProbe<'a> {
+    pub s: &'a str,
+    pub hash: i64,
+    exotic: std::cell::Cell<bool>,
+}
+
+impl<'a> LeafNameProbe<'a> {
+    /// `hash` must be `py_str_hash(s)`.
+    #[inline]
+    pub fn new(s: &'a str, hash: i64) -> Self {
+        Self {
+            s,
+            hash,
+            exotic: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Whether a probe met a key it could not compare natively.
+    #[inline]
+    pub fn saw_exotic(&self) -> bool {
+        self.exotic.get()
+    }
+}
+
+impl Hash for LeafNameProbe<'_> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+    }
+}
+
+impl indexmap::Equivalent<DictKey> for LeafNameProbe<'_> {
+    #[inline]
+    fn equivalent(&self, key: &DictKey) -> bool {
+        match &key.0 {
+            Object::Str(k) => std::ptr::eq(k.as_ptr(), self.s.as_ptr()) || &**k == self.s,
+            // A lone surrogate never equals a valid `&str`.
+            Object::WStr(_) => false,
+            _ => {
+                self.exotic.set(true);
+                false
+            }
+        }
+    }
+}
+
+/// A dict probe for the leaf burst: a `str` or `int` key that matches a
+/// stored key only by exact native equality. It never runs Python — an
+/// exotic stored key sharing the bucket (a `__eq__` that could equate)
+/// reads as a miss, and the burst leaves every miss to the full path.
+#[derive(Debug, Clone, Copy)]
+pub struct LeafProbe<'a> {
+    pub key: &'a Object,
+    pub hash: i64,
+}
+
+impl<'a> LeafProbe<'a> {
+    /// `None` unless `key` is a `str` or a machine `int`.
+    #[inline]
+    pub fn new(key: &'a Object) -> Option<Self> {
+        let hash = match key {
+            Object::Str(s) => SharedStr::hash_cached(s),
+            Object::Int(_) => py_hash_value(key)?,
+            _ => return None,
+        };
+        Some(Self { key, hash })
+    }
+}
+
+impl Hash for LeafProbe<'_> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+    }
+}
+
+impl indexmap::Equivalent<DictKey> for LeafProbe<'_> {
+    #[inline]
+    fn equivalent(&self, key: &DictKey) -> bool {
+        match (self.key, &key.0) {
+            (Object::Str(a), Object::Str(b)) => a.as_bytes() == b.as_bytes(),
+            (Object::Int(a), Object::Int(b)) => a == b,
+            _ => false,
+        }
     }
 }
 
@@ -2975,6 +3180,78 @@ pub(crate) fn instance_has_custom_dunder(obj: &Object, name: &str) -> bool {
     }
 }
 
+/// [`instance_has_custom_dunder`]`(obj, "__eq__")`, memoised per class:
+/// membership tests and `list.remove`/`index`/`count` ask it for every
+/// element they compare.
+pub(crate) fn instance_has_custom_eq(obj: &Object) -> bool {
+    let Object::Instance(inst) = obj else {
+        return false;
+    };
+    if crate::gil::free_threading_enabled() {
+        return custom_eq_of(&inst.cls(), inst);
+    }
+    // Under the GIL nothing reassigns `__class__` while this reads it
+    // (the lookup below runs no Python code).
+    custom_eq_of(inst.cls_raw(), inst)
+}
+
+fn custom_eq_of(cls: &crate::types::TypeObject, inst: &crate::types::PyInstance) -> bool {
+    let ver = cls.attr_version.get();
+    let memo = cls.eq_kind.get();
+    let kind = if memo != 0 && memo >> 2 == ver {
+        memo & 3
+    } else {
+        let kind = match cls.lookup_with_owner("__eq__") {
+            Some((Object::Function(_) | Object::BoundMethod(_), _)) => 2,
+            Some((Object::None, _)) | None => 1,
+            Some((_, owner)) if !owner.flags.is_builtin => 2,
+            Some((_, owner))
+                if Rc::ptr_eq(&owner, &crate::builtin_types::builtin_types().object_) =>
+            {
+                1
+            }
+            Some(_) => 3,
+        };
+        cls.eq_kind.set(ver << 2 | kind);
+        kind
+    };
+    match kind {
+        1 => false,
+        2 => true,
+        _ => inst.native.get().is_none(),
+    }
+}
+
+/// `a == b` can only be `object`'s identity default: each side is a
+/// plain instance (no native payload, no `__eq__` override) or a native
+/// scalar, and at least one is such an instance, so every `__eq__` the
+/// protocol would try returns `NotImplemented` for the pair.
+pub(crate) fn eq_is_identity(a: &Object, b: &Object) -> bool {
+    fn plain(o: &Object) -> bool {
+        matches!(o, Object::Instance(i) if i.native.get().is_none()) && !instance_has_custom_eq(o)
+    }
+    fn scalar(o: &Object) -> bool {
+        matches!(
+            o,
+            Object::None
+                | Object::Bool(_)
+                | Object::Int(_)
+                | Object::Long(_)
+                | Object::Float(_)
+                | Object::Complex(_)
+                | Object::Str(_)
+                | Object::WStr(_)
+                | Object::Bytes(_)
+        )
+    }
+    match (plain(a), plain(b)) {
+        (true, true) => true,
+        (true, false) => scalar(b),
+        (false, true) => scalar(a),
+        (false, false) => false,
+    }
+}
+
 /// True when a `set`/`dict` key needs Python-level `__eq__` dispatch rather
 /// than the native [`Object::eq_value`] fast path: a foreign extension
 /// scalar (numpy `int64`/`float64`/…), a user instance with a custom
@@ -3038,8 +3315,8 @@ pub(crate) fn member_eq(a: &Object, b: &Object) -> Result<bool, RuntimeError> {
             Object::Tuple(_) | Object::List(_) | Object::Dict(_) | Object::Slice(_)
         )
     }
-    if instance_has_custom_dunder(a, "__eq__")
-        || instance_has_custom_dunder(b, "__eq__")
+    if instance_has_custom_eq(a)
+        || instance_has_custom_eq(b)
         || matches!(a, Object::Foreign(_))
         || matches!(b, Object::Foreign(_))
         || (deep_dispatch(a) && deep_dispatch(b))
@@ -3770,7 +4047,233 @@ impl Hash for DictKey {
 /// (one multiply) instead of SipHash, which profiled as a top-ten CPU
 /// consumer under pandas. Not attacker-relevant: collision resistance
 /// comes from the Python-level hash, exactly as in CPython's own tables.
-pub type DictData = indexmap::IndexMap<DictKey, Object, crate::fasthash::FxBuildHasher>;
+pub type DictMap = indexmap::IndexMap<DictKey, Object, crate::fasthash::FxBuildHasher>;
+
+/// The global source of [`DictData::mutation_stamp`] values: one
+/// monotonically increasing counter for every dict in the process, so a
+/// stamp names one state of one dict and is never reused, even by a dict
+/// replaced in place.
+static DICT_STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[inline]
+fn next_dict_stamp() -> u64 {
+    DICT_STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A [`DictMap`] with a mutation stamp: every mutable access (any
+/// `DerefMut`) draws a fresh process-unique stamp, so an inline cache can
+/// guard "this dict is exactly as I last saw it" with one integer compare
+/// instead of re-probing the table. The stamp is conservative — it also
+/// advances on mutable accesses that change nothing — and it is not the
+/// PEP 509 version tag (which counts effective changes only; see
+/// [`dict_version_get`]).
+pub struct DictData {
+    map: DictMap,
+    stamp: u64,
+    /// Deferred cycle-collector tracking (see
+    /// [`crate::gc_trace::track_deferred_owner`]): the address of the
+    /// `PyInstance` whose `__dict__` this is while that instance is not
+    /// yet tracked, else 0. Any mutation that could store a non-atomic
+    /// value (every `DerefMut`) tracks the owner first; the owner clears
+    /// it when it is tracked by other means or dies.
+    deferred_owner: std::sync::atomic::AtomicUsize,
+}
+
+impl Clone for DictData {
+    fn clone(&self) -> Self {
+        Self {
+            map: self.map.clone(),
+            stamp: self.stamp,
+            deferred_owner: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl DictData {
+    #[inline]
+    pub fn with_capacity_and_hasher(n: usize, h: crate::fasthash::FxBuildHasher) -> Self {
+        Self {
+            map: DictMap::with_capacity_and_hasher(n, h),
+            stamp: next_dict_stamp(),
+            deferred_owner: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// An empty instance `__dict__` guarding the deferred tracking of the
+    /// instance at `owner`.
+    pub(crate) fn deferred_for(owner: usize) -> Self {
+        Self {
+            map: DictMap::default(),
+            stamp: next_dict_stamp(),
+            deferred_owner: std::sync::atomic::AtomicUsize::new(owner),
+        }
+    }
+
+    /// [`Self::deferred_for`] with room for `n` keys.
+    pub(crate) fn deferred_for_capacity(owner: usize, n: usize) -> Self {
+        if n == 0 {
+            return Self::deferred_for(owner);
+        }
+        Self {
+            map: DictMap::with_capacity_and_hasher(n, crate::fasthash::FxBuildHasher),
+            stamp: next_dict_stamp(),
+            deferred_owner: std::sync::atomic::AtomicUsize::new(owner),
+        }
+    }
+
+    /// Re-arm the owner record on a recycled (empty) instance dict.
+    #[inline]
+    pub(crate) fn reset_deferred_owner(&mut self, owner: usize) {
+        *self.deferred_owner.get_mut() = owner;
+    }
+
+    /// Whether this dict still guards a deferred-tracking owner.
+    #[inline]
+    pub(crate) fn has_deferred_owner(&self) -> bool {
+        self.deferred_owner
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0
+    }
+
+    /// Take the deferred owner (0 when none). The caller tracks it.
+    #[inline]
+    pub(crate) fn take_deferred_owner(&self) -> usize {
+        if !self.has_deferred_owner() {
+            return 0;
+        }
+        self.deferred_owner
+            .swap(0, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Mutable access for a store whose value is atomic (cannot take part
+    /// in a reference cycle): stamps the dict but leaves a deferred owner
+    /// untracked.
+    #[inline]
+    pub fn map_mut_atomic_store(&mut self) -> &mut DictMap {
+        self.stamp = next_dict_stamp();
+        &mut self.map
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn track_deferred_owner(&mut self) {
+        let owner = std::mem::replace(self.deferred_owner.get_mut(), 0);
+        crate::gc_trace::track_deferred_owner(owner);
+    }
+
+    /// The stamp of the dict's current state (see the type docs).
+    #[inline]
+    pub fn mutation_stamp(&self) -> u64 {
+        self.stamp
+    }
+
+    /// Mutable access for replacing an existing key's value in place: the
+    /// keys do not move, and only key layout is what the stamp's readers
+    /// (the global/builtin load caches) watch, so it stays put. A
+    /// deferred-tracking owner still starts tracking, as for any heap
+    /// value stored into it.
+    #[inline]
+    pub fn map_mut_value_store(&mut self) -> &mut DictMap {
+        if *self.deferred_owner.get_mut() != 0 {
+            self.track_deferred_owner();
+        }
+        &mut self.map
+    }
+
+    /// Mutable access that does *not* advance the stamp: for callers that
+    /// change a value in place without adding or removing a key and whose
+    /// caches are keyed on keys alone. Use with care.
+    #[inline]
+    pub fn map_mut_unstamped(&mut self) -> &mut DictMap {
+        &mut self.map
+    }
+}
+
+impl Default for DictData {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            map: DictMap::default(),
+            stamp: next_dict_stamp(),
+            deferred_owner: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl std::ops::Deref for DictData {
+    type Target = DictMap;
+
+    #[inline]
+    fn deref(&self) -> &DictMap {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for DictData {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut DictMap {
+        if *self.deferred_owner.get_mut() != 0 {
+            self.track_deferred_owner();
+        }
+        self.stamp = next_dict_stamp();
+        &mut self.map
+    }
+}
+
+impl fmt::Debug for DictData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.map.fmt(f)
+    }
+}
+
+impl From<DictMap> for DictData {
+    fn from(map: DictMap) -> Self {
+        Self {
+            map,
+            stamp: next_dict_stamp(),
+            deferred_owner: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl FromIterator<(DictKey, Object)> for DictData {
+    fn from_iter<I: IntoIterator<Item = (DictKey, Object)>>(iter: I) -> Self {
+        Self::from(DictMap::from_iter(iter))
+    }
+}
+
+impl Extend<(DictKey, Object)> for DictData {
+    fn extend<I: IntoIterator<Item = (DictKey, Object)>>(&mut self, iter: I) {
+        (**self).extend(iter);
+    }
+}
+
+impl IntoIterator for DictData {
+    type Item = (DictKey, Object);
+    type IntoIter = indexmap::map::IntoIter<DictKey, Object>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a DictData {
+    type Item = (&'a DictKey, &'a Object);
+    type IntoIter = indexmap::map::Iter<'a, DictKey, Object>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut DictData {
+    type Item = (&'a DictKey, &'a mut Object);
+    type IntoIter = indexmap::map::IterMut<'a, DictKey, Object>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        (**self).iter_mut()
+    }
+}
 
 #[derive(Clone)]
 pub struct PyFunction {
@@ -3808,6 +4311,80 @@ pub struct PyFunction {
     /// copies `__dict__` and asserts the wrapper's annotations are
     /// untouched by the wrapped function's slots).
     pub slots: RefCell<DictData>,
+    /// The frame `cells` vector for a function whose code has free
+    /// variables but no cell variables: exactly `closure`'s cells, built
+    /// once (the closure is immutable) for the lean call paths.
+    pub closure_cells: std::sync::OnceLock<Rc<Vec<Rc<RefCell<Object>>>>>,
+    /// Set (never cleared) once `__defaults__` or `__kwdefaults__` has
+    /// been stored into [`Self::slots`], so the call paths can skip the
+    /// slot-store probe for the overwhelmingly common function that never
+    /// had them overridden.
+    pub defaults_override: OverrideFlag,
+}
+
+/// A clonable set-once flag (see [`PyFunction::defaults_override`]).
+#[derive(Debug, Default)]
+pub struct OverrideFlag(std::sync::atomic::AtomicBool);
+
+impl OverrideFlag {
+    pub const fn new(v: bool) -> Self {
+        Self(std::sync::atomic::AtomicBool::new(v))
+    }
+}
+
+impl Clone for OverrideFlag {
+    fn clone(&self) -> Self {
+        Self::new(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl PyFunction {
+    /// Whether `__defaults__`/`__kwdefaults__` may have been overridden
+    /// (see [`Self::defaults_override`]).
+    #[inline]
+    pub fn defaults_maybe_overridden(&self) -> bool {
+        self.defaults_override
+            .0
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The frame `cells` for a lean activation of this function: the
+    /// shared empty vector when the code closes over nothing, the cached
+    /// closure cells when it has free variables only, `None` when it
+    /// defines cell variables of its own (fresh cells per call) or a
+    /// closure entry is not a cell.
+    pub fn lean_cells(&self, code: &CodeObject) -> Option<Rc<Vec<Rc<RefCell<Object>>>>> {
+        self.lean_cells_ref(code).cloned()
+    }
+
+    /// [`Self::lean_cells`] by reference: the handle lives as long as
+    /// this function (the cached closure cells) or forever (the shared
+    /// empty vector).
+    pub fn lean_cells_ref(&self, code: &CodeObject) -> Option<&Rc<Vec<Rc<RefCell<Object>>>>> {
+        if !code.cellvars.is_empty() {
+            return None;
+        }
+        if code.freevars.is_empty() && self.closure.is_empty() {
+            return Some(empty_cells_ref());
+        }
+        if let Some(c) = self.closure_cells.get() {
+            return Some(c);
+        }
+        if self.closure.len() != code.freevars.len()
+            || !self.closure.iter().all(|c| matches!(c, Object::Cell(_)))
+        {
+            return None;
+        }
+        let cells: Vec<Rc<RefCell<Object>>> = self
+            .closure
+            .iter()
+            .map(|c| match c {
+                Object::Cell(c) => c.clone(),
+                _ => unreachable!("checked above"),
+            })
+            .collect();
+        Some(self.closure_cells.get_or_init(|| Rc::new(cells)))
+    }
 }
 
 /// Attribute names backed by function slots rather than `__dict__`.
@@ -3831,7 +4408,15 @@ pub fn is_function_slot(name: &str) -> bool {
 impl PyFunction {
     /// The current code object (honours `f.__code__ = …` rebinding).
     pub fn code(&self) -> Rc<CodeObject> {
-        self.code.borrow().clone()
+        if crate::gil::free_threading_enabled() {
+            return self.code.borrow().clone();
+        }
+        // SAFETY: with the GIL enabled every reader and the one writer
+        // (`f.__code__ = …`) run GIL-serialized, the reference does not
+        // outlive this expression, and an `Arc` clone cannot re-enter the
+        // interpreter. The cell lock this skips is two thread-local reads
+        // and a compare-exchange on every Python call.
+        unsafe { (*self.code.as_ptr()).clone() }
     }
 
     /// The live `__dict__` payload (honours `f.__dict__ = d` swapping).
@@ -3850,6 +4435,11 @@ impl PyFunction {
     }
 
     pub fn set_slot(&self, name: &str, value: Object) {
+        if matches!(name, "__defaults__" | "__kwdefaults__") {
+            self.defaults_override
+                .0
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         self.slots
             .borrow_mut()
             .insert(DictKey(Object::from_str(name)), value);
@@ -4097,8 +4687,40 @@ impl PyGenerator {
         }
     }
 
+    /// [`Self::new`] with the name objects already built (a function's
+    /// pinned `__name__`/`__qualname__`, shared rather than copied).
+    pub fn with_names(
+        name: Object,
+        qualname: Object,
+        kind: CoroutineKind,
+        code: Object,
+        frame: Box<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            name: RefCell::new(name),
+            qualname: RefCell::new(qualname),
+            kind,
+            code,
+            state: RefCell::new(GeneratorState::Created(frame)),
+            origin: RefCell::new(Object::None),
+            hooks_inited: crate::sync::Cell::new(false),
+            finalizer: RefCell::new(Object::None),
+            finalize_ran: crate::sync::Cell::new(false),
+        }
+    }
+
     pub fn is_finished(&self) -> bool {
         matches!(&*self.state.borrow(), GeneratorState::Finished)
+    }
+
+    /// Has the body run at all? A generator still in `Created` has
+    /// executed nothing, so closing it runs nothing either — CPython's
+    /// `gen_close` marks such a generator closed without throwing
+    /// `GeneratorExit` at it, and `gen_dealloc` frees it outright.
+    pub fn is_unstarted(&self) -> bool {
+        self.state
+            .try_borrow()
+            .is_ok_and(|s| matches!(&*s, GeneratorState::Created(_)))
     }
 }
 
@@ -7501,7 +8123,7 @@ impl PyIterator {
                 let ch = rest.chars().next()?;
                 let len = ch.len_utf8();
                 *index += len;
-                Some(Object::Str(SharedStr::from(ch.to_string().as_str())))
+                Some(Object::from_char(ch))
             }
             PyIterator::Range {
                 current,
@@ -8018,10 +8640,7 @@ impl PyIterator {
             }
             PyIterator::Str { s, index } => {
                 let start = (*index).min(s.len());
-                s[start..]
-                    .chars()
-                    .map(|c| Object::Str(SharedStr::from(c.to_string().as_str())))
-                    .collect()
+                s[start..].chars().map(Object::from_char).collect()
             }
             PyIterator::DictKeys {
                 kind,
@@ -8227,6 +8846,28 @@ impl PyIterator {
 // ---------- behavior ----------
 
 impl Object {
+    /// Whether the value can never (transitively) reference another
+    /// object — so a container holding only such values cannot be part
+    /// of a reference cycle. Used by deferred instance tracking.
+    #[inline]
+    pub fn is_gc_atomic(&self) -> bool {
+        matches!(
+            self,
+            Object::None
+                | Object::Unbound
+                | Object::Bool(_)
+                | Object::Int(_)
+                | Object::Long(_)
+                | Object::Float(_)
+                | Object::Complex(_)
+                | Object::Str(_)
+                | Object::WStr(_)
+                | Object::Bytes(_)
+                | Object::ByteArray(_)
+                | Object::Range(_)
+        )
+    }
+
     /// Python truthiness.
     pub fn is_truthy(&self) -> bool {
         match self {
@@ -8783,13 +9424,16 @@ impl Object {
                 Ok(false)
             }
             Object::Str(haystack) => match item {
-                Object::Str(needle) => Ok(haystack.contains(&**needle)),
+                // Short-needle search without the two-way searcher's
+                // per-call preprocessing (see `builtins::substr_find`).
+                Object::Str(needle) => Ok(crate::builtins::substr_find(haystack, needle).is_some()),
                 // `"..." in wstr`: a surrogate-bearing needle can never be a
                 // substring of a pure-UTF-8 haystack, so this is always false.
                 Object::WStr(_) => Ok(false),
-                _ => Err(type_error(
-                    "'in <string>' requires string as left operand".to_owned(),
-                )),
+                _ => Err(type_error(format!(
+                    "'in <string>' requires string as left operand, not {}",
+                    item.type_name_owned()
+                ))),
             },
             // Substring search over a surrogate-bearing haystack works on code
             // points so a lone surrogate matches itself.
@@ -8799,9 +9443,10 @@ impl Object {
                     let needle = item.str_codepoints().unwrap();
                     Ok(codepoint_subslice_contains(&hay, &needle))
                 }
-                _ => Err(type_error(
-                    "'in <string>' requires string as left operand".to_owned(),
-                )),
+                _ => Err(type_error(format!(
+                    "'in <string>' requires string as left operand, not {}",
+                    item.type_name_owned()
+                ))),
             },
             Object::Dict(d) => {
                 // `unhashable in {…}` raises TypeError, exactly like a
@@ -9550,7 +10195,7 @@ impl Object {
                     Object::Instance(i) => {
                         let pick = |key: &str| -> Option<String> {
                             if let Some(Object::Str(s)) =
-                                i.dict.borrow().get(&crate::object::StrKey(key))
+                                i.dict_cell().borrow().get(&crate::object::StrKey(key))
                             {
                                 return Some(s.to_string());
                             }
@@ -11122,7 +11767,7 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
     }
     match obj {
         Object::None => Some(PY_HASH_NONE),
-        Object::Str(s) => Some(py_str_hash(s)),
+        Object::Str(s) => Some(SharedStr::hash_cached(s)),
         // Code objects compare by value (`code_value_eq`), so they must
         // also hash by value or value-equal codes land in different
         // set/dict buckets (CPython `code_hash`).
@@ -11132,7 +11777,10 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
         // (disjoint by invariant), so cross-representation hash agreement is
         // unnecessary; collisions only cost a probe, never correctness.
         Object::WStr(cps) => Some(py_wstr_hash(cps)),
-        Object::Bytes(b) => Some(py_hash_bytes_slice(b)),
+        Object::Bytes(b) => Some(crate::shared_value::SharedSlice::hash_cached(
+            b,
+            py_hash_bytes_slice,
+        )),
         // A read-only byte-format view hashes as its contents — equal to the
         // hash of `tobytes()` regardless of alignment or strides (CPython
         // `memory_hash`; test_hash.test_unaligned_buffers). The value is
@@ -11687,6 +12335,24 @@ fn seq_cmp(a: &[Object], b: &[Object]) -> Result<Ordering, RuntimeError> {
 impl Object {
     pub fn from_str(s: impl Into<String>) -> Self {
         Object::Str(SharedStr::from(s.into().as_str()))
+    }
+
+    /// A one-character `str`. Latin-1 characters come from a shared table
+    /// (CPython caches the same 256), so iterating or indexing a string
+    /// allocates nothing for them.
+    #[inline]
+    pub fn from_char(ch: char) -> Self {
+        static LATIN1: std::sync::OnceLock<Box<[SharedStr]>> = std::sync::OnceLock::new();
+        let code = ch as u32;
+        if code < 256 {
+            let table = LATIN1.get_or_init(|| {
+                (0u8..=255)
+                    .map(|b| SharedStr::from(&*char::from(b).encode_utf8(&mut [0; 4])))
+                    .collect()
+            });
+            return Object::Str(table[code as usize].clone());
+        }
+        Object::Str(SharedStr::from(&*ch.encode_utf8(&mut [0; 4])))
     }
 
     /// Build a `str` from a sequence of code points, each a Unicode scalar

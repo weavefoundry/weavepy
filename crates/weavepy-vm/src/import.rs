@@ -44,7 +44,7 @@ pub struct ModuleCache {
     /// Pure-Python modules baked into the binary. Looked up after
     /// Rust-defined built-ins so a host can override frozen stdlib by
     /// registering a builtin with the same name.
-    pub frozen: Rc<RefCell<HashMap<&'static str, FrozenSource>>>,
+    pub frozen: Rc<FrozenRegistry>,
     /// RFC 0057 WS3 — `_imp._override_frozen_modules_for_tests` state:
     /// `0` default, `1` force-enabled, `-1` force-disabled. CPython's
     /// override disables every *non-essential* frozen module (imports
@@ -93,6 +93,20 @@ pub struct ModuleCache {
     pub os_native_done: Rc<crate::sync::Cell<bool>>,
 }
 
+/// The frozen-module registry: the stdlib's static table (looked up
+/// through a generated name index, see `stdlib::frozen_lookup`) once
+/// installed, plus sources registered one by one.
+#[derive(Debug, Default)]
+pub struct FrozenRegistry {
+    /// Whether the static table is installed.
+    table: crate::sync::Cell<bool>,
+    /// Table names hidden by the environment at install time.
+    suppressed: RefCell<Vec<Box<str>>>,
+    /// Sources registered through [`ModuleCache::register_frozen`];
+    /// they shadow the table.
+    extra: RefCell<HashMap<&'static str, FrozenSource>>,
+}
+
 impl Default for ModuleCache {
     fn default() -> Self {
         Self {
@@ -100,7 +114,7 @@ impl Default for ModuleCache {
             path: Rc::new(RefCell::new(Vec::new())),
             argv: Rc::new(RefCell::new(Vec::new())),
             builtins: Rc::new(RefCell::new(HashMap::new())),
-            frozen: Rc::new(RefCell::new(HashMap::new())),
+            frozen: Rc::new(FrozenRegistry::default()),
             frozen_tests_override: Rc::new(crate::sync::Cell::new(0)),
             initializing: Rc::new(RefCell::new(std::collections::HashMap::new())),
             loading: Rc::new(RefCell::new(std::collections::HashMap::new())),
@@ -251,7 +265,30 @@ impl ModuleCache {
     /// Register a Python-source module that ships inside the binary.
     /// The loader compiles and executes it lazily on first import.
     pub fn register_frozen(&self, source: FrozenSource) {
-        self.frozen.borrow_mut().insert(source.name, source);
+        self.frozen.extra.borrow_mut().insert(source.name, source);
+    }
+
+    /// Make the stdlib's static frozen table visible to imports, minus
+    /// the `suppressed` names (see `stdlib::register_all`).
+    pub fn install_frozen_table(&self, suppressed: Vec<Box<str>>) {
+        *self.frozen.suppressed.borrow_mut() = suppressed;
+        self.frozen.table.set(true);
+    }
+
+    /// The frozen source registered under `name`, ignoring the test
+    /// override (see [`Self::frozen_source`]).
+    fn frozen_entry(&self, name: &str) -> Option<FrozenSource> {
+        if let Some(src) = self.frozen.extra.borrow().get(name) {
+            return Some(*src);
+        }
+        if !self.frozen.table.get() {
+            return None;
+        }
+        let suppressed = self.frozen.suppressed.borrow();
+        if !suppressed.is_empty() && suppressed.iter().any(|s| &**s == name) {
+            return None;
+        }
+        crate::stdlib::frozen_lookup(name)
     }
 
     pub fn frozen_source(&self, name: &str) -> Option<FrozenSource> {
@@ -264,7 +301,7 @@ impl ModuleCache {
         if self.frozen_tests_override.get() < 0 && is_test_frozen_name(name) {
             return None;
         }
-        self.frozen.borrow().get(name).copied()
+        self.frozen_entry(name)
     }
 
     /// Set the `_imp._override_frozen_modules_for_tests` knob
@@ -330,6 +367,26 @@ impl ModuleCache {
             .collect()
     }
 
+    /// Whether a sourceless `full` could be on the path: a
+    /// `<leaf>.pyc` module, or a package directory with only an
+    /// `__init__.pyc`, under some search directory (read from the cached
+    /// directory listings). The native loader imports neither; the
+    /// Python `SourcelessFileLoader` does.
+    pub fn sourceless_candidate(&self, full: &str) -> bool {
+        let rel: PathBuf = full.split('.').collect();
+        let Some(leaf) = rel.file_name().and_then(|l| l.to_str()) else {
+            return false;
+        };
+        let pyc = format!("{leaf}.pyc");
+        self.search_dirs().iter().any(|dir| {
+            let parent = match rel.parent() {
+                Some(p) if !p.as_os_str().is_empty() => dir.join(p),
+                _ => dir.clone(),
+            };
+            dir_has(&parent, &pyc) || dir_has(&parent.join(leaf), "__init__.pyc")
+        })
+    }
+
     /// CPython `FileFinder`'s case check (`_relax_case`): the on-disk
     /// spelling of `path`'s final component must match the requested
     /// name byte-for-byte, even on case-insensitive filesystems —
@@ -348,6 +405,50 @@ impl ModuleCache {
         }
     }
 
+    /// The package (`<dir>/<rel>/__init__.py`, first) or module
+    /// (`<dir>/<rel>.py`) source for `rel` under path entry `dir`, probed
+    /// against the cached directory listings (see [`dir_listing`]): one
+    /// `stat` per directory visited instead of one per candidate, and the
+    /// listing's exact spelling is the case check. `PYTHONCASEOK` keeps the
+    /// per-candidate probes (its case-insensitive match is the
+    /// filesystem's).
+    fn probe_source(dir: &Path, rel: &Path) -> Option<(PathBuf, bool)> {
+        if std::env::var_os("PYTHONCASEOK").is_some() {
+            let pkg_init = dir.join(rel).join("__init__.py");
+            if pkg_init.is_file() {
+                return Some((pkg_init, true));
+            }
+            let module_file = dir.join(rel).with_extension("py");
+            if module_file.is_file() {
+                return Some((module_file, false));
+            }
+            return None;
+        }
+        let leaf = rel.file_name()?.to_str()?;
+        let parent = match rel.parent() {
+            Some(p) if !p.as_os_str().is_empty() => dir.join(p),
+            _ => dir.to_path_buf(),
+        };
+        let names = dir_listing(&parent)?;
+        if names.contains(std::ffi::OsStr::new(leaf)) {
+            let pkg_dir = parent.join(leaf);
+            if dir_has(&pkg_dir, "__init__.py") {
+                let pkg_init = pkg_dir.join("__init__.py");
+                if pkg_init.is_file() {
+                    return Some((pkg_init, true));
+                }
+            }
+        }
+        let file = format!("{leaf}.py");
+        if names.contains(std::ffi::OsStr::new(&file)) {
+            let module_file = parent.join(file);
+            if module_file.is_file() {
+                return Some((module_file, false));
+            }
+        }
+        None
+    }
+
     /// Locate a module's source on disk by walking `sys.path`.
     ///
     /// Returns:
@@ -364,7 +465,7 @@ impl ModuleCache {
         // fallback below.
         if self.frozen_tests_override.get() >= 0
             && is_test_frozen_name(full_name)
-            && self.frozen.borrow().contains_key(full_name)
+            && self.frozen_entry(full_name).is_some()
         {
             return None;
         }
@@ -384,13 +485,8 @@ impl ModuleCache {
             // CPython's FileFinder probes the package directory before
             // the module file within each path entry, so `t4/__init__.py`
             // shadows a sibling `t4.py` (test_pkg.test_4).
-            let pkg_init = dir.join(&rel).join("__init__.py");
-            if pkg_init.is_file() && Self::entry_case_ok(pkg_init.parent().unwrap_or(&pkg_init)) {
-                return Some((pkg_init, true));
-            }
-            let module_file = dir.join(&rel).with_extension("py");
-            if module_file.is_file() && Self::entry_case_ok(&module_file) {
-                return Some((module_file, false));
+            if let Some(hit) = Self::probe_source(&dir, &rel) {
+                return Some(hit);
             }
         }
         // A frozen test module hidden by the `-1` override must still be
@@ -401,7 +497,7 @@ impl ModuleCache {
         // so resolve the same fallback against the tree explicitly —
         // it holds byte-identical projections of the frozen sources.
         if self.frozen_tests_override.get() < 0 && is_test_frozen_name(full_name) {
-            if let Some(frozen) = self.frozen.borrow().get(full_name) {
+            if let Some(frozen) = self.frozen_entry(full_name) {
                 if let Some(path) =
                     crate::stdlib_tree::test_frozen_disk_path(full_name, frozen.is_package)
                 {
@@ -477,15 +573,105 @@ impl ModuleCache {
             // package (CPython's FileFinder checks both suffixes); it must
             // reach the Python-level fallback's SourcelessFileLoader, not
             // be swallowed as a PEP 420 namespace portion.
-            if pkg_dir.is_dir()
-                && !pkg_dir.join("__init__.py").is_file()
-                && !pkg_dir.join("__init__.pyc").is_file()
-            {
-                hits.push(pkg_dir);
+            if let Some(names) = dir_listing(&pkg_dir) {
+                if !names.contains(std::ffi::OsStr::new("__init__.py"))
+                    && !names.contains(std::ffi::OsStr::new("__init__.pyc"))
+                {
+                    hits.push(pkg_dir);
+                }
             }
         }
         hits
     }
+}
+
+thread_local! {
+    /// Directory listings of import search locations, each with the
+    /// directory's modification time when it was read (CPython
+    /// `FileFinder`'s `_path_cache` / `_path_mtime`).
+    static DIR_LISTINGS: std::cell::RefCell<
+        HashMap<PathBuf, (DirStamp, std::rc::Rc<std::collections::HashSet<std::ffi::OsString>>)>,
+    > = std::cell::RefCell::new(HashMap::new());
+}
+
+/// What revalidates a cached listing: the directory's modification time
+/// and, where the platform has them, its device and inode (a relative
+/// entry such as `'.'` may name another directory after a `chdir`, and a
+/// directory may be replaced by another with an equal mtime).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DirStamp {
+    mtime: std::time::SystemTime,
+    dev: u64,
+    ino: u64,
+}
+
+impl DirStamp {
+    fn of(meta: &std::fs::Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        let (dev, ino) = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let (dev, ino) = (0, 0);
+        Some(Self {
+            mtime: meta.modified().ok()?,
+            dev,
+            ino,
+        })
+    }
+}
+
+/// The entry names of directory `dir` (`None` when it is not a readable
+/// directory), from a listing revalidated by the directory's
+/// modification time: an import probes its candidates against the set
+/// instead of issuing one `stat` per candidate file (and the exact
+/// spelling of each name is CPython's case check for free). Creating or
+/// removing an entry moves the directory's mtime; `importlib
+/// .invalidate_caches()` also drops every listing (see
+/// [`clear_dir_listings`]), as CPython's finders do.
+pub fn dir_listing(
+    dir: &Path,
+) -> Option<std::rc::Rc<std::collections::HashSet<std::ffi::OsString>>> {
+    // An empty entry (`sys.path[0]` under `-c` / the REPL) is the current
+    // directory, as CPython's `FileFinder('')` makes it `'.'`.
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let meta = std::fs::metadata(dir).ok()?;
+    if !meta.is_dir() {
+        return None;
+    }
+    let stamp = DirStamp::of(&meta)?;
+    DIR_LISTINGS.with(|c| {
+        if let Some((m, names)) = c.borrow().get(dir) {
+            if *m == stamp {
+                return Some(names.clone());
+            }
+        }
+        let names: std::collections::HashSet<std::ffi::OsString> = std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        let names = std::rc::Rc::new(names);
+        c.borrow_mut()
+            .insert(dir.to_path_buf(), (stamp, names.clone()));
+        Some(names)
+    })
+}
+
+/// Forget every cached directory listing (`importlib.invalidate_caches`).
+pub fn clear_dir_listings() {
+    DIR_LISTINGS.with(|c| c.borrow_mut().clear());
+}
+
+/// Whether `dir` has an entry spelled exactly `name` (see
+/// [`dir_listing`]).
+pub fn dir_has(dir: &Path, name: &str) -> bool {
+    dir_listing(dir).is_some_and(|names| names.contains(std::ffi::OsStr::new(name)))
 }
 
 /// Resolution of a relative import (`from . import x` /

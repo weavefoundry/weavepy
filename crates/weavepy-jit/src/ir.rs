@@ -44,6 +44,8 @@ pub enum ArithKind {
     And,
     Or,
     Xor,
+    /// Float `**` (float lanes only; an integral operand promotes).
+    Pow,
 }
 
 /// Comparison operators (six-way), matching `CompareKind`.
@@ -150,6 +152,9 @@ pub enum TOp {
     Dup { depth: u32 },
     /// Swap the top two stack entries (`SWAP 2`).
     Swap2,
+    /// `SWAP n` for `n > 2`: exchange the top entry with the `n`-th
+    /// (a free lowering-stack rotation, like [`Self::Swap2`]).
+    SwapN { depth: u32 },
     /// Convert the integral value at TOS to `float` (RFC 0058 WS4 mixed
     /// arithmetic promotion, matching the interpreter's `as f64` cast).
     /// When `guarded`, deopt unless `|v| <= 2^53` — the range where the
@@ -340,6 +345,14 @@ pub enum TOp {
     /// discipline), as do active C-API dict watchers and any key-lane
     /// surprise.
     DictSet { key: JitType, val: JitType },
+    /// `del d[k]` on a pinned exact `dict`: pops the key (`key` lane)
+    /// and the dict pin, and calls the registered `wpjit_dict_del`
+    /// helper — the interpreter's own `dict_remove` chokepoint. A
+    /// missing key, a displaced value that would run the prompt-reap
+    /// cascade, active C-API dict watchers, or any key-lane surprise
+    /// deopts *before* the delete, and the interpreter re-executes it
+    /// (raising the exact `KeyError`).
+    DictDel { key: JitType },
     /// RFC 0073 WS2 — `k in d` / `k not in d` on a pinned exact
     /// `dict`: pops the dict pin and the key, calls the registered
     /// `wpjit_dict_contains` helper, and pushes the `bool` (inverted
@@ -477,6 +490,15 @@ pub enum TOp {
     /// CPython's aliasing), and pushes the fresh pinned list on the
     /// same lane. Cap pressure deopts at this pc.
     ListRepeat,
+    /// `list(range(stop))` / `list(range(start, stop))` with the whole
+    /// call shape erased: pops the bounds (`stop` above `start`; one
+    /// bound seeds `start` with 0), calls the registered
+    /// `wpjit_list_from_range` helper, and pushes the fresh pinned
+    /// `int` list. A failed build (cap pressure, an absurd length)
+    /// deopts at `deopt_pc` — the erased `LOAD_GLOBAL list` — with the
+    /// bounds dropped, so the interpreter re-executes the whole
+    /// expression (its argument loads are side-effect free).
+    ListFromRange { pops: u8, deopt_pc: u32 },
     /// RFC 0071 WS4 — `xs[a:b]` on a pinned list (an erased
     /// `BUILD_SLICE 3` whose step is the `None` constant followed by
     /// `BINARY_SUBSCR`): pops the present bounds (`stop` above
@@ -777,6 +799,11 @@ pub enum ResolvedGlobal {
     /// pinned-list length callee (lowered to [`TOp::ListLen`], never a
     /// real call).
     LenBuiltin,
+    /// The canonical builtin `list`: `list(range(...))` over simple
+    /// integer bounds lowers to [`TOp::ListFromRange`] (a fresh pinned
+    /// `int` list, never a real call). Any other use burns as an
+    /// ordinary obj-global.
+    ListBuiltin,
     /// RFC 0074 WS3 — the canonical builtin `enumerate`. Burns like any
     /// obj-global (the plan gate routes it through the obj-global
     /// probe, so its `LOAD_GLOBAL` pushes an identity-guarded pin and
@@ -1351,6 +1378,14 @@ pub struct TFunc {
     /// recorded interpreter depth (the parked prior value of the
     /// comprehension target, proven unbound at admission).
     pub comp_saved: Vec<CompSavedMeta>,
+    /// Local slots of recognized inlined-comprehension targets: accessed
+    /// only inside their comprehension bodies (and written there before
+    /// any read), so an OSR entry admits them unbound on any lane.
+    pub comp_target_slots: Vec<u32>,
+    /// Cold-exit pcs (see the analyzer's `cold_point`): an expected
+    /// hand-off to the interpreter, at most once per activation — never
+    /// charged as a deopt.
+    pub cold_exits: Vec<u32>,
     /// Erased Python callees (RFC 0059 WS3), ascending `live_from`, for
     /// deopt stack reconstruction during argument computation.
     pub callee_spans: Vec<CalleeSpanMeta>,
@@ -1443,7 +1478,7 @@ impl TOp {
                 | TOp::CallPyKw { .. }
                 | TOp::CallMethod { .. }
                 | TOp::MathIntrinsic(_)
-                | TOp::FloatArith(ArithKind::FloorDiv | ArithKind::Mod)
+                | TOp::FloatArith(ArithKind::FloorDiv | ArithKind::Mod | ArithKind::Pow)
                 | TOp::ListGet { .. }
                 | TOp::ListSet
                 | TOp::ListLen
@@ -1460,6 +1495,7 @@ impl TOp {
                 | TOp::BytesGetItem
                 | TOp::DictGet { .. }
                 | TOp::DictSet { .. }
+                | TOp::DictDel { .. }
                 | TOp::DictContains { .. }
                 | TOp::DictLen
                 | TOp::BuildMap { .. }
@@ -1476,6 +1512,7 @@ impl TOp {
                 | TOp::BuildList { .. }
                 | TOp::BuildTuple { .. }
                 | TOp::ListRepeat
+                | TOp::ListFromRange { .. }
                 | TOp::ListSlice { .. }
                 | TOp::PushGlobalObj { .. }
                 | TOp::CallDyn { .. }

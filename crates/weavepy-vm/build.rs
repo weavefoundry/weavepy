@@ -143,6 +143,43 @@ fn main() {
         &env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION"),
         frozen_sources::frozen_sources(),
     );
+    // The frozen-module name index: every name, sorted, in one contiguous
+    // string. Each name literal in the table is laid out beside its
+    // module's embedded source, so hashing the whole table at start-up
+    // touched a page of source text per module; a lookup through the
+    // index reads a few kilobytes. A repeated name resolves to its last
+    // table row, as the registration map it replaces did.
+    let mut names: Vec<(&str, usize)> = frozen_sources::frozen_sources()
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name, i))
+        .collect();
+    names.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1)));
+    names.dedup_by(|later, earlier| {
+        let same = later.0 == earlier.0;
+        if same {
+            earlier.1 = later.1;
+        }
+        same
+    });
+    let mut blob = String::new();
+    let mut index = String::new();
+    for (name, row) in &names {
+        writeln!(index, "    ({}, {}, {row}),", blob.len(), name.len()).unwrap();
+        blob.push_str(name);
+    }
+    std::fs::write(
+        out_dir.join("frozen_index.rs"),
+        format!(
+            "/// Every frozen-module name, sorted, concatenated (see build.rs).\n\
+             pub(crate) static FROZEN_NAMES: &str = {blob:?};\n\
+             /// `(offset, length)` of each name in [`FROZEN_NAMES`], in order,\n\
+             /// with its row in `frozen_sources()`.\n\
+             pub(crate) static FROZEN_INDEX: [(u32, u16, u16); {}] = [\n{index}];\n",
+            names.len()
+        ),
+    )
+    .expect("write frozen_index.rs");
     std::fs::write(
         out_dir.join("stdlib_build_id.rs"),
         format!(

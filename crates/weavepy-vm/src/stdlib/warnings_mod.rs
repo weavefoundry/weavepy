@@ -171,12 +171,11 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             ),
         );
         // The ContextVar is created once per process (like the rest of
-        // the state) and re-exposed by every (re-)import.
-        if with_state(|st| matches!(st.context, Object::None)) {
-            if let Some(var) = new_context_var() {
-                with_state(|st| st.context = var);
-            }
-        }
+        // the state), on first access (see the `__getattr__` below: the
+        // pure-Python `_contextvars` it is built from imports
+        // `_collections_abc`, which interpreter start-up — the first
+        // import of `_warnings` — has no other use for), and re-exposed by
+        // every later (re-)import.
         let (filters, onceregistry, defaultaction, context) = with_state(|st| {
             (
                 st.filters.clone(),
@@ -194,13 +193,12 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         if !matches!(context, Object::None) {
             d.insert(DictKey(Object::from_static("_warnings_context")), context);
         } else {
-            // Built before the first frame existed (interpreter start-up
-            // imports `_warnings` eagerly), so the pure-Python
-            // `ContextVar` could not be constructed yet. PEP 562 module
-            // `__getattr__` materialises it on first access — from a
-            // running frame — so `from _warnings import _warnings_context`
-            // in `warnings.py` never falls back to the Python
-            // implementation half-way through its import list.
+            // Not built yet: PEP 562 module `__getattr__` materialises it
+            // on first access — from a running frame — so `from _warnings
+            // import _warnings_context` in `warnings.py` never falls back
+            // to the Python implementation half-way through its import
+            // list. Until then no context can carry filters (setting one
+            // needs the variable), so the filter search skips it.
             d.insert(
                 DictKey(Object::from_static("__getattr__")),
                 builtin_kw("__getattr__", |args, _| {

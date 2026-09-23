@@ -11,6 +11,14 @@ def count_parts():
 
 
 def generated(n):
+    # The leading loop does not yield. A generator whose every loop
+    # yields is handed to the interpreted resume on purpose (the native
+    # resume protocol costs more than the one iteration it would run), so
+    # a yield-dense body would never reach the parking path this fixture
+    # probes. What it yields is unchanged.
+    j = 0
+    while j < 1:
+        j = j + 1
     for i in range(n):
         parts = 'parked-pin-probe alpha'.split()
         yield len(parts) + i

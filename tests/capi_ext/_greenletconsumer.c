@@ -264,7 +264,50 @@ static PyObject *gc_type_check(PyObject *self, PyObject *o) {
     return PyLong_FromLong(PyGreenlet_Check(o) ? 1 : 0);
 }
 
+/* gevent's `_extract_stack` (compiled on every `Greenlet.__init__`):
+ * walk `f_back` from `sys._getframe()`, reading each frame's code and
+ * line, and drop every frame with the inlined `Py_DECREF`, whose zero
+ * path calls `_Py_Dealloc` and so the frame type's `tp_dealloc`. */
+static PyObject *gc_extract_stack(PyObject *self, PyObject *arg) {
+    (void)self;
+    long limit = PyLong_AsLong(arg);
+    if (limit == -1 && PyErr_Occurred()) {
+        return NULL;
+    }
+    PyObject *getframe = PySys_GetObject("_getframe");
+    if (getframe == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "sys._getframe is missing");
+        return NULL;
+    }
+    PyObject *frame = PyObject_CallNoArgs(getframe);
+    if (frame == NULL) {
+        return NULL;
+    }
+    long walked = 0;
+    while (limit-- > 0 && frame != NULL) {
+        if (!PyFrame_Check(frame)) {
+            Py_DECREF(frame);
+            PyErr_SetString(PyExc_TypeError, "sys._getframe() is not a frame");
+            return NULL;
+        }
+        PyCodeObject *code = PyFrame_GetCode((PyFrameObject *)frame);
+        if (code == NULL) {
+            Py_DECREF(frame);
+            return NULL;
+        }
+        Py_DECREF(code);
+        (void)PyFrame_GetLineNumber((PyFrameObject *)frame);
+        PyFrameObject *back = PyFrame_GetBack((PyFrameObject *)frame);
+        Py_DECREF(frame);
+        frame = (PyObject *)back;
+        walked++;
+    }
+    Py_XDECREF(frame);
+    return PyLong_FromLong(walked);
+}
+
 static PyMethodDef gc_methods[] = {
+    {"extract_stack", gc_extract_stack, METH_O, "gevent's _extract_stack frame walk"},
     {"get_current", gc_get_current, METH_NOARGS, "PyGreenlet_GetCurrent()"},
     {"current_is_main", gc_current_is_main, METH_NOARGS, "PyGreenlet_MAIN(getcurrent())"},
     {"new_greenlet", gc_new_greenlet, METH_O, "PyGreenlet_New(run, NULL)"},

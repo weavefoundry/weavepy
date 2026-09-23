@@ -1494,7 +1494,7 @@ fn exc_slot_readonly(name: &str, class_name: &str, default: Object) -> Object {
 /// `__init__` that ran before the class descriptor was reachable).
 pub(crate) fn exc_attr(inst: &crate::types::PyInstance, name: &str) -> Option<Object> {
     inst.slot_get(name).or_else(|| {
-        inst.dict
+        inst.dict_cell()
             .borrow()
             .get(&crate::object::StrKey(name))
             .cloned()
@@ -1786,7 +1786,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
             return Ok(interp.build_exception_instance(cls, new_args));
         }
         let inst = Rc::new(PyInstance::new(cls));
-        inst.dict.borrow_mut().insert(
+        inst.dict_cell().borrow_mut().insert(
             DictKey(Object::from_static("args")),
             Object::new_tuple(new_args.to_vec()),
         );
@@ -1934,8 +1934,13 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // allocations join the cycle collector exactly like instances born
     // through the default `instantiate` path — otherwise they're
     // invisible to `gc.collect()` and their weakrefs never clear.
+    let native = cls.native_kind.get() != 0;
     let inst = Object::Instance(Rc::new(PyInstance::new(cls)));
-    crate::gc_trace::track(inst.clone());
+    // A natively served class's instances are never tracked (see
+    // `stdlib::datetime_native`).
+    if !native {
+        crate::gc_trace::track(inst.clone());
+    }
     Ok(inst)
 }
 
@@ -2424,7 +2429,7 @@ fn install_super_methods(super_: &Rc<TypeObject>) {
         let Some(Object::Instance(i)) = args.first() else {
             return Err(crate::error::type_error("super.__repr__ requires a super"));
         };
-        let d = i.dict.borrow();
+        let d = i.dict_cell().borrow();
         let this = match d.get(&DictKey(Object::from_static("__thisclass__"))) {
             Some(Object::Type(t)) => t.name.clone(),
             _ => "?".to_owned(),
@@ -2497,7 +2502,7 @@ fn install_module_init(module_: &Rc<TypeObject>) {
             }
         };
         let doc = args.get(2).cloned().unwrap_or(Object::None);
-        let mut dict = inst.dict.borrow_mut();
+        let mut dict = inst.dict_cell().borrow_mut();
         dict.insert(DictKey(Object::from_static("__name__")), name);
         dict.insert(DictKey(Object::from_static("__doc__")), doc);
         dict.insert(DictKey(Object::from_static("__package__")), Object::None);
@@ -2529,7 +2534,7 @@ fn install_module_methods(module_: &Rc<TypeObject>) {
     /// The namespace dict of either module representation.
     fn dict_of(o: &Object) -> Result<Rc<RefCell<DictData>>, RuntimeError> {
         match o {
-            Object::Instance(i) => Ok(i.dict.share()),
+            Object::Instance(i) => Ok(i.dict_shared()),
             Object::Module(m) => Ok(m.dict.clone()),
             _ => Err(crate::error::type_error(
                 "descriptor requires a 'module' object".to_owned(),
@@ -2799,7 +2804,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
                     // where the slot descriptor would not find it.
                     inst.slot_set(&name, args[2].clone());
                 } else {
-                    inst.dict
+                    inst.dict_cell()
                         .borrow_mut()
                         .insert(DictKey(Object::from_str(name)), args[2].clone());
                 }
@@ -2857,7 +2862,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
                 // slot-aware `object.__setattr__` fallback above).
                 let removed = inst.slot_del(&name)
                     || inst
-                        .dict
+                        .dict_cell()
                         .borrow_mut()
                         .shift_remove(&DictKey(Object::from_str(&name)))
                         .is_some();
@@ -4549,7 +4554,7 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         }
         if let Object::Instance(inst_rc) = inst {
             let key = DictKey(Object::from_static("__notes__"));
-            let mut dict = inst_rc.dict.borrow_mut();
+            let mut dict = inst_rc.dict_cell().borrow_mut();
             match dict.get(&key) {
                 // Append in place so `e.__notes__` keeps its identity.
                 Some(Object::List(l)) => l.borrow_mut().push(note.clone()),
@@ -4636,7 +4641,7 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
                 if matches!(cls.lookup(&name), Some(Object::SlotDescriptor(_))) {
                     inst_rc.slot_set(&name, v);
                 } else {
-                    inst_rc.dict.borrow_mut().insert(DictKey(key), v);
+                    inst_rc.dict_cell().borrow_mut().insert(DictKey(key), v);
                 }
             }
         }
@@ -4688,7 +4693,7 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         // diverges it (configparser's `ParsingError.append` does
         // `self.message += …` — test_configparser's pickling cases), it
         // must round-trip like any other instance attribute.
-        let dict = inst.dict.borrow();
+        let dict = inst.dict_cell().borrow();
         let message_is_derived = match (get("message"), ctor_args.first()) {
             (Some(m), Some(a)) => {
                 m.is_same(a) || matches!((&m, a), (Object::Str(x), Object::Str(y)) if x == y)
@@ -5397,7 +5402,7 @@ fn eg_subset(
         // lists; a non-sequence is silently skipped (split is not the
         // place to report that user error — CPython does the same).
         let notes = orig_inst
-            .dict
+            .dict_cell()
             .borrow()
             .get(&crate::object::StrKey("__notes__"))
             .cloned();
@@ -5408,7 +5413,7 @@ fn eg_subset(
                 _ => None,
             };
             if let Some(c) = copied {
-                dst.dict
+                dst.dict_cell()
                     .borrow_mut()
                     .insert(DictKey(Object::from_static("__notes__")), c);
             }

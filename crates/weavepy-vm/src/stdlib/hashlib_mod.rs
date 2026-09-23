@@ -243,7 +243,7 @@ fn instance_handle(args: &[Object]) -> Result<i64, RuntimeError> {
         _ => return Err(type_error("expected hasher instance")),
     };
     let handle_obj = inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static("_handle")))
         .cloned()
@@ -267,7 +267,7 @@ fn fill_hasher_instance(inst: &Rc<PyInstance>, state: AnyHasher) {
     let sha3 = state.sha3_params();
     let id = register_hasher(state);
     {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(DictKey(Object::from_static("_handle")), Object::Int(id));
         d.insert(
             DictKey(Object::from_static("name")),

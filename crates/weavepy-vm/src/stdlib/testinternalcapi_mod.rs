@@ -488,7 +488,7 @@ fn replace_sys_flags_native(args: &[Object]) -> Result<Object, RuntimeError> {
             return value.clone();
         }
         old_inst
-            .dict
+            .dict_cell()
             .borrow()
             .get(&crate::object::StrKey(field))
             .cloned()
@@ -508,7 +508,7 @@ fn replace_sys_flags_native(args: &[Object]) -> Result<Object, RuntimeError> {
         values,
     );
     if let Object::Instance(inst) = &fresh {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         for (k, v) in hidden {
             d.insert(DictKey(Object::from_static(k)), v);
         }
@@ -1288,7 +1288,7 @@ fn run_in_subinterp_with_config(args: &[Object]) -> Result<Object, RuntimeError>
         .ok_or_else(|| crate::error::type_error("run_in_subinterp_with_config: missing config"))?;
     let cfg_dict = match &config {
         Object::SimpleNamespace(d) => d.clone(),
-        Object::Instance(inst) => inst.dict.share(),
+        Object::Instance(inst) => inst.dict_shared(),
         other => {
             return Err(crate::error::type_error(format!(
                 "run_in_subinterp_with_config: config must be a namespace, not '{}'",
@@ -1572,7 +1572,7 @@ fn create_interpreter_fixture(
         Some(cfg_obj) => {
             let cfg_dict = match cfg_obj {
                 Object::SimpleNamespace(d) => d.clone(),
-                Object::Instance(inst) => inst.dict.share(),
+                Object::Instance(inst) => inst.dict_shared(),
                 other => {
                     return Err(crate::error::type_error(format!(
                         "create_interpreter: config must be a namespace, not '{}'",
@@ -1684,7 +1684,7 @@ fn exc_attr(err: &RuntimeError, name: &'static str) -> Option<Object> {
     match err {
         RuntimeError::PyException(pyexc) => match &pyexc.instance {
             Object::Instance(inst) => inst
-                .dict
+                .dict_cell()
                 .borrow()
                 .get(&DictKey(Object::from_static(name)))
                 .cloned(),

@@ -173,7 +173,7 @@ impl WeakRefSlot {
             return None;
         }
         let inst = self.py_ref.borrow().as_ref().and_then(Weak::upgrade)?;
-        let mut d = inst.dict.try_borrow_mut().ok()?;
+        let mut d = inst.dict_cell().try_borrow_mut().ok()?;
         match d.get(&StrKey("__callback__")).cloned() {
             None | Some(Object::None) => None,
             Some(cb) => {
@@ -190,7 +190,11 @@ impl WeakRefSlot {
             return None;
         }
         let inst = self.py_ref.borrow().as_ref().and_then(Weak::upgrade)?;
-        let v = inst.dict.borrow().get(&StrKey("__callback__")).cloned();
+        let v = inst
+            .dict_cell()
+            .borrow()
+            .get(&StrKey("__callback__"))
+            .cloned();
         match v {
             None | Some(Object::None) => None,
             v => v,
@@ -301,6 +305,13 @@ impl WeakRefRegistry {
     pub fn notify_clear(&self, id: ObjectId) -> Vec<(Arc<WeakRefSlot>, Option<Object>)> {
         let entries = {
             let mut g = self.inner.borrow_mut();
+            // Hot path: this runs for every object the prompt reaper
+            // frees, and almost none of them was ever weakly referenced.
+            // Skip the tree removal on the miss-filter's say-so, exactly
+            // as `count` does.
+            if g.slots.is_empty() || !g.filter.may_contain(id) {
+                return Vec::new();
+            }
             g.slots.remove(&id).unwrap_or_default()
         };
         let mut out = Vec::with_capacity(entries.len());

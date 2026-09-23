@@ -341,6 +341,17 @@ pub struct GcStats {
 #[allow(missing_debug_implementations)]
 pub struct GcState {
     generations: RefCell<[Generation; N_GENERATIONS]>,
+    /// RFC 0065 (WS4): insert-only miss-filter over `index`, maintained
+    /// at [`Self::track_now`] and consulted by the usually-miss
+    /// `is_tracked`/`handle_for` probes on the drop paths. Rebuilt from
+    /// `index` once most of its bits name objects long gone.
+    ///
+    /// One per state, not one per process: a rebuild takes *this*
+    /// state's index as the truth, so a shared filter let any state's
+    /// full collection erase every other state's bits, and their
+    /// `handle_for` then answered `None` for live objects. Production
+    /// runs one state, which hid it; the test binary runs many.
+    tracked_filter: crate::hot_filter::RebuildableBloom,
     /// Id → handle index over every tracked object (all generations
     /// plus the frozen set). Keeps `track` dedupe, `find_handle`, and
     /// `is_tracked` O(1) — the linear scans they replace made
@@ -367,6 +378,26 @@ pub struct GcState {
     /// have happened since the last collection of each
     /// generation.
     counts: RefCell<[usize; N_GENERATIONS]>,
+    /// Lock-free mirror of `counts[0]` and `thresholds[0]`, packed as
+    /// `count << 32 | threshold`. `auto_collect_due` is polled by the
+    /// burst loop's allocation opcodes, where two `RefCell` borrows and
+    /// their guards cost more than the test they guard; both halves are
+    /// small enough that a `u64` holds them without loss on the
+    /// allocation counts any real program reaches.
+    gen0_gauge: AtomicU64,
+    /// Containers born holding only atomic values (see
+    /// [`container_can_cycle`]). They cannot take part in a cycle while
+    /// that holds, so they are not registered with the collector — only
+    /// weakly remembered here, so that a collection can re-examine them
+    /// and promote any that has since acquired a non-atomic element.
+    /// A weak reference never keeps its container alive, so a deferred
+    /// container still dies by refcount exactly when CPython's would.
+    deferred: RefCell<Vec<DeferredContainer>>,
+    /// Length at which [`GcState::sweep_deferred`] compacts `deferred`.
+    /// Re-armed to twice the surviving population after each sweep, so
+    /// the O(live) scan stays amortized O(1) per deferred birth even for
+    /// a program holding millions of scalar lists.
+    deferred_limit: AtomicUsize,
     /// Frozen handles. `gc.freeze()` moves all tracked objects
     /// here; they are skipped by future collections until
     /// `gc.unfreeze()` runs.
@@ -392,7 +423,7 @@ pub struct GcState {
     /// collection or teardown. Persists past the point where the handle
     /// leaves the tracked set so `gc.is_finalized()` still answers `True`
     /// for an object its finalizer resurrected (PEP 442 / `test_is_finalized`).
-    finalized_ids: RefCell<std::collections::HashSet<ObjectId>>,
+    finalized_ids: RefCell<crate::fasthash::FxHashSet<ObjectId>>,
     /// Dedicated index over just the *finalizable* tracked objects —
     /// instances whose class defines `__del__` and unfinished
     /// generator-family objects. CPython runs `__del__` the instant an
@@ -491,10 +522,14 @@ impl GcState {
     pub fn new() -> Self {
         Self {
             generations: RefCell::new(Default::default()),
+            tracked_filter: crate::hot_filter::RebuildableBloom::new(),
             index: RefCell::new(GcIndex::default()),
             collecting: AtomicBool::new(false),
             thresholds: RefCell::new(DEFAULT_THRESHOLDS),
             counts: RefCell::new([0; N_GENERATIONS]),
+            gen0_gauge: AtomicU64::new(DEFAULT_THRESHOLDS[0] as u64),
+            deferred: RefCell::new(Vec::new()),
+            deferred_limit: AtomicUsize::new(DEFERRED_FLOOR),
             frozen: RefCell::new(Vec::new()),
             garbage: RefCell::new(Vec::new()),
             callbacks: RefCell::new(Vec::new()),
@@ -503,7 +538,7 @@ impl GcState {
             enabled: AtomicBool::new(true),
             tracked_version: AtomicUsize::new(0),
             tracked_count: AtomicUsize::new(0),
-            finalized_ids: RefCell::new(std::collections::HashSet::new()),
+            finalized_ids: RefCell::new(crate::fasthash::FxHashSet::default()),
             finalizable: RefCell::new(std::collections::BTreeMap::new()),
             finalizable_count: AtomicUsize::new(0),
             fin_scan_cursor: std::sync::atomic::AtomicU64::new(0),
@@ -663,18 +698,116 @@ impl GcState {
     /// Track `obj` for cycle detection. Idempotent — if `obj`
     /// is already tracked, this is a no-op.
     pub fn track(&self, obj: Object) {
+        // A container holding only atomic values cannot anchor a cycle
+        // yet, so it stays off the GC's books (and out of the prompt-reap
+        // cascade that every tracked death pays) until it holds something
+        // that could close one. `defer_container` keeps a weak reference
+        // so the next collection can promote it first.
+        if !container_can_cycle(&obj) && self.defer_container(&obj) {
+            return;
+        }
+        self.track_now(obj);
+    }
+
+    /// Remember `obj` weakly instead of tracking it. Returns `false` when
+    /// the kind has no weak form (the caller tracks it as before).
+    ///
+    /// A deferred birth does not advance the gen-0 allocation counter.
+    /// That counter paces automatic collections against the rate cyclic
+    /// garbage can appear, and nothing deferred here can be part of a
+    /// cycle. Counting the births and repaying them at the next sweep
+    /// instead made the counter sawtooth: a `[i, i]` loop under the JIT,
+    /// whose drops the native driver releases in batches, went from 1
+    /// automatic collection to 59. A population that genuinely
+    /// accumulates is paced by `DEFERRED_CAP` instead.
+    fn defer_container(&self, obj: &Object) -> bool {
+        let Some(weak) = DeferredContainer::new(obj) else {
+            return false;
+        };
+        let over = {
+            let Ok(mut deferred) = self.deferred.try_borrow_mut() else {
+                // A sweep is already walking the list (it upgrades and can
+                // re-enter through a promotion). Track eagerly rather than
+                // queue onto a list we cannot touch.
+                return false;
+            };
+            deferred.push(weak);
+            deferred.len() >= self.deferred_limit.load(Ordering::Relaxed)
+        };
+        if over {
+            self.sweep_deferred(false);
+        }
+        true
+    }
+
+    /// Re-examine the deferred containers: drop the ones that have died,
+    /// and hand the collector every one that has since acquired a
+    /// non-atomic element — `promote_all` forces the handover even for
+    /// those still holding only scalars (`gc.get_objects`, which must
+    /// enumerate them the way CPython does).
+    ///
+    /// Every edge of a reference cycle points at a container, so a cycle
+    /// member always holds a non-atomic value and is always promoted
+    /// here. Running this before a collection's mark phase is therefore
+    /// enough for the collector to see every cycle it would have seen
+    /// with eager tracking.
+    fn sweep_deferred(&self, promote_all: bool) {
+        let mut promote: Vec<Object> = Vec::new();
+        {
+            let Ok(mut deferred) = self.deferred.try_borrow_mut() else {
+                return;
+            };
+            deferred.retain(|entry| {
+                let Some(obj) = entry.upgrade() else {
+                    return false;
+                };
+                if promote_all || container_can_cycle(&obj) {
+                    promote.push(obj);
+                    return false;
+                }
+                true
+            });
+            let live = deferred.len();
+            if live >= DEFERRED_CAP {
+                // The set has stopped being a churn buffer: hand it all
+                // over, so these allocations resume pacing collections.
+                promote.extend(deferred.drain(..).filter_map(|e| e.upgrade()));
+            }
+            self.deferred_limit.store(
+                DEFERRED_FLOOR.max(deferred.len().saturating_mul(2)),
+                Ordering::Relaxed,
+            );
+        }
+        for obj in promote {
+            self.track_now(obj);
+        }
+    }
+
+    /// Hand every deferred container to the collector. For the reflective
+    /// APIs, which must enumerate the same population CPython does.
+    pub fn promote_all_deferred(&self) {
+        self.sweep_deferred(true);
+    }
+
+    /// [`Self::track`] without the deferral filter: register `obj` with the
+    /// collector unconditionally. For objects the caller has already decided
+    /// must be tracked (a promoted deferral, `gc.is_tracked`, `gc.get_objects`).
+    pub fn track_now(&self, obj: Object) {
         let new_id = id_of(&obj);
         {
             let mut index = self.index.borrow_mut();
-            if index.contains_key(&new_id) {
-                return;
-            }
+            // One probe decides the dedupe and the insert (this runs for
+            // every function, list and dict born).
+            let entry = match index.entry(new_id) {
+                std::collections::hash_map::Entry::Occupied(_) => return,
+                std::collections::hash_map::Entry::Vacant(e) => e,
+            };
             // RFC 0065 (WS4): publish to the miss-filter *before* the
             // insert becomes observable (we hold the index borrow, so
             // no prober can race past a fresh registration).
-            TRACKED_FILTER.insert(new_id);
+            self.tracked_filter.insert(new_id);
             let handle = Arc::new(TrackedHandle::new(obj, 0));
-            index.insert(new_id, handle.clone());
+            entry.insert(handle.clone());
             // Enroll finalizable objects in the dedicated prompt-finalization
             // index so the per-safe-point sweep scans only them, not the whole
             // tracked population.
@@ -699,10 +832,15 @@ impl GcState {
         // must start *un*-finalized, so drop any stale entry — otherwise
         // `gc.is_finalized(new_obj)` would inherit the previous tenant's
         // finalized flag (`test_is_finalized`).
-        self.finalized_ids.borrow_mut().remove(&new_id);
+        // Almost always empty (only `__del__`-bearing objects ever land
+        // there), and the borrow plus hash would otherwise be paid by
+        // every tracked birth.
+        if !self.finalized_ids.borrow().is_empty() {
+            self.finalized_ids.borrow_mut().remove(&new_id);
+        }
         self.tracked_count.fetch_add(1, Ordering::AcqRel);
         self.tracked_version.fetch_add(1, Ordering::AcqRel);
-        self.bump_count(0);
+        self.note_gen0_alloc();
     }
 
     /// Stop tracking `obj`. Used by the cycle-clearing path
@@ -738,6 +876,7 @@ impl GcState {
         {
             let mut counts = self.counts.borrow_mut();
             counts[0] = counts[0].saturating_sub(1);
+            self.sync_gen0_gauge(counts[0], None);
         }
         // Drop the finalizable-index entry in lock-step with the main index so
         // the cheap prompt-finalization scan never sees a reclaimed object.
@@ -1242,7 +1381,7 @@ impl GcState {
         // RFC 0065 (WS4): usually-miss probe — two relaxed loads
         // instead of the index borrow. A stale filter bit (untracked
         // id) just takes the precise path.
-        if !TRACKED_FILTER.may_contain(id) {
+        if !self.tracked_filter.may_contain(id) {
             return false;
         }
         self.index.borrow().contains_key(&id)
@@ -1251,7 +1390,7 @@ impl GcState {
     /// O(1) handle lookup by object id (any generation or frozen).
     pub fn handle_for(&self, id: ObjectId) -> Option<Arc<TrackedHandle>> {
         // RFC 0065 (WS4): see `is_tracked`.
-        if !TRACKED_FILTER.may_contain(id) {
+        if !self.tracked_filter.may_contain(id) {
             return None;
         }
         self.index.borrow().get(&id).cloned()
@@ -1291,7 +1430,15 @@ impl GcState {
 
     /// Number of tracked objects in each generation.
     pub fn counts(&self) -> [usize; N_GENERATIONS] {
-        *self.counts.borrow()
+        // A deferred container is an allocation an eagerly-tracking build
+        // would have counted, so report it as one: drop the ones that have
+        // died, then add those still live. `gc.get_count()` and
+        // `_testinternalcapi.get_tracked_heap_size()` then read exactly as
+        // they would have (`test_gc.test_heap_size`).
+        self.sweep_deferred(false);
+        let mut counts = *self.counts.borrow();
+        counts[0] = counts[0].saturating_add(self.deferred.borrow().len());
+        counts
     }
 
     pub fn thresholds(&self) -> [usize; N_GENERATIONS] {
@@ -1300,6 +1447,7 @@ impl GcState {
 
     pub fn set_thresholds(&self, t: [usize; N_GENERATIONS]) {
         *self.thresholds.borrow_mut() = t;
+        self.sync_gen0_gauge(self.counts.borrow()[0], Some(t[0]));
     }
 
     pub fn enable(&self) {
@@ -1317,6 +1465,34 @@ impl GcState {
     pub fn bump_count(&self, gen: usize) {
         let mut counts = self.counts.borrow_mut();
         counts[gen] = counts[gen].saturating_add(1);
+        if gen == 0 {
+            self.sync_gen0_gauge(counts[0], None);
+        }
+    }
+
+    /// Account one gen-0 allocation and, on crossing `threshold0`,
+    /// schedule the automatic collection for the next safe point — not
+    /// every allocation site polls `maybe_auto_collect` itself
+    /// (`MAKE_FUNCTION`, `list(it)`, …).
+    fn note_gen0_alloc(&self) {
+        self.bump_count(0);
+        let gauge = self.gen0_gauge.load(Ordering::Relaxed);
+        let threshold = gauge & 0xffff_ffff;
+        if threshold != 0 && (gauge >> 32) == threshold && self.is_enabled() {
+            crate::hot_gates::set(crate::hot_gates::GC_DUE);
+        }
+    }
+
+    /// Republish the gen-0 gauge after a write to `counts[0]` or
+    /// `thresholds[0]` (see the field docs).
+    #[inline]
+    fn sync_gen0_gauge(&self, count: usize, threshold: Option<usize>) {
+        let th = match threshold {
+            Some(t) => t as u64,
+            None => self.gen0_gauge.load(Ordering::Relaxed) & 0xffff_ffff,
+        };
+        self.gen0_gauge
+            .store(((count as u64) << 32) | th, Ordering::Relaxed);
     }
 
     /// Threshold-driven automatic collection (CPython's `gc_alloc`
@@ -1326,6 +1502,19 @@ impl GcState {
     /// Callers must be at a safe point (no outstanding container
     /// borrows); the interpreter invokes this from its allocation
     /// sites.
+    /// Whether the next [`Self::maybe_auto_collect`] would run a
+    /// collection (the young-generation counter has reached its
+    /// threshold). Lets an allocation site that cannot run finalizers
+    /// hand the allocation to one that can.
+    pub fn auto_collect_due(&self) -> bool {
+        if !self.is_enabled() || self.collecting.load(Ordering::Acquire) {
+            return false;
+        }
+        let gauge = self.gen0_gauge.load(Ordering::Relaxed);
+        let threshold = gauge & 0xffff_ffff;
+        threshold != 0 && (gauge >> 32) >= threshold
+    }
+
     pub fn maybe_auto_collect(&self) -> bool {
         if !self.is_enabled() || self.collecting.load(Ordering::Acquire) {
             return false;
@@ -1370,6 +1559,9 @@ impl GcState {
     /// Snapshot all tracked objects. Used by
     /// `gc.get_objects(generation=...)`.
     pub fn snapshot(&self, generation: Option<usize>) -> Vec<Object> {
+        // `gc.get_objects()` enumerates every container CPython tracks,
+        // including the all-scalar ones whose tracking we defer.
+        self.promote_all_deferred();
         let gens = self.generations.borrow();
         let mut out = Vec::new();
         match generation {
@@ -1452,6 +1644,11 @@ impl GcState {
     /// [`Self::collect_generation`]'s `weakref_only` discussion. The
     /// re-entrancy guard applies, so this is a no-op inside a collection.
     pub fn fire_dead_weakrefs(&self) {
+        // Promote any deferred container that can now anchor a cycle, so
+        // the mark phase below sees the whole candidate population
+        // (see `sweep_deferred`). Before the re-entrancy claim: promotion
+        // calls `track_now`, which a collection in progress must not see.
+        self.sweep_deferred(false);
         // Atomic claim (see `collect_impl`): even a mark-only pass mutates
         // the shared `gc_refs` counters, so it must not overlap a real
         // collection on another thread.
@@ -1482,6 +1679,11 @@ impl GcState {
     ///   suite (`test_set`'s mutation stress) re-scanned the entire accumulated
     ///   tracked set several times per trigger and blew the time budget.
     fn collect_impl(&self, upto: usize, exact: bool) -> usize {
+        // Promote any deferred container that can now anchor a cycle, so
+        // the mark phase below sees the whole candidate population
+        // (see `sweep_deferred`). Before the re-entrancy claim: promotion
+        // calls `track_now`, which a collection in progress must not see.
+        self.sweep_deferred(false);
         // Atomic claim — a plain load-then-store gate let two threads both
         // observe `false` and run *overlapping* collections over the shared
         // heap. Each phase-3 walk then subtracted the same internal edges
@@ -1569,9 +1771,26 @@ impl GcState {
             if gen + 1 < N_GENERATIONS {
                 counts[gen + 1] = counts[gen + 1].saturating_add(1);
             }
+            self.sync_gen0_gauge(counts[0], None);
+        }
+        // The tracked-id filter only ever gains bits; once most of them
+        // name objects long gone, rebuild it from the live index (a full
+        // collection has just walked everything anyway).
+        let live = self.index.borrow().len();
+        let stale = self.tracked_filter.inserts_since_rebuild();
+        if gen == N_GENERATIONS - 1 || stale > 4096.max(live.saturating_mul(4)) {
+            self.rebuild_tracked_filter();
         }
         self.collecting.store(false, Ordering::Release);
         collected
+    }
+
+    /// Rebuild the tracked-id miss filter from the live index (see
+    /// [`crate::hot_filter::RebuildableBloom`]). Holding the index borrow
+    /// serializes it against every `track`.
+    pub fn rebuild_tracked_filter(&self) {
+        let index = self.index.borrow();
+        self.tracked_filter.rebuild(index.keys().copied());
     }
 
     /// Collect a specific generation. Used by [`Self::collect`].
@@ -1749,7 +1968,12 @@ impl GcState {
                         // exceptions so their `__context__`/`__cause__`/
                         // traceback edges are subtracted (RFC 0054,
                         // test_taskgroups.test_exception_refcycles_*).
-                        Object::Instance(i) => i.cls().flags.is_exception,
+                        // An instance whose tracking is still deferred
+                        // (`track_deferred_owner`) holds only atomic values,
+                        // but its edge to its class can still close a cycle
+                        // (`A.a = A(); del A`): promote it so that edge is
+                        // subtracted, like CPython's always-tracked instance.
+                        Object::Instance(i) => i.cls().flags.is_exception || i.is_gc_deferred(),
                         // A frame's `f_locals` cache is an internal,
                         // untracked dict; it carries the frame's only
                         // object-graph edges to the locals (the `eg` in the
@@ -2639,6 +2863,11 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
                             visit(&bm.receiver);
                         }
                     }
+                    // The plain-construction fast path's own handle on the
+                    // same `__init__` is one more such edge.
+                    if let Some((init, _)) = &plan.lean_init {
+                        visit(&Object::Function(init.clone()));
+                    }
                 }
             }
         }
@@ -2669,6 +2898,21 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             }
             for cell in &f.closure {
                 visit(cell);
+            }
+            // The lean call paths cache the closure's cells as a frame
+            // `cells` vector (`PyFunction::closure_cells`): a second strong
+            // handle on every cell, owned by this function. Unvisited, it
+            // made each cell of a called closure look externally held, so
+            // no cycle through one was ever collected (attrs' slotted
+            // `_ClassBuilder` pinned the class it replaced). While a live
+            // activation shares the vector, its handles are that frame's,
+            // not this function's: leave them counted as external.
+            if let Some(cells) = f.closure_cells.get() {
+                if crate::sync::Rc::strong_count(cells) == 1 {
+                    for cell in cells.iter() {
+                        visit(&Object::Cell(cell.clone()));
+                    }
+                }
             }
             if let Ok(attrs_rc) = f.attrs.try_borrow() {
                 if let Ok(attrs) = attrs_rc.try_borrow() {
@@ -2712,39 +2956,52 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
 /// Sync` and lives in a `OnceLock`. Each thread sees the same
 /// table — registrations are a global, additive operation.
 fn run_external_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
-    let Some(table) = TRAVERSE_TABLE.get() else {
-        return;
-    };
-    // Snapshot the matching traverse fns, then *release* the table lock
-    // before invoking them. A C extension's `tp_traverse` calls our
-    // visitproc, which recurses back through the collector
-    // (`exc_has_finalizable` → `traverse_object`) and can re-enter
-    // `run_external_traverse` for a *nested* foreign object on the same
-    // thread — e.g. collecting a cycle through pandas' `BaseOffset`.
-    // `parking_lot::Mutex` is not reentrant, so holding the lock across the
-    // callback self-deadlocks. The table is registration-only and its
-    // entries are plain `fn` pointers, so a cheap snapshot is sound.
-    let matched: Vec<fn(&Object, &mut dyn FnMut(&Object))> = {
-        let entries = table.lock();
-        entries
-            .iter()
-            .filter(|e| (e.matches)(obj))
-            .map(|e| e.traverse)
-            .collect()
-    };
-    for traverse in matched {
-        traverse(obj, visit);
+    // The table is append-only and read lock-free (see `HookTable`); a
+    // hook may re-enter the collector, and this function, on the same
+    // thread.
+    for (matches, traverse) in TRAVERSE_TABLE.iter() {
+        if matches(obj) {
+            traverse(obj, visit);
+        }
     }
 }
 
-#[allow(missing_debug_implementations)]
-struct TraverseEntry {
-    matches: fn(&Object) -> bool,
-    traverse: fn(&Object, &mut dyn FnMut(&Object)),
+/// A small append-only registry of `(matches, hook)` function-pointer
+/// pairs with lock-free reads: hooks are registered at interpreter
+/// init and polled on every prompt-reap cascade and collection walk,
+/// so readers must not take a lock (nor allocate) per object.
+const HOOK_TABLE_CAP: usize = 16;
+
+struct HookTable<H: Copy> {
+    len: std::sync::atomic::AtomicUsize,
+    slots: [std::sync::OnceLock<(fn(&Object) -> bool, H)>; HOOK_TABLE_CAP],
 }
 
-static TRAVERSE_TABLE: std::sync::OnceLock<parking_lot::Mutex<Vec<TraverseEntry>>> =
-    std::sync::OnceLock::new();
+impl<H: Copy> HookTable<H> {
+    const CAP: usize = HOOK_TABLE_CAP;
+
+    const fn new() -> Self {
+        Self {
+            len: std::sync::atomic::AtomicUsize::new(0),
+            slots: [const { std::sync::OnceLock::new() }; HOOK_TABLE_CAP],
+        }
+    }
+
+    fn push(&self, matches: fn(&Object) -> bool, hook: H) {
+        let i = self.len.fetch_add(1, Ordering::AcqRel);
+        assert!(i < Self::CAP, "too many GC hook registrations");
+        let _ = self.slots[i].set((matches, hook));
+    }
+
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = (fn(&Object) -> bool, H)> + '_ {
+        let n = self.len.load(Ordering::Acquire).min(Self::CAP);
+        // A slot past a registration in flight is still unset; skip it.
+        self.slots[..n].iter().filter_map(|s| s.get().copied())
+    }
+}
+
+static TRAVERSE_TABLE: HookTable<fn(&Object, &mut dyn FnMut(&Object))> = HookTable::new();
 
 /// Register a traverse callback. Called once per Object variant
 /// whose fields are not directly visible to `traverse_object`.
@@ -2752,41 +3009,20 @@ pub fn register_traverse(
     matches: fn(&Object) -> bool,
     traverse: fn(&Object, &mut dyn FnMut(&Object)),
 ) {
-    let table = TRAVERSE_TABLE.get_or_init(|| parking_lot::Mutex::new(Vec::new()));
-    table.lock().push(TraverseEntry { matches, traverse });
+    TRAVERSE_TABLE.push(matches, traverse);
 }
 
-#[allow(missing_debug_implementations)]
-struct ClearEntry {
-    matches: fn(&Object) -> bool,
-    clear: fn(&Object),
-}
-
-static CLEAR_TABLE: std::sync::OnceLock<parking_lot::Mutex<Vec<ClearEntry>>> =
-    std::sync::OnceLock::new();
+static CLEAR_TABLE: HookTable<fn(&Object)> = HookTable::new();
 
 /// Called from `clear_object_fields` to let a type whose child
 /// references live in module-private (or C-managed) memory break its
 /// cycles during the collector's clear phase. The companion of
 /// [`register_traverse`] (RFC 0044, WS4).
 fn run_external_clear(obj: &Object) {
-    let Some(table) = CLEAR_TABLE.get() else {
-        return;
-    };
-    // Snapshot then release the lock before invoking, mirroring
-    // `run_external_traverse`: a C extension's `tp_clear` can re-enter the
-    // collector and thus this function for a nested foreign object on the
-    // same thread, which would self-deadlock on the non-reentrant mutex.
-    let matched: Vec<fn(&Object)> = {
-        let entries = table.lock();
-        entries
-            .iter()
-            .filter(|e| (e.matches)(obj))
-            .map(|e| e.clear)
-            .collect()
-    };
-    for clear in matched {
-        clear(obj);
+    for (matches, clear) in CLEAR_TABLE.iter() {
+        if matches(obj) {
+            clear(obj);
+        }
     }
 }
 
@@ -2794,8 +3030,7 @@ fn run_external_clear(obj: &Object) {
 /// during the collector's clear phase so a matching object can drop the
 /// child references it holds outside the VM's view.
 pub fn register_clear(matches: fn(&Object) -> bool, clear: fn(&Object)) {
-    let table = CLEAR_TABLE.get_or_init(|| parking_lot::Mutex::new(Vec::new()));
-    table.lock().push(ClearEntry { matches, clear });
+    CLEAR_TABLE.push(matches, clear);
 }
 
 /// Drain a container's child references in place. Used during
@@ -2951,7 +3186,16 @@ fn has_finalizer(obj: &Object) -> bool {
         // path win (236ms → 314ms). Left as-is per the RFC's fallback
         // clause; the split would need an active-suspect exemption
         // co-designed with the suspects machinery first.
-        Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => !g.is_finished(),
+        // A generator that has never been started has nothing to clean
+        // up: `close()` on it runs no Python, and neither does its drop.
+        // Enrolling it cost the prompt-finalization index a pair of
+        // inserts and removals per generator born, which is most of what
+        // a short-lived generator costs. A *coroutine* still enrolls
+        // unstarted — finalizing one that was never awaited emits the
+        // RuntimeWarning, which is exactly the observable cleanup this
+        // index exists to run promptly.
+        Object::Generator(g) => !g.is_finished() && !g.is_unstarted(),
+        Object::Coroutine(g) | Object::AsyncGenerator(g) => !g.is_finished(),
         _ => false,
     }
 }
@@ -2976,12 +3220,12 @@ fn has_finalizer(obj: &Object) -> bool {
 /// finalizes survivors via [`GcState::finalization_candidates`].
 static GC_STATE: std::sync::LazyLock<GcState> = std::sync::LazyLock::new(GcState::new);
 
-/// RFC 0065 (WS4): insert-only miss-filter over the tracked-object
-/// index. Maintained at [`GcState::track`]; consulted by the
-/// usually-miss `is_tracked`/`handle_for` probes on the drop paths.
-/// Process-global like the state it mirrors; survives fork (bits for
-/// vanished objects are harmless false positives).
-static TRACKED_FILTER: crate::hot_filter::AtomicBloom = crate::hot_filter::AtomicBloom::new();
+/// The process-wide state's miss filter (see [`GcState::tracked_filter`]),
+/// for the drop-path probes that must not take the state's borrows.
+#[inline]
+fn process_tracked_filter() -> &'static crate::hot_filter::RebuildableBloom {
+    &GC_STATE.tracked_filter
+}
 
 /// Run a closure with the shared, process-global GC state.
 pub fn with_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
@@ -3074,6 +3318,11 @@ pub fn zombie_memoryview_refs_to(target: ObjectId) -> usize {
 
 /// Convenience: track `obj` in the shared, process-global GC.
 pub fn track(obj: Object) {
+    if let Object::Instance(inst) = &obj {
+        // The instance may have been born with deferred tracking; its
+        // `__dict__` no longer needs to guard it.
+        inst.clear_deferred_tracking();
+    }
     // A module's namespace dict outlives the module object whenever
     // functions defined in it survive (their `__globals__`), so it must
     // be a collection candidate in its own right — a
@@ -3096,6 +3345,46 @@ pub fn track(obj: Object) {
         with_state(|s| s.track(dict));
     }
     with_state(|s| s.track(obj));
+}
+
+/// Deferred instance tracking.
+///
+/// CPython tracks every instance of a Python-defined class at
+/// allocation. A tracked object here costs an index entry, a strong
+/// handle and, on its death, the prompt-reap cascade — several hundred
+/// nanoseconds for a temporary whose dict only ever holds ints. An
+/// instance that holds only atomic values ([`Object::is_gc_atomic`])
+/// cannot take part in a cycle, so a fresh plain instance starts
+/// *untracked* and its `__dict__` records the instance address as its
+/// deferred owner. The first store that could put a non-atomic value
+/// into the instance — any generic dict mutation (`DictData`'s
+/// `DerefMut`), a slot store of a non-atomic value, a `__dict__`
+/// replacement — tracks it through this function; so do `gc.is_tracked`
+/// and weakref creation (the registry's strong clone would otherwise
+/// keep it alive with no collector to reap it). An instance whose owner
+/// record is still set when it dies is freed by its last `Arc` drop.
+///
+/// `owner` is the address recorded by [`crate::object::DictData`]; it is
+/// 0 when the record was already taken. The instance is alive: it clears
+/// the record from its `Drop` before its memory is released.
+pub fn track_deferred_owner(owner: usize) {
+    if owner == 0 {
+        return;
+    }
+    let ptr = owner as *const crate::types::PyInstance;
+    // SAFETY: `owner` was recorded from `Rc::as_ptr` of a live instance
+    // by `PyInstance::new_deferred`, and every path that could release
+    // the instance clears the record first (`PyInstance::drop`), so the
+    // allocation is live and the strong count can be bumped.
+    let inst = unsafe {
+        crate::Rc::increment_strong_count(ptr);
+        crate::Rc::from_raw(ptr)
+    };
+    // The dict's copy of the record was taken by the caller; clear the
+    // instance's so `is_gc_deferred` stops claiming the collector has
+    // never seen it.
+    inst.deferred.set(false);
+    track(Object::Instance(inst));
 }
 
 /// Track `obj` *and* enroll it in the prompt-finalization index even though
@@ -3154,6 +3443,11 @@ pub fn untrack(obj: &Object) {
     with_state(|s| s.untrack_id(id));
 }
 
+/// [`untrack`] by identity.
+pub fn untrack_id(id: ObjectId) {
+    with_state(|s| s.untrack_id(id));
+}
+
 /// Reinitialise the process-global cycle collector's locks in a `fork(2)`
 /// child. See [`GcState::reinit_after_fork_in_child`].
 ///
@@ -3197,24 +3491,90 @@ pub fn is_atomic(obj: &Object) -> bool {
 /// this is CPython's container-untracking optimization applied at
 /// construction time, and it keeps numeric/string-heavy workloads off
 /// the GC's books entirely.
+/// The smallest deferral population worth compacting: below this, the
+/// sweep's fixed cost outweighs what it reclaims.
+const DEFERRED_FLOOR: usize = 4096;
+
+/// How many containers may stay deferred at once. Past this the sweep
+/// hands the whole set to the collector, which both bounds the weak
+/// references parked here and restores the allocation pacing a program
+/// that *accumulates* scalar containers would otherwise lose:
+/// `test_gc.test_bug1055820c` grows a list of empty lists and requires a
+/// collection to trigger within 10000 appends.
+const DEFERRED_CAP: usize = 4096;
+
+/// A weak reference to a container whose tracking is deferred (see
+/// [`GcState::deferred`]). One variant per container kind rather than a
+/// weak `Object`, because `Object`'s payload `Arc` is what has to stay
+/// weak — holding the `Object` itself would pin the container alive.
+enum DeferredContainer {
+    List(std::sync::Weak<crate::RefCell<Vec<Object>>>),
+    Dict(std::sync::Weak<crate::RefCell<crate::object::DictData>>),
+    Set(std::sync::Weak<crate::RefCell<crate::object::SetData>>),
+}
+
+impl DeferredContainer {
+    /// A weak handle on `obj`, or `None` for a kind that is never deferred.
+    fn new(obj: &Object) -> Option<Self> {
+        match obj {
+            Object::List(l) => Some(Self::List(crate::Rc::downgrade(l))),
+            Object::Dict(d) => Some(Self::Dict(crate::Rc::downgrade(d))),
+            Object::Set(s) => Some(Self::Set(crate::Rc::downgrade(s))),
+            _ => None,
+        }
+    }
+
+    /// The container, if it is still alive.
+    fn upgrade(&self) -> Option<Object> {
+        match self {
+            Self::List(w) => w.upgrade().map(Object::List),
+            Self::Dict(w) => w.upgrade().map(Object::Dict),
+            Self::Set(w) => w.upgrade().map(Object::Set),
+        }
+    }
+}
+
+/// An element that cannot route a cycle back out of the container
+/// holding it: an atomic value, or an instance whose own tracking is
+/// still deferred — which by that deferral's invariant holds nothing but
+/// atomic values itself, so `container -> instance -> scalars` is as far
+/// as the chain goes. The first non-atomic store into such an instance
+/// tracks it, and the sweep then re-reads its holders and promotes them.
+#[inline]
+fn element_is_inert(obj: &Object) -> bool {
+    match obj {
+        Object::Instance(i) => i.is_gc_deferred(),
+        other => is_atomic(other),
+    }
+}
+
 fn container_can_cycle(obj: &Object) -> bool {
+    // A container past this size is registered without inspection: the
+    // scan is per *element* while the registration it saves is per
+    // *container*, so beyond a point it stops paying for itself — and an
+    // unbounded scan would make `track` O(len) for `list(range(1e6))`.
+    const SCAN_CAP: usize = 32;
     match obj {
         Object::List(l) => l
             .try_borrow()
-            .map(|v| v.iter().any(|x| !is_atomic(x)))
+            .map(|v| v.len() > SCAN_CAP || v.iter().any(|x| !element_is_inert(x)))
             .unwrap_or(true),
         Object::Set(s) => s
             .try_borrow()
-            .map(|m| m.iter().any(|k| !is_atomic(&k.0)))
+            .map(|m| m.len() > SCAN_CAP || m.iter().any(|k| !element_is_inert(&k.0)))
             .unwrap_or(true),
         Object::Dict(d) => d
             .try_borrow()
-            .map(|m| m.iter().any(|(k, v)| !is_atomic(&k.0) || !is_atomic(v)))
+            .map(|m| {
+                m.len() > SCAN_CAP
+                    || m.iter()
+                        .any(|(k, v)| !element_is_inert(&k.0) || !element_is_inert(v))
+            })
             .unwrap_or(true),
         // A tuple can only anchor a cycle through a non-atomic element. An
         // empty or all-scalar tuple (the interned `()`, `(1, 2)`, …) can never
         // close one, so it stays off the GC's books.
-        Object::Tuple(t) => t.iter().any(|x| !is_atomic(x)),
+        Object::Tuple(t) => t.len() > SCAN_CAP || t.iter().any(|x| !element_is_inert(x)),
         // Any other container kind: be conservative and track.
         _ => true,
     }
@@ -3248,6 +3608,20 @@ pub fn track_if_cyclic(obj: &Object) -> bool {
 /// thread's GC (see [`GcState::maybe_auto_collect`]). Returns the
 /// number of objects reclaimed; the caller should drain pending
 /// finalizers when this is non-zero.
+/// Whether `id` may be tracked: the miss-filter probe (no false
+/// negatives — every tracked object's bits are set at track time; a bit
+/// left by an untracked object is a harmless false positive).
+#[inline]
+pub fn maybe_tracked(id: ObjectId) -> bool {
+    process_tracked_filter().may_contain(id)
+}
+
+/// See [`GcState::auto_collect_due`].
+#[inline]
+pub fn auto_collect_due() -> bool {
+    with_state(GcState::auto_collect_due)
+}
+
 pub fn maybe_auto_collect() -> bool {
     let ran = with_state(GcState::maybe_auto_collect);
     if ran {
@@ -3266,7 +3640,7 @@ pub fn find_handle(id: ObjectId) -> Option<Arc<TrackedHandle>> {
 /// by refcount-emulation paths to discount the registry's own
 /// strong handle.
 pub fn is_tracked(id: ObjectId) -> bool {
-    find_handle(id).is_some()
+    with_state(|s| s.is_tracked(id))
 }
 
 /// Convenience: claim `id`'s finalizer (so a later collection
@@ -3340,6 +3714,12 @@ pub fn reap_dead_acyclic_amortized() -> usize {
 #[inline]
 pub fn has_any_finalizable() -> bool {
     with_state(GcState::has_any_finalizable)
+}
+
+/// Rebuild the tracked-id miss filter from the live tracked set (see
+/// [`GcState::rebuild_tracked_filter`]).
+pub fn rebuild_tracked_filter() {
+    with_state(GcState::rebuild_tracked_filter);
 }
 
 /// Prompt-reap *suspects* (RFC 0054): tracked, non-finalizable objects a
@@ -3797,6 +4177,15 @@ thread_local! {
     static MAYBE_DEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// A pointer to the calling thread's maybe-dead flag, for a dispatch
+/// loop that polls it after every instruction: one thread-local lookup
+/// per loop entry instead of one per poll. Valid for the life of the
+/// calling thread; only ever dereferenced on that thread.
+#[inline]
+pub(crate) fn maybe_dead_flag() -> *const std::cell::Cell<bool> {
+    MAYBE_DEAD.with(std::ptr::from_ref)
+}
+
 /// Note that the current thread just executed a reference-dropping opcode, so a
 /// finalizable object may now be dead. Cheap (a thread-local `Cell` store); the
 /// actual sweep is deferred to the next eval-loop safe point.
@@ -3869,6 +4258,18 @@ pub(crate) fn take_force_cold_tick() -> bool {
 /// costs one scan, never correctness.
 #[inline]
 pub fn note_dropped(obj: &crate::object::Object) {
+    if note_dropped_marks(obj) {
+        mark_maybe_dead();
+    }
+}
+
+/// The grading half of [`note_dropped`]: would dropping `obj` right now
+/// schedule a prompt-finalization sweep? Split out so the leaf burst
+/// (`Interpreter::leaf_burst`) can end its run at exactly the
+/// instruction that marks, handing the very next safe point back to the
+/// full eval-loop prologue.
+#[inline]
+pub fn note_dropped_marks(obj: &crate::object::Object) -> bool {
     use crate::object::Object as O;
     match obj {
         O::None
@@ -3882,28 +4283,143 @@ pub fn note_dropped(obj: &crate::object::Object) {
         | O::WStr(_)
         | O::Bytes(_)
         | O::Range(_)
-        | O::Code(_) => {}
+        | O::Code(_) => false,
+        // The common heap operands, with their count and identity read
+        // inline (no variant dispatch).
+        // A natively served class's instance (never tracked, no
+        // finalizer, only ints and a `tzinfo` inside) cannot start a
+        // finalization when it dies.
+        O::Instance(i) if i.cls_raw().native_kind.get() != 0 => false,
+        O::Instance(i) => note_dropped_counted(
+            crate::sync::Rc::strong_count(i),
+            crate::sync::Rc::as_ptr(i) as usize as u64,
+        ),
+        O::List(l) => {
+            let (sc, id) = (
+                crate::sync::Rc::strong_count(l),
+                crate::sync::Rc::as_ptr(l) as usize as u64,
+            );
+            if inert_death(sc, id, || {
+                l.try_borrow()
+                    .is_ok_and(|v| v.len() <= INERT_SCAN_CAP && v.iter().all(is_atomic))
+            }) {
+                return false;
+            }
+            note_dropped_counted(sc, id)
+        }
+        O::Dict(d) => {
+            let (sc, id) = (
+                crate::sync::Rc::strong_count(d),
+                crate::sync::Rc::as_ptr(d) as usize as u64,
+            );
+            if inert_death(sc, id, || {
+                d.try_borrow().is_ok_and(|m| {
+                    m.len() <= INERT_SCAN_CAP
+                        && m.iter().all(|(k, v)| is_atomic(&k.0) && is_atomic(v))
+                })
+            }) {
+                return false;
+            }
+            note_dropped_counted(sc, id)
+        }
+        O::Function(f) => note_dropped_counted(
+            crate::sync::Rc::strong_count(f),
+            crate::sync::Rc::as_ptr(f) as usize as u64,
+        ),
+        O::Tuple(t) => note_dropped_counted(
+            ThinArc::strong_count(t),
+            ThinArc::as_ptr(t).cast::<()>() as usize as u64,
+        ),
+        _ => note_dropped_marks_other(obj),
+    }
+}
+
+/// How many elements a dying container may hold and still be graded by
+/// inspection (see [`inert_death`]). Capped so the grade stays O(1) on a
+/// path that runs for every discarded heap value.
+const INERT_SCAN_CAP: usize = 32;
+
+/// Does this death need no prompt handling at all? A container dying at
+/// its last reference, with no collector handle and no weakref, whose
+/// every element is atomic, frees nothing that could finalize — so the
+/// burst need not end to run a sweep that would find nothing. Grading it
+/// `true` is what keeps a `x = [i, i]` loop inside the burst: the store
+/// that displaces the previous list ended it on every iteration.
+#[inline]
+fn inert_death(sc: usize, id: ObjectId, all_atomic: impl FnOnce() -> bool) -> bool {
+    sc <= 1
+        && !process_tracked_filter().may_contain(id)
+        && !crate::weakref_registry::may_have_weakrefs(id)
+        && all_atomic()
+}
+
+/// [`inert_death`] for a value the caller still holds the last reference
+/// to: dropping it frees nothing that could finalize, clear a weakref or
+/// need untracking, so the plain `Rc` drop is its whole teardown and no
+/// prompt-reap cascade has to run.
+pub fn dies_inert(obj: &crate::object::Object) -> bool {
+    use crate::object::Object as O;
+    match obj {
+        O::List(l) => inert_death(
+            crate::sync::Rc::strong_count(l),
+            crate::sync::Rc::as_ptr(l) as usize as u64,
+            || {
+                l.try_borrow()
+                    .is_ok_and(|v| v.len() <= INERT_SCAN_CAP && v.iter().all(is_atomic))
+            },
+        ),
+        O::Dict(d) => inert_death(
+            crate::sync::Rc::strong_count(d),
+            crate::sync::Rc::as_ptr(d) as usize as u64,
+            || {
+                d.try_borrow().is_ok_and(|m| {
+                    m.len() <= INERT_SCAN_CAP
+                        && m.iter().all(|(k, v)| is_atomic(&k.0) && is_atomic(v))
+                })
+            },
+        ),
+        _ => false,
+    }
+}
+
+/// The grade for an object with strong count `sc` and identity `id`
+/// (the identity is the one [`crate::weakref_registry::id_of`] yields).
+#[inline(always)]
+fn note_dropped_counted(sc: usize, id: ObjectId) -> bool {
+    floor_stats::bump(&floor_stats::DROP_NOTES, 1);
+    // A tracked object dies here when only its collector handle (and any
+    // registry-held weakref clones) remain beside the dropped reference.
+    // Probed cheapest-first: past two references only a weakref-watched
+    // object can be at its dead line, and almost none are.
+    let marked = if sc <= 1 {
+        true
+    } else if sc == 2 {
+        process_tracked_filter().may_contain(id)
+    } else {
+        crate::weakref_registry::may_have_weakrefs(id)
+            && process_tracked_filter().may_contain(id)
+            && sc <= 2 + crate::weakref_registry::strong_clone_count(id)
+    };
+    if marked {
+        floor_stats::bump(&floor_stats::DROP_NOTES_MARKED, 1);
+    }
+    marked
+}
+
+#[inline(never)]
+fn note_dropped_marks_other(obj: &crate::object::Object) -> bool {
+    use crate::object::Object as O;
+    match obj {
         // A dying bound method (the `obj.m(...)` call temporary, freed at
         // every method call) owns exactly one object: its receiver. Grade
         // that instead of marking on the method's own count of one.
         O::BoundMethod(bm) if crate::sync::Rc::strong_count(bm) <= 1 => {
-            note_dropped(&bm.receiver);
+            note_dropped_marks(&bm.receiver)
         }
         _ => {
-            floor_stats::bump(&floor_stats::DROP_NOTES, 1);
             let sc = strong_count_for(obj);
-            if sc <= 1 {
-                floor_stats::bump(&floor_stats::DROP_NOTES_MARKED, 1);
-                mark_maybe_dead();
-                return;
-            }
             let id = crate::weakref_registry::id_of(obj);
-            if TRACKED_FILTER.may_contain(id)
-                && (sc == 2 || crate::weakref_registry::may_have_weakrefs(id))
-            {
-                floor_stats::bump(&floor_stats::DROP_NOTES_MARKED, 1);
-                mark_maybe_dead();
-            }
+            note_dropped_counted(sc, id)
         }
     }
 }
@@ -4017,7 +4533,8 @@ mod tests {
             .map(|_| Object::Dict(Rc::new(RefCell::new(DictData::default()))))
             .collect();
         for root in &roots {
-            state.track(root.clone());
+            // See `track_and_untrack` on `track_now`.
+            state.track_now(root.clone());
         }
         for (collection, expected) in [(0, 1), (1, 2), (2, 2), (2, 2)] {
             assert_eq!(state.collect(collection), 0);
@@ -4066,7 +4583,10 @@ mod tests {
     fn track_and_untrack() {
         let s = GcState::new();
         let d = Object::Dict(Rc::new(RefCell::new(DictData::default())));
-        s.track(d.clone());
+        // `track_now`, not `track`: an empty dict holds nothing that could
+        // close a cycle, so `track` would defer it (see `defer_container`).
+        // This test is about the index's bookkeeping, not that policy.
+        s.track_now(d.clone());
         assert!(s.is_tracked(id_of(&d)));
         s.untrack_id(id_of(&d));
         assert!(!s.is_tracked(id_of(&d)));
@@ -4099,7 +4619,8 @@ mod tests {
     fn freeze_unfreeze_round_trip() {
         let s = GcState::new();
         let d = Object::Dict(Rc::new(RefCell::new(DictData::default())));
-        s.track(d.clone());
+        // See `track_and_untrack` on `track_now`.
+        s.track_now(d.clone());
         s.freeze_all();
         assert_eq!(s.freeze_count(), 1);
         s.unfreeze_all();

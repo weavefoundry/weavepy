@@ -66,6 +66,11 @@ def invalidate_caches():
     for finder in sys.meta_path:
         if hasattr(finder, 'invalidate_caches'):
             finder.invalidate_caches()
+    # WeavePy: the native importer's directory listings (see
+    # `import::dir_listing`) are dropped too, as CPython's FileFinders are.
+    clear = getattr(_imp, '_weave_clear_dir_listings', None)
+    if clear is not None:
+        clear()
 
 
 def import_module(name, package=None):

@@ -360,6 +360,23 @@ struct Plan {
     /// element's lane, so a surprise deopts at the erased
     /// `UNPACK_SEQUENCE`, never miscompiles.
     pair_src: HashMap<usize, PairSrc>,
+    /// `LOAD_GLOBAL` pcs of builtins that read their *caller's frame*
+    /// (`eval`/`exec`/`locals`/`vars`/`dir` without arguments, the
+    /// zero-argument `super`, `breakpoint`): native locals live in the
+    /// JIT's buffer, not the interpreter frame those builtins inspect.
+    frame_readers: HashSet<usize>,
+    /// Cold exits: statement-start pcs where native code hands the rest of
+    /// the activation to the interpreter (see `cold_point`).
+    cold: HashSet<usize>,
+    /// Typed `[]` accumulators: a `BUILD_LIST 0` pc → the local it is
+    /// stored into. When that local is assigned nothing but empty-list
+    /// literals, its list lane is the lane its appends pin (see
+    /// `infer_append`), and the literal takes it.
+    lane_lists: HashMap<usize, u32>,
+    /// `list(range(...))` sites: the outer `CALL` pc → (bounds to pop,
+    /// the erased `LOAD_GLOBAL list` pc — the deopt point). The callee
+    /// loads, their `PUSH_NULL`s, the inner `CALL` and a unit step erase.
+    list_range: HashMap<usize, (u8, usize)>,
     /// Synthetic slots appended after the code object's real locals.
     n_synth: u32,
 }
@@ -523,6 +540,34 @@ pub fn analyze_with_probes(
     analyze_impl(code, resolve, &mut probes)
 }
 
+/// A callee's return-lane analysis: [`analyze`] plus an object-global
+/// probe (`name` → its graded lane when it resolves), so bodies whose
+/// globals are used as plain values or opaque callees still type their
+/// returns. Tokens are irrelevant here (the result is never compiled).
+pub fn analyze_for_ret(
+    code: &CodeObject,
+    resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
+    obj_global: &mut dyn FnMut(&str) -> Option<JitType>,
+) -> Result<TFunc, JitVerdict> {
+    let mut arena = PathArena::default();
+    let mut obj = |name: &str| obj_global(name).map(|lane| (0u32, lane));
+    let mut probes = Probes {
+        list: &mut |_| None,
+        dict: &mut |_| None,
+        attr: &mut |_, _, _, _| None,
+        method: &mut |_, _, _| None,
+        math: &mut |_, _| false,
+        ctor_field: &mut |_, _| None,
+        param: &mut |_| None,
+        kw_slot: &mut |_, _| None,
+        obj_global: &mut obj,
+        cell: &mut |_| None,
+        obj: &mut |_| false,
+        paths: &mut arena,
+    };
+    analyze_impl(code, resolve, &mut probes)
+}
+
 /// [`analyze_with_probes`] with the full probe bundle (RFC 0069 WS1/
 /// WS2 adds the method-resolution and math-module probes).
 pub fn analyze_frame(
@@ -531,6 +576,83 @@ pub fn analyze_frame(
     probes: &mut Probes<'_>,
 ) -> Result<TFunc, JitVerdict> {
     analyze_impl(code, resolve, probes)
+}
+
+thread_local! {
+    /// The instruction the last failed inference/emission step stopped
+    /// at (see `cold_point`).
+    static FAIL_PC: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Every jump-landing pc of `code`.
+fn jump_targets(code: &CodeObject) -> HashSet<usize> {
+    let mut targets = HashSet::new();
+    for (i, item) in code.instructions.iter().enumerate() {
+        match item.op {
+            OpCode::PopJumpIfFalse
+            | OpCode::PopJumpIfTrue
+            | OpCode::PopJumpIfNone
+            | OpCode::PopJumpIfNotNone
+            | OpCode::JumpForward
+            | OpCode::ForIter => {
+                targets.insert(forward_target(i, item.arg));
+            }
+            OpCode::JumpBackward => {
+                if let Some(t) = backward_target(i, item.arg) {
+                    targets.insert(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    targets
+}
+
+/// Where an unsupported instruction at `p` can become a *cold exit*: the
+/// start of its statement (its source line, back to the nearest jump
+/// target), when that lies outside every loop and after at least one —
+/// native code then runs the loop and hands the rest of the activation
+/// to the interpreter, at most once per activation. `None` inside a
+/// loop body (a side exit there would deopt every iteration) or ahead of
+/// any loop (native entry would buy nothing).
+fn cold_point(code: &CodeObject, p: usize) -> Option<usize> {
+    let ins = &code.instructions;
+    let loops: Vec<(usize, usize)> = ins
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| x.op == OpCode::JumpBackward)
+        .filter_map(|(j, x)| backward_target(j, x.arg).map(|t| (t, j)))
+        .collect();
+    // A point inside a loop moves to the start of its outermost loop: a
+    // `for` statement's iterable setup (the instructions on its line
+    // before the `FOR_ITER` head), or a `while` loop's head.
+    let (p, for_setup) = match loops
+        .iter()
+        .filter(|&&(t, j)| t <= p && p <= j)
+        .map(|&(t, _)| t)
+        .min()
+    {
+        Some(t) if ins[t].op == OpCode::ForIter => (t.checked_sub(1)?, true),
+        Some(t) => (t, false),
+        None => (p, false),
+    };
+    // Worth it only after native work: a loop completed before the exit.
+    // A loop-free body would enter native code just to leave it (short
+    // methods with an unsupported statement near the top, every call).
+    if !loops.iter().any(|&(_, j)| j < p) {
+        return None;
+    }
+    let line = code.linetable.get(p).copied()?;
+    let targets = jump_targets(code);
+    let mut q = p;
+    while q > 0
+        && code.linetable.get(q - 1) == Some(&line)
+        && (for_setup || !targets.contains(&q))
+        && !targets.contains(&(q - 1).max(1))
+    {
+        q -= 1;
+    }
+    (q > 0 && !loops.iter().any(|&(t, j)| t < q && q <= j)).then_some(q)
 }
 
 fn analyze_impl(
@@ -546,8 +668,15 @@ fn analyze_impl(
     // admit. Each retry demotes one more name; the budget bounds
     // pathological frames (every retry is a full re-analysis).
     let mut demote: HashSet<u32> = HashSet::new();
+    // Typed `[]` accumulators are a prediction: any failure under them
+    // re-analyzes with the literal on the object lane, as before.
+    let mut lane_lists = has_empty_list_store(code);
+    // Cold exits (see `cold_point`), grown one unsupported statement at
+    // a time.
+    let mut cold: HashSet<usize> = HashSet::new();
     loop {
-        match analyze_once(code, resolve, probes, &demote) {
+        FAIL_PC.with(|c| c.set(None));
+        match analyze_once(code, resolve, probes, &demote, lane_lists, &cold) {
             Err(JitVerdict::CalleeEscapes(name_idx)) => {
                 if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
                     eprintln!(
@@ -561,9 +690,45 @@ fn analyze_impl(
                     return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
                 }
             }
+            Err(
+                e @ (JitVerdict::UnsupportedOpcode(_)
+                | JitVerdict::UnsupportedConst
+                | JitVerdict::MixedArithTypes
+                | JitVerdict::NonUniformLocal(_)),
+            ) if cold.len() < 4
+                && FAIL_PC
+                    .with(std::cell::Cell::get)
+                    .and_then(|p| cold_point(code, p))
+                    .is_some_and(|q| !cold.contains(&q)) =>
+            {
+                let q = FAIL_PC
+                    .with(std::cell::Cell::get)
+                    .and_then(|p| cold_point(code, p))
+                    .expect("checked by the guard");
+                if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+                    eprintln!("jit cold exit {:?} pc {}: {:?}", code.name, q, e);
+                }
+                cold.insert(q);
+            }
+            Err(e) if lane_lists => {
+                if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+                    eprintln!("jit lane-list retry {:?}: {:?}", code.name, e);
+                }
+                lane_lists = false;
+            }
             other => return other,
         }
     }
+}
+
+/// Whether `code` stores an empty-list literal straight into a local
+/// (a candidate typed accumulator, see `Plan::lane_lists`).
+fn has_empty_list_store(code: &CodeObject) -> bool {
+    code.instructions.windows(2).any(|w| {
+        matches!(w[0].op, OpCode::BuildList)
+            && w[0].arg == 0
+            && matches!(w[1].op, OpCode::StoreFast)
+    })
 }
 
 fn analyze_once(
@@ -571,6 +736,8 @@ fn analyze_once(
     resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
     probes: &mut Probes<'_>,
     demote: &HashSet<u32>,
+    lane_lists: bool,
+    cold: &HashSet<usize>,
 ) -> Result<TFunc, JitVerdict> {
     // RFC 0070 WS2 — sync generator bodies are admitted (yields become
     // `Yielded` side exits; entry is OSR-only). Coroutines and async
@@ -586,9 +753,10 @@ fn analyze_once(
         return Err(JitVerdict::Trivial);
     }
 
-    let plan = plan_rewrite(code, resolve, probes.obj_global, demote)?;
+    let mut plan = plan_rewrite(code, resolve, probes.obj_global, demote, lane_lists)?;
+    plan.cold = cold.clone();
 
-    let raw = build_blocks(code)?;
+    let raw = build_blocks(code, &plan.cold)?;
     let reachable = reachable_blocks(&raw);
     if reachable.is_empty() {
         return Err(JitVerdict::Trivial);
@@ -658,7 +826,16 @@ fn analyze_once(
                 &mut changed,
                 probes,
                 &mut ctor,
-            )?;
+            )
+            .inspect_err(|_| {
+                // A failure in the block's terminator (a loop header's
+                // variable lane, say) names the terminator.
+                FAIL_PC.with(|c| {
+                    if c.get().is_none() {
+                        c.set(Some(raw[bi].end - 1));
+                    }
+                });
+            })?;
             for (succ, stack) in outs {
                 if succ == entry_raw && !stack.is_empty() {
                     return Err(JitVerdict::NonEmptyBoundaryStack);
@@ -925,6 +1102,10 @@ fn analyze_once(
     // calls themselves or erasing enclosing loop iterators.
     for block in &blocks {
         if let TTerm::Deopt { pc } = block.term {
+            // A cold exit rebuilds every open span like any deopt.
+            if plan.cold.contains(&(pc as usize)) {
+                continue;
+            }
             for spans in [
                 &mut out.callee_spans,
                 &mut out.len_spans,
@@ -951,6 +1132,17 @@ fn analyze_once(
         list_loops,
         iter_loops,
         comp_saved,
+        cold_exits: {
+            let mut v: Vec<u32> = plan.cold.iter().map(|&pc| pc as u32).collect();
+            v.sort_unstable();
+            v
+        },
+        comp_target_slots: {
+            let mut v: Vec<u32> = plan.comp_headers.values().map(|c| c.saved_slot).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        },
         callee_spans: out.callee_spans,
         len_spans: out.len_spans,
         method_spans: out.method_spans,
@@ -1099,6 +1291,7 @@ fn plan_rewrite(
     resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
     obj_global: &mut dyn FnMut(&str) -> Option<(u32, JitType)>,
     demote: &HashSet<u32>,
+    lane_lists: bool,
 ) -> Result<Plan, JitVerdict> {
     let ins = &code.instructions;
     let n = ins.len();
@@ -1147,6 +1340,20 @@ fn plan_rewrite(
         if exit >= n || !matches!(ins[exit].op, OpCode::EndFor) {
             return Err(bail());
         }
+        // The iterator stays on the interpreter's operand stack across
+        // the loop epilogue: `END_FOR` leaves it and `POP_ITER` consumes
+        // it. Both are nops in the compiled plan, so a deopt landing
+        // there resumes an interpreter that still pops the iterator --
+        // the live range therefore has to end *after* its consumer, the
+        // convention every other span family records. Ending it at
+        // `END_FOR` dropped the iterator from the rebuild and the resumed
+        // `POP_ITER` underflowed the stack.
+        let iter_live_to =
+            if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopIter | OpCode::PopTop) {
+                exit + 2
+            } else {
+                exit + 1
+            };
         // RFC 0074 WS3 — the tuple-target shape (`for a, b in it:`):
         // `GET_ITER; FOR_ITER; UNPACK_SEQUENCE 2; STORE_FAST a;
         // STORE_FAST b`. The unpack and both stores erase — the
@@ -1205,7 +1412,7 @@ fn plan_rewrite(
                 seq_slot,
                 idx_slot,
                 live_from: i as u32,
-                live_to: exit as u32,
+                live_to: iter_live_to as u32,
                 interp_depth: 0,
             });
             continue;
@@ -1249,7 +1456,7 @@ fn plan_rewrite(
                 cur_slot,
                 stop_slot,
                 live_from: i as u32,
-                live_to: exit as u32,
+                live_to: iter_live_to as u32,
                 interp_depth: 0,
             });
             continue;
@@ -1282,7 +1489,7 @@ fn plan_rewrite(
                 seq_slot,
                 idx_slot,
                 live_from: i as u32,
-                live_to: exit as u32,
+                live_to: iter_live_to as u32,
                 interp_depth: 0,
             });
             continue;
@@ -1369,7 +1576,7 @@ fn plan_rewrite(
                 seq_slot,
                 idx_slot,
                 live_from: i as u32,
-                live_to: exit as u32,
+                live_to: iter_live_to as u32,
                 interp_depth: 0,
             });
             plan.comp_acc.insert(i - 2, acc_lane_slot);
@@ -1508,6 +1715,146 @@ fn plan_rewrite(
         plan.const_list.insert(i, ins[i + 1].arg);
         plan.nop.insert(i + 1);
         plan.nop.insert(i + 2);
+    }
+
+    for (i, item) in ins.iter().enumerate() {
+        if matches!(item.op, OpCode::LoadGlobal)
+            && matches!(
+                code.names.get(item.arg as usize).map(String::as_str),
+                Some("eval" | "exec" | "locals" | "vars" | "dir" | "super" | "breakpoint")
+            )
+        {
+            plan.frame_readers.insert(i);
+        }
+    }
+
+    // Typed `[]` accumulators: a local assigned only empty-list literals
+    // (`BUILD_LIST 0; STORE_FAST s` everywhere it is stored, never a
+    // parameter, never deleted).
+    if lane_lists {
+        let n_params = code.arg_count
+            + code.kwonly_count
+            + u32::from(code.has_varargs)
+            + u32::from(code.has_varkeywords);
+        let mut sites: HashMap<u32, Vec<usize>> = HashMap::new();
+        let mut other_store: HashSet<u32> = HashSet::new();
+        for i in 0..n {
+            match ins[i].op {
+                OpCode::StoreFast => {
+                    let lit = i >= 1
+                        && matches!(ins[i - 1].op, OpCode::BuildList)
+                        && ins[i - 1].arg == 0
+                        && !plan.comp_acc.contains_key(&(i - 1))
+                        && !plan.const_list.contains_key(&(i - 1))
+                        && !plan.nop.contains(&(i - 1))
+                        && !plan.nop.contains(&i)
+                        && !targets.contains(&i);
+                    if lit {
+                        sites.entry(ins[i].arg).or_default().push(i - 1);
+                    } else {
+                        other_store.insert(ins[i].arg);
+                    }
+                }
+                OpCode::DeleteFast | OpCode::LoadFastAndClear => {
+                    other_store.insert(ins[i].arg);
+                }
+                _ => {}
+            }
+        }
+        for (slot, pcs) in sites {
+            if slot < n_params || other_store.contains(&slot) {
+                continue;
+            }
+            for pc in pcs {
+                plan.lane_lists.insert(pc, slot);
+            }
+        }
+    }
+
+    // `list(range(...))`: `LOAD_GLOBAL list; PUSH_NULL; LOAD_GLOBAL
+    // range; PUSH_NULL; <k simple int args>; CALL k; CALL 1`, both
+    // callees canonical (identity-guarded). Everything but the argument
+    // loads erases; the outer `CALL` becomes `ListFromRange`.
+    for c in 1..n {
+        if !matches!(ins[c].op, OpCode::Call)
+            || ins[c].arg != 1
+            || !matches!(ins[c - 1].op, OpCode::Call)
+        {
+            continue;
+        }
+        let k = ins[c - 1].arg as usize;
+        if !(1..=3).contains(&k) || c < 5 + k {
+            continue;
+        }
+        let args_start = c - 1 - k;
+        let simple = ins[args_start..c - 1].iter().all(|a| match a.op {
+            OpCode::LoadFast | OpCode::LoadSmallInt => true,
+            OpCode::LoadConst => {
+                matches!(code.constants.get(a.arg as usize), Some(Constant::Int(_)))
+            }
+            _ => false,
+        });
+        if !simple {
+            continue;
+        }
+        // An explicit step is only admitted as the constant 1 (erased).
+        let mut pops = k as u8;
+        let mut step_pc = None;
+        if k == 3 {
+            let sp = c - 2;
+            let unit = match ins[sp].op {
+                OpCode::LoadSmallInt => ins[sp].arg == 1,
+                OpCode::LoadConst => matches!(
+                    code.constants.get(ins[sp].arg as usize),
+                    Some(Constant::Int(1))
+                ),
+                _ => false,
+            };
+            if !unit {
+                continue;
+            }
+            step_pc = Some(sp);
+            pops = 2;
+        }
+        let range_null = args_start - 1;
+        let range_load = args_start - 2;
+        let list_null = args_start - 3;
+        let list_load = args_start - 4;
+        if !matches!(ins[range_null].op, OpCode::PushNull)
+            || !matches!(ins[list_null].op, OpCode::PushNull)
+            || !matches!(ins[range_load].op, OpCode::LoadGlobal)
+            || !matches!(ins[list_load].op, OpCode::LoadGlobal)
+            || plan.globals.get(&ins[range_load].arg) != Some(&ResolvedGlobal::RangeBuiltin)
+            || plan.globals.get(&ins[list_load].arg) != Some(&ResolvedGlobal::ListBuiltin)
+        {
+            continue;
+        }
+        // Nothing may land inside the erased window (the list load
+        // itself starts the expression and may be a landing point).
+        if targets.iter().any(|&t| list_load < t && t <= c)
+            || (list_load..c).any(|p| plan.nop.contains(&p))
+        {
+            continue;
+        }
+        for p in [list_load, list_null, range_load, range_null, c - 1] {
+            plan.nop.insert(p);
+        }
+        if let Some(sp) = step_pc {
+            plan.nop.insert(sp);
+        }
+        plan.list_range.insert(c, (pops, list_load));
+        for (pc, expect) in [
+            (list_load, ResolvedGlobal::ListBuiltin),
+            (range_load, ResolvedGlobal::RangeBuiltin),
+        ] {
+            let name = &code.names[ins[pc].arg as usize];
+            if !plan.guards.iter().any(|g| g.name == *name) {
+                plan.guards.push(GlobalGuard {
+                    name: name.clone(),
+                    expect,
+                });
+            }
+        }
     }
 
     // Burnable globals: every LOAD_GLOBAL that is not a recognized range
@@ -1806,10 +2153,16 @@ fn common_error_constant(ins: weavepy_compiler::Instruction) -> bool {
 }
 
 /// Build the basic blocks, resolving relative jumps to absolute indices.
-fn build_blocks(code: &CodeObject) -> Result<Vec<RawBlock>, JitVerdict> {
+fn build_blocks(code: &CodeObject, cold: &HashSet<usize>) -> Result<Vec<RawBlock>, JitVerdict> {
     let n = code.instructions.len();
     let mut leaders: BTreeSet<usize> = BTreeSet::new();
     leaders.insert(0);
+    // A cold exit starts its own block, which ends native control.
+    for &pc in cold {
+        if pc < n {
+            leaders.insert(pc);
+        }
+    }
     for (i, ins) in code.instructions.iter().enumerate() {
         match ins.op {
             OpCode::PopJumpIfFalse
@@ -1882,6 +2235,14 @@ fn build_blocks(code: &CodeObject) -> Result<Vec<RawBlock>, JitVerdict> {
         let end = leader_vec.get(bi + 1).copied().unwrap_or(n);
         let last = end - 1;
         let ins = code.instructions[last];
+        if cold.contains(&start) {
+            blocks.push(RawBlock {
+                start,
+                end,
+                succs: Vec::new(),
+            });
+            continue;
+        }
         let succs = match ins.op {
             OpCode::ReturnValue | OpCode::RaiseVarargs => Vec::new(),
             OpCode::LoadCommonConstant if common_error_constant(ins) => Vec::new(),
@@ -2672,6 +3033,16 @@ fn infer_block(
     probes: &mut Probes<'_>,
     ctor: &mut CtorState,
 ) -> Result<Vec<(usize, Vec<SE>)>, JitVerdict> {
+    // A cold exit: the entry stack spills as-is (plain values only).
+    if plan.cold.contains(&b.start) {
+        if entry
+            .iter()
+            .any(|v| !v.is_plain() || !v.ty.is_representable())
+        {
+            return Err(JitVerdict::TypeUnknown);
+        }
+        return Ok(Vec::new());
+    }
     let mut stack: Vec<SE> = entry;
     for i in b.start..(b.end - 1) {
         step_abstract(
@@ -2684,7 +3055,16 @@ fn infer_block(
             changed,
             probes,
             ctor,
-        )?;
+        )
+        .inspect_err(|e| {
+            FAIL_PC.with(|c| c.set(Some(i)));
+            if std::env::var_os("WEAVEPY_JIT_TRACE_PC").is_some() {
+                eprintln!(
+                    "jit infer fail {:?} pc {} {:?}: {:?}",
+                    code.name, i, code.instructions[i].op, e
+                );
+            }
+        })?;
     }
     // Terminator stack-shape validation + successor boundary stacks.
     let last = b.end - 1;
@@ -2776,11 +3156,20 @@ fn infer_block(
                         // re-validates each element; a malformed
                         // element or lane surprise deopts at the
                         // erased `UNPACK_SEQUENCE`).
+                        // Without a trained source, a variable already
+                        // on a scalar lane (an index reused from a
+                        // `while` counter, say) keeps it: the step
+                        // helper validates each unpacked element
+                        // against it and deopts on a surprise.
+                        let settled = |slot: u32| match local_types.get(slot as usize) {
+                            Some(Some(t @ (JitType::Int | JitType::Float))) => *t,
+                            _ => JitType::Obj,
+                        };
                         let (e1, e2) = ctor
                             .pair_lanes
                             .get(&seq_slot)
                             .copied()
-                            .unwrap_or((JitType::Obj, JitType::Obj));
+                            .unwrap_or_else(|| (settled(var), settled(var2)));
                         set_local(local_types, var, e1, changed)?;
                         set_local(local_types, var2, e2, changed)?;
                     } else if lane == JitType::Obj {
@@ -3098,6 +3487,11 @@ fn step_abstract(
     if plan.nop.contains(&i) {
         return Ok(());
     }
+    if plan.frame_readers.contains(&i) {
+        return Err(JitVerdict::UnsupportedOpcode(
+            "LOAD_GLOBAL (frame-reading builtin)",
+        ));
+    }
     if let Some(&(pops, cur, stop)) = plan.calls.get(&i) {
         for _ in 0..pops {
             let v = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
@@ -3112,6 +3506,21 @@ fn step_abstract(
         }
         set_local(local_types, cur, JitType::Int, changed)?;
         set_local(local_types, stop, JitType::Int, changed)?;
+        return Ok(());
+    }
+    if let Some(&(pops, _)) = plan.list_range.get(&i) {
+        for _ in 0..pops {
+            let v = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if v.ty.is_representable() {
+                if !v.ty.is_integral() {
+                    return Err(JitVerdict::TypeUnknown);
+                }
+            } else if let Some(slot) = v.src {
+                // A live-in feeding a range bound must be an int.
+                set_local(local_types, slot, JitType::Int, changed)?;
+            }
+        }
+        stack.push(SE::known(JitType::ListInt));
         return Ok(());
     }
     if let Some(&var) = plan.fused_store.get(&i) {
@@ -3296,6 +3705,12 @@ fn step_abstract(
                                 set_local(local_types, seq_slot, JitType::Obj, changed)?;
                                 return Ok(());
                             }
+                        }
+                        // A plain local assigned in this body (a
+                        // comprehension result, say) may be typed by a
+                        // later fixpoint iteration: transient.
+                        if v.src.is_some_and(|slot| slot >= code.arg_count) {
+                            return Ok(());
                         }
                         // The param probe is a no-op on the unseeded
                         // pass: surface `TypeUnknown` so the seeded
@@ -3967,6 +4382,9 @@ fn step_abstract(
                         } else if (probes.dict)(slot).is_some() {
                             // RFC 0073 WS2 — `len(d)` on an exact dict.
                             set_local(local_types, slot, JitType::Dict, changed)?;
+                        } else if slot >= code.arg_count {
+                            // A plain local assigned in this body: a
+                            // later fixpoint iteration may type it.
                         } else {
                             // Neither — fail as `TypeUnknown` so the
                             // seeded retry can type a `str`/`bytes`
@@ -4085,20 +4503,22 @@ fn step_abstract(
             stack.push(v);
         }
         OpCode::Swap => {
-            if ins.arg != 2 {
-                return Err(JitVerdict::UnsupportedOpcode("SWAP n!=2"));
+            let n = ins.arg as usize;
+            if !(2..=8).contains(&n) {
+                return Err(JitVerdict::UnsupportedOpcode("SWAP n"));
             }
             let len = stack.len();
-            if len < 2 {
+            if len < n {
                 return Err(JitVerdict::StackUnderflow);
             }
             // A marker's recorded interp-stack position must stay fixed
-            // between load and call; reordering it disqualifies.
-            if !stack[len - 1].is_plain() || !stack[len - 2].is_plain() {
-                let (a, b) = (stack[len - 1], stack[len - 2]);
+            // between load and call; reordering it disqualifies (the
+            // entries between the swapped pair stay put).
+            if !stack[len - 1].is_plain() || !stack[len - n].is_plain() {
+                let (a, b) = (stack[len - 1], stack[len - n]);
                 return Err(escape_verdict(code, &[&a, &b], "CALL (callee escapes)"));
             }
-            stack.swap(len - 1, len - 2);
+            stack.swap(len - 1, len - n);
         }
         // RFC 0061 WS5 — pinned-list element read. The container must
         // be (or probe as) a homogeneous int/float list local; the
@@ -4238,6 +4658,18 @@ fn step_abstract(
                 k = items.len();
             }
             if k == 0 {
+                // A typed accumulator takes its local's list lane once an
+                // append has pinned it (transient until then).
+                if let Some(&slot) = plan.lane_lists.get(&i) {
+                    let ty = local_types
+                        .get(slot as usize)
+                        .copied()
+                        .flatten()
+                        .filter(|t| t.is_list())
+                        .unwrap_or(JitType::Unknown);
+                    stack.push(SE::known(ty));
+                    return Ok(());
+                }
                 // RFC 0076 WS8 — the `[]` literal: an empty list on the
                 // object-element lane (`self.xs = []` prologues, list
                 // accumulators the appends type later).
@@ -4453,6 +4885,22 @@ fn step_abstract(
                     set_local(local_types, slot, el, changed)?;
                 }
             }
+        }
+        // `del d[k]` on an exact dict (the key lane as a store's).
+        OpCode::DeleteSubscr => {
+            let idx = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let cont = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if !idx.is_plain() || !cont.is_plain() {
+                return Err(escape_verdict(
+                    code,
+                    &[&idx, &cont],
+                    "CALL (callee escapes)",
+                ));
+            }
+            let Some((pk, _)) = resolve_dict_container(&cont, local_types, changed, probes)? else {
+                return Err(JitVerdict::UnsupportedOpcode("DELETE_SUBSCR"));
+            };
+            check_dict_key(&idx, pk, local_types, changed)?;
         }
         // RFC 0073 WS2 — `k in d` / `k not in d` on an exact dict.
         // RFC 0076 WS8 — any other *pinned* container (a set through
@@ -4971,6 +5419,8 @@ fn bin_result_type(kind: ArithKind, a: JitType, b: JitType) -> Result<JitType, J
     let b_int = b.is_integral();
     if a_int && b_int {
         match kind {
+            // `int ** int` can go big or float: interpreted.
+            ArithKind::Pow => Err(JitVerdict::UnsupportedOpcode("int pow")),
             ArithKind::TrueDiv => Ok(JitType::Float),
             ArithKind::And | ArithKind::Or | ArithKind::Xor => {
                 // bool∘bool stays bool in Python; we bail on that rare
@@ -4993,7 +5443,8 @@ fn bin_result_type(kind: ArithKind, a: JitType, b: JitType) -> Result<JitType, J
             | ArithKind::Mul
             | ArithKind::TrueDiv
             | ArithKind::FloorDiv
-            | ArithKind::Mod => Ok(JitType::Float),
+            | ArithKind::Mod
+            | ArithKind::Pow => Ok(JitType::Float),
             _ => Err(JitVerdict::UnsupportedOpcode("float bitop")),
         }
     } else if (a.is_integral() && b == JitType::Float) || (a == JitType::Float && b.is_integral()) {
@@ -5001,9 +5452,11 @@ fn bin_result_type(kind: ArithKind, a: JitType, b: JitType) -> Result<JitType, J
         // promoted with the same `as f64` cast the interpreter
         // applies, so only the unguarded-promotion op set is legal.
         match kind {
-            ArithKind::Add | ArithKind::Sub | ArithKind::Mul | ArithKind::TrueDiv => {
-                Ok(JitType::Float)
-            }
+            ArithKind::Add
+            | ArithKind::Sub
+            | ArithKind::Mul
+            | ArithKind::TrueDiv
+            | ArithKind::Pow => Ok(JitType::Float),
             _ => Err(JitVerdict::UnsupportedOpcode("mixed floordiv/mod/bitop")),
         }
     } else if a == JitType::Str {
@@ -5098,6 +5551,7 @@ fn bin_kind(arg: u32) -> Result<ArithKind, JitVerdict> {
         x if x == BinOpKind::BitOr as u32 => ArithKind::Or,
         x if x == BinOpKind::BitXor as u32 => ArithKind::Xor,
         x if x == BinOpKind::BitAnd as u32 => ArithKind::And,
+        x if x == BinOpKind::Pow as u32 => ArithKind::Pow,
         _ => return Err(JitVerdict::UnsupportedOpcode("BINARY_OP kind")),
     };
     Ok(k)
@@ -5320,6 +5774,14 @@ fn emit_block(
             entry_stack.push(s.ty);
         }
     }
+    if plan.cold.contains(&b.start) {
+        out.max_stack = out.max_stack.max(entry.len() as u32);
+        return Ok(TBlock {
+            entry_stack,
+            stmts: Vec::new(),
+            term: TTerm::Deopt { pc: b.start as u32 },
+        });
+    }
     let mut stack: Vec<ESlot> = entry;
     let mut stmts: Vec<TStmt> = Vec::new();
     out.max_stack = out.max_stack.max(stack.len() as u32);
@@ -5336,7 +5798,16 @@ fn emit_block(
             out,
             probes,
             ctor,
-        )?;
+        )
+        .inspect_err(|e| {
+            FAIL_PC.with(|c| c.set(Some(i)));
+            if std::env::var_os("WEAVEPY_JIT_TRACE_PC").is_some() {
+                eprintln!(
+                    "jit emit fail {:?} pc {} {:?}: {:?}",
+                    code.name, i, code.instructions[i].op, e
+                );
+            }
+        })?;
     }
 
     let last = b.end - 1;
@@ -5729,6 +6200,24 @@ fn emit_instr(
         push(TOp::StoreLocal(cur_slot), None, stack, stmts);
         return Ok(());
     }
+    if let Some(&(pops, list_load)) = plan.list_range.get(&i) {
+        for _ in 0..pops {
+            let v = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if !v.ty.is_integral() {
+                return Err(JitVerdict::TypeUnknown);
+            }
+        }
+        push(
+            TOp::ListFromRange {
+                pops,
+                deopt_pc: list_load as u32,
+            },
+            Some(JitType::ListInt),
+            stack,
+            stmts,
+        );
+        return Ok(());
+    }
     // `break` inside a rewritten loop: erase the phantom iterator pop.
     if matches!(ins.op, OpCode::PopTop) && stack.is_empty() && plan.in_loop_span(i) {
         return Ok(());
@@ -6020,7 +6509,11 @@ fn emit_instr(
                 // float-supported op set is legal.
                 if !matches!(
                     kind,
-                    ArithKind::Add | ArithKind::Sub | ArithKind::Mul | ArithKind::TrueDiv
+                    ArithKind::Add
+                        | ArithKind::Sub
+                        | ArithKind::Mul
+                        | ArithKind::TrueDiv
+                        | ArithKind::Pow
                 ) {
                     return Err(JitVerdict::UnsupportedOpcode("mixed floordiv/mod/bitop"));
                 }
@@ -6038,6 +6531,9 @@ fn emit_instr(
                 stack.pop();
                 push(TOp::FloatArith(kind), Some(JitType::Float), stack, stmts);
             } else {
+                if matches!(kind, ArithKind::Add) && a == JitType::Str && str_accumulator(code, i) {
+                    return Err(JitVerdict::UnsupportedOpcode("str accumulator"));
+                }
                 let (op, ty) = lower_bin(kind, a, b)?;
                 push(op, Some(ty), stack, stmts);
             }
@@ -7105,18 +7601,23 @@ fn emit_instr(
             *max_stack = (*max_stack).max(stack.len() as u32);
         }
         OpCode::Swap => {
-            if ins.arg != 2 {
-                return Err(JitVerdict::UnsupportedOpcode("SWAP n!=2"));
+            let n = ins.arg as usize;
+            if !(2..=8).contains(&n) {
+                return Err(JitVerdict::UnsupportedOpcode("SWAP n"));
             }
             let len = stack.len();
-            if len < 2 {
+            if len < n {
                 return Err(JitVerdict::StackUnderflow);
             }
-            if !stack[len - 1].is_plain() || !stack[len - 2].is_plain() {
+            if !stack[len - 1].is_plain() || !stack[len - n].is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
-            stack.swap(len - 1, len - 2);
-            push(TOp::Swap2, None, stack, stmts);
+            stack.swap(len - 1, len - n);
+            if n == 2 {
+                push(TOp::Swap2, None, stack, stmts);
+            } else {
+                push(TOp::SwapN { depth: n as u32 }, None, stack, stmts);
+            }
         }
         // RFC 0071 WS4 — `BUILD_LIST k` (uniform lane or all-`None`).
         OpCode::BuildList => {
@@ -7167,16 +7668,27 @@ fn emit_instr(
                 k = items.len();
             }
             if k == 0 {
-                // RFC 0076 WS8 — the `[]` literal (see inference).
+                // RFC 0076 WS8 — the `[]` literal (see inference); a typed
+                // accumulator builds on its local's element lane.
+                let list = match plan.lane_lists.get(&i) {
+                    Some(&slot) => local_types
+                        .get(slot as usize)
+                        .copied()
+                        .flatten()
+                        .filter(|t| t.is_list())
+                        .ok_or(JitVerdict::TypeUnknown)?,
+                    None => JitType::ListObj,
+                };
+                let elem = list.elem_lane().ok_or(JitVerdict::TypeUnknown)?;
                 push(
                     TOp::BuildList {
                         n: 0,
-                        elem: JitType::Obj,
+                        elem,
                         none_fill: false,
                         mixed: false,
                         konst: false,
                     },
-                    Some(JitType::ListObj),
+                    Some(list),
                     stack,
                     stmts,
                 );
@@ -7568,6 +8080,14 @@ fn emit_instr(
             }
             push(TOp::ListSet, None, stack, stmts);
         }
+        OpCode::DeleteSubscr => {
+            let idx = pop_val(stack)?;
+            let cont = pop_val(stack)?;
+            if cont != JitType::Dict || !matches!(idx, JitType::Int | JitType::Str) {
+                return Err(JitVerdict::UnsupportedOpcode("DELETE_SUBSCR"));
+            }
+            push(TOp::DictDel { key: idx }, None, stack, stmts);
+        }
         // RFC 0073 WS2 — `k in d` / `k not in d` on a pinned exact
         // dict. RFC 0076 WS8 — any other pinned container rides the
         // generic membership helper (`ContainsDyn`).
@@ -7609,11 +8129,26 @@ fn emit_instr(
     Ok(())
 }
 
+/// `s = s + t` / `s += t` rebinding the local it read: the interpreter
+/// grows such a string in place (the local lets go of its lone
+/// reference), where the pinned result here would be copied every time —
+/// a loop building a string this way is left interpreted.
+fn str_accumulator(code: &CodeObject, i: usize) -> bool {
+    let Some(next) = code.instructions.get(i + 1) else {
+        return false;
+    };
+    next.op == OpCode::StoreFast
+        && code.instructions[i.saturating_sub(16)..i]
+            .iter()
+            .any(|p| p.op == OpCode::LoadFast && p.arg == next.arg)
+}
+
 /// Choose the IR op + result lane for a binary arithmetic op at emission
 /// time (types are all known).
 fn lower_bin(kind: ArithKind, a: JitType, b: JitType) -> Result<(TOp, JitType), JitVerdict> {
     if a.is_integral() && b.is_integral() {
         match kind {
+            ArithKind::Pow => Err(JitVerdict::UnsupportedOpcode("int pow")),
             ArithKind::TrueDiv => Ok((TOp::IntTrueDiv, JitType::Float)),
             ArithKind::And | ArithKind::Or | ArithKind::Xor => {
                 if a == JitType::Bool && b == JitType::Bool {
@@ -7631,7 +8166,8 @@ fn lower_bin(kind: ArithKind, a: JitType, b: JitType) -> Result<(TOp, JitType), 
             | ArithKind::Mul
             | ArithKind::TrueDiv
             | ArithKind::FloorDiv
-            | ArithKind::Mod => Ok((TOp::FloatArith(kind), JitType::Float)),
+            | ArithKind::Mod
+            | ArithKind::Pow => Ok((TOp::FloatArith(kind), JitType::Float)),
             _ => Err(JitVerdict::UnsupportedOpcode("float bitop")),
         }
     } else if a == JitType::Str {

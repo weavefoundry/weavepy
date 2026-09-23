@@ -1439,6 +1439,21 @@ pub(crate) fn intern_name(name: &str) -> Object {
     })
 }
 
+/// `sys.intern` for an existing string: the pooled object for its value,
+/// which becomes `text` itself on first sight. The native unpickler interns
+/// attribute names this way, exactly as `load_build` does.
+pub(crate) fn intern_shared(text: &SharedStr) -> SharedStr {
+    INTERN_POOL.with(|pool| {
+        let mut map = pool.borrow_mut();
+        if let Some(existing) = map.get(text.as_ref()) {
+            existing.clone()
+        } else {
+            map.insert(text.clone());
+            text.clone()
+        }
+    })
+}
+
 /// CPython's `intern_string_constants` rule (codeobject.c): a str
 /// constant is interned when it is ASCII and every character is a name
 /// character (`Py_ISALNUM` or `_`); the empty string and every
@@ -2116,7 +2131,7 @@ fn sys_getwindowsversion(_args: &[Object]) -> Result<Object, RuntimeError> {
     // straight into the instance dict, which bypasses the readonly
     // `__setattr__` guard the struct-seq type installs.
     if let Object::Instance(inst) = &obj {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(
             DictKey(Object::from_static("service_pack_major")),
             Object::Int(i64::from(info.wServicePackMajor)),
@@ -2218,7 +2233,7 @@ fn sys_flags_value() -> Object {
         .collect();
     let flags = crate::stdlib::os::struct_seq_instance(ty, SYS_FLAGS_FIELDS, values);
     if let Object::Instance(inst) = &flags {
-        let mut dict = inst.dict.borrow_mut();
+        let mut dict = inst.dict_cell().borrow_mut();
         // This build always runs with the GIL (no free-threading), and
         // the two PEP 649-era context flags take their 3.14 GIL-build
         // defaults (both off; `-X thread_inherit_context=1` /

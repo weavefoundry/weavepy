@@ -316,6 +316,128 @@ pub(crate) mod type_cache {
 /// The dict stores methods and class attributes — the same dict you
 /// see as `cls.__dict__`. The MRO is precomputed at construction
 /// time so attribute lookups are linear in the depth of inheritance.
+/// How a class resolves one attribute name for the leaf burst's
+/// instance-attribute paths, keyed by the *interned* name object's
+/// address and the class's attribute version. A small direct-mapped
+/// cache per class: polymorphic sites (one receiver class per iteration)
+/// find every class's answer here with no site cache at all.
+///
+/// Read and written only from the dispatch loop with the GIL held (the
+/// burst is off in free-threaded mode), like the dispatch loop's other
+/// side caches.
+pub struct LeafAttrCache(std::cell::UnsafeCell<[LeafAttrEntry; 32]>);
+
+// SAFETY: see the type docs — GIL-serialized access from one thread at a
+// time, never across a Python call.
+unsafe impl Send for LeafAttrCache {}
+unsafe impl Sync for LeafAttrCache {}
+
+#[derive(Clone, Debug)]
+pub struct LeafAttrEntry {
+    /// Interned name object address; `0` = empty.
+    pub name: usize,
+    pub ver: u64,
+    pub kind: LeafAttrKind,
+}
+
+/// The cached answer (see [`LeafAttrCache`]).
+#[derive(Clone, Debug)]
+pub enum LeafAttrKind {
+    /// Not on the class MRO: instances resolve it from their own dict.
+    InstanceOnly,
+    /// A plain function on the MRO (a non-data descriptor: the instance
+    /// dict still wins when it has the name).
+    Method(crate::sync::Weak<crate::object::PyFunction>),
+    /// A static method's function: read through a class or an instance,
+    /// it is the function itself, never bound.
+    StaticFn(crate::sync::Weak<crate::object::PyFunction>),
+    /// A native method on the MRO that binds the instance as its first
+    /// argument (a non-data descriptor: the instance dict still wins).
+    BuiltinMethod(crate::sync::Rc<crate::object::BuiltinFn>),
+    /// A plain scalar/string class value (instance dict still wins).
+    Value(Object),
+    /// A plain (non-descriptor) instance stored on the class, held
+    /// weakly: the cache must not add an edge the collector cannot see.
+    ValueInstance(crate::sync::Weak<PyInstance>),
+    /// A class stored on the class, likewise held weakly.
+    ValueType(crate::sync::Weak<TypeObject>),
+    /// A `property` on the MRO (a data descriptor: it wins over the
+    /// instance dict); its getter is read at access time.
+    Property(crate::sync::Weak<crate::object::PyProperty>),
+    /// Anything else: the full path decides.
+    Other,
+}
+
+impl LeafAttrCache {
+    pub fn new() -> Self {
+        Self(std::cell::UnsafeCell::new(std::array::from_fn(|_| {
+            LeafAttrEntry {
+                name: 0,
+                ver: 0,
+                kind: LeafAttrKind::Other,
+            }
+        })))
+    }
+
+    #[inline]
+    fn index(name: usize) -> usize {
+        ((name >> 4) ^ (name >> 9) ^ (name >> 14)) & 31
+    }
+
+    /// The second slot a name may live in (two-choice placement: two
+    /// names sharing their first slot, used alternately, would otherwise
+    /// evict each other on every lookup).
+    #[inline]
+    fn alt(name: usize) -> usize {
+        Self::index(name) ^ (1 + ((name >> 7) & 15))
+    }
+
+    /// The cached kind for `name` under `ver`, if present.
+    #[inline]
+    pub fn get(&self, name: usize, ver: u64) -> Option<&LeafAttrKind> {
+        // SAFETY: GIL-serialized; no `&mut` escapes `set`.
+        let t = unsafe { &*self.0.get() };
+        let e = &t[Self::index(name)];
+        if e.name == name && e.ver == ver {
+            return Some(&e.kind);
+        }
+        let e = &t[Self::alt(name)];
+        (e.name == name && e.ver == ver).then_some(&e.kind)
+    }
+
+    #[inline]
+    pub fn set(&self, name: usize, ver: u64, kind: LeafAttrKind) {
+        // SAFETY: GIL-serialized; the exclusive reference lives only for
+        // the assignment.
+        let t = unsafe { &mut *self.0.get() };
+        let (i, j) = (Self::index(name), Self::alt(name));
+        // The first slot unless it holds another name that is still
+        // current; then the second, unless that one is too (evict the
+        // first).
+        let busy = |e: &LeafAttrEntry| e.name != 0 && e.name != name && e.ver == ver;
+        let k = if !busy(&t[i]) || busy(&t[j]) { i } else { j };
+        t[k] = LeafAttrEntry { name, ver, kind };
+    }
+}
+
+impl Default for LeafAttrCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for LeafAttrCache {
+    fn clone(&self) -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for LeafAttrCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LeafAttrCache")
+    }
+}
+
 pub struct TypeObject {
     pub name: String,
     /// PEP 3155 `__qualname__`. CPython's `type_new` *pops* the
@@ -394,6 +516,21 @@ pub struct TypeObject {
     /// in `__dict__` is seen by already-specialised call sites. Also keys
     /// the per-thread [`type_cache`] (RFC 0077 WS4).
     pub attr_version: AttrVersion,
+    /// The leaf burst's per-class attribute-kind cache (see
+    /// [`LeafAttrCache`]).
+    pub leaf_attrs: LeafAttrCache,
+    /// The most attributes an instance's `__dict__` was seen to hold
+    /// (capped): new instances' dicts are presized to it, so `__init__`'s
+    /// stores do not regrow them.
+    pub inst_dict_hint: std::sync::atomic::AtomicU32,
+    /// Non-zero for an exact class whose hot methods have native
+    /// implementations (see `stdlib::datetime_native`): its instances
+    /// are never cycle-collector tracked (like CPython's C types without
+    /// `Py_TPFLAGS_HAVE_GC`), and the leaf guards key on the value.
+    pub native_kind: Cell<u8>,
+    /// Native-implementation state for such a class (see
+    /// `stdlib::datetime_native`), set once.
+    pub native_ext: std::sync::OnceLock<Rc<dyn std::any::Any + Send + Sync>>,
     /// Cached "do instances of this type carry a `__del__` finalizer
     /// anywhere in their MRO?" answer, so [`crate::object::PyInstance`]'s
     /// `Drop` safety net can skip an MRO walk on the hot per-instance drop
@@ -402,6 +539,13 @@ pub struct TypeObject {
     /// `__del__` is assigned to / deleted from a type's dict or the MRO is
     /// recomputed (`__bases__` assignment).
     pub has_del: Cell<u8>,
+    /// Memoised `__eq__` resolution for instances of this type, packed
+    /// as `attr_version << 2 | kind` (`0` = not yet computed): kind `1` =
+    /// `object`'s identity default (or no `__eq__`), `2` = a Python-level
+    /// override, `3` = a built-in type's own override (Python dispatch
+    /// only for instances without a native payload). A stale version
+    /// recomputes. See `object::instance_has_custom_eq`.
+    pub eq_kind: Cell<u64>,
     /// Memoised instantiation plan (`type(…)` call protocol resolution:
     /// `__new__`/`__init__`/native-payload classification), stamped with
     /// the [`Self::attr_version`] observed when it was built. Rebuilt
@@ -452,6 +596,12 @@ pub struct TypeObject {
     /// so the drift is adopted the moment Python asks for the class of
     /// the class.
     pub c_ext_ptr: Cell<usize>,
+    /// Memoised exception-family membership for this type's MRO (see
+    /// `Interpreter::build_exception_instance`), packed as
+    /// `attr_version << 10 | flags << 1 | 1`; `0` = not yet computed.
+    /// Every exception construction asked the MRO for nine names. Last
+    /// field: the hot ones above keep their offsets.
+    pub exc_families: Cell<u64>,
 }
 
 /// Per-class resolution of the `type.__call__` protocol, cached on the
@@ -484,6 +634,15 @@ pub struct InstancePlan {
     /// The MRO beyond the class itself is just `object` — the strict
     /// "takes no arguments" arity check applies when no `__init__` exists.
     pub only_object_init: bool,
+    /// The plain-construction shape (`Interpreter::instantiate_plain_lean`)
+    /// holds for this class as far as the class-level facts go, and
+    /// `__init__` is this plain function with this code object (the
+    /// per-call check re-verifies the code identity and its lean
+    /// eligibility, which can change under the class).
+    pub lean_init: Option<(
+        Rc<crate::object::PyFunction>,
+        Rc<weavepy_compiler::CodeObject>,
+    )>,
 }
 
 /// How a fresh instance's `native` payload is provisioned (see
@@ -767,6 +926,10 @@ impl TypeObject {
             dict: Rc::new(RefCell::new(dict)),
             flags,
             metaclass: RefCell::new(None),
+            leaf_attrs: LeafAttrCache::new(),
+            inst_dict_hint: std::sync::atomic::AtomicU32::new(0),
+            native_kind: Cell::new(0),
+            native_ext: std::sync::OnceLock::new(),
             slot_names: RefCell::new(Vec::new()),
             declares_slots: Cell::new(false),
             forbids_dict: false,
@@ -776,12 +939,14 @@ impl TypeObject {
             mro_kind: std::sync::atomic::AtomicU8::new(0),
             attr_version: AttrVersion::fresh(),
             has_del: Cell::new(0),
+            eq_kind: Cell::new(0),
             instance_plan: RefCell::new(None),
             c_tp_name: crate::sync::RefCell::new(None),
             c_sq_item: Cell::new(false),
             immutable: Cell::new(false),
             frozen_heap_type: Cell::new(false),
             c_ext_ptr: Cell::new(0),
+            exc_families: Cell::new(0),
         });
         let mro = compute_c3(&ty, &bases, name)?;
         *ty.mro.borrow_mut() = mro;
@@ -1633,9 +1798,119 @@ pub struct SlotStorage {
 #[cfg(target_pointer_width = "64")]
 #[derive(Debug, Clone)]
 enum SlotData {
-    Single { key: Option<DictKey>, value: Object },
+    Single {
+        key: Option<DictKey>,
+        value: Object,
+    },
     Small(Vec<(DictKey, Object)>),
-    Many(DictData),
+    /// Boxed: this variant is for instances with more than eight slots,
+    /// and inline it would set the size of *every* instance's slot field
+    /// (a `DictData` is 72 bytes) — `SlotStorage` sits in `PyInstance`
+    /// by value.
+    Many(Box<DictData>),
+    /// Every slot of a layout shared across instances (one `Rc` for the
+    /// names instead of a key per slot per instance), all populated —
+    /// the natively built instances of `datetime`'s classes. Adding or
+    /// removing a key converts to [`Self::Small`] / [`Self::Many`].
+    Fixed {
+        layout: crate::sync::Rc<[DictKey]>,
+        values: Box<[Object]>,
+    },
+}
+
+#[cfg(target_pointer_width = "64")]
+/// `stored == name` for a slot name, without the call into `memcmp`.
+/// Slot names are short (`_data`, `_head`, `x`) and almost always differ
+/// in the first byte or the length, so the libc call — a PLT stub, a
+/// dispatch on size and a return — costs more than the comparison it
+/// performs. `collections.deque` reads three slots per operation, which
+/// put `memcmp` at 8% of `deque_ops`.
+#[inline(always)]
+fn slot_name_eq(stored: &str, name: &str) -> bool {
+    let (a, b) = (stored.as_bytes(), name.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    if a.len() > 16 {
+        // Past a couple of words the library routine's vector loop wins.
+        return a == b;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+impl SlotStorage {
+    /// Storage holding exactly `entries` (distinct `str` keys, in slot
+    /// order), built in one step.
+    pub fn from_entries(entries: Vec<(DictKey, Object)>) -> Self {
+        let data = match entries.len() {
+            0 => SlotData::Single {
+                key: None,
+                value: Object::None,
+            },
+            1..=16 => SlotData::Small(entries),
+            n => {
+                let mut table =
+                    DictData::with_capacity_and_hasher(n, crate::fasthash::FxBuildHasher);
+                table.extend(entries);
+                SlotData::Many(Box::new(table))
+            }
+        };
+        Self { data }
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+impl SlotStorage {
+    /// Storage holding `values` under the shared slot names `layout`
+    /// (distinct `str` keys, in slot order; one value per name).
+    pub fn from_layout(layout: crate::sync::Rc<[DictKey]>, values: Vec<Object>) -> Self {
+        if layout.len() != values.len() {
+            return Self::from_entries(layout.iter().cloned().zip(values).collect());
+        }
+        Self {
+            data: SlotData::Fixed {
+                layout,
+                values: values.into_boxed_slice(),
+            },
+        }
+    }
+
+    /// Turn a [`SlotData::Fixed`] storage into the per-key form (before
+    /// a key is added or removed).
+    fn unfix(&mut self) {
+        if let SlotData::Fixed { layout, values } = &mut self.data {
+            let values = std::mem::take(values);
+            let entries: Vec<(DictKey, Object)> =
+                layout.iter().cloned().zip(values.into_vec()).collect();
+            *self = Self::from_entries(entries);
+        }
+    }
+}
+
+#[cfg(not(target_pointer_width = "64"))]
+impl SlotStorage {
+    /// Storage holding `values` under `layout` (see the 64-bit variant).
+    pub fn from_layout(layout: crate::sync::Rc<[DictKey]>, values: Vec<Object>) -> Self {
+        Self::from_entries(layout.iter().cloned().zip(values).collect())
+    }
+}
+
+#[cfg(not(target_pointer_width = "64"))]
+impl SlotStorage {
+    /// Storage holding exactly `entries` (see the 64-bit variant).
+    pub fn from_entries(entries: Vec<(DictKey, Object)>) -> Self {
+        let mut table =
+            DictData::with_capacity_and_hasher(entries.len(), crate::fasthash::FxBuildHasher);
+        table.extend(entries);
+        Self(table)
+    }
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -1660,12 +1935,18 @@ impl SlotStorage {
             SlotData::Small(entries) => entries
                 .iter()
                 .position(
-                    |(key, _)| matches!(&key.0, Object::Str(stored) if stored.as_ref() == name),
+                    |(key, _)| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
                 )
                 .map(|index| index as u32),
             SlotData::Many(table) => table
                 .get_index_of(&crate::object::StrKey(name))
                 .and_then(|index| u32::try_from(index).ok()),
+            SlotData::Fixed { layout, .. } => layout
+                .iter()
+                .position(
+                    |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
+                )
+                .map(|index| index as u32),
         }
     }
 
@@ -1677,6 +1958,7 @@ impl SlotStorage {
             SlotData::Single { key, value } if index == 0 => key.as_ref().map(|key| (key, value)),
             SlotData::Small(entries) => entries.get(index).map(|(key, value)| (key, value)),
             SlotData::Many(table) => table.get_index(index),
+            SlotData::Fixed { layout, values } => layout.get(index).zip(values.get(index)),
             _ => None,
         }
     }
@@ -1687,6 +1969,7 @@ impl SlotStorage {
             SlotData::Single { key, value } if index == 0 => key.as_ref().map(|key| (key, value)),
             SlotData::Small(entries) => entries.get_mut(index).map(|(key, value)| (&*key, value)),
             SlotData::Many(table) => table.get_index_mut(index),
+            SlotData::Fixed { layout, values } => layout.get(index).zip(values.get_mut(index)),
             _ => None,
         }
     }
@@ -1696,11 +1979,65 @@ impl SlotStorage {
             SlotData::Single {
                 key: Some(DictKey(Object::Str(stored))),
                 value,
-            } if stored.as_ref() == name => Some(value),
+            } if slot_name_eq(stored.as_ref(), name) => Some(value),
             SlotData::Small(entries) => entries.iter().find_map(|(key, value)| {
-                matches!(&key.0, Object::Str(stored) if stored.as_ref() == name).then_some(value)
+                matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)).then_some(value)
             }),
             SlotData::Many(table) => table.get(&crate::object::StrKey(name)),
+            SlotData::Fixed { layout, values } => layout
+                .iter()
+                .position(
+                    |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
+                )
+                .and_then(|i| values.get(i)),
+            _ => None,
+        }
+    }
+
+    /// `get(name)` with a position hint: one key compare when the slot
+    /// sits at `idx` (the usual layout for a class whose `__init__`
+    /// assigns its slots in a fixed order), the name scan otherwise.
+    #[inline]
+    pub fn get_hinted(&self, idx: usize, name: &str) -> Option<&Object> {
+        if let Some((DictKey(Object::Str(stored)), value)) = self.get_index(idx) {
+            // Interned names usually share the probe's storage.
+            if std::ptr::eq(stored.as_ptr(), name.as_ptr()) || slot_name_eq(stored.as_ref(), name) {
+                return Some(value);
+            }
+        }
+        self.get(name)
+    }
+
+    /// `get_mut(name)` with a position hint (see [`Self::get_hinted`]).
+    #[inline]
+    pub fn get_hinted_mut(&mut self, idx: usize, name: &str) -> Option<&mut Object> {
+        let at_hint = matches!(
+            self.get_index(idx),
+            Some((DictKey(Object::Str(stored)), _)) if slot_name_eq(stored.as_ref(), name)
+        );
+        if at_hint {
+            return self.get_index_mut(idx).map(|(_, v)| v);
+        }
+        self.get_mut(name)
+    }
+
+    /// Mutable access to a populated slot's value, by name.
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut Object> {
+        match &mut self.data {
+            SlotData::Single {
+                key: Some(DictKey(Object::Str(stored))),
+                value,
+            } if slot_name_eq(stored.as_ref(), name) => Some(value),
+            SlotData::Small(entries) => entries.iter_mut().find_map(|(key, value)| {
+                matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)).then_some(value)
+            }),
+            SlotData::Many(table) => table.get_mut(&crate::object::StrKey(name)),
+            SlotData::Fixed { layout, values } => layout
+                .iter()
+                .position(
+                    |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
+                )
+                .and_then(|i| values.get_mut(i)),
             _ => None,
         }
     }
@@ -1727,6 +2064,12 @@ impl SlotStorage {
         value: Object,
         make_key: impl FnOnce() -> DictKey,
     ) -> Option<Object> {
+        if let SlotData::Fixed { .. } = &self.data {
+            if let Some(slot) = self.get_mut(name) {
+                return Some(std::mem::replace(slot, value));
+            }
+            self.unfix();
+        }
         match &mut self.data {
             SlotData::Single { key, value: slot } if key.is_none() => {
                 *key = Some(make_key());
@@ -1736,14 +2079,16 @@ impl SlotStorage {
             SlotData::Single {
                 key: Some(DictKey(Object::Str(stored))),
                 value: slot,
-            } if stored.as_ref() == name => return Some(std::mem::replace(slot, value)),
+            } if slot_name_eq(stored.as_ref(), name) => {
+                return Some(std::mem::replace(slot, value))
+            }
             SlotData::Small(entries) => {
                 if let Some((_, slot)) = entries.iter_mut().find(
-                    |(key, _)| matches!(&key.0, Object::Str(stored) if stored.as_ref() == name),
+                    |(key, _)| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
                 ) {
                     return Some(std::mem::replace(slot, value));
                 }
-                if entries.len() < 8 {
+                if entries.len() < 16 {
                     entries.push((make_key(), value));
                     return None;
                 }
@@ -1772,7 +2117,7 @@ impl SlotStorage {
                     table.insert(key, previous);
                 }
                 table.insert(make_key(), value);
-                SlotData::Many(table)
+                SlotData::Many(Box::new(table))
             }
             _ => unreachable!("only populated single or small slots need promotion"),
         };
@@ -1780,8 +2125,9 @@ impl SlotStorage {
     }
 
     pub fn remove(&mut self, name: &str) -> Option<Object> {
+        self.unfix();
         match &mut self.data {
-            SlotData::Single { key, value } if matches!(key.as_ref(), Some(DictKey(Object::Str(stored))) if stored.as_ref() == name) =>
+            SlotData::Single { key, value } if matches!(key.as_ref(), Some(DictKey(Object::Str(stored))) if slot_name_eq(stored.as_ref(), name)) =>
             {
                 *key = None;
                 Some(std::mem::replace(value, Object::None))
@@ -1789,7 +2135,7 @@ impl SlotStorage {
             SlotData::Small(entries) => entries
                 .iter()
                 .position(
-                    |(key, _)| matches!(&key.0, Object::Str(stored) if stored.as_ref() == name),
+                    |(key, _)| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
                 )
                 .map(|index| entries.remove(index).1),
             SlotData::Many(table) => table.shift_remove(&crate::object::StrKey(name)),
@@ -1798,15 +2144,23 @@ impl SlotStorage {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&DictKey, &Object)> {
-        let (single, small, many) = match &self.data {
-            SlotData::Single { key, value } => (key.as_ref().map(|key| (key, value)), None, None),
-            SlotData::Small(entries) => (None, Some(entries), None),
-            SlotData::Many(table) => (None, None, Some(table)),
+        let (single, small, many, fixed) = match &self.data {
+            SlotData::Single { key, value } => {
+                (key.as_ref().map(|key| (key, value)), None, None, None)
+            }
+            SlotData::Small(entries) => (None, Some(entries), None, None),
+            SlotData::Many(table) => (None, None, Some(table), None),
+            SlotData::Fixed { layout, values } => (None, None, None, Some((layout, values))),
         };
         single
             .into_iter()
             .chain(small.into_iter().flatten().map(|(key, value)| (key, value)))
             .chain(many.into_iter().flat_map(|table| table.iter()))
+            .chain(
+                fixed
+                    .into_iter()
+                    .flat_map(|(layout, values)| layout.iter().zip(values.iter())),
+            )
     }
 }
 
@@ -1832,6 +2186,10 @@ impl SlotStorage {
     #[inline]
     pub fn get_index_mut(&mut self, index: usize) -> Option<(&DictKey, &mut Object)> {
         self.0.get_index_mut(index)
+    }
+
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut Object> {
+        self.0.get_mut(&crate::object::StrKey(name))
     }
 
     pub fn get(&self, name: &str) -> Option<&Object> {
@@ -1938,6 +2296,17 @@ pub struct PyInstance {
     /// `test_multiprocessing_*` `test_release_task_refs` leaked one
     /// `CountedObject` per race).
     pub finalize_ran: Cell<bool>,
+    /// Cycle-collector tracking is still deferred: the collector has
+    /// never seen this instance, and it holds only atomic values (see
+    /// [`crate::gc_trace::track_deferred_owner`]).
+    ///
+    /// The state lives here rather than in the `__dict__` so that an
+    /// instance which never grows one can stay deferred — an attribute
+    /// read or a method call must not conjure a dictionary. While a
+    /// `__dict__` does exist it carries the owner record as well, so a
+    /// mutation reached through the dict alone (`vars(obj)['x'] = y`)
+    /// still starts tracking; the two are set and cleared together.
+    pub deferred: Cell<bool>,
     /// The stable C "inline body" this instance owns once it has crossed
     /// into a C extension that reads its fields at fixed `tp_basicsize`
     /// offsets (RFC 0045, wave 3). `0` for the overwhelmingly common case
@@ -1945,6 +2314,15 @@ pub struct PyInstance {
     /// `__dict__`). Freed exactly once, in [`PyInstance`]'s `Drop`, via
     /// the [`register_instance_body_free`] hook.
     pub c_body: CBody,
+}
+
+/// Per-thread freelist of retired deferred-tracking instances (see
+/// [`PyInstance::try_recycle`]).
+const INSTANCE_POOL_CAP: usize = 128;
+
+thread_local! {
+    static INSTANCE_POOL: std::cell::RefCell<Vec<Rc<PyInstance>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl PyInstance {
@@ -1957,6 +2335,7 @@ impl PyInstance {
             slots: RefCell::new(SlotStorage::default()),
             hash_cache: crate::sync::CachedHash::new(None),
             finalize_ran: Cell::new(false),
+            deferred: Cell::new(false),
             c_body: CBody::default(),
         }
     }
@@ -1972,7 +2351,199 @@ impl PyInstance {
             slots: RefCell::new(SlotStorage::default()),
             hash_cache: crate::sync::CachedHash::new(None),
             finalize_ran: Cell::new(false),
+            deferred: Cell::new(false),
             c_body: CBody::default(),
+        }
+    }
+
+    /// A plain instance whose cycle-collector tracking is deferred until
+    /// it could hold a non-atomic value (see
+    /// [`crate::gc_trace::track_deferred_owner`]).
+    ///
+    /// No `__dict__` is published: an instance that only ever reads class
+    /// attributes or calls methods keeps CPython's cold-instance shape,
+    /// and [`Self::dict_shared`] installs the owner record if and when a
+    /// dictionary is actually needed.
+    pub fn new_deferred(class: Rc<TypeObject>) -> Rc<Self> {
+        let hint = class
+            .inst_dict_hint
+            .load(std::sync::atomic::Ordering::Relaxed) as usize;
+        if let Some(mut inst) = INSTANCE_POOL.with(|p| p.borrow_mut().pop()) {
+            // Recycled: every field was reset by `try_recycle`; only the
+            // class changes. A pooled instance keeps whatever dict it
+            // was retired with, already cleared and carrying the record.
+            if let Some(m) = Rc::get_mut(&mut inst) {
+                *m.class.get_mut() = class;
+                m.deferred.set(true);
+                if hint > 0 {
+                    if let Some(dict) = m.dict.get() {
+                        if let Ok(mut d) = dict.try_borrow_mut() {
+                            if d.capacity() < hint {
+                                d.map_mut_atomic_store().reserve(hint);
+                            }
+                        }
+                    }
+                }
+                return inst;
+            }
+        }
+        let inst = Rc::new(Self::new(class));
+        inst.deferred.set(true);
+        inst
+    }
+
+    /// The instance `__dict__`, created on demand.
+    ///
+    /// A dictionary born while tracking is still deferred carries the
+    /// owner record, so a mutation that reaches it without going through
+    /// the instance — `vars(obj)['x'] = y`, or a handle kept from
+    /// `obj.__dict__` — still starts tracking through the write barrier
+    /// on [`crate::object::DictData`]'s `DerefMut`.
+    pub fn dict_shared(&self) -> Rc<RefCell<DictData>> {
+        self.dict_cell();
+        self.dict.share()
+    }
+
+    /// The instance `__dict__` cell, created on demand and carrying the
+    /// owner record while tracking is deferred.
+    ///
+    /// Every path in the core VM that may materialise a *user* instance's
+    /// dictionary goes through here rather than through `LazyArc`'s
+    /// `Deref`, which would publish one with no record and leave the
+    /// write barrier unable to find the owner. (The stdlib's
+    /// native-backed objects are never deferred, so a record-free
+    /// dictionary is the right answer for them.)
+    pub fn dict_cell(&self) -> &RefCell<DictData> {
+        if self.deferred.get() {
+            let owner = std::ptr::from_ref(self) as usize;
+            let hint = self
+                .cls()
+                .inst_dict_hint
+                .load(std::sync::atomic::Ordering::Relaxed) as usize;
+            return self.dict.get_or_init(|| {
+                Rc::new(RefCell::new(DictData::deferred_for_capacity(owner, hint)))
+            });
+        }
+        self.dict
+            .get_or_init(|| Rc::new(RefCell::new(DictData::default())))
+    }
+
+    /// Retire a dying deferred-tracking instance into the per-thread
+    /// pool for `new_deferred` (CPython's per-type freelist), or drop it.
+    /// The caller established that `obj` is its only reference, the
+    /// instance is still deferred and owns no C body.
+    pub fn try_recycle(mut inst: Rc<Self>) {
+        let Some(m) = Rc::get_mut(&mut inst) else {
+            return;
+        };
+        let owner = std::ptr::from_ref(&*m) as usize;
+        if m.native.get().is_some() || m.finalize_ran.get() || m.c_body.get() != 0 {
+            return;
+        }
+        // An instance that never grew a `__dict__` is the common case
+        // now and needs no reset; one that did keeps it for the next
+        // tenant, cleared and carrying a fresh owner record.
+        if let Some(dict) = m.dict.get() {
+            // The dict must be private too: `vars(obj)` / `obj.__dict__`
+            // hand out the same `Arc`, and a holder must keep seeing the
+            // dead instance's attributes, not the next tenant's.
+            if m.dict.strong_count() != 1 {
+                return;
+            }
+            // Reset in place: values are atomic, so clearing runs no code
+            // that could observe the instance.
+            let Ok(mut d) = dict.try_borrow_mut() else {
+                return;
+            };
+            if d.capacity() > 32 {
+                return;
+            }
+            d.map_mut_atomic_store().clear();
+            d.reset_deferred_owner(owner);
+        }
+        *m.slots.get_mut() = SlotStorage::default();
+        m.inline_values.set(true);
+        m.deferred.set(true);
+        m.hash_cache = crate::sync::CachedHash::new(None);
+        // A pooled instance must not keep its class alive (a transient
+        // class is collected as soon as its last instance dies).
+        *m.class.get_mut() = crate::builtin_types::builtin_types().object_.clone();
+        INSTANCE_POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() < INSTANCE_POOL_CAP {
+                p.push(inst);
+            }
+        });
+    }
+
+    /// Whether tracking is still deferred (the `__dict__` carries the
+    /// owner record).
+    #[inline]
+    pub fn is_gc_deferred(&self) -> bool {
+        self.deferred.get()
+    }
+
+    /// Whether the last reference to this instance may simply be
+    /// dropped (or the instance recycled): tracking is still deferred,
+    /// so it holds only atomic values and has no weakref or collector
+    /// handle; it owns no C body; and its class gained no `__del__`
+    /// since it was born.
+    #[inline]
+    pub fn dies_by_plain_drop(&self) -> bool {
+        if self.c_body.get() != 0 {
+            return false;
+        }
+        let Ok(cls) = self.class.try_borrow() else {
+            return false;
+        };
+        if cls.native_kind.get() != 0 {
+            // Never tracked; see `stdlib::datetime_native::plain_drop_ok`.
+            return !cls.instances_need_finalize()
+                && crate::stdlib::datetime_native::plain_drop_ok(self);
+        }
+        self.is_gc_deferred() && !cls.instances_need_finalize()
+    }
+
+    /// Drop the deferred-tracking record without tracking (the instance
+    /// is being tracked by other means, or is dying).
+    #[inline]
+    pub(crate) fn clear_deferred_tracking(&self) {
+        self.deferred.set(false);
+        if let Some(d) = self.dict.get() {
+            match d.try_borrow() {
+                Ok(d) => {
+                    d.take_deferred_owner();
+                }
+                // A live mutable borrow: the mutator has already taken
+                // the record through `DerefMut`; nothing else sets it.
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Track a deferred instance now (no-op otherwise).
+    pub fn ensure_gc_tracked(&self) {
+        if !self.deferred.get() {
+            return;
+        }
+        // Retire the dict's copy of the record so the write barrier does
+        // not track a second time, then track from the instance itself —
+        // which works whether or not a `__dict__` was ever created.
+        if let Some(d) = self.dict.get() {
+            if let Ok(d) = d.try_borrow() {
+                d.take_deferred_owner();
+            }
+        }
+        self.deferred.set(false);
+        crate::gc_trace::track_deferred_owner(std::ptr::from_ref(self) as usize);
+    }
+
+    /// A value is about to be stored outside the `__dict__` (a slot):
+    /// track a deferred instance unless the value is atomic.
+    #[inline]
+    pub fn note_slot_store(&self, value: &Object) {
+        if !value.is_gc_atomic() {
+            self.ensure_gc_tracked();
         }
     }
 
@@ -1980,6 +2551,18 @@ impl PyInstance {
     #[inline]
     pub fn cls(&self) -> Rc<TypeObject> {
         self.class.borrow().clone()
+    }
+
+    /// The class, read without the cell's borrow bookkeeping: for the
+    /// leaf burst, which runs under the GIL (it is off in free-threaded
+    /// mode) with no Python code in flight — `__class__` assignment, the
+    /// cell's only writer, is a plain store between bytecodes. The
+    /// reference must not outlive the current instruction.
+    #[inline]
+    pub(crate) fn cls_raw(&self) -> &TypeObject {
+        debug_assert!(!crate::gil::free_threading_enabled());
+        // SAFETY: see above — no writer can run while the burst reads.
+        unsafe { &*self.class.as_ptr() }
     }
 
     /// Re-point the instance at a new class (`obj.__class__ = C`).
@@ -1996,6 +2579,7 @@ impl PyInstance {
 
     /// Write slot `name` into the side table.
     pub fn slot_set(&self, name: &str, value: Object) {
+        self.note_slot_store(&value);
         self.slots.borrow_mut().insert(name, value);
     }
 
@@ -2033,6 +2617,21 @@ impl Drop for PyInstance {
     /// a shallow copy that shares the dying instance's `__dict__`/slots/native
     /// value onto the VM's pending-finalizer queue so `__del__` still runs.
     fn drop(&mut self) {
+        // A deferred-tracking record names this instance; the dict may
+        // outlive it (`d = obj.__dict__`), so retire the record first.
+        if let Some(d) = self.dict.get() {
+            match d.try_borrow() {
+                Ok(d) => {
+                    d.take_deferred_owner();
+                }
+                Err(_) => {
+                    // SAFETY: only the atomic record is touched; a mutable
+                    // borrow elsewhere already took it through `DerefMut`,
+                    // so this store is a no-op that races with nothing.
+                    unsafe { (*d.as_ptr()).take_deferred_owner() };
+                }
+            }
+        }
         if crate::hot_gates::env_flags::reap_trace() {
             let name = self.cls().name.clone();
             if name.contains("Block") || name.contains("DataFrame") {
@@ -2085,6 +2684,7 @@ impl Drop for PyInstance {
             finalize_ran: Cell::new(true),
             // The resurrected copy is a distinct object that owns no C
             // body (the dying `self` already freed its own above).
+            deferred: crate::sync::Cell::new(false),
             c_body: CBody::default(),
         }));
         crate::vm_singletons::try_push_pending_finalizer(resurrected);
@@ -2202,16 +2802,16 @@ mod slot_storage_tests {
     }
 
     #[test]
-    fn ninth_slot_promotes_without_replacing_existing_keys() {
+    fn seventeenth_slot_promotes_without_replacing_existing_keys() {
         let mut slots = SlotStorage::default();
         let mut keys = Vec::new();
-        for i in 0..16 {
+        for i in 0..24 {
             let name = format!("slot{i}");
             assert!(slots.insert(&name, Object::Int(i)).is_none());
             keys.push(slots.iter().last().unwrap().0 .0.clone());
             match i {
                 0 => assert!(matches!(slots.data, SlotData::Single { .. })),
-                1..=7 => assert!(matches!(slots.data, SlotData::Small(_))),
+                1..=15 => assert!(matches!(slots.data, SlotData::Small(_))),
                 _ => assert!(matches!(slots.data, SlotData::Many(_))),
             }
             for (index, (key, value)) in slots.iter().enumerate() {
@@ -2220,7 +2820,7 @@ mod slot_storage_tests {
             }
         }
         let mut cloned = slots.clone();
-        for i in (0..16).rev() {
+        for i in (0..24).rev() {
             let name = format!("slot{i}");
             assert_eq!(slots.remove(&name).and_then(|v| v.as_i64()), Some(i));
             assert!(slots.get(&name).is_none());
@@ -2270,7 +2870,7 @@ mod slot_storage_tests {
             let name = format!("slot{}", 2 * index + 1);
             assert_eq!(slots.index_of(&name), Some(index));
             let (key, value) = slots.get_index_mut(index as usize).unwrap();
-            assert!(matches!(&key.0, Object::Str(stored) if stored.as_ref() == name));
+            assert!(matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), &name)));
             *value = Object::Int(100 + i64::from(index));
             assert_eq!(
                 slots.get(&name).and_then(Object::as_i64),

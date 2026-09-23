@@ -1648,7 +1648,7 @@ unsafe fn wptr(body: *mut PyObject, off: usize, v: *mut PyObject) {
 /// Read an integer `__slots__`/`__dict__` field, defaulting to 0.
 fn field_i64(inst: &Rc<PyInstance>, name: &str) -> i64 {
     let v = inst.slot_get(name).or_else(|| {
-        inst.dict
+        inst.dict_cell()
             .borrow()
             .get(&DictKey(Object::from_str(name)))
             .cloned()

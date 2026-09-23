@@ -2702,7 +2702,7 @@ fn slot_getstate(args: &[Object]) -> Result<Object, RuntimeError> {
         let dict_state = if dict_is_empty {
             Object::None
         } else {
-            Object::Dict(inst.dict.share())
+            Object::Dict(inst.dict_shared())
         };
         if !slots.is_empty() {
             let mut slot_dict = crate::object::DictData::default();
@@ -3812,7 +3812,7 @@ fn property_dunder_delete(args: &[Object]) -> Result<Object, RuntimeError> {
 pub(crate) fn wstr_attr_dict(obj: &Object) -> Option<Rc<RefCell<crate::object::DictData>>> {
     match obj {
         Object::Module(m) => Some(m.dict.clone()),
-        Object::Instance(inst) => Some(inst.dict.share()),
+        Object::Instance(inst) => Some(inst.dict_shared()),
         _ => None,
     }
 }
@@ -3938,7 +3938,7 @@ fn b_vars(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Instance(inst)) if inst.cls().forbids_dict => {
             Err(type_error("vars() argument must have __dict__ attribute"))
         }
-        Some(Object::Instance(inst)) => Ok(Object::Dict(inst.dict.share())),
+        Some(Object::Instance(inst)) => Ok(Object::Dict(inst.dict_shared())),
         Some(Object::Module(m)) => Ok(Object::Dict(m.dict.clone())),
         Some(Object::Type(t)) => Ok(Object::Dict(t.dict.clone())),
         Some(other) => Err(type_error(format!(
@@ -4045,7 +4045,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
     match obj {
         Object::Instance(inst) => {
             if let Some(v) = inst
-                .dict
+                .dict_cell()
                 .borrow()
                 .get(&crate::object::DictKey(Object::from_str(name)))
                 .cloned()
@@ -4059,7 +4059,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                 return Some(bind_descriptor(&v, obj));
             }
             match name {
-                "__dict__" => Some(Object::Dict(inst.dict.share())),
+                "__dict__" => Some(Object::Dict(inst.dict_shared())),
                 "__class__" => Some(Object::Type(inst.cls())),
                 _ => None,
             }
@@ -5210,7 +5210,7 @@ pub fn code_flags(c: &weavepy_compiler::CodeObject) -> u32 {
 fn attr_set(obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError> {
     match obj {
         Object::Instance(inst) => {
-            inst.dict
+            inst.dict_cell()
                 .borrow_mut()
                 .insert(crate::object::DictKey(Object::from_str(name)), value);
             Ok(())
@@ -5264,7 +5264,7 @@ fn attr_set(obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError>
 fn attr_delete(obj: &Object, name: &str) -> Result<(), RuntimeError> {
     match obj {
         Object::Instance(inst) => {
-            inst.dict
+            inst.dict_cell()
                 .borrow_mut()
                 .shift_remove(&crate::object::DictKey(Object::from_str(name)));
             Ok(())
@@ -8567,6 +8567,7 @@ pub(crate) fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object 
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
         hash_cache: crate::sync::CachedHash::new(None),
         finalize_ran: crate::sync::Cell::new(false),
+        deferred: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
     };
     Object::Instance(Rc::new(inst))
@@ -8645,6 +8646,7 @@ pub(crate) fn build_super_proxy(
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
         hash_cache: crate::sync::CachedHash::new(None),
         finalize_ran: crate::sync::Cell::new(false),
+        deferred: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
     };
     Object::Instance(Rc::new(inst))
@@ -8682,7 +8684,7 @@ pub fn super_init_impl(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(_) => return Err(type_error("super() argument 1 must be a type")),
     };
     let receiver = args.get(2).cloned().unwrap_or(Object::None);
-    let mut d = target.dict.borrow_mut();
+    let mut d = target.dict_cell().borrow_mut();
     d.insert(
         DictKey(Object::from_static("__thisclass__")),
         Object::Type(class.clone()),
@@ -8710,7 +8712,7 @@ pub fn super_descr_get_impl(args: &[Object]) -> Result<Object, RuntimeError> {
     // Already bound (has a non-None __self__) → return self unchanged.
     if let Object::Instance(i) = &this {
         let (bound, class) = {
-            let d = i.dict.borrow();
+            let d = i.dict_cell().borrow();
             let bound = d
                 .get(&DictKey(Object::from_static("__self__")))
                 .map(|v| !matches!(v, Object::None))
@@ -9482,7 +9484,7 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     match obj {
         Object::Instance(inst) => {
-            for k in inst.dict.borrow().keys() {
+            for k in inst.dict_cell().borrow().keys() {
                 if let Object::Str(s) = &k.0 {
                     names.insert(s.to_string());
                 }
@@ -9528,17 +9530,17 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
             // bypass — so modules natively imported looked spec-less
             // (test_decimal's CheckAttributes diffs `dir(C)` against
             // `dir(P)`, and P is the natively imported `_pydecimal`).
-            // Trigger the synthesis first; harmless no-op once done.
+            // List both names without resolving them: the first attribute
+            // read synthesizes the pair (`ensure_module_spec`), and doing
+            // it here would import `importlib` from a bare `dir()` — the
+            // `posix` shim's `dir(_os)` at interpreter start-up did.
             let missing_spec = !m
                 .dict
                 .borrow()
                 .contains_key(&crate::object::DictKey(Object::from_static("__spec__")));
             if missing_spec {
-                if let Some(p) = crate::vm_singletons::current_interpreter_ptr() {
-                    // SAFETY: published by the enclosing VM dispatch
-                    // frame on this thread; the GIL keeps it exclusive.
-                    let _ = unsafe { &mut *p }.ensure_module_spec(m);
-                }
+                names.insert("__spec__".to_owned());
+                names.insert("__loader__".to_owned());
             }
             for k in m.dict.borrow().keys() {
                 if let Object::Str(s) = &k.0 {
@@ -10434,6 +10436,9 @@ fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
         // both, matching CPython where the function object is the same.
         attrs: RefCell::new(f.attrs()),
         slots: RefCell::new(f.slots.borrow().clone()),
+        closure_cells: std::sync::OnceLock::new(),
+        // The copied slot store carries any override along.
+        defaults_override: crate::object::OverrideFlag::new(f.defaults_maybe_overridden()),
     };
     Ok(Object::Function(Rc::new(marked)))
 }
@@ -10847,24 +10852,53 @@ fn split_maxsplit(o: Option<&Object>) -> Result<i64, RuntimeError> {
 /// `maxsplit`. Leading/trailing whitespace is stripped and empty fields
 /// are dropped, matching CPython (Py_UNICODE_ISSPACE, which covers
 /// U+001C..U+001F unlike Rust's `char::is_whitespace`).
+/// Which ASCII bytes [`crate::unicode_case::is_space`] accepts, derived
+/// from it so the two can never disagree. The byte scan below is what
+/// makes whitespace splitting cheap on the ASCII text it almost always
+/// gets: `str::split(char_predicate)` decodes every character.
+fn ascii_space_table() -> &'static [bool; 128] {
+    static TABLE: std::sync::OnceLock<[bool; 128]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|i| crate::unicode_case::is_space(i as u8 as char)))
+}
+
 fn str_split_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
     use crate::unicode_case::is_space;
-    if maxsplit < 0 {
-        return s
-            .split(is_space)
-            .filter(|f| !f.is_empty())
-            .map(|s| Object::Str(SharedStr::from(s)))
-            .collect();
+    // Presized: `collect()` over a filtered split carries no size hint,
+    // so the vector grew several times for a sentence-length string.
+    let mut out = Vec::with_capacity((s.len() / 8).min(64) + 1);
+    let limit = if maxsplit < 0 { i64::MAX } else { maxsplit };
+    let mut splits = 0i64;
+    if str_is_ascii_cached(s) {
+        let table = ascii_space_table();
+        let b = s.as_bytes();
+        let mut i = 0;
+        loop {
+            while i < b.len() && table[b[i] as usize] {
+                i += 1;
+            }
+            if i == b.len() {
+                break;
+            }
+            if splits >= limit {
+                out.push(Object::Str(SharedStr::from(&s[i..])));
+                break;
+            }
+            let start = i;
+            while i < b.len() && !table[b[i] as usize] {
+                i += 1;
+            }
+            out.push(Object::Str(SharedStr::from(&s[start..i])));
+            splits += 1;
+        }
+        return out;
     }
-    let mut out = Vec::new();
     let mut rest = s;
-    let mut splits = 0;
     loop {
         rest = rest.trim_start_matches(is_space);
         if rest.is_empty() {
             break;
         }
-        if splits >= maxsplit {
+        if splits >= limit {
             out.push(Object::Str(SharedStr::from(rest)));
             break;
         }
@@ -11215,25 +11249,28 @@ fn str_replace_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
     if count == 0 {
         return Ok(str_result(args, s.into_owned()));
     }
-    let out = if count < 0 {
-        s.replace(from, to)
-    } else if from.is_empty() {
-        // `str::replacen` with an empty pattern matches between every
-        // char and at both ends, same as CPython.
-        let mut out = String::new();
+    let out = if from.is_empty() {
+        // An empty pattern matches between every char and at both ends,
+        // same as CPython.
+        let limit = if count < 0 { i64::MAX } else { count };
+        let mut out = String::with_capacity(s.len() + to.len() * (s.len() + 1));
         let mut done = 0i64;
-        for (i, ch) in s.chars().enumerate() {
-            let _ = i;
-            if done < count {
+        for ch in s.chars() {
+            if done < limit {
                 out.push_str(to);
                 done += 1;
             }
             out.push(ch);
         }
-        if done < count {
+        if done < limit {
             out.push_str(to);
         }
         out
+    } else if count < 0 {
+        // Not `substr_find`'s loop: `replace` scans the whole haystack,
+        // where the two-way searcher's one-off preprocessing amortizes
+        // and beats a memchr candidate scan (measured: 3385 -> 3631).
+        s.replace(from, to)
     } else {
         s.replacen(from, to, count as usize)
     };
@@ -11268,6 +11305,114 @@ fn str_search_window(args: &[Object], total_chars: i64) -> Option<(i64, i64)> {
     }
 }
 
+/// `haystack[from..].find(needle)` without the two-way searcher's
+/// preprocessing. `str::find(&str)` builds a critical factorization of
+/// the needle on *every* call — `StrSearcher::new` was 11% of a
+/// `s.find("lazy")` loop — and that only pays for itself on a long
+/// needle or a long search. For a short one, scanning for the first
+/// byte and comparing is what CPython's `stringlib` does.
+///
+/// The naive scan's worst case is quadratic, so a run of failed
+/// candidates that has already cost more than the haystack hands the
+/// rest to the two-way searcher.
+pub(crate) fn substr_find(hay: &str, needle: &str) -> Option<usize> {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    if n.is_empty() {
+        return Some(0);
+    }
+    if n.len() > 16 || h.len() < n.len() {
+        return hay.find(needle);
+    }
+    let last_start = h.len() - n.len();
+    // `str::find(char)` is memchr-backed, so the candidate scan runs at
+    // vector width; the manual byte loop it replaced did not.
+    let first = needle.chars().next()?;
+    let step = first.len_utf8();
+    let mut i = 0;
+    let mut budget = h.len() / n.len() + 32;
+    while i <= last_start {
+        // `i` is always a char boundary — it starts at 0 and advances by
+        // whole characters — but `last_start` is a byte count and need
+        // not be one, so the scan runs to the end and rejects a
+        // candidate with no room for the needle after it.
+        let off = hay[i..].find(first)?;
+        let at = i + off;
+        if at > last_start {
+            return None;
+        }
+        if h[at..at + n.len()] == *n {
+            return Some(at);
+        }
+        budget -= 1;
+        if budget == 0 {
+            return hay[at + step..].find(needle).map(|k| k + at + step);
+        }
+        i = at + step;
+    }
+    None
+}
+
+/// [`substr_find`] from the right.
+pub(crate) fn substr_rfind(hay: &str, needle: &str) -> Option<usize> {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    if n.is_empty() {
+        return Some(h.len());
+    }
+    if n.len() > 16 || h.len() < n.len() {
+        return hay.rfind(needle);
+    }
+    let first = n[0];
+    let mut end = h.len() - n.len();
+    let mut budget = h.len() / n.len() + 32;
+    loop {
+        let at = h[..=end].iter().rposition(|&b| b == first)?;
+        if at + n.len() <= h.len() && h[at..at + n.len()] == *n {
+            return Some(at);
+        }
+        budget -= 1;
+        if budget == 0 || at == 0 {
+            // Everything right of `at` has been ruled out, so the
+            // rightmost match overall is the rightmost below it.
+            return hay.rfind(needle);
+        }
+        end = at - 1;
+    }
+}
+
+/// Non-overlapping occurrences of `needle` in `hay` (`str.count`), with
+/// [`substr_find`]'s memchr-backed candidate scan. The two-way
+/// searcher's *scan* — not just its setup — was 46% of an
+/// `s.count("fox")` loop.
+pub(crate) fn substr_count(hay: &str, needle: &str) -> usize {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    if n.is_empty() || n.len() > 16 || h.len() < n.len() {
+        return hay.matches(needle).count();
+    }
+    let last_start = h.len() - n.len();
+    let Some(first) = needle.chars().next() else {
+        return 0;
+    };
+    let step = first.len_utf8();
+    let mut count = 0;
+    let mut i = 0;
+    while i <= last_start {
+        let Some(off) = hay[i..].find(first) else {
+            break;
+        };
+        let at = i + off;
+        if at > last_start {
+            break;
+        }
+        if h[at..at + n.len()] == *n {
+            count += 1;
+            i = at + n.len();
+        } else {
+            i = at + step;
+        }
+    }
+    count
+}
+
 fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("find", args, 1, 3)?;
     let s = str_self(args)?;
@@ -11276,17 +11421,35 @@ fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(p) => p,
         None => return Err(type_error("find() expected str")),
     };
-    let total_chars = str_char_len(s) as i64;
+    // One ASCII probe for the whole call: each of the char/byte
+    // conversions below consults the same thread-local cache, and the
+    // TLS access costs more than the work it guards.
+    let ascii = str_is_ascii_cached(s);
+    let total_chars = if ascii {
+        s.len() as i64
+    } else {
+        str_char_len(s) as i64
+    };
     let Some((start, end)) = str_search_window(args, total_chars) else {
         return Ok(Object::Int(-1));
     };
-    let start_byte = char_offset_to_byte(s, start as usize);
-    let end_byte = char_offset_to_byte(s, end as usize);
+    let (start_byte, end_byte) = if ascii {
+        ((start as usize).min(s.len()), (end as usize).min(s.len()))
+    } else {
+        (
+            char_offset_to_byte(s, start as usize),
+            char_offset_to_byte(s, end as usize),
+        )
+    };
     let hay = &s[start_byte..end_byte];
-    match hay.find(&*sub) {
+    match substr_find(hay, &sub) {
         Some(byte_idx) => {
             let abs_byte = byte_idx + start_byte;
-            Ok(Object::Int(byte_offset_to_char(s, abs_byte) as i64))
+            Ok(Object::Int(if ascii {
+                abs_byte as i64
+            } else {
+                byte_offset_to_char(s, abs_byte) as i64
+            }))
         }
         None => Ok(Object::Int(-1)),
     }
@@ -11544,7 +11707,7 @@ fn str_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
     let start_byte = char_offset_to_byte(s, start as usize);
     let end_byte = char_offset_to_byte(s, end as usize);
     let hay = &s[start_byte..end_byte];
-    match hay.rfind(&*sub) {
+    match substr_rfind(hay, &sub) {
         Some(byte_idx) => {
             let abs_byte = byte_idx + start_byte;
             Ok(Object::Int(byte_offset_to_char(s, abs_byte) as i64))
@@ -11582,17 +11745,29 @@ fn str_count(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(p) => p,
         None => return Err(type_error("count() expected str")),
     };
-    let total_chars = str_char_len(s) as i64;
+    // One ASCII probe for the whole call, as `str.find` does.
+    let ascii = str_is_ascii_cached(s);
+    let total_chars = if ascii {
+        s.len() as i64
+    } else {
+        str_char_len(s) as i64
+    };
     let Some((start, end)) = str_search_window(args, total_chars) else {
         return Ok(Object::Int(0));
     };
-    let start_byte = char_offset_to_byte(s, start as usize);
-    let end_byte = char_offset_to_byte(s, end as usize);
+    let (start_byte, end_byte) = if ascii {
+        ((start as usize).min(s.len()), (end as usize).min(s.len()))
+    } else {
+        (
+            char_offset_to_byte(s, start as usize),
+            char_offset_to_byte(s, end as usize),
+        )
+    };
     // An empty needle matches at every code-point boundary (CPython counts
     // `len+1`); Rust's `matches("")` already yields that, but on the bridged
     // string each PUA char is one boundary, matching code-point semantics.
     Ok(Object::Int(
-        s[start_byte..end_byte].matches(&*sub).count() as i64
+        substr_count(&s[start_byte..end_byte], &sub) as i64
     ))
 }
 
@@ -11606,7 +11781,7 @@ fn str_partition(args: &[Object]) -> Result<Object, RuntimeError> {
     if sep.is_empty() {
         return Err(value_error("empty separator"));
     }
-    let (head, tail) = match s.find(&*sep) {
+    let (head, tail) = match substr_find(s, &sep) {
         Some(i) => (s[..i].to_owned(), s[i + sep.len()..].to_owned()),
         None => {
             return Ok(Object::new_tuple_array([
@@ -11754,7 +11929,12 @@ fn str_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
         // clamp to 0 so `*i as usize` can't wrap to a gigantic pad count.
         Some(Object::Int(i)) => (*i).max(0) as usize,
         Some(Object::Bool(b)) => usize::from(*b),
-        _ => return Err(type_error("zfill() expected int")),
+        other => {
+            let name = other.map_or_else(|| "NoneType".to_owned(), |a| class_of(a).name.clone());
+            return Err(type_error(format!(
+                "'{name}' object cannot be interpreted as an integer"
+            )));
+        }
     };
     let len = s.chars().count();
     if len >= width {
@@ -11816,7 +11996,12 @@ fn str_center(args: &[Object]) -> Result<Object, RuntimeError> {
         // underflow that would request a gigantic allocation.
         Some(Object::Int(i)) => (*i).max(0) as usize,
         Some(Object::Bool(b)) => usize::from(*b),
-        _ => return Err(type_error("center() expected int")),
+        other => {
+            let name = other.map_or_else(|| "NoneType".to_owned(), |a| class_of(a).name.clone());
+            return Err(type_error(format!(
+                "'{name}' object cannot be interpreted as an integer"
+            )));
+        }
     };
     let fill = match args.get(2).map(str_arg_bridged) {
         Some(Some(f)) if f.chars().count() == 1 => f.chars().next().unwrap(),
@@ -11872,7 +12057,12 @@ fn str_expandtabs(args: &[Object]) -> Result<Object, RuntimeError> {
         // can't wrap into a gigantic pad allocation.
         Some(Object::Int(i)) => (*i).max(0) as usize,
         None => 8,
-        _ => return Err(type_error("expandtabs() expected int")),
+        other => {
+            let name = other.map_or_else(|| "NoneType".to_owned(), |a| class_of(a).name.clone());
+            return Err(type_error(format!(
+                "'{name}' object cannot be interpreted as an integer"
+            )));
+        }
     };
     let mut out = String::new();
     let mut col = 0usize;
@@ -16619,7 +16809,7 @@ fn mem_dict_slot(receiver: &Object) -> Object {
 fn mem_apply_dict(receiver: &Object, dict: &Rc<RefCell<DictData>>) {
     match receiver {
         Object::Instance(inst) => {
-            let mut inst_dict = inst.dict.borrow_mut();
+            let mut inst_dict = inst.dict_cell().borrow_mut();
             for (k, v) in dict.borrow().iter() {
                 inst_dict.insert(k.clone(), v.clone());
             }
@@ -17723,7 +17913,7 @@ fn ns_dict_of(recv: &Object) -> Option<Rc<RefCell<crate::object::DictData>>> {
     match recv {
         Object::SimpleNamespace(d) => Some(d.clone()),
         Object::Instance(i) if matches!(i.native.get(), Some(Object::SimpleNamespace(_))) => {
-            Some(i.dict.share())
+            Some(i.dict_shared())
         }
         _ => None,
     }

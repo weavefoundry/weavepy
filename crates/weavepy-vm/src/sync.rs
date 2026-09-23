@@ -32,7 +32,7 @@ use std::cell::UnsafeCell;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -81,7 +81,11 @@ pub struct GilCell<T: ?Sized> {
     /// cross-thread access exclusive, but within a single OS thread
     /// the lock is reentrant — the counter prevents undefined
     /// behaviour on nested `borrow_mut()`.
-    borrow: AtomicIsize,
+    /// 32-bit, and placed next to the 32-bit `depth` below, so the two
+    /// share one word: `GilCell` is embedded by value in every
+    /// instance, list, dict and set, where each word of header is a
+    /// word per object on the heap.
+    borrow: AtomicI32,
     /// The cross-thread reentrant lock, hand-rolled for the hot path.
     /// `0` means unowned; otherwise it holds the owning thread's id
     /// ([`crate::gil::current_thread_id`]). The uncontended borrow —
@@ -91,10 +95,11 @@ pub struct GilCell<T: ?Sized> {
     /// thread-local bookkeeping this replaced, which dominated
     /// interpreter profiles (RFC 0047 wave 5: every `Cell::get` on an
     /// object field paid ~10× the cost of the field read itself).
-    owner: AtomicU64,
     /// Recursion depth. Only ever touched by the thread that owns
-    /// [`Self::owner`], so a plain (unsafe) cell is sound.
+    /// [`Self::owner`], so a plain (unsafe) cell is sound. Declared
+    /// next to `borrow` so the two 32-bit fields share one word.
     depth: UnsafeCell<u32>,
+    owner: AtomicU64,
     /// The guarded payload. Access is gated by holding the owner
     /// lock; the borrow counter rules out aliasing `&mut T` within a
     /// thread. Last field so `T: ?Sized` cells stay layout-legal.
@@ -314,12 +319,288 @@ impl CellTls {
     }
 }
 
+/// Whether more than one OS thread has ever run VM code (a second
+/// thread acquired the GIL, or free-threading is on). Until then every
+/// cell is touched by exactly one thread, and a borrow skips the lock
+/// word: no compare-exchange to take it, no release store to drop it.
+/// Set by [`note_vm_thread`] *before* the second thread touches any
+/// cell; the first thread cannot hold a borrow across a GIL release
+/// (the hand-off refuses while guards are live), so no guard taken
+/// lock-free is ever live once another thread runs. A guard remembers
+/// whether it took the lock, so a flip while one is live (impossible
+/// per the invariant) still releases correctly.
+static CELLS_SHARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn cells_shared() -> bool {
+    CELLS_SHARED.load(Ordering::Relaxed)
+}
+
+/// Cells may be reached by a thread that does **not** hold the GIL:
+/// free-threading, or a watchdog that reads interpreter state from
+/// outside it (`faulthandler.dump_traceback_later`).
+///
+/// Deliberately distinct from [`CELLS_SHARED`]. A second *Python* thread
+/// revokes the borrow bias, because two threads then take borrows of the
+/// same cell — but the GIL still serialises them, so a guardless read
+/// between two native operations (see [`GilCell::peek`]) cannot race and
+/// stays available. Conflating the two cost tier-2 every attribute read
+/// in any program that ever started a thread: `peek` returned `None`,
+/// each read deopted, and the compiled code retired on its deopt budget.
+static CELLS_UNGUARDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn cells_unguarded() -> bool {
+    CELLS_UNGUARDED.load(Ordering::Relaxed)
+}
+
+/// The first thread to run VM code (see [`note_vm_thread`]).
+static FIRST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Live borrow guards taken lock-free (while the bias held). Only the
+/// biased thread takes such guards, but [`revoke_bias`] reads the count
+/// from another thread, so both sides are sequentially consistent: the
+/// drain below and the re-check in the borrow fast paths must not miss
+/// each other.
+static SOLE_GUARDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The `tls` tag of a guard counted in [`SOLE_GUARDS`].
+const SOLE_TAG: *const CellTls = std::ptr::dangling();
+
+/// True while the calling thread may borrow without taking the lock
+/// word: the bias has not been revoked.
+///
+/// This is one relaxed load, and it is sound because of an invariant the
+/// VM already keeps: a thread touches objects only while it holds the
+/// GIL, and the GIL acquire path registers it ([`note_vm_thread`] in
+/// `gil.rs`). So a second thread revokes the bias before it can reach a
+/// cell, and its acquire/release of the GIL orders the flag store before
+/// the first thread's next borrow. The threads that legitimately touch
+/// objects *without* the GIL -- free-threading, the faulthandler
+/// watchdog -- announce themselves through [`mark_cells_shared`].
+///
+/// Reading the calling thread's identity here instead (a thread-local
+/// load per borrow) would steer an unregistered thread to the locked
+/// path, but it costs more than it protects: pyaes read 1.4x-1.6x its
+/// branch point on x86 with it, and an unregistered thread is a
+/// contract violation whatever the borrow path does. That check runs in
+/// debug builds only, where it turns a violation into a panic in the
+/// test job rather than silent memory corruption in a release.
+#[inline]
+fn biased_here() -> bool {
+    if cells_shared() {
+        return false;
+    }
+    // Debug builds -- which is what the unit-test binary is -- keep the
+    // identity check as a *steer*: that binary runs many VM threads at
+    // once with no GIL between them (every test is its own interpreter),
+    // so the invariant above does not hold there, and only the first
+    // registered thread may take the lock-free path. A release build has
+    // one VM thread under the GIL and pays nothing.
+    #[cfg(debug_assertions)]
+    {
+        let first = FIRST.load(Ordering::Relaxed);
+        first != 0 && CELL_TLS.try_with(|t| t.thread_id.get()).unwrap_or(0) == first
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        true
+    }
+}
+
+/// Publish a lock-free guard and re-check that the bias still holds.
+/// Both accesses are `SeqCst`, so this and [`revoke_bias`] linearise:
+/// whichever runs second observes the other's write, and a borrow is
+/// therefore never held lock-free once a revoker has moved on.
+#[inline]
+fn publish_sole_guard() {
+    // Only the biased thread writes this count, so a plain store is its
+    // whole cost. It needs no barrier: a revoker that can race this
+    // thread is one that touches cells without the GIL, which is outside
+    // the contract `biased_here` documents -- and for the backstop in
+    // `try_borrow_locked` that catches such a thread anyway, `revoke_bias`
+    // runs a barrier on *every* thread first, which makes this store
+    // visible to its drain.
+    let n = SOLE_GUARDS.load(Ordering::Relaxed);
+    SOLE_GUARDS.store(n + 1, Ordering::Relaxed);
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
+/// Whether [`heavy_barrier`] can make *every* thread execute a full
+/// memory barrier: `membarrier(2)` on Linux, `FlushProcessWriteBuffers`
+/// on Windows. Set once, at process start-up, only after the platform
+/// facility is confirmed to work; a thread that reads it stale (`false`)
+/// simply fences itself, which is always sound.
+///
+/// This is what keeps the biased borrow path free of barriers: the
+/// ordering the revocation handshake needs is paid by the revoker, at
+/// most once per process, instead of by every borrow in the VM. (With a
+/// per-borrow fence the bench gate read pyaes at 1.43x merge-base on
+/// x86, where the fence is a full `mfence`.)
+static ASYMMETRIC_BARRIER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Try to enable [`heavy_barrier`]. Linux needs the process registered
+/// for expedited private membarriers first (kernel 4.14+); Windows has
+/// the facility unconditionally; other platforms keep the per-borrow
+/// fence.
+fn enable_asymmetric_barrier() {
+    #[cfg(target_os = "linux")]
+    {
+        const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: libc::c_int = 1 << 4;
+        // SAFETY: a plain syscall with no pointer arguments.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_membarrier,
+                MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED,
+                0 as libc::c_int,
+            )
+        };
+        if rc == 0 {
+            ASYMMETRIC_BARRIER.store(true, Ordering::SeqCst);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        ASYMMETRIC_BARRIER.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A full memory barrier on every thread of the process, when
+/// [`ASYMMETRIC_BARRIER`] is set; otherwise a barrier on this thread
+/// only, which suffices because every other thread then fences itself.
+fn heavy_barrier() {
+    if !ASYMMETRIC_BARRIER.load(Ordering::SeqCst) {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        const MEMBARRIER_CMD_PRIVATE_EXPEDITED: libc::c_int = 1 << 3;
+        // SAFETY: a plain syscall with no pointer arguments. Registration
+        // succeeded (that is the only way the flag is set), so this
+        // cannot fail with EPERM; on any other outcome fall back to a
+        // local fence *and* keep the flag, because readers may already be
+        // relying on it -- the fence below then orders this side, and the
+        // spin in `revoke_bias` still waits for every published guard.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_membarrier,
+                MEMBARRIER_CMD_PRIVATE_EXPEDITED,
+                0 as libc::c_int,
+            )
+        };
+        if rc != 0 {
+            std::sync::atomic::fence(Ordering::SeqCst);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        extern "system" {
+            fn FlushProcessWriteBuffers();
+        }
+        // SAFETY: no arguments, no preconditions; documented for exactly
+        // this use (a one-sided barrier across all threads).
+        unsafe { FlushProcessWriteBuffers() };
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        std::sync::atomic::fence(Ordering::SeqCst);
+    }
+}
+
+/// Drop a guard published by [`publish_sole_guard`]. Callers undo their
+/// borrow-counter claim *before* this, so that a revoker which observes
+/// the count at zero also observes every undone claim.
+#[inline]
+fn retract_sole_guard() {
+    // Release: a revoker that observes the count reach zero also
+    // observes the borrow counter this guard restored.
+    let n = SOLE_GUARDS.load(Ordering::Relaxed);
+    SOLE_GUARDS.store(n.saturating_sub(1), Ordering::Release);
+}
+
+/// Take every cell off the biased path, then wait for the biased
+/// thread's lock-free guards to drain. Only the thread that performs
+/// the transition drains, so a thread that already sees cells shared —
+/// including the biased thread backing out of its own fast path — never
+/// waits on a guard it is itself holding.
+fn revoke_bias() {
+    if CELLS_SHARED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if std::env::var_os("WEAVEPY_CELLS_TRACE").is_some() {
+        eprintln!("[cells] shared: bias revoked");
+    }
+    // After this every thread has executed a full barrier: a borrow that
+    // read the flag as clear did so before it, and its guard store --
+    // program-ordered before that read and compiler-fenced -- is therefore
+    // visible to the drain below.
+    heavy_barrier();
+    while SOLE_GUARDS.load(Ordering::SeqCst) > 0 {
+        std::hint::spin_loop();
+    }
+}
+
+/// Record that `thread_id` is about to run VM code. Called from the GIL
+/// acquire path (and free-threading start-up); the first thread to
+/// register is the sole owner of every cell until a second one appears.
+pub fn note_vm_thread(thread_id: u64) {
+    if CELLS_SHARED.load(Ordering::Relaxed) {
+        return;
+    }
+    match FIRST.compare_exchange(0, thread_id, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => enable_asymmetric_barrier(),
+        Err(first) if first == thread_id => {}
+        Err(first) => {
+            if std::env::var_os("WEAVEPY_CELLS_TRACE").is_some() {
+                eprintln!("[cells] shared: thread {thread_id:#x} joins {first:#x}");
+            }
+            revoke_bias();
+        }
+    }
+}
+
+/// Every cell is shared from now on (free-threading, a foreign thread
+/// that may touch objects without the GIL).
+/// Test hook: revoke the borrow bias -- every thread takes the locked
+/// path from now on -- *without* declaring that cells are touched
+/// outside the GIL. The unit-test binary is one process, and
+/// [`mark_cells_shared`]'s second effect (see [`CELLS_UNGUARDED`]) would
+/// switch off guardless reads for every test that runs after, which the
+/// tier-2 attribute tests would then report as deopts.
+#[cfg(test)]
+pub(crate) fn revoke_bias_for_test() {
+    revoke_bias();
+}
+
+pub fn mark_cells_shared() {
+    // Ordered before the revocation: a thread that observes the bias
+    // gone must also observe that guardless reads are off.
+    CELLS_UNGUARDED.store(true, Ordering::SeqCst);
+    revoke_bias();
+}
+
 // `try_with`, not `with`, throughout: guards can be dropped from TLS
 // destructors at thread teardown, where the counter cell itself may
 // already be gone — the count is then irrelevant, so a no-op is right.
 #[inline]
-fn note_cell_guard_released() {
-    let _ = CELL_TLS.try_with(|t| t.live_guards.set(t.live_guards.get().saturating_sub(1)));
+fn note_cell_guard_released(tls: *const CellTls) {
+    if tls.is_null() {
+        return;
+    }
+    if tls == SOLE_TAG {
+        // Only the biased thread takes (and so releases) these, but a
+        // revoker drains the count from another thread.
+        retract_sole_guard();
+        return;
+    }
+    // SAFETY: the pointer was taken from this thread's live TLS block
+    // when the guard was created; guards are `!Send`, so this runs on
+    // the same thread, and the block outlives every guard created from
+    // it (a guard dropped from a TLS destructor took a null pointer).
+    let t = unsafe { &*tls };
+    t.live_guards.set(t.live_guards.get().saturating_sub(1));
 }
 
 /// True iff the calling thread holds at least one live [`GilCell`]
@@ -327,6 +608,11 @@ fn note_cell_guard_released() {
 /// this is true (see [`CELL_TLS`]).
 #[inline]
 pub fn cell_guards_live() -> bool {
+    if SOLE_GUARDS.load(Ordering::Relaxed) > 0
+        && FIRST.load(Ordering::Relaxed) == crate::gil::current_thread_id()
+    {
+        return true;
+    }
     CELL_TLS
         .try_with(|t| t.live_guards.get() > 0)
         .unwrap_or(false)
@@ -365,7 +651,7 @@ impl<T> GilCell<T> {
     #[must_use]
     pub const fn new(value: T) -> Self {
         Self {
-            borrow: AtomicIsize::new(0),
+            borrow: AtomicI32::new(0),
             owner: AtomicU64::new(0),
             depth: UnsafeCell::new(0),
             data: UnsafeCell::new(value),
@@ -530,24 +816,65 @@ impl<T: ?Sized> GilCell<T> {
 
     /// Non-panicking variant of [`borrow`](Self::borrow). Returns
     /// [`BorrowError`] if a mutable borrow is live.
+    #[inline]
     pub fn try_borrow(&self) -> Result<Ref<'_, T>, BorrowError> {
+        if biased_here() {
+            // Publish the guard *before* claiming the counter, so a
+            // revoker's drain (see `revoke_bias`) covers the claim.
+            publish_sole_guard();
+            if self.borrow_shared(false) {
+                // SAFETY: the counter is `>= 1`, so no `&mut T` to the
+                // data exists, and this is the biased thread (see
+                // `biased_here`), so no other thread is inside the cell.
+                let value: &T = unsafe { &*self.data.get() };
+                return Ok(Ref {
+                    cell: self,
+                    value,
+                    tls: SOLE_TAG,
+                    locked: false,
+                    _not_send: std::marker::PhantomData,
+                });
+            }
+            retract_sole_guard();
+            return Err(BorrowError);
+        }
+        self.try_borrow_locked()
+    }
+
+    /// [`Self::try_borrow`] once cells are shared: out of line, so the
+    /// thread-local address it needs is never hoisted into a caller's
+    /// hot loop.
+    #[cold]
+    #[inline(never)]
+    fn try_borrow_locked(&self) -> Result<Ref<'_, T>, BorrowError> {
+        let locked = true;
         // One thread-local access covers the lock word's owner id and
         // the live-guard count. If the block is already torn down (a
         // guard taken from a TLS destructor) fall back to the uncached
         // id and skip the count, which is irrelevant by then.
-        let ok = CELL_TLS
+        let (ok, tls) = CELL_TLS
             .try_with(|t| {
-                self.lock_acquire_as(t.thread_id());
-                if self.borrow_shared() {
+                // Every thread that borrows through the lock registers
+                // here, so the bias is only ever held while its owner
+                // really is the one thread touching cells — a raw
+                // thread, a pool worker or a C-API caller revokes it
+                // before it can reach the data.
+                note_vm_thread(t.thread_id());
+                if locked {
+                    self.lock_acquire_as(t.thread_id());
+                }
+                if self.borrow_shared(locked) {
                     t.live_guards.set(t.live_guards.get() + 1);
-                    true
+                    (true, std::ptr::from_ref(t))
                 } else {
-                    false
+                    (false, std::ptr::null())
                 }
             })
             .unwrap_or_else(|_| {
-                self.lock_acquire();
-                self.borrow_shared()
+                if locked {
+                    self.lock_acquire();
+                }
+                (self.borrow_shared(locked), std::ptr::null())
             });
         if !ok {
             return Err(BorrowError);
@@ -561,6 +888,8 @@ impl<T: ?Sized> GilCell<T> {
         Ok(Ref {
             cell: self,
             value,
+            tls,
+            locked,
             _not_send: std::marker::PhantomData,
         })
     }
@@ -569,13 +898,17 @@ impl<T: ?Sized> GilCell<T> {
     /// negative value (a mutable borrow is live on this thread — the
     /// reentrant lock let us in), unwind, release, and report failure.
     #[inline]
-    fn borrow_shared(&self) -> bool {
-        // The owner lock already serializes access across threads. The
-        // counter only checks same-thread reentry, so it needs no atomic
-        // read-modify-write or second acquire/release barrier.
+    fn borrow_shared(&self, locked: bool) -> bool {
+        // A real read-modify-write, on both the locked and the biased
+        // path. The lock word serializes the locked path against itself,
+        // but the biased thread borrows without it, so a plain
+        // load/store pair here would let the two lose each other's
+        // updates and hand out a `&mut T` alongside a live `&T`.
         let prev = self.borrow.load(Ordering::Relaxed);
-        if prev < 0 || prev == isize::MAX {
-            self.lock_release();
+        if prev < 0 || prev == i32::MAX {
+            if locked {
+                self.lock_release();
+            }
             return false;
         }
         self.borrow.store(prev + 1, Ordering::Relaxed);
@@ -586,9 +919,11 @@ impl<T: ?Sized> GilCell<T> {
     /// the counter is exactly zero (no shared borrow and no nested
     /// mutable borrow); releases the lock and reports failure otherwise.
     #[inline]
-    fn borrow_exclusive(&self) -> bool {
+    fn borrow_exclusive(&self, locked: bool) -> bool {
         if self.borrow.load(Ordering::Relaxed) != 0 {
-            self.lock_release();
+            if locked {
+                self.lock_release();
+            }
             return false;
         }
         self.borrow.store(-1, Ordering::Relaxed);
@@ -597,20 +932,54 @@ impl<T: ?Sized> GilCell<T> {
 
     /// Non-panicking variant of [`borrow_mut`](Self::borrow_mut).
     /// Returns [`BorrowMutError`] if any borrow is live.
+    #[inline]
     pub fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
-        let ok = CELL_TLS
+        if biased_here() {
+            // Guard first, then claim — see `try_borrow`.
+            publish_sole_guard();
+            if !self.borrow_exclusive(false) {
+                retract_sole_guard();
+                return Err(BorrowMutError);
+            }
+            // SAFETY: as in `try_borrow_mut_locked`; the exclusive count
+            // is ours and the bias still held after publishing.
+            let value: &mut T = unsafe { &mut *self.data.get() };
+            return Ok(RefMut {
+                cell: self,
+                value,
+                tls: SOLE_TAG,
+                locked: false,
+                _not_send: std::marker::PhantomData,
+            });
+        }
+        self.try_borrow_mut_locked()
+    }
+
+    /// [`Self::try_borrow_mut`] once cells are shared (see
+    /// [`Self::try_borrow_locked`]).
+    #[cold]
+    #[inline(never)]
+    fn try_borrow_mut_locked(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
+        let locked = true;
+        let (ok, tls) = CELL_TLS
             .try_with(|t| {
-                self.lock_acquire_as(t.thread_id());
-                if self.borrow_exclusive() {
+                // Registers the caller — see `try_borrow_locked`.
+                note_vm_thread(t.thread_id());
+                if locked {
+                    self.lock_acquire_as(t.thread_id());
+                }
+                if self.borrow_exclusive(locked) {
                     t.live_guards.set(t.live_guards.get() + 1);
-                    true
+                    (true, std::ptr::from_ref(t))
                 } else {
-                    false
+                    (false, std::ptr::null())
                 }
             })
             .unwrap_or_else(|_| {
-                self.lock_acquire();
-                self.borrow_exclusive()
+                if locked {
+                    self.lock_acquire();
+                }
+                (self.borrow_exclusive(locked), std::ptr::null())
             });
         if !ok {
             return Err(BorrowMutError);
@@ -622,13 +991,59 @@ impl<T: ?Sized> GilCell<T> {
         Ok(RefMut {
             cell: self,
             value,
+            tls,
+            locked,
             _not_send: std::marker::PhantomData,
         })
+    }
+
+    /// Exclusive access through an exclusive reference: no lock, no
+    /// borrow bookkeeping (matches `std::cell::RefCell::get_mut`).
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
     }
 
     /// Returns a raw pointer to the inner data. Doesn't claim any
     /// borrow; the caller is responsible for ensuring the pointer
     /// isn't dereferenced concurrently with another borrow.
+    /// A shared view that registers no guard: `None` while the cell is
+    /// exclusively borrowed or cells are shared across threads.
+    ///
+    /// # Safety
+    ///
+    /// The reference must be dropped before anything that could borrow
+    /// this cell mutably runs (no Python code, no nested `borrow_mut`):
+    /// a read-only peek between two instructions.
+    #[inline]
+    pub unsafe fn peek(&self) -> Option<&T> {
+        if cells_unguarded() || self.borrow.load(Ordering::Relaxed) < 0 {
+            return None;
+        }
+        // SAFETY: no exclusive borrow is live (checked above) and the
+        // caller keeps this view from outliving any code that could take
+        // one.
+        Some(unsafe { &*self.data.get() })
+    }
+
+    /// [`Self::peek`]'s exclusive form: the value, without a guard, when
+    /// cells are unshared and no borrow at all is live.
+    ///
+    /// # Safety
+    ///
+    /// The caller keeps the reference from outliving any code that could
+    /// borrow this cell (nothing between the check and the last use may
+    /// run code that reaches it).
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn peek_mut(&self) -> Option<&mut T> {
+        if cells_unguarded() || self.borrow.load(Ordering::Relaxed) != 0 {
+            return None;
+        }
+        // SAFETY: no borrow is live (checked above) and the caller keeps
+        // this view from outliving any code that could take one.
+        Some(unsafe { &mut *self.data.get() })
+    }
+
     pub fn as_ptr(&self) -> *mut T {
         self.data.get()
     }
@@ -798,6 +1213,11 @@ impl<T: Hash> Hash for GilCell<T> {
 pub struct Ref<'a, T: ?Sized + 'a> {
     cell: &'a GilCell<T>,
     value: &'a T,
+    /// This thread's [`CELL_TLS`] block (null when unavailable), for
+    /// the live-guard count at release without a second lookup.
+    tls: *const CellTls,
+    /// Whether the cell's lock word was taken (see [`CELLS_SHARED`]).
+    locked: bool,
     _not_send: std::marker::PhantomData<*mut ()>,
 }
 
@@ -822,10 +1242,15 @@ impl<T: ?Sized + fmt::Display> fmt::Display for Ref<'_, T> {
 
 impl<T: ?Sized> Drop for Ref<'_, T> {
     fn drop(&mut self) {
+        // Plain, like the claim: the guard published in `try_borrow`
+        // keeps any revoker out until `note_cell_guard_released` below
+        // retires it.
         let count = self.cell.borrow.load(Ordering::Relaxed);
         self.cell.borrow.store(count - 1, Ordering::Relaxed);
-        self.cell.lock_release();
-        note_cell_guard_released();
+        if self.locked {
+            self.cell.lock_release();
+        }
+        note_cell_guard_released(self.tls);
     }
 }
 
@@ -835,6 +1260,8 @@ impl<T: ?Sized> Drop for Ref<'_, T> {
 pub struct RefMut<'a, T: ?Sized + 'a> {
     cell: &'a GilCell<T>,
     value: &'a mut T,
+    tls: *const CellTls,
+    locked: bool,
     _not_send: std::marker::PhantomData<*mut ()>,
 }
 
@@ -862,8 +1289,10 @@ impl<T: ?Sized> Drop for RefMut<'_, T> {
         // From -1 back to 0 — there's only ever one outstanding
         // mutable borrow at a time.
         self.cell.borrow.store(0, Ordering::Relaxed);
-        self.cell.lock_release();
-        note_cell_guard_released();
+        if self.locked {
+            self.cell.lock_release();
+        }
+        note_cell_guard_released(self.tls);
     }
 }
 
@@ -1691,6 +2120,13 @@ mod tests {
 
     #[test]
     fn gilcell_contended_borrows_publish_consistent_state() {
+        // Eight raw threads and no GIL: the contract is that threads
+        // which touch cells without holding the GIL announce themselves
+        // first (see `biased_here`). This is the cross-thread primitive's
+        // stress test, so it exercises the locked path on purpose. (The
+        // bias alone is revoked: these threads share nothing with any
+        // `peek` reader in the process.)
+        revoke_bias_for_test();
         let shared = Rc::new(GilCell::new((0_u64, 0_u64)));
         let start = Arc::new(std::sync::Barrier::new(8));
         let workers: Vec<_> = (0..8)

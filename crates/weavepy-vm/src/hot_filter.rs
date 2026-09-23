@@ -87,6 +87,75 @@ impl AtomicBloom {
     }
 }
 
+/// An [`AtomicBloom`] that can be *rebuilt* from its registry's live
+/// ids, so the stale bits of long-gone registrations stop pinning probes
+/// on the slow path (an insert-only filter saturates as a process
+/// creates and frees objects). Double-buffered: a rebuild fills the idle
+/// filter from scratch and flips the active index, leaving the previous
+/// filter intact for any prober that loaded the old index; inserts go to
+/// both, so either filter answers for every registered id.
+pub struct RebuildableBloom {
+    filters: [AtomicBloom; 2],
+    active: std::sync::atomic::AtomicUsize,
+    /// Inserts since the last rebuild (a staleness estimate).
+    inserts: std::sync::atomic::AtomicUsize,
+}
+
+impl std::fmt::Debug for RebuildableBloom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RebuildableBloom")
+            .field(
+                "active",
+                &self.filters[self.active.load(Ordering::Relaxed) & 1],
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl RebuildableBloom {
+    #[allow(clippy::new_without_default)]
+    pub const fn new() -> Self {
+        Self {
+            filters: [AtomicBloom::new(), AtomicBloom::new()],
+            active: std::sync::atomic::AtomicUsize::new(0),
+            inserts: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    #[inline]
+    pub fn insert(&self, id: u64) {
+        self.filters[0].insert(id);
+        self.filters[1].insert(id);
+        self.inserts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn may_contain(&self, id: u64) -> bool {
+        self.filters[self.active.load(Ordering::Acquire) & 1].may_contain(id)
+    }
+
+    /// Inserts since the last rebuild.
+    pub fn inserts_since_rebuild(&self) -> usize {
+        self.inserts.load(Ordering::Relaxed)
+    }
+
+    /// Replace the filter's contents with exactly `live`. The caller
+    /// must hold whatever serializes registrations (no insert may race
+    /// the fill), which is what makes the flipped filter complete.
+    pub fn rebuild(&self, live: impl Iterator<Item = u64>) {
+        let next = (self.active.load(Ordering::Relaxed) + 1) & 1;
+        let f = &self.filters[next];
+        for w in &f.bits {
+            w.store(0, Ordering::Relaxed);
+        }
+        for id in live {
+            f.insert(id);
+        }
+        self.active.store(next, Ordering::Release);
+        self.inserts.store(0, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

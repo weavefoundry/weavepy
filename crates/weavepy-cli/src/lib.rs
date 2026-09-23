@@ -36,7 +36,199 @@ use tracing_subscriber::EnvFilter;
 
 use weavepy::{InterpreterFlags, RunOptions};
 
+/// The process allocator: the system allocator behind per-thread
+/// small-block caches (see `weavepy_vm::tcache`), enabled on the VM's
+/// own threads.
+#[global_allocator]
+static GLOBAL_ALLOC: weavepy::vm::tcache::ThreadCacheAlloc = weavepy::vm::tcache::ThreadCacheAlloc;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Opt-in in-process PC sampler (`WEAVEPY_PCPROF=<file>`): a `SIGPROF`
+/// handler records the interrupted program counter every 100µs,
+/// and the samples (slide-adjusted to link-time addresses, one hex
+/// address per line) are written to `<file>` when the program finishes.
+/// A development aid for instruction-level profiling of the dispatch
+/// loops, which the system sampler only resolves to whole functions.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod pcprof {
+    use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
+    /// Words per sample: the pc, the link register, then return
+    /// addresses from the frame-pointer chain (zero-padded).
+    const W: usize = 10;
+    const CAP: usize = 1 << 20;
+    static BUF: AtomicPtr<u64> = AtomicPtr::new(std::ptr::null_mut());
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    static STACK_LO: AtomicUsize = AtomicUsize::new(0);
+    static STACK_HI: AtomicUsize = AtomicUsize::new(0);
+    static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    extern "C" {
+        fn _dyld_get_image_vmaddr_slide(image_index: u32) -> isize;
+    }
+
+    // The kernel hands the handler an 8-byte-aligned `ucontext_t`, and
+    // every offset walked below is ABI-fixed, so each reinterpretation is
+    // aligned by construction (see the SAFETY note inside).
+    #[allow(clippy::cast_ptr_alignment)]
+    extern "C" fn on_prof(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+        let buf = BUF.load(Ordering::Relaxed);
+        if buf.is_null() || ctx.is_null() {
+            return;
+        }
+        // SAFETY: `ctx` is the kernel's `ucontext_t`; on arm64 macOS its
+        // `uc_mcontext` pointer sits at offset 48, and in the machine
+        // context the thread state follows the 16-byte exception state:
+        // x0-x28, then fp (x29), lr, sp and pc.
+        let (pc, lr, mut fp) = unsafe {
+            let mctx = *(ctx as *const u8).add(48).cast::<*const u8>();
+            if mctx.is_null() {
+                return;
+            }
+            let ss = mctx.add(16).cast::<u64>();
+            (*ss.add(32), *ss.add(30), *ss.add(29) as usize)
+        };
+        let i = NEXT.fetch_add(1, Ordering::Relaxed);
+        if i >= CAP {
+            return;
+        }
+        // SAFETY: `i < CAP`; the slot is this sample's alone.
+        let slot = unsafe { buf.add(i * W) };
+        unsafe {
+            *slot = pc;
+            *slot.add(1) = lr;
+        }
+        // Walk the frame-pointer chain within the VM thread's stack.
+        let (lo, hi) = (
+            STACK_LO.load(Ordering::Relaxed),
+            STACK_HI.load(Ordering::Relaxed),
+        );
+        let mut k = 2;
+        while k < W && fp >= lo && fp + 16 <= hi && fp % 8 == 0 {
+            // SAFETY: `fp` lies inside the sampled thread's stack.
+            let (next, ret) = unsafe { (*(fp as *const usize), *((fp + 8) as *const u64)) };
+            unsafe { *slot.add(k) = ret };
+            k += 1;
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
+    }
+
+    pub(crate) fn start() {
+        if std::env::var_os("WEAVEPY_PCPROF").is_none() {
+            return;
+        }
+        let buf: &'static mut [u64] = Box::leak(vec![0u64; CAP * W].into_boxed_slice());
+        BUF.store(buf.as_mut_ptr(), Ordering::Relaxed);
+        // SAFETY: plain pthread/libc queries and signal/timer setup; the
+        // handler only touches atomics, the leaked buffer, and the
+        // sampled thread's own stack.
+        unsafe {
+            let me = libc::pthread_self();
+            let hi = libc::pthread_get_stackaddr_np(me) as usize;
+            let size = libc::pthread_get_stacksize_np(me);
+            STACK_HI.store(hi, Ordering::Relaxed);
+            STACK_LO.store(hi - size, Ordering::Relaxed);
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_prof as *const () as usize;
+            sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+            libc::sigemptyset(&raw mut sa.sa_mask);
+            libc::sigaction(libc::SIGPROF, &raw const sa, std::ptr::null_mut());
+        }
+        // `ITIMER_PROF` fires at the scheduler tick (~100 Hz) however
+        // short the interval asked for, so a helper thread signals the VM
+        // thread itself: wall-clock paced (a benchmark is CPU-bound, so
+        // this is CPU time in practice), every `WEAVEPY_PCPROF_US`
+        // microseconds (default 100).
+        let us: u64 = std::env::var("WEAVEPY_PCPROF_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        // SAFETY: plain pthread query.
+        let target = unsafe { libc::pthread_self() } as usize;
+        let _ = std::thread::Builder::new()
+            .name("pcprof".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_micros(us));
+                if STOP.load(Ordering::Relaxed) {
+                    break;
+                }
+                // SAFETY: the VM thread outlives the sampler (the main
+                // thread stops it in `finish` before exiting).
+                unsafe { libc::pthread_kill(target as libc::pthread_t, libc::SIGPROF) };
+            });
+    }
+
+    pub(crate) fn finish() {
+        let Some(path) = std::env::var_os("WEAVEPY_PCPROF") else {
+            return;
+        };
+        // Stop sampling before reading the buffer: a signal still in
+        // flight only appends past the snapshot below.
+        STOP.store(true, Ordering::Relaxed);
+        let buf = BUF.load(Ordering::Relaxed);
+        if buf.is_null() {
+            return;
+        }
+        let n = NEXT.load(Ordering::Relaxed).min(CAP);
+        // SAFETY: the main executable is image 0.
+        let slide = unsafe { _dyld_get_image_vmaddr_slide(0) } as u64;
+        let main_base = {
+            // SAFETY: `dladdr` on one of this image's own functions.
+            let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+            unsafe { libc::dladdr(finish as *const libc::c_void, &raw mut info) };
+            info.dli_fbase as usize
+        };
+        // Addresses outside the executable (system libraries) are named
+        // in-process, while their images are still mapped; the rest are
+        // written slide-adjusted, for `nm`/`atos` on the binary.
+        let mut names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+        let mut out = String::with_capacity(n * 40);
+        for i in 0..n {
+            for k in 0..W {
+                // SAFETY: `i < n <= CAP`, `k < W`.
+                let a = unsafe { *buf.add(i * W + k) };
+                if a == 0 {
+                    break;
+                }
+                if k > 0 {
+                    out.push(' ');
+                }
+                let name = names.entry(a).or_insert_with(|| {
+                    // SAFETY: `dladdr` only reads the loader's tables.
+                    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+                    let ok =
+                        unsafe { libc::dladdr(a as usize as *const libc::c_void, &raw mut info) };
+                    if ok != 0 && info.dli_fbase as usize == main_base {
+                        return String::new();
+                    }
+                    if ok != 0 && !info.dli_sname.is_null() {
+                        // SAFETY: a NUL-terminated loader string.
+                        let s = unsafe { std::ffi::CStr::from_ptr(info.dli_sname) };
+                        return format!("@{}", s.to_string_lossy());
+                    }
+                    "@?".to_owned()
+                });
+                if name.is_empty() {
+                    out.push_str(&format!("{:x}", a.wrapping_sub(slide)));
+                } else {
+                    out.push_str(name);
+                }
+            }
+            out.push('\n');
+        }
+        let _ = std::fs::write(path, out);
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+mod pcprof {
+    pub(crate) fn start() {}
+    pub(crate) fn finish() {}
+}
 
 /// Recognised subcommands. We thread them through manually instead of
 /// using `clap`'s `#[command(subcommand)]` because the bare `weavepy`
@@ -529,6 +721,7 @@ fn run_on_large_stack(entry: fn() -> i32) -> i32 {
     weavepy::vm::stdlib::signal_mod::block_async_signals_current_thread();
 
     let vm_entry = move || -> i32 {
+        weavepy::vm::tcache::enable_for_current_thread();
         // Opt-in (`WEAVEPY_CRASH_BT`): register the native crash handler +
         // per-thread sigaltstack on the VM thread itself so a stack-overflow
         // SIGSEGV can be caught and reported (no-op stub on Windows).
@@ -551,7 +744,10 @@ fn run_on_large_stack(entry: fn() -> i32) -> i32 {
         // quiescent process already has >1 OS thread; this baseline is what the
         // fork-warning check measures additional threads against.
         weavepy::vm::stdlib::os_process::capture_thread_baseline();
-        entry()
+        pcprof::start();
+        let code = entry();
+        pcprof::finish();
+        code
     };
 
     match std::thread::Builder::new()
@@ -2003,7 +2199,7 @@ fn exit_with_system_exit(code: weavepy::vm::object::Object) -> ! {
             // `args` is a real slot on exceptions (RFC 0057); older
             // plain instances may still carry it in the dict.
             let args = inst.slot_get("args").or_else(|| {
-                inst.dict
+                inst.dict_cell()
                     .borrow()
                     .get(&weavepy::vm::object::DictKey(Object::from_static("args")))
                     .cloned()
@@ -2109,6 +2305,7 @@ fn run_repl(flags: InterpreterFlags, startup: Option<&Path>, argv: Vec<String>) 
     if !flags.no_site {
         let _ = interpreter.run_site();
     }
+    interpreter.note_startup_finished();
     let repl = repl::Repl::new(interpreter, flags.quiet)?;
     repl.run(startup)
 }

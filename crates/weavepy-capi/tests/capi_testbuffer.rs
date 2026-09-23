@@ -58,11 +58,22 @@ fn run_with_testbuffer(driver_body: &str) {
     std::fs::copy(&ext, &staged).expect("staging extension");
     let p_dir = py_quote(&tmp.path().display().to_string());
     let driver = format!("import sys\nsys.path.insert(0, {p_dir})\n{driver_body}");
-    let opts = RunOptions::new("<testbuffer-test>").with_flags(InterpreterFlags::default());
-    if let Err(err) = run_source_with_options(&driver, &opts) {
-        let formatted = err.format(&driver, "<testbuffer-test>");
-        panic!("_testbuffer driver failed:\n{formatted}");
-    }
+    // Rust's 2 MiB test thread is not enough for `site` initialization in
+    // an unoptimized build — the interpreter's dispatch frames are
+    // enormous when nothing is inlined. Mirror `capi_wheel_endtoend` and
+    // the fixture harness.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let opts = RunOptions::new("<testbuffer-test>").with_flags(InterpreterFlags::default());
+            if let Err(err) = run_source_with_options(&driver, &opts) {
+                let formatted = err.format(&driver, "<testbuffer-test>");
+                panic!("_testbuffer driver failed:\n{formatted}");
+            }
+        })
+        .expect("spawn test thread")
+        .join()
+        .expect("test thread panicked");
 }
 
 #[test]

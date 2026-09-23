@@ -260,14 +260,14 @@ fn lru_self(args: &[Object]) -> Result<Rc<crate::types::PyInstance>, RuntimeErro
 }
 
 fn lru_get(inst: &crate::types::PyInstance, name: &'static str) -> Option<Object> {
-    inst.dict
+    inst.dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static(name)))
         .cloned()
 }
 
 fn lru_set(inst: &crate::types::PyInstance, name: &'static str, v: Object) {
-    inst.dict
+    inst.dict_cell()
         .borrow_mut()
         .insert(DictKey(Object::from_static(name)), v);
 }

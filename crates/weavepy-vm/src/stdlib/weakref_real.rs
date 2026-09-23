@@ -149,7 +149,11 @@ fn ref_type_call(args: &[Object]) -> Result<Object, RuntimeError> {
         .first()
         .ok_or_else(|| type_error("__call__() missing self"))?;
     if let Object::Instance(inst) = me {
-        let getter = inst.dict.borrow().get(&StrKey("__weakref_get__")).cloned();
+        let getter = inst
+            .dict_cell()
+            .borrow()
+            .get(&StrKey("__weakref_get__"))
+            .cloned();
         if let Some(Object::Builtin(b)) = getter {
             return (b.call)(&[]);
         }
@@ -214,7 +218,11 @@ fn wrapper_referent(obj: &Object) -> Option<Option<Object>> {
     let Object::Instance(inst) = obj else {
         return None;
     };
-    let getter = inst.dict.borrow().get(&StrKey("__weakref_get__")).cloned();
+    let getter = inst
+        .dict_cell()
+        .borrow()
+        .get(&StrKey("__weakref_get__"))
+        .cloned();
     match getter {
         Some(Object::Builtin(b)) => {
             let t = (b.call)(&[]).ok()?;
@@ -416,7 +424,7 @@ fn ref_type_repr(args: &[Object]) -> Result<Object, RuntimeError> {
 /// (test_set_callback_attribute).
 fn ref_callback_get(args: &[Object]) -> Result<Object, RuntimeError> {
     if let Some(Object::Instance(inst)) = args.first() {
-        if let Some(v) = inst.dict.borrow().get(&StrKey("__callback__")) {
+        if let Some(v) = inst.dict_cell().borrow().get(&StrKey("__callback__")) {
             return Ok(v.clone());
         }
     }
@@ -523,7 +531,11 @@ pub fn proxy_referent(obj: &Object) -> Option<Result<Object, RuntimeError>> {
 /// referent has been collected — CPython's `proxy_checkref`.
 fn proxy_target(me: &Object) -> Result<Object, RuntimeError> {
     if let Object::Instance(inst) = me {
-        let getter = inst.dict.borrow().get(&StrKey("__weakref_get__")).cloned();
+        let getter = inst
+            .dict_cell()
+            .borrow()
+            .get(&StrKey("__weakref_get__"))
+            .cloned();
         if let Some(Object::Builtin(b)) = getter {
             let t = (b.call)(&[])?;
             if !matches!(t, Object::None) {
@@ -1082,6 +1094,12 @@ fn make_ref_object_with_class(
     class_override: Option<Rc<TypeObject>>,
 ) -> Object {
     let target_id = id_of(&target);
+    // The registry's strong clone keeps the referent alive until the
+    // collector's prompt reap clears it, so a deferred instance is
+    // tracked from here on.
+    if let Object::Instance(inst) = &target {
+        inst.ensure_gc_tracked();
+    }
     let slot = Arc::new(WeakRefSlot::new(
         target_id,
         target.clone(),
@@ -1175,6 +1193,7 @@ fn make_ref_object_with_class(
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
         hash_cache: crate::sync::CachedHash::new(None),
         finalize_ran: crate::sync::Cell::new(false),
+        deferred: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
     });
     // Back-pointer so `obj.__weakref__` / `getweakrefs(obj)` can return

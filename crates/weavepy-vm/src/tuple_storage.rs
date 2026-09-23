@@ -31,6 +31,18 @@ impl TupleStorage {
 
     /// Move a dynamically sized sequence into one reference-counted block.
     pub fn from_vec(items: Vec<Object>) -> SharedTuple {
+        Self::from_exact_iter(items.into_iter())
+    }
+
+    /// [`Self::from_vec`] straight from an iterator that knows its
+    /// length: the elements are moved into the tuple's own allocation
+    /// without the intermediate vector. A `*args` parameter is bound
+    /// from the tail of the call's argument vector, which used to be
+    /// collected into a `Vec` only to be moved out of again.
+    pub fn from_exact_iter<I>(items: I) -> SharedTuple
+    where
+        I: ExactSizeIterator<Item = Object>,
+    {
         let (prefix, _) = Layout::new::<usize>()
             .extend(Layout::new::<CachedHash>())
             .expect("tuple prefix exceeds layout limit");
@@ -46,7 +58,7 @@ impl TupleStorage {
         macro_rules! allocate {
             ($($word:ty),*) => {
                 $(if layout.align() == std::mem::align_of::<$word>() {
-                    return Self::from_vec_aligned::<$word>(items, layout);
+                    return Self::from_iter_aligned::<$word, I>(items, layout);
                 })*
             };
         }
@@ -54,7 +66,10 @@ impl TupleStorage {
         panic!("unsupported tuple payload alignment: {}", layout.align());
     }
 
-    fn from_vec_aligned<Word>(items: Vec<Object>, layout: Layout) -> SharedTuple {
+    fn from_iter_aligned<Word, I>(items: I, layout: Layout) -> SharedTuple
+    where
+        I: ExactSizeIterator<Item = Object>,
+    {
         assert_eq!(layout.align(), std::mem::align_of::<Word>());
         assert_eq!(layout.size() % std::mem::size_of::<Word>(), 0);
         let len = items.len();
@@ -78,7 +93,7 @@ impl TupleStorage {
             std::ptr::addr_of_mut!((*tuple).len).write(len);
             std::ptr::addr_of_mut!((*tuple).hash).write(CachedHash::default());
             let destination = std::ptr::addr_of_mut!((*tuple).items).cast::<Object>();
-            for (index, item) in items.into_iter().enumerate() {
+            for (index, item) in items.enumerate() {
                 destination.add(index).write(item);
             }
             let result = Rc::from_raw(tuple);

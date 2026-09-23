@@ -282,6 +282,13 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             builtin("exec_builtin", imp_exec_builtin),
         );
         d.insert(
+            DictKey(Object::from_static("_weave_clear_dir_listings")),
+            builtin("_weave_clear_dir_listings", |_args| {
+                crate::import::clear_dir_listings();
+                Ok(Object::None)
+            }),
+        );
+        d.insert(
             DictKey(Object::from_static("is_builtin")),
             builtin("is_builtin", imp_is_builtin),
         );
@@ -506,7 +513,7 @@ fn extract_spec(spec: &Object) -> Result<(String, String), RuntimeError> {
             // test_import.test_create_dynamic_null builds carry `name` /
             // `origin` as plain class attributes.
             let lookup = |keys: &[&'static str]| -> Object {
-                let dict = inst.dict.borrow();
+                let dict = inst.dict_cell().borrow();
                 for k in keys {
                     if let Some(v) = dict.get(&DictKey(Object::from_static(k))) {
                         return v.clone();

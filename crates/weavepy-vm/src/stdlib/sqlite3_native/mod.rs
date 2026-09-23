@@ -199,7 +199,7 @@ pub(crate) fn raise_sqlite_error_msg(errcode: i32, msg: &str) -> RuntimeError {
     };
     let inst = crate::builtin_types::make_exception_with_class(cls, msg);
     if let Object::Instance(i) = &inst {
-        let mut d = i.dict.borrow_mut();
+        let mut d = i.dict_cell().borrow_mut();
         d.insert(
             DictKey(Object::from_static("sqlite_errorcode")),
             Object::Int(i64::from(errcode)),
@@ -553,7 +553,7 @@ pub(crate) fn conn_state_of(obj: &Object) -> Result<Rc<RefCell<ConnState>>, Runt
         return Err(type_error("argument must be a sqlite3.Connection instance"));
     };
     let handle = inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static(HANDLE_KEY)))
         .cloned();

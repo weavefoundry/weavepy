@@ -990,7 +990,7 @@ fn extract_self(args: &[Object]) -> Result<Rc<PyInstance>, RuntimeError> {
 }
 
 fn extract_handle(inst: &PyInstance) -> Result<i64, RuntimeError> {
-    let dict = inst.dict.borrow();
+    let dict = inst.dict_cell().borrow();
     match dict.get(&DictKey(Object::from_static("_handle"))) {
         Some(Object::Int(h)) => Ok(*h),
         _ => Err(closed_socket_error()),
@@ -1533,7 +1533,7 @@ fn sock_init_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     } else {
         next_handle(state)
     };
-    let mut dict = inst.dict.borrow_mut();
+    let mut dict = inst.dict_cell().borrow_mut();
     dict.insert(DictKey(Object::from_static("_handle")), Object::Int(handle));
     dict.insert(
         DictKey(Object::from_static("family")),
@@ -1573,7 +1573,7 @@ fn sock_exit(args: &[Object]) -> Result<Object, RuntimeError> {
         // Mark the object closed *before* issuing close(2), like CPython's
         // sock_close (fd invalidated first, so a double .close() on the same
         // object is a no-op even when the close itself errors).
-        inst.dict
+        inst.dict_cell()
             .borrow_mut()
             .insert(DictKey(Object::from_static("_handle")), Object::Int(-1));
         if let Some(state) = state {
@@ -1595,7 +1595,7 @@ fn sock_exit(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         return Ok(Object::Bool(false));
     }
-    inst.dict
+    inst.dict_cell()
         .borrow_mut()
         .insert(DictKey(Object::from_static("_handle")), Object::Int(-1));
     Ok(Object::Bool(false))
@@ -1608,7 +1608,7 @@ fn sock_repr(args: &[Object]) -> Result<Object, RuntimeError> {
     // repr lives in socket.py on top of this).
     let inst = extract_self(args)?;
     let attr_int = |name: &'static str| {
-        inst.dict
+        inst.dict_cell()
             .borrow()
             .get(&DictKey(Object::from_static(name)))
             .and_then(Object::as_i64)
@@ -1672,7 +1672,7 @@ fn sock_accept(args: &[Object]) -> Result<Object, RuntimeError> {
     let cls = socket_class();
     let inst = Rc::new(PyInstance::new(cls));
     {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(DictKey(Object::from_static("_handle")), Object::Int(handle));
         d.insert(
             DictKey(Object::from_static("family")),
@@ -3106,7 +3106,7 @@ fn sock_detach(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     }
     remove_state(h);
-    inst.dict
+    inst.dict_cell()
         .borrow_mut()
         .insert(DictKey(Object::from_static("_handle")), Object::Int(-1));
     Ok(Object::Int(fd))
@@ -3188,7 +3188,7 @@ fn sock_dup(args: &[Object]) -> Result<Object, RuntimeError> {
     let cls = socket_class();
     let inst = Rc::new(PyInstance::new(cls));
     {
-        let mut d = inst.dict.borrow_mut();
+        let mut d = inst.dict_cell().borrow_mut();
         d.insert(DictKey(Object::from_static("_handle")), Object::Int(handle));
         d.insert(
             DictKey(Object::from_static("family")),
@@ -3299,7 +3299,7 @@ fn sock_proto_attr(args: &[Object]) -> Result<Object, RuntimeError> {
 fn sock_dict_int(args: &[Object], key: &'static str) -> Result<Object, RuntimeError> {
     let inst = extract_self(args)?;
     let v = inst
-        .dict
+        .dict_cell()
         .borrow()
         .get(&DictKey(Object::from_static(key)))
         .cloned();
@@ -4841,7 +4841,7 @@ fn unix_socketpair(family: i32, sock_type: i32, proto: i32) -> Result<Object, Ru
         }));
         let h = next_handle(state);
         let inst = Rc::new(PyInstance::new(socket_class()));
-        inst.dict
+        inst.dict_cell()
             .borrow_mut()
             .insert(DictKey(Object::from_static("_handle")), Object::Int(h));
         Object::Instance(inst)
@@ -4879,7 +4879,7 @@ fn inet_socketpair_emulation() -> Result<Object, RuntimeError> {
         let h = next_handle(state);
         let cls = socket_class();
         let inst = Rc::new(PyInstance::new(cls));
-        inst.dict
+        inst.dict_cell()
             .borrow_mut()
             .insert(DictKey(Object::from_static("_handle")), Object::Int(h));
         Object::Instance(inst)

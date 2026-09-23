@@ -1945,7 +1945,7 @@ struct DecodedRaw {
 /// op + caches). Shared by [`decode`] and [`decode_full`].
 fn decode_raws(co_code: &[u8]) -> Vec<DecodedRaw> {
     let total_units = co_code.len() / 2;
-    let mut raws: Vec<DecodedRaw> = Vec::new();
+    let mut raws: Vec<DecodedRaw> = Vec::with_capacity(total_units);
     let mut unit = 0usize;
     let mut pending_ext: u32 = 0;
     let mut ext_start: Option<usize> = None;
@@ -1984,13 +1984,11 @@ fn decode_raws(co_code: &[u8]) -> Vec<DecodedRaw> {
     raws
 }
 
-/// Build the code-unit-offset → raw-index map used for jump retargeting.
-fn unit_index_map(raws: &[DecodedRaw]) -> std::collections::HashMap<usize, usize> {
-    let mut unit_to_idx = std::collections::HashMap::new();
-    for (idx, r) in raws.iter().enumerate() {
-        unit_to_idx.insert(r.start_unit, idx);
-    }
-    unit_to_idx
+/// The raw starting at code unit `unit` (raws are in unit order), or
+/// `raws.len()` when none does — the jump-retargeting lookup.
+fn raw_at_unit(raws: &[DecodedRaw], unit: usize) -> usize {
+    raws.binary_search_by_key(&unit, |r| r.start_unit)
+        .unwrap_or(raws.len())
 }
 
 /// Instruction count a raw expands to: superinstructions unfuse into
@@ -2144,7 +2142,6 @@ fn decode_instructions(
     slots: &SlotMap,
     constants: &[Constant],
 ) -> Option<(Vec<Instruction>, Vec<u8>)> {
-    let unit_to_idx = unit_index_map(raws);
     let expansions = raw_expansions(raws);
     let first = raw_first_instr(&expansions);
     let total = *first.last().unwrap_or(&0);
@@ -2153,7 +2150,7 @@ fn decode_instructions(
     // reached from other paths are unknown; unknown self slots decode
     // as NULL-style calls, which is what every compiler-produced
     // cross-block call shape actually is).
-    let mut leaders: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut leaders: Vec<usize> = Vec::new();
     for r in raws {
         if is_rel_jump(r.cp_op) {
             let next_unit = r.start_unit + r.size;
@@ -2162,9 +2159,12 @@ fn decode_instructions(
             } else {
                 next_unit + r.arg as usize
             };
-            leaders.insert(t);
+            leaders.push(t);
         }
     }
+    // Visited in unit order below, through a cursor.
+    leaders.sort_unstable();
+    let mut next_leader = 0usize;
     let mut shadow: Vec<SlotKind> = Vec::new();
     let mut out = Vec::with_capacity(total);
     let mut marks: Vec<u8> = Vec::with_capacity(total);
@@ -2189,7 +2189,10 @@ fn decode_instructions(
         }
     };
     for (idx, r) in raws.iter().enumerate() {
-        if leaders.contains(&r.start_unit) {
+        while leaders.get(next_leader).is_some_and(|&t| t < r.start_unit) {
+            next_leader += 1;
+        }
+        if leaders.get(next_leader) == Some(&r.start_unit) {
             shadow.clear();
         }
         let after_swap = idx > 0 && raws[idx - 1].cp_op == op::SWAP;
@@ -2400,7 +2403,7 @@ fn decode_instructions(
             } else {
                 next_unit + r.arg as usize
             };
-            let target_raw = *unit_to_idx.get(&target_unit).unwrap_or(&raws.len());
+            let target_raw = raw_at_unit(raws, target_unit);
             let target_idx = instr_of_raw(target_raw);
             if is_backward_jump(r.cp_op) {
                 (self_idx + 1).saturating_sub(target_idx) as u32
@@ -2410,7 +2413,7 @@ fn decode_instructions(
         } else if r.cp_op == op::PUSH_EXC_INFO && r.arg != 0 {
             // Inverse of the encoder's handler-body tag: absolute code
             // unit → instruction index (see the encode fixpoint loop).
-            let raw_idx = *unit_to_idx.get(&(r.arg as usize)).unwrap_or(&raws.len());
+            let raw_idx = raw_at_unit(raws, r.arg as usize);
             instr_of_raw(raw_idx) as u32
         } else {
             op.1
@@ -2541,13 +2544,19 @@ pub fn decode_full(
     let exception_table = decode_exception_table(co_exceptiontable, &raws);
     // Recover the NO_INTERRUPT flag per decoded instruction index (the
     // internal stream folds both backward jumps into one opcode).
-    let first = raw_first_instr(&raw_expansions(&raws));
-    let no_interrupt_jumps: Vec<u32> = raws
+    let no_interrupt_jumps: Vec<u32> = if raws
         .iter()
-        .enumerate()
-        .filter(|(_, r)| r.cp_op == op::JUMP_BACKWARD_NO_INTERRUPT)
-        .map(|(idx, _)| first[idx] as u32)
-        .collect();
+        .any(|r| r.cp_op == op::JUMP_BACKWARD_NO_INTERRUPT)
+    {
+        let first = raw_first_instr(&raw_expansions(&raws));
+        raws.iter()
+            .enumerate()
+            .filter(|(_, r)| r.cp_op == op::JUMP_BACKWARD_NO_INTERRUPT)
+            .map(|(idx, _)| first[idx] as u32)
+            .collect()
+    } else {
+        Vec::new()
+    };
     Some(DecodedCode {
         instructions,
         linetable,
@@ -2601,8 +2610,25 @@ fn decode_linetable(
     firstlineno: u32,
     instruction_count: usize,
 ) -> (Vec<u32>, Vec<crate::ColSpan>) {
-    let mut unit_lines: Vec<u32> = Vec::new();
-    let mut unit_cols: Vec<crate::ColSpan> = Vec::new();
+    // Entries cover consecutive code-unit runs; each raw takes the
+    // location of the run holding its first unit (raws are in unit
+    // order, so one cursor walks them alongside the table). Fused wire
+    // instructions expand into several interpreter instructions, so
+    // the output is sized for the decoded length.
+    let mut lines = Vec::with_capacity(instruction_count);
+    let mut cols = Vec::with_capacity(instruction_count);
+    let mut next_raw = 0usize;
+    let mut emit = |line: u32, span: crate::ColSpan, end_unit: usize| {
+        while let Some(r) = raws.get(next_raw).filter(|r| r.start_unit < end_unit) {
+            // Both halves of an unfused superinstruction share its location.
+            for _ in 0..raw_expansion(r.cp_op, r.arg) {
+                lines.push(line);
+                cols.push(span);
+            }
+            next_raw += 1;
+        }
+    };
+    let mut unit = 0usize;
     let mut pos = 0usize;
     let mut line = firstlineno as i32;
     while pos < table.len() {
@@ -2613,11 +2639,11 @@ fn decode_linetable(
         }
         let code = (first >> 3) & 0x0F;
         let length = ((first & 0x07) as usize) + 1;
+        unit += length;
         if code == 15 {
             // NONE — no location. Units decode to the 0 sentinel and
             // the running line is unchanged.
-            unit_lines.extend(std::iter::repeat_n(0, length));
-            unit_cols.extend(std::iter::repeat_n(crate::ColSpan::default(), length));
+            emit(0, crate::ColSpan::default(), unit);
             continue;
         }
         let (delta, span) = match code {
@@ -2667,24 +2693,10 @@ fn decode_linetable(
             }
         };
         line += delta;
-        for _ in 0..length {
-            unit_lines.push(line.max(0) as u32);
-            unit_cols.push(span);
-        }
+        emit(line.max(0) as u32, span, unit);
     }
-    // Fused wire instructions can expand into multiple interpreter
-    // instructions. Reserve for that decoded length, not the raw count.
-    let mut lines = Vec::with_capacity(instruction_count);
-    let mut cols = Vec::with_capacity(instruction_count);
-    for r in raws {
-        let line = unit_lines.get(r.start_unit).copied().unwrap_or(firstlineno);
-        let col = unit_cols.get(r.start_unit).copied().unwrap_or_default();
-        // Both halves of an unfused superinstruction share its location.
-        for _ in 0..raw_expansion(r.cp_op, r.arg) {
-            lines.push(line);
-            cols.push(col);
-        }
-    }
+    // Units past the table keep the first line.
+    emit(firstlineno, crate::ColSpan::default(), usize::MAX);
     (lines, cols)
 }
 
@@ -2710,13 +2722,15 @@ fn read_exc_field(table: &[u8], pos: &mut usize) -> u32 {
 /// assembler merges adjacent same-handler units into one entry, and
 /// the codec is 1:1, so each wire entry is exactly one handler range.
 fn decode_exception_table(table: &[u8], raws: &[DecodedRaw]) -> Vec<ExcHandler> {
-    let unit_to_idx = unit_index_map(raws);
+    if table.is_empty() {
+        return Vec::new();
+    }
     let first = raw_first_instr(&raw_expansions(raws));
     let total = *first.last().unwrap_or(&0) as u32;
     let map_unit = |unit: usize| -> u32 {
-        unit_to_idx
-            .get(&unit)
-            .and_then(|i| first.get(*i))
+        // A unit no raw starts at maps past the end (the sentinel).
+        first
+            .get(raw_at_unit(raws, unit))
             .map_or(total, |i| *i as u32)
     };
     let mut out: Vec<ExcHandler> = Vec::new();

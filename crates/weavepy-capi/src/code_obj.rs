@@ -523,6 +523,17 @@ unsafe extern "C" fn frame_dealloc(obj: *mut PyObject) {
     if obj.is_null() {
         return;
     }
+    // A VM frame (`sys._getframe()`, `f_back`) crosses into C as an
+    // ordinary minted box wearing `PyFrame_Type` (see `type_for_object`),
+    // and a compiled `Py_DECREF` reaching zero calls `_Py_Dealloc`, which
+    // prefers this `tp_dealloc`. Freeing that box as a facade leaked its
+    // VM frame, left a stale minted entry, and released a block smaller
+    // than the facade layout claims (gevent's `_extract_stack` walks
+    // `f_back` from Cython on every `Greenlet.__init__`).
+    if crate::object::is_weavepy_owned(obj) {
+        unsafe { crate::object::free_owned_storage(obj) };
+        return;
+    }
     let layout = Layout::from_size_align(FRAME_BODY_SIZE, 8).expect("frame layout");
     unsafe { alloc::dealloc(obj as *mut u8, layout) };
 }

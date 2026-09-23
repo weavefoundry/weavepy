@@ -191,16 +191,177 @@ impl std::fmt::Debug for VmExt {
 /// not follow clones (a `replace()`d code object may change shape),
 /// never participates in equality, and is not serialized.
 #[derive(Default)]
-pub struct JitHint(std::sync::atomic::AtomicBool);
+pub struct JitHint {
+    not_jitable: std::sync::atomic::AtomicBool,
+    /// Whether the code has a loop back edge: `0` not yet derived, `1`
+    /// has one, `2` loop-free. A loop-free body runs a bounded number
+    /// of instructions per activation, so a framed native entry (guard
+    /// validation, marshaling) cannot amortize; callers that enter code
+    /// from the interpreter prefer to interpret such bodies.
+    loops: std::sync::atomic::AtomicU8,
+    /// Lean (interpreted, loop-free) activations so far; the VM warms
+    /// the tier-2 compile from it so native callers can still reach a
+    /// compiled form.
+    lean_entries: std::sync::atomic::AtomicU32,
+    /// Whether every loop in the code yields (0 unknown, 1 no, 2 yes):
+    /// a generator whose native resume could run at most one iteration
+    /// of any loop before yielding again.
+    yields_in_loops: std::sync::atomic::AtomicU8,
+    /// A native entry at pc 0 exists (the VM's tier-2 compiled it).
+    compiled: std::sync::atomic::AtomicBool,
+    /// Back edges left before the next consultation of the tier-2 state
+    /// (see [`JitHint::backedge_tick`]).
+    backedge_countdown: std::sync::atomic::AtomicU8,
+    /// The tier-2 state has no further interest in this code's back
+    /// edges (compiled, OSR budget spent).
+    backedge_quiet: std::sync::atomic::AtomicBool,
+}
 
 impl JitHint {
     #[must_use]
     pub fn is_not_jitable(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Relaxed)
+        self.not_jitable.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Back edges per consultation of the tier-2 state.
+    pub const BACKEDGE_STRIDE: u8 = 8;
+
+    /// Count one loop back edge; `true` every
+    /// [`Self::BACKEDGE_STRIDE`]-th time (when the tier-2 state should be
+    /// consulted), or never once [`Self::set_backedge_quiet`] ran.
+    #[inline]
+    pub fn backedge_tick(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.backedge_quiet.load(Relaxed) {
+            return false;
+        }
+        let n = self.backedge_countdown.load(Relaxed);
+        if n > 1 {
+            self.backedge_countdown.store(n - 1, Relaxed);
+            return false;
+        }
+        self.backedge_countdown
+            .store(Self::BACKEDGE_STRIDE, Relaxed);
+        true
+    }
+
+    /// [`Self::backedge_tick`] for a caller that defers the consultation
+    /// to someone who ticks: counts down while more than one back edge
+    /// remains, and reports (without consuming) the edge on which the
+    /// consultation is due.
+    #[inline]
+    pub fn backedge_pending(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.backedge_quiet.load(Relaxed) {
+            return false;
+        }
+        let n = self.backedge_countdown.load(Relaxed);
+        if n > 1 {
+            self.backedge_countdown.store(n - 1, Relaxed);
+            return false;
+        }
+        true
+    }
+
+    pub fn set_backedge_quiet(&self) {
+        self.backedge_quiet
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn is_compiled(&self) -> bool {
+        self.compiled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn mark_compiled(&self) {
+        self.compiled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn mark_not_jitable(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.not_jitable
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Lean activations counted so far (see [`Self::bump_lean_entries`]).
+    #[must_use]
+    pub fn lean_entries(&self) -> u32 {
+        self.lean_entries.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Count one lean activation; returns the new count.
+    pub fn bump_lean_entries(&self) -> u32 {
+        // A heuristic counter: a plain load/store pair (a lost update under
+        // a race only delays the warm compile), not a read-modify-write.
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = self.lean_entries.load(Relaxed);
+        if n > 1 << 20 {
+            return n;
+        }
+        let n = n.wrapping_add(1);
+        self.lean_entries.store(n, Relaxed);
+        n
+    }
+
+    /// Whether `code` (the owner of this hint) has no loop back edge
+    /// (see the field docs), derived on first use.
+    #[must_use]
+    pub fn loop_free(&self, code: &CodeObject) -> bool {
+        match self.loops.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let has_loop = code
+                    .instructions
+                    .iter()
+                    .any(|i| i.op == OpCode::JumpBackward);
+                self.loops.store(
+                    if has_loop { 1 } else { 2 },
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                !has_loop
+            }
+        }
+    }
+}
+
+impl JitHint {
+    /// Whether every loop back edge in `code` spans a `YIELD_VALUE`
+    /// (see the field docs), derived on first use. Vacuously true for
+    /// loop-free code.
+    #[must_use]
+    pub fn every_loop_yields(&self, code: &CodeObject) -> bool {
+        match self
+            .yields_in_loops
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            1 => false,
+            2 => true,
+            _ => {
+                let ins = &code.instructions;
+                // A loop is everything from its head to the furthest back
+                // edge targeting it: a conditional yield's loop has a
+                // second back edge (the not-taken branch's) whose own span
+                // holds no yield, yet the loop still yields.
+                let mut extent: std::collections::HashMap<usize, usize> =
+                    std::collections::HashMap::new();
+                for (pc, i) in ins.iter().enumerate() {
+                    if i.op == OpCode::JumpBackward {
+                        let target = (pc + 1).saturating_sub(i.arg as usize);
+                        let e = extent.entry(target).or_insert(pc);
+                        *e = (*e).max(pc);
+                    }
+                }
+                let all = extent.iter().all(|(&target, &end)| {
+                    ins[target..=end].iter().any(|j| j.op == OpCode::YieldValue)
+                });
+                self.yields_in_loops.store(
+                    if all { 2 } else { 1 },
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                all
+            }
+        }
     }
 }
 

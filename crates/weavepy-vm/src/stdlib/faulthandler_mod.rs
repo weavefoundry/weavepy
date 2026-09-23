@@ -922,6 +922,8 @@ fn fh_dump_traceback_later(
     // Bump the generation; the watchdog only fires while it is current.
     let my_gen = WATCHDOG_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let timeout_us = (timeout * 1e6).round() as u64;
+    // The watchdog reads interpreter state from outside the GIL.
+    crate::sync::mark_cells_shared();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_micros(timeout_us));
         if WATCHDOG_GEN.load(Ordering::SeqCst) != my_gen {
@@ -1140,6 +1142,7 @@ fn fh_py_fatal_error(args: &[Object]) -> Result<Object, RuntimeError> {
 /// no tstate is current, so every block in the dump reads `Thread 0x…`.
 fn fh_fatal_error_c_thread(_args: &[Object]) -> Result<Object, RuntimeError> {
     flush_std_streams();
+    crate::sync::mark_cells_shared();
     std::thread::spawn(|| {
         py_fatal_error_and_abort("faulthandler_fatal_error_thread: in new thread", None);
     });

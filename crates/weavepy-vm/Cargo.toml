@@ -66,7 +66,6 @@ rustls                = { workspace = true }
 rustls-pki-types      = { workspace = true }
 pkcs8                 = { workspace = true }
 rustls-pemfile        = { workspace = true }
-rustls-native-certs   = { workspace = true }
 webpki-roots          = { workspace = true }
 x509-parser           = { workspace = true }
 
@@ -87,6 +86,13 @@ corosensei = "0.3"
 # stdlib core. Only present in Windows builds.
 [target.'cfg(windows)'.dependencies]
 windows-sys           = { workspace = true }
+chrono                = { workspace = true, features = ["clock"] }
+
+# The platform CA store. On macOS it would link Security.framework and
+# CoreFoundation into every launch (see the workspace `chrono` note); the
+# macOS build reads the system PEM bundle instead (`ssl_real`).
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+rustls-native-certs   = { workspace = true }
 
 [features]
 # RFC 0067 WS3 — the tier-2 JIT ships in the default build. Runtime

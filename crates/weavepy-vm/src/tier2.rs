@@ -106,6 +106,8 @@ struct MethodEntry {
     code: Rc<CodeObject>,
     /// The method name (for the shadow check and the span rebuild).
     name: String,
+    /// `hash(name)`, so the per-call shadow probe hashes nothing.
+    name_hash: i64,
     /// Positional arity, `self` included.
     arg_count: u32,
     /// Arity minus trailing defaults, `self` included.
@@ -127,13 +129,42 @@ type MethodTable = Vec<MethodEntry>;
 /// the snapshotted function (module dicts are mutable).
 type MathTable = Vec<(String, String, Object)>;
 
+/// The burned-in globals a compilation guards on (`name` → the object
+/// it resolved to at compile time), with the namespaces' mutation
+/// stamps from the last successful validation: while the entering
+/// frame's globals and builtins dicts are the same objects in the same
+/// state, every name still resolves identically and the per-name
+/// probes are skipped (a resume or entry then costs two stamp reads).
+struct GuardSnapshot {
+    entries: Vec<(String, Object)>,
+    /// `(globals id, globals stamp, builtins id, builtins stamp)` of the
+    /// last full validation that held; all-zero until one has.
+    last_ok: std::cell::Cell<(usize, u64, usize, u64)>,
+}
+
+impl GuardSnapshot {
+    fn new(entries: Vec<(String, Object)>) -> Self {
+        Self {
+            entries,
+            last_ok: std::cell::Cell::new((0, 0, 0, 0)),
+        }
+    }
+}
+
+impl std::ops::Deref for GuardSnapshot {
+    type Target = [(String, Object)];
+    fn deref(&self) -> &[(String, Object)] {
+        &self.entries
+    }
+}
+
 /// A compiled frame plus the globals it burned in: `snapshot[i]` is the
 /// object `guards[i].name` resolved to at compile time. Every entry
 /// re-resolves each name against the entering frame's namespaces and
 /// requires identity (`is_same`) with the snapshot (RFC 0058 WS4).
 struct CompiledEntry {
     cf: StdRc<CompiledFrame>,
-    guard_snapshot: StdRc<Vec<(String, Object)>>,
+    guard_snapshot: StdRc<GuardSnapshot>,
     callees: StdRc<CalleeTable>,
     /// RFC 0074 WS1 — the obj-global table: `obj_globals[token]` is
     /// the identity-guarded object `PushGlobalObj { token }` pins
@@ -212,7 +243,7 @@ struct DirectEntry {
 /// resolution tables its entries validate against.
 struct Artifacts {
     cf: StdRc<CompiledFrame>,
-    snap: StdRc<Vec<(String, Object)>>,
+    snap: StdRc<GuardSnapshot>,
     callees: StdRc<CalleeTable>,
     /// RFC 0074 WS1 — `obj_globals[token]` is the snapshotted object
     /// behind each `PushGlobalObj` token (identity-guarded through
@@ -319,6 +350,21 @@ pub(crate) const DEOPT_BUDGET: u32 = 64;
 /// Retire it to tier-1.
 pub(crate) const GENERIC_CALL_RETIRE_RATIO: u32 = 4;
 
+/// Retire a compiled code object — and deopt the running activation —
+/// once one activation has made this many interpreter round-trips
+/// through the call helpers. Each such call pays activation-shell
+/// setup, a generic call, and a full `guards_hold` re-validation; the
+/// interpreter's own call path is several times cheaper. A native
+/// activation that keeps coming back here is a loop around calls the
+/// JIT cannot run natively, so the interpreter finishes it (and runs
+/// every later activation).
+/// Zero disables the backoff (its `!= 0` guards then short-circuit, and
+/// clippy reads the `>=` behind them as vacuous — hence the allows at
+/// the three sites). Kept as a constant rather than deleted: the
+/// measurement that zeroed it is recorded above, and re-arming it is a
+/// one-line change.
+pub(crate) const INTERP_CALL_RETIRE_BUDGET: u32 = 0;
+
 /// Minimum framed entries before the generic-call ratio is judged —
 /// avoids retiring on a cold first activation (e.g. a setup call that
 /// makes a burst of generic calls once and then loops natively).
@@ -335,6 +381,8 @@ pub(crate) struct JitStats {
     /// Fully reconstructed exits requested to release native temporary pins.
     /// These do not spend the speculative-deopt budget.
     pub pin_pressure_exits: u64,
+    /// Expected hand-offs at cold exits (see `CompiledFrame::cold_exits`).
+    pub cold_exits: u64,
     pub entry_guard_failures: u64,
     /// Mid-loop (OSR) native entries, a subset of `native_entries`
     /// (RFC 0059 WS3b).
@@ -411,25 +459,112 @@ struct JitState {
     compile_gen: u64,
 }
 
+/// Process-wide "could any thread's JIT be on?" gate: `0` not yet
+/// derived, `1` possibly on, `2` off for the whole run. Whether the JIT
+/// runs is settled by the environment and the free-threading mode, both
+/// fixed before the first Python call, so every per-thread [`JitState`]
+/// agrees. The tier-up hooks sit on every Python call and loop back
+/// edge; with the JIT off they answer from this one relaxed load instead
+/// of a thread-local borrow.
+static JIT_PROCESS_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The `WEAVEPY_JIT` / free-threading verdict shared by every thread.
+fn jit_enabled_by_config() -> bool {
+    // RFC 0067 WS3 — the tier-2 JIT is on by default; `WEAVEPY_JIT=0`
+    // (or `off`, or an empty value) restores the pure interpreter.
+    let enabled = match std::env::var("WEAVEPY_JIT") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("off") && !v.is_empty(),
+        Err(_) => true,
+    };
+    // RFC 0076 WS11 — tier-2 native code assumes the GIL's
+    // single-writer discipline (unsynchronized inline-cache and
+    // guard-table reads); the free-threaded mode pins execution
+    // to tiers 0/1 for the whole run, even if an extension later
+    // re-enables the GIL.
+    enabled && !crate::gil::free_threading_requested()
+}
+
+/// Whether interpreter start-up (the `site` import and everything it
+/// pulls in) is over. Until then compilation waits: start-up code runs
+/// once, and compiling the few helpers it calls a few dozen times costs
+/// more (time and resident memory) than interpreting them ever could.
+static STARTUP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    /// The lean entry count at which the interpreter warms a tier-2
+    /// compile, clamped to the tier-2 threshold.
+    ///
+    /// A loop-free callee never gets a frame entry to count, so this is
+    /// the only thing that compiles it — and a native caller can only
+    /// take a direct lane into a callee that *is* compiled. Waiting for
+    /// the lean constant when tier-2 would have compiled after far fewer
+    /// entries left those callees interpreted and every native call site
+    /// generic.
+    ///
+    /// Thread-local, like the threshold it is clamped to: a process-wide
+    /// cell would let one thread's threshold decide another's warm
+    /// point, which in the test binary means whichever test ran last.
+    static LEAN_WARM_AT: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(LEAN_WARM_COMPILE_THRESHOLD_CAP) };
+}
+
+/// The cap the clamp above starts from.
+pub(crate) const LEAN_WARM_COMPILE_THRESHOLD_CAP: u32 = 24;
+
+#[inline]
+pub(crate) fn lean_warm_at() -> u32 {
+    LEAN_WARM_AT
+        .try_with(std::cell::Cell::get)
+        .unwrap_or(LEAN_WARM_COMPILE_THRESHOLD_CAP)
+}
+
+/// Clamp [`LEAN_WARM_AT`] to `threshold` (called wherever the tier-2
+/// threshold is established).
+fn set_lean_warm_from_threshold(threshold: u32) {
+    let v = LEAN_WARM_COMPILE_THRESHOLD_CAP.min(threshold.max(1));
+    let _ = LEAN_WARM_AT.try_with(|c| c.set(v));
+}
+
+/// Mark interpreter start-up finished (see [`STARTUP_DONE`]).
+pub(crate) fn note_startup_finished() {
+    STARTUP_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a code object whose counter reached `counter` against
+/// `threshold` may compile now: after start-up, or (for an embedder
+/// that never reports start-up) once far past the threshold.
+#[inline]
+fn compile_allowed(counter: u32, threshold: u32) -> bool {
+    STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed)
+        || counter >= threshold.saturating_mul(16)
+}
+
+/// True when no thread's JIT can be enabled (see [`JIT_PROCESS_GATE`]).
+#[inline]
+pub(crate) fn jit_off_for_process() -> bool {
+    match JIT_PROCESS_GATE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => jit_process_gate_init(),
+    }
+}
+
+#[cold]
+fn jit_process_gate_init() -> bool {
+    let on = jit_enabled_by_config();
+    JIT_PROCESS_GATE.store(if on { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+    !on
+}
+
 impl JitState {
     fn new() -> JitState {
-        // RFC 0067 WS3 — the tier-2 JIT is on by default; `WEAVEPY_JIT=0`
-        // (or `off`, or an empty value) restores the pure interpreter.
-        let enabled = match std::env::var("WEAVEPY_JIT") {
-            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("off") && !v.is_empty(),
-            Err(_) => true,
-        };
-        // RFC 0076 WS11 — tier-2 native code assumes the GIL's
-        // single-writer discipline (unsynchronized inline-cache and
-        // guard-table reads); the free-threaded mode pins execution
-        // to tiers 0/1 for the whole run, even if an extension later
-        // re-enables the GIL.
-        let enabled = enabled && !crate::gil::free_threading_requested();
+        let enabled = jit_enabled_by_config();
         let threshold = std::env::var("WEAVEPY_JIT_THRESHOLD")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(50);
+        set_lean_warm_from_threshold(threshold);
         // RFC 0059 WS3 — must precede the first compile of a frame
         // containing calls. Registered unconditionally (it only stores a
         // fn pointer) so late enabling, e.g. via the test hook, works.
@@ -452,6 +587,7 @@ impl JitState {
             wpjit_list_repeat,
             wpjit_list_slice,
         );
+        weavepy_jit::register_list_from_range_helper(wpjit_list_from_range);
         // RFC 0071 WS6 — the string/bytes read helpers.
         weavepy_jit::register_str_helpers(
             wpjit_str_eq,
@@ -467,6 +603,7 @@ impl JitState {
             wpjit_dict_contains,
             wpjit_dict_len,
         );
+        weavepy_jit::register_dict_del_helper(wpjit_dict_del);
         weavepy_jit::register_build_map_helper(wpjit_build_map);
         weavepy_jit::register_const_str_helper(wpjit_const_str);
         weavepy_jit::register_tuple_read_helpers(wpjit_const_tuple, wpjit_tuple_len);
@@ -492,6 +629,7 @@ impl JitState {
             wpjit_float_floordiv,
             wpjit_float_mod,
         );
+        weavepy_jit::register_float_pow_helper(wpjit_float_pow);
         // RFC 0074 — the frame-coverage lanes: obj globals, the
         // opaque-call lane, dynamic attributes, generic/pair
         // iteration, str %-format and slice.
@@ -567,7 +705,9 @@ impl JitState {
                 Tier::NotJitable => return None,
                 Tier::Cold => {
                     entry.counter += 1;
-                    if entry.counter < self.threshold {
+                    if entry.counter < self.threshold
+                        || !compile_allowed(entry.counter, self.threshold)
+                    {
                         return None;
                     }
                     // RFC 0073 WS1 — a probe-miss rejection is
@@ -816,7 +956,13 @@ impl JitState {
                 obj: &mut **obj_live,
                 paths: &mut path_arena,
             };
+            let t0 = std::env::var_os("WEAVEPY_JIT_TRACE")
+                .is_some()
+                .then(std::time::Instant::now);
             let r = engine.compile_frame(code, &mut classify, &mut jit_probes);
+            if let Some(t0) = t0 {
+                eprintln!("jit compile-time {:?} {:?}", code.name, t0.elapsed());
+            }
             let obj_names = obj_names.into_inner().into_iter().map(|(n, _)| n).collect();
             (r, callees.into_inner(), methods, obj_names)
         };
@@ -878,16 +1024,31 @@ impl JitState {
                     self.stats.frames_notjitable += 1;
                     (Tier::NotJitable, None)
                 } else {
-                    if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+                    if crate::hot_gates::env_flags::jit_trace() {
                         eprintln!(
-                            "jit compile {:?} (entry pc {entry_pc}, scalar leaf {})",
+                            "jit compile {:?} (entry pc {entry_pc}, scalar leaf {}, generic/total ops {:?}, kinds {:?})",
                             code.name,
-                            cf.is_scalar_leaf()
+                            cf.is_scalar_leaf(),
+                            cf.op_mix(),
+                            cf.op_kinds()
                         );
+                    }
+                    // The interpreter's lean paths hand a self-recursive
+                    // compiled body's calls to the native entry from now
+                    // on: it reaches its native self through the direct
+                    // lanes. Any other loop-free body is cheaper to
+                    // interpret than to frame (and an OO body's calls
+                    // would bounce back through the interpreter).
+                    if entry_pc == 0
+                        && callees
+                            .iter()
+                            .any(|(_, c)| std::ptr::eq(Rc::as_ptr(c), std::ptr::from_ref(&**code)))
+                    {
+                        code.jit_hint.mark_compiled();
                     }
                     let artifacts = StdRc::new(Artifacts {
                         cf: StdRc::new(cf),
-                        snap: StdRc::new(snap),
+                        snap: StdRc::new(GuardSnapshot::new(snap)),
                         callees: StdRc::new(callees),
                         obj_globals: StdRc::new(obj_globals),
                         attr_guards: StdRc::new(attr_guards),
@@ -917,7 +1078,7 @@ impl JitState {
                 }
             }
             Err(v) => {
-                if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+                if crate::hot_gates::env_flags::jit_trace() {
                     eprintln!("jit reject {:?} (entry pc {entry_pc}): {v:?}", code.name);
                 }
                 if matches!(v, weavepy_jit::JitVerdict::ProbeMiss(_)) {
@@ -1170,11 +1331,24 @@ impl JitState {
         });
         match entry.tier {
             Tier::Cold => {
-                entry.counter = entry.counter.saturating_add(1);
+                // One consultation stands for a stride of back edges.
+                entry.counter = entry
+                    .counter
+                    .saturating_add(u32::from(weavepy_compiler::JitHint::BACKEDGE_STRIDE));
                 entry.counter >= self.threshold
             }
-            Tier::Compiled(..) => entry.osr_failures < OSR_FAILURE_BUDGET,
-            Tier::NotJitable => false,
+            Tier::Compiled(..) => {
+                if entry.osr_failures < OSR_FAILURE_BUDGET {
+                    true
+                } else {
+                    code.jit_hint.set_backedge_quiet();
+                    false
+                }
+            }
+            Tier::NotJitable => {
+                code.jit_hint.mark_not_jitable();
+                false
+            }
         }
     }
 
@@ -1367,6 +1541,29 @@ fn ctor_field_plan(icode: &CodeObject) -> Option<Vec<(String, CtorFieldSrc)>> {
 /// [`TypeObject::instance_plan`]'s `attr_version` key, so revalidation
 /// is a version check in the common case).
 fn probe_class_ctor(interp: &super::Interpreter, cls: &Rc<TypeObject>) -> Option<ClassCtorEntry> {
+    let (icode, arg_count, min_args) = probe_class_ctor_shape(interp, cls)?;
+    // RFC 0073 WS1 — the canonical shape additionally requires the
+    // instance to actually keep a dict for the indexed fingerprint.
+    let fields = if cls.forbids_dict || cls.declares_slots.get() {
+        Vec::new()
+    } else {
+        ctor_field_plan(&icode).unwrap_or_default()
+    };
+    Some(ClassCtorEntry {
+        init_code: icode,
+        arg_count,
+        min_args,
+        fields,
+    })
+}
+
+/// [`probe_class_ctor`] without the field plan (the guard predicate only
+/// needs the constructor's `__init__` code): `(init code, arg_count,
+/// min_args)`.
+fn probe_class_ctor_shape(
+    interp: &super::Interpreter,
+    cls: &Rc<TypeObject>,
+) -> Option<(Rc<CodeObject>, u32, u32)> {
     let bt = crate::builtin_types::builtin_types();
     // `type` subclasses (metaclasses) construct *classes* through the
     // three-argument form, never plain instances.
@@ -1395,19 +1592,7 @@ fn probe_class_ctor(interp: &super::Interpreter, cls: &Rc<TypeObject>) -> Option
     }
     let arg_count = icode.arg_count - 1;
     let min_args = arg_count.saturating_sub(u32::try_from(init.defaults.len()).unwrap_or(u32::MAX));
-    // RFC 0073 WS1 — the canonical shape additionally requires the
-    // instance to actually keep a dict for the indexed fingerprint.
-    let fields = if cls.forbids_dict || cls.declares_slots.get() {
-        Vec::new()
-    } else {
-        ctor_field_plan(&icode).unwrap_or_default()
-    };
-    Some(ClassCtorEntry {
-        init_code: icode,
-        arg_count,
-        min_args,
-        fields,
-    })
+    Some((icode, arg_count, min_args))
 }
 
 /// RFC 0073 WS1 — the constructor-shape fallback probe: resolve the
@@ -1439,7 +1624,9 @@ fn scalar_lane_ty(t: JitType) -> bool {
 /// travels as an `ObjPin` entry that the callee re-pins in its own
 /// table).
 fn marshalable_lane_ty(t: JitType) -> bool {
-    scalar_lane_ty(t) || t == JitType::Obj
+    // A pinned list crosses as its pin too (re-pinned on the callee side
+    // with the same element lane).
+    scalar_lane_ty(t) || t == JitType::Obj || t.is_list()
 }
 
 /// RFC 0067 WS1 — whether a *compiled* callee can be entered directly
@@ -1563,9 +1750,16 @@ fn callee_ret_info(
         }
         classify_global(obj.as_ref())
     };
-    let (lane, ret_none) = match weavepy_jit::analyze(fcode, &mut classify) {
+    let mut obj_global = |name: &str| resolve(name).map(|o| grade_obj_global(&o));
+    let (lane, ret_none) = match weavepy_jit::analyze_for_ret(fcode, &mut classify, &mut obj_global)
+    {
         Ok(tf) => (tf.ret_lane, tf.ret_none),
-        Err(_) => (None, weavepy_jit::returns_none_syntactically(fcode)),
+        Err(e) => {
+            if crate::hot_gates::env_flags::jit_trace() {
+                eprintln!("jit ret-lane {:?}: {:?}", fcode.name, e);
+            }
+            (None, weavepy_jit::returns_none_syntactically(fcode))
+        }
     };
     RET_LANE_CACHE.with(|c| c.borrow_mut().insert(key, (lane, ret_none, fcode.clone())));
     (lane, ret_none)
@@ -1805,6 +1999,7 @@ fn unpack_ty(bits: u64, ty: JitType, pins: &PinTable) -> Object {
         JitType::ListInt
         | JitType::ListFloat
         | JitType::ListObj
+        | JitType::ListListFloat
         | JitType::Obj
         | JitType::Str
         | JitType::Bytes
@@ -1862,16 +2057,22 @@ fn entry_local_ok(obj: &Object, ty: JitType) -> bool {
     let Object::List(l) = obj else {
         return false;
     };
-    matches!(
-        (l.borrow().first(), elem),
-        (None, _)
-            | (Some(Object::Int(_)), JitType::Int)
-            | (Some(Object::Float(_)), JitType::Float)
-            | (
-                Some(Object::Instance(_) | Object::Str(_) | Object::None),
-                JitType::Obj
-            )
-    )
+    match (l.borrow().first(), elem) {
+        // A float-list element: its own first element is the proxy.
+        (Some(Object::List(inner)), JitType::ListFloat) => {
+            matches!(inner.borrow().first(), None | Some(Object::Float(_)))
+        }
+        (first, elem) => matches!(
+            (first, elem),
+            (None, _)
+                | (Some(Object::Int(_)), JitType::Int)
+                | (Some(Object::Float(_)), JitType::Float)
+                | (
+                    Some(Object::Instance(_) | Object::Str(_) | Object::None | Object::Tuple(_)),
+                    JitType::Obj
+                )
+        ),
+    }
 }
 
 /// The compile-time shape probe (RFC 0061 WS5): report the element lane
@@ -1895,7 +2096,16 @@ fn probe_list_lane(frame: &super::Frame, slot: u32) -> Option<JitType> {
             Object::Float(_) => JitType::Float,
             // RFC 0071 WS4 — instances (and `None`) ride the object
             // element lane; the access helpers re-validate per element.
-            Object::Instance(_) | Object::None => JitType::Obj,
+            // Tuples too (a list of pairs a `for a, b in` loop unpacks).
+            Object::Instance(_) | Object::None | Object::Tuple(_) => JitType::Obj,
+            // A non-empty all-`float` list element: the nested lane.
+            Object::List(inner) => {
+                let inner = inner.borrow();
+                if inner.is_empty() || !inner.iter().all(|x| matches!(x, Object::Float(_))) {
+                    return None;
+                }
+                JitType::ListFloat
+            }
             _ => return None,
         };
         match lane {
@@ -2263,6 +2473,7 @@ fn probe_method_entry(
         func: f,
         code: fcode,
         name: name.to_owned(),
+        name_hash: crate::object::py_str_hash(name),
         arg_count,
         min_args,
         ret,
@@ -2360,7 +2571,12 @@ fn attr_fingerprint_obj(
     // resolve the staged pin); RFC 0071 WS6 — exact `str`/`bytes`
     // values take the read lanes; anything else must be a scalar.
     let lane = match v {
-        Object::Instance(_) | Object::None => JitType::Obj,
+        // A `list`/`dict` attribute pins exactly like an instance one —
+        // the value is pinned at the load and the guard re-validates the
+        // lane per access — and an object-holding attribute is very
+        // common (`self.constraints`, `self.cache`). Without this the
+        // site stayed fully dynamic.
+        Object::Instance(_) | Object::None | Object::List(_) | Object::Dict(_) => JitType::Obj,
         Object::Str(_) => JitType::Str,
         Object::Bytes(_) => JitType::Bytes,
         _ => scalar_lane(v)?,
@@ -2414,13 +2630,116 @@ pub(crate) fn gc_sweep() {
 /// Bump the back-edge hot counter for a code object. Returns `true`
 /// when the caller should attempt an OSR entry (RFC 0059 WS3b); always
 /// `false` when the JIT is disabled.
+/// The leaf burst's back-edge hook: whether the next back edge's
+/// consultation of the tier-2 state is due. The burst then hands the
+/// edge to the full `JUMP_BACKWARD` handler, whose [`note_backedge`]
+/// ticks, consults, and attempts the OSR entry.
+#[inline]
+pub(crate) fn backedge_due(code: &Rc<CodeObject>) -> bool {
+    !code.jit_hint.is_not_jitable() && !jit_off_for_process() && code.jit_hint.backedge_pending()
+}
+
 pub(crate) fn note_backedge(code: &Rc<CodeObject>) -> bool {
     // RFC 0067 — same fast-out as `try_enter`: rejected code pays one
-    // relaxed load per back edge, not a thread-local + map lookup.
-    if code.jit_hint.is_not_jitable() {
+    // relaxed load per back edge, not a thread-local + map lookup. The
+    // state itself is consulted only every `BACKEDGE_STRIDE` back edges.
+    if code.jit_hint.is_not_jitable() || jit_off_for_process() || !code.jit_hint.backedge_tick() {
         return false;
     }
     JIT.with(|cell| cell.borrow_mut().note_backedge(code))
+}
+
+/// Compile `frame`'s code if it is hot, without entering it: the lean
+/// interpreter path runs a loop-free body itself (a framed native entry
+/// would cost more than the body), but a native caller can still take
+/// the direct call lanes into the compiled form, and those resolve only
+/// once the code has been compiled. Called on the lean path's threshold.
+pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::Frame) {
+    if frame.code.jit_hint.is_not_jitable() || jit_off_for_process() {
+        return;
+    }
+    JIT.with(|cell| {
+        let mut st = cell.borrow_mut();
+        if !st.enabled {
+            return;
+        }
+        // Pull the counter to whatever `compile_allowed` asks for, so
+        // `get_compiled` compiles now. A body reached only through the
+        // lean/inline call path never gets a frame entry to count it, so
+        // this is its *only* route into tier-2: applying a stricter rule
+        // here than the frame path does (refusing outright until
+        // start-up is reported) left every such body interpreted for the
+        // life of an embedder that never reports it.
+        let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
+        let threshold = st.threshold;
+        let warm = if STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed) {
+            threshold
+        } else {
+            threshold.saturating_mul(16)
+        };
+        if let Some(entry) = st.cache.get_mut(&key) {
+            if let Tier::Cold = entry.tier {
+                entry.counter = entry.counter.max(warm);
+            }
+        } else {
+            st.cache.insert(
+                key,
+                CacheEntry {
+                    counter: warm,
+                    tier: Tier::Cold,
+                    osr_failures: 0,
+                    deopts: 0,
+                    native_entries: 0,
+                    generic_dyn_calls: 0,
+                    probe_misses: Vec::new(),
+                    native: None,
+                    method_native: None,
+                    direct: None,
+                    code: frame.code.clone(),
+                },
+            );
+        }
+        let interp_ref: &super::Interpreter = interp;
+        let frame_ref: &super::Frame = frame;
+        let mut resolve = |name: &str| resolve_plain_global(interp_ref, frame_ref, name);
+        let mut ret_of = |f: &Rc<PyFunction>, c: &Rc<CodeObject>| callee_ret_lane(interp_ref, f, c);
+        let mut probe = |slot: u32| probe_list_lane(frame_ref, slot);
+        let mut probe_dict = |slot: u32| probe_dict_lane(frame_ref, slot);
+        let mut probe_attr = |slot: u32, path: &[String], name: &str, store: bool| {
+            probe_attr_lane(frame_ref, slot, path, name, store)
+        };
+        let mut attr_guard = |site: &AttrSiteMeta| attr_site_guard(interp_ref, frame_ref, site);
+        let mut probe_method = |slot: u32, path: &[String], name: &str| {
+            probe_method_entry(interp_ref, frame_ref, slot, path, name)
+        };
+        let mut math_attr =
+            |name: &str, attr: &str| math_attr_object(interp_ref, frame_ref, name, attr);
+        let mut probe_param = |slot: u32| probe_param_lane(frame_ref, slot);
+        let mut probe_class = |cls: &Rc<TypeObject>| probe_class_ctor(interp_ref, cls);
+        let mut probe_ctor_fld =
+            |cls: &str, attr: &str| probe_ctor_field(interp_ref, frame_ref, cls, attr);
+        let mut probe_cell = |idx: u32| probe_cell_lane(frame_ref, idx);
+        let mut probe_obj = |slot: u32| probe_obj_live(frame_ref, slot);
+        let _ = st.get_compiled(
+            &frame.code,
+            0,
+            &mut VmProbes {
+                resolve_obj: &mut resolve,
+                ret_lane_of: &mut ret_of,
+                list: &mut probe,
+                dict: &mut probe_dict,
+                attr: &mut probe_attr,
+                attr_guard_of: &mut attr_guard,
+                method: &mut probe_method,
+                math_attr: &mut math_attr,
+                param: &mut probe_param,
+                class_ctor: &mut probe_class,
+                ctor_field: &mut probe_ctor_fld,
+                cell: &mut probe_cell,
+                obj_live: &mut probe_obj,
+            },
+        );
+    });
 }
 
 /// Resolve a global name the way `LOAD_GLOBAL`'s happy path does —
@@ -2485,6 +2804,12 @@ fn classify_global(obj: Option<&Object>) -> ResolvedGlobal {
         // Builtins reject attribute mutation, so identity (the entry
         // guard) implies unmodified call semantics.
         Some(Object::Builtin(b)) if b.name == "len" => ResolvedGlobal::LenBuiltin,
+        // The canonical `list` type (builtins may hold the function
+        // flavour): `list(range(...))` builds natively.
+        Some(Object::Builtin(b)) if b.name == "list" => ResolvedGlobal::ListBuiltin,
+        Some(Object::Type(t)) if Rc::ptr_eq(t, &crate::builtin_types::builtin_types().list_) => {
+            ResolvedGlobal::ListBuiltin
+        }
         // RFC 0074 WS3 — canonical `enumerate` (builtins hold the
         // function flavour; module globals may hold the type object).
         // Certifies the tuple-target recognizer's lane training; the
@@ -2511,7 +2836,7 @@ struct CallCtx {
     /// re-entrancy pattern as `vm_singletons::publish_interpreter_ptr`).
     interp: *mut super::Interpreter,
     callees: StdRc<CalleeTable>,
-    guard_snapshot: StdRc<Vec<(String, Object)>>,
+    guard_snapshot: StdRc<GuardSnapshot>,
     /// The caller frame's namespaces, for post-call guard revalidation
     /// (the caller `Frame` itself is mutably borrowed across the native
     /// call and must not be touched from here).
@@ -2560,6 +2885,29 @@ struct CallCtx {
     /// call tree can't rebind anything, so clean calls skip the guard
     /// lookups entirely.
     dirty: bool,
+    /// Interpreter round-trips this activation has made through the call
+    /// helpers (see [`INTERP_CALL_RETIRE_BUDGET`]).
+    interp_calls: u32,
+    /// Generic calls of an *interpreted* callee since the last poll (the
+    /// density the poll judges: an attribute round-trip or a native
+    /// callee is charged separately).
+    dyn_py_calls: u32,
+    /// Generic calls of native callees this activation has made (see
+    /// [`charge_native_roundtrip`]).
+    native_calls: u32,
+    /// Native loop polls this activation made (one per
+    /// `JIT_POLL_STRIDE` loop-header iterations): the native work that
+    /// earns generic native-callee calls their keep (see
+    /// [`charge_native_roundtrip`]).
+    polls: u32,
+    /// The context of this activation's most recent native callee, kept
+    /// for reuse by its next call of the same callee (see
+    /// `try_native_call`). Owns its handles; taken out while in use.
+    child: Option<Box<CallCtx>>,
+    /// The executing thread's recursion-depth cell (see
+    /// `crate::recursion::depth_cell`), resolved once per entry into
+    /// native code and inherited by nested native calls.
+    depth_cell: *const std::cell::Cell<usize>,
     /// RFC 0067 WS1 — identity of this activation's code object, so a
     /// self-recursive fast call can reuse [`Self::native`] without a
     /// cache lookup.
@@ -2620,21 +2968,39 @@ fn guards_hold(
     interp: &super::Interpreter,
     globals: &Rc<GilRefCell<DictData>>,
     builtins: &Rc<GilRefCell<DictData>>,
-    guard_snapshot: &[(String, Object)],
+    guard_snapshot: &GuardSnapshot,
     callees: &CalleeTable,
     math: &MathTable,
 ) -> bool {
-    for (name, expected) in guard_snapshot {
-        let ok = resolve_plain_dicts(interp, globals, builtins, name)
-            .is_some_and(|cur| cur.is_same(expected));
-        if !ok {
-            return false;
+    // SAFETY (stamp reads): GIL-serialized raw reads of the dicts'
+    // mutation stamps — no dict borrow is held while native code is
+    // entered or resumed (the reentrant dict paths exist so user code
+    // never runs under one).
+    let key = (
+        Rc::as_ptr(globals) as usize,
+        unsafe { (*globals.as_ptr()).mutation_stamp() },
+        Rc::as_ptr(builtins) as usize,
+        unsafe { (*builtins.as_ptr()).mutation_stamp() },
+    );
+    if guard_snapshot.last_ok.get() != key || interp.globals_missing_any.get() {
+        for (name, expected) in guard_snapshot.entries.iter() {
+            let ok = resolve_plain_dicts(interp, globals, builtins, name)
+                .is_some_and(|cur| cur.is_same(expected));
+            if !ok {
+                return false;
+            }
         }
+        guard_snapshot.last_ok.set(key);
     }
     for (f, code_snap) in callees {
         match f {
             Object::Function(pf) => {
-                if !Rc::ptr_eq(&pf.code.borrow(), code_snap) {
+                // SAFETY: GIL-serialized raw read of the code cell (see
+                // `PyFunction::code`); only the pointer is compared.
+                if !std::ptr::eq(
+                    unsafe { Rc::as_ptr(&*pf.code.as_ptr()) },
+                    Rc::as_ptr(code_snap),
+                ) {
                     return false;
                 }
             }
@@ -2647,8 +3013,8 @@ fn guards_hold(
             // revalidates with a version compare.
             Object::Type(t) => {
                 let ok = matches!(
-                    probe_class_ctor(interp, t),
-                    Some(cc) if Rc::ptr_eq(&cc.init_code, code_snap)
+                    probe_class_ctor_shape(interp, t),
+                    Some((init_code, ..)) if Rc::ptr_eq(&init_code, code_snap)
                 );
                 if !ok {
                     return false;
@@ -2857,6 +3223,32 @@ mod scratch_pool_tests {
 /// Same contract as [`wpjit_call_py`], except this helper never runs
 /// Python code and never touches the frame's exchange buffers.
 unsafe extern "C" fn wpjit_poll(frame: *mut JitFrame) -> i64 {
+    {
+        // SAFETY: as below.
+        let jf = unsafe { &*frame };
+        if !jf.ctx.is_null() {
+            #[allow(clippy::cast_ptr_alignment)]
+            let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+            ctx.polls = ctx.polls.saturating_add(1);
+            // A poll interval dense with generic calls — of a native
+            // callee, or of an interpreted one the callee tables could
+            // not enter natively: the loop is a native driver around
+            // interpreter calls, each paying an activation shell, a
+            // generic call and a full `guards_hold` revalidation. The
+            // interpreter's own inline call path serves such a loop
+            // several times better (measured on OO call loops: a
+            // one-call-per-iteration loop ran 3x slower compiled).
+            let dense = (ctx.native_calls > NATIVE_CALLS_PER_POLL
+                || ctx.dyn_py_calls > INTERP_CALLS_PER_POLL)
+                && !ctx.code_ptr.is_null();
+            ctx.native_calls = 0;
+            ctx.dyn_py_calls = 0;
+            if dense {
+                retire_native_driver(ctx);
+                return 1;
+            }
+        }
+    }
     crate::gil::yield_checkpoint();
     if crate::hot_gates::load() != 0 || crate::trace::any_observers_active() {
         return 1;
@@ -2902,6 +3294,9 @@ fn lane_tag(t: JitType) -> u32 {
         JitType::Bool => SlotTag::Bool as u32,
         // RFC 0071 WS1 — the nullable object lane crosses as a pin.
         JitType::Obj => SlotTag::ObjPin as u32,
+        JitType::ListInt | JitType::ListFloat | JitType::ListObj | JitType::ListListFloat => {
+            SlotTag::ListPin as u32
+        }
         _ => u32::MAX,
     }
 }
@@ -2938,6 +3333,16 @@ fn current_compile_gen() -> u64 {
     JIT.with(|cell| cell.borrow().compile_gen)
 }
 
+/// Bump a native-call diagnostic counter. The counters only feed the
+/// VM stats report (and unit tests), so they stay off the call path
+/// otherwise: each is a thread-local access.
+#[inline(always)]
+fn native_stat(f: impl FnOnce(&NativeCallStats)) {
+    if cfg!(test) || crate::specialize::stats_enabled() {
+        NATIVE_CALL_STATS.with(f);
+    }
+}
+
 const SCALAR_LEAF_SLOTS: usize = 32;
 
 /// Enter a certified scalar leaf with bounded stack storage. The caller
@@ -2950,6 +3355,8 @@ const SCALAR_LEAF_SLOTS: usize = 32;
 /// are initialized, and all missing trailing arguments have scalar defaults.
 #[inline(never)]
 unsafe fn enter_scalar_leaf(nc: &NativeCallee, jf: &JitFrame, argc: usize) -> Option<(u64, u32)> {
+    // Only the locals need initializing: the operand spill and its tags
+    // are written by native code before anything reads them.
     let mut locals = [0u64; SCALAR_LEAF_SLOTS];
     for (j, slot) in locals.iter_mut().enumerate().take(argc) {
         // SAFETY: the caller validated the marshaled argument prefix.
@@ -2964,8 +3371,8 @@ unsafe fn enter_scalar_leaf(nc: &NativeCallee, jf: &JitFrame, argc: usize) -> Op
         let default = &nc.func.defaults[nc.func.defaults.len() - (nc.code.arg_count as usize - k)];
         *slot = pack(default, nc.cf.local_types[k]?)?;
     }
-    let mut spill = [0u64; SCALAR_LEAF_SLOTS];
-    let mut tags = [0u32; SCALAR_LEAF_SLOTS];
+    let mut spill = std::mem::MaybeUninit::<[u64; SCALAR_LEAF_SLOTS]>::uninit();
+    let mut tags = std::mem::MaybeUninit::<[u32; SCALAR_LEAF_SLOTS]>::uninit();
     let mut frame = JitFrame {
         locals: locals.as_mut_ptr(),
         n_locals: nc.cf.n_locals,
@@ -2973,8 +3380,8 @@ unsafe fn enter_scalar_leaf(nc: &NativeCallee, jf: &JitFrame, argc: usize) -> Op
         ret_bits: 0,
         ret_tag: 0,
         deopt_pc: 0,
-        stack_spill: spill.as_mut_ptr(),
-        stack_tags: tags.as_mut_ptr(),
+        stack_spill: spill.as_mut_ptr().cast::<u64>(),
+        stack_tags: tags.as_mut_ptr().cast::<u32>(),
         stack_len: 0,
         stack_cap: SCALAR_LEAF_SLOTS as u32,
         ctx: std::ptr::null_mut(),
@@ -3018,8 +3425,20 @@ unsafe fn try_native_call(
     // point (RFC 0067 WS2): hand the GIL off inline; route pending
     // interpreter work — and active observers, which need the callee's
     // trace events fired — through the interpreter path.
-    crate::gil::yield_checkpoint();
+    interp.gil_countdown = interp.gil_countdown.wrapping_sub(1);
+    if interp.gil_countdown == 0 {
+        interp.gil_countdown = crate::gil::GIL_CHECK_INTERVAL;
+        crate::gil::yield_checkpoint();
+    }
     if crate::hot_gates::load() != 0 || crate::trace::any_observers_active() {
+        return None;
+    }
+    // A callee retired since this activation resolved its callee table
+    // (the deopt backoff below, or another caller's) must not be entered
+    // again: the table is only re-resolved when the compile generation
+    // moves, and a chronic side-exiter would otherwise keep paying an
+    // entry plus a full frame materialization per call.
+    if nc.code.jit_hint.is_not_jitable() {
         return None;
     }
     // RFC 0073 WS5 — an under-arity call site splices the missing
@@ -3039,7 +3458,7 @@ unsafe fn try_native_call(
     }
     let first_default = n_params - nc.func.defaults.len().min(n_params);
     if supplied < n_params {
-        if nc.func.slot("__defaults__").is_some() {
+        if nc.func.defaults_maybe_overridden() && nc.func.slot("__defaults__").is_some() {
             return None;
         }
         if supplied < first_default {
@@ -3092,6 +3511,12 @@ unsafe fn try_native_call(
         {
             return None;
         }
+        // A list argument's pin must carry the callee's element lane.
+        if tag == SlotTag::ListPin as u32
+            && !matches!(ctx.pins.get(bits as usize), Some(Pin::List(_, e)) if Some(*e) == lane.elem_lane())
+        {
+            return None;
+        }
     }
     // The callee's burned-in resolutions must hold before entry. A
     // self-call (same snapshot, same namespaces) is covered by the
@@ -3114,11 +3539,11 @@ unsafe fn try_native_call(
     // The same recursion tick the interpreter path charges, so
     // `RecursionError` fires at the same depth in both tiers. On
     // overflow the interpreter path raises it with full fidelity.
-    let recursion_guard = match crate::recursion::enter() {
+    let recursion_guard = match crate::recursion::enter_with(ctx.depth_cell) {
         crate::recursion::Enter::Ok(g) => g,
         crate::recursion::Enter::Overflow => return None,
     };
-    NATIVE_CALL_STATS.with(|s| s.calls.set(s.calls.get() + 1));
+    native_stat(|s| s.calls.set(s.calls.get() + 1));
 
     if recv.is_none()
         && nc.cf.is_scalar_leaf()
@@ -3127,7 +3552,7 @@ unsafe fn try_native_call(
     {
         // Grow before entering the separate function that owns the fixed
         // arrays, preserving the ordinary native call's stack discipline.
-        NATIVE_CALL_STATS.with(|s| s.scalar_leaf_calls.set(s.scalar_leaf_calls.get() + 1));
+        native_stat(|s| s.scalar_leaf_calls.set(s.scalar_leaf_calls.get() + 1));
         // SAFETY: the checks above establish the helper's size, scalar
         // lane, default-binding, code-lifetime, and recursion invariants.
         let enter = || unsafe { enter_scalar_leaf(nc, jf, argc_usize) };
@@ -3151,24 +3576,98 @@ unsafe fn try_native_call(
                 // can restart to compute a bignum or raise with a complete
                 // interpreter frame. This return releases the recursion
                 // guard before that path charges its own tick.
-                NATIVE_CALL_STATS.with(|s| s.deopts.set(s.deopts.get() + 1));
+                native_stat(|s| s.deopts.set(s.deopts.get() + 1));
                 None
             }
         };
     }
 
+    // A framed native call of a *tiny* callee (a getter, a comparison)
+    // costs more than the interpreter's own inline activation of the
+    // same body, so a loop dense with them belongs to tier-1: charge it
+    // to the poll's density judgment (see `wpjit_poll`).
+    // A body the interpreter evaluates without a frame at all (a pure
+    // leaf: a getter, a comparison, a constant return) is one such
+    // callee whatever its shape. A tiny *method* that stores — the
+    // attribute fixtures' `tick` — is not, and its loop keeps its
+    // native lane.
+    if crate::code_is_pure_leaf_pub(&nc.code)
+        || (recv.is_none() && nc.code.instructions.len() <= TINY_CALLEE_OPS)
+    {
+        ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
+    }
+    // The framed native call below is itself expensive (buffers, pins, a
+    // callee context, a recursion tick): a loop of them is call-shaped
+    // too. Past the budget the interpreter path takes it (and retires
+    // the code through `finish_interp_call`).
+    #[allow(clippy::absurd_extreme_comparisons)] // budget currently 0 — see the constant
+    if INTERP_CALL_RETIRE_BUDGET != 0
+        && ctx.interp_calls.saturating_add(1) >= INTERP_CALL_RETIRE_BUDGET
+    {
+        drop(recursion_guard);
+        return None;
+    }
+    ctx.interp_calls = ctx.interp_calls.saturating_add(1);
     // Keep disjoint regions in one pooled owner per element width, as
     // direct native entry does. Owners stay live through every native or
     // materialized continuation; no pool borrow crosses the call.
     let n_locals = nc.cf.n_locals as usize;
     let cap = nc.cf.max_stack as usize + 1;
     let call_cap = (nc.cf.max_call_args as usize).max(1);
-    let mut u64_buf = take_u64(n_locals + cap + call_cap);
-    let (locals_buf, rest) = u64_buf.split_at_mut(n_locals);
+    // Small frames keep their buffers on this native frame (zeroed prefix
+    // only); larger ones take pooled owners.
+    const INLINE_WORDS: usize = 64;
+    let words = n_locals + cap + call_cap;
+    let halfs = cap + call_cap;
+    let inline_bufs = words <= INLINE_WORDS;
+    let mut inline_u64 = std::mem::MaybeUninit::<[u64; INLINE_WORDS]>::uninit();
+    let mut inline_u32 = std::mem::MaybeUninit::<[u32; INLINE_WORDS]>::uninit();
+    let mut u64_buf: Vec<u64> = if inline_bufs {
+        Vec::new()
+    } else {
+        take_u64(words)
+    };
+    let mut u32_buf: Vec<u32> = if inline_bufs {
+        Vec::new()
+    } else {
+        take_u32(halfs)
+    };
+    let (u64s, u32s): (&mut [u64], &mut [u32]) = if inline_bufs {
+        // SAFETY: both prefixes fit the arrays and are zeroed before any
+        // slice over them exists; the arrays outlive every use below.
+        unsafe {
+            // A fixed-size prefix zeroes with inline stores (no `memset`
+            // call); larger frames finish the tail.
+            const QUICK: usize = 16;
+            let p = inline_u64.as_mut_ptr().cast::<u64>();
+            p.cast::<[u64; QUICK]>().write([0; QUICK]);
+            for k in QUICK..words {
+                p.add(k).write(0);
+            }
+            let q = inline_u32.as_mut_ptr().cast::<u32>();
+            q.cast::<[u32; QUICK]>().write([0; QUICK]);
+            for k in QUICK..halfs {
+                q.add(k).write(0);
+            }
+            (
+                std::slice::from_raw_parts_mut(p, words),
+                std::slice::from_raw_parts_mut(q, halfs),
+            )
+        }
+    } else {
+        (&mut u64_buf[..], &mut u32_buf[..])
+    };
+    let (locals_buf, rest) = u64s.split_at_mut(n_locals);
     let (spill, call_args) = rest.split_at_mut(cap);
-    let mut u32_buf = take_u32(cap + call_cap);
-    let (tags, call_tags) = u32_buf.split_at_mut(cap);
-    let mut pins: PinTable = Vec::new();
+    let (tags, call_tags) = u32s.split_at_mut(cap);
+    // The cached child's (drained) pin table keeps its capacity.
+    let mut pins: PinTable = match ctx.child.as_deref_mut() {
+        Some(c) => std::mem::take(&mut c.pins),
+        None => Vec::new(),
+    };
+    if !pins.is_empty() {
+        pins.clear();
+    }
     if let Some(r) = recv {
         // The receiver slot carries pin index 0 (`take_u64` zeroed it).
         pins.push(Pin::Obj(r.clone()));
@@ -3188,6 +3687,16 @@ unsafe fn try_native_call(
                 }
                 // Unreachable per the validation pass; the nullable
                 // `None` is the safe stand-in.
+                _ => u64::MAX,
+            }
+        } else if tag == SlotTag::ListPin as u32 {
+            match ctx.pins.get(bits as usize) {
+                Some(Pin::List(l, e)) => {
+                    let idx = pins.len() as u64;
+                    pins.push(Pin::List(l.clone(), *e));
+                    idx
+                }
+                // Unreachable per the validation pass.
                 _ => u64::MAX,
             }
         } else {
@@ -3219,54 +3728,100 @@ unsafe fn try_native_call(
     }
     let entry_pin_count = pins.len();
     let callee_key = Rc::as_ptr(&nc.code).cast::<CodeObject>();
-    // Self-recursion reuses this activation's own tables. An immutable
-    // compilation with no call tokens needs no resolution, even when
-    // another function compiles and advances the cache generation.
-    // Nonempty tables retain the generation-checked cache lookup.
-    let (native, method_native) = if callee_key == ctx.code_ptr {
-        (ctx.native.clone(), ctx.method_native.clone())
+    // The callee's context: this activation's cached child when it was
+    // built for this very callee (same code, artifact tables and
+    // namespaces — the child holds those handles, so pointer identity
+    // is sound), else a fresh one. Reuse resets only the per-activation
+    // state; the handles and resolved tables carry over (stale tables
+    // re-resolve on demand, as for any long-lived activation).
+    let reusable = ctx.child.as_deref().is_some_and(|c| {
+        c.code_ptr == callee_key
+            && StdRc::ptr_eq(&c.callees, &nc.callees)
+            && StdRc::ptr_eq(&c.guard_snapshot, &nc.snap)
+            && Rc::ptr_eq(&c.globals, &nc.func.globals)
+            && Rc::ptr_eq(&c.builtins, &nc.func.builtins)
+    });
+    let mut child: Box<CallCtx> = if reusable {
+        let mut c = ctx.child.take().expect("checked above");
+        // (A previous call left `parked`/`raised` empty.)
+        if !c.const_pins.is_empty() {
+            c.const_pins.clear();
+        }
+        c.pins = pins;
+        c.entry_pin_count = entry_pin_count;
+        c.pin_pressure_exit = false;
+        if !c.obj_global_pins.is_empty() {
+            c.obj_global_pins.clear();
+        }
+        c.dirty = false;
+        c.interp_calls = 0;
+        c.dyn_py_calls = 0;
+        c.native_calls = 0;
+        c.polls = 0;
+        c
     } else {
-        (
-            if nc.callees.is_empty() {
-                None
-            } else {
-                resolved_native_table(callee_key)
-            },
-            if nc.methods.is_empty() {
-                None
-            } else {
-                resolved_method_native_table(callee_key)
-            },
-        )
+        // Self-recursion reuses this activation's own tables. An immutable
+        // compilation with no call tokens needs no resolution, even when
+        // another function compiles and advances the cache generation.
+        // Nonempty tables retain the generation-checked cache lookup.
+        let (native, method_native) = if callee_key == ctx.code_ptr {
+            (ctx.native.clone(), ctx.method_native.clone())
+        } else {
+            (
+                if nc.callees.is_empty() {
+                    None
+                } else {
+                    resolved_native_table(callee_key)
+                },
+                if nc.methods.is_empty() {
+                    None
+                } else {
+                    resolved_method_native_table(callee_key)
+                },
+            )
+        };
+        let table_gen = if callee_key == ctx.code_ptr {
+            ctx.table_gen
+        } else {
+            current_compile_gen()
+        };
+        Box::new(CallCtx {
+            interp: ctx.interp,
+            callees: nc.callees.clone(),
+            guard_snapshot: nc.snap.clone(),
+            globals: nc.func.globals.clone(),
+            builtins: nc.func.builtins.clone(),
+            // Native callees are cell-free by `py_callee_ok`.
+            cells: crate::object::empty_cells(),
+            parked: None,
+            raised: None,
+            const_pins: Vec::new(),
+            pins,
+            entry_pin_count,
+            pin_pressure_exit: false,
+            obj_globals: nc.obj_globals.clone(),
+            obj_global_pins: Vec::new(),
+            attr_guards: nc.attr_guards.clone(),
+            methods: nc.methods.clone(),
+            math: nc.math.clone(),
+            dirty: false,
+            interp_calls: 0,
+            dyn_py_calls: 0,
+            native_calls: 0,
+            polls: 0,
+            child: None,
+            depth_cell: ctx.depth_cell,
+            code_ptr: callee_key,
+            native,
+            method_native,
+            table_gen,
+            // The native call lanes push no interpreter frame for the
+            // callee — keep it observable to callee-side stack walkers.
+            frameless_code: Some(nc.code.clone()),
+        })
     };
-    let mut nctx = CallCtx {
-        interp: ctx.interp,
-        callees: nc.callees.clone(),
-        guard_snapshot: nc.snap.clone(),
-        globals: nc.func.globals.clone(),
-        builtins: nc.func.builtins.clone(),
-        // Native callees are cell-free by `py_callee_ok`.
-        cells: crate::object::empty_cells(),
-        parked: None,
-        raised: None,
-        const_pins: Vec::new(),
-        pins,
-        entry_pin_count,
-        pin_pressure_exit: false,
-        obj_globals: nc.obj_globals.clone(),
-        obj_global_pins: Vec::new(),
-        attr_guards: nc.attr_guards.clone(),
-        methods: nc.methods.clone(),
-        math: nc.math.clone(),
-        dirty: false,
-        code_ptr: callee_key,
-        native,
-        method_native,
-        table_gen: current_compile_gen(),
-        // The native call lanes push no interpreter frame for the
-        // callee — keep it observable to callee-side stack walkers.
-        frameless_code: Some(nc.code.clone()),
-    };
+    child.interp = ctx.interp;
+    let nctx: &mut CallCtx = &mut child;
     let mut njf = JitFrame {
         locals: locals_buf.as_mut_ptr(),
         n_locals: nc.cf.n_locals,
@@ -3278,7 +3833,7 @@ unsafe fn try_native_call(
         stack_tags: tags.as_mut_ptr(),
         stack_len: 0,
         stack_cap: cap as u32,
-        ctx: std::ptr::from_mut(&mut nctx).cast::<u8>(),
+        ctx: std::ptr::from_mut::<CallCtx>(nctx).cast::<u8>(),
         call_args: call_args.as_mut_ptr(),
         call_tags: call_tags.as_mut_ptr(),
     };
@@ -3286,9 +3841,13 @@ unsafe fn try_native_call(
     // (the same invariants `enter_compiled` documents); the engine
     // backing `nc.cf` lives in this thread's `JIT` state for the
     // process lifetime; `nctx` outlives the call. The stack-growth
-    // discipline mirrors `run_until_yield_or_return`: grow in segments,
-    // except on a greenlet's dedicated (large, non-growable) stack.
-    let status = if crate::stdlib::greenlet_native::on_greenlet_stack() {
+    // discipline mirrors `run_until_yield_or_return`: grow in segments
+    // (probed every few nested levels — a native call level is far
+    // smaller than the red zone divided by the probe interval), except
+    // on a greenlet's dedicated (large, non-growable) stack.
+    let status = if recursion_guard.depth() % 4 != 0
+        || crate::stdlib::greenlet_native::on_greenlet_stack()
+    {
         unsafe { nc.cf.enter(&raw mut njf) }
     } else {
         stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || unsafe {
@@ -3320,7 +3879,25 @@ unsafe fn try_native_call(
                 debug_assert_eq!(status, JitStatus::Deopt);
                 JIT.with(|cell| cell.borrow_mut().stats.pin_pressure_exits += 1);
             } else {
-                NATIVE_CALL_STATS.with(|s| s.deopts.set(s.deopts.get() + 1));
+                native_stat(|s| s.deopts.set(s.deopts.get() + 1));
+                // The same deopt backoff the framed and frameless entries
+                // charge: a callee that side-exits on most calls (a
+                // burned-in attribute shape a second receiver class
+                // misses) must retire, or every call keeps paying a
+                // native entry plus a full frame materialization.
+                if matches!(status, JitStatus::Deopt) {
+                    let callee_key = Rc::as_ptr(&nc.code).cast::<CodeObject>();
+                    JIT.with(|cell| {
+                        let mut st = cell.borrow_mut();
+                        if let Some(ce) = st.cache.get_mut(&callee_key) {
+                            ce.deopts += 1;
+                            if ce.deopts >= DEOPT_BUDGET {
+                                ce.tier = Tier::NotJitable;
+                                nc.code.jit_hint.mark_not_jitable();
+                            }
+                        }
+                    });
+                }
             }
             nctx.dirty = true;
             // The materialized continuation is a full interpreter
@@ -3334,20 +3911,28 @@ unsafe fn try_native_call(
             } else {
                 None
             };
-            match finish_deopted_callee(
-                interp, nc, &mut nctx, locals_buf, spill, tags, &njf, pending,
-            ) {
+            match finish_deopted_callee(interp, nc, nctx, locals_buf, spill, tags, &njf, pending) {
                 Ok(v) => Done::Obj(v),
                 Err(e) => Done::Raised(e),
             }
         }
     };
-    put_u64(u64_buf);
-    put_u32(u32_buf);
+    if !inline_bufs {
+        put_u64(u64_buf);
+        put_u32(u32_buf);
+    }
     // Reap the callee's pins (after every
     // pin-based rebuild above); a reap cascade runs Python, so it
     // dirties the call like any interpreter-path work.
-    let child_dirty = nctx.dirty | drain_activation_pins(interp, &mut nctx.pins);
+    let child_dirty =
+        nctx.dirty | (!nctx.pins.is_empty() && drain_activation_pins(interp, &mut nctx.pins));
+    if nctx.parked.is_some() {
+        nctx.parked = None;
+    }
+    if nctx.raised.is_some() {
+        nctx.raised = None;
+    }
+    ctx.child = Some(child);
     ctx.dirty |= child_dirty;
 
     Some(match done {
@@ -3468,6 +4053,22 @@ unsafe fn try_native_ctor(
     expect_tag: u32,
 ) -> Option<i64> {
     let cls = nc.ctor.as_ref()?;
+    // A native construction is a framed call plus allocation and
+    // tracking: charged like any other heavy round-trip, and past the
+    // budget left to the interpreter (see `charge_roundtrip`).
+    #[allow(clippy::absurd_extreme_comparisons)] // budget currently 0 — see the constant
+    if INTERP_CALL_RETIRE_BUDGET != 0
+        && ctx.interp_calls.saturating_add(1) >= INTERP_CALL_RETIRE_BUDGET
+    {
+        return None;
+    }
+    ctx.interp_calls = ctx.interp_calls.saturating_add(1);
+    // A constructor whose `__init__` is tiny is dominated by the call
+    // and the allocation, which the interpreter's own `instantiate`
+    // does with less ceremony: charge the poll's density judgment.
+    if nc.code.instructions.len() <= TINY_CALLEE_OPS {
+        ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
+    }
     let (inst, ran_finalizers) = interp.alloc_plain_instance(cls)?;
     if ran_finalizers {
         // Threshold collection ran finalizers — arbitrary Python.
@@ -3702,7 +4303,7 @@ unsafe extern "C" fn wpjit_call_py(
             match attempted {
                 Some(status) => return status,
                 None => {
-                    NATIVE_CALL_STATS.with(|s| s.fallbacks.set(s.fallbacks.get() + 1));
+                    native_stat(|s| s.fallbacks.set(s.fallbacks.get() + 1));
                     break;
                 }
             }
@@ -3742,6 +4343,11 @@ unsafe extern "C" fn wpjit_call_py(
             CallStatus::Raised as i64
         }
         Ok(v) => {
+            ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
+            if charge_roundtrip(ctx) {
+                ctx.parked = Some(v);
+                return CallStatus::Boxed as i64;
+            }
             // The callee may have rebound a burned-in global or a
             // callee's `__code__`; the *next* burned operation would
             // then be wrong, so the caller must deopt after this call.
@@ -3809,6 +4415,14 @@ fn finish_interp_call(
             CallStatus::Raised as i64
         }
         Ok(v) => {
+            ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
+            if charge_roundtrip(ctx) {
+                // Call-shaped: hand the rest of this activation, and every
+                // later one, to the interpreter (a `Boxed` exit spills the
+                // result and resumes after the call).
+                ctx.parked = Some(v);
+                return CallStatus::Boxed as i64;
+            }
             let still_valid = guards_hold(
                 interp,
                 &ctx.globals,
@@ -3856,6 +4470,101 @@ fn finish_interp_call(
     }
 }
 
+/// Charge one expensive round-trip (an interpreter call, a generic
+/// attribute access, or a heavy native-to-native call) to the running
+/// activation. Returns true once the activation has spent
+/// [`INTERP_CALL_RETIRE_BUDGET`]: the code object is retired to tier-1
+/// (its `jit_hint` fast-out gates every later entry and back edge) and
+/// the caller should deopt the activation into the interpreter.
+/// A generic call of a *native* callee (a builtin function or a bound
+/// builtin method) from compiled code: the interpreter runs the same
+/// call through its leaf paths without the activation shell, guard
+/// re-validation and pin traffic, so an activation making many of them
+/// is a net loss. Past the budget the code retires to the interpreter
+/// (which takes over right after this call, through the `Boxed` exit).
+fn charge_native_roundtrip(ctx: &mut CallCtx) -> bool {
+    ctx.native_calls = ctx.native_calls.saturating_add(1);
+    // The density check runs at each loop poll (see `wpjit_poll`); this
+    // cap only catches calls piling up between polls.
+    if ctx.native_calls < NATIVE_CALL_RETIRE_BUDGET || ctx.code_ptr.is_null() {
+        return false;
+    }
+    retire_native_driver(ctx);
+    true
+}
+
+/// Retire the activation's code as a thin native driver around native
+/// callees (the interpreter's leaf calls serve such a loop better).
+fn retire_native_driver(ctx: &CallCtx) {
+    JIT.with(|cell| {
+        let mut st = cell.borrow_mut();
+        if let Some(ce) = st.cache.get_mut(&ctx.code_ptr) {
+            if !matches!(ce.tier, Tier::NotJitable) {
+                ce.tier = Tier::NotJitable;
+                st.stats.generic_retires += 1;
+            }
+        }
+    });
+    // SAFETY: the activation's code object outlives the activation (see
+    // the field docs).
+    unsafe { (*ctx.code_ptr).jit_hint.mark_not_jitable() };
+}
+
+/// Generic native-callee calls one activation may make between two
+/// loop polls before its code retires (see [`charge_native_roundtrip`]).
+const NATIVE_CALL_RETIRE_BUDGET: u32 = 4096;
+
+/// `str`-method calls one activation may make before its code retires.
+/// Lower than the generic budget: tier-1 calls the very same bodies
+/// through its leaf table with no argument marshaling, and a body that
+/// side-exits every few hundred iterations never reaches a poll for the
+/// density check to judge it.
+const STR_METHOD_RETIRE_BUDGET: u32 = 256;
+/// Generic native-callee calls one poll interval (`JIT_POLL_STRIDE`
+/// loop-header iterations) may make: more than one per four native
+/// iterations and the loop is a driver around its calls.
+const NATIVE_CALLS_PER_POLL: u32 = (weavepy_jit::JIT_POLL_STRIDE / 4) as u32;
+
+/// A compiled callee this size or smaller is served better by the
+/// interpreter's inline activation than by a framed native call: its
+/// body is a getter, a comparison or a constant return, and the call's
+/// own buffers, pins, context and recursion tick dominate it.
+const TINY_CALLEE_OPS: usize = 12;
+
+/// Generic *interpreter* calls one poll interval may make before the
+/// same judgment applies (see [`wpjit_poll`]). A call every fourth
+/// native iteration is the break-even measured against the
+/// interpreter's inline-activation call path.
+const INTERP_CALLS_PER_POLL: u32 = (weavepy_jit::JIT_POLL_STRIDE / 4) as u32;
+
+fn charge_roundtrip(ctx: &mut CallCtx) -> bool {
+    ctx.interp_calls = ctx.interp_calls.saturating_add(1);
+    // Measured (attr_access): a native loop that calls interpreted
+    // methods still beats interpreting the loop — the round trip is no
+    // dearer than the interpreter's own call — so a plain interpreter
+    // call never retires the caller; only the deopt backoff does.
+    #[allow(clippy::absurd_extreme_comparisons)] // budget currently 0 — see the constant
+    if INTERP_CALL_RETIRE_BUDGET == 0
+        || ctx.interp_calls < INTERP_CALL_RETIRE_BUDGET
+        || ctx.code_ptr.is_null()
+    {
+        return false;
+    }
+    JIT.with(|cell| {
+        let mut st = cell.borrow_mut();
+        if let Some(ce) = st.cache.get_mut(&ctx.code_ptr) {
+            if !matches!(ce.tier, Tier::NotJitable) {
+                ce.tier = Tier::NotJitable;
+                st.stats.generic_retires += 1;
+            }
+        }
+    });
+    // SAFETY: the activation's code object outlives the activation (see
+    // the field docs).
+    unsafe { (*ctx.code_ptr).jit_hint.mark_not_jitable() };
+    true
+}
+
 /// The `wpjit_call_method` helper (RFC 0069 WS1): native code calls
 /// this with a burned-in method token, the receiver's pin, and the
 /// marshaled scalar arguments (receiver excluded). The guard is
@@ -3892,9 +4601,9 @@ unsafe extern "C" fn wpjit_call_method(
     // SAFETY: the `&mut Interpreter` that entered native code is dormant
     // while the helper runs; this is the only live path to it.
     let interp = unsafe { &mut *ctx.interp };
-    NATIVE_CALL_STATS.with(|s| s.method_calls.set(s.method_calls.get() + 1));
+    native_stat(|s| s.method_calls.set(s.method_calls.get() + 1));
     let guard_miss = || {
-        NATIVE_CALL_STATS.with(|s| s.method_guard_misses.set(s.method_guard_misses.get() + 1));
+        native_stat(|s| s.method_guard_misses.set(s.method_guard_misses.get() + 1));
         CallStatus::Reject as i64
     };
 
@@ -3911,15 +4620,19 @@ unsafe extern "C" fn wpjit_call_method(
     };
     let guard_ok = match &recv {
         Object::Instance(inst) => {
-            let cls_ok = {
-                let cls = inst.class.borrow();
-                cls.attr_version.get() == entry.ver
+            let probe = crate::object::StrKeyHashed {
+                s: &entry.name,
+                hash: entry.name_hash,
             };
-            cls_ok
-                && inst
-                    .dict
-                    .get()
-                    .is_none_or(|dict| dict.borrow().get(&StrKey(&entry.name)).is_none())
+            attr_class_ok(inst, entry.ver)
+                && inst.dict.get().is_none_or(|dict| {
+                    // SAFETY: a read between two native ops; nothing
+                    // here runs code (see `GilCell::peek`).
+                    match unsafe { dict.peek() } {
+                        Some(d) => d.get(&probe).is_none(),
+                        None => dict.borrow().get(&probe).is_none(),
+                    }
+                })
                 && Rc::ptr_eq(&entry.func.code.borrow(), &entry.code)
         }
         _ => false,
@@ -3930,7 +4643,7 @@ unsafe extern "C" fn wpjit_call_method(
         // `__code__`, or a non-instance receiver). Resolve and call
         // generically instead of deopting: a missing attribute raises
         // here exactly as the interpreter's `LOAD_ATTR` would.
-        NATIVE_CALL_STATS.with(|s| s.method_guard_misses.set(s.method_guard_misses.get() + 1));
+        native_stat(|s| s.method_guard_misses.set(s.method_guard_misses.get() + 1));
         ctx.dirty = true;
         let bound = match interp.load_attr_public(&recv, &entry.name) {
             Err(err) => {
@@ -3973,7 +4686,7 @@ unsafe extern "C" fn wpjit_call_method(
                 {
                     Some(status) => return status,
                     None => {
-                        NATIVE_CALL_STATS.with(|s| s.fallbacks.set(s.fallbacks.get() + 1));
+                        native_stat(|s| s.fallbacks.set(s.fallbacks.get() + 1));
                         break;
                     }
                 }
@@ -4073,6 +4786,10 @@ unsafe extern "C" fn wpjit_str_method(
     let Some(m) = weavepy_jit::StrMethod::from_raw(method) else {
         return CallStatus::Reject as i64;
     };
+    // The interpreter calls the same builtin body through its own leaf
+    // table, with no argument marshaling: a loop whose work is `str`
+    // methods belongs to tier-1 (see `wpjit_poll`'s density judgment).
+    ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
     let recv = match ctx.pins.get(recv_pin as usize) {
         Some(Pin::Obj(o @ Object::Str(_))) => o.clone(),
         _ => return CallStatus::Reject as i64,
@@ -4128,6 +4845,18 @@ unsafe extern "C" fn wpjit_str_method(
             CallStatus::Raised as i64
         }
         Ok(v) => {
+            // A loop of `str` methods belongs to tier-1 (its leaf table
+            // calls the same bodies without marshaling): past the budget
+            // the activation hands back here, like the generic call
+            // helpers' round-trip charge. The poll's density check only
+            // sees loops that reach a poll; a body that side-exits more
+            // often than that never does.
+            ctx.native_calls = ctx.native_calls.saturating_add(1);
+            if ctx.native_calls >= STR_METHOD_RETIRE_BUDGET && !ctx.code_ptr.is_null() {
+                retire_native_driver(ctx);
+                ctx.parked = Some(v);
+                return CallStatus::Boxed as i64;
+            }
             match SlotTag::from_raw(expect_tag) {
                 SlotTag::Int | SlotTag::Bool => {
                     let expect = if SlotTag::from_raw(expect_tag) == SlotTag::Int {
@@ -4198,6 +4927,13 @@ extern "C" fn wpjit_math_cos(x: f64) -> f64 {
     x.cos()
 }
 
+/// The float `**` helper: libm `pow`, exactly as the interpreter's
+/// `float_pow` computes it (native code admits only a positive base and
+/// deopts on a non-finite result).
+extern "C" fn wpjit_float_pow(a: f64, b: f64) -> f64 {
+    a.powf(b)
+}
+
 /// Python-semantics `float` floor division (RFC 0069 WS2): CPython's
 /// `float_divmod` quotient, sign discipline included. The compiled
 /// guard deopts the zero-divisor case *before* the call (the
@@ -4230,11 +4966,15 @@ unsafe extern "C" fn wpjit_list_get(frame: *mut JitFrame, pin: i64, idx: i64) ->
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     // Scoped so the list borrow (through `ctx.pins`) ends before an
     // object element appends a fresh pin (RFC 0071 WS4).
-    let outcome: Result<u64, Object> = {
+    let outcome: Result<u64, Pin> = {
         let Some(Pin::List(list, elem)) = ctx.pins.get(pin as usize) else {
             return 1;
         };
-        let items = list.borrow();
+        // SAFETY: a read between two native ops; nothing here runs code
+        // (see `GilCell::peek`).
+        let Some(items) = (unsafe { list.peek() }) else {
+            return 1;
+        };
         let len = items.len() as i64;
         let i = if idx < 0 { idx + len } else { idx };
         if i < 0 || i >= len {
@@ -4248,7 +4988,14 @@ unsafe extern "C" fn wpjit_list_get(frame: *mut JitFrame, pin: i64, idx: i64) ->
             (Object::None, JitType::Obj) => Ok(u64::MAX),
             // RFC 0073 WS3 — exact-`str` elements pin on the object
             // lane (indexing into a `split` result).
-            (v @ (Object::Instance(_) | Object::Str(_)), JitType::Obj) => Err(v.clone()),
+            (v @ (Object::Instance(_) | Object::Str(_) | Object::Tuple(_)), JitType::Obj) => {
+                Err(Pin::Obj(v.clone()))
+            }
+            // The nested lane: a list element pins on the float-list
+            // lane (its reads re-validate each float).
+            (Object::List(inner), JitType::ListFloat) => {
+                Err(Pin::List(inner.clone(), JitType::Float))
+            }
             _ => return 1,
         }
     };
@@ -4257,12 +5004,12 @@ unsafe extern "C" fn wpjit_list_get(frame: *mut JitFrame, pin: i64, idx: i64) ->
             jf.ret_bits = bits;
             0
         }
-        Err(obj) => {
+        Err(p) => {
             if ctx.pins.len() >= RUNTIME_PIN_CAP {
                 return 1;
             }
             jf.ret_bits = ctx.pins.len() as u64;
-            ctx.pins.push(Pin::Obj(obj));
+            ctx.pins.push(p);
             0
         }
     }
@@ -4311,7 +5058,11 @@ unsafe extern "C" fn wpjit_list_set(frame: *mut JitFrame, pin: i64, idx: i64) ->
         },
         _ => return 1,
     };
-    let mut items = list.borrow_mut();
+    // SAFETY: as `wpjit_list_get` — nothing below runs code (the
+    // displaced value is a scalar, checked before the store).
+    let Some(items) = (unsafe { list.peek_mut() }) else {
+        return 1;
+    };
     let len = items.len() as i64;
     let i = if idx < 0 { idx + len } else { idx };
     if i < 0 || i >= len {
@@ -4489,7 +5240,13 @@ unsafe extern "C" fn wpjit_list_append(frame: *mut JitFrame, pin: i64) -> i64 {
         }
         _ => return 1,
     };
-    list.borrow_mut().push(v);
+    // SAFETY: a push runs no code and drops no object, so the guard-free
+    // view (live only while cells are unshared and nothing borrows the
+    // list) ends before anything could borrow it.
+    match unsafe { list.peek_mut() } {
+        Some(items) => items.push(v),
+        None => list.borrow_mut().push(v),
+    }
     0
 }
 
@@ -4750,6 +5507,57 @@ unsafe extern "C" fn wpjit_dict_set(
     }
 }
 
+/// The `wpjit_dict_del` helper: `del d[k]` on a pinned exact dict,
+/// through the interpreter's own [`crate::builtins::dict_remove`]
+/// chokepoint (and its removed-entry queue, as `delete_subscr`). Returns
+/// `0`, or `1` to deopt *before* the delete: a missing key (the
+/// interpreter raises the exact `KeyError`), a comparison that would
+/// need Python, a displaced value the prompt-reap cascade would take
+/// (the `wpjit_dict_set` discipline), or active C-API dict watchers.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe extern "C" fn wpjit_dict_del(
+    frame: *mut JitFrame,
+    pin: i64,
+    key_bits: i64,
+    key_tag: i64,
+    _val_tag: i64,
+) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    if crate::capi_watchers::dicts_active() {
+        return 1;
+    }
+    let Some((d, key)) = dict_pin_and_key(ctx, pin, key_bits, key_tag) else {
+        return 1;
+    };
+    let old = match dict_probe_native(&d, &key) {
+        Ok(Some(v)) => v,
+        _ => return 1,
+    };
+    if !matches!(
+        old,
+        Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+    ) && super::Interpreter::local_needs_prompt_reap(&old)
+        && super::Interpreter::looks_reapable_temporary(&old)
+    {
+        return 1;
+    }
+    drop(old);
+    match crate::builtins::dict_remove(&d, &key) {
+        Ok(Some((k, v))) => {
+            crate::vm_singletons::queue_container_removed(&k);
+            crate::vm_singletons::queue_container_removed(&v);
+            0
+        }
+        _ => 1,
+    }
+}
+
 /// The `wpjit_dict_contains` helper (RFC 0073 WS2): `k in d` on a
 /// pinned exact dict. Returns `0` with the `bool` in
 /// [`JitFrame::ret_bits`] (negation is native), or `1` to deopt (pin
@@ -4956,14 +5764,18 @@ unsafe extern "C" fn wpjit_list_next(frame: *mut JitFrame, pin: i64, idx: i64) -
     #[allow(clippy::cast_ptr_alignment)]
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     // Scoped so the list borrow ends before an object element pins.
-    let outcome: Result<u64, Object> = {
+    let outcome: Result<u64, Pin> = {
         let Some(Pin::List(list, elem)) = ctx.pins.get(pin as usize) else {
             return 2;
         };
-        let items = list.borrow();
         if idx < 0 {
             return 2;
         }
+        // SAFETY: a read between two native ops; nothing here runs code
+        // (see `GilCell::peek`).
+        let Some(items) = (unsafe { list.peek() }) else {
+            return 2;
+        };
         let Some(v) = items.get(idx as usize) else {
             return 1;
         };
@@ -4974,7 +5786,14 @@ unsafe extern "C" fn wpjit_list_next(frame: *mut JitFrame, pin: i64, idx: i64) -
             (Object::None, JitType::Obj) => Ok(u64::MAX),
             // RFC 0073 WS3 — exact-`str` elements pin on the object
             // lane (a `split` result's `ForList` consumer).
-            (v @ (Object::Instance(_) | Object::Str(_)), JitType::Obj) => Err(v.clone()),
+            (v @ (Object::Instance(_) | Object::Str(_) | Object::Tuple(_)), JitType::Obj) => {
+                Err(Pin::Obj(v.clone()))
+            }
+            // The nested lane: a list element pins on the float-list
+            // lane (see `wpjit_list_get`).
+            (Object::List(inner), JitType::ListFloat) => {
+                Err(Pin::List(inner.clone(), JitType::Float))
+            }
             _ => return 2,
         }
     };
@@ -4983,12 +5802,12 @@ unsafe extern "C" fn wpjit_list_next(frame: *mut JitFrame, pin: i64, idx: i64) -
             jf.ret_bits = bits;
             0
         }
-        Err(obj) => {
+        Err(p) => {
             if ctx.pins.len() >= RUNTIME_PIN_CAP {
                 return 2;
             }
             jf.ret_bits = ctx.pins.len() as u64;
-            ctx.pins.push(Pin::Obj(obj));
+            ctx.pins.push(p);
             0
         }
     }
@@ -5456,6 +6275,41 @@ unsafe extern "C" fn wpjit_list_repeat(frame: *mut JitFrame, pin: i64, count: i6
     idx
 }
 
+/// The `wpjit_list_from_range` helper: `list(range(start, stop))` —
+/// the fresh `int` list pins on the `int` lane and is GC-tracked like
+/// every list the interpreter builds. Negative deopts (cap pressure,
+/// or a length past what the fast path builds — the interpreter then
+/// raises exactly or builds it itself). Never runs Python code.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe extern "C" fn wpjit_list_from_range(frame: *mut JitFrame, start: i64, stop: i64) -> i64 {
+    // Far past any sane fast-path build; the interpreter handles the rest.
+    const MAX_LEN: i64 = 1 << 28;
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    if ctx.pins.len() >= RUNTIME_PIN_CAP {
+        return -1;
+    }
+    let len = stop.saturating_sub(start).max(0);
+    if len > MAX_LEN {
+        return -1;
+    }
+    let items: Vec<Object> = (start..start + len).map(Object::Int).collect();
+    let list = Rc::new(crate::sync::RefCell::new(items));
+    let obj = Object::List(list.clone());
+    crate::gc_trace::track(obj.clone());
+    if crate::stdlib::tracemalloc_real::is_tracking() {
+        crate::stdlib::tracemalloc_real::track_new_object(&obj);
+    }
+    let idx = ctx.pins.len() as i64;
+    ctx.pins.push(Pin::List(list, JitType::Int));
+    idx
+}
+
 /// The `wpjit_list_slice` helper (RFC 0071 WS4): `xs[a:b]` (unit
 /// step) on a pinned list. Bounds clamp CPython-style (negative
 /// bounds add `len`, then clamp to `[0, len]`); `i64::MIN` marks an
@@ -5512,8 +6366,21 @@ unsafe extern "C" fn wpjit_list_slice(
 /// `true` when a dict key is the string `name` (the per-access name
 /// re-check that makes an indexed hit safe against `del`-driven index
 /// shifts, mirroring the tier-1 caches).
-fn key_is(key: &DictKey, name: &str) -> bool {
-    matches!(&key.0, Object::Str(s) if &**s == name)
+fn key_is(key: &DictKey, name: &SharedStr) -> bool {
+    // Instance-dict keys are interned on insert and the guard holds the
+    // interned name: identity usually settles it.
+    matches!(&key.0, Object::Str(s) if SharedStr::ptr_eq(s, name) || **s == **name)
+}
+
+/// A site guard's class check: the receiver's class still carries the
+/// compiled `attr_version` (read without a borrow guard when only one
+/// thread runs Python; nothing here runs code).
+#[inline]
+fn attr_class_ok(inst: &crate::types::PyInstance, ver: u64) -> bool {
+    if crate::gil::free_threading_enabled() {
+        return inst.class.borrow().attr_version.get() == ver;
+    }
+    inst.cls_raw().attr_version.get() == ver
 }
 
 /// The `wpjit_attr_get` helper (RFC 0065 WS5): read one scalar
@@ -5541,11 +6408,7 @@ unsafe extern "C" fn wpjit_attr_get(frame: *mut JitFrame, pin: i64, site: i64) -
         let Some(g) = ctx.attr_guards.get(site as usize) else {
             return 1;
         };
-        let guard_ok = {
-            let cls = inst.class.borrow();
-            cls.attr_version.get() == g.ver
-        };
-        if !guard_ok {
+        if !attr_class_ok(inst, g.ver) {
             return 1;
         }
         // RFC 0070 WS1 — the nullable object lane: `None` is the
@@ -5587,7 +6450,11 @@ unsafe extern "C" fn wpjit_attr_get(frame: *mut JitFrame, pin: i64, site: i64) -
                 let Some(dict) = inst.dict.get() else {
                     return 1;
                 };
-                let dict = dict.borrow();
+                // SAFETY: a read between two native ops; nothing here
+                // runs code (see `GilCell::peek`).
+                let Some(dict) = (unsafe { dict.peek() }) else {
+                    return 1;
+                };
                 match dict.get_index(key_idx as usize) {
                     Some((k, v)) if key_is(k, &g.name) => match classify(v) {
                         Some(o) => o,
@@ -5662,11 +6529,7 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
     let Some(Pin::Obj(Object::Instance(inst))) = ctx.pins.get(pin as usize) else {
         return 1;
     };
-    let guard_ok = {
-        let cls = inst.class.borrow();
-        cls.attr_version.get() == g.ver
-    };
-    if !guard_ok {
+    if !attr_class_ok(inst, g.ver) {
         return 1;
     }
     match g.storage {
@@ -5676,6 +6539,7 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
         // displaced slot value, so the in-place overwrite is exactly
         // faithful.
         AttrStorage::Slot(key_idx) => {
+            inst.note_slot_store(&v);
             let old = {
                 let mut slots = inst.slots.borrow_mut();
                 match slots.get_index_mut(key_idx as usize) {
@@ -5687,7 +6551,14 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
             0
         }
         AttrStorage::Indexed(key_idx) => {
-            let mut dict = inst.dict.borrow_mut();
+            let mut dict = inst.dict_cell().borrow_mut();
+            let atomic = v.is_gc_atomic();
+            let dict = &mut *dict;
+            let dict = if atomic {
+                dict.map_mut_atomic_store()
+            } else {
+                &mut **dict
+            };
             let Some((k, dst)) = dict.get_index_mut(key_idx as usize) else {
                 return 1;
             };
@@ -5710,7 +6581,6 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
                 return 1;
             }
             let old = std::mem::replace(dst, v);
-            drop(dict);
             drop(old);
             0
         }
@@ -5722,7 +6592,14 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
             if crate::capi_watchers::dicts_active() {
                 return 1;
             }
-            let mut dict = inst.dict.borrow_mut();
+            let mut dict = inst.dict_cell().borrow_mut();
+            let atomic = v.is_gc_atomic();
+            let dict = &mut *dict;
+            let dict = if atomic {
+                dict.map_mut_atomic_store()
+            } else {
+                &mut **dict
+            };
             let old = if let Some(dst) = dict.get_mut(&StrKey(&g.name)) {
                 // The displaced-value discipline of the indexed arm.
                 if !matches!(
@@ -5743,7 +6620,6 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
                 );
                 None
             };
-            drop(dict);
             drop(old);
             0
         }
@@ -6011,6 +6887,21 @@ unsafe fn call_dyn_impl(
             return status;
         }
     }
+    // A keyword call of a plain function whose site carries the
+    // interpreter's `CallPyKwNames` permutation binds through it, as the
+    // `CALL_KW` handler's hit does: no name strings, no generic binder.
+    // SAFETY: per the function contract — same live buffers.
+    if let Some((f, locals)) = (kwc > 0)
+        .then(|| unsafe { dyn_kw_site_bind(jf, ctx, &callee, argc, kwc, names) })
+        .flatten()
+    {
+        note_generic_dyn_call(ctx);
+        ctx.dirty = true;
+        let called =
+            call_with_activation_shell(interp, ctx, jf, |i| i.run_py_exact_nofree(&f, locals));
+        // SAFETY: as above.
+        return unsafe { dyn_call_result(jf, ctx, called, false, int_result) };
+    }
     let n = (argc + kwc) as usize;
     let mut args: Vec<Object> = Vec::with_capacity(n);
     for j in 0..n {
@@ -6044,15 +6935,45 @@ unsafe fn call_dyn_impl(
     // WS1's dirtiness discipline).
     note_generic_dyn_call(ctx);
     ctx.dirty = true;
+    let native_callee = matches!(&callee, Object::Builtin(_))
+        || matches!(&callee, Object::BoundMethod(bm) if matches!(bm.function, Object::Builtin(_)));
     let called = call_with_activation_shell(interp, ctx, jf, |i| {
         i.call_object_with_globals(&callee, &args, &kwargs, &ctx.globals)
     });
+    // SAFETY: as above.
+    unsafe { dyn_call_result(jf, ctx, called, native_callee, int_result) }
+}
+
+/// `call_dyn_impl`'s result protocol: park a raise, or deliver the
+/// result unboxed (`int_result`) or pinned, parking it (`Boxed`) when a
+/// round-trip charge or an invalidated guard ends the activation.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe fn dyn_call_result(
+    jf: &mut JitFrame,
+    ctx: &mut CallCtx,
+    called: Result<Object, RuntimeError>,
+    native_callee: bool,
+    int_result: bool,
+) -> i64 {
+    // SAFETY: the `&mut Interpreter` that entered native code is
+    // dormant while the helper runs.
+    let interp = unsafe { &mut *ctx.interp };
     match called {
         Err(err) => {
             ctx.raised = Some(err);
             CallStatus::Raised as i64
         }
         Ok(v) => {
+            if !native_callee {
+                ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
+            }
+            if charge_roundtrip(ctx) || (native_callee && charge_native_roundtrip(ctx)) {
+                ctx.parked = Some(v);
+                return CallStatus::Boxed as i64;
+            }
             let still_valid = guards_hold(
                 interp,
                 &ctx.globals,
@@ -6078,6 +6999,79 @@ unsafe fn call_dyn_impl(
             CallStatus::Boxed as i64
         }
     }
+}
+
+/// Bind a dynamic keyword call's marshaled operands for a plain function
+/// (or a bound method over one) through the call site's cached
+/// `CallPyKwNames` permutation, re-verified against the live function
+/// (`Interpreter::kw_names_bind_check`). Returns the function and its
+/// bound locals, or `None` (nothing consumed) for the generic binder.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`]; the call site's pc is in
+/// `jf.deopt_pc` (stored before every call helper runs).
+unsafe fn dyn_kw_site_bind(
+    jf: &mut JitFrame,
+    ctx: &CallCtx,
+    callee: &Object,
+    argc: u32,
+    kwc: u32,
+    names: u32,
+) -> Option<(Rc<crate::object::PyFunction>, Vec<Object>)> {
+    use weavepy_compiler::InlineCache as IC;
+    // SAFETY: per the function contract, the activation keeps its code
+    // object alive.
+    let code = unsafe { &*ctx.code_ptr };
+    let IC::CallPyKwNames {
+        func_id,
+        perm,
+        argc: ca,
+        kwc: ck,
+    } = code.caches.get(jf.deopt_pc)
+    else {
+        return None;
+    };
+    let Some(Object::Tuple(name_items)) = crate::code_const_objects(code).get(names as usize)
+    else {
+        return None;
+    };
+    let (f, recv) = match callee {
+        Object::Function(f) => (f, None),
+        Object::BoundMethod(bm) => match &bm.function {
+            Object::Function(f) => (f, Some(&bm.receiver)),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let (argc, kwc) = (argc as usize, kwc as usize);
+    let eff_argc = argc + usize::from(recv.is_some());
+    if ca as usize != eff_argc || ck as usize != kwc || name_items.len() != kwc {
+        return None;
+    }
+    let (fcode, covered) =
+        crate::Interpreter::kw_names_bind_check(f, func_id, perm, name_items, eff_argc)?;
+    let mut staged: Vec<Object> = Vec::with_capacity(eff_argc + kwc);
+    staged.extend(recv.cloned());
+    for j in 0..argc + kwc {
+        // SAFETY: native code wrote `argc + kwc` entries, and the
+        // buffers are `max_call_args` wide.
+        let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
+        staged.push(unpack_pins(bits, tag, &ctx.pins));
+    }
+    let mut locals = Vec::new();
+    crate::Interpreter::kw_names_fill_locals(
+        &mut locals,
+        &mut staged,
+        name_items,
+        f,
+        &fcode,
+        perm,
+        covered,
+        kwc,
+        eff_argc,
+    );
+    Some((f.clone(), locals))
 }
 
 /// RFC 0076 WS7 follow-up — charge one generic interpreter round-trip
@@ -6144,6 +7138,10 @@ unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i6
             1
         }
         Ok(v) => {
+            if charge_roundtrip(ctx) {
+                ctx.parked = Some(v);
+                return 2;
+            }
             let still_valid = guards_hold(
                 interp,
                 &ctx.globals,
@@ -6503,6 +7501,25 @@ fn next_enumerated_byte(it: &Object) -> NativeBytePair {
     let Object::Iter(it) = it else {
         return NativeBytePair::Unsupported;
     };
+    // Guard-free while cells are unshared: this step runs no code and
+    // touches no cell besides these two, so neither view can meet a
+    // conflicting borrow before it ends with this function.
+    // SAFETY: as above.
+    if let Some(state) = unsafe { it.peek_mut() } {
+        let PyIterator::Enumerate {
+            inner,
+            count,
+            count_big: None,
+        } = state
+        else {
+            return NativeBytePair::Unsupported;
+        };
+        // SAFETY: as above; `inner` is a different cell.
+        return match unsafe { inner.peek_mut() } {
+            Some(source) => step_enumerated_byte(count, source),
+            None => NativeBytePair::Unsupported,
+        };
+    }
     let Ok(mut state) = it.try_borrow_mut() else {
         return NativeBytePair::Unsupported;
     };
@@ -6514,13 +7531,20 @@ fn next_enumerated_byte(it: &Object) -> NativeBytePair {
     else {
         return NativeBytePair::Unsupported;
     };
-    let Some(next_count) = count.checked_add(1) else {
-        return NativeBytePair::Unsupported;
-    };
     let Ok(mut source) = inner.try_borrow_mut() else {
         return NativeBytePair::Unsupported;
     };
-    let PyIterator::Bytes { data, index } = &mut *source else {
+    step_enumerated_byte(count, &mut source)
+}
+
+/// One step of `enumerate(<bytes iterator>)`: both cursors advance
+/// together, or neither does.
+#[inline]
+fn step_enumerated_byte(count: &mut i64, source: &mut PyIterator) -> NativeBytePair {
+    let Some(next_count) = count.checked_add(1) else {
+        return NativeBytePair::Unsupported;
+    };
+    let PyIterator::Bytes { data, index } = source else {
         return NativeBytePair::Unsupported;
     };
     let Some(&byte) = data.get(*index) else {
@@ -6893,7 +7917,7 @@ pub(crate) fn try_call_native_direct(
     args: &[Object],
 ) -> Option<Result<Object, RuntimeError>> {
     // One relaxed load gates every never-compilable callee.
-    if code.jit_hint.is_not_jitable() {
+    if code.jit_hint.is_not_jitable() || jit_off_for_process() {
         return None;
     }
     // Pending interpreter work and active observers (which need the
@@ -6913,6 +7937,9 @@ pub(crate) fn try_call_native_direct(
         st.direct_entry_for(key)
     })?;
     let cf = &entry.art.cf;
+    if !cf.interp_entry {
+        return None;
+    }
     let method_shape = entry.method_shape;
     if method_shape && !matches!(args[0], Object::Instance(_)) {
         return None;
@@ -7011,6 +8038,12 @@ pub(crate) fn try_call_native_direct(
         methods: entry.art.methods.clone(),
         math: entry.art.math.clone(),
         dirty: false,
+        interp_calls: 0,
+        dyn_py_calls: 0,
+        native_calls: 0,
+        polls: 0,
+        child: None,
+        depth_cell: crate::recursion::depth_cell(),
         code_ptr: key,
         native: entry.native.clone(),
         method_native: entry.method_native.clone(),
@@ -7047,7 +8080,7 @@ pub(crate) fn try_call_native_direct(
         })
     };
 
-    NATIVE_CALL_STATS.with(|s| s.direct_calls.set(s.direct_calls.get() + 1));
+    native_stat(|s| s.direct_calls.set(s.direct_calls.get() + 1));
 
     let out = match status {
         JitStatus::Returned => Ok(unpack_pins(jf.ret_bits, jf.ret_tag, &ctx.pins)),
@@ -7107,7 +8140,7 @@ pub(crate) fn try_enter(interp: &mut super::Interpreter, frame: &mut super::Fram
     // relaxed load; with the JIT on by default this is the per-call
     // tax on every never-compilable function (kwargs/defaults/
     // generator shapes), so it must stay off the map lookup.
-    if frame.code.jit_hint.is_not_jitable() {
+    if frame.code.jit_hint.is_not_jitable() || jit_off_for_process() {
         return JitEntry::Skip;
     }
     // RFC 0070 WS2 — generator bodies compile, but a fresh pc-0
@@ -7170,6 +8203,11 @@ pub(crate) fn try_enter(interp: &mut super::Interpreter, frame: &mut super::Fram
     let Some(entry) = entry else {
         return JitEntry::Skip;
     };
+    // A loop-free body that round-trips into the interpreter runs no
+    // faster natively (see `CompiledFrame::interp_entry`).
+    if !entry.cf.interp_entry {
+        return JitEntry::Skip;
+    }
 
     // Phase 2a: global identity + callee code guards.
     if !guards_hold(
@@ -7297,8 +8335,28 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
                         || (ty == JitType::Obj
                             && matches!(o, Object::Unbound)
                             && !osr.unassigned_reads.contains(&(slot as u32)))
+                        // An unbound scalar-lane local written before
+                        // any native read from this entry (an inlined
+                        // comprehension's target, an accumulator bound
+                        // after the loop): the packed placeholder is
+                        // never read.
+                        || (matches!(o, Object::Unbound)
+                            && matches!(ty, JitType::Int | JitType::Float | JitType::Bool)
+                            && !osr.unassigned_reads.contains(&(slot as u32)))
                 });
                 if !ok {
+                    if crate::hot_gates::env_flags::jit_trace() {
+                        eprintln!(
+                            "jit osr refuse {:?} pc {}: local {} {:?} holds {}",
+                            frame.code.name,
+                            pc,
+                            slot,
+                            ty,
+                            locals
+                                .get(slot)
+                                .map_or("?".to_owned(), |o| o.type_name_owned())
+                        );
+                    }
                     drop(locals);
                     return fail(&frame.code);
                 }
@@ -7311,6 +8369,9 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
     // Decompose them into the synthetic slots the compiled loops run
     // on; the headers re-check their bounds on entry.
     let Some(synth) = decompose_live_loops(cf, pc, &frame.stack) else {
+        if crate::hot_gates::env_flags::jit_trace() {
+            eprintln!("jit osr refuse {:?} pc {}: live loops", frame.code.name, pc);
+        }
         return fail(&frame.code);
     };
     // The iterators are consumed by the decomposition: native code owns
@@ -7438,7 +8499,7 @@ pub(crate) fn try_enter_resume(
     if frame.parked_native.is_some() {
         return resume_parked(interp, frame);
     }
-    if frame.code.jit_hint.is_not_jitable() {
+    if frame.code.jit_hint.is_not_jitable() || jit_off_for_process() {
         return JitEntry::Skip;
     }
     let entry = JIT.with(|cell| {
@@ -7691,6 +8752,12 @@ fn enter_compiled(
         methods: entry.methods.clone(),
         math: entry.math.clone(),
         dirty: false,
+        interp_calls: 0,
+        dyn_py_calls: 0,
+        native_calls: 0,
+        polls: 0,
+        child: None,
+        depth_cell: crate::recursion::depth_cell(),
         code_ptr: Rc::as_ptr(&frame.code).cast::<CodeObject>(),
         native: entry.native.clone(),
         method_native: entry.method_native.clone(),
@@ -7723,7 +8790,9 @@ fn enter_compiled(
     // call and is only touched by the `wpjit_call_py` helper.
     let status = unsafe { cf.enter(&raw mut jf) };
 
-    note_native_exit(frame, &jf, status, ctx.pin_pressure_exit);
+    // A cold exit is an expected hand-off, never a deopt charge.
+    let cold_exit = matches!(status, JitStatus::Deopt) && cf.cold_exits.contains(&jf.deopt_pc);
+    note_native_exit(frame, &jf, status, ctx.pin_pressure_exit, cold_exit);
 
     // RFC 0073 WS4 — a healthy yield whose continuation is a
     // registered resume entry parks the *whole* activation on the
@@ -7747,6 +8816,8 @@ fn enter_compiled(
                 obj_global_pins: ctx.obj_global_pins,
                 entry_pin_count,
                 dirty: ctx.dirty,
+                interp_calls: ctx.interp_calls,
+                dyn_py_calls: ctx.dyn_py_calls,
                 local_types: cf.local_types.clone(),
                 plan,
             }));
@@ -7795,10 +8866,15 @@ fn note_native_exit(
     jf: &JitFrame,
     status: JitStatus,
     pin_pressure_exit: bool,
+    cold_exit: bool,
 ) {
     JIT.with(|cell| {
         let mut st = cell.borrow_mut();
         st.stats.native_entries += 1;
+        if cold_exit {
+            st.stats.cold_exits += 1;
+            return;
+        }
         if pin_pressure_exit {
             debug_assert_eq!(status, JitStatus::Deopt);
             st.stats.pin_pressure_exits += 1;
@@ -7838,7 +8914,7 @@ fn note_native_exit(
         }
         if matches!(status, JitStatus::Deopt) {
             st.stats.deopts += 1;
-            if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+            if crate::hot_gates::env_flags::jit_trace() {
                 eprintln!("jit deopt {:?} pc {}", frame.code.name, jf.deopt_pc);
             }
             // Deopt backoff: a compiled frame whose activations keep
@@ -8081,7 +9157,7 @@ fn rebuild_stack(
                 (s.native_index, name)
             }),
     );
-    if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+    if crate::hot_gates::env_flags::jit_trace() {
         eprintln!(
             "jit rebuild {:?} deopt_pc {} stack_len {} inserts {:?} null_spans {:?} callee_spans {:?}",
             frame.code.name,
@@ -8208,6 +9284,10 @@ pub(crate) struct NativeActivation {
     /// for the temporary-pin soft limit across native suspensions.
     entry_pin_count: usize,
     dirty: bool,
+    /// Interpreter round-trips so far (see `CallCtx::interp_calls`).
+    interp_calls: u32,
+    /// See `CallCtx::dyn_py_calls`.
+    dyn_py_calls: u32,
     /// Per-slot lanes for the locals writeback at materialization
     /// (cloned once from the compiled frame at first park).
     local_types: Vec<Option<JitType>>,
@@ -8393,7 +9473,7 @@ pub(crate) fn materialize_parked(frame: &mut super::Frame) {
     let Some(mut act) = frame.parked_native.take() else {
         return;
     };
-    if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+    if crate::hot_gates::env_flags::jit_trace() {
         eprintln!(
             "jit gen materialize {:?} yield pc {}",
             frame.code.name, act.yield_pc
@@ -8550,6 +9630,12 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
         methods: entry.methods.clone(),
         math: entry.math.clone(),
         dirty: act.dirty,
+        interp_calls: act.interp_calls,
+        dyn_py_calls: act.dyn_py_calls,
+        native_calls: 0,
+        polls: 0,
+        child: None,
+        depth_cell: crate::recursion::depth_cell(),
         code_ptr: Rc::as_ptr(&frame.code).cast::<CodeObject>(),
         native: entry.native.clone(),
         method_native: entry.method_native.clone(),
@@ -8583,7 +9669,8 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
     // call; the engine backing `cf` lives in this thread's `JIT`
     // thread-local for the process lifetime; `ctx` outlives the call.
     let status = unsafe { cf.enter(&raw mut jf) };
-    note_native_exit(frame, &jf, status, ctx.pin_pressure_exit);
+    let cold_exit = matches!(status, JitStatus::Deopt) && cf.cold_exits.contains(&jf.deopt_pc);
+    note_native_exit(frame, &jf, status, ctx.pin_pressure_exit, cold_exit);
     if matches!(status, JitStatus::Yielded) {
         if let Some(plan) = park_plan(frame, &entry, &jf) {
             // Re-park in place: same box, same buffers, zero moves.
@@ -8649,10 +9736,12 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
 /// test builds so it never reaches release binaries.
 #[cfg(test)]
 pub(crate) fn force_enable_for_test(threshold: u32) {
+    JIT_PROCESS_GATE.store(1, std::sync::atomic::Ordering::Relaxed);
     JIT.with(|cell| {
         let mut st = cell.borrow_mut();
         st.enabled = true;
         st.threshold = threshold.max(1);
+        set_lean_warm_from_threshold(st.threshold);
     });
 }
 
@@ -8664,12 +9753,6 @@ pub(crate) fn stats_for_test() -> (u64, u64, u64) {
         let s = &cell.borrow().stats;
         (s.frames_compiled, s.native_entries, s.deopts)
     })
-}
-
-/// Test hook: pressure exits are distinct from failed native assumptions.
-#[cfg(test)]
-pub(crate) fn pin_pressure_exits_for_test() -> u64 {
-    JIT.with(|cell| cell.borrow().stats.pin_pressure_exits)
 }
 
 /// Test hook: OSR entry count for the current thread (RFC 0059 WS3b).
@@ -8753,6 +9836,7 @@ pub(crate) fn format_stats_markdown() -> Option<String> {
              - parked materializations: **{}**\n\
              - deopts: **{}**\n\
              - pin-pressure exits: **{}**\n\
+             - cold exits: **{}**\n\
              - entry-guard failures: **{}**\n\
              - native-to-native calls: **{}**\n\
              - scalar leaf calls: **{}**\n\
@@ -8776,6 +9860,7 @@ pub(crate) fn format_stats_markdown() -> Option<String> {
             s.gen_materialized,
             s.deopts,
             s.pin_pressure_exits,
+            s.cold_exits,
             s.entry_guard_failures,
             ncalls,
             leaves,

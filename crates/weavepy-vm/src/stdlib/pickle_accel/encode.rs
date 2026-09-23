@@ -1,15 +1,25 @@
-//! Speculative protocol-4/5 encoding for exact built-in data.
+//! Speculative protocol-4/5 encoding for exact built-in data and for
+//! instances of plain classes that use the default object reduction.
 //!
 //! This module never invokes Python callbacks. Unsupported graphs discard the
 //! private byte buffer and return to the existing pickler. The caller must first
 //! verify the pickler's methods, dispatch table, and configuration.
+//!
+//! An instance is encoded only when type metadata alone proves that
+//! `object.__reduce_ex__` would produce `copyreg.__newobj__(cls)` plus the
+//! default state, and that `save_global` would find the class. The one side
+//! effect of that reduction, the `__slotnames__` cache, is applied only after
+//! the whole graph has been encoded.
 
 use std::collections::{HashMap, HashSet};
 
 use num_traits::ToPrimitive;
 
+use super::classes;
 use crate::builtins::object_identity;
-use crate::object::Object;
+use crate::object::{DictData, DictKey, Object, StrKey};
+use crate::sync::{Rc, RefCell};
+use crate::types::{PyInstance, TypeObject};
 
 const FRAME_TARGET: usize = 65_536;
 const MAX_DEPTH: usize = 128;
@@ -83,22 +93,54 @@ impl Framer {
     }
 }
 
-#[derive(Default)]
-struct Encoder {
+/// The interpreter state that `save_global` and the reduction consult. It is
+/// produced on demand so that built-in data never pays for it.
+pub(super) struct InstanceContext {
+    pub(super) modules: Rc<RefCell<DictData>>,
+    pub(super) dispatch_table: Rc<RefCell<DictData>>,
+}
+
+struct ClassPlan {
+    module: Object,
+    qualname: Object,
+    slot_names: Vec<Object>,
+    has_dict: bool,
+}
+
+struct Encoder<'a> {
     writer: Framer,
     // Pins prevent another thread's container mutation from releasing an
     // already memoized value and reusing its address during this operation.
     memo: HashMap<i64, (u32, Object)>,
+    // Memo positions taken by the default state's temporary tuple and
+    // dictionary, to which no later object can refer.
+    anonymous: u32,
     active: HashSet<i64>,
     python_headroom: usize,
+    context: &'a dyn Fn() -> Option<InstanceContext>,
+    resolved: Option<InstanceContext>,
+    classes: HashMap<usize, Rc<ClassPlan>>,
+    slot_name_caches: Vec<(Rc<TypeObject>, Vec<Object>)>,
 }
 
-impl Encoder {
+impl Encoder<'_> {
+    fn next_index(&self) -> Option<u32> {
+        u32::try_from(self.memo.len())
+            .ok()?
+            .checked_add(self.anonymous)
+    }
+
     fn memoize(&mut self, value: &Object) -> Option<()> {
-        let index = u32::try_from(self.memo.len()).ok()?;
+        let index = self.next_index()?;
         self.memo.try_reserve(1).ok()?;
         self.memo
             .insert(object_identity(value), (index, value.clone()));
+        self.writer.write(&[0x94])
+    }
+
+    fn memoize_anonymous(&mut self) -> Option<()> {
+        self.next_index()?;
+        self.anonymous += 1;
         self.writer.write(&[0x94])
     }
 
@@ -159,6 +201,7 @@ impl Encoder {
                 | Object::List(_)
                 | Object::Dict(_)
                 | Object::Tuple(_)
+                | Object::Instance(_)
         );
         let id = if memoized { object_identity(value) } else { 0 };
         if memoized {
@@ -261,45 +304,268 @@ impl Encoder {
                 self.active.insert(id);
                 self.writer.write(b"}")?;
                 self.memoize(value)?;
-                for batch in items.chunks(1000) {
-                    if batch.len() != 1 {
-                        self.writer.write(b"(")?;
-                    }
-                    for (key, value) in batch {
-                        self.save(key, depth + 1)?;
-                        self.save(value, depth + 1)?;
-                    }
-                    self.writer
-                        .write(if batch.len() == 1 { b"s" } else { b"u" })?;
-                }
+                self.save_items(&items, depth + 1)?;
+                self.active.remove(&id);
+                Some(())
+            }
+            Object::Instance(instance) => {
+                // The instance is memoized before its state, but a graph
+                // that returns to it is cyclic and keeps the full pickler.
+                self.active.try_reserve(1).ok()?;
+                self.active.insert(id);
+                self.save_instance(value, instance, depth)?;
                 self.active.remove(&id);
                 Some(())
             }
             _ => None,
         }
     }
+
+    fn save_items(&mut self, items: &[(Object, Object)], depth: usize) -> Option<()> {
+        for batch in items.chunks(1000) {
+            if batch.len() != 1 {
+                self.writer.write(b"(")?;
+            }
+            for (key, value) in batch {
+                self.save(key, depth)?;
+                self.save(value, depth)?;
+            }
+            self.writer
+                .write(if batch.len() == 1 { b"s" } else { b"u" })?;
+        }
+        Some(())
+    }
+
+    /// `save_reduce(copyreg.__newobj__, (cls,), state)` for the default
+    /// `object.__reduce_ex__`, in the pickler's exact `save` order.
+    fn save_instance(
+        &mut self,
+        value: &Object,
+        instance: &Rc<PyInstance>,
+        depth: usize,
+    ) -> Option<()> {
+        if instance.native.get().is_some() || instance.c_body.get() != 0 {
+            return None;
+        }
+        let class = instance.cls();
+        let plan = self.class_plan(&class)?;
+        let dict = match instance.dict.get_shared() {
+            Some(dict) => {
+                let nonempty = {
+                    let dict = dict.borrow();
+                    // A dunder entry can shadow a reduction hook, and a
+                    // non-string key never comes from attribute assignment.
+                    if !dict.keys().all(|key| {
+                        matches!(&key.0, Object::Str(name)
+                            if !(name.starts_with("__") && name.ends_with("__")))
+                    }) {
+                        return None;
+                    }
+                    !dict.is_empty()
+                };
+                nonempty.then_some(dict)
+            }
+            None => None,
+        };
+        if dict.is_some() && !plan.has_dict {
+            return None;
+        }
+        let mut slots: Vec<(Object, Object)> = Vec::new();
+        if !plan.slot_names.is_empty() {
+            let storage = instance.slots.borrow();
+            slots.try_reserve_exact(plan.slot_names.len()).ok()?;
+            for name in &plan.slot_names {
+                let Object::Str(text) = name else {
+                    return None;
+                };
+                let repeated = slots
+                    .iter()
+                    .any(|(seen, _)| matches!(seen, Object::Str(seen) if seen == text));
+                if let (false, Some(value)) = (repeated, storage.get(text)) {
+                    slots.push((name.clone(), value.clone()));
+                }
+            }
+        }
+
+        self.save_class(&class, &plan, depth + 1)?;
+        self.save(&Object::new_tuple(Vec::new()), depth + 1)?;
+        self.writer.write(&[0x81])?;
+        self.memoize(value)?;
+        match (dict, slots.is_empty()) {
+            (None, true) => return Some(()),
+            (Some(dict), true) => self.save(&Object::Dict(dict), depth + 1)?,
+            (dict, false) => {
+                // The state is the temporary `(dict or None, {slot: value})`.
+                self.writer.commit(false);
+                self.save(&dict.map_or(Object::None, Object::Dict), depth + 2)?;
+                self.writer.commit(false);
+                self.writer.write(b"}")?;
+                self.memoize_anonymous()?;
+                self.save_items(&slots, depth + 3)?;
+                self.writer.write(&[0x86])?;
+                self.memoize_anonymous()?;
+            }
+        }
+        self.writer.write(b"b")
+    }
+
+    /// `save_global` for a class that [`Self::class_plan`] accepted.
+    fn save_class(&mut self, class: &Rc<TypeObject>, plan: &ClassPlan, depth: usize) -> Option<()> {
+        self.writer.commit(false);
+        let value = Object::Type(class.clone());
+        if let Some(&(index, _)) = self.memo.get(&object_identity(&value)) {
+            return self.get(index);
+        }
+        self.save(&plan.module, depth + 1)?;
+        self.save(&plan.qualname, depth + 1)?;
+        self.writer.write(&[0x93])?;
+        self.memoize(&value)
+    }
+
+    fn class_plan(&mut self, class: &Rc<TypeObject>) -> Option<Rc<ClassPlan>> {
+        let key = Rc::as_ptr(class) as usize;
+        if let Some(plan) = self.classes.get(&key) {
+            return Some(plan.clone());
+        }
+        if self.resolved.is_none() {
+            self.resolved = Some((self.context)()?);
+        }
+        let context = self.resolved.as_ref()?;
+        let has_dict = classes::plain_layout(class, classes::ENCODE_HOOKS)?;
+        if !classes::benign_metaclass(class) || class.immutable.get() {
+            return None;
+        }
+        // `copyreg.dispatch_table` is consulted for the instance's class and,
+        // when the class itself is saved, for its metaclass.
+        let metaclass = class.metaclass.borrow().clone();
+        for (key, _) in context.dispatch_table.borrow().iter() {
+            let Object::Type(registered) = &key.0 else {
+                return None;
+            };
+            if Rc::ptr_eq(registered, class)
+                || metaclass
+                    .as_ref()
+                    .is_some_and(|meta| Rc::ptr_eq(registered, meta))
+            {
+                return None;
+            }
+        }
+        // `getattr(cls, "__qualname__")` and `whichmodule`: both must name
+        // the class itself through plain module and class dictionaries.
+        let (module, own_qualname) = {
+            let dict = class.dict.borrow();
+            (
+                dict.get(&StrKey("__module__")).cloned()?,
+                dict.get(&StrKey("__qualname__")).cloned(),
+            )
+        };
+        let Object::Str(module_name) = &module else {
+            return None;
+        };
+        let qualname = match own_qualname {
+            Some(name @ Object::Str(_)) => name,
+            _ => Object::interned_str(class.qualname.borrow().as_deref().unwrap_or(&class.name)),
+        };
+        let Object::Str(qualified) = &qualname else {
+            return None;
+        };
+        let found = classes::resolve_global(&context.modules, module_name, qualified)?;
+        if !Rc::ptr_eq(&found, class) {
+            return None;
+        }
+        // `copyreg._slotnames`: reuse the cached list when it is the one
+        // that function would compute, else remember to publish it.
+        let mut slot_names = classes::slot_names(class)?;
+        let cached = class.dict.borrow().get(&StrKey("__slotnames__")).cloned();
+        match cached {
+            Some(Object::List(cached)) => {
+                let cached = cached.borrow().clone();
+                let same = cached.len() == slot_names.len()
+                    && cached.iter().zip(&slot_names).all(|pair| {
+                        matches!(pair, (Object::Str(left), Object::Str(right)) if left == right)
+                    });
+                if !same {
+                    return None;
+                }
+                slot_names = cached;
+            }
+            Some(_) => return None,
+            None => {
+                self.slot_name_caches.try_reserve(1).ok()?;
+                self.slot_name_caches
+                    .push((class.clone(), slot_names.clone()));
+            }
+        }
+        let plan = Rc::new(ClassPlan {
+            module,
+            qualname,
+            slot_names,
+            has_dict,
+        });
+        self.classes.try_reserve(1).ok()?;
+        self.classes.insert(key, plan.clone());
+        Some(plan)
+    }
+
+    /// `cls.__slotnames__ = names`, the reduction's only side effect.
+    fn publish_slot_name_caches(&mut self) {
+        for (class, names) in self.slot_name_caches.drain(..) {
+            let mut dict = class.dict.borrow_mut();
+            if dict.contains_key(&StrKey("__slotnames__")) {
+                continue;
+            }
+            let names = Object::new_list(names);
+            crate::gc_trace::track(names.clone());
+            dict.insert(DictKey(Object::from_static("__slotnames__")), names);
+            drop(dict);
+            class.bump_attr_version();
+        }
+    }
 }
 
-pub(super) fn encode(value: &Object, protocol: u8) -> Option<Vec<u8>> {
-    encode_with_headroom(
+pub(super) fn encode(
+    value: &Object,
+    protocol: u8,
+    context: &dyn Fn() -> Option<InstanceContext>,
+) -> Option<Vec<u8>> {
+    encode_with_context(
         value,
         protocol,
         crate::recursion::recursion_limit().saturating_sub(crate::recursion::current_depth()),
+        context,
     )
 }
 
+#[cfg(test)]
 fn encode_with_headroom(value: &Object, protocol: u8, python_headroom: usize) -> Option<Vec<u8>> {
+    encode_with_context(value, protocol, python_headroom, &|| None)
+}
+
+fn encode_with_context(
+    value: &Object,
+    protocol: u8,
+    python_headroom: usize,
+    context: &dyn Fn() -> Option<InstanceContext>,
+) -> Option<Vec<u8>> {
     if !matches!(protocol, 4 | 5) {
         return None;
     }
     let mut encoder = Encoder {
+        writer: Framer::default(),
+        memo: HashMap::new(),
+        anonymous: 0,
+        active: HashSet::new(),
         python_headroom,
-        ..Encoder::default()
+        context,
+        resolved: None,
+        classes: HashMap::new(),
+        slot_name_caches: Vec::new(),
     };
     extend(&mut encoder.writer.output, &[0x80, protocol])?;
     encoder.save(value, 0)?;
     encoder.writer.write(b".")?;
     encoder.writer.commit(true);
+    encoder.publish_slot_name_caches();
     Some(encoder.writer.output)
 }
 
@@ -314,7 +580,8 @@ mod tests {
         let child = Object::new_list(vec![Object::Int(7)]);
         let value = Object::new_list(vec![child; 2001]);
         let bytes = encode_with_headroom(&value, 5, 1000).unwrap();
-        let Object::List(decoded) = super::super::decode(&bytes, |_| true).unwrap() else {
+        let Object::List(decoded) = super::super::decode(&bytes, |_| true, &|| None).unwrap()
+        else {
             panic!("expected decoded list");
         };
         let decoded = decoded.borrow();
@@ -324,6 +591,11 @@ mod tests {
 
     #[test]
     fn list_encoding_tolerates_concurrent_resizing() {
+        // Two raw threads share a cell with no GIL between them: the
+        // contract `GilCell` documents is that such threads announce
+        // themselves before touching objects. (The bias alone is
+        // revoked -- see `revoke_bias_for_test`.)
+        crate::sync::revoke_bias_for_test();
         let items = Rc::new(crate::sync::RefCell::new(vec![Object::Int(7); 5001]));
         let value = Object::List(items.clone());
         let barrier = Rc::new(std::sync::Barrier::new(2));
@@ -342,7 +614,9 @@ mod tests {
             // A resize may request fallback. Every accepted stream must be
             // complete and contain only the actual integer list elements.
             if let Some(bytes) = encode_with_headroom(&value, 5, 1000) {
-                let Object::List(decoded) = super::super::decode(&bytes, |_| true).unwrap() else {
+                let Object::List(decoded) =
+                    super::super::decode(&bytes, |_| true, &|| None).unwrap()
+                else {
                     panic!("expected decoded list");
                 };
                 let decoded = decoded.borrow();
