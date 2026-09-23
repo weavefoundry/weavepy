@@ -249,3 +249,44 @@ fn explicit_exit_preserves_operands_and_updated_locals() {
     assert_eq!(&tags[..2], &[SlotTag::Int as u32; 2]);
     assert_eq!(locals, [99, 7]);
 }
+
+#[test]
+fn engine_drop_releases_native_mappings() {
+    // Use a separate process so concurrently running tests cannot allocate
+    // new code at the address being checked after its engine is destroyed.
+    const CHILD: &str = "WEAVEPY_ENGINE_DROP_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "engine::tests::engine_drop_releases_native_mappings",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("spawn mapping test");
+        assert!(status.success(), "isolated mapping test failed: {status}");
+        return;
+    }
+    let mut engine = super::JitEngine::new().expect("host ISA");
+    let compiled = engine
+        .compile_tfunc(&function(&[
+            TOp::LoadLocal(0),
+            TOp::LoadLocal(1),
+            TOp::IntArith(ArithKind::Add),
+        ]))
+        .expect("compile scalar function");
+    let address = compiled.func as *const ();
+    assert!(region::query(address)
+        .expect("live native mapping")
+        .protection()
+        .contains(region::Protection::EXECUTE));
+    drop(engine);
+    assert!(
+        matches!(region::query(address), Err(region::Error::UnmappedRegion)),
+        "dropping the engine must unmap its native code"
+    );
+    // Metadata may outlive the engine, but entering it would violate the
+    // unsafe entry contract. Dropping metadata must not free anything twice.
+    drop(compiled);
+}

@@ -23,6 +23,8 @@ cranelift-native   = { workspace = true }
 [dev-dependencies]
 # Analyzer tests parse + compile real Python shapes (RFC 0058 WS4).
 weavepy-parser     = { workspace = true }
+# Query native mappings without dereferencing them in lifecycle tests.
+region            = "3.0.2"
 
 [lints]
 workspace = true

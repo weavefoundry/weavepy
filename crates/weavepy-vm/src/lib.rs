@@ -62920,6 +62920,23 @@ assert loop(2000) == 1999000
         assert!(compiled >= 2, "caller and callee must reach the JIT");
     }
 
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_worker_exit_preserves_shared_code_and_parked_generators() {
+        let (out, parks, resumes, materialized) = run_jit_park(include_str!(
+            "../../../tests/regrtest/test_jit_worker_exit.py"
+        ));
+        assert!(out.contains("JIT worker exit: ok"));
+        assert!(
+            parks > 0 && resumes > 0,
+            "resumed generators must enter native code"
+        );
+        assert!(
+            materialized >= 8,
+            "each worker's parked activation must materialize on its receiving thread"
+        );
+    }
+
     /// RFC 0032 — run `src` with the tier-2 JIT forced on, on a fresh
     /// thread so the thread-local JIT state can't leak into other
     /// tests. Returns `(stdout, frames_compiled, deopts)`.
