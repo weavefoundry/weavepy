@@ -2413,19 +2413,24 @@ impl PyInstance {
     /// write barrier unable to find the owner. (The stdlib's
     /// native-backed objects are never deferred, so a record-free
     /// dictionary is the right answer for them.)
+    #[inline]
     pub fn dict_cell(&self) -> &RefCell<DictData> {
-        if self.deferred.get() {
-            let owner = std::ptr::from_ref(self) as usize;
-            let hint = self
-                .cls()
-                .inst_dict_hint
-                .load(std::sync::atomic::Ordering::Relaxed) as usize;
-            return self.dict.get_or_init(|| {
-                Rc::new(RefCell::new(DictData::deferred_for_capacity(owner, hint)))
-            });
-        }
-        self.dict
-            .get_or_init(|| Rc::new(RefCell::new(DictData::default())))
+        self.dict.get_or_init(|| {
+            // Class ownership and its allocation hint matter only when the
+            // dictionary is first published. Existing dictionaries need only
+            // LazyArc's acquiring pointer load, even for deferred instances.
+            let data = if self.deferred.get() {
+                let owner = std::ptr::from_ref(self) as usize;
+                let hint = self
+                    .cls()
+                    .inst_dict_hint
+                    .load(std::sync::atomic::Ordering::Relaxed) as usize;
+                DictData::deferred_for_capacity(owner, hint)
+            } else {
+                DictData::default()
+            };
+            Rc::new(RefCell::new(data))
+        })
     }
 
     /// Retire a dying deferred-tracking instance into the per-thread
