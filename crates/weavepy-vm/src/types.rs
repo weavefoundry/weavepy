@@ -320,12 +320,13 @@ pub(crate) mod type_cache {
 /// instance-attribute paths, keyed by the *interned* name object's
 /// address and the class's attribute version. A small direct-mapped
 /// cache per class: polymorphic sites (one receiver class per iteration)
-/// find every class's answer here with no site cache at all.
+/// find every class's answer here with no site cache at all. Storage is
+/// allocated on the first fill; unused classes occupy only one pointer.
 ///
 /// Read and written only from the dispatch loop with the GIL held (the
 /// burst is off in free-threaded mode), like the dispatch loop's other
 /// side caches.
-pub struct LeafAttrCache(std::cell::UnsafeCell<[LeafAttrEntry; 32]>);
+pub struct LeafAttrCache(std::cell::UnsafeCell<Option<Box<[LeafAttrEntry; 32]>>>);
 
 // SAFETY: see the type docs — GIL-serialized access from one thread at a
 // time, never across a Python call.
@@ -370,13 +371,7 @@ pub enum LeafAttrKind {
 
 impl LeafAttrCache {
     pub fn new() -> Self {
-        Self(std::cell::UnsafeCell::new(std::array::from_fn(|_| {
-            LeafAttrEntry {
-                name: 0,
-                ver: 0,
-                kind: LeafAttrKind::Other,
-            }
-        })))
+        Self(std::cell::UnsafeCell::new(None))
     }
 
     #[inline]
@@ -396,7 +391,7 @@ impl LeafAttrCache {
     #[inline]
     pub fn get(&self, name: usize, ver: u64) -> Option<&LeafAttrKind> {
         // SAFETY: GIL-serialized; no `&mut` escapes `set`.
-        let t = unsafe { &*self.0.get() };
+        let t = unsafe { &*self.0.get() }.as_deref()?;
         let e = &t[Self::index(name)];
         if e.name == name && e.ver == ver {
             return Some(&e.kind);
@@ -409,7 +404,13 @@ impl LeafAttrCache {
     pub fn set(&self, name: usize, ver: u64, kind: LeafAttrKind) {
         // SAFETY: GIL-serialized; the exclusive reference lives only for
         // the assignment.
-        let t = unsafe { &mut *self.0.get() };
+        let t = unsafe { &mut *self.0.get() }.get_or_insert_with(|| {
+            Box::new(std::array::from_fn(|_| LeafAttrEntry {
+                name: 0,
+                ver: 0,
+                kind: LeafAttrKind::Other,
+            }))
+        });
         let (i, j) = (Self::index(name), Self::alt(name));
         // The first slot unless it holds another name that is still
         // current; then the second, unless that one is too (evict the
@@ -435,6 +436,55 @@ impl Clone for LeafAttrCache {
 impl std::fmt::Debug for LeafAttrCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("LeafAttrCache")
+    }
+}
+
+#[cfg(test)]
+mod leaf_attr_cache_tests {
+    use super::{LeafAttrCache, LeafAttrKind};
+    use crate::object::Object;
+    use crate::shared_value::SharedStr;
+
+    #[test]
+    fn cold_cache_and_its_clone_do_not_allocate_entries() {
+        let cache = LeafAttrCache::new();
+        assert_eq!(std::mem::size_of_val(&cache), std::mem::size_of::<usize>());
+        assert!(cache.get(16, 1).is_none());
+        // SAFETY: this test owns the cache exclusively.
+        assert!(unsafe { &*cache.0.get() }.is_none());
+        cache.set(16, 1, LeafAttrKind::InstanceOnly);
+        let other = cache.clone();
+        assert!(other.get(16, 1).is_none());
+        // SAFETY: this test owns the clone exclusively.
+        assert!(unsafe { &*other.0.get() }.is_none());
+    }
+
+    #[test]
+    fn warm_cache_preserves_versions_collisions_and_value_ownership() {
+        let cache = LeafAttrCache::new();
+        let name = 16;
+        let collision = (17..100_000)
+            .find(|&other| LeafAttrCache::index(other) == LeafAttrCache::index(name))
+            .unwrap();
+        let text = SharedStr::from("cached value");
+        cache.set(name, 1, LeafAttrKind::Value(Object::Str(text.clone())));
+        cache.set(collision, 1, LeafAttrKind::InstanceOnly);
+        assert!(
+            matches!(cache.get(name, 1), Some(LeafAttrKind::Value(Object::Str(value))) if SharedStr::ptr_eq(value, &text))
+        );
+        assert!(matches!(
+            cache.get(collision, 1),
+            Some(LeafAttrKind::InstanceOnly)
+        ));
+        assert!(cache.get(name, 2).is_none());
+        assert_eq!(SharedStr::strong_count(&text), 2);
+        cache.set(name, 2, LeafAttrKind::Other);
+        assert_eq!(SharedStr::strong_count(&text), 1);
+        assert!(cache.get(name, 1).is_none());
+        assert!(matches!(cache.get(name, 2), Some(LeafAttrKind::Other)));
+        cache.set(name, 2, LeafAttrKind::Value(Object::Str(text.clone())));
+        drop(cache);
+        assert_eq!(SharedStr::strong_count(&text), 1);
     }
 }
 
