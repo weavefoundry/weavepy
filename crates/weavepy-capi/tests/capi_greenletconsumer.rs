@@ -290,3 +290,39 @@ assert s.get_tag() == {'loop': 1}, 'C field did not survive the run'
 ",
     );
 }
+
+/// gevent's `_extract_stack` walks `f_back` from C and drops each VM
+/// frame with the inlined `Py_DECREF`, reaching the frame type's
+/// `tp_dealloc`. A VM frame crosses as an ordinary box, so that dealloc
+/// must release it as one: freed as a `PyFrame_New` facade, the box
+/// leaked its frame (pinning the frame's locals) and handed the
+/// allocator a block smaller than the facade layout it claimed, which
+/// corrupted the heap under the thread-caching allocator.
+#[test]
+fn greenletconsumer_frames_walked_from_c_are_released() {
+    run_with_consumer(
+        "
+import gc
+import weakref
+import _greenletconsumer as cons
+
+class Marker:
+    pass
+
+def inner():
+    marker = Marker()
+    ref = weakref.ref(marker)
+    walked = cons.extract_stack(4)
+    assert walked >= 1, walked
+    return ref
+
+def outer():
+    return inner()
+
+refs = [outer() for _ in range(200)]
+gc.collect()
+alive = sum(1 for r in refs if r() is not None)
+assert alive == 0, f'{alive} frames walked from C kept their locals alive'
+",
+    );
+}
