@@ -62892,6 +62892,27 @@ assert loop(2000) == 1999000
     #[cfg(feature = "jit")]
     #[test]
     fn jit_return_cache_releases_retired_code() {
+        // The collector is process-global and skips a collection when a
+        // peer is already collecting. This test requires three completed
+        // collections, so isolate it from concurrently running VM tests.
+        const CHILD: &str = "WEAVEPY_CODE_RETIREMENT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "tests::jit_return_cache_releases_retired_code",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .status()
+                    .expect("spawn code-retirement test");
+            assert!(
+                status.success(),
+                "isolated code-retirement test failed: {status}"
+            );
+            return;
+        }
         let (out, compiled, _) = run_jit(include_str!(
             "../../../tests/regrtest/test_jit_cache_collection.py"
         ));
