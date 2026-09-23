@@ -56,6 +56,15 @@ is 1.382, and peak RSS is 1.727. There are eight workload-time wins among 23
 workloads and no peak-RSS wins among the 24 processes. The target of beating
 CPython across all measured metrics hasn't been reached.
 
+A final seven-cycle warmed recheck of `tools/bench_leaf_returns.py` at
+500,000 iterations confirms the focused call improvement on the final binary:
+elapsed-time ratios are 0.906 with the JIT and 0.905 without it, relative to
+the original release. Workload CPU ratios are 0.906 and 0.905, process CPU
+ratios are 0.903 and 0.909, and peak-RSS ratios are 0.995 and 0.987. The
+default-JIT workload remains 3.198 times CPython's time. These final measurements
+are in `target/performance/final-return-probe.json`; the earlier call report
+records the first commit's measurement separately.
+
 The following default-JIT rows retain every fixture, including the library
 census. Smaller ratios indicate less cost. The startup row uses process
 elapsed time in the workload columns.
