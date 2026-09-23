@@ -62889,6 +62889,16 @@ assert loop(2000) == 1999000
         .expect("startup JIT worker");
     }
 
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_return_cache_releases_retired_code() {
+        let (out, compiled, _) = run_jit(include_str!(
+            "../../../tests/regrtest/test_jit_cache_collection.py"
+        ));
+        assert!(out.contains("JIT code cache collection: ok"));
+        assert!(compiled >= 2, "caller and callee must reach the JIT");
+    }
+
     /// RFC 0032 — run `src` with the tier-2 JIT forced on, on a fresh
     /// thread so the thread-local JIT state can't leak into other
     /// tests. Returns `(stdout, frames_compiled, deopts)`.

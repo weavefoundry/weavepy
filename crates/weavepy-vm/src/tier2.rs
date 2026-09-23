@@ -1798,13 +1798,15 @@ thread_local! {
 
     /// Memoized callee return typing (RFC 0059 WS3 / RFC 0069 WS1):
     /// `(scalar lane, provably-returns-None)`, keyed by code object
-    /// identity. The `Rc<CodeObject>` pins the address against reuse.
+    /// identity. A weak handle pins the allocation address against reuse
+    /// without keeping its code payload alive. A strong handle here and in
+    /// the tier cache would keep each cache from becoming the sole owner.
     /// Both are *predictions* — the call helpers re-check the actual
     /// result at runtime — so staleness (e.g. the callee's own globals
     /// changing what its analysis would say) costs a deopt, never
     /// correctness.
     static RET_LANE_CACHE: RefCell<
-        HashMap<*const CodeObject, (Option<JitType>, bool, Rc<CodeObject>)>,
+        HashMap<*const CodeObject, (Option<JitType>, bool, crate::sync::Weak<CodeObject>)>,
     > = RefCell::new(HashMap::new());
 }
 
@@ -1861,7 +1863,10 @@ fn callee_ret_info(
             (None, weavepy_jit::returns_none_syntactically(fcode))
         }
     };
-    RET_LANE_CACHE.with(|c| c.borrow_mut().insert(key, (lane, ret_none, fcode.clone())));
+    RET_LANE_CACHE.with(|c| {
+        c.borrow_mut()
+            .insert(key, (lane, ret_none, Rc::downgrade(fcode)))
+    });
     (lane, ret_none)
 }
 
@@ -2693,8 +2698,8 @@ fn attr_fingerprint_obj(
     Some((lane, ver, storage, inst.cls()))
 }
 
-/// RFC 0068 — drop tier-cache and ret-lane entries whose code object
-/// the JIT is the *sole* owner of (`Rc::strong_count == 1`). The cache
+/// Drop tier-cache entries whose code object the JIT is the sole real
+/// owner of, then discard return-lane entries whose weak code is dead. The cache
 /// pins code objects so pointer keys stay valid, which would otherwise
 /// make every executed code object immortal (observable through
 /// `weakref` on `__code__`). Called from `gc.collect()`. Eviction is
@@ -2710,7 +2715,13 @@ pub(crate) fn gc_sweep() {
             let dead: Vec<*const CodeObject> = st
                 .cache
                 .iter()
-                .filter(|(_, e)| Rc::strong_count(&e.code) == 1)
+                .filter(|(key, e)| {
+                    // Python weakref slots temporarily hold strong clones;
+                    // the collector discounts those from reachability too.
+                    let weak_clones =
+                        crate::weakref_registry::strong_clone_count(**key as usize as u64);
+                    Rc::strong_count(&e.code) == 1 + weak_clones
+                })
                 .map(|(k, _)| *k)
                 .collect();
             for k in dead {
@@ -2722,7 +2733,7 @@ pub(crate) fn gc_sweep() {
             let mut m = c.borrow_mut();
             let dead: Vec<*const CodeObject> = m
                 .iter()
-                .filter(|(_, (_, _, code))| Rc::strong_count(code) == 1)
+                .filter(|(_, (_, _, code))| code.strong_count() == 0)
                 .map(|(k, _)| *k)
                 .collect();
             for k in dead {
