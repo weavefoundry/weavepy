@@ -86,13 +86,12 @@ struct AttrGuard {
     name_hash: i64,
     /// The value lane the site was compiled with.
     lane: JitType,
-    /// The class's `attr_version` at compile time (bumps on any class
-    /// or MRO mutation, exactly like the tier-1 caches).
+    /// The class's `attr_version` at compile time. Tokens are globally unique
+    /// across class lifetimes and mutations, so this guard needn't own the
+    /// original class. Each live receiver owns the class checked at access.
     ver: u64,
     /// How the access reaches its storage.
     storage: AttrStorage,
-    /// Keeps the original guard dependency alive.
-    _class: Rc<TypeObject>,
     /// Advisory index into the current activation's pin table. Guards are
     /// shared by nested and suspended activations, so every hit must validate
     /// the actual object's identity in the calling activation's table.
@@ -101,9 +100,9 @@ struct AttrGuard {
 
 /// RFC 0069 WS1 — one burned-in method-site resolution: the class-
 /// resolved plain Python function the `(slot, name)` probe found, plus
-/// the guard fingerprint (class identity + attr-version) and its
-/// `__code__` at compile time. `wpjit_call_method` re-validates all of
-/// it per call and rejects (deopts) on any mismatch, so class mutation,
+/// the guard fingerprint (a globally unique class-resolution token) and
+/// its `__code__` at compile time. `wpjit_call_method` revalidates all of
+/// it per call and rejects a mismatch, so class mutation,
 /// instance-dict shadowing, and `__code__` rebinding introduced after
 /// compilation stay exact.
 struct MethodEntry {
@@ -120,10 +119,9 @@ struct MethodEntry {
     min_args: u32,
     /// The burned-in result typing.
     ret: MethodRet,
-    /// The class's `attr_version` at compile time.
+    /// A globally unique resolution token. The live receiver owns the class
+    /// checked at access; this cached method must not keep that class alive.
     ver: u64,
-    /// Keeps the original guard dependency alive.
-    _class: Rc<TypeObject>,
 }
 
 /// One slot per method token (parallel to `cf.method_sites`).
@@ -2339,7 +2337,7 @@ fn scalar_lane(obj: &Object) -> Option<JitType> {
 /// `None` mid-chain value (the lane is nullable) or any ineligible
 /// shape ends the walk.
 fn attr_chain_step(obj: &Object, name: &str) -> Option<Object> {
-    let (lane, _, storage, _) = attr_fingerprint_obj(obj, name, false)?;
+    let (lane, _, storage) = attr_fingerprint_obj(obj, name, false)?;
     if lane != JitType::Obj {
         return None;
     }
@@ -2467,7 +2465,6 @@ fn attr_site_guard(
             lane: site.lane,
             ver: cls.attr_version.get(),
             storage: AttrStorage::Indexed(*field_idx),
-            _class: cls,
             last_result_pin: Cell::new(usize::MAX),
         });
     }
@@ -2486,7 +2483,7 @@ fn attr_site_guard(
         else {
             return None;
         };
-        let Object::Instance(inst) = &recv else {
+        let Object::Instance(_) = &recv else {
             return None;
         };
         return Some(AttrGuard {
@@ -2495,12 +2492,11 @@ fn attr_site_guard(
             lane: site.lane,
             ver,
             storage: AttrStorage::Indexed(field_idx),
-            _class: inst.cls(),
             last_result_pin: Cell::new(usize::MAX),
         });
     }
     let recv = walk_attr_path(frame, site.slot, &site.path)?;
-    let (lane, ver, storage, class) = attr_fingerprint_obj(&recv, &site.name, site.store)?;
+    let (lane, ver, storage) = attr_fingerprint_obj(&recv, &site.name, site.store)?;
     // RFC 0071 WS2 — a new-key site has no current value, so its lane
     // came from the stored value; the storage modes must agree.
     if site.new_key {
@@ -2516,7 +2512,6 @@ fn attr_site_guard(
         lane: site.lane,
         ver,
         storage,
-        _class: class,
         last_result_pin: Cell::new(usize::MAX),
     })
 }
@@ -2592,7 +2587,6 @@ fn probe_method_entry(
         min_args,
         ret,
         ver,
-        _class: cls,
     })
 }
 
@@ -2638,7 +2632,7 @@ fn attr_fingerprint_obj(
     obj: &Object,
     name: &str,
     store: bool,
-) -> Option<(JitType, u64, AttrStorage, Rc<TypeObject>)> {
+) -> Option<(JitType, u64, AttrStorage)> {
     use weavepy_compiler::InlineCache as IC;
     let Object::Instance(inst) = obj else {
         return None;
@@ -2669,7 +2663,7 @@ fn attr_fingerprint_obj(
     let slot_val;
     let dict;
     let v: &Object = match storage {
-        AttrStorage::NewKey => return Some((JitType::Unknown, ver, storage, inst.cls())),
+        AttrStorage::NewKey => return Some((JitType::Unknown, ver, storage)),
         AttrStorage::Slot(_) => {
             slot_val = inst.slot_get(name)?;
             &slot_val
@@ -2695,7 +2689,7 @@ fn attr_fingerprint_obj(
         Object::Bytes(_) => JitType::Bytes,
         _ => scalar_lane(v)?,
     };
-    Some((lane, ver, storage, inst.cls()))
+    Some((lane, ver, storage))
 }
 
 /// Drop tier-cache entries whose code object the JIT is the sole real

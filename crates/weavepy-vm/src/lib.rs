@@ -62939,6 +62939,75 @@ assert loop(2000) == 1999000
 
     #[cfg(feature = "jit")]
     #[test]
+    fn jit_version_guards_release_unreachable_classes() {
+        // A peer collection can make gc.collect() return without collecting.
+        // Every lifetime assertion here requires a completed collection.
+        const CHILD: &str = "WEAVEPY_CLASS_GUARD_LIFETIME_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "tests::jit_version_guards_release_unreachable_classes",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .status()
+                    .expect("spawn class-guard lifetime test");
+            assert!(
+                status.success(),
+                "isolated class-guard test failed: {status}"
+            );
+            return;
+        }
+        std::thread::spawn(|| {
+            crate::tier2::force_enable_for_test(2);
+            let source = include_str!("../../../tests/regrtest/test_jit_class_guard_lifetime.py");
+            let (lifetime, replacements) = source
+                .split_once("# New classes can reuse old allocation addresses")
+                .expect("replacement phase marker");
+            let module = parse_module(lifetime).expect("parse lifetime fixture");
+            let code = compile_module(&module).expect("compile lifetime fixture");
+            let mut interp = Interpreter::new();
+            interp.run_module(&code).expect("class lifetime assertions");
+            let globals = {
+                let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+                    panic!("missing main module");
+                };
+                main.dict.clone()
+            };
+            {
+                let globals = globals.borrow();
+                let Some(Object::Dict(drivers)) = globals.get(&crate::object::StrKey("drivers"))
+                else {
+                    panic!("missing retained drivers");
+                };
+                let drivers = drivers.borrow();
+                for kind in ["dict", "slots", "store", "method"] {
+                    let Some(Object::Function(driver)) = drivers.get(&crate::object::StrKey(kind))
+                    else {
+                        panic!("missing {kind} driver");
+                    };
+                    assert!(
+                        crate::tier2::code_compiled_for_test(&driver.code.borrow()),
+                        "{kind} must keep its compiled guard after collection"
+                    );
+                }
+            }
+            let replacements =
+                format!("# New classes can reuse old allocation addresses{replacements}");
+            let module = parse_module(&replacements).expect("parse replacement fixture");
+            let code = compile_module(&module).expect("compile replacement fixture");
+            interp
+                .exec_module_in(&code, globals)
+                .expect("replacement guard assertions");
+        })
+        .join()
+        .expect("class-guard JIT worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
     fn jit_container_attributes_preserve_identity_and_lifetime() {
         // A peer collection can make gc.collect() return without collecting.
         // These in-loop lifetime assertions require an isolated collector.
