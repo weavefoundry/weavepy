@@ -5240,7 +5240,13 @@ unsafe extern "C" fn wpjit_list_append(frame: *mut JitFrame, pin: i64) -> i64 {
         }
         _ => return 1,
     };
-    list.borrow_mut().push(v);
+    // SAFETY: a push runs no code and drops no object, so the guard-free
+    // view (live only while cells are unshared and nothing borrows the
+    // list) ends before anything could borrow it.
+    match unsafe { list.peek_mut() } {
+        Some(items) => items.push(v),
+        None => list.borrow_mut().push(v),
+    }
     0
 }
 
@@ -7495,6 +7501,25 @@ fn next_enumerated_byte(it: &Object) -> NativeBytePair {
     let Object::Iter(it) = it else {
         return NativeBytePair::Unsupported;
     };
+    // Guard-free while cells are unshared: this step runs no code and
+    // touches no cell besides these two, so neither view can meet a
+    // conflicting borrow before it ends with this function.
+    // SAFETY: as above.
+    if let Some(state) = unsafe { it.peek_mut() } {
+        let PyIterator::Enumerate {
+            inner,
+            count,
+            count_big: None,
+        } = state
+        else {
+            return NativeBytePair::Unsupported;
+        };
+        // SAFETY: as above; `inner` is a different cell.
+        return match unsafe { inner.peek_mut() } {
+            Some(source) => step_enumerated_byte(count, source),
+            None => NativeBytePair::Unsupported,
+        };
+    }
     let Ok(mut state) = it.try_borrow_mut() else {
         return NativeBytePair::Unsupported;
     };
@@ -7506,13 +7531,20 @@ fn next_enumerated_byte(it: &Object) -> NativeBytePair {
     else {
         return NativeBytePair::Unsupported;
     };
-    let Some(next_count) = count.checked_add(1) else {
-        return NativeBytePair::Unsupported;
-    };
     let Ok(mut source) = inner.try_borrow_mut() else {
         return NativeBytePair::Unsupported;
     };
-    let PyIterator::Bytes { data, index } = &mut *source else {
+    step_enumerated_byte(count, &mut source)
+}
+
+/// One step of `enumerate(<bytes iterator>)`: both cursors advance
+/// together, or neither does.
+#[inline]
+fn step_enumerated_byte(count: &mut i64, source: &mut PyIterator) -> NativeBytePair {
+    let Some(next_count) = count.checked_add(1) else {
+        return NativeBytePair::Unsupported;
+    };
+    let PyIterator::Bytes { data, index } = source else {
         return NativeBytePair::Unsupported;
     };
     let Some(&byte) = data.get(*index) else {
