@@ -29,6 +29,8 @@ fn compile_first_fn(src: &str) -> CodeObject {
 /// obj-global probe, and optional trained container lanes.
 #[derive(Default)]
 struct Cfg {
+    /// Globals with a specialized callee classification before demotion.
+    globals: Vec<(&'static str, ResolvedGlobal)>,
     /// `(slot, elem lane)` answered by the list probe.
     list: Option<(u32, JitType)>,
     /// `(slot, key lane, value lane)` answered by the dict probe.
@@ -50,6 +52,9 @@ fn analyze_cfg(src: &str, cfg: &Cfg) -> Result<TFunc, JitVerdict> {
 fn analyze_code_cfg(code: &CodeObject, cfg: &Cfg) -> Result<TFunc, JitVerdict> {
     let missing = cfg.missing.clone();
     let mut resolve = |name: &str| -> ResolvedGlobal {
+        if let Some((_, resolution)) = cfg.globals.iter().find(|(key, _)| *key == name) {
+            return *resolution;
+        }
         match name {
             "range" => ResolvedGlobal::RangeBuiltin,
             "enumerate" => ResolvedGlobal::EnumerateBuiltin,
@@ -103,6 +108,104 @@ fn has_op(tf: &TFunc, pred: impl Fn(&TOp) -> bool) -> bool {
     tf.blocks
         .iter()
         .any(|b| b.stmts.iter().any(|s| pred(&s.op)))
+}
+
+#[test]
+fn keyword_constructor_demotes_without_disqualifying_the_loop() {
+    let tf = analyze_cfg(
+        "def k(n):\n    item = Item(value=3)\n    total = 0\n    for i in range(n):\n        total = total + i\n    return total\n",
+        &Cfg {
+            globals: vec![("Item", ResolvedGlobal::PyFunc {
+                token: 0,
+                arg_count: 1,
+                min_args: 0,
+                is_self: false,
+                ret: Some(JitType::Obj),
+                ctor: true,
+            })],
+            ..Cfg::default()
+        },
+    ).expect("keyword setup should leave the numeric loop compilable");
+    assert!(has_op(&tf, |op| matches!(
+        op,
+        TOp::CallDyn {
+            argc: 0,
+            kwc: 1,
+            ..
+        }
+    )));
+    assert!(!has_op(&tf, |op| matches!(op, TOp::CallPyKw { .. })));
+    assert!(!tf.osr_entries.is_empty());
+    assert!(
+        tf.callee_spans.is_empty(),
+        "demoted objects must not reconstruct burned callees"
+    );
+    assert!(tf
+        .global_guards
+        .iter()
+        .any(|g| g.name == "Item" && matches!(g.expect, ResolvedGlobal::ObjGlobal { .. })));
+}
+
+#[test]
+fn nested_keyword_and_positional_constructors_share_the_demoted_global() {
+    let tf = analyze_cfg(
+        "def k():\n    return Item(Item(value=3))\n",
+        &Cfg {
+            globals: vec![(
+                "Item",
+                ResolvedGlobal::PyFunc {
+                    token: 0,
+                    arg_count: 1,
+                    min_args: 0,
+                    is_self: false,
+                    ret: Some(JitType::Obj),
+                    ctor: true,
+                },
+            )],
+            ..Cfg::default()
+        },
+    )
+    .expect("nested constructor calls should retain their original arguments");
+    assert!(has_op(&tf, |op| matches!(
+        op,
+        TOp::CallDyn {
+            argc: 0,
+            kwc: 1,
+            ..
+        }
+    )));
+    assert!(has_op(&tf, |op| matches!(
+        op,
+        TOp::CallDyn {
+            argc: 1,
+            kwc: 0,
+            ..
+        }
+    )));
+    assert_eq!(tf.ret_lane, Some(JitType::Obj));
+    assert!(tf.callee_spans.is_empty());
+    assert_eq!(tf.null_spans.len(), 2);
+}
+
+#[test]
+fn keyword_builtin_callee_keeps_runtime_argument_validation() {
+    let tf = analyze_cfg(
+        "def k(value):\n    return len(obj=value)\n",
+        &Cfg {
+            obj_params: vec![0],
+            ..Cfg::default()
+        },
+    )
+    .expect("the dynamic call must retain len's invalid keyword for runtime validation");
+    assert!(has_op(&tf, |op| matches!(
+        op,
+        TOp::CallDyn {
+            argc: 0,
+            kwc: 1,
+            ..
+        }
+    )));
+    assert!(!has_op(&tf, |op| matches!(op, TOp::ListLen)));
 }
 
 #[test]

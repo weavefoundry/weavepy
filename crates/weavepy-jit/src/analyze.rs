@@ -4463,11 +4463,13 @@ fn step_abstract(
             };
             match resolve_kw_perm(&mark, &names, argc, probes.kw_slot) {
                 Ok(_) => {}
-                Err(JitVerdict::UnsupportedOpcode("CALL_KW (keyword gap)")) => {
-                    // A positional prefix can't represent a skipped default.
-                    // Re-plan this global as a real object and let CallDyn
-                    // bind the original keyword names and current defaults.
-                    return Err(escape_verdict(code, &[&f], "CALL_KW (keyword gap)"));
+                Err(JitVerdict::UnsupportedOpcode(
+                    reason @ ("CALL_KW (keyword gap)" | "CALL_KW (callee kind)"),
+                )) => {
+                    // A positional prefix cannot bind skipped defaults or
+                    // a constructor's keyword arguments. Re-plan this global
+                    // as a real object so CallDyn uses normal keyword binding.
+                    return Err(escape_verdict(code, &[&f], reason));
                 }
                 Err(error) => return Err(error),
             }
