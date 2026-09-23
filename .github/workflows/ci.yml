@@ -248,6 +248,35 @@ jobs:
           target/release/weavepy-bench gate $FLAGS \
             --weavepy=target/release/weavepy \
             | tee bench-report.md
+      - name: TEMP macOS pyaes diagnostics
+        if: always() && matrix.os == 'macos-latest' && env.BASE_WEAVEPY != ''
+        shell: bash
+        run: |
+          sysctl -n machdep.cpu.brand_string hw.model hw.ncpu || true
+          F=crates/weavepy-bench/fixtures/pyaes.py
+          for mode in jit interp; do
+            for bin in target/release/weavepy "$BASE_WEAVEPY"; do
+              ts=""
+              for i in $(seq 11); do
+                if [ $mode = interp ]; then e="WEAVEPY_JIT=0"; else e="WEAVEPY_DIAG=1"; fi
+                t=$(env $e WEAVEPY_BENCH_WORK=400 "$bin" $F | sed 's/.*=//')
+                ts="$ts $((t/1000))"
+              done
+              echo "$mode $([ "$bin" = target/release/weavepy ] && echo head || echo base) us:$ts"
+            done
+          done
+          for bin in target/release/weavepy "$BASE_WEAVEPY"; do
+            echo "== rusage $bin"
+            WEAVEPY_BENCH_WORK=400 /usr/bin/time -l "$bin" $F 2>&1 | grep -E "instructions|cycles|page|context|BENCH" || true
+          done
+          for w in 100 400 1600; do
+            for bin in target/release/weavepy "$BASE_WEAVEPY"; do
+              best=999999999999
+              for i in 1 2 3 4 5; do t=$(WEAVEPY_BENCH_WORK=$w "$bin" $F | sed 's/.*=//'); [ $t -lt $best ] && best=$t; done
+              echo "work=$w $([ "$bin" = target/release/weavepy ] && echo head || echo base) best_us=$((best/1000))"
+            done
+          done
+          WEAVEPY_BENCH_WORK=400 WEAVEPY_JIT_TRACE=1 target/release/weavepy $F 2>&1 | grep -v reject | head -30
       - name: Append bench report to job summary
         if: always()
         shell: bash
