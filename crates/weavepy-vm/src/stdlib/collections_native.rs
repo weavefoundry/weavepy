@@ -505,6 +505,22 @@ fn deque_next(args: &[Object], reverse: bool) -> Result<Object, RuntimeError> {
     Ok(d[slot].clone())
 }
 
+// Only exact integer indices keep these calls within the leaf contract.
+// __index__ on another object must run after publishing the caller's frame.
+fn deque_getitem_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [_, Object::Int(_) | Object::Long(_) | Object::Bool(_)] => Some(deque_getitem(args)),
+        _ => None,
+    }
+}
+
+fn deque_rotate_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [_] | [_, Object::Int(_) | Object::Long(_) | Object::Bool(_)] => Some(deque_rotate(args)),
+        _ => None,
+    }
+}
+
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::default()));
     {
@@ -541,9 +557,9 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             "__next__",
             deque_reverse_iterator_next,
         );
-        // The end operations, length, truth, indexing, and rotation run no
-        // Python code for any argument (they only ever touch the deque's
-        // own slots and list): the leaf burst may call them directly.
+        // The end operations, length, truth, and iterator steps run no
+        // Python code. Indexing and rotation require an argument guard
+        // because index coercion can invoke Python's __index__ protocol.
         for name in [
             "append",
             "appendleft",
@@ -551,13 +567,22 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             "popleft",
             "__len__",
             "__bool__",
-            "__getitem__",
-            "rotate",
             "iterator_next",
             "reverse_iterator_next",
         ] {
             if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
                 crate::leaf_builtins::register(b);
+            }
+        }
+        for (name, fast) in [
+            (
+                "__getitem__",
+                deque_getitem_leaf as crate::leaf_builtins::Fast,
+            ),
+            ("rotate", deque_rotate_leaf as crate::leaf_builtins::Fast),
+        ] {
+            if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
+                crate::leaf_builtins::register_fast(b, fast);
             }
         }
     }

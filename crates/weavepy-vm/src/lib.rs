@@ -62967,6 +62967,33 @@ assert loop(2000) == 1999000
         assert!(compiled > 0, "the fixture must exercise the JIT");
     }
 
+    #[test]
+    fn deque_index_callbacks_see_their_python_caller() {
+        // The Python compiler retains source positions, which the minimal
+        // AST-only `run` helper doesn't supply to its outer module.
+        let source = Object::from_str(include_str!(
+            "../../../tests/regrtest/test_deque_index_callback_frames.py"
+        ))
+        .repr();
+        let out = run(&format!(
+            "exec(compile({source}, 'deque_callback.py', 'exec'))"
+        ));
+        assert!(out.contains("warmed deque callback frame: ok"));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_deque_index_callbacks_see_their_python_caller() {
+        let source = Object::from_str(include_str!(
+            "../../../tests/regrtest/test_deque_index_callback_frames.py"
+        ))
+        .repr();
+        let (out, _, _) = run_jit(&format!(
+            "exec(compile({source}, 'deque_callback.py', 'exec'))"
+        ));
+        assert!(out.contains("warmed deque callback frame: ok"));
+    }
+
     /// RFC 0032 — run `src` with the tier-2 JIT forced on, on a fresh
     /// thread so the thread-local JIT state can't leak into other
     /// tests. Returns `(stdout, frames_compiled, deopts)`.
