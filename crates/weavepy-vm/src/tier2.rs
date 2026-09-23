@@ -12,7 +12,7 @@
 //! boundaries — hence the thread-local state and the plain [`StdRc`].
 
 use crate::shared_value::SharedStr;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc as StdRc;
 
@@ -93,6 +93,10 @@ struct AttrGuard {
     storage: AttrStorage,
     /// Keeps the original guard dependency alive.
     _class: Rc<TypeObject>,
+    /// Advisory index into the current activation's pin table. Guards are
+    /// shared by nested and suspended activations, so every hit must validate
+    /// the actual object's identity in the calling activation's table.
+    last_result_pin: Cell<usize>,
 }
 
 /// RFC 0069 WS1 — one burned-in method-site resolution: the class-
@@ -1962,8 +1966,8 @@ impl Pin {
 type PinTable = Vec<Pin>;
 
 /// RFC 0070 WS1 — hard cap on an activation's pin table. Object-lane
-/// attribute loads append a pin per access (a list traversal appends
-/// one per node), so an unbounded loop needs a bound: at the cap the
+/// attribute loads append pins for changing results (a list traversal
+/// appends one per node), so an unbounded loop needs a bound: at the cap the
 /// access deopts, the activation exits, and the re-entry (usually OSR
 /// at the loop header) starts over with a fresh table.
 const RUNTIME_PIN_CAP: usize = 1 << 16;
@@ -2429,6 +2433,7 @@ fn attr_site_guard(
             ver: cls.attr_version.get(),
             storage: AttrStorage::Indexed(*field_idx),
             _class: cls,
+            last_result_pin: Cell::new(usize::MAX),
         });
     }
     // RFC 0073 WS1 — the *self-body* residue: the receiver is live but
@@ -2456,6 +2461,7 @@ fn attr_site_guard(
             ver,
             storage: AttrStorage::Indexed(field_idx),
             _class: inst.cls(),
+            last_result_pin: Cell::new(usize::MAX),
         });
     }
     let recv = walk_attr_path(frame, site.slot, &site.path)?;
@@ -2476,6 +2482,7 @@ fn attr_site_guard(
         ver,
         storage,
         _class: class,
+        last_result_pin: Cell::new(usize::MAX),
     })
 }
 
@@ -6449,6 +6456,64 @@ fn attr_class_ok(inst: &crate::types::PyInstance, ver: u64) -> bool {
     inst.cls_raw().attr_version.get() == ver
 }
 
+/// Reuse a pin only when it still owns the exact attribute result. A hint
+/// from another activation can be out of range or name an unrelated object.
+/// No equality protocol runs here, and the hint itself owns no object.
+#[inline]
+fn attr_result_pin(value: &Object, pins: &[Pin], hint: usize) -> Option<u64> {
+    let Pin::Obj(pinned) = pins.get(hint)? else {
+        return None;
+    };
+    let same = match (value, pinned) {
+        (Object::Instance(a), Object::Instance(b)) => Rc::ptr_eq(a, b),
+        (Object::Str(a), Object::Str(b)) => SharedStr::ptr_eq(a, b),
+        (Object::Bytes(a), Object::Bytes(b)) => crate::shared_value::SharedSlice::ptr_eq(a, b),
+        _ => false,
+    };
+    same.then_some(hint as u64)
+}
+
+#[cfg(test)]
+mod attr_pin_tests {
+    use super::*;
+    use crate::shared_value::SharedSlice;
+
+    #[test]
+    fn stale_hints_check_the_current_activation_and_object_identity() {
+        let class = TypeObject::new_user("PinValue", vec![], DictData::default()).unwrap();
+        let a = Object::Instance(Rc::new(crate::types::PyInstance::new(class.clone())));
+        let b = Object::Instance(Rc::new(crate::types::PyInstance::new(class)));
+        let outer = vec![Pin::Obj(a.clone()), Pin::Obj(b.clone())];
+        let inner = vec![Pin::Obj(b.clone()), Pin::Obj(a.clone())];
+        assert_eq!(attr_result_pin(&a, &outer, 0), Some(0));
+        assert_eq!(attr_result_pin(&a, &inner, 0), None);
+        assert_eq!(attr_result_pin(&a, &inner, 1), Some(1));
+        assert_eq!(attr_result_pin(&a, &outer, 1), None);
+        assert_eq!(attr_result_pin(&a, &[], 0), None);
+        assert_eq!(attr_result_pin(&a, &outer, usize::MAX), None);
+    }
+
+    #[test]
+    fn equal_text_and_bytes_need_distinct_pins() {
+        let a = Object::Str(SharedStr::from("same content"));
+        let b = Object::Str(SharedStr::from("same content"));
+        let c = Object::Bytes(SharedSlice::from(b"same content".as_slice()));
+        let d = Object::Bytes(SharedSlice::from(b"same content".as_slice()));
+        let pins = vec![Pin::Obj(a.clone()), Pin::Obj(c.clone())];
+        assert_eq!(attr_result_pin(&a, &pins, 0), Some(0));
+        assert_eq!(attr_result_pin(&b, &pins, 0), None);
+        assert_eq!(attr_result_pin(&c, &pins, 1), Some(1));
+        assert_eq!(attr_result_pin(&d, &pins, 1), None);
+        assert_eq!(attr_result_pin(&a, &pins, 1), None);
+        let Object::Str(text) = &a else {
+            unreachable!()
+        };
+        assert_eq!(SharedStr::strong_count(text), 2);
+        drop(pins);
+        assert_eq!(SharedStr::strong_count(text), 1);
+    }
+}
+
 /// The `wpjit_attr_get` helper (RFC 0065 WS5): read one scalar
 /// attribute of a pinned instance through the burned-in site guard —
 /// class identity + attr-version, indexed instance-dict hit with name
@@ -6478,18 +6543,21 @@ unsafe extern "C" fn wpjit_attr_get(frame: *mut JitFrame, pin: i64, site: i64) -
             return 1;
         }
         // RFC 0070 WS1 — the nullable object lane: `None` is the
-        // machine value `-1`; an instance value gets a fresh runtime
-        // pin. Any other value drifted from the compiled lane and
-        // deopts.
+        // machine value `-1`; an instance value reuses its last pin
+        // when identity still matches, or gets a fresh runtime pin.
+        // Any other value drifted from the compiled lane and deopts.
+        let pinned_result = |v: &Object| {
+            attr_result_pin(v, &ctx.pins, g.last_result_pin.get()).ok_or_else(|| v.clone())
+        };
         let classify = |v: &Object| -> Option<Result<u64, Object>> {
             match (g.lane, v) {
                 (JitType::Obj, Object::None) => Some(Ok(u64::MAX)),
-                (JitType::Obj, Object::Instance(_)) => Some(Err(v.clone())),
+                (JitType::Obj, Object::Instance(_)) => Some(pinned_result(v)),
                 (JitType::Obj, _) => None,
                 // RFC 0071 WS6 — `str`/`bytes` read lanes pin the
                 // value; a drifted type deopts like any lane miss.
                 (JitType::Str, Object::Str(_)) | (JitType::Bytes, Object::Bytes(_)) => {
-                    Some(Err(v.clone()))
+                    Some(pinned_result(v))
                 }
                 (JitType::Str | JitType::Bytes, _) => None,
                 _ => pack(v, g.lane).map(Ok),
@@ -6545,8 +6613,10 @@ unsafe extern "C" fn wpjit_attr_get(frame: *mut JitFrame, pin: i64, site: i64) -
             if ctx.pins.len() >= RUNTIME_PIN_CAP {
                 return 1;
             }
-            jf.ret_bits = ctx.pins.len() as u64;
+            let next = ctx.pins.len();
             ctx.pins.push(Pin::Obj(obj));
+            ctx.attr_guards[site as usize].last_result_pin.set(next);
+            jf.ret_bits = next as u64;
             0
         }
     }
