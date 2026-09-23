@@ -125,11 +125,69 @@ struct MethodEntry {
 /// One slot per method token (parallel to `cf.method_sites`).
 type MethodTable = Vec<MethodEntry>;
 
-/// RFC 0069 WS2 — the snapshot of one burned-in math intrinsic:
-/// `(global name, attr, function object)`. The entry check and the
-/// per-stride poll re-resolve `name.attr` and require identity with
-/// the snapshotted function (module dicts are mutable).
-type MathTable = Vec<(String, String, Object)>;
+/// One burned-in math intrinsic. The ordinary global snapshot guards the
+/// module's identity; this guard reads its current attribute by a checked
+/// dictionary index. Neither a value replacement nor a moved key is hidden.
+struct MathGuard {
+    dict: Rc<GilRefCell<DictData>>,
+    attr: SharedStr,
+    hash: i64,
+    key_idx: std::cell::Cell<usize>,
+    expected: Object,
+}
+
+type MathTable = Vec<MathGuard>;
+
+impl MathGuard {
+    fn snapshot(module: &Object, attr: &str, expected: Object) -> Option<Self> {
+        let Object::Module(module) = module else {
+            return None;
+        };
+        let dict = module.dict.borrow();
+        let (key_idx, key, value) = dict.get_full(&StrKey(attr))?;
+        if !value.is_same(&expected) {
+            return None;
+        }
+        let Object::Str(name) = &key.0 else {
+            return None;
+        };
+        Some(Self {
+            dict: module.dict.clone(),
+            attr: name.clone(),
+            hash: SharedStr::hash_cached(name),
+            key_idx: std::cell::Cell::new(key_idx),
+            expected,
+        })
+    }
+
+    #[inline]
+    fn holds(&self) -> bool {
+        // SAFETY: tier 2 runs under the GIL, and this check invokes no Python
+        // callbacks. The guard's owner keeps the dictionary alive.
+        let Some(dict) = (unsafe { self.dict.peek() }) else {
+            return false;
+        };
+        if let Some((key, value)) = dict.get_index(self.key_idx.get()) {
+            if key_is(key, &self.attr) {
+                return value.is_same(&self.expected);
+            }
+        }
+        // Deleting an earlier key moves indices without changing the math
+        // function. Refresh the hint with a callback-free name probe.
+        let probe = crate::object::LeafNameProbe::new(&self.attr, self.hash);
+        let found = dict.get_full(&probe);
+        if probe.saw_exotic() {
+            return false;
+        }
+        match found {
+            Some((index, _, value)) if value.is_same(&self.expected) => {
+                self.key_idx.set(index);
+                true
+            }
+            _ => false,
+        }
+    }
+}
 
 /// The burned-in globals a compilation guards on (`name` → the object
 /// it resolved to at compile time), with the namespaces' mutation
@@ -1013,8 +1071,14 @@ impl JitState {
                 // resolves here too.
                 let mut math_tbl: MathTable = Vec::with_capacity(cf.math_guards.len());
                 for g in &cf.math_guards {
-                    match math_attr(&g.name, &g.attr) {
-                        Some(f) => math_tbl.push((g.name.clone(), g.attr.clone(), f)),
+                    let guard = math_attr(&g.name, &g.attr).and_then(|expected| {
+                        // Every math module is also an identity-guarded global.
+                        // Reuse that snapshot instead of resolving it per call.
+                        let (_, module) = snap.iter().find(|(name, _)| name == &g.name)?;
+                        MathGuard::snapshot(module, &g.attr, expected)
+                    });
+                    match guard {
+                        Some(guard) => math_tbl.push(guard),
                         None => break,
                     }
                 }
@@ -3031,16 +3095,8 @@ fn guards_hold(
             _ => return false,
         }
     }
-    for (name, attr, expected) in math {
-        let ok = match resolve_plain_dicts(interp, globals, builtins, name) {
-            Some(Object::Module(m)) => m
-                .dict
-                .borrow()
-                .get(&StrKey(attr))
-                .is_some_and(|cur| cur.is_same(expected)),
-            _ => false,
-        };
-        if !ok {
+    for guard in math {
+        if !guard.holds() {
             return false;
         }
     }
@@ -3354,7 +3410,8 @@ fn native_stat(f: impl FnOnce(&NativeCallStats)) {
 const SCALAR_LEAF_SLOTS: usize = 32;
 
 /// Enter a certified scalar leaf with bounded stack storage. The caller
-/// has validated argument/default lanes and charged the recursion tick.
+/// has validated argument/default lanes, global and math guards, and charged
+/// the recursion tick.
 ///
 /// # Safety
 ///
@@ -3396,8 +3453,9 @@ unsafe fn enter_scalar_leaf(nc: &NativeCallee, jf: &JitFrame, argc: usize) -> Op
         call_args: std::ptr::null_mut(),
         call_tags: std::ptr::null_mut(),
     };
-    // SAFETY: the engine's scalar-leaf allowlist excludes every helper,
-    // pin, poll, and call. All buffers fit and the native entry is live.
+    // SAFETY: the engine's scalar-leaf allowlist excludes every contextual
+    // helper, pin, poll, and Python call. Its math helpers need only scalar
+    // arguments. All buffers fit and the guarded native entry is live.
     let status = unsafe { nc.cf.enter(&raw mut frame) };
     (status == JitStatus::Returned).then_some((frame.ret_bits, frame.ret_tag))
 }
@@ -9133,7 +9191,7 @@ fn rebuild_stack(
         let f = entry
             .math
             .get(s.token as usize)
-            .map_or(Object::None, |(_, _, f)| f.clone());
+            .map_or(Object::None, |guard| guard.expected.clone());
         inserts.push((s.interp_depth, f));
         inserts.push((s.interp_depth + 1, Object::Unbound));
     }
@@ -9458,7 +9516,7 @@ fn park_plan(frame: &super::Frame, entry: &CompiledEntry, jf: &JitFrame) -> Opti
         let f = entry
             .math
             .get(s.token as usize)
-            .map_or(Object::None, |(_, _, f)| f.clone());
+            .map_or(Object::None, |guard| guard.expected.clone());
         inserts.push((s.interp_depth, PlanSlot::Obj(f)));
         inserts.push((s.interp_depth + 1, PlanSlot::Obj(Object::Unbound)));
     }

@@ -1,4 +1,4 @@
-//! Scalar-leaf certification excludes helpers and nonlocal effects.
+//! Scalar-leaf certification excludes contextual helpers and nonlocal effects.
 use super::is_scalar_leaf;
 use crate::ir::{ArithKind, TBlock, TFunc, TOp, TStmt, TTerm};
 use crate::value::JitType;
@@ -134,6 +134,77 @@ fn scalar_leaf_returns_and_deopts_with_no_embedder_context() {
             assert_eq!(frame.stack_len, 2);
             assert_eq!(&spill[..2], &[a as u64, b as u64]);
             assert_eq!(&tags[..2], &[SlotTag::Int as u32; 2]);
+        }
+    }
+}
+
+#[test]
+fn scalar_math_leaves_need_no_embedder_context() {
+    use crate::ir::{GlobalGuard, MathFunc, ResolvedGlobal};
+    use crate::runtime::{JitFrame, JitStatus, SlotTag};
+
+    extern "C" fn sin(x: f64) -> f64 {
+        x.sin()
+    }
+    extern "C" fn cos(x: f64) -> f64 {
+        x.cos()
+    }
+    extern "C" fn unused_binary(_: f64, _: f64) -> f64 {
+        panic!("a scalar math leaf must not call a binary helper")
+    }
+    crate::runtime::register_math_helpers(sin, cos, unused_binary, unused_binary);
+    let mut engine = super::JitEngine::new().expect("host ISA");
+    for (op, input, expected) in [
+        (MathFunc::Sqrt, 4.0_f64, Some(2.0_f64)),
+        (MathFunc::Sqrt, -0.0, Some(-0.0)),
+        (MathFunc::Sqrt, -1.0, None),
+        (MathFunc::Fabs, -3.0, Some(3.0)),
+        (MathFunc::Sin, 0.5, Some(0.5_f64.sin())),
+        (MathFunc::Cos, 0.5, Some(0.5_f64.cos())),
+        (MathFunc::Sin, f64::INFINITY, None),
+        (MathFunc::Cos, f64::NEG_INFINITY, None),
+    ] {
+        let mut tf = function(&[TOp::LoadLocal(0), TOp::MathIntrinsic(op)]);
+        tf.local_types = vec![Some(JitType::Float), Some(JitType::Float)];
+        tf.ret_lane = Some(JitType::Float);
+        // The embedder validates this metadata before entering a leaf.
+        tf.global_guards.push(GlobalGuard {
+            name: "math".to_owned(),
+            expect: ResolvedGlobal::MathModule,
+        });
+        let cf = engine.compile_tfunc(&tf).expect("compile math leaf");
+        assert!(cf.is_scalar_leaf());
+        let mut locals = [input.to_bits(), 0];
+        let mut spill = [0u64; 3];
+        let mut tags = [0u32; 3];
+        let mut frame = JitFrame {
+            locals: locals.as_mut_ptr(),
+            n_locals: 2,
+            entry_pc: 0,
+            ret_bits: 0,
+            ret_tag: 0,
+            deopt_pc: 0,
+            stack_spill: spill.as_mut_ptr(),
+            stack_tags: tags.as_mut_ptr(),
+            stack_len: 0,
+            stack_cap: 3,
+            ctx: std::ptr::null_mut(),
+            call_args: std::ptr::null_mut(),
+            call_tags: std::ptr::null_mut(),
+        };
+        // SAFETY: only certified scalar operations run, buffers fit, and
+        // the context-free math helpers were registered before compilation.
+        let status = unsafe { cf.enter(&raw mut frame) };
+        if let Some(value) = expected {
+            assert_eq!(status, JitStatus::Returned);
+            assert_eq!(frame.ret_tag, SlotTag::Float as u32);
+            assert_eq!(frame.ret_bits, value.to_bits());
+        } else {
+            assert_eq!(status, JitStatus::Deopt);
+            assert_eq!(frame.deopt_pc, 1);
+            assert_eq!(frame.stack_len, 1);
+            assert_eq!(spill[0], input.to_bits());
+            assert_eq!(tags[0], SlotTag::Float as u32);
         }
     }
 }

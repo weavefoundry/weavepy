@@ -122,8 +122,10 @@ pub struct CompiledFrame {
 
 impl CompiledFrame {
     /// Whether this frame has one bounded block of pure scalar operations.
-    /// It cannot call helpers, access pins or namespaces, or run a poll. Its
-    /// only exits are a scalar return or a side-effect-free numeric deopt.
+    /// It cannot access pins or namespaces or run a poll. Its only helpers
+    /// are context-free math intrinsics; the caller must validate global and
+    /// math guards before entry. Its exits are a scalar return or a numeric
+    /// deopt after which the pure body can be restarted.
     #[must_use]
     pub fn is_scalar_leaf(&self) -> bool {
         self.scalar_leaf
@@ -571,7 +573,6 @@ fn is_scalar_leaf(tfunc: &TFunc) -> bool {
         && tfunc.local_types.iter().all(|ty| {
             matches!(ty, None | Some(JitType::Int | JitType::Bool | JitType::Float))
         })
-        && tfunc.global_guards.is_empty()
         && tfunc.range_loops.is_empty()
         && tfunc.list_loops.is_empty()
         && tfunc.iter_loops.is_empty()
@@ -584,8 +585,6 @@ fn is_scalar_leaf(tfunc: &TFunc) -> bool {
         && tfunc.method_sites.is_empty()
         && tfunc.str_method_sites.is_empty()
         && tfunc.str_method_spans.is_empty()
-        && tfunc.math_guards.is_empty()
-        && tfunc.math_spans.is_empty()
         && tfunc.null_spans.is_empty()
         && tfunc.osr_entries.is_empty()
         && tfunc.max_call_args == 0
@@ -627,6 +626,12 @@ fn is_scalar_leaf(tfunc: &TFunc) -> bool {
                     | TOp::SwapN { .. }
                     | TOp::IntToFloatTos { .. }
                     | TOp::IntToFloatSecond { .. }
+                    | TOp::MathIntrinsic(
+                        crate::ir::MathFunc::Sqrt
+                            | crate::ir::MathFunc::Fabs
+                            | crate::ir::MathFunc::Sin
+                            | crate::ir::MathFunc::Cos
+                    )
             )
         })
 }
