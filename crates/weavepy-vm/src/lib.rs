@@ -63237,6 +63237,95 @@ assert loop(2000) == 1999000
         .expect("getter-path worker");
     }
 
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_dynamic_attribute_results_keep_their_owners() {
+        const CHILD: &str = "WEAVEPY_ATTRIBUTE_OWNER_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::jit_dynamic_attribute_results_keep_their_owners",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("spawn attribute-owner test");
+            assert!(status.success(), "attribute-owner test failed: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                crate::tier2::force_enable_for_test(2);
+                let source =
+                    include_str!("../../../tests/regrtest/test_jit_dynamic_attribute_ownership.py");
+                let (warmup, mutations) = source.split_once("# OWNERSHIP MUTATIONS:").unwrap();
+                let module = parse_module(warmup).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    warmup,
+                    "attribute_ownership_warmup.py",
+                )
+                .unwrap();
+                let mut interp = Interpreter::new();
+                interp
+                    .run_module(&code)
+                    .expect("attribute ownership warmup");
+                let reads = crate::tier2::dyn_attr_native_reads_for_test();
+                for kind in [1, 2, 3, 4] {
+                    assert!(
+                        reads[kind] > 1000,
+                        "native ownership path {kind}: {reads:?}"
+                    );
+                }
+                let globals = {
+                    let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+                        panic!("missing main module");
+                    };
+                    main.dict.clone()
+                };
+                {
+                    let globals = globals.borrow();
+                    for name in [
+                        "read_self",
+                        "read_list",
+                        "read_dict",
+                        "read_tuple",
+                        "read_text",
+                        "read_none",
+                        "read_class",
+                        "read_module",
+                        "capture_list",
+                    ] {
+                        let Some(Object::Function(reader)) =
+                            globals.get(&crate::object::StrKey(name))
+                        else {
+                            panic!("missing {name}");
+                        };
+                        assert!(
+                            crate::tier2::code_compiled_for_test(&reader.code.borrow()),
+                            "{name} must compile before its fallback case"
+                        );
+                    }
+                }
+                let mutations = format!("# OWNERSHIP MUTATIONS:{mutations}");
+                let module = parse_module(&mutations).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    &mutations,
+                    "attribute_ownership_mutations.py",
+                )
+                .unwrap();
+                interp
+                    .exec_module_in(&code, globals)
+                    .expect("attribute ownership mutations");
+            })
+            .expect("spawn attribute-owner worker")
+            .join()
+            .expect("attribute-owner worker");
+    }
+
     #[test]
     fn class_key_callbacks_publish_caller_frame() {
         const CHILD: &str = "WEAVEPY_CLASS_KEY_FRAME_TEST_CHILD";

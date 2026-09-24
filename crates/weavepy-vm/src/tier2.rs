@@ -7542,17 +7542,25 @@ unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i6
     let jf = unsafe { &mut *frame };
     #[allow(clippy::cast_ptr_alignment)]
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
-    let Some(receiver) = ctx.pins.get(pin as usize).map(Pin::to_object) else {
-        return 3;
+    // An object pin already owns the receiver for the entire callback-free
+    // lookup. Only the specialized list pin needs a temporary Object wrapper.
+    let temporary_receiver;
+    let receiver = match ctx.pins.get(pin as usize) {
+        Some(Pin::Obj(receiver)) => receiver,
+        Some(pin) => {
+            temporary_receiver = pin.to_object();
+            &temporary_receiver
+        }
+        None => return 3,
     };
     let Ok(name_idx) = u32::try_from(name) else {
         return 3;
     };
     // SAFETY: the activation retains the code object until native return.
     let code = unsafe { &*ctx.code_ptr };
-    let (value, kind) = match &receiver {
+    let (value, kind) = match receiver {
         Object::Instance(inst) if inst.cls_raw().native_kind.get() == 0 => (
-            super::Interpreter::leaf_load_attr_recv(code, &receiver, jf.deopt_pc, name_idx),
+            super::Interpreter::leaf_load_attr_recv(code, receiver, jf.deopt_pc, name_idx),
             0,
         ),
         Object::Type(cls) if super::Interpreter::plain_metaclass(cls) => (
@@ -7560,7 +7568,7 @@ unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i6
             1,
         ),
         Object::Module(module) if crate::object::module_class(module).is_none() => (
-            super::Interpreter::leaf_load_attr_recv(code, &receiver, jf.deopt_pc, name_idx),
+            super::Interpreter::leaf_load_attr_recv(code, receiver, jf.deopt_pc, name_idx),
             2,
         ),
         // Exact built-in values have no instance overrides. Their method
@@ -7584,7 +7592,7 @@ unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i6
             let Some(name) = code.names.get(name_idx as usize) else {
                 return 3;
             };
-            let method = crate::builtins::lookup_method(&receiver, name).map(|method| {
+            let method = crate::builtins::lookup_method(receiver, name).map(|method| {
                 if matches!(&method, Object::Builtin(b) if !b.binds_instance) {
                     method
                 } else {
@@ -7606,7 +7614,7 @@ unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i6
             let interp = unsafe { &*ctx.interp };
             // SAFETY: the activation retains this thread's depth cell.
             let depth = unsafe { (*ctx.depth_cell).get() };
-            let Some(value) = interp.leaf_getter_read(code, &receiver, name_idx, depth) else {
+            let Some(value) = interp.leaf_getter_read(code, receiver, name_idx, depth) else {
                 return 3;
             };
             (value, 4)
@@ -7619,20 +7627,30 @@ unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i6
         ctx.parked = Some(value);
         return 2;
     }
-    if let Some(bits) = pin_any(value.clone(), &mut ctx.pins) {
-        jf.ret_bits = bits;
-        #[cfg(test)]
-        DYN_ATTR_NATIVE_READS.with(|reads| {
-            let mut counts = reads.get();
-            counts[kind] += 1;
-            reads.set(counts);
-        });
-        #[cfg(not(test))]
-        let _ = kind;
-        return 0;
-    }
-    ctx.parked = Some(value);
-    2
+    // Consume the completed value once. On cap pressure retain that same
+    // value for the interpreter; None still uses its allocation-free sentinel.
+    let bits = match value {
+        Object::None => u64::MAX,
+        value if ctx.pins.len() < RUNTIME_PIN_CAP => {
+            let index = ctx.pins.len();
+            ctx.pins.push(Pin::Obj(value));
+            index as u64
+        }
+        value => {
+            ctx.parked = Some(value);
+            return 2;
+        }
+    };
+    jf.ret_bits = bits;
+    #[cfg(test)]
+    DYN_ATTR_NATIVE_READS.with(|reads| {
+        let mut counts = reads.get();
+        counts[kind] += 1;
+        reads.set(counts);
+    });
+    #[cfg(not(test))]
+    let _ = kind;
+    0
 }
 
 /// The `wpjit_dyn_attr_set` helper (RFC 0074 WS4): the interpreter's
