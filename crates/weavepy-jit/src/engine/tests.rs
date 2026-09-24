@@ -900,3 +900,196 @@ fn cached_attribute_chains_keep_native_fallback_and_exact_exits() {
     assert!(s.chains.is_empty());
     assert_eq!((s.singles, s.dynamic.len()), (1, 1));
 }
+
+#[test]
+fn adjacent_scalar_reads_share_only_a_guarded_value() {
+    use crate::ir::{AttrSiteMeta, CalleeSpanMeta, CmpKind};
+    use crate::runtime::{JitFrame, JitStatus, SlotTag};
+    const CHILD: &str = "WEAVEPY_REPEATED_SCALAR_LOWERING_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "engine::tests::adjacent_scalar_reads_share_only_a_guarded_value",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("spawn isolated helper test");
+        assert!(status.success(), "repeated-read helper test: {status}");
+        return;
+    }
+    #[derive(Default)]
+    struct State {
+        calls: usize,
+        bits: u64,
+        fail: bool,
+    }
+    thread_local! { static STATE: std::cell::RefCell<State> = std::cell::RefCell::new(State::default()); }
+    unsafe extern "C" fn get(frame: *mut JitFrame, _: i64, _: i64) -> i64 {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.calls += 1;
+            if state.fail {
+                return 1;
+            }
+            // SAFETY: the caller retains the test frame through native return.
+            unsafe {
+                (*frame).ret_bits = state.bits;
+            }
+            0
+        })
+    }
+    unsafe extern "C" fn unused(_: *mut JitFrame, _: i64, _: i64) -> i64 {
+        1
+    }
+    crate::runtime::register_attr_helpers(get, unused);
+    fn repeated(lane: JitType) -> TFunc {
+        let mut f = function(&[
+            TOp::LoadLocal(0),
+            TOp::AttrGet { site: 0, out: lane },
+            TOp::LoadLocal(0),
+            TOp::AttrGet { site: 1, out: lane },
+            if lane == JitType::Float {
+                TOp::FloatArith(ArithKind::Mul)
+            } else {
+                TOp::IntArith(ArithKind::Mul)
+            },
+        ]);
+        f.max_stack = 3;
+        f.local_types[0] = Some(JitType::Obj);
+        f.ret_lane = Some(if lane == JitType::Bool {
+            JitType::Int
+        } else {
+            lane
+        });
+        f.attr_sites = vec![
+            AttrSiteMeta {
+                slot: 0,
+                path: vec![],
+                name: "value".into(),
+                lane,
+                store: false,
+                new_key: false,
+                ctor: None,
+                self_ctor: None
+            };
+            2
+        ];
+        f
+    }
+    fn run(
+        engine: &mut super::JitEngine,
+        f: &TFunc,
+        bits: u64,
+        expected: u64,
+        calls: usize,
+        fail: bool,
+    ) {
+        let compiled = engine.compile_tfunc(f).expect("compile repeated read");
+        STATE.with(|state| {
+            *state.borrow_mut() = State {
+                calls: 0,
+                bits,
+                fail,
+            }
+        });
+        let mut locals = [7u64, 9];
+        let mut spill = [0u64; 4];
+        let mut tags = [0u32; 4];
+        let mut frame = JitFrame {
+            locals: locals.as_mut_ptr(),
+            n_locals: 2,
+            entry_pc: 0,
+            ret_bits: 0,
+            ret_tag: 0,
+            deopt_pc: 0,
+            stack_spill: spill.as_mut_ptr(),
+            stack_tags: tags.as_mut_ptr(),
+            stack_len: 0,
+            stack_cap: 4,
+            ctx: std::ptr::null_mut(),
+            call_args: std::ptr::null_mut(),
+            call_tags: std::ptr::null_mut(),
+        };
+        // SAFETY: the engine, buffers, and registered helper outlive this call.
+        let status = unsafe { compiled.enter(&raw mut frame) };
+        if fail {
+            assert_eq!(status, JitStatus::Deopt);
+            assert_eq!(frame.deopt_pc, 1);
+            assert_eq!(frame.stack_len, 1);
+            assert_eq!(spill[0], 7);
+            assert_eq!(tags[0], SlotTag::ObjPin as u32);
+        } else {
+            assert_eq!(status, JitStatus::Returned);
+            assert_eq!(frame.ret_bits, expected);
+        }
+        assert_eq!(STATE.with(|state| state.borrow().calls), calls);
+    }
+    let mut engine = super::JitEngine::new().expect("host ISA");
+    let f = repeated(JitType::Int);
+    run(&mut engine, &f, 7, 49, 1, false);
+    run(&mut engine, &f, 7, 0, 1, true);
+    run(
+        &mut engine,
+        &repeated(JitType::Float),
+        1.5f64.to_bits(),
+        2.25f64.to_bits(),
+        1,
+        false,
+    );
+    run(&mut engine, &repeated(JitType::Bool), 1, 1, 1, false);
+    let mut equality = repeated(JitType::Float);
+    equality.blocks[0].stmts[4].op = TOp::FloatCmp(CmpKind::Eq);
+    equality.ret_lane = Some(JitType::Bool);
+    run(&mut engine, &equality, 1.5f64.to_bits(), 1, 1, false);
+    run(&mut engine, &equality, f64::NAN.to_bits(), 0, 1, false);
+
+    let mut changed = f.clone();
+    changed.attr_sites[1].name = "other".into();
+    run(&mut engine, &changed, 7, 49, 2, false);
+    let mut changed = f.clone();
+    changed.attr_sites[1].slot = 1;
+    changed.blocks[0].stmts[2].op = TOp::LoadLocal(1);
+    changed.local_types[1] = Some(JitType::Obj);
+    run(&mut engine, &changed, 7, 49, 2, false);
+    let mut changed = f.clone();
+    for stmt in &mut changed.blocks[0].stmts {
+        stmt.pc *= 2;
+    }
+    run(&mut engine, &changed, 7, 49, 2, false);
+    let mut changed = f.clone();
+    for site in &mut changed.attr_sites {
+        site.path.push("child".into());
+    }
+    run(&mut engine, &changed, 7, 49, 2, false);
+    let mut changed = f.clone();
+    changed.null_spans.push(CalleeSpanMeta {
+        live_from: 2,
+        live_to: 6,
+        interp_depth: 0,
+        token: 0,
+    });
+    run(&mut engine, &changed, 7, 49, 2, false);
+    let mut changed = f.clone();
+    changed.blocks[0].stmts.insert(
+        2,
+        TStmt {
+            pc: 2,
+            op: TOp::LoadLocal(1),
+        },
+    );
+    changed.blocks[0].stmts.insert(
+        3,
+        TStmt {
+            pc: 3,
+            op: TOp::Pop,
+        },
+    );
+    for (i, stmt) in changed.blocks[0].stmts.iter_mut().enumerate() {
+        stmt.pc = i as u32;
+    }
+    run(&mut engine, &changed, 7, 49, 2, false);
+    let mut changed = repeated(JitType::Obj);
+    changed.blocks[0].stmts[4].op = TOp::Pop;
+    run(&mut engine, &changed, 7, 7, 2, false);
+}

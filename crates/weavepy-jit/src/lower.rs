@@ -352,6 +352,17 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let mut i = 0;
         while i < block.stmts.len() {
             let stmt = block.stmts[i];
+            if let Some(window) = block.stmts.get(i..i + 4) {
+                if self.repeated_scalar_read(window) {
+                    self.emit_stmt(window[0]);
+                    self.emit_stmt(window[1]);
+                    // The first guarded read establishes a callback-free scalar
+                    // value. The second local load cannot change the receiver.
+                    self.vstack.push(*self.vstack.last().expect("scalar read"));
+                    i += 4;
+                    continue;
+                }
+            }
             if cached_chain_helper != 0
                 && matches!(
                     stmt.op,
@@ -806,6 +817,56 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .store(trusted, tag, self.frame_ptr, OFF_RET_TAG);
         let status = self.b.ins().iconst(types::I64, JitStatus::Returned as i64);
         self.b.ins().return_(&[status]);
+    }
+
+    /// Reuse only an adjacent, identical numeric field read. No calls, stores,
+    /// polling points, block boundaries, or erased NULL markers may intervene.
+    fn repeated_scalar_read(&self, stmts: &[TStmt]) -> bool {
+        let [TStmt {
+            op: TOp::LoadLocal(first),
+            ..
+        }, TStmt {
+            op: TOp::AttrGet { site: a, out: lane },
+            ..
+        }, TStmt {
+            op: TOp::LoadLocal(second),
+            ..
+        }, TStmt {
+            op: TOp::AttrGet {
+                site: b,
+                out: other,
+            },
+            ..
+        }] = stmts
+        else {
+            return false;
+        };
+        if first != second
+            || lane != other
+            || !matches!(lane, JitType::Int | JitType::Float | JitType::Bool)
+        {
+            return false;
+        }
+        let (Some(a), Some(b)) = (
+            self.tfunc.attr_sites.get(*a as usize),
+            self.tfunc.attr_sites.get(*b as usize),
+        ) else {
+            return false;
+        };
+        a == b
+            && a.slot == *first
+            && a.path.is_empty()
+            && a.lane == *lane
+            && !a.store
+            && !a.new_key
+            && stmts.iter().enumerate().all(|(offset, stmt)| {
+                stmts[0].pc.checked_add(offset as u32) == Some(stmt.pc)
+                    && !self
+                        .tfunc
+                        .null_spans
+                        .iter()
+                        .any(|span| span.live_from == stmt.pc || span.live_to == stmt.pc)
+            })
     }
 
     fn emit_stmt(&mut self, stmt: TStmt) {

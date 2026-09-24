@@ -44,7 +44,7 @@ def execution_context() -> dict:
                         "WEAVEPY_CLASS_CACHE_WARM", "WEAVEPY_CHAIN_DEPTH",
                         "WEAVEPY_CHAIN_LAYOUT", "WEAVEPY_CHAIN_FALLBACK",
                         "WEAVEPY_DYNAMIC_ATTRIBUTE_KIND", "WEAVEPY_GENERATOR_RESUME_KIND",
-                        "WEAVEPY_IMPORT_WORK_KIND")
+                        "WEAVEPY_IMPORT_WORK_KIND", "WEAVEPY_REPEATED_SCALAR_KIND")
         },
     }
 

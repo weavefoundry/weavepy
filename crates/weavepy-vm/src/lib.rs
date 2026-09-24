@@ -63054,6 +63054,106 @@ assert loop(2000) == 1999000
 
     #[cfg(feature = "jit")]
     #[test]
+    fn jit_repeated_scalar_attribute_reads_preserve_fallbacks() {
+        const CHILD: &str = "WEAVEPY_REPEATED_SCALAR_VM_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::jit_repeated_scalar_attribute_reads_preserve_fallbacks",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("spawn scalar-read test");
+            assert!(status.success(), "scalar-read test failed: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                crate::tier2::force_enable_for_test(1);
+                crate::tier2::note_startup_finished();
+                let source =
+                    include_str!("../../../tests/regrtest/test_repeated_scalar_attributes.py");
+                let (warmup, mutations) = source
+                    .split_once("# REPEATED ATTRIBUTE MUTATIONS:")
+                    .expect("fixture phases");
+                let module = parse_module(warmup).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    warmup,
+                    "repeated_scalar.py",
+                )
+                .unwrap();
+                let mut interp = Interpreter::new();
+                interp.run_module(&code).expect("stable scalar warmup");
+                let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+                    panic!("main module")
+                };
+                let globals = main.dict.clone();
+                for name in ["square", "sum_squares"] {
+                    let Object::Function(function) = globals
+                        .borrow()
+                        .get(&crate::object::StrKey(name))
+                        .unwrap()
+                        .clone()
+                    else {
+                        panic!("function")
+                    };
+                    assert!(
+                        crate::tier2::code_compiled_for_test(&function.code.borrow()),
+                        "{name} must compile before mutation"
+                    );
+                }
+                let sum_squares = globals
+                    .borrow()
+                    .get(&crate::object::StrKey("sum_squares"))
+                    .unwrap()
+                    .clone();
+                let point = globals
+                    .borrow()
+                    .get(&crate::object::StrKey("proof_point"))
+                    .unwrap()
+                    .clone();
+                let (_, entries, deopts) = crate::tier2::stats_for_test();
+                let direct = crate::tier2::direct_call_count_for_test();
+                let (_, _, call_deopts) = crate::tier2::native_call_stats_for_test();
+                let result = interp
+                    .call_object(sum_squares, &[point, Object::Int(10)], &[])
+                    .expect("compiled scalar loop");
+                assert!(matches!(result, Object::Int(90)));
+                let (_, after_entries, after_deopts) = crate::tier2::stats_for_test();
+                assert!(
+                    after_entries + crate::tier2::direct_call_count_for_test() > entries + direct,
+                    "the scalar loop must enter native execution"
+                );
+                assert_eq!(
+                    after_deopts, deopts,
+                    "the stable scalar loop must not deopt"
+                );
+                assert_eq!(
+                    crate::tier2::native_call_stats_for_test().2,
+                    call_deopts,
+                    "the direct call must not deopt"
+                );
+                let module = parse_module(mutations).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    mutations,
+                    "repeated_scalar_mutations.py",
+                )
+                .unwrap();
+                interp
+                    .exec_module_in(&code, globals)
+                    .expect("scalar mutations and callbacks");
+            })
+            .expect("spawn scalar-read worker")
+            .join()
+            .expect("scalar-read worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
     fn jit_return_cache_releases_retired_code() {
         // The collector is process-global and skips a collection when a
         // peer is already collecting. This test requires three completed
