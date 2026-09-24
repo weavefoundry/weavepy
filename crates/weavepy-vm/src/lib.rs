@@ -63017,20 +63017,26 @@ assert loop(2000) == 1999000
         }
         // The exotic-class-key flag is process-wide, so this regression
         // must not change cache admission for unrelated tests.
-        std::thread::spawn(|| {
-            let source = include_str!("../../../tests/regrtest/test_class_key_callback_frames.py");
-            let module = parse_module(source).unwrap();
-            let code = weavepy_compiler::compile_module_with_source(
-                &module,
-                source,
-                "class_key_callbacks.py",
-            )
-            .unwrap();
-            let mut interp = Interpreter::new();
-            interp.run_module(&code).expect("class-key callback frames");
-        })
-        .join()
-        .expect("class-key callback worker");
+        // Nested Python callbacks and frame inspection need more than the
+        // default 2 MiB debug-build test-thread stack on Linux and Windows.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let source =
+                    include_str!("../../../tests/regrtest/test_class_key_callback_frames.py");
+                let module = parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    source,
+                    "class_key_callbacks.py",
+                )
+                .unwrap();
+                let mut interp = Interpreter::new();
+                interp.run_module(&code).expect("class-key callback frames");
+            })
+            .expect("spawn class-key callback worker")
+            .join()
+            .expect("class-key callback worker");
     }
 
     #[cfg(feature = "jit")]
