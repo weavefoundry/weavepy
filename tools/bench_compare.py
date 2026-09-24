@@ -40,6 +40,7 @@ def execution_context() -> dict:
         "environment": {
             key: os.environ.get(key)
             for key in ("TZ", "LANG", "LC_ALL", "LC_TIME", "PYTHON_JIT", "PYTHON_GIL",
+                        "PYTHONDONTWRITEBYTECODE",
                         "WEAVEPY_CLASS_CACHE_WARM", "WEAVEPY_CHAIN_DEPTH",
                         "WEAVEPY_CHAIN_LAYOUT", "WEAVEPY_CHAIN_FALLBACK",
                         "WEAVEPY_DYNAMIC_ATTRIBUTE_KIND")
@@ -161,6 +162,19 @@ def frozen_cache_snapshot(root: Path) -> dict[str, str]:
             for path in sorted(root.rglob("*")) if path.is_file()}
 
 
+def warmed_frozen_cache_snapshot(root: Path, caches: list[Path]) -> dict[str, str]:
+    """Require real artifacts for each binary before validating warm caches."""
+    snapshot = frozen_cache_snapshot(root)
+    for cache in sorted(set(caches)):
+        relative = cache.relative_to(root)
+        if not any(Path(name).is_relative_to(relative) for name in snapshot):
+            raise RuntimeError(
+                f"Frozen cache warmup produced no artifacts in {cache}; "
+                "check bytecode-writing flags such as PYTHONDONTWRITEBYTECODE"
+            )
+    return snapshot
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", required=True, help="Unmodified release binary")
@@ -267,7 +281,8 @@ def main() -> None:
                 if run:
                     samples[label].append(sample)
             if run == 0 and args.frozen_cache_root is not None:
-                frozen_before = frozen_cache_snapshot(args.frozen_cache_root)
+                frozen_before = warmed_frozen_cache_snapshot(
+                    args.frozen_cache_root, list(caches.values()))
         row = {
             label: {
                 "samples": values,

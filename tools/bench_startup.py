@@ -98,7 +98,10 @@ def main():
                 if cycle:
                     samples[label].append(sample)
             if cycle == 0:
-                before = bench_compare.frozen_cache_snapshot(args.frozen_cache_root)
+                before = bench_compare.warmed_frozen_cache_snapshot(
+                    args.frozen_cache_root,
+                    [args.frozen_cache_root / label for label, _, _ in variants[:-1]],
+                )
         after = bench_compare.frozen_cache_snapshot(args.frozen_cache_root)
         assert before == after, name + ': frozen cache changed during measurement'
         row = {label: {
