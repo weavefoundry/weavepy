@@ -32,12 +32,13 @@ if not hasattr(signal, "SIGUSR1") or sys.platform == "win32":
     sys.exit(0)
 
 q = queue.SimpleQueue()
-delivered = 0
+delivered = []
 
 
 def _handler(signum, frame):
-    global delivered
-    delivered += 1
+    # A handler can interrupt another handler's read/add/store sequence.
+    # Record each call without losing updates to a reentrant integer +=.
+    delivered.append(signum)
     q.put_nowait(signum)
 
 
@@ -88,8 +89,8 @@ while True:
         got += 1
     except queue.Empty:
         break
-assert delivered > 0, "no signals were delivered"
-assert got == delivered, (got, delivered)
+assert delivered, "no signals were delivered"
+assert got == len(delivered), (got, len(delivered))
 
 # The gate discipline survives a timed-out wait: a `put` after `get` gave
 # up must not error (`release unlocked lock`) and the item is delivered.
