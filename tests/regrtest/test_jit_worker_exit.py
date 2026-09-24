@@ -26,6 +26,9 @@ errors = []
 def create():
     try:
         assert total(5000) == 12497500
+        # A short first call may defer compilation; the repeated call must
+        # still leave compiled code behind when its worker exits.
+        assert total(5000) == 12497500
         generator = values(5000)
         for i in range(1000):
             assert next(generator) == i * 3

@@ -66670,6 +66670,74 @@ assert namespace is exported.__dict__
 
     #[cfg(feature = "jit")]
     #[test]
+    fn jit_first_short_range_defers_but_later_calls_compile() {
+        const CHILD: &str = "WEAVEPY_SHORT_RANGE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for mode in ["default", "explicit"] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "tests::jit_first_short_range_defers_but_later_calls_compile",
+                    ])
+                    .env(CHILD, mode)
+                    .env("WEAVEPY_JIT", "1");
+                if mode == "default" {
+                    command.env_remove("WEAVEPY_JIT_THRESHOLD");
+                } else {
+                    command.env("WEAVEPY_JIT_THRESHOLD", "50");
+                }
+                let status = command.status().expect("spawn range-budget test");
+                assert!(status.success(), "range-budget {mode}: {status}");
+            }
+            return;
+        }
+        std::thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(|| {
+            crate::tier2::note_startup_finished();
+            let explicit = std::env::var(CHILD).unwrap() == "explicit";
+            let mut source = String::new();
+            for name in ["first", "again", "later", "large"] {
+                source.push_str(&format!("def {name}(n):\n    total = 0\n    for i in range(n):\n        total += i\n    return total\n"));
+            }
+            source.push_str("def nested(n):\n    total = 0\n    for i in range(n):\n        for j in range(n):\n            total += j\n    return total\n");
+            source.push_str("def while_loop(n):\n    total = 0\n    i = 0\n    while i < n:\n        total += i\n        i += 1\n    return total\n");
+            let code = compile_module(&parse_module(&source).unwrap()).unwrap();
+            let mut interp = Interpreter::new();
+            interp.run_module(&code).unwrap();
+            let globals = {
+                let Some(Object::Module(main)) = interp.cache.get("__main__") else { panic!("main") };
+                main.dict.clone()
+            };
+            let codes: Vec<_> = ["first", "again", "later", "large", "nested", "while_loop"].iter().map(|name| {
+                let globals = globals.borrow();
+                let Some(Object::Function(function)) = globals.get(&crate::object::StrKey(name)) else { panic!("function {name}") };
+                let code = function.code.borrow().clone();
+                code
+            }).collect();
+            let execute = |interp: &mut Interpreter, source: &str| {
+                let code = compile_module(&parse_module(source).unwrap()).unwrap();
+                interp.exec_module_in(&code, globals.clone()).unwrap();
+            };
+            execute(&mut interp, "assert first(2000) == 1999000\nassert again(2000) == 1999000\nassert later(2000) == 1999000\n");
+            for code in &codes[..3] {
+                assert_eq!(crate::tier2::code_compiled_for_test(code), explicit, "first short call: {}", code.name);
+                assert!(!code.jit_hint.is_not_jitable(), "deferral must not retire code");
+            }
+            if !explicit {
+                assert_eq!(crate::tier2::stats_for_test().0, 0, "first short calls must not compile anything");
+                assert_eq!(crate::tier2::osr_stats_for_test(), 0);
+            }
+            execute(&mut interp, "assert again(2000) == 1999000\nassert later(20000) == 199990000\nassert large(20000) == 199990000\nassert nested(80) == 252800\nassert while_loop(2000) == 1999000\n");
+            for code in &codes[1..] {
+                assert!(crate::tier2::code_compiled_for_test(code), "later, large, or excluded shape must compile: {}", code.name);
+            }
+            assert!(crate::tier2::osr_stats_for_test() >= 3, "large, nested, and while loops must enter native code");
+            assert_eq!(crate::tier2::stats_for_test().2, 0);
+        }).unwrap().join().unwrap();
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
     fn jit_dict_items_pair_loop() {
         // RFC 0074 WS3 — `for k, v in d.items():` trains (Str, Int)
         // pair lanes and steps the checked items iterator natively.

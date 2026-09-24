@@ -335,6 +335,9 @@ enum Tier {
 struct CacheEntry {
     counter: u32,
     tier: Tier,
+    /// A short first activation doesn't have enough remaining work to pay
+    /// for compilation. A fresh call clears this advisory deferral.
+    defer_osr: bool,
     /// Failed OSR validations (RFC 0059 WS3b). Mid-loop entry re-checks
     /// guards + locals on every back edge while it keeps failing, so a
     /// chronically unenterable loop stops polling after a budget.
@@ -511,6 +514,7 @@ thread_local! {
 struct JitState {
     enabled: bool,
     threshold: u32,
+    range_budget: bool,
     engine: Option<JitEngine>,
     cache: HashMap<*const CodeObject, CacheEntry>,
     stats: JitStats,
@@ -678,11 +682,11 @@ fn jit_process_gate_init() -> bool {
 impl JitState {
     fn new() -> JitState {
         let enabled = jit_enabled_by_config();
-        let threshold = std::env::var("WEAVEPY_JIT_THRESHOLD")
+        let explicit_threshold = std::env::var("WEAVEPY_JIT_THRESHOLD")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(50);
+            .filter(|n| *n > 0);
+        let threshold = explicit_threshold.unwrap_or(50);
         set_lean_warm_from_threshold(threshold);
         // RFC 0059 WS3 — must precede the first compile of a frame
         // containing calls. Registered unconditionally (it only stores a
@@ -769,6 +773,7 @@ impl JitState {
         JitState {
             enabled,
             threshold,
+            range_budget: explicit_threshold.is_none(),
             engine: None,
             cache: HashMap::new(),
             stats: JitStats::default(),
@@ -791,6 +796,7 @@ impl JitState {
             let entry = self.cache.entry(key).or_insert_with(|| CacheEntry {
                 counter: 0,
                 tier: Tier::Cold,
+                defer_osr: false,
                 osr_failures: 0,
                 deopts: 0,
                 native_entries: 0,
@@ -801,6 +807,11 @@ impl JitState {
                 direct: None,
                 code: code.clone(),
             });
+            if entry_pc == 0 {
+                // Backedge heat survives: repeated calls can amortize the
+                // compile even when an individual activation is short.
+                entry.defer_osr = false;
+            }
             match &entry.tier {
                 Tier::Compiled(a) => {
                     let out = CompiledEntry {
@@ -1446,6 +1457,7 @@ impl JitState {
         let entry = self.cache.entry(key).or_insert_with(|| CacheEntry {
             counter: 0,
             tier: Tier::Cold,
+            defer_osr: false,
             osr_failures: 0,
             deopts: 0,
             native_entries: 0,
@@ -1458,6 +1470,9 @@ impl JitState {
         });
         match entry.tier {
             Tier::Cold => {
+                if entry.defer_osr {
+                    return false;
+                }
                 // One consultation stands for a stride of back edges.
                 entry.counter = entry
                     .counter
@@ -2824,6 +2839,7 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
         let entry = st.cache.entry(key).or_insert_with(|| CacheEntry {
             counter: 0,
             tier: Tier::Cold,
+            defer_osr: false,
             osr_failures: 0,
             deopts: 0,
             native_entries: 0,
@@ -8975,6 +8991,84 @@ pub(crate) fn try_enter(interp: &mut super::Interpreter, frame: &mut super::Fram
     enter_compiled(interp, frame, &entry, 0, &[], None)
 }
 
+/// Below this much remaining straight-line scalar work, a first activation
+/// can finish in the interpreter before compilation is likely to pay off.
+/// Calls, nested loops, and unknown iteration counts keep the usual policy.
+const FIRST_RANGE_WORK_BUDGET: u64 = 64 * 1024;
+
+fn short_scalar_range(frame: &super::Frame) -> bool {
+    use weavepy_compiler::{BinOpKind, OpCode, BINARY_OP_INPLACE_FLAG};
+    let code = &frame.code;
+    if code.is_generator
+        || code.is_coroutine
+        || code.is_async_generator
+        || !code.exception_table.is_empty()
+    {
+        return false;
+    }
+    let [Object::Iter(iterator)] = frame.stack.as_slice() else {
+        return false;
+    };
+    let remaining = match &*iterator.borrow() {
+        PyIterator::Range {
+            current,
+            stop,
+            step: 1,
+        } => i128::from(*stop) - i128::from(*current),
+        _ => return false,
+    };
+    let Ok(remaining) = u64::try_from(remaining) else {
+        return false;
+    };
+    let pc = frame.pc as usize;
+    let instructions = &code.instructions;
+    if instructions.get(pc).is_none_or(|i| i.op != OpCode::ForIter) {
+        return false;
+    }
+    let mut backedges = instructions
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| matches!(i.op, OpCode::ForIter | OpCode::JumpBackward));
+    // Only one loop, with its one backedge targeting this exact header.
+    if backedges.next().map(|(pos, _)| pos) != Some(pc) {
+        return false;
+    }
+    let Some((end, backedge)) = backedges.next() else {
+        return false;
+    };
+    if backedge.op != OpCode::JumpBackward
+        || backedges.next().is_some()
+        || (end + 1).checked_sub(backedge.arg as usize) != Some(pc)
+    {
+        return false;
+    }
+    let Some(work) = remaining.checked_mul((end + 1 - pc) as u64) else {
+        return false;
+    };
+    if work >= FIRST_RANGE_WORK_BUDGET {
+        return false;
+    }
+    let locals = frame.locals.borrow();
+    instructions[pc + 1..end].iter().all(|i| match i.op {
+        OpCode::Nop | OpCode::StoreFast => true,
+        OpCode::LoadFast => matches!(
+            locals.get(i.arg as usize),
+            Some(Object::Int(_) | Object::Float(_) | Object::Bool(_))
+        ),
+        OpCode::LoadConst => matches!(
+            code.constants.get(i.arg as usize),
+            Some(weavepy_compiler::Constant::Int(_) | weavepy_compiler::Constant::Float(_))
+        ),
+        OpCode::BinaryOp => matches!(
+            i.arg & !BINARY_OP_INPLACE_FLAG,
+            n if n == BinOpKind::Add as u32
+                || n == BinOpKind::Sub as u32
+                || n == BinOpKind::Mult as u32
+        ),
+        _ => false,
+    })
+}
+
 /// Attempt an on-stack replacement entry at a loop back-edge target
 /// (RFC 0059 WS3b). `frame.pc` must already be the jump target. The
 /// operand stack must consist of exactly the live rewritten-`range`
@@ -8986,6 +9080,15 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
         let mut st = cell.borrow_mut();
         if !st.enabled {
             return None;
+        }
+        if st.range_budget {
+            let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
+            if let Some(entry) = st.cache.get_mut(&key) {
+                if matches!(entry.tier, Tier::Cold) && short_scalar_range(frame) {
+                    entry.defer_osr = true;
+                    return None;
+                }
+            }
         }
         let interp_ref: &super::Interpreter = interp;
         let frame_ref: &super::Frame = frame;
@@ -10473,6 +10576,7 @@ pub(crate) fn force_enable_for_test(threshold: u32) {
         let mut st = cell.borrow_mut();
         st.enabled = true;
         st.threshold = threshold.max(1);
+        st.range_budget = false;
         set_lean_warm_from_threshold(st.threshold);
     });
 }
