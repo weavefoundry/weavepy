@@ -290,3 +290,158 @@ fn engine_drop_releases_native_mappings() {
     // unsafe entry contract. Dropping metadata must not free anything twice.
     drop(compiled);
 }
+
+#[test]
+fn attribute_chains_keep_the_first_read_deopt_snapshot() {
+    use crate::ir::AttrSiteMeta;
+    use crate::runtime::{JitFrame, JitStatus, SlotTag};
+
+    const CHILD: &str = "WEAVEPY_ATTR_CHAIN_LOWERING_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "engine::tests::attribute_chains_keep_the_first_read_deopt_snapshot",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("spawn isolated helper-registration test");
+        assert!(status.success(), "attribute-chain test failed: {status}");
+        return;
+    }
+
+    #[derive(Default, Debug)]
+    struct State {
+        singles: usize,
+        chains: usize,
+        fail: bool,
+        chain: (i64, i64, i64),
+    }
+
+    unsafe extern "C" fn get(frame: *mut JitFrame, pin: i64, site: i64) -> i64 {
+        // SAFETY: the test supplies a live frame and State until native return.
+        let frame = unsafe { &mut *frame };
+        let state = unsafe { &mut *frame.ctx.cast::<State>() };
+        state.singles += 1;
+        frame.ret_bits = (pin + site + 1) as u64;
+        0
+    }
+
+    unsafe extern "C" fn set(_: *mut JitFrame, _: i64, _: i64) -> i64 {
+        1
+    }
+
+    unsafe extern "C" fn chain(frame: *mut JitFrame, pin: i64, site: i64, count: i64) -> i64 {
+        // SAFETY: as for get.
+        let frame = unsafe { &mut *frame };
+        let state = unsafe { &mut *frame.ctx.cast::<State>() };
+        state.chains += 1;
+        state.chain = (pin, site, count);
+        if state.fail {
+            return 1;
+        }
+        frame.ret_bits = (pin + (site..site + count).map(|i| i + 1).sum::<i64>()) as u64;
+        0
+    }
+
+    let mut tfunc = function(&[
+        TOp::PushConstInt(99),
+        TOp::LoadLocal(0),
+        TOp::AttrGet {
+            site: 0,
+            out: JitType::Obj,
+        },
+        TOp::AttrGet {
+            site: 1,
+            out: JitType::Obj,
+        },
+        TOp::AttrGet {
+            site: 2,
+            out: JitType::Obj,
+        },
+        TOp::AttrGet {
+            site: 3,
+            out: JitType::Int,
+        },
+        TOp::IntArith(ArithKind::Add),
+    ]);
+    tfunc.local_types[0] = Some(JitType::Obj);
+    tfunc.attr_sites = (0..4)
+        .map(|site| AttrSiteMeta {
+            slot: 0,
+            path: (0..site).map(|i| format!("field_{i}")).collect(),
+            name: format!("field_{site}"),
+            lane: if site == 3 {
+                JitType::Int
+            } else {
+                JitType::Obj
+            },
+            store: false,
+            new_key: false,
+            ctor: None,
+            self_ctor: None,
+        })
+        .collect();
+
+    fn run(engine: &mut super::JitEngine, tfunc: &TFunc, fail: bool) -> State {
+        let compiled = engine
+            .compile_tfunc(tfunc)
+            .expect("compile attribute chain");
+        let mut state = State {
+            fail,
+            ..State::default()
+        };
+        let mut locals = [7u64, 0];
+        let mut spill = [0u64; 3];
+        let mut tags = [0u32; 3];
+        let mut frame = JitFrame {
+            locals: locals.as_mut_ptr(),
+            n_locals: 2,
+            entry_pc: 0,
+            ret_bits: 0,
+            ret_tag: 0,
+            deopt_pc: 0,
+            stack_spill: spill.as_mut_ptr(),
+            stack_tags: tags.as_mut_ptr(),
+            stack_len: 0,
+            stack_cap: 3,
+            ctx: (&raw mut state).cast(),
+            call_args: std::ptr::null_mut(),
+            call_tags: std::ptr::null_mut(),
+        };
+        // SAFETY: all buffers and the registered helper context remain live;
+        // the owning engine outlives the call.
+        let status = unsafe { compiled.enter(&raw mut frame) };
+        if fail {
+            assert_eq!(status, JitStatus::Deopt);
+            assert_eq!(frame.deopt_pc, 2);
+            assert_eq!(frame.stack_len, 2);
+            assert_eq!(&spill[..2], &[99, 7]);
+            assert_eq!(&tags[..2], &[SlotTag::Int as u32, SlotTag::ObjPin as u32]);
+            assert_eq!(locals[0], 7);
+        } else {
+            assert_eq!(status, JitStatus::Returned);
+            assert_eq!(frame.ret_tag, SlotTag::Int as u32);
+            assert_eq!(frame.ret_bits, 116);
+        }
+        state
+    }
+
+    crate::runtime::register_attr_helpers(get, set);
+    let mut engine = super::JitEngine::new().expect("host ISA");
+    let ordinary = run(&mut engine, &tfunc, false);
+    assert_eq!((ordinary.singles, ordinary.chains), (4, 0));
+
+    crate::runtime::register_attr_get_chain_helper(chain);
+    let fused = run(&mut engine, &tfunc, false);
+    assert_eq!((fused.singles, fused.chains), (0, 1));
+    assert_eq!(fused.chain, (7, 0, 4));
+    let failed = run(&mut engine, &tfunc, true);
+    assert_eq!((failed.singles, failed.chains), (0, 1));
+
+    for (i, stmt) in tfunc.blocks[0].stmts.iter_mut().enumerate() {
+        stmt.pc = (i * 2) as u32;
+    }
+    let separated = run(&mut engine, &tfunc, false);
+    assert_eq!((separated.singles, separated.chains), (4, 0));
+}

@@ -688,6 +688,7 @@ impl JitState {
             wpjit_bytes_get,
         );
         weavepy_jit::register_attr_helpers(wpjit_attr_get, wpjit_attr_set);
+        weavepy_jit::register_attr_get_chain_helper(wpjit_attr_get_chain);
         // RFC 0073 WS2 — the dict-lane helpers.
         weavepy_jit::register_dict_helpers(
             wpjit_dict_get,
@@ -6661,6 +6662,236 @@ unsafe extern "C" fn wpjit_attr_get(frame: *mut JitFrame, pin: i64, site: i64) -
             0
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum AttrChainMiss {
+    Guard,
+    SlotBorrow,
+}
+
+/// Inspect a field without retaining an owning intermediate result.
+///
+/// # Safety
+/// The caller must retain the root instance and finish every use of the
+/// returned reference before running Python, mutating fields, or releasing
+/// the GIL. Both peek paths reject mutable borrows and unguarded VM access.
+#[inline(always)]
+unsafe fn chain_attr_peek<'a>(
+    inst: &'a crate::types::PyInstance,
+    guard: &AttrGuard,
+) -> Result<&'a Object, AttrChainMiss> {
+    if !attr_class_ok(inst, guard.ver) {
+        return Err(AttrChainMiss::Guard);
+    }
+    match guard.storage {
+        AttrStorage::Slot(index) => {
+            // SAFETY: the caller keeps the entire chain read-only.
+            let slots = unsafe { inst.slots.peek() }.ok_or(AttrChainMiss::SlotBorrow)?;
+            slots
+                .get_index(index as usize)
+                .filter(|(name, _)| key_is(name, &guard.name))
+                .map(|(_, value)| value)
+                .or_else(|| slots.get(&guard.name))
+                .ok_or(AttrChainMiss::Guard)
+        }
+        AttrStorage::Indexed(index) => {
+            // SAFETY: the same callback-free interval as the slot read.
+            let dict = unsafe { inst.dict.get().ok_or(AttrChainMiss::Guard)?.peek() }
+                .ok_or(AttrChainMiss::Guard)?;
+            let (name, value) = dict.get_index(index as usize).ok_or(AttrChainMiss::Guard)?;
+            if !key_is(name, &guard.name) {
+                return Err(AttrChainMiss::Guard);
+            }
+            Ok(value)
+        }
+        AttrStorage::NewKey => Err(AttrChainMiss::Guard),
+    }
+}
+
+#[inline(always)]
+fn chain_attr_value(
+    guard: &AttrGuard,
+    value: &Object,
+    pins: &[Pin],
+) -> Option<Result<u64, Object>> {
+    match (guard.lane, value) {
+        (JitType::Obj, Object::None) => Some(Ok(u64::MAX)),
+        (JitType::Obj, Object::Instance(_))
+        | (JitType::Str, Object::Str(_))
+        | (JitType::Bytes, Object::Bytes(_)) => Some(
+            attr_result_pin(value, pins, guard.last_result_pin.get()).ok_or_else(|| value.clone()),
+        ),
+        (JitType::Obj | JitType::Str | JitType::Bytes, _) => None,
+        _ => pack(value, guard.lane).map(Ok),
+    }
+}
+
+/// Walk borrowed values in a loop so code size doesn't grow with every
+/// possible mix of dictionary and slot storage along the chain.
+#[inline(always)]
+fn attr_chain_peek_result(
+    mut inst: &crate::types::PyInstance,
+    guards: &[AttrGuard],
+    pins: &[Pin],
+) -> Result<Result<u64, Object>, AttrChainMiss> {
+    let (last, prefix) = guards.split_last().ok_or(AttrChainMiss::Guard)?;
+    for guard in prefix {
+        if guard.lane != JitType::Obj {
+            return Err(AttrChainMiss::Guard);
+        }
+        // SAFETY: the root pin owns the graph, and this walk neither
+        // mutates it nor calls Python. No borrowed reference escapes.
+        let Object::Instance(next) = (unsafe { chain_attr_peek(inst, guard) })? else {
+            return Err(AttrChainMiss::Guard);
+        };
+        inst = next;
+    }
+    // SAFETY: the same read-only interval; the final result alone may clone.
+    let value = unsafe { chain_attr_peek(inst, last) }?;
+    chain_attr_value(last, value, pins).ok_or(AttrChainMiss::Guard)
+}
+
+/// Inspect guarded storage while retaining any slot borrow for the read.
+/// The callback and every caller must remain callback-free and read-only.
+fn chain_attr_read<R>(
+    inst: &crate::types::PyInstance,
+    guard: &AttrGuard,
+    read: impl FnOnce(&Object) -> R,
+) -> Option<R> {
+    if !attr_class_ok(inst, guard.ver) {
+        return None;
+    }
+    match guard.storage {
+        AttrStorage::Slot(index) => {
+            let slots = inst.slots.try_borrow().ok()?;
+            let value = slots
+                .get_index(index as usize)
+                .filter(|(name, _)| key_is(name, &guard.name))
+                .map(|(_, value)| value)
+                .or_else(|| slots.get(&guard.name))?;
+            Some(read(value))
+        }
+        AttrStorage::Indexed(index) => {
+            // SAFETY: every chain step is a read without Python callbacks.
+            let dict = unsafe { inst.dict.get()?.peek() }?;
+            let (name, value) = dict.get_index(index as usize)?;
+            key_is(name, &guard.name).then(|| read(value))
+        }
+        AttrStorage::NewKey => None,
+    }
+}
+
+fn attr_chain_borrowed_result(
+    inst: &crate::types::PyInstance,
+    guards: &[AttrGuard],
+    pins: &[Pin],
+) -> Option<Result<u64, Object>> {
+    let (guard, rest) = guards.split_first()?;
+    chain_attr_read(inst, guard, |value| {
+        if !rest.is_empty() {
+            let (JitType::Obj, Object::Instance(next)) = (guard.lane, value) else {
+                return None;
+            };
+            return attr_chain_borrowed_result(next, rest, pins);
+        }
+        chain_attr_value(guard, value, pins)
+    })?
+}
+
+/// An out-of-GIL observer can revoke guardless reads. Keep the existing
+/// guarded slot behavior in that mode, with every borrow alive through its
+/// nested read. Ordinary chains take the compact borrowed walk above.
+#[inline(always)]
+fn attr_chain_result(
+    inst: &crate::types::PyInstance,
+    guards: &[AttrGuard],
+    pins: &[Pin],
+) -> Option<Result<u64, Object>> {
+    match attr_chain_peek_result(inst, guards, pins) {
+        Ok(value) => Some(value),
+        Err(AttrChainMiss::Guard) => None,
+        Err(AttrChainMiss::SlotBorrow) => {
+            let value = attr_chain_borrowed_result(inst, guards, pins)?;
+            #[cfg(test)]
+            ATTR_CHAIN_BORROWED_COUNT.with(|count| count.set(count.get() + 1));
+            Some(value)
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ATTR_CHAIN_TEST_COUNTS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    static ATTR_CHAIN_BORROWED_COUNT: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn attr_chain_counts_for_test() -> (u64, u64) {
+    ATTR_CHAIN_TEST_COUNTS.with(Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn attr_chain_borrowed_count_for_test() -> u64 {
+    ATTR_CHAIN_BORROWED_COUNT.with(Cell::get)
+}
+
+/// Read a bounded chain without creating intermediate owning pins. A miss
+/// leaves all Python state unchanged and replays from the first attribute.
+///
+/// # Safety
+/// Same live-buffer and GIL contract as [`wpjit_attr_get`].
+unsafe extern "C" fn wpjit_attr_get_chain(
+    frame: *mut JitFrame,
+    pin: i64,
+    first_site: i64,
+    count: i64,
+) -> i64 {
+    if !(2..=4).contains(&count) {
+        return 1;
+    }
+    let Ok(first) = usize::try_from(first_site) else {
+        return 1;
+    };
+    let Some(end) = first.checked_add(count as usize) else {
+        return 1;
+    };
+    // SAFETY: the caller supplies the same live activation as a single read.
+    let jf = unsafe { &mut *frame };
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    let outcome = {
+        let Some(Pin::Obj(Object::Instance(inst))) = ctx.pins.get(pin as usize) else {
+            return 1;
+        };
+        let Some(guards) = ctx.attr_guards.get(first..end) else {
+            return 1;
+        };
+        let Some(outcome) = attr_chain_result(inst, guards, &ctx.pins) else {
+            return 1;
+        };
+        outcome
+    };
+    match outcome {
+        Ok(bits) => jf.ret_bits = bits,
+        Err(value) => {
+            if ctx.pins.len() >= RUNTIME_PIN_CAP {
+                return 1;
+            }
+            let next = ctx.pins.len();
+            ctx.pins.push(Pin::Obj(value));
+            ctx.attr_guards[end - 1].last_result_pin.set(next);
+            jf.ret_bits = next as u64;
+        }
+    }
+    #[cfg(test)]
+    ATTR_CHAIN_TEST_COUNTS.with(|counts| {
+        let (dict, slots) = counts.get();
+        counts.set(match ctx.attr_guards[first].storage {
+            AttrStorage::Slot(_) => (dict, slots + 1),
+            _ => (dict + 1, slots),
+        });
+    });
+    0
 }
 
 /// The `wpjit_attr_set` helper (RFC 0065 WS5 / RFC 0070 WS1):

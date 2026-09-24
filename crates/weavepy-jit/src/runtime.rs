@@ -860,6 +860,27 @@ pub type AttrGetHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, si
 /// contract as [`AttrGetHelper`].
 pub type AttrSetHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, site: i64) -> i64;
 
+/// Optional fused read of two to four consecutive attribute sites. A miss
+/// must leave Python state unchanged: the caller resumes at the first read.
+/// Intermediate values are borrowed; only the final result may acquire a pin.
+/// The helper must never run Python. Same safety contract as [`AttrGetHelper`].
+pub type AttrGetChainHelper =
+    unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, first_site: i64, count: i64) -> i64;
+
+static ATTR_GET_CHAIN_HELPER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register optional attribute-chain fusion before compiling affected frames.
+/// Without this registration, each attribute uses the ordinary read helper.
+pub fn register_attr_get_chain_helper(helper: AttrGetChainHelper) {
+    ATTR_GET_CHAIN_HELPER.store(helper as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn attr_get_chain_helper_addr() -> usize {
+    ATTR_GET_CHAIN_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
 static ATTR_GET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static ATTR_SET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 

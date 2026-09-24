@@ -347,8 +347,51 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             }
         }
         let block = self.tfunc.blocks[bi].clone();
-        for stmt in &block.stmts {
-            self.emit_stmt(*stmt);
+        let chain_helper = runtime::attr_get_chain_helper_addr();
+        let mut i = 0;
+        while i < block.stmts.len() {
+            let stmt = block.stmts[i];
+            if chain_helper != 0 {
+                if let TOp::AttrGet {
+                    site,
+                    out: JitType::Obj,
+                } = stmt.op
+                {
+                    let mut end = i + 1;
+                    let mut out = JitType::Obj;
+                    while end < block.stmts.len() && end - i < 4 && out == JitType::Obj {
+                        let next = block.stmts[end];
+                        let TOp::AttrGet {
+                            site: next_site,
+                            out: next_out,
+                        } = next.op
+                        else {
+                            break;
+                        };
+                        let distance = (end - i) as u32;
+                        if site.checked_add(distance) != Some(next_site)
+                            || stmt.pc.checked_add(distance) != Some(next.pc)
+                        {
+                            break;
+                        }
+                        out = next_out;
+                        end += 1;
+                    }
+                    if end - i >= 2 {
+                        self.emit_attr_get_chain(
+                            chain_helper,
+                            site,
+                            (end - i) as u32,
+                            out,
+                            stmt.pc,
+                        );
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+            self.emit_stmt(stmt);
+            i += 1;
         }
         match block.term {
             TTerm::Return => self.emit_return(),
@@ -2511,6 +2554,39 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .b
             .ins()
             .load(Self::cl_ty(out), trusted, self.frame_ptr, OFF_RET_BITS);
+        self.vstack.push((res, out));
+    }
+
+    /// Consecutive callback-free reads can replay from the first read on a
+    /// later miss. Preserve its original receiver in the deopt snapshot.
+    fn emit_attr_get_chain(
+        &mut self,
+        address: usize,
+        site: u32,
+        count: u32,
+        out: JitType,
+        pc: u32,
+    ) {
+        let snapshot = self.vstack.clone();
+        let (pin, _) = self.pop();
+        let sig = self.quad_helper_sig();
+        let helper = self.b.ins().iconst(self.ptr_ty, address as i64);
+        let sitev = self.b.ins().iconst(types::I64, i64::from(site));
+        let countv = self.b.ins().iconst(types::I64, i64::from(count));
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, pin, sitev, countv]);
+        let status = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        let res = self.b.ins().load(
+            Self::cl_ty(out),
+            MemFlags::trusted(),
+            self.frame_ptr,
+            OFF_RET_BITS,
+        );
         self.vstack.push((res, out));
     }
 

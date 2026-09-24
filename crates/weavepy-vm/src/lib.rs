@@ -62939,6 +62939,85 @@ assert loop(2000) == 1999000
 
     #[cfg(feature = "jit")]
     #[test]
+    fn jit_attribute_chains_preserve_guard_fallbacks() {
+        const CHILD: &str = "WEAVEPY_ATTR_CHAIN_VM_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "tests::jit_attribute_chains_preserve_guard_fallbacks",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .status()
+                    .expect("spawn attribute-chain test");
+            assert!(
+                status.success(),
+                "isolated attribute-chain test failed: {status}"
+            );
+            return;
+        }
+        std::thread::spawn(|| {
+            crate::tier2::force_enable_for_test(2);
+            let source = include_str!("../../../tests/regrtest/test_jit_attribute_chains.py");
+            let (warmup, mutations) = source
+                .split_once("# CHAIN MUTATIONS:")
+                .expect("fixture phases");
+            let module = parse_module(warmup).expect("parse chain warmup");
+            let code = compile_module(&module).expect("compile chain warmup");
+            let mut interp = Interpreter::new();
+            interp.run_module(&code).expect("run chain warmup");
+            let (dict_reads, slot_reads) = crate::tier2::attr_chain_counts_for_test();
+            assert!(dict_reads > 100, "dict driver must execute fused reads");
+            assert!(slot_reads > 100, "slot driver must execute fused reads");
+            let globals = {
+                let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+                    panic!("missing main module");
+                };
+                main.dict.clone()
+            };
+            {
+                let globals = globals.borrow();
+                for name in ["dict_chain", "slot_chain", "object_chain", "text_chain"] {
+                    let Some(Object::Function(driver)) = globals.get(&crate::object::StrKey(name))
+                    else {
+                        panic!("missing {name} driver");
+                    };
+                    assert!(
+                        crate::tier2::code_compiled_for_test(&driver.code.borrow()),
+                        "{name} must compile before guard mutations"
+                    );
+                }
+            }
+            let mutations = format!("# CHAIN MUTATIONS:{mutations}");
+            let module = parse_module(&mutations).expect("parse chain mutations");
+            let code = compile_module(&module).expect("compile chain mutations");
+            interp
+                .exec_module_in(&code, globals.clone())
+                .expect("chain mutation assertions");
+
+            // Model an out-of-GIL observer: slot reads must still execute
+            // natively while using retained borrow guards.
+            crate::sync::mark_cells_shared();
+            let before = crate::tier2::attr_chain_borrowed_count_for_test();
+            let module = parse_module("assert slot_chain(slot_root, 1200) == 20400")
+                .expect("parse guarded slot fallback");
+            let code = compile_module(&module).expect("compile guarded slot fallback");
+            interp
+                .exec_module_in(&code, globals)
+                .expect("guarded slot fallback result");
+            assert!(
+                crate::tier2::attr_chain_borrowed_count_for_test() > before + 100,
+                "unguarded VM access must retain the native slot fallback"
+            );
+        })
+        .join()
+        .expect("attribute-chain JIT worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
     fn jit_version_guards_release_unreachable_classes() {
         // A peer collection can make gc.collect() return without collecting.
         // Every lifetime assertion here requires a completed collection.
