@@ -431,16 +431,16 @@ impl Builder<'_> {
     }
 
     fn module(&self, m: &past::Module, mode: &str) -> Object {
+        if mode == "eval" {
+            // Eval only needs the expression, not an unused statement body.
+            let inner = m.body.first().and_then(|s| match &s.kind {
+                past::StmtKind::Expr(e) => Some(self.expr(e)),
+                _ => None,
+            });
+            return node_noloc("Expression", vec![("body", inner.unwrap_or(Object::None))]);
+        }
         let body = list_of(&m.body, |s| self.stmt(s));
         match mode {
-            "eval" => {
-                // Expression(body=<expr>): only valid for a single Expr stmt.
-                let inner = m.body.first().and_then(|s| match &s.kind {
-                    past::StmtKind::Expr(e) => Some(self.expr(e)),
-                    _ => None,
-                });
-                node_noloc("Expression", vec![("body", inner.unwrap_or(Object::None))])
-            }
             "single" => node_noloc("Interactive", vec![("body", body)]),
             _ => {
                 let ignores = self
