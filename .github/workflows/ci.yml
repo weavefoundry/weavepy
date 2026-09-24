@@ -51,6 +51,11 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      # Debug VM frames can exceed Rust's default test-thread stack during
+      # nested imports (including the range/pickle regression on macOS ARM).
+      # Match local VM validation; release benchmark jobs keep their defaults.
+      RUST_MIN_STACK: "8388608"
     strategy:
       fail-fast: false
       matrix:
