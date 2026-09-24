@@ -141,4 +141,48 @@ try:
 finally:
     sys.setprofile(None)
 assert events == [(name, i) for i in range(2, 5) for name in ("append", "popleft")], events
+# Argument evaluation may replace a method after its original binding. The
+# call must still use that original method, and later lookups see the change.
+class Rebound(deque):
+    pass
+
+
+def change_method(values, item):
+    Rebound.append = lambda self, value: deque.append(self, value + 100)
+    return item
+
+
+def call_with_argument(values, n, replace):
+    for i in range(n):
+        values.append(replace(values, i))
+    return list(values)
+
+
+assert call_with_argument(Rebound(), 4000, lambda values, item: item) == list(range(4000))
+assert call_with_argument(Rebound(), 3, change_method) == [0, 101, 102]
+del Rebound.append
+
+# Method lookup precedes an unbound local argument, even at a site that has
+# previously used a native method.
+def maybe_unbound(values, n, initialized):
+    if initialized:
+        item = 3
+    for i in range(n):
+        values.append(item)
+
+
+maybe_unbound(Rebound(), 4000, True)
+class FailingDescriptor:
+    def __get__(self, instance, owner):
+        raise ValueError("lookup first")
+
+
+Rebound.append = FailingDescriptor()
+try:
+    maybe_unbound(Rebound(), 1, False)
+except ValueError as error:
+    assert str(error) == "lookup first"
+else:
+    raise AssertionError("method lookup must precede argument evaluation")
+del Rebound.append
 print("Native method semantics: ok")
