@@ -7512,78 +7512,127 @@ fn note_generic_dyn_call(ctx: &CallCtx) {
     });
 }
 
-/// The attribute name behind `names` index `idx` of the activation's
-/// code object (RFC 0074 WS2/WS4).
-///
-/// # Safety
-///
-/// `ctx.code_ptr` stays alive for the whole activation (the entering
-/// frame / native-callee entry holds the `Rc`).
-unsafe fn ctx_name(ctx: &CallCtx, idx: i64) -> Option<&str> {
-    // SAFETY: per the function contract.
-    let code = unsafe { &*ctx.code_ptr };
-    code.names.get(idx as usize).map(String::as_str)
+#[cfg(test)]
+thread_local! {
+    static DYN_ATTR_NATIVE_READS: Cell<[u64; 5]> = const { Cell::new([0; 5]) };
 }
 
-/// The `wpjit_dyn_attr_get` helper (RFC 0074 WS2/WS4): the
-/// interpreter's exact attribute load on a pinned receiver (bound
-/// methods materialize, descriptors and `__getattr__` run — arbitrary
-/// Python; the dirtiness discipline applies). Statuses: `0` ok (fresh
-/// pin in `ret_bits`), `1` raised, `2` completed but guards fell / cap
-/// pressure (result parked; deopt at the *next* pc — never
-/// re-executed), `3` rejected before any Python ran (deopt here,
-/// re-execute generically).
+#[cfg(test)]
+pub(crate) fn dyn_attr_native_reads_for_test() -> [u64; 5] {
+    DYN_ATTR_NATIVE_READS.with(Cell::get)
+}
+
+/// Read an object-lane field using the interpreter's callback-free caches.
+/// An unproved read returns 3 before it can run a callback, so native code
+/// materializes the original receiver and current locals and retries this
+/// exact instruction. Simple getter paths can finish in the borrowed evaluator.
+/// Unproved getters run with a real caller frame and write-through locals.
+/// Success pins the same result as the generic lane; cap pressure parks that
+/// completed result and returns 2. No new object lanes or pin reuse are added.
 ///
 /// # Safety
-///
-/// Same contract as [`wpjit_call_py`].
+/// Same live-buffer and GIL contract as [`wpjit_call_py`]. The lowering must
+/// publish this read's bytecode PC in `deopt_pc` before invoking the helper.
 unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i64) -> i64 {
-    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    if crate::gil::free_threading_enabled() {
+        return 3;
+    }
+    // SAFETY: the native entry owns these live buffers. Its erased context
+    // pointer originated from an aligned CallCtx, as in the other helpers.
     let jf = unsafe { &mut *frame };
     #[allow(clippy::cast_ptr_alignment)]
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
-    // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
-    let interp = unsafe { &mut *ctx.interp };
-    let recv = match ctx.pins.get(pin as usize) {
-        Some(p) => p.to_object(),
-        // `-1` (the nullable `None`) loads attributes of `None` —
-        // legitimate (`None.__class__`) but cold; re-execute.
-        None => return 3,
-    };
-    // SAFETY: the activation keeps its code object alive.
-    let Some(attr) = (unsafe { ctx_name(ctx, name) }) else {
+    let Some(receiver) = ctx.pins.get(pin as usize).map(Pin::to_object) else {
         return 3;
     };
-    let attr = attr.to_owned();
-    ctx.dirty = true;
-    match interp.load_attr_public(&recv, &attr) {
-        Err(err) => {
-            ctx.raised = Some(err);
-            1
-        }
-        Ok(v) => {
-            if charge_roundtrip(ctx) {
-                ctx.parked = Some(v);
-                return 2;
-            }
-            let still_valid = guards_hold(
-                interp,
-                &ctx.globals,
-                &ctx.builtins,
-                &ctx.guard_snapshot,
-                &ctx.callees,
-                &ctx.math,
-            );
-            if still_valid {
-                if let Some(bits) = pin_any(v.clone(), &mut ctx.pins) {
-                    jf.ret_bits = bits;
-                    return 0;
+    let Ok(name_idx) = u32::try_from(name) else {
+        return 3;
+    };
+    // SAFETY: the activation retains the code object until native return.
+    let code = unsafe { &*ctx.code_ptr };
+    let (value, kind) = match &receiver {
+        Object::Instance(inst) if inst.cls_raw().native_kind.get() == 0 => (
+            super::Interpreter::leaf_load_attr_recv(code, &receiver, jf.deopt_pc, name_idx),
+            0,
+        ),
+        Object::Type(cls) if super::Interpreter::plain_metaclass(cls) => (
+            super::Interpreter::leaf_load_type_attr(code, cls, jf.deopt_pc, name_idx),
+            1,
+        ),
+        Object::Module(module) if crate::object::module_class(module).is_none() => (
+            super::Interpreter::leaf_load_attr_recv(code, &receiver, jf.deopt_pc, name_idx),
+            2,
+        ),
+        // Exact built-in values have no instance overrides. Their method
+        // table only constructs native callables; binding doesn't invoke
+        // them. Keep method capture (including dict.items and fromkeys)
+        // native without admitting arbitrary descriptor execution.
+        Object::List(_)
+        | Object::Dict(_)
+        | Object::Tuple(_)
+        | Object::Str(_)
+        | Object::Bytes(_)
+        | Object::ByteArray(_)
+        | Object::Set(_)
+        | Object::FrozenSet(_)
+        | Object::Range(_)
+        | Object::Int(_)
+        | Object::Long(_)
+        | Object::Bool(_)
+        | Object::Float(_)
+        | Object::Complex(_) => {
+            let Some(name) = code.names.get(name_idx as usize) else {
+                return 3;
+            };
+            let method = crate::builtins::lookup_method(&receiver, name).map(|method| {
+                if matches!(&method, Object::Builtin(b) if !b.binds_instance) {
+                    method
+                } else {
+                    Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+                        receiver.clone(),
+                        method,
+                    )))
                 }
-            }
-            ctx.parked = Some(v);
-            2
+            });
+            (method, 3)
         }
+        _ => return 3,
+    };
+    let (value, kind) = match value {
+        Some(value) => (value, kind),
+        None => {
+            // SAFETY: the entering interpreter is dormant. The borrowed
+            // evaluator neither calls Python nor mutates interpreter state.
+            let interp = unsafe { &*ctx.interp };
+            // SAFETY: the activation retains this thread's depth cell.
+            let depth = unsafe { (*ctx.depth_cell).get() };
+            let Some(value) = interp.leaf_getter_read(code, &receiver, name_idx, depth) else {
+                return 3;
+            };
+            (value, 4)
+        }
+    };
+    // Retain the existing roundtrip and pin-cap behavior. No Python ran, so
+    // this read cannot invalidate the activation's globals or callees and
+    // doesn't mark the context dirty or recheck those unrelated guards.
+    if charge_roundtrip(ctx) {
+        ctx.parked = Some(value);
+        return 2;
     }
+    if let Some(bits) = pin_any(value.clone(), &mut ctx.pins) {
+        jf.ret_bits = bits;
+        #[cfg(test)]
+        DYN_ATTR_NATIVE_READS.with(|reads| {
+            let mut counts = reads.get();
+            counts[kind] += 1;
+            reads.set(counts);
+        });
+        #[cfg(not(test))]
+        let _ = kind;
+        return 0;
+    }
+    ctx.parked = Some(value);
+    2
 }
 
 /// The `wpjit_dyn_attr_set` helper (RFC 0074 WS4): the interpreter's

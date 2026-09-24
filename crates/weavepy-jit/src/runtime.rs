@@ -1084,9 +1084,10 @@ pub(crate) fn call_dyn_helper_addr() -> usize {
 /// RFC 0074 WS2/WS4 — the embedder's *generic attribute* helpers
 /// ([`crate::ir::TOp::DynAttrGet`] / [`crate::ir::TOp::DynAttrSet`]).
 /// Shape: `(frame, pin, name_idx) -> status` (the [`ListGetHelper`]
-/// signature). Both run the interpreter's exact attribute machinery
-/// (**arbitrary Python may run** — descriptors, `__getattr__`,
-/// `__setattr__`; the dirtiness discipline applies). For the store,
+/// signature). The embedder may complete an access or reject it before
+/// dispatch so the interpreter retries it with a materialized frame.
+/// If a helper runs arbitrary Python (descriptors, `__getattr__`, or
+/// `__setattr__`), the dirtiness discipline applies. For the store,
 /// the value is staged in `call_args[0]` / `call_tags[0]`. Status:
 ///
 /// - `0` — ok; for the get, the loaded value's fresh pin index is in
@@ -1096,7 +1097,7 @@ pub(crate) fn call_dyn_helper_addr() -> usize {
 /// - `2` — the access *completed* but a guard was invalidated (or,
 ///   for the get, pin-cap pressure): the result (get) is parked and
 ///   the caller deopts at the *next* pc — never re-executed;
-/// - `3` — rejected before any Python ran (pin miss — defensive):
+/// - `3` — rejected before any Python ran (for example, a cache miss):
 ///   deopt at this pc and re-execute generically.
 pub type DynAttrHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, name: i64) -> i64;
 
