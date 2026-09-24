@@ -37,6 +37,7 @@ pub(crate) fn frozen_lookup(name: &str) -> Option<frozen_sources::FrozenSource> 
     frozen_sources().get(FROZEN_INDEX[at].2 as usize).copied()
 }
 
+pub(crate) mod ast_build;
 pub mod ast_convert;
 pub mod ast_mod;
 mod ast_validate;

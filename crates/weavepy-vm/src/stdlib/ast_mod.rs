@@ -56,6 +56,15 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::Builtin(Rc::new(bf)),
         );
         d.insert(
+            DictKey(Object::from_static("_build")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__vm:ast_build",
+                binds_instance: false,
+                call: Box::new(|_| Err(crate::error::runtime_error("AST builder needs the VM"))),
+                call_kw: None,
+            })),
+        );
+        d.insert(
             DictKey(Object::from_static("_validate_fields")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "_validate_fields",

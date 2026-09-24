@@ -41683,6 +41683,9 @@ impl Interpreter {
                             Object::from_str(out)
                         });
                     }
+                    if b.name == "__vm:ast_build" {
+                        return stdlib::ast_build::build(self, args, kwargs, outer_globals);
+                    }
                     // PathLike (`__fspath__`) coercion for the path-accepting
                     // builtins. Our Rust `open`/`os.fspath`/`os.fsdecode`/
                     // `os.fsencode` only understand str/bytes, so reduce an
