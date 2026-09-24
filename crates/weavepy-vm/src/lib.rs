@@ -66682,6 +66682,42 @@ assert namespace is exported.__dict__
 
     #[cfg(feature = "jit")]
     #[test]
+    fn jit_checked_integer_overflow_preserves_python_values() {
+        const CHILD: &str = "WEAVEPY_CHECKED_INTEGER_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::jit_checked_integer_overflow_preserves_python_values",
+                ])
+                .env(CHILD, "1")
+                .env("WEAVEPY_JIT", "1")
+                .env("WEAVEPY_JIT_THRESHOLD", "50")
+                .status()
+                .expect("spawn checked arithmetic test");
+            assert!(status.success(), "checked arithmetic child: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                crate::tier2::note_startup_finished();
+                let source =
+                    include_str!("../../../tests/regrtest/test_jit_checked_integer_arithmetic.py");
+                let code = compile_module(&parse_module(source).unwrap()).unwrap();
+                Interpreter::new().run_module(&code).unwrap();
+                let (compiled, entries, deopts) = crate::tier2::stats_for_test();
+                assert!(compiled >= 3 && entries >= 3, "{compiled}, {entries}");
+                assert!(crate::tier2::osr_stats_for_test() >= 3);
+                assert!(deopts >= 3, "overflow must exercise native exits: {deopts}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
     fn jit_first_short_range_defers_but_later_calls_compile() {
         const CHILD: &str = "WEAVEPY_SHORT_RANGE_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
