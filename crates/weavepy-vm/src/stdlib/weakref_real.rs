@@ -1430,8 +1430,13 @@ mod tests {
 
     #[test]
     fn ref_returns_alive_target_then_none_after_clear() {
-        let target = Object::from_static("hello");
-        let r = make_ref_object(target.clone(), None, kind::REF);
+        // Use a supported target: the unchecked string fixture can be
+        // cleared by another test's weakref-only collection.
+        let target = Object::Type(
+            TypeObject::new_user("WeakrefTarget", vec![], DictData::default()).unwrap(),
+        );
+        let r = c_new_ref(target.clone(), None).unwrap();
+        crate::gc_trace::sweep_weakref_only_targets();
         let live = ref_type_call(std::slice::from_ref(&r)).unwrap();
         assert!(live.is_same(&target));
         let id = id_of(&target);
