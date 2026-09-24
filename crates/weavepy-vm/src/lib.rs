@@ -62923,6 +62923,28 @@ assert loop(2000) == 1999000
     #[cfg(feature = "jit")]
     #[test]
     fn jit_worker_exit_preserves_shared_code_and_parked_generators() {
+        // Peer VM tests run without one shared GIL. Their process-global
+        // collections can retain a newly created function while this test
+        // attaches its construction-time attributes. Keep all worker,
+        // generator, and collection assertions in an isolated process.
+        const CHILD: &str = "WEAVEPY_WORKER_EXIT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "tests::jit_worker_exit_preserves_shared_code_and_parked_generators",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .status()
+                    .expect("spawn worker-exit test");
+            assert!(
+                status.success(),
+                "isolated worker-exit test failed: {status}"
+            );
+            return;
+        }
         let (out, parks, resumes, materialized) = run_jit_park(include_str!(
             "../../../tests/regrtest/test_jit_worker_exit.py"
         ));

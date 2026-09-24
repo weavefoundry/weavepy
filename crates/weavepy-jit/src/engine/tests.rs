@@ -318,11 +318,14 @@ fn attribute_chains_keep_the_first_read_deopt_snapshot() {
         chain: (i64, i64, i64),
     }
 
+    thread_local! {
+        static STATE: std::cell::RefCell<State> = std::cell::RefCell::new(State::default());
+    }
+
     unsafe extern "C" fn get(frame: *mut JitFrame, pin: i64, site: i64) -> i64 {
-        // SAFETY: the test supplies a live frame and State until native return.
+        // SAFETY: the test supplies a live frame until native return.
         let frame = unsafe { &mut *frame };
-        let state = unsafe { &mut *frame.ctx.cast::<State>() };
-        state.singles += 1;
+        STATE.with(|state| state.borrow_mut().singles += 1);
         frame.ret_bits = (pin + site + 1) as u64;
         0
     }
@@ -334,10 +337,13 @@ fn attribute_chains_keep_the_first_read_deopt_snapshot() {
     unsafe extern "C" fn chain(frame: *mut JitFrame, pin: i64, site: i64, count: i64) -> i64 {
         // SAFETY: as for get.
         let frame = unsafe { &mut *frame };
-        let state = unsafe { &mut *frame.ctx.cast::<State>() };
-        state.chains += 1;
-        state.chain = (pin, site, count);
-        if state.fail {
+        let fail = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.chains += 1;
+            state.chain = (pin, site, count);
+            state.fail
+        });
+        if fail {
             return 1;
         }
         frame.ret_bits = (pin + (site..site + count).map(|i| i + 1).sum::<i64>()) as u64;
@@ -387,10 +393,12 @@ fn attribute_chains_keep_the_first_read_deopt_snapshot() {
         let compiled = engine
             .compile_tfunc(tfunc)
             .expect("compile attribute chain");
-        let mut state = State {
-            fail,
-            ..State::default()
-        };
+        STATE.with(|state| {
+            *state.borrow_mut() = State {
+                fail,
+                ..State::default()
+            }
+        });
         let mut locals = [7u64, 0];
         let mut spill = [0u64; 3];
         let mut tags = [0u32; 3];
@@ -405,7 +413,7 @@ fn attribute_chains_keep_the_first_read_deopt_snapshot() {
             stack_tags: tags.as_mut_ptr(),
             stack_len: 0,
             stack_cap: 3,
-            ctx: (&raw mut state).cast(),
+            ctx: std::ptr::null_mut(),
             call_args: std::ptr::null_mut(),
             call_tags: std::ptr::null_mut(),
         };
@@ -424,7 +432,7 @@ fn attribute_chains_keep_the_first_read_deopt_snapshot() {
             assert_eq!(frame.ret_tag, SlotTag::Int as u32);
             assert_eq!(frame.ret_bits, 116);
         }
-        state
+        STATE.with(|state| state.take())
     }
 
     crate::runtime::register_attr_helpers(get, set);
