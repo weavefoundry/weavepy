@@ -20,6 +20,7 @@
 //!   peephole optimizer and adaptive specialization produce different
 //!   shapes that we deliberately don't reproduce.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -1425,12 +1426,30 @@ pub fn compile_module_with_options(
     filename: &str,
     opts: CompileOptions,
 ) -> Result<CodeObject, CompileError> {
-    let params = make_params(module, opts);
+    compile_module_cow(Cow::Borrowed(module), source, filename, opts)
+}
+
+/// As [`compile_module_with_options`], consuming the internal syntax tree.
+/// Folding reuses its storage instead of cloning the tree.
+pub fn compile_owned_module_with_options(
+    module: Module,
+    source: &str,
+    filename: &str,
+    opts: CompileOptions,
+) -> Result<CodeObject, CompileError> {
+    compile_module_cow(Cow::Owned(module), source, filename, opts)
+}
+
+fn compile_module_cow(
+    mut module: Cow<'_, Module>,
+    source: &str,
+    filename: &str,
+    opts: CompileOptions,
+) -> Result<CodeObject, CompileError> {
+    let params = make_params(&module, opts);
     let _pep563 = Pep563Guard::install(params.future_annotations);
-    validate::validate_module(module, source, params.future_annotations)?;
-    let mut folded = module.clone();
-    ast_opt::fold_module(&mut folded, params.future_annotations);
-    let module = &folded;
+    validate::validate_module(&module, source, params.future_annotations)?;
+    ast_opt::fold_module(module.to_mut(), params.future_annotations);
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
@@ -1440,7 +1459,7 @@ pub fn compile_module_with_options(
         Rc::from(source),
         params,
     );
-    top.compile_module_body(module)?;
+    top.compile_module_body(&module)?;
     Ok(top.finish())
 }
 
@@ -1464,12 +1483,30 @@ pub fn compile_interactive_with_options(
     filename: &str,
     opts: CompileOptions,
 ) -> Result<CodeObject, CompileError> {
-    let params = make_params(module, opts);
+    compile_interactive_cow(Cow::Borrowed(module), source, filename, opts)
+}
+
+/// As [`compile_interactive_with_options`], consuming the internal syntax tree.
+/// Folding reuses its storage instead of cloning the tree.
+pub fn compile_owned_interactive_with_options(
+    module: Module,
+    source: &str,
+    filename: &str,
+    opts: CompileOptions,
+) -> Result<CodeObject, CompileError> {
+    compile_interactive_cow(Cow::Owned(module), source, filename, opts)
+}
+
+fn compile_interactive_cow(
+    mut module: Cow<'_, Module>,
+    source: &str,
+    filename: &str,
+    opts: CompileOptions,
+) -> Result<CodeObject, CompileError> {
+    let params = make_params(&module, opts);
     let _pep563 = Pep563Guard::install(params.future_annotations);
-    validate::validate_module(module, source, params.future_annotations)?;
-    let mut folded = module.clone();
-    ast_opt::fold_module(&mut folded, params.future_annotations);
-    let module = &folded;
+    validate::validate_module(&module, source, params.future_annotations)?;
+    ast_opt::fold_module(module.to_mut(), params.future_annotations);
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
@@ -1480,7 +1517,7 @@ pub fn compile_interactive_with_options(
         params,
     );
     top.interactive = true;
-    top.compile_module_body(module)?;
+    top.compile_module_body(&module)?;
     Ok(top.finish())
 }
 
@@ -1503,12 +1540,32 @@ pub fn compile_eval_with_options(
     filename: &str,
     opts: CompileOptions,
 ) -> Result<CodeObject, CompileError> {
+    compile_eval_cow(Cow::Borrowed(module), source, filename, opts)
+}
+
+/// As [`compile_eval_with_options`], consuming the internal syntax tree.
+/// Folding reuses its storage instead of cloning the tree.
+pub fn compile_owned_eval_with_options(
+    module: Module,
+    source: &str,
+    filename: &str,
+    opts: CompileOptions,
+) -> Result<CodeObject, CompileError> {
+    compile_eval_cow(Cow::Owned(module), source, filename, opts)
+}
+
+fn compile_eval_cow(
+    mut module: Cow<'_, Module>,
+    source: &str,
+    filename: &str,
+    opts: CompileOptions,
+) -> Result<CodeObject, CompileError> {
     // CPython's `eval` grammar only admits a single expression; any
     // statement syntax (`del x`, `x = 1`, a second statement, …) is a
     // bare "invalid syntax" pointing at the first token the expression
     // grammar can't accept — *before* any statement-level diagnostics
     // like "cannot delete f-string expression" can fire.
-    if let Some(bad) = eval_mode_invalid_stmt(module) {
+    if let Some(bad) = eval_mode_invalid_stmt(&module) {
         let span = match &bad.kind {
             // The expression grammar chokes on the `=`: locate it
             // between the last target and the value.
@@ -1534,12 +1591,10 @@ pub fn compile_eval_with_options(
             span,
         ));
     }
-    let params = make_params(module, opts);
+    let params = make_params(&module, opts);
     let _pep563 = Pep563Guard::install(params.future_annotations);
-    validate::validate_module(module, source, params.future_annotations)?;
-    let mut folded = module.clone();
-    ast_opt::fold_module(&mut folded, params.future_annotations);
-    let module = &folded;
+    validate::validate_module(&module, source, params.future_annotations)?;
+    ast_opt::fold_module(module.to_mut(), params.future_annotations);
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
@@ -1550,7 +1605,7 @@ pub fn compile_eval_with_options(
         params,
     );
     top.eval_mode = true;
-    top.compile_module_body(module)?;
+    top.compile_module_body(&module)?;
     Ok(top.finish())
 }
 
@@ -16984,5 +17039,67 @@ mod tests {
         let dis = co.format_dis();
         assert!(dis.contains("LOAD_CONST"));
         assert!(dis.contains("STORE_NAME"));
+    }
+
+    #[test]
+    fn owned_compilation_matches_borrowed_without_mutating_the_input() {
+        type Borrowed = fn(&Module, &str, &str, CompileOptions) -> Result<CodeObject, CompileError>;
+        type Owned = fn(Module, &str, &str, CompileOptions) -> Result<CodeObject, CompileError>;
+        let modes: [(Borrowed, Owned); 3] = [
+            (
+                compile_module_with_options,
+                compile_owned_module_with_options,
+            ),
+            (
+                compile_interactive_with_options,
+                compile_owned_interactive_with_options,
+            ),
+            (compile_eval_with_options, compile_owned_eval_with_options),
+        ];
+        let sources = [
+            "1 + 2 * 3\n",
+            "'doc'\nx = (1, 2, 3)\nassert __debug__\n",
+            "from __future__ import annotations\ndef f(x: list[int]) -> str:\n    return 'a' + 'b'\n",
+            "def outer(x):\n    def inner():\n        return x + 1\n    return inner\n",
+            "try:\n    value = 1 / 0\nexcept ZeroDivisionError:\n    value = 3\n",
+            "x = [n * 2 for n in range(5)]\n",
+        ];
+        for source in sources {
+            let module = parse_module(source).unwrap();
+            let original = module.clone();
+            for (borrowed, owned) in modes {
+                for optimize in 0..=2 {
+                    for flags in [0, flags::CO_FUTURE_ANNOTATIONS] {
+                        let opts = CompileOptions { flags, optimize };
+                        let before = borrowed(&module, source, "owned.py", opts);
+                        let after = owned(module.clone(), source, "owned.py", opts);
+                        match (before, after) {
+                            (Ok(before), Ok(after)) => assert_eq!(before, after),
+                            (Err(before), Err(after)) => assert_eq!(before, after),
+                            result => panic!("different outcomes for {source:?}: {result:?}"),
+                        }
+                        assert_eq!(module, original, "borrowed input was changed");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn owned_compilation_preserves_validation_errors() {
+        for source in [
+            "return 1\n",
+            "break\n",
+            "def f():\n    value = 1\n    global value\n",
+            "x = 1\nfrom __future__ import annotations\n",
+        ] {
+            let module = parse_module(source).unwrap();
+            let opts = CompileOptions::default();
+            let before =
+                compile_module_with_options(&module, source, "errors.py", opts).unwrap_err();
+            let after =
+                compile_owned_module_with_options(module, source, "errors.py", opts).unwrap_err();
+            assert_eq!(before, after);
+        }
     }
 }

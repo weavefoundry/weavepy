@@ -48753,14 +48753,16 @@ impl Interpreter {
             self.emit_escape_warnings(&src, &filename, &warnings)?;
             let code = match root_mode {
                 crate::stdlib::ast_convert::RootMode::Exec => {
-                    weavepy_compiler::compile_module_with_options(&module, &src, &filename, opts)
+                    weavepy_compiler::compile_owned_module_with_options(
+                        module, &src, &filename, opts,
+                    )
                 }
                 crate::stdlib::ast_convert::RootMode::Eval => {
-                    weavepy_compiler::compile_eval_with_options(&module, &src, &filename, opts)
+                    weavepy_compiler::compile_owned_eval_with_options(module, &src, &filename, opts)
                 }
                 crate::stdlib::ast_convert::RootMode::Single => {
-                    weavepy_compiler::compile_interactive_with_options(
-                        &module, &src, &filename, opts,
+                    weavepy_compiler::compile_owned_interactive_with_options(
+                        module, &src, &filename, opts,
                     )
                 }
             }
@@ -48842,17 +48844,19 @@ impl Interpreter {
         let module = self.parse_for_compile(&source, &filename, parse_flags, root_mode)?;
         let code = match root_mode {
             crate::stdlib::ast_convert::RootMode::Exec => {
-                weavepy_compiler::compile_module_with_options(&module, &source, &filename, opts)
+                weavepy_compiler::compile_owned_module_with_options(
+                    module, &source, &filename, opts,
+                )
             }
             crate::stdlib::ast_convert::RootMode::Eval => {
-                weavepy_compiler::compile_eval_with_options(&module, &source, &filename, opts)
+                weavepy_compiler::compile_owned_eval_with_options(module, &source, &filename, opts)
             }
             // Interactive mode: top-level expression statements echo
             // through `sys.displayhook` (`PrintExpr`). Powers the REPL,
             // `code`/`codeop`, and `doctest`'s example execution.
             crate::stdlib::ast_convert::RootMode::Single => {
-                weavepy_compiler::compile_interactive_with_options(
-                    &module, &source, &filename, opts,
+                weavepy_compiler::compile_owned_interactive_with_options(
+                    module, &source, &filename, opts,
                 )
             }
         }
@@ -49137,8 +49141,8 @@ impl Interpreter {
                 // never raises `ValueError` for bad syntax. Invalid-escape
                 // `SyntaxWarning`s replay here too.
                 let module = self.parse_source_emitting_warnings(&src, "<string>")?;
-                let compiled = weavepy_compiler::compile_module_with_options(
-                    &module,
+                let compiled = weavepy_compiler::compile_owned_module_with_options(
+                    module,
                     &src,
                     "<string>",
                     self.exec_eval_compile_options(),
@@ -49348,8 +49352,8 @@ impl Interpreter {
         // call `eval("f'...'")` and assert `SyntaxError`) rely on.
         let trimmed = src.trim_start_matches([' ', '\t', '\n', '\r', '\x0c']);
         let module = self.parse_eval_source_emitting_warnings(trimmed, "<string>")?;
-        let code = weavepy_compiler::compile_eval_with_options(
-            &module,
+        let code = weavepy_compiler::compile_owned_eval_with_options(
+            module,
             trimmed,
             "<string>",
             self.exec_eval_compile_options(),
@@ -50705,8 +50709,13 @@ impl Interpreter {
             let diag = format!("{}.py", full.rsplit('.').next().unwrap_or(full));
             parse_error_to_syntax_error(&e, source, &diag)
         })?;
-        let code = weavepy_compiler::compile_module_with_source(&module, source, filename)
-            .map_err(|e| compile_error_to_syntax_error(&e, source, filename))?;
+        let code = weavepy_compiler::compile_owned_module_with_options(
+            module,
+            source,
+            filename,
+            weavepy_compiler::CompileOptions::default(),
+        )
+        .map_err(|e| compile_error_to_syntax_error(&e, source, filename))?;
         // RFC 0021 — populate the process-global frozen cache so the
         // *next* interpreter in this process skips parse + compile.
         // We cache only the compiled code, never the running module
@@ -50908,8 +50917,8 @@ impl Interpreter {
             let source = decode_source_bytes(&raw, &filename)?;
             let module = weavepy_parser::parse_module(&source)
                 .map_err(|e| parse_error_to_syntax_error(&e, &source, &filename))?;
-            let code = weavepy_compiler::compile_module_with_options(
-                &module,
+            let code = weavepy_compiler::compile_owned_module_with_options(
+                module,
                 &source,
                 &filename,
                 self.default_compile_options(),
