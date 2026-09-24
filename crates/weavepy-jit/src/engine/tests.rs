@@ -459,3 +459,88 @@ fn attribute_chains_keep_the_first_read_deopt_snapshot() {
     let separated = run(&mut engine, &tfunc, false);
     assert_eq!((separated.singles, separated.chains), (4, 0));
 }
+
+#[test]
+fn dynamic_attribute_reads_publish_each_cache_pc() {
+    use crate::runtime::{JitFrame, JitStatus, SlotTag};
+    const CHILD: &str = "WEAVEPY_DYN_ATTR_PC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "engine::tests::dynamic_attribute_reads_publish_each_cache_pc",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("spawn cache-PC test");
+        assert!(status.success(), "cache-PC test failed: {status}");
+        return;
+    }
+    thread_local! {
+        static READS: std::cell::RefCell<Vec<(u32, i64, i64)>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+    unsafe extern "C" fn get(frame: *mut JitFrame, pin: i64, name: i64) -> i64 {
+        // SAFETY: the test keeps the frame alive through native return.
+        let frame = unsafe { &mut *frame };
+        READS.with(|reads| reads.borrow_mut().push((frame.deopt_pc, pin, name)));
+        frame.ret_bits = (pin + name + 1) as u64;
+        0
+    }
+    unsafe extern "C" fn set(_: *mut JitFrame, _: i64, _: i64) -> i64 {
+        3
+    }
+    unsafe extern "C" fn unused_unary(_: *mut JitFrame, _: i64) -> i64 {
+        3
+    }
+    unsafe extern "C" fn unused_ternary(_: *mut JitFrame, _: i64, _: i64, _: i64) -> i64 {
+        3
+    }
+    unsafe extern "C" fn unused_call(_: *mut JitFrame, _: i64, _: u32, _: u32, _: u32) -> i64 {
+        3
+    }
+    // Compilation requires the whole frame-coverage helper group. These
+    // additional helpers are never emitted by this two-read function.
+    crate::runtime::register_call_dyn_helper(unused_call);
+    crate::runtime::register_global_obj_helper(unused_unary);
+    crate::runtime::register_iter_new_helper(unused_unary);
+    crate::runtime::register_iter_next_pair_helper(unused_ternary);
+    crate::runtime::register_str_format_helpers(unused_ternary, unused_ternary);
+    let mut tfunc = function(&[
+        TOp::LoadLocal(0),
+        TOp::DynAttrGet { name: 0 },
+        TOp::DynAttrGet { name: 1 },
+    ]);
+    tfunc.local_types[0] = Some(JitType::Obj);
+    tfunc.ret_lane = Some(JitType::Obj);
+    crate::runtime::register_dyn_attr_helpers(get, set);
+    let mut engine = super::JitEngine::new().expect("host ISA");
+    let compiled = engine.compile_tfunc(&tfunc).expect("dynamic read frame");
+    let mut locals = [7u64, 0];
+    let mut spill = [0u64; 3];
+    let mut tags = [0u32; 3];
+    let mut frame = JitFrame {
+        locals: locals.as_mut_ptr(),
+        n_locals: 2,
+        entry_pc: 0,
+        ret_bits: 0,
+        ret_tag: 0,
+        deopt_pc: 987,
+        stack_spill: spill.as_mut_ptr(),
+        stack_tags: tags.as_mut_ptr(),
+        stack_len: 0,
+        stack_cap: 3,
+        ctx: std::ptr::null_mut(),
+        call_args: std::ptr::null_mut(),
+        call_tags: std::ptr::null_mut(),
+    };
+    // SAFETY: the engine, frame, and buffers outlive this entry.
+    assert_eq!(
+        unsafe { compiled.enter(&raw mut frame) },
+        JitStatus::Returned
+    );
+    assert_eq!(frame.ret_tag, SlotTag::ObjPin as u32);
+    assert_eq!(frame.ret_bits, 10);
+    READS.with(|reads| assert_eq!(*reads.borrow(), [(1, 7, 0), (2, 8, 1)]));
+}

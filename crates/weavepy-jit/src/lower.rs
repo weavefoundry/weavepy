@@ -1214,9 +1214,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.vstack.push((res, JitType::Bool));
     }
 
-    /// RFC 0074 WS2/WS4 — the eager generic attribute load via
-    /// `wpjit_dyn_attr_get`: pop the receiver pin, run the
-    /// interpreter's exact lookup, push the fresh object-lane pin.
+    /// RFC 0074 WS2/WS4: offer an object-lane attribute read to the
+    /// embedder. Pop the receiver pin and push the loaded value's pin
+    /// when the helper completes the lookup.
     /// `1` = raised at this pc (receiver consumed); `2` = completed
     /// but a guard was invalidated / cap pressure — deopt at the
     /// *next* pc with the parked result (never re-executed); `3` =
@@ -1229,6 +1229,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let snapshot = self.vstack.clone();
 
         self.writeback_locals();
+        // The native read reuses this exact instruction's inline cache.
+        self.store_call_site_pc(pc);
 
         let sig = self.list_helper_sig();
         let helper = self
