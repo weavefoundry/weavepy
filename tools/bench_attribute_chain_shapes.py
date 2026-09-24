@@ -1,9 +1,9 @@
 """Compare guarded attribute reads across chain depths and storage layouts.
 
-WEAVEPY_CHAIN_DEPTH selects 2, 3, 4, 8, 9, or 16 fields, including the final
+WEAVEPY_CHAIN_DEPTH selects 2, 3, 4, 8, 9, 16, 17, 32, or 33 fields, including the final
 value. WEAVEPY_CHAIN_LAYOUT selects dict, slots, or mixed storage. Source
 generation happens before timing so every iteration executes explicit reads.
-The 9- and 16-field cases expose behavior beyond the native fusion bound.
+The deeper cases exercise the guarded and cached native fusion boundaries.
 """
 
 import os
@@ -26,7 +26,7 @@ class SlotNode:
 
 depth = int(os.environ.get("WEAVEPY_CHAIN_DEPTH", "8"))
 layout = os.environ.get("WEAVEPY_CHAIN_LAYOUT", "dict")
-if depth not in (2, 3, 4, 8, 9, 16):
+if depth not in (2, 3, 4, 8, 9, 16, 17, 32, 33):
     raise ValueError("unsupported chain depth")
 if layout not in ("dict", "slots", "mixed"):
     raise ValueError("unsupported storage layout")
