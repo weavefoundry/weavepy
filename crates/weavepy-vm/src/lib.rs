@@ -9708,9 +9708,11 @@ impl Interpreter {
         let Some(Object::Generator(g)) = frame.stack.last() else {
             return None;
         };
+        // Validate and take the frame under one borrow. No Python runs
+        // while it is held; release it before resuming the activation.
+        let mut state = g.state.try_borrow_mut().ok()?;
         let first_resume;
         {
-            let state = g.state.try_borrow().ok()?;
             let boxed = match &*state {
                 GeneratorState::Suspended(boxed) => {
                     first_resume = false;
@@ -9740,8 +9742,9 @@ impl Interpreter {
             return None;
         };
         // Committed.
+        let prev_state = std::mem::replace(&mut *state, GeneratorState::Running);
+        drop(state);
         let g = g.clone();
-        let prev_state = std::mem::replace(&mut *g.state.borrow_mut(), GeneratorState::Running);
         let (GeneratorState::Suspended(mut boxed) | GeneratorState::Created(mut boxed)) =
             prev_state
         else {
@@ -33897,9 +33900,11 @@ impl Interpreter {
         }
         // A never-started generator runs its first activation here too
         // (only a `None` may be sent into it; the general path raises).
+        // Validate and take the frame under one borrow. No Python runs
+        // while it is held; release it before resuming the activation.
+        let mut state = gen.state.try_borrow_mut().ok()?;
         let first_resume;
         {
-            let state = gen.state.try_borrow().ok()?;
             let boxed = match &*state {
                 GeneratorState::Suspended(boxed) => {
                     first_resume = false;
@@ -33927,6 +33932,7 @@ impl Interpreter {
         let guard = match crate::recursion::enter() {
             crate::recursion::Enter::Ok(g) => g,
             crate::recursion::Enter::Overflow => {
+                drop(state);
                 return Some(Err(RuntimeError::PyException(
                     crate::error::PyException::new(crate::builtin_types::make_exception(
                         "RecursionError",
@@ -33935,7 +33941,8 @@ impl Interpreter {
                 )));
             }
         };
-        let prev_state = std::mem::replace(&mut *gen.state.borrow_mut(), GeneratorState::Running);
+        let prev_state = std::mem::replace(&mut *state, GeneratorState::Running);
+        drop(state);
         let (GeneratorState::Suspended(mut boxed) | GeneratorState::Created(mut boxed)) =
             prev_state
         else {
