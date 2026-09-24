@@ -6950,33 +6950,66 @@ unsafe extern "C" fn wpjit_attr_get_chain(
 /// inside a read-only interval with no Python callbacks or GIL release.
 #[inline(always)]
 unsafe fn cached_chain_peek<'a>(
-    inst: &'a crate::types::PyInstance,
+    receiver: &'a Object,
     code: &CodeObject,
+    extension: &super::CodeConstObjects,
     pc: u32,
 ) -> Option<&'a Object> {
     use weavepy_compiler::{InlineCache as IC, OpCode};
     let instruction = code.instructions.get(pc as usize)?;
-    if instruction.op != OpCode::LoadAttr || inst.cls_raw().native_kind.get() != 0 {
+    if instruction.op != OpCode::LoadAttr {
         return None;
     }
-    let version = inst.cls_raw().attr_version.get();
-    match code.caches.get(pc) {
-        IC::LoadAttrInstance { key_idx, ver } if ver == version => {
-            // SAFETY: the enclosing walk is read-only and callback-free.
-            let dict = unsafe { inst.dict.get()?.peek() }?;
-            let (key, value) = dict.get_index(key_idx as usize)?;
-            super::slot_name_matches(code, instruction.arg, key).then_some(value)
+    let Some(Object::Str(name)) = extension.name_objs.get(instruction.arg as usize) else {
+        return None;
+    };
+    let cache = code.caches.get(pc);
+    match receiver {
+        Object::Instance(inst) if inst.cls_raw().native_kind.get() == 0 => {
+            let version = inst.cls_raw().attr_version.get();
+            match cache {
+                IC::LoadAttrInstance { key_idx, ver } if ver == version => {
+                    // SAFETY: the rooted walk is read-only and callback-free.
+                    let dict = unsafe { inst.dict.get()?.peek() }?;
+                    let (key, value) = dict.get_index(key_idx as usize)?;
+                    key_is(key, name).then_some(value)
+                }
+                IC::LoadAttrSlot { key_idx, ver } if ver == version => {
+                    // SAFETY: shared cells and conflicting borrows reject
+                    // this peek instead of exposing an unguarded reference.
+                    let slots = unsafe { inst.slots.peek() }?;
+                    slots
+                        .get_index(key_idx as usize)
+                        .filter(|(key, _)| key_is(key, name))
+                        .map(|(_, value)| value)
+                        .or_else(|| slots.get(name.as_ref()))
+                }
+                _ => {
+                    let index = extension
+                        .attr_poly
+                        .get()?
+                        .get(pc as usize)?
+                        .index(version)?;
+                    // SAFETY: the same callback-free, rooted interval.
+                    let dict = unsafe { inst.dict.get()?.peek() }?;
+                    let (key, value) = dict.get_index(index as usize)?;
+                    key_is(key, name).then_some(value)
+                }
+            }
         }
-        IC::LoadAttrSlot { key_idx, ver } if ver == version => {
-            // SAFETY: the same interval. An observer can revoke this peek;
-            // decline the whole walk instead of keeping unguarded references.
-            let slots = unsafe { inst.slots.peek() }?;
-            let name = code.names.get(instruction.arg as usize)?;
-            slots
-                .get_index(key_idx as usize)
-                .filter(|(key, _)| super::slot_name_matches(code, instruction.arg, key))
-                .map(|(_, value)| value)
-                .or_else(|| slots.get(name.as_str()))
+        Object::Module(module) => {
+            let IC::LoadAttrModule { module_id, key_idx } = cache else {
+                return None;
+            };
+            if crate::specialize::rc_id(&module.dict) != module_id
+                || crate::object::module_class(module).is_some()
+            {
+                return None;
+            }
+            // SAFETY: the original root owns the whole read-only graph.
+            let dict = unsafe { module.dict.peek() }?;
+            let (key, value) = dict.get_index(key_idx as usize)?;
+            key_is(key, name).then_some(value)
         }
         _ => None,
     }
@@ -7034,6 +7067,11 @@ unsafe extern "C" fn wpjit_cached_attr_chain(
     #[allow(clippy::cast_ptr_alignment)]
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     let code = unsafe { &*ctx.code_ptr };
+    // The activation owns immutable names and cache storage through its code.
+    // Fetch them once, and decline without initializing a missing extension.
+    let Some(extension) = super::code_vm_ext_existing(code) else {
+        return 1;
+    };
     let Some(last_pc) = jf.deopt_pc.checked_add(total as u32 - 1) else {
         return 1;
     };
@@ -7044,8 +7082,10 @@ unsafe extern "C" fn wpjit_cached_attr_chain(
         Complete(Object),
         Prefix(Result<u64, Object>),
     }
+    #[cfg(test)]
+    let mut read_kinds = [0; 5];
     let outcome = (|| {
-        let Pin::Obj(root @ Object::Instance(_)) = ctx.pins.get(pin as usize)? else {
+        let Pin::Obj(root) = ctx.pins.get(pin as usize)? else {
             return None;
         };
         let guards = ctx.attr_guards.get(first..end)?;
@@ -7064,19 +7104,23 @@ unsafe extern "C" fn wpjit_cached_attr_chain(
         // suffix miss can transfer this exact result instead of walking twice.
         let prefix = value;
         for offset in guarded as u32..total as u32 {
-            let next = match value {
-                // SAFETY: exact cache hits don't call Python or mutate fields.
-                Object::Instance(inst) => unsafe {
-                    cached_chain_peek(inst, code, jf.deopt_pc + offset)
-                },
-                _ => None,
-            };
+            // SAFETY: exact cache hits don't call Python or mutate fields.
+            let next = unsafe { cached_chain_peek(value, code, extension, jf.deopt_pc + offset) };
             let Some(next) = next else {
                 // Match the ordinary prefix's result lane and identity-based
                 // pin reuse. No dynamic read has been charged or committed.
                 let outcome = chain_attr_value(guards.last()?, prefix, &ctx.pins)?;
                 return Some(Outcome::Prefix(outcome));
             };
+            #[cfg(test)]
+            {
+                let kind = if matches!(value, Object::Module(_)) {
+                    2
+                } else {
+                    0
+                };
+                read_kinds[kind] += 1;
+            }
             value = next;
         }
         if int_result == 1 && !matches!(value, Object::Int(_)) {
@@ -7146,7 +7190,9 @@ unsafe extern "C" fn wpjit_cached_attr_chain(
         });
         DYN_ATTR_NATIVE_READS.with(|reads| {
             let mut counts = reads.get();
-            counts[0] += (total - guarded) as u64;
+            for (count, increment) in counts.iter_mut().zip(read_kinds) {
+                *count += increment;
+            }
             reads.set(counts);
         });
     }
@@ -10579,6 +10625,22 @@ pub(crate) fn force_enable_for_test(threshold: u32) {
         st.range_budget = false;
         set_lean_warm_from_threshold(st.threshold);
     });
+}
+
+#[cfg(test)]
+pub(crate) fn pin_pressure_exits_for_test() -> u64 {
+    JIT.with(|cell| cell.borrow().stats.pin_pressure_exits)
+}
+
+#[cfg(test)]
+pub(crate) unsafe fn cached_chain_peek_for_test<'a>(
+    receiver: &'a Object,
+    code: &CodeObject,
+    pc: u32,
+) -> Option<&'a Object> {
+    let extension = super::code_vm_ext_existing(code)?;
+    // SAFETY: callers uphold cached_chain_peek's read-only GIL contract.
+    unsafe { cached_chain_peek(receiver, code, extension, pc) }
 }
 
 /// Test hook: `(frames_compiled, native_entries, deopts)` for the

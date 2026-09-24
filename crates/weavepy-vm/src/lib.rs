@@ -60301,6 +60301,19 @@ fn code_vm_ext(code: &CodeObject) -> Option<&CodeConstObjects> {
         Some(arc) => arc,
         None => code_vm_ext_init(code),
     };
+    Some(code_vm_ext_ref(arc))
+}
+
+/// Borrow an already initialized extension without filling any cache.
+#[cfg(feature = "jit")]
+#[inline]
+fn code_vm_ext_existing(code: &CodeObject) -> Option<&CodeConstObjects> {
+    code.vm_ext.0.get().map(code_vm_ext_ref)
+}
+
+#[inline]
+#[allow(clippy::cast_ptr_alignment)] // The erased pointer has the producer's alignment.
+fn code_vm_ext_ref(arc: &std::sync::Arc<dyn std::any::Any + Send + Sync>) -> &CodeConstObjects {
     // RFC 0077 (WS5): the slot has exactly one producer (the initializer
     // above; `marshal` only ever creates the empty default), so the
     // `Any::type_id` vtable probe on every constant/name lookup is
@@ -60309,12 +60322,10 @@ fn code_vm_ext(code: &CodeObject) -> Option<&CodeConstObjects> {
     debug_assert!(arc.downcast_ref::<CodeConstObjects>().is_some());
     // SAFETY: `get_or_init` only ever stores an `Arc<CodeConstObjects>`
     // here (no other code writes `vm_ext`), so the erased pointer is a
-    // pointer to a live `CodeConstObjects` for as long as `code` is.
+    // pointer to a live `CodeConstObjects` for the borrowed Arc's lifetime.
     // The cast from the erased `dyn Any` pointer to the concrete type is
     // the whole point (the alignment lint cannot see the invariant).
-    #[allow(clippy::cast_ptr_alignment)]
-    let table = unsafe { &*(std::sync::Arc::as_ptr(arc).cast::<CodeConstObjects>()) };
-    Some(table)
+    unsafe { &*(std::sync::Arc::as_ptr(arc).cast::<CodeConstObjects>()) }
 }
 
 /// [`code_vm_ext`]'s first call for a code object: build the table.
@@ -63644,6 +63655,203 @@ assert loop(2000) == 1999000
             .expect("spawn class-key callback worker")
             .join()
             .expect("class-key callback worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_module_attribute_chains_preserve_guards_and_ownership() {
+        const CHILD: &str = "WEAVEPY_MODULE_CHAIN_VM_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::jit_module_attribute_chains_preserve_guards_and_ownership",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("spawn module-chain VM test");
+            assert!(status.success(), "module-chain VM test failed: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                crate::tier2::force_enable_for_test(2);
+                let source =
+                    include_str!("../../../tests/regrtest/test_jit_module_attribute_chains.py");
+                let (warmup, mutations) = source.split_once("# MODULE CHAIN MUTATIONS:").unwrap();
+                let code = compile_module(&parse_module(warmup).unwrap()).unwrap();
+                let mut interp = Interpreter::new();
+                interp.run_module(&code).expect("module-chain warmup");
+                let hits = crate::tier2::cached_attr_chain_hits_for_test();
+                assert!(hits[0] > 1000 && hits[1] > 10000, "fused reads: {hits:?}");
+                assert_eq!(
+                    crate::tier2::pin_pressure_exits_for_test(),
+                    0,
+                    "integer chains must not retain intermediate pins"
+                );
+                let globals = {
+                    let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+                        panic!("missing main module")
+                    };
+                    main.dict.clone()
+                };
+                let code = compile_module(
+                    &parse_module("assert integer_read(3000, native_root) == 9000").unwrap(),
+                )
+                .unwrap();
+                interp.exec_module_in(&code, globals.clone()).unwrap();
+                {
+                    let _gil = crate::gil::global_gil().acquire();
+                    let g = globals.borrow();
+                    let root = g.get(&crate::object::StrKey("native_root")).unwrap();
+                    let fresh = compile_module(&parse_module("root._weavepy_chain_child").unwrap())
+                        .unwrap();
+                    let fresh_pc = fresh
+                        .instructions
+                        .iter()
+                        .position(|ins| ins.op == OpCode::LoadAttr)
+                        .unwrap() as u32;
+                    assert!(fresh.vm_ext.0.get().is_none());
+                    let python_root = g.get(&crate::object::StrKey("python_root")).unwrap();
+                    // SAFETY: the GIL and root owner stay live; no result
+                    // escapes this callback-free probe.
+                    assert!(unsafe {
+                        crate::tier2::cached_chain_peek_for_test(python_root, &fresh, fresh_pc)
+                    }
+                    .is_none());
+                    assert!(
+                        fresh.vm_ext.0.get().is_none(),
+                        "a miss must not initialize metadata"
+                    );
+
+                    let Object::Module(module) = root else {
+                        panic!("expected native module")
+                    };
+                    let Some(Object::Function(reader)) =
+                        g.get(&crate::object::StrKey("integer_read"))
+                    else {
+                        panic!("missing reader")
+                    };
+                    let code = reader.code.borrow();
+                    let pc = code
+                        .instructions
+                        .iter()
+                        .position(|ins| ins.op == OpCode::LoadAttr)
+                        .unwrap() as u32;
+                    // SAFETY: each result stays inside this rooted, read-only
+                    // interval under the GIL. No result crosses a mutation.
+                    let tail = unsafe { crate::tier2::cached_chain_peek_for_test(root, &code, pc) }
+                        .unwrap()
+                        .clone();
+                    assert!(matches!(
+                        unsafe { crate::tier2::cached_chain_peek_for_test(&tail, &code, pc + 1) },
+                        Some(Object::Int(3))
+                    ));
+                    let other = g.get(&crate::object::StrKey("math")).unwrap();
+                    assert!(
+                        unsafe { crate::tier2::cached_chain_peek_for_test(other, &code, pc) }
+                            .is_none(),
+                        "module owner must match the cache"
+                    );
+                    let guard = module.dict.borrow_mut();
+                    assert!(
+                        unsafe { crate::tier2::cached_chain_peek_for_test(root, &code, pc) }
+                            .is_none()
+                    );
+                    drop(guard);
+                    let Object::Instance(tail) = &tail else {
+                        panic!("expected Python module")
+                    };
+                    let guard = tail.dict.get().unwrap().borrow_mut();
+                    let tail_object = Object::Instance(tail.clone());
+                    assert!(unsafe {
+                        crate::tier2::cached_chain_peek_for_test(&tail_object, &code, pc + 1)
+                    }
+                    .is_none());
+                    drop(guard);
+                }
+                let code = compile_module(
+                    &parse_module("assert integer_read(3000, math) == 9000").unwrap(),
+                )
+                .unwrap();
+                interp.exec_module_in(&code, globals.clone()).unwrap();
+                {
+                    let _gil = crate::gil::global_gil().acquire();
+                    let g = globals.borrow();
+                    let root = g.get(&crate::object::StrKey("math")).unwrap();
+                    let Object::Module(module) = root else {
+                        panic!("expected native module")
+                    };
+                    let Some(Object::Function(reader)) =
+                        g.get(&crate::object::StrKey("integer_read"))
+                    else {
+                        panic!("missing reader")
+                    };
+                    let code = reader.code.borrow();
+                    let pc = code
+                        .instructions
+                        .iter()
+                        .position(|ins| ins.op == OpCode::LoadAttr)
+                        .unwrap() as u32;
+                    // SAFETY: each result is inspected and discarded before
+                    // the class registry changes, with the GIL held.
+                    assert!(
+                        unsafe { crate::tier2::cached_chain_peek_for_test(root, &code, pc) }
+                            .is_some()
+                    );
+                    crate::object::set_module_class(
+                        module,
+                        Object::Type(builtin_types().module_.clone()),
+                    );
+                    assert!(
+                        unsafe { crate::tier2::cached_chain_peek_for_test(root, &code, pc) }
+                            .is_none(),
+                        "an assigned module class must revoke the borrowed cache"
+                    );
+                }
+                let mutations = format!("# MODULE CHAIN MUTATIONS:{mutations}");
+                let code = compile_module(&parse_module(&mutations).unwrap()).unwrap();
+                interp
+                    .exec_module_in(&code, globals.clone())
+                    .expect("module-chain mutations");
+                let before = crate::tier2::cached_attr_chain_hits_for_test();
+                let source = concat!(
+                    "native_root._weavepy_chain_child = child(3)\n",
+                    "def shared_read(n, root):\n",
+                    "    total = 0\n",
+                    "    for _ in range(n):\n",
+                    "        total += root._weavepy_chain_child.value\n",
+                    "    return total\n",
+                    "assert shared_read(10000, native_root) == 30000",
+                );
+                let code = compile_module(&parse_module(source).unwrap()).unwrap();
+                interp.exec_module_in(&code, globals.clone()).unwrap();
+                let warmed = crate::tier2::cached_attr_chain_hits_for_test();
+                assert!(
+                    warmed[1] > before[1] + 1000,
+                    "shared-cell probe must first fuse"
+                );
+                let before = warmed;
+                crate::sync::mark_cells_shared();
+                let source = concat!(
+                    "assert shared_read(10000, native_root) == 30000\n",
+                    "del native_root._weavepy_chain_child",
+                );
+                let code = compile_module(&parse_module(source).unwrap()).unwrap();
+                interp
+                    .exec_module_in(&code, globals)
+                    .expect("shared module fallback");
+                assert_eq!(
+                    crate::tier2::cached_attr_chain_hits_for_test(),
+                    before,
+                    "shared cells must revoke borrowed module chains"
+                );
+            })
+            .expect("spawn module-chain worker")
+            .join()
+            .expect("module-chain worker");
     }
 
     #[cfg(feature = "jit")]
