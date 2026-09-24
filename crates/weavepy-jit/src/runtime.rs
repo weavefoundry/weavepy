@@ -886,6 +886,42 @@ pub(crate) fn attr_get_chain_helper_addr() -> usize {
     ATTR_GET_CHAIN_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Bound for a callback-free walk combining guarded and cached reads.
+/// This does not increase guarded receiver provenance or per-code metadata.
+pub const MAX_CACHED_ATTR_CHAIN_LEN: usize = 32;
+
+/// Optional mixed attribute-chain read. `guarded` consecutive sites start at
+/// `first_site`; the remaining reads use the caches at the published bytecode
+/// PC. `int_result` is 0 for an object pin or 1 for an exact integer result.
+/// Success returns 0 with `ret_bits` set. Status 1 leaves pins, accounting,
+/// and Python state unchanged. Status 2 completes only the guarded prefix,
+/// using its ordinary result pin and pin-reuse policy; `ret_bits` holds that
+/// object pin and lowering runs the remaining dynamic reads. No dynamic reads
+/// are charged on either fallback. The helper never calls Python. Same safety
+/// contract as [`AttrGetHelper`].
+pub type CachedAttrChainHelper = unsafe extern "C" fn(
+    frame: *mut JitFrame,
+    pin: i64,
+    first_site: i64,
+    guarded: i64,
+    total: i64,
+    int_result: i64,
+) -> i64;
+
+static CACHED_ATTR_CHAIN_HELPER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register optional mixed-chain fusion before compiling affected frames.
+/// Without it, the existing guarded and dynamic helpers remain in use.
+pub fn register_cached_attr_chain_helper(helper: CachedAttrChainHelper) {
+    CACHED_ATTR_CHAIN_HELPER.store(helper as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn cached_attr_chain_helper_addr() -> usize {
+    CACHED_ATTR_CHAIN_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
 static ATTR_GET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static ATTR_SET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 

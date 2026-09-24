@@ -689,6 +689,7 @@ impl JitState {
         );
         weavepy_jit::register_attr_helpers(wpjit_attr_get, wpjit_attr_set);
         weavepy_jit::register_attr_get_chain_helper(wpjit_attr_get_chain);
+        weavepy_jit::register_cached_attr_chain_helper(wpjit_cached_attr_chain);
         // RFC 0073 WS2 — the dict-lane helpers.
         weavepy_jit::register_dict_helpers(
             wpjit_dict_get,
@@ -6893,6 +6894,216 @@ unsafe extern "C" fn wpjit_attr_get_chain(
             _ => (dict + 1, slots),
         });
     });
+    0
+}
+
+/// Borrow a dynamic field only when the exact bytecode cache proves the read.
+///
+/// # Safety
+/// The caller retains the original root and keeps every traversed reference
+/// inside a read-only interval with no Python callbacks or GIL release.
+#[inline(always)]
+unsafe fn cached_chain_peek<'a>(
+    inst: &'a crate::types::PyInstance,
+    code: &CodeObject,
+    pc: u32,
+) -> Option<&'a Object> {
+    use weavepy_compiler::{InlineCache as IC, OpCode};
+    let instruction = code.instructions.get(pc as usize)?;
+    if instruction.op != OpCode::LoadAttr || inst.cls_raw().native_kind.get() != 0 {
+        return None;
+    }
+    let version = inst.cls_raw().attr_version.get();
+    match code.caches.get(pc) {
+        IC::LoadAttrInstance { key_idx, ver } if ver == version => {
+            // SAFETY: the enclosing walk is read-only and callback-free.
+            let dict = unsafe { inst.dict.get()?.peek() }?;
+            let (key, value) = dict.get_index(key_idx as usize)?;
+            super::slot_name_matches(code, instruction.arg, key).then_some(value)
+        }
+        IC::LoadAttrSlot { key_idx, ver } if ver == version => {
+            // SAFETY: the same interval. An observer can revoke this peek;
+            // decline the whole walk instead of keeping unguarded references.
+            let slots = unsafe { inst.slots.peek() }?;
+            let name = code.names.get(instruction.arg as usize)?;
+            slots
+                .get_index(key_idx as usize)
+                .filter(|(key, _)| super::slot_name_matches(code, instruction.arg, key))
+                .map(|(_, value)| value)
+                .or_else(|| slots.get(name.as_str()))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CACHED_ATTR_CHAIN_HITS: Cell<[u64; 2]> = const { Cell::new([0; 2]) };
+    static CACHED_ATTR_PREFIX_HITS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn cached_attr_chain_hits_for_test() -> [u64; 2] {
+    CACHED_ATTR_CHAIN_HITS.with(Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn cached_attr_prefix_hits_for_test() -> u64 {
+    CACHED_ATTR_PREFIX_HITS.with(Cell::get)
+}
+
+/// Read guarded and dynamically cached fields without owning intermediates.
+/// Status 1 leaves accounting and pins untouched. Status 2 completes only the
+/// guarded prefix using its original pin-reuse policy; lowering runs the dynamic
+/// suffix through the original helpers. No Python runs inside this walk.
+///
+/// # Safety
+/// Same live buffers and GIL contract as [`wpjit_attr_get`]. Native lowering must
+/// publish the first read's bytecode PC in deopt_pc before entering this helper.
+unsafe extern "C" fn wpjit_cached_attr_chain(
+    frame: *mut JitFrame,
+    pin: i64,
+    first_site: i64,
+    guarded: i64,
+    total: i64,
+    int_result: i64,
+) -> i64 {
+    if crate::gil::free_threading_enabled()
+        || !(2..=weavepy_jit::MAX_CACHED_ATTR_CHAIN_LEN as i64).contains(&total)
+        || !(0..total).contains(&guarded)
+        || guarded > weavepy_jit::MAX_ATTR_CHAIN_LEN as i64
+        || !matches!(int_result, 0 | 1)
+    {
+        return 1;
+    }
+    let Ok(first) = usize::try_from(first_site) else {
+        return 1;
+    };
+    let Some(end) = first.checked_add(guarded as usize) else {
+        return 1;
+    };
+    // SAFETY: native entry retains the frame, context, and code object.
+    let jf = unsafe { &mut *frame };
+    // The opaque pointer originated from an aligned, live CallCtx.
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    let code = unsafe { &*ctx.code_ptr };
+    let Some(last_pc) = jf.deopt_pc.checked_add(total as u32 - 1) else {
+        return 1;
+    };
+    if last_pc as usize >= code.instructions.len() {
+        return 1;
+    }
+    enum Outcome {
+        Complete(Object),
+        Prefix(Result<u64, Object>),
+    }
+    let outcome = (|| {
+        let Pin::Obj(root @ Object::Instance(_)) = ctx.pins.get(pin as usize)? else {
+            return None;
+        };
+        let guards = ctx.attr_guards.get(first..end)?;
+        let mut value = root;
+        for guard in guards {
+            let Object::Instance(inst) = value else {
+                return None;
+            };
+            if guard.lane != JitType::Obj {
+                return None;
+            }
+            // SAFETY: the original root pin owns the read-only graph.
+            value = unsafe { chain_attr_peek(inst, guard) }.ok()?;
+        }
+        // Keep only a borrowed reference to the completed guarded prefix. A
+        // suffix miss can transfer this exact result instead of walking twice.
+        let prefix = value;
+        for offset in guarded as u32..total as u32 {
+            let next = match value {
+                // SAFETY: exact cache hits don't call Python or mutate fields.
+                Object::Instance(inst) => unsafe {
+                    cached_chain_peek(inst, code, jf.deopt_pc + offset)
+                },
+                _ => None,
+            };
+            let Some(next) = next else {
+                // Match the ordinary prefix's result lane and identity-based
+                // pin reuse. No dynamic read has been charged or committed.
+                let outcome = chain_attr_value(guards.last()?, prefix, &ctx.pins)?;
+                return Some(Outcome::Prefix(outcome));
+            };
+            value = next;
+        }
+        if int_result == 1 && !matches!(value, Object::Int(_)) {
+            return None;
+        }
+        // Own only the final result; no graph reference escapes this closure.
+        Some(Outcome::Complete(value.clone()))
+    })();
+    let result = match outcome {
+        Some(Outcome::Complete(result)) => result,
+        Some(Outcome::Prefix(outcome)) => {
+            let bits = match outcome {
+                Ok(bits) => bits,
+                Err(value) => {
+                    if ctx.pins.len() >= RUNTIME_PIN_CAP {
+                        return 1;
+                    }
+                    let index = ctx.pins.len();
+                    ctx.pins.push(Pin::Obj(value));
+                    ctx.attr_guards[end - 1].last_result_pin.set(index);
+                    index as u64
+                }
+            };
+            jf.ret_bits = bits;
+            jf.ret_tag = SlotTag::ObjPin as u32;
+            #[cfg(test)]
+            CACHED_ATTR_PREFIX_HITS.with(|hits| hits.set(hits.get() + 1));
+            return 2;
+        }
+        None => return 1,
+    };
+    // A miss must leave the ordinary helpers their original accounting.
+    // Preflight before any counter or pin mutation. The usual helpers handle
+    // the precise completed-result boundary if retirement would be reached.
+    let dynamic_reads = (total - guarded) as u32;
+    #[allow(clippy::absurd_extreme_comparisons)] // current budget is zero
+    let retires = INTERP_CALL_RETIRE_BUDGET != 0
+        && ctx.interp_calls.saturating_add(dynamic_reads) >= INTERP_CALL_RETIRE_BUDGET;
+    if retires
+        || (int_result == 0 && !matches!(result, Object::None) && ctx.pins.len() >= RUNTIME_PIN_CAP)
+    {
+        return 1;
+    }
+    // All failure conditions have been checked. Preserve saturating charges
+    // once per dynamic read, without allocating an intermediate owner.
+    ctx.interp_calls = ctx.interp_calls.saturating_add(dynamic_reads);
+    let (bits, tag) = if int_result == 1 {
+        let Object::Int(integer) = result else {
+            unreachable!("validated integer result");
+        };
+        (integer as u64, SlotTag::Int)
+    } else if matches!(result, Object::None) {
+        (u64::MAX, SlotTag::ObjPin)
+    } else {
+        let bits = ctx.pins.len() as u64;
+        ctx.pins.push(Pin::Obj(result));
+        (bits, SlotTag::ObjPin)
+    };
+    jf.ret_bits = bits;
+    jf.ret_tag = tag as u32;
+    #[cfg(test)]
+    {
+        CACHED_ATTR_CHAIN_HITS.with(|hits| {
+            let mut counts = hits.get();
+            counts[int_result as usize] += 1;
+            hits.set(counts);
+        });
+        DYN_ATTR_NATIVE_READS.with(|reads| {
+            let mut counts = reads.get();
+            counts[0] += (total - guarded) as u64;
+            reads.set(counts);
+        });
+    }
     0
 }
 

@@ -544,3 +544,359 @@ fn dynamic_attribute_reads_publish_each_cache_pc() {
     assert_eq!(frame.ret_bits, 10);
     READS.with(|reads| assert_eq!(*reads.borrow(), [(1, 7, 0), (2, 8, 1)]));
 }
+
+#[test]
+fn cached_attribute_chains_keep_native_fallback_and_exact_exits() {
+    use crate::ir::{AttrSiteMeta, CalleeSpanMeta};
+    use crate::runtime::{self, JitFrame, JitStatus, SlotTag};
+    const CHILD: &str = "WEAVEPY_CACHED_CHAIN_LOWERING_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "engine::tests::cached_attribute_chains_keep_native_fallback_and_exact_exits",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("spawn cached-chain test");
+        assert!(status.success(), "cached-chain test failed: {status}");
+        return;
+    }
+    #[derive(Default, Debug)]
+    struct State {
+        chains: Vec<(u32, i64, i64, i64, i64, i64)>,
+        singles: usize,
+        prefixes: usize,
+        dynamic: Vec<(u32, i64)>,
+        unboxes: usize,
+        miss: bool,
+        prefix_only: bool,
+        exit: Option<(u32, i64)>,
+        unbox_miss: bool,
+    }
+    thread_local! {
+        static STATE: std::cell::RefCell<State> = std::cell::RefCell::new(State::default());
+    }
+    unsafe extern "C" fn get(frame: *mut JitFrame, pin: i64, _: i64) -> i64 {
+        STATE.with(|s| s.borrow_mut().singles += 1);
+        // SAFETY: every test entry retains this frame and its buffers.
+        unsafe {
+            (*frame).ret_bits = (pin + 1) as u64;
+        }
+        0
+    }
+    unsafe extern "C" fn prefix(frame: *mut JitFrame, pin: i64, _: i64, count: i64) -> i64 {
+        STATE.with(|s| s.borrow_mut().prefixes += 1);
+        // SAFETY: as for get.
+        unsafe {
+            (*frame).ret_bits = (pin + count) as u64;
+        }
+        0
+    }
+    unsafe extern "C" fn dynamic(frame: *mut JitFrame, pin: i64, _: i64) -> i64 {
+        // SAFETY: as for get.
+        let frame = unsafe { &mut *frame };
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.dynamic.push((frame.deopt_pc, pin));
+            if let Some((pc, status)) = s.exit {
+                if pc == frame.deopt_pc {
+                    return status;
+                }
+            }
+            frame.ret_bits = (pin + 1) as u64;
+            0
+        })
+    }
+    unsafe extern "C" fn unbox(frame: *mut JitFrame, pin: i64) -> i64 {
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.unboxes += 1;
+            if s.unbox_miss {
+                return 1;
+            }
+            // SAFETY: as for get.
+            unsafe {
+                (*frame).ret_bits = pin as u64;
+            }
+            0
+        })
+    }
+    unsafe extern "C" fn chain(
+        frame: *mut JitFrame,
+        pin: i64,
+        site: i64,
+        guarded: i64,
+        total: i64,
+        int_result: i64,
+    ) -> i64 {
+        // SAFETY: as for get.
+        let frame = unsafe { &mut *frame };
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.chains
+                .push((frame.deopt_pc, pin, site, guarded, total, int_result));
+            if s.miss {
+                if s.prefix_only && guarded > 0 {
+                    frame.ret_bits = (pin + guarded) as u64;
+                    return 2;
+                }
+                return 1;
+            }
+            frame.ret_bits = (pin + total) as u64;
+            0
+        })
+    }
+    unsafe extern "C" fn unused3(_: *mut JitFrame, _: i64, _: i64) -> i64 {
+        3
+    }
+    unsafe extern "C" fn unused4(_: *mut JitFrame, _: i64, _: i64, _: i64) -> i64 {
+        3
+    }
+    unsafe extern "C" fn unused_call(_: *mut JitFrame, _: i64, _: u32, _: u32, _: u32) -> i64 {
+        3
+    }
+    runtime::register_attr_helpers(get, unused3);
+    runtime::register_attr_get_chain_helper(prefix);
+    runtime::register_dyn_attr_helpers(dynamic, unused3);
+    runtime::register_unbox_int_helper(unbox);
+    runtime::register_call_dyn_helper(unused_call);
+    runtime::register_global_obj_helper(unbox);
+    runtime::register_iter_new_helper(unbox);
+    runtime::register_iter_next_pair_helper(unused4);
+    runtime::register_str_format_helpers(unused4, unused4);
+
+    fn chain_function(guarded: usize, total: usize, integer: bool) -> TFunc {
+        let mut ops = Vec::new();
+        if integer {
+            ops.push(TOp::PushConstInt(99));
+        }
+        ops.push(TOp::LoadLocal(0));
+        for i in 0..total {
+            ops.push(if i < guarded {
+                TOp::AttrGet {
+                    site: i as u32,
+                    out: JitType::Obj,
+                }
+            } else {
+                TOp::DynAttrGet { name: i as u32 }
+            });
+        }
+        if integer {
+            ops.push(TOp::UnboxInt { depth: 0 });
+            ops.push(TOp::IntArith(ArithKind::Add));
+        }
+        let mut f = function(&ops);
+        f.local_types[0] = Some(JitType::Obj);
+        f.ret_lane = Some(if integer { JitType::Int } else { JitType::Obj });
+        f.attr_sites = (0..guarded)
+            .map(|i| AttrSiteMeta {
+                slot: 0,
+                path: vec![],
+                name: format!("field_{i}"),
+                lane: JitType::Obj,
+                store: false,
+                new_key: false,
+                ctor: None,
+                self_ctor: None,
+            })
+            .collect();
+        f
+    }
+    fn run(
+        engine: &mut super::JitEngine,
+        f: &TFunc,
+        state: State,
+        expected: JitStatus,
+    ) -> (State, u32, Vec<u64>, Vec<u32>) {
+        let compiled = engine.compile_tfunc(f).expect("compile cached chain");
+        STATE.with(|s| *s.borrow_mut() = state);
+        let mut locals = [7u64, 0];
+        let mut spill = [0u64; 3];
+        let mut tags = [0u32; 3];
+        let mut frame = JitFrame {
+            locals: locals.as_mut_ptr(),
+            n_locals: 2,
+            entry_pc: 0,
+            ret_bits: 0,
+            ret_tag: 0,
+            deopt_pc: 0,
+            stack_spill: spill.as_mut_ptr(),
+            stack_tags: tags.as_mut_ptr(),
+            stack_len: 0,
+            stack_cap: 3,
+            ctx: std::ptr::null_mut(),
+            call_args: std::ptr::null_mut(),
+            call_tags: std::ptr::null_mut(),
+        };
+        // SAFETY: all buffers fit the compiled metadata and outlive this call.
+        assert_eq!(unsafe { compiled.enter(&raw mut frame) }, expected);
+        if expected == JitStatus::Returned {
+            let reads = f.blocks[0]
+                .stmts
+                .iter()
+                .filter(|s| matches!(s.op, TOp::AttrGet { .. } | TOp::DynAttrGet { .. }))
+                .count() as u64;
+            let integer = f.ret_lane == Some(JitType::Int);
+            assert_eq!(frame.ret_bits, 7 + reads + if integer { 99 } else { 0 });
+            assert_eq!(
+                frame.ret_tag,
+                if integer {
+                    SlotTag::Int
+                } else {
+                    SlotTag::ObjPin
+                } as u32
+            );
+        }
+        (
+            STATE.with(|s| s.take()),
+            frame.deopt_pc,
+            spill[..frame.stack_len as usize].to_vec(),
+            tags[..frame.stack_len as usize].to_vec(),
+        )
+    }
+    let mut engine = super::JitEngine::new().unwrap();
+    let f = chain_function(2, 4, true);
+    let (s, ..) = run(&mut engine, &f, State::default(), JitStatus::Returned);
+    assert!(s.chains.is_empty());
+    assert_eq!((s.prefixes, s.dynamic.len(), s.unboxes), (1, 2, 1));
+    runtime::register_cached_attr_chain_helper(chain);
+    for (guarded, total, integer) in [
+        (2, 4, true),
+        (8, 16, true),
+        (0, 4, false),
+        (0, 32, true),
+        (0, 33, true),
+    ] {
+        let f = chain_function(guarded, total, integer);
+        let (s, ..) = run(&mut engine, &f, State::default(), JitStatus::Returned);
+        assert_eq!(
+            s.chains,
+            [(
+                if integer { 2 } else { 1 },
+                7,
+                0,
+                guarded as i64,
+                total.min(32) as i64,
+                i64::from(integer && total <= 32)
+            )]
+        );
+        assert_eq!(
+            (s.singles, s.prefixes, s.dynamic.len(), s.unboxes),
+            (0, 0, usize::from(total > 32), usize::from(total > 32))
+        );
+        let (s, ..) = run(
+            &mut engine,
+            &f,
+            State {
+                miss: true,
+                ..State::default()
+            },
+            JitStatus::Returned,
+        );
+        assert_eq!(s.prefixes, usize::from(guarded >= 2));
+        assert_eq!(s.dynamic.len(), total - guarded);
+        assert_eq!(s.unboxes, usize::from(integer));
+        let (s, ..) = run(
+            &mut engine,
+            &f,
+            State {
+                miss: true,
+                prefix_only: true,
+                ..State::default()
+            },
+            JitStatus::Returned,
+        );
+        assert_eq!(s.prefixes, 0);
+        assert_eq!(s.dynamic.len(), total - guarded);
+        assert_eq!(s.unboxes, usize::from(integer));
+    }
+    // A failed fused read leaves the originals responsible for their own PCs,
+    // receiver/result stacks, and distinct reject, parked, and raised statuses.
+    for prefix_only in [false, true] {
+        for status in [1, 2, 3] {
+            let (s, pc, spill, tags) = run(
+                &mut engine,
+                &f,
+                State {
+                    miss: true,
+                    prefix_only,
+                    exit: Some((5, status)),
+                    ..State::default()
+                },
+                if status == 1 {
+                    JitStatus::Raised
+                } else {
+                    JitStatus::Deopt
+                },
+            );
+            assert_eq!(s.dynamic, [(4, 9), (5, 10)]);
+            assert_eq!(pc, if status == 2 { 6 } else { 5 });
+            assert_eq!(spill, if status == 3 { vec![99, 10] } else { vec![99] });
+            assert_eq!(
+                tags,
+                if status == 3 {
+                    vec![SlotTag::Int as u32, SlotTag::ObjPin as u32]
+                } else {
+                    vec![SlotTag::Int as u32]
+                }
+            );
+        }
+    }
+    let (_, pc, spill, _) = run(
+        &mut engine,
+        &f,
+        State {
+            miss: true,
+            unbox_miss: true,
+            ..State::default()
+        },
+        JitStatus::Deopt,
+    );
+    assert_eq!((pc, spill), (6, vec![99, 11]));
+    let mut separated = f.clone();
+    for stmt in &mut separated.blocks[0].stmts {
+        stmt.pc *= 2;
+    }
+    let (s, ..) = run(
+        &mut engine,
+        &separated,
+        State::default(),
+        JitStatus::Returned,
+    );
+    assert!(s.chains.is_empty());
+    assert_eq!((s.singles, s.prefixes, s.dynamic.len()), (2, 0, 2));
+    let mut discontinuous = f.clone();
+    discontinuous.blocks[0].stmts[3].op = TOp::AttrGet {
+        site: 0,
+        out: JitType::Obj,
+    };
+    let (s, ..) = run(
+        &mut engine,
+        &discontinuous,
+        State::default(),
+        JitStatus::Returned,
+    );
+    assert_eq!(s.singles, 1);
+    assert_eq!(s.chains, [(3, 8, 0, 1, 3, 1)]);
+    let mut later_unbox = f.clone();
+    later_unbox.blocks[0].stmts[6].pc += 2;
+    let (s, ..) = run(
+        &mut engine,
+        &later_unbox,
+        State::default(),
+        JitStatus::Returned,
+    );
+    assert_eq!(s.chains, [(2, 7, 0, 2, 4, 0)]);
+    assert_eq!(s.unboxes, 1);
+    let mut method = chain_function(1, 2, false);
+    method.null_spans.push(CalleeSpanMeta {
+        live_from: 2,
+        live_to: 3,
+        token: 0,
+        interp_depth: 1,
+    });
+    let (s, ..) = run(&mut engine, &method, State::default(), JitStatus::Returned);
+    assert!(s.chains.is_empty());
+    assert_eq!((s.singles, s.dynamic.len()), (1, 1));
+}

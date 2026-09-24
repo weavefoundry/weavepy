@@ -63368,6 +63368,125 @@ assert loop(2000) == 1999000
     }
 
     #[cfg(feature = "jit")]
+    #[test]
+    fn jit_cached_attribute_chains_preserve_fallbacks_and_lifetimes() {
+        const CHILD: &str = "WEAVEPY_CACHED_CHAIN_VM_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::jit_cached_attribute_chains_preserve_fallbacks_and_lifetimes",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("spawn cached-chain VM test");
+            assert!(status.success(), "cached-chain VM test failed: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                crate::tier2::force_enable_for_test(2);
+                let source =
+                    include_str!("../../../tests/regrtest/test_jit_cached_attribute_chains.py");
+                let (warmup, mutations) = source.split_once("# CACHED CHAIN MUTATIONS:").unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &parse_module(warmup).unwrap(),
+                    warmup,
+                    "cached_chain_warmup.py",
+                )
+                .unwrap();
+                let mut interp = Interpreter::new();
+                interp.run_module(&code).expect("cached-chain warmup");
+                let hits = crate::tier2::cached_attr_chain_hits_for_test();
+                assert!(
+                    hits[0] > 1000,
+                    "object results must execute fused reads: {hits:?}"
+                );
+                assert!(
+                    hits[1] > 1000,
+                    "integer results must execute fused reads: {hits:?}"
+                );
+                assert!(
+                    crate::tier2::cached_attr_prefix_hits_for_test() > 1000,
+                    "fallback chains must reuse their completed prefix"
+                );
+                let reads = crate::tier2::dyn_attr_native_reads_for_test();
+                for kind in [1, 2, 4] {
+                    assert!(
+                        reads[kind] > 1000,
+                        "native class/module/getter fallback {kind}: {reads:?}"
+                    );
+                }
+                let globals = {
+                    let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+                        panic!("missing main")
+                    };
+                    main.dict.clone()
+                };
+                {
+                    let globals = globals.borrow();
+                    for name in [
+                        "dict_read",
+                        "slot_read",
+                        "mixed_read",
+                        "object_read",
+                        "class_read",
+                        "module_read",
+                        "getter_read",
+                        "boundary_9",
+                        "boundary_17",
+                        "boundary_32",
+                        "boundary_33",
+                    ] {
+                        let Some(Object::Function(driver)) =
+                            globals.get(&crate::object::StrKey(name))
+                        else {
+                            panic!("missing {name}")
+                        };
+                        assert!(
+                            crate::tier2::code_compiled_for_test(&driver.code.borrow()),
+                            "{name} must compile before mutations"
+                        );
+                    }
+                }
+                let mutations = format!("# CACHED CHAIN MUTATIONS:{mutations}");
+                let code = weavepy_compiler::compile_module_with_source(
+                    &parse_module(&mutations).unwrap(),
+                    &mutations,
+                    "cached_chain_mutations.py",
+                )
+                .unwrap();
+                interp
+                    .exec_module_in(&code, globals.clone())
+                    .expect("cached-chain mutations and collection");
+                crate::sync::mark_cells_shared();
+                let hits = crate::tier2::cached_attr_chain_hits_for_test();
+                let borrowed = crate::tier2::attr_chain_borrowed_count_for_test();
+                let code = compile_module(
+                    &parse_module("assert slot_read(slot_root, 3000) == 33000").unwrap(),
+                )
+                .unwrap();
+                interp
+                    .exec_module_in(&code, globals)
+                    .expect("observer fallback");
+                assert_eq!(
+                    crate::tier2::cached_attr_chain_hits_for_test(),
+                    hits,
+                    "an observer must disable the borrowed walk"
+                );
+                assert!(
+                    crate::tier2::attr_chain_borrowed_count_for_test() > borrowed + 100,
+                    "ordinary guarded prefix must remain native"
+                );
+            })
+            .expect("cached-chain worker")
+            .join()
+            .expect("cached-chain assertions");
+    }
+
+    #[cfg(feature = "jit")]
     fn run_attribute_chain_fixture(
         test_name: &'static str,
         child: &'static str,
