@@ -50671,7 +50671,11 @@ impl Interpreter {
         self.cache.begin_initializing(full);
         self.cache.insert(full, module_obj.clone());
         let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, None);
-        let body_result = self.run_frame(&mut frame);
+        let body_result = {
+            #[cfg(feature = "jit")]
+            let _compilation_budget = crate::tier2::budget_import_compilation();
+            self.run_frame(&mut frame)
+        };
         self.cache.end_initializing(full);
         if let Err(e) = body_result {
             self.cache.remove(full);
@@ -50831,7 +50835,11 @@ impl Interpreter {
         self.cache.insert(full, module_obj.clone());
         let code_rc = Rc::new(code);
         let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, None);
-        let body_result = self.run_frame(&mut frame);
+        let body_result = {
+            #[cfg(feature = "jit")]
+            let _compilation_budget = crate::tier2::budget_import_compilation();
+            self.run_frame(&mut frame)
+        };
         self.cache.end_initializing(full);
         if let Err(e) = body_result {
             self.cache.remove(full);
@@ -50987,7 +50995,11 @@ impl Interpreter {
         // `spec._initializing`).
         let code_rc = Rc::new(code);
         let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, None);
-        let body_result = self.run_frame(&mut frame);
+        let body_result = {
+            #[cfg(feature = "jit")]
+            let _compilation_budget = crate::tier2::budget_import_compilation();
+            self.run_frame(&mut frame)
+        };
         self.cache.end_initializing(full);
         if let Err(e) = body_result {
             self.cache.remove(full);
@@ -62993,6 +63005,51 @@ assert loop(2000) == 1999000
         })
         .join()
         .expect("startup JIT worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn imported_functions_compile_during_sustained_work_or_after_import() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                crate::tier2::force_enable_for_test(4);
+                crate::tier2::note_startup_finished();
+                let mut interp = Interpreter::new();
+                let source = "def leaf(x):\n    return x + 1\nfor i in range(12):\n    assert leaf(i) == i + 1\n";
+                let module = interp
+                    .load_from_source("budget_light", source, false, "budget_light.py")
+                    .expect("light import");
+                let Object::Module(module) = module else { panic!("module") };
+                let leaf = module.dict.borrow().get(&crate::object::StrKey("leaf")).unwrap().clone();
+                let Object::Function(function) = &leaf else { panic!("function") };
+                let code = function.code.borrow().clone();
+                assert!(!crate::tier2::code_compiled_for_test(&code));
+                for i in 0..24 {
+                    interp.call_object(leaf.clone(), &[Object::Int(i)], &[]).expect("later call");
+                }
+                assert!(crate::tier2::code_compiled_for_test(&code), "deferred lean code must compile after import");
+                let source = "def leaf(x):\n    return x + 1\nfor i in range(256):\n    assert leaf(i) == i + 1\ndef total(n):\n    s = 0\n    for i in range(n):\n        s += i\n    return s\nassert total(10000) == 49995000\n";
+                let module = interp
+                    .load_from_source("budget_heavy", source, false, "budget_heavy.py")
+                    .expect("sustained import work");
+                let Object::Module(module) = module else { panic!("module") };
+                for name in ["leaf", "total"] {
+                    let Object::Function(function) = module.dict.borrow().get(&crate::object::StrKey(name)).unwrap().clone() else { panic!("function") };
+                    assert!(crate::tier2::code_compiled_for_test(&function.code.borrow()), "{name} must compile during sustained import work");
+                }
+                crate::tier2::force_enable_for_test(50);
+                let source = "def leaf(x):\n    return x + 1\nfor i in range(400):\n    assert leaf(i) == i + 1\n";
+                let module = interp
+                    .load_from_source("budget_relative", source, false, "budget_relative.py")
+                    .expect("default relative lean budget");
+                let Object::Module(module) = module else { panic!("module") };
+                let Object::Function(function) = module.dict.borrow().get(&crate::object::StrKey("leaf")).unwrap().clone() else { panic!("function") };
+                assert!(crate::tier2::code_compiled_for_test(&function.code.borrow()), "lean code must retain its earlier relative warm point");
+            })
+            .expect("spawn import-budget worker")
+            .join()
+            .expect("import-budget worker");
     }
 
     #[cfg(feature = "jit")]

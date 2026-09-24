@@ -552,11 +552,17 @@ fn jit_enabled_by_config() -> bool {
 /// more (time and resident memory) than interpreting them ever could.
 static STARTUP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompilationPhase {
+    Normal,
+    Startup,
+    Import,
+}
+
 thread_local! {
-    /// Explicit, bounded startup differs from an embedder that never reports
-    /// startup completion. Such an embedder retains the hot-code escape hatch.
-    static STARTUP_COMPILATION_DEFERRED: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
+    /// Explicit startup deferral takes priority over nested import budgets.
+    static COMPILATION_PHASE: std::cell::Cell<CompilationPhase> =
+        const { std::cell::Cell::new(CompilationPhase::Normal) };
 
     /// The lean entry count at which the interpreter warms a tier-2
     /// compile, clamped to the tier-2 threshold.
@@ -592,28 +598,46 @@ fn set_lean_warm_from_threshold(threshold: u32) {
     let _ = LEAN_WARM_AT.try_with(|c| c.set(v));
 }
 
-/// A thread-local startup scope. Nested scopes restore their predecessor, and
-/// the marker prevents moving a guard to a different thread before dropping it.
-pub(crate) struct StartupCompilationGuard {
-    previous: bool,
+/// A nested compilation scope. The marker keeps restoration on the thread
+/// that established it, including when unwinding from module execution.
+pub(crate) struct CompilationGuard {
+    previous: CompilationPhase,
     _thread: std::marker::PhantomData<*mut ()>,
 }
 
-pub(crate) fn defer_startup_compilation() -> StartupCompilationGuard {
-    StartupCompilationGuard {
-        previous: STARTUP_COMPILATION_DEFERRED.with(|flag| flag.replace(true)),
+pub(crate) fn defer_startup_compilation() -> CompilationGuard {
+    CompilationGuard {
+        previous: COMPILATION_PHASE.with(|phase| phase.replace(CompilationPhase::Startup)),
         _thread: std::marker::PhantomData,
     }
 }
 
-impl Drop for StartupCompilationGuard {
-    fn drop(&mut self) {
-        STARTUP_COMPILATION_DEFERRED.with(|flag| flag.set(self.previous));
+pub(crate) fn budget_import_compilation() -> CompilationGuard {
+    CompilationGuard {
+        previous: COMPILATION_PHASE.with(|phase| {
+            let previous = phase.get();
+            if previous != CompilationPhase::Startup {
+                phase.set(CompilationPhase::Import);
+            }
+            previous
+        }),
+        _thread: std::marker::PhantomData,
     }
 }
 
-fn startup_compilation_deferred() -> bool {
-    STARTUP_COMPILATION_DEFERRED.with(std::cell::Cell::get)
+impl Drop for CompilationGuard {
+    fn drop(&mut self) {
+        COMPILATION_PHASE.with(|phase| phase.set(self.previous));
+    }
+}
+
+fn compilation_phase() -> CompilationPhase {
+    COMPILATION_PHASE.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn import_compilation_budget() -> bool {
+    compilation_phase() == CompilationPhase::Import
 }
 
 /// Mark interpreter start-up finished (see [`STARTUP_DONE`]).
@@ -622,12 +646,15 @@ pub(crate) fn note_startup_finished() {
 }
 
 /// Whether a code object whose counter reached `counter` against
-/// `threshold` may compile now: after start-up, or (for an embedder
-/// that never reports start-up) once far past the threshold.
+/// `threshold` may compile now. Fresh imports and embedders that never
+/// report startup completion require sustained work beyond the normal
+/// threshold. Explicit startup deferral still takes precedence.
 #[inline]
 fn compile_allowed(counter: u32, threshold: u32) -> bool {
-    !startup_compilation_deferred()
-        && (STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed)
+    let phase = compilation_phase();
+    phase != CompilationPhase::Startup
+        && ((phase == CompilationPhase::Normal
+            && STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed))
             || counter >= threshold.saturating_mul(16))
 }
 
@@ -2771,7 +2798,8 @@ pub(crate) fn note_backedge(code: &Rc<CodeObject>) -> bool {
 /// the direct call lanes into the compiled form, and those resolve only
 /// once the code has been compiled. Called on the lean path's threshold.
 pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::Frame) {
-    if startup_compilation_deferred() {
+    let phase = compilation_phase();
+    if phase == CompilationPhase::Startup {
         // Permit a later retry. Leaving the counter at the warm threshold
         // would permanently bypass compilation on lean and pure-leaf paths.
         frame.code.jit_hint.defer_lean_compile();
@@ -2785,41 +2813,43 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
         if !st.enabled {
             return;
         }
-        // Pull the counter to whatever `compile_allowed` asks for, so
-        // `get_compiled` compiles now. A body reached only through the
-        // lean/inline call path never gets a frame entry to count it, so
-        // this is its *only* route into tier-2: applying a stricter rule
-        // here than the frame path does (refusing outright until
-        // start-up is reported) left every such body interpreted for the
-        // life of an embedder that never reports it.
         let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
         let threshold = st.threshold;
-        let warm = if STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed) {
+        let importing = phase == CompilationPhase::Import;
+        let warm = if STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed) && !importing {
             threshold
         } else {
             threshold.saturating_mul(16)
         };
-        if let Some(entry) = st.cache.get_mut(&key) {
-            if let Tier::Cold = entry.tier {
-                entry.counter = entry.counter.max(warm);
+        let entry = st.cache.entry(key).or_insert_with(|| CacheEntry {
+            counter: 0,
+            tier: Tier::Cold,
+            osr_failures: 0,
+            deopts: 0,
+            native_entries: 0,
+            generic_dyn_calls: 0,
+            probe_misses: Vec::new(),
+            native: None,
+            method_native: None,
+            direct: None,
+            code: frame.code.clone(),
+        });
+        if matches!(entry.tier, Tier::Cold) {
+            if importing {
+                // The lean path has no ordinary frame-entry counter. Account
+                // for the interval just completed, then permit another one.
+                // Resetting keeps the equality checkpoint reachable after the
+                // import exits, including when pure-leaf calls can skip frames.
+                let interval = lean_warm_at();
+                entry.counter = entry.counter.saturating_add(interval);
+                if entry.counter < interval.saturating_mul(16) {
+                    frame.code.jit_hint.defer_lean_compile();
+                    return;
+                }
             }
-        } else {
-            st.cache.insert(
-                key,
-                CacheEntry {
-                    counter: warm,
-                    tier: Tier::Cold,
-                    osr_failures: 0,
-                    deopts: 0,
-                    native_entries: 0,
-                    generic_dyn_calls: 0,
-                    probe_misses: Vec::new(),
-                    native: None,
-                    method_native: None,
-                    direct: None,
-                    code: frame.code.clone(),
-                },
-            );
+            // Preserve the earlier lean warm point relative to frame/loop
+            // hotness, including the escape hatch for unreported startup.
+            entry.counter = entry.counter.max(warm);
         }
         let interp_ref: &super::Interpreter = interp;
         let frame_ref: &super::Frame = frame;
@@ -10878,7 +10908,46 @@ mod native_pair_tests {
 
 #[cfg(test)]
 mod startup_compilation_tests {
-    use super::{compile_allowed, defer_startup_compilation};
+    use super::{
+        budget_import_compilation, compile_allowed, defer_startup_compilation,
+        import_compilation_budget,
+    };
+
+    #[test]
+    fn import_budget_is_nested_thread_local_and_unwinds() {
+        assert!(!import_compilation_budget());
+        {
+            let _outer = budget_import_compilation();
+            assert!(!compile_allowed(15, 1));
+            assert!(compile_allowed(16, 1));
+            {
+                let _inner = budget_import_compilation();
+                assert!(import_compilation_budget());
+            }
+            assert!(import_compilation_budget());
+            std::thread::spawn(|| assert!(!import_compilation_budget()))
+                .join()
+                .unwrap();
+            let caught = std::panic::catch_unwind(|| {
+                let _inner = budget_import_compilation();
+                panic!("import failure");
+            });
+            assert!(caught.is_err());
+            assert!(import_compilation_budget());
+            {
+                let _startup = defer_startup_compilation();
+                assert!(!import_compilation_budget());
+                {
+                    let _nested_import = budget_import_compilation();
+                    assert!(!import_compilation_budget());
+                    assert!(!compile_allowed(u32::MAX, 1));
+                }
+                assert!(!compile_allowed(u32::MAX, 1));
+            }
+            assert!(import_compilation_budget());
+        }
+        assert!(!import_compilation_budget());
+    }
 
     #[test]
     fn explicit_startup_deferral_is_nested_and_unwinds() {
