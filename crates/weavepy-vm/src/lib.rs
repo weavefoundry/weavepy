@@ -11746,6 +11746,21 @@ impl Interpreter {
                                             }
                                         }
                                         if next.op == OpCode::LoadAttr {
+                                            if code
+                                                .instructions
+                                                .get(pc + 2)
+                                                .is_some_and(|ins| ins.op == OpCode::LoadAttr)
+                                            {
+                                                if let Some((v, end)) =
+                                                    Self::core_local_attr_chain(code, other, pc + 1)
+                                                {
+                                                    base.add(len).write(v);
+                                                    len += 1;
+                                                    last = end;
+                                                    pc = end + 1;
+                                                    continue;
+                                                }
+                                            }
                                             if let Some(v) =
                                                 Self::core_local_attr(code, other, pc + 1, next.arg)
                                             {
@@ -14961,6 +14976,88 @@ impl Interpreter {
             return slot_name_matches(code, name_idx, k).then(|| Self::clone_operand(v));
         }
         Self::leaf_fused_local_attr(code, local, attr_pc, name_idx)
+    }
+
+    /// Read a bounded chain of cached instance fields through its root local.
+    /// The quiet core loop holds the GIL and runs no callbacks or mutations
+    /// here, so the local keeps every intermediate field value alive.
+    /// Retain only the final value. A miss after two proven reads returns
+    /// that prefix; the next instruction uses the ordinary attribute path.
+    #[inline(never)]
+    fn core_local_attr_chain(
+        code: &CodeObject,
+        root: &Object,
+        attr_pc: usize,
+    ) -> Option<(Object, usize)> {
+        use weavepy_compiler::InlineCache as IC;
+        let mut value = root;
+        let mut count = 0;
+        for pc in attr_pc..attr_pc.saturating_add(8) {
+            let Some(ins) = code.instructions.get(pc) else {
+                break;
+            };
+            if ins.op != OpCode::LoadAttr {
+                break;
+            }
+            let Object::Instance(inst) = value else {
+                break;
+            };
+            let cls = inst.cls_raw();
+            if cls.native_kind.get() != 0 {
+                break;
+            }
+            let ver = cls.attr_version.get();
+            let cache = code.caches.get(pc as u32);
+            let next = match cache {
+                IC::LoadAttrSlot {
+                    key_idx,
+                    ver: cached,
+                } if ver == cached => {
+                    // SAFETY: the root local owns this graph throughout the
+                    // walk. Nothing mutates it, releases an owner, or runs
+                    // Python code; peek also rejects conflicting borrows.
+                    let Some(slots) = (unsafe { inst.slots.peek() }) else {
+                        break;
+                    };
+                    let Some(name) = code.names.get(ins.arg as usize) else {
+                        break;
+                    };
+                    let indexed = slots
+                        .get_index(key_idx as usize)
+                        .filter(|(key, _)| slot_name_matches(code, ins.arg, key))
+                        .map(|(_, value)| value);
+                    indexed.or_else(|| slots.get(name))
+                }
+                _ => {
+                    // SAFETY: the same rooted, callback-free walk as above.
+                    let Some(dict) = inst.dict.get().and_then(|d| unsafe { d.peek() }) else {
+                        break;
+                    };
+                    let indexed = |index| {
+                        dict.get_index(index as usize)
+                            .filter(|(key, _)| slot_name_matches(code, ins.arg, key))
+                            .map(|(_, value)| value)
+                    };
+                    let primary = match cache {
+                        IC::LoadAttrInstance {
+                            key_idx,
+                            ver: cached,
+                        } if ver == cached => indexed(key_idx),
+                        _ => None,
+                    };
+                    primary.or_else(|| {
+                        let poly = code_vm_ext(code)?.attr_poly.get()?.get(pc)?;
+                        indexed(poly.index(ver)?)
+                    })
+                }
+            };
+            let Some(next) = next else {
+                break;
+            };
+            value = next;
+            count += 1;
+        }
+        (count >= 2).then(|| (clone_hot(value), attr_pc + count - 1))
     }
 
     /// The core loop's fused `LOAD_FAST x; STORE_ATTR name`: the value at
@@ -59593,14 +59690,20 @@ impl AttrPoly {
     /// index still holds the name.
     #[inline]
     fn hit(&self, code: &CodeObject, inst: &PyInstance, ver: u64, name_idx: u32) -> Option<Object> {
-        // SAFETY: see the type docs.
-        let entries = unsafe { &*self.0.get() };
-        let &(_, ix) = entries.iter().find(|e| e.0 == ver && ver != 0)?;
+        let ix = self.index(ver)?;
         let dict = inst.dict.get()?;
         // SAFETY: a read between two instructions (see `GilCell::peek`).
         let d = unsafe { dict.peek() }?;
         let (k, v) = d.get_index(ix as usize)?;
         slot_name_matches(code, name_idx, k).then(|| Interpreter::clone_operand(v))
+    }
+
+    /// A candidate index still needs its dictionary key checked by the caller.
+    #[inline]
+    fn index(&self, ver: u64) -> Option<u32> {
+        // SAFETY: see the type docs.
+        let entries = unsafe { &*self.0.get() };
+        entries.iter().find(|e| e.0 == ver && ver != 0).map(|e| e.1)
     }
 
     /// Remember `ver` → `ix` (the older of two full entries yields).
@@ -66710,6 +66813,194 @@ assert namespace is exported.__dict__
                 assert!(compiled >= 3 && entries >= 3, "{compiled}, {entries}");
                 assert!(crate::tier2::osr_stats_for_test() >= 3);
                 assert!(deopts >= 3, "overflow must exercise native exits: {deopts}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn interpreter_attribute_chains_preserve_guards_and_ownership() {
+        const CHILD: &str = "WEAVEPY_INTERPRETER_CHAIN_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::interpreter_attribute_chains_preserve_guards_and_ownership",
+                ])
+                .env(CHILD, "1")
+                .env("WEAVEPY_JIT", "0")
+                .status()
+                .expect("spawn interpreter chain test");
+            assert!(status.success(), "interpreter chain child: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let source =
+                    include_str!("../../../tests/regrtest/test_interpreter_attribute_chains.py");
+                let (warmup, mutations) =
+                    source.split_once("# INTERPRETER CHAIN MUTATIONS:").unwrap();
+                let warmup = format!(
+                    "{warmup}\nroot4 = chains[4][0]\nroot9 = chains[9][0]\ntail9 = chains[9][-1]\n"
+                );
+                let code = compile_module(&parse_module(&warmup).unwrap()).unwrap();
+                let mut interp = Interpreter::new();
+                interp.run_module(&code).unwrap();
+                let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+                    panic!("missing main module")
+                };
+                let globals = main.dict.clone();
+                {
+                    let _gil = crate::gil::global_gil().acquire();
+                    let g = globals.borrow();
+                    let root = g.get(&crate::object::StrKey("root4")).unwrap();
+                    let payload = g.get(&crate::object::StrKey("payload")).unwrap();
+                    let Some(Object::Function(reader)) = g.get(&crate::object::StrKey("read_4"))
+                    else {
+                        panic!("missing reader")
+                    };
+                    let code = reader.code.borrow();
+                    let pc = code
+                        .instructions
+                        .iter()
+                        .position(|ins| ins.op == OpCode::LoadAttr)
+                        .unwrap();
+                    let (value, end) = Interpreter::core_local_attr_chain(&code, root, pc)
+                        .expect("warmed interpreter sites must fuse");
+                    assert!(value.is_same(payload));
+                    assert_eq!(end, pc + 3);
+                    let Object::Instance(first) = root else {
+                        panic!("missing root instance")
+                    };
+                    let dict = first.dict.get().unwrap();
+                    let guard = dict.borrow_mut();
+                    assert!(Interpreter::core_local_attr_chain(&code, root, pc).is_none());
+                    drop(guard);
+                    let second = dict
+                        .borrow()
+                        .get(&crate::object::StrKey("next"))
+                        .unwrap()
+                        .clone();
+                    let Object::Instance(second) = second else {
+                        panic!("missing second instance")
+                    };
+                    let third = second
+                        .dict
+                        .get()
+                        .unwrap()
+                        .borrow()
+                        .get(&crate::object::StrKey("next"))
+                        .unwrap()
+                        .clone();
+                    let Object::Instance(third_inst) = &third else {
+                        panic!("missing third instance")
+                    };
+                    let guard = third_inst.dict.get().unwrap().borrow_mut();
+                    let (value, end) = Interpreter::core_local_attr_chain(&code, root, pc)
+                        .expect("two completed reads can materialize a prefix");
+                    assert!(value.is_same(&third));
+                    assert_eq!(end, pc + 1);
+                    drop(guard);
+                    let root = g.get(&crate::object::StrKey("root9")).unwrap();
+                    let tail = g.get(&crate::object::StrKey("tail9")).unwrap();
+                    let Some(Object::Function(reader)) = g.get(&crate::object::StrKey("read_9"))
+                    else {
+                        panic!("missing longer reader")
+                    };
+                    let code = reader.code.borrow();
+                    let pc = code
+                        .instructions
+                        .iter()
+                        .position(|ins| ins.op == OpCode::LoadAttr)
+                        .unwrap();
+                    let (value, end) = Interpreter::core_local_attr_chain(&code, root, pc).unwrap();
+                    assert!(value.is_same(tail));
+                    assert_eq!(end, pc + 7, "the walk must stop after eight reads");
+                    for (root_name, reader_name) in [
+                        ("slot_root", "read_slots_4"),
+                        ("mixed_root", "read_mixed_4"),
+                    ] {
+                        let root = g.get(&crate::object::StrKey(root_name)).unwrap();
+                        let Some(Object::Function(reader)) =
+                            g.get(&crate::object::StrKey(reader_name))
+                        else {
+                            panic!("missing {reader_name}")
+                        };
+                        let code = reader.code.borrow();
+                        let pc = code
+                            .instructions
+                            .iter()
+                            .position(|ins| ins.op == OpCode::LoadAttr)
+                            .unwrap();
+                        let (value, end) =
+                            Interpreter::core_local_attr_chain(&code, root, pc).unwrap();
+                        assert!(value.is_same(payload));
+                        assert_eq!(end, pc + 3);
+                        if root_name == "slot_root" {
+                            let Object::Instance(first) = root else {
+                                panic!("missing slot root")
+                            };
+                            let guard = first.slots.borrow_mut();
+                            assert!(Interpreter::core_local_attr_chain(&code, root, pc).is_none());
+                            drop(guard);
+                            let second = first.slots.borrow().get("next").unwrap().clone();
+                            let Object::Instance(second) = second else {
+                                panic!("missing second slot node")
+                            };
+                            let third = second.slots.borrow().get("next").unwrap().clone();
+                            let Object::Instance(third_inst) = &third else {
+                                panic!("missing third slot node")
+                            };
+                            let guard = third_inst.slots.borrow_mut();
+                            let (value, end) =
+                                Interpreter::core_local_attr_chain(&code, root, pc).unwrap();
+                            assert!(value.is_same(&third));
+                            assert_eq!(end, pc + 1);
+                            drop(guard);
+                        }
+                    }
+                }
+                let code = compile_module(&parse_module(mutations).unwrap()).unwrap();
+                interp.exec_module_in(&code, globals.clone()).unwrap();
+                let code = compile_module(
+                    &parse_module(
+                        "for _ in range(300):\n    assert read_4(root4) is payload\n    assert read_slots_4(slot_root) is payload\n    assert read_mixed_4(mixed_root) is payload\n",
+                    ).unwrap(),
+                )
+                .unwrap();
+                interp.exec_module_in(&code, globals.clone()).unwrap();
+                for shared in [false, true] {
+                    // Revocation waits for existing borrow guards to leave.
+                    if shared {
+                        crate::sync::mark_cells_shared();
+                    }
+                    let _gil = crate::gil::global_gil().acquire();
+                    let g = globals.borrow();
+                    for (root_name, reader_name) in [
+                        ("root4", "read_4"),
+                        ("slot_root", "read_slots_4"),
+                        ("mixed_root", "read_mixed_4"),
+                    ] {
+                        let root = g.get(&crate::object::StrKey(root_name)).unwrap();
+                        let Some(Object::Function(reader)) =
+                            g.get(&crate::object::StrKey(reader_name))
+                        else {
+                            panic!("missing {reader_name}")
+                        };
+                        let code = reader.code.borrow();
+                        let pc = code
+                            .instructions
+                            .iter()
+                            .position(|ins| ins.op == OpCode::LoadAttr)
+                            .unwrap();
+                        assert_eq!(
+                            Interpreter::core_local_attr_chain(&code, root, pc).is_some(),
+                            !shared
+                        );
+                    }
+                }
             })
             .unwrap()
             .join()
