@@ -1348,3 +1348,45 @@ fn constant(c: &past::Constant) -> Object {
         C::Ellipsis => crate::vm_singletons::ellipsis(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn target_contexts_and_source_positions() {
+        const CHILD: &str = "WEAVEPY_AST_CONTEXT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for jit in ["0", "1"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "stdlib::ast_mod::tests::target_contexts_and_source_positions",
+                    ])
+                    .env(CHILD, "1")
+                    .env("WEAVEPY_JIT", jit)
+                    .status()
+                    .expect("spawn AST context test");
+                assert!(status.success(), "AST context child, JIT={jit}: {status}");
+            }
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let source = include_str!("../../../../tests/regrtest/test_ast_target_contexts.py");
+                let tree = weavepy_parser::parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_owned_module_with_options(
+                    tree,
+                    source,
+                    "test_ast_target_contexts.py",
+                    weavepy_compiler::CompileOptions::default(),
+                )
+                .unwrap();
+                crate::Interpreter::new()
+                    .run_module(&code)
+                    .unwrap_or_else(|error| panic!("AST context fixture: {error}"));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
