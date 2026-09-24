@@ -55,6 +55,15 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("parse")),
             Object::Builtin(Rc::new(bf)),
         );
+        d.insert(
+            DictKey(Object::from_static("_validate_fields")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "_validate_fields",
+                binds_instance: false,
+                call: Box::new(super::ast_validate::validate_fields),
+                call_kw: None,
+            })),
+        );
         // `compile()` control flags (CPython `_ast` exposes these;
         // `ast.py` re-exports them) — RFC 0052.
         use weavepy_compiler::flags as cf;

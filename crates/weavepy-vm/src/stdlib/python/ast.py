@@ -1659,7 +1659,8 @@ def _validate_stmt(s):
 
 def _validate(tree):
     """CPython obj2ast + _PyAST_Validate over a user-supplied node tree."""
-    _obj2ast_check(tree)
+    if not _ast._validate_fields(tree, AST, _SUM_TYPES):
+        _obj2ast_check(tree)
     cls = type(tree)
     if cls in (Module, Interactive):
         _validate_stmts(tree.body)

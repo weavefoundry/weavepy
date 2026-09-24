@@ -39,6 +39,7 @@ pub(crate) fn frozen_lookup(name: &str) -> Option<frozen_sources::FrozenSource> 
 
 pub mod ast_convert;
 pub mod ast_mod;
+mod ast_validate;
 pub mod asyncio_mod;
 pub mod binascii_mod;
 pub mod bisect_accel;
