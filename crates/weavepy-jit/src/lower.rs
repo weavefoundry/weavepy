@@ -359,7 +359,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 {
                     let mut end = i + 1;
                     let mut out = JitType::Obj;
-                    while end < block.stmts.len() && end - i < 4 && out == JitType::Obj {
+                    while end < block.stmts.len()
+                        && end - i < runtime::MAX_ATTR_CHAIN_LEN
+                        && out == JitType::Obj
+                    {
                         let next = block.stmts[end];
                         let TOp::AttrGet {
                             site: next_site,

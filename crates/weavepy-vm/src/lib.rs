@@ -62962,16 +62962,50 @@ assert loop(2000) == 1999000
     #[cfg(feature = "jit")]
     #[test]
     fn jit_attribute_chains_preserve_guard_fallbacks() {
-        const CHILD: &str = "WEAVEPY_ATTR_CHAIN_VM_TEST_CHILD";
-        if std::env::var_os(CHILD).is_none() {
+        run_attribute_chain_fixture(
+            "tests::jit_attribute_chains_preserve_guard_fallbacks",
+            "WEAVEPY_ATTR_CHAIN_VM_TEST_CHILD",
+            include_str!("../../../tests/regrtest/test_jit_attribute_chains.py"),
+            "# CHAIN MUTATIONS:",
+            &["dict_chain", "slot_chain", "object_chain", "text_chain"],
+            "assert slot_chain(slot_root, 1200) == 20400",
+        );
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_deep_attribute_chains_preserve_guards_and_lifetimes() {
+        run_attribute_chain_fixture(
+            "tests::jit_deep_attribute_chains_preserve_guards_and_lifetimes",
+            "WEAVEPY_DEEP_ATTR_CHAIN_VM_TEST_CHILD",
+            include_str!("../../../tests/regrtest/test_jit_deep_attribute_chains.py"),
+            "# DEEP CHAIN MUTATIONS:",
+            &[
+                "dict_read",
+                "slot_read",
+                "mixed_read",
+                "float_read",
+                "object_read",
+                "bytes_read",
+            ],
+            "assert slot_read(slot_root, 1200) == 13200",
+        );
+    }
+
+    #[cfg(feature = "jit")]
+    fn run_attribute_chain_fixture(
+        test_name: &'static str,
+        child: &'static str,
+        source: &'static str,
+        marker: &'static str,
+        drivers: &'static [&'static str],
+        fallback_source: &'static str,
+    ) {
+        if std::env::var_os(child).is_none() {
             let status =
                 std::process::Command::new(std::env::current_exe().expect("test executable"))
-                    .args([
-                        "--exact",
-                        "tests::jit_attribute_chains_preserve_guard_fallbacks",
-                        "--nocapture",
-                    ])
-                    .env(CHILD, "1")
+                    .args(["--exact", test_name, "--nocapture"])
+                    .env(child, "1")
                     .status()
                     .expect("spawn attribute-chain test");
             assert!(
@@ -62980,12 +63014,9 @@ assert loop(2000) == 1999000
             );
             return;
         }
-        std::thread::spawn(|| {
+        std::thread::spawn(move || {
             crate::tier2::force_enable_for_test(2);
-            let source = include_str!("../../../tests/regrtest/test_jit_attribute_chains.py");
-            let (warmup, mutations) = source
-                .split_once("# CHAIN MUTATIONS:")
-                .expect("fixture phases");
+            let (warmup, mutations) = source.split_once(marker).expect("fixture phases");
             let module = parse_module(warmup).expect("parse chain warmup");
             let code = compile_module(&module).expect("compile chain warmup");
             let mut interp = Interpreter::new();
@@ -63001,7 +63032,7 @@ assert loop(2000) == 1999000
             };
             {
                 let globals = globals.borrow();
-                for name in ["dict_chain", "slot_chain", "object_chain", "text_chain"] {
+                for &name in drivers {
                     let Some(Object::Function(driver)) = globals.get(&crate::object::StrKey(name))
                     else {
                         panic!("missing {name} driver");
@@ -63012,7 +63043,7 @@ assert loop(2000) == 1999000
                     );
                 }
             }
-            let mutations = format!("# CHAIN MUTATIONS:{mutations}");
+            let mutations = format!("{marker}{mutations}");
             let module = parse_module(&mutations).expect("parse chain mutations");
             let code = compile_module(&module).expect("compile chain mutations");
             interp
@@ -63023,8 +63054,7 @@ assert loop(2000) == 1999000
             // natively while using retained borrow guards.
             crate::sync::mark_cells_shared();
             let before = crate::tier2::attr_chain_borrowed_count_for_test();
-            let module = parse_module("assert slot_chain(slot_root, 1200) == 20400")
-                .expect("parse guarded slot fallback");
+            let module = parse_module(fallback_source).expect("parse guarded slot fallback");
             let code = compile_module(&module).expect("compile guarded slot fallback");
             interp
                 .exec_module_in(&code, globals)

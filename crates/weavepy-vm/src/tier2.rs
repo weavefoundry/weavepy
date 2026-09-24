@@ -6847,7 +6847,7 @@ unsafe extern "C" fn wpjit_attr_get_chain(
     first_site: i64,
     count: i64,
 ) -> i64 {
-    if !(2..=4).contains(&count) {
+    if !(2..=weavepy_jit::MAX_ATTR_CHAIN_LEN as i64).contains(&count) {
         return 1;
     }
     let Ok(first) = usize::try_from(first_site) else {
@@ -6858,6 +6858,8 @@ unsafe extern "C" fn wpjit_attr_get_chain(
     };
     // SAFETY: the caller supplies the same live activation as a single read.
     let jf = unsafe { &mut *frame };
+    // The opaque ABI pointer originated from an aligned, live CallCtx.
+    #[allow(clippy::cast_ptr_alignment)]
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     let outcome = {
         let Some(Pin::Obj(Object::Instance(inst))) = ctx.pins.get(pin as usize) else {

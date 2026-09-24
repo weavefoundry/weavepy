@@ -40,7 +40,8 @@ def execution_context() -> dict:
         "environment": {
             key: os.environ.get(key)
             for key in ("TZ", "LANG", "LC_ALL", "LC_TIME", "PYTHON_JIT", "PYTHON_GIL",
-                        "WEAVEPY_CLASS_CACHE_WARM")
+                        "WEAVEPY_CLASS_CACHE_WARM", "WEAVEPY_CHAIN_DEPTH",
+                        "WEAVEPY_CHAIN_LAYOUT")
         },
     }
 

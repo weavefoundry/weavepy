@@ -350,44 +350,39 @@ fn attribute_chains_keep_the_first_read_deopt_snapshot() {
         0
     }
 
-    let mut tfunc = function(&[
-        TOp::PushConstInt(99),
-        TOp::LoadLocal(0),
-        TOp::AttrGet {
-            site: 0,
-            out: JitType::Obj,
-        },
-        TOp::AttrGet {
-            site: 1,
-            out: JitType::Obj,
-        },
-        TOp::AttrGet {
-            site: 2,
-            out: JitType::Obj,
-        },
-        TOp::AttrGet {
-            site: 3,
-            out: JitType::Int,
-        },
-        TOp::IntArith(ArithKind::Add),
-    ]);
-    tfunc.local_types[0] = Some(JitType::Obj);
-    tfunc.attr_sites = (0..4)
-        .map(|site| AttrSiteMeta {
-            slot: 0,
-            path: (0..site).map(|i| format!("field_{i}")).collect(),
-            name: format!("field_{site}"),
-            lane: if site == 3 {
-                JitType::Int
-            } else {
-                JitType::Obj
-            },
-            store: false,
-            new_key: false,
-            ctor: None,
-            self_ctor: None,
-        })
-        .collect();
+    fn chain_function(reads: usize) -> TFunc {
+        let mut ops = vec![TOp::PushConstInt(99), TOp::LoadLocal(0)];
+        for site in 0..reads {
+            ops.push(TOp::AttrGet {
+                site: site as u32,
+                out: if site + 1 == reads {
+                    JitType::Int
+                } else {
+                    JitType::Obj
+                },
+            });
+        }
+        ops.push(TOp::IntArith(ArithKind::Add));
+        let mut tfunc = function(&ops);
+        tfunc.local_types[0] = Some(JitType::Obj);
+        tfunc.attr_sites = (0..reads)
+            .map(|site| AttrSiteMeta {
+                slot: 0,
+                path: (0..site).map(|i| format!("field_{i}")).collect(),
+                name: format!("field_{site}"),
+                lane: if site + 1 == reads {
+                    JitType::Int
+                } else {
+                    JitType::Obj
+                },
+                store: false,
+                new_key: false,
+                ctor: None,
+                self_ctor: None,
+            })
+            .collect();
+        tfunc
+    }
 
     fn run(engine: &mut super::JitEngine, tfunc: &TFunc, fail: bool) -> State {
         let compiled = engine
@@ -430,13 +425,15 @@ fn attribute_chains_keep_the_first_read_deopt_snapshot() {
         } else {
             assert_eq!(status, JitStatus::Returned);
             assert_eq!(frame.ret_tag, SlotTag::Int as u32);
-            assert_eq!(frame.ret_bits, 116);
+            let reads = tfunc.attr_sites.len() as u64;
+            assert_eq!(frame.ret_bits, 106 + reads * (reads + 1) / 2);
         }
         STATE.with(|state| state.take())
     }
 
     crate::runtime::register_attr_helpers(get, set);
     let mut engine = super::JitEngine::new().expect("host ISA");
+    let mut tfunc = chain_function(4);
     let ordinary = run(&mut engine, &tfunc, false);
     assert_eq!((ordinary.singles, ordinary.chains), (4, 0));
 
@@ -446,6 +443,15 @@ fn attribute_chains_keep_the_first_read_deopt_snapshot() {
     assert_eq!(fused.chain, (7, 0, 4));
     let failed = run(&mut engine, &tfunc, true);
     assert_eq!((failed.singles, failed.chains), (0, 1));
+
+    for reads in [2, 8, 9] {
+        let deeper = chain_function(reads);
+        let fused = run(&mut engine, &deeper, false);
+        assert_eq!((fused.singles, fused.chains), (usize::from(reads == 9), 1));
+        assert_eq!(fused.chain, (7, 0, reads.min(8) as i64));
+        let failed = run(&mut engine, &deeper, true);
+        assert_eq!((failed.singles, failed.chains), (0, 1));
+    }
 
     for (i, stmt) in tfunc.blocks[0].stmts.iter_mut().enumerate() {
         stmt.pc = (i * 2) as u32;

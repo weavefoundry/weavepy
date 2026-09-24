@@ -860,7 +860,12 @@ pub type AttrGetHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, si
 /// contract as [`AttrGetHelper`].
 pub type AttrSetHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, site: i64) -> i64;
 
-/// Optional fused read of two to four consecutive attribute sites. A miss
+/// Maximum number of consecutive attribute reads in one callback-free helper.
+/// Receiver provenance needs at most one fewer links to specialize this many
+/// reads. Keep lowering and the VM's ABI validation on this shared bound.
+pub const MAX_ATTR_CHAIN_LEN: usize = 8;
+
+/// Optional fused read of two to eight consecutive attribute sites. A miss
 /// must leave Python state unchanged: the caller resumes at the first read.
 /// Intermediate values are borrowed; only the final result may acquire a pin.
 /// The helper must never run Python. Same safety contract as [`AttrGetHelper`].
