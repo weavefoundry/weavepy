@@ -16898,6 +16898,12 @@ impl Interpreter {
 
     #[inline(never)]
     fn default_getattribute_slow(cls: &TypeObject) -> bool {
+        // A class key's equality method may run Python during this lookup.
+        // Quiet callers haven't published their complete activation yet.
+        // Leave an unresolved class to the ordinary attribute handler.
+        if crate::object::exotic_str_keys_possible() {
+            return false;
+        }
         let default = matches!(
             cls.lookup("__getattribute__"),
             Some(Object::Builtin(b)) if b.name == ".object_getattribute"
@@ -62990,6 +62996,41 @@ assert loop(2000) == 1999000
             ],
             "assert slot_read(slot_root, 1200) == 13200",
         );
+    }
+
+    #[test]
+    fn class_key_callbacks_publish_caller_frame() {
+        const CHILD: &str = "WEAVEPY_CLASS_KEY_FRAME_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::class_key_callbacks_publish_caller_frame",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("WEAVEPY_JIT", "0")
+                .status()
+                .expect("spawn class-key callback test");
+            assert!(status.success(), "class-key callback test failed: {status}");
+            return;
+        }
+        // The exotic-class-key flag is process-wide, so this regression
+        // must not change cache admission for unrelated tests.
+        std::thread::spawn(|| {
+            let source = include_str!("../../../tests/regrtest/test_class_key_callback_frames.py");
+            let module = parse_module(source).unwrap();
+            let code = weavepy_compiler::compile_module_with_source(
+                &module,
+                source,
+                "class_key_callbacks.py",
+            )
+            .unwrap();
+            let mut interp = Interpreter::new();
+            interp.run_module(&code).expect("class-key callback frames");
+        })
+        .join()
+        .expect("class-key callback worker");
     }
 
     #[cfg(feature = "jit")]
