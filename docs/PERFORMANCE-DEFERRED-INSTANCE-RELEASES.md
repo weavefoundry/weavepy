@@ -111,6 +111,10 @@ ratios are 0.999/0.998/0.998/0.994, CPU 0.995/0.993/1.004/0.992, and RSS
 Source snapshots, immutable binaries, controllers, logs, hashes, and raw results
 remain under `target/performance/deferred-instance-drop-investigation/` and
 `target/performance/deferred-instance-drop-*`. Original platform failures remain
-under `target/performance/embedding-stack-bounds-investigation/`. Platform benchmark
-gates were still running at the last inspection; passing unit CI doesn't establish
-performance-gate success.
+under `target/performance/embedding-stack-bounds-investigation/`. Linux and
+macOS benchmark gates pass at `6ea3e53`. The Windows gate still
+fails its existing cold sumvm/nested-loops/jitloop checks at
+1.297/1.185/1.161 against the merge base. Separate cold diagnostic ratios are
+1.330/1.171/1.153, versus warm ratios 1.017/0.989/0.993. Process elapsed improves
+in all six diagnostic comparisons. The [cold-JIT report](PERFORMANCE-COLD-JIT-DIAGNOSTICS.md)
+records the unresolved first-use cost; no gate or baseline was relaxed.

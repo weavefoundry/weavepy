@@ -84,3 +84,22 @@ identify the internal compiler stage responsible or establish a fix. Both
 metrics matter; precompiling unused functions or moving initialization outside
 the timer would not resolve the cost. Raw samples, hashes, and phase-marked
 traces remain in `target/performance/ci-6dfb4be-cold-jit/`.
+
+
+## Windows results at 6ea3e53
+
+All three unit jobs, including the formerly failing predicate coverage and
+embedding lifecycle, pass. Linux and macOS benchmark gates pass. The
+[Windows benchmark job](https://github.com/weavefoundry/weavepy/actions/runs/36110529146/job/107992852742)
+retains cold sumvm/nested-loops/jitloop gate ratios of 1.297/1.185/1.161 against
+the merge base. The initial suite geometric means are 1.001 against the merge
+base and 0.93 against its CPython reference; individual application gaps remain.
+
+The separate paired diagnostic reports cold workload ratios of
+1.330/1.171/1.153 and warm ratios of 1.017/0.989/0.993. Cold process elapsed
+ratios are 0.913/0.907/0.920; warm process elapsed ratios are 0.905/0.897/0.922.
+These observations continue to point to first-use compilation costs, not a
+comparable steady-state slowdown. The guard fix doesn't resolve that cost.
+Gate work sizes, thresholds, retry policy, and pass/fail behavior are unchanged.
+The raw job log is retained under
+`target/performance/deferred-instance-drop-investigation/ci-windows-bench.log`.
