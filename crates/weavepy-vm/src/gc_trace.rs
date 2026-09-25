@@ -74,7 +74,9 @@
 use crate::shared_value::ThinArc;
 use crate::sync::RefCell;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use std::sync::Arc;
 
 use crate::object::Object;
@@ -175,7 +177,7 @@ pub struct TrackedHandle {
     /// [`GcState::untrack_id`] can `swap_remove` in O(1) instead of
     /// scanning every generation (which made drop-heavy,
     /// large-heap workloads quadratic — RFC 0039 WS4).
-    pub slot: AtomicUsize,
+    pub slot: CachedSlot,
     /// Has this object's `__del__` already *run* to completion? CPython
     /// guarantees a finaliser runs at most once.
     pub finalized: AtomicBool,
@@ -218,12 +220,62 @@ pub struct TrackedHandle {
     /// Position in `GcState::finalizable_hot` while hot (RFC 0077 WS2);
     /// only valid under that vector's lock, fixed up on swap-remove
     /// exactly like [`Self::slot`].
-    pub fin_hot_slot: AtomicUsize,
+    pub fin_hot_slot: CachedSlot,
     /// Strong count seen at the previous hot probe and the number of
     /// consecutive probes it has held (RFC 0077 WS2); a count unchanged
     /// for [`FIN_STABLE_PROBES`] probes demotes the entry to cold.
     pub fin_last_sc: AtomicUsize,
     pub fin_stable: AtomicU8,
+}
+
+/// A compact vector-position hint, with separate absent and uncached states.
+///
+/// Positions too large to cache use the existing pointer-search fallback.
+/// They must not look absent: a hot finalizer with an uncached position still
+/// belongs to the hot set. Neither decoded sentinel can index a live
+/// `Vec<Arc<TrackedHandle>>`, whose allocation is bounded by `isize::MAX`.
+#[derive(Debug)]
+pub struct CachedSlot(AtomicU32);
+
+impl CachedSlot {
+    const fn encode(slot: usize) -> u32 {
+        if slot == usize::MAX {
+            u32::MAX
+        } else if slot >= (u32::MAX - 1) as usize {
+            u32::MAX - 1
+        } else {
+            slot as u32
+        }
+    }
+
+    const fn decode(slot: u32) -> usize {
+        if slot == u32::MAX {
+            usize::MAX
+        } else if slot == u32::MAX - 1 {
+            usize::MAX - 1
+        } else {
+            slot as usize
+        }
+    }
+
+    pub const fn new(slot: usize) -> Self {
+        Self(AtomicU32::new(Self::encode(slot)))
+    }
+
+    #[inline]
+    pub fn load(&self, order: Ordering) -> usize {
+        Self::decode(self.0.load(order))
+    }
+
+    #[inline]
+    pub fn store(&self, slot: usize, order: Ordering) {
+        self.0.store(Self::encode(slot), order);
+    }
+
+    #[inline]
+    pub fn swap(&self, slot: usize, order: Ordering) -> usize {
+        Self::decode(self.0.swap(Self::encode(slot), order))
+    }
 }
 
 /// RFC 0077 (WS2): a finalizable entry whose strong count exceeds the
@@ -268,13 +320,13 @@ impl TrackedHandle {
             gc_refs: AtomicI64::new(0),
             color: AtomicU8::new(color::White),
             generation: AtomicU8::new(generation as u8),
-            slot: AtomicUsize::new(0),
+            slot: CachedSlot::new(0),
             finalized: AtomicBool::new(false),
             finalize_queued: AtomicBool::new(false),
             weak_clones: AtomicUsize::new(0),
             untracked: AtomicBool::new(false),
             fin_cold: AtomicBool::new(false),
-            fin_hot_slot: AtomicUsize::new(usize::MAX),
+            fin_hot_slot: CachedSlot::new(usize::MAX),
             fin_last_sc: AtomicUsize::new(0),
             fin_stable: AtomicU8::new(0),
         }
@@ -4507,6 +4559,105 @@ mod tests {
     use crate::sync::RefCell;
 
     use crate::object::DictData;
+
+    #[test]
+    fn compact_positions_keep_absent_and_uncached_states_distinct() {
+        for value in [0, 1, (u32::MAX - 2) as usize, usize::MAX] {
+            let hint = CachedSlot::new(value);
+            assert_eq!(hint.load(Ordering::Acquire), value);
+            assert_eq!(hint.swap(3, Ordering::AcqRel), value);
+            assert_eq!(hint.load(Ordering::Acquire), 3);
+            hint.store(value, Ordering::Release);
+            assert_eq!(hint.load(Ordering::Acquire), value);
+        }
+        for value in [(u32::MAX - 1) as usize, usize::MAX - 1] {
+            let hint = CachedSlot::new(value);
+            assert_eq!(hint.load(Ordering::Acquire), usize::MAX - 1);
+            assert_eq!(hint.swap(usize::MAX, Ordering::AcqRel), usize::MAX - 1);
+            assert_eq!(hint.load(Ordering::Acquire), usize::MAX);
+        }
+        #[cfg(target_pointer_width = "64")]
+        {
+            let hint = CachedSlot::new(u32::MAX as usize + 100);
+            assert_eq!(hint.load(Ordering::Acquire), usize::MAX - 1);
+            assert_eq!(std::mem::size_of::<TrackedHandle>(), 64);
+        }
+    }
+
+    #[test]
+    fn uncacheable_generation_and_frozen_positions_use_identity_fallback() {
+        for frozen in [false, true] {
+            let state = GcState::new();
+            let roots: Vec<_> = (0..3)
+                .map(|_| Object::Dict(Rc::new(RefCell::new(DictData::default()))))
+                .collect();
+            for root in &roots {
+                state.track_now(root.clone());
+            }
+            if frozen {
+                state.freeze_all();
+            }
+            let first = state.handle_for(id_of(&roots[0])).unwrap();
+            first.slot.store((u32::MAX - 1) as usize, Ordering::Release);
+            state.untrack_id(first.id);
+            assert!(!state.is_tracked(first.id));
+            let moved = state.handle_for(id_of(&roots[2])).unwrap();
+            assert_eq!(moved.slot.load(Ordering::Acquire), 0);
+            let second = state.handle_for(id_of(&roots[1])).unwrap();
+            // A cacheable but stale position must also validate identity.
+            second.slot.store(0, Ordering::Release);
+            state.untrack_id(second.id);
+            assert!(!state.is_tracked(second.id));
+            assert!(state.is_tracked(moved.id));
+            assert_eq!(state.freeze_count(), usize::from(frozen));
+            state.untrack_id(moved.id);
+            assert!(!state.is_tracked(moved.id));
+            assert_eq!(state.freeze_count(), 0);
+        }
+    }
+
+    #[test]
+    fn uncacheable_hot_positions_preserve_membership_and_move_fixups() {
+        let state = GcState::new();
+        let roots: Vec<_> = (0..3)
+            .map(|_| Object::Dict(Rc::new(RefCell::new(DictData::default()))))
+            .collect();
+        let handles: Vec<_> = roots
+            .iter()
+            .map(|root| {
+                state.track_now(root.clone());
+                state.handle_for(id_of(root)).unwrap()
+            })
+            .collect();
+        for handle in &handles {
+            assert!(state.fin_insert(handle.id, handle.clone()));
+        }
+        let middle = &handles[1];
+        middle
+            .fin_hot_slot
+            .store((u32::MAX - 1) as usize, Ordering::Release);
+        state.fin_make_hot(middle);
+        assert_eq!(state.finalizable_hot.borrow().len(), 3);
+        state.fin_make_cold(middle);
+        assert_eq!(state.finalizable_hot.borrow().len(), 2);
+        assert_eq!(handles[2].fin_hot_slot.load(Ordering::Acquire), 1);
+        assert!(middle.fin_cold.load(Ordering::Acquire));
+        assert_eq!(middle.fin_hot_slot.load(Ordering::Acquire), usize::MAX);
+        state.fin_make_hot(middle);
+        assert_eq!(middle.fin_hot_slot.load(Ordering::Acquire), 2);
+        handles[0]
+            .fin_hot_slot
+            .store((u32::MAX - 1) as usize, Ordering::Release);
+        assert!(state.fin_remove(handles[0].id));
+        assert!(!state.fin_remove(handles[0].id));
+        assert_eq!(middle.fin_hot_slot.load(Ordering::Acquire), 0);
+        for handle in &handles {
+            state.untrack_id(handle.id);
+        }
+        assert!(state.finalizable_hot.borrow().is_empty());
+        assert_eq!(state.finalizable_count.load(Ordering::Acquire), 0);
+        assert_eq!(state.fin_hot_count.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn deferred_instance_drop_ignores_stale_gc_filter() {
