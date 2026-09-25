@@ -39,6 +39,9 @@ Windows CI for `c3b2bd4` still records zero predicate hits with the JIT disabled
 while getter coverage succeeds. Native dispatch therefore isn't a complete
 explanation. Failure diagnostics now print the getter, predicate, and arithmetic
 function shapes, bytecode, and caches without relaxing the coverage requirement.
+On `3e1453d`, macOS and Linux unit CI pass; Windows correctly classifies the
+predicate but still records zero hits. Test-only call-guard and field-hit counters
+now narrow that remaining discrepancy without changing runtime behavior.
 The reusable field-read probe pairs slot getters, arithmetic, and
 chains with dictionary controls; setup and result checks remain timed.
 

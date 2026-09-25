@@ -13905,11 +13905,17 @@ impl Interpreter {
         // `PyFunction::code`); only compared and borrowed below, while the
         // caller's stack keeps the function alive.
         let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        #[cfg(test)]
+        note_predicate_stage(code_rc, 0);
         if !code_is_pure_leaf(code_rc) || !pure_leaf_warm(code_rc) {
             return None;
         }
+        #[cfg(test)]
+        note_predicate_stage(code_rc, 1);
         let slot = code_call_slot(code, pc)?;
         let (missing, slot_self) = slot.hit(Rc::as_ptr(f), Rc::as_ptr(code_rc))?;
+        #[cfg(test)]
+        note_predicate_stage(code_rc, 2);
         let has_self = !matches!(ops.get(1)?, Object::Unbound);
         if slot_self != has_self || !Self::lean_code_ok(code_rc) {
             return None;
@@ -13926,12 +13932,39 @@ impl Interpreter {
         if unsafe { (*depth_cell).get() } >= crate::recursion::recursion_limit() {
             return None;
         }
+        #[cfg(test)]
+        {
+            note_predicate_stage(code_rc, 3);
+            if code_vm_ext(code_rc)
+                .is_some_and(|ext| ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) == 7)
+            {
+                for operand in ops {
+                    if matches!(operand, Object::Unbound) || Self::core_droppable(operand) {
+                        continue;
+                    }
+                    let index = match operand {
+                        Object::Function(_) => 0,
+                        Object::Instance(_) => 1,
+                        Object::List(_) | Object::Dict(_) | Object::Tuple(_) => 2,
+                        _ => 3,
+                    };
+                    PURE_PREDICATE_DROP_MISSES.with(|counts| {
+                        let mut values = counts.get();
+                        values[index] += 1;
+                        counts.set(values);
+                    });
+                    break;
+                }
+            }
+        }
         if !ops
             .iter()
             .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
         {
             return None;
         }
+        #[cfg(test)]
+        note_predicate_stage(code_rc, 4);
         let first = if has_self { 1 } else { 2 };
         let nargs = ops.len() - first;
         let total = nargs + missing;
@@ -14205,6 +14238,8 @@ impl Interpreter {
                     }
                 }
                 7 => {
+                    #[cfg(test)]
+                    note_predicate_stage(code, 5);
                     // Cached field comparisons need neither the general
                     // leaf stack nor its owned-result scratch.
                     let cached_field = |load_pc: usize| -> Option<V> {
@@ -14221,6 +14256,8 @@ impl Interpreter {
                         let value = unsafe {
                             Self::leaf_cached_instance_field(code, inst, pc as u32, attr.arg)
                         }?;
+                        #[cfg(test)]
+                        note_predicate_stage(code, if load_pc == start { 6 } else { 7 });
                         Some(norm(std::ptr::from_ref(value)))
                     };
                     let compare_fields = || {
@@ -14238,6 +14275,8 @@ impl Interpreter {
                         compare(a, b, kind).map(Object::Bool)
                     };
                     if let Some(result) = compare_fields() {
+                        #[cfg(test)]
+                        note_predicate_stage(code, 8);
                         #[cfg(test)]
                         PURE_CACHED_FIELD_PREDICATES.with(|hits| hits.set(hits.get() + 1));
                         return Some(result);
@@ -55145,7 +55184,22 @@ thread_local! {
     static NATIVE_FAST_SUBSCRIPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static PURE_SLOT_FIELD_READS: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
     static PURE_CACHED_FIELD_PREDICATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PURE_PREDICATE_STAGES: std::cell::Cell<[u64; 9]> = const { std::cell::Cell::new([0; 9]) };
+    static PURE_PREDICATE_DROP_MISSES: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
     static NATIVE_SUBSCRIPT_CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_predicate_stage(code: &CodeObject, stage: usize) {
+    if code_vm_ext(code)
+        .is_some_and(|ext| ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) == 7)
+    {
+        PURE_PREDICATE_STAGES.with(|counts| {
+            let mut values = counts.get();
+            values[stage] += 1;
+            counts.set(values);
+        });
+    }
 }
 
 /// Builtins that native modules vouch for as *leaf*: for every argument,
@@ -63785,6 +63839,12 @@ assert loop(2000) == 1999000
 
     #[cfg(feature = "jit")]
     fn diagnose_pure_leaf_coverage(interp: &Interpreter, names: &[&str]) {
+        eprintln!("Predicate stages [called, warm, slot, binding, droppable, eval, left, right, compared]: {:?}",
+            PURE_PREDICATE_STAGES.with(std::cell::Cell::get));
+        eprintln!(
+            "Predicate drop misses [function, instance, container, other]: {:?}",
+            PURE_PREDICATE_DROP_MISSES.with(std::cell::Cell::get)
+        );
         let Some(Object::Module(main)) = interp.cache.get("__main__") else {
             panic!("missing main module for coverage diagnostics");
         };
@@ -63794,6 +63854,24 @@ assert loop(2000) == 1999000
                 panic!("missing {name} for coverage diagnostics");
             };
             let code = function.code();
+            let id = Rc::as_ptr(function) as usize as u64;
+            eprintln!(
+                "  function owners={}, maybe_tracked={}, tracked={}",
+                Rc::strong_count(function),
+                gc_trace::maybe_tracked(id),
+                gc_trace::is_tracked(id)
+            );
+            if *name == "default_predicate" {
+                if let Some(receiver @ Object::Instance(inst)) = function.defaults.first() {
+                    let args = [std::ptr::from_ref(receiver); 2];
+                    eprintln!(
+                        "  direct evaluator: {:?}, class_version={}, native_kind={}",
+                        interp.pure_leaf_eval::<false>(&code, function, &args),
+                        inst.cls_raw().attr_version.get(),
+                        inst.cls_raw().native_kind.get()
+                    );
+                }
+            }
             let shape = code_vm_ext(&code)
                 .map(|ext| ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed));
             eprintln!(

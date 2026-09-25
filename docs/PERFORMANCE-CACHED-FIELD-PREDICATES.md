@@ -36,7 +36,11 @@ That mode records 1,822 DeltaBlue hits locally; both modes retain the semantic c
 Windows CI for `c3b2bd4` still records zero hits with the JIT disabled, so native
 dispatch alone doesn't explain the discrepancy. The unchanged coverage assertions
 now print the affected function's classification, bytecode, and inline caches on
-failure. The Windows cause remains unresolved pending those diagnostics.
+failure. Diagnostics from `3e1453d` confirm the expected predicate shape and warmed
+instance caches on Windows. Further test-only counters distinguish call guards,
+operand-release admission, evaluator entry, and field hits. The original hit
+snapshot and assertion remain unchanged; diagnostic calls can't satisfy coverage.
+The Windows cause remains unresolved. macOS and Linux unit CI pass on `3e1453d`.
 
 The binary is 51,872,944 bytes, 4,208 bytes larger than baseline `a7b67f6`. Its SHA-256 is
 `58e904115755973c50311371967a0c96ca111e863bcacf522fda8ec9770c628d`; the baseline is

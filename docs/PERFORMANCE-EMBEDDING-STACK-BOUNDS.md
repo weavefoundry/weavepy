@@ -24,6 +24,8 @@ restored remaining stack was 1,054,688 bytes, slightly larger than the requested
 1 MiB. The test now compares against the OS-reported allocation on macOS,
 which can round the requested size up. It still requests a 1 MiB worker and
 checks the first restored bounds without initializing stacker's cache early.
+The corrected assertion and complete lifecycle pass in macOS ARM CI for
+`3e1453d`; the Windows embedding test also passes on that commit.
 C-API formatting and Clippy pass with the two previously documented VM lint
 exclusions. This change makes no throughput or peak-memory claim. Source analysis,
 the Windows failure log, and local validation remain under
