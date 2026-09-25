@@ -126,3 +126,13 @@ The latest inspected preceding `6d6fd89` CI head has 15 passing checks, 12 runni
 and one queued. Its Linux benchmark gate passes; Windows and macOS gates are still
 running. The earlier accepted head retains the Windows cold-compilation regression
 recorded in [Cached field predicates](PERFORMANCE-CACHED-FIELD-PREDICATES.md).
+
+## Release-guard follow-up
+
+The `949d5df` macOS and Windows diagnostics identify instance-release rejection
+after successful predicate classification and binding. A local reproduction
+finds a stale positive collector filter on an untracked instance with two owners.
+The [deferred-instance release fix](PERFORMANCE-DEFERRED-INSTANCE-RELEASES.md)
+uses the existing exact deferral flag while retaining last-owner and tracked-object
+cleanup checks. Cross-platform validation and performance measurements are pending;
+the earlier measurements above remain the accepted baseline.

@@ -4509,6 +4509,62 @@ mod tests {
     use crate::object::DictData;
 
     #[test]
+    fn deferred_instance_drop_ignores_stale_gc_filter() {
+        const CHILD: &str = "WEAVEPY_DEFERRED_DROP_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "gc_trace::tests::deferred_instance_drop_ignores_stale_gc_filter",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("spawn deferred-drop test");
+            assert!(status.success(), "deferred-drop child: {status}");
+            return;
+        }
+        let _gil = crate::gil::global_gil().acquire();
+        let class =
+            crate::types::TypeObject::new_user("DeferredDrop", Vec::new(), DictData::default())
+                .unwrap();
+        let owner = crate::types::PyInstance::new_deferred(class);
+        let operand = Object::Instance(owner.clone());
+        let id = id_of(&operand);
+        assert!(owner.is_gc_deferred());
+        assert!(!is_tracked(id));
+        assert_eq!(Rc::strong_count(&owner), 2);
+
+        // Model stale bits from an earlier allocation at this address.
+        // This makes the reported CI failure deterministic without
+        // relying on allocator placement or weakening path coverage.
+        process_tracked_filter().insert(id);
+        assert!(maybe_tracked(id));
+        assert!(!is_tracked(id));
+        assert!(note_dropped_marks(&operand));
+        assert!(crate::Interpreter::core_droppable(&operand));
+
+        // A final program owner still requires ordinary teardown.
+        drop(owner);
+        assert!(!crate::Interpreter::core_droppable(&operand));
+
+        // A non-atomic field revokes the deferral proof. After releasing
+        // the extra program owner, the collector and operand are the
+        // only owners, so this release must mark prompt cleanup.
+        let Object::Instance(owner) = &operand else {
+            unreachable!()
+        };
+        owner.note_slot_store(&Object::List(Rc::new(RefCell::new(Vec::new()))));
+        assert!(!owner.is_gc_deferred());
+        assert!(is_tracked(id));
+        assert_eq!(Rc::strong_count(owner), 2);
+        assert!(note_dropped_marks(&operand));
+        assert!(!crate::Interpreter::core_droppable(&operand));
+        with_state(|state| state.untrack_id(id));
+        assert!(!is_tracked(id));
+    }
+
+    #[test]
     fn gc_index_distributes_aligned_object_addresses() {
         use std::hash::BuildHasher;
         let hasher = BuildHasherDefault::<GcIndexHasher>::default();

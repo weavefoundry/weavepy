@@ -13507,7 +13507,14 @@ impl Interpreter {
             Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None | Object::Str(_) => {
                 true
             }
-            Object::Instance(i) => Rc::strong_count(i) > 1 && !gc_trace::note_dropped_marks(v),
+            Object::Instance(i) => {
+                // Deferred tracking is an exact proof that the collector
+                // and weakref registry hold no owner. A stale Bloom-filter
+                // hit must not reject this nonfinal release. The last
+                // owner still takes ordinary teardown, and every store or
+                // weakref operation that requires tracking revokes the flag.
+                Rc::strong_count(i) > 1 && (i.is_gc_deferred() || !gc_trace::note_dropped_marks(v))
+            }
             Object::List(l) => Rc::strong_count(l) > 1 && !gc_trace::note_dropped_marks(v),
             Object::Dict(d) => Rc::strong_count(d) > 1 && !gc_trace::note_dropped_marks(v),
             Object::Tuple(t) => ThinArc::strong_count(t) > 1 && !gc_trace::note_dropped_marks(v),
@@ -13950,6 +13957,16 @@ impl Interpreter {
                     };
                     PURE_PREDICATE_DROP_MISSES.with(|counts| {
                         let mut values = counts.get();
+                        if values[index] == 0 {
+                            if let Object::Instance(instance) = operand {
+                                let id = Rc::as_ptr(instance) as usize as u64;
+                                eprintln!("First predicate instance drop miss: owners={}, deferred={}, maybe_tracked={}, tracked={}, weakrefs={}, weak_clones={}",
+                                    Rc::strong_count(instance), instance.is_gc_deferred(),
+                                    gc_trace::maybe_tracked(id), gc_trace::is_tracked(id),
+                                    crate::weakref_registry::may_have_weakrefs(id),
+                                    crate::weakref_registry::strong_clone_count(id));
+                            }
+                        }
                         values[index] += 1;
                         counts.set(values);
                     });

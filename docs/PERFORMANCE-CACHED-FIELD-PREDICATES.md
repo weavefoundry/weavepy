@@ -111,3 +111,13 @@ pass. The Windows gate retains a 1.218 cold sumvm ratio against the merge base;
 separate diagnostic cold sumvm/nested-loop/jitloop ratios are 1.209/1.157/1.161,
 versus warm ratios of 0.998/1.002/1.003. Complete process elapsed improves, but the
 first-use compilation cost remains unresolved.
+
+## Release-guard follow-up
+
+The `949d5df` macOS and Windows diagnostics identify instance-release rejection
+after successful predicate classification and binding. A local reproduction
+finds a stale positive collector filter on an untracked instance with two owners.
+The [deferred-instance release fix](PERFORMANCE-DEFERRED-INSTANCE-RELEASES.md)
+uses the existing exact deferral flag while retaining last-owner and tracked-object
+cleanup checks. Cross-platform validation and performance measurements are pending;
+the earlier measurements above remain the accepted baseline.
