@@ -153,4 +153,44 @@ try:
 finally:
     sys.setrecursionlimit(old_limit)
 assert leaf_sum(50, leaf_add) == 1275
+
+
+def leaf_branch(a, b):
+    if a < 0:
+        return a - b
+    return a + b
+
+
+def leaf_constant(a, b):
+    return 7
+
+
+def leaf_one(n, callback):
+    total = 0
+    for i in range(n):
+        total += callback(i)
+    return total
+
+
+# Non-leaf frames, unused parameters, namespace guards, and missing trailing
+# arguments reuse ordinary call resolution after the borrowed path declines.
+assert leaf_sum(4000, leaf_branch) == 8002000
+assert leaf_branch(-1, 2) == -3
+assert leaf_sum(4000, leaf_constant) == 28000
+assert leaf_one(4000, leaf_default) == 8118000
+leaf_default.__defaults__ = (3, 4)
+assert leaf_one(4000, leaf_default) == 8026000
+leaf_default.__defaults__ = None
+try:
+    leaf_one(1, leaf_default)
+except TypeError:
+    pass
+else:
+    raise AssertionError('dynamic call ignored missing defaults')
+leaf_default.__defaults__ = (10, 20)
+assert leaf_one(50, leaf_default) == 2725
+one.__globals__['OFFSET'] = 7
+assert leaf_sum(50, one) == 1625
+one.__globals__['OFFSET'] = 1
+assert leaf_sum(50, one) == 1325
 print('ok')

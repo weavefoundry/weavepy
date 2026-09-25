@@ -3511,11 +3511,18 @@ const SCALAR_LEAF_SLOTS: usize = 32;
 ///
 /// # Safety
 ///
-/// `nc` is a live scalar leaf with fewer than `SCALAR_LEAF_SLOTS` stack
-/// entries and at most that many locals. `argc` entries of `jf.call_args`
+/// `cf` is a live scalar leaf with fewer than `SCALAR_LEAF_SLOTS` stack
+/// entries and at most that many locals, compiled from `func`'s `code`.
+/// `argc` entries of `jf.call_args`
 /// are initialized, and all missing trailing arguments have scalar defaults.
 #[inline(never)]
-unsafe fn enter_scalar_leaf(nc: &NativeCallee, jf: &JitFrame, argc: usize) -> Option<(u64, u32)> {
+unsafe fn enter_scalar_leaf(
+    cf: &CompiledFrame,
+    func: &PyFunction,
+    code: &CodeObject,
+    jf: &JitFrame,
+    argc: usize,
+) -> Option<(u64, u32)> {
     // Only the locals need initializing: the operand spill and its tags
     // are written by native code before anything reads them.
     let mut locals = [0u64; SCALAR_LEAF_SLOTS];
@@ -3526,17 +3533,17 @@ unsafe fn enter_scalar_leaf(nc: &NativeCallee, jf: &JitFrame, argc: usize) -> Op
     for (k, slot) in locals
         .iter_mut()
         .enumerate()
-        .take(nc.code.arg_count as usize)
+        .take(code.arg_count as usize)
         .skip(argc)
     {
-        let default = &nc.func.defaults[nc.func.defaults.len() - (nc.code.arg_count as usize - k)];
-        *slot = pack(default, nc.cf.local_types[k]?)?;
+        let default = &func.defaults[func.defaults.len() - (code.arg_count as usize - k)];
+        *slot = pack(default, cf.local_types[k]?)?;
     }
     let mut spill = std::mem::MaybeUninit::<[u64; SCALAR_LEAF_SLOTS]>::uninit();
     let mut tags = std::mem::MaybeUninit::<[u32; SCALAR_LEAF_SLOTS]>::uninit();
     let mut frame = JitFrame {
         locals: locals.as_mut_ptr(),
-        n_locals: nc.cf.n_locals,
+        n_locals: cf.n_locals,
         entry_pc: 0,
         ret_bits: 0,
         ret_tag: 0,
@@ -3552,7 +3559,7 @@ unsafe fn enter_scalar_leaf(nc: &NativeCallee, jf: &JitFrame, argc: usize) -> Op
     // SAFETY: the engine's scalar-leaf allowlist excludes every contextual
     // helper, pin, poll, and Python call. Its math helpers need only scalar
     // arguments. All buffers fit and the guarded native entry is live.
-    let status = unsafe { nc.cf.enter(&raw mut frame) };
+    let status = unsafe { cf.enter(&raw mut frame) };
     (status == JitStatus::Returned).then_some((frame.ret_bits, frame.ret_tag))
 }
 
@@ -3717,7 +3724,7 @@ unsafe fn try_native_call(
         native_stat(|s| s.scalar_leaf_calls.set(s.scalar_leaf_calls.get() + 1));
         // SAFETY: the checks above establish the helper's size, scalar
         // lane, default-binding, code-lifetime, and recursion invariants.
-        let enter = || unsafe { enter_scalar_leaf(nc, jf, argc_usize) };
+        let enter = || unsafe { enter_scalar_leaf(&nc.cf, &nc.func, &nc.code, jf, argc_usize) };
         let result = if crate::stdlib::greenlet_native::on_greenlet_stack() {
             enter()
         } else {
@@ -5836,6 +5843,22 @@ unsafe extern "C" fn wpjit_tuple_len(frame: *mut JitFrame, pin: i64) -> i64 {
     items.len() as i64
 }
 
+#[cfg(test)]
+thread_local! {
+    static BORROWED_DYN_SCALAR_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static RESOLVED_DYN_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn borrowed_dyn_scalar_calls_for_test() -> u64 {
+    BORROWED_DYN_SCALAR_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn resolved_dyn_calls_for_test() -> u64 {
+    RESOLVED_DYN_CALLS.with(std::cell::Cell::get)
+}
+
 /// Guard a pinned exact integer before native arithmetic. All other
 /// values, including integer subclasses and large integers, deopt without
 /// invoking conversion or arithmetic hooks.
@@ -7468,11 +7491,30 @@ unsafe fn try_dyn_native(
         }
         _ => return None,
     };
+    // SAFETY: the resolved owners outlive the call, and the same initialized
+    // argument-buffer contract applies to the shared entry path.
+    unsafe { enter_dyn_native(jf, ctx, interp, &nc, argc, recv.as_ref(), int_result) }
+}
+
+/// Enter an already resolved dynamic callee and adapt its return lane.
+///
+/// # Safety
+///
+/// The owners and initialized buffers required by `try_dyn_native` remain
+/// live. No JIT cache borrow may cross this call: guards can invoke Python.
+unsafe fn enter_dyn_native(
+    jf: &mut JitFrame,
+    ctx: &mut CallCtx,
+    interp: &mut super::Interpreter,
+    nc: &NativeCallee,
+    argc: u32,
+    recv: Option<&Object>,
+    int_result: bool,
+) -> Option<i64> {
     if nc.ctor.is_some() {
         // The constructor form allocates the instance and enters the
         // compiled `__init__`; the site's value is the instance pin.
-        let status =
-            unsafe { try_native_ctor(jf, ctx, interp, &nc, argc, SlotTag::ObjPin as u32) }?;
+        let status = unsafe { try_native_ctor(jf, ctx, interp, nc, argc, SlotTag::ObjPin as u32) }?;
         return Some(if status == CallStatus::Ok as i64 {
             finish_dyn_native_result(jf, ctx, int_result)
         } else {
@@ -7491,7 +7533,7 @@ unsafe fn try_dyn_native(
         }
         tag
     };
-    let status = unsafe { try_native_call(jf, ctx, interp, &nc, argc, expect, recv.as_ref()) }?;
+    let status = unsafe { try_native_call(jf, ctx, interp, nc, argc, expect, recv) }?;
     Some(if status == CallStatus::Ok as i64 {
         finish_dyn_native_result(jf, ctx, int_result)
     } else {
@@ -7534,6 +7576,128 @@ fn finish_dyn_native_result(jf: &mut JitFrame, ctx: &mut CallCtx, int_result: bo
         }
     }
     CallStatus::Ok as i64
+}
+
+enum BorrowedScalarCall {
+    Completed(u64, u32),
+    Resolved(NativeCallee),
+    RetryPython,
+}
+
+/// Resolve a dynamic function once, borrowing exact-arity scalar leaves
+/// without constructing an owning callee bundle. Other eligible functions
+/// return an owning resolution for the ordinary native call machinery.
+/// The activation pin holds the function; the borrowed thread-local
+/// cache holds its code and native artifacts. Only guard-free scalar leaves
+/// qualify: even namespace guard lookups can invoke Python for exotic keys.
+/// These leaves cannot call Python, use contextual helpers, or mutate the pin
+/// table. Every borrow ends before a result is pinned or the interpreter
+/// handles a declined call.
+///
+/// # Safety
+///
+/// The live activation and initialized argument-buffer contract of
+/// `wpjit_call_dyn` applies. This helper never publishes or mutates the caller's
+/// pins, and only enters the engine's certified scalar-leaf subset.
+unsafe fn try_borrowed_dyn_scalar(
+    jf: &JitFrame,
+    ctx: &CallCtx,
+    interp: &mut super::Interpreter,
+    callee_pin: i64,
+    argc: u32,
+) -> Option<BorrowedScalarCall> {
+    let Some(Pin::Obj(Object::Function(func))) = ctx.pins.get(callee_pin as usize) else {
+        return None;
+    };
+    // Do not hold a function-code borrow across the GIL checkpoint.
+    let key = Rc::as_ptr(&func.code.borrow());
+    JIT.with(|cell| {
+        let state = cell.borrow();
+        let Some(entry) = state.cache.get(&key) else {
+            return Some(BorrowedScalarCall::RetryPython);
+        };
+        let Tier::Compiled(art) = &entry.tier else {
+            return Some(BorrowedScalarCall::RetryPython);
+        };
+        let (cf, code) = (&art.cf, &entry.code);
+        if !native_callable(cf, code) {
+            return Some(BorrowedScalarCall::RetryPython);
+        }
+        if !cf.is_scalar_leaf()
+            || !art.snap.entries.is_empty()
+            || !art.callees.is_empty()
+            || !art.math.is_empty()
+            || cf.n_locals as usize > SCALAR_LEAF_SLOTS
+            || cf.max_stack as usize >= SCALAR_LEAF_SLOTS
+            || code.arg_count != argc
+        {
+            // Reuse this lookup for the ordinary native call. Construct
+            // owners here, then release the cache borrow before any guard
+            // lookup, default binding, framed call, or Python fallback.
+            #[cfg(test)]
+            RESOLVED_DYN_CALLS.with(|count| count.set(count.get() + 1));
+            return Some(BorrowedScalarCall::Resolved(NativeCallee {
+                art: art.clone(),
+                func: func.clone(),
+                code: code.clone(),
+                ctor: None,
+            }));
+        }
+        // The cache is this thread's, and this checkpoint runs no Python.
+        // Another thread may replace the function's code while it holds the
+        // GIL, so validate the live identity again after reacquiring it.
+        interp.gil_countdown = interp.gil_countdown.wrapping_sub(1);
+        if interp.gil_countdown == 0 {
+            interp.gil_countdown = crate::gil::GIL_CHECK_INTERVAL;
+            crate::gil::yield_checkpoint();
+        }
+        if crate::hot_gates::load() != 0
+            || crate::trace::any_observers_active()
+            || code.jit_hint.is_not_jitable()
+            || !Rc::ptr_eq(&func.code.borrow(), code)
+        {
+            return Some(BorrowedScalarCall::RetryPython);
+        }
+        for j in 0..argc as usize {
+            let Some(lane) = cf.local_types.get(j).copied().flatten() else {
+                return Some(BorrowedScalarCall::RetryPython);
+            };
+            // SAFETY: the caller initialized argc argument tags.
+            if unsafe { *jf.call_tags.add(j) } != lane_tag(lane) {
+                return Some(BorrowedScalarCall::RetryPython);
+            }
+        }
+        let _guard = match crate::recursion::enter_with(ctx.depth_cell) {
+            crate::recursion::Enter::Ok(guard) => guard,
+            crate::recursion::Enter::Overflow => return Some(BorrowedScalarCall::RetryPython),
+        };
+        native_stat(|stats| {
+            stats.calls.set(stats.calls.get() + 1);
+            stats
+                .scalar_leaf_calls
+                .set(stats.scalar_leaf_calls.get() + 1);
+        });
+        #[cfg(test)]
+        BORROWED_DYN_SCALAR_CALLS.with(|count| count.set(count.get() + 1));
+        // SAFETY: certification, sizes, scalar argument lanes, exact arity,
+        // guards, and recursion were checked above. The cache borrow keeps
+        // the compiled entry alive; this body cannot reenter the interpreter.
+        let enter = || unsafe { enter_scalar_leaf(cf, func, code, jf, argc as usize) };
+        let result = if crate::stdlib::greenlet_native::on_greenlet_stack() {
+            enter()
+        } else {
+            stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, enter)
+        };
+        Some(match result {
+            Some((bits, tag)) => BorrowedScalarCall::Completed(bits, tag),
+            None => {
+                // Only pure numeric work ran. Release the cache borrow and
+                // recursion guard before replaying it in the interpreter.
+                native_stat(|stats| stats.deopts.set(stats.deopts.get() + 1));
+                BorrowedScalarCall::RetryPython
+            }
+        })
+    })
 }
 
 /// The `wpjit_call_dyn` helper (RFC 0074 WS2): call an arbitrary
@@ -7595,6 +7759,31 @@ unsafe fn call_dyn_impl(
     // SAFETY: the `&mut Interpreter` that entered native code is
     // dormant while the helper runs.
     let interp = unsafe { &mut *ctx.interp };
+    let retry_python = if kwc == 0 {
+        // SAFETY: the same live buffers; the borrowed path releases every
+        // borrow before this code updates the result or enters Python.
+        match unsafe { try_borrowed_dyn_scalar(jf, ctx, interp, callee_pin, argc) } {
+            Some(BorrowedScalarCall::Completed(bits, tag)) => {
+                jf.ret_bits = bits;
+                jf.ret_tag = tag;
+                return finish_dyn_native_result(jf, ctx, int_result);
+            }
+            Some(BorrowedScalarCall::RetryPython) => true,
+            Some(BorrowedScalarCall::Resolved(nc)) => {
+                // SAFETY: resolution released its cache borrow, and this
+                // activation's argument buffers remain initialized.
+                if let Some(status) =
+                    unsafe { enter_dyn_native(jf, ctx, interp, &nc, argc, None, int_result) }
+                {
+                    return status;
+                }
+                true
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
     // The callee rode a pinned lane; `-1` is the nullable `None`
     // (calling `None` raises) — both misses re-execute generically.
     let callee = match ctx.pins.get(callee_pin as usize) {
@@ -7607,7 +7796,7 @@ unsafe fn call_dyn_impl(
     // natively through the `wpjit_call_py` machinery; everything else
     // pays the interpreter core below. Keyword sites stay generic —
     // the kwnames binder is the interpreter's.
-    if kwc == 0 {
+    if kwc == 0 && !retry_python {
         // SAFETY: per the function contract — same live buffers.
         if let Some(status) = unsafe { try_dyn_native(jf, ctx, interp, &callee, argc, int_result) }
         {

@@ -63690,6 +63690,63 @@ assert loop(2000) == 1999000
 
     #[cfg(feature = "jit")]
     #[test]
+    fn jit_scalar_leaf_calls_borrow_cached_artifacts() {
+        const CHILD: &str = "WEAVEPY_BORROWED_SCALAR_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::jit_scalar_leaf_calls_borrow_cached_artifacts",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("WEAVEPY_JIT", "1")
+                .status()
+                .expect("spawn borrowed scalar test");
+            assert!(status.success(), "borrowed scalar child: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut interp = Interpreter::new();
+                let source =
+                    include_str!("../../../tests/regrtest/test_jit_guarded_integer_comparisons.py");
+                let module = parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    source,
+                    "guarded_integer_comparisons.py",
+                )
+                .unwrap();
+                interp
+                    .run_module(&code)
+                    .expect("comparison callback and value assertions");
+                let before = crate::tier2::borrowed_dyn_scalar_calls_for_test();
+                let resolved_before = crate::tier2::resolved_dyn_calls_for_test();
+                let source = include_str!("../../../tests/regrtest/test_jit_scalar_leaf_calls.py");
+                let module = parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    source,
+                    "borrowed_dynamic_scalar_calls.py",
+                )
+                .unwrap();
+                interp
+                    .run_module(&code)
+                    .expect("scalar call guards and fallback assertions");
+                let borrowed = crate::tier2::borrowed_dyn_scalar_calls_for_test() - before;
+                assert!(borrowed > 1000, "borrowed scalar calls: {borrowed}");
+                let resolved = crate::tier2::resolved_dyn_calls_for_test() - resolved_before;
+                assert!(resolved > 1000, "reused owning resolutions: {resolved}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
     fn jit_borrowed_getters_preserve_callback_and_binding_rules() {
         const CHILD: &str = "WEAVEPY_GETTER_PATH_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
