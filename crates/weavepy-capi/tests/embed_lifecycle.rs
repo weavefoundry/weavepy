@@ -81,9 +81,15 @@ fn embedding_lifecycle() {
     // Do not query before Py_Initialize: its first stack switch must save
     // the OS stack's bounds even when stacker's cache starts uninitialized.
     let remaining = stacker::remaining_stack();
+    // macOS can round the requested size up. Compare against the actual
+    // allocation without changing the worker's requested 1 MiB stack.
+    #[cfg(target_os = "macos")]
+    let stack_size = unsafe { libc::pthread_get_stacksize_np(libc::pthread_self()) };
+    #[cfg(not(target_os = "macos"))]
+    let stack_size = 1024 * 1024;
     assert!(
-        remaining.is_none_or(|bytes| bytes > 0 && bytes <= 1024 * 1024),
-        "restored bounds exceed the 1 MiB embedding stack: {remaining:?} bytes"
+        remaining.is_none_or(|bytes| bytes > 0 && bytes <= stack_size),
+        "restored bounds exceed the embedding stack ({stack_size} bytes): {remaining:?} bytes"
     );
 
     lifecycle_step("simple execution");

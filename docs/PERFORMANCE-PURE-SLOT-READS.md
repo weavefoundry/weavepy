@@ -35,6 +35,10 @@ but record zero predicate hits with native compilation enabled. The coverage tes
 now runs both modes and requires interpreter-path counts with the JIT disabled;
 native calls may bypass those counters. Locally, that mode records 31,739 getter,
 23,728 predicate, and 31,724 general reads. Both modes retain all semantic assertions.
+Windows CI for `c3b2bd4` still records zero predicate hits with the JIT disabled,
+while getter coverage succeeds. Native dispatch therefore isn't a complete
+explanation. Failure diagnostics now print the getter, predicate, and arithmetic
+function shapes, bytecode, and caches without relaxing the coverage requirement.
 The reusable field-read probe pairs slot getters, arithmetic, and
 chains with dictionary controls; setup and result checks remain timed.
 

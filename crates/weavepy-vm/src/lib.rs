@@ -63784,6 +63784,35 @@ assert loop(2000) == 1999000
     }
 
     #[cfg(feature = "jit")]
+    fn diagnose_pure_leaf_coverage(interp: &Interpreter, names: &[&str]) {
+        let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+            panic!("missing main module for coverage diagnostics");
+        };
+        let globals = main.dict.borrow();
+        for name in names {
+            let Some(Object::Function(function)) = globals.get(&crate::object::StrKey(name)) else {
+                panic!("missing {name} for coverage diagnostics");
+            };
+            let code = function.code();
+            let shape = code_vm_ext(&code)
+                .map(|ext| ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed));
+            eprintln!(
+                "Pure leaf {name}: shape={shape:?}, argc={}, varnames={:?}, names={:?}, JIT={:?}",
+                code.arg_count,
+                code.varnames,
+                code.names,
+                std::env::var_os("WEAVEPY_JIT")
+            );
+            for (pc, instruction) in code.instructions.iter().enumerate() {
+                eprintln!(
+                    "  {pc}: {instruction:?}, cache={:?}",
+                    code.caches.get(pc as u32)
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "jit")]
     #[test]
     fn pure_slot_fields_preserve_lookup_and_lifetimes() {
         const CHILD: &str = "WEAVEPY_PURE_SLOT_TEST_CHILD";
@@ -63821,6 +63850,9 @@ assert loop(2000) == 1999000
                 let before = PURE_SLOT_FIELD_READS.with(std::cell::Cell::get);
                 interp.run_module(&code).expect("pure slot assertions");
                 let after = PURE_SLOT_FIELD_READS.with(std::cell::Cell::get);
+                if require_hits && (0..3).any(|index| after[index] - before[index] <= 1000) {
+                    diagnose_pure_leaf_coverage(&interp, &["read", "compare", "add"]);
+                }
                 for (index, name) in ["getter", "predicate", "general"].iter().enumerate() {
                     let hits = after[index] - before[index];
                     if require_hits {
@@ -63880,6 +63912,12 @@ assert loop(2000) == 1999000
                 );
                 let hits = PURE_CACHED_FIELD_PREDICATES.with(std::cell::Cell::get) - before;
                 if require_hits {
+                    if hits <= 1000 {
+                        diagnose_pure_leaf_coverage(
+                            &interp,
+                            &["default_predicate", "other_fields"],
+                        );
+                    }
                     assert!(hits > 1000, "cached field predicate hits: {hits}");
                 }
                 let source = format!(

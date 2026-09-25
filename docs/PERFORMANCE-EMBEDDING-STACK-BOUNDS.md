@@ -18,9 +18,13 @@ Unknown bounds remain valid: stacker then grows conservatively. Nested
 compilation, evaluation, cleanup, exceptions, and reinitialization retain
 their existing assertions.
 
-The embedding lifecycle passes locally on macOS x86-64. C-API formatting and
-Clippy pass with the two previously documented VM lint exclusions. Windows
-confirmation requires the new CI result; the local pass alone doesn't establish
-it. This change makes no throughput or peak-memory claim. Source analysis,
+The embedding lifecycle passes locally on macOS x86-64 and in Windows CI for
+`c3b2bd4`. macOS ARM CI exposed an overly strict regression assertion: its
+restored remaining stack was 1,054,688 bytes, slightly larger than the requested
+1 MiB. The test now compares against the OS-reported allocation on macOS,
+which can round the requested size up. It still requests a 1 MiB worker and
+checks the first restored bounds without initializing stacker's cache early.
+C-API formatting and Clippy pass with the two previously documented VM lint
+exclusions. This change makes no throughput or peak-memory claim. Source analysis,
 the Windows failure log, and local validation remain under
 `target/performance/embedding-stack-bounds-investigation/`.

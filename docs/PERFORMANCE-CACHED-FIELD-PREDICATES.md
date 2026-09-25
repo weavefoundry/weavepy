@@ -33,6 +33,10 @@ pass the Python assertions but report zero hits in the JIT-enabled coverage test
 The test now executes both modes and requires these interpreter-path counts with
 native compilation disabled, avoiding dependence on native dispatch decisions.
 That mode records 1,822 DeltaBlue hits locally; both modes retain the semantic checks.
+Windows CI for `c3b2bd4` still records zero hits with the JIT disabled, so native
+dispatch alone doesn't explain the discrepancy. The unchanged coverage assertions
+now print the affected function's classification, bytecode, and inline caches on
+failure. The Windows cause remains unresolved pending those diagnostics.
 
 The binary is 51,872,944 bytes, 4,208 bytes larger than baseline `a7b67f6`. Its SHA-256 is
 `58e904115755973c50311371967a0c96ca111e863bcacf522fda8ec9770c628d`; the baseline is
