@@ -10,8 +10,8 @@ private storage, callee/code/default checks, and ordinary callback fallback.
 It adds no owners, metadata, JIT admission, or threshold changes.
 
 This candidate is not admitted. Its complete field callers improve substantially,
-but descriptor fallback costs repeat. An early cache check is being evaluated
-before deciding whether to retain the runtime change. The accepted runtime
+but descriptor fallback costs repeat. An early cache check also fails to resolve those costs; both runtime
+variants are held. The accepted runtime
 remains `6ea3e53`; the earlier held conditional-getter and local-release changes
 are absent from this experiment.
 
@@ -84,3 +84,37 @@ startup admission. Those batches weren't run for this first candidate.
 Original results aren't replaced by later measurements. Raw samples, hashes,
 source snapshots, the complete patch, and immutable executable remain under
 `target/performance/borrowed-field-arguments-*`.
+
+## Early-cache-check refinement
+
+The second candidate rejects a first field argument unless its primary cache
+already names an instance dictionary or slot read. The full reader still checks
+receiver identity, class versions, actual names, private storage, and all later
+instructions. This check doesn't allocate cache metadata. A test-only correction
+also excludes caller argument reads from the older callee-field coverage counts;
+those counts match the accepted runtime again. Completed field-call counts and
+all 38 compilation decisions/statistics remain unchanged.
+
+All 389 VM tests, embedding, Clippy with existing exclusions, no-default
+compilation, scoped formatting, and 14 benchmark-tool tests pass. The release
+passes 291 runs across 97 fixtures and 768 semantic probes. The final build takes
+7 minutes, 28 seconds, and its controller closes before freezing. The binary is
+51,877,200 bytes with SHA-256
+`5dcc66419b2389f8c40fb99fcdf38ffd568e630b2964cd7aaf3c7fa08f49fca7`;
+its patch is
+`660ecb81d54d2f2d0429394cdb84d42b54b1d2ec6b141ddb61bbfb395cd5064f`
+against `3f73305`.
+
+The sustained field-call JIT ratios range from 0.682 to 0.732 and interpreter
+ratios from 0.651 to 0.726. However, descriptor fallback costs 2.5%/1.7%, lookup
+hooks cost 2.7%/4.0%, and descriptor transitions cost 7.7%/5.0% in JIT/interpreter
+work. Hook transitions measure 0.996/1.020. The two-argument scalar JIT control
+costs 3.3%, repeating its standard-work result. Standard DeltaBlue/Richards work
+ratios are 0.988/1.012 with JIT and 1.011/1.028 without it; their initial RSS
+ratios are 1.005/1.021 and haven't been rechecked.
+
+This refinement is also held. Neither variant establishes an application gain,
+and broad/startup admission batches weren't run after repeated fallback costs.
+Both complete patches and frozen executables remain under `target/`. The
+committed behavioral fixture and reusable probes cover the opportunity and its
+fallback costs; the accepted runtime still remains `6ea3e53`.
