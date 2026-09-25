@@ -13700,7 +13700,7 @@ impl Interpreter {
         lbase: *const Object,
         nlocals: usize,
         consts: &[Object],
-        scratch: &mut [Object; 8],
+        scratch: &mut [std::mem::MaybeUninit<Object>; 8],
         args: &mut [*const Object; 8],
         first: usize,
     ) -> Option<(usize, usize)> {
@@ -13730,8 +13730,10 @@ impl Interpreter {
                     if n == 8 {
                         return None;
                     }
-                    scratch[n] = Object::Int(i64::from(ins.arg));
-                    args[n] = &raw const scratch[n];
+                    // Initialize only the scalar slot this argument uses.
+                    // Its pointer never precedes the write, and the buffer
+                    // owns nothing that needs teardown on a later miss.
+                    args[n] = scratch[n].write(Object::Int(i64::from(ins.arg)));
                 }
                 OpCode::Call if ins.arg as usize == n - first => return Some((n - first, pc)),
                 _ => return None,
@@ -13821,7 +13823,7 @@ impl Interpreter {
         }
         let fp = mslots.get(attr_pc)?.peek_fn(cls.attr_version.get())?;
         // Scalars only (small ints): nothing to drop on the way out.
-        let mut scratch = std::mem::ManuallyDrop::new([const { Object::None }; 8]);
+        let mut scratch = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
         let mut args: [*const Object; 8] = [std::ptr::null(); 8];
         args[0] = recv;
         // SAFETY: the core loop's own locals and constants.
@@ -13850,6 +13852,8 @@ impl Interpreter {
         }
         let r =
             self.core_pure_fused_eval(code, fp, call_pc, true, &mut args, nargs + 1, depth_cell)?;
+        #[cfg(test)]
+        note_literal_argument_call(code, attr_pc + 1, call_pc, true);
         Some((r, call_pc))
     }
 
@@ -13871,7 +13875,7 @@ impl Interpreter {
         depth_cell: *const std::cell::Cell<usize>,
     ) -> Option<(Object, usize)> {
         // Scalars only (small ints): nothing to drop on the way out.
-        let mut scratch = std::mem::ManuallyDrop::new([const { Object::None }; 8]);
+        let mut scratch = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
         let mut args: [*const Object; 8] = [std::ptr::null(); 8];
         // SAFETY: the core loop's own locals and constants.
         let (nargs, call_pc) = unsafe {
@@ -13888,6 +13892,8 @@ impl Interpreter {
         }?;
         let r =
             self.core_pure_fused_eval(code, fp, call_pc, false, &mut args, nargs, depth_cell)?;
+        #[cfg(test)]
+        note_literal_argument_call(code, args_pc, call_pc, false);
         Some((r, call_pc))
     }
 
@@ -55199,11 +55205,28 @@ enum QuietShell<'a> {
 #[cfg(test)]
 thread_local! {
     static NATIVE_FAST_SUBSCRIPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PURE_LITERAL_ARGUMENT_CALLS: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
     static PURE_SLOT_FIELD_READS: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
     static PURE_CACHED_FIELD_PREDICATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static PURE_PREDICATE_STAGES: std::cell::Cell<[u64; 9]> = const { std::cell::Cell::new([0; 9]) };
     static PURE_PREDICATE_DROP_MISSES: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
     static NATIVE_SUBSCRIPT_CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_literal_argument_call(code: &CodeObject, start: usize, end: usize, bound: bool) {
+    PURE_LITERAL_ARGUMENT_CALLS.with(|hits| {
+        let mut counts = hits.get();
+        let index = usize::from(bound);
+        counts[index] += 1;
+        if code.instructions[start..end]
+            .iter()
+            .any(|ins| ins.op == OpCode::LoadSmallInt)
+        {
+            counts[index + 2] += 1;
+        }
+        hits.set(counts);
+    });
 }
 
 #[cfg(test)]
@@ -63905,6 +63928,67 @@ assert loop(2000) == 1999000
                 );
             }
         }
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn pure_literal_arguments_preserve_values_and_fallback() {
+        const CHILD: &str = "WEAVEPY_PURE_LITERAL_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for jit in ["0", "1"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::pure_literal_arguments_preserve_values_and_fallback",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("WEAVEPY_JIT", jit)
+                    .status()
+                    .expect("spawn pure literal argument test");
+                assert!(status.success(), "pure literal argument child: {status}");
+            }
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut interp = Interpreter::new();
+                let run = |interp: &mut Interpreter, source: &str| {
+                    let module = parse_module(source).unwrap();
+                    let code = weavepy_compiler::compile_module_with_source(
+                        &module,
+                        source,
+                        "pure_literal_arguments.py",
+                    )
+                    .unwrap();
+                    interp
+                        .run_module(&code)
+                        .expect("literal argument assertions");
+                };
+                run(
+                    &mut interp,
+                    include_str!("../../../tests/regrtest/test_pure_literal_arguments.py"),
+                );
+                for kind in ["global", "static", "method", "eight", "zero"] {
+                    let source = format!(
+                        "__name__ = 'literal_coverage'\n{}\nKIND = '{kind}'\nbench(4000)\n",
+                        include_str!("../../../tools/bench_literal_calls.py")
+                    );
+                    let before = PURE_LITERAL_ARGUMENT_CALLS.with(std::cell::Cell::get);
+                    run(&mut interp, &source);
+                    let after = PURE_LITERAL_ARGUMENT_CALLS.with(std::cell::Cell::get);
+                    let index = usize::from(kind == "method") + if kind == "zero" { 0 } else { 2 };
+                    let hits = after[index] - before[index];
+                    if crate::tier2::jit_off_for_process() {
+                        assert!(hits > 1000, "completed pure {kind} literal calls: {hits}");
+                    }
+                    eprintln!("Completed pure {kind} literal calls: {hits}");
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[cfg(feature = "jit")]
