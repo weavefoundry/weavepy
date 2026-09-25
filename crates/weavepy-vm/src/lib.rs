@@ -14081,6 +14081,40 @@ impl Interpreter {
                 },
             })
         }
+        // Both the decoded field shape and the general evaluator use
+        // the same callback-free comparison rules. NaNs and unsupported
+        // operands still fall back to the interpreter.
+        #[inline(always)]
+        fn compare(a: V, b: V, kind: CompareKind) -> Option<bool> {
+            const EXACT: u64 = 1 << 53;
+            let ord = match (a, b) {
+                (V::I(x), V::I(y)) => x.cmp(&y),
+                (V::F(x), V::F(y)) => x.partial_cmp(&y)?,
+                (V::I(x), V::F(y)) if x.unsigned_abs() < EXACT => (x as f64).partial_cmp(&y)?,
+                (V::F(x), V::I(y)) if y.unsigned_abs() < EXACT => x.partial_cmp(&(y as f64))?,
+                (V::B(x), V::B(y)) => x.cmp(&y),
+                (V::B(x), V::I(y)) => i64::from(x).cmp(&y),
+                (V::I(x), V::B(y)) => x.cmp(&i64::from(y)),
+                (V::N, V::N) if matches!(kind, CompareKind::Eq | CompareKind::NotEq) => {
+                    std::cmp::Ordering::Equal
+                }
+                // SAFETY: these pointers name values owned by live
+                // arguments or the evaluator's scratch; no Python runs.
+                (V::R(p), V::R(q)) => match (unsafe { &*p }, unsafe { &*q }) {
+                    (Object::Str(s), Object::Str(t)) => (**s).cmp(&**t),
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            Some(match kind {
+                CompareKind::Lt => ord.is_lt(),
+                CompareKind::LtE => ord.is_le(),
+                CompareKind::Eq => ord.is_eq(),
+                CompareKind::NotEq => ord.is_ne(),
+                CompareKind::Gt => ord.is_gt(),
+                CompareKind::GtE => ord.is_ge(),
+            })
+        }
         let ext = code_vm_ext(code)?;
         let consts: &[Object] = &ext.objects;
         let stamps: &[StampSlot] = ext.stamp_slots.get().map_or(&[], |s| &s[..]);
@@ -14123,6 +14157,58 @@ impl Interpreter {
                         }
                         return Self::leaf_attr_resolve_site(code, inst, recv, pc as u32, attr.arg);
                     }
+                }
+                7 => {
+                    // Cached field comparisons need neither the general
+                    // leaf stack nor its owned-result scratch.
+                    let cached_field = |load_pc: usize| -> Option<V> {
+                        let pc = load_pc + 1;
+                        let IC::LoadAttrInstance { key_idx, ver } = code.caches.get(pc as u32)
+                        else {
+                            return None;
+                        };
+                        let load = instrs.get(load_pc)?;
+                        // SAFETY: the argument stays live, and no read
+                        // in this path invokes Python or releases owners.
+                        let Object::Instance(inst) = (unsafe { &**args.get(load.arg as usize)? })
+                        else {
+                            return None;
+                        };
+                        let attr = instrs.get(pc)?;
+                        let cls = inst.cls_raw();
+                        if cls.attr_version.get() != ver || cls.native_kind.get() != 0 {
+                            return None;
+                        }
+                        // SAFETY: as for the argument above; shared and
+                        // mutably borrowed dictionaries decline peek().
+                        let (key, value) =
+                            unsafe { inst.dict.get()?.peek() }?.get_index(key_idx as usize)?;
+                        if !slot_name_matches(code, attr.arg, key) {
+                            return None;
+                        }
+                        Some(norm(std::ptr::from_ref(value)))
+                    };
+                    let compare_fields = || {
+                        let a = cached_field(start)?;
+                        let b = cached_field(start + 2)?;
+                        let kind = match instrs.get(start + 4)?.arg & !COMPARE_OP_TO_BOOL_FLAG {
+                            x if x == CompareKind::Lt as u32 => CompareKind::Lt,
+                            x if x == CompareKind::LtE as u32 => CompareKind::LtE,
+                            x if x == CompareKind::Eq as u32 => CompareKind::Eq,
+                            x if x == CompareKind::NotEq as u32 => CompareKind::NotEq,
+                            x if x == CompareKind::Gt as u32 => CompareKind::Gt,
+                            x if x == CompareKind::GtE as u32 => CompareKind::GtE,
+                            _ => return None,
+                        };
+                        compare(a, b, kind).map(Object::Bool)
+                    };
+                    if let Some(result) = compare_fields() {
+                        #[cfg(test)]
+                        PURE_CACHED_FIELD_PREDICATES.with(|hits| hits.set(hits.get() + 1));
+                        return Some(result);
+                    }
+                    // Preserve the existing general leaf evaluator on a
+                    // shape miss, including its slot and polymorphic reads.
                 }
                 _ => {}
             }
@@ -14295,37 +14381,7 @@ impl Interpreter {
                     // SAFETY: as in `compare_op_step`.
                     let kind: CompareKind =
                         unsafe { std::mem::transmute((ins.arg & !COMPARE_OP_TO_BOOL_FLAG) as u8) };
-                    const EXACT: u64 = 1 << 53;
-                    let ord = match (a, b) {
-                        (V::I(x), V::I(y)) => x.cmp(&y),
-                        (V::F(x), V::F(y)) => x.partial_cmp(&y)?,
-                        (V::I(x), V::F(y)) if x.unsigned_abs() < EXACT => {
-                            (x as f64).partial_cmp(&y)?
-                        }
-                        (V::F(x), V::I(y)) if y.unsigned_abs() < EXACT => {
-                            x.partial_cmp(&(y as f64))?
-                        }
-                        (V::B(x), V::B(y)) => x.cmp(&y),
-                        (V::B(x), V::I(y)) => i64::from(x).cmp(&y),
-                        (V::I(x), V::B(y)) => x.cmp(&i64::from(y)),
-                        (V::N, V::N) if matches!(kind, CompareKind::Eq | CompareKind::NotEq) => {
-                            std::cmp::Ordering::Equal
-                        }
-                        // SAFETY: as `norm`.
-                        (V::R(p), V::R(q)) => match (unsafe { &*p }, unsafe { &*q }) {
-                            (Object::Str(s), Object::Str(t)) => (**s).cmp(&**t),
-                            _ => return None,
-                        },
-                        _ => return None,
-                    };
-                    push!(V::B(match kind {
-                        CompareKind::Lt => ord.is_lt(),
-                        CompareKind::LtE => ord.is_le(),
-                        CompareKind::Eq => ord.is_eq(),
-                        CompareKind::NotEq => ord.is_ne(),
-                        CompareKind::Gt => ord.is_gt(),
-                        CompareKind::GtE => ord.is_ge(),
-                    }));
+                    push!(V::B(compare(a, b, kind)?));
                 }
                 OpCode::IsOp => {
                     let b = pop!();
@@ -55061,6 +55117,7 @@ enum QuietShell<'a> {
 #[cfg(test)]
 thread_local! {
     static NATIVE_FAST_SUBSCRIPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PURE_CACHED_FIELD_PREDICATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static NATIVE_SUBSCRIPT_CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -59663,7 +59720,8 @@ struct CodeConstObjects {
     call_slots: std::sync::OnceLock<Box<[CallSlot]>>,
     /// Whether this code is a *pure leaf* (see [`code_is_pure_leaf`]):
     /// `0` not yet decided, `1` no, `2` general leaf, `3` argument return,
-    /// `4` constant return, `5` small-int return, `6` attribute return.
+    /// `4` constant return, `5` small-int return, `6` attribute return,
+    /// `7` comparison of two argument fields.
     pure_leaf: std::sync::atomic::AtomicU8,
     /// Per-instruction fused-pair kinds (see [`code_fast_pairs`]): `1`
     /// at a `LOAD_FAST` whose successor is another `LOAD_FAST`, `2` when
@@ -60243,7 +60301,7 @@ fn code_is_pure_leaf(code: &CodeObject) -> bool {
     };
     match ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) {
         1 => false,
-        2..=6 => true,
+        2..=7 => true,
         _ => code_pure_leaf_decide(code, ext),
     }
 }
@@ -60324,6 +60382,16 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
                     && ret.op == OpCode::ReturnValue =>
             {
                 6
+            }
+            [left, left_attr, right, right_attr, compare, ret]
+                if argument(left.op)
+                    && argument(right.op)
+                    && left_attr.op == OpCode::LoadAttr
+                    && right_attr.op == OpCode::LoadAttr
+                    && compare.op == OpCode::CompareOp
+                    && ret.op == OpCode::ReturnValue =>
+            {
+                7
             }
             _ => 2,
         }
@@ -63682,6 +63750,62 @@ assert loop(2000) == 1999000
                 drop(native);
                 run(&mut interp, "native_class_ref = weakref.ref(NativeFastProbe)\ndel native_probe, NativeFastProbe, _native_fast_getitem\ngc.collect()\nassert native_class_ref() is None\n");
                 assert!(native_ref.upgrade().is_none(), "subscript cache retained builtin");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn pure_cached_field_predicates_preserve_fallbacks() {
+        const CHILD: &str = "WEAVEPY_FIELD_PREDICATE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::pure_cached_field_predicates_preserve_fallbacks",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("WEAVEPY_JIT", "1")
+                .status()
+                .expect("spawn field predicate test");
+            assert!(status.success(), "field predicate child: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut interp = Interpreter::new();
+                let run = |interp: &mut Interpreter, source: &str| {
+                    let module = parse_module(source).unwrap();
+                    let code = weavepy_compiler::compile_module_with_source(
+                        &module,
+                        source,
+                        "pure_field_predicates.py",
+                    )
+                    .unwrap();
+                    interp
+                        .run_module(&code)
+                        .expect("field predicate assertions");
+                };
+                let before = PURE_CACHED_FIELD_PREDICATES.with(std::cell::Cell::get);
+                run(
+                    &mut interp,
+                    include_str!("../../../tests/regrtest/test_pure_field_predicates.py"),
+                );
+                let hits = PURE_CACHED_FIELD_PREDICATES.with(std::cell::Cell::get) - before;
+                assert!(hits > 1000, "cached field predicate hits: {hits}");
+                let source = format!(
+                    "__name__ = 'predicate_coverage'\n{}\nassert bench(2) == 0\n",
+                    include_str!("../../weavepy-bench/fixtures/deltablue.py")
+                );
+                let before = PURE_CACHED_FIELD_PREDICATES.with(std::cell::Cell::get);
+                run(&mut interp, &source);
+                let hits = PURE_CACHED_FIELD_PREDICATES.with(std::cell::Cell::get) - before;
+                assert!(hits > 1000, "DeltaBlue cached field predicate hits: {hits}");
+                eprintln!("DeltaBlue predicate hits in two complete iterations: {hits}");
             })
             .unwrap()
             .join()
