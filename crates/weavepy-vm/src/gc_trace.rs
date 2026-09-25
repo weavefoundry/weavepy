@@ -4033,10 +4033,31 @@ fn publish_suspect_counts(s: &SuspectMap, active: usize) {
     }
 }
 
-/// Count of budget-remaining entries in the locked map (used only on
-/// the cold eviction path, where the map is at capacity anyway).
-fn count_active(s: &SuspectMap) -> usize {
-    s.values().filter(|e| e.budget > 0).count()
+/// Evict the first minimum-budget entry, preserving `min_by_key`'s tie
+/// order. Zero is the minimum possible budget, so scanning can stop there.
+/// The caller holds the map lock and its exact active count throughout.
+fn evict_lowest_budget_suspect(s: &mut SuspectMap, active: &mut usize) -> bool {
+    let Some((_, first)) = s.get_index(0) else {
+        return false;
+    };
+    let mut victim = 0;
+    let mut budget = first.budget;
+    if budget > 0 {
+        for (index, entry) in s.values().enumerate().skip(1) {
+            if entry.budget < budget {
+                victim = index;
+                budget = entry.budget;
+                if budget == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    let (_, removed) = s
+        .swap_remove_index(victim)
+        .expect("selected suspect exists");
+    *active = active.saturating_sub(usize::from(removed.budget > 0));
+    true
 }
 
 /// RFC 0065 (WS1): *active*-population probe for the dispatch loop's
@@ -4087,17 +4108,8 @@ pub fn note_suspect(h: Arc<TrackedHandle>) {
         // arrived after ~200 module-teardown stragglers and was never
         // re-probed, pinning the Timeout→Task→frame web the test_ssl
         // leak tests watch).
-        match s
-            .values()
-            .enumerate()
-            .min_by_key(|(_, e)| e.budget)
-            .map(|(i, _)| i)
-        {
-            Some(i) => {
-                s.swap_remove_index(i);
-                active = count_active(&s);
-            }
-            None => return,
+        if !evict_lowest_budget_suspect(&mut s, &mut active) {
+            return;
         }
     }
     floor_stats::bump(&floor_stats::SUSPECT_ENROLLED, 1);
@@ -4571,6 +4583,60 @@ mod tests {
     use crate::sync::RefCell;
 
     use crate::object::DictData;
+
+    #[test]
+    fn suspect_eviction_preserves_minimum_order_counts_and_release() {
+        for mode in 0..6 {
+            let mut suspects = SuspectMap::new();
+            let mut reference = Vec::new();
+            let mut handles = std::collections::HashMap::new();
+            for index in 0..SUSPECT_CAP {
+                let budget = match mode {
+                    0 => 0,
+                    1 => SUSPECT_BUDGET,
+                    2 => u8::from(index + 1 != SUSPECT_CAP),
+                    3 => ((SUSPECT_CAP - index) % 16 + 1) as u8,
+                    4 => ((index * 37 + 113) % 17) as u8,
+                    _ => u8::MAX,
+                };
+                let object = Object::List(Rc::new(RefCell::new(Vec::new())));
+                let handle = Arc::new(TrackedHandle::new(object, 0));
+                let id = handle.id;
+                handles.insert(id, Arc::downgrade(&handle));
+                suspects.insert(
+                    id,
+                    Suspect {
+                        handle,
+                        budget,
+                        dormant_probes: (index % 16) as u8,
+                    },
+                );
+                reference.push((id, budget));
+            }
+            let mut active = reference.iter().filter(|(_, b)| *b > 0).count();
+            while !reference.is_empty() {
+                // The old policy is the oracle, including the first tied
+                // minimum and the order produced by each swap removal.
+                let victim = reference
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (_, budget))| *budget)
+                    .map(|(index, _)| index)
+                    .unwrap();
+                let (removed_id, _) = reference.swap_remove(victim);
+                assert!(evict_lowest_budget_suspect(&mut suspects, &mut active));
+                assert_eq!(active, reference.iter().filter(|(_, b)| *b > 0).count());
+                let actual: Vec<_> = suspects
+                    .iter()
+                    .map(|(id, entry)| (*id, entry.budget))
+                    .collect();
+                assert_eq!(actual, reference);
+                assert!(handles[&removed_id].upgrade().is_none());
+            }
+            assert!(!evict_lowest_budget_suspect(&mut suspects, &mut active));
+            assert_eq!(active, 0);
+        }
+    }
 
     #[test]
     fn weakref_snapshot_skips_tracked_payloads_and_observes_transitions() {
