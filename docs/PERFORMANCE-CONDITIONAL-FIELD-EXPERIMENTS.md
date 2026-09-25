@@ -88,6 +88,7 @@ controllers, validation logs, and raw measurements remain under
 remain in the corresponding conditional, guarded-conditional, and
 cached-conditional investigation directories.
 
-The production shortcut is held. The next priority is understanding why the
-instance-release guard prevents existing predicate paths from running in some
-CI processes, followed by the missing borrowed-argument shapes in complete callers.
+The production shortcut is held. The subsequent [release-guard fix](PERFORMANCE-DEFERRED-INSTANCE-RELEASES.md)
+resolves the predicate coverage failure on all three CI platforms. Further work
+targets remaining release-guard costs and borrowed field arguments in complete
+callers. Compiler-only paired loads already lower to supported instructions.

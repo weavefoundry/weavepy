@@ -134,5 +134,7 @@ after successful predicate classification and binding. A local reproduction
 finds a stale positive collector filter on an untracked instance with two owners.
 The [deferred-instance release fix](PERFORMANCE-DEFERRED-INSTANCE-RELEASES.md)
 uses the existing exact deferral flag while retaining last-owner and tracked-object
-cleanup checks. Cross-platform validation and performance measurements are pending;
-the earlier measurements above remain the accepted baseline.
+cleanup checks. All three platform unit jobs pass on `6ea3e53`; macOS and Windows
+now record 23,728 slot-predicate hits with the JIT disabled. The follow-up report
+records its paired performance results and remaining arithmetic/memory costs.
+The earlier measurements above remain the baseline for that comparison.
