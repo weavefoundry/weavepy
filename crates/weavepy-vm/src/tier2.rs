@@ -14,6 +14,7 @@
 use crate::shared_value::SharedStr;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc as StdRc;
 
 use weavepy_compiler::CodeObject;
@@ -511,12 +512,37 @@ thread_local! {
     static NATIVE_CALL_STATS: NativeCallStats = NativeCallStats::default();
 }
 
+// Code identities are aligned allocation addresses. Fold their upper hash
+// bits into the lower bits, as the GC index does, to spread home buckets.
+#[derive(Default)]
+struct CodeIdentityHasher(crate::fasthash::FxHasher);
+
+impl Hasher for CodeIdentityHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        let hash = self.0.finish();
+        hash ^ (hash >> 32)
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.write(bytes);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, word: usize) {
+        self.0.write_usize(word);
+    }
+}
+
+type CodeMap<V> = HashMap<*const CodeObject, V, BuildHasherDefault<CodeIdentityHasher>>;
+
 struct JitState {
     enabled: bool,
     threshold: u32,
     range_budget: bool,
     engine: Option<JitEngine>,
-    cache: HashMap<*const CodeObject, CacheEntry>,
+    cache: CodeMap<CacheEntry>,
     stats: JitStats,
     /// RFC 0067 WS1 — bumped on every successful compile; stale
     /// native-callee tables (stamped with an older generation) are
@@ -775,7 +801,7 @@ impl JitState {
             threshold,
             range_budget: explicit_threshold.is_none(),
             engine: None,
-            cache: HashMap::new(),
+            cache: CodeMap::default(),
             stats: JitStats::default(),
             compile_gen: 0,
         }
@@ -1848,8 +1874,8 @@ thread_local! {
     /// changing what its analysis would say) costs a deopt, never
     /// correctness.
     static RET_LANE_CACHE: RefCell<
-        HashMap<*const CodeObject, (Option<JitType>, bool, crate::sync::Weak<CodeObject>)>,
-    > = RefCell::new(HashMap::new());
+        CodeMap<(Option<JitType>, bool, crate::sync::Weak<CodeObject>)>,
+    > = RefCell::new(CodeMap::default());
 }
 
 /// Infer a candidate callee's return typing — its stable scalar return
