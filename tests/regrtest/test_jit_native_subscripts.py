@@ -107,6 +107,24 @@ del Custom.__getitem__
 assert last_read(custom, -1, 10) == 9
 
 
+class NativeBase(deque):
+    pass
+
+
+class InheritedNative(NativeBase):
+    pass
+
+
+inherited = InheritedNative([13])
+assert last_read(inherited, 0, 4000) == 13
+events.clear()
+NativeBase.__getitem__ = changed_getitem
+assert last_read(inherited, 0, 3) == 29
+assert events == [("last_read", 173, 0)] * 3, events
+del NativeBase.__getitem__
+assert last_read(inherited, 0, 10) == 13
+
+
 class Index:
     def __index__(self):
         frame = sys._getframe(1)

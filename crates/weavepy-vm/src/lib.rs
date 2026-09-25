@@ -16231,7 +16231,7 @@ impl Interpreter {
                             if !matches!(idx, Object::Int(_) | Object::Str(_)) {
                                 break;
                             }
-                            match self.leaf_instance_subscript(&stack[n - 2..]) {
+                            match self.leaf_instance_subscript(&stack[n - 2..], code, pc as u32) {
                                 Some(Ok(value)) => value,
                                 Some(Err(error)) => {
                                     stack.truncate(n - 2);
@@ -16965,35 +16965,66 @@ impl Interpreter {
     /// interpreter, where callbacks see the published caller frame.
     /// Keep this uncommon receiver case out of the main dispatch body.
     #[inline(never)]
-    fn leaf_instance_subscript(&self, args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    fn leaf_instance_subscript(
+        &self,
+        args: &[Object],
+        code: &CodeObject,
+        cache_pc: u32,
+    ) -> Option<Result<Object, RuntimeError>> {
         let [Object::Instance(inst), _] = args else {
             return None;
+        };
+        let cls = inst.cls_raw();
+        if !Self::default_getattribute(cls) || crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let version = cls.attr_version.get();
+        let generation = leaf_builtins::generation();
+        // Inspect an existing table first. A Python-defined subscript
+        // must not allocate a native cache or pay the temporary probe.
+        let cached = code_vm_ext(code)
+            .and_then(|ext| ext.method_slots.get())
+            .and_then(|slots| slots.get(cache_pc as usize))
+            .and_then(|slot| slot.get_native_subscript(version, generation));
+        let fast = match cached {
+            Some(fast) => {
+                #[cfg(test)]
+                NATIVE_SUBSCRIPT_CACHE_HITS.with(|hits| hits.set(hits.get() + 1));
+                fast
+            }
+            None => {
+                let Object::Builtin(builtin) = cls.lookup("__getitem__")? else {
+                    return None;
+                };
+                if !builtin.binds_instance || builtin.call_kw.is_some() {
+                    return None;
+                }
+                match self.leaf_call_kind(&builtin)? {
+                    LeafKind::Fast(fast) => {
+                        if let Some(slot) = code_method_slot(code, cache_pc) {
+                            slot.set_native_subscript(version, generation, fast);
+                        }
+                        fast
+                    }
+                    LeafKind::Opaque => {
+                        if Self::looks_reapable_temporary(&args[0]) {
+                            return None;
+                        }
+                        return Some((builtin.call)(args));
+                    }
+                    _ => return None,
+                }
+            }
         };
         // The full handler promptly reaps a consumed temporary and any
         // finalizable contents. Decline before the read can do work.
         if Self::looks_reapable_temporary(&args[0]) {
             return None;
         }
-        let cls = inst.cls_raw();
-        if !Self::default_getattribute(cls) || crate::object::exotic_str_keys_possible() {
-            return None;
-        }
-        let Object::Builtin(builtin) = cls.lookup("__getitem__")? else {
-            return None;
-        };
-        if !builtin.binds_instance || builtin.call_kw.is_some() {
-            return None;
-        }
-        match self.leaf_call_kind(&builtin)? {
-            LeafKind::Opaque => Some((builtin.call)(args)),
-            LeafKind::Fast(fast) => {
-                let completed = fast(args)?;
-                #[cfg(test)]
-                NATIVE_FAST_SUBSCRIPTS.with(|calls| calls.set(calls.get() + 1));
-                Some(completed)
-            }
-            _ => None,
-        }
+        let completed = fast(args)?;
+        #[cfg(test)]
+        NATIVE_FAST_SUBSCRIPTS.with(|calls| calls.set(calls.get() + 1));
+        Some(completed)
     }
 
     /// A registered leaf builtin method `name` on the instance's class
@@ -55030,6 +55061,7 @@ enum QuietShell<'a> {
 #[cfg(test)]
 thread_local! {
     static NATIVE_FAST_SUBSCRIPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static NATIVE_SUBSCRIPT_CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Builtins that native modules vouch for as *leaf*: for every argument,
@@ -59921,6 +59953,12 @@ enum MethodSlotFn {
     /// A `CALL` site's leaf builtin and its kind (the identity check is
     /// the pointer compare on read).
     Leaf(Rc<crate::object::BuiltinFn>, LeafKind),
+    /// A native subscript's static pure function. No class or builtin
+    /// owner is retained. Re-registration also invalidates the entry.
+    NativeSubscript {
+        generation: u64,
+        fast: leaf_builtins::Fast,
+    },
 }
 
 // SAFETY: read and written only from the dispatch loop with the GIL
@@ -60086,6 +60124,27 @@ impl MethodSlot {
     fn set_leaf(&self, f: &Rc<crate::object::BuiltinFn>, kind: LeafKind) {
         // SAFETY: as `set`.
         unsafe { *self.0.get() = (0, MethodSlotFn::Leaf(f.clone(), kind)) };
+    }
+
+    #[inline]
+    fn get_native_subscript(&self, ver: u64, generation: u64) -> Option<leaf_builtins::Fast> {
+        // SAFETY: as `get`; the returned function has a static lifetime.
+        match unsafe { &*self.0.get() } {
+            (
+                v,
+                MethodSlotFn::NativeSubscript {
+                    generation: g,
+                    fast,
+                },
+            ) if *v == ver && *g == generation => Some(*fast),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn set_native_subscript(&self, ver: u64, generation: u64, fast: leaf_builtins::Fast) {
+        // SAFETY: as `set`; neither value owns Python objects.
+        unsafe { *self.0.get() = (ver, MethodSlotFn::NativeSubscript { generation, fast }) };
     }
 }
 
@@ -63530,6 +63589,8 @@ assert loop(2000) == 1999000
                 ).unwrap();
                 interp.run_module(&code).unwrap();
                 assert!(NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get) > 1000);
+                assert!(NATIVE_SUBSCRIPT_CACHE_HITS.with(std::cell::Cell::get) > 1000);
+                eprintln!("MethodSlot bytes: {}", std::mem::size_of::<MethodSlot>());
                 let run = |interp: &mut Interpreter, source: &str| {
                     let module = parse_module(source).unwrap();
                     let code = weavepy_compiler::compile_module_with_source(
@@ -63567,11 +63628,13 @@ assert loop(2000) == 1999000
                 };
                 main.dict.borrow_mut().insert(
                     crate::object::DictKey(Object::from_str("_native_fast_getitem")),
-                    Object::Builtin(native),
+                    Object::Builtin(native.clone()),
                 );
                 let calls = NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get);
+                let hits = NATIVE_SUBSCRIPT_CACHE_HITS.with(std::cell::Cell::get);
                 run(&mut interp, "class NativeFastProbe:\n    __getitem__ = _native_fast_getitem\nnative_probe = NativeFastProbe()\ndef fast_reads(values, index, n):\n    result = None\n    for i in range(n):\n        result = values[index]\n    return result\nassert fast_reads(native_probe, 1, 4000) == 7.5\n");
                 let native_calls = NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get) - calls;
+                assert!(NATIVE_SUBSCRIPT_CACHE_HITS.with(std::cell::Cell::get) > hits + 1000);
                 assert!(native_calls > 1000, "native: {native_calls}; full: {}", full_calls.load(Ordering::Relaxed));
                 assert_eq!(native_calls as usize + full_calls.load(Ordering::Relaxed), 4000);
                 run(&mut interp, "try:\n    fast_reads(native_probe, 2, 1)\nexcept ValueError as error:\n    assert str(error) == 'native-fast-read'\nelse:\n    raise AssertionError('missing fast error')\n");
@@ -63589,11 +63652,11 @@ assert loop(2000) == 1999000
                     .unwrap().clone();
                 let full_before = full_calls.load(Ordering::Relaxed);
                 let native_before = NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get);
-                assert!(interp.leaf_instance_subscript(&[receiver.clone(), Object::Int(0)]).is_none());
+                assert!(interp.leaf_instance_subscript(&[receiver.clone(), Object::Int(0)], &code, 0).is_none());
                 assert_eq!(full_calls.load(Ordering::Relaxed), full_before);
                 assert_eq!(NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get), native_before);
                 assert!(matches!(
-                    interp.leaf_instance_subscript(&[receiver.clone(), Object::Int(2)]),
+                    interp.leaf_instance_subscript(&[receiver.clone(), Object::Int(2)], &code, 0),
                     Some(Err(_))
                 ));
                 assert_eq!(NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get), native_before + 1);
@@ -63601,9 +63664,24 @@ assert loop(2000) == 1999000
                 run(&mut interp, "assert fast_reads(native_probe, 0, 3) == 41\n");
                 assert_eq!(NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get), native_before + 1);
                 assert_eq!(full_calls.load(Ordering::Relaxed), full_before + 3);
+                // Registration can narrow admission without changing the
+                // class or builtin identity. A cached old fast half must
+                // not handle this error after the generation changes.
+                fn narrowed_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+                    matches!(args, [_, Object::Int(1)]).then(|| fast(args).unwrap())
+                }
+                crate::leaf_builtins::register_fast(&native, narrowed_fast);
+                run(&mut interp, "try:\n    fast_reads(native_probe, 2, 1)\nexcept ValueError as error:\n    assert str(error) == 'native-fast-read'\nelse:\n    raise AssertionError('missing re-registered error')\n");
+                assert_eq!(NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get), native_before + 1);
+                assert_eq!(full_calls.load(Ordering::Relaxed), full_before + 4);
                 run(&mut interp, "NativeFastProbe.__getitem__ = lambda self, index: 43\nassert fast_reads(native_probe, 1, 3) == 43\n");
                 assert_eq!(NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get), native_before + 1);
-                assert_eq!(full_calls.load(Ordering::Relaxed), full_before + 3);
+                assert_eq!(full_calls.load(Ordering::Relaxed), full_before + 4);
+                drop(receiver);
+                let native_ref = Rc::downgrade(&native);
+                drop(native);
+                run(&mut interp, "native_class_ref = weakref.ref(NativeFastProbe)\ndel native_probe, NativeFastProbe, _native_fast_getitem\ngc.collect()\nassert native_class_ref() is None\n");
+                assert!(native_ref.upgrade().is_none(), "subscript cache retained builtin");
             })
             .unwrap()
             .join()
