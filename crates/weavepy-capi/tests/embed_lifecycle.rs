@@ -78,6 +78,14 @@ fn embedding_lifecycle() {
     unsafe { Py_Initialize() };
     assert_eq!(unsafe { Py_IsInitialized() }, 1, "initialized after init");
 
+    // Do not query before Py_Initialize: its first stack switch must save
+    // the OS stack's bounds even when stacker's cache starts uninitialized.
+    let remaining = stacker::remaining_stack();
+    assert!(
+        remaining.is_none_or(|bytes| bytes > 0 && bytes <= 1024 * 1024),
+        "restored bounds exceed the 1 MiB embedding stack: {remaining:?} bytes"
+    );
+
     lifecycle_step("simple execution");
     assert_eq!(run_simple("x = 20 + 22"), 0, "simple exec succeeds");
     assert_eq!(eval_int("x"), Some(42), "state visible across PyRun calls");

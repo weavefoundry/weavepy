@@ -68,6 +68,10 @@ pub fn is_initialized() -> bool {
 /// bootstrap in unoptimized builds; the CLI reserves 1 GiB up front,
 /// and this is the embedding twin of that reservation.
 fn with_embed_stack<R>(body: impl FnOnce() -> R) -> R {
+    // Initialize stacker's thread-local bounds on the caller's stack.
+    // Its Windows fiber entry saves those bounds after switching stacks;
+    // a first query there would cache the temporary fiber as the caller.
+    let _ = stacker::remaining_stack();
     stacker::grow(64 * 1024 * 1024, body)
 }
 
