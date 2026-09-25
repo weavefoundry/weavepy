@@ -30,7 +30,12 @@ with caller frames, chained reads, object identity, prompt cleanup, and tracing.
 
 The focused VM test records 31,718 slot getter reads, 23,684 predicate reads, and
 31,636 reads through general evaluation. Thus the semantic fixture exercises all
-three new routes. The reusable field-read probe pairs slot getters, arithmetic, and
+three new routes. Subsequent macOS and Windows CI runs pass the Python assertions
+but record zero predicate hits with native compilation enabled. The coverage test
+now runs both modes and requires interpreter-path counts with the JIT disabled;
+native calls may bypass those counters. Locally, that mode records 31,739 getter,
+23,728 predicate, and 31,724 general reads. Both modes retain all semantic assertions.
+The reusable field-read probe pairs slot getters, arithmetic, and
 chains with dictionary controls; setup and result checks remain timed.
 
 The frozen release passes 282 regression runs across 94 fixtures in JIT,

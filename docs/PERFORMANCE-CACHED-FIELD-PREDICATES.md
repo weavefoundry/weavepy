@@ -28,7 +28,11 @@ across 93 fixtures in JIT, interpreter-only, and GIL-disabled modes, plus 352 pr
 checks. The new fixture covers all six comparisons, operand order, numeric boundaries,
 non-boolean rich results, descriptor callbacks and caller frames, mutation, exceptions,
 default/code replacement, tracing, and collection. A test-only counter records 1,780
-uses in two complete DeltaBlue iterations.
+uses in two complete DeltaBlue iterations. Subsequent macOS and Windows CI runs
+pass the Python assertions but report zero hits in the JIT-enabled coverage test.
+The test now executes both modes and requires these interpreter-path counts with
+native compilation disabled, avoiding dependence on native dispatch decisions.
+That mode records 1,822 DeltaBlue hits locally; both modes retain the semantic checks.
 
 The binary is 51,872,944 bytes, 4,208 bytes larger than baseline `a7b67f6`. Its SHA-256 is
 `58e904115755973c50311371967a0c96ca111e863bcacf522fda8ec9770c628d`; the baseline is

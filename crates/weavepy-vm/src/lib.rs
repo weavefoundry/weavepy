@@ -63788,23 +63788,28 @@ assert loop(2000) == 1999000
     fn pure_slot_fields_preserve_lookup_and_lifetimes() {
         const CHILD: &str = "WEAVEPY_PURE_SLOT_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "tests::pure_slot_fields_preserve_lookup_and_lifetimes",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .env("WEAVEPY_JIT", "1")
-                .status()
-                .expect("spawn pure slot test");
-            assert!(status.success(), "pure slot child: {status}");
+            // Native calls may bypass these interpreter counters. Require
+            // path coverage with the JIT off and semantic checks in both modes.
+            for jit in ["0", "1"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::pure_slot_fields_preserve_lookup_and_lifetimes",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("WEAVEPY_JIT", jit)
+                    .status()
+                    .expect("spawn pure slot test");
+                assert!(status.success(), "pure slot child: {status}");
+            }
             return;
         }
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {
                 let mut interp = Interpreter::new();
+                let require_hits = crate::tier2::jit_off_for_process();
                 let source = include_str!("../../../tests/regrtest/test_pure_slot_reads.py");
                 let module = parse_module(source).unwrap();
                 let code = weavepy_compiler::compile_module_with_source(
@@ -63818,7 +63823,9 @@ assert loop(2000) == 1999000
                 let after = PURE_SLOT_FIELD_READS.with(std::cell::Cell::get);
                 for (index, name) in ["getter", "predicate", "general"].iter().enumerate() {
                     let hits = after[index] - before[index];
-                    assert!(hits > 1000, "pure slot {name} hits: {hits}");
+                    if require_hits {
+                        assert!(hits > 1000, "pure slot {name} hits: {hits}");
+                    }
                     eprintln!("Pure slot {name} hits: {hits}");
                 }
             })
@@ -63832,23 +63839,28 @@ assert loop(2000) == 1999000
     fn pure_cached_field_predicates_preserve_fallbacks() {
         const CHILD: &str = "WEAVEPY_FIELD_PREDICATE_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "tests::pure_cached_field_predicates_preserve_fallbacks",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .env("WEAVEPY_JIT", "1")
-                .status()
-                .expect("spawn field predicate test");
-            assert!(status.success(), "field predicate child: {status}");
+            // Native calls may bypass these interpreter counters. Require
+            // path coverage with the JIT off and semantic checks in both modes.
+            for jit in ["0", "1"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::pure_cached_field_predicates_preserve_fallbacks",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("WEAVEPY_JIT", jit)
+                    .status()
+                    .expect("spawn field predicate test");
+                assert!(status.success(), "field predicate child: {status}");
+            }
             return;
         }
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {
                 let mut interp = Interpreter::new();
+                let require_hits = crate::tier2::jit_off_for_process();
                 let run = |interp: &mut Interpreter, source: &str| {
                     let module = parse_module(source).unwrap();
                     let code = weavepy_compiler::compile_module_with_source(
@@ -63867,7 +63879,9 @@ assert loop(2000) == 1999000
                     include_str!("../../../tests/regrtest/test_pure_field_predicates.py"),
                 );
                 let hits = PURE_CACHED_FIELD_PREDICATES.with(std::cell::Cell::get) - before;
-                assert!(hits > 1000, "cached field predicate hits: {hits}");
+                if require_hits {
+                    assert!(hits > 1000, "cached field predicate hits: {hits}");
+                }
                 let source = format!(
                     "__name__ = 'predicate_coverage'\n{}\nassert bench(2) == 0\n",
                     include_str!("../../weavepy-bench/fixtures/deltablue.py")
@@ -63875,7 +63889,9 @@ assert loop(2000) == 1999000
                 let before = PURE_CACHED_FIELD_PREDICATES.with(std::cell::Cell::get);
                 run(&mut interp, &source);
                 let hits = PURE_CACHED_FIELD_PREDICATES.with(std::cell::Cell::get) - before;
-                assert!(hits > 1000, "DeltaBlue cached field predicate hits: {hits}");
+                if require_hits {
+                    assert!(hits > 1000, "DeltaBlue cached field predicate hits: {hits}");
+                }
                 eprintln!("DeltaBlue predicate hits in two complete iterations: {hits}");
             })
             .unwrap()
