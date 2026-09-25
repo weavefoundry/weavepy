@@ -74,10 +74,11 @@ pub fn push_pending_finalizer(obj: Object) {
 /// tolerates thread-teardown (destroyed TLS) and re-entrant borrows
 /// by silently dropping the request.
 pub fn try_push_pending_finalizer(obj: Object) {
+    let mut pending = Some(obj);
     let pushed = PENDING_FINALIZERS
         .try_with(|cell| {
             if let Ok(mut queue) = cell.try_borrow_mut() {
-                queue.push(obj);
+                queue.push(pending.take().expect("pending finalizer exists"));
                 true
             } else {
                 false
@@ -87,6 +88,17 @@ pub fn try_push_pending_finalizer(obj: Object) {
     if pushed {
         PENDING_FINALIZER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Release);
         crate::hot_gates::set(crate::hot_gates::PENDING_FINALIZERS);
+    } else if let Some(obj) = pending {
+        // No safe point can run this request during TLS teardown or a
+        // reentrant queue borrow. Suppress its Drop fallback before releasing
+        // the unscheduled copy, or Drop would keep resurrecting it forever.
+        match &obj {
+            Object::Instance(inst) => inst.finalize_ran.set(true),
+            Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
+                g.finalize_ran.set(true);
+            }
+            _ => {}
+        }
     }
 }
 

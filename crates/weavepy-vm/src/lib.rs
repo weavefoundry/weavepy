@@ -4232,7 +4232,12 @@ impl Interpreter {
             // (test_sys_setprofile.test_unfinished_generator,
             // test_sys_settrace.test_13_genexp).
             for obj in pending {
-                self.invoke_finalizer(&obj);
+                if !self.invoke_finalizer(&obj) {
+                    // Another request claimed this allocation. Its dispatch
+                    // owns completion, including while it runs on another
+                    // thread or reenters this drain from Python.
+                    continue;
+                }
                 finalizers_run += 1;
                 // The finalizer has now run to completion: mark the object
                 // finalized and clear its deferral flag so the next collection
@@ -4656,7 +4661,20 @@ impl Interpreter {
         }
     }
 
-    fn invoke_finalizer(&mut self, obj: &Object) {
+    /// Claim this allocation before running any finalizer code. Independent
+    /// prompt, collector, and shutdown requests may refer to the same object.
+    /// Only the winning request may publish finalizer completion.
+    fn invoke_finalizer(&mut self, obj: &Object) -> bool {
+        let finalize_ran = match obj {
+            Object::Instance(inst) => &inst.finalize_ran,
+            Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
+                &g.finalize_ran
+            }
+            _ => return false,
+        };
+        if finalize_ran.replace(true) {
+            return false;
+        }
         // A coroutine that was created but never driven: CPython's
         // `_PyGen_Finalize` emits the "was never awaited"
         // RuntimeWarning instead of closing. With warnings-as-errors
@@ -4667,15 +4685,8 @@ impl Interpreter {
                 *g.state.borrow_mut() = GeneratorState::Finished;
                 let qualname = g.qualname.borrow().to_str();
                 self.warn_unawaited_coroutine(obj, &qualname);
-                return;
+                return true;
             }
-        }
-        // Mark "finalize ran" first (CPython sets the GC FINALIZED bit
-        // before tp_finalize): whatever happens below runs at most
-        // once; a generator left suspended by its finalizer will not
-        // be resurrected and re-finalized on its next drop.
-        if let Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) = obj {
-            g.finalize_ran.set(true);
         }
         // PEP 525: an async generator whose firstiter hook captured a
         // finalizer routes finalization through that hook (CPython
@@ -4688,7 +4699,7 @@ impl Interpreter {
                 if let Err(err) = self.call(&finalizer, &[obj.clone()], &[], &globals) {
                     self.write_unraisable_fmt(&err, "finalizing generator", obj);
                 }
-                return;
+                return true;
             }
         }
         // A generator/coroutine dropped while suspended: deliver
@@ -4702,17 +4713,13 @@ impl Interpreter {
             if let Err(err) = self.gen_method_close(obj) {
                 self.write_unraisable_fmt(&err, "closing generator", obj);
             }
-            return;
+            return true;
         }
         let Object::Instance(inst) = obj else {
-            return;
+            return true;
         };
-        // Claim the one-shot finalizer (CPython's `_PyGC_FINALIZED` bit)
-        // before dispatch, so [`crate::types::PyInstance`]'s `Drop` net never
-        // re-resurrects an instance whose `__del__` already ran here.
-        inst.finalize_ran.set(true);
         let Some(del) = inst.cls().lookup("__del__") else {
-            return;
+            return true;
         };
         let bound = Object::BoundMethod(Rc::new(BoundMethod::new(obj.clone(), del.clone())));
         let kwargs: Vec<(String, Object)> = Vec::new();
@@ -4724,6 +4731,7 @@ impl Interpreter {
             // a `None` hook object (test_generators' Leaker doctest).
             self.write_unraisable_fmt(&err, "calling deallocator", &del);
         }
+        true
     }
 
     /// Route an out-of-band exception (raised by a `__del__` finalizer,
@@ -63151,6 +63159,88 @@ mod tests {
     // it leaves nothing inconsistent behind, so the poison is recovered
     // rather than cascaded -- otherwise one real failure reports as five.
     static HEAP_SNAPSHOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn finalizer_queue_claims_once_and_preserves_drop_fallback() {
+        let code = compile_module(
+            &parse_module(
+                r"
+events = []
+class Finalizer:
+    def __del__(self):
+        events.append(self.label)
+root = Finalizer()
+root.label = 'queued'
+
+def generator():
+    try:
+        yield 1
+    finally:
+        events.append('generator')
+gen = generator()
+next(gen)
+",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut interp = Interpreter::new();
+        interp.run_module(&code).unwrap();
+        let _gil = crate::gil::global_gil().acquire();
+        let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+            panic!("missing main module");
+        };
+        let (root, gen, events, class) = {
+            let globals = main.dict.borrow();
+            let read = |name| globals.get(&crate::object::StrKey(name)).unwrap().clone();
+            (read("root"), read("gen"), read("events"), read("Finalizer"))
+        };
+        let Object::List(events) = events else {
+            panic!("missing events")
+        };
+        let Object::Type(class) = class else {
+            panic!("missing class")
+        };
+        interp.run_pending_finalizers();
+        // Prompt and collector paths can enqueue the same live allocation.
+        // Only the first request may invoke Python or complete its finalizer.
+        crate::vm_singletons::push_pending_finalizer(root.clone());
+        crate::vm_singletons::push_pending_finalizer(root.clone());
+        assert_eq!(interp.run_pending_finalizers(), 1);
+        assert_eq!(events.borrow().len(), 1);
+        crate::vm_singletons::push_pending_finalizer(gen.clone());
+        crate::vm_singletons::push_pending_finalizer(gen.clone());
+        assert_eq!(interp.run_pending_finalizers(), 1);
+        assert_eq!(events.borrow().len(), 2);
+
+        let drop_instance = |label: &str| {
+            let inst = Rc::new(PyInstance::new(class.clone()));
+            inst.dict_cell().borrow_mut().insert(
+                DictKey(Object::from_static("label")),
+                Object::from_str(label),
+            );
+            inst
+        };
+        // An untracked last-Arc drop must still queue and run its copy once.
+        let dropped = drop_instance("drop");
+        let weak = Rc::downgrade(&dropped);
+        drop(dropped);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(interp.run_pending_finalizers(), 1);
+        assert_eq!(events.borrow().len(), 3);
+        // A queue borrow that prevents Drop from scheduling must release the
+        // unscheduled copy without recursively resurrecting it again.
+        let rejected = drop_instance("rejected");
+        let weak = Rc::downgrade(&rejected);
+        crate::vm_singletons::PENDING_FINALIZERS.with(|queue| {
+            let _borrow = queue.borrow_mut();
+            drop(rejected);
+        });
+        assert!(weak.upgrade().is_none());
+        assert_eq!(interp.run_pending_finalizers(), 0);
+        let labels: Vec<_> = events.borrow().iter().map(Object::to_str).collect();
+        assert_eq!(labels, ["queued", "generator", "drop"]);
+    }
 
     #[test]
     fn range_collection_preserves_python_semantics() {

@@ -2739,7 +2739,9 @@ impl Drop for PyInstance {
             inline_values: Cell::new(self.inline_values.get()),
             slots: RefCell::new(self.slots.borrow().clone()),
             hash_cache: crate::sync::CachedHash::new(self.hash_cache.get()),
-            finalize_ran: Cell::new(true),
+            // This copy still owes its queued invocation. Dispatch claims
+            // its flag atomically; a failed enqueue suppresses its Drop.
+            finalize_ran: Cell::new(false),
             // The resurrected copy is a distinct object that owns no C
             // body (the dying `self` already freed its own above).
             deferred: crate::sync::Cell::new(false),
