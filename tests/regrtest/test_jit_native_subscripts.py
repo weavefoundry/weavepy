@@ -29,6 +29,17 @@ assert last_read(queue, -1, 4000) == 7
 assert last_read(queue, 0, 0) == 0
 assert last_read(queue, True, 1) == 7
 
+def conditional_read(values, n):
+    marker = 73
+    total = 0
+    for i in range(n):
+        if values:
+            total += values[0]
+    return total
+
+
+assert conditional_read(deque([7]), 4000) == 28000
+
 # SUBSCRIPT FALLBACKS:
 
 def fresh_reader():
@@ -177,6 +188,10 @@ class Custom(deque):
 assert drain(deque(range(4000)), 4000) == 7998000
 assert drain(Custom([1, 2, 3]), 3) == 6
 assert events == [('drain', 73, i) for i in range(4)], events
+
+events.clear()
+assert conditional_read(Custom([7]), 3) == 21
+assert events == [('conditional_read', 73, i) for i in range(3)], events
 
 
 print("Native subscript semantics: ok")
