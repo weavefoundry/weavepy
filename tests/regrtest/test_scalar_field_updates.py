@@ -222,3 +222,63 @@ events.clear()
 assert invoke(inherited, 1) == 4001
 assert events == [('read', 'advance'), ('write', 'advance'), ('read', 'advance')], events
 print('scalar field update behavior: ok')
+
+# Changing the observed result lane must preserve the already completed store.
+class FloatCounter:
+    def __init__(self, value):
+        self.value = value
+    def tick(self):
+        self.value += 1
+        return self.value
+
+def repeat(counter, n):
+    total = 0.0
+    for _ in range(n):
+        total += counter.tick()
+    return total
+
+counter = FloatCounter(0.0)
+assert repeat(counter, 4000) == 8002000.0
+counter.value = 10
+assert repeat(counter, 3) == 36.0
+assert counter.value == 13 and type(counter.value) is int
+print('native completed result transition: ok')
+
+# Saved bound methods retain their binding, code changes, and receiver lifetime.
+import gc
+import weakref
+class AliasCounter:
+    def __init__(self):
+        self.value = 0
+    def advance(self, amount):
+        self.value += amount
+        return self.value
+
+def repeat_saved(method, n):
+    total = 0
+    for _ in range(n):
+        total += method(1)
+    return total
+
+owner = AliasCounter()
+saved = owner.advance
+assert repeat_saved(saved, 4000) == 8002000
+AliasCounter.advance = lambda self, amount: -99
+assert repeat_saved(saved, 3) == 12006
+assert owner.value == 4003
+
+def changed(self, amount):
+    self.value += amount + 10
+    return self.value
+saved.__func__.__code__ = changed.__code__
+assert repeat_saved(saved, 3) == 12075
+assert owner.value == 4036
+reference = weakref.ref(owner)
+del owner
+gc.collect()
+assert reference() is not None
+assert repeat_saved(saved, 1) == 4047
+del saved
+gc.collect()
+assert reference() is None
+print('native saved update binding and lifetime: ok')
