@@ -4,7 +4,8 @@ Three unadopted revisions evaluate a method that adds an exact integer to one
 instance field and returns that field. They recognize the precise bytecode
 shape, check binding, code, defaults, recursion, observers, GIL state, field
 caches, and overflow, and perform one final store. They don't classify mutation
-as a read-only leaf or bypass a compiled callee from the interpreter.
+as a read-only leaf. JIT admission, call-density accounting, and the existing
+interpreter/native dispatch rules are unchanged.
 
 The first revision reduces interpreter Richards work by about half but raises
 slot-backed interpreter work by 20%, repeated at sustained work. An early store
@@ -65,7 +66,11 @@ original probe adds 180 semantic checks and six matching compilation traces.
 
 Completed-path counters cover parameters, constants, defaults, and class
 constants, with 3,998 updates per 4,000-call interpreter probe and 689 with JIT.
-The six unsupported controls record no evaluator attempts. Fixtures cover
+The six unsupported controls record no evaluator attempts. An earlier counter
+labeled "compiled callees" read a hint that is set only for self-recursive
+native dispatch; zero did not prove that no compiled code existed. Native-entry
+experiments therefore count successful interpreter and native paths separately.
+Fixtures cover
 integer overflow, retained dictionaries and iterators, dictionary reshaping,
 code/default/binding changes, inherited attributes, MRO changes, callback
 frames, descriptor order, arithmetic errors, and trace/profile events. A
