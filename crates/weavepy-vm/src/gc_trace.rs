@@ -1439,6 +1439,17 @@ impl GcState {
         self.index.borrow().contains_key(&id)
     }
 
+    /// Copy only weakref targets not already owned by the cycle collector.
+    /// Hold the index before the registry, matching `track_now`'s lock order.
+    /// Both borrows end before the sweep clears slots or queues callbacks.
+    fn untracked_weakref_targets(
+        &self,
+        registry: &crate::weakref_registry::WeakRefRegistry,
+    ) -> Vec<(ObjectId, Object)> {
+        let index = self.index.borrow();
+        registry.targets_matching(|id| !index.contains_key(&id))
+    }
+
     /// O(1) handle lookup by object id (any generation or frozen).
     pub fn handle_for(&self, id: ObjectId) -> Option<Arc<TrackedHandle>> {
         // RFC 0065 (WS4): see `is_tracked`.
@@ -4531,7 +4542,8 @@ pub fn fire_dead_weakrefs() {
 /// `del f; gc.collect()` flips `weakref.ref(f)()` to `None` exactly
 /// like CPython's refcount-driven `tp_dealloc` would.
 pub fn sweep_weakref_only_targets() -> usize {
-    let targets = crate::weakref_registry::with_registry(|r| r.targets());
+    let targets =
+        with_state(|s| crate::weakref_registry::with_registry(|r| s.untracked_weakref_targets(r)));
     let mut cleared = 0;
     for (id, target) in targets {
         if is_tracked(id) {
@@ -4559,6 +4571,68 @@ mod tests {
     use crate::sync::RefCell;
 
     use crate::object::DictData;
+
+    #[test]
+    fn weakref_snapshot_skips_tracked_payloads_and_observes_transitions() {
+        use crate::weakref_registry::{kind, WeakRefRegistry, WeakRefSlot};
+
+        let state = GcState::new();
+        let registry = WeakRefRegistry::new();
+        let roots: Vec<_> = (0..3)
+            .map(|_| Object::List(Rc::new(RefCell::new(Vec::new()))))
+            .collect();
+        let slots: Vec<_> = roots
+            .iter()
+            .map(|target| {
+                let slot = Arc::new(WeakRefSlot::new(
+                    id_of(target),
+                    target.clone(),
+                    false,
+                    kind::REF,
+                ));
+                registry.register(slot.clone());
+                slot
+            })
+            .collect();
+        state.track_now(roots[0].clone());
+        // The excluded payload cannot even be borrowed. This catches a
+        // regression to cloning every target and filtering afterwards.
+        let excluded = slots[0].target.borrow_mut();
+        let before = strong_count_for(&roots[0]);
+        let snapshot = state.untracked_weakref_targets(&registry);
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(strong_count_for(&roots[0]), before);
+        for (id, target) in &snapshot {
+            assert_eq!(*id, id_of(target));
+            assert!(!target.is_same(&roots[0]));
+        }
+        drop(snapshot);
+        drop(excluded);
+
+        state.track_now(roots[1].clone());
+        let snapshot = state.untracked_weakref_targets(&registry);
+        assert_eq!(snapshot.len(), 1);
+        assert!(snapshot[0].1.is_same(&roots[2]));
+        drop(snapshot);
+        state.untrack_id(id_of(&roots[0]));
+        state.untrack_id(id_of(&roots[1]));
+        assert_eq!(state.untracked_weakref_targets(&registry).len(), 3);
+
+        slots[1].clear();
+        let snapshot = state.untracked_weakref_targets(&registry);
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot
+            .iter()
+            .all(|(_, target)| !target.is_same(&roots[1])));
+        // A returned snapshot owns its targets independently of the slots.
+        for slot in &slots {
+            slot.clear();
+        }
+        assert!(state.untracked_weakref_targets(&registry).is_empty());
+        assert!(snapshot.iter().all(|(id, target)| *id == id_of(target)));
+        drop(slots);
+        assert!(registry.targets().is_empty());
+    }
 
     #[test]
     fn compact_positions_keep_absent_and_uncached_states_distinct() {

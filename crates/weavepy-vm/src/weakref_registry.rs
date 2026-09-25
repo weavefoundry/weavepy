@@ -410,9 +410,21 @@ impl WeakRefRegistry {
     /// strong references to a target are the slots' own clones, the
     /// object is unreachable from Python and its weakrefs must clear.
     pub fn targets(&self) -> Vec<(ObjectId, Object)> {
+        self.targets_matching(|_| true)
+    }
+
+    /// Snapshot selected ids without touching excluded slots or their targets.
+    /// The predicate must only inspect already-borrowed state, since it runs
+    /// under the registry borrow. In particular, the collector takes its
+    /// index borrow before this one, as it does when registering finalizers.
+    pub(crate) fn targets_matching(
+        &self,
+        include: impl Fn(ObjectId) -> bool,
+    ) -> Vec<(ObjectId, Object)> {
         let g = self.inner.borrow();
         g.slots
             .iter()
+            .filter(|(id, _)| include(**id))
             .filter_map(|(id, v)| {
                 v.iter()
                     .filter_map(Weak::upgrade)
