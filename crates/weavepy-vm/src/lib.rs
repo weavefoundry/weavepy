@@ -16225,22 +16225,20 @@ impl Interpreter {
                                 None => break,
                             }
                         }
-                        (recv @ Object::Instance(_), idx) => {
+                        (Object::Instance(_), idx) => {
                             // A registered leaf `__getitem__` (a native
                             // container class), with a leaf index.
                             if !matches!(idx, Object::Int(_) | Object::Str(_)) {
                                 break;
                             }
-                            match self.leaf_instance_dunder(recv, "__getitem__") {
-                                Some(b) => match (b.call)(&stack[n - 2..]) {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        stack.truncate(n - 2);
-                                        pc += 1;
-                                        stop = LeafStop::Raised(e);
-                                        break;
-                                    }
-                                },
+                            match self.leaf_instance_subscript(&stack[n - 2..]) {
+                                Some(Ok(value)) => value,
+                                Some(Err(error)) => {
+                                    stack.truncate(n - 2);
+                                    pc += 1;
+                                    stop = LeafStop::Raised(error);
+                                    break;
+                                }
                                 None => break,
                             }
                         }
@@ -16960,6 +16958,42 @@ impl Interpreter {
             }
         }
         Some(true)
+    }
+
+    /// Offer borrowed subscript operands to a registered native body or its
+    /// pure fast half. A declined fast half leaves the full call to the
+    /// interpreter, where callbacks see the published caller frame.
+    /// Keep this uncommon receiver case out of the main dispatch body.
+    #[inline(never)]
+    fn leaf_instance_subscript(&self, args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+        let [Object::Instance(inst), _] = args else {
+            return None;
+        };
+        // The full handler promptly reaps a consumed temporary and any
+        // finalizable contents. Decline before the read can do work.
+        if Self::looks_reapable_temporary(&args[0]) {
+            return None;
+        }
+        let cls = inst.cls_raw();
+        if !Self::default_getattribute(cls) || crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let Object::Builtin(builtin) = cls.lookup("__getitem__")? else {
+            return None;
+        };
+        if !builtin.binds_instance || builtin.call_kw.is_some() {
+            return None;
+        }
+        match self.leaf_call_kind(&builtin)? {
+            LeafKind::Opaque => Some((builtin.call)(args)),
+            LeafKind::Fast(fast) => {
+                let completed = fast(args)?;
+                #[cfg(test)]
+                NATIVE_FAST_SUBSCRIPTS.with(|calls| calls.set(calls.get() + 1));
+                Some(completed)
+            }
+            _ => None,
+        }
     }
 
     /// A registered leaf builtin method `name` on the instance's class
@@ -54993,6 +55027,11 @@ enum QuietShell<'a> {
     Lazy(&'a mut LeanAct),
 }
 
+#[cfg(test)]
+thread_local! {
+    static NATIVE_FAST_SUBSCRIPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Builtins that native modules vouch for as *leaf*: for every argument,
 /// the body runs no Python code, walks no frames, and calls
 /// [`gc_trace::mark_maybe_dead`] itself whenever it releases a reference
@@ -63461,6 +63500,114 @@ assert loop(2000) == 1999000
         })
         .join()
         .expect("dynamic-attribute worker");
+    }
+
+    #[test]
+    fn native_fast_subscripts_preserve_completion_and_callbacks() {
+        const CHILD: &str = "WEAVEPY_NATIVE_FAST_SUBSCRIPT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::native_fast_subscripts_preserve_completion_and_callbacks",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("WEAVEPY_JIT", "0")
+                .status()
+                .expect("spawn native fast subscript test");
+            assert!(status.success(), "native fast subscript child: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut interp = Interpreter::new();
+                let source = include_str!("../../../tests/regrtest/test_jit_native_subscripts.py");
+                let module = parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module, source, "native_fast_subscripts.py",
+                ).unwrap();
+                interp.run_module(&code).unwrap();
+                assert!(NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get) > 1000);
+                let run = |interp: &mut Interpreter, source: &str| {
+                    let module = parse_module(source).unwrap();
+                    let code = weavepy_compiler::compile_module_with_source(
+                        &module, source, "native_fast_subscripts.py",
+                    ).unwrap();
+                    let Object::Module(main) = interp.cache.get("__main__").unwrap() else {
+                        panic!("missing main module")
+                    };
+                    interp.exec_module_in(&code, main.dict.clone()).unwrap();
+                };
+                fn fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+                    match args {
+                        [_, Object::Int(1)] => Some(Ok(Object::Float(7.5))),
+                        [_, Object::Int(2)] => Some(Err(crate::error::value_error("native-fast-read"))),
+                        _ => None,
+                    }
+                }
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                let full_calls = std::sync::Arc::new(AtomicUsize::new(0));
+                let native = Rc::new(crate::object::BuiltinFn {
+                    name: "native_fast_read_probe",
+                    binds_instance: true,
+                    call_kw: None,
+                    call: Box::new({
+                        let full_calls = full_calls.clone();
+                        move |args| {
+                            full_calls.fetch_add(1, Ordering::Relaxed);
+                            fast(args).unwrap_or_else(|| Ok(Object::Int(41)))
+                        }
+                    }),
+                });
+                crate::leaf_builtins::register_fast(&native, fast);
+                let Object::Module(main) = interp.cache.get("__main__").unwrap() else {
+                    panic!("missing main module")
+                };
+                main.dict.borrow_mut().insert(
+                    crate::object::DictKey(Object::from_str("_native_fast_getitem")),
+                    Object::Builtin(native),
+                );
+                let calls = NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get);
+                run(&mut interp, "class NativeFastProbe:\n    __getitem__ = _native_fast_getitem\nnative_probe = NativeFastProbe()\ndef fast_reads(values, index, n):\n    result = None\n    for i in range(n):\n        result = values[index]\n    return result\nassert fast_reads(native_probe, 1, 4000) == 7.5\n");
+                let native_calls = NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get) - calls;
+                assert!(native_calls > 1000, "native: {native_calls}; full: {}", full_calls.load(Ordering::Relaxed));
+                assert_eq!(native_calls as usize + full_calls.load(Ordering::Relaxed), 4000);
+                run(&mut interp, "try:\n    fast_reads(native_probe, 2, 1)\nexcept ValueError as error:\n    assert str(error) == 'native-fast-read'\nelse:\n    raise AssertionError('missing fast error')\n");
+                assert_eq!(
+                    (NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get) - calls) as usize
+                        + full_calls.load(Ordering::Relaxed),
+                    4001,
+                );
+                // Probe both helper outcomes directly as well, independently
+                // of whether the dispatch loop is temporarily on its full path.
+                let Object::Module(main) = interp.cache.get("__main__").unwrap() else {
+                    panic!("missing main module")
+                };
+                let receiver = main.dict.borrow().get(&crate::object::StrKey("native_probe"))
+                    .unwrap().clone();
+                let full_before = full_calls.load(Ordering::Relaxed);
+                let native_before = NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get);
+                assert!(interp.leaf_instance_subscript(&[receiver.clone(), Object::Int(0)]).is_none());
+                assert_eq!(full_calls.load(Ordering::Relaxed), full_before);
+                assert_eq!(NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get), native_before);
+                assert!(matches!(
+                    interp.leaf_instance_subscript(&[receiver.clone(), Object::Int(2)]),
+                    Some(Err(_))
+                ));
+                assert_eq!(NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get), native_before + 1);
+                assert_eq!(full_calls.load(Ordering::Relaxed), full_before);
+                run(&mut interp, "assert fast_reads(native_probe, 0, 3) == 41\n");
+                assert_eq!(NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get), native_before + 1);
+                assert_eq!(full_calls.load(Ordering::Relaxed), full_before + 3);
+                run(&mut interp, "NativeFastProbe.__getitem__ = lambda self, index: 43\nassert fast_reads(native_probe, 1, 3) == 43\n");
+                assert_eq!(NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get), native_before + 1);
+                assert_eq!(full_calls.load(Ordering::Relaxed), full_before + 3);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[cfg(feature = "jit")]

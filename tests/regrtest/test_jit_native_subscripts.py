@@ -193,5 +193,32 @@ events.clear()
 assert conditional_read(Custom([7]), 3) == 21
 assert events == [('conditional_read', 73, i) for i in range(3)], events
 
+finalization_events = []
+
+class Finalizable:
+    def __init__(self, value):
+        self.value = value
+
+    def __del__(self):
+        finalization_events.append(self.value)
+
+
+def temporary_queue(value):
+    return deque([0, Finalizable(value)])
+
+
+def read_temporary(n):
+    total = 0
+    for i in range(n):
+        total += temporary_queue(i)[0]
+        total += len(finalization_events)
+    return total
+
+
+# Consuming a temporary queue must finalize its remaining contents before
+# the following instruction can inspect their effects.
+assert read_temporary(20) == 210
+assert finalization_events == list(range(20)), finalization_events
+
 
 print("Native subscript semantics: ok")
