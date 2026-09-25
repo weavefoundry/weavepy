@@ -15,6 +15,7 @@ use crate::sync::Weak;
 
 use crate::error::{type_error, RuntimeError};
 use crate::object::{DictData, DictKey, Object};
+use crate::shared_value::SharedSlice;
 
 /// The C-API bridge's metaclass-drift probe (RFC 0076 WS5): given a
 /// readied stock type's own `PyTypeObject*` and its VM bridge, adopt any
@@ -1858,12 +1859,14 @@ enum SlotData {
     /// (a `DictData` is 72 bytes) — `SlotStorage` sits in `PyInstance`
     /// by value.
     Many(Box<DictData>),
-    /// Every slot of a layout shared across instances (one `Rc` for the
-    /// names instead of a key per slot per instance), all populated —
-    /// the natively built instances of `datetime`'s classes. Adding or
+    /// Every slot of a layout shared across instances (one owner for the
+    /// names instead of a key per slot per instance), all populated, for
+    /// natively built instances of `datetime`'s classes. Adding or
     /// removing a key converts to [`Self::Small`] / [`Self::Many`].
     Fixed {
-        layout: crate::sync::Rc<[DictKey]>,
+        // Keep the owner one word wide so this variant fits in the
+        // single-entry representation without enlarging every instance.
+        layout: SharedSlice<DictKey>,
         values: Box<[Object]>,
     },
 }
@@ -1920,7 +1923,7 @@ impl SlotStorage {
 impl SlotStorage {
     /// Storage holding `values` under the shared slot names `layout`
     /// (distinct `str` keys, in slot order; one value per name).
-    pub fn from_layout(layout: crate::sync::Rc<[DictKey]>, values: Vec<Object>) -> Self {
+    pub fn from_layout(layout: SharedSlice<DictKey>, values: Vec<Object>) -> Self {
         if layout.len() != values.len() {
             return Self::from_entries(layout.iter().cloned().zip(values).collect());
         }
@@ -1947,7 +1950,7 @@ impl SlotStorage {
 #[cfg(not(target_pointer_width = "64"))]
 impl SlotStorage {
     /// Storage holding `values` under `layout` (see the 64-bit variant).
-    pub fn from_layout(layout: crate::sync::Rc<[DictKey]>, values: Vec<Object>) -> Self {
+    pub fn from_layout(layout: SharedSlice<DictKey>, values: Vec<Object>) -> Self {
         Self::from_entries(layout.iter().cloned().zip(values).collect())
     }
 }
@@ -2749,6 +2752,101 @@ impl Drop for PyInstance {
 #[cfg(all(test, target_pointer_width = "64"))]
 mod slot_storage_tests {
     use super::*;
+    use crate::shared_value::SharedStr;
+
+    #[test]
+    fn shared_layout_keeps_slot_storage_compact() {
+        assert_eq!(std::mem::size_of::<SlotStorage>(), 32);
+        assert_eq!(std::mem::size_of::<PyInstance>(), 128);
+    }
+
+    #[test]
+    fn fixed_layout_shares_keys_and_owns_independent_values() {
+        // Exercise both conversions: a small vector and an ordered table.
+        for len in [4, 24] {
+            let names: Vec<SharedStr> = (0..len)
+                .map(|i| SharedStr::from(format!("slot_α{i}")))
+                .collect();
+            let layout: SharedSlice<DictKey> = names
+                .iter()
+                .map(|name| DictKey(Object::Str(name.clone())))
+                .collect::<Vec<_>>()
+                .into();
+            let weak_layout = SharedSlice::downgrade(&layout);
+            let value = SharedStr::from("owned slot value");
+            let weak_value = SharedStr::downgrade(&value);
+            let mut first = SlotStorage::from_layout(
+                layout.clone(),
+                (0..len).map(|_| Object::Str(value.clone())).collect(),
+            );
+            let mut second = first.clone();
+            assert_eq!(SharedSlice::strong_count(&layout), 3);
+            assert_eq!(SharedStr::strong_count(&value), 1 + 2 * len);
+            assert!(names.iter().all(|name| SharedStr::strong_count(name) == 2));
+            drop(value);
+            drop(layout);
+
+            *first.get_hinted_mut(1, &names[1]).unwrap() = Object::Int(11);
+            // An incorrect hint must still find the named value.
+            *first.get_hinted_mut(0, &names[2]).unwrap() = Object::Int(22);
+            assert_eq!(
+                first.get_hinted(0, &names[1]).and_then(Object::as_i64),
+                Some(11)
+            );
+            assert!(matches!(second.get(&names[1]), Some(Object::Str(_))));
+            assert_eq!(weak_value.strong_count(), 2 * len - 2);
+            assert!(matches!(first.data, SlotData::Fixed { .. }));
+            assert!(first.get_index(len).is_none());
+            assert!(first.get_index_mut(usize::MAX).is_none());
+
+            first.insert("extra", Object::Int(33));
+            assert_eq!(weak_layout.strong_count(), 1);
+            assert_eq!(first.index_of("extra"), Some(len as u32));
+            assert!(second.get("extra").is_none());
+            assert!(matches!(first.data, SlotData::Small(_)) == (len == 4));
+            assert!(matches!(first.data, SlotData::Many(_)) == (len == 24));
+            assert!(second.remove(&names[0]).is_some());
+            assert!(weak_layout.upgrade().is_none());
+            assert_eq!(weak_value.strong_count(), 2 * len - 3);
+            for (index, (key, _)) in first.iter().take(len).enumerate() {
+                let Object::Str(stored) = &key.0 else {
+                    panic!("string key")
+                };
+                assert!(SharedStr::ptr_eq(stored, &names[index]));
+            }
+            for (index, (key, _)) in second.iter().enumerate() {
+                let Object::Str(stored) = &key.0 else {
+                    panic!("string key")
+                };
+                assert!(SharedStr::ptr_eq(stored, &names[index + 1]));
+            }
+            drop(first);
+            assert_eq!(weak_value.strong_count(), len - 1);
+            assert!(matches!(second.get(&names[1]), Some(Object::Str(_))));
+            drop(second);
+            assert!(weak_value.upgrade().is_none());
+            assert!(names.iter().all(|name| SharedStr::strong_count(name) == 1));
+        }
+    }
+
+    #[test]
+    fn fixed_layout_length_mismatches_preserve_zip_behavior() {
+        let layout: SharedSlice<DictKey> = ["a", "b"]
+            .into_iter()
+            .map(|name| DictKey(Object::Str(SharedStr::from(name))))
+            .collect::<Vec<_>>()
+            .into();
+        for count in [0, 1, 2, 3] {
+            let slots =
+                SlotStorage::from_layout(layout.clone(), (0..count).map(Object::Int).collect());
+            assert_eq!(slots.iter().count(), count.min(2) as usize);
+            assert!(matches!(slots.data, SlotData::Fixed { .. }) == (count == 2));
+            for (index, (key, value)) in slots.iter().enumerate() {
+                assert!(key.0.is_same(&layout[index].0));
+                assert_eq!(value.as_i64(), Some(index as i64));
+            }
+        }
+    }
 
     #[test]
     fn shared_slot_names_survive_promotion_and_release_with_their_owners() {
