@@ -14027,6 +14027,61 @@ impl Interpreter {
         self.pure_leaf_eval::<false>(code_rc, f, &args[..total])
     }
 
+    /// Borrow a guarded instance-dictionary or slot cache hit.
+    ///
+    /// # Safety
+    ///
+    /// The receiver must stay rooted, and the returned reference must not
+    /// cross Python execution, mutation, or owner release. `peek` rejects
+    /// shared storage and conflicting mutable borrows.
+    #[inline(always)]
+    unsafe fn leaf_cached_instance_field<'a>(
+        code: &CodeObject,
+        inst: &'a PyInstance,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Option<&'a Object> {
+        use weavepy_compiler::InlineCache as IC;
+        let (key_idx, cached, is_slot) = match code.caches.get(cache_pc) {
+            IC::LoadAttrInstance { key_idx, ver } => (key_idx, ver, false),
+            IC::LoadAttrSlot { key_idx, ver } => (key_idx, ver, true),
+            _ => return None,
+        };
+        let cls = inst.cls_raw();
+        if cls.native_kind.get() != 0 || cls.attr_version.get() != cached {
+            return None;
+        }
+        if !is_slot {
+            // SAFETY: the caller keeps this rooted read callback-free.
+            let dict = unsafe { inst.dict.get()?.peek() }?;
+            let (key, value) = dict.get_index(key_idx as usize)?;
+            slot_name_matches(code, name_idx, key).then_some(value)
+        } else {
+            // SAFETY: the same rooted read as the dictionary path.
+            let slots = unsafe { inst.slots.peek() }?;
+            let indexed = slots
+                .get_index(key_idx as usize)
+                .filter(|(key, _)| slot_name_matches(code, name_idx, key))
+                .map(|(_, value)| value);
+            // Slot order can vary by instance or after deletion.
+            let value = indexed.or_else(|| slots.get(code.names.get(name_idx as usize)?))?;
+            #[cfg(test)]
+            PURE_SLOT_FIELD_READS.with(|hits| {
+                let mut counts = hits.get();
+                let shape = code_vm_ext(code)
+                    .map(|ext| ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed));
+                let index = match shape {
+                    Some(6) => 0,
+                    Some(7) => 1,
+                    _ => 2,
+                };
+                counts[index] += 1;
+                hits.set(counts);
+            });
+            Some(value)
+        }
+    }
+
     /// Evaluate a pure leaf's body (see [`code_is_pure_leaf`]) on borrowed
     /// arguments: operands are scalars or pointers to objects that stay
     /// put (nothing here stores, calls, or runs Python code), so no
@@ -14139,21 +14194,12 @@ impl Interpreter {
                     if let Object::Instance(inst) = recv {
                         let pc = start + 1;
                         let attr = instrs.get(pc)?;
-                        if let IC::LoadAttrInstance { key_idx, ver } = code.caches.get(pc as u32) {
-                            if inst.cls_raw().attr_version.get() == ver
-                                && inst.cls_raw().native_kind.get() == 0
-                            {
-                                // SAFETY: no Python code runs during a leaf.
-                                if let Some((_, value)) = inst
-                                    .dict
-                                    .get()
-                                    .and_then(|d| unsafe { d.peek() })
-                                    .and_then(|d| d.get_index(key_idx as usize))
-                                    .filter(|(key, _)| slot_name_matches(code, attr.arg, key))
-                                {
-                                    return Some(clone_hot(value));
-                                }
-                            }
+                        // SAFETY: the argument roots the receiver until the
+                        // result is retained; nothing here invokes Python.
+                        if let Some(value) = unsafe {
+                            Self::leaf_cached_instance_field(code, inst, pc as u32, attr.arg)
+                        } {
+                            return Some(clone_hot(value));
                         }
                         return Self::leaf_attr_resolve_site(code, inst, recv, pc as u32, attr.arg);
                     }
@@ -14163,29 +14209,18 @@ impl Interpreter {
                     // leaf stack nor its owned-result scratch.
                     let cached_field = |load_pc: usize| -> Option<V> {
                         let pc = load_pc + 1;
-                        let IC::LoadAttrInstance { key_idx, ver } = code.caches.get(pc as u32)
-                        else {
-                            return None;
-                        };
                         let load = instrs.get(load_pc)?;
-                        // SAFETY: the argument stays live, and no read
-                        // in this path invokes Python or releases owners.
+                        // SAFETY: arguments root both field values for this
+                        // callback-free evaluation, with no owner releases.
                         let Object::Instance(inst) = (unsafe { &**args.get(load.arg as usize)? })
                         else {
                             return None;
                         };
                         let attr = instrs.get(pc)?;
-                        let cls = inst.cls_raw();
-                        if cls.attr_version.get() != ver || cls.native_kind.get() != 0 {
-                            return None;
-                        }
-                        // SAFETY: as for the argument above; shared and
-                        // mutably borrowed dictionaries decline peek().
-                        let (key, value) =
-                            unsafe { inst.dict.get()?.peek() }?.get_index(key_idx as usize)?;
-                        if !slot_name_matches(code, attr.arg, key) {
-                            return None;
-                        }
+                        // SAFETY: the same rooted, callback-free read.
+                        let value = unsafe {
+                            Self::leaf_cached_instance_field(code, inst, pc as u32, attr.arg)
+                        }?;
                         Some(norm(std::ptr::from_ref(value)))
                     };
                     let compare_fields = || {
@@ -14325,21 +14360,12 @@ impl Interpreter {
                             if GETTER && cls.native_kind.get() != 0 {
                                 return None;
                             }
-                            let hit = match code.caches.get(pc as u32) {
-                                IC::LoadAttrInstance { key_idx, ver }
-                                    if cls.attr_version.get() == ver
-                                        && cls.native_kind.get() == 0 =>
-                                {
-                                    // SAFETY: a read with nothing running.
-                                    inst.dict
-                                        .get()
-                                        .and_then(|d| unsafe { d.peek() })
-                                        .and_then(|d| d.get_index(key_idx as usize))
-                                        .filter(|(k, _)| slot_name_matches(code, ins.arg, k))
-                                        .map(|(_, v)| std::ptr::from_ref(v))
-                                }
-                                _ => None,
-                            };
+                            // SAFETY: the receiver remains rooted by an
+                            // argument or owned scratch; no Python runs.
+                            let hit = unsafe {
+                                Self::leaf_cached_instance_field(code, inst, pc as u32, ins.arg)
+                            }
+                            .map(std::ptr::from_ref);
                             match hit {
                                 Some(v) => norm(v),
                                 // A stale or absent site cache resolves
@@ -55117,6 +55143,7 @@ enum QuietShell<'a> {
 #[cfg(test)]
 thread_local! {
     static NATIVE_FAST_SUBSCRIPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PURE_SLOT_FIELD_READS: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
     static PURE_CACHED_FIELD_PREDICATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static NATIVE_SUBSCRIPT_CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -63750,6 +63777,50 @@ assert loop(2000) == 1999000
                 drop(native);
                 run(&mut interp, "native_class_ref = weakref.ref(NativeFastProbe)\ndel native_probe, NativeFastProbe, _native_fast_getitem\ngc.collect()\nassert native_class_ref() is None\n");
                 assert!(native_ref.upgrade().is_none(), "subscript cache retained builtin");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn pure_slot_fields_preserve_lookup_and_lifetimes() {
+        const CHILD: &str = "WEAVEPY_PURE_SLOT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::pure_slot_fields_preserve_lookup_and_lifetimes",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("WEAVEPY_JIT", "1")
+                .status()
+                .expect("spawn pure slot test");
+            assert!(status.success(), "pure slot child: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut interp = Interpreter::new();
+                let source = include_str!("../../../tests/regrtest/test_pure_slot_reads.py");
+                let module = parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    source,
+                    "pure_slot_reads.py",
+                )
+                .unwrap();
+                let before = PURE_SLOT_FIELD_READS.with(std::cell::Cell::get);
+                interp.run_module(&code).expect("pure slot assertions");
+                let after = PURE_SLOT_FIELD_READS.with(std::cell::Cell::get);
+                for (index, name) in ["getter", "predicate", "general"].iter().enumerate() {
+                    let hits = after[index] - before[index];
+                    assert!(hits > 1000, "pure slot {name} hits: {hits}");
+                    eprintln!("Pure slot {name} hits: {hits}");
+                }
             })
             .unwrap()
             .join()
