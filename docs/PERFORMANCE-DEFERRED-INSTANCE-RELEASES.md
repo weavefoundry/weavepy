@@ -118,3 +118,46 @@ fails its existing cold sumvm/nested-loops/jitloop checks at
 1.330/1.171/1.153, versus warm ratios 1.017/0.989/0.993. Process elapsed improves
 in all six diagnostic comparisons. The [cold-JIT report](PERFORMANCE-COLD-JIT-DIAGNOSTICS.md)
 records the unresolved first-use cost; no gate or baseline was relaxed.
+
+## Held escaped-local and overwritten-local experiment
+
+A subsequent candidate extends the same deferral proof to two other checks:
+overwriting a local instance and returning from a frame whose heap locals remain
+owned elsewhere. It keeps the old conservative grades first, then consults the
+exact flag after a rejection. The return check still counts every heap local so
+aliases can't hide a final release. The accepted `core_droppable` is unchanged.
+
+The strengthened deterministic regression fails before the change and passes
+afterward, including final-owner, alias, and tracking-revocation cases. All 388
+VM tests, embedding, lint, no-default compilation, scoped formatting, and 14
+benchmark-tool tests pass. The frozen build passes 288 release runs across 96
+fixtures and 608 probes; all 22 compilation traces and statistics match the
+accepted baseline. The executable stays at 51,877,200 bytes, with SHA-256
+`9de7e6ed2c6ef17fae18616471e8ef284c8d8141f934f53d8ec7ab1d08f631a0`.
+
+The paired baseline is accepted `6ea3e53`. Focused seven-cycle DeltaBlue and
+Richards JIT ratios are 0.980/0.975, but DeltaBlue's 31-cycle work/RSS ratios
+are 0.995/1.004. No substantial DeltaBlue gain or memory reduction is established.
+Richards JIT repeats at 0.977, with an interpreter cost of 1.3%. Fibonacci's
+broad JIT cost of 2.6% repeats at 2.7%, with 1.7% interpreter cost. Pickle's
+initial 11% JIT gain shrinks to 1.8%, with 1.5% interpreter cost. Attribute
+access's initial 2.5% JIT cost doesn't repeat (0.996).
+
+Several million-operation arithmetic and chain cases improve 1-3%; scalar
+conditional selectors improve about 3-4%. The initial 7.9% string-predicate
+interpreter cost decreases to 1.5% at sustained work and repeats at 1.7% at
+standard work. Float-selector and dictionary-getter costs don't repeat.
+
+The unchanged 24-fixture JIT geometric means are 0.997 workload, 0.985 elapsed,
+0.988 CPU, and 1.002 RSS versus the accepted baseline. Interpreter means are
+0.999/0.980/0.981/0.994. This experimental build's CPython means are
+1.087/1.400/1.288/1.565; they don't replace the accepted results above.
+All four startup cases use 31 cycles. Ordinary/no-site/isolated/import JIT
+elapsed ratios are 0.997/1.006/0.990/0.993, CPU 0.990/1.021/1.000/0.992, and
+RSS 1.005/1.009/1.005/1.006.
+
+The candidate is held because the modest workload aggregate and inconsistent
+application gains don't justify its repeated costs. Both new guards and their
+uncommitted test extensions are removed; the accepted fix and its original
+regression remain. Raw results, rechecks, source snapshots, and the immutable
+binary are retained under `target/performance/deferred-instance-escape-*`.
