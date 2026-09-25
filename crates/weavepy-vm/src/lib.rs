@@ -55205,6 +55205,13 @@ enum QuietShell<'a> {
 #[cfg(test)]
 thread_local! {
     static NATIVE_FAST_SUBSCRIPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    #[cfg(feature = "jit")]
+    static SCALAR_FIELD_UPDATE_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    #[cfg(feature = "jit")]
+    static SCALAR_FIELD_UPDATE_BOXED_RETURNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    #[cfg(feature = "jit")]
+    static SCALAR_FIELD_UPDATE_NATIVE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
     static PURE_LITERAL_ARGUMENT_CALLS: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
     static PURE_SLOT_FIELD_READS: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
     static PURE_CACHED_FIELD_PREDICATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -63928,6 +63935,134 @@ assert loop(2000) == 1999000
                 );
             }
         }
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn scalar_field_updates_preserve_calls_and_fallbacks() {
+        const CHILD: &str = "WEAVEPY_FIELD_UPDATE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for jit in ["0", "1"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::scalar_field_updates_preserve_calls_and_fallbacks",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("WEAVEPY_JIT", jit)
+                    .status()
+                    .expect("spawn scalar field update test");
+                assert!(status.success(), "scalar field update child: {status}");
+            }
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut interp = Interpreter::new();
+                let run = |interp: &mut Interpreter, source: &str| {
+                    let module = parse_module(source).unwrap();
+                    let code = weavepy_compiler::compile_module_with_source(
+                        &module,
+                        source,
+                        "scalar_field_updates.py",
+                    )
+                    .unwrap();
+                    interp
+                        .run_module(&code)
+                        .expect("scalar field update assertions");
+                };
+                let boxed = SCALAR_FIELD_UPDATE_BOXED_RETURNS.with(std::cell::Cell::get);
+                run(
+                    &mut interp,
+                    include_str!("../../../tests/regrtest/test_scalar_field_updates.py"),
+                );
+                let boxed = SCALAR_FIELD_UPDATE_BOXED_RETURNS.with(std::cell::Cell::get) - boxed;
+                eprintln!("Native completed-result lane transitions: {boxed}");
+                if !crate::tier2::jit_off_for_process() {
+                    assert!(boxed > 0, "completed-result lane transition coverage");
+                }
+                for kind in [
+                    "parameter",
+                    "constant",
+                    "default",
+                    "class-default",
+                    "slots",
+                    "alias",
+                    "hook",
+                    "property",
+                    "class-object",
+                    "large-integer",
+                ] {
+                    let probe = if matches!(
+                        kind,
+                        "class-default" | "property" | "class-object" | "large-integer"
+                    ) {
+                        include_str!("../../../tools/bench_field_update_fallbacks.py")
+                    } else {
+                        include_str!("../../../tools/bench_field_updates.py")
+                    };
+                    let source = format!(
+                        "__name__ = 'update_coverage'\n{probe}\nKIND = '{kind}'\nbench(4000)\n"
+                    );
+                    let native = SCALAR_FIELD_UPDATE_NATIVE_CALLS.with(std::cell::Cell::get);
+                    let attempts = SCALAR_FIELD_UPDATE_ATTEMPTS.with(std::cell::Cell::get);
+                    run(&mut interp, &source);
+                    let native =
+                        SCALAR_FIELD_UPDATE_NATIVE_CALLS.with(std::cell::Cell::get) - native;
+                    eprintln!("Completed scalar field update {kind} calls: native {native}");
+                    let attempts =
+                        SCALAR_FIELD_UPDATE_ATTEMPTS.with(std::cell::Cell::get) - attempts;
+                    if crate::tier2::jit_off_for_process() {
+                        assert_eq!(native, 0, "native entry requires JIT");
+                        assert_eq!(attempts, 0, "interpreted calls use their ordinary path");
+                    } else if matches!(kind, "parameter" | "constant" | "default" | "alias") {
+                        assert!(
+                            native > 100,
+                            "compiled {kind} native update coverage: {native}"
+                        );
+                    } else {
+                        assert_eq!(native, 0, "{kind} uses its ordinary call path");
+                        assert_eq!(attempts, 0, "{kind} bypasses the update evaluator");
+                    }
+                }
+                for (name, fixture, work) in [
+                    (
+                        "deltablue",
+                        include_str!("../../weavepy-bench/fixtures/deltablue.py"),
+                        3,
+                    ),
+                    (
+                        "richards",
+                        include_str!("../../weavepy-bench/fixtures/richards.py"),
+                        500,
+                    ),
+                    (
+                        "call_overhead",
+                        include_str!("../../weavepy-bench/fixtures/call_overhead.py"),
+                        4000,
+                    ),
+                ] {
+                    let native = SCALAR_FIELD_UPDATE_NATIVE_CALLS.with(std::cell::Cell::get);
+                    run(
+                        &mut interp,
+                        &format!("__name__ = 'update_coverage'\n{fixture}\nbench({work})\n"),
+                    );
+                    let native =
+                        SCALAR_FIELD_UPDATE_NATIVE_CALLS.with(std::cell::Cell::get) - native;
+                    eprintln!("Application {name} completed updates: native {native}");
+                    if name == "richards" && !crate::tier2::jit_off_for_process() {
+                        assert!(native > 100, "Richards native update coverage: {native}");
+                    }
+                    if crate::tier2::jit_off_for_process() {
+                        assert_eq!(native, 0, "{name} ordinary interpreter dispatch");
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[cfg(feature = "jit")]

@@ -10,8 +10,9 @@ lane mismatch preserves the completed value and resumes after the call.
 
 This candidate also includes the interpreter shortcut from the
 [earlier field-update experiments](PERFORMANCE-FIELD-UPDATE-EXPERIMENTS.md).
-It remains unadopted while a narrower native-only candidate is evaluated:
-compiled workloads improve substantially, but some fallback costs repeat.
+It remains unadopted: compiled workloads improve substantially, but some
+fallback costs repeat. The subsequent [compiled field-update plans](PERFORMANCE-COMPILED-FIELD-UPDATES.md)
+are adopted separately and keep their metadata in compiled artifacts.
 No JIT admission, density, retirement, pin, or benchmark thresholds change.
 
 ## Measurements

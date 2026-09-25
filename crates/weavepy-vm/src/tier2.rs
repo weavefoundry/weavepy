@@ -85,6 +85,9 @@ struct AttrGuard {
     name: SharedStr,
     /// Python hash of the name, shared by every constructor-store probe.
     name_hash: i64,
+    /// The class value can't acquire descriptor hooks independently of
+    /// the receiver's class version. Only native scalar updates use this.
+    stable_descriptor: bool,
     /// The value lane the site was compiled with.
     lane: JitType,
     /// The class's `attr_version` at compile time. Tokens are globally unique
@@ -306,6 +309,9 @@ struct DirectEntry {
 /// resolution tables its entries validate against.
 struct Artifacts {
     cf: StdRc<CompiledFrame>,
+    /// A plan for a callback-free bound update, owned by this compilation.
+    /// Other code adds no allocation and keeps ordinary native dispatch.
+    scalar_update: Option<Box<ScalarFieldUpdatePlan>>,
     snap: StdRc<GuardSnapshot>,
     callees: StdRc<CalleeTable>,
     /// RFC 0074 WS1 — `obj_globals[token]` is the snapshotted object
@@ -1210,8 +1216,11 @@ impl JitState {
                     {
                         code.jit_hint.mark_compiled();
                     }
+                    let scalar_update =
+                        scalar_field_update_plan(code, &cf, &attr_guards).map(Box::new);
                     let artifacts = StdRc::new(Artifacts {
                         cf: StdRc::new(cf),
+                        scalar_update,
                         snap: StdRc::new(GuardSnapshot::new(snap)),
                         callees: StdRc::new(callees),
                         obj_globals: StdRc::new(obj_globals),
@@ -2532,6 +2541,7 @@ fn attr_site_guard(
         return Some(AttrGuard {
             name: shared_name(),
             name_hash: crate::object::py_str_hash(&site.name),
+            stable_descriptor: false,
             lane: site.lane,
             ver: cls.attr_version.get(),
             storage: AttrStorage::Indexed(*field_idx),
@@ -2559,6 +2569,7 @@ fn attr_site_guard(
         return Some(AttrGuard {
             name: shared_name(),
             name_hash: crate::object::py_str_hash(&site.name),
+            stable_descriptor: false,
             lane: site.lane,
             ver,
             storage: AttrStorage::Indexed(field_idx),
@@ -2576,9 +2587,14 @@ fn attr_site_guard(
     } else if storage == AttrStorage::NewKey || lane != site.lane {
         return None;
     }
+    let stable_descriptor = site.store
+        && matches!(storage, AttrStorage::Indexed(_))
+        && scalar_field_update_shape(&frame.code)
+        && scalar_update_class_value_stable(&recv, &site.name, ver);
     Some(AttrGuard {
         name: shared_name(),
         name_hash: crate::object::py_str_hash(&site.name),
+        stable_descriptor,
         lane: site.lane,
         ver,
         storage,
@@ -3589,6 +3605,250 @@ unsafe fn enter_scalar_leaf(
     (status == JitStatus::Returned).then_some((frame.ret_bits, frame.ret_tag))
 }
 
+/// One already compiled method's exact update shape. The attribute guard
+/// owns the name and the class/storage snapshot; no receiver is retained.
+struct ScalarFieldUpdatePlan {
+    store_token: usize,
+    /// None reads the second bound parameter; Some is a literal increment.
+    increment: Option<i64>,
+}
+
+/// A stable built-in class value can't acquire descriptor hooks on its own.
+/// Mutable class values retain ordinary calls, even while they have no hooks.
+fn scalar_update_class_value_stable(receiver: &Object, name: &str, ver: u64) -> bool {
+    // An exotic class key can run Python equality during lookup, even if
+    // default_getattribute has already cached the ordinary access method.
+    if crate::object::exotic_str_keys_possible() {
+        return false;
+    }
+    let Object::Instance(inst) = receiver else {
+        return false;
+    };
+    let cls = inst.cls();
+    cls.native_kind.get() == 0
+        && super::Interpreter::default_getattribute(&cls)
+        && matches!(
+            cls.lookup(name),
+            None | Some(
+                Object::Function(_)
+                    | Object::Int(_)
+                    | Object::Long(_)
+                    | Object::Float(_)
+                    | Object::Bool(_)
+                    | Object::None
+                    | Object::Str(_)
+                    | Object::WStr(_)
+                    | Object::Bytes(_)
+                    | Object::Complex(_)
+            )
+        )
+        && cls.attr_version.get() == ver
+}
+
+fn scalar_field_update_plan(
+    code: &CodeObject,
+    cf: &CompiledFrame,
+    guards: &[AttrGuard],
+) -> Option<ScalarFieldUpdatePlan> {
+    use weavepy_compiler::{Constant, OpCode};
+    if !scalar_field_update_shape(code) || cf.attr_sites.len() != guards.len() {
+        return None;
+    }
+    let start = usize::from(code.instructions.first()?.op == OpCode::Resume);
+    let name = code
+        .names
+        .get(code.instructions.get(start + 2)?.arg as usize)?;
+    let amount = code.instructions.get(start + 3)?;
+    let increment = match amount.op {
+        OpCode::LoadFast => None,
+        OpCode::LoadSmallInt => Some(i64::from(amount.arg)),
+        OpCode::LoadConst => match code.constants.get(amount.arg as usize)? {
+            Constant::Int(value) => Some(*value),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let mut store_token = None;
+    let mut read = false;
+    let mut fingerprint = None;
+    for (token, (site, guard)) in cf.attr_sites.iter().zip(guards).enumerate() {
+        if site.slot != 0
+            || !site.path.is_empty()
+            || site.name != *name
+            || site.ctor.is_some()
+            || site.self_ctor.is_some()
+            || site.new_key
+        {
+            return None;
+        }
+        let AttrStorage::Indexed(index) = guard.storage else {
+            return None;
+        };
+        let current = (guard.ver, index);
+        if fingerprint.is_some_and(|old| old != current) {
+            return None;
+        }
+        fingerprint = Some(current);
+        if site.store {
+            if !guard.stable_descriptor || store_token.is_some() {
+                return None;
+            }
+            store_token = Some(token);
+        } else {
+            read = true;
+        }
+    }
+    if !read {
+        return None;
+    }
+    Some(ScalarFieldUpdatePlan {
+        store_token: store_token?,
+        increment,
+    })
+}
+
+/// Recognize a single in-place addition and return of the same field.
+/// Mutation is a separate classification from the read-only leaf family.
+#[cold]
+#[inline(never)]
+fn scalar_field_update_shape(code: &weavepy_compiler::CodeObject) -> bool {
+    use weavepy_compiler::{BinOpKind, Constant, OpCode, BINARY_OP_INPLACE_FLAG};
+    if code.is_generator
+        || code.is_coroutine
+        || code.is_async_generator
+        || code.is_iterable_coroutine
+        || code.is_class_body
+        || !code.cellvars.is_empty()
+        || !code.freevars.is_empty()
+        || code.has_varargs
+        || code.has_varkeywords
+        || code.kwonly_count != 0
+        || !(1..=2).contains(&code.arg_count)
+        || code.varnames.len() != code.arg_count as usize
+        || !code.exception_table.is_empty()
+    {
+        return false;
+    }
+    let body = code.instructions.as_slice();
+    let body = if body.first().is_some_and(|i| i.op == OpCode::Resume) {
+        &body[1..]
+    } else {
+        body
+    };
+    let [receiver, copy, read, amount, add, swap, store, returned, reread, ret] = body else {
+        return false;
+    };
+    receiver.op == OpCode::LoadFast
+        && receiver.arg == 0
+        && copy.op == OpCode::CopyTop
+        && copy.arg == 1
+        && read.op == OpCode::LoadAttr
+        && add.op == OpCode::BinaryOp
+        && add.arg == (BinOpKind::Add as u32 | BINARY_OP_INPLACE_FLAG)
+        && swap.op == OpCode::Swap
+        && swap.arg == 2
+        && store.op == OpCode::StoreAttr
+        && store.arg == read.arg
+        && returned.op == OpCode::LoadFast
+        && returned.arg == 0
+        && reread.op == OpCode::LoadAttr
+        && reread.arg == read.arg
+        && ret.op == OpCode::ReturnValue
+        && match amount.op {
+            OpCode::LoadFast => code.arg_count == 2 && amount.arg == 1,
+            OpCode::LoadSmallInt => code.arg_count == 1,
+            OpCode::LoadConst => {
+                code.arg_count == 1
+                    && matches!(
+                        code.constants.get(amount.arg as usize),
+                        Some(Constant::Int(_))
+                    )
+            }
+            _ => false,
+        }
+}
+
+/// Complete one callback-free update after the ordinary native-call preflight.
+/// All guards and arithmetic precede the only store. The plan is tied to the
+/// actual compiled artifact; the receiver, key, and values are checked live.
+///
+/// # Safety
+///
+/// The caller validated binding, defaults, argument lanes/pins, namespaces,
+/// observers, and recursion. It retains the GIL and roots every borrowed value.
+#[inline(never)]
+unsafe fn native_scalar_field_update(
+    jf: &JitFrame,
+    ctx: &CallCtx,
+    nc: &NativeCallee,
+    receiver: &Object,
+    argc: usize,
+) -> Option<i64> {
+    #[cfg(test)]
+    crate::SCALAR_FIELD_UPDATE_ATTEMPTS.with(|hits| hits.set(hits.get() + 1));
+    if crate::gil::free_threading_enabled()
+        || crate::trace::any_observers_active()
+        || crate::capi_watchers::dicts_active()
+        || crate::object::exotic_str_keys_possible()
+    {
+        return None;
+    }
+    let plan = nc.scalar_update.as_deref()?;
+    let guard = nc.attr_guards.get(plan.store_token)?;
+    let AttrStorage::Indexed(index) = guard.storage else {
+        return None;
+    };
+    let Object::Instance(inst) = receiver else {
+        return None;
+    };
+    let cls = inst.cls_raw();
+    if cls.attr_version.get() != guard.ver
+        || cls.native_kind.get() != 0
+        || !super::Interpreter::default_getattribute(cls)
+    {
+        return None;
+    }
+    let increment = if let Some(increment) = plan.increment {
+        increment
+    } else if argc == 0 {
+        let Object::Int(value) = nc.func.defaults.last()? else {
+            return None;
+        };
+        *value
+    } else {
+        // SAFETY: the ordinary native preflight checked this live argument.
+        let (bits, tag) = unsafe { (*jf.call_args, *jf.call_tags) };
+        if tag == SlotTag::Int as u32 {
+            bits as i64
+        } else if tag == SlotTag::ObjPin as u32 {
+            let Some(Pin::Obj(Object::Int(value))) = ctx.pins.get(bits as usize) else {
+                return None;
+            };
+            *value
+        } else {
+            return None;
+        }
+    };
+    // SAFETY: no callback, allocation, or Python execution can overlap this
+    // exclusive view. A shared cell is rejected by peek_mut.
+    let dict = unsafe { inst.dict.get()?.peek_mut() }?;
+    let (key, old) = dict.get_index(index as usize)?;
+    if !key_is(key, &guard.name) {
+        return None;
+    }
+    let Object::Int(old) = old else {
+        return None;
+    };
+    let value = old.checked_add(increment)?;
+    let (_, slot) = dict.map_mut_unstamped().get_index_mut(index as usize)?;
+    // Exact integers own no destructor or GC edge. Existing-key replacement
+    // preserves key stamps. No failing operation follows the completed store.
+    *slot = Object::Int(value);
+    #[cfg(test)]
+    crate::SCALAR_FIELD_UPDATE_NATIVE_CALLS.with(|hits| hits.set(hits.get() + 1));
+    Some(value)
+}
+
 /// RFC 0067 WS1 — attempt a native-to-native call for one marshaled
 /// `CallPy` site. Returns `Some(CallStatus as i64)` when the call
 /// completed through the native path (including via a materialized
@@ -3803,6 +4063,27 @@ unsafe fn try_native_call(
         return None;
     }
     ctx.interp_calls = ctx.interp_calls.saturating_add(1);
+    if nc.scalar_update.is_some() {
+        if let Some(receiver) = recv {
+            // SAFETY: the ordinary native-call preflight above validated
+            // binding, live lanes/pins, namespaces, observers, and recursion.
+            if let Some(value) =
+                unsafe { native_scalar_field_update(jf, ctx, nc, receiver, argc_usize) }
+            {
+                if expect_tag == SlotTag::Int as u32 {
+                    jf.ret_bits = value as u64;
+                    jf.ret_tag = SlotTag::Int as u32;
+                    return Some(CallStatus::Ok as i64);
+                }
+                // The store is complete. Preserve its result on a lane
+                // mismatch; never restart the body or repeat the mutation.
+                #[cfg(test)]
+                crate::SCALAR_FIELD_UPDATE_BOXED_RETURNS.with(|hits| hits.set(hits.get() + 1));
+                ctx.parked = Some(Object::Int(value));
+                return Some(CallStatus::Boxed as i64);
+            }
+        }
+    }
     // Keep disjoint regions in one pooled owner per element width, as
     // direct native entry does. Owners stay live through every native or
     // materialized continuation; no pool borrow crosses the call.
@@ -6609,6 +6890,108 @@ fn attr_result_pin(value: &Object, pins: &[Pin], hint: usize) -> Option<u64> {
         _ => false,
     };
     same.then_some(hint as u64)
+}
+
+#[cfg(test)]
+mod scalar_update_guard_tests {
+    use super::*;
+    use crate::object::BuiltinFn;
+    use crate::types::PyInstance;
+
+    #[test]
+    fn exotic_class_keys_disable_update_certification() {
+        const CHILD: &str = "WEAVEPY_UPDATE_EXOTIC_KEYS_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tier2::scalar_update_guard_tests::exotic_class_keys_disable_update_certification",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("spawn exotic class-key test");
+            assert!(status.success(), "exotic class-key child: {status}");
+            return;
+        }
+        let object = crate::builtin_types::builtin_types().object_.clone();
+        let owner = TypeObject::new_user("Owner", vec![object], DictData::default()).unwrap();
+        let receiver = Object::Instance(Rc::new(PyInstance::new(owner.clone())));
+        let version = owner.attr_version.get();
+        assert!(scalar_update_class_value_stable(
+            &receiver, "value", version
+        ));
+        assert_eq!(owner.getattribute_kind.get(), 1);
+        // This process-global state is monotone. The child keeps it from
+        // changing the eligibility of unrelated tests in the parent.
+        crate::object::note_class_dict_key(&DictKey(Object::Int(0)));
+        assert!(!scalar_update_class_value_stable(
+            &receiver, "value", version
+        ));
+    }
+
+    #[test]
+    fn mutable_descriptor_classes_never_certify_an_update() {
+        let object = crate::builtin_types::builtin_types().object_.clone();
+        let descriptor_type =
+            TypeObject::new_user("MutableValue", vec![object.clone()], DictData::default())
+                .unwrap();
+        let descriptor = Object::Instance(Rc::new(PyInstance::new(descriptor_type.clone())));
+        let mut namespace = DictData::default();
+        namespace.insert(DictKey(Object::from_static("value")), Object::Int(0));
+        let owner = TypeObject::new_user("Owner", vec![object], namespace).unwrap();
+        let receiver = Object::Instance(Rc::new(PyInstance::new(owner.clone())));
+        let initial = owner.attr_version.get();
+        assert!(scalar_update_class_value_stable(
+            &receiver, "value", initial
+        ));
+
+        owner
+            .dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_static("value")), descriptor);
+        owner.bump_attr_version();
+        let changed = owner.attr_version.get();
+        assert_ne!(initial, changed);
+        assert!(!scalar_update_class_value_stable(
+            &receiver, "value", initial
+        ));
+        assert!(!scalar_update_class_value_stable(
+            &receiver, "value", changed
+        ));
+
+        // Changing the descriptor's own class doesn't change Owner's token.
+        // It must have been excluded even before acquiring the setter hook.
+        descriptor_type.dict.borrow_mut().insert(
+            DictKey(Object::from_static("__set__")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__set__",
+                binds_instance: true,
+                call: Box::new(|_| Ok(Object::None)),
+                call_kw: None,
+            })),
+        );
+        descriptor_type.bump_attr_version();
+        assert_eq!(owner.attr_version.get(), changed);
+        assert!(!scalar_update_class_value_stable(
+            &receiver, "value", changed
+        ));
+
+        owner
+            .dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_static("value")), Object::None);
+        owner.bump_attr_version();
+        assert!(!scalar_update_class_value_stable(
+            &receiver, "value", changed
+        ));
+        assert!(scalar_update_class_value_stable(
+            &receiver,
+            "value",
+            owner.attr_version.get()
+        ));
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(std::mem::size_of::<AttrGuard>(), 48);
+    }
 }
 
 #[cfg(test)]
