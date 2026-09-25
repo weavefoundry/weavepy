@@ -2803,8 +2803,8 @@ mod slot_storage_tests {
             assert_eq!(weak_layout.strong_count(), 1);
             assert_eq!(first.index_of("extra"), Some(len as u32));
             assert!(second.get("extra").is_none());
-            assert!(matches!(first.data, SlotData::Small(_)) == (len == 4));
-            assert!(matches!(first.data, SlotData::Many(_)) == (len == 24));
+            assert_eq!(matches!(first.data, SlotData::Small(_)), len == 4);
+            assert_eq!(matches!(first.data, SlotData::Many(_)), len == 24);
             assert!(second.remove(&names[0]).is_some());
             assert!(weak_layout.upgrade().is_none());
             assert_eq!(weak_value.strong_count(), 2 * len - 3);
@@ -2840,7 +2840,7 @@ mod slot_storage_tests {
             let slots =
                 SlotStorage::from_layout(layout.clone(), (0..count).map(Object::Int).collect());
             assert_eq!(slots.iter().count(), count.min(2) as usize);
-            assert!(matches!(slots.data, SlotData::Fixed { .. }) == (count == 2));
+            assert_eq!(matches!(slots.data, SlotData::Fixed { .. }), count == 2);
             for (index, (key, value)) in slots.iter().enumerate() {
                 assert!(key.0.is_same(&layout[index].0));
                 assert_eq!(value.as_i64(), Some(index as i64));
