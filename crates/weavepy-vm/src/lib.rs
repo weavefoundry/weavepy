@@ -17289,7 +17289,12 @@ impl Interpreter {
                 (
                     LeafRecv::Set,
                     Object::new_set(),
-                    &[("add", LeafKind::SetAdd), ("discard", LeafKind::SetDiscard)],
+                    &[
+                        ("add", LeafKind::SetAdd),
+                        ("discard", LeafKind::SetDiscard),
+                        ("remove", LeafKind::SetRemove),
+                        ("pop", LeafKind::SetPop),
+                    ],
                 ),
                 (
                     LeafRecv::Str,
@@ -17607,6 +17612,27 @@ impl Interpreter {
             K::DictKeys | K::DictValues | K::DictItems => {
                 args.len() == 1 && matches!(args[0], O::Dict(_))
             }
+            // Pop transfers the final owner without hashing, comparing,
+            // dropping an element, or calling Python.
+            K::SetPop => args.len() == 1 && matches!(args[0], O::Set(_)),
+            K::SetRemove => {
+                if !(args.len() == 2 && matches!(args[0], O::Set(_)) && leaf_key(&args[1])) {
+                    return None;
+                }
+                let O::Set(st) = &args[0] else { return None };
+                // Native scalar equality can match a stored subclass without
+                // calling Python. Removing that owner can still run a finalizer,
+                // so the stored value, as well as the lookup, must be a leaf.
+                let (safe, deferred) = crate::object::with_key_eq_deferred(|| {
+                    crate::object::key_cmp_scope(|| {
+                        st.try_borrow().ok().map(|m| {
+                            m.get(&DictKey(args[1].clone()))
+                                .is_none_or(|stored| leaf_key(&stored.0))
+                        })
+                    })
+                });
+                !deferred && matches!(safe, Ok(Some(true)))
+            }
             K::SetAdd | K::SetDiscard => {
                 if !(args.len() == 2 && matches!(args[0], O::Set(_)) && leaf_key(&args[1])) {
                     return None;
@@ -17714,6 +17740,14 @@ impl Interpreter {
         };
         if !admitted {
             return None;
+        }
+        #[cfg(test)]
+        if matches!(kind, K::SetPop | K::SetRemove) {
+            LEAF_SET_REMOVALS.with(|counts| {
+                let mut values = counts.get();
+                values[usize::from(kind == K::SetRemove)] += 1;
+                counts.set(values);
+            });
         }
         Some(match b.call_kw.as_ref() {
             Some(ckw) => ckw(args, &[]),
@@ -54601,6 +54635,8 @@ enum LeafKind {
     DictItems,
     SetAdd,
     SetDiscard,
+    SetRemove,
+    SetPop,
     StrStartswith,
     StrEndswith,
     StrLower,
@@ -55225,6 +55261,7 @@ enum QuietShell<'a> {
 #[cfg(test)]
 thread_local! {
     static NATIVE_FAST_SUBSCRIPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static LEAF_SET_REMOVALS: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0; 2]) };
     #[cfg(feature = "jit")]
     static SCALAR_FIELD_UPDATE_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     #[cfg(feature = "jit")]
@@ -70078,6 +70115,77 @@ print("native pickle coverage: ok")
             "    print(e.value)\n",
         );
         assert_eq!(run(src), "1\ndone\n");
+    }
+
+    #[test]
+    fn set_leaf_dispatch_preserves_callbacks_and_owners() {
+        const CHILD: &str = "WEAVEPY_TEST_SET_LEAF_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::set_leaf_dispatch_preserves_callbacks_and_owners",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("WEAVEPY_JIT", "0")
+                .status()
+                .expect("spawn set leaf dispatch test");
+            assert!(status.success(), "set leaf dispatch child: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut interp = Interpreter::new();
+                let source = include_str!("../../../tests/regrtest/test_set_leaf_dispatch.py");
+                let module = parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    source,
+                    "test_set_leaf_dispatch.py",
+                )
+                .unwrap();
+                LEAF_SET_REMOVALS.with(|counts| counts.set([0; 2]));
+                interp.run_module(&code).unwrap();
+                let source = include_str!("../../../tests/regrtest/test_set_remove_owners.py");
+                let module = parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    source,
+                    "test_set_remove_owners.py",
+                )
+                .unwrap();
+                interp.run_module(&code).unwrap();
+                let counts = LEAF_SET_REMOVALS.with(std::cell::Cell::get);
+                assert!(counts.iter().all(|count| *count > 3000), "{counts:?}");
+                eprintln!("Set leaf calls (pop, remove): {counts:?}");
+
+                // Unsupported arguments decline before touching the set.
+                let receiver = Object::new_set();
+                let Object::Set(values) = &receiver else {
+                    unreachable!()
+                };
+                values.borrow_mut().insert(DictKey(Object::Int(1)));
+                let pop = interp.leaf_builtin_method(&receiver, "pop").unwrap();
+                let remove = interp.leaf_builtin_method(&receiver, "remove").unwrap();
+                assert!(interp
+                    .leaf_builtin_call(LeafKind::SetPop, &pop, &[receiver.clone(), Object::Int(1)])
+                    .is_none());
+                assert!(interp
+                    .leaf_builtin_call(
+                        LeafKind::SetRemove,
+                        &remove,
+                        &[receiver.clone(), Object::new_list(Vec::new())],
+                    )
+                    .is_none());
+                assert_eq!(values.borrow().len(), 1);
+                assert!(values.borrow().contains(&DictKey(Object::Int(1))));
+                assert_eq!(LEAF_SET_REMOVALS.with(std::cell::Cell::get), counts);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     // ---------- pattern matching (RFC 0009) ----------
