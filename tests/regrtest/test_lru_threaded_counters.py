@@ -3,12 +3,14 @@ import functools
 import threading
 
 
-def exercise(maxsize, strings):
+def exercise(maxsize, kind):
     @functools.lru_cache(maxsize=maxsize)
     def cached(key):
         return key
 
-    keys = [str(i) if strings else i for i in range(8)]
+    keys = [str(i) if kind == 'str' else
+            (i, (str(i), 10**30 + i)) if kind == 'tuple' else i
+            for i in range(8)]
     for key in keys:
         assert cached(key) == key
     start = threading.Event()
@@ -33,17 +35,17 @@ def exercise(maxsize, strings):
         thread.join()
     assert not errors, errors
     expected = (0, 4008, 0, 0) if maxsize == 0 else (4000, 8, maxsize, 8)
-    assert cached.cache_info() == expected, (maxsize, strings, cached.cache_info())
+    assert cached.cache_info() == expected, (maxsize, kind, cached.cache_info())
     cached.cache_clear()
     assert cached.cache_info() == (0, 0, maxsize, 0)
 
 
-for strings in (False, True):
+for kind in ('int', 'str', 'tuple'):
     for maxsize in (32, 0):
-        exercise(maxsize, strings)
+        exercise(maxsize, kind)
 
 
-def exercise_clear():
+def exercise_clear(tuples):
     @functools.lru_cache(maxsize=3)
     def cached(key):
         return key
@@ -61,6 +63,8 @@ def exercise_clear():
                     cached.cache_clear()
                 else:
                     value = key + number % 7
+                    if tuples:
+                        value = (value, str(value))
                     if cached(value) != value:
                         errors.append(value)
         except BaseException as error:
@@ -78,12 +82,14 @@ def exercise_clear():
     assert cached.cache_info().currsize <= 3
     cached.cache_clear()
     assert cached.cache_info() == (0, 0, 3, 0)
-    for key in range(3):
+    for number in range(3):
+        key = (number, str(number)) if tuples else number
         assert cached(key) == key
     assert cached.cache_info() == (0, 3, 3, 3)
 
 
 for _ in range(25):
-    exercise_clear()
+    exercise_clear(False)
+    exercise_clear(True)
 
 print("Threaded LRU counters: ok")

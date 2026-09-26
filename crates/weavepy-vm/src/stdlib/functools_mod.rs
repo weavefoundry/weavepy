@@ -408,8 +408,30 @@ enum ScalarLru {
     Complete(Option<Object>),
 }
 
-fn scalar_lru_key(key: &Object) -> bool {
-    matches!(key, Object::Int(_) | Object::Long(_) | Object::Str(_))
+#[inline]
+fn native_lru_key(key: &Object) -> bool {
+    match key {
+        Object::Int(_) | Object::Long(_) | Object::Str(_) => true,
+        Object::Tuple(_) => native_lru_tuple_key(key, 8, &mut 64),
+        _ => false,
+    }
+}
+
+/// Bound admission work and stack use independently of user key size.
+/// Exact tuples of native leaves cannot call Python or own finalizers;
+/// subclasses and larger/deeper keys keep the callback-capable path.
+fn native_lru_tuple_key(key: &Object, depth: usize, remaining: &mut usize) -> bool {
+    if *remaining == 0 {
+        return false;
+    }
+    *remaining -= 1;
+    match key {
+        Object::Int(_) | Object::Long(_) | Object::Str(_) => true,
+        Object::Tuple(items) if depth > 0 && items.len() <= *remaining => items
+            .iter()
+            .all(|item| native_lru_tuple_key(item, depth - 1, remaining)),
+        _ => false,
+    }
 }
 
 fn invalid_lru_order() -> RuntimeError {
@@ -417,7 +439,7 @@ fn invalid_lru_order() -> RuntimeError {
 }
 
 /// Once a cache admits a key that can invoke Python, retain its existing
-/// ordered-map implementation. The scalar representation holds no Python
+/// ordered-map implementation. The native representation holds no Python
 /// owners outside that map and never changes the layout of ordinary objects.
 fn scalar_lru_links(
     inst: &crate::types::PyInstance,
@@ -455,7 +477,7 @@ fn scalar_lru_operation(
     key: &Object,
     insert: Option<(&Object, usize)>,
 ) -> Result<ScalarLru, RuntimeError> {
-    let scalar = scalar_lru_key(key);
+    let scalar = native_lru_key(key);
     let Some(links) = scalar_lru_links(inst, scalar)? else {
         return Ok(ScalarLru::Slow);
     };
@@ -474,7 +496,7 @@ fn scalar_lru_operation(
         if !scalar || insert.is_some_and(|(_, limit)| data.len() > limit) {
             crate::object::bytearray_check_resizable(&links)?;
             let indices = order.indices().ok_or_else(invalid_lru_order)?;
-            if !data.keys().all(|stored| scalar_lru_key(&stored.0)) {
+            if !data.keys().all(|stored| native_lru_key(&stored.0)) {
                 return Err(invalid_lru_order());
             }
             // Restore logical oldest-to-newest order once, before any
@@ -507,7 +529,7 @@ fn scalar_lru_operation(
         }
         if let Some(index) = found {
             let (stored, value) = data.get_index(index).ok_or_else(invalid_lru_order)?;
-            if !scalar_lru_key(&stored.0) {
+            if !native_lru_key(&stored.0) {
                 return Err(invalid_lru_order());
             }
             // A recursive call may have populated a miss. Its entry and
@@ -852,6 +874,10 @@ mod tests {
                     (
                         "test_lru_scalar_owners.py",
                         include_str!("../../../../tests/regrtest/test_lru_scalar_owners.py"),
+                    ),
+                    (
+                        "test_lru_native_tuples.py",
+                        include_str!("../../../../tests/regrtest/test_lru_native_tuples.py"),
                     ),
                 ] {
                     let module = weavepy_parser::parse_module(source).unwrap();

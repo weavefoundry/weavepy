@@ -53,8 +53,9 @@ for capacity in (1, 2, 3, 7, 31):
         check_order(capacity, kind)
 
 
-# The physical cache entry order differs from logical recency before fallback.
-for unsupported in ((4,), 4.0, False):
+# Physical entry order differs from recency before changing the key shape.
+# Exact native tuples stay in dense recency; floats and bools use fallback.
+for next_key in ((4,), 4.0, False):
     calls = []
 
     @functools.lru_cache(3)
@@ -65,7 +66,7 @@ for unsupported in ((4,), 4.0, False):
     for key in (0, 1, 2, 0, 3, 2):
         transition(key)
     assert calls == [0, 1, 2, 3]
-    transition(unsupported)
+    transition(next_key)
     before = len(calls)
     transition(3)
     transition(2)
@@ -108,7 +109,7 @@ assert clearing.cache_info() == (0, 0, 3, 1)
 assert clearing(9) == 9 and clearing.cache_info().hits == 1
 
 
-# The wrapped function can switch representation during an outer scalar miss.
+# The wrapped function can change the key shape during an outer scalar miss.
 @functools.lru_cache(3)
 def changing(key):
     if key == 99:
