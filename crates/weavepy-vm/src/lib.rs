@@ -61818,11 +61818,10 @@ pub fn make_pep604_union(a: &Object, b: &Object) -> Result<Object, RuntimeError>
 /// `typing._type_check`), nested unions flatten, duplicates collapse, a
 /// lone survivor is returned bare, and no arguments is an error.
 pub fn union_class_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
-    let item = args
-        .get(1)
-        .cloned()
-        .ok_or_else(|| type_error("__class_getitem__() missing argument"))?;
-    let items: Vec<Object> = match &item {
+    let [_, item] = args else {
+        return Err(type_error("__class_getitem__() takes exactly one argument"));
+    };
+    let items: Vec<Object> = match item {
         Object::Tuple(t) => t.iter().cloned().collect(),
         other => vec![other.clone()],
     };
@@ -63384,6 +63383,25 @@ next(gen)
             .unwrap_or_else(|error| panic!("run: {error}"));
         let bytes = buf.borrow().clone();
         String::from_utf8(bytes).expect("utf-8")
+    }
+
+    #[test]
+    fn union_class_getitem_binds_direct_calls() {
+        run(r"
+from types import UnionType
+method = UnionType.__class_getitem__
+assert method.__self__ is UnionType
+assert method(int) is int
+assert method((int, str)) == int | str
+assert UnionType[int, str] == int | str
+for args in [(), (int, str), ((int, str), float), ((),)]:
+    try:
+        method(*args)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError('invalid Union arguments accepted')
+");
     }
 
     fn check_constructor_slot_names(typed_store: bool) {
