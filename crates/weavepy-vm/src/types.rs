@@ -1935,6 +1935,29 @@ impl SlotStorage {
         }
     }
 
+    /// Access native fields only when the shared layout is the same
+    /// allocation. Equal user-defined slot names aren't sufficient.
+    pub(crate) fn values_for_layout(&self, expected: &SharedSlice<DictKey>) -> Option<&[Object]> {
+        match &self.data {
+            SlotData::Fixed { layout, values } if SharedSlice::ptr_eq(layout, expected) => {
+                Some(values)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn values_for_layout_mut(
+        &mut self,
+        expected: &SharedSlice<DictKey>,
+    ) -> Option<&mut [Object]> {
+        match &mut self.data {
+            SlotData::Fixed { layout, values } if SharedSlice::ptr_eq(layout, expected) => {
+                Some(values)
+            }
+            _ => None,
+        }
+    }
+
     /// Turn a [`SlotData::Fixed`] storage into the per-key form (before
     /// a key is added or removed).
     fn unfix(&mut self) {
@@ -1949,6 +1972,17 @@ impl SlotStorage {
 
 #[cfg(not(target_pointer_width = "64"))]
 impl SlotStorage {
+    pub(crate) fn values_for_layout(&self, _expected: &SharedSlice<DictKey>) -> Option<&[Object]> {
+        None
+    }
+
+    pub(crate) fn values_for_layout_mut(
+        &mut self,
+        _expected: &SharedSlice<DictKey>,
+    ) -> Option<&mut [Object]> {
+        None
+    }
+
     /// Storage holding `values` under `layout` (see the 64-bit variant).
     pub fn from_layout(layout: SharedSlice<DictKey>, values: Vec<Object>) -> Self {
         Self::from_entries(layout.iter().cloned().zip(values).collect())
@@ -2312,7 +2346,8 @@ pub struct PyInstance {
     /// fast paths so e.g. `class C(int)` instances behave like real ints.
     pub native: std::sync::OnceLock<Object>,
     /// Mirrors CPython 3.13's "inline values" state observable through
-    /// `_testinternalcapi.has_inline_values`: starts `true` and is
+    /// `_testinternalcapi.has_inline_values`: starts `true` for ordinary
+    /// instances (native fixed weakrefs start `false`) and is
     /// permanently cleared when the instance's `__dict__` is deleted or
     /// replaced wholesale (`del obj.__dict__` / `obj.__dict__ = d`).
     /// The capacity-overflow half of the state (too many attributes)
@@ -2760,6 +2795,36 @@ mod slot_storage_tests {
     fn shared_layout_keeps_slot_storage_compact() {
         assert_eq!(std::mem::size_of::<SlotStorage>(), 32);
         assert_eq!(std::mem::size_of::<PyInstance>(), 128);
+    }
+
+    #[test]
+    fn native_layout_access_requires_identity_and_preserves_independent_values() {
+        let make_layout = || -> SharedSlice<DictKey> {
+            vec![
+                DictKey(Object::from_static("__weakref_get__")),
+                DictKey(Object::from_static("__callback__")),
+            ]
+            .into()
+        };
+        let native = make_layout();
+        let equal_names = make_layout();
+        let mut slots =
+            SlotStorage::from_layout(native.clone(), vec![Object::Int(3), Object::Int(5)]);
+        assert!(slots.values_for_layout(&equal_names).is_none());
+        assert!(slots.values_for_layout_mut(&equal_names).is_none());
+        let other = slots.clone();
+        slots.values_for_layout_mut(&native).unwrap()[1] = Object::None;
+        assert_eq!(
+            other.values_for_layout(&native).unwrap()[1].as_i64(),
+            Some(5)
+        );
+        assert!(matches!(
+            slots.values_for_layout(&native).unwrap()[1],
+            Object::None
+        ));
+        slots.insert("extra", Object::Int(7));
+        assert!(slots.values_for_layout(&native).is_none());
+        assert_eq!(slots.get("__weakref_get__").unwrap().as_i64(), Some(3));
     }
 
     #[test]

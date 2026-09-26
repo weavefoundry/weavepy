@@ -159,7 +159,7 @@ fn m(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
 /// CPython looks up special methods (here `__call__`) on the *type*,
 /// not the instance, so `weakref.ref(obj)()` must resolve `__call__`
 /// via the class MRO. Each ref instance stores its per-target deref
-/// closure under `__weakref_get__` in its own dict; this shared
+/// closure in its traced native slots or dictionary; this shared
 /// type-level method bridges to it so `r()` returns the live target
 /// (or `None` once the referent is collected).
 fn ref_type_call(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -167,11 +167,7 @@ fn ref_type_call(args: &[Object]) -> Result<Object, RuntimeError> {
         .first()
         .ok_or_else(|| type_error("__call__() missing self"))?;
     if let Object::Instance(inst) = me {
-        let getter = inst
-            .dict_cell()
-            .borrow()
-            .get(&StrKey("__weakref_get__"))
-            .cloned();
+        let getter = reg::wrapper_value(inst, WrapperKey::Get);
         if let Some(Object::Builtin(b)) = getter {
             return (b.call)(&[]);
         }
@@ -236,11 +232,7 @@ fn wrapper_referent(obj: &Object) -> Option<Option<Object>> {
     let Object::Instance(inst) = obj else {
         return None;
     };
-    let getter = inst
-        .dict_cell()
-        .borrow()
-        .get(&StrKey("__weakref_get__"))
-        .cloned();
+    let getter = reg::wrapper_value(inst, WrapperKey::Get);
     match getter {
         Some(Object::Builtin(b)) => {
             let t = (b.call)(&[]).ok()?;
@@ -436,14 +428,14 @@ fn ref_type_repr(args: &[Object]) -> Result<Object, RuntimeError> {
 
 /// Getter behind the read-only `__callback__` property: the live
 /// callback before the referent dies, `None` once it has fired (the
-/// clear path nulls the backing dict entry). The property (a data
+/// clear path nulls the backing field). The property (a data
 /// descriptor with no setter) is what makes
 /// `ref.__callback__ = …` raise `AttributeError`
 /// (test_set_callback_attribute).
 fn ref_callback_get(args: &[Object]) -> Result<Object, RuntimeError> {
     if let Some(Object::Instance(inst)) = args.first() {
-        if let Some(v) = inst.dict_cell().borrow().get(&StrKey("__callback__")) {
-            return Ok(v.clone());
+        if let Some(v) = reg::wrapper_value(inst, WrapperKey::Callback) {
+            return Ok(v);
         }
     }
     Ok(Object::None)
@@ -1118,12 +1110,18 @@ fn make_ref_object_with_class(
     if let Object::Instance(inst) = &target {
         inst.ensure_gc_tracked();
     }
-    let slot = Arc::new(WeakRefSlot::new(
-        target_id,
-        target.clone(),
-        callback.is_some(),
-        kind_tag,
-    ));
+    let class = class_override.unwrap_or_else(|| match kind_tag {
+        kind::PROXY => proxy_type(),
+        kind::CALLABLE_PROXY => callable_proxy_type(),
+        _ => ref_type(),
+    });
+    // Only exact refs share methods and native storage. Foreign classes,
+    // proxies, and subclasses preserve their dictionary representation.
+    let shared_methods = kind_tag == kind::REF && Rc::ptr_eq(&class, &ref_type());
+    let fixed_wrapper = shared_methods && cfg!(target_pointer_width = "64");
+    let mut slot = WeakRefSlot::new(target_id, target.clone(), callback.is_some(), kind_tag);
+    slot.fixed_wrapper = fixed_wrapper;
+    let slot = Arc::new(slot);
     register(slot.clone());
 
     // RFC 0040 (GC arc): a weakref *with a callback* (`weakref.ref(obj, cb)`,
@@ -1147,26 +1145,23 @@ fn make_ref_object_with_class(
         crate::gc_trace::note_weakref_finalizable(target_id);
     }
 
-    let dict = Rc::new(RefCell::new(DictData::default()));
-
-    let class = class_override.unwrap_or_else(|| match kind_tag {
-        kind::PROXY => proxy_type(),
-        kind::CALLABLE_PROXY => callable_proxy_type(),
-        _ => ref_type(),
-    });
-    // Exact refs already have shared call/repr methods on their type.
-    // Binding those methods retains the wrapper and its callback when a
-    // caller saves an explicit method. Keep other wrapper kinds unchanged.
-    let shared_methods = kind_tag == kind::REF && Rc::ptr_eq(&class, &ref_type());
-
     // The getter owns the slot. Registry entries and the wrapper's
-    // back-pointer are weak; callback ownership stays in the traced dict.
+    // back-pointer are weak; callback ownership stays in traced storage.
     let slot_for_get = slot.clone();
     let get_target = move |_args: &[Object]| -> Result<Object, RuntimeError> {
         Ok(slot_for_get.upgrade().unwrap_or(Object::None))
     };
 
-    {
+    let (dict, slots) = if fixed_wrapper {
+        (
+            crate::sync::LazyArc::new(),
+            reg::fixed_wrapper_storage(
+                b_dyn("__weakref_get__", get_target),
+                callback.clone().unwrap_or(Object::None),
+            ),
+        )
+    } else {
+        let dict = Rc::new(RefCell::new(DictData::default()));
         let mut d = dict.borrow_mut();
         if !shared_methods {
             let slot_for_call = slot.clone();
@@ -1201,14 +1196,16 @@ fn make_ref_object_with_class(
             d.insert(WrapperKey::Callback.owned(), Object::None);
         }
         d.insert(WrapperKey::Kind.owned(), Object::Int(i64::from(kind_tag)));
-    }
+        drop(d);
+        (dict.into(), crate::types::SlotStorage::default())
+    };
 
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(class),
-        dict: dict.into(),
+        dict,
         native: std::sync::OnceLock::new(),
-        inline_values: crate::sync::Cell::new(true),
-        slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
+        inline_values: crate::sync::Cell::new(!fixed_wrapper),
+        slots: crate::sync::RefCell::new(slots),
         hash_cache: crate::sync::CachedHash::new(None),
         finalize_ran: crate::sync::Cell::new(false),
         deferred: crate::sync::Cell::new(false),
@@ -1220,7 +1217,7 @@ fn make_ref_object_with_class(
     let wrapper = Object::Instance(inst);
     // CPython GC-tracks a weakref *with a callback* (`gc_track` in
     // `weakref___init__`): the wrapper's strong `wr_callback` edge (our
-    // `__callback__` dict entry) must be visible to the cycle collector
+    // `__callback__` slot or dict entry) must be visible to the cycle collector
     // or a cycle routed through the callback — `c.wr = ref(d, c.cb)`
     // with `c ↔ d` — is never collected (test_callbacks_on_callback,
     // test_callback_in_cycle_resurrection). Callback-less wrappers stay
@@ -1445,6 +1442,54 @@ fn referent_of_proxy(_args: &[Object]) -> Result<Object, RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn native_wrapper_storage_stays_authoritative_after_dict_materialization() {
+        let target = Object::Type(
+            TypeObject::new_user("FixedWeakrefTarget", vec![], DictData::default()).unwrap(),
+        );
+        let callback = b("callback", |_| Ok(Object::None));
+        let wrapper = c_new_ref(target.clone(), Some(callback.clone())).unwrap();
+        let Object::Instance(inst) = &wrapper else {
+            panic!("expected wrapper instance")
+        };
+        assert!(inst.dict.get().is_none());
+        assert!(ref_type_call(std::slice::from_ref(&wrapper))
+            .unwrap()
+            .is_same(&target));
+        assert!(ref_callback_get(std::slice::from_ref(&wrapper))
+            .unwrap()
+            .is_same(&callback));
+        assert!(inst.dict.get().is_none());
+        // Materializing implementation-looking dictionary entries must
+        // neither hide native state nor create a second callback owner.
+        {
+            let mut dict = inst.dict_cell().borrow_mut();
+            dict.insert(WrapperKey::Get.owned(), Object::Int(23));
+            dict.insert(WrapperKey::Callback.owned(), Object::Int(29));
+        }
+        assert!(ref_type_call(std::slice::from_ref(&wrapper))
+            .unwrap()
+            .is_same(&target));
+        assert!(ref_callback_get(std::slice::from_ref(&wrapper))
+            .unwrap()
+            .is_same(&callback));
+        let cleared = reg::notify_clear(id_of(&target));
+        assert_eq!(cleared.len(), 1);
+        assert!(cleared[0].1.as_ref().unwrap().is_same(&callback));
+        assert!(matches!(
+            ref_type_call(std::slice::from_ref(&wrapper)),
+            Ok(Object::None)
+        ));
+        assert!(matches!(
+            ref_callback_get(std::slice::from_ref(&wrapper)),
+            Ok(Object::None)
+        ));
+        assert!(cleared[0].0.callback().is_none());
+        assert!(reg::notify_clear(id_of(&target)).is_empty());
+        eprintln!("WeakRefSlot size: {}", std::mem::size_of::<WeakRefSlot>());
+    }
 
     #[test]
     fn saved_methods_preserve_wrapper_owners() {

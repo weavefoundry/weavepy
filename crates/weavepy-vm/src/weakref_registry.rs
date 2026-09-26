@@ -35,7 +35,7 @@
 //! `gc.collect`, finaliser code) can invoke.
 
 use crate::fasthash::ObjectIdHasher;
-use crate::shared_value::{SharedStr, ThinArc};
+use crate::shared_value::{SharedSlice, SharedStr, ThinArc};
 use crate::sync::RefCell;
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -97,8 +97,8 @@ pub struct WeakRefSlot {
     /// alive. Set to `None` by `notify_clear`.
     pub target: RefCell<Option<Object>>,
     /// Whether a callback was supplied at creation. The callback
-    /// *object* itself lives in the user-visible wrapper's instance
-    /// dict (under `__callback__`), never here: the wrapper is
+    /// *object* itself lives in the user-visible wrapper's traced slots
+    /// or dictionary (under `__callback__`), never here: the wrapper is
     /// GC-tracked when a callback exists, so the reference is a
     /// *traced edge* the cycle collector can account. A strong clone
     /// hidden inside this slot would make any cycle routed through a
@@ -107,6 +107,9 @@ pub struct WeakRefSlot {
     /// visits `wr_callback` for exactly this reason
     /// (test_weakref's `test_callbacks_on_callback`).
     pub has_callback: bool,
+    /// Callback/getter storage for an exact native wrapper, selected before
+    /// registration. Legacy refs and all proxies/subclasses keep dictionaries.
+    pub(crate) fixed_wrapper: bool,
     /// Cached `id(referent)` so the weakref's `__hash__`
     /// remains stable across the referent's life.
     pub identity_hash: i64,
@@ -120,6 +123,39 @@ pub struct WeakRefSlot {
     /// alive; lets `obj.__weakref__` / `weakref.getweakrefs` return
     /// the *same* object the user holds.
     pub py_ref: RefCell<Option<crate::sync::Weak<crate::types::PyInstance>>>,
+}
+
+// A process-wide identity recognizes native storage across threads without
+// confusing subclass slots with the same names. Only 64-bit exact refs use it.
+static WRAPPER_LAYOUT: std::sync::OnceLock<SharedSlice<DictKey>> = std::sync::OnceLock::new();
+
+pub(crate) fn fixed_wrapper_storage(getter: Object, callback: Object) -> crate::types::SlotStorage {
+    let layout = WRAPPER_LAYOUT
+        .get_or_init(|| vec![WrapperKey::Get.owned(), WrapperKey::Callback.owned()].into());
+    crate::types::SlotStorage::from_layout(layout.clone(), vec![getter, callback])
+}
+
+/// Read authoritative native state before any materialized instance dict.
+/// Exact native wrappers don't use managed inline dictionary values. The
+/// flag is only a negative filter; layout identity validates the storage.
+pub(crate) fn wrapper_value(inst: &crate::types::PyInstance, key: WrapperKey) -> Option<Object> {
+    if !inst.inline_values.get() {
+        if let Some(layout) = WRAPPER_LAYOUT.get() {
+            let slots = inst.slots.borrow();
+            if let Some(values) = slots.values_for_layout(layout) {
+                return match key {
+                    WrapperKey::Get => values.first().cloned(),
+                    WrapperKey::Callback => values.get(1).cloned(),
+                    _ => None,
+                };
+            }
+        }
+    }
+    inst.dict
+        .get()?
+        .borrow()
+        .get(&StrKey(WRAPPER_NAMES[key as usize]))
+        .cloned()
 }
 
 /// Weakref kinds as exposed to Python. Numeric so the field
@@ -136,6 +172,7 @@ impl WeakRefSlot {
             target_id,
             target: RefCell::new(Some(target)),
             has_callback,
+            fixed_wrapper: false,
             identity_hash: target_id as i64,
             dead: AtomicBool::new(false),
             kind,
@@ -156,7 +193,7 @@ impl WeakRefSlot {
 
     /// Clear the slot. Returns the callback (if any) so the caller can
     /// invoke it on the calling thread. The callback is *taken* from
-    /// the wrapper's instance dict (set to `None` there), matching
+    /// the wrapper's traced storage (set to `None` there), matching
     /// CPython, which drops `wr_callback` once it has fired:
     /// `ref.__callback__` reads `None` afterwards
     /// (test_callback_attribute_after_deletion). If the wrapper object
@@ -171,6 +208,13 @@ impl WeakRefSlot {
             return None;
         }
         let inst = self.py_ref.borrow().as_ref().and_then(Weak::upgrade)?;
+        if self.fixed_wrapper {
+            let mut slots = inst.slots.try_borrow_mut().ok()?;
+            let values = slots.values_for_layout_mut(WRAPPER_LAYOUT.get()?)?;
+            let callback = std::mem::replace(values.get_mut(1)?, Object::None);
+            drop(slots);
+            return (!matches!(callback, Object::None)).then_some(callback);
+        }
         let mut d = inst.dict_cell().try_borrow_mut().ok()?;
         match d.get(&StrKey("__callback__")).cloned() {
             None | Some(Object::None) => None,
@@ -182,17 +226,24 @@ impl WeakRefSlot {
     }
 
     /// The live callback, read (non-destructively) from the wrapper's
-    /// instance dict.
+    /// traced storage.
     pub fn callback(&self) -> Option<Object> {
         if !self.has_callback || self.is_dead() {
             return None;
         }
         let inst = self.py_ref.borrow().as_ref().and_then(Weak::upgrade)?;
-        let v = inst
-            .dict_cell()
-            .borrow()
-            .get(&StrKey("__callback__"))
-            .cloned();
+        let v = if self.fixed_wrapper {
+            inst.slots
+                .borrow()
+                .values_for_layout(WRAPPER_LAYOUT.get()?)?
+                .get(1)
+                .cloned()
+        } else {
+            inst.dict_cell()
+                .borrow()
+                .get(&StrKey("__callback__"))
+                .cloned()
+        };
         match v {
             None | Some(Object::None) => None,
             v => v,
