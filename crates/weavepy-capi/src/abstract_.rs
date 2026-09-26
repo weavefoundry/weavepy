@@ -520,9 +520,8 @@ fn foreign_getattr_dispatch(o: *mut PyObject, obj: &Object, key: &str) -> *mut P
 ///
 /// * a `classmethod` binds to the class itself (`BoundMethod(t, func)`),
 /// * a `staticmethod` unwraps to its plain function,
-/// * everything else (plain functions, properties, data) is returned as-is
-///   — on a *type* receiver a bare function is the unbound function and a
-///   property descriptor returns itself, matching CPython.
+/// * other values are returned as-is; `attr_lookup` defers descriptors that
+///   need evaluation to the VM before reaching this helper.
 fn bind_type_attr(t: &weavepy_vm::sync::Rc<weavepy_vm::types::TypeObject>, raw: Object) -> Object {
     match raw {
         Object::ClassMethod(inner) => Object::BoundMethod(weavepy_vm::sync::Rc::new(
@@ -575,6 +574,12 @@ fn attr_lookup(o: &Object, key: &str) -> Option<Object> {
             // extraction of a DataType *class* (RFC 0076 WS5). The VM's
             // `LOAD_ATTR` runs the full metatype protocol; defer to it.
             if matches!(raw, Object::Property(_)) {
+                return None;
+            }
+            // A Python descriptor must evaluate __get__(None, t), just as
+            // a bytecode attribute load does. Returning it raw makes a C
+            // extension call the descriptor instead of its bound result.
+            if matches!(&raw, Object::Instance(inst) if inst.cls().lookup("__get__").is_some()) {
                 return None;
             }
             Some(bind_type_attr(t, raw))
@@ -4144,20 +4149,9 @@ pub unsafe extern "C" fn _PyObject_LookupAttr(
     if o.is_null() || attr.is_null() {
         return -1;
     }
-    let key = match unsafe { crate::object::clone_object(attr) } {
-        Object::Str(s) => s.to_string(),
-        _ => return -1,
-    };
-    let obj = unsafe { crate::object::clone_object(o) };
-    match attr_lookup(&obj, &key) {
-        Some(v) => {
-            if !result.is_null() {
-                unsafe { *result = crate::object::into_owned(v) };
-            }
-            1
-        }
-        None => 0,
-    }
+    // A declined fast lookup can still resolve through a descriptor or
+    // __getattr__. Use the full protocol and suppress only AttributeError.
+    unsafe { crate::wave4::PyObject_GetOptionalAttr(o, attr, result) }
 }
 
 #[no_mangle]
@@ -4172,19 +4166,7 @@ pub unsafe extern "C" fn _PyObject_LookupAttrId(
     if o.is_null() || name.is_null() {
         return -1;
     }
-    let key = unsafe { CStr::from_ptr(name) }
-        .to_string_lossy()
-        .into_owned();
-    let obj = unsafe { crate::object::clone_object(o) };
-    match attr_lookup(&obj, &key) {
-        Some(v) => {
-            if !result.is_null() {
-                unsafe { *result = crate::object::into_owned(v) };
-            }
-            1
-        }
-        None => 0,
-    }
+    unsafe { crate::wave5::PyObject_GetOptionalAttrString(o, name, result) }
 }
 
 #[no_mangle]
