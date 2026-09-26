@@ -100,4 +100,56 @@ for expanded in (False, True):
         assert retained(expected=53) == 53
     gc.collect()
     assert witness() is None
+
+# Warm one zero-argument call site, then change its target and result shape.
+# Cached native entry must agree with generic dispatch after each change.
+def call_zero(callback):
+    return callback()
+
+
+for callback, expected in [([1, 2].__len__, 2), ([3, 5].copy, [3, 5]),
+                           ({'a': 7}.copy, {'a': 7}), ({11}.copy, {11}),
+                           (instance.method, (instance, 17)), (lambda: 13, 13)]:
+    for unused in range(100):
+        assert call_zero(callback) == expected
+
+# Errors must survive both cached native entry and arity deoptimization.
+for callback in ([].pop, [].append):
+    for unused in range(100):
+        try:
+            call_zero(callback)
+        except (IndexError, TypeError):
+            pass
+        else:
+            raise AssertionError('zero-argument native call lost its error')
+
+
+def call_expanded(callback, arguments):
+    return callback(*arguments)
+
+
+for unused in range(100):
+    items = [17, 19]
+    assert call_expanded(items.pop, ()) == 19
+    assert call_expanded(items.pop, (0,)) == 17
+
+# Native mutation still promptly releases referents, including a destructor
+# that reenters the same call site and discards the saved bound method.
+deaths = []
+
+
+class Released:
+    def __del__(self):
+        global clear_saved
+        clear_saved = None
+        deaths.append(call_zero([1, 2, 3].__len__))
+
+
+for unused in range(100):
+    items = [Released()]
+    clear_saved = items.clear
+    call_zero(clear_saved)
+    assert clear_saved is None
+    assert deaths[-1] == 3
+assert deaths == [3] * 100
 print('self-only bound calls preserve binding and lifetime')

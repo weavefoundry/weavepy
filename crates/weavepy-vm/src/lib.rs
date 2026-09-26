@@ -46901,7 +46901,11 @@ impl Interpreter {
         // RFC 0061 (WS3b): stage the operands through a pooled vector
         // (`drain` moves them without the fresh `split_off` allocation);
         // the shared tail hands the emptied vector back to the pool.
-        let mut args: Vec<Object> = self.pooled_scratch();
+        let mut args: Vec<Object> = if argc == 0 {
+            Vec::new()
+        } else {
+            self.pooled_scratch()
+        };
         args.extend(frame.stack.drain(split_at..));
         let callable = frame.pop()?;
         // PEP 669 CALL fires for every `CALL`-family instruction in
@@ -47279,19 +47283,27 @@ impl Interpreter {
                         if let Object::Builtin(b) = &bm.function {
                             if specialize::native_fn_id(b) == func_id && args.len() == argc {
                                 specialize::record_hit(op_idx);
-                                // Stage `receiver, args…` in a pooled
-                                // scratch vector rather than a fresh
-                                // allocation per call (RFC 0077 WS3: this
-                                // was a `malloc`/`free` pair on every
-                                // `xs.append(v)`).
-                                let mut combined = self.pooled_scratch();
-                                combined.push(bm.receiver.clone());
-                                combined.extend(args.iter().cloned());
-                                let r = match b.call_kw.as_ref() {
-                                    Some(ckw) => ckw(&combined, &[]),
-                                    None => (b.call)(&combined),
+                                let r = if args.is_empty() {
+                                    // As in generic bound dispatch, the
+                                    // callable roots its receiver across
+                                    // reentry. A self-only call can borrow
+                                    // it without staging another owner.
+                                    let receiver = std::slice::from_ref(&bm.receiver);
+                                    match b.call_kw.as_ref() {
+                                        Some(ckw) => ckw(receiver, &[]),
+                                        None => (b.call)(receiver),
+                                    }
+                                } else {
+                                    let mut combined = self.pooled_scratch();
+                                    combined.push(bm.receiver.clone());
+                                    combined.extend(args.iter().cloned());
+                                    let r = match b.call_kw.as_ref() {
+                                        Some(ckw) => ckw(&combined, &[]),
+                                        None => (b.call)(&combined),
+                                    };
+                                    self.recycle_scratch(combined);
+                                    r
                                 };
-                                self.recycle_scratch(combined);
                                 frame.push(r?);
                                 took_fast = true;
                             }
