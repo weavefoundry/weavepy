@@ -1,5 +1,10 @@
 # Avoid repeated startup work
 
+The measurements below describe the original change. The later
+[startup admission rollback](PERFORMANCE-STARTUP-JIT-ADMISSION.md) restores
+hot-code compilation during startup after Windows cold-work regressions.
+The single `site` initialization fix remains in place.
+
 Startup imported `site`, which invokes its own `main()`, and then called
 `site.main()` again. This repeated path processing and executed `.pth` import
 lines twice. Startup now relies on the module's normal initialization.

@@ -582,10 +582,10 @@ fn jit_enabled_by_config() -> bool {
     enabled && !crate::gil::free_threading_requested()
 }
 
-/// Whether interpreter start-up (the `site` import and everything it
-/// pulls in) is over. Until then compilation waits: start-up code runs
-/// once, and compiling the few helpers it calls a few dozen times costs
-/// more (time and resident memory) than interpreting them ever could.
+/// Whether interpreter startup (the `site` import and everything it
+/// pulls in) is over. Startup frame/backedge counters use the existing
+/// sixteen-times threshold; naturally hot lean callees can still compile
+/// through `warm_compile`, as they did before explicit startup deferral.
 static STARTUP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -596,7 +596,7 @@ enum CompilationPhase {
 }
 
 thread_local! {
-    /// Explicit startup deferral takes priority over nested import budgets.
+    /// Startup keeps its own admission policy across nested imports.
     static COMPILATION_PHASE: std::cell::Cell<CompilationPhase> =
         const { std::cell::Cell::new(CompilationPhase::Normal) };
 
@@ -641,7 +641,7 @@ pub(crate) struct CompilationGuard {
     _thread: std::marker::PhantomData<*mut ()>,
 }
 
-pub(crate) fn defer_startup_compilation() -> CompilationGuard {
+pub(crate) fn startup_compilation_scope() -> CompilationGuard {
     CompilationGuard {
         previous: COMPILATION_PHASE.with(|phase| phase.replace(CompilationPhase::Startup)),
         _thread: std::marker::PhantomData,
@@ -684,14 +684,13 @@ pub(crate) fn note_startup_finished() {
 /// Whether a code object whose counter reached `counter` against
 /// `threshold` may compile now. Fresh imports and embedders that never
 /// report startup completion require sustained work beyond the normal
-/// threshold. Explicit startup deferral still takes precedence.
+/// threshold. Startup scopes keep this escape hatch and exclude nested
+/// import budgets rather than prohibiting compilation altogether.
 #[inline]
 fn compile_allowed(counter: u32, threshold: u32) -> bool {
     let phase = compilation_phase();
-    phase != CompilationPhase::Startup
-        && ((phase == CompilationPhase::Normal
-            && STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed))
-            || counter >= threshold.saturating_mul(16))
+    (phase == CompilationPhase::Normal && STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed))
+        || counter >= threshold.saturating_mul(16)
 }
 
 /// True when no thread's JIT can be enabled (see [`JIT_PROCESS_GATE`]).
@@ -2856,12 +2855,6 @@ pub(crate) fn note_backedge(code: &Rc<CodeObject>) -> bool {
 /// once the code has been compiled. Called on the lean path's threshold.
 pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::Frame) {
     let phase = compilation_phase();
-    if phase == CompilationPhase::Startup {
-        // Permit a later retry. Leaving the counter at the warm threshold
-        // would permanently bypass compilation on lean and pure-leaf paths.
-        frame.code.jit_hint.defer_lean_compile();
-        return;
-    }
     if frame.code.jit_hint.is_not_jitable() || jit_off_for_process() {
         return;
     }
@@ -2873,7 +2866,9 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
         let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
         let threshold = st.threshold;
         let importing = phase == CompilationPhase::Import;
-        let warm = if STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed) && !importing {
+        let warm = if phase == CompilationPhase::Normal
+            && STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed)
+        {
             threshold
         } else {
             threshold.saturating_mul(16)
@@ -11673,8 +11668,8 @@ mod native_pair_tests {
 #[cfg(test)]
 mod startup_compilation_tests {
     use super::{
-        budget_import_compilation, compile_allowed, defer_startup_compilation,
-        import_compilation_budget,
+        budget_import_compilation, compile_allowed, import_compilation_budget,
+        startup_compilation_scope,
     };
 
     #[test]
@@ -11699,14 +11694,16 @@ mod startup_compilation_tests {
             assert!(caught.is_err());
             assert!(import_compilation_budget());
             {
-                let _startup = defer_startup_compilation();
+                let _startup = startup_compilation_scope();
                 assert!(!import_compilation_budget());
                 {
                     let _nested_import = budget_import_compilation();
                     assert!(!import_compilation_budget());
-                    assert!(!compile_allowed(u32::MAX, 1));
+                    assert!(!compile_allowed(15, 1));
+                    assert!(compile_allowed(16, 1));
                 }
-                assert!(!compile_allowed(u32::MAX, 1));
+                assert!(!compile_allowed(15, 1));
+                assert!(compile_allowed(16, 1));
             }
             assert!(import_compilation_budget());
         }
@@ -11714,22 +11711,26 @@ mod startup_compilation_tests {
     }
 
     #[test]
-    fn explicit_startup_deferral_is_nested_and_unwinds() {
+    fn startup_admission_is_nested_and_unwinds() {
         assert!(compile_allowed(u32::MAX, 1));
         {
-            let _outer = defer_startup_compilation();
-            assert!(!compile_allowed(u32::MAX, 1));
+            let _outer = startup_compilation_scope();
+            assert!(!compile_allowed(15, 1));
+            assert!(compile_allowed(16, 1));
             {
-                let _inner = defer_startup_compilation();
-                assert!(!compile_allowed(u32::MAX, 1));
+                let _inner = startup_compilation_scope();
+                assert!(!compile_allowed(15, 1));
+                assert!(compile_allowed(16, 1));
             }
-            assert!(!compile_allowed(u32::MAX, 1));
+            assert!(!compile_allowed(15, 1));
+            assert!(compile_allowed(16, 1));
             let caught = std::panic::catch_unwind(|| {
-                let _inner = defer_startup_compilation();
+                let _inner = startup_compilation_scope();
                 panic!("startup failure");
             });
             assert!(caught.is_err());
-            assert!(!compile_allowed(u32::MAX, 1));
+            assert!(!compile_allowed(15, 1));
+            assert!(compile_allowed(16, 1));
         }
         assert!(compile_allowed(u32::MAX, 1));
     }

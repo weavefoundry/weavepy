@@ -1,5 +1,10 @@
 # Import compilation performance
 
+The measurements below describe the original change. The later
+[startup admission rollback](PERFORMANCE-STARTUP-JIT-ADMISSION.md) restores
+hot-code compilation during startup. Startup still takes precedence over
+nested import budgets, and the post-startup import policy below remains.
+
 Fresh module execution now requires more evidence of sustained work before JIT
 compilation. A thread-local phase distinguishes normal execution, imports, and
 explicit startup deferral. Nested scopes restore their predecessor, including

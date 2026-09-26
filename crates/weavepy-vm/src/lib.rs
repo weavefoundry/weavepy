@@ -1782,7 +1782,7 @@ impl Interpreter {
     }
 
     /// Report that interpreter start-up is over: user code runs next
-    /// (the JIT defers compilation until then).
+    /// (the JIT then uses its normal counter thresholds).
     pub fn note_startup_finished(&self) {
         #[cfg(feature = "jit")]
         crate::tier2::note_startup_finished();
@@ -1796,7 +1796,7 @@ impl Interpreter {
     /// Startup import errors retain their best-effort handling.
     pub fn run_site(&mut self) -> Result<(), RuntimeError> {
         #[cfg(feature = "jit")]
-        let _compile_guard = crate::tier2::defer_startup_compilation();
+        let _compile_guard = crate::tier2::startup_compilation_scope();
         // Startup runs bytecode too (site/.pth imports can allocate enough
         // to trip an auto-collection), so engage the GIL here just as
         // `run_module_as` does for the program body. The process is
@@ -63692,7 +63692,7 @@ refill(second, 23, 3)
 
     #[cfg(feature = "jit")]
     #[test]
-    fn jit_startup_defers_hot_code_then_compiles_the_same_functions() {
+    fn jit_startup_admits_hot_code_and_preserves_compiled_functions() {
         std::thread::spawn(|| {
             crate::tier2::force_enable_for_test(2);
             let module = parse_module(
@@ -63729,24 +63729,22 @@ assert loop(2000) == 1999000
             };
             let before;
             {
-                let _outer = crate::tier2::defer_startup_compilation();
+                let _outer = crate::tier2::startup_compilation_scope();
                 {
-                    let _inner = crate::tier2::defer_startup_compilation();
+                    let _inner = crate::tier2::startup_compilation_scope();
                     interp.run_module(&code).expect("nested startup");
                 }
                 interp.run_module(&code).expect("outer startup");
                 before = functions(&interp);
-                assert_eq!(crate::tier2::stats_for_test().0, 0);
-                assert!(before
-                    .iter()
-                    .all(|code| !crate::tier2::code_compiled_for_test(code)));
+                assert!(crate::tier2::stats_for_test().0 >= 2);
+                assert!(before.iter().all(crate::tier2::code_compiled_for_test));
             }
             interp.run_module(&code).expect("user code after startup");
             for (old, new) in before.iter().zip(functions(&interp)) {
-                assert!(Rc::ptr_eq(old, &new), "the deferred code must be reused");
+                assert!(Rc::ptr_eq(old, &new), "startup code must be reused");
                 assert!(
                     crate::tier2::code_compiled_for_test(&new),
-                    "deferred function must compile later"
+                    "startup function must stay compiled"
                 );
             }
         })
