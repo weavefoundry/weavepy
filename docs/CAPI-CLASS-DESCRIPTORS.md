@@ -73,3 +73,20 @@ The native SQLAlchemy wheel is unchanged from the
 Sources, package inputs, test logs, and measurements remain under
 `target/performance/capi-class-descriptor-investigation/`, with the frozen
 binary at `target/performance/weavepy-capi-class-descriptors`.
+
+## Portable integration test follow-up
+
+Windows CI for `b1c903d` failed before the new regression reached any
+descriptor assertions: importing `ctypes` requires `_ctypes.COMError`,
+which WeavePy doesn't yet provide on Windows. The Rust integration test
+now initializes the embedded interpreter and calls the C attribute APIs
+directly. It checks inherited descriptor owners, callable results,
+descriptor mutation, error values, optional missing results, and owned
+references. It also exercises both private lookup helpers and their
+existing presence-only behavior. The independent Python/CPython fixture
+remains unchanged.
+
+The direct integration test and its Clippy check pass locally. Windows
+execution remains pending CI; this test-only change doesn't implement
+Windows COM support or change the runtime measured above. Its logs are
+under `target/performance/capi-direct-descriptor-test/`.
