@@ -8,12 +8,14 @@
 
 mod lru_order;
 
+use indexmap::map::RawEntryApiV1;
+
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
 use crate::error::{type_error, RuntimeError};
 use crate::import::ModuleCache;
-use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
+use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule, StrKey};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::default()));
@@ -262,10 +264,7 @@ fn lru_self(args: &[Object]) -> Result<Rc<crate::types::PyInstance>, RuntimeErro
 }
 
 fn lru_get(inst: &crate::types::PyInstance, name: &'static str) -> Option<Object> {
-    inst.dict_cell()
-        .borrow()
-        .get(&DictKey(Object::from_static(name)))
-        .cloned()
+    inst.dict_cell().borrow().get(&StrKey(name)).cloned()
 }
 
 fn lru_set(inst: &crate::types::PyInstance, name: &'static str, v: Object) {
@@ -340,9 +339,10 @@ fn lru_counter_bump(inst: &crate::types::PyInstance, name: &'static str) {
     // Keep the read and increment under one lock. Separate get/set borrows
     // lose updates when multiple threads hit a shared cache under gil=0.
     let mut dict = inst.dict_cell().borrow_mut();
-    let count = dict
-        .entry(DictKey(Object::from_static(name)))
-        .or_insert(Object::Int(0));
+    let (_, count) = dict
+        .raw_entry_mut_v1()
+        .from_key(&StrKey(name))
+        .or_insert_with(|| (DictKey(Object::from_static(name)), Object::Int(0)));
     match count {
         Object::Int(n) => *n += 1,
         _ => *count = Object::Int(1),
@@ -424,9 +424,15 @@ fn scalar_lru_links(
     scalar: bool,
 ) -> Result<Option<Rc<RefCell<Vec<u8>>>>, RuntimeError> {
     let mut dict = inst.dict_cell().borrow_mut();
-    let state = dict
-        .entry(DictKey(Object::from_static("_lru_state")))
-        .or_insert(Object::Bool(false));
+    let (_, state) = dict
+        .raw_entry_mut_v1()
+        .from_key(&StrKey("_lru_state"))
+        .or_insert_with(|| {
+            (
+                DictKey(Object::from_static("_lru_state")),
+                Object::Bool(false),
+            )
+        });
     // True remains a typed cache; false is an uninitialized untyped cache.
     // None permanently disables scalar mode, and a bytearray owns the links.
     if matches!(state, Object::Bool(false)) {
