@@ -13635,7 +13635,7 @@ fn apply_set_inplace_op(s: &mut crate::object::SetData, op: SetInplaceOp) {
             s.insert(k);
         }
         SetInplaceOp::Discard(k) => {
-            if let Some(removed) = s.shift_take(&k) {
+            if let Some(removed) = s.swap_take(&k) {
                 queue_removed(removed.0);
             }
         }
@@ -13767,7 +13767,7 @@ fn set_remove(args: &[Object]) -> Result<Object, RuntimeError> {
     let key = set_membership_key(&v)?;
     match set_self(args)? {
         Object::Set(s) => {
-            let removed = crate::object::key_cmp_scope(|| s.borrow_mut().shift_remove(&key))?;
+            let removed = crate::object::key_cmp_scope(|| s.borrow_mut().swap_remove(&key))?;
             if removed {
                 Ok(Object::None)
             } else {
@@ -13785,12 +13785,11 @@ fn set_remove(args: &[Object]) -> Result<Object, RuntimeError> {
 fn set_pop(args: &[Object]) -> Result<Object, RuntimeError> {
     match set_self(args)? {
         Object::Set(s) => {
-            let key = s.borrow().iter().next().cloned();
-            match key {
-                Some(k) => {
-                    s.borrow_mut().shift_remove(&k);
-                    Ok(k.0)
-                }
+            // Sets have no insertion-order contract. Taking the last stored
+            // entry avoids both shifting the remaining keys and hashing it again.
+            let popped = s.borrow_mut().pop();
+            match popped {
+                Some(k) => Ok(k.0),
                 None => Err(key_error("pop from an empty set")),
             }
         }
@@ -13977,7 +13976,7 @@ fn set_difference_update(args: &[Object]) -> Result<Object, RuntimeError> {
         let mut keep: crate::object::SetData = s.borrow().clone();
         for other in args.iter().skip(1) {
             for k in set_iter_items(other)? {
-                keep.shift_remove(&k);
+                keep.swap_remove(&k);
             }
         }
         *s.borrow_mut() = keep;
