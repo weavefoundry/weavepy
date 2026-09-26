@@ -1781,10 +1781,6 @@ impl Interpreter {
         }
     }
 
-    /// Run the `site` module on first interpreter start, mirroring
-    /// CPython's bootstrap. We `import site` if available, then call
-    /// `site.main()`. Errors are intentionally swallowed — a broken
-    /// `.pth` file shouldn't kill the whole interpreter.
     /// Report that interpreter start-up is over: user code runs next
     /// (the JIT defers compilation until then).
     pub fn note_startup_finished(&self) {
@@ -1795,7 +1791,12 @@ impl Interpreter {
         gc_trace::rebuild_tracked_filter();
     }
 
+    /// Import `site` during startup. The module calls `main()` itself unless
+    /// `-S` is active; another explicit call would repeat `.pth` processing.
+    /// Startup import errors retain their best-effort handling.
     pub fn run_site(&mut self) -> Result<(), RuntimeError> {
+        #[cfg(feature = "jit")]
+        let _compile_guard = crate::tier2::defer_startup_compilation();
         // Startup runs bytecode too (site/.pth imports can allocate enough
         // to trip an auto-collection), so engage the GIL here just as
         // `run_module_as` does for the program body. The process is
@@ -1825,21 +1826,7 @@ impl Interpreter {
         // them — breaking every namedtuple built during bootstrap.
         let _interp_guard =
             crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
-        let site = match self.import_path("site") {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
-        };
-        if let Object::Module(m) = site {
-            let main_fn = m
-                .dict
-                .borrow()
-                .get(&crate::object::DictKey(Object::from_static("main")))
-                .cloned();
-            if let Some(main_fn) = main_fn {
-                let globals = m.dict.clone();
-                let _ = self.call(&main_fn, &[], &[], &globals);
-            }
-        }
+        let _ = self.import_path("site");
         Ok(())
     }
 
@@ -4245,7 +4232,12 @@ impl Interpreter {
             // (test_sys_setprofile.test_unfinished_generator,
             // test_sys_settrace.test_13_genexp).
             for obj in pending {
-                self.invoke_finalizer(&obj);
+                if !self.invoke_finalizer(&obj) {
+                    // Another request claimed this allocation. Its dispatch
+                    // owns completion, including while it runs on another
+                    // thread or reenters this drain from Python.
+                    continue;
+                }
                 finalizers_run += 1;
                 // The finalizer has now run to completion: mark the object
                 // finalized and clear its deferral flag so the next collection
@@ -4669,7 +4661,20 @@ impl Interpreter {
         }
     }
 
-    fn invoke_finalizer(&mut self, obj: &Object) {
+    /// Claim this allocation before running any finalizer code. Independent
+    /// prompt, collector, and shutdown requests may refer to the same object.
+    /// Only the winning request may publish finalizer completion.
+    fn invoke_finalizer(&mut self, obj: &Object) -> bool {
+        let finalize_ran = match obj {
+            Object::Instance(inst) => &inst.finalize_ran,
+            Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
+                &g.finalize_ran
+            }
+            _ => return false,
+        };
+        if finalize_ran.replace(true) {
+            return false;
+        }
         // A coroutine that was created but never driven: CPython's
         // `_PyGen_Finalize` emits the "was never awaited"
         // RuntimeWarning instead of closing. With warnings-as-errors
@@ -4680,15 +4685,8 @@ impl Interpreter {
                 *g.state.borrow_mut() = GeneratorState::Finished;
                 let qualname = g.qualname.borrow().to_str();
                 self.warn_unawaited_coroutine(obj, &qualname);
-                return;
+                return true;
             }
-        }
-        // Mark "finalize ran" first (CPython sets the GC FINALIZED bit
-        // before tp_finalize): whatever happens below runs at most
-        // once; a generator left suspended by its finalizer will not
-        // be resurrected and re-finalized on its next drop.
-        if let Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) = obj {
-            g.finalize_ran.set(true);
         }
         // PEP 525: an async generator whose firstiter hook captured a
         // finalizer routes finalization through that hook (CPython
@@ -4701,7 +4699,7 @@ impl Interpreter {
                 if let Err(err) = self.call(&finalizer, &[obj.clone()], &[], &globals) {
                     self.write_unraisable_fmt(&err, "finalizing generator", obj);
                 }
-                return;
+                return true;
             }
         }
         // A generator/coroutine dropped while suspended: deliver
@@ -4715,17 +4713,13 @@ impl Interpreter {
             if let Err(err) = self.gen_method_close(obj) {
                 self.write_unraisable_fmt(&err, "closing generator", obj);
             }
-            return;
+            return true;
         }
         let Object::Instance(inst) = obj else {
-            return;
+            return true;
         };
-        // Claim the one-shot finalizer (CPython's `_PyGC_FINALIZED` bit)
-        // before dispatch, so [`crate::types::PyInstance`]'s `Drop` net never
-        // re-resurrects an instance whose `__del__` already ran here.
-        inst.finalize_ran.set(true);
         let Some(del) = inst.cls().lookup("__del__") else {
-            return;
+            return true;
         };
         let bound = Object::BoundMethod(Rc::new(BoundMethod::new(obj.clone(), del.clone())));
         let kwargs: Vec<(String, Object)> = Vec::new();
@@ -4737,6 +4731,7 @@ impl Interpreter {
             // a `None` hook object (test_generators' Leaker doctest).
             self.write_unraisable_fmt(&err, "calling deallocator", &del);
         }
+        true
     }
 
     /// Route an out-of-band exception (raised by a `__del__` finalizer,
@@ -9721,9 +9716,11 @@ impl Interpreter {
         let Some(Object::Generator(g)) = frame.stack.last() else {
             return None;
         };
+        // Validate and take the frame under one borrow. No Python runs
+        // while it is held; release it before resuming the activation.
+        let mut state = g.state.try_borrow_mut().ok()?;
         let first_resume;
         {
-            let state = g.state.try_borrow().ok()?;
             let boxed = match &*state {
                 GeneratorState::Suspended(boxed) => {
                     first_resume = false;
@@ -9753,8 +9750,9 @@ impl Interpreter {
             return None;
         };
         // Committed.
+        let prev_state = std::mem::replace(&mut *state, GeneratorState::Running);
+        drop(state);
         let g = g.clone();
-        let prev_state = std::mem::replace(&mut *g.state.borrow_mut(), GeneratorState::Running);
         let (GeneratorState::Suspended(mut boxed) | GeneratorState::Created(mut boxed)) =
             prev_state
         else {
@@ -11756,6 +11754,21 @@ impl Interpreter {
                                             }
                                         }
                                         if next.op == OpCode::LoadAttr {
+                                            if code
+                                                .instructions
+                                                .get(pc + 2)
+                                                .is_some_and(|ins| ins.op == OpCode::LoadAttr)
+                                            {
+                                                if let Some((v, end)) =
+                                                    Self::core_local_attr_chain(code, other, pc + 1)
+                                                {
+                                                    base.add(len).write(v);
+                                                    len += 1;
+                                                    last = end;
+                                                    pc = end + 1;
+                                                    continue;
+                                                }
+                                            }
                                             if let Some(v) =
                                                 Self::core_local_attr(code, other, pc + 1, next.arg)
                                             {
@@ -12806,6 +12819,27 @@ impl Interpreter {
                                     }
                                 }
                             }
+                            Object::BoundMethod(bm)
+                                if argc == 0 && matches!(&bm.function, Object::Builtin(_)) =>
+                            {
+                                if let Some(slot) = mslots.get(pc) {
+                                    if slot.is_non_leaf(bm) {
+                                        // A prior body/receiver rejection still
+                                        // applies to this immutable bound method.
+                                        // Leave every operand for full dispatch.
+                                        #[cfg(test)]
+                                        SAVED_NATIVE_REJECTED_CALLS
+                                            .with(|calls| calls.set(calls.get() + 1));
+                                        break Some(CoreExit::Stop(LeafStop::Step));
+                                    }
+                                    if matches!(&bm.function, Object::Builtin(b)
+                                        if slot.get_leaf(b).is_some())
+                                    {
+                                        break Some(CoreExit::Helper);
+                                    }
+                                }
+                                break None;
+                            }
                             // A leaf builtin or directly constructible type: out
                             // of line.
                             Object::Builtin(_) | Object::Type(_) => break Some(CoreExit::Helper),
@@ -13502,7 +13536,14 @@ impl Interpreter {
             Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None | Object::Str(_) => {
                 true
             }
-            Object::Instance(i) => Rc::strong_count(i) > 1 && !gc_trace::note_dropped_marks(v),
+            Object::Instance(i) => {
+                // Deferred tracking is an exact proof that the collector
+                // and weakref registry hold no owner. A stale Bloom-filter
+                // hit must not reject this nonfinal release. The last
+                // owner still takes ordinary teardown, and every store or
+                // weakref operation that requires tracking revokes the flag.
+                Rc::strong_count(i) > 1 && (i.is_gc_deferred() || !gc_trace::note_dropped_marks(v))
+            }
             Object::List(l) => Rc::strong_count(l) > 1 && !gc_trace::note_dropped_marks(v),
             Object::Dict(d) => Rc::strong_count(d) > 1 && !gc_trace::note_dropped_marks(v),
             Object::Tuple(t) => ThinArc::strong_count(t) > 1 && !gc_trace::note_dropped_marks(v),
@@ -13688,7 +13729,7 @@ impl Interpreter {
         lbase: *const Object,
         nlocals: usize,
         consts: &[Object],
-        scratch: &mut [Object; 8],
+        scratch: &mut [std::mem::MaybeUninit<Object>; 8],
         args: &mut [*const Object; 8],
         first: usize,
     ) -> Option<(usize, usize)> {
@@ -13718,8 +13759,10 @@ impl Interpreter {
                     if n == 8 {
                         return None;
                     }
-                    scratch[n] = Object::Int(i64::from(ins.arg));
-                    args[n] = &raw const scratch[n];
+                    // Initialize only the scalar slot this argument uses.
+                    // Its pointer never precedes the write, and the buffer
+                    // owns nothing that needs teardown on a later miss.
+                    args[n] = scratch[n].write(Object::Int(i64::from(ins.arg)));
                 }
                 OpCode::Call if ins.arg as usize == n - first => return Some((n - first, pc)),
                 _ => return None,
@@ -13776,7 +13819,7 @@ impl Interpreter {
         for (k, o) in f.defaults[f.defaults.len() - missing..].iter().enumerate() {
             args[nargs + k] = o;
         }
-        self.pure_leaf_eval(code_rc, f, &args[..total])
+        self.pure_leaf_eval::<false>(code_rc, f, &args[..total])
     }
 
     /// The core loop's fused `LOAD_FAST x; LOAD_ATTR m (method); <simple
@@ -13809,7 +13852,7 @@ impl Interpreter {
         }
         let fp = mslots.get(attr_pc)?.peek_fn(cls.attr_version.get())?;
         // Scalars only (small ints): nothing to drop on the way out.
-        let mut scratch = std::mem::ManuallyDrop::new([const { Object::None }; 8]);
+        let mut scratch = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
         let mut args: [*const Object; 8] = [std::ptr::null(); 8];
         args[0] = recv;
         // SAFETY: the core loop's own locals and constants.
@@ -13838,6 +13881,8 @@ impl Interpreter {
         }
         let r =
             self.core_pure_fused_eval(code, fp, call_pc, true, &mut args, nargs + 1, depth_cell)?;
+        #[cfg(test)]
+        note_literal_argument_call(code, attr_pc + 1, call_pc, true);
         Some((r, call_pc))
     }
 
@@ -13859,7 +13904,7 @@ impl Interpreter {
         depth_cell: *const std::cell::Cell<usize>,
     ) -> Option<(Object, usize)> {
         // Scalars only (small ints): nothing to drop on the way out.
-        let mut scratch = std::mem::ManuallyDrop::new([const { Object::None }; 8]);
+        let mut scratch = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
         let mut args: [*const Object; 8] = [std::ptr::null(); 8];
         // SAFETY: the core loop's own locals and constants.
         let (nargs, call_pc) = unsafe {
@@ -13876,6 +13921,8 @@ impl Interpreter {
         }?;
         let r =
             self.core_pure_fused_eval(code, fp, call_pc, false, &mut args, nargs, depth_cell)?;
+        #[cfg(test)]
+        note_literal_argument_call(code, args_pc, call_pc, false);
         Some((r, call_pc))
     }
 
@@ -13900,11 +13947,17 @@ impl Interpreter {
         // `PyFunction::code`); only compared and borrowed below, while the
         // caller's stack keeps the function alive.
         let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        #[cfg(test)]
+        note_predicate_stage(code_rc, 0);
         if !code_is_pure_leaf(code_rc) || !pure_leaf_warm(code_rc) {
             return None;
         }
+        #[cfg(test)]
+        note_predicate_stage(code_rc, 1);
         let slot = code_call_slot(code, pc)?;
         let (missing, slot_self) = slot.hit(Rc::as_ptr(f), Rc::as_ptr(code_rc))?;
+        #[cfg(test)]
+        note_predicate_stage(code_rc, 2);
         let has_self = !matches!(ops.get(1)?, Object::Unbound);
         if slot_self != has_self || !Self::lean_code_ok(code_rc) {
             return None;
@@ -13921,12 +13974,49 @@ impl Interpreter {
         if unsafe { (*depth_cell).get() } >= crate::recursion::recursion_limit() {
             return None;
         }
+        #[cfg(test)]
+        {
+            note_predicate_stage(code_rc, 3);
+            if code_vm_ext(code_rc)
+                .is_some_and(|ext| ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) == 7)
+            {
+                for operand in ops {
+                    if matches!(operand, Object::Unbound) || Self::core_droppable(operand) {
+                        continue;
+                    }
+                    let index = match operand {
+                        Object::Function(_) => 0,
+                        Object::Instance(_) => 1,
+                        Object::List(_) | Object::Dict(_) | Object::Tuple(_) => 2,
+                        _ => 3,
+                    };
+                    PURE_PREDICATE_DROP_MISSES.with(|counts| {
+                        let mut values = counts.get();
+                        if values[index] == 0 {
+                            if let Object::Instance(instance) = operand {
+                                let id = Rc::as_ptr(instance) as usize as u64;
+                                eprintln!("First predicate instance drop miss: owners={}, deferred={}, maybe_tracked={}, tracked={}, weakrefs={}, weak_clones={}",
+                                    Rc::strong_count(instance), instance.is_gc_deferred(),
+                                    gc_trace::maybe_tracked(id), gc_trace::is_tracked(id),
+                                    crate::weakref_registry::may_have_weakrefs(id),
+                                    crate::weakref_registry::strong_clone_count(id));
+                            }
+                        }
+                        values[index] += 1;
+                        counts.set(values);
+                    });
+                    break;
+                }
+            }
+        }
         if !ops
             .iter()
             .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
         {
             return None;
         }
+        #[cfg(test)]
+        note_predicate_stage(code_rc, 4);
         let first = if has_self { 1 } else { 2 };
         let nargs = ops.len() - first;
         let total = nargs + missing;
@@ -13940,7 +14030,7 @@ impl Interpreter {
         for (k, o) in f.defaults[f.defaults.len() - missing..].iter().enumerate() {
             args[nargs + k] = o;
         }
-        self.pure_leaf_eval(code_rc, f, &args[..total])
+        self.pure_leaf_eval::<false>(code_rc, f, &args[..total])
     }
 
     /// [`Self::core_pure_call`] for a `CALL_KW` at `pc`: `ops` is the
@@ -14019,7 +14109,62 @@ impl Interpreter {
                     .get(f.defaults.len().checked_sub(total - slot)?)?;
             }
         }
-        self.pure_leaf_eval(code_rc, f, &args[..total])
+        self.pure_leaf_eval::<false>(code_rc, f, &args[..total])
+    }
+
+    /// Borrow a guarded instance-dictionary or slot cache hit.
+    ///
+    /// # Safety
+    ///
+    /// The receiver must stay rooted, and the returned reference must not
+    /// cross Python execution, mutation, or owner release. `peek` rejects
+    /// shared storage and conflicting mutable borrows.
+    #[inline(always)]
+    unsafe fn leaf_cached_instance_field<'a>(
+        code: &CodeObject,
+        inst: &'a PyInstance,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Option<&'a Object> {
+        use weavepy_compiler::InlineCache as IC;
+        let (key_idx, cached, is_slot) = match code.caches.get(cache_pc) {
+            IC::LoadAttrInstance { key_idx, ver } => (key_idx, ver, false),
+            IC::LoadAttrSlot { key_idx, ver } => (key_idx, ver, true),
+            _ => return None,
+        };
+        let cls = inst.cls_raw();
+        if cls.native_kind.get() != 0 || cls.attr_version.get() != cached {
+            return None;
+        }
+        if !is_slot {
+            // SAFETY: the caller keeps this rooted read callback-free.
+            let dict = unsafe { inst.dict.get()?.peek() }?;
+            let (key, value) = dict.get_index(key_idx as usize)?;
+            slot_name_matches(code, name_idx, key).then_some(value)
+        } else {
+            // SAFETY: the same rooted read as the dictionary path.
+            let slots = unsafe { inst.slots.peek() }?;
+            let indexed = slots
+                .get_index(key_idx as usize)
+                .filter(|(key, _)| slot_name_matches(code, name_idx, key))
+                .map(|(_, value)| value);
+            // Slot order can vary by instance or after deletion.
+            let value = indexed.or_else(|| slots.get(code.names.get(name_idx as usize)?))?;
+            #[cfg(test)]
+            PURE_SLOT_FIELD_READS.with(|hits| {
+                let mut counts = hits.get();
+                let shape = code_vm_ext(code)
+                    .map(|ext| ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed));
+                let index = match shape {
+                    Some(6) => 0,
+                    Some(7) => 1,
+                    _ => 2,
+                };
+                counts[index] += 1;
+                hits.set(counts);
+            });
+            Some(value)
+        }
     }
 
     /// Evaluate a pure leaf's body (see [`code_is_pure_leaf`]) on borrowed
@@ -14031,7 +14176,7 @@ impl Interpreter {
     /// abandons the evaluation with `None`, having done nothing
     /// observable.
     #[inline(never)]
-    fn pure_leaf_eval(
+    fn pure_leaf_eval<const GETTER: bool>(
         &self,
         code: &CodeObject,
         f: &crate::object::PyFunction,
@@ -14076,10 +14221,124 @@ impl Interpreter {
                 },
             })
         }
+        // Both the decoded field shape and the general evaluator use
+        // the same callback-free comparison rules. NaNs and unsupported
+        // operands still fall back to the interpreter.
+        #[inline(always)]
+        fn compare(a: V, b: V, kind: CompareKind) -> Option<bool> {
+            const EXACT: u64 = 1 << 53;
+            let ord = match (a, b) {
+                (V::I(x), V::I(y)) => x.cmp(&y),
+                (V::F(x), V::F(y)) => x.partial_cmp(&y)?,
+                (V::I(x), V::F(y)) if x.unsigned_abs() < EXACT => (x as f64).partial_cmp(&y)?,
+                (V::F(x), V::I(y)) if y.unsigned_abs() < EXACT => x.partial_cmp(&(y as f64))?,
+                (V::B(x), V::B(y)) => x.cmp(&y),
+                (V::B(x), V::I(y)) => i64::from(x).cmp(&y),
+                (V::I(x), V::B(y)) => x.cmp(&i64::from(y)),
+                (V::N, V::N) if matches!(kind, CompareKind::Eq | CompareKind::NotEq) => {
+                    std::cmp::Ordering::Equal
+                }
+                // SAFETY: these pointers name values owned by live
+                // arguments or the evaluator's scratch; no Python runs.
+                (V::R(p), V::R(q)) => match (unsafe { &*p }, unsafe { &*q }) {
+                    (Object::Str(s), Object::Str(t)) => (**s).cmp(&**t),
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            Some(match kind {
+                CompareKind::Lt => ord.is_lt(),
+                CompareKind::LtE => ord.is_le(),
+                CompareKind::Eq => ord.is_eq(),
+                CompareKind::NotEq => ord.is_ne(),
+                CompareKind::Gt => ord.is_gt(),
+                CompareKind::GtE => ord.is_ge(),
+            })
+        }
         let ext = code_vm_ext(code)?;
         let consts: &[Object] = &ext.objects;
         let stamps: &[StampSlot] = ext.stamp_slots.get().map_or(&[], |s| &s[..]);
         let instrs = &code.instructions;
+        // Tiny return bodies need no operand stack or owned-value scratch.
+        // The shape is certified once, alongside the pure-leaf decision;
+        // call, observer, and recursion guards still belong to the caller.
+        let shape = ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed);
+        if shape >= 3 {
+            let start = usize::from(instrs.first()?.op == OpCode::Resume);
+            let load = instrs.get(start)?;
+            match shape {
+                3 => {
+                    // SAFETY: the argument remains live for this evaluation.
+                    return Some(clone_hot(unsafe { &**args.get(load.arg as usize)? }));
+                }
+                4 => return Some(clone_hot(consts.get(load.arg as usize)?)),
+                5 => return Some(Object::Int(i64::from(load.arg))),
+                6 => {
+                    // SAFETY: as for the argument-return case above.
+                    let recv = unsafe { &**args.get(load.arg as usize)? };
+                    if let Object::Instance(inst) = recv {
+                        let pc = start + 1;
+                        let attr = instrs.get(pc)?;
+                        // SAFETY: the argument roots the receiver until the
+                        // result is retained; nothing here invokes Python.
+                        if let Some(value) = unsafe {
+                            Self::leaf_cached_instance_field(code, inst, pc as u32, attr.arg)
+                        } {
+                            return Some(clone_hot(value));
+                        }
+                        return Self::leaf_attr_resolve_site(code, inst, recv, pc as u32, attr.arg);
+                    }
+                }
+                7 => {
+                    #[cfg(test)]
+                    note_predicate_stage(code, 5);
+                    // Cached field comparisons need neither the general
+                    // leaf stack nor its owned-result scratch.
+                    let cached_field = |load_pc: usize| -> Option<V> {
+                        let pc = load_pc + 1;
+                        let load = instrs.get(load_pc)?;
+                        // SAFETY: arguments root both field values for this
+                        // callback-free evaluation, with no owner releases.
+                        let Object::Instance(inst) = (unsafe { &**args.get(load.arg as usize)? })
+                        else {
+                            return None;
+                        };
+                        let attr = instrs.get(pc)?;
+                        // SAFETY: the same rooted, callback-free read.
+                        let value = unsafe {
+                            Self::leaf_cached_instance_field(code, inst, pc as u32, attr.arg)
+                        }?;
+                        #[cfg(test)]
+                        note_predicate_stage(code, if load_pc == start { 6 } else { 7 });
+                        Some(norm(std::ptr::from_ref(value)))
+                    };
+                    let compare_fields = || {
+                        let a = cached_field(start)?;
+                        let b = cached_field(start + 2)?;
+                        let kind = match instrs.get(start + 4)?.arg & !COMPARE_OP_TO_BOOL_FLAG {
+                            x if x == CompareKind::Lt as u32 => CompareKind::Lt,
+                            x if x == CompareKind::LtE as u32 => CompareKind::LtE,
+                            x if x == CompareKind::Eq as u32 => CompareKind::Eq,
+                            x if x == CompareKind::NotEq as u32 => CompareKind::NotEq,
+                            x if x == CompareKind::Gt as u32 => CompareKind::Gt,
+                            x if x == CompareKind::GtE as u32 => CompareKind::GtE,
+                            _ => return None,
+                        };
+                        compare(a, b, kind).map(Object::Bool)
+                    };
+                    if let Some(result) = compare_fields() {
+                        #[cfg(test)]
+                        note_predicate_stage(code, 8);
+                        #[cfg(test)]
+                        PURE_CACHED_FIELD_PREDICATES.with(|hits| hits.set(hits.get() + 1));
+                        return Some(result);
+                    }
+                    // Preserve the existing general leaf evaluator on a
+                    // shape miss, including its slot and polymorphic reads.
+                }
+                _ => {}
+            }
+        }
         let mut st = [V::N; 8];
         let mut sp = 0usize;
         // Values a leaf path hands back owned (a polymorphic or class
@@ -14189,21 +14448,15 @@ impl Interpreter {
                     let v = match recv {
                         Object::Instance(inst) => {
                             let cls = inst.cls_raw();
-                            let hit = match code.caches.get(pc as u32) {
-                                IC::LoadAttrInstance { key_idx, ver }
-                                    if cls.attr_version.get() == ver
-                                        && cls.native_kind.get() == 0 =>
-                                {
-                                    // SAFETY: a read with nothing running.
-                                    inst.dict
-                                        .get()
-                                        .and_then(|d| unsafe { d.peek() })
-                                        .and_then(|d| d.get_index(key_idx as usize))
-                                        .filter(|(k, _)| slot_name_matches(code, ins.arg, k))
-                                        .map(|(_, v)| std::ptr::from_ref(v))
-                                }
-                                _ => None,
-                            };
+                            if GETTER && cls.native_kind.get() != 0 {
+                                return None;
+                            }
+                            // SAFETY: the receiver remains rooted by an
+                            // argument or owned scratch; no Python runs.
+                            let hit = unsafe {
+                                Self::leaf_cached_instance_field(code, inst, pc as u32, ins.arg)
+                            }
+                            .map(std::ptr::from_ref);
                             match hit {
                                 Some(v) => norm(v),
                                 // A stale or absent site cache resolves
@@ -14216,6 +14469,9 @@ impl Interpreter {
                             }
                         }
                         Object::Type(cls) => {
+                            if GETTER && !Self::plain_metaclass(cls) {
+                                return None;
+                            }
                             match stamps.get(pc).and_then(|s| class_attr_hit(s, cls)) {
                                 Some(v) => own(v)?,
                                 None => {
@@ -14223,7 +14479,13 @@ impl Interpreter {
                                 }
                             }
                         }
-                        Object::Module(_) => {
+                        Object::Module(module) => {
+                            if GETTER
+                                && (crate::object::module_class(module).is_some()
+                                    || code.names.get(ins.arg as usize)?.starts_with("__"))
+                            {
+                                return None;
+                            }
                             own(Self::leaf_load_attr_recv(code, recv, pc as u32, ins.arg)?)?
                         }
                         _ => return None,
@@ -14236,37 +14498,7 @@ impl Interpreter {
                     // SAFETY: as in `compare_op_step`.
                     let kind: CompareKind =
                         unsafe { std::mem::transmute((ins.arg & !COMPARE_OP_TO_BOOL_FLAG) as u8) };
-                    const EXACT: u64 = 1 << 53;
-                    let ord = match (a, b) {
-                        (V::I(x), V::I(y)) => x.cmp(&y),
-                        (V::F(x), V::F(y)) => x.partial_cmp(&y)?,
-                        (V::I(x), V::F(y)) if x.unsigned_abs() < EXACT => {
-                            (x as f64).partial_cmp(&y)?
-                        }
-                        (V::F(x), V::I(y)) if y.unsigned_abs() < EXACT => {
-                            x.partial_cmp(&(y as f64))?
-                        }
-                        (V::B(x), V::B(y)) => x.cmp(&y),
-                        (V::B(x), V::I(y)) => i64::from(x).cmp(&y),
-                        (V::I(x), V::B(y)) => x.cmp(&i64::from(y)),
-                        (V::N, V::N) if matches!(kind, CompareKind::Eq | CompareKind::NotEq) => {
-                            std::cmp::Ordering::Equal
-                        }
-                        // SAFETY: as `norm`.
-                        (V::R(p), V::R(q)) => match (unsafe { &*p }, unsafe { &*q }) {
-                            (Object::Str(s), Object::Str(t)) => (**s).cmp(&**t),
-                            _ => return None,
-                        },
-                        _ => return None,
-                    };
-                    push!(V::B(match kind {
-                        CompareKind::Lt => ord.is_lt(),
-                        CompareKind::LtE => ord.is_le(),
-                        CompareKind::Eq => ord.is_eq(),
-                        CompareKind::NotEq => ord.is_ne(),
-                        CompareKind::Gt => ord.is_gt(),
-                        CompareKind::GtE => ord.is_ge(),
-                    }));
+                    push!(V::B(compare(a, b, kind)?));
                 }
                 OpCode::IsOp => {
                     let b = pop!();
@@ -14840,7 +15072,15 @@ impl Interpreter {
             }
             return CoreAttr::Done;
         }
-        let r = {
+        let r = if argc == 0
+            && first == self_slot + 1
+            && matches!(frame.stack[callee_slot], Object::BoundMethod(_))
+        {
+            let Some(r) = self.leaf_bound_zero_call(code, pc, &frame.stack[callee_slot]) else {
+                return CoreAttr::Decline;
+            };
+            r
+        } else {
             let stack: &Vec<Object> = &frame.stack;
             let Object::Builtin(b) = &stack[callee_slot] else {
                 return CoreAttr::Decline;
@@ -14875,6 +15115,9 @@ impl Interpreter {
                 for arg in stack.drain(self_slot..) {
                     marked |= gc_trace::note_dropped_marks(&arg);
                     drop_operand(arg);
+                }
+                if matches!(stack[callee_slot], Object::BoundMethod(_)) {
+                    marked |= gc_trace::note_dropped_marks(&stack[callee_slot]);
                 }
                 stack.pop(); // the callee
                 stack.push(v);
@@ -14917,6 +15160,88 @@ impl Interpreter {
             return slot_name_matches(code, name_idx, k).then(|| Self::clone_operand(v));
         }
         Self::leaf_fused_local_attr(code, local, attr_pc, name_idx)
+    }
+
+    /// Read a bounded chain of cached instance fields through its root local.
+    /// The quiet core loop holds the GIL and runs no callbacks or mutations
+    /// here, so the local keeps every intermediate field value alive.
+    /// Retain only the final value. A miss after two proven reads returns
+    /// that prefix; the next instruction uses the ordinary attribute path.
+    #[inline(never)]
+    fn core_local_attr_chain(
+        code: &CodeObject,
+        root: &Object,
+        attr_pc: usize,
+    ) -> Option<(Object, usize)> {
+        use weavepy_compiler::InlineCache as IC;
+        let mut value = root;
+        let mut count = 0;
+        for pc in attr_pc..attr_pc.saturating_add(8) {
+            let Some(ins) = code.instructions.get(pc) else {
+                break;
+            };
+            if ins.op != OpCode::LoadAttr {
+                break;
+            }
+            let Object::Instance(inst) = value else {
+                break;
+            };
+            let cls = inst.cls_raw();
+            if cls.native_kind.get() != 0 {
+                break;
+            }
+            let ver = cls.attr_version.get();
+            let cache = code.caches.get(pc as u32);
+            let next = match cache {
+                IC::LoadAttrSlot {
+                    key_idx,
+                    ver: cached,
+                } if ver == cached => {
+                    // SAFETY: the root local owns this graph throughout the
+                    // walk. Nothing mutates it, releases an owner, or runs
+                    // Python code; peek also rejects conflicting borrows.
+                    let Some(slots) = (unsafe { inst.slots.peek() }) else {
+                        break;
+                    };
+                    let Some(name) = code.names.get(ins.arg as usize) else {
+                        break;
+                    };
+                    let indexed = slots
+                        .get_index(key_idx as usize)
+                        .filter(|(key, _)| slot_name_matches(code, ins.arg, key))
+                        .map(|(_, value)| value);
+                    indexed.or_else(|| slots.get(name))
+                }
+                _ => {
+                    // SAFETY: the same rooted, callback-free walk as above.
+                    let Some(dict) = inst.dict.get().and_then(|d| unsafe { d.peek() }) else {
+                        break;
+                    };
+                    let indexed = |index| {
+                        dict.get_index(index as usize)
+                            .filter(|(key, _)| slot_name_matches(code, ins.arg, key))
+                            .map(|(_, value)| value)
+                    };
+                    let primary = match cache {
+                        IC::LoadAttrInstance {
+                            key_idx,
+                            ver: cached,
+                        } if ver == cached => indexed(key_idx),
+                        _ => None,
+                    };
+                    primary.or_else(|| {
+                        let poly = code_vm_ext(code)?.attr_poly.get()?.get(pc)?;
+                        indexed(poly.index(ver)?)
+                    })
+                }
+            };
+            let Some(next) = next else {
+                break;
+            };
+            value = next;
+            count += 1;
+        }
+        (count >= 2).then(|| (clone_hot(value), attr_pc + count - 1))
     }
 
     /// The core loop's fused `LOAD_FAST x; STORE_ATTR name`: the value at
@@ -16084,22 +16409,20 @@ impl Interpreter {
                                 None => break,
                             }
                         }
-                        (recv @ Object::Instance(_), idx) => {
+                        (Object::Instance(_), idx) => {
                             // A registered leaf `__getitem__` (a native
                             // container class), with a leaf index.
                             if !matches!(idx, Object::Int(_) | Object::Str(_)) {
                                 break;
                             }
-                            match self.leaf_instance_dunder(recv, "__getitem__") {
-                                Some(b) => match (b.call)(&stack[n - 2..]) {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        stack.truncate(n - 2);
-                                        pc += 1;
-                                        stop = LeafStop::Raised(e);
-                                        break;
-                                    }
-                                },
+                            match self.leaf_instance_subscript(&stack[n - 2..], code, pc as u32) {
+                                Some(Ok(value)) => value,
+                                Some(Err(error)) => {
+                                    stack.truncate(n - 2);
+                                    pc += 1;
+                                    stop = LeafStop::Raised(error);
+                                    break;
+                                }
                                 None => break,
                             }
                         }
@@ -16394,25 +16717,37 @@ impl Interpreter {
                         }
                         continue;
                     }
-                    let Object::Builtin(b) = &stack[callee_slot] else {
-                        break;
-                    };
-                    // The site remembers its leaf builtin and kind.
-                    let slot = code_method_slot(code, pc as u32);
-                    let kind = match slot.and_then(|s| s.get_leaf(b)) {
-                        Some(k) => k,
-                        None => {
-                            let Some(k) = self.leaf_call_kind(b) else {
-                                break;
-                            };
-                            if let Some(s) = slot {
-                                s.set_leaf(b, k);
+                    let r = if argc == 0
+                        && first == self_slot + 1
+                        && matches!(stack[callee_slot], Object::BoundMethod(_))
+                    {
+                        let Some(r) = self.leaf_bound_zero_call(code, pc, &stack[callee_slot])
+                        else {
+                            break;
+                        };
+                        r
+                    } else {
+                        let Object::Builtin(b) = &stack[callee_slot] else {
+                            break;
+                        };
+                        // The site remembers its leaf builtin and kind.
+                        let slot = code_method_slot(code, pc as u32);
+                        let kind = match slot.and_then(|s| s.get_leaf(b)) {
+                            Some(k) => k,
+                            None => {
+                                let Some(k) = self.leaf_call_kind(b) else {
+                                    break;
+                                };
+                                if let Some(s) = slot {
+                                    s.set_leaf(b, k);
+                                }
+                                k
                             }
-                            k
-                        }
-                    };
-                    let Some(r) = self.leaf_builtin_call(kind, b, &stack[first..]) else {
-                        break;
+                        };
+                        let Some(r) = self.leaf_builtin_call(kind, b, &stack[first..]) else {
+                            break;
+                        };
+                        r
                     };
                     match r {
                         Ok(v) => {
@@ -16424,6 +16759,9 @@ impl Interpreter {
                             for arg in stack.drain(self_slot..) {
                                 marked |= gc_trace::note_dropped_marks(&arg);
                                 drop_operand(arg);
+                            }
+                            if matches!(stack[callee_slot], Object::BoundMethod(_)) {
+                                marked |= gc_trace::note_dropped_marks(&stack[callee_slot]);
                             }
                             stack.pop(); // the callee
                             stack.push(v);
@@ -16821,6 +17159,73 @@ impl Interpreter {
         Some(true)
     }
 
+    /// Offer borrowed subscript operands to a registered native body or its
+    /// pure fast half. A declined fast half leaves the full call to the
+    /// interpreter, where callbacks see the published caller frame.
+    /// Keep this uncommon receiver case out of the main dispatch body.
+    #[inline(never)]
+    fn leaf_instance_subscript(
+        &self,
+        args: &[Object],
+        code: &CodeObject,
+        cache_pc: u32,
+    ) -> Option<Result<Object, RuntimeError>> {
+        let [Object::Instance(inst), _] = args else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        if !Self::default_getattribute(cls) || crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let version = cls.attr_version.get();
+        let generation = leaf_builtins::generation();
+        // Inspect an existing table first. A Python-defined subscript
+        // must not allocate a native cache or pay the temporary probe.
+        let cached = code_vm_ext(code)
+            .and_then(|ext| ext.method_slots.get())
+            .and_then(|slots| slots.get(cache_pc as usize))
+            .and_then(|slot| slot.get_native_subscript(version, generation));
+        let fast = match cached {
+            Some(fast) => {
+                #[cfg(test)]
+                NATIVE_SUBSCRIPT_CACHE_HITS.with(|hits| hits.set(hits.get() + 1));
+                fast
+            }
+            None => {
+                let Object::Builtin(builtin) = cls.lookup("__getitem__")? else {
+                    return None;
+                };
+                if !builtin.binds_instance || builtin.call_kw.is_some() {
+                    return None;
+                }
+                match self.leaf_call_kind(&builtin)? {
+                    LeafKind::Fast(fast) => {
+                        if let Some(slot) = code_method_slot(code, cache_pc) {
+                            slot.set_native_subscript(version, generation, fast);
+                        }
+                        fast
+                    }
+                    LeafKind::Opaque => {
+                        if Self::looks_reapable_temporary(&args[0]) {
+                            return None;
+                        }
+                        return Some((builtin.call)(args));
+                    }
+                    _ => return None,
+                }
+            }
+        };
+        // The full handler promptly reaps a consumed temporary and any
+        // finalizable contents. Decline before the read can do work.
+        if Self::looks_reapable_temporary(&args[0]) {
+            return None;
+        }
+        let completed = fast(args)?;
+        #[cfg(test)]
+        NATIVE_FAST_SUBSCRIPTS.with(|calls| calls.set(calls.get() + 1));
+        Some(completed)
+    }
+
     /// A registered leaf builtin method `name` on the instance's class
     /// (default attribute access, native class surface), if any.
     #[inline]
@@ -16869,6 +17274,12 @@ impl Interpreter {
 
     #[inline(never)]
     fn default_getattribute_slow(cls: &TypeObject) -> bool {
+        // A class key's equality method may run Python during this lookup.
+        // Quiet callers haven't published their complete activation yet.
+        // Leave an unresolved class to the ordinary attribute handler.
+        if crate::object::exotic_str_keys_possible() {
+            return false;
+        }
         let default = matches!(
             cls.lookup("__getattribute__"),
             Some(Object::Builtin(b)) if b.name == ".object_getattribute"
@@ -16904,6 +17315,7 @@ impl Interpreter {
                     LeafRecv::List,
                     Object::new_list(Vec::new()),
                     &[
+                        ("__len__", LeafKind::Len),
                         ("append", LeafKind::ListAppend),
                         ("pop", LeafKind::ListPop),
                         ("insert", LeafKind::ListInsert),
@@ -16916,6 +17328,7 @@ impl Interpreter {
                     LeafRecv::Dict,
                     Object::new_dict(),
                     &[
+                        ("__len__", LeafKind::Len),
                         ("get", LeafKind::DictGet),
                         ("keys", LeafKind::DictKeys),
                         ("values", LeafKind::DictValues),
@@ -16925,12 +17338,19 @@ impl Interpreter {
                 (
                     LeafRecv::Set,
                     Object::new_set(),
-                    &[("add", LeafKind::SetAdd), ("discard", LeafKind::SetDiscard)],
+                    &[
+                        ("__len__", LeafKind::Len),
+                        ("add", LeafKind::SetAdd),
+                        ("discard", LeafKind::SetDiscard),
+                        ("remove", LeafKind::SetRemove),
+                        ("pop", LeafKind::SetPop),
+                    ],
                 ),
                 (
                     LeafRecv::Str,
                     Object::from_static(""),
                     &[
+                        ("__len__", LeafKind::Len),
                         ("startswith", LeafKind::StrStartswith),
                         ("endswith", LeafKind::StrEndswith),
                         ("lower", LeafKind::StrLower),
@@ -17135,6 +17555,59 @@ impl Interpreter {
         })
     }
 
+    /// A saved native method with no explicit arguments. Only the quiet,
+    /// GIL-held leaf paths call this helper. The admitted operations don't
+    /// release hidden owners or invoke Python; a retained method owner keeps
+    /// its receiver alive without staging an additional reference.
+    fn leaf_bound_zero_call(
+        &mut self,
+        code: &CodeObject,
+        pc: usize,
+        callable: &Object,
+    ) -> Option<Result<Object, RuntimeError>> {
+        let Object::BoundMethod(bm) = callable else {
+            return None;
+        };
+        if bm.redispatch_descriptor {
+            return None;
+        }
+        let Object::Builtin(b) = &bm.function else {
+            return None;
+        };
+        let slot = code_method_slot(code, pc as u32)?;
+        if slot.is_non_leaf(bm) {
+            return None;
+        }
+        let cached = slot.get_leaf(b);
+        let Some(kind) = cached.or_else(|| self.leaf_call_kind(b)) else {
+            slot.set_non_leaf(bm);
+            return None;
+        };
+        if !kind.retains_bound_receiver() {
+            slot.set_non_leaf(bm);
+            return None;
+        }
+        // Collector handles and weakref-registry clones aren't program
+        // owners. Use the same conservative proof as prompt reaping.
+        if Self::looks_reapable_temporary(callable) {
+            return None;
+        }
+        let Some(result) = self.leaf_builtin_call(kind, b, std::slice::from_ref(&bm.receiver))
+        else {
+            // The same builtin can serve an exact receiver or an excluded
+            // subclass. Key rejection by this immutable bound method,
+            // not by its function, so a later exact receiver can specialize.
+            slot.set_non_leaf(bm);
+            return None;
+        };
+        if cached.is_none() {
+            slot.set_leaf(b, kind);
+        }
+        #[cfg(test)]
+        SAVED_NATIVE_LEAF_CALLS.with(|calls| calls.set(calls.get() + 1));
+        Some(result)
+    }
+
     /// Call a leaf builtin if `args` (receiver first for methods) has an
     /// admitted shape; `None` sends the call down the full path.
     fn leaf_builtin_call(
@@ -17242,6 +17715,27 @@ impl Interpreter {
             }
             K::DictKeys | K::DictValues | K::DictItems => {
                 args.len() == 1 && matches!(args[0], O::Dict(_))
+            }
+            // Pop transfers the final owner without hashing, comparing,
+            // dropping an element, or calling Python.
+            K::SetPop => args.len() == 1 && matches!(args[0], O::Set(_)),
+            K::SetRemove => {
+                if !(args.len() == 2 && matches!(args[0], O::Set(_)) && leaf_key(&args[1])) {
+                    return None;
+                }
+                let O::Set(st) = &args[0] else { return None };
+                // Native scalar equality can match a stored subclass without
+                // calling Python. Removing that owner can still run a finalizer,
+                // so the stored value, as well as the lookup, must be a leaf.
+                let (safe, deferred) = crate::object::with_key_eq_deferred(|| {
+                    crate::object::key_cmp_scope(|| {
+                        st.try_borrow().ok().map(|m| {
+                            m.get(&DictKey(args[1].clone()))
+                                .is_none_or(|stored| leaf_key(&stored.0))
+                        })
+                    })
+                });
+                !deferred && matches!(safe, Ok(Some(true)))
             }
             K::SetAdd | K::SetDiscard => {
                 if !(args.len() == 2 && matches!(args[0], O::Set(_)) && leaf_key(&args[1])) {
@@ -17351,6 +17845,14 @@ impl Interpreter {
         if !admitted {
             return None;
         }
+        #[cfg(test)]
+        if matches!(kind, K::SetPop | K::SetRemove) {
+            LEAF_SET_REMOVALS.with(|counts| {
+                let mut values = counts.get();
+                values[usize::from(kind == K::SetRemove)] += 1;
+                counts.set(values);
+            });
+        }
         Some(match b.call_kw.as_ref() {
             Some(ckw) => ckw(args, &[]),
             None => (b.call)(args),
@@ -17418,6 +17920,87 @@ impl Interpreter {
             }
             _ => None,
         }
+    }
+
+    /// A property or missing-field getter whose observed path needs no Python
+    /// calls, stores, or raising operations. Any unproved operation leaves
+    /// the original attribute read to run with a materialized caller frame.
+    #[cfg(feature = "jit")]
+    fn leaf_getter_read(
+        &self,
+        code: &CodeObject,
+        receiver: &Object,
+        name_idx: u32,
+        depth: usize,
+    ) -> Option<Object> {
+        if !self.inline_calls_ok()
+            || self.lean_snapshot().is_none()
+            || crate::object::exotic_str_keys_possible()
+            || depth >= crate::recursion::recursion_limit()
+        {
+            return None;
+        }
+        let Object::Instance(inst) = receiver else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        if cls.native_kind.get() != 0 || !Self::default_getattribute(cls) {
+            return None;
+        }
+        let (getter, name) = match Self::leaf_class_attr(code, cls, name_idx)? {
+            LeafAttr::Property(property) => (property.fget(), None),
+            LeafAttr::InstanceOnly => {
+                // A data descriptor or a real field wins over __getattr__.
+                // This probe must prove a miss without comparing Python keys.
+                if let Some(dict) = inst.dict.get() {
+                    let probe = code_name_leaf_probe(code, name_idx)?;
+                    let dict = dict.try_borrow().ok()?;
+                    if dict.contains_key(&probe) || probe.saw_exotic() {
+                        return None;
+                    }
+                }
+                let name = code_name_obj(code, name_idx)?;
+                (cls.lookup("__getattr__")?, Some(name))
+            }
+            _ => return None,
+        };
+        // Descriptor-valued hooks and native accessors keep their full binding
+        // and callback behavior. No defaults or keyword arguments bind here.
+        let Object::Function(f) = getter else {
+            return None;
+        };
+        let args = [
+            std::ptr::from_ref(receiver),
+            name.map_or(std::ptr::null(), std::ptr::from_ref),
+        ];
+        let nargs = 1 + usize::from(name.is_some());
+        let fcode = f.code.try_borrow().ok()?;
+        if fcode.arg_count as usize != nargs
+            || fcode.has_varargs
+            || fcode.has_varkeywords
+            || fcode.kwonly_count != 0
+            || fcode.is_generator
+            || fcode.is_coroutine
+            || fcode.is_async_generator
+            || fcode.is_iterable_coroutine
+            || fcode.is_class_body
+            || !fcode.freevars.is_empty()
+            || !fcode.cellvars.is_empty()
+            || !fcode.exception_table.is_empty()
+            || fcode.varnames.len() != nargs
+            || fcode.instructions.len() > 64
+            || fcode.wire.as_ref().is_some_and(|w| w.exec_error.is_some())
+        {
+            return None;
+        }
+        // Warm the existing tiny-return classification. A cold error branch
+        // may prevent whole-body leaf admission, but the evaluator can still
+        // finish an earlier return. Its forward-only, bounded stack machine
+        // declines before a call, store, error, or unsupported instruction.
+        // Getter mode additionally validates metaclasses and module overrides;
+        // ordinary pure-call evaluation avoids these extra checks.
+        let _ = code_is_pure_leaf(&fcode);
+        self.pure_leaf_eval::<true>(&fcode, &f, &args[..nargs])
     }
 
     /// The cache-free half of [`Self::leaf_load_attr_recv`]: the site's
@@ -26088,7 +26671,12 @@ impl Interpreter {
     }
 
     fn lookup_method(&self, obj: &Object, name: &str) -> Option<Object> {
-        builtins::lookup_method(obj, name)
+        // Reuse the leaf table's native callable for exact receivers. The
+        // table is populated by builtins::lookup_method itself, so this
+        // preserves the body and gives saved methods a stable identity.
+        self.leaf_builtin_method(obj, name)
+            .map(Object::Builtin)
+            .or_else(|| builtins::lookup_method(obj, name))
     }
 
     /// `print(*args, sep=' ', end='\n', file=...)`. We honour `sep`
@@ -33769,9 +34357,11 @@ impl Interpreter {
         }
         // A never-started generator runs its first activation here too
         // (only a `None` may be sent into it; the general path raises).
+        // Validate and take the frame under one borrow. No Python runs
+        // while it is held; release it before resuming the activation.
+        let mut state = gen.state.try_borrow_mut().ok()?;
         let first_resume;
         {
-            let state = gen.state.try_borrow().ok()?;
             let boxed = match &*state {
                 GeneratorState::Suspended(boxed) => {
                     first_resume = false;
@@ -33799,6 +34389,7 @@ impl Interpreter {
         let guard = match crate::recursion::enter() {
             crate::recursion::Enter::Ok(g) => g,
             crate::recursion::Enter::Overflow => {
+                drop(state);
                 return Some(Err(RuntimeError::PyException(
                     crate::error::PyException::new(crate::builtin_types::make_exception(
                         "RecursionError",
@@ -33807,7 +34398,8 @@ impl Interpreter {
                 )));
             }
         };
-        let prev_state = std::mem::replace(&mut *gen.state.borrow_mut(), GeneratorState::Running);
+        let prev_state = std::mem::replace(&mut *state, GeneratorState::Running);
+        drop(state);
         let (GeneratorState::Suspended(mut boxed) | GeneratorState::Created(mut boxed)) =
             prev_state
         else {
@@ -41548,6 +42140,9 @@ impl Interpreter {
                             Object::from_str(out)
                         });
                     }
+                    if b.name == "__vm:ast_build" {
+                        return stdlib::ast_build::build(self, args, kwargs, outer_globals);
+                    }
                     // PathLike (`__fspath__`) coercion for the path-accepting
                     // builtins. Our Rust `open`/`os.fspath`/`os.fsdecode`/
                     // `os.fsencode` only understand str/bytes, so reduce an
@@ -41878,6 +42473,18 @@ impl Interpreter {
                             other => other,
                         };
                     }
+                }
+                if args.is_empty() {
+                    // The bound method roots its receiver throughout this
+                    // call, including reentry. Borrow that owner for a
+                    // self-only argument slice instead of allocating and
+                    // retaining a second temporary owner.
+                    return self.call(
+                        &bm.function,
+                        std::slice::from_ref(&bm.receiver),
+                        kwargs,
+                        outer_globals,
+                    );
                 }
                 let mut combined: Vec<Object> = Vec::with_capacity(args.len() + 1);
                 combined.push(bm.receiver.clone());
@@ -46403,7 +47010,11 @@ impl Interpreter {
         // RFC 0061 (WS3b): stage the operands through a pooled vector
         // (`drain` moves them without the fresh `split_off` allocation);
         // the shared tail hands the emptied vector back to the pool.
-        let mut args: Vec<Object> = self.pooled_scratch();
+        let mut args: Vec<Object> = if argc == 0 {
+            Vec::new()
+        } else {
+            self.pooled_scratch()
+        };
         args.extend(frame.stack.drain(split_at..));
         let callable = frame.pop()?;
         // PEP 669 CALL fires for every `CALL`-family instruction in
@@ -46781,19 +47392,27 @@ impl Interpreter {
                         if let Object::Builtin(b) = &bm.function {
                             if specialize::native_fn_id(b) == func_id && args.len() == argc {
                                 specialize::record_hit(op_idx);
-                                // Stage `receiver, args…` in a pooled
-                                // scratch vector rather than a fresh
-                                // allocation per call (RFC 0077 WS3: this
-                                // was a `malloc`/`free` pair on every
-                                // `xs.append(v)`).
-                                let mut combined = self.pooled_scratch();
-                                combined.push(bm.receiver.clone());
-                                combined.extend(args.iter().cloned());
-                                let r = match b.call_kw.as_ref() {
-                                    Some(ckw) => ckw(&combined, &[]),
-                                    None => (b.call)(&combined),
+                                let r = if args.is_empty() {
+                                    // As in generic bound dispatch, the
+                                    // callable roots its receiver across
+                                    // reentry. A self-only call can borrow
+                                    // it without staging another owner.
+                                    let receiver = std::slice::from_ref(&bm.receiver);
+                                    match b.call_kw.as_ref() {
+                                        Some(ckw) => ckw(receiver, &[]),
+                                        None => (b.call)(receiver),
+                                    }
+                                } else {
+                                    let mut combined = self.pooled_scratch();
+                                    combined.push(bm.receiver.clone());
+                                    combined.extend(args.iter().cloned());
+                                    let r = match b.call_kw.as_ref() {
+                                        Some(ckw) => ckw(&combined, &[]),
+                                        None => (b.call)(&combined),
+                                    };
+                                    self.recycle_scratch(combined);
+                                    r
                                 };
-                                self.recycle_scratch(combined);
                                 frame.push(r?);
                                 took_fast = true;
                             }
@@ -48618,14 +49237,16 @@ impl Interpreter {
             self.emit_escape_warnings(&src, &filename, &warnings)?;
             let code = match root_mode {
                 crate::stdlib::ast_convert::RootMode::Exec => {
-                    weavepy_compiler::compile_module_with_options(&module, &src, &filename, opts)
+                    weavepy_compiler::compile_owned_module_with_options(
+                        module, &src, &filename, opts,
+                    )
                 }
                 crate::stdlib::ast_convert::RootMode::Eval => {
-                    weavepy_compiler::compile_eval_with_options(&module, &src, &filename, opts)
+                    weavepy_compiler::compile_owned_eval_with_options(module, &src, &filename, opts)
                 }
                 crate::stdlib::ast_convert::RootMode::Single => {
-                    weavepy_compiler::compile_interactive_with_options(
-                        &module, &src, &filename, opts,
+                    weavepy_compiler::compile_owned_interactive_with_options(
+                        module, &src, &filename, opts,
                     )
                 }
             }
@@ -48707,17 +49328,19 @@ impl Interpreter {
         let module = self.parse_for_compile(&source, &filename, parse_flags, root_mode)?;
         let code = match root_mode {
             crate::stdlib::ast_convert::RootMode::Exec => {
-                weavepy_compiler::compile_module_with_options(&module, &source, &filename, opts)
+                weavepy_compiler::compile_owned_module_with_options(
+                    module, &source, &filename, opts,
+                )
             }
             crate::stdlib::ast_convert::RootMode::Eval => {
-                weavepy_compiler::compile_eval_with_options(&module, &source, &filename, opts)
+                weavepy_compiler::compile_owned_eval_with_options(module, &source, &filename, opts)
             }
             // Interactive mode: top-level expression statements echo
             // through `sys.displayhook` (`PrintExpr`). Powers the REPL,
             // `code`/`codeop`, and `doctest`'s example execution.
             crate::stdlib::ast_convert::RootMode::Single => {
-                weavepy_compiler::compile_interactive_with_options(
-                    &module, &source, &filename, opts,
+                weavepy_compiler::compile_owned_interactive_with_options(
+                    module, &source, &filename, opts,
                 )
             }
         }
@@ -49002,8 +49625,8 @@ impl Interpreter {
                 // never raises `ValueError` for bad syntax. Invalid-escape
                 // `SyntaxWarning`s replay here too.
                 let module = self.parse_source_emitting_warnings(&src, "<string>")?;
-                let compiled = weavepy_compiler::compile_module_with_options(
-                    &module,
+                let compiled = weavepy_compiler::compile_owned_module_with_options(
+                    module,
                     &src,
                     "<string>",
                     self.exec_eval_compile_options(),
@@ -49213,8 +49836,8 @@ impl Interpreter {
         // call `eval("f'...'")` and assert `SyntaxError`) rely on.
         let trimmed = src.trim_start_matches([' ', '\t', '\n', '\r', '\x0c']);
         let module = self.parse_eval_source_emitting_warnings(trimmed, "<string>")?;
-        let code = weavepy_compiler::compile_eval_with_options(
-            &module,
+        let code = weavepy_compiler::compile_owned_eval_with_options(
+            module,
             trimmed,
             "<string>",
             self.exec_eval_compile_options(),
@@ -50536,7 +51159,11 @@ impl Interpreter {
         self.cache.begin_initializing(full);
         self.cache.insert(full, module_obj.clone());
         let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, None);
-        let body_result = self.run_frame(&mut frame);
+        let body_result = {
+            #[cfg(feature = "jit")]
+            let _compilation_budget = crate::tier2::budget_import_compilation();
+            self.run_frame(&mut frame)
+        };
         self.cache.end_initializing(full);
         if let Err(e) = body_result {
             self.cache.remove(full);
@@ -50566,8 +51193,13 @@ impl Interpreter {
             let diag = format!("{}.py", full.rsplit('.').next().unwrap_or(full));
             parse_error_to_syntax_error(&e, source, &diag)
         })?;
-        let code = weavepy_compiler::compile_module_with_source(&module, source, filename)
-            .map_err(|e| compile_error_to_syntax_error(&e, source, filename))?;
+        let code = weavepy_compiler::compile_owned_module_with_options(
+            module,
+            source,
+            filename,
+            weavepy_compiler::CompileOptions::default(),
+        )
+        .map_err(|e| compile_error_to_syntax_error(&e, source, filename))?;
         // RFC 0021 — populate the process-global frozen cache so the
         // *next* interpreter in this process skips parse + compile.
         // We cache only the compiled code, never the running module
@@ -50696,7 +51328,11 @@ impl Interpreter {
         self.cache.insert(full, module_obj.clone());
         let code_rc = Rc::new(code);
         let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, None);
-        let body_result = self.run_frame(&mut frame);
+        let body_result = {
+            #[cfg(feature = "jit")]
+            let _compilation_budget = crate::tier2::budget_import_compilation();
+            self.run_frame(&mut frame)
+        };
         self.cache.end_initializing(full);
         if let Err(e) = body_result {
             self.cache.remove(full);
@@ -50765,8 +51401,8 @@ impl Interpreter {
             let source = decode_source_bytes(&raw, &filename)?;
             let module = weavepy_parser::parse_module(&source)
                 .map_err(|e| parse_error_to_syntax_error(&e, &source, &filename))?;
-            let code = weavepy_compiler::compile_module_with_options(
-                &module,
+            let code = weavepy_compiler::compile_owned_module_with_options(
+                module,
                 &source,
                 &filename,
                 self.default_compile_options(),
@@ -50852,7 +51488,11 @@ impl Interpreter {
         // `spec._initializing`).
         let code_rc = Rc::new(code);
         let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, None);
-        let body_result = self.run_frame(&mut frame);
+        let body_result = {
+            #[cfg(feature = "jit")]
+            let _compilation_budget = crate::tier2::budget_import_compilation();
+            self.run_frame(&mut frame)
+        };
         self.cache.end_initializing(full);
         if let Err(e) = body_result {
             self.cache.remove(full);
@@ -54116,6 +54756,8 @@ enum LeafKind {
     DictItems,
     SetAdd,
     SetDiscard,
+    SetRemove,
+    SetPop,
     StrStartswith,
     StrEndswith,
     StrLower,
@@ -54133,6 +54775,32 @@ enum LeafKind {
     StrFormat,
     /// A registered leaf builtin (see [`leaf_builtins`]): any arguments.
     Opaque,
+}
+
+impl LeafKind {
+    /// These self-only operations neither invoke Python nor discard any
+    /// existing reference held by the receiver. Argument-shape admission
+    /// still belongs to `leaf_builtin_call`; subclasses must fall back.
+    fn retains_bound_receiver(self) -> bool {
+        matches!(
+            self,
+            Self::Len
+                | Self::ListReverse
+                | Self::ListCopy
+                | Self::DictKeys
+                | Self::DictValues
+                | Self::DictItems
+                | Self::StrLower
+                | Self::StrUpper
+                | Self::StrStrip
+                | Self::StrLstrip
+                | Self::StrRstrip
+                | Self::StrIsdigit
+                | Self::StrIsalpha
+                | Self::StrIsspace
+                | Self::StrSplit
+        )
+    }
 }
 
 /// A receiver's builtin variant, for the method table.
@@ -54735,6 +55403,56 @@ fn borrowed_rc<T>(r: &Rc<T>) -> Rc<T> {
 enum QuietShell<'a> {
     Ready(&'a crate::object::FrameShell),
     Lazy(&'a mut LeanAct),
+}
+
+#[cfg(test)]
+thread_local! {
+    static NATIVE_FAST_SUBSCRIPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static LEAF_SET_REMOVALS: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0; 2]) };
+    static SAVED_NATIVE_LEAF_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SAVED_NATIVE_REJECTED_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    #[cfg(feature = "jit")]
+    static SCALAR_FIELD_UPDATE_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    #[cfg(feature = "jit")]
+    static SCALAR_FIELD_UPDATE_BOXED_RETURNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    #[cfg(feature = "jit")]
+    static SCALAR_FIELD_UPDATE_NATIVE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    static PURE_LITERAL_ARGUMENT_CALLS: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
+    static PURE_SLOT_FIELD_READS: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
+    static PURE_CACHED_FIELD_PREDICATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PURE_PREDICATE_STAGES: std::cell::Cell<[u64; 9]> = const { std::cell::Cell::new([0; 9]) };
+    static PURE_PREDICATE_DROP_MISSES: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
+    static NATIVE_SUBSCRIPT_CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_literal_argument_call(code: &CodeObject, start: usize, end: usize, bound: bool) {
+    PURE_LITERAL_ARGUMENT_CALLS.with(|hits| {
+        let mut counts = hits.get();
+        let index = usize::from(bound);
+        counts[index] += 1;
+        if code.instructions[start..end]
+            .iter()
+            .any(|ins| ins.op == OpCode::LoadSmallInt)
+        {
+            counts[index + 2] += 1;
+        }
+        hits.set(counts);
+    });
+}
+
+#[cfg(test)]
+fn note_predicate_stage(code: &CodeObject, stage: usize) {
+    if code_vm_ext(code)
+        .is_some_and(|ext| ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) == 7)
+    {
+        PURE_PREDICATE_STAGES.with(|counts| {
+            let mut values = counts.get();
+            values[stage] += 1;
+            counts.set(values);
+        });
+    }
 }
 
 /// Builtins that native modules vouch for as *leaf*: for every argument,
@@ -59335,7 +60053,9 @@ struct CodeConstObjects {
     /// on the first inline call in this code object.
     call_slots: std::sync::OnceLock<Box<[CallSlot]>>,
     /// Whether this code is a *pure leaf* (see [`code_is_pure_leaf`]):
-    /// `0` not yet decided, `1` no, `2` yes.
+    /// `0` not yet decided, `1` no, `2` general leaf, `3` argument return,
+    /// `4` constant return, `5` small-int return, `6` attribute return,
+    /// `7` comparison of two argument fields.
     pure_leaf: std::sync::atomic::AtomicU8,
     /// Per-instruction fused-pair kinds (see [`code_fast_pairs`]): `1`
     /// at a `LOAD_FAST` whose successor is another `LOAD_FAST`, `2` when
@@ -59433,14 +60153,20 @@ impl AttrPoly {
     /// index still holds the name.
     #[inline]
     fn hit(&self, code: &CodeObject, inst: &PyInstance, ver: u64, name_idx: u32) -> Option<Object> {
-        // SAFETY: see the type docs.
-        let entries = unsafe { &*self.0.get() };
-        let &(_, ix) = entries.iter().find(|e| e.0 == ver && ver != 0)?;
+        let ix = self.index(ver)?;
         let dict = inst.dict.get()?;
         // SAFETY: a read between two instructions (see `GilCell::peek`).
         let d = unsafe { dict.peek() }?;
         let (k, v) = d.get_index(ix as usize)?;
         slot_name_matches(code, name_idx, k).then(|| Interpreter::clone_operand(v))
+    }
+
+    /// A candidate index still needs its dictionary key checked by the caller.
+    #[inline]
+    fn index(&self, ver: u64) -> Option<u32> {
+        // SAFETY: see the type docs.
+        let entries = unsafe { &*self.0.get() };
+        entries.iter().find(|e| e.0 == ver && ver != 0).map(|e| e.1)
     }
 
     /// Remember `ver` → `ix` (the older of two full entries yields).
@@ -59619,6 +60345,15 @@ enum MethodSlotFn {
     /// A `CALL` site's leaf builtin and its kind (the identity check is
     /// the pointer compare on read).
     Leaf(Rc<crate::object::BuiltinFn>, LeafKind),
+    /// A native subscript's static pure function. No class or builtin
+    /// owner is retained. Re-registration also invalidates the entry.
+    NativeSubscript {
+        generation: u64,
+        fast: leaf_builtins::Fast,
+    },
+    /// A rejected native bound-call body, weakly held so a call site
+    /// doesn't extend its lifetime. The key is the registry generation.
+    NonLeaf(crate::sync::Weak<crate::object::BoundMethod>),
 }
 
 // SAFETY: read and written only from the dispatch loop with the GIL
@@ -59785,6 +60520,45 @@ impl MethodSlot {
         // SAFETY: as `set`.
         unsafe { *self.0.get() = (0, MethodSlotFn::Leaf(f.clone(), kind)) };
     }
+
+    fn is_non_leaf(&self, method: &Rc<crate::object::BoundMethod>) -> bool {
+        // SAFETY: GIL-held leaf dispatch, as `get_leaf`. A live Weak keeps
+        // the allocation reserved, preventing address-reuse aliasing.
+        matches!(unsafe { &*self.0.get() }, (version, MethodSlotFn::NonLeaf(cached))
+            if cached.as_ptr() == Rc::as_ptr(method)
+                && *version == leaf_builtins::generation())
+    }
+
+    fn set_non_leaf(&self, method: &Rc<crate::object::BoundMethod>) {
+        // SAFETY: GIL-held leaf dispatch, as `set_leaf`.
+        unsafe {
+            *self.0.get() = (
+                leaf_builtins::generation(),
+                MethodSlotFn::NonLeaf(Rc::downgrade(method)),
+            )
+        };
+    }
+
+    #[inline]
+    fn get_native_subscript(&self, ver: u64, generation: u64) -> Option<leaf_builtins::Fast> {
+        // SAFETY: as `get`; the returned function has a static lifetime.
+        match unsafe { &*self.0.get() } {
+            (
+                v,
+                MethodSlotFn::NativeSubscript {
+                    generation: g,
+                    fast,
+                },
+            ) if *v == ver && *g == generation => Some(*fast),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn set_native_subscript(&self, ver: u64, generation: u64, fast: leaf_builtins::Fast) {
+        // SAFETY: as `set`; neither value owns Python objects.
+        unsafe { *self.0.get() = (ver, MethodSlotFn::NativeSubscript { generation, fast }) };
+    }
 }
 
 /// The method slot for `cache_pc`, allocating the table on first use.
@@ -59882,7 +60656,7 @@ fn code_is_pure_leaf(code: &CodeObject) -> bool {
     };
     match ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) {
         1 => false,
-        2 => true,
+        2..=7 => true,
         _ => code_pure_leaf_decide(code, ext),
     }
 }
@@ -59937,7 +60711,49 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
                     | OpCode::ReturnValue
             )
         });
-    ext.pure_leaf.store(if ok { 2 } else { 1 }, Relaxed);
+    let shape = if ok {
+        let body = code.instructions.as_slice();
+        let body = if body.first().is_some_and(|i| i.op == OpCode::Resume) {
+            &body[1..]
+        } else {
+            body
+        };
+        let argument = |op| {
+            matches!(
+                op,
+                OpCode::LoadFast | OpCode::LoadFastBorrow | OpCode::LoadFastCheck
+            )
+        };
+        match body {
+            [load, ret] if ret.op == OpCode::ReturnValue => match load.op {
+                op if argument(op) => 3,
+                OpCode::LoadConst => 4,
+                OpCode::LoadSmallInt => 5,
+                _ => 2,
+            },
+            [load, attr, ret]
+                if argument(load.op)
+                    && attr.op == OpCode::LoadAttr
+                    && ret.op == OpCode::ReturnValue =>
+            {
+                6
+            }
+            [left, left_attr, right, right_attr, compare, ret]
+                if argument(left.op)
+                    && argument(right.op)
+                    && left_attr.op == OpCode::LoadAttr
+                    && right_attr.op == OpCode::LoadAttr
+                    && compare.op == OpCode::CompareOp
+                    && ret.op == OpCode::ReturnValue =>
+            {
+                7
+            }
+            _ => 2,
+        }
+    } else {
+        1
+    };
+    ext.pure_leaf.store(shape, Relaxed);
     ok
 }
 
@@ -60006,6 +60822,19 @@ fn code_vm_ext(code: &CodeObject) -> Option<&CodeConstObjects> {
         Some(arc) => arc,
         None => code_vm_ext_init(code),
     };
+    Some(code_vm_ext_ref(arc))
+}
+
+/// Borrow an already initialized extension without filling any cache.
+#[cfg(feature = "jit")]
+#[inline]
+fn code_vm_ext_existing(code: &CodeObject) -> Option<&CodeConstObjects> {
+    code.vm_ext.0.get().map(code_vm_ext_ref)
+}
+
+#[inline]
+#[allow(clippy::cast_ptr_alignment)] // The erased pointer has the producer's alignment.
+fn code_vm_ext_ref(arc: &std::sync::Arc<dyn std::any::Any + Send + Sync>) -> &CodeConstObjects {
     // RFC 0077 (WS5): the slot has exactly one producer (the initializer
     // above; `marshal` only ever creates the empty default), so the
     // `Any::type_id` vtable probe on every constant/name lookup is
@@ -60014,12 +60843,10 @@ fn code_vm_ext(code: &CodeObject) -> Option<&CodeConstObjects> {
     debug_assert!(arc.downcast_ref::<CodeConstObjects>().is_some());
     // SAFETY: `get_or_init` only ever stores an `Arc<CodeConstObjects>`
     // here (no other code writes `vm_ext`), so the erased pointer is a
-    // pointer to a live `CodeConstObjects` for as long as `code` is.
+    // pointer to a live `CodeConstObjects` for the borrowed Arc's lifetime.
     // The cast from the erased `dyn Any` pointer to the concrete type is
     // the whole point (the alignment lint cannot see the invariant).
-    #[allow(clippy::cast_ptr_alignment)]
-    let table = unsafe { &*(std::sync::Arc::as_ptr(arc).cast::<CodeConstObjects>()) };
-    Some(table)
+    unsafe { &*(std::sync::Arc::as_ptr(arc).cast::<CodeConstObjects>()) }
 }
 
 /// [`code_vm_ext`]'s first call for a code object: build the table.
@@ -61161,11 +61988,10 @@ pub fn make_pep604_union(a: &Object, b: &Object) -> Result<Object, RuntimeError>
 /// `typing._type_check`), nested unions flatten, duplicates collapse, a
 /// lone survivor is returned bare, and no arguments is an error.
 pub fn union_class_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
-    let item = args
-        .get(1)
-        .cloned()
-        .ok_or_else(|| type_error("__class_getitem__() missing argument"))?;
-    let items: Vec<Object> = match &item {
+    let [_, item] = args else {
+        return Err(type_error("__class_getitem__() takes exactly one argument"));
+    };
+    let items: Vec<Object> = match item {
         Object::Tuple(t) => t.iter().cloned().collect(),
         other => vec![other.clone()],
     };
@@ -62553,6 +63379,88 @@ mod tests {
     static HEAP_SNAPSHOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn finalizer_queue_claims_once_and_preserves_drop_fallback() {
+        let code = compile_module(
+            &parse_module(
+                r"
+events = []
+class Finalizer:
+    def __del__(self):
+        events.append(self.label)
+root = Finalizer()
+root.label = 'queued'
+
+def generator():
+    try:
+        yield 1
+    finally:
+        events.append('generator')
+gen = generator()
+next(gen)
+",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut interp = Interpreter::new();
+        interp.run_module(&code).unwrap();
+        let _gil = crate::gil::global_gil().acquire();
+        let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+            panic!("missing main module");
+        };
+        let (root, gen, events, class) = {
+            let globals = main.dict.borrow();
+            let read = |name| globals.get(&crate::object::StrKey(name)).unwrap().clone();
+            (read("root"), read("gen"), read("events"), read("Finalizer"))
+        };
+        let Object::List(events) = events else {
+            panic!("missing events")
+        };
+        let Object::Type(class) = class else {
+            panic!("missing class")
+        };
+        interp.run_pending_finalizers();
+        // Prompt and collector paths can enqueue the same live allocation.
+        // Only the first request may invoke Python or complete its finalizer.
+        crate::vm_singletons::push_pending_finalizer(root.clone());
+        crate::vm_singletons::push_pending_finalizer(root.clone());
+        assert_eq!(interp.run_pending_finalizers(), 1);
+        assert_eq!(events.borrow().len(), 1);
+        crate::vm_singletons::push_pending_finalizer(gen.clone());
+        crate::vm_singletons::push_pending_finalizer(gen.clone());
+        assert_eq!(interp.run_pending_finalizers(), 1);
+        assert_eq!(events.borrow().len(), 2);
+
+        let drop_instance = |label: &str| {
+            let inst = Rc::new(PyInstance::new(class.clone()));
+            inst.dict_cell().borrow_mut().insert(
+                DictKey(Object::from_static("label")),
+                Object::from_str(label),
+            );
+            inst
+        };
+        // An untracked last-Arc drop must still queue and run its copy once.
+        let dropped = drop_instance("drop");
+        let weak = Rc::downgrade(&dropped);
+        drop(dropped);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(interp.run_pending_finalizers(), 1);
+        assert_eq!(events.borrow().len(), 3);
+        // A queue borrow that prevents Drop from scheduling must release the
+        // unscheduled copy without recursively resurrecting it again.
+        let rejected = drop_instance("rejected");
+        let weak = Rc::downgrade(&rejected);
+        crate::vm_singletons::PENDING_FINALIZERS.with(|queue| {
+            let _borrow = queue.borrow_mut();
+            drop(rejected);
+        });
+        assert!(weak.upgrade().is_none());
+        assert_eq!(interp.run_pending_finalizers(), 0);
+        let labels: Vec<_> = events.borrow().iter().map(Object::to_str).collect();
+        assert_eq!(labels, ["queued", "generator", "drop"]);
+    }
+
+    #[test]
     fn range_collection_preserves_python_semantics() {
         #[cfg(feature = "jit")]
         let _guard = HEAP_SNAPSHOT_TEST_LOCK
@@ -62645,6 +63553,25 @@ mod tests {
             .unwrap_or_else(|error| panic!("run: {error}"));
         let bytes = buf.borrow().clone();
         String::from_utf8(bytes).expect("utf-8")
+    }
+
+    #[test]
+    fn union_class_getitem_binds_direct_calls() {
+        run(r"
+from types import UnionType
+method = UnionType.__class_getitem__
+assert method.__self__ is UnionType
+assert method(int) is int
+assert method((int, str)) == int | str
+assert UnionType[int, str] == int | str
+for args in [(), (int, str), ((int, str), float), ((),)]:
+    try:
+        method(*args)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError('invalid Union arguments accepted')
+");
     }
 
     fn check_constructor_slot_names(typed_store: bool) {
@@ -62761,6 +63688,1663 @@ refill(second, 23, 3)
         })
         .join()
         .expect("jit worker thread");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_startup_defers_hot_code_then_compiles_the_same_functions() {
+        std::thread::spawn(|| {
+            crate::tier2::force_enable_for_test(2);
+            let module = parse_module(
+                r"
+def leaf(x):
+    return x + 1
+def loop(n):
+    total = 0
+    i = 0
+    while i < n:
+        total += i
+        i += 1
+    return total
+for i in range(200):
+    assert leaf(i) == i + 1
+assert loop(2000) == 1999000
+",
+            )
+            .expect("parse startup fixture");
+            let code = compile_module(&module).expect("compile startup fixture");
+            let mut interp = Interpreter::new();
+            let functions = |interp: &Interpreter| {
+                let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+                    panic!("missing main module");
+                };
+                let globals = main.dict.borrow();
+                ["leaf", "loop"].map(|name| {
+                    let Some(Object::Function(f)) = globals.get(&crate::object::StrKey(name))
+                    else {
+                        panic!("missing fixture function");
+                    };
+                    f.code.borrow().clone()
+                })
+            };
+            let before;
+            {
+                let _outer = crate::tier2::defer_startup_compilation();
+                {
+                    let _inner = crate::tier2::defer_startup_compilation();
+                    interp.run_module(&code).expect("nested startup");
+                }
+                interp.run_module(&code).expect("outer startup");
+                before = functions(&interp);
+                assert_eq!(crate::tier2::stats_for_test().0, 0);
+                assert!(before
+                    .iter()
+                    .all(|code| !crate::tier2::code_compiled_for_test(code)));
+            }
+            interp.run_module(&code).expect("user code after startup");
+            for (old, new) in before.iter().zip(functions(&interp)) {
+                assert!(Rc::ptr_eq(old, &new), "the deferred code must be reused");
+                assert!(
+                    crate::tier2::code_compiled_for_test(&new),
+                    "deferred function must compile later"
+                );
+            }
+        })
+        .join()
+        .expect("startup JIT worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn imported_functions_compile_during_sustained_work_or_after_import() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                crate::tier2::force_enable_for_test(4);
+                crate::tier2::note_startup_finished();
+                let mut interp = Interpreter::new();
+                let source = "def leaf(x):\n    return x + 1\nfor i in range(12):\n    assert leaf(i) == i + 1\n";
+                let module = interp
+                    .load_from_source("budget_light", source, false, "budget_light.py")
+                    .expect("light import");
+                let Object::Module(module) = module else { panic!("module") };
+                let leaf = module.dict.borrow().get(&crate::object::StrKey("leaf")).unwrap().clone();
+                let Object::Function(function) = &leaf else { panic!("function") };
+                let code = function.code.borrow().clone();
+                assert!(!crate::tier2::code_compiled_for_test(&code));
+                for i in 0..24 {
+                    interp.call_object(leaf.clone(), &[Object::Int(i)], &[]).expect("later call");
+                }
+                assert!(crate::tier2::code_compiled_for_test(&code), "deferred lean code must compile after import");
+                let source = "def leaf(x):\n    return x + 1\nfor i in range(256):\n    assert leaf(i) == i + 1\ndef total(n):\n    s = 0\n    for i in range(n):\n        s += i\n    return s\nassert total(10000) == 49995000\n";
+                let module = interp
+                    .load_from_source("budget_heavy", source, false, "budget_heavy.py")
+                    .expect("sustained import work");
+                let Object::Module(module) = module else { panic!("module") };
+                for name in ["leaf", "total"] {
+                    let Object::Function(function) = module.dict.borrow().get(&crate::object::StrKey(name)).unwrap().clone() else { panic!("function") };
+                    assert!(crate::tier2::code_compiled_for_test(&function.code.borrow()), "{name} must compile during sustained import work");
+                }
+                crate::tier2::force_enable_for_test(50);
+                let source = "def leaf(x):\n    return x + 1\nfor i in range(400):\n    assert leaf(i) == i + 1\n";
+                let module = interp
+                    .load_from_source("budget_relative", source, false, "budget_relative.py")
+                    .expect("default relative lean budget");
+                let Object::Module(module) = module else { panic!("module") };
+                let Object::Function(function) = module.dict.borrow().get(&crate::object::StrKey("leaf")).unwrap().clone() else { panic!("function") };
+                assert!(crate::tier2::code_compiled_for_test(&function.code.borrow()), "lean code must retain its earlier relative warm point");
+            })
+            .expect("spawn import-budget worker")
+            .join()
+            .expect("import-budget worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_repeated_scalar_attribute_reads_preserve_fallbacks() {
+        const CHILD: &str = "WEAVEPY_REPEATED_SCALAR_VM_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::jit_repeated_scalar_attribute_reads_preserve_fallbacks",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("spawn scalar-read test");
+            assert!(status.success(), "scalar-read test failed: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                crate::tier2::force_enable_for_test(1);
+                crate::tier2::note_startup_finished();
+                let source =
+                    include_str!("../../../tests/regrtest/test_repeated_scalar_attributes.py");
+                let (warmup, mutations) = source
+                    .split_once("# REPEATED ATTRIBUTE MUTATIONS:")
+                    .expect("fixture phases");
+                let module = parse_module(warmup).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    warmup,
+                    "repeated_scalar.py",
+                )
+                .unwrap();
+                let mut interp = Interpreter::new();
+                interp.run_module(&code).expect("stable scalar warmup");
+                let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+                    panic!("main module")
+                };
+                let globals = main.dict.clone();
+                for name in ["square", "sum_squares"] {
+                    let Object::Function(function) = globals
+                        .borrow()
+                        .get(&crate::object::StrKey(name))
+                        .unwrap()
+                        .clone()
+                    else {
+                        panic!("function")
+                    };
+                    assert!(
+                        crate::tier2::code_compiled_for_test(&function.code.borrow()),
+                        "{name} must compile before mutation"
+                    );
+                }
+                let sum_squares = globals
+                    .borrow()
+                    .get(&crate::object::StrKey("sum_squares"))
+                    .unwrap()
+                    .clone();
+                let point = globals
+                    .borrow()
+                    .get(&crate::object::StrKey("proof_point"))
+                    .unwrap()
+                    .clone();
+                let (_, entries, deopts) = crate::tier2::stats_for_test();
+                let direct = crate::tier2::direct_call_count_for_test();
+                let (_, _, call_deopts) = crate::tier2::native_call_stats_for_test();
+                let result = interp
+                    .call_object(sum_squares, &[point, Object::Int(10)], &[])
+                    .expect("compiled scalar loop");
+                assert!(matches!(result, Object::Int(90)));
+                let (_, after_entries, after_deopts) = crate::tier2::stats_for_test();
+                assert!(
+                    after_entries + crate::tier2::direct_call_count_for_test() > entries + direct,
+                    "the scalar loop must enter native execution"
+                );
+                assert_eq!(
+                    after_deopts, deopts,
+                    "the stable scalar loop must not deopt"
+                );
+                assert_eq!(
+                    crate::tier2::native_call_stats_for_test().2,
+                    call_deopts,
+                    "the direct call must not deopt"
+                );
+                let module = parse_module(mutations).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    mutations,
+                    "repeated_scalar_mutations.py",
+                )
+                .unwrap();
+                interp
+                    .exec_module_in(&code, globals)
+                    .expect("scalar mutations and callbacks");
+            })
+            .expect("spawn scalar-read worker")
+            .join()
+            .expect("scalar-read worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_return_cache_releases_retired_code() {
+        // The collector is process-global and skips a collection when a
+        // peer is already collecting. This test requires three completed
+        // collections, so isolate it from concurrently running VM tests.
+        const CHILD: &str = "WEAVEPY_CODE_RETIREMENT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "tests::jit_return_cache_releases_retired_code",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .status()
+                    .expect("spawn code-retirement test");
+            assert!(
+                status.success(),
+                "isolated code-retirement test failed: {status}"
+            );
+            return;
+        }
+        let (out, compiled, _) = run_jit(include_str!(
+            "../../../tests/regrtest/test_jit_cache_collection.py"
+        ));
+        assert!(out.contains("JIT code cache collection: ok"));
+        assert!(compiled >= 2, "caller and callee must reach the JIT");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_worker_exit_preserves_shared_code_and_parked_generators() {
+        // Peer VM tests run without one shared GIL. Their process-global
+        // collections can retain a newly created function while this test
+        // attaches its construction-time attributes. Keep all worker,
+        // generator, and collection assertions in an isolated process.
+        const CHILD: &str = "WEAVEPY_WORKER_EXIT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "tests::jit_worker_exit_preserves_shared_code_and_parked_generators",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .status()
+                    .expect("spawn worker-exit test");
+            assert!(
+                status.success(),
+                "isolated worker-exit test failed: {status}"
+            );
+            return;
+        }
+        let (out, parks, resumes, materialized) = run_jit_park(include_str!(
+            "../../../tests/regrtest/test_jit_worker_exit.py"
+        ));
+        assert!(out.contains("JIT worker exit: ok"));
+        assert!(
+            parks > 0 && resumes > 0,
+            "resumed generators must enter native code"
+        );
+        assert!(
+            materialized >= 8,
+            "each worker's parked activation must materialize on its receiving thread"
+        );
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_attribute_chains_preserve_guard_fallbacks() {
+        run_attribute_chain_fixture(
+            "tests::jit_attribute_chains_preserve_guard_fallbacks",
+            "WEAVEPY_ATTR_CHAIN_VM_TEST_CHILD",
+            include_str!("../../../tests/regrtest/test_jit_attribute_chains.py"),
+            "# CHAIN MUTATIONS:",
+            &["dict_chain", "slot_chain", "object_chain", "text_chain"],
+            "assert slot_chain(slot_root, 1200) == 20400",
+        );
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_deep_attribute_chains_preserve_guards_and_lifetimes() {
+        run_attribute_chain_fixture(
+            "tests::jit_deep_attribute_chains_preserve_guards_and_lifetimes",
+            "WEAVEPY_DEEP_ATTR_CHAIN_VM_TEST_CHILD",
+            include_str!("../../../tests/regrtest/test_jit_deep_attribute_chains.py"),
+            "# DEEP CHAIN MUTATIONS:",
+            &[
+                "dict_read",
+                "slot_read",
+                "mixed_read",
+                "float_read",
+                "object_read",
+                "bytes_read",
+            ],
+            "assert slot_read(slot_root, 1200) == 13200",
+        );
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_dynamic_attribute_cache_and_callback_frames() {
+        const CHILD: &str = "WEAVEPY_DYN_ATTR_CACHE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::jit_dynamic_attribute_cache_and_callback_frames",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("spawn dynamic-attribute test");
+            assert!(status.success(), "dynamic-attribute test failed: {status}");
+            return;
+        }
+        std::thread::spawn(|| {
+            crate::tier2::force_enable_for_test(2);
+            let source =
+                include_str!("../../../tests/regrtest/test_jit_dynamic_attribute_cache.py");
+            let (warmup, mutations) = source
+                .split_once("# DYNAMIC CACHE MUTATIONS:")
+                .expect("fixture phases");
+            let module = parse_module(warmup).expect("parse cache warmup");
+            let code =
+                weavepy_compiler::compile_module_with_source(&module, warmup, "dynamic_cache.py")
+                    .expect("compile cache warmup");
+            let mut interp = Interpreter::new();
+            interp.run_module(&code).expect("run cache warmup");
+            let globals = {
+                let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+                    panic!("missing main module");
+                };
+                main.dict.clone()
+            };
+            {
+                let globals = globals.borrow();
+                for name in ["dict_read", "slot_read", "class_read", "module_read"] {
+                    let Some(Object::Function(driver)) = globals.get(&crate::object::StrKey(name))
+                    else {
+                        panic!("missing {name}");
+                    };
+                    assert!(
+                        crate::tier2::code_compiled_for_test(&driver.code.borrow()),
+                        "{name} must compile before mutations"
+                    );
+                }
+            }
+            let reads = crate::tier2::dyn_attr_native_reads_for_test();
+            assert!(
+                reads[..3].iter().all(|&count| count > 100),
+                "instance, class, and module reads must use native caches: {reads:?}"
+            );
+            let mutations = format!("# DYNAMIC CACHE MUTATIONS:{mutations}");
+            let module = parse_module(&mutations).expect("parse cache mutations");
+            let code = weavepy_compiler::compile_module_with_source(
+                &module,
+                &mutations,
+                "dynamic_mutations.py",
+            )
+            .expect("compile cache mutations");
+            interp
+                .exec_module_in(&code, globals)
+                .expect("cache mutation assertions");
+            let callbacks =
+                include_str!("../../../tests/regrtest/test_jit_dynamic_attribute_callbacks.py");
+            let module = parse_module(callbacks).expect("parse callback frames");
+            let code = weavepy_compiler::compile_module_with_source(
+                &module,
+                callbacks,
+                "dynamic_callbacks.py",
+            )
+            .expect("compile callback frames");
+            interp
+                .run_module(&code)
+                .expect("callback frame and local assertions");
+        })
+        .join()
+        .expect("dynamic-attribute worker");
+    }
+
+    #[test]
+    fn native_fast_subscripts_preserve_completion_and_callbacks() {
+        const CHILD: &str = "WEAVEPY_NATIVE_FAST_SUBSCRIPT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::native_fast_subscripts_preserve_completion_and_callbacks",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("WEAVEPY_JIT", "0")
+                .status()
+                .expect("spawn native fast subscript test");
+            assert!(status.success(), "native fast subscript child: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut interp = Interpreter::new();
+                let source = include_str!("../../../tests/regrtest/test_jit_native_subscripts.py");
+                let module = parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module, source, "native_fast_subscripts.py",
+                ).unwrap();
+                interp.run_module(&code).unwrap();
+                assert!(NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get) > 1000);
+                assert!(NATIVE_SUBSCRIPT_CACHE_HITS.with(std::cell::Cell::get) > 1000);
+                eprintln!("MethodSlot bytes: {}", std::mem::size_of::<MethodSlot>());
+                let run = |interp: &mut Interpreter, source: &str| {
+                    let module = parse_module(source).unwrap();
+                    let code = weavepy_compiler::compile_module_with_source(
+                        &module, source, "native_fast_subscripts.py",
+                    ).unwrap();
+                    let Object::Module(main) = interp.cache.get("__main__").unwrap() else {
+                        panic!("missing main module")
+                    };
+                    interp.exec_module_in(&code, main.dict.clone()).unwrap();
+                };
+                fn fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+                    match args {
+                        [_, Object::Int(1)] => Some(Ok(Object::Float(7.5))),
+                        [_, Object::Int(2)] => Some(Err(crate::error::value_error("native-fast-read"))),
+                        _ => None,
+                    }
+                }
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                let full_calls = std::sync::Arc::new(AtomicUsize::new(0));
+                let native = Rc::new(crate::object::BuiltinFn {
+                    name: "native_fast_read_probe",
+                    binds_instance: true,
+                    call_kw: None,
+                    call: Box::new({
+                        let full_calls = full_calls.clone();
+                        move |args| {
+                            full_calls.fetch_add(1, Ordering::Relaxed);
+                            fast(args).unwrap_or_else(|| Ok(Object::Int(41)))
+                        }
+                    }),
+                });
+                crate::leaf_builtins::register_fast(&native, fast);
+                let Object::Module(main) = interp.cache.get("__main__").unwrap() else {
+                    panic!("missing main module")
+                };
+                main.dict.borrow_mut().insert(
+                    crate::object::DictKey(Object::from_str("_native_fast_getitem")),
+                    Object::Builtin(native.clone()),
+                );
+                let calls = NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get);
+                let hits = NATIVE_SUBSCRIPT_CACHE_HITS.with(std::cell::Cell::get);
+                run(&mut interp, "class NativeFastProbe:\n    __getitem__ = _native_fast_getitem\nnative_probe = NativeFastProbe()\ndef fast_reads(values, index, n):\n    result = None\n    for i in range(n):\n        result = values[index]\n    return result\nassert fast_reads(native_probe, 1, 4000) == 7.5\n");
+                let native_calls = NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get) - calls;
+                assert!(NATIVE_SUBSCRIPT_CACHE_HITS.with(std::cell::Cell::get) > hits + 1000);
+                assert!(native_calls > 1000, "native: {native_calls}; full: {}", full_calls.load(Ordering::Relaxed));
+                assert_eq!(native_calls as usize + full_calls.load(Ordering::Relaxed), 4000);
+                run(&mut interp, "try:\n    fast_reads(native_probe, 2, 1)\nexcept ValueError as error:\n    assert str(error) == 'native-fast-read'\nelse:\n    raise AssertionError('missing fast error')\n");
+                assert_eq!(
+                    (NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get) - calls) as usize
+                        + full_calls.load(Ordering::Relaxed),
+                    4001,
+                );
+                // Probe both helper outcomes directly as well, independently
+                // of whether the dispatch loop is temporarily on its full path.
+                let Object::Module(main) = interp.cache.get("__main__").unwrap() else {
+                    panic!("missing main module")
+                };
+                let receiver = main.dict.borrow().get(&crate::object::StrKey("native_probe"))
+                    .unwrap().clone();
+                let full_before = full_calls.load(Ordering::Relaxed);
+                let native_before = NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get);
+                assert!(interp.leaf_instance_subscript(&[receiver.clone(), Object::Int(0)], &code, 0).is_none());
+                assert_eq!(full_calls.load(Ordering::Relaxed), full_before);
+                assert_eq!(NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get), native_before);
+                assert!(matches!(
+                    interp.leaf_instance_subscript(&[receiver.clone(), Object::Int(2)], &code, 0),
+                    Some(Err(_))
+                ));
+                assert_eq!(NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get), native_before + 1);
+                assert_eq!(full_calls.load(Ordering::Relaxed), full_before);
+                run(&mut interp, "assert fast_reads(native_probe, 0, 3) == 41\n");
+                assert_eq!(NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get), native_before + 1);
+                assert_eq!(full_calls.load(Ordering::Relaxed), full_before + 3);
+                // Registration can narrow admission without changing the
+                // class or builtin identity. A cached old fast half must
+                // not handle this error after the generation changes.
+                fn narrowed_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+                    matches!(args, [_, Object::Int(1)]).then(|| fast(args).unwrap())
+                }
+                crate::leaf_builtins::register_fast(&native, narrowed_fast);
+                run(&mut interp, "try:\n    fast_reads(native_probe, 2, 1)\nexcept ValueError as error:\n    assert str(error) == 'native-fast-read'\nelse:\n    raise AssertionError('missing re-registered error')\n");
+                assert_eq!(NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get), native_before + 1);
+                assert_eq!(full_calls.load(Ordering::Relaxed), full_before + 4);
+                run(&mut interp, "NativeFastProbe.__getitem__ = lambda self, index: 43\nassert fast_reads(native_probe, 1, 3) == 43\n");
+                assert_eq!(NATIVE_FAST_SUBSCRIPTS.with(std::cell::Cell::get), native_before + 1);
+                assert_eq!(full_calls.load(Ordering::Relaxed), full_before + 4);
+                drop(receiver);
+                let native_ref = Rc::downgrade(&native);
+                drop(native);
+                run(&mut interp, "native_class_ref = weakref.ref(NativeFastProbe)\ndel native_probe, NativeFastProbe, _native_fast_getitem\ngc.collect()\nassert native_class_ref() is None\n");
+                assert!(native_ref.upgrade().is_none(), "subscript cache retained builtin");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "jit")]
+    fn diagnose_pure_leaf_coverage(interp: &Interpreter, names: &[&str]) {
+        eprintln!("Predicate stages [called, warm, slot, binding, droppable, eval, left, right, compared]: {:?}",
+            PURE_PREDICATE_STAGES.with(std::cell::Cell::get));
+        eprintln!(
+            "Predicate drop misses [function, instance, container, other]: {:?}",
+            PURE_PREDICATE_DROP_MISSES.with(std::cell::Cell::get)
+        );
+        let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+            panic!("missing main module for coverage diagnostics");
+        };
+        let globals = main.dict.borrow();
+        for name in names {
+            let Some(Object::Function(function)) = globals.get(&crate::object::StrKey(name)) else {
+                panic!("missing {name} for coverage diagnostics");
+            };
+            let code = function.code();
+            let id = Rc::as_ptr(function) as usize as u64;
+            eprintln!(
+                "  function owners={}, maybe_tracked={}, tracked={}",
+                Rc::strong_count(function),
+                gc_trace::maybe_tracked(id),
+                gc_trace::is_tracked(id)
+            );
+            if *name == "default_predicate" {
+                if let Some(receiver @ Object::Instance(inst)) = function.defaults.first() {
+                    let args = [std::ptr::from_ref(receiver); 2];
+                    eprintln!(
+                        "  direct evaluator: {:?}, class_version={}, native_kind={}",
+                        interp.pure_leaf_eval::<false>(&code, function, &args),
+                        inst.cls_raw().attr_version.get(),
+                        inst.cls_raw().native_kind.get()
+                    );
+                }
+            }
+            let shape = code_vm_ext(&code)
+                .map(|ext| ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed));
+            eprintln!(
+                "Pure leaf {name}: shape={shape:?}, argc={}, varnames={:?}, names={:?}, JIT={:?}",
+                code.arg_count,
+                code.varnames,
+                code.names,
+                std::env::var_os("WEAVEPY_JIT")
+            );
+            for (pc, instruction) in code.instructions.iter().enumerate() {
+                eprintln!(
+                    "  {pc}: {instruction:?}, cache={:?}",
+                    code.caches.get(pc as u32)
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn scalar_field_updates_preserve_calls_and_fallbacks() {
+        const CHILD: &str = "WEAVEPY_FIELD_UPDATE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for jit in ["0", "1"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::scalar_field_updates_preserve_calls_and_fallbacks",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("WEAVEPY_JIT", jit)
+                    .status()
+                    .expect("spawn scalar field update test");
+                assert!(status.success(), "scalar field update child: {status}");
+            }
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut interp = Interpreter::new();
+                let run = |interp: &mut Interpreter, source: &str| {
+                    let module = parse_module(source).unwrap();
+                    let code = weavepy_compiler::compile_module_with_source(
+                        &module,
+                        source,
+                        "scalar_field_updates.py",
+                    )
+                    .unwrap();
+                    interp
+                        .run_module(&code)
+                        .expect("scalar field update assertions");
+                };
+                let boxed = SCALAR_FIELD_UPDATE_BOXED_RETURNS.with(std::cell::Cell::get);
+                run(
+                    &mut interp,
+                    include_str!("../../../tests/regrtest/test_scalar_field_updates.py"),
+                );
+                let boxed = SCALAR_FIELD_UPDATE_BOXED_RETURNS.with(std::cell::Cell::get) - boxed;
+                eprintln!("Native completed-result lane transitions: {boxed}");
+                if !crate::tier2::jit_off_for_process() {
+                    assert!(boxed > 0, "completed-result lane transition coverage");
+                }
+                for kind in [
+                    "parameter",
+                    "constant",
+                    "default",
+                    "class-default",
+                    "slots",
+                    "alias",
+                    "hook",
+                    "property",
+                    "class-object",
+                    "large-integer",
+                ] {
+                    let probe = if matches!(
+                        kind,
+                        "class-default" | "property" | "class-object" | "large-integer"
+                    ) {
+                        include_str!("../../../tools/bench_field_update_fallbacks.py")
+                    } else {
+                        include_str!("../../../tools/bench_field_updates.py")
+                    };
+                    let source = format!(
+                        "__name__ = 'update_coverage'\n{probe}\nKIND = '{kind}'\nbench(4000)\n"
+                    );
+                    let native = SCALAR_FIELD_UPDATE_NATIVE_CALLS.with(std::cell::Cell::get);
+                    let attempts = SCALAR_FIELD_UPDATE_ATTEMPTS.with(std::cell::Cell::get);
+                    run(&mut interp, &source);
+                    let native =
+                        SCALAR_FIELD_UPDATE_NATIVE_CALLS.with(std::cell::Cell::get) - native;
+                    eprintln!("Completed scalar field update {kind} calls: native {native}");
+                    let attempts =
+                        SCALAR_FIELD_UPDATE_ATTEMPTS.with(std::cell::Cell::get) - attempts;
+                    if crate::tier2::jit_off_for_process() {
+                        assert_eq!(native, 0, "native entry requires JIT");
+                        assert_eq!(attempts, 0, "interpreted calls use their ordinary path");
+                    } else if matches!(kind, "parameter" | "constant" | "default" | "alias") {
+                        assert!(
+                            native > 100,
+                            "compiled {kind} native update coverage: {native}"
+                        );
+                    } else {
+                        assert_eq!(native, 0, "{kind} uses its ordinary call path");
+                        assert_eq!(attempts, 0, "{kind} bypasses the update evaluator");
+                    }
+                }
+                for (name, fixture, work) in [
+                    (
+                        "deltablue",
+                        include_str!("../../weavepy-bench/fixtures/deltablue.py"),
+                        3,
+                    ),
+                    (
+                        "richards",
+                        include_str!("../../weavepy-bench/fixtures/richards.py"),
+                        500,
+                    ),
+                    (
+                        "call_overhead",
+                        include_str!("../../weavepy-bench/fixtures/call_overhead.py"),
+                        4000,
+                    ),
+                ] {
+                    let native = SCALAR_FIELD_UPDATE_NATIVE_CALLS.with(std::cell::Cell::get);
+                    run(
+                        &mut interp,
+                        &format!("__name__ = 'update_coverage'\n{fixture}\nbench({work})\n"),
+                    );
+                    let native =
+                        SCALAR_FIELD_UPDATE_NATIVE_CALLS.with(std::cell::Cell::get) - native;
+                    eprintln!("Application {name} completed updates: native {native}");
+                    if name == "richards" && !crate::tier2::jit_off_for_process() {
+                        assert!(native > 100, "Richards native update coverage: {native}");
+                    }
+                    if crate::tier2::jit_off_for_process() {
+                        assert_eq!(native, 0, "{name} ordinary interpreter dispatch");
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn pure_literal_arguments_preserve_values_and_fallback() {
+        const CHILD: &str = "WEAVEPY_PURE_LITERAL_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for jit in ["0", "1"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::pure_literal_arguments_preserve_values_and_fallback",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("WEAVEPY_JIT", jit)
+                    .status()
+                    .expect("spawn pure literal argument test");
+                assert!(status.success(), "pure literal argument child: {status}");
+            }
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut interp = Interpreter::new();
+                let run = |interp: &mut Interpreter, source: &str| {
+                    let module = parse_module(source).unwrap();
+                    let code = weavepy_compiler::compile_module_with_source(
+                        &module,
+                        source,
+                        "pure_literal_arguments.py",
+                    )
+                    .unwrap();
+                    interp
+                        .run_module(&code)
+                        .expect("literal argument assertions");
+                };
+                run(
+                    &mut interp,
+                    include_str!("../../../tests/regrtest/test_pure_literal_arguments.py"),
+                );
+                for kind in ["global", "static", "method", "eight", "zero"] {
+                    let source = format!(
+                        "__name__ = 'literal_coverage'\n{}\nKIND = '{kind}'\nbench(4000)\n",
+                        include_str!("../../../tools/bench_literal_calls.py")
+                    );
+                    let before = PURE_LITERAL_ARGUMENT_CALLS.with(std::cell::Cell::get);
+                    run(&mut interp, &source);
+                    let after = PURE_LITERAL_ARGUMENT_CALLS.with(std::cell::Cell::get);
+                    let index = usize::from(kind == "method") + if kind == "zero" { 0 } else { 2 };
+                    let hits = after[index] - before[index];
+                    if crate::tier2::jit_off_for_process() {
+                        assert!(hits > 1000, "completed pure {kind} literal calls: {hits}");
+                    }
+                    eprintln!("Completed pure {kind} literal calls: {hits}");
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn pure_slot_fields_preserve_lookup_and_lifetimes() {
+        const CHILD: &str = "WEAVEPY_PURE_SLOT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Native calls may bypass these interpreter counters. Require
+            // path coverage with the JIT off and semantic checks in both modes.
+            for jit in ["0", "1"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::pure_slot_fields_preserve_lookup_and_lifetimes",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("WEAVEPY_JIT", jit)
+                    .status()
+                    .expect("spawn pure slot test");
+                assert!(status.success(), "pure slot child: {status}");
+            }
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut interp = Interpreter::new();
+                let require_hits = crate::tier2::jit_off_for_process();
+                let source = include_str!("../../../tests/regrtest/test_pure_slot_reads.py");
+                let module = parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    source,
+                    "pure_slot_reads.py",
+                )
+                .unwrap();
+                let before = PURE_SLOT_FIELD_READS.with(std::cell::Cell::get);
+                interp.run_module(&code).expect("pure slot assertions");
+                let after = PURE_SLOT_FIELD_READS.with(std::cell::Cell::get);
+                if require_hits && (0..3).any(|index| after[index] - before[index] <= 1000) {
+                    diagnose_pure_leaf_coverage(&interp, &["read", "compare", "add"]);
+                }
+                for (index, name) in ["getter", "predicate", "general"].iter().enumerate() {
+                    let hits = after[index] - before[index];
+                    if require_hits {
+                        assert!(hits > 1000, "pure slot {name} hits: {hits}");
+                    }
+                    eprintln!("Pure slot {name} hits: {hits}");
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn pure_cached_field_predicates_preserve_fallbacks() {
+        const CHILD: &str = "WEAVEPY_FIELD_PREDICATE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Native calls may bypass these interpreter counters. Require
+            // path coverage with the JIT off and semantic checks in both modes.
+            for jit in ["0", "1"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::pure_cached_field_predicates_preserve_fallbacks",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("WEAVEPY_JIT", jit)
+                    .status()
+                    .expect("spawn field predicate test");
+                assert!(status.success(), "field predicate child: {status}");
+            }
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut interp = Interpreter::new();
+                let require_hits = crate::tier2::jit_off_for_process();
+                let run = |interp: &mut Interpreter, source: &str| {
+                    let module = parse_module(source).unwrap();
+                    let code = weavepy_compiler::compile_module_with_source(
+                        &module,
+                        source,
+                        "pure_field_predicates.py",
+                    )
+                    .unwrap();
+                    interp
+                        .run_module(&code)
+                        .expect("field predicate assertions");
+                };
+                let before = PURE_CACHED_FIELD_PREDICATES.with(std::cell::Cell::get);
+                run(
+                    &mut interp,
+                    include_str!("../../../tests/regrtest/test_pure_field_predicates.py"),
+                );
+                let hits = PURE_CACHED_FIELD_PREDICATES.with(std::cell::Cell::get) - before;
+                if require_hits {
+                    if hits <= 1000 {
+                        diagnose_pure_leaf_coverage(
+                            &interp,
+                            &["default_predicate", "other_fields"],
+                        );
+                    }
+                    assert!(hits > 1000, "cached field predicate hits: {hits}");
+                }
+                let source = format!(
+                    "__name__ = 'predicate_coverage'\n{}\nassert bench(2) == 0\n",
+                    include_str!("../../weavepy-bench/fixtures/deltablue.py")
+                );
+                let before = PURE_CACHED_FIELD_PREDICATES.with(std::cell::Cell::get);
+                run(&mut interp, &source);
+                let hits = PURE_CACHED_FIELD_PREDICATES.with(std::cell::Cell::get) - before;
+                if require_hits {
+                    assert!(hits > 1000, "DeltaBlue cached field predicate hits: {hits}");
+                }
+                eprintln!("DeltaBlue predicate hits in two complete iterations: {hits}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_scalar_leaf_calls_borrow_cached_artifacts() {
+        const CHILD: &str = "WEAVEPY_BORROWED_SCALAR_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::jit_scalar_leaf_calls_borrow_cached_artifacts",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("WEAVEPY_JIT", "1")
+                .status()
+                .expect("spawn borrowed scalar test");
+            assert!(status.success(), "borrowed scalar child: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut interp = Interpreter::new();
+                let source =
+                    include_str!("../../../tests/regrtest/test_jit_guarded_integer_comparisons.py");
+                let module = parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    source,
+                    "guarded_integer_comparisons.py",
+                )
+                .unwrap();
+                interp
+                    .run_module(&code)
+                    .expect("comparison callback and value assertions");
+                let before = crate::tier2::borrowed_dyn_scalar_calls_for_test();
+                let resolved_before = crate::tier2::resolved_dyn_calls_for_test();
+                let source = include_str!("../../../tests/regrtest/test_jit_scalar_leaf_calls.py");
+                let module = parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    source,
+                    "borrowed_dynamic_scalar_calls.py",
+                )
+                .unwrap();
+                interp
+                    .run_module(&code)
+                    .expect("scalar call guards and fallback assertions");
+                let borrowed = crate::tier2::borrowed_dyn_scalar_calls_for_test() - before;
+                assert!(borrowed > 1000, "borrowed scalar calls: {borrowed}");
+                let resolved = crate::tier2::resolved_dyn_calls_for_test() - resolved_before;
+                assert!(resolved > 1000, "reused owning resolutions: {resolved}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_borrowed_getters_preserve_callback_and_binding_rules() {
+        const CHILD: &str = "WEAVEPY_GETTER_PATH_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::jit_borrowed_getters_preserve_callback_and_binding_rules",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("spawn getter-path test");
+            assert!(status.success(), "getter-path test failed: {status}");
+            return;
+        }
+        std::thread::spawn(|| {
+            crate::tier2::force_enable_for_test(2);
+            let source = include_str!("../../../tests/regrtest/test_jit_getter_paths.py");
+            let (warmup, mutations) = source.split_once("# GETTER MUTATIONS:").unwrap();
+            let module = parse_module(warmup).unwrap();
+            let code =
+                weavepy_compiler::compile_module_with_source(&module, warmup, "getter_warmup.py")
+                    .unwrap();
+            let mut interp = Interpreter::new();
+            interp.run_module(&code).expect("getter warmup");
+            let reads = crate::tier2::dyn_attr_native_reads_for_test();
+            assert!(reads[4] > 1000, "getters must finish natively: {reads:?}");
+            let globals = {
+                let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+                    panic!("missing main module");
+                };
+                main.dict.clone()
+            };
+            {
+                let globals = globals.borrow();
+                for name in ["read", "binding_read", "suspended_read", "key_read"] {
+                    let Some(Object::Function(reader)) = globals.get(&crate::object::StrKey(name))
+                    else {
+                        panic!("missing {name}");
+                    };
+                    assert!(
+                        crate::tier2::code_compiled_for_test(&reader.code.borrow()),
+                        "{name} must compile before its fallback case"
+                    );
+                }
+            }
+            let mutations = format!("# GETTER MUTATIONS:{mutations}");
+            let module = parse_module(&mutations).unwrap();
+            let code = weavepy_compiler::compile_module_with_source(
+                &module,
+                &mutations,
+                "getter_mutations.py",
+            )
+            .unwrap();
+            interp
+                .exec_module_in(&code, globals)
+                .expect("getter mutation assertions");
+        })
+        .join()
+        .expect("getter-path worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_dynamic_attribute_results_keep_their_owners() {
+        const CHILD: &str = "WEAVEPY_ATTRIBUTE_OWNER_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::jit_dynamic_attribute_results_keep_their_owners",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("spawn attribute-owner test");
+            assert!(status.success(), "attribute-owner test failed: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                crate::tier2::force_enable_for_test(2);
+                let source =
+                    include_str!("../../../tests/regrtest/test_jit_dynamic_attribute_ownership.py");
+                let (warmup, mutations) = source.split_once("# OWNERSHIP MUTATIONS:").unwrap();
+                let module = parse_module(warmup).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    warmup,
+                    "attribute_ownership_warmup.py",
+                )
+                .unwrap();
+                let mut interp = Interpreter::new();
+                interp
+                    .run_module(&code)
+                    .expect("attribute ownership warmup");
+                let reads = crate::tier2::dyn_attr_native_reads_for_test();
+                for kind in [1, 2, 3, 4] {
+                    assert!(
+                        reads[kind] > 1000,
+                        "native ownership path {kind}: {reads:?}"
+                    );
+                }
+                let globals = {
+                    let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+                        panic!("missing main module");
+                    };
+                    main.dict.clone()
+                };
+                {
+                    let globals = globals.borrow();
+                    for name in [
+                        "read_self",
+                        "read_list",
+                        "read_dict",
+                        "read_tuple",
+                        "read_text",
+                        "read_none",
+                        "read_class",
+                        "read_module",
+                        "capture_list",
+                    ] {
+                        let Some(Object::Function(reader)) =
+                            globals.get(&crate::object::StrKey(name))
+                        else {
+                            panic!("missing {name}");
+                        };
+                        assert!(
+                            crate::tier2::code_compiled_for_test(&reader.code.borrow()),
+                            "{name} must compile before its fallback case"
+                        );
+                    }
+                }
+                let mutations = format!("# OWNERSHIP MUTATIONS:{mutations}");
+                let module = parse_module(&mutations).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    &mutations,
+                    "attribute_ownership_mutations.py",
+                )
+                .unwrap();
+                interp
+                    .exec_module_in(&code, globals)
+                    .expect("attribute ownership mutations");
+            })
+            .expect("spawn attribute-owner worker")
+            .join()
+            .expect("attribute-owner worker");
+    }
+
+    #[test]
+    fn class_key_callbacks_publish_caller_frame() {
+        const CHILD: &str = "WEAVEPY_CLASS_KEY_FRAME_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::class_key_callbacks_publish_caller_frame",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("WEAVEPY_JIT", "0")
+                .status()
+                .expect("spawn class-key callback test");
+            assert!(status.success(), "class-key callback test failed: {status}");
+            return;
+        }
+        // The exotic-class-key flag is process-wide, so this regression
+        // must not change cache admission for unrelated tests.
+        // Nested Python callbacks and frame inspection need more than the
+        // default 2 MiB debug-build test-thread stack on Linux and Windows.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let source =
+                    include_str!("../../../tests/regrtest/test_class_key_callback_frames.py");
+                let module = parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    source,
+                    "class_key_callbacks.py",
+                )
+                .unwrap();
+                let mut interp = Interpreter::new();
+                interp.run_module(&code).expect("class-key callback frames");
+            })
+            .expect("spawn class-key callback worker")
+            .join()
+            .expect("class-key callback worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_module_attribute_chains_preserve_guards_and_ownership() {
+        const CHILD: &str = "WEAVEPY_MODULE_CHAIN_VM_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::jit_module_attribute_chains_preserve_guards_and_ownership",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("spawn module-chain VM test");
+            assert!(status.success(), "module-chain VM test failed: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                crate::tier2::force_enable_for_test(2);
+                let source =
+                    include_str!("../../../tests/regrtest/test_jit_module_attribute_chains.py");
+                let (warmup, mutations) = source.split_once("# MODULE CHAIN MUTATIONS:").unwrap();
+                let code = compile_module(&parse_module(warmup).unwrap()).unwrap();
+                let mut interp = Interpreter::new();
+                interp.run_module(&code).expect("module-chain warmup");
+                let hits = crate::tier2::cached_attr_chain_hits_for_test();
+                assert!(hits[0] > 1000 && hits[1] > 10000, "fused reads: {hits:?}");
+                assert_eq!(
+                    crate::tier2::pin_pressure_exits_for_test(),
+                    0,
+                    "integer chains must not retain intermediate pins"
+                );
+                let globals = {
+                    let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+                        panic!("missing main module")
+                    };
+                    main.dict.clone()
+                };
+                let code = compile_module(
+                    &parse_module("assert integer_read(3000, native_root) == 9000").unwrap(),
+                )
+                .unwrap();
+                interp.exec_module_in(&code, globals.clone()).unwrap();
+                {
+                    let _gil = crate::gil::global_gil().acquire();
+                    let g = globals.borrow();
+                    let root = g.get(&crate::object::StrKey("native_root")).unwrap();
+                    let fresh = compile_module(&parse_module("root._weavepy_chain_child").unwrap())
+                        .unwrap();
+                    let fresh_pc = fresh
+                        .instructions
+                        .iter()
+                        .position(|ins| ins.op == OpCode::LoadAttr)
+                        .unwrap() as u32;
+                    assert!(fresh.vm_ext.0.get().is_none());
+                    let python_root = g.get(&crate::object::StrKey("python_root")).unwrap();
+                    // SAFETY: the GIL and root owner stay live; no result
+                    // escapes this callback-free probe.
+                    assert!(unsafe {
+                        crate::tier2::cached_chain_peek_for_test(python_root, &fresh, fresh_pc)
+                    }
+                    .is_none());
+                    assert!(
+                        fresh.vm_ext.0.get().is_none(),
+                        "a miss must not initialize metadata"
+                    );
+
+                    let Object::Module(module) = root else {
+                        panic!("expected native module")
+                    };
+                    let Some(Object::Function(reader)) =
+                        g.get(&crate::object::StrKey("integer_read"))
+                    else {
+                        panic!("missing reader")
+                    };
+                    let code = reader.code.borrow();
+                    let pc = code
+                        .instructions
+                        .iter()
+                        .position(|ins| ins.op == OpCode::LoadAttr)
+                        .unwrap() as u32;
+                    // SAFETY: each result stays inside this rooted, read-only
+                    // interval under the GIL. No result crosses a mutation.
+                    let tail = unsafe { crate::tier2::cached_chain_peek_for_test(root, &code, pc) }
+                        .unwrap()
+                        .clone();
+                    assert!(matches!(
+                        unsafe { crate::tier2::cached_chain_peek_for_test(&tail, &code, pc + 1) },
+                        Some(Object::Int(3))
+                    ));
+                    let other = g.get(&crate::object::StrKey("math")).unwrap();
+                    assert!(
+                        unsafe { crate::tier2::cached_chain_peek_for_test(other, &code, pc) }
+                            .is_none(),
+                        "module owner must match the cache"
+                    );
+                    let guard = module.dict.borrow_mut();
+                    assert!(
+                        unsafe { crate::tier2::cached_chain_peek_for_test(root, &code, pc) }
+                            .is_none()
+                    );
+                    drop(guard);
+                    let Object::Instance(tail) = &tail else {
+                        panic!("expected Python module")
+                    };
+                    let guard = tail.dict.get().unwrap().borrow_mut();
+                    let tail_object = Object::Instance(tail.clone());
+                    assert!(unsafe {
+                        crate::tier2::cached_chain_peek_for_test(&tail_object, &code, pc + 1)
+                    }
+                    .is_none());
+                    drop(guard);
+                }
+                let code = compile_module(
+                    &parse_module("assert integer_read(3000, math) == 9000").unwrap(),
+                )
+                .unwrap();
+                interp.exec_module_in(&code, globals.clone()).unwrap();
+                {
+                    let _gil = crate::gil::global_gil().acquire();
+                    let g = globals.borrow();
+                    let root = g.get(&crate::object::StrKey("math")).unwrap();
+                    let Object::Module(module) = root else {
+                        panic!("expected native module")
+                    };
+                    let Some(Object::Function(reader)) =
+                        g.get(&crate::object::StrKey("integer_read"))
+                    else {
+                        panic!("missing reader")
+                    };
+                    let code = reader.code.borrow();
+                    let pc = code
+                        .instructions
+                        .iter()
+                        .position(|ins| ins.op == OpCode::LoadAttr)
+                        .unwrap() as u32;
+                    // SAFETY: each result is inspected and discarded before
+                    // the class registry changes, with the GIL held.
+                    assert!(
+                        unsafe { crate::tier2::cached_chain_peek_for_test(root, &code, pc) }
+                            .is_some()
+                    );
+                    crate::object::set_module_class(
+                        module,
+                        Object::Type(builtin_types().module_.clone()),
+                    );
+                    assert!(
+                        unsafe { crate::tier2::cached_chain_peek_for_test(root, &code, pc) }
+                            .is_none(),
+                        "an assigned module class must revoke the borrowed cache"
+                    );
+                }
+                let mutations = format!("# MODULE CHAIN MUTATIONS:{mutations}");
+                let code = compile_module(&parse_module(&mutations).unwrap()).unwrap();
+                interp
+                    .exec_module_in(&code, globals.clone())
+                    .expect("module-chain mutations");
+                let before = crate::tier2::cached_attr_chain_hits_for_test();
+                let source = concat!(
+                    "native_root._weavepy_chain_child = child(3)\n",
+                    "def shared_read(n, root):\n",
+                    "    total = 0\n",
+                    "    for _ in range(n):\n",
+                    "        total += root._weavepy_chain_child.value\n",
+                    "    return total\n",
+                    "assert shared_read(10000, native_root) == 30000",
+                );
+                let code = compile_module(&parse_module(source).unwrap()).unwrap();
+                interp.exec_module_in(&code, globals.clone()).unwrap();
+                let warmed = crate::tier2::cached_attr_chain_hits_for_test();
+                assert!(
+                    warmed[1] > before[1] + 1000,
+                    "shared-cell probe must first fuse"
+                );
+                let before = warmed;
+                crate::sync::mark_cells_shared();
+                let source = concat!(
+                    "assert shared_read(10000, native_root) == 30000\n",
+                    "del native_root._weavepy_chain_child",
+                );
+                let code = compile_module(&parse_module(source).unwrap()).unwrap();
+                interp
+                    .exec_module_in(&code, globals)
+                    .expect("shared module fallback");
+                assert_eq!(
+                    crate::tier2::cached_attr_chain_hits_for_test(),
+                    before,
+                    "shared cells must revoke borrowed module chains"
+                );
+            })
+            .expect("spawn module-chain worker")
+            .join()
+            .expect("module-chain worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_cached_attribute_chains_preserve_fallbacks_and_lifetimes() {
+        const CHILD: &str = "WEAVEPY_CACHED_CHAIN_VM_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::jit_cached_attribute_chains_preserve_fallbacks_and_lifetimes",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("spawn cached-chain VM test");
+            assert!(status.success(), "cached-chain VM test failed: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                crate::tier2::force_enable_for_test(2);
+                let source =
+                    include_str!("../../../tests/regrtest/test_jit_cached_attribute_chains.py");
+                let (warmup, mutations) = source.split_once("# CACHED CHAIN MUTATIONS:").unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &parse_module(warmup).unwrap(),
+                    warmup,
+                    "cached_chain_warmup.py",
+                )
+                .unwrap();
+                let mut interp = Interpreter::new();
+                interp.run_module(&code).expect("cached-chain warmup");
+                let hits = crate::tier2::cached_attr_chain_hits_for_test();
+                assert!(
+                    hits[0] > 1000,
+                    "object results must execute fused reads: {hits:?}"
+                );
+                assert!(
+                    hits[1] > 1000,
+                    "integer results must execute fused reads: {hits:?}"
+                );
+                assert!(
+                    crate::tier2::cached_attr_prefix_hits_for_test() > 1000,
+                    "fallback chains must reuse their completed prefix"
+                );
+                let reads = crate::tier2::dyn_attr_native_reads_for_test();
+                for kind in [1, 2, 4] {
+                    assert!(
+                        reads[kind] > 1000,
+                        "native class/module/getter fallback {kind}: {reads:?}"
+                    );
+                }
+                let globals = {
+                    let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+                        panic!("missing main")
+                    };
+                    main.dict.clone()
+                };
+                {
+                    let globals = globals.borrow();
+                    for name in [
+                        "dict_read",
+                        "slot_read",
+                        "mixed_read",
+                        "object_read",
+                        "class_read",
+                        "module_read",
+                        "getter_read",
+                        "boundary_9",
+                        "boundary_17",
+                        "boundary_32",
+                        "boundary_33",
+                    ] {
+                        let Some(Object::Function(driver)) =
+                            globals.get(&crate::object::StrKey(name))
+                        else {
+                            panic!("missing {name}")
+                        };
+                        assert!(
+                            crate::tier2::code_compiled_for_test(&driver.code.borrow()),
+                            "{name} must compile before mutations"
+                        );
+                    }
+                }
+                let mutations = format!("# CACHED CHAIN MUTATIONS:{mutations}");
+                let code = weavepy_compiler::compile_module_with_source(
+                    &parse_module(&mutations).unwrap(),
+                    &mutations,
+                    "cached_chain_mutations.py",
+                )
+                .unwrap();
+                interp
+                    .exec_module_in(&code, globals.clone())
+                    .expect("cached-chain mutations and collection");
+                crate::sync::mark_cells_shared();
+                let hits = crate::tier2::cached_attr_chain_hits_for_test();
+                let borrowed = crate::tier2::attr_chain_borrowed_count_for_test();
+                let code = compile_module(
+                    &parse_module("assert slot_read(slot_root, 3000) == 33000").unwrap(),
+                )
+                .unwrap();
+                interp
+                    .exec_module_in(&code, globals)
+                    .expect("observer fallback");
+                assert_eq!(
+                    crate::tier2::cached_attr_chain_hits_for_test(),
+                    hits,
+                    "an observer must disable the borrowed walk"
+                );
+                assert!(
+                    crate::tier2::attr_chain_borrowed_count_for_test() > borrowed + 100,
+                    "ordinary guarded prefix must remain native"
+                );
+            })
+            .expect("cached-chain worker")
+            .join()
+            .expect("cached-chain assertions");
+    }
+
+    #[cfg(feature = "jit")]
+    fn run_attribute_chain_fixture(
+        test_name: &'static str,
+        child: &'static str,
+        source: &'static str,
+        marker: &'static str,
+        drivers: &'static [&'static str],
+        fallback_source: &'static str,
+    ) {
+        if std::env::var_os(child).is_none() {
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args(["--exact", test_name, "--nocapture"])
+                    .env(child, "1")
+                    .status()
+                    .expect("spawn attribute-chain test");
+            assert!(
+                status.success(),
+                "isolated attribute-chain test failed: {status}"
+            );
+            return;
+        }
+        std::thread::spawn(move || {
+            crate::tier2::force_enable_for_test(2);
+            let (warmup, mutations) = source.split_once(marker).expect("fixture phases");
+            let module = parse_module(warmup).expect("parse chain warmup");
+            let code = compile_module(&module).expect("compile chain warmup");
+            let mut interp = Interpreter::new();
+            interp.run_module(&code).expect("run chain warmup");
+            let (dict_reads, slot_reads) = crate::tier2::attr_chain_counts_for_test();
+            assert!(dict_reads > 100, "dict driver must execute fused reads");
+            assert!(slot_reads > 100, "slot driver must execute fused reads");
+            let globals = {
+                let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+                    panic!("missing main module");
+                };
+                main.dict.clone()
+            };
+            {
+                let globals = globals.borrow();
+                for &name in drivers {
+                    let Some(Object::Function(driver)) = globals.get(&crate::object::StrKey(name))
+                    else {
+                        panic!("missing {name} driver");
+                    };
+                    assert!(
+                        crate::tier2::code_compiled_for_test(&driver.code.borrow()),
+                        "{name} must compile before guard mutations"
+                    );
+                }
+            }
+            let mutations = format!("{marker}{mutations}");
+            let module = parse_module(&mutations).expect("parse chain mutations");
+            let code = compile_module(&module).expect("compile chain mutations");
+            interp
+                .exec_module_in(&code, globals.clone())
+                .expect("chain mutation assertions");
+
+            // Model an out-of-GIL observer: slot reads must still execute
+            // natively while using retained borrow guards.
+            crate::sync::mark_cells_shared();
+            let before = crate::tier2::attr_chain_borrowed_count_for_test();
+            let module = parse_module(fallback_source).expect("parse guarded slot fallback");
+            let code = compile_module(&module).expect("compile guarded slot fallback");
+            interp
+                .exec_module_in(&code, globals)
+                .expect("guarded slot fallback result");
+            assert!(
+                crate::tier2::attr_chain_borrowed_count_for_test() > before + 100,
+                "unguarded VM access must retain the native slot fallback"
+            );
+        })
+        .join()
+        .expect("attribute-chain JIT worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_version_guards_release_unreachable_classes() {
+        // A peer collection can make gc.collect() return without collecting.
+        // Every lifetime assertion here requires a completed collection.
+        const CHILD: &str = "WEAVEPY_CLASS_GUARD_LIFETIME_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "tests::jit_version_guards_release_unreachable_classes",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .status()
+                    .expect("spawn class-guard lifetime test");
+            assert!(
+                status.success(),
+                "isolated class-guard test failed: {status}"
+            );
+            return;
+        }
+        std::thread::spawn(|| {
+            crate::tier2::force_enable_for_test(2);
+            let source = include_str!("../../../tests/regrtest/test_jit_class_guard_lifetime.py");
+            let (lifetime, replacements) = source
+                .split_once("# New classes can reuse old allocation addresses")
+                .expect("replacement phase marker");
+            let module = parse_module(lifetime).expect("parse lifetime fixture");
+            let code = compile_module(&module).expect("compile lifetime fixture");
+            let mut interp = Interpreter::new();
+            interp.run_module(&code).expect("class lifetime assertions");
+            let globals = {
+                let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+                    panic!("missing main module");
+                };
+                main.dict.clone()
+            };
+            {
+                let globals = globals.borrow();
+                let Some(Object::Dict(drivers)) = globals.get(&crate::object::StrKey("drivers"))
+                else {
+                    panic!("missing retained drivers");
+                };
+                let drivers = drivers.borrow();
+                for kind in ["dict", "slots", "store", "method"] {
+                    let Some(Object::Function(driver)) = drivers.get(&crate::object::StrKey(kind))
+                    else {
+                        panic!("missing {kind} driver");
+                    };
+                    assert!(
+                        crate::tier2::code_compiled_for_test(&driver.code.borrow()),
+                        "{kind} must keep its compiled guard after collection"
+                    );
+                }
+            }
+            let replacements =
+                format!("# New classes can reuse old allocation addresses{replacements}");
+            let module = parse_module(&replacements).expect("parse replacement fixture");
+            let code = compile_module(&module).expect("compile replacement fixture");
+            interp
+                .exec_module_in(&code, globals)
+                .expect("replacement guard assertions");
+        })
+        .join()
+        .expect("class-guard JIT worker");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_container_attributes_preserve_identity_and_lifetime() {
+        // A peer collection can make gc.collect() return without collecting.
+        // These in-loop lifetime assertions require an isolated collector.
+        const CHILD: &str = "WEAVEPY_CONTAINER_LIFETIME_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "tests::jit_container_attributes_preserve_identity_and_lifetime",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .status()
+                    .expect("spawn container-lifetime test");
+            assert!(
+                status.success(),
+                "isolated container-lifetime test failed: {status}"
+            );
+            return;
+        }
+        let (out, compiled, _) = run_jit(include_str!(
+            "../../../tests/regrtest/test_jit_container_attributes.py"
+        ));
+        assert!(out.contains("container attributes: ok"));
+        assert!(compiled > 0, "the fixture must exercise the JIT");
+    }
+
+    #[test]
+    fn deque_index_callbacks_see_their_python_caller() {
+        // The Python compiler retains source positions, which the minimal
+        // AST-only `run` helper doesn't supply to its outer module.
+        let source = Object::from_str(include_str!(
+            "../../../tests/regrtest/test_deque_index_callback_frames.py"
+        ))
+        .repr();
+        let out = run(&format!(
+            "exec(compile({source}, 'deque_callback.py', 'exec'))"
+        ));
+        assert!(out.contains("warmed deque callback frame: ok"));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_deque_index_callbacks_see_their_python_caller() {
+        let source = Object::from_str(include_str!(
+            "../../../tests/regrtest/test_deque_index_callback_frames.py"
+        ))
+        .repr();
+        let (out, _, _) = run_jit(&format!(
+            "exec(compile({source}, 'deque_callback.py', 'exec'))"
+        ));
+        assert!(out.contains("warmed deque callback frame: ok"));
     }
 
     /// RFC 0032 — run `src` with the tier-2 JIT forced on, on a fresh
@@ -65581,6 +68165,298 @@ assert namespace is exported.__dict__
 
     #[cfg(feature = "jit")]
     #[test]
+    fn jit_checked_integer_overflow_preserves_python_values() {
+        const CHILD: &str = "WEAVEPY_CHECKED_INTEGER_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::jit_checked_integer_overflow_preserves_python_values",
+                ])
+                .env(CHILD, "1")
+                .env("WEAVEPY_JIT", "1")
+                .env("WEAVEPY_JIT_THRESHOLD", "50")
+                .status()
+                .expect("spawn checked arithmetic test");
+            assert!(status.success(), "checked arithmetic child: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                crate::tier2::note_startup_finished();
+                let source =
+                    include_str!("../../../tests/regrtest/test_jit_checked_integer_arithmetic.py");
+                let code = compile_module(&parse_module(source).unwrap()).unwrap();
+                Interpreter::new().run_module(&code).unwrap();
+                let (compiled, entries, deopts) = crate::tier2::stats_for_test();
+                assert!(compiled >= 3 && entries >= 3, "{compiled}, {entries}");
+                assert!(crate::tier2::osr_stats_for_test() >= 3);
+                assert!(deopts >= 3, "overflow must exercise native exits: {deopts}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn interpreter_attribute_chains_preserve_guards_and_ownership() {
+        const CHILD: &str = "WEAVEPY_INTERPRETER_CHAIN_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::interpreter_attribute_chains_preserve_guards_and_ownership",
+                ])
+                .env(CHILD, "1")
+                .env("WEAVEPY_JIT", "0")
+                .status()
+                .expect("spawn interpreter chain test");
+            assert!(status.success(), "interpreter chain child: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let source =
+                    include_str!("../../../tests/regrtest/test_interpreter_attribute_chains.py");
+                let (warmup, mutations) =
+                    source.split_once("# INTERPRETER CHAIN MUTATIONS:").unwrap();
+                let warmup = format!(
+                    "{warmup}\nroot4 = chains[4][0]\nroot9 = chains[9][0]\ntail9 = chains[9][-1]\n"
+                );
+                let code = compile_module(&parse_module(&warmup).unwrap()).unwrap();
+                let mut interp = Interpreter::new();
+                interp.run_module(&code).unwrap();
+                let Some(Object::Module(main)) = interp.cache.get("__main__") else {
+                    panic!("missing main module")
+                };
+                let globals = main.dict.clone();
+                {
+                    let _gil = crate::gil::global_gil().acquire();
+                    let g = globals.borrow();
+                    let root = g.get(&crate::object::StrKey("root4")).unwrap();
+                    let payload = g.get(&crate::object::StrKey("payload")).unwrap();
+                    let Some(Object::Function(reader)) = g.get(&crate::object::StrKey("read_4"))
+                    else {
+                        panic!("missing reader")
+                    };
+                    let code = reader.code.borrow();
+                    let pc = code
+                        .instructions
+                        .iter()
+                        .position(|ins| ins.op == OpCode::LoadAttr)
+                        .unwrap();
+                    let (value, end) = Interpreter::core_local_attr_chain(&code, root, pc)
+                        .expect("warmed interpreter sites must fuse");
+                    assert!(value.is_same(payload));
+                    assert_eq!(end, pc + 3);
+                    let Object::Instance(first) = root else {
+                        panic!("missing root instance")
+                    };
+                    let dict = first.dict.get().unwrap();
+                    let guard = dict.borrow_mut();
+                    assert!(Interpreter::core_local_attr_chain(&code, root, pc).is_none());
+                    drop(guard);
+                    let second = dict
+                        .borrow()
+                        .get(&crate::object::StrKey("next"))
+                        .unwrap()
+                        .clone();
+                    let Object::Instance(second) = second else {
+                        panic!("missing second instance")
+                    };
+                    let third = second
+                        .dict
+                        .get()
+                        .unwrap()
+                        .borrow()
+                        .get(&crate::object::StrKey("next"))
+                        .unwrap()
+                        .clone();
+                    let Object::Instance(third_inst) = &third else {
+                        panic!("missing third instance")
+                    };
+                    let guard = third_inst.dict.get().unwrap().borrow_mut();
+                    let (value, end) = Interpreter::core_local_attr_chain(&code, root, pc)
+                        .expect("two completed reads can materialize a prefix");
+                    assert!(value.is_same(&third));
+                    assert_eq!(end, pc + 1);
+                    drop(guard);
+                    let root = g.get(&crate::object::StrKey("root9")).unwrap();
+                    let tail = g.get(&crate::object::StrKey("tail9")).unwrap();
+                    let Some(Object::Function(reader)) = g.get(&crate::object::StrKey("read_9"))
+                    else {
+                        panic!("missing longer reader")
+                    };
+                    let code = reader.code.borrow();
+                    let pc = code
+                        .instructions
+                        .iter()
+                        .position(|ins| ins.op == OpCode::LoadAttr)
+                        .unwrap();
+                    let (value, end) = Interpreter::core_local_attr_chain(&code, root, pc).unwrap();
+                    assert!(value.is_same(tail));
+                    assert_eq!(end, pc + 7, "the walk must stop after eight reads");
+                    for (root_name, reader_name) in [
+                        ("slot_root", "read_slots_4"),
+                        ("mixed_root", "read_mixed_4"),
+                    ] {
+                        let root = g.get(&crate::object::StrKey(root_name)).unwrap();
+                        let Some(Object::Function(reader)) =
+                            g.get(&crate::object::StrKey(reader_name))
+                        else {
+                            panic!("missing {reader_name}")
+                        };
+                        let code = reader.code.borrow();
+                        let pc = code
+                            .instructions
+                            .iter()
+                            .position(|ins| ins.op == OpCode::LoadAttr)
+                            .unwrap();
+                        let (value, end) =
+                            Interpreter::core_local_attr_chain(&code, root, pc).unwrap();
+                        assert!(value.is_same(payload));
+                        assert_eq!(end, pc + 3);
+                        if root_name == "slot_root" {
+                            let Object::Instance(first) = root else {
+                                panic!("missing slot root")
+                            };
+                            let guard = first.slots.borrow_mut();
+                            assert!(Interpreter::core_local_attr_chain(&code, root, pc).is_none());
+                            drop(guard);
+                            let second = first.slots.borrow().get("next").unwrap().clone();
+                            let Object::Instance(second) = second else {
+                                panic!("missing second slot node")
+                            };
+                            let third = second.slots.borrow().get("next").unwrap().clone();
+                            let Object::Instance(third_inst) = &third else {
+                                panic!("missing third slot node")
+                            };
+                            let guard = third_inst.slots.borrow_mut();
+                            let (value, end) =
+                                Interpreter::core_local_attr_chain(&code, root, pc).unwrap();
+                            assert!(value.is_same(&third));
+                            assert_eq!(end, pc + 1);
+                            drop(guard);
+                        }
+                    }
+                }
+                let code = compile_module(&parse_module(mutations).unwrap()).unwrap();
+                interp.exec_module_in(&code, globals.clone()).unwrap();
+                let code = compile_module(
+                    &parse_module(
+                        "for _ in range(300):\n    assert read_4(root4) is payload\n    assert read_slots_4(slot_root) is payload\n    assert read_mixed_4(mixed_root) is payload\n",
+                    ).unwrap(),
+                )
+                .unwrap();
+                interp.exec_module_in(&code, globals.clone()).unwrap();
+                for shared in [false, true] {
+                    // Revocation waits for existing borrow guards to leave.
+                    if shared {
+                        crate::sync::mark_cells_shared();
+                    }
+                    let _gil = crate::gil::global_gil().acquire();
+                    let g = globals.borrow();
+                    for (root_name, reader_name) in [
+                        ("root4", "read_4"),
+                        ("slot_root", "read_slots_4"),
+                        ("mixed_root", "read_mixed_4"),
+                    ] {
+                        let root = g.get(&crate::object::StrKey(root_name)).unwrap();
+                        let Some(Object::Function(reader)) =
+                            g.get(&crate::object::StrKey(reader_name))
+                        else {
+                            panic!("missing {reader_name}")
+                        };
+                        let code = reader.code.borrow();
+                        let pc = code
+                            .instructions
+                            .iter()
+                            .position(|ins| ins.op == OpCode::LoadAttr)
+                            .unwrap();
+                        assert_eq!(
+                            Interpreter::core_local_attr_chain(&code, root, pc).is_some(),
+                            !shared
+                        );
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_first_short_range_defers_but_later_calls_compile() {
+        const CHILD: &str = "WEAVEPY_SHORT_RANGE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for mode in ["default", "explicit"] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "tests::jit_first_short_range_defers_but_later_calls_compile",
+                    ])
+                    .env(CHILD, mode)
+                    .env("WEAVEPY_JIT", "1");
+                if mode == "default" {
+                    command.env_remove("WEAVEPY_JIT_THRESHOLD");
+                } else {
+                    command.env("WEAVEPY_JIT_THRESHOLD", "50");
+                }
+                let status = command.status().expect("spawn range-budget test");
+                assert!(status.success(), "range-budget {mode}: {status}");
+            }
+            return;
+        }
+        std::thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(|| {
+            crate::tier2::note_startup_finished();
+            let explicit = std::env::var(CHILD).unwrap() == "explicit";
+            let mut source = String::new();
+            for name in ["first", "again", "later", "large"] {
+                source.push_str(&format!("def {name}(n):\n    total = 0\n    for i in range(n):\n        total += i\n    return total\n"));
+            }
+            source.push_str("def nested(n):\n    total = 0\n    for i in range(n):\n        for j in range(n):\n            total += j\n    return total\n");
+            source.push_str("def while_loop(n):\n    total = 0\n    i = 0\n    while i < n:\n        total += i\n        i += 1\n    return total\n");
+            let code = compile_module(&parse_module(&source).unwrap()).unwrap();
+            let mut interp = Interpreter::new();
+            interp.run_module(&code).unwrap();
+            let globals = {
+                let Some(Object::Module(main)) = interp.cache.get("__main__") else { panic!("main") };
+                main.dict.clone()
+            };
+            let codes: Vec<_> = ["first", "again", "later", "large", "nested", "while_loop"].iter().map(|name| {
+                let globals = globals.borrow();
+                let Some(Object::Function(function)) = globals.get(&crate::object::StrKey(name)) else { panic!("function {name}") };
+                let code = function.code.borrow().clone();
+                code
+            }).collect();
+            let execute = |interp: &mut Interpreter, source: &str| {
+                let code = compile_module(&parse_module(source).unwrap()).unwrap();
+                interp.exec_module_in(&code, globals.clone()).unwrap();
+            };
+            execute(&mut interp, "assert first(2000) == 1999000\nassert again(2000) == 1999000\nassert later(2000) == 1999000\n");
+            for code in &codes[..3] {
+                assert_eq!(crate::tier2::code_compiled_for_test(code), explicit, "first short call: {}", code.name);
+                assert!(!code.jit_hint.is_not_jitable(), "deferral must not retire code");
+            }
+            if !explicit {
+                assert_eq!(crate::tier2::stats_for_test().0, 0, "first short calls must not compile anything");
+                assert_eq!(crate::tier2::osr_stats_for_test(), 0);
+            }
+            execute(&mut interp, "assert again(2000) == 1999000\nassert later(20000) == 199990000\nassert large(20000) == 199990000\nassert nested(80) == 252800\nassert while_loop(2000) == 1999000\n");
+            for code in &codes[1..] {
+                assert!(crate::tier2::code_compiled_for_test(code), "later, large, or excluded shape must compile: {}", code.name);
+            }
+            assert!(crate::tier2::osr_stats_for_test() >= 3, "large, nested, and while loops must enter native code");
+            assert_eq!(crate::tier2::stats_for_test().2, 0);
+        }).unwrap().join().unwrap();
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
     fn jit_dict_items_pair_loop() {
         // RFC 0074 WS3 — `for k, v in d.items():` trains (Str, Int)
         // pair lanes and steps the checked items iterator natively.
@@ -67427,6 +70303,160 @@ print("native pickle coverage: ok")
             "    print(e.value)\n",
         );
         assert_eq!(run(src), "1\ndone\n");
+    }
+
+    #[test]
+    fn native_leaf_lookup_uses_body_identity() {
+        let interp = Interpreter::new();
+        let receiver = Object::new_list(Vec::new());
+        let Object::Builtin(first) = interp.lookup_method(&receiver, "__len__").unwrap() else {
+            panic!("native length method");
+        };
+        let Object::Builtin(second) = interp.lookup_method(&receiver, "__len__").unwrap() else {
+            panic!("native length method");
+        };
+        assert!(Rc::ptr_eq(&first, &second));
+        assert!(matches!(interp.leaf_call_kind(&first), Some(LeafKind::Len)));
+        let unrelated = Rc::new(BuiltinFn {
+            name: "__len__",
+            binds_instance: true,
+            call: Box::new(|_| panic!("unrelated native body must not run")),
+            call_kw: None,
+        });
+        assert!(interp.leaf_call_kind(&unrelated).is_none());
+    }
+
+    #[test]
+    fn native_bound_rejection_cache_does_not_own_methods() {
+        let receiver = Rc::new(RefCell::new(Vec::new()));
+        let weak_receiver = Rc::downgrade(&receiver);
+        let object = Object::List(receiver);
+        let function = crate::builtins::lookup_method(&object, "clear").unwrap();
+        let method = Rc::new(BoundMethod::new(object, function));
+        let weak_method = Rc::downgrade(&method);
+        let slot = MethodSlot::empty();
+        slot.set_non_leaf(&method);
+        assert_eq!(Rc::strong_count(&method), 1);
+        drop(method);
+        assert!(weak_method.upgrade().is_none());
+        assert!(weak_receiver.upgrade().is_none());
+    }
+
+    #[test]
+    fn saved_native_leaf_preserves_owners_and_observers() {
+        const CHILD: &str = "WEAVEPY_TEST_SAVED_NATIVE_LEAF_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::saved_native_leaf_preserves_owners_and_observers",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("WEAVEPY_JIT", "0")
+                .status()
+                .expect("spawn saved native leaf test");
+            assert!(status.success(), "saved native leaf child: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut interp = Interpreter::new();
+                let source = include_str!("../../../tests/regrtest/test_saved_native_leaf.py");
+                let module = parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    source,
+                    "test_saved_native_leaf.py",
+                )
+                .unwrap();
+                SAVED_NATIVE_LEAF_CALLS.with(|calls| calls.set(0));
+                SAVED_NATIVE_REJECTED_CALLS.with(|calls| calls.set(0));
+                interp.run_module(&code).unwrap();
+                let calls = SAVED_NATIVE_LEAF_CALLS.with(std::cell::Cell::get);
+                assert!(calls > 500, "saved native leaf calls: {calls}");
+                let rejections = SAVED_NATIVE_REJECTED_CALLS.with(std::cell::Cell::get);
+                assert!(
+                    rejections > 100,
+                    "saved native rejection hits: {rejections}"
+                );
+                eprintln!("Saved native leaf calls: {calls}; rejection hits: {rejections}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn set_leaf_dispatch_preserves_callbacks_and_owners() {
+        const CHILD: &str = "WEAVEPY_TEST_SET_LEAF_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::set_leaf_dispatch_preserves_callbacks_and_owners",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("WEAVEPY_JIT", "0")
+                .status()
+                .expect("spawn set leaf dispatch test");
+            assert!(status.success(), "set leaf dispatch child: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut interp = Interpreter::new();
+                let source = include_str!("../../../tests/regrtest/test_set_leaf_dispatch.py");
+                let module = parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    source,
+                    "test_set_leaf_dispatch.py",
+                )
+                .unwrap();
+                LEAF_SET_REMOVALS.with(|counts| counts.set([0; 2]));
+                interp.run_module(&code).unwrap();
+                let source = include_str!("../../../tests/regrtest/test_set_remove_owners.py");
+                let module = parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    source,
+                    "test_set_remove_owners.py",
+                )
+                .unwrap();
+                interp.run_module(&code).unwrap();
+                let counts = LEAF_SET_REMOVALS.with(std::cell::Cell::get);
+                assert!(counts.iter().all(|count| *count > 3000), "{counts:?}");
+                eprintln!("Set leaf calls (pop, remove): {counts:?}");
+
+                // Unsupported arguments decline before touching the set.
+                let receiver = Object::new_set();
+                let Object::Set(values) = &receiver else {
+                    unreachable!()
+                };
+                values.borrow_mut().insert(DictKey(Object::Int(1)));
+                let pop = interp.leaf_builtin_method(&receiver, "pop").unwrap();
+                let remove = interp.leaf_builtin_method(&receiver, "remove").unwrap();
+                assert!(interp
+                    .leaf_builtin_call(LeafKind::SetPop, &pop, &[receiver.clone(), Object::Int(1)])
+                    .is_none());
+                assert!(interp
+                    .leaf_builtin_call(
+                        LeafKind::SetRemove,
+                        &remove,
+                        &[receiver.clone(), Object::new_list(Vec::new())],
+                    )
+                    .is_none());
+                assert_eq!(values.borrow().len(), 1);
+                assert!(values.borrow().contains(&DictKey(Object::Int(1))));
+                assert_eq!(LEAF_SET_REMOVALS.with(std::cell::Cell::get), counts);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     // ---------- pattern matching (RFC 0009) ----------

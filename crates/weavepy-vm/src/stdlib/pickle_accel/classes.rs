@@ -167,26 +167,38 @@ pub(super) fn benign_metaclass(class: &TypeObject) -> bool {
 }
 
 /// `getattr(sys.modules[module], ...)` along a dotted `qualname`, restricted
-/// to steps that are plain dictionary hits. Module-level `__getattr__`,
-/// module subclasses, descriptors, and absent modules report `None`.
+/// to steps that are plain dictionary hits. Module subclasses, descriptors,
+/// and absent modules or attributes report `None`, leaving missing-attribute
+/// hooks to the full pickler.
 pub(super) fn resolve_global(
     modules: &RefCell<DictData>,
     module: &str,
     qualname: &str,
 ) -> Option<Rc<TypeObject>> {
-    let Object::Module(module) = pure_get(&modules.borrow(), module)?? else {
-        return None;
+    let module = pure_get(&modules.borrow(), module)??;
+    let dict = match &module {
+        Object::Module(module) if crate::object::module_class(module).is_none() => {
+            module.dict.clone()
+        }
+        // types.ModuleType constructs a PyInstance with the same namespace
+        // semantics as an imported module. Only the exact built-in class is
+        // safe here; subclasses can intercept an otherwise ordinary lookup.
+        Object::Instance(instance)
+            if Rc::ptr_eq(&instance.cls(), &builtin_types().module_)
+                && instance.native.get().is_none()
+                && instance.c_body.get() == 0 =>
+        {
+            instance.dict.get_shared()?
+        }
+        _ => return None,
     };
-    if crate::object::module_class(&module).is_some() {
-        return None;
-    }
     let mut parts = qualname.split('.');
     let first = parts.next()?;
     let special = |part: &str| part.is_empty() || (part.starts_with("__") && part.ends_with("__"));
     if special(first) {
         return None;
     }
-    let Object::Type(mut current) = pure_get(&module.dict.borrow(), first)?? else {
+    let Object::Type(mut current) = pure_get(&dict.borrow(), first)?? else {
         return None;
     };
     for part in parts {

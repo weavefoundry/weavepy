@@ -65,11 +65,34 @@ fn embedding_lifecycle_end_to_end() {
         .unwrap();
 }
 
+fn lifecycle_step(step: &str) {
+    // Bypass libtest's capture buffer so an aborting stack overflow still
+    // leaves the last reached phase in the CI log.
+    use std::io::Write;
+    writeln!(std::io::stderr().lock(), "embedding lifecycle: {step}").unwrap();
+}
+
 fn embedding_lifecycle() {
+    lifecycle_step("initialization");
     // --- Round 1: plain Py_Initialize ------------------------------
     unsafe { Py_Initialize() };
     assert_eq!(unsafe { Py_IsInitialized() }, 1, "initialized after init");
 
+    // Do not query before Py_Initialize: its first stack switch must save
+    // the OS stack's bounds even when stacker's cache starts uninitialized.
+    let remaining = stacker::remaining_stack();
+    // macOS can round the requested size up. Compare against the actual
+    // allocation without changing the worker's requested 1 MiB stack.
+    #[cfg(target_os = "macos")]
+    let stack_size = unsafe { libc::pthread_get_stacksize_np(libc::pthread_self()) };
+    #[cfg(not(target_os = "macos"))]
+    let stack_size = 1024 * 1024;
+    assert!(
+        remaining.is_none_or(|bytes| bytes > 0 && bytes <= stack_size),
+        "restored bounds exceed the embedding stack ({stack_size} bytes): {remaining:?} bytes"
+    );
+
+    lifecycle_step("simple execution");
     assert_eq!(run_simple("x = 20 + 22"), 0, "simple exec succeeds");
     assert_eq!(eval_int("x"), Some(42), "state visible across PyRun calls");
 
@@ -88,12 +111,14 @@ fn embedding_lifecycle() {
         ));
     }
     source.push_str("x = f0()\n");
+    lifecycle_step("nested execution");
     assert_eq!(run_simple(&source), 0, "nested compilation succeeds");
     assert_eq!(eval_int("x"), Some(42));
 
     // The separate compile/evaluate entry points need the same headroom.
     unsafe {
         let source = CString::new(source).unwrap();
+        lifecycle_step("separate compilation");
         let code = Py_CompileString(source.as_ptr(), c"<embed>".as_ptr(), Py_file_input);
         assert!(
             !code.is_null(),
@@ -101,16 +126,19 @@ fn embedding_lifecycle() {
         );
         let main = weavepy_capi::module::PyImport_AddModule(c"__main__".as_ptr());
         let dict = weavepy_capi::module::PyModule_GetDict(main);
+        lifecycle_step("separate evaluation");
         let result = PyEval_EvalCode(code, dict, dict);
         assert!(
             !result.is_null(),
             "PyEval_EvalCode succeeds on a small stack"
         );
+        lifecycle_step("compiled-code cleanup");
         weavepy_capi::object::Py_DecRef(result);
         weavepy_capi::object::Py_DecRef(code);
     }
     assert_eq!(eval_int("x"), Some(42));
 
+    lifecycle_step("exception reporting");
     // A failing PyRun_SimpleString reports -1 (and prints a traceback).
     assert_eq!(run_simple("raise ValueError('embedding')"), -1);
 
@@ -120,6 +148,7 @@ fn embedding_lifecycle() {
         0
     );
 
+    lifecycle_step("first finalization");
     assert_eq!(unsafe { Py_FinalizeEx() }, 0, "finalize succeeds");
     assert_eq!(unsafe { Py_IsInitialized() }, 0, "uninitialized after fini");
     assert_eq!(
@@ -128,6 +157,7 @@ fn embedding_lifecycle() {
         "Py_AtExit callback ran during finalize"
     );
 
+    lifecycle_step("reinitialization");
     // --- Round 2: re-init is a *fresh* interpreter -----------------
     unsafe { Py_Initialize() };
     assert_eq!(unsafe { Py_IsInitialized() }, 1);
@@ -141,6 +171,7 @@ fn embedding_lifecycle() {
     unsafe { Py_Finalize() };
     assert_eq!(unsafe { Py_IsInitialized() }, 0);
 
+    lifecycle_step("PyConfig initialization");
     // --- Round 3: Py_InitializeFromConfig with argv ----------------
     unsafe {
         let mut config: PyConfig = std::mem::zeroed();
@@ -164,6 +195,7 @@ fn embedding_lifecycle() {
     assert!(eval_int("n").is_some(), "sys.argv populated from config");
     assert_eq!(unsafe { Py_FinalizeEx() }, 0);
 
+    lifecycle_step("PyInitConfig initialization");
     // --- Round 4: PEP 741 PyInitConfig (RFC 0076 WS14) --------------
     unsafe {
         use weavepy_capi::pep741::{
@@ -220,4 +252,5 @@ fn embedding_lifecycle() {
         PyInitConfig_Free(config);
         assert_eq!(Py_FinalizeEx(), 0);
     }
+    lifecycle_step("complete");
 }

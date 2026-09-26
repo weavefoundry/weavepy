@@ -34,8 +34,10 @@
 //! explicit `notify_clear(id)` method that callers (the GC,
 //! `gc.collect`, finaliser code) can invoke.
 
-use crate::shared_value::{SharedStr, ThinArc};
+use crate::fasthash::ObjectIdHasher;
+use crate::shared_value::{SharedSlice, SharedStr, ThinArc};
 use crate::sync::RefCell;
+use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -47,25 +49,21 @@ use crate::object::{DictKey, Object, StrKey};
 pub(crate) enum WrapperKey {
     Call,
     Get,
-    Clear,
-    Alive,
     Repr,
     Callback,
     Kind,
 }
 
-const WRAPPER_NAMES: [&str; 7] = [
+const WRAPPER_NAMES: [&str; 5] = [
     "__call__",
     "__weakref_get__",
-    "__clear__",
-    "__alive__",
     "__repr__",
     "__callback__",
     "__weakref_kind__",
 ];
 
 thread_local! {
-    static WRAPPER_KEYS: [DictKey; 7] = WRAPPER_NAMES.map(|name| DictKey(Object::from_static(name)));
+    static WRAPPER_KEYS: [DictKey; 5] = WRAPPER_NAMES.map(|name| DictKey(Object::from_static(name)));
 }
 
 impl WrapperKey {
@@ -99,8 +97,8 @@ pub struct WeakRefSlot {
     /// alive. Set to `None` by `notify_clear`.
     pub target: RefCell<Option<Object>>,
     /// Whether a callback was supplied at creation. The callback
-    /// *object* itself lives in the user-visible wrapper's instance
-    /// dict (under `__callback__`), never here: the wrapper is
+    /// *object* itself lives in the user-visible wrapper's traced slots
+    /// or dictionary (under `__callback__`), never here: the wrapper is
     /// GC-tracked when a callback exists, so the reference is a
     /// *traced edge* the cycle collector can account. A strong clone
     /// hidden inside this slot would make any cycle routed through a
@@ -109,6 +107,9 @@ pub struct WeakRefSlot {
     /// visits `wr_callback` for exactly this reason
     /// (test_weakref's `test_callbacks_on_callback`).
     pub has_callback: bool,
+    /// Callback/getter storage for an exact native wrapper, selected before
+    /// registration. Legacy refs and all proxies/subclasses keep dictionaries.
+    pub(crate) fixed_wrapper: bool,
     /// Cached `id(referent)` so the weakref's `__hash__`
     /// remains stable across the referent's life.
     pub identity_hash: i64,
@@ -124,6 +125,39 @@ pub struct WeakRefSlot {
     pub py_ref: RefCell<Option<crate::sync::Weak<crate::types::PyInstance>>>,
 }
 
+// A process-wide identity recognizes native storage across threads without
+// confusing subclass slots with the same names. Only 64-bit exact refs use it.
+static WRAPPER_LAYOUT: std::sync::OnceLock<SharedSlice<DictKey>> = std::sync::OnceLock::new();
+
+pub(crate) fn fixed_wrapper_storage(getter: Object, callback: Object) -> crate::types::SlotStorage {
+    let layout = WRAPPER_LAYOUT
+        .get_or_init(|| vec![WrapperKey::Get.owned(), WrapperKey::Callback.owned()].into());
+    crate::types::SlotStorage::from_layout(layout.clone(), vec![getter, callback])
+}
+
+/// Read authoritative native state before any materialized instance dict.
+/// Exact native wrappers don't use managed inline dictionary values. The
+/// flag is only a negative filter; layout identity validates the storage.
+pub(crate) fn wrapper_value(inst: &crate::types::PyInstance, key: WrapperKey) -> Option<Object> {
+    if !inst.inline_values.get() {
+        if let Some(layout) = WRAPPER_LAYOUT.get() {
+            let slots = inst.slots.borrow();
+            if let Some(values) = slots.values_for_layout(layout) {
+                return match key {
+                    WrapperKey::Get => values.first().cloned(),
+                    WrapperKey::Callback => values.get(1).cloned(),
+                    _ => None,
+                };
+            }
+        }
+    }
+    inst.dict
+        .get()?
+        .borrow()
+        .get(&StrKey(WRAPPER_NAMES[key as usize]))
+        .cloned()
+}
+
 /// Weakref kinds as exposed to Python. Numeric so the field
 /// fits in a `u8`.
 pub mod kind {
@@ -136,8 +170,9 @@ impl WeakRefSlot {
     pub fn new(target_id: ObjectId, target: Object, has_callback: bool, kind: u8) -> Self {
         Self {
             target_id,
-            target: RefCell::new(Some(target.clone())),
+            target: RefCell::new(Some(target)),
             has_callback,
+            fixed_wrapper: false,
             identity_hash: target_id as i64,
             dead: AtomicBool::new(false),
             kind,
@@ -158,7 +193,7 @@ impl WeakRefSlot {
 
     /// Clear the slot. Returns the callback (if any) so the caller can
     /// invoke it on the calling thread. The callback is *taken* from
-    /// the wrapper's instance dict (set to `None` there), matching
+    /// the wrapper's traced storage (set to `None` there), matching
     /// CPython, which drops `wr_callback` once it has fired:
     /// `ref.__callback__` reads `None` afterwards
     /// (test_callback_attribute_after_deletion). If the wrapper object
@@ -173,6 +208,13 @@ impl WeakRefSlot {
             return None;
         }
         let inst = self.py_ref.borrow().as_ref().and_then(Weak::upgrade)?;
+        if self.fixed_wrapper {
+            let mut slots = inst.slots.try_borrow_mut().ok()?;
+            let values = slots.values_for_layout_mut(WRAPPER_LAYOUT.get()?)?;
+            let callback = std::mem::replace(values.get_mut(1)?, Object::None);
+            drop(slots);
+            return (!matches!(callback, Object::None)).then_some(callback);
+        }
         let mut d = inst.dict_cell().try_borrow_mut().ok()?;
         match d.get(&StrKey("__callback__")).cloned() {
             None | Some(Object::None) => None,
@@ -184,17 +226,24 @@ impl WeakRefSlot {
     }
 
     /// The live callback, read (non-destructively) from the wrapper's
-    /// instance dict.
+    /// traced storage.
     pub fn callback(&self) -> Option<Object> {
         if !self.has_callback || self.is_dead() {
             return None;
         }
         let inst = self.py_ref.borrow().as_ref().and_then(Weak::upgrade)?;
-        let v = inst
-            .dict_cell()
-            .borrow()
-            .get(&StrKey("__callback__"))
-            .cloned();
+        let v = if self.fixed_wrapper {
+            inst.slots
+                .borrow()
+                .values_for_layout(WRAPPER_LAYOUT.get()?)?
+                .get(1)
+                .cloned()
+        } else {
+            inst.dict_cell()
+                .borrow()
+                .get(&StrKey("__callback__"))
+                .cloned()
+        };
         match v {
             None | Some(Object::None) => None,
             v => v,
@@ -202,9 +251,9 @@ impl WeakRefSlot {
     }
 }
 
-/// Per-id registry. Stored as `BTreeMap<ObjectId, Vec<Weak<WeakRefSlot>>>`
-/// so the GC can iterate efficiently and dead slots can be
-/// pruned in place.
+/// Per-id registry. A hash index serves identity lookups; snapshots sort
+/// selected ids so collection keeps its previous target order. Dead slots
+/// can be pruned in place.
 ///
 /// **Process-global** (see [`REGISTRY`]), mirroring the cycle
 /// collector ([`crate::gc_trace`]). RFC 0025 made the whole VM heap
@@ -225,11 +274,13 @@ pub struct WeakRefRegistry {
 
 #[derive(Default)]
 struct RegistryInner {
-    /// Map from referent id -> list of weakref slots that
-    /// observe it. Outer Vec is dense (we shrink-to-fit on
-    /// notify); the inner `Weak` is so the slot itself is
-    /// freed when no Python reference points at the weakref.
-    slots: std::collections::BTreeMap<ObjectId, Vec<Weak<WeakRefSlot>>>,
+    /// Each referent's slots stay in registration order. Weak ownership
+    /// lets a slot die when no Python reference holds its wrapper.
+    slots: std::collections::HashMap<
+        ObjectId,
+        Vec<Weak<WeakRefSlot>>,
+        BuildHasherDefault<ObjectIdHasher>,
+    >,
     /// Bumped on every register call. Used as a cheap
     /// "version" counter so cache-invalidation paths can know
     /// when to re-scan.
@@ -237,11 +288,11 @@ struct RegistryInner {
     /// Bloom-style pre-filter over watched ids (4096 bits). The prompt
     /// reaper probes `count`/`strong_clone_count` for *every* dropped
     /// object; once any weakref exists the `is_empty` fast path is gone
-    /// and each probe pays a `BTreeMap` walk. A clear bit here proves
+    /// and each probe pays a map lookup. A clear bit here proves
     /// the id was never registered, so the overwhelmingly common
     /// "dropped object was never weakly referenced" case stays O(1).
     /// Bits are set on register and only rebuilt on [`WeakRefRegistry::
-    /// shrink`]; stale bits merely cost the tree lookup they'd have paid
+    /// shrink`]; stale bits merely cost the map lookup they'd have paid
     /// anyway.
     filter: IdFilter,
 }
@@ -307,7 +358,7 @@ impl WeakRefRegistry {
             let mut g = self.inner.borrow_mut();
             // Hot path: this runs for every object the prompt reaper
             // frees, and almost none of them was ever weakly referenced.
-            // Skip the tree removal on the miss-filter's say-so, exactly
+            // Skip the map removal on the miss-filter's say-so, exactly
             // as `count` does.
             if g.slots.is_empty() || !g.filter.may_contain(id) {
                 return Vec::new();
@@ -333,7 +384,7 @@ impl WeakRefRegistry {
     pub fn count(&self, id: ObjectId) -> usize {
         let g = self.inner.borrow();
         // Hot path: consulted for every dropped object by the prompt
-        // reaper; skip the tree lookup when `id` was never registered.
+        // reaper; skip the map lookup when `id` was never registered.
         if g.slots.is_empty() || !g.filter.may_contain(id) {
             return 0;
         }
@@ -395,12 +446,14 @@ impl WeakRefRegistry {
             v.retain(|w| w.strong_count() > 0);
             !v.is_empty()
         });
+        // Empty or much smaller registries should release their old table.
+        g.slots.shrink_to_fit();
         // Rebuild the pre-filter from the surviving ids so bits for
-        // long-dead referents stop forcing tree lookups.
-        g.filter.clear();
-        let ids: Vec<ObjectId> = g.slots.keys().copied().collect();
-        for id in ids {
-            g.filter.insert(id);
+        // long-dead referents stop forcing map lookups.
+        let RegistryInner { slots, filter, .. } = &mut *g;
+        filter.clear();
+        for id in slots.keys() {
+            filter.insert(*id);
         }
     }
 
@@ -410,9 +463,26 @@ impl WeakRefRegistry {
     /// strong references to a target are the slots' own clones, the
     /// object is unreachable from Python and its weakrefs must clear.
     pub fn targets(&self) -> Vec<(ObjectId, Object)> {
+        self.targets_matching(|_| true)
+    }
+
+    /// Snapshot selected ids without touching excluded slots or their targets.
+    /// The predicate must only inspect already-borrowed state, since it runs
+    /// under the registry borrow. Predicate evaluation order is unspecified;
+    /// the selected targets are cloned and returned in ascending id order.
+    /// The collector takes its index borrow before this one, as it does
+    /// when registering finalizers.
+    pub(crate) fn targets_matching(
+        &self,
+        include: impl Fn(ObjectId) -> bool,
+    ) -> Vec<(ObjectId, Object)> {
         let g = self.inner.borrow();
-        g.slots
-            .iter()
+        // The predicate only inspects borrowed state. Excluded slots are
+        // never upgraded or borrowed, and sorting precedes target cloning.
+        let mut selected: Vec<_> = g.slots.iter().filter(|(id, _)| include(**id)).collect();
+        selected.sort_unstable_by_key(|(id, _)| **id);
+        selected
+            .into_iter()
             .filter_map(|(id, v)| {
                 v.iter()
                     .filter_map(Weak::upgrade)
@@ -622,5 +692,83 @@ mod tests {
         let cleared = notify_clear(1);
         assert_eq!(cleared.len(), 1);
         assert!(slot.is_dead());
+    }
+
+    #[test]
+    fn registry_counts_and_clear_order_survive_dead_watchers() {
+        let reg = WeakRefRegistry::new();
+        let first = Arc::new(WeakRefSlot::new(64, Object::Int(1), false, kind::REF));
+        let dead = Arc::new(WeakRefSlot::new(64, Object::Int(1), false, kind::REF));
+        let last = Arc::new(WeakRefSlot::new(64, Object::Int(1), false, kind::REF));
+        reg.register(first.clone());
+        reg.register(dead.clone());
+        reg.register(last.clone());
+        drop(dead);
+        assert_eq!(reg.count(64), 2);
+        assert_eq!(reg.strong_clone_count(64), 2);
+        first.clear();
+        // A still-owned, cleared slot is a live wrapper, not a target owner.
+        assert_eq!(reg.count(64), 2);
+        assert_eq!(reg.strong_clone_count(64), 1);
+        reg.shrink();
+        let watchers = reg.collect_strong(64);
+        assert_eq!(watchers.len(), 2);
+        assert!(Arc::ptr_eq(&watchers[0], &first));
+        assert!(Arc::ptr_eq(&watchers[1], &last));
+        let cleared = reg.notify_clear(64);
+        assert_eq!(cleared.len(), 2);
+        assert!(Arc::ptr_eq(&cleared[0].0, &last));
+        assert!(Arc::ptr_eq(&cleared[1].0, &first));
+        assert!(last.upgrade().is_none());
+        assert_eq!(reg.count(64), 0);
+        assert_eq!(reg.strong_clone_count(64), 0);
+        assert!(reg.notify_clear(64).is_empty());
+    }
+
+    #[test]
+    fn registry_snapshots_order_selected_targets_without_accessing_excluded_slots() {
+        let reg = WeakRefRegistry::new();
+        let ids = [96, 16, 128, 64, 32];
+        let slots: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let slot = Arc::new(WeakRefSlot::new(
+                    *id,
+                    Object::Int(*id as i64),
+                    false,
+                    kind::REF,
+                ));
+                reg.register(slot.clone());
+                slot
+            })
+            .collect();
+        let excluded = slots[2].target.borrow_mut();
+        let selected = reg.targets_matching(|id| id != 128);
+        assert_eq!(
+            selected.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [16, 32, 64, 96]
+        );
+        for (id, target) in selected {
+            assert!(matches!(target, Object::Int(value) if value == id as i64));
+        }
+        drop(excluded);
+        slots[1].clear();
+        assert_eq!(
+            reg.targets().iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [32, 64, 96, 128]
+        );
+        drop(slots);
+        reg.shrink();
+        assert!(reg.targets().is_empty());
+        assert_eq!(reg.total_alive(), 0);
+        // Reusing an id after pruning must republish both filters.
+        let replacement = Arc::new(WeakRefSlot::new(16, Object::Int(7), false, kind::REF));
+        reg.register(replacement.clone());
+        assert_eq!(reg.count(16), 1);
+        assert_eq!(reg.strong_clone_count(16), 1);
+        assert_eq!(reg.count(17), 0);
+        assert_eq!(reg.strong_clone_count(17), 0);
+        assert!(reg.collect_strong(17).is_empty());
+        assert!(reg.notify_clear(17).is_empty());
     }
 }

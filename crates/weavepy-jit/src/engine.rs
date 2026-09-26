@@ -7,7 +7,7 @@
 //! the GIL), so the function pointers stay valid for the thread's
 //! lifetime and there is no cross-thread aliasing.
 
-use std::mem;
+use std::mem::{self, ManuallyDrop};
 
 use cranelift_codegen::ir::{types, AbiParam, Type};
 use cranelift_codegen::settings::{self, Configurable};
@@ -122,8 +122,10 @@ pub struct CompiledFrame {
 
 impl CompiledFrame {
     /// Whether this frame has one bounded block of pure scalar operations.
-    /// It cannot call helpers, access pins or namespaces, or run a poll. Its
-    /// only exits are a scalar return or a side-effect-free numeric deopt.
+    /// It cannot access pins or namespaces or run a poll. Its only helpers
+    /// are context-free math intrinsics; the caller must validate global and
+    /// math guards before entry. Its exits are a scalar return or a numeric
+    /// deopt after which the pure body can be restarted.
     #[must_use]
     pub fn is_scalar_leaf(&self) -> bool {
         self.scalar_leaf
@@ -164,11 +166,24 @@ impl CompiledFrame {
 
 /// Owns the Cranelift JIT module and reusable codegen contexts.
 pub struct JitEngine {
-    module: JITModule,
+    module: ManuallyDrop<JITModule>,
     ctx: Context,
     fbctx: FunctionBuilderContext,
     ptr_ty: Type,
     next_id: u32,
+}
+
+impl Drop for JitEngine {
+    fn drop(&mut self) {
+        // SAFETY: CompiledFrame::enter requires its owning engine to remain
+        // alive. The VM's thread-local engine outlives all native entries on
+        // that thread. Parked generators retain buffers and a compilation id,
+        // not code pointers; another thread materializes their saved state.
+        // Worker teardown abandons suspended greenlet stacks before TLS drops.
+        // Take the module exactly once to reclaim mappings that Cranelift's
+        // default Drop deliberately leaves allocated.
+        unsafe { ManuallyDrop::take(&mut self.module).free_memory() };
+    }
 }
 
 impl std::fmt::Debug for JitEngine {
@@ -207,7 +222,7 @@ impl JitEngine {
         let ptr_ty = module.target_config().pointer_type();
         let ctx = module.make_context();
         Some(JitEngine {
-            module,
+            module: ManuallyDrop::new(module),
             ctx,
             fbctx: FunctionBuilderContext::new(),
             ptr_ty,
@@ -571,7 +586,6 @@ fn is_scalar_leaf(tfunc: &TFunc) -> bool {
         && tfunc.local_types.iter().all(|ty| {
             matches!(ty, None | Some(JitType::Int | JitType::Bool | JitType::Float))
         })
-        && tfunc.global_guards.is_empty()
         && tfunc.range_loops.is_empty()
         && tfunc.list_loops.is_empty()
         && tfunc.iter_loops.is_empty()
@@ -584,8 +598,6 @@ fn is_scalar_leaf(tfunc: &TFunc) -> bool {
         && tfunc.method_sites.is_empty()
         && tfunc.str_method_sites.is_empty()
         && tfunc.str_method_spans.is_empty()
-        && tfunc.math_guards.is_empty()
-        && tfunc.math_spans.is_empty()
         && tfunc.null_spans.is_empty()
         && tfunc.osr_entries.is_empty()
         && tfunc.max_call_args == 0
@@ -627,6 +639,12 @@ fn is_scalar_leaf(tfunc: &TFunc) -> bool {
                     | TOp::SwapN { .. }
                     | TOp::IntToFloatTos { .. }
                     | TOp::IntToFloatSecond { .. }
+                    | TOp::MathIntrinsic(
+                        crate::ir::MathFunc::Sqrt
+                            | crate::ir::MathFunc::Fabs
+                            | crate::ir::MathFunc::Sin
+                            | crate::ir::MathFunc::Cos
+                    )
             )
         })
 }

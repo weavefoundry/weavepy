@@ -309,11 +309,11 @@ impl Repl {
             .0
             .map_err(|e| weavepy::Error::Parse(e).format(source, &filename))?;
         let compile = if interactive {
-            compiler::compile_interactive_with_options
+            compiler::compile_owned_interactive_with_options
         } else {
-            compiler::compile_module_with_options
+            compiler::compile_owned_module_with_options
         };
-        let code = compile(&module, source, &filename, self.compile_options())
+        let code = compile(module, source, &filename, self.compile_options())
             .map_err(|e| weavepy::Error::Compile(e).format(source, &filename))?;
         self.future_flags |= code.future_flags;
         if interactive {

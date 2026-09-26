@@ -55,6 +55,24 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("parse")),
             Object::Builtin(Rc::new(bf)),
         );
+        d.insert(
+            DictKey(Object::from_static("_build")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__vm:ast_build",
+                binds_instance: false,
+                call: Box::new(|_| Err(crate::error::runtime_error("AST builder needs the VM"))),
+                call_kw: None,
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("_validate_fields")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "_validate_fields",
+                binds_instance: false,
+                call: Box::new(super::ast_validate::validate_fields),
+                call_kw: None,
+            })),
+        );
         // `compile()` control flags (CPython `_ast` exposes these;
         // `ast.py` re-exports them) — RFC 0052.
         use weavepy_compiler::flags as cf;
@@ -413,16 +431,16 @@ impl Builder<'_> {
     }
 
     fn module(&self, m: &past::Module, mode: &str) -> Object {
+        if mode == "eval" {
+            // Eval only needs the expression, not an unused statement body.
+            let inner = m.body.first().and_then(|s| match &s.kind {
+                past::StmtKind::Expr(e) => Some(self.expr(e)),
+                _ => None,
+            });
+            return node_noloc("Expression", vec![("body", inner.unwrap_or(Object::None))]);
+        }
         let body = list_of(&m.body, |s| self.stmt(s));
         match mode {
-            "eval" => {
-                // Expression(body=<expr>): only valid for a single Expr stmt.
-                let inner = m.body.first().and_then(|s| match &s.kind {
-                    past::StmtKind::Expr(e) => Some(self.expr(e)),
-                    _ => None,
-                });
-                node_noloc("Expression", vec![("body", inner.unwrap_or(Object::None))])
-            }
             "single" => node_noloc("Interactive", vec![("body", body)]),
             _ => {
                 let ignores = self
@@ -1328,5 +1346,47 @@ fn constant(c: &past::Constant) -> Object {
         C::Tuple(items) => Object::new_tuple(items.iter().map(constant).collect()),
         C::FrozenSet(items) => Object::new_frozenset_from(items.iter().map(constant)),
         C::Ellipsis => crate::vm_singletons::ellipsis(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn target_contexts_and_source_positions() {
+        const CHILD: &str = "WEAVEPY_AST_CONTEXT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for jit in ["0", "1"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "stdlib::ast_mod::tests::target_contexts_and_source_positions",
+                    ])
+                    .env(CHILD, "1")
+                    .env("WEAVEPY_JIT", jit)
+                    .status()
+                    .expect("spawn AST context test");
+                assert!(status.success(), "AST context child, JIT={jit}: {status}");
+            }
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let source = include_str!("../../../../tests/regrtest/test_ast_target_contexts.py");
+                let tree = weavepy_parser::parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_owned_module_with_options(
+                    tree,
+                    source,
+                    "test_ast_target_contexts.py",
+                    weavepy_compiler::CompileOptions::default(),
+                )
+                .unwrap();
+                crate::Interpreter::new()
+                    .run_module(&code)
+                    .unwrap_or_else(|error| panic!("AST context fixture: {error}"));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

@@ -347,8 +347,132 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             }
         }
         let block = self.tfunc.blocks[bi].clone();
-        for stmt in &block.stmts {
-            self.emit_stmt(*stmt);
+        let chain_helper = runtime::attr_get_chain_helper_addr();
+        let cached_chain_helper = runtime::cached_attr_chain_helper_addr();
+        let mut i = 0;
+        while i < block.stmts.len() {
+            let stmt = block.stmts[i];
+            if let Some(window) = block.stmts.get(i..i + 4) {
+                if self.repeated_scalar_read(window) {
+                    self.emit_stmt(window[0]);
+                    self.emit_stmt(window[1]);
+                    // The first guarded read establishes a callback-free scalar
+                    // value. The second local load cannot change the receiver.
+                    self.vstack.push(*self.vstack.last().expect("scalar read"));
+                    i += 4;
+                    continue;
+                }
+            }
+            if cached_chain_helper != 0
+                && matches!(
+                    stmt.op,
+                    TOp::AttrGet {
+                        out: JitType::Obj,
+                        ..
+                    } | TOp::DynAttrGet { .. }
+                )
+            {
+                let mut end = i;
+                let mut guarded = 0u32;
+                let mut first_site = 0u32;
+                let mut dynamic = false;
+                while end < block.stmts.len() && end - i < runtime::MAX_CACHED_ATTR_CHAIN_LEN {
+                    let next = block.stmts[end];
+                    if stmt.pc.checked_add((end - i) as u32) != Some(next.pc)
+                        || self
+                            .tfunc
+                            .null_spans
+                            .iter()
+                            .any(|span| span.live_from == next.pc)
+                    {
+                        break;
+                    }
+                    match next.op {
+                        TOp::AttrGet {
+                            site,
+                            out: JitType::Obj,
+                        } if !dynamic => {
+                            if guarded == 0 {
+                                first_site = site;
+                            }
+                            if first_site.checked_add(guarded) != Some(site)
+                                || guarded as usize >= runtime::MAX_ATTR_CHAIN_LEN
+                            {
+                                break;
+                            }
+                            guarded += 1;
+                        }
+                        TOp::DynAttrGet { .. } => dynamic = true,
+                        _ => break,
+                    }
+                    end += 1;
+                }
+                let total = end - i;
+                if dynamic && total >= 2 {
+                    // Keep existing analyzer/type rules. Fuse only its explicit guard of
+                    // an adjacent result at depth zero, never infer a new integer lane.
+                    let int_result = block.stmts.get(end).is_some_and(|next| {
+                        matches!(next.op, TOp::UnboxInt { depth: 0 })
+                            && stmt.pc.checked_add(total as u32) == Some(next.pc)
+                    });
+                    let resume = end + usize::from(int_result);
+                    self.emit_cached_attr_chain(
+                        cached_chain_helper,
+                        first_site,
+                        guarded,
+                        total as u32,
+                        int_result,
+                        &block.stmts[i..resume],
+                    );
+                    i = resume;
+                    continue;
+                }
+            }
+
+            if chain_helper != 0 {
+                if let TOp::AttrGet {
+                    site,
+                    out: JitType::Obj,
+                } = stmt.op
+                {
+                    let mut end = i + 1;
+                    let mut out = JitType::Obj;
+                    while end < block.stmts.len()
+                        && end - i < runtime::MAX_ATTR_CHAIN_LEN
+                        && out == JitType::Obj
+                    {
+                        let next = block.stmts[end];
+                        let TOp::AttrGet {
+                            site: next_site,
+                            out: next_out,
+                        } = next.op
+                        else {
+                            break;
+                        };
+                        let distance = (end - i) as u32;
+                        if site.checked_add(distance) != Some(next_site)
+                            || stmt.pc.checked_add(distance) != Some(next.pc)
+                        {
+                            break;
+                        }
+                        out = next_out;
+                        end += 1;
+                    }
+                    if end - i >= 2 {
+                        self.emit_attr_get_chain(
+                            chain_helper,
+                            site,
+                            (end - i) as u32,
+                            out,
+                            stmt.pc,
+                        );
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+            self.emit_stmt(stmt);
+            i += 1;
         }
         match block.term {
             TTerm::Return => self.emit_return(),
@@ -693,6 +817,56 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .store(trusted, tag, self.frame_ptr, OFF_RET_TAG);
         let status = self.b.ins().iconst(types::I64, JitStatus::Returned as i64);
         self.b.ins().return_(&[status]);
+    }
+
+    /// Reuse only an adjacent, identical numeric field read. No calls, stores,
+    /// polling points, block boundaries, or erased NULL markers may intervene.
+    fn repeated_scalar_read(&self, stmts: &[TStmt]) -> bool {
+        let [TStmt {
+            op: TOp::LoadLocal(first),
+            ..
+        }, TStmt {
+            op: TOp::AttrGet { site: a, out: lane },
+            ..
+        }, TStmt {
+            op: TOp::LoadLocal(second),
+            ..
+        }, TStmt {
+            op: TOp::AttrGet {
+                site: b,
+                out: other,
+            },
+            ..
+        }] = stmts
+        else {
+            return false;
+        };
+        if first != second
+            || lane != other
+            || !matches!(lane, JitType::Int | JitType::Float | JitType::Bool)
+        {
+            return false;
+        }
+        let (Some(a), Some(b)) = (
+            self.tfunc.attr_sites.get(*a as usize),
+            self.tfunc.attr_sites.get(*b as usize),
+        ) else {
+            return false;
+        };
+        a == b
+            && a.slot == *first
+            && a.path.is_empty()
+            && a.lane == *lane
+            && !a.store
+            && !a.new_key
+            && stmts.iter().enumerate().all(|(offset, stmt)| {
+                stmts[0].pc.checked_add(offset as u32) == Some(stmt.pc)
+                    && !self
+                        .tfunc
+                        .null_spans
+                        .iter()
+                        .any(|span| span.live_from == stmt.pc || span.live_to == stmt.pc)
+            })
     }
 
     fn emit_stmt(&mut self, stmt: TStmt) {
@@ -1168,9 +1342,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.vstack.push((res, JitType::Bool));
     }
 
-    /// RFC 0074 WS2/WS4 — the eager generic attribute load via
-    /// `wpjit_dyn_attr_get`: pop the receiver pin, run the
-    /// interpreter's exact lookup, push the fresh object-lane pin.
+    /// RFC 0074 WS2/WS4: offer an object-lane attribute read to the
+    /// embedder. Pop the receiver pin and push the loaded value's pin
+    /// when the helper completes the lookup.
     /// `1` = raised at this pc (receiver consumed); `2` = completed
     /// but a guard was invalidated / cap pressure — deopt at the
     /// *next* pc with the parked result (never re-executed); `3` =
@@ -1183,6 +1357,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let snapshot = self.vstack.clone();
 
         self.writeback_locals();
+        // The native read reuses this exact instruction's inline cache.
+        self.store_call_site_pc(pc);
 
         let sig = self.list_helper_sig();
         let helper = self
@@ -2512,6 +2688,150 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .load(Self::cl_ty(out), trusted, self.frame_ptr, OFF_RET_BITS);
         self.vstack.push((res, out));
+    }
+
+    /// Consecutive callback-free reads can replay from the first read on a
+    /// later miss. Preserve its original receiver in the deopt snapshot.
+    fn emit_attr_get_chain(
+        &mut self,
+        address: usize,
+        site: u32,
+        count: u32,
+        out: JitType,
+        pc: u32,
+    ) {
+        let snapshot = self.vstack.clone();
+        let (pin, _) = self.pop();
+        let sig = self.quad_helper_sig();
+        let helper = self.b.ins().iconst(self.ptr_ty, address as i64);
+        let sitev = self.b.ins().iconst(types::I64, i64::from(site));
+        let countv = self.b.ins().iconst(types::I64, i64::from(count));
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, pin, sitev, countv]);
+        let status = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        let res = self.b.ins().load(
+            Self::cl_ty(out),
+            MemFlags::trusted(),
+            self.frame_ptr,
+            OFF_RET_BITS,
+        );
+        self.vstack.push((res, out));
+    }
+
+    /// Try a callback-free borrowed walk, then join with the original native
+    /// sequence on a cache miss. Each ordinary helper keeps its own exit PC.
+    fn emit_cached_attr_chain(
+        &mut self,
+        address: usize,
+        first_site: u32,
+        guarded: u32,
+        total: u32,
+        int_result: bool,
+        original: &[TStmt],
+    ) {
+        let snapshot = self.vstack.clone();
+        let (pin, _) = self.pop();
+        let pc = original[0].pc;
+        self.store_call_site_pc(pc);
+        let mut signature = Signature::new(self.b.func.signature.call_conv);
+        signature.params.push(AbiParam::new(self.ptr_ty));
+        for _ in 0..5 {
+            signature.params.push(AbiParam::new(types::I64));
+        }
+        signature.returns.push(AbiParam::new(types::I64));
+        let sig = self.b.import_signature(signature);
+        let helper = self.b.ins().iconst(self.ptr_ty, address as i64);
+        let firstv = self.b.ins().iconst(types::I64, i64::from(first_site));
+        let guardedv = self.b.ins().iconst(types::I64, i64::from(guarded));
+        let totalv = self.b.ins().iconst(types::I64, i64::from(total));
+        let integerv = self.b.ins().iconst(types::I64, i64::from(int_result));
+        let call = self.b.ins().call_indirect(
+            sig,
+            helper,
+            &[self.frame_ptr, pin, firstv, guardedv, totalv, integerv],
+        );
+        let status = self.b.inst_results(call)[0];
+        let success = self.b.create_block();
+        let ordinary = self.b.create_block();
+        let join = self.b.create_block();
+        self.b.append_block_param(join, types::I64);
+        let ok = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
+        self.b.ins().brif(ok, success, &[], ordinary, &[]);
+
+        self.b.switch_to_block(success);
+        let result = self.b.ins().load(
+            types::I64,
+            MemFlags::trusted(),
+            self.frame_ptr,
+            OFF_RET_BITS,
+        );
+        self.b.ins().jump(join, &[BlockArg::from(result)]);
+
+        self.b.switch_to_block(ordinary);
+        self.vstack = snapshot.clone();
+        let start = if guarded != 0 {
+            let ready = self.b.create_block();
+            let read = self.b.create_block();
+            let prefix_join = self.b.create_block();
+            self.b.append_block_param(prefix_join, types::I64);
+            let prefix_done = self.b.ins().icmp_imm(IntCC::Equal, status, 2);
+            self.b.ins().brif(prefix_done, ready, &[], read, &[]);
+
+            self.b.switch_to_block(ready);
+            let prefix = self.b.ins().load(
+                types::I64,
+                MemFlags::trusted(),
+                self.frame_ptr,
+                OFF_RET_BITS,
+            );
+            self.b.ins().jump(prefix_join, &[BlockArg::from(prefix)]);
+
+            self.b.switch_to_block(read);
+            // A prefix guard miss still uses the original read and snapshot.
+            // Keep its existing fusion when the optional helper is available.
+            let known = runtime::attr_get_chain_helper_addr();
+            if guarded >= 2 && known != 0 {
+                self.emit_attr_get_chain(known, first_site, guarded, JitType::Obj, pc);
+            } else {
+                for &stmt in &original[..guarded as usize] {
+                    self.emit_stmt(stmt);
+                }
+            }
+            let (prefix, out) = self.pop();
+            debug_assert_eq!(out, JitType::Obj);
+            self.b.ins().jump(prefix_join, &[BlockArg::from(prefix)]);
+
+            self.b.switch_to_block(prefix_join);
+            self.vstack = snapshot.clone();
+            self.vstack.pop();
+            let prefix = self.b.block_params(prefix_join)[0];
+            self.vstack.push((prefix, JitType::Obj));
+            guarded as usize
+        } else {
+            0
+        };
+        for &stmt in &original[start..] {
+            self.emit_stmt(stmt);
+        }
+        let (result, out) = self.pop();
+        let expected = if int_result {
+            JitType::Int
+        } else {
+            JitType::Obj
+        };
+        debug_assert_eq!(out, expected);
+        self.b.ins().jump(join, &[BlockArg::from(result)]);
+
+        self.b.switch_to_block(join);
+        self.vstack = snapshot;
+        self.vstack.pop();
+        let result = self.b.block_params(join)[0];
+        self.vstack.push((result, expected));
     }
 
     /// RFC 0065 WS5 — pinned-instance attribute write via

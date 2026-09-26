@@ -588,13 +588,9 @@ def pyobject_print_os_error(filename):
 def pyobject_clear_weakrefs_no_callbacks(obj):
     # PyUnstable_Object_ClearWeakRefsNoCallbacks(): clear every weak
     # reference to obj without running callbacks.
-    import weakref
+    from _weakref import _clear_weakrefs_no_callbacks
 
-    for r in weakref.getweakrefs(obj):
-        clear = getattr(r, "__clear__", None)
-        if clear is not None:
-            clear()
-    return None
+    return _clear_weakrefs_no_callbacks(obj)
 
 
 # ---------------------------------------------------------------------------

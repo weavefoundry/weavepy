@@ -11,12 +11,11 @@
 //! effect of that reduction, the `__slotnames__` cache, is applied only after
 //! the whole graph has been encoded.
 
-use std::collections::{HashMap, HashSet};
-
 use num_traits::ToPrimitive;
 
 use super::classes;
 use crate::builtins::object_identity;
+use crate::fasthash::FxHashMap;
 use crate::object::{DictData, DictKey, Object, StrKey};
 use crate::sync::{Rc, RefCell};
 use crate::types::{PyInstance, TypeObject};
@@ -111,15 +110,16 @@ struct Encoder<'a> {
     writer: Framer,
     // Pins prevent another thread's container mutation from releasing an
     // already memoized value and reusing its address during this operation.
-    memo: HashMap<i64, (u32, Object)>,
+    memo: FxHashMap<i64, (u32, Object)>,
     // Memo positions taken by the default state's temporary tuple and
     // dictionary, to which no later object can refer.
     anonymous: u32,
-    active: HashSet<i64>,
+    // Ancestors only, bounded by MAX_DEPTH; ordinary graphs keep this short.
+    active: Vec<i64>,
     python_headroom: usize,
     context: &'a dyn Fn() -> Option<InstanceContext>,
     resolved: Option<InstanceContext>,
-    classes: HashMap<usize, Rc<ClassPlan>>,
+    classes: FxHashMap<usize, Rc<ClassPlan>>,
     slot_name_caches: Vec<(Rc<TypeObject>, Vec<Object>)>,
 }
 
@@ -207,7 +207,7 @@ impl Encoder<'_> {
         if memoized {
             // Recursive tuples require a POP/GET repair. Retain the existing
             // pickler for every cyclic graph in this first implementation.
-            if self.active.contains(&id) {
+            if !matches!(value, Object::Str(_) | Object::Bytes(_)) && self.active.contains(&id) {
                 return None;
             }
             if let Some(&(index, _)) = self.memo.get(&id) {
@@ -226,18 +226,18 @@ impl Encoder<'_> {
                 self.writer.write(b"G")?;
                 self.writer.write(&value.to_bits().to_be_bytes())
             }
-            Object::Str(value) => {
-                self.writer.data(value.as_bytes(), true)?;
-                self.memoize(&Object::Str(value.clone()))
+            Object::Str(text) => {
+                self.writer.data(text.as_bytes(), true)?;
+                self.memoize(value)
             }
-            Object::Bytes(value) => {
-                self.writer.data(value, false)?;
-                self.memoize(&Object::Bytes(value.clone()))
+            Object::Bytes(bytes) => {
+                self.writer.data(bytes, false)?;
+                self.memoize(value)
             }
             Object::Tuple(items) if items.is_empty() => self.writer.write(b")"),
             Object::Tuple(items) => {
                 self.active.try_reserve(1).ok()?;
-                self.active.insert(id);
+                self.active.push(id);
                 if items.len() > 3 {
                     self.writer.write(b"(")?;
                 }
@@ -251,7 +251,7 @@ impl Encoder<'_> {
                     _ => b't',
                 }])?;
                 self.memoize(value)?;
-                self.active.remove(&id);
+                self.active.pop();
                 Some(())
             }
             Object::List(items) => {
@@ -263,7 +263,7 @@ impl Encoder<'_> {
                 let mut batch = Vec::new();
                 batch.try_reserve_exact(length.min(1000)).ok()?;
                 self.active.try_reserve(1).ok()?;
-                self.active.insert(id);
+                self.active.push(id);
                 self.writer.write(b"]")?;
                 self.memoize(value)?;
                 for start in (0..length).step_by(1000) {
@@ -285,7 +285,7 @@ impl Encoder<'_> {
                     self.writer
                         .write(if batch.len() == 1 { b"a" } else { b"e" })?;
                 }
-                self.active.remove(&id);
+                self.active.pop();
                 Some(())
             }
             Object::Dict(items) => {
@@ -301,20 +301,20 @@ impl Encoder<'_> {
                     snapshot
                 };
                 self.active.try_reserve(1).ok()?;
-                self.active.insert(id);
+                self.active.push(id);
                 self.writer.write(b"}")?;
                 self.memoize(value)?;
                 self.save_items(&items, depth + 1)?;
-                self.active.remove(&id);
+                self.active.pop();
                 Some(())
             }
             Object::Instance(instance) => {
                 // The instance is memoized before its state, but a graph
                 // that returns to it is cyclic and keeps the full pickler.
                 self.active.try_reserve(1).ok()?;
-                self.active.insert(id);
+                self.active.push(id);
                 self.save_instance(value, instance, depth)?;
-                self.active.remove(&id);
+                self.active.pop();
                 Some(())
             }
             _ => None,
@@ -552,13 +552,13 @@ fn encode_with_context(
     }
     let mut encoder = Encoder {
         writer: Framer::default(),
-        memo: HashMap::new(),
+        memo: FxHashMap::default(),
         anonymous: 0,
-        active: HashSet::new(),
+        active: Vec::new(),
         python_headroom,
         context,
         resolved: None,
-        classes: HashMap::new(),
+        classes: FxHashMap::default(),
         slot_name_caches: Vec::new(),
     };
     extend(&mut encoder.writer.output, &[0x80, protocol])?;

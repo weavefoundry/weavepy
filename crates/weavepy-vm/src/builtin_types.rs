@@ -575,12 +575,14 @@ impl BuiltinTypes {
         }
         union_type_.dict.borrow_mut().insert(
             crate::object::DictKey(Object::from_static("__class_getitem__")),
-            Object::Builtin(Rc::new(crate::object::BuiltinFn {
-                name: "__class_getitem__",
-                binds_instance: false,
-                call: Box::new(crate::union_class_getitem),
-                call_kw: None,
-            })),
+            Object::ClassMethod(MethodWrapper::new(Object::Builtin(Rc::new(
+                crate::object::BuiltinFn {
+                    name: "__class_getitem__",
+                    binds_instance: true,
+                    call: Box::new(crate::union_class_getitem),
+                    call_kw: None,
+                },
+            )))),
         );
         // (Their C tp_doc strings live in `builtin_type_doc` — the
         // `type.__doc__` getset path; test_pydoc test_union_type.)

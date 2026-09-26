@@ -1160,11 +1160,14 @@ def _build(spec):
     return spec
 
 
+_BUILD_STATE = (_build.__code__, dict, list, isinstance)
+
+
 def _from_spec(spec):
     """Build a node tree from an `_ast` spec (used by the native
     `compile(..., PyCF_ONLY_AST)` path — RFC 0052). Store/Del expression
     contexts are already stamped on the spec by the native builder."""
-    return _build(spec)
+    return _ast._build(spec, _build, _BUILD_STATE)
 
 
 # ---------------------------------------------------------------------------
@@ -1659,7 +1662,8 @@ def _validate_stmt(s):
 
 def _validate(tree):
     """CPython obj2ast + _PyAST_Validate over a user-supplied node tree."""
-    _obj2ast_check(tree)
+    if not _ast._validate_fields(tree, AST, _SUM_TYPES):
+        _obj2ast_check(tree)
     cls = type(tree)
     if cls in (Module, Interactive):
         _validate_stmts(tree.body)
@@ -2715,4 +2719,3 @@ del _export_node_classes_to_native
 
 if __name__ == '__main__':
     main()
-
