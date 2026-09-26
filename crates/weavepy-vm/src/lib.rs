@@ -12819,6 +12819,27 @@ impl Interpreter {
                                     }
                                 }
                             }
+                            Object::BoundMethod(bm)
+                                if argc == 0 && matches!(&bm.function, Object::Builtin(_)) =>
+                            {
+                                if let Some(slot) = mslots.get(pc) {
+                                    if slot.is_non_leaf(bm) {
+                                        // A prior body/receiver rejection still
+                                        // applies to this immutable bound method.
+                                        // Leave every operand for full dispatch.
+                                        #[cfg(test)]
+                                        SAVED_NATIVE_REJECTED_CALLS
+                                            .with(|calls| calls.set(calls.get() + 1));
+                                        break Some(CoreExit::Stop(LeafStop::Step));
+                                    }
+                                    if matches!(&bm.function, Object::Builtin(b)
+                                        if slot.get_leaf(b).is_some())
+                                    {
+                                        break Some(CoreExit::Helper);
+                                    }
+                                }
+                                break None;
+                            }
                             // A leaf builtin or directly constructible type: out
                             // of line.
                             Object::Builtin(_) | Object::Type(_) => break Some(CoreExit::Helper),
@@ -15051,7 +15072,15 @@ impl Interpreter {
             }
             return CoreAttr::Done;
         }
-        let r = {
+        let r = if argc == 0
+            && first == self_slot + 1
+            && matches!(frame.stack[callee_slot], Object::BoundMethod(_))
+        {
+            let Some(r) = self.leaf_bound_zero_call(code, pc, &frame.stack[callee_slot]) else {
+                return CoreAttr::Decline;
+            };
+            r
+        } else {
             let stack: &Vec<Object> = &frame.stack;
             let Object::Builtin(b) = &stack[callee_slot] else {
                 return CoreAttr::Decline;
@@ -15086,6 +15115,9 @@ impl Interpreter {
                 for arg in stack.drain(self_slot..) {
                     marked |= gc_trace::note_dropped_marks(&arg);
                     drop_operand(arg);
+                }
+                if matches!(stack[callee_slot], Object::BoundMethod(_)) {
+                    marked |= gc_trace::note_dropped_marks(&stack[callee_slot]);
                 }
                 stack.pop(); // the callee
                 stack.push(v);
@@ -16685,25 +16717,37 @@ impl Interpreter {
                         }
                         continue;
                     }
-                    let Object::Builtin(b) = &stack[callee_slot] else {
-                        break;
-                    };
-                    // The site remembers its leaf builtin and kind.
-                    let slot = code_method_slot(code, pc as u32);
-                    let kind = match slot.and_then(|s| s.get_leaf(b)) {
-                        Some(k) => k,
-                        None => {
-                            let Some(k) = self.leaf_call_kind(b) else {
-                                break;
-                            };
-                            if let Some(s) = slot {
-                                s.set_leaf(b, k);
+                    let r = if argc == 0
+                        && first == self_slot + 1
+                        && matches!(stack[callee_slot], Object::BoundMethod(_))
+                    {
+                        let Some(r) = self.leaf_bound_zero_call(code, pc, &stack[callee_slot])
+                        else {
+                            break;
+                        };
+                        r
+                    } else {
+                        let Object::Builtin(b) = &stack[callee_slot] else {
+                            break;
+                        };
+                        // The site remembers its leaf builtin and kind.
+                        let slot = code_method_slot(code, pc as u32);
+                        let kind = match slot.and_then(|s| s.get_leaf(b)) {
+                            Some(k) => k,
+                            None => {
+                                let Some(k) = self.leaf_call_kind(b) else {
+                                    break;
+                                };
+                                if let Some(s) = slot {
+                                    s.set_leaf(b, k);
+                                }
+                                k
                             }
-                            k
-                        }
-                    };
-                    let Some(r) = self.leaf_builtin_call(kind, b, &stack[first..]) else {
-                        break;
+                        };
+                        let Some(r) = self.leaf_builtin_call(kind, b, &stack[first..]) else {
+                            break;
+                        };
+                        r
                     };
                     match r {
                         Ok(v) => {
@@ -16715,6 +16759,9 @@ impl Interpreter {
                             for arg in stack.drain(self_slot..) {
                                 marked |= gc_trace::note_dropped_marks(&arg);
                                 drop_operand(arg);
+                            }
+                            if matches!(stack[callee_slot], Object::BoundMethod(_)) {
+                                marked |= gc_trace::note_dropped_marks(&stack[callee_slot]);
                             }
                             stack.pop(); // the callee
                             stack.push(v);
@@ -17268,6 +17315,7 @@ impl Interpreter {
                     LeafRecv::List,
                     Object::new_list(Vec::new()),
                     &[
+                        ("__len__", LeafKind::Len),
                         ("append", LeafKind::ListAppend),
                         ("pop", LeafKind::ListPop),
                         ("insert", LeafKind::ListInsert),
@@ -17280,6 +17328,7 @@ impl Interpreter {
                     LeafRecv::Dict,
                     Object::new_dict(),
                     &[
+                        ("__len__", LeafKind::Len),
                         ("get", LeafKind::DictGet),
                         ("keys", LeafKind::DictKeys),
                         ("values", LeafKind::DictValues),
@@ -17290,6 +17339,7 @@ impl Interpreter {
                     LeafRecv::Set,
                     Object::new_set(),
                     &[
+                        ("__len__", LeafKind::Len),
                         ("add", LeafKind::SetAdd),
                         ("discard", LeafKind::SetDiscard),
                         ("remove", LeafKind::SetRemove),
@@ -17300,6 +17350,7 @@ impl Interpreter {
                     LeafRecv::Str,
                     Object::from_static(""),
                     &[
+                        ("__len__", LeafKind::Len),
                         ("startswith", LeafKind::StrStartswith),
                         ("endswith", LeafKind::StrEndswith),
                         ("lower", LeafKind::StrLower),
@@ -17502,6 +17553,59 @@ impl Interpreter {
             Some(f) => LeafKind::Fast(*f),
             None => LeafKind::Opaque,
         })
+    }
+
+    /// A saved native method with no explicit arguments. Only the quiet,
+    /// GIL-held leaf paths call this helper. The admitted operations don't
+    /// release hidden owners or invoke Python; a retained method owner keeps
+    /// its receiver alive without staging an additional reference.
+    fn leaf_bound_zero_call(
+        &mut self,
+        code: &CodeObject,
+        pc: usize,
+        callable: &Object,
+    ) -> Option<Result<Object, RuntimeError>> {
+        let Object::BoundMethod(bm) = callable else {
+            return None;
+        };
+        if bm.redispatch_descriptor {
+            return None;
+        }
+        let Object::Builtin(b) = &bm.function else {
+            return None;
+        };
+        let slot = code_method_slot(code, pc as u32)?;
+        if slot.is_non_leaf(bm) {
+            return None;
+        }
+        let cached = slot.get_leaf(b);
+        let Some(kind) = cached.or_else(|| self.leaf_call_kind(b)) else {
+            slot.set_non_leaf(bm);
+            return None;
+        };
+        if !kind.retains_bound_receiver() {
+            slot.set_non_leaf(bm);
+            return None;
+        }
+        // Collector handles and weakref-registry clones aren't program
+        // owners. Use the same conservative proof as prompt reaping.
+        if Self::looks_reapable_temporary(callable) {
+            return None;
+        }
+        let Some(result) = self.leaf_builtin_call(kind, b, std::slice::from_ref(&bm.receiver))
+        else {
+            // The same builtin can serve an exact receiver or an excluded
+            // subclass. Key rejection by this immutable bound method,
+            // not by its function, so a later exact receiver can specialize.
+            slot.set_non_leaf(bm);
+            return None;
+        };
+        if cached.is_none() {
+            slot.set_leaf(b, kind);
+        }
+        #[cfg(test)]
+        SAVED_NATIVE_LEAF_CALLS.with(|calls| calls.set(calls.get() + 1));
+        Some(result)
     }
 
     /// Call a leaf builtin if `args` (receiver first for methods) has an
@@ -26567,7 +26671,12 @@ impl Interpreter {
     }
 
     fn lookup_method(&self, obj: &Object, name: &str) -> Option<Object> {
-        builtins::lookup_method(obj, name)
+        // Reuse the leaf table's native callable for exact receivers. The
+        // table is populated by builtins::lookup_method itself, so this
+        // preserves the body and gives saved methods a stable identity.
+        self.leaf_builtin_method(obj, name)
+            .map(Object::Builtin)
+            .or_else(|| builtins::lookup_method(obj, name))
     }
 
     /// `print(*args, sep=' ', end='\n', file=...)`. We honour `sep`
@@ -54668,6 +54777,32 @@ enum LeafKind {
     Opaque,
 }
 
+impl LeafKind {
+    /// These self-only operations neither invoke Python nor discard any
+    /// existing reference held by the receiver. Argument-shape admission
+    /// still belongs to `leaf_builtin_call`; subclasses must fall back.
+    fn retains_bound_receiver(self) -> bool {
+        matches!(
+            self,
+            Self::Len
+                | Self::ListReverse
+                | Self::ListCopy
+                | Self::DictKeys
+                | Self::DictValues
+                | Self::DictItems
+                | Self::StrLower
+                | Self::StrUpper
+                | Self::StrStrip
+                | Self::StrLstrip
+                | Self::StrRstrip
+                | Self::StrIsdigit
+                | Self::StrIsalpha
+                | Self::StrIsspace
+                | Self::StrSplit
+        )
+    }
+}
+
 /// A receiver's builtin variant, for the method table.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LeafRecv {
@@ -55274,6 +55409,8 @@ enum QuietShell<'a> {
 thread_local! {
     static NATIVE_FAST_SUBSCRIPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static LEAF_SET_REMOVALS: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0; 2]) };
+    static SAVED_NATIVE_LEAF_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SAVED_NATIVE_REJECTED_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     #[cfg(feature = "jit")]
     static SCALAR_FIELD_UPDATE_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     #[cfg(feature = "jit")]
@@ -60214,6 +60351,9 @@ enum MethodSlotFn {
         generation: u64,
         fast: leaf_builtins::Fast,
     },
+    /// A rejected native bound-call body, weakly held so a call site
+    /// doesn't extend its lifetime. The key is the registry generation.
+    NonLeaf(crate::sync::Weak<crate::object::BoundMethod>),
 }
 
 // SAFETY: read and written only from the dispatch loop with the GIL
@@ -60379,6 +60519,24 @@ impl MethodSlot {
     fn set_leaf(&self, f: &Rc<crate::object::BuiltinFn>, kind: LeafKind) {
         // SAFETY: as `set`.
         unsafe { *self.0.get() = (0, MethodSlotFn::Leaf(f.clone(), kind)) };
+    }
+
+    fn is_non_leaf(&self, method: &Rc<crate::object::BoundMethod>) -> bool {
+        // SAFETY: GIL-held leaf dispatch, as `get_leaf`. A live Weak keeps
+        // the allocation reserved, preventing address-reuse aliasing.
+        matches!(unsafe { &*self.0.get() }, (version, MethodSlotFn::NonLeaf(cached))
+            if cached.as_ptr() == Rc::as_ptr(method)
+                && *version == leaf_builtins::generation())
+    }
+
+    fn set_non_leaf(&self, method: &Rc<crate::object::BoundMethod>) {
+        // SAFETY: GIL-held leaf dispatch, as `set_leaf`.
+        unsafe {
+            *self.0.get() = (
+                leaf_builtins::generation(),
+                MethodSlotFn::NonLeaf(Rc::downgrade(method)),
+            )
+        };
     }
 
     #[inline]
@@ -70145,6 +70303,89 @@ print("native pickle coverage: ok")
             "    print(e.value)\n",
         );
         assert_eq!(run(src), "1\ndone\n");
+    }
+
+    #[test]
+    fn native_leaf_lookup_uses_body_identity() {
+        let interp = Interpreter::new();
+        let receiver = Object::new_list(Vec::new());
+        let Object::Builtin(first) = interp.lookup_method(&receiver, "__len__").unwrap() else {
+            panic!("native length method");
+        };
+        let Object::Builtin(second) = interp.lookup_method(&receiver, "__len__").unwrap() else {
+            panic!("native length method");
+        };
+        assert!(Rc::ptr_eq(&first, &second));
+        assert!(matches!(interp.leaf_call_kind(&first), Some(LeafKind::Len)));
+        let unrelated = Rc::new(BuiltinFn {
+            name: "__len__",
+            binds_instance: true,
+            call: Box::new(|_| panic!("unrelated native body must not run")),
+            call_kw: None,
+        });
+        assert!(interp.leaf_call_kind(&unrelated).is_none());
+    }
+
+    #[test]
+    fn native_bound_rejection_cache_does_not_own_methods() {
+        let receiver = Rc::new(RefCell::new(Vec::new()));
+        let weak_receiver = Rc::downgrade(&receiver);
+        let object = Object::List(receiver);
+        let function = crate::builtins::lookup_method(&object, "clear").unwrap();
+        let method = Rc::new(BoundMethod::new(object, function));
+        let weak_method = Rc::downgrade(&method);
+        let slot = MethodSlot::empty();
+        slot.set_non_leaf(&method);
+        assert_eq!(Rc::strong_count(&method), 1);
+        drop(method);
+        assert!(weak_method.upgrade().is_none());
+        assert!(weak_receiver.upgrade().is_none());
+    }
+
+    #[test]
+    fn saved_native_leaf_preserves_owners_and_observers() {
+        const CHILD: &str = "WEAVEPY_TEST_SAVED_NATIVE_LEAF_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::saved_native_leaf_preserves_owners_and_observers",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("WEAVEPY_JIT", "0")
+                .status()
+                .expect("spawn saved native leaf test");
+            assert!(status.success(), "saved native leaf child: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut interp = Interpreter::new();
+                let source = include_str!("../../../tests/regrtest/test_saved_native_leaf.py");
+                let module = parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    source,
+                    "test_saved_native_leaf.py",
+                )
+                .unwrap();
+                SAVED_NATIVE_LEAF_CALLS.with(|calls| calls.set(0));
+                SAVED_NATIVE_REJECTED_CALLS.with(|calls| calls.set(0));
+                interp.run_module(&code).unwrap();
+                let calls = SAVED_NATIVE_LEAF_CALLS.with(std::cell::Cell::get);
+                assert!(calls > 500, "saved native leaf calls: {calls}");
+                let rejections = SAVED_NATIVE_REJECTED_CALLS.with(std::cell::Cell::get);
+                assert!(
+                    rejections > 100,
+                    "saved native rejection hits: {rejections}"
+                );
+                eprintln!("Saved native leaf calls: {calls}; rejection hits: {rejections}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
