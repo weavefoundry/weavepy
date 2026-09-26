@@ -1,5 +1,9 @@
 # Bounded LRU recency for native tuple keys
 
+This report describes the native tuple increment at `6343cc1`. A subsequent
+[typed-cache increment](PERFORMANCE-TYPED-LRU.md) extends the same recency
+representation to admitted typed keys.
+
 Untyped caches now use dense index links for exact tuples containing exact
 integers, long integers, strings, and nested tuples of those leaves. This
 extends the preceding scalar optimization to ordinary multiargument and

@@ -3,8 +3,8 @@ import functools
 import threading
 
 
-def exercise(maxsize, kind):
-    @functools.lru_cache(maxsize=maxsize)
+def exercise(maxsize, kind, typed=False):
+    @functools.lru_cache(maxsize=maxsize, typed=typed)
     def cached(key):
         return key
 
@@ -35,18 +35,19 @@ def exercise(maxsize, kind):
         thread.join()
     assert not errors, errors
     expected = (0, 4008, 0, 0) if maxsize == 0 else (4000, 8, maxsize, 8)
-    assert cached.cache_info() == expected, (maxsize, kind, cached.cache_info())
+    assert cached.cache_info() == expected, (maxsize, kind, typed, cached.cache_info())
     cached.cache_clear()
     assert cached.cache_info() == (0, 0, maxsize, 0)
 
 
-for kind in ('int', 'str', 'tuple'):
-    for maxsize in (32, 0):
-        exercise(maxsize, kind)
+for typed in (False, True):
+    for kind in ('int', 'str', 'tuple'):
+        for maxsize in (32, 0):
+            exercise(maxsize, kind, typed)
 
 
-def exercise_clear(tuples):
-    @functools.lru_cache(maxsize=3)
+def exercise_clear(tuples, typed=False):
+    @functools.lru_cache(maxsize=3, typed=typed)
     def cached(key):
         return key
 
@@ -91,5 +92,7 @@ def exercise_clear(tuples):
 for _ in range(25):
     exercise_clear(False)
     exercise_clear(True)
+    exercise_clear(False, True)
+    exercise_clear(True, True)
 
 print("Threaded LRU counters: ok")

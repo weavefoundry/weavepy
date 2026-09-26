@@ -285,9 +285,18 @@ fn lru_cache_wrapper_new(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = Rc::new(crate::types::PyInstance::new(lru_type()));
     lru_set(&inst, "__wrapped__", user_function.clone());
     lru_set(&inst, "_lru_maxsize", maxsize.clone());
-    // Untyped caches reuse this field for recency state once called. Adding
-    // another field would grow a normally decorated wrapper's dictionary.
-    lru_set(&inst, "_lru_state", Object::Bool(typed.is_truthy()));
+    // Reuse this field for recency state. An immediate sentinel keeps empty
+    // typed wrappers allocation-free; their active links get a tuple tag.
+    // Another field would grow a normally decorated wrapper's dictionary.
+    lru_set(
+        &inst,
+        "_lru_state",
+        if typed.is_truthy() {
+            Object::Int(1)
+        } else {
+            Object::Bool(false)
+        },
+    );
     lru_set(
         &inst,
         "_lru_cache",
@@ -427,6 +436,14 @@ fn native_lru_tuple_key(key: &Object, depth: usize, remaining: &mut usize) -> bo
     *remaining -= 1;
     match key {
         Object::Int(_) | Object::Long(_) | Object::Str(_) => true,
+        Object::Type(cls) => {
+            // Typed keys append argument classes. Only these exact builtin
+            // identities have immutable metatype behavior and no finalizers.
+            let builtins = crate::builtin_types::builtin_types();
+            Rc::ptr_eq(cls, &builtins.int_)
+                || Rc::ptr_eq(cls, &builtins.str_)
+                || Rc::ptr_eq(cls, &builtins.tuple_)
+        }
         Object::Tuple(items) if depth > 0 && items.len() <= *remaining => items
             .iter()
             .all(|item| native_lru_tuple_key(item, depth - 1, remaining)),
@@ -436,6 +453,35 @@ fn native_lru_tuple_key(key: &Object, depth: usize, remaining: &mut usize) -> bo
 
 fn invalid_lru_order() -> RuntimeError {
     type_error("lru_cache has inconsistent private recency data")
+}
+
+fn lru_state_links(state: &Object) -> Option<&Rc<RefCell<Vec<u8>>>> {
+    match state {
+        Object::ByteArray(links) => Some(links),
+        Object::Tuple(parts) if parts.len() == 1 => match &parts[0] {
+            Object::ByteArray(links) => Some(links),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn lru_mode(inst: &crate::types::PyInstance) -> Result<(bool, bool), RuntimeError> {
+    // Read the tag without cloning active recency storage. Release this
+    // borrow before hashing the key or calling the wrapped function.
+    let dict = inst.dict_cell().borrow();
+    match dict.get(&StrKey("_lru_state")) {
+        Some(Object::Bool(true)) => Ok((true, false)),
+        Some(Object::Int(1)) => Ok((true, true)),
+        Some(state @ Object::Tuple(_)) => {
+            if lru_state_links(state).is_none() {
+                return Err(invalid_lru_order());
+            }
+            Ok((true, true))
+        }
+        Some(Object::None) => Ok((false, false)),
+        _ => Ok((false, true)),
+    }
 }
 
 /// Once a cache admits a key that can invoke Python, retain its existing
@@ -455,19 +501,29 @@ fn scalar_lru_links(
                 Object::Bool(false),
             )
         });
-    // True remains a typed cache; false is an uninitialized untyped cache.
-    // None permanently disables scalar mode, and a bytearray owns the links.
-    if matches!(state, Object::Bool(false)) {
+    // False/Int(1) are uninitialized untyped/typed states. None/True retain
+    // permanent fallback. A one-element tuple tags typed active links.
+    let typed = matches!(state, Object::Int(1));
+    if typed || matches!(state, Object::Bool(false)) {
         *state = if scalar {
-            Object::ByteArray(Rc::new(RefCell::new(lru_order::empty())))
+            let links = Object::ByteArray(Rc::new(RefCell::new(lru_order::empty())));
+            if typed {
+                Object::new_tuple_array([links])
+            } else {
+                links
+            }
+        } else if typed {
+            Object::Bool(true)
         } else {
             Object::None
         };
     }
     match state {
-        Object::ByteArray(links) => Ok(Some(links.clone())),
         Object::Bool(true) | Object::None => Ok(None),
-        _ => Err(invalid_lru_order()),
+        _ => lru_state_links(state)
+            .cloned()
+            .map(Some)
+            .ok_or_else(invalid_lru_order),
     }
 }
 
@@ -513,7 +569,21 @@ fn scalar_lru_operation(
             bytes.clear();
             // Keep the empty buffer for in-flight users of this snapshot,
             // but let future calls decline from their existing state read.
-            lru_set(inst, "_lru_state", Object::None);
+            // Demotion is serialized by the cache lock. Read its stable
+            // typed tag here instead of carrying it through every call.
+            let typed = matches!(
+                inst.dict_cell().borrow().get(&StrKey("_lru_state")),
+                Some(Object::Tuple(_))
+            );
+            lru_set(
+                inst,
+                "_lru_state",
+                if typed {
+                    Object::Bool(true)
+                } else {
+                    Object::None
+                },
+            );
             #[cfg(test)]
             note_scalar_lru_event(2);
             return Ok(ScalarLru::Slow);
@@ -590,11 +660,7 @@ fn lru_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
         return interp.call(&func, call_args, kwargs, &globals);
     }
 
-    let (typed, scalar_enabled) = match lru_get(&inst, "_lru_state") {
-        Some(Object::Bool(true)) => (true, false),
-        Some(Object::None) => (false, false),
-        _ => (false, true),
-    };
+    let (typed, scalar_enabled) = lru_mode(&inst)?;
     let key = lru_make_key(call_args, kwargs, typed);
     // Compute a tuple key's hash before touching the cache. Successful
     // hashes are retained by the tuple, so lookup, recency updates, and
@@ -729,13 +795,14 @@ fn lru_cache_clear(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Obje
             // Read the mode after locking the cache: a concurrent first call
             // may initialize recency storage before we acquire this lock.
             let mut cache = c.borrow_mut();
-            if let Some(Object::ByteArray(links)) = lru_get(&inst, "_lru_state") {
+            let state = lru_get(&inst, "_lru_state");
+            if let Some(links) = state.as_ref().and_then(lru_state_links) {
                 let mut bytes = links.borrow_mut();
                 if bytes.is_empty() {
                     cache.clear();
                     None
                 } else {
-                    crate::object::bytearray_check_resizable(&links)?;
+                    crate::object::bytearray_check_resizable(links)?;
                     *bytes = lru_order::empty();
                     Some(std::mem::take(&mut *cache))
                 }
@@ -878,6 +945,10 @@ mod tests {
                     (
                         "test_lru_native_tuples.py",
                         include_str!("../../../../tests/regrtest/test_lru_native_tuples.py"),
+                    ),
+                    (
+                        "test_lru_typed_native.py",
+                        include_str!("../../../../tests/regrtest/test_lru_typed_native.py"),
                     ),
                 ] {
                     let module = weavepy_parser::parse_module(source).unwrap();
