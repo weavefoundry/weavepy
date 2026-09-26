@@ -2,9 +2,7 @@
 
 use std::ffi::CString;
 use std::ptr;
-use weavepy_capi::abstract_::{
-    PyObject_GetAttr, PyObject_GetAttrString, _PyObject_LookupAttr, _PyObject_LookupAttrId,
-};
+use weavepy_capi::abstract_::{PyObject_GetAttr, PyObject_GetAttrString};
 use weavepy_capi::containers::PyDict_SetItemString;
 use weavepy_capi::errors::{PyErr_GetRaisedException, PyErr_Occurred};
 use weavepy_capi::lifecycle::{Py_FinalizeEx, Py_Initialize};
@@ -88,10 +86,16 @@ impl Lookup {
                 Self::OptionalString => {
                     PyObject_GetOptionalAttrString(cls, string_name.as_ptr(), result)
                 }
-                Self::PrivateObject => _PyObject_LookupAttr(cls, object_name, result),
+                Self::PrivateObject => {
+                    weavepy_capi::abstract_::_PyObject_LookupAttr(cls, object_name, result)
+                }
                 // This legacy WeavePy helper takes a string, not CPython's
                 // _Py_Identifier structure. Test its existing ABI directly.
-                Self::PrivateString => _PyObject_LookupAttrId(cls, string_name.as_ptr(), result),
+                Self::PrivateString => weavepy_capi::abstract_::_PyObject_LookupAttrId(
+                    cls,
+                    string_name.as_ptr(),
+                    result,
+                ),
             }
         };
         unsafe { Py_DecRef(object_name) };

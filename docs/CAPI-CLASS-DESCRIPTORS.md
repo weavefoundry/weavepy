@@ -87,6 +87,7 @@ existing presence-only behavior. The independent Python/CPython fixture
 remains unchanged.
 
 The direct integration test and its Clippy check pass locally. Windows
-execution remains pending CI; this test-only change doesn't implement
-Windows COM support or change the runtime measured above. Its logs are
+CI for `f0117c8` also passes this test. A later import-order adjustment
+resolves its formatting disagreement with CI. These test-only changes
+don't implement Windows COM support or change the runtime measured above. Its logs are
 under `target/performance/capi-direct-descriptor-test/`.
