@@ -42331,6 +42331,18 @@ impl Interpreter {
                         };
                     }
                 }
+                if args.is_empty() {
+                    // The bound method roots its receiver throughout this
+                    // call, including reentry. Borrow that owner for a
+                    // self-only argument slice instead of allocating and
+                    // retaining a second temporary owner.
+                    return self.call(
+                        &bm.function,
+                        std::slice::from_ref(&bm.receiver),
+                        kwargs,
+                        outer_globals,
+                    );
+                }
                 let mut combined: Vec<Object> = Vec::with_capacity(args.len() + 1);
                 combined.push(bm.receiver.clone());
                 combined.extend_from_slice(args);
