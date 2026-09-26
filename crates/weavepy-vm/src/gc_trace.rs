@@ -71,9 +71,10 @@
 //! up as `gc_refs > 0`, so the cycle survives one more
 //! generation than it strictly has to).
 
+use crate::fasthash::ObjectIdHasher;
 use crate::shared_value::ThinArc;
 use crate::sync::RefCell;
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::BuildHasherDefault;
 use std::sync::atomic::{
     AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
@@ -82,32 +83,8 @@ use std::sync::Arc;
 use crate::object::Object;
 use crate::weakref_registry::{id_of, ObjectId};
 
-// Object ids are aligned allocation addresses. Fx's final multiplication
-// retains their zero low bits, concentrating HashMap home buckets. Mix the
-// upper half into the lower half for this private index only.
-#[derive(Default)]
-struct GcIndexHasher(crate::fasthash::FxHasher);
-
-impl Hasher for GcIndexHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        let hash = self.0.finish();
-        hash ^ (hash >> 32)
-    }
-
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        self.0.write(bytes);
-    }
-
-    #[inline]
-    fn write_u64(&mut self, word: u64) {
-        self.0.write_u64(word);
-    }
-}
-
 type GcIndex =
-    std::collections::HashMap<ObjectId, Arc<TrackedHandle>, BuildHasherDefault<GcIndexHasher>>;
+    std::collections::HashMap<ObjectId, Arc<TrackedHandle>, BuildHasherDefault<ObjectIdHasher>>;
 
 /// The standard CPython generation count (3) and default
 /// thresholds: gen 0 collects when 700 untracked allocations
@@ -4858,7 +4835,7 @@ mod tests {
     #[test]
     fn gc_index_distributes_aligned_object_addresses() {
         use std::hash::BuildHasher;
-        let hasher = BuildHasherDefault::<GcIndexHasher>::default();
+        let hasher = BuildHasherDefault::<ObjectIdHasher>::default();
         // Exercise regular allocation strides at multiple address regions.
         // The unmodified word hash uses at most 512 of these 8192 buckets.
         for region in [0u64, 0x1_0000_0000, 0x6000_0000_0000] {

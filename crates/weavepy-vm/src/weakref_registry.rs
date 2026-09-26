@@ -34,8 +34,10 @@
 //! explicit `notify_clear(id)` method that callers (the GC,
 //! `gc.collect`, finaliser code) can invoke.
 
+use crate::fasthash::ObjectIdHasher;
 use crate::shared_value::{SharedStr, ThinArc};
 use crate::sync::RefCell;
+use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -202,9 +204,9 @@ impl WeakRefSlot {
     }
 }
 
-/// Per-id registry. Stored as `BTreeMap<ObjectId, Vec<Weak<WeakRefSlot>>>`
-/// so the GC can iterate efficiently and dead slots can be
-/// pruned in place.
+/// Per-id registry. A hash index serves identity lookups; snapshots sort
+/// selected ids so collection keeps its previous target order. Dead slots
+/// can be pruned in place.
 ///
 /// **Process-global** (see [`REGISTRY`]), mirroring the cycle
 /// collector ([`crate::gc_trace`]). RFC 0025 made the whole VM heap
@@ -225,11 +227,13 @@ pub struct WeakRefRegistry {
 
 #[derive(Default)]
 struct RegistryInner {
-    /// Map from referent id -> list of weakref slots that
-    /// observe it. Outer Vec is dense (we shrink-to-fit on
-    /// notify); the inner `Weak` is so the slot itself is
-    /// freed when no Python reference points at the weakref.
-    slots: std::collections::BTreeMap<ObjectId, Vec<Weak<WeakRefSlot>>>,
+    /// Each referent's slots stay in registration order. Weak ownership
+    /// lets a slot die when no Python reference holds its wrapper.
+    slots: std::collections::HashMap<
+        ObjectId,
+        Vec<Weak<WeakRefSlot>>,
+        BuildHasherDefault<ObjectIdHasher>,
+    >,
     /// Bumped on every register call. Used as a cheap
     /// "version" counter so cache-invalidation paths can know
     /// when to re-scan.
@@ -237,11 +241,11 @@ struct RegistryInner {
     /// Bloom-style pre-filter over watched ids (4096 bits). The prompt
     /// reaper probes `count`/`strong_clone_count` for *every* dropped
     /// object; once any weakref exists the `is_empty` fast path is gone
-    /// and each probe pays a `BTreeMap` walk. A clear bit here proves
+    /// and each probe pays a map lookup. A clear bit here proves
     /// the id was never registered, so the overwhelmingly common
     /// "dropped object was never weakly referenced" case stays O(1).
     /// Bits are set on register and only rebuilt on [`WeakRefRegistry::
-    /// shrink`]; stale bits merely cost the tree lookup they'd have paid
+    /// shrink`]; stale bits merely cost the map lookup they'd have paid
     /// anyway.
     filter: IdFilter,
 }
@@ -307,7 +311,7 @@ impl WeakRefRegistry {
             let mut g = self.inner.borrow_mut();
             // Hot path: this runs for every object the prompt reaper
             // frees, and almost none of them was ever weakly referenced.
-            // Skip the tree removal on the miss-filter's say-so, exactly
+            // Skip the map removal on the miss-filter's say-so, exactly
             // as `count` does.
             if g.slots.is_empty() || !g.filter.may_contain(id) {
                 return Vec::new();
@@ -333,7 +337,7 @@ impl WeakRefRegistry {
     pub fn count(&self, id: ObjectId) -> usize {
         let g = self.inner.borrow();
         // Hot path: consulted for every dropped object by the prompt
-        // reaper; skip the tree lookup when `id` was never registered.
+        // reaper; skip the map lookup when `id` was never registered.
         if g.slots.is_empty() || !g.filter.may_contain(id) {
             return 0;
         }
@@ -395,12 +399,14 @@ impl WeakRefRegistry {
             v.retain(|w| w.strong_count() > 0);
             !v.is_empty()
         });
+        // Empty or much smaller registries should release their old table.
+        g.slots.shrink_to_fit();
         // Rebuild the pre-filter from the surviving ids so bits for
-        // long-dead referents stop forcing tree lookups.
-        g.filter.clear();
-        let ids: Vec<ObjectId> = g.slots.keys().copied().collect();
-        for id in ids {
-            g.filter.insert(id);
+        // long-dead referents stop forcing map lookups.
+        let RegistryInner { slots, filter, .. } = &mut *g;
+        filter.clear();
+        for id in slots.keys() {
+            filter.insert(*id);
         }
     }
 
@@ -415,16 +421,21 @@ impl WeakRefRegistry {
 
     /// Snapshot selected ids without touching excluded slots or their targets.
     /// The predicate must only inspect already-borrowed state, since it runs
-    /// under the registry borrow. In particular, the collector takes its
-    /// index borrow before this one, as it does when registering finalizers.
+    /// under the registry borrow. Predicate evaluation order is unspecified;
+    /// the selected targets are cloned and returned in ascending id order.
+    /// The collector takes its index borrow before this one, as it does
+    /// when registering finalizers.
     pub(crate) fn targets_matching(
         &self,
         include: impl Fn(ObjectId) -> bool,
     ) -> Vec<(ObjectId, Object)> {
         let g = self.inner.borrow();
-        g.slots
-            .iter()
-            .filter(|(id, _)| include(**id))
+        // The predicate only inspects borrowed state. Excluded slots are
+        // never upgraded or borrowed, and sorting precedes target cloning.
+        let mut selected: Vec<_> = g.slots.iter().filter(|(id, _)| include(**id)).collect();
+        selected.sort_unstable_by_key(|(id, _)| **id);
+        selected
+            .into_iter()
             .filter_map(|(id, v)| {
                 v.iter()
                     .filter_map(Weak::upgrade)
@@ -634,5 +645,83 @@ mod tests {
         let cleared = notify_clear(1);
         assert_eq!(cleared.len(), 1);
         assert!(slot.is_dead());
+    }
+
+    #[test]
+    fn registry_counts_and_clear_order_survive_dead_watchers() {
+        let reg = WeakRefRegistry::new();
+        let first = Arc::new(WeakRefSlot::new(64, Object::Int(1), false, kind::REF));
+        let dead = Arc::new(WeakRefSlot::new(64, Object::Int(1), false, kind::REF));
+        let last = Arc::new(WeakRefSlot::new(64, Object::Int(1), false, kind::REF));
+        reg.register(first.clone());
+        reg.register(dead.clone());
+        reg.register(last.clone());
+        drop(dead);
+        assert_eq!(reg.count(64), 2);
+        assert_eq!(reg.strong_clone_count(64), 2);
+        first.clear();
+        // A still-owned, cleared slot is a live wrapper, not a target owner.
+        assert_eq!(reg.count(64), 2);
+        assert_eq!(reg.strong_clone_count(64), 1);
+        reg.shrink();
+        let watchers = reg.collect_strong(64);
+        assert_eq!(watchers.len(), 2);
+        assert!(Arc::ptr_eq(&watchers[0], &first));
+        assert!(Arc::ptr_eq(&watchers[1], &last));
+        let cleared = reg.notify_clear(64);
+        assert_eq!(cleared.len(), 2);
+        assert!(Arc::ptr_eq(&cleared[0].0, &last));
+        assert!(Arc::ptr_eq(&cleared[1].0, &first));
+        assert!(last.upgrade().is_none());
+        assert_eq!(reg.count(64), 0);
+        assert_eq!(reg.strong_clone_count(64), 0);
+        assert!(reg.notify_clear(64).is_empty());
+    }
+
+    #[test]
+    fn registry_snapshots_order_selected_targets_without_accessing_excluded_slots() {
+        let reg = WeakRefRegistry::new();
+        let ids = [96, 16, 128, 64, 32];
+        let slots: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let slot = Arc::new(WeakRefSlot::new(
+                    *id,
+                    Object::Int(*id as i64),
+                    false,
+                    kind::REF,
+                ));
+                reg.register(slot.clone());
+                slot
+            })
+            .collect();
+        let excluded = slots[2].target.borrow_mut();
+        let selected = reg.targets_matching(|id| id != 128);
+        assert_eq!(
+            selected.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [16, 32, 64, 96]
+        );
+        for (id, target) in selected {
+            assert!(matches!(target, Object::Int(value) if value == id as i64));
+        }
+        drop(excluded);
+        slots[1].clear();
+        assert_eq!(
+            reg.targets().iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [32, 64, 96, 128]
+        );
+        drop(slots);
+        reg.shrink();
+        assert!(reg.targets().is_empty());
+        assert_eq!(reg.total_alive(), 0);
+        // Reusing an id after pruning must republish both filters.
+        let replacement = Arc::new(WeakRefSlot::new(16, Object::Int(7), false, kind::REF));
+        reg.register(replacement.clone());
+        assert_eq!(reg.count(16), 1);
+        assert_eq!(reg.strong_clone_count(16), 1);
+        assert_eq!(reg.count(17), 0);
+        assert_eq!(reg.strong_clone_count(17), 0);
+        assert!(reg.collect_strong(17).is_empty());
+        assert!(reg.notify_clear(17).is_empty());
     }
 }

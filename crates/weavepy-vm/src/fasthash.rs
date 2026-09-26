@@ -102,6 +102,30 @@ impl Hasher for FxHasher {
     }
 }
 
+// Object ids are aligned allocation addresses. Fx's final multiplication
+// retains their zero low bits, concentrating HashMap home buckets. Mix the
+// upper half into the lower half for internal address indexes.
+#[derive(Default)]
+pub(crate) struct ObjectIdHasher(FxHasher);
+
+impl Hasher for ObjectIdHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        let hash = self.0.finish();
+        hash ^ (hash >> 32)
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.write(bytes);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, word: u64) {
+        self.0.write_u64(word);
+    }
+}
+
 /// `BuildHasher` for [`FxHasher`] — usable as the `S` parameter of
 /// `HashMap`/`HashSet` statics (it is `Default` + `Clone`).
 #[derive(Default, Debug, Clone, Copy)]
