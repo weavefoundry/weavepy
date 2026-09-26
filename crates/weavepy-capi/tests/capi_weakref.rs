@@ -2,6 +2,7 @@
 use std::ffi::CString;
 use std::ptr;
 use weavepy_capi::abi313::{PyWeakref_GetRef, PyWeakref_NewRef};
+use weavepy_capi::abi314::PyUnstable_Object_ClearWeakRefsNoCallbacks;
 use weavepy_capi::abstract_::{PyObject_CallNoArgs, PyObject_GetAttrString};
 use weavepy_capi::containers::PyDict_SetItemString;
 use weavepy_capi::lifecycle::{Py_FinalizeEx, Py_Initialize};
@@ -77,6 +78,15 @@ fn weakref_identity_methods_and_referent_lifetime() {
             Py_DecRef(wrapper);
         }
         Py_DecRef(saved_call);
+        run("clear_root = Node()\nclear_events = []\nclear_refs = [weakref.ref(clear_root, lambda ref, i=i: clear_events.append(i)) for i in range(6)]\nclear_plain = weakref.ref(clear_root)\n");
+        let target = eval("clear_root", globals);
+        PyUnstable_Object_ClearWeakRefsNoCallbacks(target);
+        run("assert all(ref() is None for ref in clear_refs)\nassert clear_plain() is None\nassert weakref.getweakrefs(clear_root) == []\ngc.collect()\nassert clear_events == []\n");
+        Py_DecRef(target);
+        run("del clear_root\ngc.collect()\nassert clear_events == []\n");
+        run(include_str!(
+            "../../../tests/regrtest/test_weakref_no_callback_clear.py"
+        ));
         run(include_str!(
             "../../../tests/regrtest/test_weakref_saved_methods.py"
         ));

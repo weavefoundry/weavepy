@@ -49,25 +49,21 @@ use crate::object::{DictKey, Object, StrKey};
 pub(crate) enum WrapperKey {
     Call,
     Get,
-    Clear,
-    Alive,
     Repr,
     Callback,
     Kind,
 }
 
-const WRAPPER_NAMES: [&str; 7] = [
+const WRAPPER_NAMES: [&str; 5] = [
     "__call__",
     "__weakref_get__",
-    "__clear__",
-    "__alive__",
     "__repr__",
     "__callback__",
     "__weakref_kind__",
 ];
 
 thread_local! {
-    static WRAPPER_KEYS: [DictKey; 7] = WRAPPER_NAMES.map(|name| DictKey(Object::from_static(name)));
+    static WRAPPER_KEYS: [DictKey; 5] = WRAPPER_NAMES.map(|name| DictKey(Object::from_static(name)));
 }
 
 impl WrapperKey {
@@ -138,7 +134,7 @@ impl WeakRefSlot {
     pub fn new(target_id: ObjectId, target: Object, has_callback: bool, kind: u8) -> Self {
         Self {
             target_id,
-            target: RefCell::new(Some(target.clone())),
+            target: RefCell::new(Some(target)),
             has_callback,
             identity_hash: target_id as i64,
             dead: AtomicBool::new(false),

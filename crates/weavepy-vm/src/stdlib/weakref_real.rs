@@ -93,6 +93,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::Type(callable_proxy_type()),
         );
         d.insert(
+            DictKey(Object::from_static("_clear_weakrefs_no_callbacks")),
+            b("_clear_weakrefs_no_callbacks", clear_weakrefs_no_callbacks),
+        );
+        d.insert(
             DictKey(Object::from_static("_remove_dead_weakref")),
             b("_remove_dead_weakref", remove_dead_weakref),
         );
@@ -102,6 +106,20 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         filename: None,
         dict,
     })
+}
+
+/// Internal bridge for the bundled C API shim. Clearing through the
+/// registry avoids allocating a clearing closure in every wrapper.
+fn clear_weakrefs_no_callbacks(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [target] = args else {
+        return Err(type_error(
+            "_clear_weakrefs_no_callbacks() takes exactly one argument",
+        ));
+    };
+    // Match the native C API: detach every watcher and discard the
+    // returned callbacks without publishing any to the pending queue.
+    drop(reg::notify_clear(id_of(target)));
+    Ok(Object::None)
 }
 
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
@@ -1141,21 +1159,11 @@ fn make_ref_object_with_class(
     // caller saves an explicit method. Keep other wrapper kinds unchanged.
     let shared_methods = kind_tag == kind::REF && Rc::ptr_eq(&class, &ref_type());
 
-    // Methods.
+    // The getter owns the slot. Registry entries and the wrapper's
+    // back-pointer are weak; callback ownership stays in the traced dict.
     let slot_for_get = slot.clone();
     let get_target = move |_args: &[Object]| -> Result<Object, RuntimeError> {
         Ok(slot_for_get.upgrade().unwrap_or(Object::None))
-    };
-    let slot_for_clear = slot.clone();
-    let target_id_for_clear = target_id;
-    let clear = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-        let _ = slot_for_clear.clear();
-        reg::queue_callbacks(reg::notify_clear(target_id_for_clear));
-        Ok(Object::None)
-    };
-    let slot_for_alive = slot.clone();
-    let alive = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-        Ok(Object::Bool(!slot_for_alive.is_dead()))
     };
 
     {
@@ -1173,8 +1181,6 @@ fn make_ref_object_with_class(
             WrapperKey::Get.owned(),
             b_dyn("__weakref_get__", get_target),
         );
-        d.insert(WrapperKey::Clear.owned(), b_dyn("__clear__", clear));
-        d.insert(WrapperKey::Alive.owned(), b_dyn("__alive__", alive));
         if !shared_methods {
             let slot_for_repr = slot.clone();
             d.insert(
