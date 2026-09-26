@@ -1136,12 +1136,12 @@ fn make_ref_object_with_class(
         kind::CALLABLE_PROXY => callable_proxy_type(),
         _ => ref_type(),
     });
+    // Exact refs already have shared call/repr methods on their type.
+    // Binding those methods retains the wrapper and its callback when a
+    // caller saves an explicit method. Keep other wrapper kinds unchanged.
+    let shared_methods = kind_tag == kind::REF && Rc::ptr_eq(&class, &ref_type());
 
     // Methods.
-    let slot_for_call = slot.clone();
-    let call = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-        Ok(slot_for_call.upgrade().unwrap_or(Object::None))
-    };
     let slot_for_get = slot.clone();
     let get_target = move |_args: &[Object]| -> Result<Object, RuntimeError> {
         Ok(slot_for_get.upgrade().unwrap_or(Object::None))
@@ -1157,26 +1157,38 @@ fn make_ref_object_with_class(
     let alive = move |_args: &[Object]| -> Result<Object, RuntimeError> {
         Ok(Object::Bool(!slot_for_alive.is_dead()))
     };
-    let slot_for_repr = slot.clone();
-    let repr = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-        let txt = if slot_for_repr.is_dead() {
-            "<weakref at 0x0; dead>"
-        } else {
-            "<weakref at 0x0; live>"
-        };
-        Ok(Object::from_static(txt))
-    };
 
     {
         let mut d = dict.borrow_mut();
-        d.insert(WrapperKey::Call.owned(), b_dyn("__call__", call));
+        if !shared_methods {
+            let slot_for_call = slot.clone();
+            d.insert(
+                WrapperKey::Call.owned(),
+                b_dyn("__call__", move |_args| {
+                    Ok(slot_for_call.upgrade().unwrap_or(Object::None))
+                }),
+            );
+        }
         d.insert(
             WrapperKey::Get.owned(),
             b_dyn("__weakref_get__", get_target),
         );
         d.insert(WrapperKey::Clear.owned(), b_dyn("__clear__", clear));
         d.insert(WrapperKey::Alive.owned(), b_dyn("__alive__", alive));
-        d.insert(WrapperKey::Repr.owned(), b_dyn("__repr__", repr));
+        if !shared_methods {
+            let slot_for_repr = slot.clone();
+            d.insert(
+                WrapperKey::Repr.owned(),
+                b_dyn("__repr__", move |_args| {
+                    let txt = if slot_for_repr.is_dead() {
+                        "<weakref at 0x0; dead>"
+                    } else {
+                        "<weakref at 0x0; live>"
+                    };
+                    Ok(Object::from_static(txt))
+                }),
+            );
+        }
         if let Some(cb) = callback.clone() {
             d.insert(WrapperKey::Callback.owned(), cb);
         } else {
@@ -1427,6 +1439,43 @@ fn referent_of_proxy(_args: &[Object]) -> Result<Object, RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_methods_preserve_wrapper_owners() {
+        const CHILD: &str = "WEAVEPY_TEST_WEAKREF_METHODS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "stdlib::weakref_real::tests::saved_methods_preserve_wrapper_owners",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("WEAVEPY_JIT", "0")
+                .status()
+                .expect("spawn weakref method test");
+            assert!(status.success(), "weakref method child: {status}");
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let source =
+                    include_str!("../../../../tests/regrtest/test_weakref_saved_methods.py");
+                let module = weavepy_parser::parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    source,
+                    "test_weakref_saved_methods.py",
+                )
+                .unwrap();
+                let mut interp = crate::Interpreter::new();
+                interp.run_module(&code).unwrap();
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     #[test]
     fn ref_returns_alive_target_then_none_after_clear() {
