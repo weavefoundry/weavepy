@@ -2877,6 +2877,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "region",
  "weavepy-compiler",
  "weavepy-parser",
 ]

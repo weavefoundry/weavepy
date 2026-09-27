@@ -39,7 +39,17 @@ def execution_context() -> dict:
         ),
         "environment": {
             key: os.environ.get(key)
-            for key in ("TZ", "LANG", "LC_ALL", "LC_TIME", "PYTHON_JIT", "PYTHON_GIL")
+            for key in ("TZ", "LANG", "LC_ALL", "LC_TIME", "PYTHON_JIT", "PYTHON_GIL",
+                        "PYTHONDONTWRITEBYTECODE",
+                        "WEAVEPY_CLASS_CACHE_WARM", "WEAVEPY_CHAIN_DEPTH",
+                        "WEAVEPY_CHAIN_LAYOUT", "WEAVEPY_CHAIN_FALLBACK",
+                        "WEAVEPY_MODULE_ROOT", "WEAVEPY_AST_PARSE_MODE",
+                        "WEAVEPY_DYNAMIC_ATTRIBUTE_KIND", "WEAVEPY_GENERATOR_RESUME_KIND",
+                        "WEAVEPY_IMPORT_WORK_KIND", "WEAVEPY_REPEATED_SCALAR_KIND", "WEAVEPY_NATIVE_CONTAINER_KIND",
+                        "WEAVEPY_SCALAR_CALL_KIND", "WEAVEPY_FIELD_PREDICATE_KIND", "WEAVEPY_FIELD_READ_KIND", "WEAVEPY_CONDITIONAL_FIELD_KIND", "WEAVEPY_FIELD_ARGUMENT_KIND", "WEAVEPY_FIELD_ARGUMENT_FALLBACK", "WEAVEPY_LITERAL_CALL_KIND", "WEAVEPY_FIELD_UPDATE_KIND",
+                        "WEAVEPY_INSTANCE_KIND", "WEAVEPY_WEAKREF_KIND", "WEAVEPY_BOUND_CALL_KIND", "WEAVEPY_SAVED_NATIVE_KIND",
+                        "WEAVEPY_SET_MUTATION_KIND", "WEAVEPY_LRU_KIND",
+                        "WEAVEPY_LRU_CAPACITY", "WEAVEPY_LRU_KEY_KIND")
         },
     }
 
@@ -158,6 +168,19 @@ def frozen_cache_snapshot(root: Path) -> dict[str, str]:
             for path in sorted(root.rglob("*")) if path.is_file()}
 
 
+def warmed_frozen_cache_snapshot(root: Path, caches: list[Path]) -> dict[str, str]:
+    """Require real artifacts for each binary before validating warm caches."""
+    snapshot = frozen_cache_snapshot(root)
+    for cache in sorted(set(caches)):
+        relative = cache.relative_to(root)
+        if not any(Path(name).is_relative_to(relative) for name in snapshot):
+            raise RuntimeError(
+                f"Frozen cache warmup produced no artifacts in {cache}; "
+                "check bytecode-writing flags such as PYTHONDONTWRITEBYTECODE"
+            )
+    return snapshot
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", required=True, help="Unmodified release binary")
@@ -166,6 +189,8 @@ def main() -> None:
     parser.add_argument("--python", default="python3.14")
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--fixtures", nargs="*", help="Optional fixture names")
+    parser.add_argument("--probe", type=Path,
+                        help="Standalone Python fixture exposing bench(n); requires --work")
     parser.add_argument("--work", type=int, help="Override work for a single fixture")
     parser.add_argument(
         "--warm", action="store_true",
@@ -198,6 +223,15 @@ def main() -> None:
         if unknown:
             parser.error(f"Unknown fixtures: {', '.join(sorted(unknown))}")
         work = {name: work[name] for name in args.fixtures}
+    fixture_root = None
+    if args.probe is not None:
+        if args.fixtures or args.work is None:
+            parser.error("--probe requires --work and cannot be combined with --fixtures")
+        args.probe = args.probe.resolve()
+        if args.probe.suffix != ".py" or not args.probe.is_file():
+            parser.error("--probe must name an existing Python file")
+        fixture_root = args.probe.parent
+        work = {args.probe.stem: args.work}
     if args.work is not None:
         if len(work) != 1 or args.work < 1:
             parser.error("--work requires one fixture and a positive work value")
@@ -228,6 +262,11 @@ def main() -> None:
         },
         "rows": {},
     }
+    if args.probe is not None:
+        report["probe"] = {
+            "path": str(args.probe),
+            "sha256": hashlib.sha256(args.probe.read_bytes()).hexdigest(),
+        }
     caches = {}
     if args.frozen_cache_root is not None:
         args.frozen_cache_root.mkdir(parents=True, exist_ok=False)
@@ -243,11 +282,13 @@ def main() -> None:
             order = variants if run % 2 == 0 else list(reversed(variants))
             for label, binary, jit in order:
                 sample = measure(binary, jit, name, n, args.warm,
+                                 fixture_root=fixture_root,
                                  frozen_cache=caches.get(label))
                 if run:
                     samples[label].append(sample)
             if run == 0 and args.frozen_cache_root is not None:
-                frozen_before = frozen_cache_snapshot(args.frozen_cache_root)
+                frozen_before = warmed_frozen_cache_snapshot(
+                    args.frozen_cache_root, list(caches.values()))
         row = {
             label: {
                 "samples": values,

@@ -58,10 +58,9 @@ fn st(pc: u32, op: TOp) -> TStmt {
     TStmt { pc, op }
 }
 
-#[test]
-fn add_two_ints() {
-    // def f(a, b): return a + b
-    let tfunc = TFunc {
+fn integer_binary(kind: ArithKind) -> TFunc {
+    // def f(a, b): return a <operation> b
+    TFunc {
         n_locals: 2,
         local_types: vec![Some(JitType::Int), Some(JitType::Int)],
         livein_locals: vec![0, 1],
@@ -94,15 +93,109 @@ fn add_two_ints() {
             stmts: vec![
                 st(0, TOp::LoadLocal(0)),
                 st(1, TOp::LoadLocal(1)),
-                st(2, TOp::IntArith(ArithKind::Add)),
+                st(2, TOp::IntArith(kind)),
             ],
             term: TTerm::Return,
         }],
-    };
+    }
+}
+
+#[test]
+fn add_two_ints() {
+    let tfunc = integer_binary(ArithKind::Add);
     let (status, bits, tag, _, _) = run(&tfunc, &[(40i64) as u64, (2i64) as u64]);
     assert_eq!(status, JitStatus::Returned);
     assert_eq!(tag, SlotTag::Int as u32);
     assert_eq!(bits as i64, 42);
+}
+
+#[test]
+fn checked_integer_results_and_overflow_snapshots_match_wide_arithmetic() {
+    let edges = [
+        i64::MIN,
+        i64::MIN + 1,
+        i64::MIN / 2,
+        -(1i64 << 32),
+        -3_037_000_500,
+        -3_037_000_499,
+        -2,
+        -1,
+        0,
+        1,
+        2,
+        3_037_000_499,
+        3_037_000_500,
+        1i64 << 32,
+        i64::MAX / 2,
+        i64::MAX - 1,
+        i64::MAX,
+    ];
+    let mut pairs: Vec<_> = edges
+        .iter()
+        .flat_map(|&a| edges.iter().map(move |&b| (a, b)))
+        .collect();
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed as i64
+    };
+    for _ in 0..512 {
+        pairs.push((next(), next()));
+        pairs.push((next() % 1_000_000_000, next() % 1_000_000_000));
+    }
+
+    let mut engine = JitEngine::new().expect("host ISA");
+    for kind in [ArithKind::Add, ArithKind::Sub, ArithKind::Mul] {
+        let cf = engine.compile_tfunc(&integer_binary(kind)).unwrap();
+        let mut locals = [0u64; 2];
+        let mut spill = [0u64; 2];
+        let mut tags = [0u32; 2];
+        let mut frame = JitFrame {
+            locals: locals.as_mut_ptr(),
+            n_locals: 2,
+            entry_pc: 0,
+            ret_bits: 0,
+            ret_tag: 0,
+            deopt_pc: 0,
+            stack_spill: spill.as_mut_ptr(),
+            stack_tags: tags.as_mut_ptr(),
+            stack_len: 0,
+            stack_cap: 2,
+            ctx: std::ptr::null_mut(),
+            call_args: std::ptr::null_mut(),
+            call_tags: std::ptr::null_mut(),
+        };
+        for &(a, b) in &pairs {
+            locals.copy_from_slice(&[a as u64, b as u64]);
+            frame.stack_len = 0;
+            let wide = match kind {
+                ArithKind::Add => i128::from(a) + i128::from(b),
+                ArithKind::Sub => i128::from(a) - i128::from(b),
+                ArithKind::Mul => i128::from(a) * i128::from(b),
+                _ => unreachable!(),
+            };
+            // SAFETY: this scalar function needs no embedder helpers, the
+            // buffers fit its metadata, and the engine owns its live code.
+            let status = unsafe { cf.enter(&raw mut frame) };
+            match i64::try_from(wide) {
+                Ok(expected) => {
+                    assert_eq!(status, JitStatus::Returned, "{kind:?}: {a}, {b}");
+                    assert_eq!(frame.ret_bits as i64, expected, "{kind:?}: {a}, {b}");
+                    assert_eq!(frame.ret_tag, SlotTag::Int as u32);
+                }
+                Err(_) => {
+                    assert_eq!(status, JitStatus::Deopt, "{kind:?}: {a}, {b}");
+                    assert_eq!(frame.deopt_pc, 2);
+                    assert_eq!(frame.stack_len, 2);
+                    assert_eq!(spill, [a as u64, b as u64]);
+                    assert_eq!(tags, [SlotTag::Int as u32; 2]);
+                }
+            }
+            assert_eq!(locals, [a as u64, b as u64]);
+        }
+    }
 }
 
 #[test]

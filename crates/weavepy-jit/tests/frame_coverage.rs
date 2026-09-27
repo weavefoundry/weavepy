@@ -29,6 +29,8 @@ fn compile_first_fn(src: &str) -> CodeObject {
 /// obj-global probe, and optional trained container lanes.
 #[derive(Default)]
 struct Cfg {
+    /// Globals with a specialized callee classification before demotion.
+    globals: Vec<(&'static str, ResolvedGlobal)>,
     /// `(slot, elem lane)` answered by the list probe.
     list: Option<(u32, JitType)>,
     /// `(slot, key lane, value lane)` answered by the dict probe.
@@ -37,6 +39,8 @@ struct Cfg {
     obj_params: Vec<u32>,
     /// Explicit parameter lanes, including exact bytes.
     typed_params: Vec<(u32, JitType)>,
+    /// Admit linked-instance fields for bounded attribute provenance tests.
+    linked_attrs: bool,
     /// Names the resolver treats as genuinely missing (`Opaque` and
     /// no obj-global token — the `NameError` shape).
     missing: Vec<&'static str>,
@@ -50,6 +54,9 @@ fn analyze_cfg(src: &str, cfg: &Cfg) -> Result<TFunc, JitVerdict> {
 fn analyze_code_cfg(code: &CodeObject, cfg: &Cfg) -> Result<TFunc, JitVerdict> {
     let missing = cfg.missing.clone();
     let mut resolve = |name: &str| -> ResolvedGlobal {
+        if let Some((_, resolution)) = cfg.globals.iter().find(|(key, _)| *key == name) {
+            return *resolution;
+        }
         match name {
             "range" => ResolvedGlobal::RangeBuiltin,
             "enumerate" => ResolvedGlobal::EnumerateBuiltin,
@@ -77,7 +84,17 @@ fn analyze_code_cfg(code: &CodeObject, cfg: &Cfg) -> Result<TFunc, JitVerdict> {
     let mut probes = Probes {
         list: &mut move |s| list.filter(|(slot, _)| *slot == s).map(|(_, e)| e),
         dict: &mut move |s| dict.filter(|(slot, ..)| *slot == s).map(|(_, k, v)| (k, v)),
-        attr: &mut |_, _, _, _| None,
+        attr: &mut |_, _, name, store| {
+            if cfg.linked_attrs && !store {
+                match name {
+                    "next" => Some(JitType::Obj),
+                    "value" => Some(JitType::Int),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        },
         method: &mut |_, _, _| None,
         math: &mut |_, _| false,
         ctor_field: &mut |_, _| None,
@@ -103,6 +120,153 @@ fn has_op(tf: &TFunc, pred: impl Fn(&TOp) -> bool) -> bool {
     tf.blocks
         .iter()
         .any(|b| b.stmts.iter().any(|s| pred(&s.op)))
+}
+
+#[test]
+fn linked_attribute_provenance_stops_at_the_native_chain_bound() {
+    for reads in [2, 4, 8, 9, 16] {
+        let expr = format!("root{}.value", ".next".repeat(reads - 1));
+        let src = format!("def k(root):\n    return {expr}\n");
+        let tf = analyze_cfg(
+            &src,
+            &Cfg {
+                obj_params: vec![0],
+                linked_attrs: true,
+                ..Cfg::default()
+            },
+        )
+        .expect("deep chains retain a dynamic fallback");
+        let ops: Vec<_> = tf
+            .blocks
+            .iter()
+            .flat_map(|b| &b.stmts)
+            .map(|s| s.op)
+            .collect();
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, TOp::AttrGet { .. }))
+                .count(),
+            reads.min(8)
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, TOp::DynAttrGet { .. }))
+                .count(),
+            reads.saturating_sub(8)
+        );
+        for (index, site) in tf.attr_sites.iter().enumerate() {
+            assert_eq!(site.path, vec!["next"; index]);
+        }
+    }
+}
+
+#[test]
+fn linked_attribute_provenance_converges_when_a_loop_rebinds_its_root() {
+    let tf = analyze_cfg(
+        "def k(root, n):\n    for i in range(n):\n        root = root.next\n    return root.next.next.next.next.next.next.next.value\n",
+        &Cfg { obj_params: vec![0], linked_attrs: true, ..Cfg::default() },
+    ).expect("a cyclic object graph must not grow analysis paths indefinitely");
+    assert!(!has_op(&tf, |op| matches!(op, TOp::DynAttrGet { .. })));
+    assert_eq!(tf.attr_sites.len(), 9);
+    assert!(tf.attr_sites.iter().all(|site| site.path.len() < 8));
+}
+
+#[test]
+fn keyword_constructor_demotes_without_disqualifying_the_loop() {
+    let tf = analyze_cfg(
+        "def k(n):\n    item = Item(value=3)\n    total = 0\n    for i in range(n):\n        total = total + i\n    return total\n",
+        &Cfg {
+            globals: vec![("Item", ResolvedGlobal::PyFunc {
+                token: 0,
+                arg_count: 1,
+                min_args: 0,
+                is_self: false,
+                ret: Some(JitType::Obj),
+                ctor: true,
+            })],
+            ..Cfg::default()
+        },
+    ).expect("keyword setup should leave the numeric loop compilable");
+    assert!(has_op(&tf, |op| matches!(
+        op,
+        TOp::CallDyn {
+            argc: 0,
+            kwc: 1,
+            ..
+        }
+    )));
+    assert!(!has_op(&tf, |op| matches!(op, TOp::CallPyKw { .. })));
+    assert!(!tf.osr_entries.is_empty());
+    assert!(
+        tf.callee_spans.is_empty(),
+        "demoted objects must not reconstruct burned callees"
+    );
+    assert!(tf
+        .global_guards
+        .iter()
+        .any(|g| g.name == "Item" && matches!(g.expect, ResolvedGlobal::ObjGlobal { .. })));
+}
+
+#[test]
+fn nested_keyword_and_positional_constructors_share_the_demoted_global() {
+    let tf = analyze_cfg(
+        "def k():\n    return Item(Item(value=3))\n",
+        &Cfg {
+            globals: vec![(
+                "Item",
+                ResolvedGlobal::PyFunc {
+                    token: 0,
+                    arg_count: 1,
+                    min_args: 0,
+                    is_self: false,
+                    ret: Some(JitType::Obj),
+                    ctor: true,
+                },
+            )],
+            ..Cfg::default()
+        },
+    )
+    .expect("nested constructor calls should retain their original arguments");
+    assert!(has_op(&tf, |op| matches!(
+        op,
+        TOp::CallDyn {
+            argc: 0,
+            kwc: 1,
+            ..
+        }
+    )));
+    assert!(has_op(&tf, |op| matches!(
+        op,
+        TOp::CallDyn {
+            argc: 1,
+            kwc: 0,
+            ..
+        }
+    )));
+    assert_eq!(tf.ret_lane, Some(JitType::Obj));
+    assert!(tf.callee_spans.is_empty());
+    assert_eq!(tf.null_spans.len(), 2);
+}
+
+#[test]
+fn keyword_builtin_callee_keeps_runtime_argument_validation() {
+    let tf = analyze_cfg(
+        "def k(value):\n    return len(obj=value)\n",
+        &Cfg {
+            obj_params: vec![0],
+            ..Cfg::default()
+        },
+    )
+    .expect("the dynamic call must retain len's invalid keyword for runtime validation");
+    assert!(has_op(&tf, |op| matches!(
+        op,
+        TOp::CallDyn {
+            argc: 0,
+            kwc: 1,
+            ..
+        }
+    )));
+    assert!(!has_op(&tf, |op| matches!(op, TOp::ListLen)));
 }
 
 #[test]

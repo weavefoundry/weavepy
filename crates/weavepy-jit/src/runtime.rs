@@ -860,6 +860,68 @@ pub type AttrGetHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, si
 /// contract as [`AttrGetHelper`].
 pub type AttrSetHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, site: i64) -> i64;
 
+/// Maximum number of consecutive attribute reads in one callback-free helper.
+/// Receiver provenance needs at most one fewer links to specialize this many
+/// reads. Keep lowering and the VM's ABI validation on this shared bound.
+pub const MAX_ATTR_CHAIN_LEN: usize = 8;
+
+/// Optional fused read of two to eight consecutive attribute sites. A miss
+/// must leave Python state unchanged: the caller resumes at the first read.
+/// Intermediate values are borrowed; only the final result may acquire a pin.
+/// The helper must never run Python. Same safety contract as [`AttrGetHelper`].
+pub type AttrGetChainHelper =
+    unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, first_site: i64, count: i64) -> i64;
+
+static ATTR_GET_CHAIN_HELPER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register optional attribute-chain fusion before compiling affected frames.
+/// Without this registration, each attribute uses the ordinary read helper.
+pub fn register_attr_get_chain_helper(helper: AttrGetChainHelper) {
+    ATTR_GET_CHAIN_HELPER.store(helper as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn attr_get_chain_helper_addr() -> usize {
+    ATTR_GET_CHAIN_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Bound for a callback-free walk combining guarded and cached reads.
+/// This does not increase guarded receiver provenance or per-code metadata.
+pub const MAX_CACHED_ATTR_CHAIN_LEN: usize = 32;
+
+/// Optional mixed attribute-chain read. `guarded` consecutive sites start at
+/// `first_site`; the remaining reads use the caches at the published bytecode
+/// PC. `int_result` is 0 for an object pin or 1 for an exact integer result.
+/// Success returns 0 with `ret_bits` set. Status 1 leaves pins, accounting,
+/// and Python state unchanged. Status 2 completes only the guarded prefix,
+/// using its ordinary result pin and pin-reuse policy; `ret_bits` holds that
+/// object pin and lowering runs the remaining dynamic reads. No dynamic reads
+/// are charged on either fallback. The helper never calls Python. Same safety
+/// contract as [`AttrGetHelper`].
+pub type CachedAttrChainHelper = unsafe extern "C" fn(
+    frame: *mut JitFrame,
+    pin: i64,
+    first_site: i64,
+    guarded: i64,
+    total: i64,
+    int_result: i64,
+) -> i64;
+
+static CACHED_ATTR_CHAIN_HELPER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register optional mixed-chain fusion before compiling affected frames.
+/// Without it, the existing guarded and dynamic helpers remain in use.
+pub fn register_cached_attr_chain_helper(helper: CachedAttrChainHelper) {
+    CACHED_ATTR_CHAIN_HELPER.store(helper as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn cached_attr_chain_helper_addr() -> usize {
+    CACHED_ATTR_CHAIN_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
 static ATTR_GET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static ATTR_SET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -1058,9 +1120,10 @@ pub(crate) fn call_dyn_helper_addr() -> usize {
 /// RFC 0074 WS2/WS4 — the embedder's *generic attribute* helpers
 /// ([`crate::ir::TOp::DynAttrGet`] / [`crate::ir::TOp::DynAttrSet`]).
 /// Shape: `(frame, pin, name_idx) -> status` (the [`ListGetHelper`]
-/// signature). Both run the interpreter's exact attribute machinery
-/// (**arbitrary Python may run** — descriptors, `__getattr__`,
-/// `__setattr__`; the dirtiness discipline applies). For the store,
+/// signature). The embedder may complete an access or reject it before
+/// dispatch so the interpreter retries it with a materialized frame.
+/// If a helper runs arbitrary Python (descriptors, `__getattr__`, or
+/// `__setattr__`), the dirtiness discipline applies. For the store,
 /// the value is staged in `call_args[0]` / `call_tags[0]`. Status:
 ///
 /// - `0` — ok; for the get, the loaded value's fresh pin index is in
@@ -1070,7 +1133,7 @@ pub(crate) fn call_dyn_helper_addr() -> usize {
 /// - `2` — the access *completed* but a guard was invalidated (or,
 ///   for the get, pin-cap pressure): the result (get) is parked and
 ///   the caller deopts at the *next* pc — never re-executed;
-/// - `3` — rejected before any Python ran (pin miss — defensive):
+/// - `3` — rejected before any Python ran (for example, a cache miss):
 ///   deopt at this pc and re-execute generically.
 pub type DynAttrHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, name: i64) -> i64;
 

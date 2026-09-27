@@ -32,7 +32,7 @@ use std::fmt::Write as _;
 
 use crate::error::{overflow_error, type_error, RuntimeError};
 use crate::object::{BuiltinFn, DictKey, Object};
-use crate::shared_value::SharedStr;
+use crate::shared_value::{SharedSlice, SharedStr};
 use crate::sync::{Rc, RefCell, Weak};
 use crate::types::{PyInstance, SlotStorage, TypeObject};
 
@@ -148,9 +148,9 @@ struct State {
     /// The slot layouts natively built instances share (see
     /// `SlotStorage::from_layout`), in the order `new_td` / `new_date` /
     /// `new_dt` fill them.
-    td_layout: Rc<[DictKey]>,
-    date_layout: Rc<[DictKey]>,
-    dt_layout: Rc<[DictKey]>,
+    td_layout: SharedSlice<DictKey>,
+    date_layout: SharedSlice<DictKey>,
+    dt_layout: SharedSlice<DictKey>,
     /// `(kind, name)` → the replaced Python implementation.
     orig: HashMap<(u8, &'static str), Object>,
     /// The `attr_version` at which each exact class was last verified to
@@ -413,7 +413,11 @@ fn instance(cls: Rc<TypeObject>, entries: Vec<(DictKey, Object)>) -> Object {
 }
 
 /// [`instance`] over one of the shared layouts (see `State`).
-fn instance_fixed(cls: Rc<TypeObject>, layout: &Rc<[DictKey]>, values: Vec<Object>) -> Object {
+fn instance_fixed(
+    cls: Rc<TypeObject>,
+    layout: &SharedSlice<DictKey>,
+    values: Vec<Object>,
+) -> Object {
     let mut i = PyInstance::new(cls);
     i.slots = RefCell::new(SlotStorage::from_layout(layout.clone(), values));
     Object::Instance(Rc::new(i))
@@ -1626,7 +1630,7 @@ pub(crate) fn install(args: &[Object]) -> Result<Object, RuntimeError> {
         orig.insert((spec.kind, spec.name), v);
     }
     let names = Names::new();
-    let layout = |keys: &[&SharedStr]| -> Rc<[DictKey]> {
+    let layout = |keys: &[&SharedStr]| -> SharedSlice<DictKey> {
         keys.iter()
             .map(|k| DictKey(Object::Str((*k).clone())))
             .collect::<Vec<_>>()

@@ -362,8 +362,8 @@ fn run_source_with_options_impl(
     };
     // `-O`/`-OO` applies to the main module too (assert/docstring
     // stripping, `__debug__` folding) — RFC 0052.
-    let code = match compiler::compile_module_with_options(
-        &module,
+    let code = match compiler::compile_owned_module_with_options(
+        module,
         source_ref,
         &opts.filename,
         compiler::CompileOptions {

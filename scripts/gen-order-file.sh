@@ -7,15 +7,15 @@
 # code instead of pages scattered across the whole text segment.
 #
 # Needs the `llvm-tools` rustup component and python3. Takes one
-# instrumented release build (in target-order/, kept apart from
-# target/) plus the regular release binary. The instrumented build
+# instrumented release build (in target/order/, kept apart from
+# target/release/) plus the regular release binary. The instrumented build
 # skips LTO, which drops the temporal-profile flag, and names the host
 # target explicitly so build scripts stay uninstrumented; both change
 # cargo's crate hashes, so the names are then remapped onto the
 # release binary's (scripts/remap-order-file.py).
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-OUT="$ROOT/target-order"
+OUT="$ROOT/target/order"
 RAW="$OUT/raw"
 HOST=$(rustc -vV | sed -n 's/^host: //p')
 PROFDATA="$(rustc --print sysroot)/lib/rustlib/$HOST/bin/llvm-profdata"
@@ -46,5 +46,6 @@ done
 "$PROFDATA" merge -o "$OUT/merged.profdata" "$RAW"/run-*.profraw
 "$PROFDATA" order "$OUT/merged.profdata" --output="$OUT/order.txt"
 # Mach-O symbol names carry a leading underscore; drop the comments.
-sed -e '/^#/d' -e 's/^/_/' "$OUT/order.txt" > "$ROOT/crates/weavepy-cli/weavepy.order"
-python3 "$ROOT/scripts/remap-order-file.py" "$ROOT/crates/weavepy-cli/weavepy.order" "$BIN" "$REL"
+sed -e '/^#/d' -e 's/^/_/' "$OUT/order.txt" > "$OUT/remapped.order"
+python3 "$ROOT/scripts/remap-order-file.py" "$OUT/remapped.order" "$BIN" "$REL"
+cp "$OUT/remapped.order" "$ROOT/crates/weavepy-cli/weavepy.order"

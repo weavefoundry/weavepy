@@ -2,6 +2,7 @@
 
 import importlib.util
 import statistics
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -54,6 +55,36 @@ class PairedRatioTests(unittest.TestCase):
             bench_compare.relative_metrics([], [])
         with self.assertRaises(ValueError):
             bench_compare.relative_metrics([{"ns": 1}], [{"ns": 2, "cpu_ns": 2}])
+
+
+class FrozenCacheTests(unittest.TestCase):
+    def test_empty_warmup_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(RuntimeError, "no artifacts.*base"):
+                bench_compare.warmed_frozen_cache_snapshot(root, [root / "base"])
+
+    def test_each_binary_needs_its_own_warm_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "base").mkdir()
+            (root / "base" / "site.pyc").write_bytes(b"baseline")
+            with self.assertRaisesRegex(RuntimeError, "no artifacts.*new"):
+                bench_compare.warmed_frozen_cache_snapshot(
+                    root, [root / "base", root / "new"])
+
+    def test_populated_shared_mode_caches_keep_exact_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("base", "new"):
+                directory = root / name / "nested"
+                directory.mkdir(parents=True)
+                (directory / "site.pyc").write_bytes(name.encode())
+            snapshot = bench_compare.warmed_frozen_cache_snapshot(
+                root, [root / "base", root / "new", root / "base"])
+            self.assertEqual(snapshot, bench_compare.frozen_cache_snapshot(root))
+            self.assertEqual(len(snapshot), 2)
+            self.assertNotEqual(*snapshot.values())
 
 
 if __name__ == "__main__":

@@ -159,6 +159,9 @@ pub(crate) fn parse_type_comments(
 
 struct Parser<'src> {
     source: &'src str,
+    /// Built on demand for compound-statement metadata and block diagnostics.
+    /// Simple statements don't need source-line lookups.
+    line_starts: std::cell::OnceCell<Vec<usize>>,
     tokens: Vec<Token>,
     pos: usize,
     /// PEP 401: `from __future__ import barry_as_FLUFL` is active
@@ -320,6 +323,7 @@ impl<'src> Parser<'src> {
             .collect();
         Self {
             source,
+            line_starts: std::cell::OnceCell::new(),
             tokens,
             pos: 0,
             flufl: false,
@@ -896,13 +900,11 @@ impl<'src> Parser<'src> {
                 | StmtKind::Try { .. }
                 | StmtKind::Match { .. }
         );
-        let line = self.line_of(stmt.span);
-        if compound && self.last_stmt.is_none_or(|(l, _)| l <= line) {
-            let start = stmt.span.start.0 as usize;
-            let line_start = self.source[..start].rfind('\n').map_or(0, |i| i + 1);
-            // AST `col_offset` is a UTF-8 byte offset.
-            let col = (start - line_start) as u32;
-            self.last_stmt = Some((line, col));
+        if compound {
+            let (line, col) = self.line_col(stmt.span);
+            if self.last_stmt.is_none_or(|(l, _)| l <= line) {
+                self.last_stmt = Some((line, col));
+            }
         }
         Ok(stmt)
     }
@@ -3611,10 +3613,28 @@ impl<'src> Parser<'src> {
         Ok(expr)
     }
 
-    /// 1-based source line containing the start of `span`.
-    fn line_of(&self, span: weavepy_lexer::Span) -> u32 {
+    /// 1-based source line and UTF-8 byte column at the start of `span`.
+    /// A nested statement may finish before its parent, so queries can move
+    /// backward. Index once instead of recounting every preceding newline.
+    fn line_col(&self, span: Span) -> (u32, u32) {
         let start = (span.start.0 as usize).min(self.source.len());
-        self.source[..start].bytes().filter(|&b| b == b'\n').count() as u32 + 1
+        let starts = self.line_starts.get_or_init(|| {
+            std::iter::once(0)
+                .chain(
+                    self.source
+                        .bytes()
+                        .enumerate()
+                        .filter_map(|(i, byte)| (byte == b'\n').then_some(i + 1)),
+                )
+                .collect()
+        });
+        let index = starts.partition_point(|&offset| offset <= start) - 1;
+        ((index + 1) as u32, (start - starts[index]) as u32)
+    }
+
+    /// 1-based source line containing the start of `span`.
+    fn line_of(&self, span: Span) -> u32 {
+        self.line_col(span).0
     }
 
     /// Block suite after `:`. `after` names the introducing construct
@@ -7641,4 +7661,72 @@ pub fn expr_children(e: &Expr) -> Vec<&Expr> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod source_location_tests {
+    use super::*;
+
+    #[test]
+    fn indexed_positions_match_prefix_scans_in_both_directions() {
+        for source in [
+            "",
+            "x",
+            "\n",
+            "\n\n",
+            "é = 1\n\tλ = 2\n",
+            "a\r\nb\r\nc",
+            "a\rb\rc",
+        ] {
+            let parser = Parser::new(source, Vec::new());
+            let offsets: Vec<_> = source
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain([source.len(), source.len() + 10])
+                .collect();
+            for &offset in offsets.iter().chain(offsets.iter().rev()) {
+                let start = offset.min(source.len());
+                let prefix = &source[..start];
+                let line = prefix.bytes().filter(|&b| b == b'\n').count() as u32 + 1;
+                let col = (start - prefix.rfind('\n').map_or(0, |i| i + 1)) as u32;
+                let span = Span::new(offset as u32, offset as u32);
+                assert_eq!(parser.line_col(span), (line, col), "{source:?} at {offset}");
+                assert_eq!(parser.line_of(span), line);
+            }
+        }
+    }
+
+    #[test]
+    fn simple_statements_leave_the_line_index_unallocated() {
+        let source = "x = 1\ny = x + 2\nprint(y)\n";
+        let mut parser = Parser::new(source, weavepy_lexer::tokenize(source).unwrap());
+        assert_eq!(parser.parse_module().unwrap().body.len(), 3);
+        assert_eq!(parser.last_stmt, None);
+        assert!(parser.line_starts.get().is_none());
+    }
+
+    #[test]
+    fn nested_completion_keeps_the_latest_compound_location() {
+        let source =
+            "def outer():\n    if True:\n        class Inner:\n            pass\nvalue = 1\n";
+        let mut parser = Parser::new(source, weavepy_lexer::tokenize(source).unwrap());
+        parser.parse_module().unwrap();
+        assert_eq!(parser.last_stmt, Some((3, 8)));
+        assert!(parser.line_starts.get().is_some());
+    }
+
+    #[test]
+    fn missing_block_reports_the_introducing_line_after_unicode() {
+        let source = "label = 'é'\n\nif True:\n";
+        let (result, _, meta) = crate::parse_module_full(source, false);
+        let error = result.unwrap_err();
+        let ParseError::Indentation { message, .. } = error else {
+            panic!("expected missing block diagnostic, got {error:?}");
+        };
+        assert_eq!(
+            message,
+            "expected an indented block after 'if' statement on line 3"
+        );
+        assert_eq!(meta.last_stmt, (0, 0));
+    }
 }

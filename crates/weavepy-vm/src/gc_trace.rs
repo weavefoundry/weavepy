@@ -71,41 +71,20 @@
 //! up as `gc_refs > 0`, so the cycle survives one more
 //! generation than it strictly has to).
 
+use crate::fasthash::ObjectIdHasher;
 use crate::shared_value::ThinArc;
 use crate::sync::RefCell;
-use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::hash::BuildHasherDefault;
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use std::sync::Arc;
 
 use crate::object::Object;
 use crate::weakref_registry::{id_of, ObjectId};
 
-// Object ids are aligned allocation addresses. Fx's final multiplication
-// retains their zero low bits, concentrating HashMap home buckets. Mix the
-// upper half into the lower half for this private index only.
-#[derive(Default)]
-struct GcIndexHasher(crate::fasthash::FxHasher);
-
-impl Hasher for GcIndexHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        let hash = self.0.finish();
-        hash ^ (hash >> 32)
-    }
-
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        self.0.write(bytes);
-    }
-
-    #[inline]
-    fn write_u64(&mut self, word: u64) {
-        self.0.write_u64(word);
-    }
-}
-
 type GcIndex =
-    std::collections::HashMap<ObjectId, Arc<TrackedHandle>, BuildHasherDefault<GcIndexHasher>>;
+    std::collections::HashMap<ObjectId, Arc<TrackedHandle>, BuildHasherDefault<ObjectIdHasher>>;
 
 /// The standard CPython generation count (3) and default
 /// thresholds: gen 0 collects when 700 untracked allocations
@@ -175,7 +154,7 @@ pub struct TrackedHandle {
     /// [`GcState::untrack_id`] can `swap_remove` in O(1) instead of
     /// scanning every generation (which made drop-heavy,
     /// large-heap workloads quadratic — RFC 0039 WS4).
-    pub slot: AtomicUsize,
+    pub slot: CachedSlot,
     /// Has this object's `__del__` already *run* to completion? CPython
     /// guarantees a finaliser runs at most once.
     pub finalized: AtomicBool,
@@ -218,12 +197,62 @@ pub struct TrackedHandle {
     /// Position in `GcState::finalizable_hot` while hot (RFC 0077 WS2);
     /// only valid under that vector's lock, fixed up on swap-remove
     /// exactly like [`Self::slot`].
-    pub fin_hot_slot: AtomicUsize,
+    pub fin_hot_slot: CachedSlot,
     /// Strong count seen at the previous hot probe and the number of
     /// consecutive probes it has held (RFC 0077 WS2); a count unchanged
     /// for [`FIN_STABLE_PROBES`] probes demotes the entry to cold.
     pub fin_last_sc: AtomicUsize,
     pub fin_stable: AtomicU8,
+}
+
+/// A compact vector-position hint, with separate absent and uncached states.
+///
+/// Positions too large to cache use the existing pointer-search fallback.
+/// They must not look absent: a hot finalizer with an uncached position still
+/// belongs to the hot set. Neither decoded sentinel can index a live
+/// `Vec<Arc<TrackedHandle>>`, whose allocation is bounded by `isize::MAX`.
+#[derive(Debug)]
+pub struct CachedSlot(AtomicU32);
+
+impl CachedSlot {
+    const fn encode(slot: usize) -> u32 {
+        if slot == usize::MAX {
+            u32::MAX
+        } else if slot >= (u32::MAX - 1) as usize {
+            u32::MAX - 1
+        } else {
+            slot as u32
+        }
+    }
+
+    const fn decode(slot: u32) -> usize {
+        if slot == u32::MAX {
+            usize::MAX
+        } else if slot == u32::MAX - 1 {
+            usize::MAX - 1
+        } else {
+            slot as usize
+        }
+    }
+
+    pub const fn new(slot: usize) -> Self {
+        Self(AtomicU32::new(Self::encode(slot)))
+    }
+
+    #[inline]
+    pub fn load(&self, order: Ordering) -> usize {
+        Self::decode(self.0.load(order))
+    }
+
+    #[inline]
+    pub fn store(&self, slot: usize, order: Ordering) {
+        self.0.store(Self::encode(slot), order);
+    }
+
+    #[inline]
+    pub fn swap(&self, slot: usize, order: Ordering) -> usize {
+        Self::decode(self.0.swap(Self::encode(slot), order))
+    }
 }
 
 /// RFC 0077 (WS2): a finalizable entry whose strong count exceeds the
@@ -268,13 +297,13 @@ impl TrackedHandle {
             gc_refs: AtomicI64::new(0),
             color: AtomicU8::new(color::White),
             generation: AtomicU8::new(generation as u8),
-            slot: AtomicUsize::new(0),
+            slot: CachedSlot::new(0),
             finalized: AtomicBool::new(false),
             finalize_queued: AtomicBool::new(false),
             weak_clones: AtomicUsize::new(0),
             untracked: AtomicBool::new(false),
             fin_cold: AtomicBool::new(false),
-            fin_hot_slot: AtomicUsize::new(usize::MAX),
+            fin_hot_slot: CachedSlot::new(usize::MAX),
             fin_last_sc: AtomicUsize::new(0),
             fin_stable: AtomicU8::new(0),
         }
@@ -1385,6 +1414,17 @@ impl GcState {
             return false;
         }
         self.index.borrow().contains_key(&id)
+    }
+
+    /// Copy only weakref targets not already owned by the cycle collector.
+    /// Hold the index before the registry, matching `track_now`'s lock order.
+    /// Both borrows end before the sweep clears slots or queues callbacks.
+    fn untracked_weakref_targets(
+        &self,
+        registry: &crate::weakref_registry::WeakRefRegistry,
+    ) -> Vec<(ObjectId, Object)> {
+        let index = self.index.borrow();
+        registry.targets_matching(|id| !index.contains_key(&id))
     }
 
     /// O(1) handle lookup by object id (any generation or frozen).
@@ -3970,10 +4010,31 @@ fn publish_suspect_counts(s: &SuspectMap, active: usize) {
     }
 }
 
-/// Count of budget-remaining entries in the locked map (used only on
-/// the cold eviction path, where the map is at capacity anyway).
-fn count_active(s: &SuspectMap) -> usize {
-    s.values().filter(|e| e.budget > 0).count()
+/// Evict the first minimum-budget entry, preserving `min_by_key`'s tie
+/// order. Zero is the minimum possible budget, so scanning can stop there.
+/// The caller holds the map lock and its exact active count throughout.
+fn evict_lowest_budget_suspect(s: &mut SuspectMap, active: &mut usize) -> bool {
+    let Some((_, first)) = s.get_index(0) else {
+        return false;
+    };
+    let mut victim = 0;
+    let mut budget = first.budget;
+    if budget > 0 {
+        for (index, entry) in s.values().enumerate().skip(1) {
+            if entry.budget < budget {
+                victim = index;
+                budget = entry.budget;
+                if budget == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    let (_, removed) = s
+        .swap_remove_index(victim)
+        .expect("selected suspect exists");
+    *active = active.saturating_sub(usize::from(removed.budget > 0));
+    true
 }
 
 /// RFC 0065 (WS1): *active*-population probe for the dispatch loop's
@@ -4024,17 +4085,8 @@ pub fn note_suspect(h: Arc<TrackedHandle>) {
         // arrived after ~200 module-teardown stragglers and was never
         // re-probed, pinning the Timeout→Task→frame web the test_ssl
         // leak tests watch).
-        match s
-            .values()
-            .enumerate()
-            .min_by_key(|(_, e)| e.budget)
-            .map(|(i, _)| i)
-        {
-            Some(i) => {
-                s.swap_remove_index(i);
-                active = count_active(&s);
-            }
-            None => return,
+        if !evict_lowest_budget_suspect(&mut s, &mut active) {
+            return;
         }
     }
     floor_stats::bump(&floor_stats::SUSPECT_ENROLLED, 1);
@@ -4479,7 +4531,8 @@ pub fn fire_dead_weakrefs() {
 /// `del f; gc.collect()` flips `weakref.ref(f)()` to `None` exactly
 /// like CPython's refcount-driven `tp_dealloc` would.
 pub fn sweep_weakref_only_targets() -> usize {
-    let targets = crate::weakref_registry::with_registry(|r| r.targets());
+    let targets =
+        with_state(|s| crate::weakref_registry::with_registry(|r| s.untracked_weakref_targets(r)));
     let mut cleared = 0;
     for (id, target) in targets {
         if is_tracked(id) {
@@ -4509,9 +4562,280 @@ mod tests {
     use crate::object::DictData;
 
     #[test]
+    fn suspect_eviction_preserves_minimum_order_counts_and_release() {
+        for mode in 0..6 {
+            let mut suspects = SuspectMap::new();
+            let mut reference = Vec::new();
+            let mut handles = std::collections::HashMap::new();
+            for index in 0..SUSPECT_CAP {
+                let budget = match mode {
+                    0 => 0,
+                    1 => SUSPECT_BUDGET,
+                    2 => u8::from(index + 1 != SUSPECT_CAP),
+                    3 => ((SUSPECT_CAP - index) % 16 + 1) as u8,
+                    4 => ((index * 37 + 113) % 17) as u8,
+                    _ => u8::MAX,
+                };
+                let object = Object::List(Rc::new(RefCell::new(Vec::new())));
+                let handle = Arc::new(TrackedHandle::new(object, 0));
+                let id = handle.id;
+                handles.insert(id, Arc::downgrade(&handle));
+                suspects.insert(
+                    id,
+                    Suspect {
+                        handle,
+                        budget,
+                        dormant_probes: (index % 16) as u8,
+                    },
+                );
+                reference.push((id, budget));
+            }
+            let mut active = reference.iter().filter(|(_, b)| *b > 0).count();
+            while !reference.is_empty() {
+                // The old policy is the oracle, including the first tied
+                // minimum and the order produced by each swap removal.
+                let victim = reference
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (_, budget))| *budget)
+                    .map(|(index, _)| index)
+                    .unwrap();
+                let (removed_id, _) = reference.swap_remove(victim);
+                assert!(evict_lowest_budget_suspect(&mut suspects, &mut active));
+                assert_eq!(active, reference.iter().filter(|(_, b)| *b > 0).count());
+                let actual: Vec<_> = suspects
+                    .iter()
+                    .map(|(id, entry)| (*id, entry.budget))
+                    .collect();
+                assert_eq!(actual, reference);
+                assert!(handles[&removed_id].upgrade().is_none());
+            }
+            assert!(!evict_lowest_budget_suspect(&mut suspects, &mut active));
+            assert_eq!(active, 0);
+        }
+    }
+
+    #[test]
+    fn weakref_snapshot_skips_tracked_payloads_and_observes_transitions() {
+        use crate::weakref_registry::{kind, WeakRefRegistry, WeakRefSlot};
+
+        let state = GcState::new();
+        let registry = WeakRefRegistry::new();
+        let roots: Vec<_> = (0..3)
+            .map(|_| Object::List(Rc::new(RefCell::new(Vec::new()))))
+            .collect();
+        let slots: Vec<_> = roots
+            .iter()
+            .map(|target| {
+                let slot = Arc::new(WeakRefSlot::new(
+                    id_of(target),
+                    target.clone(),
+                    false,
+                    kind::REF,
+                ));
+                registry.register(slot.clone());
+                slot
+            })
+            .collect();
+        state.track_now(roots[0].clone());
+        // The excluded payload cannot even be borrowed. This catches a
+        // regression to cloning every target and filtering afterwards.
+        let excluded = slots[0].target.borrow_mut();
+        let before = strong_count_for(&roots[0]);
+        let snapshot = state.untracked_weakref_targets(&registry);
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(strong_count_for(&roots[0]), before);
+        for (id, target) in &snapshot {
+            assert_eq!(*id, id_of(target));
+            assert!(!target.is_same(&roots[0]));
+        }
+        drop(snapshot);
+        drop(excluded);
+
+        state.track_now(roots[1].clone());
+        let snapshot = state.untracked_weakref_targets(&registry);
+        assert_eq!(snapshot.len(), 1);
+        assert!(snapshot[0].1.is_same(&roots[2]));
+        drop(snapshot);
+        state.untrack_id(id_of(&roots[0]));
+        state.untrack_id(id_of(&roots[1]));
+        assert_eq!(state.untracked_weakref_targets(&registry).len(), 3);
+
+        slots[1].clear();
+        let snapshot = state.untracked_weakref_targets(&registry);
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot
+            .iter()
+            .all(|(_, target)| !target.is_same(&roots[1])));
+        // A returned snapshot owns its targets independently of the slots.
+        for slot in &slots {
+            slot.clear();
+        }
+        assert!(state.untracked_weakref_targets(&registry).is_empty());
+        assert!(snapshot.iter().all(|(id, target)| *id == id_of(target)));
+        drop(slots);
+        assert!(registry.targets().is_empty());
+    }
+
+    #[test]
+    fn compact_positions_keep_absent_and_uncached_states_distinct() {
+        for value in [0, 1, (u32::MAX - 2) as usize, usize::MAX] {
+            let hint = CachedSlot::new(value);
+            assert_eq!(hint.load(Ordering::Acquire), value);
+            assert_eq!(hint.swap(3, Ordering::AcqRel), value);
+            assert_eq!(hint.load(Ordering::Acquire), 3);
+            hint.store(value, Ordering::Release);
+            assert_eq!(hint.load(Ordering::Acquire), value);
+        }
+        for value in [(u32::MAX - 1) as usize, usize::MAX - 1] {
+            let hint = CachedSlot::new(value);
+            assert_eq!(hint.load(Ordering::Acquire), usize::MAX - 1);
+            assert_eq!(hint.swap(usize::MAX, Ordering::AcqRel), usize::MAX - 1);
+            assert_eq!(hint.load(Ordering::Acquire), usize::MAX);
+        }
+        #[cfg(target_pointer_width = "64")]
+        {
+            let hint = CachedSlot::new(u32::MAX as usize + 100);
+            assert_eq!(hint.load(Ordering::Acquire), usize::MAX - 1);
+            assert_eq!(std::mem::size_of::<TrackedHandle>(), 64);
+        }
+    }
+
+    #[test]
+    fn uncacheable_generation_and_frozen_positions_use_identity_fallback() {
+        for frozen in [false, true] {
+            let state = GcState::new();
+            let roots: Vec<_> = (0..3)
+                .map(|_| Object::Dict(Rc::new(RefCell::new(DictData::default()))))
+                .collect();
+            for root in &roots {
+                state.track_now(root.clone());
+            }
+            if frozen {
+                state.freeze_all();
+            }
+            let first = state.handle_for(id_of(&roots[0])).unwrap();
+            first.slot.store((u32::MAX - 1) as usize, Ordering::Release);
+            state.untrack_id(first.id);
+            assert!(!state.is_tracked(first.id));
+            let moved = state.handle_for(id_of(&roots[2])).unwrap();
+            assert_eq!(moved.slot.load(Ordering::Acquire), 0);
+            let second = state.handle_for(id_of(&roots[1])).unwrap();
+            // A cacheable but stale position must also validate identity.
+            second.slot.store(0, Ordering::Release);
+            state.untrack_id(second.id);
+            assert!(!state.is_tracked(second.id));
+            assert!(state.is_tracked(moved.id));
+            assert_eq!(state.freeze_count(), usize::from(frozen));
+            state.untrack_id(moved.id);
+            assert!(!state.is_tracked(moved.id));
+            assert_eq!(state.freeze_count(), 0);
+        }
+    }
+
+    #[test]
+    fn uncacheable_hot_positions_preserve_membership_and_move_fixups() {
+        let state = GcState::new();
+        let roots: Vec<_> = (0..3)
+            .map(|_| Object::Dict(Rc::new(RefCell::new(DictData::default()))))
+            .collect();
+        let handles: Vec<_> = roots
+            .iter()
+            .map(|root| {
+                state.track_now(root.clone());
+                state.handle_for(id_of(root)).unwrap()
+            })
+            .collect();
+        for handle in &handles {
+            assert!(state.fin_insert(handle.id, handle.clone()));
+        }
+        let middle = &handles[1];
+        middle
+            .fin_hot_slot
+            .store((u32::MAX - 1) as usize, Ordering::Release);
+        state.fin_make_hot(middle);
+        assert_eq!(state.finalizable_hot.borrow().len(), 3);
+        state.fin_make_cold(middle);
+        assert_eq!(state.finalizable_hot.borrow().len(), 2);
+        assert_eq!(handles[2].fin_hot_slot.load(Ordering::Acquire), 1);
+        assert!(middle.fin_cold.load(Ordering::Acquire));
+        assert_eq!(middle.fin_hot_slot.load(Ordering::Acquire), usize::MAX);
+        state.fin_make_hot(middle);
+        assert_eq!(middle.fin_hot_slot.load(Ordering::Acquire), 2);
+        handles[0]
+            .fin_hot_slot
+            .store((u32::MAX - 1) as usize, Ordering::Release);
+        assert!(state.fin_remove(handles[0].id));
+        assert!(!state.fin_remove(handles[0].id));
+        assert_eq!(middle.fin_hot_slot.load(Ordering::Acquire), 0);
+        for handle in &handles {
+            state.untrack_id(handle.id);
+        }
+        assert!(state.finalizable_hot.borrow().is_empty());
+        assert_eq!(state.finalizable_count.load(Ordering::Acquire), 0);
+        assert_eq!(state.fin_hot_count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn deferred_instance_drop_ignores_stale_gc_filter() {
+        const CHILD: &str = "WEAVEPY_DEFERRED_DROP_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "gc_trace::tests::deferred_instance_drop_ignores_stale_gc_filter",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("spawn deferred-drop test");
+            assert!(status.success(), "deferred-drop child: {status}");
+            return;
+        }
+        let _gil = crate::gil::global_gil().acquire();
+        let class =
+            crate::types::TypeObject::new_user("DeferredDrop", Vec::new(), DictData::default())
+                .unwrap();
+        let owner = crate::types::PyInstance::new_deferred(class);
+        let operand = Object::Instance(owner.clone());
+        let id = id_of(&operand);
+        assert!(owner.is_gc_deferred());
+        assert!(!is_tracked(id));
+        assert_eq!(Rc::strong_count(&owner), 2);
+
+        // Model stale bits from an earlier allocation at this address.
+        // This makes the reported CI failure deterministic without
+        // relying on allocator placement or weakening path coverage.
+        process_tracked_filter().insert(id);
+        assert!(maybe_tracked(id));
+        assert!(!is_tracked(id));
+        assert!(note_dropped_marks(&operand));
+        assert!(crate::Interpreter::core_droppable(&operand));
+
+        // A final program owner still requires ordinary teardown.
+        drop(owner);
+        assert!(!crate::Interpreter::core_droppable(&operand));
+
+        // A non-atomic field revokes the deferral proof. After releasing
+        // the extra program owner, the collector and operand are the
+        // only owners, so this release must mark prompt cleanup.
+        let Object::Instance(owner) = &operand else {
+            unreachable!()
+        };
+        owner.note_slot_store(&Object::List(Rc::new(RefCell::new(Vec::new()))));
+        assert!(!owner.is_gc_deferred());
+        assert!(is_tracked(id));
+        assert_eq!(Rc::strong_count(owner), 2);
+        assert!(note_dropped_marks(&operand));
+        assert!(!crate::Interpreter::core_droppable(&operand));
+        with_state(|state| state.untrack_id(id));
+        assert!(!is_tracked(id));
+    }
+
+    #[test]
     fn gc_index_distributes_aligned_object_addresses() {
         use std::hash::BuildHasher;
-        let hasher = BuildHasherDefault::<GcIndexHasher>::default();
+        let hasher = BuildHasherDefault::<ObjectIdHasher>::default();
         // Exercise regular allocation strides at multiple address regions.
         // The unmodified word hash uses at most 512 of these 8192 buckets.
         for region in [0u64, 0x1_0000_0000, 0x6000_0000_0000] {

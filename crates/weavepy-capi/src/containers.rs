@@ -1428,7 +1428,7 @@ pub unsafe extern "C" fn PySet_Discard(s: *mut PyObject, item: *mut PyObject) ->
         Some(rc) => {
             let removed = rc
                 .borrow_mut()
-                .shift_remove(&DictKey(unsafe { crate::object::clone_object(item) }));
+                .swap_remove(&DictKey(unsafe { crate::object::clone_object(item) }));
             unsafe { crate::mirror::sync_set_used(s) };
             i32::from(removed)
         }
@@ -1772,12 +1772,9 @@ pub unsafe extern "C" fn PySet_Pop(s: *mut PyObject) -> *mut PyObject {
     }
     match as_set_rc(&unsafe { crate::object::clone_object(s) }) {
         Some(rc) => {
-            let mut set = rc.borrow_mut();
-            let first = set.iter().next().cloned();
-            match first {
+            let popped = rc.borrow_mut().pop();
+            match popped {
                 Some(k) => {
-                    set.shift_remove(&k);
-                    drop(set);
                     unsafe { crate::mirror::sync_set_used(s) };
                     crate::object::into_owned(k.0)
                 }

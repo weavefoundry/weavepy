@@ -51,10 +51,10 @@ pub struct MethodResolution {
     pub ret: MethodRet,
 }
 
-/// RFC 0071 WS3 — the maximum attribute-chain depth the analyzer
-/// tracks as provenance (`a.b.c.d` from a root local). Deeper chains
-/// disqualify the access rather than growing unbounded metadata.
-const MAX_ATTR_PATH: usize = 4;
+/// Maximum receiver path retained by analysis. The final attribute read adds
+/// one field, matching the largest chain the native helper can consume.
+/// Deeper reads lose provenance and use the existing dynamic fallback.
+const MAX_ATTR_PATH: usize = crate::runtime::MAX_ATTR_CHAIN_LEN - 1;
 
 /// RFC 0071 WS3 — interned attribute-path provenance. An `Obj`-lane
 /// value produced by an attribute load carries `(root local, chain of
@@ -102,6 +102,30 @@ impl PathArena {
         }
         out.reverse();
         out
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::{PathArena, MAX_ATTR_PATH};
+
+    #[test]
+    fn interning_reuses_paths_and_rejects_unbounded_growth() {
+        let mut arena = PathArena::default();
+        for root in [0, 1] {
+            let mut parent = None;
+            for depth in 1..=MAX_ATTR_PATH {
+                let next = arena.seg(parent, root, "next").expect("bounded path");
+                assert_eq!(arena.seg(parent, root, "next"), Some(next));
+                assert_eq!(arena.root(next), root);
+                assert_eq!(arena.names(Some(next)), vec!["next"; depth]);
+                parent = Some(next);
+            }
+            for _ in 0..100 {
+                assert_eq!(arena.seg(parent, root, "next"), None);
+            }
+        }
+        assert_eq!(arena.segs.len(), 2 * MAX_ATTR_PATH);
     }
 }
 
@@ -4463,11 +4487,13 @@ fn step_abstract(
             };
             match resolve_kw_perm(&mark, &names, argc, probes.kw_slot) {
                 Ok(_) => {}
-                Err(JitVerdict::UnsupportedOpcode("CALL_KW (keyword gap)")) => {
-                    // A positional prefix can't represent a skipped default.
-                    // Re-plan this global as a real object and let CallDyn
-                    // bind the original keyword names and current defaults.
-                    return Err(escape_verdict(code, &[&f], "CALL_KW (keyword gap)"));
+                Err(JitVerdict::UnsupportedOpcode(
+                    reason @ ("CALL_KW (keyword gap)" | "CALL_KW (callee kind)"),
+                )) => {
+                    // A positional prefix cannot bind skipped defaults or
+                    // a constructor's keyword arguments. Re-plan this global
+                    // as a real object so CallDyn uses normal keyword binding.
+                    return Err(escape_verdict(code, &[&f], reason));
                 }
                 Err(error) => return Err(error),
             }

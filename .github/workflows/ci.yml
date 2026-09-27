@@ -51,6 +51,11 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      # Debug VM frames can exceed Rust's default test-thread stack during
+      # nested imports (including the range/pickle regression on macOS ARM).
+      # Match local VM validation; release benchmark jobs keep their defaults.
+      RUST_MIN_STACK: "8388608"
     strategy:
       fail-fast: false
       matrix:
@@ -238,6 +243,7 @@ jobs:
           [ -f "$BIN.exe" ] && BIN="$BIN.exe"
           echo "BASE_WEAVEPY=$BIN" >> "$GITHUB_ENV"
       - name: Run bench gate
+        id: bench_gate
         shell: bash
         run: |
           if [ -n "${BASE_WEAVEPY:-}" ]; then
@@ -248,6 +254,22 @@ jobs:
           target/release/weavepy-bench gate $FLAGS \
             --weavepy=target/release/weavepy \
             | tee bench-report.md
+      - name: Diagnose cold Windows JIT costs after a failed gate
+        id: cold_jit_diagnostic
+        if: failure() && matrix.os == 'windows-latest' && github.event_name == 'pull_request' && steps.bench_gate.outcome == 'failure'
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          python tools/bench_cold_jit.py \
+            --base "$BASE_WEAVEPY" --new target/release/weavepy.exe \
+            --samples 7 \
+            --out "target/performance/cold-jit-ci/${{ github.run_id }}-${{ github.run_attempt }}/report.json"
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.cold_jit_diagnostic.outcome != 'skipped' && steps.cold_jit_diagnostic.outcome != ''
+        with:
+          name: cold-jit-diagnostic-${{ matrix.os }}
+          path: target/performance/cold-jit-ci/${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: warn
       - name: Append bench report to job summary
         if: always()
         shell: bash

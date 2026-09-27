@@ -322,7 +322,8 @@ decl_static_type! {
     pub PyCoro_Type;
     pub PyAsyncGen_Type;
     // RFC 0047 (wave 5): the umbrella type for WeavePy's native iterators
-    // (`Object::Iter` — list/tuple/range/dict/set/... iterators). Macro-heavy
+    // (`Object::Iter` and `Object::LazyIter`, including itertools adapters).
+    // Macro-heavy
     // Cython reads `Py_TYPE(it)->tp_iternext` *directly* in its `for` loop and
     // `next()` codegen; without a non-NULL slot a compiled `for x in range(n)`
     // (numpy.random's `SeedSequence.generate_state`) jumps to its error label
@@ -853,7 +854,7 @@ pub fn type_for_object(o: &Object) -> *mut PyTypeObject {
         O::StaticMethod(_) => PyStaticMethod_Type.as_ptr(),
         O::Property(_) => PyProperty_Type.as_ptr(),
         O::Generator(_) => PyGen_Type.as_ptr(),
-        O::Iter(_) => PySeqIter_Type.as_ptr(),
+        O::Iter(_) | O::LazyIter(_) => PySeqIter_Type.as_ptr(),
         O::Coroutine(_) => PyCoro_Type.as_ptr(),
         O::AsyncGenerator(_) => PyAsyncGen_Type.as_ptr(),
         O::Slice(_) => PySlice_Type.as_ptr(),
