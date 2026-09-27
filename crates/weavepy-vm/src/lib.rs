@@ -12167,10 +12167,13 @@ impl Interpreter {
                     // Container reads, stores and comprehension appends run
                     // out of line: arms added here cost the rest of the loop
                     // its register allocation.
-                    OpCode::BinarySubscr | OpCode::StoreSubscr | OpCode::ListAppend => {
+                    OpCode::BinarySubscr
+                    | OpCode::StoreSubscr
+                    | OpCode::ListAppend
+                    | OpCode::UnpackSequence => {
                         // SAFETY: the `len` slots at `base` are initialized,
                         // and the helper touches nothing else.
-                        match unsafe { Self::core_container_op(ins, base, len) } {
+                        match unsafe { Self::core_container_op(ins, base, len, cap) } {
                             Some(n) => {
                                 len = n;
                                 last = pc;
@@ -12298,6 +12301,7 @@ impl Interpreter {
                             }
                             _ => break None,
                         };
+                        let unique = Rc::strong_count(it) == 1;
                         // SAFETY: nothing below runs code until `it`'s last use
                         // (the guard-free reads of `GilCell::peek`).
                         let Some(it) = (unsafe { it.peek_mut() }) else {
@@ -12362,6 +12366,54 @@ impl Interpreter {
                                 };
                                 *index += ch.len_utf8();
                                 Object::from_char(ch)
+                            }
+                            // A dict or dict view's next key, value, or item; an
+                            // item unpacked by the `UNPACK_SEQUENCE 2` that
+                            // follows goes straight to the stack, as below.
+                            it @ crate::object::PyIterator::DictKeys { .. } => {
+                                let fuse = len + 2 <= cap
+                                    && pc + 1 < ninstrs
+                                    // SAFETY: `pc + 1 < ninstrs`.
+                                    && unsafe { (*instrs.add(pc + 1)).op }
+                                        == OpCode::UnpackSequence
+                                    // SAFETY: as above.
+                                    && unsafe { (*instrs.add(pc + 1)).arg } == 2;
+                                match Self::core_dict_next(it, fuse, unique) {
+                                    DictStep::Item(v, Some(k)) => {
+                                        // SAFETY: `len + 2 <= cap`.
+                                        unsafe { base.add(len).write(v) };
+                                        len += 1;
+                                        pc += 1;
+                                        k
+                                    }
+                                    DictStep::Item(v, None) => v,
+                                    DictStep::Exhausted => {
+                                        // The iterator (its sole owner is the
+                                        // stack) leaves it, and the loop exits
+                                        // past its `END_FOR`/`POP_ITER` pair.
+                                        len -= 1;
+                                        // SAFETY: the slot is initialized; its
+                                        // release frees only the iterator.
+                                        unsafe { drop_hot(base.add(len).read()) };
+                                        last = pc;
+                                        pc += 1 + ins.arg as usize;
+                                        let op_at = |pc: usize| {
+                                            // SAFETY: `pc < ninstrs` is checked first.
+                                            (pc < ninstrs).then(|| unsafe { (*instrs.add(pc)).op })
+                                        };
+                                        if op_at(pc) == Some(OpCode::EndFor) {
+                                            pc += 1;
+                                            if matches!(
+                                                op_at(pc),
+                                                Some(OpCode::PopIter | OpCode::PopTop)
+                                            ) {
+                                                pc += 1;
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    DictStep::Decline => break None,
+                                }
                             }
                             // `for i, x in enumerate(xs)`: the pair goes straight
                             // to the `UNPACK_SEQUENCE 2` that follows, which is
@@ -13322,8 +13374,14 @@ impl Interpreter {
                         // SAFETY: `len > 0`.
                         let top = unsafe { base.add(len - 1) };
                         let v = unsafe { &*top };
-                        if !matches!(v, Object::List(_) | Object::Tuple(_) | Object::Range(_))
-                            || !Self::core_droppable(v)
+                        if !matches!(
+                            v,
+                            Object::List(_)
+                                | Object::Tuple(_)
+                                | Object::Range(_)
+                                | Object::Dict(_)
+                                | Object::DictView(_)
+                        ) || !Self::core_droppable(v)
                         {
                             break Some(CoreExit::Helper);
                         }
@@ -13560,6 +13618,7 @@ impl Interpreter {
         ins: weavepy_compiler::Instruction,
         base: *mut Object,
         len: usize,
+        cap: usize,
     ) -> Option<usize> {
         fn scalar(v: &Object) -> bool {
             matches!(
@@ -13681,6 +13740,57 @@ impl Interpreter {
                 drop_hot(old);
                 Some(len - 3)
             }
+            OpCode::UnpackSequence => {
+                let n = ins.arg as usize;
+                if len == 0 || n == 0 || len - 1 + n > cap {
+                    return None;
+                }
+                // SAFETY: `len > 0`.
+                let seq = unsafe { &*base.add(len - 1) };
+                // The sequence's release frees nothing that could finalize:
+                // its items outlive it on the stack, and a sole owner here
+                // means neither the collector nor a weakref holds it.
+                let unique = match seq {
+                    Object::Tuple(t) if t.len() == n => ThinArc::strong_count(t) == 1,
+                    Object::List(l) if Rc::strong_count(l) == 1 => true,
+                    _ => false,
+                };
+                if !unique && !Self::core_droppable(seq) {
+                    return None;
+                }
+                // SAFETY: the sequence leaves its slot, which the last item
+                // (pushed first) takes; `len - 1 + n <= cap`.
+                unsafe {
+                    let seq = base.add(len - 1).read();
+                    match &seq {
+                        Object::Tuple(t) if t.len() == n => {
+                            for (k, item) in t.iter().rev().enumerate() {
+                                base.add(len - 1 + k).write(clone_hot(item));
+                            }
+                        }
+                        Object::List(l) => {
+                            let Ok(items) = l.try_borrow() else {
+                                base.add(len - 1).write(seq);
+                                return None;
+                            };
+                            if items.len() != n {
+                                drop(items);
+                                base.add(len - 1).write(seq);
+                                return None;
+                            }
+                            for (k, item) in items.iter().rev().enumerate() {
+                                base.add(len - 1 + k).write(clone_hot(item));
+                            }
+                        }
+                        _ => {
+                            base.add(len - 1).write(seq);
+                            return None;
+                        }
+                    }
+                    drop_hot(seq);
+                }
+                Some(len - 1 + n)
+            }
             OpCode::ListAppend => {
                 let depth = ins.arg as usize;
                 if len < 2 || depth == 0 || depth >= len {
@@ -13697,6 +13807,65 @@ impl Interpreter {
             }
             _ => None,
         }
+    }
+
+    /// The next step of a dict or dict-view iterator, for the core loop:
+    /// the key, the value, or the item (as `(value, Some(key))` when
+    /// `fuse`, for an unpacking `FOR_ITER`), or exhaustion, detaching the
+    /// iterator from its dict. `Decline`, having changed nothing, for a
+    /// size or key change the checked step reports, an exhaustion that
+    /// could release anything (a shared iterator, the dict's last
+    /// reference, a subclass keepalive), or a reverse iterator.
+    #[inline(never)]
+    fn core_dict_next(it: &mut crate::object::PyIterator, fuse: bool, unique: bool) -> DictStep {
+        use crate::object::DictViewKind;
+        let crate::object::PyIterator::DictKeys {
+            kind,
+            index,
+            dict: dict @ Some(_),
+            len,
+            watch,
+            reverse: false,
+            owner,
+        } = it
+        else {
+            return DictStep::Decline;
+        };
+        let d = dict.as_ref().expect("matched above");
+        // SAFETY: a read with nothing running (see `peek`).
+        let Some(data) = (unsafe { d.peek() }) else {
+            return DictStep::Decline;
+        };
+        if data.len() != *len
+            || watch
+                .as_ref()
+                .is_some_and(crate::object::DictWatch::changed)
+        {
+            return DictStep::Decline;
+        }
+        let Some((k, v)) = data.get_index(*index) else {
+            if !unique || owner.is_some() || Rc::strong_count(d) == 1 {
+                return DictStep::Decline;
+            }
+            // CPython clears `di_dict` on the first StopIteration.
+            *dict = None;
+            *watch = None;
+            return DictStep::Exhausted;
+        };
+        let item = match kind {
+            DictViewKind::Keys => (clone_hot(&k.0), None),
+            DictViewKind::Values => (clone_hot(v), None),
+            DictViewKind::Items if fuse => (clone_hot(v), Some(clone_hot(&k.0))),
+            DictViewKind::Items => (
+                Object::new_tuple_array([clone_hot(&k.0), clone_hot(v)]),
+                None,
+            ),
+        };
+        if watch.is_none() {
+            *watch = Some(crate::object::DictWatch::new(d));
+        }
+        *index += 1;
+        DictStep::Item(item.0, item.1)
     }
 
     /// Whether the core loop may release `v` with a plain drop: a scalar,
@@ -35778,6 +35947,9 @@ impl Interpreter {
         op: CompareKind,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<bool, RuntimeError> {
+        if let Some(r) = native_scalar_compare(a, b, op) {
+            return Ok(r);
+        }
         // CPython's `PyObject_RichCompareBool` truth-tests the comparison
         // *result* with `PyObject_IsTrue`, so `arr == x` yielding a
         // multi-element numpy bool array raises "truth value ... ambiguous"
@@ -35885,6 +36057,9 @@ impl Interpreter {
         op: CompareKind,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        if let Some(r) = native_scalar_compare(a, b, op) {
+            return Ok(Object::Bool(r));
+        }
         // An object-backed `mappingproxy` compares as the wrapped mapping
         // (CPython `mappingproxy_richcompare` delegates unconditionally).
         if matches!(a, Object::MappingProxyObj(_)) || matches!(b, Object::MappingProxyObj(_)) {
@@ -55835,6 +56010,14 @@ enum LeafStop {
     Core,
 }
 
+/// A step of a dict iterator in the core loop (see
+/// [`Interpreter::core_dict_next`]).
+enum DictStep {
+    Item(Object, Option<Object>),
+    Exhausted,
+    Decline,
+}
+
 /// Why [`Interpreter::leaf_core`] handed control back.
 enum CoreExit {
     /// End the burst.
@@ -55936,6 +56119,7 @@ static CORE_LEAF_OPS: [bool; 256] = {
         OpCode::BinarySubscr,
         OpCode::StoreSubscr,
         OpCode::ListAppend,
+        OpCode::UnpackSequence,
         OpCode::CompareOp,
         OpCode::PopJumpIfFalse,
         OpCode::PopJumpIfTrue,
@@ -63287,6 +63471,35 @@ pub(crate) fn coerce_len_result(r: Object) -> Result<i64, RuntimeError> {
             other.type_name()
         ))),
     }
+}
+
+/// `a <op> b` for a pair of native `int`s, `float`s or `str`s, whose
+/// comparison consults no protocol; `None` for anything else.
+#[inline]
+fn native_scalar_compare(a: &Object, b: &Object, op: CompareKind) -> Option<bool> {
+    use std::cmp::Ordering;
+    let ord = match (a, b) {
+        (Object::Int(x), Object::Int(y)) => Some(x.cmp(y)),
+        (Object::Float(x), Object::Float(y)) => x.partial_cmp(y),
+        (Object::Str(x), Object::Str(y)) => {
+            if matches!(op, CompareKind::Eq | CompareKind::NotEq) {
+                let eq = SharedStr::ptr_eq(x, y) || x.as_bytes() == y.as_bytes();
+                return Some(eq == matches!(op, CompareKind::Eq));
+            }
+            // UTF-8 byte order is code point order.
+            Some(x.as_bytes().cmp(y.as_bytes()))
+        }
+        _ => return None,
+    };
+    // An unordered pair (a NaN) is unequal and not ordered either way.
+    Some(match op {
+        CompareKind::Eq => ord == Some(Ordering::Equal),
+        CompareKind::NotEq => ord != Some(Ordering::Equal),
+        CompareKind::Lt => ord == Some(Ordering::Less),
+        CompareKind::LtE => matches!(ord, Some(Ordering::Less | Ordering::Equal)),
+        CompareKind::Gt => ord == Some(Ordering::Greater),
+        CompareKind::GtE => matches!(ord, Some(Ordering::Greater | Ordering::Equal)),
+    })
 }
 
 pub(crate) fn compare_op(a: &Object, b: &Object, op: CompareKind) -> Result<bool, RuntimeError> {
