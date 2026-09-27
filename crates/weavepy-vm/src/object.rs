@@ -3052,11 +3052,16 @@ impl indexmap::Equivalent<DictKey> for LeafNameProbe<'_> {
 /// A dict probe for the leaf burst: a `str` or `int` key that matches a
 /// stored key only by exact native equality. It never runs Python — an
 /// exotic stored key sharing the bucket (a `__eq__` that could equate)
-/// reads as a miss, and the burst leaves every miss to the full path.
-#[derive(Debug, Clone, Copy)]
+/// reads as a miss, and the burst leaves every miss to the full path
+/// unless [`LeafProbe::miss_is_exact`] proves no such key was seen.
+#[derive(Debug)]
 pub struct LeafProbe<'a> {
     pub key: &'a Object,
     pub hash: i64,
+    /// Set when the table compared this probe with a stored key of another
+    /// kind, whose equality to the probe might need Python (`1.0`, `True`,
+    /// a `str` subclass, an instance with `__eq__`).
+    foreign: std::cell::Cell<bool>,
 }
 
 impl<'a> LeafProbe<'a> {
@@ -3068,7 +3073,21 @@ impl<'a> LeafProbe<'a> {
             Object::Int(_) => py_hash_value(key)?,
             _ => return None,
         };
-        Some(Self { key, hash })
+        Some(Self {
+            key,
+            hash,
+            foreign: std::cell::Cell::new(false),
+        })
+    }
+
+    /// After a lookup that found nothing: whether no stored key can equal
+    /// this one, so inserting it natively is exact. Any key that Python
+    /// would compare with the probe has an equal hash, so the table
+    /// compared it with the probe, and a key of another kind set
+    /// `foreign`.
+    #[inline]
+    pub fn miss_is_exact(&self) -> bool {
+        !self.foreign.get()
     }
 }
 
@@ -3085,7 +3104,10 @@ impl indexmap::Equivalent<DictKey> for LeafProbe<'_> {
         match (self.key, &key.0) {
             (Object::Str(a), Object::Str(b)) => a.as_bytes() == b.as_bytes(),
             (Object::Int(a), Object::Int(b)) => a == b,
-            _ => false,
+            _ => {
+                self.foreign.set(true);
+                false
+            }
         }
     }
 }
@@ -3152,74 +3174,37 @@ fn current_interp_eq(a: &Object, b: &Object) -> Option<bool> {
 /// `name` dunder (a real Python `def`, not the inherited identity default).
 /// Used to gate the reentrant `__eq__` dispatch so plain instances keep the
 /// native identity fast path.
-pub(crate) fn instance_has_custom_dunder(obj: &Object, name: &str) -> bool {
+pub(crate) fn instance_has_custom_dunder(obj: &Object, dunder: crate::types::Dunder) -> bool {
     let Object::Instance(inst) = obj else {
         return false;
     };
-    match inst.cls().lookup_with_owner(name) {
-        Some((Object::Function(_) | Object::BoundMethod(_), _)) => true,
-        Some((Object::None, _)) | None => false,
-        // A non-function dunder. A user class supplying it (e.g.
-        // `unittest.mock` installs `Mock` instances as `__hash__` /
-        // `__eq__` on per-instance subclasses) needs Python dispatch.
-        Some((_, owner)) if !owner.flags.is_builtin => true,
-        // A built-in type that *overrides* the dunder in its own dict
-        // rather than inheriting `object`'s identity default needs Python
-        // dispatch too: `weakref` compares/hashes by referent, so its
-        // `ref` objects can't be keyed by the native identity path
-        // (`test_weakref`/`test_weakset` rely on `ref(a) == ref(a)` and
-        // matching hashes finding the same set slot). `object`'s own
-        // `__eq__`/`__hash__` — where every *plain* instance resolves —
-        // stay native so ordinary objects keep identity semantics, and
-        // value-wrapping subclasses (`class C(int)`, struct sequences)
-        // keep their native structural comparison via `native`.
-        Some((_, owner)) => {
-            inst.native.get().is_none()
-                && !Rc::ptr_eq(&owner, &crate::builtin_types::builtin_types().object_)
-        }
+    let info = inst.class_dunder(dunder);
+    if !info.present() || info.is_none() {
+        return false;
     }
+    // A Python function, or any other object a user class supplies (e.g.
+    // `unittest.mock` installs `Mock` instances as `__hash__` / `__eq__`
+    // on per-instance subclasses), needs Python dispatch.
+    if info.is_function() || !info.builtin_owner() {
+        return true;
+    }
+    // A built-in type that *overrides* the dunder in its own dict rather
+    // than inheriting `object`'s identity default needs Python dispatch
+    // too: `weakref` compares/hashes by referent, so its `ref` objects
+    // can't be keyed by the native identity path (`test_weakref`/
+    // `test_weakset` rely on `ref(a) == ref(a)` and matching hashes
+    // finding the same set slot). `object`'s own `__eq__`/`__hash__` —
+    // where every *plain* instance resolves — stay native so ordinary
+    // objects keep identity semantics, and value-wrapping subclasses
+    // (`class C(int)`, struct sequences) keep their native structural
+    // comparison via `native`.
+    inst.native.get().is_none() && !info.object_owner()
 }
 
-/// [`instance_has_custom_dunder`]`(obj, "__eq__")`, memoised per class:
-/// membership tests and `list.remove`/`index`/`count` ask it for every
-/// element they compare.
+/// [`instance_has_custom_dunder`] for `__eq__`: membership tests and
+/// `list.remove`/`index`/`count` ask it for every element they compare.
 pub(crate) fn instance_has_custom_eq(obj: &Object) -> bool {
-    let Object::Instance(inst) = obj else {
-        return false;
-    };
-    if crate::gil::free_threading_enabled() {
-        return custom_eq_of(&inst.cls(), inst);
-    }
-    // Under the GIL nothing reassigns `__class__` while this reads it
-    // (the lookup below runs no Python code).
-    custom_eq_of(inst.cls_raw(), inst)
-}
-
-fn custom_eq_of(cls: &crate::types::TypeObject, inst: &crate::types::PyInstance) -> bool {
-    let ver = cls.attr_version.get();
-    let memo = cls.eq_kind.get();
-    let kind = if memo != 0 && memo >> 2 == ver {
-        memo & 3
-    } else {
-        let kind = match cls.lookup_with_owner("__eq__") {
-            Some((Object::Function(_) | Object::BoundMethod(_), _)) => 2,
-            Some((Object::None, _)) | None => 1,
-            Some((_, owner)) if !owner.flags.is_builtin => 2,
-            Some((_, owner))
-                if Rc::ptr_eq(&owner, &crate::builtin_types::builtin_types().object_) =>
-            {
-                1
-            }
-            Some(_) => 3,
-        };
-        cls.eq_kind.set(ver << 2 | kind);
-        kind
-    };
-    match kind {
-        1 => false,
-        2 => true,
-        _ => inst.native.get().is_none(),
-    }
+    instance_has_custom_dunder(obj, crate::types::Dunder::Eq)
 }
 
 /// `a == b` can only be `object`'s identity default: each side is a
@@ -3275,7 +3260,7 @@ pub(crate) fn key_needs_interp_eq(obj: &Object) -> bool {
         // `_UnionGenericAlias` — structural namespace equality can't
         // express either (RFC 0076 WS5).
         Object::SimpleNamespace(_) => crate::is_pep604_union(obj).is_some(),
-        _ => instance_has_custom_dunder(obj, "__eq__"),
+        _ => instance_has_custom_dunder(obj, crate::types::Dunder::Eq),
     }
 }
 
@@ -3604,11 +3589,8 @@ fn key_eq_defer_active() -> bool {
 pub(crate) fn dict_key_is_reentrant(key: &Object) -> bool {
     match key {
         Object::Instance(inst) => {
-            let py_dunder = |name: &str| match inst.cls().lookup_with_owner(name) {
-                Some((Object::None, _)) | None => false,
-                Some((_, owner)) => !owner.flags.is_builtin,
-            };
-            py_dunder("__eq__") || py_dunder("__hash__")
+            inst.class_dunder(crate::types::Dunder::Eq).user_defined()
+                || inst.class_dunder(crate::types::Dunder::Hash).user_defined()
         }
         Object::Tuple(items) => items.iter().any(dict_key_is_reentrant),
         _ => false,
@@ -4672,7 +4654,7 @@ impl PyGenerator {
         qualname: impl Into<String>,
         kind: CoroutineKind,
         code: Object,
-        frame: Box<dyn std::any::Any + Send + Sync>,
+        frame: Box<crate::Frame>,
     ) -> Self {
         Self {
             name: RefCell::new(Object::from_str(name.into())),
@@ -4694,7 +4676,7 @@ impl PyGenerator {
         qualname: Object,
         kind: CoroutineKind,
         code: Object,
-        frame: Box<dyn std::any::Any + Send + Sync>,
+        frame: Box<crate::Frame>,
     ) -> Self {
         Self {
             name: RefCell::new(name),
@@ -4812,9 +4794,9 @@ impl CoroutineKind {
 pub enum GeneratorState {
     /// Created but not yet started — body hasn't executed past the
     /// initial `RETURN_GENERATOR`.
-    Created(Box<dyn std::any::Any + Send + Sync>),
+    Created(Box<crate::Frame>),
     /// Paused at a `YIELD_VALUE`.
-    Suspended(Box<dyn std::any::Any + Send + Sync>),
+    Suspended(Box<crate::Frame>),
     /// Body returned (cleanly or via exception). Subsequent
     /// `next`/`send` raise `StopIteration`.
     Finished,
@@ -11906,7 +11888,7 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             // A user-defined `__hash__` outranks the wrapped value's hash —
             // e.g. functools' `_HashedSeq(list)` caches its hash precisely so
             // the (unhashable) list payload is never consulted.
-            if instance_has_custom_dunder(obj, "__hash__") {
+            if instance_has_custom_dunder(obj, crate::types::Dunder::Hash) {
                 // When the instance wraps an *immutable* builtin value (an
                 // `int`/`str`/`tuple`/… subclass), the value can't change, so
                 // a custom `__hash__` is genuinely constant and may be

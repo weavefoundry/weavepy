@@ -74,12 +74,12 @@ pub mod specialize;
 pub mod stdlib;
 pub mod stdlib_tree;
 pub mod sync;
-pub mod tcache;
 pub mod thread_registry;
 /// RFC 0032 — tier-2 Cranelift JIT integration. Present only under the
 /// `jit` feature; the dispatch loop calls into it behind `#[cfg]` gates.
 #[cfg(feature = "jit")]
 mod tier2;
+mod timsort;
 pub mod trace;
 mod tuple_storage;
 pub mod type_surface;
@@ -107,7 +107,10 @@ use crate::types::{PyInstance, TypeObject};
 
 // ---------- frame ----------
 
-struct Frame {
+/// An activation's execution state. Public only so a suspended generator
+/// can own one ([`GeneratorState`]); its fields are private to the VM.
+#[doc(hidden)]
+pub struct Frame {
     code: Rc<CodeObject>,
     /// Local variables, indexed by `LOAD_FAST` / `STORE_FAST`.
     ///
@@ -248,6 +251,15 @@ struct Frame {
     parked_native: Option<Box<crate::tier2::NativeActivation>>,
 }
 
+impl std::fmt::Debug for Frame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Frame")
+            .field("code", &self.code.qualname)
+            .field("pc", &self.pc)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Frame {
     fn push(&mut self, v: Object) {
         self.stack.push(v);
@@ -360,7 +372,8 @@ fn generator_frame_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
         GeneratorState::Created(b) | GeneratorState::Suspended(b) => b,
         _ => return,
     };
-    if let Some(frame) = boxed.downcast_ref::<Frame>() {
+    let frame: &Frame = boxed;
+    {
         if let Ok(locals) = frame.locals.try_borrow() {
             for v in locals.iter() {
                 visit(v);
@@ -483,9 +496,7 @@ fn frame_reapables(g: &Rc<PyGenerator>) -> Vec<Object> {
         GeneratorState::Created(b) | GeneratorState::Suspended(b) => b,
         _ => return Vec::new(),
     };
-    let Some(frame) = boxed.downcast_ref::<Frame>() else {
-        return Vec::new();
-    };
+    let frame: &Frame = boxed;
     // CPython clears a generator's frame the instant it finishes/closes
     // (`gen_send`/`gen_close` → `_PyFrame_ClearExceptCode`), so every
     // local and value-stack entry is decref'd promptly. WeavePy mirrors
@@ -7771,9 +7782,9 @@ impl Interpreter {
             return g.code.clone();
         }
         match &*g.state.borrow() {
-            GeneratorState::Created(boxed) | GeneratorState::Suspended(boxed) => boxed
-                .downcast_ref::<Frame>()
-                .map_or(Object::None, |f| Object::Code(f.code.clone())),
+            GeneratorState::Created(frame) | GeneratorState::Suspended(frame) => {
+                Object::Code(frame.code.clone())
+            }
             GeneratorState::Running | GeneratorState::Finished => Object::None,
         }
     }
@@ -7787,33 +7798,28 @@ impl Interpreter {
     fn gen_py_frame(&self, g: &Rc<PyGenerator>) -> Object {
         let mut state = g.state.borrow_mut();
         match &mut *state {
-            GeneratorState::Created(boxed) | GeneratorState::Suspended(boxed) => {
-                match boxed.downcast_mut::<Frame>() {
-                    Some(frame) => {
-                        // RFC 0073 WS4 — a Python-visible frame shares
-                        // the locals storage; write a parked native
-                        // activation back before exposing one (park
-                        // refuses whenever a `PyFrame` already exists,
-                        // so this is the only creation path to guard).
-                        #[cfg(feature = "jit")]
-                        crate::tier2::materialize_parked(frame);
-                        if let Some(py) = frame.py_frame.clone() {
-                            if py.gen_owner.borrow().is_none() {
-                                *py.gen_owner.borrow_mut() = Some(Rc::downgrade(g));
-                            }
-                            return Object::Frame(py);
-                        }
-                        // Not yet entered: build the frame snapshot now so
-                        // `gi_frame` is observable before the first
-                        // `next()`. `back` is None — a created/suspended
-                        // generator frame has no live caller.
-                        let py = self.build_py_frame(frame, None);
+            GeneratorState::Created(frame) | GeneratorState::Suspended(frame) => {
+                // RFC 0073 WS4 — a Python-visible frame shares
+                // the locals storage; write a parked native
+                // activation back before exposing one (park
+                // refuses whenever a `PyFrame` already exists,
+                // so this is the only creation path to guard).
+                #[cfg(feature = "jit")]
+                crate::tier2::materialize_parked(frame);
+                if let Some(py) = frame.py_frame.clone() {
+                    if py.gen_owner.borrow().is_none() {
                         *py.gen_owner.borrow_mut() = Some(Rc::downgrade(g));
-                        frame.py_frame = Some(py.clone());
-                        Object::Frame(py)
                     }
-                    None => Object::None,
+                    return Object::Frame(py);
                 }
+                // Not yet entered: build the frame snapshot now so
+                // `gi_frame` is observable before the first
+                // `next()`. `back` is None — a created/suspended
+                // generator frame has no live caller.
+                let py = self.build_py_frame(frame, None);
+                *py.gen_owner.borrow_mut() = Some(Rc::downgrade(g));
+                frame.py_frame = Some(py.clone());
+                Object::Frame(py)
             }
             // Running: the frame is live on the interpreter call stack, not
             // in the box — find it by its generator backlink. CPython's
@@ -7874,8 +7880,8 @@ impl Interpreter {
     /// `SEND`/`YIELD_VALUE` pair with the delegate at top-of-stack.
     fn gen_yieldfrom(&self, g: &Rc<PyGenerator>) -> Object {
         let state = g.state.borrow();
-        if let GeneratorState::Suspended(boxed) = &*state {
-            if let Some(frame) = boxed.downcast_ref::<Frame>() {
+        if let GeneratorState::Suspended(frame) = &*state {
+            {
                 let pc = frame.pc as usize;
                 if pc >= 2 {
                     if let Some(send_ins) = frame.code.instructions.get(pc - 2) {
@@ -9320,9 +9326,12 @@ impl Interpreter {
                             // complete before they run.
                             self.flush_lean(frame, shell);
                             self.drain_if_maybe_dead();
-                            if crate::hot_gates::loop_gen() != snap_gen {
-                                break 'run QuietExit::Yield;
-                            }
+                        }
+                        // The drop may also have queued work of its own (an
+                        // unclosed file's ResourceWarning), which CPython
+                        // delivers at the instruction that dropped it.
+                        if crate::hot_gates::loop_gen() != snap_gen {
+                            break 'run QuietExit::Yield;
                         }
                         continue;
                     }
@@ -9733,7 +9742,7 @@ impl Interpreter {
                 }
                 _ => return None,
             };
-            let gf = boxed.downcast_ref::<Frame>()?;
+            let gf: &Frame = boxed;
             if gf.py_frame.is_some()
                 || !gf.saved_exc_info.is_empty()
                 || gf.pc == 0
@@ -9759,9 +9768,7 @@ impl Interpreter {
         else {
             unreachable!("checked above");
         };
-        let gf = boxed
-            .downcast_mut::<Frame>()
-            .expect("checked by the downcast_ref above");
+        let gf: &mut Frame = &mut boxed;
         // A native activation parked at the yield is rebuilt into the
         // interpreted suspension resumed here.
         #[cfg(feature = "jit")]
@@ -9846,9 +9853,7 @@ impl Interpreter {
             }
             Ok(FrameOutcome::Returned(_)) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
-                let frame = boxed
-                    .downcast_mut::<Frame>()
-                    .expect("a generator activation's frame");
+                let frame: &mut Frame = &mut boxed;
                 self.reap_dead_frame(frame);
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(&gen);
@@ -9863,9 +9868,7 @@ impl Interpreter {
             Err(err) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
                 let escaped = self.pep479_escape(&gen, err);
-                let frame = boxed
-                    .downcast_mut::<Frame>()
-                    .expect("a generator activation's frame");
+                let frame: &mut Frame = &mut boxed;
                 self.reap_dead_frame(frame);
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(&gen);
@@ -12161,6 +12164,21 @@ impl Interpreter {
                         last = pc;
                         pc += 1;
                     }
+                    // Container reads, stores and comprehension appends run
+                    // out of line: arms added here cost the rest of the loop
+                    // its register allocation.
+                    OpCode::BinarySubscr | OpCode::StoreSubscr | OpCode::ListAppend => {
+                        // SAFETY: the `len` slots at `base` are initialized,
+                        // and the helper touches nothing else.
+                        match unsafe { Self::core_container_op(ins, base, len) } {
+                            Some(n) => {
+                                len = n;
+                                last = pc;
+                                pc += 1;
+                            }
+                            None => break None,
+                        }
+                    }
                     OpCode::CompareOp => {
                         if len < 2 {
                             break None;
@@ -13525,6 +13543,160 @@ impl Interpreter {
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
         true
+    }
+
+    /// The core loop's container instructions: `seq[i]` and `d[key]` over
+    /// exact containers (an in-range index or a present `str`/`int` key),
+    /// `seq[i] = v` in range and `d[key] = v`, and a comprehension's
+    /// `LIST_APPEND` — each only when every release it makes is a scalar or
+    /// a plain decrement. Returns the new stack length, or `None`, having
+    /// touched nothing, for the full leaf arms.
+    ///
+    /// # Safety
+    ///
+    /// The `len` slots at `base` are initialized operand stack entries.
+    #[inline(never)]
+    unsafe fn core_container_op(
+        ins: weavepy_compiler::Instruction,
+        base: *mut Object,
+        len: usize,
+    ) -> Option<usize> {
+        fn scalar(v: &Object) -> bool {
+            matches!(
+                v,
+                Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+            )
+        }
+        match ins.op {
+            OpCode::BinarySubscr => {
+                if len < 2 {
+                    return None;
+                }
+                // SAFETY: `len >= 2`.
+                let (c, k) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
+                if !Self::core_droppable(c) {
+                    return None;
+                }
+                let r = match (c, k) {
+                    (Object::List(xs), Object::Int(i)) => {
+                        let xs = xs.try_borrow().ok()?;
+                        let n = xs.len() as i64;
+                        let i = if *i < 0 { *i + n } else { *i };
+                        if i < 0 || i >= n {
+                            return None;
+                        }
+                        clone_hot(&xs[i as usize])
+                    }
+                    (Object::Tuple(t), Object::Int(i)) => {
+                        let n = t.len() as i64;
+                        let i = if *i < 0 { *i + n } else { *i };
+                        if i < 0 || i >= n {
+                            return None;
+                        }
+                        clone_hot(&t[i as usize])
+                    }
+                    (Object::Dict(d), Object::Str(_) | Object::Int(_)) => {
+                        let probe = crate::object::LeafProbe::new(k)?;
+                        let d = d.try_borrow().ok()?;
+                        clone_hot(d.get(&probe)?)
+                    }
+                    _ => return None,
+                };
+                // SAFETY: both operand slots are initialized. The key is a
+                // scalar or string and the container a shared value
+                // (`core_droppable`), so neither release runs code; the
+                // result takes the container's slot.
+                unsafe {
+                    drop_hot(base.add(len - 1).read());
+                    drop_hot(base.add(len - 2).read());
+                    base.add(len - 2).write(r);
+                }
+                Some(len - 1)
+            }
+            OpCode::StoreSubscr => {
+                if len < 3 {
+                    return None;
+                }
+                // SAFETY: `len >= 3`.
+                let (c, k) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
+                if !Self::core_droppable(c) {
+                    return None;
+                }
+                let displaced_ok = |old: &Object| scalar(old) || Self::core_droppable(old);
+                let old = match (c, k) {
+                    (Object::List(xs), Object::Int(i)) => {
+                        let mut xs = xs.try_borrow_mut().ok()?;
+                        let n = xs.len() as i64;
+                        let i = if *i < 0 { *i + n } else { *i };
+                        if i < 0 || i >= n || !displaced_ok(&xs[i as usize]) {
+                            return None;
+                        }
+                        // SAFETY: the value slot is initialized and leaves the
+                        // stack into the list.
+                        std::mem::replace(&mut xs[i as usize], unsafe { base.add(len - 3).read() })
+                    }
+                    (Object::Dict(cell), Object::Str(_) | Object::Int(_)) => {
+                        if crate::capi_watchers::dicts_active() {
+                            return None;
+                        }
+                        let probe = crate::object::LeafProbe::new(k)?;
+                        let mut d = cell.try_borrow_mut().ok()?;
+                        let (old, changed) = match d.get_mut(&probe) {
+                            Some(slot) => {
+                                if !displaced_ok(slot) {
+                                    return None;
+                                }
+                                // SAFETY: as above.
+                                let old =
+                                    std::mem::replace(slot, unsafe { base.add(len - 3).read() });
+                                let changed = !old.is_same(slot);
+                                (old, changed)
+                            }
+                            None => {
+                                if !probe.miss_is_exact() {
+                                    return None;
+                                }
+                                // SAFETY: as above.
+                                d.insert(DictKey(clone_hot(k)), unsafe {
+                                    base.add(len - 3).read()
+                                });
+                                (Object::None, true)
+                            }
+                        };
+                        drop(d);
+                        if changed {
+                            crate::object::dict_mutation_event(cell);
+                        }
+                        old
+                    }
+                    _ => return None,
+                };
+                // SAFETY: the key and container slots are initialized (the
+                // value slot was moved out above); each release is a scalar
+                // or a plain decrement.
+                unsafe {
+                    drop_hot(base.add(len - 1).read());
+                    drop_hot(base.add(len - 2).read());
+                }
+                drop_hot(old);
+                Some(len - 3)
+            }
+            OpCode::ListAppend => {
+                let depth = ins.arg as usize;
+                if len < 2 || depth == 0 || depth >= len {
+                    return None;
+                }
+                // SAFETY: `depth < len`, so both slots are initialized.
+                let Object::List(lst) = (unsafe { &*base.add(len - 1 - depth) }) else {
+                    return None;
+                };
+                let mut l = lst.try_borrow_mut().ok()?;
+                // SAFETY: the value leaves the stack into the list.
+                l.push(unsafe { base.add(len - 1).read() });
+                Some(len - 1)
+            }
+            _ => None,
+        }
     }
 
     /// Whether the core loop may release `v` with a plain drop: a scalar,
@@ -16472,16 +16644,17 @@ impl Interpreter {
                             let v = std::mem::replace(value_slot, Object::Unbound);
                             std::mem::replace(slot, v)
                         }
-                        (Object::Dict(d), key @ (Object::Str(_) | Object::Int(_))) => {
+                        (Object::Dict(cell), key @ (Object::Str(_) | Object::Int(_))) => {
                             if crate::capi_watchers::dicts_active() {
                                 break;
                             }
                             let Some(probe) = crate::object::LeafProbe::new(key) else {
                                 break;
                             };
-                            let Ok(mut d) = d.try_borrow_mut() else { break };
-                            let d = &mut *d;
-                            match d.get_mut(&probe) {
+                            let Ok(mut d) = cell.try_borrow_mut() else {
+                                break;
+                            };
+                            let (old, changed) = match d.get_mut(&probe) {
                                 Some(slot) => {
                                     if Self::local_needs_prompt_reap(slot)
                                         && Self::looks_reapable_temporary(slot)
@@ -16489,17 +16662,24 @@ impl Interpreter {
                                         break;
                                     }
                                     let v = std::mem::replace(value_slot, Object::Unbound);
-                                    std::mem::replace(slot, v)
+                                    let old = std::mem::replace(slot, v);
+                                    let changed = !old.is_same(slot);
+                                    (old, changed)
                                 }
                                 None => {
-                                    if d.len() > 8 || !d.keys().all(|k| k.0.is_gc_atomic()) {
+                                    if !probe.miss_is_exact() {
                                         break;
                                     }
                                     let v = std::mem::replace(value_slot, Object::Unbound);
                                     d.insert(DictKey(key.clone()), v);
-                                    Object::Unbound
+                                    (Object::Unbound, true)
                                 }
+                            };
+                            drop(d);
+                            if changed {
+                                crate::object::dict_mutation_event(cell);
                             }
+                            old
                         }
                         _ => break,
                     };
@@ -29800,43 +29980,7 @@ impl Interpreter {
                 Err(e) => return Err(e),
             }
         }
-        // Native ABCs (e.g. the `io` `IOBase`/`RawIOBase`/`BufferedIOBase`/
-        // `TextIOBase` family) record virtual subclasses in a `_abc_registry`
-        // set via `register()`. CPython's `ABCMeta.__subclasscheck__` honours
-        // that registry; the native isinstance path must too, otherwise
-        // `isinstance(_pyio.BufferedReader(...), io.IOBase)` — the layered `io`
-        // module's classes are the registered `_pyio` ones — wrongly returns
-        // False. Match if `real` is, or descends from, any registered class.
-        if Self::class_is_abc_registered(cls, &real) {
-            return Ok(Object::Bool(true));
-        }
         Ok(Object::Bool(false))
-    }
-
-    /// Whether `candidate` is registered against the native ABC `cls` via its
-    /// `_abc_registry` set (directly, or as a descendant of a registered
-    /// virtual subclass). Mirrors one level of CPython's
-    /// `ABCMeta.__subclasscheck__` registry walk — sufficient for the `io` ABC
-    /// family, where `_pyio` registers each of `IOBase`/`RawIOBase`/
-    /// `BufferedIOBase`/`TextIOBase`.
-    fn class_is_abc_registered(cls: &Rc<TypeObject>, candidate: &Rc<TypeObject>) -> bool {
-        let reg = cls
-            .dict
-            .borrow()
-            .get(&crate::object::DictKey(Object::from_static(
-                "_abc_registry",
-            )))
-            .cloned();
-        if let Some(Object::Set(s)) = reg {
-            for k in s.borrow().iter() {
-                if let Object::Type(r) = &k.0 {
-                    if Rc::ptr_eq(r, candidate) || candidate.is_subclass_of(r) {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
     }
 
     /// `issubclass(cls, classinfo)` — same protocol as
@@ -30237,7 +30381,7 @@ impl Interpreter {
         if !matches!(obj, Object::Instance(_)) {
             return None;
         }
-        if !crate::object::instance_has_custom_dunder(obj, "__hash__") {
+        if !crate::object::instance_has_custom_dunder(obj, crate::types::Dunder::Hash) {
             return None;
         }
         let globals = self.builtins.clone();
@@ -30701,10 +30845,10 @@ impl Interpreter {
         Ok(Object::None)
     }
 
-    /// Stable sort over `items`. With `key`, every element is mapped
-    /// through it once and the results are sorted alongside the
-    /// originals (decorate-sort-undecorate). Errors from the key
-    /// function propagate.
+    /// `list.sort`: a stable sort of `items`, by `key(item)` when a key
+    /// function is given (called once per item), descending when `reverse`
+    /// (still stable, as CPython does it: reverse, sort, reverse). On a
+    /// comparison error `items` holds a permutation of its input.
     fn sort_with_key(
         &mut self,
         items: &mut Vec<Object>,
@@ -30712,112 +30856,103 @@ impl Interpreter {
         reverse: bool,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<(), RuntimeError> {
-        // `key=None` is CPython's spelling of "no key function" (sort by the
-        // elements themselves) — `sorted(xs, key=None)` and `xs.sort(key=None)`
-        // are identity sorts, not "call `None` on every element". Callers thread
-        // the raw kwarg through, so collapse the `None` sentinel here.
-        let key_fn = match key_fn {
-            Some(Object::None) => None,
-            other => other,
+        // `key=None` is CPython's spelling of "no key function".
+        let Some(f) = key_fn.filter(|f| !matches!(f, Object::None)) else {
+            if reverse {
+                items.reverse();
+            }
+            let result = self.sort_keyed(items, |o| o, globals);
+            if reverse {
+                items.reverse();
+            }
+            return result;
         };
-        // CPython's `reverse=True` is *tie-stable*: equal elements keep
-        // their original relative order (list.sort reverses the slice
-        // before and after sorting). A post-sort `.reverse()` alone would
-        // flip ties — observable in `heapq.nlargest`/`Counter.most_common`.
-        if let Some(f) = key_fn {
-            let mut decorated: Vec<(Object, Object)> = Vec::with_capacity(items.len());
-            for item in items.iter() {
-                let k = self.call(f, std::slice::from_ref(item), &[], globals)?;
-                decorated.push((k, item.clone()));
-            }
-            if reverse {
-                decorated.reverse();
-            }
-            if decorated.iter().any(|(k, _)| sort_key_needs_dunder_lt(k)) {
-                decorated =
-                    merge_sort_by_pylt(self, decorated, &|p: &(Object, Object)| &p.0, globals)?;
-            } else {
-                // Uncomparable keys must surface the `TypeError` (CPython
-                // propagates the failed `<`), not silently compare equal.
-                let mut err: Option<RuntimeError> = None;
-                decorated.sort_by(|a, b| match a.0.cmp(&b.0) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        if err.is_none() {
-                            err = Some(e);
-                        }
-                        std::cmp::Ordering::Equal
-                    }
-                });
-                if let Some(e) = err {
-                    return Err(e);
-                }
-            }
-            if reverse {
-                decorated.reverse();
-            }
-            // Undecorate, then promptly reap the dying key objects: CPython
-            // decrefs the keys inside `list.sort` while the list is still
-            // detached, so a key `__del__` that mutates the list is caught
-            // by the caller's mutation check
-            // (test_sort.test_key_with_mutating_del).
-            let mut dead_keys: Vec<Object> = Vec::with_capacity(decorated.len());
-            *items = decorated
-                .into_iter()
-                .map(|(k, v)| {
-                    dead_keys.push(k);
-                    v
-                })
-                .collect();
-            for k in dead_keys {
-                if matches!(
-                    k,
-                    Object::Instance(_)
-                        | Object::Generator(_)
-                        | Object::Coroutine(_)
-                        | Object::AsyncGenerator(_)
-                ) && Self::is_refcount_dead(&k, 1)
-                {
-                    self.reap_dead_subgraph(k);
-                }
-            }
-        } else {
-            if reverse {
-                items.reverse();
-            }
-            if items.iter().any(sort_key_needs_dunder_lt) {
-                // Keep a (cheap, Rc-clone) backup: `merge_sort_by_pylt`
-                // consumes the vec, and a raising `__lt__` must not empty
-                // the caller's list (CPython reattaches the partially
-                // sorted array on error).
-                let backup = items.clone();
-                match merge_sort_by_pylt(self, std::mem::take(items), &|o: &Object| o, globals) {
-                    Ok(sorted) => *items = sorted,
-                    Err(e) => {
-                        *items = backup;
-                        return Err(e);
-                    }
-                }
-            } else {
-                let mut err: Option<RuntimeError> = None;
-                items.sort_by(|a, b| match a.cmp(b) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        if err.is_none() {
-                            err = Some(e);
-                        }
-                        std::cmp::Ordering::Equal
-                    }
-                });
-                if let Some(e) = err {
-                    return Err(e);
-                }
-            }
-            if reverse {
-                items.reverse();
+        let mut decorated: Vec<(Object, Object)> = Vec::with_capacity(items.len());
+        for item in items.iter() {
+            let k = self.call(f, std::slice::from_ref(item), &[], globals)?;
+            decorated.push((k, item.clone()));
+        }
+        if reverse {
+            decorated.reverse();
+        }
+        let result = self.sort_keyed(&mut decorated, |p| &p.0, globals);
+        if reverse {
+            decorated.reverse();
+        }
+        // Undecorate, then promptly reap the dying key objects: CPython
+        // decrefs the keys inside `list.sort` while the list is still
+        // detached, so a key `__del__` that mutates the list is caught by
+        // the caller's mutation check (test_sort.test_key_with_mutating_del).
+        let mut dead_keys: Vec<Object> = Vec::with_capacity(decorated.len());
+        *items = decorated
+            .into_iter()
+            .map(|(k, v)| {
+                dead_keys.push(k);
+                v
+            })
+            .collect();
+        for k in dead_keys {
+            if matches!(
+                k,
+                Object::Instance(_)
+                    | Object::Generator(_)
+                    | Object::Coroutine(_)
+                    | Object::AsyncGenerator(_)
+            ) && Self::is_refcount_dead(&k, 1)
+            {
+                self.reap_dead_subgraph(k);
             }
         }
-        Ok(())
+        result
+    }
+
+    /// Sort `v` stably by the keys `key` projects, with the comparison
+    /// CPython's `list.sort` pre-sort check picks for the keys' types: a
+    /// native one for `str`, `int` or `float` keys (and for tuples whose
+    /// first items are one of those), else Python's `<`.
+    fn sort_keyed<T>(
+        &mut self,
+        v: &mut [T],
+        key: impl Fn(&T) -> &Object + Copy,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<(), RuntimeError> {
+        match SortKind::of(v.iter().map(key)) {
+            SortKind::Str => crate::timsort::sort(v, |a, b| Ok(SortKind::str_lt(key(a), key(b)))),
+            SortKind::Int => crate::timsort::sort(v, |a, b| Ok(SortKind::int_lt(key(a), key(b)))),
+            SortKind::Float => {
+                crate::timsort::sort(v, |a, b| Ok(SortKind::float_lt(key(a), key(b))))
+            }
+            SortKind::Numeric => {
+                crate::timsort::sort(v, |a, b| compare_op(key(a), key(b), CompareKind::Lt))
+            }
+            SortKind::Tuples(first) => crate::timsort::sort(v, |a, b| {
+                let (Object::Tuple(x), Object::Tuple(y)) = (key(a), key(b)) else {
+                    return self.dispatch_compare_op(key(a), key(b), CompareKind::Lt, globals);
+                };
+                // The first differing position decides; only it is
+                // compared with `<` (CPython `unsafe_tuple_compare`).
+                let mut i = 0;
+                while i < x.len() && i < y.len() {
+                    if !x[i].is_same(&y[i]) && !self.vm_eq(&x[i], &y[i], globals)? {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i >= x.len() || i >= y.len() {
+                    return Ok(x.len() < y.len());
+                }
+                match (i, first) {
+                    (0, SortKindScalar::Str) => Ok(SortKind::str_lt(&x[0], &y[0])),
+                    (0, SortKindScalar::Int) => Ok(SortKind::int_lt(&x[0], &y[0])),
+                    (0, SortKindScalar::Float) => Ok(SortKind::float_lt(&x[0], &y[0])),
+                    (0, SortKindScalar::Numeric) => compare_op(&x[0], &y[0], CompareKind::Lt),
+                    _ => self.dispatch_compare_op(&x[i], &y[i], CompareKind::Lt, globals),
+                }
+            }),
+            SortKind::General => crate::timsort::sort(v, |a, b| {
+                self.dispatch_compare_op(key(a), key(b), CompareKind::Lt, globals)
+            }),
+        }
     }
 
     /// Run `__str__` on instances, falling back to `__repr__` then
@@ -32016,10 +32151,8 @@ impl Interpreter {
                 // CPython GET_AWAITABLE: a coroutine that is suspended
                 // inside its own `await` (it has a yield-from
                 // sub-iterator) cannot gain a second awaiter.
-                let busy = matches!(&*g.state.borrow(), GeneratorState::Suspended(boxed)
-                    if boxed
-                        .downcast_ref::<Frame>()
-                        .is_some_and(|f| detect_yield_from_subiter(f).is_some()));
+                let busy = matches!(&*g.state.borrow(), GeneratorState::Suspended(frame)
+                    if detect_yield_from_subiter(frame).is_some());
                 if busy {
                     return Err(crate::error::runtime_error(
                         "coroutine is being awaited already",
@@ -33316,8 +33449,7 @@ impl Interpreter {
         // as "already running" in CPython's `ag_running_async` sense.
         let mid_await = matches!(
             &*g.state.borrow(),
-            GeneratorState::Suspended(boxed)
-                if boxed.downcast_ref::<Frame>().is_some_and(|f| !f.agen_yielded_value)
+            GeneratorState::Suspended(frame) if !frame.agen_yielded_value
         ) || matches!(&*g.state.borrow(), GeneratorState::Running);
         if !mid_await {
             return None;
@@ -33443,9 +33575,7 @@ impl Interpreter {
     /// (e.g. the generator already finished).
     fn agen_yielded_a_value(g: &Rc<PyGenerator>) -> bool {
         match &*g.state.borrow() {
-            GeneratorState::Suspended(boxed) => boxed
-                .downcast_ref::<Frame>()
-                .is_none_or(|f| f.agen_yielded_value),
+            GeneratorState::Suspended(frame) => frame.agen_yielded_value,
             _ => true,
         }
     }
@@ -33621,9 +33751,7 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         let prev_state = std::mem::replace(&mut *gen.state.borrow_mut(), GeneratorState::Running);
         let mut frame = match prev_state {
-            GeneratorState::Created(boxed) | GeneratorState::Suspended(boxed) => *boxed
-                .downcast::<Frame>()
-                .map_err(|_| RuntimeError::Internal("generator frame downcast".to_owned()))?,
+            GeneratorState::Created(boxed) | GeneratorState::Suspended(boxed) => *boxed,
             GeneratorState::Finished => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
                 // bpo-25887: throwing into an exhausted coroutine is a
@@ -33932,9 +34060,7 @@ impl Interpreter {
         if !created && crate::trace::any_observers_active() {
             return false;
         }
-        let Some(frame) = boxed.downcast_mut::<Frame>() else {
-            return false;
-        };
+        let frame: &mut Frame = boxed;
         // A Python-visible frame keeps showing the locals (the general
         // path leaves them to it).
         if frame.py_frame.is_some()
@@ -33965,10 +34091,8 @@ impl Interpreter {
         else {
             unreachable!("checked above");
         };
-        if let Some(frame) = boxed.downcast_mut::<Frame>() {
-            self.reap_dead_frame(frame);
-            self.recycle_frame_allocs(frame);
-        }
+        self.reap_dead_frame(&mut boxed);
+        self.recycle_frame_allocs(&mut boxed);
         Self::release_finished_gen(g);
         drop(boxed);
         true
@@ -34374,7 +34498,7 @@ impl Interpreter {
                 }
                 _ => return None,
             };
-            let frame = boxed.downcast_ref::<Frame>()?;
+            let frame: &Frame = boxed;
             if frame.py_frame.is_some()
                 || !frame.saved_exc_info.is_empty()
                 || frame.pc == 0
@@ -34407,9 +34531,7 @@ impl Interpreter {
             unreachable!("checked above");
         };
         let outcome = {
-            let frame = boxed
-                .downcast_mut::<Frame>()
-                .expect("checked by the downcast_ref above");
+            let frame: &mut Frame = &mut boxed;
             // A native activation parked at the yield (the generator's
             // first run entered compiled code) is rebuilt into the
             // interpreted suspension this path resumes.
@@ -34500,9 +34622,7 @@ impl Interpreter {
             }
             Ok(FrameOutcome::Returned(v)) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
-                let frame = boxed
-                    .downcast_mut::<Frame>()
-                    .expect("checked by the downcast_ref above");
+                let frame: &mut Frame = &mut boxed;
                 self.reap_dead_frame(frame);
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(gen);
@@ -34517,9 +34637,7 @@ impl Interpreter {
             Err(err) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
                 let escaped = self.pep479_escape(gen, err);
-                let frame = boxed
-                    .downcast_mut::<Frame>()
-                    .expect("checked by the downcast_ref above");
+                let frame: &mut Frame = &mut boxed;
                 self.reap_dead_frame(frame);
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(gen);
@@ -34546,12 +34664,10 @@ impl Interpreter {
         gc_trace::untrack_id(id);
     }
 
-    fn park_suspended_boxed(gen: &Rc<PyGenerator>, boxed: Box<dyn std::any::Any + Send + Sync>) {
-        if let Some(frame) = boxed.downcast_ref::<Frame>() {
-            if let Some(py) = &frame.py_frame {
-                if py.gen_owner.borrow().is_none() {
-                    *py.gen_owner.borrow_mut() = Some(Rc::downgrade(gen));
-                }
+    fn park_suspended_boxed(gen: &Rc<PyGenerator>, boxed: Box<Frame>) {
+        if let Some(py) = &boxed.py_frame {
+            if py.gen_owner.borrow().is_none() {
+                *py.gen_owner.borrow_mut() = Some(Rc::downgrade(gen));
             }
         }
         *gen.state.borrow_mut() = GeneratorState::Suspended(boxed);
@@ -34590,11 +34706,6 @@ impl Interpreter {
                 )));
             }
         };
-        if boxed.downcast_ref::<Frame>().is_none() {
-            return Err(RuntimeError::Internal(
-                "generator frame downcast".to_owned(),
-            ));
-        }
         // On the first call, `sent` must be None (or omitted).
         if first_resume && !matches!(sent, Object::None) {
             Self::park_suspended_boxed(gen, boxed);
@@ -34604,9 +34715,7 @@ impl Interpreter {
             )));
         }
         let outcome = {
-            let frame = boxed
-                .downcast_mut::<Frame>()
-                .expect("checked by the downcast_ref above");
+            let frame: &mut Frame = &mut boxed;
             // PEP 667: writes made through the suspended frame's `f_locals`
             // take effect when the generator resumes.
             Self::apply_py_frame_locals_writes(frame);
@@ -34658,9 +34767,7 @@ impl Interpreter {
                 // string we get from `from_builtin("StopIteration",
                 // "")`.
                 *gen.state.borrow_mut() = GeneratorState::Finished;
-                let frame = boxed
-                    .downcast_mut::<Frame>()
-                    .expect("checked by the downcast_ref above");
+                let frame: &mut Frame = &mut boxed;
                 self.reap_dead_frame(frame);
                 // RFC 0059 WS4: the exhausted frame's storage is dead —
                 // donate it back to the frame pools.
@@ -34677,9 +34784,7 @@ impl Interpreter {
             Err(err) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
                 let escaped = self.pep479_escape(gen, err);
-                let frame = boxed
-                    .downcast_mut::<Frame>()
-                    .expect("checked by the downcast_ref above");
+                let frame: &mut Frame = &mut boxed;
                 self.reap_dead_frame(frame);
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(gen);
@@ -46941,9 +47046,7 @@ impl Interpreter {
     /// without eager `PyFrame` construction.
     fn set_frame_gen_owner(gen: &Rc<PyGenerator>) {
         if let GeneratorState::Created(boxed) = &mut *gen.state.borrow_mut() {
-            if let Some(fr) = boxed.downcast_mut::<Frame>() {
-                fr.gen_owner = Some(Rc::downgrade(gen));
-            }
+            boxed.gen_owner = Some(Rc::downgrade(gen));
         }
     }
 
@@ -54890,7 +54993,7 @@ struct InlineAct {
     /// its own boxed frame runs instead of the slot's (which stays
     /// parked); `gen_frame` points into `gen_box`.
     gen: Option<Rc<PyGenerator>>,
-    gen_box: Option<Box<dyn std::any::Any + Send + Sync>>,
+    gen_box: Option<Box<Frame>>,
     gen_frame: *mut Frame,
     /// The resuming `FOR_ITER`'s jump distance (the exhaustion exit).
     exhaust_arg: u32,
@@ -55830,6 +55933,9 @@ static CORE_LEAF_OPS: [bool; 256] = {
         OpCode::StoreFast,
         OpCode::PopTop,
         OpCode::BinaryOp,
+        OpCode::BinarySubscr,
+        OpCode::StoreSubscr,
+        OpCode::ListAppend,
         OpCode::CompareOp,
         OpCode::PopJumpIfFalse,
         OpCode::PopJumpIfTrue,
@@ -56648,109 +56754,95 @@ fn oserror_subclass_name(errno: i64) -> Option<&'static str> {
     Some(name)
 }
 
-fn sort_key_needs_dunder_lt(o: &Object) -> bool {
-    sort_key_needs_dunder_lt_depth(o, 0)
+/// The comparison `list.sort` uses for a list of keys, chosen by the
+/// CPython pre-sort check: keys of one native type compare natively.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortKind {
+    Str,
+    Int,
+    Float,
+    /// Mixed `bool`, `int` and `float` keys.
+    Numeric,
+    /// Non-empty tuples whose first items have the given scalar kind.
+    Tuples(SortKindScalar),
+    General,
 }
 
-/// Whether a sort key must be ordered through Python's `<` (rich-comparison
-/// dispatch) rather than the fast Rust `Object::cmp` total order. True for a
-/// custom instance carrying a `__lt__`, *and* — crucially — for a `tuple`/
-/// `list` that (recursively) contains one: the Rust `seq_cmp` path bottoms
-/// out in `Object::cmp`, which has no case for user instances and would
-/// raise a spurious "'<' not supported" (e.g. `pprint`'s `_safe_tuple` keys,
-/// which wrap each dict key/value in a `__lt__`-only `_safe_key`). The depth
-/// guard avoids unbounded recursion on self-referential containers.
-fn sort_key_needs_dunder_lt_depth(o: &Object, depth: u32) -> bool {
-    if depth > 100 {
-        return false;
-    }
-    match o {
-        Object::Instance(inst) => {
-            // A user-defined Python `__lt__`/bound method always needs the
-            // Python `<` path (the historical case: `pprint`'s `_safe_key`).
-            if matches!(
-                inst.cls().lookup("__lt__"),
-                Some(Object::Function(_) | Object::BoundMethod(_))
-            ) {
-                return true;
+/// The scalar [`SortKind`]s, for the first items of tuple keys.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortKindScalar {
+    Str,
+    Int,
+    Float,
+    Numeric,
+    General,
+}
+
+impl SortKind {
+    fn of<'a>(keys: impl Iterator<Item = &'a Object> + Clone) -> Self {
+        let mut first = keys.clone().next();
+        if let Some(Object::Tuple(t)) = first {
+            if t.is_empty() {
+                first = None;
             }
-            // CPython's `list.sort`/`sorted` *always* order through `<`
-            // (`PyObject_RichCompareBool(x, y, Py_LT)`); WeavePy's native
-            // `Object::cmp` is only a safe fast path when it yields the
-            // identical answer. That holds for a plain value subclass
-            // (`class E(int)`) — ordered by its `native_value()` payload —
-            // but NOT for a Cython/C extension class surfaced as an
-            // `Object::Instance` (pandas `Period`/`Timestamp`,
-            // `decimal.Decimal`) whose `__lt__` is a C slot wrapper
-            // (`builtin_function_or_method`) and which carries no native
-            // scalar for `Object::cmp` to order. Detect exactly that: an
-            // ordering dunder is present, yet `native_value()` is `None`, so
-            // the native path would raise a spurious "'<' not supported".
-            if o.native_value().is_none()
-                && (inst.cls().lookup("__lt__").is_some() || inst.cls().lookup("__gt__").is_some())
-            {
-                return true;
-            }
-            // A `list`/`tuple` *subclass* instance orders as its native
-            // payload — recurse into it so contained `__lt__`-bearing
-            // elements still get Python `<` dispatch
-            // (test_sort.test_unsafe_object_compare's WackyList1).
-            match inst.native.get() {
-                Some(n @ (Object::List(_) | Object::Tuple(_))) => {
-                    sort_key_needs_dunder_lt_depth(n, depth + 1)
+        }
+        if matches!(first, Some(Object::Tuple(_))) {
+            let mut firsts = Vec::new();
+            for k in keys {
+                match k {
+                    Object::Tuple(t) if !t.is_empty() => firsts.push(&t[0]),
+                    _ => return Self::General,
                 }
-                _ => false,
             }
+            return Self::Tuples(SortKindScalar::of(firsts.into_iter()));
         }
-        // A genuinely foreign extension object (a bare numpy scalar not
-        // surfaced as an `Object::Instance`, …) orders through its
-        // `tp_richcompare` slot, which the native `Object::cmp` total order
-        // cannot reach — so it must sort through Python's `<`.
-        Object::Foreign(_) => true,
-        Object::Tuple(items) => items
-            .iter()
-            .any(|x| sort_key_needs_dunder_lt_depth(x, depth + 1)),
-        Object::List(items) => items
-            .borrow()
-            .iter()
-            .any(|x| sort_key_needs_dunder_lt_depth(x, depth + 1)),
-        _ => false,
+        match SortKindScalar::of(keys) {
+            SortKindScalar::Str => Self::Str,
+            SortKindScalar::Int => Self::Int,
+            SortKindScalar::Float => Self::Float,
+            SortKindScalar::Numeric => Self::Numeric,
+            SortKindScalar::General => Self::General,
+        }
+    }
+
+    #[inline]
+    fn str_lt(a: &Object, b: &Object) -> bool {
+        // UTF-8 byte order is code point order.
+        matches!((a, b), (Object::Str(x), Object::Str(y)) if x.as_bytes() < y.as_bytes())
+    }
+
+    #[inline]
+    fn int_lt(a: &Object, b: &Object) -> bool {
+        matches!((a, b), (Object::Int(x), Object::Int(y)) if x < y)
+    }
+
+    #[inline]
+    fn float_lt(a: &Object, b: &Object) -> bool {
+        matches!((a, b), (Object::Float(x), Object::Float(y)) if x < y)
     }
 }
 
-/// Stable merge sort that orders by Python `<` (full rich-comparison
-/// dispatch, reflected operands included). `key` projects the comparison
-/// object out of each element (the decorated sort key, or the element
-/// itself). Comparison errors (unorderable types, raising `__lt__`)
-/// propagate exactly as CPython's `list.sort` does.
-fn merge_sort_by_pylt<T: Clone>(
-    interp: &mut Interpreter,
-    mut v: Vec<T>,
-    key: &impl Fn(&T) -> &Object,
-    globals: &Rc<RefCell<DictData>>,
-) -> Result<Vec<T>, RuntimeError> {
-    if v.len() <= 1 {
-        return Ok(v);
-    }
-    let right = v.split_off(v.len() / 2);
-    let left = merge_sort_by_pylt(interp, v, key, globals)?;
-    let right = merge_sort_by_pylt(interp, right, key, globals)?;
-    let mut out = Vec::with_capacity(left.len() + right.len());
-    let (mut li, mut ri) = (0, 0);
-    while li < left.len() && ri < right.len() {
-        // Stability: take from the right run only when strictly smaller
-        // (timsort's `b < a` merge test).
-        if interp.dispatch_compare_op(key(&right[ri]), key(&left[li]), CompareKind::Lt, globals)? {
-            out.push(right[ri].clone());
-            ri += 1;
-        } else {
-            out.push(left[li].clone());
-            li += 1;
+impl SortKindScalar {
+    fn of<'a>(keys: impl Iterator<Item = &'a Object>) -> Self {
+        let mut kind = None;
+        for k in keys {
+            let this = match k {
+                Object::Str(_) => Self::Str,
+                Object::Int(_) => Self::Int,
+                Object::Float(_) => Self::Float,
+                Object::Long(_) | Object::Bool(_) => Self::Numeric,
+                _ => return Self::General,
+            };
+            kind = Some(match kind {
+                None => this,
+                Some(k) if k == this => k,
+                Some(Self::Str) | Some(Self::General) => return Self::General,
+                Some(_) if this == Self::Str => return Self::General,
+                Some(_) => Self::Numeric,
+            });
         }
+        kind.unwrap_or(Self::General)
     }
-    out.extend_from_slice(&left[li..]);
-    out.extend_from_slice(&right[ri..]);
-    Ok(out)
 }
 
 /// Convert a freshly built `set` result into a `frozenset` — used when

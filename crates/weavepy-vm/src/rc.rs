@@ -71,8 +71,11 @@ fn strong_word<T: ?Sized>(value: *const T) -> *const AtomicUsize {
     let header = 2 * std::mem::size_of::<usize>();
     let offset = (header + align - 1) & !(align - 1);
     // SAFETY: the payload lives `offset` bytes into its ArcInner, whose
-    // first field is the strong count.
-    unsafe { value.cast::<u8>().sub(offset).cast::<AtomicUsize>() }
+    // first field is the strong count, aligned for `AtomicUsize`.
+    #[allow(clippy::cast_ptr_alignment)]
+    unsafe {
+        value.cast::<u8>().sub(offset).cast::<AtomicUsize>()
+    }
 }
 
 /// Add one strong owner of the `Arc` payload at `value`.
@@ -174,7 +177,7 @@ impl<T: ?Sized> Rc<T> {
     pub fn into_arc(this: Self) -> Arc<T> {
         let this = ManuallyDrop::new(this);
         // SAFETY: moves the owned Arc out; `this` is never dropped.
-        unsafe { ptr::read(&*this.0) }
+        unsafe { ptr::read(&raw const *this.0) }
     }
 
     #[inline]
@@ -259,7 +262,7 @@ impl<T: ?Sized> Clone for Rc<T> {
         // accounts for the added reference.
         unsafe {
             increment_strong(Arc::as_ptr(&self.0));
-            Self(ManuallyDrop::new(ptr::read(&*self.0)))
+            Self(ManuallyDrop::new(ptr::read(&raw const *self.0)))
         }
     }
 }

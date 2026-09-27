@@ -8244,17 +8244,9 @@ fn b_sorted(args: &[Object]) -> Result<Object, RuntimeError> {
     while let Some(v) = it.next_value() {
         buf.push(v);
     }
-    let mut err: Option<RuntimeError> = None;
-    buf.sort_by(|a: &Object, b: &Object| match a.cmp(b) {
-        Ok(o) => o,
-        Err(e) => {
-            err = Some(e);
-            std::cmp::Ordering::Equal
-        }
-    });
-    if let Some(e) = err {
-        return Err(e);
-    }
+    crate::timsort::sort(&mut buf, |a, b| {
+        crate::compare_op(a, b, weavepy_compiler::CompareKind::Lt)
+    })?;
     let obj = Object::new_list(buf);
     crate::gc_trace::track(obj.clone());
     Ok(obj)
@@ -9276,7 +9268,7 @@ pub fn ensure_hashable(obj: &Object) -> Result<(), RuntimeError> {
         // container lookup runs (test_import's unhashable-`__name__`
         // str subclass in set membership).
         Object::Instance(inst) => {
-            if matches!(inst.cls().lookup("__hash__"), Some(Object::None)) {
+            if inst.class_dunder(crate::types::Dunder::Hash).is_none() {
                 return Err(type_error(format!(
                     "unhashable type: '{}'",
                     inst.cls().name
@@ -12873,18 +12865,9 @@ fn range_count(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn list_sort(args: &[Object]) -> Result<Object, RuntimeError> {
     let l = list_self(args)?;
-    let mut err: Option<RuntimeError> = None;
-    l.borrow_mut()
-        .sort_by(|a: &Object, b: &Object| match a.cmp(b) {
-            Ok(o) => o,
-            Err(e) => {
-                err = Some(e);
-                std::cmp::Ordering::Equal
-            }
-        });
-    if let Some(e) = err {
-        return Err(e);
-    }
+    crate::timsort::sort(&mut l.borrow_mut(), |a, b| {
+        crate::compare_op(a, b, weavepy_compiler::CompareKind::Lt)
+    })?;
     Ok(Object::None)
 }
 

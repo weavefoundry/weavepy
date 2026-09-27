@@ -182,34 +182,6 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     })
 }
 
-/// `IOBase.register(subclass)` — ABC virtual-subclass registration. The
-/// class binds first (classmethod); we record the subclass in the class's
-/// `_abc_registry` set and return it so `register` also works as a
-/// decorator, mirroring `_abc._abc_register`.
-fn io_abc_register(args: &[Object]) -> Result<Object, RuntimeError> {
-    let cls = args.first().cloned().unwrap_or(Object::None);
-    let sub = args.get(1).cloned().unwrap_or(Object::None);
-    if let Object::Type(t) = &cls {
-        let key = DictKey(Object::from_static("_abc_registry"));
-        let reg = {
-            let existing = t.dict.borrow().get(&key).cloned();
-            match existing {
-                Some(Object::Set(s)) => s,
-                _ => {
-                    let s = Object::new_set();
-                    t.dict.borrow_mut().insert(key, s.clone());
-                    match s {
-                        Object::Set(s) => s,
-                        _ => return Ok(sub),
-                    }
-                }
-            }
-        };
-        reg.borrow_mut().insert(DictKey(sub.clone()));
-    }
-    Ok(sub)
-}
-
 fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
@@ -1861,21 +1833,10 @@ pub(crate) fn file_io_abc_match(
 /// Build the `IOBase → {RawIOBase, BufferedIOBase, TextIOBase} → FileIO`
 /// hierarchy with the CPython mixin methods installed on the root.
 fn build_iobase_family_inner() -> IoFamily {
-    use crate::object::MethodWrapper;
     use crate::types::{TypeFlags, TypeObject};
     let bt = crate::builtin_types::builtin_types();
     let mut dict = DictData::default();
     install_iobase_mixins(&mut dict);
-    // `io.IOBase.register(...)` — ABC virtual-subclass registration.
-    dict.insert(
-        DictKey(Object::from_static("register")),
-        Object::ClassMethod(MethodWrapper::new(Object::Builtin(Rc::new(BuiltinFn {
-            name: "register",
-            binds_instance: true,
-            call: Box::new(io_abc_register),
-            call_kw: None,
-        })))),
-    );
     let flags = || TypeFlags {
         is_exception: false,
         is_builtin: true,
