@@ -6,6 +6,8 @@ For the later JSON and string work, including comparisons with CPython,
 see [JSON and string performance](PERFORMANCE-JSON.md).
 For the latest object metadata, numeric text, and enumeration changes,
 see [Runtime metadata and numeric text performance](PERFORMANCE-RUNTIME-METADATA.md).
+For the subsequent dispatch, allocation, and garbage-collection changes,
+see [Dispatch, allocation, and memory performance](PERFORMANCE-DISPATCH-MEMORY.md).
 
 The September 8, 2026, optimization pass reduces warm-cache process startup
 from 50.7 ms to 32.3 ms on the measured macOS ARM64 host. Across all 24 existing
