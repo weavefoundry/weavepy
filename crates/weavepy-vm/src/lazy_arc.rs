@@ -3,12 +3,12 @@
 //! A published pointer is never reset through shared access. Every borrowed
 //! value remains live until its owner can be exclusively destroyed or replaced.
 
+use crate::sync::Rc as Arc;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::Arc;
 
 pub struct LazyArc<T> {
     pointer: AtomicPtr<T>,

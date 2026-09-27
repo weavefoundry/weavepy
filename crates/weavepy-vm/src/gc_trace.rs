@@ -2186,12 +2186,12 @@ impl GcState {
         let mut trash_ids: std::collections::HashSet<ObjectId> =
             unreachable.iter().map(|h| h.id).collect();
         let wrapper_is_trash =
-            |slot: &Arc<crate::weakref_registry::WeakRefSlot>,
+            |slot: &crate::sync::Rc<crate::weakref_registry::WeakRefSlot>,
              trash: &std::collections::HashSet<ObjectId>| {
                 slot.py_ref
                     .borrow()
                     .as_ref()
-                    .and_then(std::sync::Weak::upgrade)
+                    .and_then(crate::sync::Weak::upgrade)
                     .is_none_or(|inst| {
                         trash.contains(&(crate::sync::Rc::as_ptr(&inst) as usize as u64))
                     })
@@ -2217,7 +2217,7 @@ impl GcState {
                     .py_ref
                     .borrow()
                     .as_ref()
-                    .and_then(std::sync::Weak::upgrade)
+                    .and_then(crate::sync::Weak::upgrade)
                     .map(crate::object::Object::Instance);
                 if let Some(wr) = wr {
                     crate::vm_singletons::push_pending_weakref_callback(cb, wr);
@@ -2520,7 +2520,7 @@ impl GcState {
                 .py_ref
                 .borrow()
                 .as_ref()
-                .and_then(std::sync::Weak::upgrade)
+                .and_then(crate::sync::Weak::upgrade)
                 .map(crate::object::Object::Instance);
             if let Some(wr) = wr {
                 crate::vm_singletons::push_pending_weakref_callback(cb, wr);
@@ -3548,9 +3548,9 @@ const DEFERRED_CAP: usize = 4096;
 /// weak `Object`, because `Object`'s payload `Arc` is what has to stay
 /// weak — holding the `Object` itself would pin the container alive.
 enum DeferredContainer {
-    List(std::sync::Weak<crate::RefCell<Vec<Object>>>),
-    Dict(std::sync::Weak<crate::RefCell<crate::object::DictData>>),
-    Set(std::sync::Weak<crate::RefCell<crate::object::SetData>>),
+    List(crate::sync::Weak<crate::RefCell<Vec<Object>>>),
+    Dict(crate::sync::Weak<crate::RefCell<crate::object::DictData>>),
+    Set(crate::sync::Weak<crate::RefCell<crate::object::SetData>>),
 }
 
 impl DeferredContainer {
@@ -4627,7 +4627,7 @@ mod tests {
         let slots: Vec<_> = roots
             .iter()
             .map(|target| {
-                let slot = Arc::new(WeakRefSlot::new(
+                let slot = Rc::new(WeakRefSlot::new(
                     id_of(target),
                     target.clone(),
                     false,

@@ -408,6 +408,7 @@ fn mtime_seconds(meta: &fs::Metadata) -> u32 {
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+    use std::sync::Arc;
     use weavepy_compiler::{compile_module, Constant};
 
     #[test]
@@ -433,7 +434,7 @@ mod ownership_tests {
         fn collect(code: &CodeObject, rows: &mut Vec<(*const CodeObject, String)>) {
             for c in &code.constants {
                 if let Constant::Code(inner) = c {
-                    rows.push((Rc::as_ptr(inner), inner.filename.clone()));
+                    rows.push((Arc::as_ptr(inner), inner.filename.clone()));
                     collect(inner, rows);
                 }
             }
@@ -455,17 +456,17 @@ mod ownership_tests {
 
     #[test]
     fn relocation_preserves_shared_code_and_nested_tuple_constants() {
-        let child = Rc::new(CodeObject {
+        let child = Arc::new(CodeObject {
             name: "child".to_owned(),
             filename: "original.py".to_owned(),
             ..CodeObject::default()
         });
-        let root = Rc::new(CodeObject {
+        let root = Arc::new(CodeObject {
             filename: "original.py".to_owned(),
             constants: vec![Constant::Tuple(vec![Constant::Code(child.clone())])],
             ..CodeObject::default()
         });
-        let mut moved = own_decoded_code(root.clone());
+        let mut moved = own_decoded_code(Rc::from_arc(root.clone()));
         rewrite_filenames(&mut moved, "relocated.py");
         assert_eq!(root.filename, "original.py");
         assert_eq!(child.filename, "original.py");
@@ -476,6 +477,6 @@ mod ownership_tests {
             panic!("expected code");
         };
         assert_eq!(relocated.filename, "relocated.py");
-        assert!(!Rc::ptr_eq(&child, relocated));
+        assert!(!Arc::ptr_eq(&child, relocated));
     }
 }

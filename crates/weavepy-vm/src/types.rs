@@ -1092,7 +1092,7 @@ impl TypeObject {
     /// CPython `best_base`: the base contributing the instance layout —
     /// the one whose solid base is the most derived. Ties resolve to the
     /// first base (matching `type_new`'s left-to-right scan).
-    pub fn best_base(self: &Rc<Self>) -> Option<Rc<TypeObject>> {
+    pub fn best_base(&self) -> Option<Rc<TypeObject>> {
         let bases = self.bases.borrow();
         let mut best: Option<Rc<TypeObject>> = None;
         for b in bases.iter() {
@@ -1118,8 +1118,8 @@ impl TypeObject {
     /// CPython `compatible_for_assignment`'s `newbase`/`oldbase` walk:
     /// climb the `best_base` chain past every level that doesn't change
     /// the struct, returning the most-derived type that *does*.
-    pub fn layout_struct_base(self: &Rc<Self>) -> Rc<TypeObject> {
-        let mut cur = self.clone();
+    pub fn layout_struct_base(this: &Rc<Self>) -> Rc<TypeObject> {
+        let mut cur = this.clone();
         while !cur.changes_layout() {
             match cur.best_base() {
                 Some(b) => cur = b,

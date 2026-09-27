@@ -1345,6 +1345,8 @@ fn spawn_python_worker(
     // deep recursion. A 64 MiB starting reserve keeps early-startup
     // segment churn low while letting hundreds of workers coexist.
     const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+                                                        // The worker clones and drops objects before it first takes the GIL.
+    crate::rc::revoke_refcount_bias();
     let handle = std::thread::Builder::new()
         .name(format!("weavepy-worker-{}", synth_id))
         .stack_size(WORKER_STACK_BYTES)

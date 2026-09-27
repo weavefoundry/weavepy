@@ -5,7 +5,8 @@ use std::alloc::Layout;
 use std::ops::{Deref, DerefMut};
 
 use crate::object::Object;
-use crate::sync::{CachedHash, Rc};
+use crate::sync::CachedHash;
+use std::sync::Arc as Rc;
 
 pub type SharedTuple = ThinArc<TupleStorage>;
 

@@ -30,8 +30,8 @@
 //! `True`.
 
 use crate::sync::Rc;
+use crate::sync::Rc as Arc;
 use crate::sync::RefCell;
-use std::sync::Arc;
 
 use crate::error::{type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;

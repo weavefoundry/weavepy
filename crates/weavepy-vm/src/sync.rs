@@ -43,17 +43,9 @@ use parking_lot::{Condvar, Mutex, ReentrantMutex};
 // `std::cell::RefCell`, `std::cell::Cell`.
 // ---------------------------------------------------------------------------
 
-/// Drop-in replacement for [`std::rc::Rc`]. Backed by
-/// [`std::sync::Arc`], so it carries the same atomic refcount
-/// behaviour. Every method on `Arc` (`ptr_eq`, `clone`, `as_ptr`,
-/// `strong_count`, `weak_count`, `downgrade`, `try_unwrap`,
-/// `get_mut`, `into_inner`) is identical to the `Rc` API the
-/// workspace already calls.
-pub type Rc<T> = std::sync::Arc<T>;
-
-/// Drop-in replacement for [`std::rc::Weak`]. Backed by
-/// [`std::sync::Weak`].
-pub type Weak<T> = std::sync::Weak<T>;
+/// Drop-in replacement for [`std::rc::Rc`] and [`std::rc::Weak`], backed
+/// by [`std::sync::Arc`] with biased counting (see [`crate::rc`]).
+pub use crate::rc::{Rc, Weak};
 
 /// An interior-mutability cell that's `Send + Sync` (when the
 /// payload is `Send`) and supports both the `RefCell` and `Cell`
@@ -354,6 +346,26 @@ fn cells_unguarded() -> bool {
     CELLS_UNGUARDED.load(Ordering::Relaxed)
 }
 
+/// Whether reference counts must be updated atomically: set whenever the
+/// cell bias is revoked, and also before spawning a thread that may touch
+/// objects before it registers (see [`crate::rc`]). Never cleared.
+static RC_SHARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True while one thread owns every reference count (see [`crate::rc`]).
+#[cfg_attr(debug_assertions, allow(dead_code))]
+#[inline(always)]
+pub(crate) fn bias_held() -> bool {
+    !RC_SHARED.load(Ordering::Relaxed)
+}
+
+/// Make reference counting atomic before spawning a thread that will run
+/// VM code. Cell borrows keep their bias until the thread registers: the
+/// spawner may hold a lock-free guard now, and it can't hand the GIL to the
+/// new thread until that guard is released.
+pub(crate) fn revoke_bias_for_spawn() {
+    RC_SHARED.store(true, Ordering::SeqCst);
+}
+
 /// The first thread to run VM code (see [`note_vm_thread`]).
 static FIRST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -526,6 +538,7 @@ fn retract_sole_guard() {
 /// including the biased thread backing out of its own fast path — never
 /// waits on a guard it is itself holding.
 fn revoke_bias() {
+    RC_SHARED.store(true, Ordering::SeqCst);
     if CELLS_SHARED.swap(true, Ordering::SeqCst) {
         return;
     }

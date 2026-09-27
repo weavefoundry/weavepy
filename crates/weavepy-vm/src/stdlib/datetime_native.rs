@@ -1677,7 +1677,7 @@ pub(crate) fn install(args: &[Object]) -> Result<Object, RuntimeError> {
     for (kind, cls) in &classes {
         let _ = cls
             .native_ext
-            .set(state.clone() as Rc<dyn std::any::Any + Send + Sync>);
+            .set(crate::rc_unsize!(state.clone() => dyn std::any::Any + Send + Sync));
         cls.native_kind.set(*kind);
     }
     for spec in SPECS {

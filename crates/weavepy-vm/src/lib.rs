@@ -67,6 +67,7 @@ pub mod proc_init;
 pub mod py_errno;
 pub mod pycache;
 pub mod rare_events;
+pub mod rc;
 pub mod recursion;
 pub mod shared_value;
 pub mod specialize;
@@ -976,7 +977,7 @@ impl Default for Interpreter {
         // `_Py_SetLocaleFromEnv`) so `_locale.getencoding()` and
         // `locale.setlocale(..., None)` observe the user's locale.
         crate::stdlib::locale_mod::init_from_env();
-        let stdout: Stdout = Rc::new(RefCell::new(std::io::stdout()));
+        let stdout: Stdout = Rc::from_arc(std::sync::Arc::new(RefCell::new(std::io::stdout())));
         let mut builtins_dict = builtins::default_builtins();
         // The `builtins` module exposes the core types/exceptions as the
         // real `type` objects (CPython's `builtins.int is int`), not the
@@ -38082,8 +38083,8 @@ impl Interpreter {
         if old.solid_base_name() != new.solid_base_name() {
             return false;
         }
-        let oldbase = old.layout_struct_base();
-        let newbase = new.layout_struct_base();
+        let oldbase = TypeObject::layout_struct_base(old);
+        let newbase = TypeObject::layout_struct_base(new);
         if Rc::ptr_eq(&oldbase, &newbase) {
             return true;
         }
@@ -61058,7 +61059,7 @@ fn constant_to_object(c: Constant) -> Object {
         }
         // Hand out the pool's own `Arc` so every access sees the *same*
         // code object (identity, like CPython's co_consts).
-        Constant::Code(c) => Object::Code(c),
+        Constant::Code(c) => Object::Code(Rc::from_arc(c)),
         Constant::Ellipsis => crate::vm_singletons::ellipsis(),
         Constant::Slice(parts) => {
             let (start, stop, step) = *parts;
@@ -61097,7 +61098,7 @@ fn object_to_constant(o: &Object) -> Constant {
         Object::FrozenSet(s) => {
             Constant::FrozenSet(s.iter().map(|k| object_to_constant(&k.0)).collect())
         }
-        Object::Code(c) => Constant::Code(c.clone()),
+        Object::Code(c) => Constant::Code(Rc::into_arc(c.clone())),
         // A `slice` reaches the pool from 3.14's constant-slice folding
         // (`a[1:2]`); its bounds must themselves be pool-representable.
         Object::Slice(s) => {
@@ -63546,7 +63547,7 @@ next(gen)
         let code = compile_module(&module).expect("compile");
         let mut interp = Interpreter::new();
         let buf: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
-        let writer: Stdout = buf.clone() as Rc<RefCell<dyn Write + Send + Sync>>;
+        let writer: Stdout = crate::rc_unsize!(buf.clone() => RefCell<dyn Write + Send + Sync>);
         interp.set_stdout(writer);
         interp
             .run_module(&code)
@@ -68995,7 +68996,7 @@ print(sliced('é😀z', 2))
                     _ => None,
                 })
                 .expect("slice function");
-            let function = Rc::make_mut(nested);
+            let function = std::sync::Arc::make_mut(nested);
             let pc = function
                 .instructions
                 .iter()
@@ -69008,7 +69009,8 @@ print(sliced('é😀z', 2))
             function.instructions[pc].arg = 2;
             let mut interp = Interpreter::new();
             let buffer: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
-            let writer: Stdout = buffer.clone() as Rc<RefCell<dyn Write + Send + Sync>>;
+            let writer: Stdout =
+                crate::rc_unsize!(buffer.clone() => RefCell<dyn Write + Send + Sync>);
             interp.set_stdout(writer);
             interp.run_module(&code).expect("two-bound native fallback");
             assert_eq!(String::from_utf8(buffer.borrow().clone()).unwrap(), "é😀\n");
