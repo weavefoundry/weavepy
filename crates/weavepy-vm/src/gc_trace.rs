@@ -760,6 +760,16 @@ impl GcState {
                 // queue onto a list we cannot touch.
                 return false;
             };
+            // The churn shape — a loop that builds a container and drops
+            // the previous one — leaves its dead predecessors just below
+            // the tail: reclaim them here, so steady churn neither grows
+            // the list nor parks dead allocations until a sweep.
+            let n = deferred.len();
+            for i in (n.saturating_sub(2)..n).rev() {
+                if deferred[i].is_dead() {
+                    deferred.swap_remove(i);
+                }
+            }
             deferred.push(weak);
             deferred.len() >= self.deferred_limit.load(Ordering::Relaxed)
         };
@@ -3578,6 +3588,16 @@ impl DeferredContainer {
             Object::Dict(d) => Some(Self::Dict(crate::Rc::downgrade(d))),
             Object::Set(s) => Some(Self::Set(crate::Rc::downgrade(s))),
             _ => None,
+        }
+    }
+
+    /// Whether the container has died.
+    #[inline]
+    fn is_dead(&self) -> bool {
+        match self {
+            Self::List(w) => w.strong_count() == 0,
+            Self::Dict(w) => w.strong_count() == 0,
+            Self::Set(w) => w.strong_count() == 0,
         }
     }
 

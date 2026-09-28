@@ -12103,6 +12103,20 @@ impl Interpreter {
                                             pc += 1;
                                             continue;
                                         }
+                                        // An untracked container of scalars:
+                                        // a plain drop.
+                                        Object::List(_) | Object::Dict(_)
+                                            if Self::core_plain_last_container(&*slot) =>
+                                        {
+                                            len -= 1;
+                                            drop(std::mem::replace(
+                                                &mut *slot,
+                                                base.add(len).read(),
+                                            ));
+                                            last = pc;
+                                            pc += 1;
+                                            continue;
+                                        }
                                         _ => break None,
                                     }
                                 }
@@ -12118,6 +12132,32 @@ impl Interpreter {
                                 }
                             }
                         }
+                        last = pc;
+                        pc += 1;
+                    }
+                    // A list literal, tracked like the full handler's (an
+                    // allocation due to trigger a collection is left to it).
+                    OpCode::BuildList => {
+                        let n = ins.arg as usize;
+                        if n > len
+                            || (n == 0 && len == cap)
+                            || crate::stdlib::tracemalloc_real::is_tracking()
+                            || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+                            || gc_trace::auto_collect_due()
+                        {
+                            break None;
+                        }
+                        // SAFETY: the top `n` slots are initialized; they move
+                        // into the list and leave the stack.
+                        let items: Vec<Object> = (len - n..len)
+                            .map(|j| unsafe { base.add(j).read() })
+                            .collect();
+                        len -= n;
+                        let obj = Object::new_list(items);
+                        gc_trace::track(obj.clone());
+                        // SAFETY: `len < cap` (the operands' slots were freed).
+                        unsafe { base.add(len).write(obj) };
+                        len += 1;
                         last = pc;
                         pc += 1;
                     }
@@ -12527,6 +12567,10 @@ impl Interpreter {
                         let Some(it) = (unsafe { it.peek_mut() }) else {
                             break None;
                         };
+                        // An exhausted range or list iterator the loop holds
+                        // alone, whose death frees nothing else (see the leaf
+                        // arm): retired here instead of by the full handler.
+                        let mut retire = false;
                         let v = match it {
                             crate::object::PyIterator::Range {
                                 current,
@@ -12538,22 +12582,42 @@ impl Interpreter {
                                 } else {
                                     *step < 0 && *current > *stop
                                 };
-                                if !live {
+                                if live {
+                                    let v = *current;
+                                    *current = current.wrapping_add(*step);
+                                    Object::Int(v)
+                                } else if unique {
+                                    retire = true;
+                                    Object::None
+                                } else {
                                     break None;
                                 }
-                                let v = *current;
-                                *current = current.wrapping_add(*step);
-                                Object::Int(v)
                             }
-                            crate::object::PyIterator::List { items, index, .. } => {
+                            crate::object::PyIterator::List {
+                                items,
+                                index,
+                                owner,
+                            } => {
                                 // SAFETY: as above.
-                                let v = match unsafe { items.peek() } {
-                                    Some(xs) => xs.get(*index).map(Self::clone_operand),
-                                    None => None,
+                                let Some(xs) = (unsafe { items.peek() }) else {
+                                    break None;
                                 };
-                                let Some(v) = v else { break None };
-                                *index += 1;
-                                v
+                                match xs.get(*index) {
+                                    Some(v) => {
+                                        let v = Self::clone_operand(v);
+                                        *index += 1;
+                                        v
+                                    }
+                                    None if unique
+                                        && owner.is_none()
+                                        && Rc::strong_count(items) >= 2
+                                        && !Self::iter_backing_list_dead(items) =>
+                                    {
+                                        retire = true;
+                                        Object::None
+                                    }
+                                    None => break None,
+                                }
                             }
                             crate::object::PyIterator::Tuple { items, index } => {
                                 let Some(v) = items.get(*index).cloned() else {
@@ -12734,6 +12798,34 @@ impl Interpreter {
                             }
                             _ => break None,
                         };
+                        if retire {
+                            // Popped, and the loop exit skips the `END_FOR` /
+                            // `POP_ITER` pair (the full handler's shape).
+                            len -= 1;
+                            // SAFETY: the iterator slot leaves the stack.
+                            let it = unsafe { base.add(len).read() };
+                            let marked =
+                                gc_trace::maybe_tracked(crate::weakref_registry::id_of(&it))
+                                    && gc_trace::note_dropped_marks(&it);
+                            drop(it);
+                            last = pc;
+                            pc += 1 + ins.arg as usize;
+                            let op_at = |pc: usize| {
+                                // SAFETY: `pc < ninstrs` is checked first.
+                                (pc < ninstrs).then(|| unsafe { (*instrs.add(pc)).op })
+                            };
+                            if op_at(pc) == Some(OpCode::EndFor) {
+                                pc += 1;
+                                if matches!(op_at(pc), Some(OpCode::PopIter | OpCode::PopTop)) {
+                                    pc += 1;
+                                }
+                            }
+                            if marked {
+                                gc_trace::mark_maybe_dead();
+                                break Some(CoreExit::Stop(LeafStop::Marked));
+                            }
+                            continue;
+                        }
                         // SAFETY: `len < cap`.
                         unsafe { base.add(len).write(v) };
                         len += 1;
@@ -14191,13 +14283,31 @@ impl Interpreter {
                 // weakref operation that requires tracking revokes the flag.
                 Rc::strong_count(i) > 1 && (i.is_gc_deferred() || !gc_trace::note_dropped_marks(v))
             }
-            Object::List(l) => Rc::strong_count(l) > 1 && !gc_trace::note_dropped_marks(v),
-            Object::Dict(d) => Rc::strong_count(d) > 1 && !gc_trace::note_dropped_marks(v),
+            Object::List(l) if Rc::strong_count(l) > 1 => !gc_trace::note_dropped_marks(v),
+            Object::Dict(d) if Rc::strong_count(d) > 1 => !gc_trace::note_dropped_marks(v),
+            // The last owner of a container the collector never took, and
+            // no weakref watches, holding only scalars: freeing it runs no
+            // code (`prompt_reap_dropped` reaches the same plain drop the
+            // long way round).
+            Object::List(_) | Object::Dict(_) => Self::core_plain_last_container(v),
             Object::Tuple(t) => ThinArc::strong_count(t) > 1 && !gc_trace::note_dropped_marks(v),
             Object::Function(f) => Rc::strong_count(f) > 1 && !gc_trace::note_dropped_marks(v),
             Object::Type(t) => Rc::strong_count(t) > 1 && !gc_trace::note_dropped_marks(v),
             _ => false,
         }
+    }
+
+    /// [`Self::core_droppable`] for the last owner of an exact `list` or
+    /// `dict`: untracked (the miss filter proves it), unwatched, and
+    /// holding only scalars.
+    #[inline(never)]
+    fn core_plain_last_container(v: &Object) -> bool {
+        let id = crate::weakref_registry::id_of(v);
+        !gc_trace::maybe_tracked(id)
+            && !crate::weakref_registry::may_have_weakrefs(id)
+            && !crate::capi_watchers::dicts_active()
+            && !crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+            && Self::is_scalar_leaf_container(v)
     }
 
     /// Module scope for the core loop's `LOAD_NAME` / `STORE_NAME` arms:
