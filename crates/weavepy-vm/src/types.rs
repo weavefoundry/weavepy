@@ -2031,7 +2031,10 @@ fn slot_key(name: &str) -> DictKey {
         let keys = KEYS.get_or_init(|| COMMON.map(crate::stdlib::sys::intern_name));
         return DictKey(keys[i].clone());
     }
-    DictKey(Object::Str(crate::shared_value::SharedStr::from(name)))
+    // Interned, as instance-dict keys are: a guard holding the interned
+    // name settles a slot's key by identity, and no instance allocates
+    // its own copy of the name.
+    DictKey(crate::stdlib::sys::intern_name(name))
 }
 
 impl SlotStorage {

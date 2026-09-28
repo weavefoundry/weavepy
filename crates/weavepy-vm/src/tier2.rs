@@ -3702,10 +3702,11 @@ fn scalar_field_update_plan(
         {
             return None;
         }
-        let AttrStorage::Indexed(index) = guard.storage else {
-            return None;
+        let current = match guard.storage {
+            AttrStorage::Indexed(index) => (guard.ver, index, false),
+            AttrStorage::Slot(index) => (guard.ver, index, true),
+            AttrStorage::NewKey => return None,
         };
-        let current = (guard.ver, index);
         if fingerprint.is_some_and(|old| old != current) {
             return None;
         }
@@ -3816,8 +3817,10 @@ unsafe fn native_scalar_field_update(
     }
     let plan = nc.scalar_update.as_deref()?;
     let guard = nc.attr_guards.get(plan.store_token)?;
-    let AttrStorage::Indexed(index) = guard.storage else {
-        return None;
+    let (index, slot_storage) = match guard.storage {
+        AttrStorage::Indexed(index) => (index, false),
+        AttrStorage::Slot(index) => (index, true),
+        AttrStorage::NewKey => return None,
     };
     let Object::Instance(inst) = receiver else {
         return None;
@@ -3850,6 +3853,22 @@ unsafe fn native_scalar_field_update(
             return None;
         }
     };
+    if slot_storage {
+        // SAFETY: as for the dictionary below.
+        let slots = unsafe { inst.slots.peek_mut() }?;
+        let (key, old) = slots.get_index(index as usize)?;
+        if !key_is(key, &guard.name) {
+            return None;
+        }
+        let Object::Int(old) = old else {
+            return None;
+        };
+        let value = old.checked_add(increment)?;
+        let (_, slot) = slots.get_index_mut(index as usize)?;
+        // An exact integer owns no destructor or GC edge.
+        *slot = Object::Int(value);
+        return Some(value);
+    }
     // SAFETY: no callback, allocation, or Python execution can overlap this
     // exclusive view. A shared cell is rejected by peek_mut.
     let dict = unsafe { inst.dict.get()?.peek_mut() }?;
@@ -5114,7 +5133,7 @@ unsafe fn pure_leaf_call(
         // SAFETY: as above.
         ptrs[offset + j] = unsafe { written.0.add(j) };
     }
-    let v = interp.pure_leaf_eval::<false>(code, func, &ptrs[..n])?;
+    let v = interp.pure_leaf_eval::<false, false>(code, func, &ptrs[..n])?;
     Some(deliver_call_result(jf, ctx, v, expect_tag))
 }
 
@@ -7527,7 +7546,11 @@ unsafe extern "C" fn wpjit_attr_get(frame: *mut JitFrame, pin: i64, site: i64) -
         };
         match g.storage {
             AttrStorage::Slot(key_idx) => {
-                let slots = inst.slots.borrow();
+                // SAFETY: a read between two native ops; nothing here
+                // runs code (see `GilCell::peek`).
+                let Some(slots) = (unsafe { inst.slots.peek() }) else {
+                    return 1;
+                };
                 let indexed = slots
                     .get_index(key_idx as usize)
                     .filter(|(key, _)| key_is(key, &g.name))
@@ -8140,10 +8163,12 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
             let mut dict = inst.dict_cell().borrow_mut();
             let atomic = v.is_gc_atomic();
             let dict = &mut *dict;
+            // Replacing an existing key's value leaves the key layout (and
+            // so the stamp) alone, as the interpreter's indexed store does.
             let dict = if atomic {
-                dict.map_mut_atomic_store()
+                dict.map_mut_unstamped()
             } else {
-                &mut **dict
+                dict.map_mut_value_store()
             };
             let Some((k, dst)) = dict.get_index_mut(key_idx as usize) else {
                 return 1;
