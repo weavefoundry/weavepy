@@ -130,7 +130,7 @@ pub(crate) struct Profiled;
 unsafe impl GlobalAlloc for Profiled {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: forwarded unchanged.
-        let p = unsafe { mimalloc::MiMalloc.alloc(layout) };
+        let p = unsafe { crate::alloc::Mimalloc.alloc(layout) };
         if ENABLED.load(Ordering::Relaxed) && !p.is_null() {
             sample(p as usize, layout.size());
         }
@@ -142,7 +142,7 @@ unsafe impl GlobalAlloc for Profiled {
             forget(ptr as usize);
         }
         // SAFETY: forwarded unchanged.
-        unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) }
+        unsafe { crate::alloc::Mimalloc.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -150,7 +150,7 @@ unsafe impl GlobalAlloc for Profiled {
             forget(ptr as usize);
         }
         // SAFETY: forwarded unchanged.
-        let p = unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) };
+        let p = unsafe { crate::alloc::Mimalloc.realloc(ptr, layout, new_size) };
         if ENABLED.load(Ordering::Relaxed) && !p.is_null() {
             sample(p as usize, new_size);
         }

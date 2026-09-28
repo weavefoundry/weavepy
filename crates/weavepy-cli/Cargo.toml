@@ -39,7 +39,7 @@ weavepy-compiler   = { workspace = true }
 weavepy-conformance = { workspace = true }
 weavepy-version    = { workspace = true }
 libc               = { workspace = true }
-mimalloc           = { workspace = true }
+libmimalloc-sys    = { workspace = true }
 anyhow             = { workspace = true }
 clap               = { workspace = true }
 serde_json         = { workspace = true }

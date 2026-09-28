@@ -36,12 +36,14 @@ use tracing_subscriber::EnvFilter;
 
 use weavepy::{InterpreterFlags, RunOptions};
 
+mod alloc;
+
 /// The process allocator. The interpreter allocates and frees small blocks
 /// constantly; mimalloc serves them from per-thread free lists, several
 /// times faster than the system allocator on macOS.
 #[cfg(not(all(feature = "alloc-profile", target_os = "macos")))]
 #[global_allocator]
-static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL_ALLOC: alloc::Mimalloc = alloc::Mimalloc;
 
 #[cfg(all(feature = "alloc-profile", target_os = "macos"))]
 mod alloc_profile;
