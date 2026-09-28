@@ -3101,7 +3101,7 @@ impl Interpreter {
             // unpickler temporary holding the memo) cascades through the
             // untracked `memo` dict to the tracked argument. The refcount guard
             // below still filters anything that stays externally reachable.
-            let mut child_ids: Vec<crate::weakref_registry::ObjectId> = Vec::new();
+            let mut children: Vec<std::sync::Arc<gc_trace::TrackedHandle>> = Vec::new();
             // Untracked descendants with live weakrefs: CPython clears an
             // object's weakrefs at refcount zero whether or not the GC ever
             // tracked it, but this cascade's "next link" set is (otherwise)
@@ -3124,10 +3124,30 @@ impl Interpreter {
             // (the argument tuple is anchored by a dead list/frame local).
             let mut pool_candidates: Vec<Object> = Vec::new();
             let mut scan_through: Vec<Object> = vec![obj.clone()];
-            let mut scanned: std::collections::HashSet<crate::weakref_registry::ObjectId> =
-                std::collections::HashSet::new();
+            let mut scanned: std::collections::HashSet<
+                crate::weakref_registry::ObjectId,
+                std::hash::BuildHasherDefault<crate::fasthash::ObjectIdHasher>,
+            > = std::collections::HashSet::default();
             while let Some(parent) = scan_through.pop() {
                 gc_trace::traverse_object(&parent, &mut |c| {
+                    // Scalars are never tracked, weakly referenced, or
+                    // anchors of anything; a deferred-tracking instance
+                    // holds only scalars and has no collector handle.
+                    // Neither can lead the cascade anywhere, which matters
+                    // for the commonest large death: a list of plain
+                    // objects falling out of scope.
+                    if gc_trace::is_atomic(c) {
+                        return;
+                    }
+                    if let Object::Instance(i) = c {
+                        if i.is_gc_deferred() && i.c_body.get() == 0 {
+                            let cid = crate::weakref_registry::id_of(c);
+                            if crate::weakref_registry::count_for(cid) > 0 && scanned.insert(cid) {
+                                weakref_candidates.push(c.clone());
+                            }
+                            return;
+                        }
+                    }
                     let cid = crate::weakref_registry::id_of(c);
                     if let Object::Tuple(t) = c {
                         if !t.is_empty()
@@ -3138,8 +3158,8 @@ impl Interpreter {
                             pool_candidates.push(c.clone());
                         }
                     }
-                    if gc_trace::is_tracked(cid) {
-                        child_ids.push(cid);
+                    if let Some(h) = gc_trace::find_handle(cid) {
+                        children.push(h);
                     } else if matches!(
                         c,
                         Object::Tuple(_)
@@ -3207,9 +3227,9 @@ impl Interpreter {
             }
             // Any tracked child that just lost its last program reference
             // is the next link in the chain.
-            for cid in child_ids {
-                if let Some(h) = gc_trace::find_handle(cid) {
-                    let weak = crate::weakref_registry::strong_clone_count(cid);
+            for h in children {
+                if !h.untracked.load(std::sync::atomic::Ordering::Acquire) {
+                    let weak = crate::weakref_registry::strong_clone_count(h.id);
                     // `h.object` is the GC's own strong reference; the
                     // child is dead iff nothing beyond that handle and its
                     // weakref clones still points at it.
@@ -4038,6 +4058,7 @@ impl Interpreter {
                     || *budget == 0
                     || c.is_gc_atomic()
                     || matches!(c, Object::Frame(f) if f.on_stack.get() > 0)
+                    || matches!(c, Object::Instance(i) if i.is_gc_deferred() && i.c_body.get() == 0)
                 {
                     return;
                 }
