@@ -216,10 +216,13 @@ pub struct JitHint {
     /// The tier-2 state has no further interest in this code's back
     /// edges (compiled, OSR budget spent).
     backedge_quiet: std::sync::atomic::AtomicBool,
-    /// The VM's pure-leaf verdict (0 not yet decided, 1 no, 2 yes),
-    /// mirrored here so native call sites read it without the VM
-    /// extension lookup.
+    /// The VM's pure-leaf verdict (0 not yet decided, 1 no, 2 yes, 3 an
+    /// effect leaf), mirrored here so native call sites read it without
+    /// the VM extension lookup.
     pure_leaf: std::sync::atomic::AtomicU8,
+    /// Consecutive leaf evaluations the VM abandoned (see
+    /// [`Self::note_leaf_miss`]).
+    leaf_misses: std::sync::atomic::AtomicU8,
 }
 
 impl JitHint {
@@ -277,9 +280,44 @@ impl JitHint {
     #[must_use]
     pub fn pure_leaf(&self) -> Option<bool> {
         match self.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) {
-            1 => Some(false),
+            1 | 3 => Some(false),
             2 => Some(true),
             _ => None,
+        }
+    }
+
+    /// Whether the VM decided the code is an *effect leaf*: a pure leaf
+    /// but for attribute stores (never a pure leaf itself).
+    #[must_use]
+    pub fn effect_leaf(&self) -> bool {
+        self.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) == 3
+    }
+
+    /// Record an effect-leaf verdict (see [`Self::effect_leaf`]).
+    pub fn set_effect_leaf(&self) {
+        self.pure_leaf
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Count one abandoned leaf evaluation. A long enough run of them
+    /// (a callee the evaluator never settles, a store that always
+    /// declines) withdraws the leaf verdict for good, so calls stop
+    /// paying for an attempt before their ordinary path.
+    pub fn note_leaf_miss(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = self.leaf_misses.load(Relaxed).saturating_add(1);
+        self.leaf_misses.store(n, Relaxed);
+        if n >= 64 {
+            self.pure_leaf.store(1, Relaxed);
+        }
+    }
+
+    /// A completed leaf evaluation ends a run of misses.
+    #[inline]
+    pub fn note_leaf_hit(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.leaf_misses.load(Relaxed) != 0 {
+            self.leaf_misses.store(0, Relaxed);
         }
     }
 

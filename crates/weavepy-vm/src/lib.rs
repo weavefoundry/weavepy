@@ -966,6 +966,10 @@ pub struct Interpreter {
     /// The registered leaf builtins (see [`leaf_builtins`]) as last
     /// snapshotted, with the registry generation they reflect.
     leaf_opaque: ThreadCell<(u64, leaf_builtins::LeafMap)>,
+    /// The core loop's last native iterator `__next__`, keyed by the
+    /// (process-unique) attribute version of the class that resolved it
+    /// (see [`Interpreter::core_leaf_next`]).
+    core_next: ThreadCell<Option<(u64, Rc<crate::object::BuiltinFn>)>>,
     /// `WP_DBG_SAMPLE`: periodic frame-entry sampling to stderr.
     dbg_sample: bool,
 }
@@ -1195,6 +1199,7 @@ impl Default for Interpreter {
             lean_pending: Vec::new(),
             leaf_fns: std::cell::OnceCell::new(),
             leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
+            core_next: ThreadCell::new(None),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
         };
         // RFC 0025: publish the shared parts of this interpreter
@@ -1321,6 +1326,7 @@ impl Interpreter {
             lean_pending: Vec::new(),
             leaf_fns: std::cell::OnceCell::new(),
             leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
+            core_next: ThreadCell::new(None),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
         }
     }
@@ -11884,11 +11890,12 @@ impl Interpreter {
                                             ) {
                                                 (Object::Instance(i), Some(ms)) => ms
                                                     .peek_fn(i.cls_raw().attr_version.get())
-                                                    .is_some_and(|fp| fn_is_pure_leaf(&*fp)),
+                                                    .is_some_and(|fp| fn_is_leaf(&*fp)),
                                                 _ => false,
                                             };
                                             if pure_site {
                                                 if let Some((v, call_pc)) = self.core_pure_method(
+                                                    ext,
                                                     code,
                                                     other,
                                                     pc + 1,
@@ -11923,9 +11930,13 @@ impl Interpreter {
                                                     continue;
                                                 }
                                             }
-                                            if let Some(v) =
-                                                Self::core_local_attr(code, other, pc + 1, next.arg)
-                                            {
+                                            if let Some(v) = Self::core_local_attr(
+                                                ext.map_or(&[], |t| &t.name_objs),
+                                                code,
+                                                other,
+                                                pc + 1,
+                                                next.arg,
+                                            ) {
                                                 base.add(len).write(v);
                                                 len += 1;
                                                 last = pc + 1;
@@ -12437,6 +12448,35 @@ impl Interpreter {
                         // SAFETY: `len > 0`.
                         let it = match unsafe { &*base.add(len - 1) } {
                             Object::Iter(it) => it,
+                            // A native iterator class's `__next__` (a registered
+                            // leaf builtin), called in place. Exhaustion goes to
+                            // the full arm, which asks again (a leaf iterator
+                            // stays exhausted) and ends the loop.
+                            obj @ Object::Instance(inst) => {
+                                let Some(b) = self.core_leaf_next(inst) else {
+                                    break None;
+                                };
+                                match (b.call)(std::slice::from_ref(obj)) {
+                                    Ok(v) => {
+                                        // SAFETY: `len < cap`.
+                                        unsafe { base.add(len).write(v) };
+                                        len += 1;
+                                        last = pc;
+                                        pc += 1;
+                                        continue;
+                                    }
+                                    Err(RuntimeError::PyException(exc))
+                                        if exc.type_name() == "StopIteration" =>
+                                    {
+                                        break None;
+                                    }
+                                    // As a raising call: the pc moves past it.
+                                    Err(e) => {
+                                        pc += 1;
+                                        break Some(CoreExit::Stop(LeafStop::Raised(e)));
+                                    }
+                                }
+                            }
                             // A generator resumes inline, switched to in place
                             // (the quiet loop's lean path when it declines).
                             Object::Generator(_) => {
@@ -12894,7 +12934,7 @@ impl Interpreter {
                             let ops = unsafe {
                                 std::slice::from_raw_parts(base.add(len - argc - 2), argc + 2)
                             };
-                            if matches!(&ops[0], Object::Function(f) if fn_is_pure_leaf(f)) {
+                            if matches!(&ops[0], Object::Function(f) if fn_is_leaf(f)) {
                                 if let Some(r) = self.core_pure_call(code, pc, ops, sw.depth_cell) {
                                     let start = len - argc - 2;
                                     // SAFETY: every operand was checked to leave
@@ -14418,7 +14458,9 @@ impl Interpreter {
         let f = unsafe { &*fp };
         // SAFETY: GIL-serialized raw read of the function's code cell.
         let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
-        if !code_is_pure_leaf(code_rc) || !pure_leaf_warm(code_rc) {
+        let pure = code_is_pure_leaf(code_rc);
+        let effect = !pure && code_is_effect_leaf(code_rc);
+        if !(pure || effect) || !pure_leaf_warm(code_rc) {
             return None;
         }
         let (missing, slot_self) = code_call_slot(code, call_pc)?.hit(fp, Rc::as_ptr(code_rc))?;
@@ -14444,7 +14486,11 @@ impl Interpreter {
         for (k, o) in f.defaults[f.defaults.len() - missing..].iter().enumerate() {
             args[nargs + k] = o;
         }
-        self.pure_leaf_eval::<false>(code_rc, f, &args[..total])
+        if effect {
+            self.pure_leaf_eval::<false, true>(code_rc, f, &args[..total])
+        } else {
+            self.pure_leaf_eval::<false, false>(code_rc, f, &args[..total])
+        }
     }
 
     /// The core loop's fused `LOAD_FAST x; LOAD_ATTR m (method); <simple
@@ -14458,6 +14504,7 @@ impl Interpreter {
     #[allow(clippy::too_many_arguments)]
     fn core_pure_method(
         &self,
+        ext: Option<&CodeConstObjects>,
         code: &CodeObject,
         recv: &Object,
         attr_pc: usize,
@@ -14498,10 +14545,25 @@ impl Interpreter {
             // SAFETY: a read with nothing running (see `GilCell::peek`).
             let d = unsafe { dict.peek() }?;
             if !d.is_empty() {
-                let probe = code_name_leaf_probe(code, name_idx)?;
-                if d.may_hold_str_hash(probe.hash) && (d.contains_key(&probe) || probe.saw_exotic())
-                {
-                    return None;
+                // The interned name and its hash, from the loaded table.
+                let idx = name_idx as usize;
+                let named =
+                    ext.and_then(|t| match (t.name_objs.get(idx), t.name_hashes.get(idx)) {
+                        (Some(Object::Str(n)), Some(h)) => Some((&**n, *h)),
+                        _ => None,
+                    });
+                let (name, hash) = match named {
+                    Some(nh) => nh,
+                    None => {
+                        let k = code_name_key(code, name_idx)?;
+                        (k.s, k.hash)
+                    }
+                };
+                if d.may_hold_str_hash(hash) {
+                    let probe = crate::object::LeafNameProbe::new(name, hash);
+                    if d.contains_key(&probe) || probe.saw_exotic() {
+                        return None;
+                    }
                 }
             }
         }
@@ -14575,7 +14637,9 @@ impl Interpreter {
         let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
         #[cfg(test)]
         note_predicate_stage(code_rc, 0);
-        if !code_is_pure_leaf(code_rc) || !pure_leaf_warm(code_rc) {
+        let pure = code_is_pure_leaf(code_rc);
+        let effect = !pure && code_is_effect_leaf(code_rc);
+        if !(pure || effect) || !pure_leaf_warm(code_rc) {
             return None;
         }
         #[cfg(test)]
@@ -14656,7 +14720,11 @@ impl Interpreter {
         for (k, o) in f.defaults[f.defaults.len() - missing..].iter().enumerate() {
             args[nargs + k] = o;
         }
-        self.pure_leaf_eval::<false>(code_rc, f, &args[..total])
+        if effect {
+            self.pure_leaf_eval::<false, true>(code_rc, f, &args[..total])
+        } else {
+            self.pure_leaf_eval::<false, false>(code_rc, f, &args[..total])
+        }
     }
 
     /// [`Self::core_pure_call`] for a `CALL_KW` at `pc`: `ops` is the
@@ -14735,10 +14803,11 @@ impl Interpreter {
                     .get(f.defaults.len().checked_sub(total - slot)?)?;
             }
         }
-        self.pure_leaf_eval::<false>(code_rc, f, &args[..total])
+        self.pure_leaf_eval::<false, false>(code_rc, f, &args[..total])
     }
 
-    /// Borrow a guarded instance-dictionary or slot cache hit.
+    /// Borrow a guarded instance-dictionary or slot cache hit. `names` is
+    /// the code's interned name objects (see [`slot_name_matches_in`]).
     ///
     /// # Safety
     ///
@@ -14747,6 +14816,7 @@ impl Interpreter {
     /// shared storage and conflicting mutable borrows.
     #[inline(always)]
     unsafe fn leaf_cached_instance_field<'a>(
+        names: &[Object],
         code: &CodeObject,
         inst: &'a PyInstance,
         cache_pc: u32,
@@ -14766,13 +14836,13 @@ impl Interpreter {
             // SAFETY: the caller keeps this rooted read callback-free.
             let dict = unsafe { inst.dict.get()?.peek() }?;
             let (key, value) = dict.get_index(key_idx as usize)?;
-            slot_name_matches(code, name_idx, key).then_some(value)
+            slot_name_matches_in(names, code, name_idx, key).then_some(value)
         } else {
             // SAFETY: the same rooted read as the dictionary path.
             let slots = unsafe { inst.slots.peek() }?;
             let indexed = slots
                 .get_index(key_idx as usize)
-                .filter(|(key, _)| slot_name_matches(code, name_idx, key))
+                .filter(|(key, _)| slot_name_matches_in(names, code, name_idx, key))
                 .map(|(_, value)| value);
             // Slot order can vary by instance or after deletion.
             let value = indexed.or_else(|| slots.get(code.names.get(name_idx as usize)?))?;
@@ -14795,22 +14865,48 @@ impl Interpreter {
 
     /// Evaluate a pure leaf's body (see [`code_is_pure_leaf`]) on borrowed
     /// arguments: operands are scalars or pointers to objects that stay
-    /// put (nothing here stores, calls, or runs Python code), so no
-    /// reference is taken until the returned value's. Loads take the core
-    /// loop's cache-hit paths; anything else — a miss, an operand shape
-    /// the scalar arms don't settle, an operation that could raise —
-    /// abandons the evaluation with `None`, having done nothing
-    /// observable.
-    #[inline(never)]
-    fn pure_leaf_eval<const GETTER: bool>(
+    /// put (nothing here runs Python code, and an effect leaf's stores
+    /// wait for its return), so no reference is taken until the returned
+    /// value's. Loads take the core loop's cache-hit paths, and a call
+    /// evaluates a pure-leaf callee the same way; anything else — a miss,
+    /// an operand shape the scalar arms don't settle, an operation that
+    /// could raise — abandons the evaluation with `None`, having done
+    /// nothing observable.
+    #[inline(always)]
+    fn pure_leaf_eval<const GETTER: bool, const EFFECT: bool>(
         &self,
         code: &CodeObject,
         f: &crate::object::PyFunction,
         args: &[*const Object],
     ) -> Option<Object> {
+        let r = self.leaf_eval::<GETTER, EFFECT>(code, f, args, 0);
+        if r.is_some() {
+            code.jit_hint.note_leaf_hit();
+        } else {
+            code.jit_hint.note_leaf_miss();
+        }
+        r
+    }
+
+    /// [`Self::pure_leaf_eval`] at call-nesting depth `nest` (a pure-leaf
+    /// callee of a leaf is evaluated one level down, to a small bound).
+    #[inline(never)]
+    fn leaf_eval<const GETTER: bool, const EFFECT: bool>(
+        &self,
+        code: &CodeObject,
+        f: &crate::object::PyFunction,
+        args: &[*const Object],
+        nest: u8,
+    ) -> Option<Object> {
         use weavepy_compiler::InlineCache as IC;
+        /// Nested leaf calls evaluated in place at most this deep.
+        const NEST: u8 = 3;
         #[derive(Clone, Copy)]
         enum V {
+            /// A resolved callee: a function the class or namespace holds.
+            Fn(*const crate::object::PyFunction),
+            /// A call's empty self slot.
+            Null,
             /// A heap object, borrowed.
             R(*const Object),
             I(i64),
@@ -14845,6 +14941,7 @@ impl Interpreter {
                     Object::Dict(d) => !unsafe { d.peek() }?.is_empty(),
                     _ => return None,
                 },
+                V::Fn(_) | V::Null => return None,
             })
         }
         // Both the decoded field shape and the general evaluator use
@@ -14893,6 +14990,39 @@ impl Interpreter {
             let start = usize::from(instrs.first()?.op == OpCode::Resume);
             let load = instrs.get(start)?;
             match shape {
+                16 if EFFECT => {
+                    // The setter: store, and return `None`. A declined
+                    // store touched nothing (the ordinary call runs it).
+                    // SAFETY (argument reads): the arguments stay live for
+                    // this evaluation.
+                    let arg = |k: u32| args.get(k as usize).map(|&p| unsafe { &*p });
+                    let (value, recv, store_pc) = match load.op {
+                        OpCode::LoadFastLoadFast | OpCode::LoadFastBorrowLoadFastBorrow => (
+                            clone_hot(arg(load.arg >> 4)?),
+                            arg(load.arg & 15)?,
+                            start + 1,
+                        ),
+                        op => {
+                            let value = match op {
+                                OpCode::LoadConst => clone_hot(consts.get(load.arg as usize)?),
+                                OpCode::LoadSmallInt => Object::Int(i64::from(load.arg)),
+                                _ => clone_hot(arg(load.arg)?),
+                            };
+                            (value, arg(instrs.get(start + 1)?.arg)?, start + 2)
+                        }
+                    };
+                    let Object::Instance(inst) = recv else {
+                        return None;
+                    };
+                    let store = instrs.get(store_pc)?;
+                    let value = std::mem::ManuallyDrop::new(value);
+                    // On `true` the value moved into the dict.
+                    if Self::core_store_attr(code, inst, store_pc, store.arg, &value) {
+                        return Some(Object::None);
+                    }
+                    drop(std::mem::ManuallyDrop::into_inner(value));
+                    return None;
+                }
                 3 => {
                     // SAFETY: the argument remains live for this evaluation.
                     return Some(clone_hot(unsafe { &**args.get(load.arg as usize)? }));
@@ -14908,7 +15038,13 @@ impl Interpreter {
                         // SAFETY: the argument roots the receiver until the
                         // result is retained; nothing here invokes Python.
                         if let Some(value) = unsafe {
-                            Self::leaf_cached_instance_field(code, inst, pc as u32, attr.arg)
+                            Self::leaf_cached_instance_field(
+                                &ext.name_objs,
+                                code,
+                                inst,
+                                pc as u32,
+                                attr.arg,
+                            )
                         } {
                             return Some(clone_hot(value));
                         }
@@ -14932,7 +15068,13 @@ impl Interpreter {
                         let attr = instrs.get(pc)?;
                         // SAFETY: the same rooted, callback-free read.
                         let value = unsafe {
-                            Self::leaf_cached_instance_field(code, inst, pc as u32, attr.arg)
+                            Self::leaf_cached_instance_field(
+                                &ext.name_objs,
+                                code,
+                                inst,
+                                pc as u32,
+                                attr.arg,
+                            )
                         }?;
                         #[cfg(test)]
                         note_predicate_stage(code, if load_pc == start { 6 } else { 7 });
@@ -14986,6 +15128,55 @@ impl Interpreter {
             n: 0,
         };
         let op: *mut Owned = &raw mut owned;
+        // An effect leaf's attribute stores, in order, until the return
+        // commits them: receiver, store pc, name index, value (all owned).
+        // Entries are only appended, so a value read back from one stays
+        // put while the evaluation runs.
+        const PENDING: usize = 6;
+        // The receiver is a stable location for the whole evaluation: an
+        // argument (rooted by the caller) or an owned-scratch clone.
+        type Store = (*const Object, u32, u32, Object);
+        struct Pending {
+            buf: [std::mem::MaybeUninit<Store>; PENDING],
+            n: usize,
+            /// Entries whose value the return moved into a dict.
+            moved: u8,
+        }
+        impl Pending {
+            fn get(&self, k: usize) -> &Store {
+                debug_assert!(k < self.n);
+                // SAFETY: the first `n` entries are initialized.
+                unsafe { self.buf[k].assume_init_ref() }
+            }
+            /// Whether entry `k` is the last store to its attribute.
+            fn latest(&self, k: usize) -> bool {
+                let (r0, _, n0, _) = self.get(k);
+                !(k + 1..self.n).any(|j| {
+                    let (r1, _, n1, _) = self.get(j);
+                    // SAFETY: stable receivers (see `Store`).
+                    n1 == n0 && unsafe { (**r1).is_same(&**r0) }
+                })
+            }
+        }
+        impl Drop for Pending {
+            fn drop(&mut self) {
+                for k in 0..self.n {
+                    // SAFETY: the first `n` entries are initialized; a
+                    // moved value is left in place, not dropped again.
+                    let (_, _, _, value) = unsafe { self.buf[k].assume_init_read() };
+                    if self.moved & (1 << k) == 0 {
+                        drop_hot(value);
+                    } else {
+                        std::mem::forget(value);
+                    }
+                }
+            }
+        }
+        let mut pend = Pending {
+            buf: [const { std::mem::MaybeUninit::uninit() }; PENDING],
+            n: 0,
+            moved: 0,
+        };
         let own = |v: Object| -> Option<V> {
             match v {
                 Object::Int(i) => Some(V::I(i)),
@@ -15024,17 +15215,57 @@ impl Interpreter {
                 st[sp]
             }};
         }
+        // Locals: an argument reads through its pointer until the body
+        // assigns it; any other local must be assigned before it's read.
+        const LOCALS: usize = 16;
+        let mut locs = [V::N; LOCALS];
+        let mut bound: u32 = 0;
+        macro_rules! local {
+            ($i:expr) => {{
+                let i = $i as usize;
+                if i < LOCALS && bound & (1 << i) != 0 {
+                    locs[i]
+                } else {
+                    norm(*args.get(i)?)
+                }
+            }};
+        }
+        macro_rules! set_local {
+            ($i:expr, $v:expr) => {{
+                let i = $i as usize;
+                if i >= LOCALS {
+                    return None;
+                }
+                locs[i] = $v;
+                bound |= 1 << i;
+            }};
+        }
         let mut pc = 0usize;
         loop {
             let ins = *instrs.get(pc)?;
             match ins.op {
                 OpCode::Resume | OpCode::Nop | OpCode::NotTaken => {}
                 OpCode::LoadFast | OpCode::LoadFastBorrow | OpCode::LoadFastCheck => {
-                    push!(norm(*args.get(ins.arg as usize)?));
+                    push!(local!(ins.arg));
                 }
                 OpCode::LoadFastLoadFast | OpCode::LoadFastBorrowLoadFastBorrow => {
-                    push!(norm(*args.get((ins.arg >> 4) as usize)?));
-                    push!(norm(*args.get((ins.arg & 15) as usize)?));
+                    push!(local!(ins.arg >> 4));
+                    push!(local!(ins.arg & 15));
+                }
+                OpCode::StoreFast => {
+                    let v = pop!();
+                    set_local!(ins.arg, v);
+                }
+                OpCode::StoreFastLoadFast => {
+                    let v = pop!();
+                    set_local!(ins.arg >> 4, v);
+                    push!(local!(ins.arg & 15));
+                }
+                OpCode::StoreFastStoreFast => {
+                    let v = pop!();
+                    set_local!(ins.arg >> 4, v);
+                    let w = pop!();
+                    set_local!(ins.arg & 15, w);
                 }
                 OpCode::LoadConst => push!(norm(consts.get(ins.arg as usize)?)),
                 OpCode::LoadSmallInt => push!(V::I(i64::from(ins.arg))),
@@ -15071,6 +15302,19 @@ impl Interpreter {
                     };
                     // SAFETY: as `norm`.
                     let recv = unsafe { &*p };
+                    if EFFECT && pend.n > 0 {
+                        // A buffered store to this attribute, the latest.
+                        let hit = (0..pend.n)
+                            .rev()
+                            .map(|k| pend.get(k))
+                            // SAFETY: stable receivers (see `Store`).
+                            .find(|(r, _, name, _)| *name == ins.arg && unsafe { (**r).is_same(recv) });
+                        if let Some((_, _, _, v)) = hit {
+                            push!(norm(v));
+                            pc += 1;
+                            continue;
+                        }
+                    }
                     let v = match recv {
                         Object::Instance(inst) => {
                             let cls = inst.cls_raw();
@@ -15080,7 +15324,13 @@ impl Interpreter {
                             // SAFETY: the receiver remains rooted by an
                             // argument or owned scratch; no Python runs.
                             let hit = unsafe {
-                                Self::leaf_cached_instance_field(code, inst, pc as u32, ins.arg)
+                                Self::leaf_cached_instance_field(
+                                    &ext.name_objs,
+                                    code,
+                                    inst,
+                                    pc as u32,
+                                    ins.arg,
+                                )
                             }
                             .map(std::ptr::from_ref);
                             match hit {
@@ -15225,8 +15475,129 @@ impl Interpreter {
                 OpCode::PopTop => {
                     let _ = pop!();
                 }
+                OpCode::PushNull => push!(V::Null),
+                OpCode::LoadGlobalPushNull => {
+                    // As `LOAD_GLOBAL`, then the call's empty self slot.
+                    let slot = stamps.get(pc)?;
+                    let gdict = f.globals.as_ptr();
+                    let gid = specialize::rc_id(&f.globals);
+                    // SAFETY (raw dict reads): nothing runs code here.
+                    let g_stamp = unsafe { (*gdict).mutation_stamp() };
+                    let hit = match code.caches.get(pc as u32) {
+                        IC::LoadGlobalModule {
+                            globals_id,
+                            key_idx,
+                        } if globals_id == gid && slot.get() == [gid, g_stamp, 0] => unsafe {
+                            (*gdict).get_index(key_idx as usize)
+                        },
+                        _ => return None,
+                    };
+                    push!(norm(hit?.1));
+                    push!(V::Null);
+                }
+                OpCode::LoadMethodAttr => {
+                    // A method off the site's slot: the function under
+                    // the receiver, or a class's function with an empty
+                    // self slot (as the core loop's arm).
+                    let V::R(p) = pop!() else {
+                        return None;
+                    };
+                    let ms = code_method_slot(code, pc as u32)?;
+                    // SAFETY: as `norm`.
+                    match unsafe { &*p } {
+                        Object::Instance(inst) => {
+                            let cls = inst.cls_raw();
+                            if !Self::default_getattribute(cls) {
+                                return None;
+                            }
+                            let fp = ms.peek_fn(cls.attr_version.get())?;
+                            // The instance dict must not shadow the method.
+                            if let Some(dict) = inst.dict.get() {
+                                // SAFETY: a read with nothing running.
+                                let d = unsafe { dict.peek() }?;
+                                let idx = ins.arg as usize;
+                                let (Some(Object::Str(name)), Some(&hash)) =
+                                    (ext.name_objs.get(idx), ext.name_hashes.get(idx))
+                                else {
+                                    return None;
+                                };
+                                if !d.is_empty() && d.may_hold_str_hash(hash) {
+                                    let probe = crate::object::LeafNameProbe::new(name, hash);
+                                    if d.contains_key(&probe) || probe.saw_exotic() {
+                                        return None;
+                                    }
+                                }
+                            }
+                            push!(V::Fn(fp));
+                            push!(V::R(p));
+                        }
+                        Object::Type(cls) => {
+                            push!(V::Fn(ms.peek_unbound(cls.attr_version.get())?));
+                            push!(V::Null);
+                        }
+                        _ => return None,
+                    }
+                }
+                OpCode::Call => {
+                    // A pure-leaf callee, evaluated in place: only while
+                    // no store is buffered (it would not see one).
+                    let argc = ins.arg as usize;
+                    if (EFFECT && pend.n > 0) || nest >= NEST || sp < argc + 2 {
+                        return None;
+                    }
+                    let at = sp - argc - 2;
+                    let fp = match st[at] {
+                        V::Fn(fp) => fp,
+                        // SAFETY: as `norm`.
+                        V::R(p) => match unsafe { &*p } {
+                            Object::Function(func) => Rc::as_ptr(func),
+                            _ => return None,
+                        },
+                        _ => return None,
+                    };
+                    // SAFETY: the class or the namespace holds the callee,
+                    // and nothing here runs code that could release it.
+                    let callee = unsafe { &*fp };
+                    // SAFETY: GIL-serialized raw read of the code cell.
+                    let ccode: &Rc<CodeObject> = unsafe { &*callee.code.as_ptr() };
+                    let first = if matches!(st[at + 1], V::Null) {
+                        at + 2
+                    } else {
+                        at + 1
+                    };
+                    let n = sp - first;
+                    if !code_is_pure_leaf(ccode)
+                        || !Self::lean_code_ok(ccode)
+                        || n != ccode.arg_count as usize
+                        || n > 8
+                        || crate::recursion::current_depth() + usize::from(nest) + 1
+                            >= crate::recursion::recursion_limit()
+                    {
+                        return None;
+                    }
+                    // Scalar arguments are staged as objects (no drop glue).
+                    let mut staged = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
+                    let mut ptrs = [std::ptr::null::<Object>(); 8];
+                    for k in 0..n {
+                        let o = match st[first + k] {
+                            V::R(p) => {
+                                ptrs[k] = p;
+                                continue;
+                            }
+                            V::I(i) => Object::Int(i),
+                            V::F(x) => Object::Float(x),
+                            V::B(b) => Object::Bool(b),
+                            V::N => Object::None,
+                            V::Fn(_) | V::Null => return None,
+                        };
+                        ptrs[k] = staged[k].write(o);
+                    }
+                    let r = self.leaf_eval::<false, false>(ccode, callee, &ptrs[..n], nest + 1)?;
+                    sp = at;
+                    push!(own(r)?);
+                }
                 OpCode::ReturnValue => {
-                    return Some(match pop!() {
+                    let r = match pop!() {
                         // SAFETY: as `norm` (an owned value is cloned before
                         // its holder drops).
                         V::R(p) => clone_hot(unsafe { &*p }),
@@ -15234,7 +15605,82 @@ impl Interpreter {
                         V::F(x) => Object::Float(x),
                         V::B(b) => Object::Bool(b),
                         V::N => Object::None,
-                    });
+                        V::Fn(_) | V::Null => return None,
+                    };
+                    if EFFECT && pend.n > 0 {
+                        // The latest store to each attribute is the one
+                        // that lands; every one of them must go through
+                        // before any does (a decline touched nothing, and
+                        // the ordinary call runs the body instead). A
+                        // lone store is its own check: it declines whole.
+                        if pend.n > 1 {
+                            for k in 0..pend.n {
+                                if !pend.latest(k) {
+                                    continue;
+                                }
+                                let (rp, spc, name, _) = pend.get(k);
+                                // SAFETY: stable receivers (see `Store`).
+                                let Object::Instance(inst) = (unsafe { &**rp }) else {
+                                    return None;
+                                };
+                                if !Self::core_store_attr_ready(code, inst, *spc as usize, *name) {
+                                    return None;
+                                }
+                            }
+                        }
+                        let n = pend.n;
+                        for k in 0..n {
+                            if !pend.latest(k) {
+                                continue;
+                            }
+                            let (rp, spc, name, value) = pend.get(k);
+                            // SAFETY: stable receivers (see `Store`).
+                            let Object::Instance(inst) = (unsafe { &**rp }) else {
+                                return None;
+                            };
+                            // On `true` the value moved into the dict.
+                            if Self::core_store_attr(code, inst, *spc as usize, *name, value) {
+                                pend.moved |= 1 << k;
+                            } else if n == 1 {
+                                // The lone store declined, untouched.
+                                return None;
+                            } else {
+                                debug_assert!(false, "a ready store declined");
+                            }
+                        }
+                    }
+                    return Some(r);
+                }
+                OpCode::StoreAttr if EFFECT => {
+                    let V::R(rp) = pop!() else {
+                        return None;
+                    };
+                    // SAFETY: as `norm`.
+                    let recv = unsafe { &*rp };
+                    if !matches!(recv, Object::Instance(_)) || pend.n == PENDING {
+                        return None;
+                    }
+                    let value = match pop!() {
+                        // SAFETY: as `norm`.
+                        V::R(p) => clone_hot(unsafe { &*p }),
+                        V::I(i) => Object::Int(i),
+                        V::F(x) => Object::Float(x),
+                        V::B(b) => Object::Bool(b),
+                        V::N => Object::None,
+                        V::Fn(_) | V::Null => return None,
+                    };
+                    // An argument receiver is used in place; any other
+                    // (a field's value) is held by the owned scratch.
+                    let rp = if args.iter().any(|&a| std::ptr::eq(a, rp)) {
+                        rp
+                    } else {
+                        let V::R(held) = own(clone_hot(recv))? else {
+                            return None;
+                        };
+                        held
+                    };
+                    pend.buf[pend.n].write((rp, pc as u32, ins.arg, value));
+                    pend.n += 1;
                 }
                 _ => return None,
             }
@@ -15804,6 +16250,7 @@ impl Interpreter {
     /// code), anything else through [`Self::leaf_fused_local_attr`].
     #[inline(never)]
     fn core_local_attr(
+        names: &[Object],
         code: &CodeObject,
         local: &Object,
         attr_pc: usize,
@@ -15820,7 +16267,7 @@ impl Interpreter {
             // SAFETY: a read between two instructions (see `peek`).
             let d = unsafe { inst.dict.get()?.peek() }?;
             let (k, v) = d.get_index(key_idx as usize)?;
-            return slot_name_matches(code, name_idx, k).then(|| Self::clone_operand(v));
+            return slot_name_matches_in(names, code, name_idx, k).then(|| Self::clone_operand(v));
         }
         Self::leaf_fused_local_attr(code, local, attr_pc, name_idx)
     }
@@ -15984,6 +16431,62 @@ impl Interpreter {
                 Self::core_store_new_attr(code, inst, cls, attr_pc, name_idx, ver, value)
             }
             _ => false,
+        }
+    }
+
+    /// Whether [`Self::core_store_attr`] would perform this store right
+    /// now (it declines exactly when this is `false`), touching nothing:
+    /// an effect leaf validates every buffered store before committing
+    /// any of them.
+    fn core_store_attr_ready(
+        code: &CodeObject,
+        inst: &PyInstance,
+        attr_pc: usize,
+        name_idx: u32,
+    ) -> bool {
+        use weavepy_compiler::InlineCache as IC;
+        let cls = inst.cls_raw();
+        let ver = match code.caches.get(attr_pc as u32) {
+            IC::StoreAttrInstance { ver, .. } | IC::StoreAttrNewKey { ver } => ver,
+            _ => return false,
+        };
+        if cls.native_kind.get() != 0
+            || cls.attr_version.get() != ver
+            || crate::capi_watchers::dicts_active()
+        {
+            return false;
+        }
+        match code.caches.get(attr_pc as u32) {
+            IC::StoreAttrInstance { key_idx, .. } => {
+                // SAFETY: an unused view with nothing running (the store's
+                // own `peek_mut` condition: no borrow at all).
+                let Some(d) = inst.dict.get().and_then(|d| unsafe { d.peek_mut() }) else {
+                    return false;
+                };
+                matches!(d.get_index(key_idx as usize), Some((k, old))
+                    if slot_name_matches(code, name_idx, k) && Self::core_droppable(old))
+            }
+            _ => {
+                // No dictionary yet: the store creates it and inserts.
+                let Some(dict) = inst.dict.get() else {
+                    return true;
+                };
+                let Some(probe) = code_name_leaf_probe(code, name_idx) else {
+                    return false;
+                };
+                // SAFETY: as above.
+                let Some(d) = (unsafe { dict.peek_mut() }) else {
+                    return false;
+                };
+                let found = d.get_index_of(&probe);
+                if probe.saw_exotic() {
+                    return false;
+                }
+                found.is_none_or(|i| {
+                    d.get_index(i)
+                        .is_some_and(|(_, old)| Self::core_droppable(old))
+                })
+            }
         }
     }
 
@@ -18227,6 +18730,27 @@ impl Interpreter {
 
     /// Which leaf builtin `b` is, if any (pointer identity).
     #[inline]
+    /// `inst`'s class's `__next__` when it is a registered leaf builtin
+    /// that binds its instance (the core loop's native iterators).
+    fn core_leaf_next(&self, inst: &PyInstance) -> Option<Rc<crate::object::BuiltinFn>> {
+        let ver = inst.cls_raw().attr_version.get();
+        if let Some((v, b)) = &*self.core_next.borrow() {
+            if *v == ver {
+                return Some(b.clone());
+            }
+        }
+        match inst.cls().lookup("__next__")? {
+            Object::Builtin(b)
+                if b.binds_instance
+                    && matches!(self.leaf_call_kind(&b), Some(LeafKind::Opaque)) =>
+            {
+                *self.core_next.borrow_mut() = Some((ver, b.clone()));
+                Some(b)
+            }
+            _ => None,
+        }
+    }
+
     fn leaf_call_kind(&self, b: &Rc<crate::object::BuiltinFn>) -> Option<LeafKind> {
         let p = Rc::as_ptr(b) as usize;
         if let Some(k) = self.leaf_fns().calls.get(&p) {
@@ -18683,7 +19207,7 @@ impl Interpreter {
         // Getter mode additionally validates metaclasses and module overrides;
         // ordinary pure-call evaluation avoids these extra checks.
         let _ = code_is_pure_leaf(&fcode);
-        self.pure_leaf_eval::<true>(&fcode, &f, &args[..nargs])
+        self.pure_leaf_eval::<true, false>(&fcode, &f, &args[..nargs])
     }
 
     /// The cache-free half of [`Self::leaf_load_attr_recv`]: the site's
@@ -21387,8 +21911,13 @@ impl Interpreter {
                     },
                     Object::Instance(_) => {
                         // Call __next__; treat StopIteration as exhaustion.
-                        match instance_method(&it_obj, "__next__") {
-                            Some(m) => match self.call(&m, &[], &[], &frame.globals) {
+                        let next = match instance_native_dunder(&it_obj, "__next__", None) {
+                            Some(r) => Some(r),
+                            None => instance_method(&it_obj, "__next__")
+                                .map(|m| self.call(&m, &[], &[], &frame.globals)),
+                        };
+                        match next {
+                            Some(r) => match r {
                                 Ok(v) => Some(v),
                                 Err(RuntimeError::PyException(exc))
                                     if exc.type_name() == "StopIteration" =>
@@ -28201,6 +28730,9 @@ impl Interpreter {
         // `len(x)` is `type(x).__len__(x)` — for an *instance* that's the
         // class's method; for a *class* it's the metaclass's
         // (`len(SomeEnum)` → `EnumType.__len__`).
+        if let Some(r) = instance_native_dunder(v, "__len__", None) {
+            return coerce_len_result(r?).map(Object::Int);
+        }
         let method = instance_method(v, "__len__").or_else(|| metaclass_method(v, "__len__"));
         if let Some(method) = method {
             let r = self.call(&method, &[], &[], globals)?;
@@ -29110,8 +29642,18 @@ impl Interpreter {
                     "NotImplemented should not be used in a boolean context",
                 ));
             }
-            if let Some(method) = instance_method(v, "__bool__") {
-                let r = self.call(&method, &[], &[], globals)?;
+            let native = instance_native_dunder(v, "__bool__", None);
+            let method = if native.is_none() {
+                instance_method(v, "__bool__")
+            } else {
+                None
+            };
+            if native.is_some() || method.is_some() {
+                let r = match (native, method) {
+                    (Some(r), _) => r?,
+                    (None, Some(method)) => self.call(&method, &[], &[], globals)?,
+                    (None, None) => unreachable!("checked above"),
+                };
                 // CPython's `slot_nb_bool` is strict: anything but an exact
                 // bool — even an int — raises (`__bool__` returning `1` is a
                 // TypeError, test_bool `test_convert_to_bool`).
@@ -29122,6 +29664,9 @@ impl Interpreter {
                         other.type_name()
                     ))),
                 };
+            }
+            if let Some(r) = instance_native_dunder(v, "__len__", None) {
+                return coerce_len_result(r?).map(|n| n != 0);
             }
             if let Some(method) = instance_method(v, "__len__") {
                 let r = self.call(&method, &[], &[], globals)?;
@@ -32827,6 +33372,17 @@ impl Interpreter {
                 Err(e) => Err(e),
             },
             Object::Instance(inst) => {
+                if let Some(r) = instance_native_dunder(iter, "__next__", None) {
+                    return match r {
+                        Ok(v) => Ok(Some(v)),
+                        Err(RuntimeError::PyException(exc))
+                            if exc.type_name() == "StopIteration" =>
+                        {
+                            Ok(None)
+                        }
+                        Err(e) => Err(e),
+                    };
+                }
                 if let Some(method) = instance_method(iter, "__next__") {
                     match self.call(&method, &[], &[], globals) {
                         Ok(v) => Ok(Some(v)),
@@ -48223,7 +48779,7 @@ impl Interpreter {
                 for (p, v) in ptrs.iter_mut().zip(&locals[..nargs]) {
                     *p = v;
                 }
-                if let Some(v) = self.pure_leaf_eval::<false>(&code, f, &ptrs[..nargs]) {
+                if let Some(v) = self.pure_leaf_eval::<false, false>(&code, f, &ptrs[..nargs]) {
                     self.recycle_scratch(locals);
                     return Ok(v);
                 }
@@ -56736,6 +57292,43 @@ pub(crate) fn callable_function_str(callable: &Object) -> Option<String> {
     }
 }
 
+/// `type(obj).<name>(obj, arg?)` for an instance whose class resolves the
+/// dunder `name` to a native builtin that binds its instance: the
+/// builtin's body, called directly (no bound method, no general call).
+/// `None`, with nothing done, for any other resolution (a Python method, a
+/// descriptor, an interpreter-aware builtin) or while a profiler or tracer
+/// could observe the call; the caller then takes its ordinary path.
+fn instance_native_dunder(
+    obj: &Object,
+    name: &str,
+    arg: Option<&Object>,
+) -> Option<Result<Object, RuntimeError>> {
+    let Object::Instance(inst) = obj else {
+        return None;
+    };
+    if crate::trace::any_observers_active() {
+        return None;
+    }
+    let Object::Builtin(b) = inst.cls().lookup(name)? else {
+        return None;
+    };
+    if !b.binds_instance || builtin_needs_interp(b.name) {
+        return None;
+    }
+    let pair;
+    let args: &[Object] = match arg {
+        Some(a) => {
+            pair = [obj.clone(), a.clone()];
+            &pair
+        }
+        None => std::slice::from_ref(obj),
+    };
+    Some(match b.call_kw.as_ref() {
+        Some(ckw) => ckw(args, &[]),
+        None => (b.call)(args),
+    })
+}
+
 pub(crate) fn instance_method(obj: &Object, name: &str) -> Option<Object> {
     let inst = match obj {
         Object::Instance(i) => i.clone(),
@@ -61623,7 +62216,7 @@ fn code_is_pure_leaf(code: &CodeObject) -> bool {
         return false;
     };
     match ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => false,
+        1 | 16 => false,
         2..=7 => true,
         _ => code_pure_leaf_decide(code, ext),
     }
@@ -61634,7 +62227,7 @@ fn code_is_pure_leaf(code: &CodeObject) -> bool {
 #[inline(never)]
 fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    let ok = !code.is_generator
+    let structural = !code.is_generator
         && !code.is_coroutine
         && !code.is_async_generator
         && !code.is_iterable_coroutine
@@ -61645,40 +62238,58 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
         && !code.has_varkeywords
         && code.kwonly_count == 0
         && code.arg_count <= 8
-        && code.varnames.len() == code.arg_count as usize
+        && code.varnames.len() <= 16
         && code.exception_table.is_empty()
-        && code.instructions.len() <= 64
-        && code.instructions.iter().all(|i| {
-            matches!(
-                i.op,
-                OpCode::Resume
-                    | OpCode::Nop
-                    | OpCode::NotTaken
-                    | OpCode::LoadFast
-                    | OpCode::LoadFastBorrow
-                    | OpCode::LoadFastCheck
-                    | OpCode::LoadFastLoadFast
-                    | OpCode::LoadFastBorrowLoadFastBorrow
-                    | OpCode::LoadConst
-                    | OpCode::LoadSmallInt
-                    | OpCode::LoadGlobal
-                    | OpCode::LoadAttr
-                    | OpCode::CompareOp
-                    | OpCode::IsOp
-                    | OpCode::ToBool
-                    | OpCode::UnaryOp
-                    | OpCode::PopJumpIfFalse
-                    | OpCode::PopJumpIfTrue
-                    | OpCode::PopJumpIfNone
-                    | OpCode::PopJumpIfNotNone
-                    | OpCode::JumpForward
-                    | OpCode::BinaryOp
-                    | OpCode::CopyTop
-                    | OpCode::Swap
-                    | OpCode::PopTop
-                    | OpCode::ReturnValue
-            )
-        });
+        && code.instructions.len() <= 64;
+    let pure_op = |op: OpCode| {
+        matches!(
+            op,
+            OpCode::Resume
+                | OpCode::Nop
+                | OpCode::NotTaken
+                | OpCode::LoadFast
+                | OpCode::LoadFastBorrow
+                | OpCode::LoadFastCheck
+                | OpCode::StoreFast
+                | OpCode::StoreFastLoadFast
+                | OpCode::StoreFastStoreFast
+                | OpCode::LoadGlobalPushNull
+                | OpCode::PushNull
+                | OpCode::LoadMethodAttr
+                | OpCode::Call
+                | OpCode::LoadFastLoadFast
+                | OpCode::LoadFastBorrowLoadFastBorrow
+                | OpCode::LoadConst
+                | OpCode::LoadSmallInt
+                | OpCode::LoadGlobal
+                | OpCode::LoadAttr
+                | OpCode::CompareOp
+                | OpCode::IsOp
+                | OpCode::ToBool
+                | OpCode::UnaryOp
+                | OpCode::PopJumpIfFalse
+                | OpCode::PopJumpIfTrue
+                | OpCode::PopJumpIfNone
+                | OpCode::PopJumpIfNotNone
+                | OpCode::JumpForward
+                | OpCode::BinaryOp
+                | OpCode::CopyTop
+                | OpCode::Swap
+                | OpCode::PopTop
+                | OpCode::ReturnValue
+        )
+    };
+    let ok = structural && code.instructions.iter().all(|i| pure_op(i.op));
+    // An effect leaf: a pure leaf but for attribute stores, which its
+    // evaluation buffers and commits at the return (see
+    // `Interpreter::pure_leaf_eval`).
+    let effect = !ok
+        && structural
+        && code
+            .instructions
+            .iter()
+            .all(|i| pure_op(i.op) || i.op == OpCode::StoreAttr)
+        && code.instructions.iter().any(|i| i.op == OpCode::StoreAttr);
     let shape = if ok {
         let body = code.instructions.as_slice();
         let body = if body.first().is_some_and(|i| i.op == OpCode::Resume) {
@@ -61721,9 +62332,70 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
     } else {
         1
     };
+    // An effect leaf's one fast shape: the setter, `self.x = <argument,
+    // constant or small int>; return None`.
+    let shape = if effect && effect_setter_shape(code) {
+        16
+    } else {
+        shape
+    };
     ext.pure_leaf.store(shape, Relaxed);
-    code.jit_hint.set_pure_leaf(ok);
+    if effect {
+        code.jit_hint.set_effect_leaf();
+    } else {
+        code.jit_hint.set_pure_leaf(ok);
+    }
     ok
+}
+
+/// Whether an effect leaf's body is the setter shape (`16`, see
+/// `Interpreter::pure_leaf_eval`): one attribute store of an argument,
+/// constant or small int into an argument, then `return None`.
+fn effect_setter_shape(code: &CodeObject) -> bool {
+    let body = code.instructions.as_slice();
+    let body = match body.first() {
+        Some(i) if i.op == OpCode::Resume => &body[1..],
+        _ => body,
+    };
+    let local = |op| {
+        matches!(
+            op,
+            OpCode::LoadFast | OpCode::LoadFastBorrow | OpCode::LoadFastCheck
+        )
+    };
+    let tail = match body {
+        [pair, rest @ ..]
+            if matches!(
+                pair.op,
+                OpCode::LoadFastLoadFast | OpCode::LoadFastBorrowLoadFastBorrow
+            ) =>
+        {
+            rest
+        }
+        [value, recv, rest @ ..]
+            if (local(value.op)
+                || matches!(value.op, OpCode::LoadConst | OpCode::LoadSmallInt))
+                && local(recv.op) =>
+        {
+            rest
+        }
+        _ => return false,
+    };
+    matches!(tail, [store, none, ret]
+        if store.op == OpCode::StoreAttr
+            && none.op == OpCode::LoadConst
+            && matches!(code.constants.get(none.arg as usize), Some(Constant::None))
+            && ret.op == OpCode::ReturnValue)
+}
+
+/// Whether `code` is an *effect leaf* (see `code_pure_leaf_decide`),
+/// deciding its leaf verdicts on first use.
+#[inline]
+fn code_is_effect_leaf(code: &CodeObject) -> bool {
+    if code.jit_hint.pure_leaf().is_none() {
+        code_is_pure_leaf(code);
+    }
+    code.jit_hint.effect_leaf()
 }
 
 /// Whether the instructions from `pc` could open a simple call's
@@ -61759,6 +62431,15 @@ fn pure_leaf_warm(code: &CodeObject) -> bool {
     }
     let _ = code;
     true
+}
+
+/// Whether `f`'s code is a pure or an effect leaf (the core loop's
+/// frameless call candidates).
+#[inline(always)]
+fn fn_is_leaf(f: &crate::object::PyFunction) -> bool {
+    // SAFETY: as in `fn_is_pure_leaf`.
+    let code = unsafe { &*f.code.as_ptr() };
+    code_is_pure_leaf(code) || code.jit_hint.effect_leaf()
 }
 
 /// Whether function `f`'s current code is a pure leaf (see
@@ -61863,10 +62544,18 @@ fn code_const_objects(code: &CodeObject) -> &[Object] {
 /// needed the interpreter): does dict key `key` name `co_names[name_idx]`?
 #[inline]
 fn slot_name_matches(code: &CodeObject, name_idx: u32, key: &DictKey) -> bool {
+    let names: &[Object] = code_vm_ext(code).map_or(&[], |t| &t.name_objs);
+    slot_name_matches_in(names, code, name_idx, key)
+}
+
+/// [`slot_name_matches`] with the code's interned name objects already
+/// in hand (`code_vm_ext(code).name_objs`, or empty).
+#[inline(always)]
+fn slot_name_matches_in(names: &[Object], code: &CodeObject, name_idx: u32, key: &DictKey) -> bool {
     let Object::Str(s) = &key.0 else {
         return false;
     };
-    if let Some(Object::Str(n)) = code_name_obj(code, name_idx) {
+    if let Some(Object::Str(n)) = names.get(name_idx as usize) {
         if SharedStr::ptr_eq(n, s) {
             return true;
         }
@@ -65239,7 +65928,7 @@ assert loop(2000) == 1999000
                     let args = [std::ptr::from_ref(receiver); 2];
                     eprintln!(
                         "  direct evaluator: {:?}, class_version={}, native_kind={}",
-                        interp.pure_leaf_eval::<false>(&code, function, &args),
+                        interp.pure_leaf_eval::<false, false>(&code, function, &args),
                         inst.cls_raw().attr_version.get(),
                         inst.cls_raw().native_kind.get()
                     );

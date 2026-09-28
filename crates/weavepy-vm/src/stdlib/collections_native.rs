@@ -35,7 +35,6 @@ use crate::sync::RefCell;
 use crate::error::{index_error, runtime_error, stop_iteration, type_error, RuntimeError};
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
-use crate::types::PyInstance;
 
 /// The receiver must be a deque instance (any class whose `_data` slot
 /// is the backing list). CPython's method descriptor rejects a foreign
@@ -172,13 +171,6 @@ fn receiver<'a>(args: &'a [Object], method: &str) -> Result<DequeState<'a>, Runt
 
 /// Read-only helper for the iterator paths that still address the
 /// instance directly.
-fn head(inst: &PyInstance) -> usize {
-    match inst.slot_get("_head") {
-        Some(Object::Int(h)) if h >= 0 => h as usize,
-        _ => 0,
-    }
-}
-
 fn popleft_locked(st: &mut DequeState<'_>, d: &mut Vec<Object>) -> Result<Object, RuntimeError> {
     let mut h = st.head();
     if h >= d.len() {
@@ -464,39 +456,70 @@ fn deque_reverse_iterator_next(args: &[Object]) -> Result<Object, RuntimeError> 
     deque_next(args, true)
 }
 
+// The iterator classes' slot positions as their `__init__` assigns them
+// (hints, like the deque's own).
+const IT_DEQ: usize = 0;
+const IT_INDEX: usize = 1;
+const IT_STATE: usize = 2;
+
 fn deque_next(args: &[Object], reverse: bool) -> Result<Object, RuntimeError> {
     let [Object::Instance(iterator)] = args else {
         return Err(type_error("deque iterator __next__ requires one iterator"));
     };
-    let deque = match iterator.slot_get("_deq") {
-        Some(Object::Instance(deque)) => deque,
-        Some(Object::None) => return Err(stop_iteration()),
-        _ => return Err(type_error("deque iterator expected")),
+    let (deque, index, it_state) = {
+        let s = iterator.slots.borrow();
+        let deque = match s.get_hinted(IT_DEQ, "_deq") {
+            Some(Object::Instance(deque)) => deque.clone(),
+            Some(Object::None) => return Err(stop_iteration()),
+            _ => return Err(type_error("deque iterator expected")),
+        };
+        (
+            deque,
+            s.get_hinted(IT_INDEX, "_index").and_then(Object::as_i64),
+            s.get_hinted(IT_STATE, "_deq_state")
+                .and_then(Object::as_i64),
+        )
     };
-    let Some(Object::List(data)) = deque.slot_get("_data") else {
-        return Err(type_error("deque expected"));
+    let (data, h, state) = {
+        let s = deque.slots.borrow();
+        let Some(Object::List(data)) = s.get_hinted(SLOT_DATA, "_data") else {
+            return Err(type_error("deque expected"));
+        };
+        (
+            data.clone(),
+            head_of(&s),
+            s.get_hinted(SLOT_STATE, "_state").and_then(Object::as_i64),
+        )
     };
     // Serialize the state check, cursor advance, and item read with deque
     // end operations, including simultaneous next() calls under gil=0.
     // The local deque reference outlives the guard, so clearing _deq can't
     // finalize its items while the backing list is borrowed.
     let d = data.borrow();
-    if deque.slot_get("_state").and_then(|s| s.as_i64())
-        != iterator.slot_get("_deq_state").and_then(|s| s.as_i64())
-    {
+    if state != it_state {
         iterator.slot_set("_deq", Object::None);
         return Err(runtime_error("deque mutated during iteration"));
     }
-    let h = head(&deque).min(d.len());
-    let index = iterator
-        .slot_get("_index")
-        .and_then(|i| i.as_i64())
-        .ok_or_else(|| type_error("invalid deque iterator index"))?;
+    let h = h.min(d.len());
+    let index = index.ok_or_else(|| type_error("invalid deque iterator index"))?;
     if index < 0 || index as usize >= d.len() - h {
         iterator.slot_set("_deq", Object::None);
         return Err(stop_iteration());
     }
-    iterator.slot_set("_index", Object::Int(index + 1));
+    let advanced = match iterator
+        .slots
+        .borrow_mut()
+        .get_hinted_mut(IT_INDEX, "_index")
+    {
+        Some(slot) => {
+            *slot = Object::Int(index + 1);
+            true
+        }
+        None => false,
+    };
+    if !advanced {
+        iterator.slot_set("_index", Object::Int(index + 1));
+    }
     let slot = if reverse {
         d.len() - 1 - index as usize
     } else {
