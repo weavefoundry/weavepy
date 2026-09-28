@@ -4059,6 +4059,10 @@ pub struct DictData {
     /// value (every `DerefMut`) tracks the owner first; the owner clears
     /// it when it is tracked by other means or dies.
     deferred_owner: std::sync::atomic::AtomicUsize,
+    /// A one-bit-per-hash-class summary of the `str` keys (see
+    /// [`Self::may_hold_str_hash`]); `0` until built, and reset by every
+    /// access that stamps.
+    key_filter: std::sync::atomic::AtomicU64,
 }
 
 impl Clone for DictData {
@@ -4067,6 +4071,7 @@ impl Clone for DictData {
             map: self.map.clone(),
             stamp: self.stamp,
             deferred_owner: std::sync::atomic::AtomicUsize::new(0),
+            key_filter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -4078,6 +4083,7 @@ impl DictData {
             map: DictMap::with_capacity_and_hasher(n, h),
             stamp: next_dict_stamp(),
             deferred_owner: std::sync::atomic::AtomicUsize::new(0),
+            key_filter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -4088,6 +4094,7 @@ impl DictData {
             map: DictMap::default(),
             stamp: next_dict_stamp(),
             deferred_owner: std::sync::atomic::AtomicUsize::new(owner),
+            key_filter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -4100,6 +4107,7 @@ impl DictData {
             map: DictMap::with_capacity_and_hasher(n, crate::fasthash::FxBuildHasher),
             stamp: next_dict_stamp(),
             deferred_owner: std::sync::atomic::AtomicUsize::new(owner),
+            key_filter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -4133,6 +4141,7 @@ impl DictData {
     #[inline]
     pub fn map_mut_atomic_store(&mut self) -> &mut DictMap {
         self.stamp = next_dict_stamp();
+        *self.key_filter.get_mut() = 0;
         &mut self.map
     }
 
@@ -4147,6 +4156,39 @@ impl DictData {
     #[inline]
     pub fn mutation_stamp(&self) -> u64 {
         self.stamp
+    }
+
+    /// Whether a `str` key with Python hash `hash` may be present: `false`
+    /// proves it absent. The summary is built once per key layout (value
+    /// stores in place leave it standing, so an instance dict's summary
+    /// survives its attribute updates). Bit 63 marks a built summary, so
+    /// the hash class it shares always answers "maybe"; a non-`str` key
+    /// makes every hash possible.
+    #[inline]
+    pub fn may_hold_str_hash(&self, hash: i64) -> bool {
+        let mut bits = self.key_filter.load(std::sync::atomic::Ordering::Relaxed);
+        if bits == 0 {
+            bits = self.build_key_filter();
+        }
+        bits & (1u64 << (hash as u64 & 63)) != 0
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn build_key_filter(&self) -> u64 {
+        let mut bits = 1u64 << 63;
+        for k in self.map.keys() {
+            match &k.0 {
+                Object::Str(s) => bits |= 1u64 << (SharedStr::hash_cached(s) as u64 & 63),
+                _ => {
+                    bits = u64::MAX;
+                    break;
+                }
+            }
+        }
+        self.key_filter
+            .store(bits, std::sync::atomic::Ordering::Relaxed);
+        bits
     }
 
     /// Mutable access for replacing an existing key's value in place: the
@@ -4178,6 +4220,7 @@ impl Default for DictData {
             map: DictMap::default(),
             stamp: next_dict_stamp(),
             deferred_owner: std::sync::atomic::AtomicUsize::new(0),
+            key_filter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -4198,6 +4241,7 @@ impl std::ops::DerefMut for DictData {
             self.track_deferred_owner();
         }
         self.stamp = next_dict_stamp();
+        *self.key_filter.get_mut() = 0;
         &mut self.map
     }
 }
@@ -4214,6 +4258,7 @@ impl From<DictMap> for DictData {
             map,
             stamp: next_dict_stamp(),
             deferred_owner: std::sync::atomic::AtomicUsize::new(0),
+            key_filter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }

@@ -89,7 +89,10 @@ if date_fields is not None:
         return result
     try:
         reference._date_fields, reference._time_fields = record_date, record_time
-        datetime.datetime(2024, 2, 29, 12, 34, 56, 123456)
+        # The exact class with int fields is built natively, before
+        # `__new__`; a subclass runs `__new__` and its helpers.
+        value = datetime.datetime(2024, 2, 29, 12, 34, 56, 123456)
+        assert calls == [] and value == Moment(2024, 2, 29, 12, 34, 56, 123456)
         assert calls == [('date', True), ('time', True)]
         calls.clear()
         datetime.date(Index('year', 2024), 2, 29)

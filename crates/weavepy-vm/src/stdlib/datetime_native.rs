@@ -182,6 +182,8 @@ const SHORTCUT_NAMES: &[(u8, &str)] = &[
     (KIND_DATE, "__le__"),
     (KIND_DATE, "__gt__"),
     (KIND_DATE, "__ge__"),
+    (KIND_DATE, "__new__"),
+    (KIND_DATE, "__init__"),
     (KIND_DATE, "year"),
     (KIND_DATE, "month"),
     (KIND_DATE, "day"),
@@ -193,6 +195,8 @@ const SHORTCUT_NAMES: &[(u8, &str)] = &[
     (KIND_DATETIME, "__le__"),
     (KIND_DATETIME, "__gt__"),
     (KIND_DATETIME, "__ge__"),
+    (KIND_DATETIME, "__new__"),
+    (KIND_DATETIME, "__init__"),
     (KIND_DATETIME, "year"),
     (KIND_DATETIME, "month"),
     (KIND_DATETIME, "day"),
@@ -273,8 +277,19 @@ fn as_int(o: &Object) -> Option<i64> {
     }
 }
 
-fn td_fields(i: &PyInstance, n: &Names) -> Option<(i64, i64, i64)> {
+// The field readers take a natively built instance's values straight
+// from the shared layout; any other storage is read by name.
+
+fn td_fields(i: &PyInstance, st: &State) -> Option<(i64, i64, i64)> {
+    let n = &st.names;
     let s = i.slots.try_borrow().ok()?;
+    if let Some(v) = s.values_for_layout(&st.td_layout) {
+        return Some((
+            as_int(&v[TD_DAYS])?,
+            as_int(&v[TD_SECONDS])?,
+            as_int(&v[TD_US])?,
+        ));
+    }
     Some((
         as_int(s.get_hinted(TD_DAYS, &n.days)?)?,
         as_int(s.get_hinted(TD_SECONDS, &n.seconds)?)?,
@@ -286,8 +301,19 @@ fn td_us(f: (i64, i64, i64)) -> i128 {
     (i128::from(f.0) * 86_400 + i128::from(f.1)) * 1_000_000 + i128::from(f.2)
 }
 
-fn date_fields(i: &PyInstance, n: &Names) -> Option<(i64, i64, i64)> {
+fn date_fields(i: &PyInstance, st: &State) -> Option<(i64, i64, i64)> {
+    let n = &st.names;
     let s = i.slots.try_borrow().ok()?;
+    if let Some(v) = s
+        .values_for_layout(&st.date_layout)
+        .or_else(|| s.values_for_layout(&st.dt_layout))
+    {
+        return Some((
+            as_int(&v[D_YEAR])?,
+            as_int(&v[D_MONTH])?,
+            as_int(&v[D_DAY])?,
+        ));
+    }
     Some((
         as_int(s.get_hinted(D_YEAR, &n.year)?)?,
         as_int(s.get_hinted(D_MONTH, &n.month)?)?,
@@ -307,8 +333,22 @@ struct Dt {
     fold: i64,
 }
 
-fn dt_fields(i: &PyInstance, n: &Names) -> Option<Dt> {
+fn dt_fields(i: &PyInstance, st: &State) -> Option<Dt> {
+    let n = &st.names;
     let s = i.slots.try_borrow().ok()?;
+    if let Some(v) = s.values_for_layout(&st.dt_layout) {
+        return Some(Dt {
+            y: as_int(&v[D_YEAR])?,
+            m: as_int(&v[D_MONTH])?,
+            d: as_int(&v[D_DAY])?,
+            hh: as_int(&v[DT_HOUR])?,
+            mm: as_int(&v[DT_MINUTE])?,
+            ss: as_int(&v[DT_SECOND])?,
+            us: as_int(&v[DT_US])?,
+            tz: v[DT_TZINFO].clone(),
+            fold: as_int(&v[DT_FOLD])?,
+        });
+    }
     Some(Dt {
         y: as_int(s.get_hinted(D_YEAR, &n.year)?)?,
         m: as_int(s.get_hinted(D_MONTH, &n.month)?)?,
@@ -329,7 +369,8 @@ enum Tz {
     Fixed(i128),
 }
 
-fn tz_of(tz: &Object, n: &Names) -> Option<Tz> {
+fn tz_of(tz: &Object, st: &State) -> Option<Tz> {
+    let n = &st.names;
     match tz {
         Object::None => Some(Tz::Naive),
         o => {
@@ -339,7 +380,7 @@ fn tz_of(tz: &Object, n: &Names) -> Option<Tz> {
                 s.get_hinted(TZ_OFFSET, &n.offset)?.clone()
             };
             let td = inst(&off, KIND_TIMEDELTA)?;
-            Some(Tz::Fixed(td_us(td_fields(td, n)?)))
+            Some(Tz::Fixed(td_us(td_fields(td, st)?)))
         }
     }
 }
@@ -423,11 +464,88 @@ fn instance_fixed(
     Object::Instance(Rc::new(i))
 }
 
+/// `date(y, m, d)` and `datetime(y, m, d[, hh[, mm[, ss[, us[, tz]]]]])`
+/// (`tzinfo=` by keyword too) of the exact classes, with in-range `int`
+/// fields and a naive or fixed-offset zone: the instance the replaced
+/// `__new__` builds, built natively. `None` for every other shape, which
+/// the Python constructor serves (and diagnoses).
+pub(crate) fn construct(
+    cls: &Rc<TypeObject>,
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Option<Result<Object, RuntimeError>> {
+    let st = state_of_cls(cls)?;
+    let kind = cls.native_kind.get();
+    let exact = match kind {
+        KIND_DATE => st.date.upgrade(),
+        KIND_DATETIME => st.datetime.upgrade(),
+        _ => None,
+    };
+    if !exact.is_some_and(|c| Rc::ptr_eq(&c, cls)) || !verified(st, cls, kind) {
+        return None;
+    }
+    let int = |o: &Object| match o {
+        Object::Int(v) => Some(*v),
+        _ => None,
+    };
+    if kind == KIND_DATE {
+        let ([y, m, d], true) = (args, kwargs.is_empty()) else {
+            return None;
+        };
+        let (y, m, d) = (int(y)?, int(m)?, int(d)?);
+        return valid_date(y, m, d)
+            .then(|| new_date(st, y, m, d))
+            .flatten()
+            .map(Ok);
+    }
+    if !(3..=8).contains(&args.len()) {
+        return None;
+    }
+    let mut tz = args.get(7).cloned().unwrap_or(Object::None);
+    for (name, v) in kwargs {
+        if name != "tzinfo" || args.len() == 8 {
+            return None;
+        }
+        tz = v.clone();
+    }
+    let field = |ix: usize| args.get(ix).map_or(Some(0), int);
+    let f = Dt {
+        y: int(&args[0])?,
+        m: int(&args[1])?,
+        d: int(&args[2])?,
+        hh: field(3)?,
+        mm: field(4)?,
+        ss: field(5)?,
+        us: field(6)?,
+        tz,
+        fold: 0,
+    };
+    let ok = valid_date(f.y, f.m, f.d)
+        && (0..24).contains(&f.hh)
+        && (0..60).contains(&f.mm)
+        && (0..60).contains(&f.ss)
+        && (0..1_000_000).contains(&f.us);
+    if !ok {
+        return None;
+    }
+    tz_of(&f.tz, st)?;
+    new_dt(st, &f).map(Ok)
+}
+
 /// A normalized exact `timedelta` from unnormalized components.
 fn new_td(st: &State, d: i128, s: i128, us: i128) -> Option<Result<Object, RuntimeError>> {
     let total = d * US_PER_DAY + s * 1_000_000 + us;
-    let days = total.div_euclid(US_PER_DAY);
-    let rest = total.rem_euclid(US_PER_DAY);
+    // 64-bit division when it fits (128-bit division is a library call).
+    let (days, rest) = match i64::try_from(total) {
+        Ok(t) => {
+            let per_day = US_PER_DAY as i64;
+            (
+                i128::from(t.div_euclid(per_day)),
+                i128::from(t.rem_euclid(per_day)),
+            )
+        }
+        Err(_) => (total.div_euclid(US_PER_DAY), total.rem_euclid(US_PER_DAY)),
+    };
     if days.abs() > MAX_DAYS {
         return Some(Err(overflow_error(format!(
             "days={days}; must have magnitude <= 999999999"
@@ -492,17 +610,28 @@ fn new_dt(st: &State, f: &Dt) -> Option<Object> {
 /// `datetime` fields shifted by `delta_us` (fold cleared, `tzinfo`
 /// kept), or `None` past the representable range.
 fn dt_shift(f: &Dt, delta_us: i128) -> Option<Dt> {
-    let base = (i128::from(ymd2ord(f.y, f.m, f.d)) * 86_400
-        + i128::from(f.hh * 3600 + f.mm * 60 + f.ss))
-        * 1_000_000
-        + i128::from(f.us);
-    let total = base + delta_us;
-    let ord = total.div_euclid(US_PER_DAY);
-    if !(1..=i128::from(MAX_ORDINAL)).contains(&ord) {
+    // Every representable datetime is under 2^59 microseconds, so a
+    // delta that fits no `i64` lands out of range (the Python path
+    // raises); the rest is 64-bit arithmetic over in-range fields.
+    let in_range = (1..=9999).contains(&f.y)
+        && valid_date(f.y, f.m, f.d)
+        && (0..24).contains(&f.hh)
+        && (0..60).contains(&f.mm)
+        && (0..60).contains(&f.ss)
+        && (0..1_000_000).contains(&f.us);
+    if !in_range {
         return None;
     }
-    let rest = total.rem_euclid(US_PER_DAY);
-    let (y, m, d) = ord2ymd(ord as i64);
+    let base =
+        (ymd2ord(f.y, f.m, f.d) * 86_400 + f.hh * 3600 + f.mm * 60 + f.ss) * 1_000_000 + f.us;
+    let total = base.checked_add(i64::try_from(delta_us).ok()?)?;
+    let per_day = US_PER_DAY as i64;
+    let ord = total.div_euclid(per_day);
+    if !(1..=MAX_ORDINAL).contains(&ord) {
+        return None;
+    }
+    let rest = total.rem_euclid(per_day);
+    let (y, m, d) = ord2ymd(ord);
     let secs = (rest / 1_000_000) as i64;
     Some(Dt {
         y,
@@ -533,8 +662,8 @@ type Fast = fn(&[Object]) -> Option<Result<Object, RuntimeError>>;
 fn td_add(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [x, y] = a else { return None };
     let st = state_of(x)?;
-    let p = td_fields(inst(x, KIND_TIMEDELTA)?, &st.names)?;
-    let q = td_fields(inst(y, KIND_TIMEDELTA)?, &st.names)?;
+    let p = td_fields(inst(x, KIND_TIMEDELTA)?, st)?;
+    let q = td_fields(inst(y, KIND_TIMEDELTA)?, st)?;
     new_td(
         st,
         i128::from(p.0) + i128::from(q.0),
@@ -546,8 +675,8 @@ fn td_add(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
 fn td_sub(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [x, y] = a else { return None };
     let st = state_of(x)?;
-    let p = td_fields(inst(x, KIND_TIMEDELTA)?, &st.names)?;
-    let q = td_fields(inst(y, KIND_TIMEDELTA)?, &st.names)?;
+    let p = td_fields(inst(x, KIND_TIMEDELTA)?, st)?;
+    let q = td_fields(inst(y, KIND_TIMEDELTA)?, st)?;
     new_td(
         st,
         i128::from(p.0) - i128::from(q.0),
@@ -559,7 +688,7 @@ fn td_sub(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
 fn td_neg(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [x] = a else { return None };
     let st = state_of(x)?;
-    let p = td_fields(inst(x, KIND_TIMEDELTA)?, &st.names)?;
+    let p = td_fields(inst(x, KIND_TIMEDELTA)?, st)?;
     new_td(st, -i128::from(p.0), -i128::from(p.1), -i128::from(p.2))
 }
 
@@ -567,7 +696,7 @@ fn td_mul(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [x, k] = a else { return None };
     let k = i128::from(as_int(k)?);
     let st = state_of(x)?;
-    let p = td_fields(inst(x, KIND_TIMEDELTA)?, &st.names)?;
+    let p = td_fields(inst(x, KIND_TIMEDELTA)?, st)?;
     new_td(
         st,
         i128::from(p.0) * k,
@@ -579,15 +708,15 @@ fn td_mul(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
 fn td_bool(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [x] = a else { return None };
     let st = state_of(x)?;
-    let p = td_fields(inst(x, KIND_TIMEDELTA)?, &st.names)?;
+    let p = td_fields(inst(x, KIND_TIMEDELTA)?, st)?;
     Some(Ok(Object::Bool(p != (0, 0, 0))))
 }
 
 fn td_cmp(a: &[Object]) -> Option<std::cmp::Ordering> {
     let [x, y] = a else { return None };
     let st = state_of(x)?;
-    let p = td_fields(inst(x, KIND_TIMEDELTA)?, &st.names)?;
-    let q = td_fields(inst(y, KIND_TIMEDELTA)?, &st.names)?;
+    let p = td_fields(inst(x, KIND_TIMEDELTA)?, st)?;
+    let q = td_fields(inst(y, KIND_TIMEDELTA)?, st)?;
     Some(p.cmp(&q))
 }
 
@@ -617,7 +746,7 @@ fn date_toordinal(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
         },
         _ => return None,
     };
-    let (y, m, d) = date_fields(i, &st.names)?;
+    let (y, m, d) = date_fields(i, st)?;
     if !valid_date(y, m, d) {
         return None;
     }
@@ -645,8 +774,8 @@ fn date_isoweekday(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
 fn date_shift(a: &[Object], sign: i64) -> Option<Result<Object, RuntimeError>> {
     let [x, y] = a else { return None };
     let st = state_of(x)?;
-    let (yy, m, d) = date_fields(inst(x, KIND_DATE)?, &st.names)?;
-    let (days, _, _) = td_fields(inst(y, KIND_TIMEDELTA)?, &st.names)?;
+    let (yy, m, d) = date_fields(inst(x, KIND_DATE)?, st)?;
+    let (days, _, _) = td_fields(inst(y, KIND_TIMEDELTA)?, st)?;
     if !valid_date(yy, m, d) {
         return None;
     }
@@ -668,8 +797,8 @@ fn date_sub(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
         return date_shift(a, -1);
     }
     let st = state_of(x)?;
-    let (y1, m1, d1) = date_fields(inst(x, KIND_DATE)?, &st.names)?;
-    let (y2, m2, d2) = date_fields(inst(y, KIND_DATE)?, &st.names)?;
+    let (y1, m1, d1) = date_fields(inst(x, KIND_DATE)?, st)?;
+    let (y2, m2, d2) = date_fields(inst(y, KIND_DATE)?, st)?;
     if !valid_date(y1, m1, d1) || !valid_date(y2, m2, d2) {
         return None;
     }
@@ -684,8 +813,8 @@ fn date_sub(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
 fn date_cmp(a: &[Object]) -> Option<std::cmp::Ordering> {
     let [x, y] = a else { return None };
     let st = state_of(x)?;
-    let p = date_fields(inst(x, KIND_DATE)?, &st.names)?;
-    let q = date_fields(inst(y, KIND_DATE)?, &st.names)?;
+    let p = date_fields(inst(x, KIND_DATE)?, st)?;
+    let q = date_fields(inst(y, KIND_DATE)?, st)?;
     Some(p.cmp(&q))
 }
 
@@ -698,7 +827,7 @@ cmp_fast!(date_ge, date_cmp, |o| o.is_ge());
 fn date_isoformat(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [x] = a else { return None };
     let st = state_of(x)?;
-    let (y, m, d) = date_fields(inst(x, KIND_DATE)?, &st.names)?;
+    let (y, m, d) = date_fields(inst(x, KIND_DATE)?, st)?;
     if !valid_date(y, m, d) {
         return None;
     }
@@ -709,7 +838,7 @@ fn date_isoformat(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
 fn date_replace(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let (x, rest) = a.split_first()?;
     let st = state_of(x)?;
-    let (mut y, mut m, mut d) = date_fields(inst(x, KIND_DATE)?, &st.names)?;
+    let (mut y, mut m, mut d) = date_fields(inst(x, KIND_DATE)?, st)?;
     if rest.len() > 3 {
         return None;
     }
@@ -733,8 +862,8 @@ fn date_replace(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
 fn dt_add(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [x, y] = a else { return None };
     let st = state_of(x)?;
-    let f = dt_fields(inst(x, KIND_DATETIME)?, &st.names)?;
-    let delta = td_us(td_fields(inst(y, KIND_TIMEDELTA)?, &st.names)?);
+    let f = dt_fields(inst(x, KIND_DATETIME)?, st)?;
+    let delta = td_us(td_fields(inst(y, KIND_TIMEDELTA)?, st)?);
     if !valid_date(f.y, f.m, f.d) {
         return None;
     }
@@ -747,26 +876,26 @@ fn dt_add(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
 fn dt_sub(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [x, y] = a else { return None };
     let st = state_of(x)?;
-    let f = dt_fields(inst(x, KIND_DATETIME)?, &st.names)?;
+    let f = dt_fields(inst(x, KIND_DATETIME)?, st)?;
     if !valid_date(f.y, f.m, f.d) {
         return None;
     }
     match kind_of(y) {
         KIND_TIMEDELTA => {
-            let delta = td_us(td_fields(inst(y, KIND_TIMEDELTA)?, &st.names)?);
+            let delta = td_us(td_fields(inst(y, KIND_TIMEDELTA)?, st)?);
             match dt_shift(&f, -delta) {
                 Some(g) => Some(Ok(new_dt(st, &g)?)),
                 None => Some(Err(overflow_error("date value out of range"))),
             }
         }
         KIND_DATETIME => {
-            let g = dt_fields(inst(y, KIND_DATETIME)?, &st.names)?;
+            let g = dt_fields(inst(y, KIND_DATETIME)?, st)?;
             if !valid_date(g.y, g.m, g.d) {
                 return None;
             }
             let mut diff = dt_us(&f) - dt_us(&g);
             if !f.tz.is_same(&g.tz) {
-                match (tz_of(&f.tz, &st.names)?, tz_of(&g.tz, &st.names)?) {
+                match (tz_of(&f.tz, st)?, tz_of(&g.tz, st)?) {
                     (Tz::Naive, Tz::Naive) => {}
                     (Tz::Fixed(a), Tz::Fixed(b)) => diff += b - a,
                     // The mixed case raises in the Python code.
@@ -784,15 +913,15 @@ fn dt_sub(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
 fn dt_cmp_raw(a: &[Object]) -> Option<(std::cmp::Ordering, bool)> {
     let [x, y] = a else { return None };
     let st = state_of(x)?;
-    let f = dt_fields(inst(x, KIND_DATETIME)?, &st.names)?;
-    let g = dt_fields(inst(y, KIND_DATETIME)?, &st.names)?;
+    let f = dt_fields(inst(x, KIND_DATETIME)?, st)?;
+    let g = dt_fields(inst(y, KIND_DATETIME)?, st)?;
     if !valid_date(f.y, f.m, f.d) || !valid_date(g.y, g.m, g.d) {
         return None;
     }
     if f.tz.is_same(&g.tz) {
         return Some((dt_us(&f).cmp(&dt_us(&g)), true));
     }
-    match (tz_of(&f.tz, &st.names)?, tz_of(&g.tz, &st.names)?) {
+    match (tz_of(&f.tz, st)?, tz_of(&g.tz, st)?) {
         (Tz::Naive, Tz::Naive) => Some((dt_us(&f).cmp(&dt_us(&g)), true)),
         (Tz::Fixed(a), Tz::Fixed(b)) => Some(((dt_us(&f) - a).cmp(&(dt_us(&g) - b)), true)),
         _ => Some((std::cmp::Ordering::Equal, false)),
@@ -826,7 +955,7 @@ dt_order!(dt_ge, |o| o.is_ge());
 fn dt_date(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [x] = a else { return None };
     let st = state_of(x)?;
-    let (y, m, d) = date_fields(inst(x, KIND_DATETIME)?, &st.names)?;
+    let (y, m, d) = date_fields(inst(x, KIND_DATETIME)?, st)?;
     if !valid_date(y, m, d) {
         return None;
     }
@@ -881,11 +1010,11 @@ fn dt_isoformat(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
         return None;
     }
     let st = state_of(x)?;
-    let f = dt_fields(inst(x, KIND_DATETIME)?, &st.names)?;
+    let f = dt_fields(inst(x, KIND_DATETIME)?, st)?;
     if !valid_date(f.y, f.m, f.d) {
         return None;
     }
-    let tz = tz_of(&f.tz, &st.names)?;
+    let tz = tz_of(&f.tz, st)?;
     let mut out = String::with_capacity(32);
     let _ = write!(out, "{:04}-{:02}-{:02}{sep}", f.y, f.m, f.d);
     match spec {
@@ -1010,11 +1139,11 @@ fn dt_strftime(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
         return None;
     };
     let st = state_of(x)?;
-    let f = dt_fields(inst(x, KIND_DATETIME)?, &st.names)?;
+    let f = dt_fields(inst(x, KIND_DATETIME)?, st)?;
     if !valid_date(f.y, f.m, f.d) {
         return None;
     }
-    let tz = tz_of(&f.tz, &st.names)?;
+    let tz = tz_of(&f.tz, st)?;
     let s = strftime_numeric(
         f.y,
         f.m,
@@ -1031,7 +1160,7 @@ fn date_strftime(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
         return None;
     };
     let st = state_of(x)?;
-    let (y, m, d) = date_fields(inst(x, KIND_DATE)?, &st.names)?;
+    let (y, m, d) = date_fields(inst(x, KIND_DATE)?, st)?;
     if !valid_date(y, m, d) {
         return None;
     }

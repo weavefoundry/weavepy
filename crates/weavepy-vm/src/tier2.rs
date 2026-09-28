@@ -8665,8 +8665,7 @@ unsafe fn call_dyn_impl(
         // `CALL_KW` binds through this same permutation and activation,
         // so tier-1 would not run the call any cheaper.
         ctx.dirty = true;
-        let called =
-            call_with_activation_shell(interp, ctx, jf, |i| i.run_py_exact_nofree(&f, locals));
+        let called = call_with_activation_shell(interp, ctx, jf, |i| i.run_py_bound(&f, locals));
         // SAFETY: as above.
         return unsafe { dyn_call_result(jf, ctx, called, false, false, int_result) };
     }
@@ -8827,7 +8826,10 @@ unsafe fn dyn_kw_site_bind(
     }
     let (fcode, covered) =
         crate::Interpreter::kw_names_bind_check(f, func_id, perm, name_items, eff_argc)?;
-    let mut staged: Vec<Object> = Vec::with_capacity(eff_argc + kwc);
+    // SAFETY: the `&mut Interpreter` that entered native code is dormant
+    // while the helper runs; only its vector pools are used here.
+    let interp = unsafe { &*ctx.interp };
+    let mut staged = interp.pooled_scratch();
     staged.extend(recv.cloned());
     for j in 0..argc + kwc {
         // SAFETY: native code wrote `argc + kwc` entries, and the
@@ -8835,7 +8837,7 @@ unsafe fn dyn_kw_site_bind(
         let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
         staged.push(unpack_pins(bits, tag, &ctx.pins));
     }
-    let mut locals = Vec::new();
+    let mut locals = interp.pooled_scratch();
     crate::Interpreter::kw_names_fill_locals(
         &mut locals,
         &mut staged,
@@ -8847,6 +8849,7 @@ unsafe fn dyn_kw_site_bind(
         kwc,
         eff_argc,
     );
+    interp.recycle_scratch(staged);
     Some((f.clone(), locals))
 }
 

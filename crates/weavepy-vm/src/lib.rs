@@ -3312,6 +3312,7 @@ impl Interpreter {
                 !(Self::local_needs_prompt_reap(v) || matches!(v, Object::Function(_)))
                     || escaped(v)
                     || matches!(v, Object::Instance(i) if i.dies_by_plain_drop())
+                    || Self::atomic_container_dies_plainly(v)
             }) {
                 for v in locals {
                     gc_trace::note_dropped(v);
@@ -3792,6 +3793,42 @@ impl Interpreter {
     /// generators/coroutines/async-generators (their `close()` delivers
     /// `GeneratorExit`). Kept deliberately narrow so the hot return path of
     /// scalar-only frames pays a single cheap `matches!` per local.
+    /// A small untracked list, tuple or dict of atomic values held only
+    /// here: its release frees nothing a reap would visit (no finalizer,
+    /// weakref or collector handle can hang off it or its values).
+    fn atomic_container_dies_plainly(o: &Object) -> bool {
+        const MAX: usize = 16;
+        fn atomic(o: &Object) -> bool {
+            matches!(
+                o,
+                Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None | Object::Str(_)
+            )
+        }
+        let (sc, id) = match o {
+            Object::List(l) => (Rc::strong_count(l), Rc::as_ptr(l) as usize as u64),
+            Object::Dict(d) => (Rc::strong_count(d), Rc::as_ptr(d) as usize as u64),
+            Object::Tuple(t) => (
+                ThinArc::strong_count(t),
+                ThinArc::as_ptr(t).cast::<()>() as usize as u64,
+            ),
+            _ => return false,
+        };
+        if sc != 1 || gc_trace::maybe_tracked(id) || crate::weakref_registry::may_have_weakrefs(id)
+        {
+            return false;
+        }
+        match o {
+            Object::List(l) => l
+                .try_borrow()
+                .is_ok_and(|v| v.len() <= MAX && v.iter().all(atomic)),
+            Object::Dict(d) => d
+                .try_borrow()
+                .is_ok_and(|d| d.len() <= MAX && d.iter().all(|(k, v)| atomic(&k.0) && atomic(v))),
+            Object::Tuple(t) => t.len() <= MAX && t.iter().all(atomic),
+            _ => false,
+        }
+    }
+
     fn local_needs_prompt_reap(o: &Object) -> bool {
         matches!(
             o,
@@ -13344,7 +13381,9 @@ impl Interpreter {
                                         else {
                                             break Some(CoreExit::Helper);
                                         };
-                                        if d.contains_key(&probe) || probe.saw_exotic() {
+                                        if d.may_hold_str_hash(probe.hash)
+                                            && (d.contains_key(&probe) || probe.saw_exotic())
+                                        {
                                             break Some(CoreExit::Helper);
                                         }
                                     }
@@ -14452,7 +14491,8 @@ impl Interpreter {
             let d = unsafe { dict.peek() }?;
             if !d.is_empty() {
                 let probe = code_name_leaf_probe(code, name_idx)?;
-                if d.contains_key(&probe) || probe.saw_exotic() {
+                if d.may_hold_str_hash(probe.hash) && (d.contains_key(&probe) || probe.saw_exotic())
+                {
                     return None;
                 }
             }
@@ -19022,7 +19062,8 @@ impl Interpreter {
             let d = dict.try_borrow().ok()?;
             if !d.is_empty() {
                 let probe = code_name_leaf_probe(code, name_idx)?;
-                if d.contains_key(&probe) || probe.saw_exotic() {
+                if d.may_hold_str_hash(probe.hash) && (d.contains_key(&probe) || probe.saw_exotic())
+                {
                     return None;
                 }
             }
@@ -37663,8 +37704,9 @@ impl Interpreter {
                         let shadowed = inst.dict.get().is_some_and(|dict| {
                             let d = dict.borrow();
                             !d.is_empty()
-                                && code_name_key(&frame.code, name_idx)
-                                    .is_none_or(|k| d.contains_key(&k))
+                                && code_name_key(&frame.code, name_idx).is_none_or(|k| {
+                                    d.may_hold_str_hash(k.hash) && d.contains_key(&k)
+                                })
                         });
                         if !shadowed {
                             let slot = code_method_slot(&frame.code, cache_pc);
@@ -37718,7 +37760,9 @@ impl Interpreter {
                             match code_name_key(&frame.code, name_idx) {
                                 Some(key) => {
                                     let d = dict.borrow();
-                                    !d.is_empty() && d.contains_key(&key)
+                                    !d.is_empty()
+                                        && d.may_hold_str_hash(key.hash)
+                                        && d.contains_key(&key)
                                 }
                                 None => true,
                             }
@@ -45876,6 +45920,12 @@ impl Interpreter {
         args: &[Object],
         kwargs: &[(String, Object)],
     ) -> Result<Object, RuntimeError> {
+        // A natively served class's common constructor shapes.
+        if cls.native_kind.get() != 0 {
+            if let Some(r) = crate::stdlib::datetime_native::construct(&cls, args, kwargs) {
+                return r;
+            }
+        }
         if kwargs.is_empty() && !cls.flags.is_builtin {
             if let Some(r) = self.instantiate_plain_lean(&cls, args) {
                 return r;
@@ -48140,6 +48190,52 @@ impl Interpreter {
         args: Vec<Object>,
     ) -> Result<Object, RuntimeError> {
         self.run_py_exact_nofree_with(f, f.code(), args)
+    }
+
+    /// Run plain function `f` on `locals` already bound to its parameter
+    /// slots (sized to its locals): as a lean activation when the
+    /// dispatch loop is quiet and the code allows one, as
+    /// [`Self::run_py_exact_nofree`] otherwise.
+    pub(crate) fn run_py_bound(
+        &mut self,
+        f: &Rc<PyFunction>,
+        mut locals: Vec<Object>,
+    ) -> Result<Object, RuntimeError> {
+        let code = f.code();
+        if let Some(snap_gen) = self.lean_snapshot() {
+            // A pure leaf evaluates frameless, as the core loop's call does.
+            let nargs = code.arg_count as usize;
+            if nargs <= 8
+                && locals.len() >= nargs
+                && code_is_pure_leaf(&code)
+                && pure_leaf_warm(&code)
+                && crate::recursion::current_depth() < crate::recursion::recursion_limit()
+            {
+                let mut ptrs = [std::ptr::null::<Object>(); 8];
+                for (p, v) in ptrs.iter_mut().zip(&locals[..nargs]) {
+                    *p = v;
+                }
+                if let Some(v) = self.pure_leaf_eval::<false>(&code, f, &ptrs[..nargs]) {
+                    self.recycle_scratch(locals);
+                    return Ok(v);
+                }
+            }
+            if Self::lean_code_ok(&code) && locals.len() <= code.varnames.len() {
+                if let Some(cells) = f.lean_cells_ref(&code) {
+                    let cells: *const Rc<Vec<Rc<RefCell<Object>>>> = cells;
+                    let n = code.varnames.len();
+                    let locals_rc = self.pooled_locals_from_args(&mut locals, n);
+                    self.recycle_scratch(locals);
+                    // SAFETY: `f` (borrowed for this whole call) owns the
+                    // cells handle and outlives the frame.
+                    let mut callee = unsafe { self.lean_frame(f, code, locals_rc, &*cells) };
+                    let result = self.run_frame_lean(&mut callee, snap_gen);
+                    self.retire_lean_frame(callee);
+                    return result;
+                }
+            }
+        }
+        self.run_py_exact_nofree_with(f, code, locals)
     }
 
     /// [`Self::run_py_exact_nofree`] for a caller that already holds the
