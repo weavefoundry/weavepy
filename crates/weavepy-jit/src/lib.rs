@@ -60,8 +60,9 @@ pub use runtime::{
     JitStatus, ListAppendHelper, ListFromRangeHelper, ListGetHelper, ListLenHelper, ListNextHelper,
     ListRepeatHelper, ListSetHelper, ListSliceHelper, MathBinaryHelper, MathUnaryHelper,
     PollHelper, SelfEnterHelper, SelfExitHelper, SelfSlowHelper, SlotTag, StrEqHelper,
-    StrLenHelper, StrModHelper, DICT_KEY_INT, DICT_KEY_STR, DICT_VAL_FLOAT, DICT_VAL_INT,
-    DICT_VAL_OBJ, ITER_ELEM_STR, JIT_POLL_STRIDE, MAX_ATTR_CHAIN_LEN, MAX_CACHED_ATTR_CHAIN_LEN,
+    StrLenHelper, StrModHelper, CALL_GAPS, DICT_KEY_INT, DICT_KEY_STR, DICT_VAL_FLOAT,
+    DICT_VAL_INT, DICT_VAL_OBJ, ITER_ELEM_STR, JIT_POLL_STRIDE, MAX_ATTR_CHAIN_LEN,
+    MAX_CACHED_ATTR_CHAIN_LEN,
 };
 pub use value::JitType;
 

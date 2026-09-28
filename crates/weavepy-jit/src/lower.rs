@@ -995,7 +995,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 } else if let Some(ix) = self.leaf_for(token, argc) {
                     self.emit_call_leaf(ix, token, argc, ret, stmt.pc);
                 } else {
-                    self.emit_call_py(token, argc, 0, 0, ret, stmt.pc);
+                    self.emit_call_py(token, argc, 0, 0, 0, ret, stmt.pc);
                 }
             }
             TOp::CallPyKw {
@@ -1003,8 +1003,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 argc,
                 kwc,
                 perm,
+                gaps,
                 ret,
-            } => self.emit_call_py(token, argc, kwc, perm, ret, stmt.pc),
+            } => self.emit_call_py(token, argc, kwc, perm, gaps, ret, stmt.pc),
             TOp::ListGet { elem } => self.emit_list_get(elem, stmt.pc),
             TOp::ListSet => self.emit_list_set(stmt.pc),
             TOp::CellGet { idx, lane } => self.emit_cell_get(idx, lane, stmt.pc),
@@ -3174,7 +3175,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // Declined: the ordinary call helper.
         self.b.switch_to_block(generic_b);
         self.vstack.extend(args.iter().copied());
-        self.emit_call_py(token, argc, 0, 0, ret, pc);
+        self.emit_call_py(token, argc, 0, 0, 0, ret, pc);
         let (v, _) = self.vstack.pop().expect("the call's result");
         self.b.ins().jump(join_b, &[v.into()]);
 
@@ -3408,7 +3409,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // Declined or deopted: the ordinary call, from the start.
         self.b.switch_to_block(generic_b);
         self.vstack.extend(args.iter().copied());
-        self.emit_call_py(token, argc, 0, 0, ret, pc);
+        self.emit_call_py(token, argc, 0, 0, 0, ret, pc);
         let (v, _) = self.vstack.pop().expect("the call's result");
         self.b.ins().jump(join_b, &[v.into()]);
 
@@ -3448,9 +3449,33 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         r
     }
 
-    fn emit_call_py(&mut self, token: u32, argc: u8, kwc: u8, perm: u32, ret: JitType, pc: u32) {
+    #[allow(clippy::too_many_arguments)]
+    fn emit_call_py(
+        &mut self,
+        token: u32,
+        argc: u8,
+        kwc: u8,
+        perm: u32,
+        gaps: u32,
+        ret: JitType,
+        pc: u32,
+    ) {
         let trusted = MemFlags::trusted();
         let n = argc as usize + kwc as usize;
+        // Skipped defaulted slots: the helper binds them (see
+        // `SlotTag::Default`).
+        let mut g = gaps;
+        while g != 0 {
+            let slot = g.trailing_zeros() as i32;
+            g &= g - 1;
+            let tagv = self
+                .b
+                .ins()
+                .iconst(types::I32, runtime::SlotTag::Default as i64);
+            self.b
+                .ins()
+                .store(trusted, tagv, self.call_tags_base, slot * 4);
+        }
         let base = self.vstack.len() - n;
         for (j, &(v, ty)) in self.vstack[base..].iter().enumerate() {
             let dst = if j < argc as usize {
@@ -3480,9 +3505,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .iconst(self.ptr_ty, runtime::call_py_helper_addr() as i64);
         let tokenv = self.b.ins().iconst(types::I32, i64::from(token));
-        // The helper receives the *filled* count — keyword values were
-        // shuffled into a contiguous positional prefix above.
-        let argcv = self.b.ins().iconst(types::I32, n as i64);
+        // The helper receives the prefix length — keyword values were
+        // shuffled into parameter slots above, with any skipped
+        // defaulted slots flagged.
+        let filled = if gaps == 0 {
+            n as i64
+        } else {
+            i64::from((n as u32 + gaps.count_ones()) | runtime::CALL_GAPS)
+        };
+        let argcv = self.b.ins().iconst(types::I32, filled);
         let expect = self.b.ins().iconst(types::I32, Self::tag(ret));
         let call =
             self.b

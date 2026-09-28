@@ -2175,7 +2175,7 @@ fn unpack(bits: u64, tag: u32) -> Object {
         SlotTag::Bool => Object::Bool(bits != 0),
         // RFC 0069 WS1 — the `None` singleton (a `ReturnNone` exit).
         SlotTag::None => Object::None,
-        SlotTag::Boxed | SlotTag::ListPin | SlotTag::ObjPin => Object::None,
+        SlotTag::Boxed | SlotTag::ListPin | SlotTag::ObjPin | SlotTag::Default => Object::None,
     }
 }
 
@@ -3879,6 +3879,110 @@ unsafe fn native_scalar_field_update(
     Some(value)
 }
 
+/// Bind the slots a keyword call skipped (tagged [`SlotTag::Default`]
+/// under [`weavepy_jit::CALL_GAPS`]) to the callee's current
+/// `__defaults__` when those are scalars, so the call is a positional
+/// prefix again (whose trailing window the lanes below bind). Returns
+/// the argument count to call with and whether every skipped slot is
+/// bound (`false` leaves the call to [`call_py_with_gaps`]).
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`]; the buffers are the compiled
+/// frame's `max_call_args` wide.
+unsafe fn bind_call_defaults(
+    jf: &mut JitFrame,
+    ctx: &CallCtx,
+    token: u32,
+    raw: u32,
+) -> (u32, bool) {
+    let gapped = raw & weavepy_jit::CALL_GAPS != 0;
+    let argc = raw & !weavepy_jit::CALL_GAPS;
+    let Some((Object::Function(f), code)) = ctx.callees.get(token as usize) else {
+        return (argc, !gapped);
+    };
+    if !gapped {
+        return (argc, true);
+    }
+    // A reassigned `__defaults__` lives in the function's slots: the
+    // generic binder reads it.
+    if f.defaults_maybe_overridden() {
+        return (argc, false);
+    }
+    let npos = code.arg_count as usize;
+    // SAFETY: the activation's compiled frame outlives its calls.
+    let cap = unsafe { ctx.cf.as_ref() }.map_or(0, |cf| cf.max_call_args as usize);
+    let first = npos.saturating_sub(f.defaults.len());
+    let scalar = |j: usize| -> Option<(u64, SlotTag)> {
+        let v = f.defaults.get(j.checked_sub(first)?)?;
+        match v {
+            Object::Int(i) => Some((*i as u64, SlotTag::Int)),
+            Object::Float(x) => Some((x.to_bits(), SlotTag::Float)),
+            Object::Bool(b) => Some((u64::from(*b), SlotTag::Bool)),
+            Object::None => Some((u64::MAX, SlotTag::ObjPin)),
+            _ => None,
+        }
+    };
+    let write = |jf: &mut JitFrame, j: usize, (bits, tag): (u64, SlotTag)| {
+        // SAFETY: `j` is below the buffers' width (checked by callers).
+        unsafe {
+            *jf.call_args.add(j) = bits;
+            *jf.call_tags.add(j) = tag as u32;
+        }
+    };
+    let mut bound = true;
+    for j in 0..(argc as usize).min(cap).min(npos) {
+        // SAFETY: native code wrote `argc` tags.
+        if unsafe { *jf.call_tags.add(j) } == SlotTag::Default as u32 {
+            match scalar(j) {
+                Some(v) => write(jf, j, v),
+                None => bound = false,
+            }
+        }
+    }
+    (argc, bound)
+}
+
+/// [`wpjit_call_py`] for a keyword call whose skipped defaulted slot
+/// could not be bound natively (a non-scalar default, or none any
+/// more): the generic call, with the prefix before the first skipped
+/// slot positional and the rest by name, binds (or rejects) it exactly
+/// as the interpreter would.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe fn call_py_with_gaps(
+    jf: &mut JitFrame,
+    ctx: &mut CallCtx,
+    interp: &mut super::Interpreter,
+    token: u32,
+    argc: u32,
+    expect_tag: u32,
+) -> i64 {
+    ctx.dirty = true;
+    let (callee, code) = ctx.callees[token as usize].clone();
+    let mut args: Vec<Object> = Vec::new();
+    let mut kwargs: Vec<(String, Object)> = Vec::new();
+    for j in 0..argc as usize {
+        // SAFETY: native code wrote `argc` entries.
+        let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
+        if tag == SlotTag::Default as u32 {
+            continue;
+        }
+        let v = unpack_pins(bits, tag, &ctx.pins);
+        if kwargs.is_empty() && args.len() == j {
+            args.push(v);
+        } else if let Some(name) = code.varnames.get(j) {
+            kwargs.push((name.to_string(), v));
+        }
+    }
+    let res = call_with_activation_shell(interp, ctx, jf, |i| {
+        i.call(&callee, &args, &kwargs, &ctx.globals)
+    });
+    finish_interp_call(jf, ctx, interp, res, expect_tag)
+}
+
 /// RFC 0067 WS1 — attempt a native-to-native call for one marshaled
 /// `CallPy` site. Returns `Some(CallStatus as i64)` when the call
 /// completed through the native path (including via a materialized
@@ -4523,9 +4627,11 @@ unsafe fn try_native_call(
                 SlotTag::Int => JitType::Int,
                 SlotTag::Float => JitType::Float,
                 SlotTag::Bool => JitType::Bool,
-                SlotTag::None | SlotTag::Boxed | SlotTag::ListPin | SlotTag::ObjPin => {
-                    JitType::Unknown
-                }
+                SlotTag::None
+                | SlotTag::Boxed
+                | SlotTag::ListPin
+                | SlotTag::ObjPin
+                | SlotTag::Default => JitType::Unknown,
             };
             match pack(&v, expect) {
                 Some(bits) if guards_ok => {
@@ -4806,11 +4912,28 @@ unsafe extern "C" fn wpjit_call_py(
     // while the helper runs; this is the only live path to it.
     let interp = unsafe { &mut *ctx.interp };
 
-    // A pure-leaf callee evaluates frameless (see `try_pure_leaf_call`).
-    let maybe_pure = ctx
-        .callees
-        .get(token as usize)
-        .is_some_and(|(_, code)| code.jit_hint.pure_leaf() != Some(false));
+    // Defaulted parameters the site didn't pass: bound here, so every
+    // lane below sees a full-arity call.
+    // SAFETY: per the function contract.
+    let (argc, bound) = unsafe { bind_call_defaults(jf, ctx, token, argc) };
+    if !bound {
+        // SAFETY: as above.
+        return unsafe { call_py_with_gaps(jf, ctx, interp, token, argc, expect_tag) };
+    }
+
+    // A pure-leaf callee evaluates frameless (see `try_pure_leaf_call`),
+    // unless its compiled scalar leaf runs it natively (cheaper still).
+    let native_scalar = ctx
+        .native
+        .as_deref()
+        .and_then(|t| t.get(token as usize))
+        .and_then(Option::as_ref)
+        .is_some_and(|nc| nc.ctor.is_none() && nc.cf.is_scalar_leaf());
+    let maybe_pure = !native_scalar
+        && ctx
+            .callees
+            .get(token as usize)
+            .is_some_and(|(_, code)| code.jit_hint.pure_leaf() != Some(false));
     let callees = if maybe_pure {
         Some(StdRc::clone(&ctx.callees))
     } else {
@@ -4933,9 +5056,11 @@ unsafe extern "C" fn wpjit_call_py(
                     // Other pin-lane call results are rejected at
                     // emission; `Unknown` never packs, forcing the
                     // boxed path.
-                    SlotTag::None | SlotTag::Boxed | SlotTag::ListPin | SlotTag::ObjPin => {
-                        JitType::Unknown
-                    }
+                    SlotTag::None
+                    | SlotTag::Boxed
+                    | SlotTag::ListPin
+                    | SlotTag::ObjPin
+                    | SlotTag::Default => JitType::Unknown,
                 };
                 if let Some(bits) = pack(&v, expect) {
                     jf.ret_bits = bits;
@@ -5026,7 +5151,7 @@ fn deliver_call_result(jf: &mut JitFrame, ctx: &mut CallCtx, v: Object, expect_t
                 return CallStatus::Ok as i64;
             }
         }
-        SlotTag::Boxed | SlotTag::ListPin => {}
+        SlotTag::Boxed | SlotTag::ListPin | SlotTag::Default => {}
     }
     ctx.parked = Some(v);
     CallStatus::Boxed as i64
@@ -5798,7 +5923,7 @@ unsafe extern "C" fn wpjit_str_method(
                         }
                     }
                 }
-                SlotTag::None | SlotTag::Float | SlotTag::Boxed => {}
+                SlotTag::None | SlotTag::Float | SlotTag::Boxed | SlotTag::Default => {}
             }
             // Lane surprise (`WStr` result, huge `int`, pin-cap
             // pressure): park the exact result and deopt after the

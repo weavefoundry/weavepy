@@ -187,10 +187,11 @@ pub enum TOp {
     /// stack order); the analyzer resolved each keyword to its
     /// parameter slot at compile time, packed 4 bits per keyword in
     /// `perm` (keyword value `j` → slot `(perm >> 4j) & 0xF`, tier-1's
-    /// `CallPyKwNames` encoding). The filled slots are validated to be
-    /// exactly `0..argc+kwc`, so lowering marshals a plain positional
-    /// prefix and the call helper needs no keyword awareness (the
-    /// trailing-defaults window binds any remaining tail). The names
+    /// `CallPyKwNames` encoding). Lowering marshals a positional prefix
+    /// up to the highest filled slot; the defaulted slots it skips
+    /// (`gaps`, one bit per slot) are tagged for the call helper to
+    /// bind from the callee's current defaults, and the
+    /// trailing-defaults window binds any remaining tail. The names
     /// tuple's `LOAD_CONST` is erased from the trace; it never exists
     /// on the native stack. Exits mirror [`TOp::CallPy`].
     CallPyKw {
@@ -198,6 +199,7 @@ pub enum TOp {
         argc: u8,
         kwc: u8,
         perm: u32,
+        gaps: u32,
         ret: JitType,
     },
     /// RFC 0061 WS5 — `BINARY_SUBSCR` on a pinned list: pops the `int`

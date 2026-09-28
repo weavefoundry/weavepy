@@ -2941,18 +2941,20 @@ fn kw_call_names(code: &CodeObject, cidx: u32) -> Vec<&str> {
 
 /// RFC 0073 WS5 — resolve a `CALL_KW` site's keyword permutation
 /// against the burned callee: keyword value `j` binds parameter slot
-/// `(perm >> 4j) & 0xF` (tier-1's `CallPyKwNames` packing). Admitted
-/// only when the filled set — the positional prefix plus the keyword
-/// slots — is exactly `0..argc+kwc`: the marshaled call is then a
-/// plain positional prefix through the unchanged `wpjit_call_py`
-/// helper, and the trailing-defaults window binds the remaining tail.
-/// Returns `(perm, filled count)`.
+/// `(perm >> 4j) & 0xF` (tier-1's `CallPyKwNames` packing). The filled
+/// set — the positional prefix plus the keyword slots — must reach
+/// every parameter without a default; a defaulted parameter it skips
+/// (`f(x, c=1)` over `def f(a, b=0, c=0)`) is a *gap* the call helper
+/// fills from the callee's current defaults, so the marshaled call is
+/// a positional prefix of `k` slots through `wpjit_call_py`, whose
+/// trailing-defaults window binds any remaining tail. Returns
+/// `(perm, k, gap mask)`.
 fn resolve_kw_perm(
     mark: &CalleeMark,
     names: &[&str],
     argc: usize,
     kw_slot: &mut dyn FnMut(u32, &str) -> Option<u32>,
-) -> Result<(u32, usize), JitVerdict> {
+) -> Result<(u32, usize, u32), JitVerdict> {
     if mark.kind != MarkKind::Py || mark.ctor {
         return Err(JitVerdict::UnsupportedOpcode("CALL_KW (callee kind)"));
     }
@@ -2974,7 +2976,11 @@ fn resolve_kw_perm(
         perm |= slot << (4 * j);
         covered |= 1 << slot;
     }
-    if covered != (1u32 << k) - 1 {
+    // The highest filled slot bounds the marshaled prefix; the slots
+    // it skips must all have defaults.
+    let k = (32 - covered.leading_zeros()) as usize;
+    let gaps = ((1u32 << k) - 1) & !covered;
+    if gaps & ((1u32 << mark.min_args.min(16)) - 1) != 0 {
         return Err(JitVerdict::UnsupportedOpcode("CALL_KW (keyword gap)"));
     }
     // The uncovered tail binds trailing defaults, exactly like the
@@ -2982,7 +2988,7 @@ fn resolve_kw_perm(
     if k < mark.min_args as usize || k > mark.arg_count as usize {
         return Err(JitVerdict::UnsupportedOpcode("CALL (arity)"));
     }
-    Ok((perm, k))
+    Ok((perm, k, gaps))
 }
 
 /// Map a representable [`Constant`] to its lane, or `None`.
@@ -7546,7 +7552,7 @@ fn emit_instr(
                 *max_stack = (*max_stack).max(stack.len() as u32);
                 return Ok(());
             };
-            let (perm, _) = resolve_kw_perm(&mark, &names, argc, probes.kw_slot)?;
+            let (perm, k, gaps) = resolve_kw_perm(&mark, &names, argc, probes.kw_slot)?;
             for &ty in &arg_tys {
                 if !ty.is_representable() {
                     return Err(JitVerdict::TypeUnknown);
@@ -7573,13 +7579,15 @@ fn emit_instr(
                 live_to: pc + 1,
                 interp_depth: mark.interp_depth,
             });
-            *max_call_args = (*max_call_args).max(n as u32);
+            // The marshaled prefix, skipped defaulted slots included.
+            *max_call_args = (*max_call_args).max(k as u32);
             push(
                 TOp::CallPyKw {
                     token: mark.token,
                     argc: argc as u8,
                     kwc: kwc as u8,
                     perm,
+                    gaps,
                     ret,
                 },
                 Some(ret),

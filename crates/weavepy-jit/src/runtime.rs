@@ -122,7 +122,15 @@ pub enum SlotTag {
     /// exit, or a provably-`None` method-call result). The bits are
     /// ignored; the embedder rebuilds `Object::None`.
     None = 6,
+    /// A call argument slot a keyword call skipped: the call helper
+    /// binds the callee's default there before anything reads it. Only
+    /// ever appears in a call marshal buffer under [`CALL_GAPS`].
+    Default = 7,
 }
+
+/// Set in a `wpjit_call_py` argument count when some marshaled slots
+/// are tagged [`SlotTag::Default`].
+pub const CALL_GAPS: u32 = 1 << 31;
 
 impl SlotTag {
     /// Decode a raw tag written by native code.
@@ -136,6 +144,7 @@ impl SlotTag {
             4 => SlotTag::ListPin,
             5 => SlotTag::ObjPin,
             6 => SlotTag::None,
+            7 => SlotTag::Default,
             _ => SlotTag::Int,
         }
     }
