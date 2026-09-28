@@ -26,7 +26,7 @@
 //! The RFC 0024 surface (real lock / event / barrier primitives
 //! that back `threading.Lock` etc.) lives below the new aliases.
 
-pub use crate::lazy_arc::LazyArc;
+pub use crate::lazy_arc::{LazyArc, OnceBox};
 
 use std::cell::UnsafeCell;
 use std::fmt;

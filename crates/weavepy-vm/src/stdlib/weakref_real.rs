@@ -1202,8 +1202,8 @@ fn make_ref_object_with_class(
 
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(class),
-        dict,
-        native: std::sync::OnceLock::new(),
+        dict: dict.into(),
+        native: crate::sync::OnceBox::new(),
         inline_values: crate::sync::Cell::new(!fixed_wrapper),
         slots: crate::sync::RefCell::new(slots),
         hash_cache: crate::sync::CachedHash::new(None),

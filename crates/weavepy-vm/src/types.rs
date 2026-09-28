@@ -658,6 +658,9 @@ pub struct TypeObject {
     /// (capped): new instances' dicts are presized to it, so `__init__`'s
     /// stores do not regrow them.
     pub inst_dict_hint: std::sync::atomic::AtomicU32,
+    /// The attribute names this class's split instance dictionaries share
+    /// (see [`crate::inst_dict`]), created at the first split store.
+    pub shared_keys: crate::sync::LazyArc<crate::inst_dict::SharedKeys>,
     /// Non-zero for an exact class whose hot methods have native
     /// implementations (see `stdlib::datetime_native`): its instances
     /// are never cycle-collector tracked (like CPython's C types without
@@ -1062,6 +1065,7 @@ impl TypeObject {
             metaclass: RefCell::new(None),
             leaf_attrs: LeafAttrCache::new(),
             inst_dict_hint: std::sync::atomic::AtomicU32::new(0),
+            shared_keys: crate::sync::LazyArc::new(),
             native_kind: Cell::new(0),
             native_ext: std::sync::OnceLock::new(),
             abc_state: std::sync::OnceLock::new(),
@@ -2467,7 +2471,7 @@ pub struct PyInstance {
     pub class: RefCell<Rc<TypeObject>>,
     /// Instance attributes, allocated on the first write or exported handle.
     /// Reads through `get()` preserve the absence of an unused dictionary.
-    pub dict: crate::sync::LazyArc<RefCell<DictData>>,
+    pub dict: crate::inst_dict::InstDict,
     /// For instances of a subclass of an immutable built-in
     /// (`int`, `str`, `float`, `bytes`, `tuple`, …) this holds the
     /// underlying primitive value the instance *is* — the moral
@@ -2479,7 +2483,7 @@ pub struct PyInstance {
     /// inline body by the extension's `tp_new` chain after allocation).
     /// Unwrapped by the numeric / comparison / hashing / conversion
     /// fast paths so e.g. `class C(int)` instances behave like real ints.
-    pub native: std::sync::OnceLock<Object>,
+    pub native: crate::sync::OnceBox<Object>,
     /// Mirrors CPython 3.13's "inline values" state observable through
     /// `_testinternalcapi.has_inline_values`: starts `true` for ordinary
     /// instances (native fixed weakrefs start `false`) and is
@@ -2552,8 +2556,8 @@ impl PyInstance {
     pub fn new(class: Rc<TypeObject>) -> Self {
         Self {
             class: RefCell::new(class),
-            dict: crate::sync::LazyArc::new(),
-            native: std::sync::OnceLock::new(),
+            dict: crate::inst_dict::InstDict::new(),
+            native: crate::sync::OnceBox::new(),
             inline_values: Cell::new(true),
             slots: RefCell::new(SlotStorage::default()),
             hash_cache: crate::sync::CachedHash::new(None),
@@ -2568,8 +2572,8 @@ impl PyInstance {
     pub fn with_native(class: Rc<TypeObject>, native: Object) -> Self {
         Self {
             class: RefCell::new(class),
-            dict: crate::sync::LazyArc::new(),
-            native: std::sync::OnceLock::from(native),
+            dict: crate::inst_dict::InstDict::new(),
+            native: crate::sync::OnceBox::from(native),
             inline_values: Cell::new(true),
             slots: RefCell::new(SlotStorage::default()),
             hash_cache: crate::sync::CachedHash::new(None),
@@ -2599,7 +2603,7 @@ impl PyInstance {
                 *m.class.get_mut() = class;
                 m.deferred.set(true);
                 if hint > 0 {
-                    if let Some(dict) = m.dict.get() {
+                    if let Some(dict) = m.dict.published() {
                         if let Ok(mut d) = dict.try_borrow_mut() {
                             if d.capacity() < hint {
                                 d.map_mut_atomic_store().reserve(hint);
@@ -2668,10 +2672,13 @@ impl PyInstance {
         if m.native.get().is_some() || m.finalize_ran.get() || m.c_body.get() != 0 {
             return;
         }
+        // Split values are atomic (the instance is deferred): clearing
+        // them runs no code. The allocation stays for the next tenant.
+        m.dict.split_mut().reset();
         // An instance that never grew a `__dict__` is the common case
         // now and needs no reset; one that did keeps it for the next
         // tenant, cleared and carrying a fresh owner record.
-        if let Some(dict) = m.dict.get() {
+        if let Some(dict) = m.dict.published() {
             // The dict must be private too: `vars(obj)` / `obj.__dict__`
             // hand out the same `Arc`, and a holder must keep seeing the
             // dead instance's attributes, not the next tenant's.
@@ -2737,7 +2744,7 @@ impl PyInstance {
     #[inline]
     pub(crate) fn clear_deferred_tracking(&self) {
         self.deferred.set(false);
-        if let Some(d) = self.dict.get() {
+        if let Some(d) = self.dict.published() {
             match d.try_borrow() {
                 Ok(d) => {
                     d.take_deferred_owner();
@@ -2757,7 +2764,7 @@ impl PyInstance {
         // Retire the dict's copy of the record so the write barrier does
         // not track a second time, then track from the instance itself —
         // which works whether or not a `__dict__` was ever created.
-        if let Some(d) = self.dict.get() {
+        if let Some(d) = self.dict.published() {
             if let Ok(d) = d.try_borrow() {
                 d.take_deferred_owner();
             }
@@ -2858,7 +2865,7 @@ impl Drop for PyInstance {
     fn drop(&mut self) {
         // A deferred-tracking record names this instance; the dict may
         // outlive it (`d = obj.__dict__`), so retire the record first.
-        if let Some(d) = self.dict.get() {
+        if let Some(d) = self.dict.published() {
             match d.try_borrow() {
                 Ok(d) => {
                     d.take_deferred_owner();
@@ -2914,8 +2921,8 @@ impl Drop for PyInstance {
             class: RefCell::new(self.cls()),
             dict: self.dict.clone(),
             native: match self.native.get() {
-                Some(v) => std::sync::OnceLock::from(v.clone()),
-                None => std::sync::OnceLock::new(),
+                Some(v) => crate::sync::OnceBox::from(v.clone()),
+                None => crate::sync::OnceBox::new(),
             },
             inline_values: Cell::new(self.inline_values.get()),
             slots: RefCell::new(self.slots.borrow().clone()),
@@ -2940,7 +2947,9 @@ mod slot_storage_tests {
     #[test]
     fn shared_layout_keeps_slot_storage_compact() {
         assert_eq!(std::mem::size_of::<SlotStorage>(), 32);
-        assert_eq!(std::mem::size_of::<PyInstance>(), 128);
+        // The split `__dict__` values pointer and its cell: with the
+        // allocator's header the instance stays in the 160-byte class.
+        assert_eq!(std::mem::size_of::<PyInstance>(), 136);
     }
 
     #[test]

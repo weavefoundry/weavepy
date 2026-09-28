@@ -2655,7 +2655,7 @@ fn slot_sizeof(args: &[Object]) -> Result<Object, RuntimeError> {
                     return Ok(Object::Int(28 + 4 * ndigits));
                 }
             }
-            16 + 8 * inst.dict.get().map_or(0, |dict| dict.borrow().len()) as i64
+            16 + 8 * inst.attr_count() as i64
         }
         // CPython's compact-unicode layout (test_str.test_raiseMemError):
         // ASCII is a 40-byte struct + len+1 one-byte units; anything wider
@@ -8549,7 +8549,7 @@ pub(crate) fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object 
             d
         }))
         .into(),
-        native: std::sync::OnceLock::new(),
+        native: crate::sync::OnceBox::new(),
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
         hash_cache: crate::sync::CachedHash::new(None),
@@ -8628,7 +8628,7 @@ pub(crate) fn build_super_proxy(
             d
         }))
         .into(),
-        native: std::sync::OnceLock::new(),
+        native: crate::sync::OnceBox::new(),
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
         hash_cache: crate::sync::CachedHash::new(None),

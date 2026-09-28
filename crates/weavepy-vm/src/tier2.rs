@@ -2770,20 +2770,12 @@ fn attr_fingerprint_obj(
     // RFC 0071 WS2 — a new-key store has no current value by
     // definition: the `Unknown` lane tells the analyzer to type the
     // site from the stored value instead.
-    let slot_val;
-    let dict;
-    let v: &Object = match storage {
+    let current = match storage {
         AttrStorage::NewKey => return Some((JitType::Unknown, ver, storage)),
-        AttrStorage::Slot(_) => {
-            slot_val = inst.slot_get(name)?;
-            &slot_val
-        }
-        AttrStorage::Indexed(key_idx) => {
-            dict = inst.dict.get()?.borrow();
-            let (_, v) = dict.get_index(key_idx as usize)?;
-            v
-        }
+        AttrStorage::Slot(_) => inst.slot_get(name)?,
+        AttrStorage::Indexed(key_idx) => inst.attr_index_map(key_idx as usize, |_, v| v.clone())?,
     };
+    let v = &current;
     // RFC 0070 WS1 — instance- or `None`-valued attributes take the
     // nullable object lane (loads pin the value at runtime; stores
     // resolve the staged pin); RFC 0071 WS6 — exact `str`/`bytes`
@@ -3871,16 +3863,14 @@ unsafe fn native_scalar_field_update(
     }
     // SAFETY: no callback, allocation, or Python execution can overlap this
     // exclusive view. A shared cell is rejected by peek_mut.
-    let dict = unsafe { inst.dict.get()?.peek_mut() }?;
-    let (key, old) = dict.get_index(index as usize)?;
+    let (key, slot) = unsafe { inst.attr_peek_index_mut(index as usize, true) }?;
     if !key_is(key, &guard.name) {
         return None;
     }
-    let Object::Int(old) = old else {
+    let Object::Int(old) = slot else {
         return None;
     };
     let value = old.checked_add(increment)?;
-    let (_, slot) = dict.map_mut_unstamped().get_index_mut(index as usize)?;
     // Exact integers own no destructor or GC edge. Existing-key replacement
     // preserves key stamps. No failing operation follows the completed store.
     *slot = Object::Int(value);
@@ -5485,16 +5475,14 @@ unsafe extern "C" fn wpjit_call_method(
                 s: &entry.name,
                 hash: entry.name_hash,
             };
+            // SAFETY: a read between two native ops; nothing here runs
+            // code (see `GilCell::peek`).
             attr_class_ok(inst, entry.ver)
-                && inst.dict.get().is_none_or(|dict| {
-                    // SAFETY: a read between two native ops; nothing
-                    // here runs code (see `GilCell::peek`).
-                    match unsafe { dict.peek() } {
-                        Some(d) => d.get(&probe).is_none(),
-                        None => dict.borrow().get(&probe).is_none(),
-                    }
-                })
-                && Rc::ptr_eq(&entry.func.code.borrow(), &entry.code)
+                && unsafe { inst.attr_peek_has(probe.s, probe.hash) } == Some(false)
+                && match unsafe { entry.func.code.peek() } {
+                    Some(code) => Rc::ptr_eq(code, &entry.code),
+                    None => Rc::ptr_eq(&entry.func.code.borrow(), &entry.code),
+                }
         }
         _ => false,
     };
@@ -7566,15 +7554,9 @@ unsafe extern "C" fn wpjit_attr_get(frame: *mut JitFrame, pin: i64, site: i64) -
                 }
             }
             AttrStorage::Indexed(key_idx) => {
-                let Some(dict) = inst.dict.get() else {
-                    return 1;
-                };
                 // SAFETY: a read between two native ops; nothing here
                 // runs code (see `GilCell::peek`).
-                let Some(dict) = (unsafe { dict.peek() }) else {
-                    return 1;
-                };
-                match dict.get_index(key_idx as usize) {
+                match unsafe { inst.attr_peek_index(key_idx as usize) } {
                     Some((k, v)) if key_is(k, &g.name) => match classify(v) {
                         Some(o) => o,
                         None => return 1,
@@ -7640,9 +7622,8 @@ unsafe fn chain_attr_peek<'a>(
         }
         AttrStorage::Indexed(index) => {
             // SAFETY: the same callback-free interval as the slot read.
-            let dict = unsafe { inst.dict.get().ok_or(AttrChainMiss::Guard)?.peek() }
-                .ok_or(AttrChainMiss::Guard)?;
-            let (name, value) = dict.get_index(index as usize).ok_or(AttrChainMiss::Guard)?;
+            let (name, value) =
+                unsafe { inst.attr_peek_index(index as usize) }.ok_or(AttrChainMiss::Guard)?;
             if !key_is(name, &guard.name) {
                 return Err(AttrChainMiss::Guard);
             }
@@ -7717,8 +7698,7 @@ fn chain_attr_read<R>(
         }
         AttrStorage::Indexed(index) => {
             // SAFETY: every chain step is a read without Python callbacks.
-            let dict = unsafe { inst.dict.get()?.peek() }?;
-            let (name, value) = dict.get_index(index as usize)?;
+            let (name, value) = unsafe { inst.attr_peek_index(index as usize) }?;
             key_is(name, &guard.name).then(|| read(value))
         }
         AttrStorage::NewKey => None,
@@ -7866,8 +7846,7 @@ unsafe fn cached_chain_peek<'a>(
             match cache {
                 IC::LoadAttrInstance { key_idx, ver } if ver == version => {
                     // SAFETY: the rooted walk is read-only and callback-free.
-                    let dict = unsafe { inst.dict.get()?.peek() }?;
-                    let (key, value) = dict.get_index(key_idx as usize)?;
+                    let (key, value) = unsafe { inst.attr_peek_index(key_idx as usize) }?;
                     key_is(key, name).then_some(value)
                 }
                 IC::LoadAttrSlot { key_idx, ver } if ver == version => {
@@ -7887,8 +7866,7 @@ unsafe fn cached_chain_peek<'a>(
                         .get(pc as usize)?
                         .index(version)?;
                     // SAFETY: the same callback-free, rooted interval.
-                    let dict = unsafe { inst.dict.get()?.peek() }?;
-                    let (key, value) = dict.get_index(index as usize)?;
+                    let (key, value) = unsafe { inst.attr_peek_index(index as usize) }?;
                     key_is(key, name).then_some(value)
                 }
             }
@@ -8160,17 +8138,12 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
             0
         }
         AttrStorage::Indexed(key_idx) => {
-            let mut dict = inst.dict_cell().borrow_mut();
-            let atomic = v.is_gc_atomic();
-            let dict = &mut *dict;
             // Replacing an existing key's value leaves the key layout (and
             // so the stamp) alone, as the interpreter's indexed store does.
-            let dict = if atomic {
-                dict.map_mut_unstamped()
-            } else {
-                dict.map_mut_value_store()
-            };
-            let Some((k, dst)) = dict.get_index_mut(key_idx as usize) else {
+            // SAFETY: nothing below runs code while the view is live.
+            let Some((k, dst)) =
+                (unsafe { inst.attr_peek_index_mut(key_idx as usize, v.is_gc_atomic()) })
+            else {
                 return 1;
             };
             if !key_is(k, &g.name) {
@@ -8206,6 +8179,32 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
             if crate::capi_watchers::dicts_active() {
                 return 1;
             }
+            // The split layout (see `Interpreter::core_store_new_attr`).
+            let v = if inst.dict.published().is_none() {
+                // SAFETY: a read between two native ops.
+                let Some(split) = (unsafe { inst.dict.split_cell().peek() }) else {
+                    return 1;
+                };
+                if let Some(dst) = split.get(&g.name) {
+                    if !matches!(
+                        dst,
+                        Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+                    ) && super::Interpreter::local_needs_prompt_reap(dst)
+                        && super::Interpreter::looks_reapable_temporary(dst)
+                    {
+                        return 1;
+                    }
+                }
+                match inst.split_store(&g.name, v) {
+                    Ok(old) => {
+                        drop(old);
+                        return 0;
+                    }
+                    Err(v) => v,
+                }
+            } else {
+                v
+            };
             let mut dict = inst.dict_cell().borrow_mut();
             let atomic = v.is_gc_atomic();
             let dict = &mut *dict;

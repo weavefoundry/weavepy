@@ -59,6 +59,7 @@ pub mod hot_filter;
 pub mod hot_gates;
 pub mod import;
 pub mod import_time;
+pub mod inst_dict;
 mod lazy_arc;
 pub mod linejump;
 pub mod malloc_stats;
@@ -2796,11 +2797,20 @@ impl Interpreter {
         let mut n = 0;
         // A dict shared through `vars(obj)` outlives the instance, and
         // with it every value.
-        let Some(dict) = inst.dict.get().filter(|_| inst.dict.strong_count() == 1) else {
-            return Some((leaves, n));
+        let split;
+        let d;
+        let attrs: &mut dyn Iterator<Item = (&DictKey, &Object)> = match inst.dict.published() {
+            Some(dict) if inst.dict.strong_count() == 1 => {
+                d = dict.try_borrow().ok()?;
+                &mut d.iter()
+            }
+            Some(_) => return Some((leaves, n)),
+            None => {
+                split = inst.dict.split_cell().try_borrow().ok()?;
+                &mut split.iter()
+            }
         };
-        let d = dict.try_borrow().ok()?;
-        for (k, v) in d.iter() {
+        for (k, v) in attrs {
             if !gc_trace::is_atomic(&k.0) {
                 return None;
             }
@@ -11916,7 +11926,6 @@ impl Interpreter {
                                             };
                                             if pure_site {
                                                 if let Some((v, call_pc)) = self.core_pure_method(
-                                                    ext,
                                                     code,
                                                     other,
                                                     pc + 1,
@@ -13428,24 +13437,10 @@ impl Interpreter {
                                 if !Self::default_getattribute(cls) {
                                     break Some(CoreExit::Helper);
                                 }
-                                // The instance dict must not shadow the method.
-                                if let Some(dict) = inst.dict.get() {
-                                    // SAFETY: a read between two instructions
-                                    // (see `GilCell::peek`).
-                                    let Some(d) = (unsafe { dict.peek() }) else {
-                                        break Some(CoreExit::Helper);
-                                    };
-                                    if !d.is_empty() {
-                                        let Some(probe) = code_name_leaf_probe(code, ins.arg)
-                                        else {
-                                            break Some(CoreExit::Helper);
-                                        };
-                                        if d.may_hold_str_hash(probe.hash)
-                                            && (d.contains_key(&probe) || probe.saw_exotic())
-                                        {
-                                            break Some(CoreExit::Helper);
-                                        }
-                                    }
+                                // The instance's attributes must not shadow
+                                // the method.
+                                if inst_may_shadow(inst, code, ins.arg) {
+                                    break Some(CoreExit::Helper);
                                 }
                                 let f = match ms.get_held(ver) {
                                     Some(f) => Object::Function(f),
@@ -13572,10 +13567,8 @@ impl Interpreter {
                         }
                         // SAFETY: a read between two instructions (see
                         // `GilCell::peek`).
-                        let Some(d) = inst.dict.get().and_then(|d| unsafe { d.peek() }) else {
-                            break Some(CoreExit::Helper);
-                        };
-                        let Some((k, v)) = d.get_index(key_idx as usize) else {
+                        let Some((k, v)) = (unsafe { inst.attr_peek_index(key_idx as usize) })
+                        else {
                             break Some(CoreExit::Helper);
                         };
                         if !slot_name_matches(code, ins.arg, k) {
@@ -14525,7 +14518,6 @@ impl Interpreter {
     #[allow(clippy::too_many_arguments)]
     fn core_pure_method(
         &self,
-        ext: Option<&CodeConstObjects>,
         code: &CodeObject,
         recv: &Object,
         attr_pc: usize,
@@ -14561,32 +14553,9 @@ impl Interpreter {
                 1,
             )
         }?;
-        // The instance dict must not shadow the method.
-        if let Some(dict) = inst.dict.get() {
-            // SAFETY: a read with nothing running (see `GilCell::peek`).
-            let d = unsafe { dict.peek() }?;
-            if !d.is_empty() {
-                // The interned name and its hash, from the loaded table.
-                let idx = name_idx as usize;
-                let named =
-                    ext.and_then(|t| match (t.name_objs.get(idx), t.name_hashes.get(idx)) {
-                        (Some(Object::Str(n)), Some(h)) => Some((&**n, *h)),
-                        _ => None,
-                    });
-                let (name, hash) = match named {
-                    Some(nh) => nh,
-                    None => {
-                        let k = code_name_key(code, name_idx)?;
-                        (k.s, k.hash)
-                    }
-                };
-                if d.may_hold_str_hash(hash) {
-                    let probe = crate::object::LeafNameProbe::new(name, hash);
-                    if d.contains_key(&probe) || probe.saw_exotic() {
-                        return None;
-                    }
-                }
-            }
+        // The instance's attributes must not shadow the method.
+        if inst_may_shadow(inst, code, name_idx) {
+            return None;
         }
         let r =
             self.core_pure_fused_eval(code, fp, call_pc, true, &mut args, nargs + 1, depth_cell)?;
@@ -14855,8 +14824,7 @@ impl Interpreter {
         }
         if !is_slot {
             // SAFETY: the caller keeps this rooted read callback-free.
-            let dict = unsafe { inst.dict.get()?.peek() }?;
-            let (key, value) = dict.get_index(key_idx as usize)?;
+            let (key, value) = unsafe { inst.attr_peek_index(key_idx as usize) }?;
             slot_name_matches_in(names, code, name_idx, key).then_some(value)
         } else {
             // SAFETY: the same rooted read as the dictionary path.
@@ -15532,22 +15500,10 @@ impl Interpreter {
                                 return None;
                             }
                             let fp = ms.peek_fn(cls.attr_version.get())?;
-                            // The instance dict must not shadow the method.
-                            if let Some(dict) = inst.dict.get() {
-                                // SAFETY: a read with nothing running.
-                                let d = unsafe { dict.peek() }?;
-                                let idx = ins.arg as usize;
-                                let (Some(Object::Str(name)), Some(&hash)) =
-                                    (ext.name_objs.get(idx), ext.name_hashes.get(idx))
-                                else {
-                                    return None;
-                                };
-                                if !d.is_empty() && d.may_hold_str_hash(hash) {
-                                    let probe = crate::object::LeafNameProbe::new(name, hash);
-                                    if d.contains_key(&probe) || probe.saw_exotic() {
-                                        return None;
-                                    }
-                                }
+                            // The instance's attributes must not shadow
+                            // the method.
+                            if inst_may_shadow(inst, code, ins.arg) {
+                                return None;
                             }
                             push!(V::Fn(fp));
                             push!(V::R(p));
@@ -16286,8 +16242,7 @@ impl Interpreter {
                 return None;
             }
             // SAFETY: a read between two instructions (see `peek`).
-            let d = unsafe { inst.dict.get()?.peek() }?;
-            let (k, v) = d.get_index(key_idx as usize)?;
+            let (k, v) = unsafe { inst.attr_peek_index(key_idx as usize) }?;
             return slot_name_matches_in(names, code, name_idx, k).then(|| Self::clone_operand(v));
         }
         Self::leaf_fused_local_attr(code, local, attr_pc, name_idx)
@@ -16345,11 +16300,9 @@ impl Interpreter {
                 }
                 _ => {
                     // SAFETY: the same rooted, callback-free walk as above.
-                    let Some(dict) = inst.dict.get().and_then(|d| unsafe { d.peek() }) else {
-                        break;
-                    };
                     let indexed = |index| {
-                        dict.get_index(index as usize)
+                        // SAFETY: as above.
+                        unsafe { inst.attr_peek_index(index as usize) }
                             .filter(|(key, _)| slot_name_matches(code, ins.arg, key))
                             .map(|(_, value)| value)
                     };
@@ -16423,24 +16376,16 @@ impl Interpreter {
                 {
                     return false;
                 }
-                // SAFETY: a read between two instructions (see `peek`).
-                let Some(d) = inst.dict.get().and_then(|d| unsafe { d.peek_mut() }) else {
-                    return false;
-                };
-                match d.get_index(key_idx as usize) {
-                    Some((k, old))
-                        if slot_name_matches(code, name_idx, k) && Self::core_droppable(old) => {}
-                    _ => return false,
-                }
                 // Replacing a value leaves the keys (and so the stamp) alone.
-                let map = if value.is_gc_atomic() {
-                    d.map_mut_unstamped()
-                } else {
-                    d.map_mut_value_store()
-                };
-                let Some((_, slot)) = map.get_index_mut(key_idx as usize) else {
+                // SAFETY: a read between two instructions (see `peek`).
+                let Some((k, slot)) =
+                    (unsafe { inst.attr_peek_index_mut(key_idx as usize, value.is_gc_atomic()) })
+                else {
                     return false;
                 };
+                if !slot_name_matches(code, name_idx, k) || !Self::core_droppable(slot) {
+                    return false;
+                }
                 // SAFETY: the value moves out of the caller's stack slot
                 // (the caller drops the slot without dropping the value)
                 // and the displaced value was checked droppable above.
@@ -16479,18 +16424,24 @@ impl Interpreter {
         }
         match code.caches.get(attr_pc as u32) {
             IC::StoreAttrInstance { key_idx, .. } => {
-                // SAFETY: an unused view with nothing running (the store's
-                // own `peek_mut` condition: no borrow at all).
-                let Some(d) = inst.dict.get().and_then(|d| unsafe { d.peek_mut() }) else {
-                    return false;
-                };
-                matches!(d.get_index(key_idx as usize), Some((k, old))
+                // SAFETY: an unused view with nothing running.
+                matches!(unsafe { inst.attr_peek_index(key_idx as usize) }, Some((k, old))
                     if slot_name_matches(code, name_idx, k) && Self::core_droppable(old))
             }
             _ => {
-                // No dictionary yet: the store creates it and inserts.
-                let Some(dict) = inst.dict.get() else {
-                    return true;
+                let Some(dict) = inst.dict.published() else {
+                    // Split storage: the store overwrites a droppable
+                    // value or appends (or declines, touching nothing).
+                    // SAFETY: as above.
+                    let Some(split) = (unsafe { inst.dict.split_cell().peek() }) else {
+                        return false;
+                    };
+                    let Some(Object::Str(name)) = code_name_obj(code, name_idx) else {
+                        return false;
+                    };
+                    return split
+                        .position(name)
+                        .is_none_or(|i| Self::core_droppable(&split.values()[i]));
                 };
                 let Some(probe) = code_name_leaf_probe(code, name_idx) else {
                     return false;
@@ -16530,6 +16481,33 @@ impl Interpreter {
             || crate::capi_watchers::dicts_active()
         {
             return false;
+        }
+        // The split layout: no hash table at all while the instance
+        // assigns its attributes in its class's usual order.
+        if inst.dict.published().is_none() {
+            let Some(Object::Str(name)) = code_name_obj(code, name_idx) else {
+                return false;
+            };
+            // SAFETY: a read between two instructions (see `peek`).
+            let Some(split) = (unsafe { inst.dict.split_cell().peek() }) else {
+                return false;
+            };
+            if split
+                .position(name)
+                .is_some_and(|i| !Self::core_droppable(&split.values()[i]))
+            {
+                return false;
+            }
+            // SAFETY: the value moves out of the caller's stack slot (the
+            // caller drops the slot without dropping the value); a
+            // declined store hands the bits back, still owned there.
+            match inst.split_store(name, unsafe { std::ptr::read(value) }) {
+                Ok(old) => {
+                    drop(old);
+                    return true;
+                }
+                Err(v) => std::mem::forget(v),
+            }
         }
         let atomic = value.is_gc_atomic();
         // The class facts were validated when the site specialized and
@@ -19114,9 +19092,9 @@ impl Interpreter {
                 if inst.cls_raw().attr_version.get() != ver {
                     return None;
                 }
-                let dict = inst.dict.get()?.try_borrow().ok()?;
-                let (k, v) = dict.get_index(key_idx as usize)?;
-                slot_name_matches(code, name_idx, k).then(|| Self::clone_operand(v))
+                inst.attr_index_map(key_idx as usize, |k, v| {
+                    slot_name_matches(code, name_idx, k).then(|| Self::clone_operand(v))
+                })?
             }
             (IC::LoadAttrSlot { key_idx, ver }, Object::Instance(inst)) => {
                 if inst.cls_raw().attr_version.get() != ver {
@@ -19180,12 +19158,8 @@ impl Interpreter {
             LeafAttr::InstanceOnly => {
                 // A data descriptor or a real field wins over __getattr__.
                 // This probe must prove a miss without comparing Python keys.
-                if let Some(dict) = inst.dict.get() {
-                    let probe = code_name_leaf_probe(code, name_idx)?;
-                    let dict = dict.try_borrow().ok()?;
-                    if dict.contains_key(&probe) || probe.saw_exotic() {
-                        return None;
-                    }
+                if inst_may_shadow(inst, code, name_idx) {
+                    return None;
                 }
                 let name = code_name_obj(code, name_idx)?;
                 (cls.lookup("__getattr__")?, Some(name))
@@ -19321,18 +19295,33 @@ impl Interpreter {
             prop @ LeafAttr::Property(_) => return Some((prop, None)),
             other => Some(other),
         };
-        if let Some(dict) = inst.dict.get() {
-            let probe = code_name_leaf_probe(code, name_idx)?;
-            let d = dict.try_borrow().ok()?;
-            if let Some((ix, _, v)) = d.get_full(&probe) {
-                return Some((
-                    LeafAttr::Value(Self::clone_operand(v)),
-                    u32::try_from(ix).ok(),
-                ));
+        match inst.dict.published() {
+            Some(dict) => {
+                let probe = code_name_leaf_probe(code, name_idx)?;
+                let d = dict.try_borrow().ok()?;
+                if let Some((ix, _, v)) = d.get_full(&probe) {
+                    return Some((
+                        LeafAttr::Value(Self::clone_operand(v)),
+                        u32::try_from(ix).ok(),
+                    ));
+                }
+                // A key only a user `__eq__` could compare: the full path.
+                if probe.saw_exotic() {
+                    return None;
+                }
             }
-            // A key only a user `__eq__` could compare: the full path.
-            if probe.saw_exotic() {
-                return None;
+            None => {
+                let split = inst.dict.split_cell().try_borrow().ok()?;
+                let ix = match code_name_obj(code, name_idx) {
+                    Some(Object::Str(n)) => split.position(n),
+                    _ => split.position_str(name.as_str()),
+                };
+                if let Some(ix) = ix {
+                    return Some((
+                        LeafAttr::Value(Self::clone_operand(&split.values()[ix])),
+                        u32::try_from(ix).ok(),
+                    ));
+                }
             }
         }
         on_class.map(|a| (a, None))
@@ -19611,15 +19600,8 @@ impl Interpreter {
                 _ => None,
             };
         }
-        if let Some(dict) = inst.dict.get() {
-            let d = dict.try_borrow().ok()?;
-            if !d.is_empty() {
-                let probe = code_name_leaf_probe(code, name_idx)?;
-                if d.may_hold_str_hash(probe.hash) && (d.contains_key(&probe) || probe.saw_exotic())
-                {
-                    return None;
-                }
-            }
+        if inst_may_shadow(inst, code, name_idx) {
+            return None;
         }
         let slot = code_method_slot(code, cache_pc);
         if let Some(f) = slot.and_then(|s| s.get(ver)) {
@@ -19717,14 +19699,7 @@ impl Interpreter {
                         // because the site never reaches it).
                         if matches!(cache, IC::Empty) {
                             let ver = cls.attr_version.get();
-                            let indexed = inst
-                                .dict
-                                .get()
-                                .and_then(|d| d.try_borrow().ok())
-                                .and_then(|d| {
-                                    use crate::specialize::DictDataExt;
-                                    d.index_of_key_str(name)
-                                });
+                            let indexed = inst.attr_position_str(name);
                             code.caches.set(
                                 cache_pc,
                                 match indexed {
@@ -19738,10 +19713,10 @@ impl Interpreter {
                 };
                 match cache {
                     IC::StoreAttrInstance { key_idx, .. } => {
-                        let dict = inst.dict.get()?;
                         {
-                            let d = dict.try_borrow().ok()?;
-                            let (k, old) = d.get_index(key_idx as usize)?;
+                            // SAFETY: a leaf store runs no code while the
+                            // views below are live.
+                            let (k, old) = unsafe { inst.attr_peek_index(key_idx as usize) }?;
                             if !slot_name_matches(code, name_idx, k) {
                                 return None;
                             }
@@ -19751,17 +19726,47 @@ impl Interpreter {
                                 return None;
                             }
                         }
-                        let mut d = dict.try_borrow_mut().ok()?;
-                        let d = &mut *d;
                         // As the core loop's arm: an in-place value store.
-                        let d = if value_slot.is_gc_atomic() {
-                            d.map_mut_unstamped()
-                        } else {
-                            d.map_mut_value_store()
-                        };
-                        let (_, slot) = d.get_index_mut(key_idx as usize)?;
+                        // SAFETY: as above.
+                        let (_, slot) = unsafe {
+                            inst.attr_peek_index_mut(key_idx as usize, value_slot.is_gc_atomic())
+                        }?;
                         let val = std::mem::replace(value_slot, Object::Unbound);
                         Some(std::mem::replace(slot, val))
+                    }
+                    IC::StoreAttrNewKey { .. } if inst.dict.published().is_none() => {
+                        // The split layout (see `core_store_new_attr`).
+                        let Some(Object::Str(shared)) = code_name_obj(code, name_idx) else {
+                            return None;
+                        };
+                        {
+                            // SAFETY: as above.
+                            let split = unsafe { inst.dict.split_cell().peek() }?;
+                            if let Some(i) = split.position(shared) {
+                                let old = &split.values()[i];
+                                if Self::local_needs_prompt_reap(old)
+                                    && Self::looks_reapable_temporary(old)
+                                {
+                                    return None;
+                                }
+                            }
+                        }
+                        let val = std::mem::replace(value_slot, Object::Unbound);
+                        match inst.split_store(shared, val) {
+                            Ok(old) => old,
+                            Err(val) => {
+                                // Needs the real dictionary: store there.
+                                let dict = inst.dict_cell();
+                                let mut d = dict.try_borrow_mut().ok()?;
+                                let d = &mut *d;
+                                let d = if val.is_gc_atomic() {
+                                    d.map_mut_atomic_store()
+                                } else {
+                                    &mut **d
+                                };
+                                d.insert(DictKey(Object::Str(shared.clone())), val)
+                            }
+                        }
                     }
                     IC::StoreAttrNewKey { .. } => {
                         let probe = code_name_leaf_probe(code, name_idx)?;
@@ -20473,21 +20478,15 @@ impl Interpreter {
                                             cls.attr_version.get() == ver
                                         };
                                         if guard_ok {
-                                            inst.dict.get().and_then(|dict| {
-                                                let dict = dict.borrow();
-                                                match dict.get_index(key_idx as usize) {
-                                                    Some((k, v))
-                                                        if self.cached_slot_name_matches(
-                                                            &frame.code,
-                                                            attr_ins.arg,
-                                                            k,
-                                                        ) =>
-                                                    {
-                                                        Some(Self::clone_operand(v))
-                                                    }
-                                                    _ => None,
-                                                }
+                                            inst.attr_index_map(key_idx as usize, |k, v| {
+                                                self.cached_slot_name_matches(
+                                                    &frame.code,
+                                                    attr_ins.arg,
+                                                    k,
+                                                )
+                                                .then(|| Self::clone_operand(v))
                                             })
+                                            .flatten()
                                         } else {
                                             None
                                         }
@@ -26986,10 +26985,8 @@ impl Interpreter {
         }
 
         // (2) Instance dict.
-        if let Some(dict) = inst.dict.get() {
-            if let Some(v) = dict.borrow().get(&crate::object::StrKey(name)) {
-                return Ok(v.clone());
-            }
+        if let Some(v) = inst.attr_get_str(name) {
+            return Ok(v);
         }
 
         // (3) Non-data descriptor / function on class.
@@ -38124,11 +38121,8 @@ impl Interpreter {
         if cls.attr_version.get() != ver {
             return None;
         }
-        if let Some(dict) = inst.dict.get() {
-            let d = dict.borrow();
-            if !d.is_empty() && d.contains_key(&code_name_key(&frame.code, name_idx)?) {
-                return None;
-            }
+        if inst_may_shadow(inst, &frame.code, name_idx) {
+            return None;
         }
         let slot = code_method_slot(&frame.code, cache_pc);
         if let Some(f) = slot.and_then(|s| s.get(ver)) {
@@ -38194,17 +38188,12 @@ impl Interpreter {
                         cls.attr_version.get() == ver
                     };
                     if guard_ok {
-                        let hit = inst.dict.get().and_then(|dict| {
-                            let dict = dict.borrow();
-                            match dict.get_index(key_idx as usize) {
-                                Some((k, v))
-                                    if self.cached_slot_name_matches(&frame.code, name_idx, k) =>
-                                {
-                                    Some(Self::clone_operand(v))
-                                }
-                                _ => None,
-                            }
-                        });
+                        let hit = inst
+                            .attr_index_map(key_idx as usize, |k, v| {
+                                self.cached_slot_name_matches(&frame.code, name_idx, k)
+                                    .then(|| Self::clone_operand(v))
+                            })
+                            .flatten();
                         if let Some(v) = hit {
                             specialize::record_hit(op_idx);
                             return Ok(v);
@@ -38286,13 +38275,7 @@ impl Interpreter {
                         // differ, so probe when non-empty (with the
                         // name's memoised hash — no siphash, no
                         // allocation).
-                        let shadowed = inst.dict.get().is_some_and(|dict| {
-                            let d = dict.borrow();
-                            !d.is_empty()
-                                && code_name_key(&frame.code, name_idx).is_none_or(|k| {
-                                    d.may_hold_str_hash(k.hash) && d.contains_key(&k)
-                                })
-                        });
+                        let shadowed = inst_may_shadow(inst, &frame.code, name_idx);
                         if !shadowed {
                             let slot = code_method_slot(&frame.code, cache_pc);
                             match slot.and_then(|s| s.get(ver)) {
@@ -38341,17 +38324,7 @@ impl Interpreter {
                         // it (pandas `MultiIndex.__new__` writes `_names`
                         // over a class-level default), so probe when
                         // non-empty — one hash of the interned name.
-                        let shadowed = inst.dict.get().is_some_and(|dict| {
-                            match code_name_key(&frame.code, name_idx) {
-                                Some(key) => {
-                                    let d = dict.borrow();
-                                    !d.is_empty()
-                                        && d.may_hold_str_hash(key.hash)
-                                        && d.contains_key(&key)
-                                }
-                                None => true,
-                            }
-                        });
+                        let shadowed = inst_may_shadow(inst, &frame.code, name_idx);
                         if shadowed {
                             None
                         } else {
@@ -38496,12 +38469,11 @@ impl Interpreter {
                         // Validate the cached index still holds *this* name:
                         // a `del` on an earlier attribute shift-renumbers
                         // every later slot (same guard as LOAD_ATTR).
-                        let name_ok = {
-                            let dict = inst.dict_cell().borrow();
-                            dict.get_index(key_idx as usize).is_some_and(|(k, _)| {
+                        let name_ok = inst
+                            .attr_index_map(key_idx as usize, |k, _| {
                                 self.cached_slot_name_matches(&frame.code, name_idx, k)
                             })
-                        };
+                            .unwrap_or(false);
                         if name_ok {
                             let val = frame.pop()?;
                             // Mirror the slow path: a bound method stored
@@ -38516,11 +38488,13 @@ impl Interpreter {
                             // earlier read-only check has been dropped, and
                             // scope it tightly so it is released before the
                             // prompt-reap cascade (which can run `__del__`).
-                            let old = inst
-                                .dict_cell()
-                                .borrow_mut()
-                                .get_index_mut(key_idx as usize)
-                                .map(|(_, slot)| std::mem::replace(slot, val));
+                            let old = match inst.attr_replace_index(key_idx as usize, val) {
+                                Ok(old) => Some(old),
+                                Err(val) => {
+                                    frame.push(val);
+                                    None
+                                }
+                            };
                             if let Some(old) = old {
                                 specialize::record_hit(op_idx);
                                 // CPython decrefs the overwritten value now;
@@ -38570,7 +38544,19 @@ impl Interpreter {
                             // the site takes the indexed shape from here on
                             // (the core loop's `STORE_ATTR` arm serves it).
                             let mut upgrade_idx = false;
-                            let old = {
+                            let mut val = Some(val);
+                            let old = 'store: {
+                                // The split layout (see `core_store_new_attr`).
+                                if watch_value.is_none() && inst.dict.published().is_none() {
+                                    if let Some(Object::Str(n)) = code_name_obj(code, name_idx) {
+                                        let v = val.take().expect("value not consumed");
+                                        match inst.split_store(n, v) {
+                                            Ok(old) => break 'store old,
+                                            Err(v) => val = Some(v),
+                                        }
+                                    }
+                                }
+                                let val = val.take().expect("value not consumed");
                                 let mut dict = inst.dict_cell().borrow_mut();
                                 let dict = &mut *dict;
                                 let dict = if val.is_gc_atomic() {
@@ -40576,7 +40562,21 @@ impl Interpreter {
         } else {
             None
         };
-        let old = {
+        let key = crate::stdlib::sys::intern_name(name);
+        let mut value = Some(value);
+        let old = 'store: {
+            // The split layout, while the instance keeps one (and no
+            // watcher needs to see a real dictionary change).
+            if watch_value.is_none() && inst.dict.published().is_none() {
+                if let Object::Str(n) = &key {
+                    let v = value.take().expect("value not consumed");
+                    match inst.split_store(n, v) {
+                        Ok(old) => break 'store old,
+                        Err(v) => value = Some(v),
+                    }
+                }
+            }
+            let value = value.take().expect("value not consumed");
             let mut dict = inst.dict_cell().borrow_mut();
             let dict = &mut *dict;
             let dict = if value.is_gc_atomic() {
@@ -40584,7 +40584,7 @@ impl Interpreter {
             } else {
                 &mut **dict
             };
-            dict.insert(DictKey(crate::stdlib::sys::intern_name(name)), value)
+            dict.insert(DictKey(key), value)
         };
         // Instance `__dict__` is a real dict; a watched one observes
         // attribute stores as ADDED/MODIFIED (test_watchers
@@ -57426,11 +57426,15 @@ fn attr_certainly_missing(obj: &Object, name: &str) -> bool {
     {
         return false;
     }
-    match inst.dict.get() {
+    match inst.dict.published() {
         Some(d) => d
             .try_borrow()
             .is_ok_and(|d| !d.contains_key(&crate::object::StrKey(name))),
-        None => true,
+        None => inst
+            .dict
+            .split_cell()
+            .try_borrow()
+            .is_ok_and(|s| s.position_str(name).is_none()),
     }
 }
 
@@ -57978,8 +57982,12 @@ fn exception_holds_nonatomic(obj: &Object) -> bool {
             return true;
         }
     }
-    let Some(dict) = inst.dict.get() else {
-        return false;
+    let Some(dict) = inst.dict.published() else {
+        return inst
+            .dict
+            .split_cell()
+            .try_borrow()
+            .map_or(true, |s| s.values().iter().any(nonatomic));
     };
     let Ok(dict) = dict.try_borrow() else {
         // Borrowed elsewhere (shouldn't happen on a just-built instance); err
@@ -61640,10 +61648,8 @@ impl AttrPoly {
     #[inline]
     fn hit(&self, code: &CodeObject, inst: &PyInstance, ver: u64, name_idx: u32) -> Option<Object> {
         let ix = self.index(ver)?;
-        let dict = inst.dict.get()?;
         // SAFETY: a read between two instructions (see `GilCell::peek`).
-        let d = unsafe { dict.peek() }?;
-        let (k, v) = d.get_index(ix as usize)?;
+        let (k, v) = unsafe { inst.attr_peek_index(ix as usize) }?;
         slot_name_matches(code, name_idx, k).then(|| Interpreter::clone_operand(v))
     }
 
@@ -62667,6 +62673,49 @@ fn exc_family_flags(cls: &crate::types::TypeObject) -> u16 {
 #[inline]
 fn code_name_obj(code: &CodeObject, name_idx: u32) -> Option<&Object> {
     code_vm_ext(code).and_then(|t| t.name_objs.get(name_idx as usize))
+}
+
+/// Whether `inst`'s own attributes may shadow `co_names[name_idx]` (a
+/// method cache's guard): `false` proves the name absent, and `true` also
+/// answers when that can't be told without borrowing.
+#[inline(always)]
+fn inst_may_shadow(inst: &PyInstance, code: &CodeObject, name_idx: u32) -> bool {
+    match inst.dict.published() {
+        Some(dict) => dict_may_shadow(dict, code, name_idx),
+        None => {
+            // SAFETY: a read between two instructions (see `GilCell::peek`).
+            let Some(split) = (unsafe { inst.dict.split_cell().peek() }) else {
+                return true;
+            };
+            if split.is_empty() {
+                return false;
+            }
+            let i = name_idx as usize;
+            match code_vm_ext(code).map(|t| (t.name_objs.get(i), t.name_hashes.get(i))) {
+                Some((Some(Object::Str(n)), Some(&hash))) => {
+                    split.position_hashed(n, hash).is_some()
+                }
+                _ => code_name_key(code, name_idx)
+                    .is_none_or(|k| split.position_hashed(k.s, k.hash).is_some()),
+            }
+        }
+    }
+}
+
+/// [`inst_may_shadow`] for an instance with a real dictionary.
+#[inline(never)]
+fn dict_may_shadow(dict: &RefCell<DictData>, code: &CodeObject, name_idx: u32) -> bool {
+    // SAFETY: a read between two instructions (see `GilCell::peek`).
+    let Some(d) = (unsafe { dict.peek() }) else {
+        return true;
+    };
+    if d.is_empty() {
+        return false;
+    }
+    let Some(probe) = code_name_leaf_probe(code, name_idx) else {
+        return true;
+    };
+    d.may_hold_str_hash(probe.hash) && (d.contains_key(&probe) || probe.saw_exotic())
 }
 
 /// A pre-hashed, Python-free probe for `co_names[name_idx]` (see

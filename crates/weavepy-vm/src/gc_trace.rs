@@ -2749,7 +2749,15 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             // `dict -> instance -> class -> method -> __globals__` cycle
             // in a dead ModuleType namespace would be immortal
             // (test_module.test_clear_dict_in_ref_cycle).
-            if let Some(dict) = i.dict.get_shared() {
+            if i.dict.published().is_none() {
+                // Split values: the instance's own children.
+                if let Ok(split) = i.dict.split_cell().try_borrow() {
+                    for (k, v) in split.iter() {
+                        visit(&k.0);
+                        visit(v);
+                    }
+                }
+            } else if let Some(dict) = i.dict.get_shared() {
                 let dict_obj = Object::Dict(dict);
                 if is_tracked(id_of(&dict_obj)) {
                     visit(&dict_obj);
@@ -3116,12 +3124,21 @@ pub fn clear_object_fields(obj: &Object) -> bool {
             if let Ok(mut slots) = i.slots.try_borrow_mut() {
                 *slots = crate::types::SlotStorage::default();
             }
+            if i.dict.published().is_none() {
+                let values = i
+                    .dict
+                    .split_cell()
+                    .try_borrow_mut()
+                    .map(|mut s| s.take())
+                    .unwrap_or_default();
+                drop(values);
+            }
             if i.dict.strong_count() > 1 {
                 // Shared `__dict__`: leave its contents to the other
                 // holder (see the doc comment).
                 return false;
             }
-            if let Some(dict) = i.dict.get() {
+            if let Some(dict) = i.dict.published() {
                 if let Ok(mut m) = dict.try_borrow_mut() {
                     m.clear();
                 }

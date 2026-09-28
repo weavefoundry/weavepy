@@ -708,7 +708,7 @@ fn make_lock_object(lock: Arc<RealLock>) -> Object {
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(lock_type()),
         dict: dict.into(),
-        native: std::sync::OnceLock::new(),
+        native: crate::sync::OnceBox::new(),
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
         hash_cache: crate::sync::CachedHash::new(None),
@@ -893,7 +893,7 @@ fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(rlock_type()),
         dict: dict.into(),
-        native: std::sync::OnceLock::new(),
+        native: crate::sync::OnceBox::new(),
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
         hash_cache: crate::sync::CachedHash::new(None),
@@ -1831,7 +1831,7 @@ fn make_thread_handle_object(state: Arc<ThreadHandleState>, ident: Object) -> Ob
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(thread_handle_type()),
         dict: dict.into(),
-        native: std::sync::OnceLock::new(),
+        native: crate::sync::OnceBox::new(),
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
         hash_cache: crate::sync::CachedHash::new(None),

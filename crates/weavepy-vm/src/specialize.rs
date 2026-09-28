@@ -171,10 +171,8 @@ pub fn attempt_specialize_load_attr(obj: &Object, name: &str) -> InlineCache {
             }
             // First check the instance dict — that's the
             // `LoadAttrInstance` shape.
-            if let Some(dict) = inst.dict.get() {
-                if let Some(idx) = dict.borrow().index_of_key_str(name) {
-                    return InlineCache::LoadAttrInstance { key_idx: idx, ver };
-                }
+            if let Some(idx) = inst.attr_position_str(name) {
+                return InlineCache::LoadAttrInstance { key_idx: idx, ver };
             }
             // Not on the instance: resolve through the MRO. A plain
             // Python function anywhere on it is the *method* shape —
@@ -322,10 +320,8 @@ pub fn attempt_specialize_store_attr(obj: &Object, name: &str) -> InlineCache {
             ) {
                 return InlineCache::Cooldown(COOLDOWN);
             }
-            if let Some(dict) = inst.dict.get() {
-                if let Some(idx) = dict.borrow().index_of_key_str(name) {
-                    return InlineCache::StoreAttrInstance { key_idx: idx, ver };
-                }
+            if let Some(idx) = inst.attr_position_str(name) {
+                return InlineCache::StoreAttrInstance { key_idx: idx, ver };
             }
             // Key not present: the constructor pattern (`self.x = …` on a
             // fresh instance). Specialize to a single-probe insert when
