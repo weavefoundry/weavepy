@@ -9559,9 +9559,13 @@ impl Interpreter {
                     && matches!(frame.stack.last(), Some(Object::Generator(_)))
                     && self.inline_calls_ok()
                 {
-                    if let Some(act) =
-                        self.try_inline_gen(frame, shell, cur_pc, crate::recursion::depth_cell())
-                    {
+                    if let Some(act) = self.try_inline_gen(
+                        frame,
+                        shell,
+                        cur_pc,
+                        crate::recursion::depth_cell(),
+                        false,
+                    ) {
                         return FrameEv::Call(act);
                     }
                 }
@@ -9845,6 +9849,9 @@ impl Interpreter {
     /// `FOR_ITER` over a suspended generator at `pc` of `frame`, as an
     /// inline activation: the generator's boxed frame runs in place (the
     /// `generator_send_lean` shape, without a nested native activation).
+    /// With `next_call`, the instruction is instead the `CALL` of builtin
+    /// `next` on the generator: the call's operands leave the stack, the
+    /// yielded value is its result, and exhaustion raises `StopIteration`.
     /// `None` leaves everything untouched.
     fn try_inline_gen(
         &mut self,
@@ -9852,8 +9859,13 @@ impl Interpreter {
         shell: &mut QuietShell<'_>,
         pc: usize,
         depth_cell: *const std::cell::Cell<usize>,
+        next_call: bool,
     ) -> Option<Box<InlineAct>> {
-        let arg = frame.code.instructions.get(pc)?.arg;
+        let arg = if next_call {
+            GEN_NEXT_CALL
+        } else {
+            frame.code.instructions.get(pc)?.arg
+        };
         let Some(Object::Generator(g)) = frame.stack.last() else {
             return None;
         };
@@ -9909,6 +9921,11 @@ impl Interpreter {
         gf.push(Object::None);
         let gen_frame: *mut Frame = gf;
         frame.pc = pc as u32 + 1;
+        if next_call {
+            // `next`, its empty self slot and the generator (held above).
+            let n = frame.stack.len();
+            drop(frame.stack.drain(n - 3..));
+        }
         let mut act = self.inline_slot();
         act.gen = Some(g);
         act.gen_box = Some(boxed);
@@ -9983,13 +10000,13 @@ impl Interpreter {
                 Self::park_suspended_boxed(&gen, boxed);
                 Ok(GenStep::Yielded(v))
             }
-            Ok(FrameOutcome::Returned(_)) => {
+            Ok(FrameOutcome::Returned(v)) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
                 let frame: &mut Frame = &mut boxed;
                 self.reap_dead_frame(frame);
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(&gen);
-                Ok(GenStep::Exhausted)
+                Ok(GenStep::Exhausted(v))
             }
             Ok(FrameOutcome::StartGenerator) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
@@ -10035,7 +10052,12 @@ impl Interpreter {
                 frame.stack.push(v);
                 QuietEntry::Returned { cur_pc: call_pc }
             }
-            Ok(GenStep::Exhausted) => {
+            // `next(gen)`: the return value rides the StopIteration.
+            Ok(GenStep::Exhausted(v)) if arg == GEN_NEXT_CALL => QuietEntry::Raised {
+                err: crate::error::stop_iteration_with(v),
+                cur_pc: call_pc,
+            },
+            Ok(GenStep::Exhausted(_)) => {
                 let it = frame.stack.pop();
                 frame.pc += arg;
                 frame.skip_end_for();
@@ -12627,7 +12649,7 @@ impl Interpreter {
                                 unsafe { frame.stack.set_len(len) };
                                 frame.pc = pc as u32;
                                 *last_pc = last;
-                                if !self.core_gen_resume(sw, pc) {
+                                if !self.core_gen_resume(sw, pc, false) {
                                     sw.pending = Some(CoreExit::Stop(LeafStop::Step));
                                 }
                                 break Some(CoreExit::Reload);
@@ -13112,6 +13134,25 @@ impl Interpreter {
                         let argc = ins.arg as usize;
                         if len < argc + 2 {
                             break None;
+                        }
+                        // `next(gen)`: the generator resumes inline, as for
+                        // `FOR_ITER`, with the yield as the call's result.
+                        // SAFETY: `len >= argc + 2 == 3`.
+                        if argc == 1
+                            && matches!(
+                                unsafe { (&*base.add(len - 3), &*base.add(len - 2), &*base.add(len - 1)) },
+                                (Object::Builtin(b), Object::Unbound, Object::Generator(_))
+                                    if Rc::as_ptr(b) as usize == self.leaf_fns().next_ptr
+                            )
+                        {
+                            // SAFETY: `len <= cap`, every slot initialized.
+                            unsafe { frame.stack.set_len(len) };
+                            frame.pc = pc as u32;
+                            *last_pc = last;
+                            if !self.core_gen_resume(sw, pc, true) {
+                                sw.pending = Some(CoreExit::Stop(LeafStop::Step));
+                            }
+                            break Some(CoreExit::Reload);
                         }
                         // SAFETY: `len >= argc + 2`.
                         let python = match unsafe { &*base.add(len - argc - 2) } {
@@ -15983,7 +16024,7 @@ impl Interpreter {
     /// ([`Self::try_inline_gen`]), with the generator's activation pushed
     /// and made the running one here. `false` touches nothing.
     #[inline(never)]
-    fn core_gen_resume(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+    fn core_gen_resume(&mut self, sw: &mut CoreSwitch, pc: usize, next_call: bool) -> bool {
         if !self.inline_calls_ok() {
             return false;
         }
@@ -15997,6 +16038,7 @@ impl Interpreter {
                 &mut *shell.cast::<QuietShell<'_>>(),
                 pc,
                 sw.depth_cell,
+                next_call,
             )
         };
         let Some(act) = act else {
@@ -18836,8 +18878,12 @@ impl Interpreter {
         self.leaf_fns.get_or_init(|| {
             let mut calls = std::collections::HashMap::default();
             let mut len_ptr = 0usize;
+            let mut next_ptr = 0usize;
             {
                 let b = self.builtins.borrow();
+                if let Some(Object::Builtin(f)) = b.get(&crate::object::StrKey("next")) {
+                    next_ptr = Rc::as_ptr(f) as usize;
+                }
                 for (name, kind) in [("len", LeafKind::Len), ("isinstance", LeafKind::Isinstance)] {
                     if let Some(Object::Builtin(f)) = b.get(&crate::object::StrKey(name)) {
                         calls.insert(Rc::as_ptr(f) as usize, kind);
@@ -18954,6 +19000,7 @@ impl Interpreter {
             LeafFns {
                 calls,
                 len_ptr,
+                next_ptr,
                 methods,
                 range_ty: bt.range_.clone(),
                 list_ty: bt.list_.clone(),
@@ -56470,6 +56517,8 @@ struct LeafFns {
     calls: std::collections::HashMap<usize, LeafKind, crate::fasthash::FxBuildHasher>,
     /// The builtin `len`'s address (for the fused `len(x)`), or 0.
     len_ptr: usize,
+    /// The builtin `next`'s address (an inline generator resume), or 0.
+    next_ptr: usize,
     /// The builtin `range` and `list` types, whose calls with leaf
     /// argument shapes construct directly.
     range_ty: Rc<TypeObject>,
@@ -56542,7 +56591,8 @@ struct InlineAct {
     gen: Option<Rc<PyGenerator>>,
     gen_box: Option<Box<Frame>>,
     gen_frame: *mut Frame,
-    /// The resuming `FOR_ITER`'s jump distance (the exhaustion exit).
+    /// The resuming `FOR_ITER`'s jump distance (the exhaustion exit), or
+    /// [`GEN_NEXT_CALL`] for a resume by builtin `next`.
     exhaust_arg: u32,
     /// A constructor call's fresh instance (see `Interpreter::core_new`):
     /// the activation runs its `__init__`, and the caller receives the
@@ -56652,11 +56702,15 @@ enum FrameEv {
 }
 
 /// How an inline generator resume concluded.
+/// [`InlineAct::exhaust_arg`] of a generator resumed by builtin `next`
+/// (no `FOR_ITER` jump is that long).
+const GEN_NEXT_CALL: u32 = u32::MAX;
+
 enum GenStep {
     /// The generator yielded this value.
     Yielded(Object),
-    /// The generator returned: the loop is exhausted.
-    Exhausted,
+    /// The generator returned this value: the loop is exhausted.
+    Exhausted(Object),
 }
 
 /// Where an activation's stretch of the quiet loop starts.
