@@ -940,6 +940,11 @@ pub struct Interpreter {
     /// exact per-instruction event stream. Refreshed from the dispatch
     /// loop's [`crate::trace::ObserverSnapshot`] every iteration.
     fuse_off: bool,
+    /// A handled exception was just released (`POP_EXCEPT`): the running
+    /// frame's object may have lost its last outside holder (the
+    /// traceback), so the dispatch loop re-probes it on the next
+    /// instruction instead of waiting for its stride.
+    recheck_frame_observed: bool,
     /// `WEAVEPY_NO_QUIET`: pin every dispatch-loop iteration to the full
     /// prologue (RFC 0065 bisection aid). Read once at construction so a
     /// frame entry does not pay a `OnceLock` probe for it (RFC 0077 WS3).
@@ -1182,6 +1187,7 @@ impl Default for Interpreter {
             sum_fold_acc: None,
             sum_fold: None,
             fuse_off: false,
+            recheck_frame_observed: false,
             quiet_off: crate::hot_gates::env_flags::no_quiet(),
             burst_on: !crate::hot_gates::env_flags::no_burst()
                 && !crate::hot_gates::env_flags::no_quiet()
@@ -1307,6 +1313,7 @@ impl Interpreter {
             sum_fold_acc: None,
             sum_fold: None,
             fuse_off: false,
+            recheck_frame_observed: false,
             quiet_off: crate::hot_gates::env_flags::no_quiet(),
             burst_on: !crate::hot_gates::env_flags::no_burst()
                 && !crate::hot_gates::env_flags::no_quiet()
@@ -3879,6 +3886,45 @@ impl Interpreter {
         }
     }
 
+    /// The common handled exception, recognized without the reap walks: a
+    /// class with no finalizer, no instance dict, and slots holding only
+    /// atomic values, a tuple of them (`args`), or a traceback whose frames
+    /// are all still executing. Neither `exc_has_finalizable` nor
+    /// `anchors_tracked_child` can find anything in it.
+    fn exc_plainly_inert(obj: &Object) -> bool {
+        let Object::Instance(inst) = obj else {
+            return false;
+        };
+        if inst.cls().instances_need_finalize()
+            || inst
+                .dict
+                .get()
+                .is_some_and(|d| d.try_borrow().map_or(true, |d| !d.is_empty()))
+        {
+            return false;
+        }
+        let Ok(slots) = inst.slots.try_borrow() else {
+            return false;
+        };
+        // (Bound, not returned directly: the iterator borrows `slots`.)
+        #[allow(clippy::let_and_return)]
+        let inert = slots.iter().all(|(_, v)| match v {
+            Object::Tuple(t) => t.iter().all(Object::is_gc_atomic),
+            Object::Traceback(tb) => {
+                let mut cur = Some(tb.clone());
+                while let Some(node) = cur {
+                    if node.frame.on_stack.get() == 0 {
+                        return false;
+                    }
+                    cur = node.next.borrow().clone();
+                }
+                true
+            }
+            other => other.is_gc_atomic(),
+        });
+        inert
+    }
+
     /// Cheap, allocation-free pre-check for the `POP_EXCEPT` reap: does the
     /// acyclic subgraph rooted at `obj` contain a finalizable object
     /// (`__del__` / an unfinished generator) reachable through value
@@ -6039,7 +6085,8 @@ impl Interpreter {
             // ran. A few extra instructions on the full path after the
             // holder goes away cost far less.
             let rederive = frame_blocks_quiet
-                && self.gil_countdown.trailing_zeros() >= 4
+                && (std::mem::take(&mut self.recheck_frame_observed)
+                    || self.gil_countdown.trailing_zeros() >= 4)
                 && !Self::frame_object_observed(&shell, py_frame_slot.as_ref(), frame);
             if lgen != loop_snap_gen || rederive {
                 loop_snap_gen = lgen;
@@ -10438,7 +10485,7 @@ impl Interpreter {
             // missing-tail fill.
             v.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
         }
-        v.resize(nlocals, Object::Unbound);
+        fill_unbound(v, nlocals);
         if !has_self {
             frame.stack.pop(); // the NULL self slot
         }
@@ -10593,6 +10640,42 @@ impl Interpreter {
         Some((code, covered))
     }
 
+    /// [`Self::kw_names_bind_check`] for the `CALL_KW` at `pc` of
+    /// `caller`, remembered in the site's call slot: the names tuple is the
+    /// site's constant, so a function and code already verified there
+    /// (under the site's `func_id`) bind the same way again, unless their
+    /// defaults may have been replaced since.
+    #[allow(clippy::too_many_arguments)]
+    fn kw_names_bind_cached(
+        caller: &CodeObject,
+        pc: usize,
+        f: &Rc<PyFunction>,
+        func_id: u64,
+        perm: u32,
+        name_items: &[Object],
+        eff_argc: usize,
+    ) -> Option<(Rc<CodeObject>, u32)> {
+        // SAFETY: GIL-serialized raw read of the function's code cell;
+        // only compared, then cloned.
+        let live: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        let slot = code_call_slot(caller, pc);
+        if specialize::rc_id(f) == func_id && !f.defaults_maybe_overridden() {
+            if let Some((covered, _)) = slot.and_then(|s| s.hit(Rc::as_ptr(f), Rc::as_ptr(live))) {
+                return Some((live.clone(), covered));
+            }
+        }
+        let (code, covered) = Self::kw_names_bind_check(f, func_id, perm, name_items, eff_argc)?;
+        if let Some(slot) = slot {
+            slot.set(CallShape {
+                func: Rc::downgrade(f),
+                code: Rc::downgrade(&code),
+                missing: covered,
+                has_self: false,
+            });
+        }
+        Some((code, covered))
+    }
+
     /// Move a verified `CallPyKwNames` call's operands off `stack` into
     /// `locals` (cleared and sized here): keyword values to their
     /// permuted slots, the positional run (with a real self as slot 0)
@@ -10731,7 +10814,8 @@ impl Interpreter {
         let Object::Function(f) = &frame.stack[self_at - 1] else {
             return None;
         };
-        let (code, covered) = Self::kw_names_bind_check(f, func_id, perm, name_items, eff_argc)?;
+        let (code, covered) =
+            Self::kw_names_bind_cached(&frame.code, pc, f, func_id, perm, name_items, eff_argc)?;
         if !Self::lean_code_ok(&code) {
             return None;
         }
@@ -12726,7 +12810,19 @@ impl Interpreter {
                             unsafe { std::slice::from_raw_parts(base.add(start), len - start) };
                         let Some(r) = self.core_pure_kw_call(code, pc, ops, argc, sw.depth_cell)
                         else {
-                            break None;
+                            // A plain Python callee switches in place, as
+                            // `CALL`'s does (see `core_call_kw`).
+                            if !matches!(&ops[0], Object::Function(_)) {
+                                break None;
+                            }
+                            // SAFETY: `len <= cap`, every slot initialized.
+                            unsafe { frame.stack.set_len(len) };
+                            frame.pc = pc as u32;
+                            *last_pc = last;
+                            if !self.core_call_kw(sw, pc) && sw.pending.is_none() {
+                                sw.pending = Some(CoreExit::Stop(LeafStop::Step));
+                            }
+                            break Some(CoreExit::Reload);
                         };
                         // SAFETY: every operand was checked to leave by a plain
                         // decrement; the result takes the callee's slot.
@@ -13467,6 +13563,9 @@ impl Interpreter {
         if !self.inline_calls_ok() {
             return false;
         }
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        Self::unpack_bound_callee(unsafe { &mut *sw.cur }, pc);
         let mut tmp = None;
         // SAFETY: see `CoreSwitch`: the running activation is the
         // innermost; its handles are live and unborrowed here.
@@ -13495,6 +13594,71 @@ impl Interpreter {
                     act
                 }
             }
+        };
+        let Some(mut act) = act else {
+            return false;
+        };
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { (*sw.inl).push(act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
+    }
+
+    /// A bound method over a plain function with an empty self slot,
+    /// called at `pc` of `frame`, becomes that function with the receiver
+    /// as self (CPython's `CALL_BOUND_METHOD_EXACT_ARGS`), so the cached
+    /// and pure-leaf call paths apply to it.
+    #[inline]
+    fn unpack_bound_callee(frame: &mut Frame, pc: usize) {
+        let Some(argc) = frame.code.instructions.get(pc).map(|i| i.arg as usize) else {
+            return;
+        };
+        let n = frame.stack.len();
+        let Some(self_slot) = n.checked_sub(argc + 1) else {
+            return;
+        };
+        let Some(callee_slot) = self_slot.checked_sub(1) else {
+            return;
+        };
+        let (f, receiver) = match &frame.stack[callee_slot] {
+            Object::BoundMethod(bm)
+                if !bm.redispatch_descriptor
+                    && matches!(frame.stack[self_slot], Object::Unbound) =>
+            {
+                match &bm.function {
+                    Object::Function(f) => (f.clone(), bm.receiver.clone()),
+                    _ => return,
+                }
+            }
+            _ => return,
+        };
+        let bm = std::mem::replace(&mut frame.stack[callee_slot], Object::Function(f));
+        frame.stack[self_slot] = receiver;
+        // The bound method was a call temporary (or is still held
+        // elsewhere): grade its release like any dropped operand.
+        if gc_trace::note_dropped_marks(&bm) {
+            gc_trace::mark_maybe_dead();
+        }
+        drop(bm);
+    }
+
+    /// [`Self::core_call`] for the `CALL_KW` at `pc`: the quiet loop's
+    /// inline keyword call ([`Self::try_inline_call_kw`]), pushed and made
+    /// the running activation. `false` touches nothing.
+    #[inline(never)]
+    fn core_call_kw(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+        if !self.inline_calls_ok() {
+            return false;
+        }
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch` (as in `core_call`).
+        let act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            self.try_inline_call_kw(&mut *frame, &mut *shell.cast::<QuietShell<'_>>(), pc)
         };
         let Some(mut act) = act else {
             return false;
@@ -13612,9 +13776,7 @@ impl Interpreter {
         locals.reserve(nlocals.max(argc + 1));
         locals.push(inst.clone());
         locals.extend(frame.stack.drain(self_slot + 1..));
-        if locals.len() < nlocals {
-            locals.resize(nlocals, Object::Unbound);
-        }
+        fill_unbound(locals, nlocals);
         // The NULL self slot and the class.
         frame.stack.truncate(callee_slot);
         drop(ty);
@@ -14120,9 +14282,7 @@ impl Interpreter {
             };
             locals.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
         }
-        if locals.len() < nlocals {
-            locals.resize(nlocals, Object::Unbound);
-        }
+        fill_unbound(locals, nlocals);
         frame.pc = pc as u32 + 1;
         // The cells handle is `f`'s (now `callable`'s) or the shared empty
         // vector: moving the callable leaves it where it was.
@@ -14490,7 +14650,7 @@ impl Interpreter {
         if !code_is_pure_leaf(code_rc) || !pure_leaf_warm(code_rc) || !Self::lean_code_ok(code_rc) {
             return None;
         }
-        let (_, covered) = Self::kw_names_bind_check(f, func_id, perm, names, eff_argc)?;
+        let (_, covered) = Self::kw_names_bind_cached(code, pc, f, func_id, perm, names, eff_argc)?;
         // The ordinary call's `RecursionError` check.
         // SAFETY: this thread's own depth cell.
         if unsafe { (*depth_cell).get() } >= crate::recursion::recursion_limit() {
@@ -16272,9 +16432,23 @@ impl Interpreter {
                                 Object::Str(SharedStr::repeat(a, times))
                             }
                         }
+                        // `"k%d" % i`: formatting scalars and strings runs no
+                        // Python code; any error is the full handler's to
+                        // raise.
+                        (Object::Str(a), args)
+                            if kind == BinOpKind::Mod
+                                && percent_leaf_args(args)
+                                && !percent_args_need_bridge(args) =>
+                        {
+                            match percent_format(a, args) {
+                                Ok(s) => Object::from_str(s),
+                                Err(_) => break,
+                            }
+                        }
                         _ => break,
                     };
-                    // Operands are scalars or strings: nothing to grade.
+                    // Operands are scalars or strings (or a tuple of them):
+                    // nothing to grade.
                     drop_operand(stack.pop().expect("length checked above"));
                     drop_operand(std::mem::replace(&mut stack[n - 2], r));
                     last = pc;
@@ -17541,6 +17715,18 @@ impl Interpreter {
                     Object::Str(_) | Object::Int(_) | Object::Bool(_) | Object::None
                 ) =>
             {
+                // A `str` or `int` key settles natively (see `LeafProbe`).
+                if let (Object::Dict(d), Some(probe)) =
+                    (container, crate::object::LeafProbe::new(item))
+                {
+                    let m = d.try_borrow().ok()?;
+                    if m.get(&probe).is_some() {
+                        return Some(true);
+                    }
+                    if probe.miss_is_exact() {
+                        return Some(false);
+                    }
+                }
                 let key = DictKey(item.clone());
                 let (found, deferred) = crate::object::with_key_eq_deferred(|| {
                     crate::object::key_cmp_scope(|| match container {
@@ -18131,6 +18317,18 @@ impl Interpreter {
                     return None;
                 }
                 let O::Dict(d) = &args[0] else { return None };
+                // A `str` or `int` key settles by native equality unless the
+                // table compared it with a key of another kind.
+                if let Some(probe) = crate::object::LeafProbe::new(&args[1]) {
+                    let m = d.try_borrow().ok()?;
+                    match m.get(&probe) {
+                        Some(v) => return Some(Ok(v.clone())),
+                        None if probe.miss_is_exact() => {
+                            return Some(Ok(args.get(2).cloned().unwrap_or(O::None)));
+                        }
+                        None => {}
+                    }
+                }
                 // The probe may need a Python comparison against a stored
                 // key: deferred, and settled by the full path.
                 let (found, deferred) = crate::object::with_key_eq_deferred(|| {
@@ -22326,6 +22524,7 @@ impl Interpreter {
                 // timing rather than waiting for the next cyclic collection
                 // (RFC 0040 deterministic-finalization arc: `test_io` /
                 // `test_subprocess` destructor-timing cases).
+                self.recheck_frame_observed = true;
                 if let Some((_, pe)) = popped {
                     // Deconstruct the handler's `PyException` *first*: its
                     // `context`/`cause` boxes and traceback entries hold
@@ -22404,9 +22603,10 @@ impl Interpreter {
                     // so an `except E as e: saved = e` pays nothing.
                     if weakly_observed
                         || gc_trace::is_tracked(id)
-                        || Self::exc_has_finalizable(&pe_instance, 6)
-                        || (Self::is_refcount_dead(&pe_instance, 1)
-                            && Self::anchors_tracked_child(&pe_instance, 5))
+                        || (!Self::exc_plainly_inert(&pe_instance)
+                            && (Self::exc_has_finalizable(&pe_instance, 6)
+                                || (Self::is_refcount_dead(&pe_instance, 1)
+                                    && Self::anchors_tracked_child(&pe_instance, 5))))
                     {
                         self.reap_dead_subgraph(pe_instance);
                     }
@@ -56071,6 +56271,27 @@ fn is_object_new(b: &Rc<crate::object::BuiltinFn>) -> bool {
     Rc::as_ptr(b) as usize == want
 }
 
+/// Extend `v` to `n` slots with `Unbound` (the fresh locals of an
+/// activation), in line: a call's handful of slots isn't worth
+/// `Vec::resize`'s out-of-line loop.
+#[inline(always)]
+fn fill_unbound(v: &mut Vec<Object>, n: usize) {
+    let len = v.len();
+    if len >= n {
+        return;
+    }
+    v.reserve(n - len);
+    // SAFETY: capacity reserved above; `Unbound` owns nothing, and every
+    // slot below `n` is written before the length covers it.
+    unsafe {
+        let p = v.as_mut_ptr();
+        for k in len..n {
+            p.add(k).write(Object::Unbound);
+        }
+        v.set_len(n);
+    }
+}
+
 /// Release an operand the burst is done with: an unboxed scalar has no
 /// heap and `Object` has no `Drop` of its own, so it needs no drop glue.
 #[inline(always)]
@@ -56673,6 +56894,19 @@ fn dunder_key(which: usize) -> &'static Object {
 /// class in that prefix carries its own `__init__`, return it.
 /// Otherwise the caller can stick with the cheap `args`-only setup.
 fn lookup_exception_init(cls: &Rc<TypeObject>) -> Option<Object> {
+    if exc_family_flags(cls) & EXC_CUSTOM_INIT == 0 {
+        return None;
+    }
+    exception_init_uncached(cls)
+}
+
+/// [`exc_family_flags`]'s pseudo-family: a class between `cls` and
+/// `BaseException` defines its own `__init__` (see
+/// [`lookup_exception_init`]).
+const EXC_CUSTOM_INIT: u16 = 1 << 9;
+
+/// [`lookup_exception_init`]'s MRO walk.
+fn exception_init_uncached(cls: &TypeObject) -> Option<Object> {
     let mro = cls.mro.borrow();
     for ty in mro.iter() {
         if ty.name == "BaseException" || ty.name == "object" {
@@ -57849,6 +58083,21 @@ fn apply_trailer(value: Object, trailer: &str) -> Result<Object, RuntimeError> {
 pub(crate) enum PercentMode {
     Str,
     Bytes,
+}
+
+/// A `%`-format argument (or argument tuple) of scalars and exact
+/// strings: its conversions run no Python code.
+fn percent_leaf_args(args: &Object) -> bool {
+    let leaf = |o: &Object| {
+        matches!(
+            o,
+            Object::Int(_) | Object::Float(_) | Object::Str(_) | Object::Bool(_) | Object::None
+        )
+    };
+    match args {
+        Object::Tuple(items) => items.iter().all(leaf),
+        other => leaf(other),
+    }
 }
 
 pub(crate) fn percent_format(template: &str, value: &Object) -> Result<String, RuntimeError> {
@@ -60483,7 +60732,22 @@ struct CodeConstObjects {
 /// that can change under a fixed code object — the defaults, the
 /// closure's cells, the JIT's claim on the code — is re-validated per
 /// call.
-struct CallSlot(std::cell::UnsafeCell<Option<CallShape>>);
+/// A `CALL` site's inline-call shape, plus up to [`POLY_CALLS`] earlier
+/// ones for a site that calls several functions (a method call over
+/// receivers of several classes).
+struct CallSlot(
+    std::cell::UnsafeCell<Option<CallShape>>,
+    std::cell::UnsafeCell<Option<Box<PolyCalls>>>,
+);
+
+/// Earlier shapes a polymorphic [`CallSlot`] keeps.
+const POLY_CALLS: usize = 3;
+
+/// A [`CallSlot`]'s earlier shapes, replaced round-robin.
+struct PolyCalls {
+    shapes: [Option<CallShape>; POLY_CALLS],
+    next: usize,
+}
 
 struct CallShape {
     func: crate::sync::Weak<crate::object::PyFunction>,
@@ -60500,9 +60764,24 @@ struct CallShape {
 unsafe impl Send for CallSlot {}
 unsafe impl Sync for CallSlot {}
 
+impl CallShape {
+    #[inline]
+    fn matches(
+        &self,
+        func: *const crate::object::PyFunction,
+        code: *const CodeObject,
+    ) -> Option<(u32, bool)> {
+        (std::ptr::eq(self.func.as_ptr(), func) && std::ptr::eq(self.code.as_ptr(), code))
+            .then_some((self.missing, self.has_self))
+    }
+}
+
 impl CallSlot {
     const fn empty() -> Self {
-        Self(std::cell::UnsafeCell::new(None))
+        Self(
+            std::cell::UnsafeCell::new(None),
+            std::cell::UnsafeCell::new(None),
+        )
     }
 
     /// The shape recorded for `func` running `code` (by identity).
@@ -60514,16 +60793,53 @@ impl CallSlot {
     ) -> Option<(u32, bool)> {
         // SAFETY: see the type docs.
         let shape = unsafe { &*self.0.get() }.as_ref()?;
-        (std::ptr::eq(shape.func.as_ptr(), func) && std::ptr::eq(shape.code.as_ptr(), code))
-            .then_some((shape.missing, shape.has_self))
+        shape
+            .matches(func, code)
+            .or_else(|| self.poly_hit(func, code))
+    }
+
+    /// [`Self::hit`] among the earlier shapes.
+    #[cold]
+    #[inline(never)]
+    fn poly_hit(
+        &self,
+        func: *const crate::object::PyFunction,
+        code: *const CodeObject,
+    ) -> Option<(u32, bool)> {
+        // SAFETY: see the type docs.
+        let poly = unsafe { &*self.1.get() }.as_deref()?;
+        poly.shapes
+            .iter()
+            .flatten()
+            .find_map(|shape| shape.matches(func, code))
     }
 
     #[inline]
     fn set(&self, shape: CallShape) {
+        let (func, code) = (shape.func.as_ptr(), shape.code.as_ptr());
         // SAFETY: see the type docs (the old handles drop after the
         // store; dropping a weak handle runs no code).
         let old = unsafe { (*self.0.get()).replace(shape) };
-        drop(old);
+        // A different live callee keeps its shape among the earlier ones.
+        if let Some(old) = old.filter(|o| {
+            o.func.strong_count() > 0 && !(o.func.as_ptr() == func && o.code.as_ptr() == code)
+        }) {
+            // SAFETY: as above.
+            let poly = unsafe { &mut *self.1.get() }.get_or_insert_with(|| {
+                Box::new(PolyCalls {
+                    shapes: std::array::from_fn(|_| None),
+                    next: 0,
+                })
+            });
+            let seen = poly.shapes.iter().flatten().any(|s| {
+                s.func.as_ptr() == old.func.as_ptr() && s.code.as_ptr() == old.code.as_ptr()
+            });
+            if !seen {
+                let i = poly.next;
+                poly.shapes[i] = Some(old);
+                poly.next = (i + 1) % POLY_CALLS;
+            }
+        }
     }
 }
 
@@ -60540,13 +60856,16 @@ fn code_call_slot(code: &CodeObject, pc: usize) -> Option<&CallSlot> {
         .get(pc)
 }
 
-/// A `LOAD_ATTR` site's polymorphic instance-attribute cache: up to two
-/// `(class attr_version, instance-dict index)` pairs. Versions are
+/// A `LOAD_ATTR` site's polymorphic instance-attribute cache: up to
+/// [`ATTR_POLY`] `(class attr_version, instance-dict index)` pairs. Versions are
 /// process-unique and never reused, so a match names exactly one class
 /// in one state — the state in which the class cache resolved the name
 /// to the instance dict (no data descriptor, default
 /// `__getattribute__`); the index is a hint the name check validates.
-struct AttrPoly(std::cell::UnsafeCell<[(u64, u32); 2]>);
+struct AttrPoly(std::cell::UnsafeCell<[(u64, u32); ATTR_POLY]>);
+
+/// Receiver classes an [`AttrPoly`] remembers.
+const ATTR_POLY: usize = 4;
 
 // SAFETY: read and written only from the dispatch loop with the GIL held
 // (the `MethodSlot` invariant).
@@ -60555,7 +60874,7 @@ unsafe impl Sync for AttrPoly {}
 
 impl AttrPoly {
     const fn empty() -> Self {
-        Self(std::cell::UnsafeCell::new([(0, 0); 2]))
+        Self(std::cell::UnsafeCell::new([(0, 0); ATTR_POLY]))
     }
 
     /// The instance-dict value an entry for `ver` points at, when its
@@ -60578,7 +60897,7 @@ impl AttrPoly {
         entries.iter().find(|e| e.0 == ver && ver != 0).map(|e| e.1)
     }
 
-    /// Remember `ver` → `ix` (the older of two full entries yields).
+    /// Remember `ver` → `ix` (the oldest of full entries yields).
     #[inline]
     fn record(&self, ver: u64, ix: u32) {
         // SAFETY: see the type docs.
@@ -60586,8 +60905,8 @@ impl AttrPoly {
         if let Some(e) = entries.iter_mut().find(|e| e.0 == ver || e.0 == 0) {
             *e = (ver, ix);
         } else {
-            entries[0] = entries[1];
-            entries[1] = (ver, ix);
+            entries.rotate_left(1);
+            entries[ATTR_POLY - 1] = (ver, ix);
         }
     }
 }
@@ -60739,7 +61058,25 @@ fn class_attr_fill(code: &CodeObject, cls: &crate::types::TypeObject, pc: usize,
 /// the name compare that the `InlineCache` shape needs. The reference
 /// is weak (CPython's `_PyType_Lookup` cache is a borrowed pointer for
 /// the same reason): a site must not keep a class or module alive.
-struct MethodSlot(std::cell::UnsafeCell<(u64, MethodSlotFn)>);
+///
+/// A site that sees several receiver classes (`c.execute()` over a list
+/// of constraint subclasses) keeps up to [`POLY_METHODS`] earlier
+/// resolutions beside the current one, so it stops re-resolving on every
+/// class change.
+struct MethodSlot(
+    std::cell::UnsafeCell<(u64, MethodSlotFn)>,
+    std::cell::UnsafeCell<Option<Box<PolyMethods>>>,
+);
+
+/// Earlier resolutions a polymorphic [`MethodSlot`] keeps.
+const POLY_METHODS: usize = 3;
+
+/// A [`MethodSlot`]'s earlier plain or static functions, by class
+/// version (`0` marks an empty entry), replaced round-robin.
+struct PolyMethods {
+    entries: [(u64, crate::sync::Weak<crate::object::PyFunction>, bool); POLY_METHODS],
+    next: usize,
+}
 
 /// What a [`MethodSlot`] resolved: a Python function off a class (keyed
 /// by the class's attribute version), or a builtin type's method body
@@ -60777,10 +61114,68 @@ impl MethodSlot {
     const BUILTIN_TAG: u64 = 1 << 63;
 
     const fn empty() -> Self {
-        Self(std::cell::UnsafeCell::new((
-            0,
-            MethodSlotFn::Py(crate::sync::Weak::new()),
-        )))
+        Self(
+            std::cell::UnsafeCell::new((0, MethodSlotFn::Py(crate::sync::Weak::new()))),
+            std::cell::UnsafeCell::new(None),
+        )
+    }
+
+    /// An earlier resolution under `ver` (a static method's only when
+    /// `unbound`), without a reference (see `peek_fn`).
+    #[cold]
+    #[inline(never)]
+    fn poly_peek(&self, ver: u64, unbound: bool) -> Option<*const crate::object::PyFunction> {
+        // SAFETY: GIL-serialized; no `&mut` escapes `poly_remember`.
+        let poly = unsafe { &*self.1.get() }.as_deref()?;
+        poly.entries
+            .iter()
+            .find(|(v, w, is_static)| {
+                *v == ver && ver != 0 && (unbound || !*is_static) && w.strong_count() > 0
+            })
+            .map(|(_, w, _)| w.as_ptr())
+    }
+
+    /// Keep the resolution the slot is about to replace, if it names a
+    /// live plain or static function under another version.
+    fn poly_remember(&self, ver: u64) {
+        // SAFETY: GIL-serialized; the references end before the slot is
+        // rewritten.
+        let (old_ver, old) = unsafe { &*self.0.get() };
+        let (w, is_static) = match old {
+            MethodSlotFn::Py(w) => (w, false),
+            MethodSlotFn::Static(w) => (w, true),
+            _ => return,
+        };
+        if *old_ver == 0 || *old_ver == ver || w.strong_count() == 0 {
+            return;
+        }
+        // SAFETY: as above.
+        let poly = unsafe { &mut *self.1.get() }.get_or_insert_with(|| {
+            Box::new(PolyMethods {
+                entries: std::array::from_fn(|_| (0, crate::sync::Weak::new(), false)),
+                next: 0,
+            })
+        });
+        if poly.entries.iter().any(|(v, _, _)| v == old_ver) {
+            return;
+        }
+        let i = poly.next;
+        poly.entries[i] = (*old_ver, w.clone(), is_static);
+        poly.next = (i + 1) % POLY_METHODS;
+    }
+
+    /// A strong handle to the function at `p` (see `get_held`).
+    ///
+    /// # Safety
+    ///
+    /// `p` names a live function its class holds.
+    #[inline]
+    unsafe fn held(p: *const crate::object::PyFunction) -> Rc<crate::object::PyFunction> {
+        // SAFETY: the caller's contract.
+        unsafe {
+            Rc::increment_strong_count(p);
+            Rc::from_raw(p)
+        }
     }
 
     /// The cached function if the slot was filled under `ver`.
@@ -60789,6 +61184,10 @@ impl MethodSlot {
         // SAFETY: GIL-serialized; no `&mut` escapes `set`.
         match unsafe { &*self.0.get() } {
             (v, MethodSlotFn::Py(w)) if *v == ver => w.upgrade(),
+            // SAFETY: the class holds a function it resolved at `ver`.
+            (_, MethodSlotFn::Py(_) | MethodSlotFn::Static(_)) => {
+                self.poly_peek(ver, false).map(|p| unsafe { Self::held(p) })
+            }
             _ => None,
         }
     }
@@ -60811,12 +61210,17 @@ impl MethodSlot {
                     Some(Rc::from_raw(p))
                 }
             }
+            // SAFETY: as above.
+            (_, MethodSlotFn::Py(_) | MethodSlotFn::Static(_)) => {
+                self.poly_peek(ver, false).map(|p| unsafe { Self::held(p) })
+            }
             _ => None,
         }
     }
 
     #[inline]
     fn set(&self, ver: u64, f: &Rc<crate::object::PyFunction>) {
+        self.poly_remember(ver);
         // SAFETY: GIL-serialized; the exclusive reference lives only for
         // the assignment.
         unsafe { *self.0.get() = (ver, MethodSlotFn::Py(Rc::downgrade(f))) };
@@ -60840,6 +61244,10 @@ impl MethodSlot {
                     Some(Rc::from_raw(p))
                 }
             }
+            // SAFETY: as above.
+            (_, MethodSlotFn::Py(_) | MethodSlotFn::Static(_)) => {
+                self.poly_peek(ver, true).map(|p| unsafe { Self::held(p) })
+            }
             _ => None,
         }
     }
@@ -60852,6 +61260,7 @@ impl MethodSlot {
         // SAFETY: GIL-serialized; no `&mut` escapes `set`.
         match unsafe { &*self.0.get() } {
             (v, MethodSlotFn::Py(w)) if *v == ver && w.strong_count() > 0 => Some(w.as_ptr()),
+            (_, MethodSlotFn::Py(_) | MethodSlotFn::Static(_)) => self.poly_peek(ver, false),
             _ => None,
         }
     }
@@ -60867,6 +61276,7 @@ impl MethodSlot {
             {
                 Some(w.as_ptr())
             }
+            (_, MethodSlotFn::Py(_) | MethodSlotFn::Static(_)) => self.poly_peek(ver, true),
             _ => None,
         }
     }
@@ -60874,6 +61284,7 @@ impl MethodSlot {
     /// Remember a static method's function read through a class at `ver`.
     #[inline]
     fn set_static(&self, ver: u64, f: &Rc<crate::object::PyFunction>) {
+        self.poly_remember(ver);
         // SAFETY: as `set`.
         unsafe { *self.0.get() = (ver, MethodSlotFn::Static(Rc::downgrade(f))) };
     }
@@ -61060,6 +61471,10 @@ fn code_fast_pairs<'a>(code: &CodeObject, ext: Option<&'a CodeConstObjects>) -> 
 }
 
 fn code_is_pure_leaf(code: &CodeObject) -> bool {
+    // The recorded verdict (see `code_pure_leaf_decide`): one load.
+    if let Some(yes) = code.jit_hint.pure_leaf() {
+        return yes;
+    }
     let Some(ext) = code_vm_ext(code) else {
         return false;
     };
@@ -61378,14 +61793,17 @@ fn exc_family_bit(name: &str) -> u16 {
 fn exc_family_flags(cls: &crate::types::TypeObject) -> u16 {
     let ver = cls.attr_version.get();
     let memo = cls.exc_families.get();
-    if memo & 1 != 0 && memo >> 10 == ver {
-        return ((memo >> 1) & 0x1FF) as u16;
+    if memo & 1 != 0 && memo >> 11 == ver {
+        return ((memo >> 1) & 0x3FF) as u16;
     }
     let mut flags = 0u16;
     for t in cls.mro.borrow().iter() {
         flags |= exc_family_bit(&t.name);
     }
-    cls.exc_families.set(ver << 10 | u64::from(flags) << 1 | 1);
+    if exception_init_uncached(cls).is_some() {
+        flags |= EXC_CUSTOM_INIT;
+    }
+    cls.exc_families.set(ver << 11 | u64::from(flags) << 1 | 1);
     flags
 }
 

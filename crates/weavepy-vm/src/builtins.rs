@@ -12949,6 +12949,17 @@ pub(crate) fn dict_lookup(
     d: &Rc<RefCell<DictData>>,
     key: &Object,
 ) -> Result<Option<Object>, RuntimeError> {
+    // A `str` or `int` key settles by native equality unless the table
+    // compared it with a key of another kind.
+    if let Some(probe) = crate::object::LeafProbe::new(key) {
+        if let Ok(m) = d.try_borrow() {
+            match m.get(&probe) {
+                Some(v) => return Ok(Some(v.clone())),
+                None if probe.miss_is_exact() => return Ok(None),
+                None => {}
+            }
+        }
+    }
     if crate::object::dict_key_is_reentrant(key) {
         return crate::object::dict_reentrant_get(d, key);
     }

@@ -6603,6 +6603,11 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
     let runs_python = !matches!(it, Object::Iter(_));
     if runs_python {
         ctx.dirty = true;
+        // A generator resume from native code rebuilds a whole interpreter
+        // activation, several times what the interpreter's own inline
+        // resume costs: charged like an interpreter call, so a loop that
+        // drives a generator retires at the next poll (see `wpjit_poll`).
+        ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
     }
     match interp.iter_next(&it, &ctx.globals) {
         Err(err) => {
@@ -9329,6 +9334,11 @@ unsafe extern "C" fn wpjit_iter_next_pair(
     let runs_python = !matches!(it, Object::Iter(_));
     if runs_python {
         ctx.dirty = true;
+        // A generator resume from native code rebuilds a whole interpreter
+        // activation, several times what the interpreter's own inline
+        // resume costs: charged like an interpreter call, so a loop that
+        // drives a generator retires at the next poll (see `wpjit_poll`).
+        ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
     }
     match interp.iter_next(&it, &ctx.globals) {
         Err(err) => {
