@@ -216,6 +216,10 @@ pub struct JitHint {
     /// The tier-2 state has no further interest in this code's back
     /// edges (compiled, OSR budget spent).
     backedge_quiet: std::sync::atomic::AtomicBool,
+    /// The VM's pure-leaf verdict (0 not yet decided, 1 no, 2 yes),
+    /// mirrored here so native call sites read it without the VM
+    /// extension lookup.
+    pure_leaf: std::sync::atomic::AtomicU8,
 }
 
 impl JitHint {
@@ -267,6 +271,24 @@ impl JitHint {
     pub fn set_backedge_quiet(&self) {
         self.backedge_quiet
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The recorded pure-leaf verdict, if the VM has decided one.
+    #[must_use]
+    pub fn pure_leaf(&self) -> Option<bool> {
+        match self.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Record the VM's pure-leaf verdict (see [`Self::pure_leaf`]).
+    pub fn set_pure_leaf(&self, yes: bool) {
+        self.pure_leaf.store(
+            if yes { 2 } else { 1 },
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     #[must_use]

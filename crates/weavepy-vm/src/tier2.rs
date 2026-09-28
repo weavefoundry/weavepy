@@ -4756,6 +4756,31 @@ unsafe extern "C" fn wpjit_call_py(
     // while the helper runs; this is the only live path to it.
     let interp = unsafe { &mut *ctx.interp };
 
+    // A pure-leaf callee evaluates frameless (see `try_pure_leaf_call`).
+    let maybe_pure = ctx
+        .callees
+        .get(token as usize)
+        .is_some_and(|(_, code)| code.jit_hint.pure_leaf() != Some(false));
+    let callees = if maybe_pure {
+        Some(StdRc::clone(&ctx.callees))
+    } else {
+        None
+    };
+    if let Some((Object::Function(f), code)) = callees.as_ref().and_then(|c| c.get(token as usize))
+    {
+        // SAFETY: GIL-serialized raw read of the function's code cell;
+        // only compared.
+        if std::ptr::eq(unsafe { Rc::as_ptr(&*f.code.as_ptr()) }, Rc::as_ptr(code)) {
+            // SAFETY: `argc` marshaled entries are live (the function
+            // contract).
+            if let Some(status) =
+                unsafe { try_pure_leaf_call(jf, ctx, interp, f, code, None, argc, expect_tag) }
+            {
+                return status;
+            }
+        }
+    }
+
     // RFC 0067 WS1 — the native-to-native fast path: a compiled,
     // shape-eligible callee is entered directly with the marshaled
     // scalars, skipping the interpreter frame entirely. (The table
@@ -4910,42 +4935,146 @@ fn finish_interp_call(
                 &ctx.math,
             );
             if still_valid {
-                match SlotTag::from_raw(expect_tag) {
-                    // The procedure lane: nothing to write back, the
-                    // compiled code pushes no result.
-                    SlotTag::None => {
-                        if matches!(v, Object::None) {
-                            return CallStatus::Ok as i64;
-                        }
-                    }
-                    SlotTag::Int | SlotTag::Float | SlotTag::Bool => {
-                        let expect = match SlotTag::from_raw(expect_tag) {
-                            SlotTag::Int => JitType::Int,
-                            SlotTag::Float => JitType::Float,
-                            _ => JitType::Bool,
-                        };
-                        if let Some(bits) = pack(&v, expect) {
-                            jf.ret_bits = bits;
-                            jf.ret_tag = expect_tag;
-                            return CallStatus::Ok as i64;
-                        }
-                    }
-                    // RFC 0071 WS1 — an object-lane result pins into
-                    // this activation's table.
-                    SlotTag::ObjPin => {
-                        if let Some(bits) = obj_ret_bits(&v, &mut ctx.pins) {
-                            jf.ret_bits = bits;
-                            jf.ret_tag = expect_tag;
-                            return CallStatus::Ok as i64;
-                        }
-                    }
-                    SlotTag::Boxed | SlotTag::ListPin => {}
-                }
+                return deliver_call_result(jf, ctx, v, expect_tag);
             }
             ctx.parked = Some(v);
             CallStatus::Boxed as i64
         }
     }
+}
+
+/// Hand a completed call's result `v` to the compiled caller in its
+/// `expect_tag` lane, or park it (`Boxed`: the caller deopts after the
+/// call) when the lane cannot carry it.
+fn deliver_call_result(jf: &mut JitFrame, ctx: &mut CallCtx, v: Object, expect_tag: u32) -> i64 {
+    match SlotTag::from_raw(expect_tag) {
+        // The procedure lane: nothing to write back, the compiled code
+        // pushes no result.
+        SlotTag::None => {
+            if matches!(v, Object::None) {
+                return CallStatus::Ok as i64;
+            }
+        }
+        SlotTag::Int | SlotTag::Float | SlotTag::Bool => {
+            let expect = match SlotTag::from_raw(expect_tag) {
+                SlotTag::Int => JitType::Int,
+                SlotTag::Float => JitType::Float,
+                _ => JitType::Bool,
+            };
+            if let Some(bits) = pack(&v, expect) {
+                jf.ret_bits = bits;
+                jf.ret_tag = expect_tag;
+                return CallStatus::Ok as i64;
+            }
+        }
+        // RFC 0071 WS1 — an object-lane result pins into this
+        // activation's table.
+        SlotTag::ObjPin => {
+            if let Some(bits) = obj_ret_bits(&v, &mut ctx.pins) {
+                jf.ret_bits = bits;
+                jf.ret_tag = expect_tag;
+                return CallStatus::Ok as i64;
+            }
+        }
+        SlotTag::Boxed | SlotTag::ListPin => {}
+    }
+    ctx.parked = Some(v);
+    CallStatus::Boxed as i64
+}
+
+/// Evaluate a pure-leaf callee (see `code_is_pure_leaf`) frameless, as
+/// the interpreter's core loop does: `recv` (a method's receiver) then
+/// the `argc` marshaled arguments bind its parameters exactly. A native
+/// activation would cost several times the body; `None` (nothing ran)
+/// leaves the call to the ordinary paths.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`]: `argc` marshal entries are live.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn try_pure_leaf_call(
+    jf: &mut JitFrame,
+    ctx: &mut CallCtx,
+    interp: &super::Interpreter,
+    func: &crate::object::PyFunction,
+    code: &CodeObject,
+    recv: Option<*const Object>,
+    argc: u32,
+    expect_tag: u32,
+) -> Option<i64> {
+    // The common native callee is no pure leaf: one relaxed load decides.
+    if code.jit_hint.pure_leaf() == Some(false)
+        || code.arg_count != argc + u32::from(recv.is_some())
+    {
+        return None;
+    }
+    // SAFETY: the caller's contract.
+    unsafe { pure_leaf_call(jf, ctx, interp, func, code, recv, argc, expect_tag) }
+}
+
+/// [`try_pure_leaf_call`]'s evaluation, out of line (its argument
+/// buffers would otherwise widen every native call helper's frame).
+///
+/// # Safety
+///
+/// As [`try_pure_leaf_call`].
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn pure_leaf_call(
+    jf: &mut JitFrame,
+    ctx: &mut CallCtx,
+    interp: &super::Interpreter,
+    func: &crate::object::PyFunction,
+    code: &CodeObject,
+    recv: Option<*const Object>,
+    argc: u32,
+    expect_tag: u32,
+) -> Option<i64> {
+    const MAX: usize = 8;
+    let offset = usize::from(recv.is_some());
+    let n = argc as usize + offset;
+    if n > MAX
+        || code.arg_count as usize != n
+        || !code
+            .jit_hint
+            .pure_leaf()
+            .unwrap_or_else(|| crate::code_is_pure_leaf_pub(code))
+        || crate::hot_gates::load() != 0
+        || crate::trace::any_observers_active()
+    {
+        return None;
+    }
+    // Only the marshaled arguments need owned values (a scalar lane
+    // becomes its `Object`, a pin names the pinned one); the receiver is
+    // borrowed where it lives.
+    let mut owned = [const { std::mem::MaybeUninit::<Object>::uninit() }; MAX];
+    /// Drops the first `.1` values at `.0` (the written arguments).
+    struct Owned(*mut Object, usize);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            for j in 0..self.1 {
+                // SAFETY: the first `self.1` values were written below.
+                unsafe { std::ptr::drop_in_place(self.0.add(j)) };
+            }
+        }
+    }
+    let mut written = Owned(owned.as_mut_ptr().cast::<Object>(), 0);
+    let mut ptrs: [*const Object; MAX] = [std::ptr::null(); MAX];
+    if let Some(r) = recv {
+        ptrs[0] = r;
+    }
+    for j in 0..argc as usize {
+        // SAFETY: the caller's contract — `argc` marshaled entries.
+        let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
+        // SAFETY: `j < argc <= MAX`; the slot is uninitialized until now.
+        unsafe { written.0.add(j).write(unpack_pins(bits, tag, &ctx.pins)) };
+        written.1 = j + 1;
+        // SAFETY: as above.
+        ptrs[offset + j] = unsafe { written.0.add(j) };
+    }
+    let v = interp.pure_leaf_eval::<false>(code, func, &ptrs[..n])?;
+    Some(deliver_call_result(jf, ctx, v, expect_tag))
 }
 
 /// The generic-call backoff for native-to-native entries (the framed
@@ -5176,6 +5305,55 @@ unsafe extern "C" fn wpjit_call_method(
             i.call(&bound, &args, &[], &ctx.globals)
         });
         return finish_interp_call(jf, ctx, interp, res, expect_tag);
+    }
+
+    // A pure-leaf method (a getter, a predicate) evaluates frameless.
+    // SAFETY: `argc` marshaled entries are live (the function contract),
+    // and `recv` outlives the evaluation.
+    if let Some(status) = unsafe {
+        try_pure_leaf_call(
+            jf,
+            ctx,
+            interp,
+            &entry.func,
+            &entry.code,
+            Some(&raw const recv),
+            argc,
+            expect_tag,
+        )
+    } {
+        return status;
+    }
+
+    // A callback-free field update (`self.n += k; return self.n`) bound
+    // exactly: the guards above and the update's own checks are all the
+    // native activation would validate for it.
+    if let Some(nc) = ctx
+        .method_native
+        .as_deref()
+        .and_then(|t| t.get(token as usize))
+        .and_then(Option::as_ref)
+    {
+        if nc.scalar_update.is_some()
+            && entry.code.arg_count == argc + 1
+            && Rc::ptr_eq(&nc.func, &entry.func)
+            && Rc::ptr_eq(&nc.code, &entry.code)
+        {
+            // SAFETY: the method guard above pinned the binding; the update
+            // checks its receiver, argument lane, and observers itself.
+            if let Some(value) =
+                unsafe { native_scalar_field_update(jf, ctx, nc, &recv, argc as usize) }
+            {
+                if expect_tag == SlotTag::Int as u32 {
+                    jf.ret_bits = value as u64;
+                    jf.ret_tag = SlotTag::Int as u32;
+                    return CallStatus::Ok as i64;
+                }
+                // The store is complete: never repeat it.
+                ctx.parked = Some(Object::Int(value));
+                return CallStatus::Boxed as i64;
+            }
+        }
     }
 
     // RFC 0069 WS1 — the native fast path: the guarded method's own

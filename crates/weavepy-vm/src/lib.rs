@@ -61163,6 +61163,7 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
         1
     };
     ext.pure_leaf.store(shape, Relaxed);
+    code.jit_hint.set_pure_leaf(ok);
     ok
 }
 
