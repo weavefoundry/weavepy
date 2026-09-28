@@ -971,6 +971,9 @@ pub struct Interpreter {
     /// (process-unique) attribute version of the class that resolved it
     /// (see [`Interpreter::core_leaf_next`]).
     core_next: ThreadCell<Option<(u64, Rc<crate::object::BuiltinFn>)>>,
+    /// How the last class seen in a boolean context answers it (see
+    /// [`Interpreter::leaf_instance_truth`]), by attribute version.
+    core_truth: ThreadCell<Option<(u64, NativeTruth)>>,
     /// `WP_DBG_SAMPLE`: periodic frame-entry sampling to stderr.
     dbg_sample: bool,
 }
@@ -1201,6 +1204,7 @@ impl Default for Interpreter {
             leaf_fns: std::cell::OnceCell::new(),
             leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
             core_next: ThreadCell::new(None),
+            core_truth: ThreadCell::new(None),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
         };
         // RFC 0025: publish the shared parts of this interpreter
@@ -1328,6 +1332,7 @@ impl Interpreter {
             leaf_fns: std::cell::OnceCell::new(),
             leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
             core_next: ThreadCell::new(None),
+            core_truth: ThreadCell::new(None),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
         }
     }
@@ -11942,6 +11947,32 @@ impl Interpreter {
                                                     pc = call_pc + 1;
                                                     continue;
                                                 }
+                                            } else if let Some((r, call_pc)) = self
+                                                .core_native_method(
+                                                    code,
+                                                    other,
+                                                    pc + 1,
+                                                    next.arg,
+                                                    mslots!(cold_mslots, ext),
+                                                    lbase,
+                                                    nlocals,
+                                                    consts,
+                                                )
+                                            {
+                                                last = call_pc;
+                                                pc = call_pc + 1;
+                                                match r {
+                                                    Ok(v) => {
+                                                        base.add(len).write(v);
+                                                        len += 1;
+                                                        continue;
+                                                    }
+                                                    Err(e) => {
+                                                        break Some(CoreExit::Stop(
+                                                            LeafStop::Raised(e),
+                                                        ));
+                                                    }
+                                                }
                                             }
                                         }
                                         if next.op == OpCode::LoadAttr {
@@ -12410,6 +12441,45 @@ impl Interpreter {
                                 last = pc;
                                 pc += 1;
                             }
+                            // An instance whose class's `__getitem__` is a
+                            // native fast subscript the site cached.
+                            None if ins.op == OpCode::BinarySubscr && len >= 2 => {
+                                let Some(fast) = self.core_native_subscript(
+                                    code,
+                                    pc,
+                                    // SAFETY: `len >= 2`.
+                                    unsafe { std::slice::from_raw_parts(base.add(len - 2), 2) },
+                                ) else {
+                                    break None;
+                                };
+                                // SAFETY: both operands leave by plain
+                                // decrements (checked); the result takes the
+                                // container's slot.
+                                let r = fast(unsafe {
+                                    std::slice::from_raw_parts(base.add(len - 2), 2)
+                                });
+                                let Some(r) = r else { break None };
+                                #[cfg(test)]
+                                NATIVE_FAST_SUBSCRIPTS.with(|calls| calls.set(calls.get() + 1));
+                                unsafe {
+                                    drop_hot(base.add(len - 1).read());
+                                    drop_hot(base.add(len - 2).read());
+                                }
+                                len -= 2;
+                                match r {
+                                    Ok(v) => {
+                                        // SAFETY: the container's slot is free.
+                                        unsafe { base.add(len).write(v) };
+                                        len += 1;
+                                        last = pc;
+                                        pc += 1;
+                                    }
+                                    Err(e) => {
+                                        pc += 1;
+                                        break Some(CoreExit::Stop(LeafStop::Raised(e)));
+                                    }
+                                }
+                            }
                             None => break None,
                         }
                     }
@@ -12523,10 +12593,12 @@ impl Interpreter {
                             // the full arm, which asks again (a leaf iterator
                             // stays exhausted) and ends the loop.
                             obj @ Object::Instance(inst) => {
-                                let Some(b) = self.core_leaf_next(inst) else {
+                                let Some(b) = self.core_leaf_next_ptr(inst) else {
                                     break None;
                                 };
-                                match (b.call)(std::slice::from_ref(obj)) {
+                                // SAFETY: the cache and the class keep the
+                                // builtin alive; its body runs no Python.
+                                match unsafe { ((*b).call)(std::slice::from_ref(obj)) } {
                                     Ok(v) => {
                                         // SAFETY: `len < cap`.
                                         unsafe { base.add(len).write(v) };
@@ -14559,6 +14631,113 @@ impl Interpreter {
             n += 1;
             pc += 1;
         }
+    }
+
+    /// The native fast `__getitem__` the `BINARY_SUBSCR` at `pc` cached for
+    /// `ops[0]`'s class (see [`Self::leaf_instance_subscript`]), when both
+    /// operands leave by plain decrements.
+    #[inline(never)]
+    fn core_native_subscript(
+        &self,
+        code: &CodeObject,
+        pc: usize,
+        ops: &[Object],
+    ) -> Option<leaf_builtins::Fast> {
+        let [Object::Instance(inst), key] = ops else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        if !Self::core_droppable(&ops[0])
+            || !Self::core_droppable(key)
+            || !Self::default_getattribute(cls)
+            || crate::object::exotic_str_keys_possible()
+        {
+            return None;
+        }
+        let fast = code_vm_ext(code)?
+            .method_slots
+            .get()?
+            .get(pc)?
+            .get_native_subscript(cls.attr_version.get(), leaf_builtins::generation())?;
+        #[cfg(test)]
+        NATIVE_SUBSCRIPT_CACHE_HITS.with(|hits| hits.set(hits.get() + 1));
+        Some(fast)
+    }
+
+    /// The core loop's fused `LOAD_FAST x; LOAD_ATTR m (method); <simple
+    /// argument loads>; CALL k` on a local instance `recv` whose class's `m`
+    /// is a registered native builtin that runs no Python code (the call
+    /// site's leaf kind): called on bitwise views of the borrowed operands,
+    /// so no reference to the receiver, the method or an argument is taken
+    /// or released. Returns the call's outcome and its pc; `None` (nothing
+    /// touched) runs the instructions one by one.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn core_native_method(
+        &self,
+        code: &CodeObject,
+        recv: &Object,
+        attr_pc: usize,
+        name_idx: u32,
+        mslots: &[MethodSlot],
+        lbase: *const Object,
+        nlocals: usize,
+        consts: &[Object],
+    ) -> Option<(Result<Object, RuntimeError>, usize)> {
+        let Object::Instance(inst) = recv else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        let b = mslots
+            .get(attr_pc)?
+            .peek_inst_builtin(cls.attr_version.get())?;
+        if !Self::default_getattribute(cls) {
+            return None;
+        }
+        let mut scratch = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
+        let mut args: [*const Object; 8] = [std::ptr::null(); 8];
+        args[0] = recv;
+        // SAFETY: the core loop's own locals and constants.
+        let (nargs, call_pc) = unsafe {
+            Self::core_simple_args(
+                &code.instructions,
+                attr_pc + 1,
+                lbase,
+                nlocals,
+                consts,
+                &mut scratch,
+                &mut args,
+                1,
+            )
+        }?;
+        let kind = mslots.get(call_pc)?.get_leaf_ptr(b)?;
+        // SAFETY: the builtin lives in the slot (and its class) for the
+        // whole call, which runs no Python code.
+        let b = unsafe { &*b };
+        if !matches!(kind, LeafKind::Opaque | LeafKind::Fast(_))
+            || inst_may_shadow(inst, code, name_idx)
+        {
+            return None;
+        }
+        // Bitwise views of the operands, never dropped: the callee reads
+        // them (and clones what it keeps), and nothing it runs can reach
+        // the locals or constants they alias.
+        let n = nargs + 1;
+        let mut ops = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
+        for (slot, &p) in ops.iter_mut().zip(&args[..n]) {
+            // SAFETY: each pointer names a live operand (see above).
+            slot.write(unsafe { std::ptr::read(p) });
+        }
+        // SAFETY: the first `n` entries were just written.
+        let ops = unsafe { std::slice::from_raw_parts(ops.as_ptr().cast::<Object>(), n) };
+        let r = match kind {
+            LeafKind::Fast(f) => f(ops)?,
+            _ => match b.call_kw.as_ref() {
+                Some(ckw) => ckw(ops, &[]),
+                None => (b.call)(ops),
+            },
+        };
+        Some((r, call_pc))
     }
 
     /// A fused simple call of pure leaf `fp` (see [`code_is_pure_leaf`]):
@@ -18460,35 +18639,64 @@ impl Interpreter {
         let Object::Instance(inst) = v else {
             return None;
         };
+        let cls = inst.cls_raw();
+        if crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let ver = cls.attr_version.get();
+        let fresh = !matches!(&*self.core_truth.borrow(), Some((v, _)) if *v == ver);
+        if fresh {
+            let t = self.native_truth_of(v, cls);
+            *self.core_truth.borrow_mut() = Some((ver, t));
+        }
+        // The cache (and the class) keep the builtin alive through the
+        // call, whose body runs no Python.
+        let (b, is_len): (*const crate::object::BuiltinFn, bool) = match &*self.core_truth.borrow()
+        {
+            Some((_, NativeTruth::AlwaysTrue)) => return Some(true),
+            Some((_, NativeTruth::Bool(b))) => (Rc::as_ptr(b), false),
+            Some((_, NativeTruth::Len(b))) => (Rc::as_ptr(b), true),
+            _ => return None,
+        };
+        // SAFETY: see above.
+        let b = unsafe { &*b };
+        let r = match b.call_kw.as_ref() {
+            Some(ckw) => ckw(std::slice::from_ref(v), &[]),
+            None => (b.call)(std::slice::from_ref(v)),
+        };
+        match r.ok()? {
+            Object::Bool(b) => Some(b),
+            Object::Int(n) if is_len && n >= 0 => Some(n != 0),
+            _ => None,
+        }
+    }
+
+    /// How instances of `cls` answer a boolean context natively (keyed by
+    /// the class's attribute version in `core_truth`).
+    #[cold]
+    #[inline(never)]
+    fn native_truth_of(&self, v: &Object, cls: &TypeObject) -> NativeTruth {
         // `NotImplemented` has neither method yet refuses a boolean
         // context (a TypeError since 3.14): the full path raises it.
-        if v.is_same(&crate::vm_singletons::not_implemented()) {
-            return None;
+        if v.is_same(&crate::vm_singletons::not_implemented()) || !Self::default_getattribute(cls) {
+            return NativeTruth::Decline;
         }
-        let cls = inst.cls_raw();
-        if !Self::default_getattribute(cls) || crate::object::exotic_str_keys_possible() {
-            return None;
-        }
-        for name in ["__bool__", "__len__"] {
+        for (name, is_len) in [("__bool__", false), ("__len__", true)] {
             match cls.lookup(name) {
                 None => continue,
                 Some(Object::Builtin(b))
                     if b.binds_instance && self.leaf_call_kind(&b) == Some(LeafKind::Opaque) =>
                 {
-                    let r = match b.call_kw.as_ref() {
-                        Some(ckw) => ckw(std::slice::from_ref(v), &[]),
-                        None => (b.call)(std::slice::from_ref(v)),
-                    };
-                    return match r.ok()? {
-                        Object::Bool(b) => Some(b),
-                        Object::Int(n) if name == "__len__" && n >= 0 => Some(n != 0),
-                        _ => None,
+                    return if is_len {
+                        NativeTruth::Len(b)
+                    } else {
+                        NativeTruth::Bool(b)
                     };
                 }
-                Some(_) => return None,
+                Some(_) => return NativeTruth::Decline,
             }
         }
-        Some(true)
+        NativeTruth::AlwaysTrue
     }
 
     /// Offer borrowed subscript operands to a registered native body or its
@@ -18860,17 +19068,29 @@ impl Interpreter {
             .map(|(_, _, f)| f.clone())
     }
 
-    /// Which leaf builtin `b` is, if any (pointer identity).
-    #[inline]
     /// `inst`'s class's `__next__` when it is a registered leaf builtin
-    /// that binds its instance (the core loop's native iterators).
-    fn core_leaf_next(&self, inst: &PyInstance) -> Option<Rc<crate::object::BuiltinFn>> {
+    /// that binds its instance (the core loop's native iterators),
+    /// uncounted: the cache (and the class) keep it alive until the next
+    /// lookup.
+    #[inline]
+    fn core_leaf_next_ptr(&self, inst: &PyInstance) -> Option<*const crate::object::BuiltinFn> {
         let ver = inst.cls_raw().attr_version.get();
         if let Some((v, b)) = &*self.core_next.borrow() {
             if *v == ver {
-                return Some(b.clone());
+                return Some(Rc::as_ptr(b));
             }
         }
+        self.core_leaf_next_resolve(inst, ver)
+            .map(|b| Rc::as_ptr(&b))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn core_leaf_next_resolve(
+        &self,
+        inst: &PyInstance,
+        ver: u64,
+    ) -> Option<Rc<crate::object::BuiltinFn>> {
         match inst.cls().lookup("__next__")? {
             Object::Builtin(b)
                 if b.binds_instance
@@ -18883,6 +19103,7 @@ impl Interpreter {
         }
     }
 
+    /// Which leaf builtin `b` is, if any (pointer identity).
     fn leaf_call_kind(&self, b: &Rc<crate::object::BuiltinFn>) -> Option<LeafKind> {
         let p = Rc::as_ptr(b) as usize;
         if let Some(k) = self.leaf_fns().calls.get(&p) {
@@ -62200,6 +62421,19 @@ impl MethodSlot {
         }
     }
 
+    /// [`Self::get_inst_builtin`] without taking a reference: the slot
+    /// (and the class) keep the builtin alive while it is used.
+    #[inline]
+    fn peek_inst_builtin(&self, ver: u64) -> Option<*const crate::object::BuiltinFn> {
+        // SAFETY: as `get`.
+        match unsafe { &*self.0.get() } {
+            (v, MethodSlotFn::Builtin(f)) if *v == ver && ver & Self::BUILTIN_TAG == 0 => {
+                Some(Rc::as_ptr(f))
+            }
+            _ => None,
+        }
+    }
+
     #[inline]
     fn set_inst_builtin(&self, ver: u64, f: &Rc<crate::object::BuiltinFn>) {
         // SAFETY: as `set`.
@@ -62228,6 +62462,18 @@ impl MethodSlot {
         // SAFETY: as `get`.
         match unsafe { &*self.0.get() } {
             (_, MethodSlotFn::Leaf(cached, kind)) if Rc::ptr_eq(cached, f) => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// [`Self::get_leaf`] by pointer identity.
+    #[inline]
+    fn get_leaf_ptr(&self, f: *const crate::object::BuiltinFn) -> Option<LeafKind> {
+        // SAFETY: as `get`.
+        match unsafe { &*self.0.get() } {
+            (_, MethodSlotFn::Leaf(cached, kind)) if std::ptr::eq(Rc::as_ptr(cached), f) => {
+                Some(*kind)
+            }
             _ => None,
         }
     }
@@ -62806,6 +63052,20 @@ fn exc_family_flags(cls: &crate::types::TypeObject) -> u16 {
 #[inline]
 fn code_name_obj(code: &CodeObject, name_idx: u32) -> Option<&Object> {
     code_vm_ext(code).and_then(|t| t.name_objs.get(name_idx as usize))
+}
+
+/// How a class's instances answer a boolean context without running
+/// Python (see [`Interpreter::leaf_instance_truth`]).
+#[derive(Clone)]
+enum NativeTruth {
+    /// Neither `__bool__` nor `__len__`: always true.
+    AlwaysTrue,
+    /// A registered native `__bool__`.
+    Bool(Rc<crate::object::BuiltinFn>),
+    /// A registered native `__len__`.
+    Len(Rc<crate::object::BuiltinFn>),
+    /// Anything else: the full path decides.
+    Decline,
 }
 
 /// Whether `inst`'s own attributes may shadow `co_names[name_idx]` (a

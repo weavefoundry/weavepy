@@ -242,6 +242,28 @@ fn deque_append(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn deque_appendleft(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let [_, x] = args {
+        if let Some((slots, d)) = fast_parts(args) {
+            bump_state_of(slots);
+            let mut h = head_of(slots).min(d.len());
+            if h == 0 {
+                h = std::cmp::max(8, d.len() / 2);
+                d.splice(0..0, std::iter::repeat_n(Object::None, h));
+            }
+            h -= 1;
+            d[h] = x.clone();
+            set_head_of(slots, h);
+            let trimmed = match maxlen_of(slots) {
+                Some(m) if d.len() - h > m => d.pop(),
+                _ => None,
+            };
+            if trimmed.is_some() {
+                crate::gc_trace::mark_maybe_dead();
+            }
+            drop(trimmed);
+            return Ok(Object::None);
+        }
+    }
     let mut st = receiver(args, "appendleft")?;
     let x = match args {
         [_, x] => x.clone(),
@@ -285,7 +307,9 @@ fn deque_pop(args: &[Object]) -> Result<Object, RuntimeError> {
             if d.len() > h {
                 bump_state_of(slots);
                 let x = d.pop().expect("len checked");
-                if d.len() == h && h != 0 {
+                // An emptied deque keeps a short free prefix for the next
+                // `appendleft` instead of splicing a new one.
+                if d.len() == h && h > 32 {
                     d.clear();
                     set_head_of(slots, 0);
                 }
@@ -364,6 +388,16 @@ fn deque_bool(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn deque_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let [_, Object::Int(i)] = args {
+        if let Some((slots, d)) = fast_parts(args) {
+            let h = head_of(slots);
+            let n = d.len().saturating_sub(h) as i64;
+            let index = if *i < 0 { *i + n } else { *i };
+            if (0..n).contains(&index) {
+                return Ok(d[h + index as usize].clone());
+            }
+        }
+    }
     let [_, index] = args else {
         receiver(args, "__getitem__")?;
         return Err(type_error("deque.__getitem__() takes one argument"));
@@ -462,10 +496,58 @@ const IT_DEQ: usize = 0;
 const IT_INDEX: usize = 1;
 const IT_STATE: usize = 2;
 
+/// [`deque_next`]'s common case over unguarded views (see
+/// [`fast_parts`]): a live iterator over an unmutated deque with an item
+/// left. `None` (nothing touched) leaves every other case to the full
+/// body.
+fn deque_next_fast(iterator: &crate::types::PyInstance, reverse: bool) -> Option<Object> {
+    // SAFETY: no guard is live on the cells (`peek`/`peek_mut` check), no
+    // Python runs before the last use, and the iterator and its deque are
+    // distinct objects.
+    let its = unsafe { iterator.slots.peek_mut() }?;
+    let Some(Object::Instance(deque)) = its.get_hinted(IT_DEQ, "_deq") else {
+        return None;
+    };
+    // The deque lives while the iterator's slot holds it (unchanged here).
+    let deque: *const crate::types::PyInstance = Rc::as_ptr(deque);
+    let index = its
+        .get_hinted(IT_INDEX, "_index")
+        .and_then(Object::as_i64)?;
+    let it_state = its
+        .get_hinted(IT_STATE, "_deq_state")
+        .and_then(Object::as_i64);
+    // SAFETY: as above.
+    let ds = unsafe { (*deque).slots.peek() }?;
+    let Some(Object::List(data)) = ds.get_hinted(SLOT_DATA, "_data") else {
+        return None;
+    };
+    if ds.get_hinted(SLOT_STATE, "_state").and_then(Object::as_i64) != it_state {
+        return None;
+    }
+    let h = head_of(ds);
+    // SAFETY: as above.
+    let d = unsafe { data.peek() }?;
+    let h = h.min(d.len());
+    if index < 0 || index as usize >= d.len() - h {
+        return None;
+    }
+    let slot = if reverse {
+        d.len() - 1 - index as usize
+    } else {
+        h + index as usize
+    };
+    let v = d[slot].clone();
+    *its.get_hinted_mut(IT_INDEX, "_index")? = Object::Int(index + 1);
+    Some(v)
+}
+
 fn deque_next(args: &[Object], reverse: bool) -> Result<Object, RuntimeError> {
     let [Object::Instance(iterator)] = args else {
         return Err(type_error("deque iterator __next__ requires one iterator"));
     };
+    if let Some(v) = deque_next_fast(iterator, reverse) {
+        return Ok(v);
+    }
     let (deque, index, it_state) = {
         let s = iterator.slots.borrow();
         let deque = match s.get_hinted(IT_DEQ, "_deq") {
