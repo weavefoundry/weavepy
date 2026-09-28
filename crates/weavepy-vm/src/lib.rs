@@ -12991,14 +12991,9 @@ impl Interpreter {
                             // `leaf_builtin_call` for these kinds).
                             Object::Builtin(b)
                                 if Rc::strong_count(b) > 1
-                                    && matches!(
-                                        site_slot.and_then(|s| s.get_leaf(b)),
-                                        Some(
-                                            LeafKind::Opaque
-                                                | LeafKind::Fast(_)
-                                                | LeafKind::Isinstance
-                                        )
-                                    ) =>
+                                    && site_slot
+                                        .and_then(|s| s.get_leaf(b))
+                                        .is_some_and(LeafKind::runs_in_core) =>
                             {
                                 let kind = site_slot.and_then(|s| s.get_leaf(b));
                                 let callee_at = len - argc - 2;
@@ -13021,10 +13016,13 @@ impl Interpreter {
                                 let r = match kind {
                                     Some(LeafKind::Fast(f)) => f(ops),
                                     Some(LeafKind::Isinstance) => Self::core_isinstance(ops),
-                                    _ => Some(match b.call_kw.as_ref() {
-                                        Some(ckw) => ckw(ops, &[]),
-                                        None => (b.call)(ops),
-                                    }),
+                                    Some(LeafKind::Opaque) | None => {
+                                        Some(match b.call_kw.as_ref() {
+                                            Some(ckw) => ckw(ops, &[]),
+                                            None => (b.call)(ops),
+                                        })
+                                    }
+                                    Some(k) => self.leaf_builtin_call(k, b, ops),
                                 };
                                 match r {
                                     // A fast half declined, untouched.
@@ -13428,10 +13426,20 @@ impl Interpreter {
                                     None => break Some(CoreExit::Helper),
                                 }
                             }
-                            // A list's site-cached native method (the helper's
-                            // builtin-receiver case, which fills the slot).
-                            Object::List(_) => {
-                                let Some(b) = ms.get_builtin(1) else {
+                            // A native container's site-cached method (the
+                            // helper's builtin-receiver case, which fills the
+                            // slot under the receiver's tag).
+                            recv @ (Object::List(_)
+                            | Object::Dict(_)
+                            | Object::Set(_)
+                            | Object::Str(_)) => {
+                                let tag = match recv {
+                                    Object::List(_) => 1,
+                                    Object::Dict(_) => 2,
+                                    Object::Set(_) => 3,
+                                    _ => 4,
+                                };
+                                let Some(b) = ms.get_builtin(tag) else {
                                     break Some(CoreExit::Helper);
                                 };
                                 // SAFETY: `len < cap`; the receiver moves up.
@@ -55440,6 +55448,46 @@ enum LeafKind {
 }
 
 impl LeafKind {
+    /// Whether the core loop runs this kind's call itself (operands that
+    /// all leave by plain decrements): the registered leaf bodies, and the
+    /// native methods that release no reference beyond their operands (a
+    /// removal, which drops an element, goes through the helper, whose
+    /// release grading covers it).
+    fn runs_in_core(self) -> bool {
+        matches!(
+            self,
+            Self::Opaque
+                | Self::Fast(_)
+                | Self::Isinstance
+                | Self::Len
+                | Self::ListAppend
+                | Self::ListPop
+                | Self::ListInsert
+                | Self::ListReverse
+                | Self::ListCopy
+                | Self::DictGet
+                | Self::DictKeys
+                | Self::DictValues
+                | Self::DictItems
+                | Self::SetPop
+                | Self::StrStartswith
+                | Self::StrEndswith
+                | Self::StrLower
+                | Self::StrUpper
+                | Self::StrStrip
+                | Self::StrLstrip
+                | Self::StrRstrip
+                | Self::StrFind
+                | Self::StrIsdigit
+                | Self::StrIsalpha
+                | Self::StrIsspace
+                | Self::StrSplit
+                | Self::StrJoin
+                | Self::StrReplace
+                | Self::StrFormat
+        )
+    }
+
     /// These self-only operations neither invoke Python nor discard any
     /// existing reference held by the receiver. Argument-shape admission
     /// still belongs to `leaf_builtin_call`; subclasses must fall back.
