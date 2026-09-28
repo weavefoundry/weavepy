@@ -327,6 +327,10 @@ struct Artifacts {
     /// generator — possibly to another thread — so buffer-layout
     /// identity needs a process-wide id.
     compile_id: u64,
+    /// Native-to-native entries of this compilation, and the interpreter
+    /// round-trips they made (see [`note_callee_exit`]).
+    callee_entries: Cell<u32>,
+    callee_roundtrips: Cell<u32>,
 }
 
 /// RFC 0073 WS4 — source of [`Artifacts::compile_id`].
@@ -421,6 +425,13 @@ pub(crate) const DEOPT_BUDGET: u32 = 64;
 /// full `guards_hold` snapshot re-validation the interpreter wouldn't.
 /// Retire it to tier-1.
 pub(crate) const GENERIC_CALL_RETIRE_RATIO: u32 = 4;
+
+/// [`GENERIC_CALL_RETIRE_RATIO`] for native-to-native entries. Such a
+/// callee is usually loop-free, so native code saves it a few dozen
+/// nanoseconds per activation while one interpreter call from it costs
+/// several hundred more than the interpreter's inline call (measured on
+/// deltablue's `execute` / `input` / `output` methods: 4x slower compiled).
+pub(crate) const CALLEE_ROUNDTRIP_RETIRE_RATIO: u32 = 1;
 
 /// Retire a compiled code object — and deopt the running activation —
 /// once one activation has made this many interpreter round-trips
@@ -1228,6 +1239,8 @@ impl JitState {
                         math: StdRc::new(math_tbl),
                         compile_id: NEXT_COMPILE_ID
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                        callee_entries: Cell::new(0),
+                        callee_roundtrips: Cell::new(0),
                     });
                     // RFC 0067 WS1 — a fresh compile can flip a
                     // `None` native-callee slot in *other* frames'
@@ -1743,10 +1756,7 @@ fn probe_class_ctor_shape(
     let bt = crate::builtin_types::builtin_types();
     // `type` subclasses (metaclasses) construct *classes* through the
     // three-argument form, never plain instances.
-    if cls.flags.is_builtin
-        || cls.is_subclass_of(&bt.type_)
-        || !Rc::ptr_eq(&cls.metaclass_or_type(), &bt.type_)
-    {
+    if cls.flags.is_builtin || cls.is_subclass_of(&bt.type_) || !cls.metaclass_is_type() {
         return None;
     }
     let plan = interp.instance_plan(cls);
@@ -2858,6 +2868,15 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
     if frame.code.jit_hint.is_not_jitable() || jit_off_for_process() {
         return;
     }
+    // A loop-free body gains nothing from native code until compiled
+    // callers exist to take its direct lanes, while compiling one during
+    // start-up or an import costs time and memory the program may never
+    // recover (`ABCMeta.register` while `_collections_abc` loads). Count
+    // again from zero; a body that stays hot compiles afterwards.
+    if phase != CompilationPhase::Normal {
+        frame.code.jit_hint.defer_lean_compile();
+        return;
+    }
     JIT.with(|cell| {
         let mut st = cell.borrow_mut();
         if !st.enabled {
@@ -2865,10 +2884,9 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
         }
         let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
         let threshold = st.threshold;
-        let importing = phase == CompilationPhase::Import;
-        let warm = if phase == CompilationPhase::Normal
-            && STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed)
-        {
+        // Embedders that never report start-up finished still compile,
+        // after sustained work.
+        let warm = if STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed) {
             threshold
         } else {
             threshold.saturating_mul(16)
@@ -2888,20 +2906,8 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
             code: frame.code.clone(),
         });
         if matches!(entry.tier, Tier::Cold) {
-            if importing {
-                // The lean path has no ordinary frame-entry counter. Account
-                // for the interval just completed, then permit another one.
-                // Resetting keeps the equality checkpoint reachable after the
-                // import exits, including when pure-leaf calls can skip frames.
-                let interval = lean_warm_at();
-                entry.counter = entry.counter.saturating_add(interval);
-                if entry.counter < interval.saturating_mul(16) {
-                    frame.code.jit_hint.defer_lean_compile();
-                    return;
-                }
-            }
             // Preserve the earlier lean warm point relative to frame/loop
-            // hotness, including the escape hatch for unreported startup.
+            // hotness.
             entry.counter = entry.counter.max(warm);
         }
         let interp_ref: &super::Interpreter = interp;
@@ -4388,6 +4394,7 @@ unsafe fn try_native_call(
             }
         }
     };
+    note_callee_exit(nc, nctx);
     if !inline_bufs {
         put_u64(u64_buf);
         put_u32(u32_buf);
@@ -4938,6 +4945,41 @@ fn finish_interp_call(
             ctx.parked = Some(v);
             CallStatus::Boxed as i64
         }
+    }
+}
+
+/// The generic-call backoff for native-to-native entries (the framed
+/// entries' twin lives in [`note_native_exit`]): a compiled callee whose
+/// activations average [`CALLEE_ROUNDTRIP_RETIRE_RATIO`] or more
+/// interpreter calls is a thin native driver around them. Each such call pays pin
+/// traffic, an activation shell and a generic call that the interpreter's
+/// inline call path avoids, so the callee retires to tier-1.
+#[inline]
+fn note_callee_exit(nc: &NativeCallee, child: &CallCtx) {
+    let entries = nc.art.callee_entries.get().saturating_add(1);
+    nc.art.callee_entries.set(entries);
+    if child.dyn_py_calls == 0 {
+        return;
+    }
+    let trips = nc
+        .art
+        .callee_roundtrips
+        .get()
+        .saturating_add(child.dyn_py_calls);
+    nc.art.callee_roundtrips.set(trips);
+    if entries >= GENERIC_RETIRE_MIN_ENTRIES
+        && trips / entries >= CALLEE_ROUNDTRIP_RETIRE_RATIO
+        && !nc.code.jit_hint.is_not_jitable()
+    {
+        let key = Rc::as_ptr(&nc.code).cast::<CodeObject>();
+        JIT.with(|cell| {
+            let mut st = cell.borrow_mut();
+            if let Some(ce) = st.cache.get_mut(&key) {
+                ce.tier = Tier::NotJitable;
+            }
+            st.stats.generic_retires += 1;
+        });
+        nc.code.jit_hint.mark_not_jitable();
     }
 }
 
@@ -5838,6 +5880,17 @@ fn dict_pin_and_key(
 /// natively found) reports `Err(())` so the caller deopts and the
 /// interpreter runs the comparison with full semantics.
 fn dict_probe_native(d: &Rc<GilRefCell<DictData>>, key: &Object) -> Result<Option<Object>, ()> {
+    // A `str` or `int` key settles by native equality unless the table
+    // compared it with a key of another kind.
+    if let Some(probe) = crate::object::LeafProbe::new(key) {
+        if let Ok(m) = d.try_borrow() {
+            match m.get(&probe) {
+                Some(v) => return Ok(Some(v.clone())),
+                None if probe.miss_is_exact() => return Ok(None),
+                None => {}
+            }
+        }
+    }
     let (found, deferred) = crate::object::with_key_eq_deferred(|| {
         crate::object::key_cmp_scope(|| d.borrow().get(&DictKey(key.clone())).cloned())
     });
@@ -5871,15 +5924,25 @@ unsafe extern "C" fn wpjit_dict_get(
     let jf = unsafe { &mut *frame };
     #[allow(clippy::cast_ptr_alignment)]
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
-    let Some((d, key)) = dict_pin_and_key(ctx, pin, key_bits, key_tag) else {
+    let Some(Pin::Obj(Object::Dict(d))) = ctx.pins.get(pin as usize) else {
         return 1;
     };
-    let found = match dict_probe_native(&d, &key) {
+    let int_key;
+    let key: &Object = if key_tag == weavepy_jit::DICT_KEY_STR {
+        match ctx.pins.get(key_bits as usize) {
+            Some(Pin::Obj(o @ Object::Str(_))) => o,
+            _ => return 1,
+        }
+    } else {
+        int_key = Object::Int(key_bits);
+        &int_key
+    };
+    let found = match dict_probe_native(d, key) {
         Ok(f) => f,
         Err(()) => return 1,
     };
     let Some(v) = found else {
-        ctx.raised = Some(crate::error::key_error_object(key));
+        ctx.raised = Some(crate::error::key_error_object(key.clone()));
         return 2;
     };
     match (val_tag, &v) {
@@ -10943,7 +11006,16 @@ fn park_plan(frame: &super::Frame, entry: &CompiledEntry, jf: &JitFrame) -> Opti
 /// a resume's sent value). Afterwards the frame is indistinguishable
 /// from an interpreted suspension. No-op without a parked box; never
 /// needs an interpreter (park refused any shape whose rebuild would).
+#[inline]
 pub(crate) fn materialize_parked(frame: &mut super::Frame) {
+    if frame.parked_native.is_some() {
+        materialize_parked_native(frame);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn materialize_parked_native(frame: &mut super::Frame) {
     let Some(mut act) = frame.parked_native.take() else {
         return;
     };

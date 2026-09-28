@@ -4117,12 +4117,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                 if let Some(v) = f.slot(name) {
                     return Some(v);
                 }
-            } else if let Some(v) = f
-                .attrs()
-                .borrow()
-                .get(&crate::object::DictKey(Object::from_str(name)))
-                .cloned()
-            {
+            } else if let Some(v) = f.attr_get(name) {
                 return Some(v);
             }
             // Synthetic dunders. Mirror `Vm::load_attr`'s function
@@ -9547,9 +9542,11 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
             // transplants pytest marks onto its wrapper that way, so a dir
             // that hid `f.pytestmark` silently dropped every
             // `@pytest.mark.parametrize` stacked under `@given`.
-            for k in f.attrs().borrow().keys() {
-                if let Object::Str(s) = &k.0 {
-                    names.insert(s.to_string());
+            if let Some(attrs) = f.attrs.borrow().as_ref() {
+                for k in attrs.borrow().keys() {
+                    if let Object::Str(s) = &k.0 {
+                        names.insert(s.to_string());
+                    }
                 }
             }
             for n in [
@@ -10426,7 +10423,7 @@ fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
         closure: f.closure.clone(),
         // Shared, not copied: `func.__dict__` mutations stay visible on
         // both, matching CPython where the function object is the same.
-        attrs: RefCell::new(f.attrs()),
+        attrs: RefCell::new(Some(f.attrs())),
         slots: RefCell::new(f.slots.borrow().clone()),
         closure_cells: std::sync::OnceLock::new(),
         // The copied slot store carries any override along.

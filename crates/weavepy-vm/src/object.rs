@@ -4284,7 +4284,8 @@ pub struct PyFunction {
     /// CPython's `func_set_dict` *aliases* the assigned dict
     /// (`f.__dict__ = d; f.__dict__ is d` — test_funcattrs), so the
     /// whole payload must be swappable, not just its contents.
-    pub attrs: RefCell<Rc<RefCell<DictData>>>,
+    /// Allocated on first use: most functions never get a `__dict__`.
+    pub attrs: RefCell<Option<Rc<RefCell<DictData>>>>,
     /// CPython function *getset/member slots* (`__name__`,
     /// `__qualname__`, `__doc__`, `__module__`, `__annotations__`,
     /// `__type_params__`, …). These live outside `__dict__`: they're
@@ -4403,7 +4404,22 @@ impl PyFunction {
 
     /// The live `__dict__` payload (honours `f.__dict__ = d` swapping).
     pub fn attrs(&self) -> Rc<RefCell<DictData>> {
-        self.attrs.borrow().clone()
+        if let Some(d) = self.attrs.borrow().as_ref() {
+            return d.clone();
+        }
+        let d = Rc::new(RefCell::new(DictData::default()));
+        *self.attrs.borrow_mut() = Some(d.clone());
+        d
+    }
+
+    /// A `__dict__` entry, without allocating an empty dictionary.
+    pub fn attr_get(&self, name: &str) -> Option<Object> {
+        self.attrs
+            .borrow()
+            .as_ref()?
+            .borrow()
+            .get(&StrKey(name))
+            .cloned()
     }
 
     /// Read a slot value if one has been stored (explicitly assigned or

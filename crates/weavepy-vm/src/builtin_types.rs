@@ -1340,6 +1340,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static PROPERTY_CLASS: std::cell::RefCell<Option<Rc<TypeObject>>> =
         const { std::cell::RefCell::new(None) };
+    /// The adopted registry behind [`builtin_types`]'s fast path.
+    static BUILTIN_TYPES_PTR: std::cell::Cell<*const BuiltinTypes> =
+        const { std::cell::Cell::new(std::ptr::null()) };
 }
 
 /// Drop this thread's lazily-built type registry (and the derived
@@ -1352,6 +1355,7 @@ thread_local! {
 pub fn clear_thread_type_registry() {
     let _ = PROPERTY_CLASS.try_with(|slot| slot.borrow_mut().take());
     let _ = BUILTIN_TYPES.try_with(|slot| slot.borrow_mut().take());
+    let _ = BUILTIN_TYPES_PTR.try_with(|p| p.set(std::ptr::null()));
 }
 
 /// Per-thread accessor. The registry is constructed lazily on first
@@ -1370,7 +1374,30 @@ pub fn property_class() -> Rc<TypeObject> {
     })
 }
 
-pub fn builtin_types() -> Rc<BuiltinTypes> {
+/// This thread's type registry. A registry is never freed once a thread
+/// has adopted it (see [`adopt_registry`]), so the reference is valid for
+/// the rest of the process: the hot accessor is one thread-local load, with
+/// no borrow flag and no reference-count traffic.
+#[inline]
+pub fn builtin_types() -> &'static BuiltinTypes {
+    let p = BUILTIN_TYPES_PTR.with(std::cell::Cell::get);
+    if p.is_null() {
+        return builtin_types_init();
+    }
+    // SAFETY: `adopt_registry` leaked a strong count before publishing the
+    // pointer, so the registry outlives every thread that can read it.
+    unsafe { &*p }
+}
+
+/// [`builtin_types`] as an owned handle (for publishing to other threads).
+pub fn builtin_types_rc() -> Rc<BuiltinTypes> {
+    builtin_types();
+    BUILTIN_TYPES.with(|cell| cell.borrow().clone().expect("registry installed above"))
+}
+
+#[cold]
+#[inline(never)]
+fn builtin_types_init() -> &'static BuiltinTypes {
     let (bt, fresh) = BUILTIN_TYPES.with(|cell| {
         if let Some(bt) = cell.borrow().as_ref() {
             return (bt.clone(), false);
@@ -1379,13 +1406,27 @@ pub fn builtin_types() -> Rc<BuiltinTypes> {
         *cell.borrow_mut() = Some(bt.clone());
         (bt, true)
     });
+    let bt = adopt_registry(&bt);
     if fresh {
         // Deferred surface pass (RFC 0056 WS4): synthesizing descriptor-
         // type members re-enters `builtin_types()`, which must resolve to
         // the just-published cell rather than recursively rebuild.
-        crate::type_surface::install_docs_table_surface(&bt);
+        crate::type_surface::install_docs_table_surface(bt);
     }
     bt
+}
+
+/// Publish `bt` as this thread's registry for [`builtin_types`], leaking
+/// one strong count so the reference it hands out stays valid. The type
+/// objects inside already live for the process (each one's MRO holds
+/// itself), so the leak is the registry struct alone, once per thread
+/// that adopts one.
+fn adopt_registry(bt: &Rc<BuiltinTypes>) -> &'static BuiltinTypes {
+    let p = Rc::as_ptr(bt);
+    std::mem::forget(bt.clone());
+    BUILTIN_TYPES_PTR.with(|c| c.set(p));
+    // SAFETY: the leaked count above keeps the registry alive.
+    unsafe { &*p }
 }
 
 /// Resolve `__objclass__` for a built-in method/slot-wrapper object by
@@ -4818,9 +4859,15 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
 
 pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<String>) -> Object {
     use crate::types::PyInstance;
-    let is_syntax = is_subclass_by_name(&class, "SyntaxError");
-    let is_stop_iteration = is_subclass_by_name(&class, "StopIteration");
-    let is_import = is_subclass_by_name(&class, "ImportError");
+    let (mut is_syntax, mut is_stop_iteration, mut is_import) = (false, false, false);
+    for t in class.mro.borrow().iter() {
+        match t.name.as_str() {
+            "SyntaxError" => is_syntax = true,
+            "StopIteration" => is_stop_iteration = true,
+            "ImportError" => is_import = true,
+            _ => {}
+        }
+    }
     let inst = PyInstance::new(class);
     let msg = Object::from_str(message);
     // A messageless raise (`StopIteration()`, `GeneratorExit()`, …)

@@ -39,8 +39,17 @@ use weavepy::{InterpreterFlags, RunOptions};
 /// The process allocator. The interpreter allocates and frees small blocks
 /// constantly; mimalloc serves them from per-thread free lists, several
 /// times faster than the system allocator on macOS.
+#[cfg(not(all(feature = "alloc-profile", target_os = "macos")))]
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(all(feature = "alloc-profile", target_os = "macos"))]
+mod alloc_profile;
+
+/// The allocation-site profiler's allocator (see [`alloc_profile`]).
+#[cfg(all(feature = "alloc-profile", target_os = "macos"))]
+#[global_allocator]
+static GLOBAL_ALLOC: alloc_profile::Profiled = alloc_profile::Profiled;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -744,8 +753,12 @@ fn run_on_large_stack(entry: fn() -> i32) -> i32 {
         // fork-warning check measures additional threads against.
         weavepy::vm::stdlib::os_process::capture_thread_baseline();
         pcprof::start();
+        #[cfg(all(feature = "alloc-profile", target_os = "macos"))]
+        alloc_profile::start();
         let code = entry();
         pcprof::finish();
+        #[cfg(all(feature = "alloc-profile", target_os = "macos"))]
+        alloc_profile::finish();
         code
     };
 

@@ -139,40 +139,91 @@ impl Mt {
         mt
     }
 
+    /// Regenerate the whole block of state words (`genrand_uint32`'s
+    /// refill).
+    fn regenerate(&mut self) {
+        for kk in 0..(N - M) {
+            let y = (self.key[kk] & UPPER_MASK) | (self.key[kk + 1] & LOWER_MASK);
+            self.key[kk] = self.key[kk + M] ^ (y >> 1) ^ if y & 1 != 0 { MATRIX_A } else { 0 };
+        }
+        for kk in (N - M)..(N - 1) {
+            let y = (self.key[kk] & UPPER_MASK) | (self.key[kk + 1] & LOWER_MASK);
+            self.key[kk] = self.key[kk + M - N] ^ (y >> 1) ^ if y & 1 != 0 { MATRIX_A } else { 0 };
+        }
+        let y = (self.key[N - 1] & UPPER_MASK) | (self.key[0] & LOWER_MASK);
+        self.key[N - 1] = self.key[M - 1] ^ (y >> 1) ^ if y & 1 != 0 { MATRIX_A } else { 0 };
+        self.pos = 0;
+    }
+}
+
+/// `genrand_uint32`'s output tempering.
+#[inline]
+fn temper(mut y: u32) -> u32 {
+    y ^= y >> 11;
+    y ^= (y << 7) & 0x9d2c_5680;
+    y ^= (y << 15) & 0xefc6_0000;
+    y ^ (y >> 18)
+}
+
+/// The persisted state, borrowed in place: the 624 key words, then the
+/// cursor, each little-endian (see [`STATE_LEN`]).
+struct MtBytes<'a>(&'a mut [u8]);
+
+impl MtBytes<'_> {
+    #[inline]
+    fn word(&self, i: usize) -> u32 {
+        let mut w = [0u8; 4];
+        w.copy_from_slice(&self.0[4 * i..4 * i + 4]);
+        u32::from_le_bytes(w)
+    }
+
+    #[inline]
+    fn set_word(&mut self, i: usize, v: u32) {
+        self.0[4 * i..4 * i + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn to_mt(&self) -> Mt {
+        let mut key = [0u32; N];
+        for (i, k) in key.iter_mut().enumerate() {
+            *k = self.word(i);
+        }
+        Mt {
+            key,
+            pos: (self.word(N) as usize).min(N),
+        }
+    }
+
+    fn write(&mut self, mt: &Mt) {
+        for (i, k) in mt.key.iter().enumerate() {
+            self.set_word(i, *k);
+        }
+        self.set_word(N, mt.pos as u32);
+    }
+
     /// `genrand_uint32` — the raw 32-bit output stream.
     fn genrand_u32(&mut self) -> u32 {
-        if self.pos >= N {
-            // Regenerate the whole block.
-            for kk in 0..(N - M) {
-                let y = (self.key[kk] & UPPER_MASK) | (self.key[kk + 1] & LOWER_MASK);
-                self.key[kk] = self.key[kk + M] ^ (y >> 1) ^ if y & 1 != 0 { MATRIX_A } else { 0 };
-            }
-            for kk in (N - M)..(N - 1) {
-                let y = (self.key[kk] & UPPER_MASK) | (self.key[kk + 1] & LOWER_MASK);
-                self.key[kk] =
-                    self.key[kk + M - N] ^ (y >> 1) ^ if y & 1 != 0 { MATRIX_A } else { 0 };
-            }
-            let y = (self.key[N - 1] & UPPER_MASK) | (self.key[0] & LOWER_MASK);
-            self.key[N - 1] = self.key[M - 1] ^ (y >> 1) ^ if y & 1 != 0 { MATRIX_A } else { 0 };
-            self.pos = 0;
+        let mut pos = self.word(N) as usize;
+        if pos >= N {
+            let mut mt = self.to_mt();
+            mt.regenerate();
+            self.write(&mt);
+            pos = 0;
         }
-        let mut y = self.key[self.pos];
-        self.pos += 1;
-        y ^= y >> 11;
-        y ^= (y << 7) & 0x9d2c_5680;
-        y ^= (y << 15) & 0xefc6_0000;
-        y ^ (y >> 18)
+        let y = self.word(pos);
+        self.set_word(N, pos as u32 + 1);
+        temper(y)
     }
 }
 
 // ===================================================================
-// Instance-state plumbing. The 624-word state lives in a bytearray in
-// the instance dict (so Python-level subclasses share it), the cursor
-// in an int.
+// Instance-state plumbing. The state lives in a bytearray in the
+// instance dict (so Python-level subclasses share it): the 624 key
+// words, then the cursor. The generator runs on it in place.
 // ===================================================================
 
 const STATE_KEY: &str = "_mt_state";
-const POS_KEY: &str = "_mt_pos";
+/// The state bytearray's length: the key words and the cursor.
+const STATE_LEN: usize = (N + 1) * 4;
 
 fn self_instance(args: &[Object], what: &str) -> Result<Rc<PyInstance>, RuntimeError> {
     match args.first() {
@@ -181,54 +232,43 @@ fn self_instance(args: &[Object], what: &str) -> Result<Rc<PyInstance>, RuntimeE
     }
 }
 
-fn load_mt(inst: &Rc<PyInstance>) -> Result<Mt, RuntimeError> {
-    let dict = inst.dict_cell().borrow();
-    let bytes = match dict.get(&DictKey(Object::from_static(STATE_KEY))) {
-        Some(Object::ByteArray(b)) => b.clone(),
-        _ => {
-            drop(dict);
-            // Unseeded use (e.g. subclass skipping __init__): seed from
-            // system entropy, as CPython does at allocation time.
-            let mt = seed_from_entropy();
-            store_mt(inst, &mt);
-            return Ok(mt);
-        }
+/// The instance's state buffer, seeding it from system entropy when it
+/// is missing (a subclass skipping `__init__`), as CPython does at
+/// allocation time.
+fn state_buffer(inst: &Rc<PyInstance>) -> Rc<RefCell<Vec<u8>>> {
+    let found = match inst
+        .dict_cell()
+        .borrow()
+        .get(&crate::object::StrKey(STATE_KEY))
+    {
+        Some(Object::ByteArray(b)) if b.borrow().len() == STATE_LEN => Some(b.clone()),
+        _ => None,
     };
-    let pos = match dict.get(&DictKey(Object::from_static(POS_KEY))) {
-        Some(Object::Int(i)) => *i as usize,
-        _ => N,
-    };
-    let buf = bytes.borrow();
-    let mut key = [0u32; N];
-    for (i, chunk) in buf.as_chunks::<4>().0.iter().enumerate().take(N) {
-        key[i] = u32::from_le_bytes(*chunk);
-    }
-    Ok(Mt { key, pos })
+    found.unwrap_or_else(|| store_mt(inst, &seed_from_entropy()))
 }
 
-fn store_mt(inst: &Rc<PyInstance>, mt: &Mt) {
-    let mut buf = Vec::with_capacity(N * 4);
-    for w in &mt.key {
-        buf.extend_from_slice(&w.to_le_bytes());
-    }
-    let mut dict = inst.dict_cell().borrow_mut();
-    dict.insert(
+fn load_mt(inst: &Rc<PyInstance>) -> Mt {
+    let buf = state_buffer(inst);
+    let mut bytes = buf.borrow_mut();
+    MtBytes(&mut bytes).to_mt()
+}
+
+fn store_mt(inst: &Rc<PyInstance>, mt: &Mt) -> Rc<RefCell<Vec<u8>>> {
+    let mut bytes = vec![0u8; STATE_LEN];
+    MtBytes(&mut bytes).write(mt);
+    let buf = Rc::new(RefCell::new(bytes));
+    inst.dict_cell().borrow_mut().insert(
         DictKey(Object::from_static(STATE_KEY)),
-        Object::ByteArray(Rc::new(RefCell::new(buf))),
+        Object::ByteArray(buf.clone()),
     );
-    dict.insert(
-        DictKey(Object::from_static(POS_KEY)),
-        Object::Int(mt.pos as i64),
-    );
+    buf
 }
 
-/// Mutate-in-place fast path: run `f` against the deserialized state,
-/// then persist the (changed) words back into the bytearray buffer.
-fn with_mt<R>(inst: &Rc<PyInstance>, f: impl FnOnce(&mut Mt) -> R) -> Result<R, RuntimeError> {
-    let mut mt = load_mt(inst)?;
-    let r = f(&mut mt);
-    store_mt(inst, &mt);
-    Ok(r)
+/// Run `f` against the instance's state, in place.
+fn with_mt<R>(inst: &Rc<PyInstance>, f: impl FnOnce(&mut MtBytes<'_>) -> R) -> R {
+    let buf = state_buffer(inst);
+    let mut bytes = buf.borrow_mut();
+    f(&mut MtBytes(&mut bytes))
 }
 
 fn seed_from_entropy() -> Mt {
@@ -317,7 +357,7 @@ fn random_random(args: &[Object]) -> Result<Object, RuntimeError> {
         let a = mt.genrand_u32() >> 5;
         let b = mt.genrand_u32() >> 6;
         (f64::from(a) * 67_108_864.0 + f64::from(b)) * (1.0 / 9_007_199_254_740_992.0)
-    })?;
+    });
     Ok(Object::Float(v))
 }
 
@@ -363,7 +403,7 @@ fn random_getrandbits(args: &[Object]) -> Result<Object, RuntimeError> {
         return Ok(Object::Int(0));
     }
     if k <= 32 {
-        let v = with_mt(&inst, |mt| mt.genrand_u32())? >> (32 - k as u32);
+        let v = with_mt(&inst, |mt| mt.genrand_u32()) >> (32 - k as u32);
         return Ok(Object::Int(i64::from(v)));
     }
     if (k - 1) / 32 + 1 > (isize::MAX as u64) / 4 {
@@ -386,7 +426,7 @@ fn random_getrandbits(args: &[Object]) -> Result<Object, RuntimeError> {
             remaining = remaining.saturating_sub(32);
         }
         out
-    })?;
+    });
     let mut bytes = Vec::with_capacity(words * 4);
     for d in &digits {
         bytes.extend_from_slice(&d.to_le_bytes());
@@ -421,14 +461,14 @@ fn random_randbytes(args: &[Object]) -> Result<Object, RuntimeError> {
             buf.extend_from_slice(&w[..take]);
         }
         buf
-    })?;
+    });
     Ok(Object::new_bytes(out))
 }
 
 /// `getstate()` → 625-tuple: the 624 state words plus the cursor.
 fn random_getstate(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = self_instance(args, "getstate()")?;
-    let mt = load_mt(&inst)?;
+    let mt = load_mt(&inst);
     let mut items: Vec<Object> = mt.key.iter().map(|w| Object::Int(i64::from(*w))).collect();
     items.push(Object::Int(mt.pos as i64));
     Ok(Object::new_tuple(items))

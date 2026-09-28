@@ -60,6 +60,9 @@ windows-sys = { workspace = true }
 default = ["jit"]
 # RFC 0032 — build the `weavepy` binary with the tier-2 JIT compiled in.
 jit = ["weavepy/jit", "weavepy-vm/jit"]
+# Sample live allocations by call stack (`WEAVEPY_ALLOC_PROFILE=<file>`,
+# macOS only); see `src/alloc_profile.rs`.
+alloc-profile = []
 
 [lints]
 workspace = true

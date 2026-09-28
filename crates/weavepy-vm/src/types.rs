@@ -42,15 +42,19 @@ static NEXT_TYPE_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 pub enum Dunder {
     Eq,
     Hash,
+    GetAttr,
+    GetAttribute,
 }
 
 impl Dunder {
-    pub const COUNT: usize = 2;
+    pub const COUNT: usize = 4;
 
     pub const fn name(self) -> &'static str {
         match self {
             Self::Eq => "__eq__",
             Self::Hash => "__hash__",
+            Self::GetAttr => "__getattr__",
+            Self::GetAttribute => "__getattribute__",
         }
     }
 }
@@ -1617,6 +1621,22 @@ impl TypeObject {
         crate::builtin_types::builtin_types().type_.clone()
     }
 
+    /// Whether [`Self::metaclass_or_type`] is `type` itself, without
+    /// cloning the metaclass handle.
+    pub fn metaclass_is_type(&self) -> bool {
+        let ext = self.c_ext_ptr.get();
+        if ext != 0 {
+            if let Some(h) = METACLASS_DRIFT_HOOK.get() {
+                h(ext, self);
+            }
+        }
+        let ty = &crate::builtin_types::builtin_types().type_;
+        match self.metaclass.borrow().as_ref() {
+            Some(m) => Rc::ptr_eq(m, ty),
+            None => true,
+        }
+    }
+
     /// `True` when `self` is a subclass of `other` (including itself).
     pub fn is_subclass_of(&self, other: &TypeObject) -> bool {
         let other_ptr = std::ptr::from_ref::<TypeObject>(other);
@@ -1994,6 +2014,26 @@ fn slot_name_eq(stored: &str, name: &str) -> bool {
     true
 }
 
+/// The key for a newly populated slot `name`. The slots every raise
+/// populates (`args`, `__traceback__`, the chaining links) share one
+/// interned key each instead of allocating a string per exception.
+fn slot_key(name: &str) -> DictKey {
+    const COMMON: [&str; 6] = [
+        "args",
+        "__traceback__",
+        "__context__",
+        "__cause__",
+        "__suppress_context__",
+        "message",
+    ];
+    static KEYS: std::sync::OnceLock<[Object; 6]> = std::sync::OnceLock::new();
+    if let Some(i) = COMMON.iter().position(|c| *c == name) {
+        let keys = KEYS.get_or_init(|| COMMON.map(crate::stdlib::sys::intern_name));
+        return DictKey(keys[i].clone());
+    }
+    DictKey(Object::Str(crate::shared_value::SharedStr::from(name)))
+}
+
 impl SlotStorage {
     /// Storage holding exactly `entries` (distinct `str` keys, in slot
     /// order), built in one step.
@@ -2226,9 +2266,7 @@ impl SlotStorage {
     }
 
     pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {
-        self.insert_with_key(name, value, || {
-            DictKey(Object::Str(crate::shared_value::SharedStr::from(name)))
-        })
+        self.insert_with_key(name, value, || slot_key(name))
     }
 
     /// Reuse an existing name allocation when populating a new slot.
@@ -2380,9 +2418,7 @@ impl SlotStorage {
     }
 
     pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {
-        self.insert_with_key(name, value, || {
-            DictKey(Object::Str(crate::shared_value::SharedStr::from(name)))
-        })
+        self.insert_with_key(name, value, || slot_key(name))
     }
 
     /// Share the name allocation only for a newly populated slot.

@@ -178,7 +178,10 @@ pub fn get_disk(name: &str, source: &str, filename: &str) -> Option<CodeObject> 
             if code.filename != filename {
                 crate::pycache::rewrite_filenames(&mut code, filename);
             }
-            insert(name, &code);
+            // Not mirrored into the in-memory cache: a later interpreter
+            // reads the same artifact again, and a resident clone of every
+            // loaded module's code would double its footprint in the
+            // (usual) single-interpreter process.
             Some(code)
         }
         _ => None,

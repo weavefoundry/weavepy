@@ -220,7 +220,22 @@ fn attr_or_none(
 
 /// CPython `_PyObject_IsAbstract`.
 fn is_abstract(interp: &mut Interpreter, obj: &Object) -> Result<bool, RuntimeError> {
-    match attr_or_none(interp, obj, "__isabstractmethod__")? {
+    let flag = match obj {
+        // A plain function carries the flag only in its `__dict__`, and
+        // built-in data values never do: answer both without an
+        // attribute lookup that would build an `AttributeError`.
+        Object::Function(f) => f.attr_get("__isabstractmethod__"),
+        Object::None
+        | Object::Bool(_)
+        | Object::Int(_)
+        | Object::Long(_)
+        | Object::Float(_)
+        | Object::Str(_)
+        | Object::Bytes(_)
+        | Object::Tuple(_) => None,
+        _ => attr_or_none(interp, obj, "__isabstractmethod__")?,
+    };
+    match flag {
         Some(flag) => interp.op_truth(&flag),
         None => Ok(false),
     }

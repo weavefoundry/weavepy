@@ -295,7 +295,7 @@ pub fn publish_interpreter_seed(interp: &crate::Interpreter) {
     let mut slot = seed_slot().lock();
     *slot = Some(interp.fork_for_thread());
     drop(slot);
-    *seed_types_slot().lock() = Some(crate::builtin_types::builtin_types());
+    *seed_types_slot().lock() = Some(crate::builtin_types::builtin_types_rc());
 }
 
 /// Run `f` (typically a `Interpreter::new()` for a *sub*-interpreter)

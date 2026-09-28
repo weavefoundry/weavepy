@@ -2954,7 +2954,7 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
                     }
                 }
             }
-            if let Ok(attrs_rc) = f.attrs.try_borrow() {
+            if let Some(attrs_rc) = f.attrs.try_borrow().ok().and_then(|a| a.clone()) {
                 if let Ok(attrs) = attrs_rc.try_borrow() {
                     for (k, v) in attrs.iter() {
                         visit(&k.0);
@@ -3159,7 +3159,7 @@ pub fn clear_object_fields(obj: &Object) -> bool {
             // dict (a module's `__dict__` or the `exec` target), reclaimed as
             // its own candidate if it too is unreachable — clearing it here
             // could wipe a live module.
-            if let Ok(attrs_rc) = f.attrs.try_borrow() {
+            if let Some(attrs_rc) = f.attrs.try_borrow().ok().and_then(|a| a.clone()) {
                 if let Ok(mut attrs) = attrs_rc.try_borrow_mut() {
                     attrs.clear();
                 }
@@ -4377,6 +4377,10 @@ pub fn note_dropped_marks(obj: &crate::object::Object) -> bool {
         O::Function(f) => note_dropped_counted(
             crate::sync::Rc::strong_count(f),
             crate::sync::Rc::as_ptr(f) as usize as u64,
+        ),
+        O::Type(t) => note_dropped_counted(
+            crate::sync::Rc::strong_count(t),
+            crate::sync::Rc::as_ptr(t) as usize as u64,
         ),
         O::Tuple(t) => note_dropped_counted(
             ThinArc::strong_count(t),
