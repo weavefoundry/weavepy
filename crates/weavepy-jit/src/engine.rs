@@ -337,6 +337,9 @@ impl JitEngine {
         direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
     ) -> Result<CompiledFrame, JitVerdict> {
         let tfunc = crate::analyze::analyze_frame(code, resolve, probes)?;
+        if calls_dynamically(&tfunc) {
+            return Err(JitVerdict::UnsupportedOpcode("dynamic call (loop-free)"));
+        }
         self.compile_tfunc_direct(&tfunc, direct)
     }
 
@@ -638,6 +641,36 @@ impl JitEngine {
             func_id: id,
         })
     }
+}
+
+/// Whether native code would cost a loop-free body more than it saves:
+/// it makes a dynamic Python call, which from native code takes the
+/// interpreter's generic call path (a nested run instead of the inline
+/// activation an interpreted caller uses), while the compile itself is
+/// the largest cost a short-lived method ever pays.
+fn calls_dynamically(tfunc: &TFunc) -> bool {
+    let has_loop = !tfunc.range_loops.is_empty()
+        || !tfunc.list_loops.is_empty()
+        || !tfunc.iter_loops.is_empty()
+        || tfunc.blocks.iter().enumerate().any(|(i, b)| {
+            use crate::ir::TTerm;
+            match b.term {
+                TTerm::Jump(t) => t as usize <= i,
+                TTerm::BranchFalse {
+                    target,
+                    fallthrough,
+                }
+                | TTerm::BranchTrue {
+                    target,
+                    fallthrough,
+                } => target as usize <= i || fallthrough as usize <= i,
+                _ => false,
+            }
+        });
+    if has_loop {
+        return false;
+    }
+    op_mix(tfunc).dyn_calls > 0
 }
 
 /// `(generic, total)`: statements that hand an operation to the

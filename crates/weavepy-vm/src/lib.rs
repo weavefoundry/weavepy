@@ -9857,9 +9857,11 @@ impl Interpreter {
         let Some(Object::Generator(g)) = frame.stack.last() else {
             return None;
         };
-        // Validate and take the frame under one borrow. No Python runs
-        // while it is held; release it before resuming the activation.
-        let mut state = g.state.try_borrow_mut().ok()?;
+        // Validate and take the frame under one exclusive view. No Python
+        // runs while it is held; it ends before the activation resumes.
+        // SAFETY: nothing below reaches the cell again until `state`'s last
+        // use (`peek_mut` rejects a live guard or shared cells).
+        let state = unsafe { g.state.peek_mut() }?;
         let first_resume;
         {
             let boxed = match &*state {
@@ -9891,8 +9893,7 @@ impl Interpreter {
             return None;
         };
         // Committed.
-        let prev_state = std::mem::replace(&mut *state, GeneratorState::Running);
-        drop(state);
+        let prev_state = std::mem::replace(state, GeneratorState::Running);
         let g = g.clone();
         let (GeneratorState::Suspended(mut boxed) | GeneratorState::Created(mut boxed)) =
             prev_state
@@ -36101,7 +36102,13 @@ impl Interpreter {
                 *py.gen_owner.borrow_mut() = Some(Rc::downgrade(gen));
             }
         }
-        *gen.state.borrow_mut() = GeneratorState::Suspended(boxed);
+        // SAFETY: the store runs no code (the displaced state is
+        // `Running`, which owns nothing) and no guard is live on the cell
+        // (`peek_mut` checks).
+        match unsafe { gen.state.peek_mut() } {
+            Some(state) => *state = GeneratorState::Suspended(boxed),
+            None => *gen.state.borrow_mut() = GeneratorState::Suspended(boxed),
+        }
     }
 
     fn generator_send(
