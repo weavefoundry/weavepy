@@ -632,6 +632,31 @@ thread_local! {
 pub(crate) const LEAN_WARM_COMPILE_THRESHOLD_CAP: u32 = 24;
 
 #[inline]
+/// Credit `n` activations a frameless path ran for `code` to its tier-2
+/// warm-up counter (the framed entries that count otherwise never happen
+/// for them). Returns whether the next framed or lean entry should
+/// compile it: a compile is due, or no entry exists yet to count in.
+pub(crate) fn note_frameless_calls(code: &CodeObject, n: u32) -> bool {
+    JIT.with(|cell| {
+        let Ok(mut st) = cell.try_borrow_mut() else {
+            return false;
+        };
+        if !st.enabled {
+            return false;
+        }
+        let threshold = st.threshold;
+        match st.cache.get_mut(&std::ptr::from_ref(code)) {
+            None => true,
+            Some(entry) if matches!(entry.tier, Tier::Cold) => {
+                entry.counter = entry.counter.saturating_add(n);
+                let next = entry.counter.saturating_add(1);
+                next >= threshold && compile_allowed(next, threshold)
+            }
+            Some(_) => false,
+        }
+    })
+}
+
 pub(crate) fn lean_warm_at() -> u32 {
     LEAN_WARM_AT
         .try_with(std::cell::Cell::get)
@@ -2875,15 +2900,6 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
     if frame.code.jit_hint.is_not_jitable() || jit_off_for_process() {
         return;
     }
-    // A loop-free body gains nothing from native code until compiled
-    // callers exist to take its direct lanes, while compiling one during
-    // start-up or an import costs time and memory the program may never
-    // recover (`ABCMeta.register` while `_collections_abc` loads). Count
-    // again from zero; a body that stays hot compiles afterwards.
-    if phase != CompilationPhase::Normal {
-        frame.code.jit_hint.defer_lean_compile();
-        return;
-    }
     JIT.with(|cell| {
         let mut st = cell.borrow_mut();
         if !st.enabled {
@@ -2893,7 +2909,9 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
         let threshold = st.threshold;
         // Embedders that never report start-up finished still compile,
         // after sustained work.
-        let warm = if STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed) {
+        let warm = if phase == CompilationPhase::Normal
+            && STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed)
+        {
             threshold
         } else {
             threshold.saturating_mul(16)
@@ -2913,6 +2931,23 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
             code: frame.code.clone(),
         });
         if matches!(entry.tier, Tier::Cold) {
+            if phase != CompilationPhase::Normal {
+                // A loop-free body gains nothing from native code until
+                // compiled callers exist to take its direct lanes, while
+                // compiling one during start-up or an import costs time and
+                // memory the program may never recover (`ABCMeta.register`
+                // while `_collections_abc` loads). The lean path has no
+                // ordinary frame-entry counter: account for the interval
+                // just completed and count another, so only sustained work
+                // compiles (the checkpoint stays reachable afterwards, even
+                // when pure-leaf calls skip frames).
+                let interval = lean_warm_at();
+                entry.counter = entry.counter.saturating_add(interval);
+                if entry.counter < interval.saturating_mul(16) {
+                    frame.code.jit_hint.defer_lean_compile();
+                    return;
+                }
+            }
             // Preserve the earlier lean warm point relative to frame/loop
             // hotness.
             entry.counter = entry.counter.max(warm);
@@ -5249,6 +5284,8 @@ unsafe fn pure_leaf_call(
         ptrs[offset + j] = unsafe { written.0.add(j) };
     }
     let v = interp.pure_leaf_eval::<false, false>(code, func, &ptrs[..n])?;
+    // A call served without an interpreter frame, like a native one.
+    native_stat(|s| s.calls.set(s.calls.get() + 1));
     Some(deliver_call_result(jf, ctx, v, expect_tag))
 }
 
@@ -5287,6 +5324,7 @@ unsafe extern "C" fn wpjit_self_enter(frame: *mut JitFrame) -> i64 {
         return 1;
     }
     depth.set(n);
+    native_stat(|s| s.calls.set(s.calls.get() + 1));
     0
 }
 
@@ -5682,6 +5720,8 @@ unsafe extern "C" fn wpjit_call_method(
                     return CallStatus::Ok as i64;
                 }
                 // The store is complete: never repeat it.
+                #[cfg(test)]
+                crate::SCALAR_FIELD_UPDATE_BOXED_RETURNS.with(|hits| hits.set(hits.get() + 1));
                 ctx.parked = Some(Object::Int(value));
                 return CallStatus::Boxed as i64;
             }

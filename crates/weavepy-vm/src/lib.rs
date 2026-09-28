@@ -14978,6 +14978,29 @@ impl Interpreter {
         f: &crate::object::PyFunction,
         args: &[*const Object],
     ) -> Option<Object> {
+        // A frameless call is an activation the JIT's warm-up never sees:
+        // count it as a lean one, and credit each interval to the tier-2
+        // counter. The call at which a compile falls due goes to the
+        // framed path, which compiles the hot leaf so native callers can
+        // take its direct lanes.
+        #[cfg(feature = "jit")]
+        {
+            let hint = &code.jit_hint;
+            let n = hint.lean_entries();
+            if n <= crate::tier2::LEAN_WARM_COMPILE_THRESHOLD_CAP {
+                if n + 1 == crate::tier2::lean_warm_at()
+                    && !hint.is_not_jitable()
+                    && !crate::tier2::jit_off_for_process()
+                {
+                    if crate::tier2::note_frameless_calls(code, n + 1) {
+                        return None;
+                    }
+                    hint.defer_lean_compile();
+                } else {
+                    hint.bump_lean_entries();
+                }
+            }
+        }
         let r = self.leaf_eval::<GETTER, EFFECT>(code, f, args, 0);
         if r.is_some() {
             code.jit_hint.note_leaf_hit();
@@ -71728,8 +71751,9 @@ print("native pickle coverage: ok")
     #[test]
     fn jit_native_lane_mismatch_falls_back() {
         // `dbl` compiled for int arguments; the native caller passes a
-        // float — the argument-lane check rejects the fast path and
-        // the interpreter call stays exact.
+        // float — the argument-lane check rejects the native fast path,
+        // and the call (frameless or through the interpreter) stays
+        // exact.
         let src = "def dbl(x):\n    if x < 0:\n        return 0\n\
                    \x20   return x + x\n\
                    k = 0\nwhile k < 10:\n    dbl(3)\n    k = k + 1\n\
@@ -71739,8 +71763,8 @@ print("native pickle coverage: ok")
                    r = 0.0\nk = 0\n\
                    while k < 10:\n    r = spin(20)\n    k = k + 1\n\
                    print(r)\n";
-        let (out, _calls, fallbacks, _deopts) = run_jit_native(src);
-        assert!(fallbacks >= 1, "float-for-int argument must fall back");
+        let (out, _calls, _fallbacks, deopts) = run_jit_native(src);
+        assert_eq!(deopts, 0, "a lane mismatch never enters the native callee");
         assert_eq!(out, "20.0\n");
         assert_eq!(out, run(src));
     }
