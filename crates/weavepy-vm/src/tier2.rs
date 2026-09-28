@@ -784,6 +784,7 @@ impl JitState {
         );
         // RFC 0067 WS2 — the eval-breaker poll for native loop headers.
         weavepy_jit::register_poll_helper(wpjit_poll);
+        weavepy_jit::register_self_call_helpers(wpjit_self_enter, wpjit_self_exit, wpjit_self_slow);
         // RFC 0069 WS1 — the guarded method-call lane.
         weavepy_jit::register_call_method_helper(wpjit_call_method);
         // RFC 0073 WS3 — the native `str`-method lane.
@@ -1133,7 +1134,21 @@ impl JitState {
             let t0 = std::env::var_os("WEAVEPY_JIT_TRACE")
                 .is_some()
                 .then(std::time::Instant::now);
-            let r = engine.compile_frame(code, &mut classify, &mut jit_probes);
+            // A callee already compiled as a guard-free scalar leaf is
+            // entered directly by native code (its identity is guarded
+            // with the callee table like any burned-in callee).
+            let mut direct = |token: u32| {
+                let callees = callees.borrow();
+                let (Object::Function(_), fcode) = callees.get(token as usize)? else {
+                    return None;
+                };
+                let k = Rc::as_ptr(fcode).cast::<CodeObject>();
+                match &cache_ref.get(&k)?.tier {
+                    Tier::Compiled(a) => a.cf.direct_leaf(fcode.arg_count),
+                    _ => None,
+                }
+            };
+            let r = engine.compile_frame_direct(code, &mut classify, &mut jit_probes, &mut direct);
             if let Some(t0) = t0 {
                 eprintln!("jit compile-time {:?} {:?}", code.name, t0.elapsed());
             }
@@ -3047,6 +3062,11 @@ struct CallCtx {
     /// re-entrancy pattern as `vm_singletons::publish_interpreter_ptr`).
     interp: *mut super::Interpreter,
     callees: StdRc<CalleeTable>,
+    /// The running compilation's frame layout, owned by whoever entered
+    /// this activation. A direct self call shares its caller's context,
+    /// so its deopt rebuild reads the layout here rather than through
+    /// the tier cache, which may retire the code mid-recursion.
+    cf: *const CompiledFrame,
     guard_snapshot: StdRc<GuardSnapshot>,
     /// The caller frame's namespaces, for post-call guard revalidation
     /// (the caller `Frame` itself is mutably borrowed across the native
@@ -4230,6 +4250,7 @@ unsafe fn try_native_call(
         if !c.obj_global_pins.is_empty() {
             c.obj_global_pins.clear();
         }
+        c.cf = StdRc::as_ptr(&nc.cf);
         c.dirty = false;
         c.interp_calls = 0;
         c.dyn_py_calls = 0;
@@ -4265,6 +4286,7 @@ unsafe fn try_native_call(
         Box::new(CallCtx {
             interp: ctx.interp,
             callees: nc.callees.clone(),
+            cf: StdRc::as_ptr(&nc.cf),
             guard_snapshot: nc.snap.clone(),
             globals: nc.func.globals.clone(),
             builtins: nc.func.builtins.clone(),
@@ -4609,19 +4631,6 @@ fn finish_deopted_callee(
     njf: &JitFrame,
     raised: Option<RuntimeError>,
 ) -> Result<Object, RuntimeError> {
-    let code = &nc.code;
-    let n_real = code.varnames.len();
-    let mut locals_v: Vec<Object> = Vec::with_capacity(n_real);
-    for slot in 0..n_real {
-        match nc.cf.local_types.get(slot).copied().flatten() {
-            Some(ty) => locals_v.push(unpack_ty(
-                locals_buf.get(slot).copied().unwrap_or(0),
-                ty,
-                &nctx.pins,
-            )),
-            None => locals_v.push(Object::Unbound),
-        }
-    }
     let entry = CompiledEntry {
         cf: nc.cf.clone(),
         guard_snapshot: nc.snap.clone(),
@@ -4632,17 +4641,49 @@ fn finish_deopted_callee(
         math: nc.math.clone(),
         native: None,
         method_native: None,
-        // Synthetic entry, only for the stack rebuild below; `0` is
-        // never a real compile id, so nothing can park against it.
+        // Synthetic entry, only for the stack rebuild; `0` is never a
+        // real compile id, so nothing can park against it.
         compile_id: 0,
     };
+    finish_deopted(
+        interp, &nc.code, &nc.func, &entry, nctx, locals_buf, spill, tags, njf, raised,
+    )
+}
+
+/// [`finish_deopted_callee`] for an activation described by `entry`
+/// (the callee's own tables), `code` and `func`.
+#[allow(clippy::too_many_arguments)]
+fn finish_deopted(
+    interp: &mut super::Interpreter,
+    code: &Rc<CodeObject>,
+    func: &PyFunction,
+    entry: &CompiledEntry,
+    nctx: &mut CallCtx,
+    locals_buf: &[u64],
+    spill: &[u64],
+    tags: &[u32],
+    njf: &JitFrame,
+    raised: Option<RuntimeError>,
+) -> Result<Object, RuntimeError> {
+    let n_real = code.varnames.len();
+    let mut locals_v: Vec<Object> = Vec::with_capacity(n_real);
+    for slot in 0..n_real {
+        match entry.cf.local_types.get(slot).copied().flatten() {
+            Some(ty) => locals_v.push(unpack_ty(
+                locals_buf.get(slot).copied().unwrap_or(0),
+                ty,
+                &nctx.pins,
+            )),
+            None => locals_v.push(Object::Unbound),
+        }
+    }
     let mut frame = super::Frame {
         code: code.clone(),
         locals: Rc::new(GilRefCell::new(locals_v)),
         cells: crate::object::empty_cells(),
         stack: Vec::new(),
-        globals: nc.func.globals.clone(),
-        builtins: nc.func.builtins.clone(),
+        globals: func.globals.clone(),
+        builtins: func.builtins.clone(),
         builtins_obj: None,
         class_namespace: None,
         class_namespace_obj: None,
@@ -4667,7 +4708,7 @@ fn finish_deopted_callee(
         nctx.parked.take()
     };
     rebuild_stack(
-        interp, &mut frame, &entry, locals_buf, spill, tags, njf, &nctx.pins, parked,
+        interp, &mut frame, entry, locals_buf, spill, tags, njf, &nctx.pins, parked,
     );
     if raised.is_some() {
         // As though the raising CALL just executed: pc points past it
@@ -5075,6 +5116,165 @@ unsafe fn pure_leaf_call(
     }
     let v = interp.pure_leaf_eval::<false>(code, func, &ptrs[..n])?;
     Some(deliver_call_result(jf, ctx, v, expect_tag))
+}
+
+/// The direct self-call enter helper (see `weavepy_jit::SelfEnterHelper`):
+/// the per-call work `try_native_call` does for a callee, reduced to what
+/// a pin-free activation of the caller's own code needs — a GIL
+/// checkpoint, the observer gate, and the recursion tick (checked
+/// against the limit, and against the native stack's headroom every few
+/// levels: the ordinary path grows the stack, this one cannot).
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe extern "C" fn wpjit_self_enter(frame: *mut JitFrame) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // SAFETY: the `&mut Interpreter` that entered native code is dormant
+    // while the helper runs.
+    let interp = unsafe { &mut *ctx.interp };
+    interp.gil_countdown = interp.gil_countdown.wrapping_sub(1);
+    if interp.gil_countdown == 0 {
+        interp.gil_countdown = crate::gil::GIL_CHECK_INTERVAL;
+        crate::gil::yield_checkpoint();
+    }
+    if crate::hot_gates::load() != 0 || crate::trace::any_observers_active() {
+        return 1;
+    }
+    // SAFETY: this thread's own depth cell (see `CallCtx::depth_cell`).
+    let depth = unsafe { &*ctx.depth_cell };
+    let n = depth.get() + 1;
+    if n > crate::recursion::recursion_limit()
+        || (n % 8 == 0 && stacker::remaining_stack().is_some_and(|r| r < 256 * 1024))
+    {
+        return 1;
+    }
+    depth.set(n);
+    0
+}
+
+/// Release [`wpjit_self_enter`]'s recursion tick.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe extern "C" fn wpjit_self_exit(frame: *mut JitFrame) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &*frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &*jf.ctx.cast::<CallCtx>() };
+    // SAFETY: as in `wpjit_self_enter`.
+    let depth = unsafe { &*ctx.depth_cell };
+    depth.set(depth.get().saturating_sub(1));
+    0
+}
+
+/// Finish a direct self call whose callee did not return (see
+/// `weavepy_jit::SelfSlowHelper`): exactly `try_native_call`'s deopt and
+/// raise handling, the callee's frame and buffers being the ones on the
+/// caller's native stack and its context the caller's own (a pin-free
+/// activation leaves the shared table empty).
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`]; `callee` is the live callee frame.
+unsafe extern "C" fn wpjit_self_slow(
+    frame: *mut JitFrame,
+    callee: *mut JitFrame,
+    status: i64,
+    token: i64,
+    expect_tag: i64,
+) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // SAFETY: as in `wpjit_self_enter`.
+    let interp = unsafe { &mut *ctx.interp };
+    // SAFETY: the caller's contract.
+    let cjf = unsafe { &*callee };
+    let raised = (status == JitStatus::Raised as i64).then(|| {
+        ctx.raised.take().unwrap_or_else(|| {
+            RuntimeError::Internal("JIT Raised exit without a parked exception".to_owned())
+        })
+    });
+    let Some((Object::Function(pf), code)) = ctx.callees.get(token as usize).cloned() else {
+        // Unreachable: the lowering only emits direct calls for tokens
+        // naming this very function.
+        ctx.raised = Some(raised.unwrap_or_else(|| {
+            RuntimeError::Internal("direct self call without its callee".to_owned())
+        }));
+        return CallStatus::Raised as i64;
+    };
+    if status == JitStatus::Deopt as i64 {
+        native_stat(|s| s.deopts.set(s.deopts.get() + 1));
+        let key = Rc::as_ptr(&code).cast::<CodeObject>();
+        JIT.with(|cell| {
+            if let Some(ce) = cell.borrow_mut().cache.get_mut(&key) {
+                ce.deopts += 1;
+                if ce.deopts >= DEOPT_BUDGET {
+                    ce.tier = Tier::NotJitable;
+                    code.jit_hint.mark_not_jitable();
+                }
+            }
+        });
+    }
+    // The callee runs the caller's own compilation, whose layout the
+    // shared context holds (the tier cache may have just retired it).
+    // SAFETY: `ctx.cf` came from a live `StdRc` its entry still owns.
+    let cf = unsafe {
+        StdRc::increment_strong_count(ctx.cf);
+        StdRc::from_raw(ctx.cf)
+    };
+    let entry = CompiledEntry {
+        cf,
+        guard_snapshot: ctx.guard_snapshot.clone(),
+        callees: ctx.callees.clone(),
+        obj_globals: ctx.obj_globals.clone(),
+        attr_guards: ctx.attr_guards.clone(),
+        methods: ctx.methods.clone(),
+        math: ctx.math.clone(),
+        native: None,
+        method_native: None,
+        compile_id: 0,
+    };
+    ctx.dirty = true;
+    // SAFETY: the callee frame's buffers are live on the caller's stack,
+    // sized by its own compiled frame.
+    let (locals, spill, tags) = unsafe {
+        (
+            std::slice::from_raw_parts(cjf.locals, cjf.n_locals as usize),
+            std::slice::from_raw_parts(cjf.stack_spill, cjf.stack_cap as usize),
+            std::slice::from_raw_parts(cjf.stack_tags, cjf.stack_cap as usize),
+        )
+    };
+    match finish_deopted(
+        interp, &code, &pf, &entry, ctx, locals, spill, tags, cjf, raised,
+    ) {
+        Err(e) => {
+            ctx.raised = Some(e);
+            CallStatus::Raised as i64
+        }
+        Ok(v) => {
+            // Python ran for the continuation: the caller's burned-in
+            // resolutions must still hold for it to continue natively.
+            if !guards_hold(
+                interp,
+                &ctx.globals,
+                &ctx.builtins,
+                &ctx.guard_snapshot,
+                &ctx.callees,
+                &ctx.math,
+            ) {
+                ctx.parked = Some(v);
+                return CallStatus::Boxed as i64;
+            }
+            deliver_call_result(jf, ctx, v, expect_tag as u32)
+        }
+    }
 }
 
 /// The generic-call backoff for native-to-native entries (the framed
@@ -8461,12 +8661,14 @@ unsafe fn call_dyn_impl(
         .then(|| unsafe { dyn_kw_site_bind(jf, ctx, &callee, argc, kwc, names) })
         .flatten()
     {
-        note_generic_dyn_call(ctx);
+        // Not charged against the native driver: the interpreter's own
+        // `CALL_KW` binds through this same permutation and activation,
+        // so tier-1 would not run the call any cheaper.
         ctx.dirty = true;
         let called =
             call_with_activation_shell(interp, ctx, jf, |i| i.run_py_exact_nofree(&f, locals));
         // SAFETY: as above.
-        return unsafe { dyn_call_result(jf, ctx, called, false, int_result) };
+        return unsafe { dyn_call_result(jf, ctx, called, false, false, int_result) };
     }
     let n = (argc + kwc) as usize;
     let mut args: Vec<Object> = Vec::with_capacity(n);
@@ -8498,8 +8700,13 @@ unsafe fn call_dyn_impl(
         }
     }
     // Arbitrary Python runs on behalf of this activation (RFC 0067
-    // WS1's dirtiness discipline).
-    note_generic_dyn_call(ctx);
+    // WS1's dirtiness discipline). A keyword call pays the generic
+    // binder in tier-1 too, so only positional calls count against the
+    // native driver.
+    let charged = kwc == 0;
+    if charged {
+        note_generic_dyn_call(ctx);
+    }
     ctx.dirty = true;
     let native_callee = matches!(&callee, Object::Builtin(_))
         || matches!(&callee, Object::BoundMethod(bm) if matches!(bm.function, Object::Builtin(_)));
@@ -8507,12 +8714,14 @@ unsafe fn call_dyn_impl(
         i.call_object_with_globals(&callee, &args, &kwargs, &ctx.globals)
     });
     // SAFETY: as above.
-    unsafe { dyn_call_result(jf, ctx, called, native_callee, int_result) }
+    unsafe { dyn_call_result(jf, ctx, called, native_callee, charged, int_result) }
 }
 
 /// `call_dyn_impl`'s result protocol: park a raise, or deliver the
 /// result unboxed (`int_result`) or pinned, parking it (`Boxed`) when a
-/// round-trip charge or an invalidated guard ends the activation.
+/// round-trip charge or an invalidated guard ends the activation. An
+/// uncharged call (one tier-1 would not run any cheaper) leaves the
+/// native driver's call density alone.
 ///
 /// # Safety
 ///
@@ -8522,6 +8731,7 @@ unsafe fn dyn_call_result(
     ctx: &mut CallCtx,
     called: Result<Object, RuntimeError>,
     native_callee: bool,
+    charged: bool,
     int_result: bool,
 ) -> i64 {
     // SAFETY: the `&mut Interpreter` that entered native code is
@@ -8533,10 +8743,10 @@ unsafe fn dyn_call_result(
             CallStatus::Raised as i64
         }
         Ok(v) => {
-            if !native_callee {
+            if charged && !native_callee {
                 ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
             }
-            if charge_roundtrip(ctx) || (native_callee && charge_native_roundtrip(ctx)) {
+            if charge_roundtrip(ctx) || (charged && native_callee && charge_native_roundtrip(ctx)) {
                 ctx.parked = Some(v);
                 return CallStatus::Boxed as i64;
             }
@@ -9659,6 +9869,7 @@ pub(crate) fn try_call_native_direct(
     let mut ctx = CallCtx {
         interp: std::ptr::from_mut(interp),
         callees: entry.art.callees.clone(),
+        cf: StdRc::as_ptr(&entry.art.cf),
         guard_snapshot: entry.art.snap.clone(),
         globals: f.globals.clone(),
         builtins: f.builtins.clone(),
@@ -10461,6 +10672,7 @@ fn enter_compiled(
     let mut ctx = CallCtx {
         interp: std::ptr::from_mut(interp),
         callees: entry.callees.clone(),
+        cf: StdRc::as_ptr(&entry.cf),
         guard_snapshot: entry.guard_snapshot.clone(),
         globals: frame.globals.clone(),
         builtins: frame.builtins.clone(),
@@ -11348,6 +11560,7 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
     let mut ctx = CallCtx {
         interp: std::ptr::from_mut(interp),
         callees: entry.callees.clone(),
+        cf: StdRc::as_ptr(&entry.cf),
         guard_snapshot: entry.guard_snapshot.clone(),
         globals: frame.globals.clone(),
         builtins: frame.builtins.clone(),

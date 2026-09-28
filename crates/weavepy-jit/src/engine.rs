@@ -9,12 +9,12 @@
 
 use std::mem::{self, ManuallyDrop};
 
-use cranelift_codegen::ir::{types, AbiParam, Type};
+use cranelift_codegen::ir::{types, AbiParam, FuncRef, Type};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Linkage, Module};
+use cranelift_module::{FuncId, Linkage, Module};
 
 use crate::analyze::{JitVerdict, Probes};
 use crate::ir::{
@@ -118,6 +118,21 @@ pub struct CompiledFrame {
     pub ret_lane: Option<JitType>,
     scalar_leaf: bool,
     op_mix: OpMix,
+    /// The engine's handle for this function, for direct calls from
+    /// frames compiled later (see [`Self::direct_leaf`]).
+    func_id: FuncId,
+}
+
+/// A compiled scalar leaf another frame may call directly (see
+/// [`CompiledFrame::direct_leaf`]): its function and frame layout, and
+/// the lanes of its parameters and result.
+#[derive(Clone, Debug)]
+pub struct DirectLeaf {
+    func_id: FuncId,
+    n_locals: u32,
+    max_stack: u32,
+    params: Vec<JitType>,
+    ret: JitType,
 }
 
 impl CompiledFrame {
@@ -129,6 +144,33 @@ impl CompiledFrame {
     #[must_use]
     pub fn is_scalar_leaf(&self) -> bool {
         self.scalar_leaf
+    }
+
+    /// This frame as a direct-call target taking `arg_count` arguments:
+    /// a scalar leaf with no global or math guards (so nothing about
+    /// the namespace can invalidate it) and scalar parameter lanes. A
+    /// caller compiled on the same engine calls it in native code; its
+    /// numeric deopt restarts the call through the ordinary path.
+    #[must_use]
+    pub fn direct_leaf(&self, arg_count: u32) -> Option<DirectLeaf> {
+        let scalar = |t: JitType| matches!(t, JitType::Int | JitType::Float | JitType::Bool);
+        if !self.scalar_leaf || !self.global_guards.is_empty() || !self.math_guards.is_empty() {
+            return None;
+        }
+        let ret = self.ret_lane.filter(|&t| scalar(t))?;
+        let params = self
+            .local_types
+            .get(..arg_count as usize)?
+            .iter()
+            .map(|t| t.filter(|&t| scalar(t)))
+            .collect::<Option<Vec<_>>>()?;
+        Some(DirectLeaf {
+            func_id: self.func_id,
+            n_locals: self.n_locals,
+            max_stack: self.max_stack,
+            params,
+            ret,
+        })
     }
 
     /// `(generic, total)` statement counts: how many of the compiled
@@ -280,12 +322,36 @@ impl JitEngine {
         resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
         probes: &mut Probes<'_>,
     ) -> Result<CompiledFrame, JitVerdict> {
+        self.compile_frame_direct(code, resolve, probes, &mut |_| None)
+    }
+
+    /// [`Self::compile_frame`] with the direct-call targets of the callee
+    /// tokens: `direct(token)` names a scalar leaf compiled on this
+    /// engine (see [`CompiledFrame::direct_leaf`]) that a matching call
+    /// site enters in native code.
+    pub fn compile_frame_direct(
+        &mut self,
+        code: &CodeObject,
+        resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
+        probes: &mut Probes<'_>,
+        direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
+    ) -> Result<CompiledFrame, JitVerdict> {
         let tfunc = crate::analyze::analyze_frame(code, resolve, probes)?;
-        self.compile_tfunc(&tfunc)
+        self.compile_tfunc_direct(&tfunc, direct)
     }
 
     /// Compile an already-analyzed [`TFunc`] (also the unit-test entry).
     pub fn compile_tfunc(&mut self, tfunc: &TFunc) -> Result<CompiledFrame, JitVerdict> {
+        self.compile_tfunc_direct(tfunc, &mut |_| None)
+    }
+
+    /// [`Self::compile_tfunc`] with direct-call targets (see
+    /// [`Self::compile_frame_direct`]).
+    pub fn compile_tfunc_direct(
+        &mut self,
+        tfunc: &TFunc,
+        direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
+    ) -> Result<CompiledFrame, JitVerdict> {
         // These operations each lower to a dedicated embedder helper.
         // Reject missing registrations before embedding an absolute address.
         for stmt in tfunc.blocks.iter().flat_map(|block| &block.stmts) {
@@ -440,14 +506,64 @@ impl JitEngine {
             .returns
             .push(AbiParam::new(types::I64));
 
-        build_function(&mut self.ctx.func, &mut self.fbctx, tfunc, self.ptr_ty);
-
         let name = format!("wpjit_{}", self.next_id);
         self.next_id += 1;
         let id = self
             .module
             .declare_function(&name, Linkage::Local, &self.ctx.func.signature)
             .map_err(|_| JitVerdict::NotConverged)?;
+        // A scalar frame calls itself directly (declared above so the body
+        // can name its own function).
+        let self_func = (runtime::self_call_helper_addrs().is_some()
+            && self_direct_eligible(tfunc))
+        .then(|| self.module.declare_func_in_func(id, &mut self.ctx.func));
+        // Direct leaf targets, per call token whose sites agree with the
+        // leaf's arity and result lane (the lowering checks the argument
+        // lanes at each site).
+        let mut leaves: Vec<(u32, FuncRef, DirectLeaf)> = Vec::new();
+        if runtime::self_call_helper_addrs().is_some() {
+            for stmt in tfunc.blocks.iter().flat_map(|b| &b.stmts) {
+                let TOp::CallPy {
+                    token,
+                    argc,
+                    ret,
+                    is_self: false,
+                } = stmt.op
+                else {
+                    continue;
+                };
+                if leaves.iter().any(|(t, ..)| *t == token) {
+                    continue;
+                }
+                if let Some(leaf) = direct(token) {
+                    if leaf.params.len() == argc as usize && leaf.ret == ret {
+                        let fref = self
+                            .module
+                            .declare_func_in_func(leaf.func_id, &mut self.ctx.func);
+                        leaves.push((token, fref, leaf));
+                    }
+                }
+            }
+        }
+
+        build_function(
+            &mut self.ctx.func,
+            &mut self.fbctx,
+            tfunc,
+            self.ptr_ty,
+            self_func,
+            leaves
+                .into_iter()
+                .map(|(token, fref, leaf)| crate::lower::LeafTarget {
+                    token,
+                    func: fref,
+                    n_locals: leaf.n_locals,
+                    max_stack: leaf.max_stack,
+                    params: leaf.params,
+                })
+                .collect(),
+        );
+
         self.module
             .define_function(id, &mut self.ctx)
             .map_err(|_| JitVerdict::NotConverged)?;
@@ -519,6 +635,7 @@ impl JitEngine {
             ret_none: tfunc.ret_none,
             scalar_leaf: is_scalar_leaf(tfunc),
             op_mix: op_mix(tfunc),
+            func_id: id,
         })
     }
 }
@@ -647,6 +764,62 @@ fn is_scalar_leaf(tfunc: &TFunc) -> bool {
                     )
             )
         })
+}
+
+/// Whether `tfunc` may call itself directly (see
+/// [`crate::runtime::SelfEnterHelper`]): it makes a self call, and every
+/// local, operand and result is a scalar and every operation pure scalar
+/// work or a self call, so no activation of it ever pins an object. Its
+/// activations can then share one embedder context (the pin table, the
+/// parked result) and live on the native stack.
+fn self_direct_eligible(tfunc: &TFunc) -> bool {
+    let scalar = |t: JitType| matches!(t, JitType::Int | JitType::Float | JitType::Bool);
+    let mut any_self = false;
+    let ops_ok = tfunc.blocks.iter().all(|b| {
+        let term_ok = matches!(
+            b.term,
+            TTerm::Return
+                | TTerm::Jump(_)
+                | TTerm::BranchFalse { .. }
+                | TTerm::BranchTrue { .. }
+                | TTerm::Deopt { .. }
+        );
+        term_ok
+            && b.stmts.iter().all(|st| match st.op {
+                TOp::CallPy {
+                    is_self: true, ret, ..
+                } => {
+                    any_self = true;
+                    scalar(ret)
+                }
+                TOp::PushConstInt(_)
+                | TOp::PushConstFloat(_)
+                | TOp::PushConstBool(_)
+                | TOp::LoadLocal(_)
+                | TOp::StoreLocal(_)
+                | TOp::IntArith(_)
+                | TOp::FloatArith(_)
+                | TOp::IntTrueDiv
+                | TOp::IntCmp(_)
+                | TOp::FloatCmp(_)
+                | TOp::IntNeg
+                | TOp::FloatNeg
+                | TOp::IntInvert
+                | TOp::IntNot
+                | TOp::FloatNot
+                | TOp::Pop
+                | TOp::Dup { .. }
+                | TOp::Swap2
+                | TOp::SwapN { .. }
+                | TOp::IntToFloatTos { .. }
+                | TOp::IntToFloatSecond { .. } => true,
+                _ => false,
+            })
+    });
+    any_self
+        && ops_ok
+        && tfunc.ret_lane.is_some_and(scalar)
+        && tfunc.local_types.iter().flatten().all(|t| scalar(*t))
 }
 
 #[cfg(test)]

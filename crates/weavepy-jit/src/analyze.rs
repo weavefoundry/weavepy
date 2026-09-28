@@ -7467,6 +7467,7 @@ fn emit_instr(
                     token: mark.token,
                     argc: argc as u8,
                     ret,
+                    is_self: mark.is_self,
                 },
                 Some(ret),
                 stack,

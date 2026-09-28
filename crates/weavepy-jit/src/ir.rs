@@ -173,7 +173,14 @@ pub enum TOp {
     /// callee takes the `Raised` exit at this pc; a result outside the
     /// `ret` lane (or a caller guard invalidated by the callee's side
     /// effects) deopts *after* the call with the result spilled.
-    CallPy { token: u32, argc: u8, ret: JitType },
+    /// `is_self`: the callee is this very code object, which a scalar
+    /// frame calls directly (see `engine::self_direct_eligible`).
+    CallPy {
+        token: u32,
+        argc: u8,
+        ret: JitType,
+        is_self: bool,
+    },
     /// RFC 0073 WS5 — a Python-to-Python *keyword* call (`CALL_KW`)
     /// through the same `wpjit_call_py` helper. Pops `argc + kwc`
     /// values (positionals below, keyword values above, interpreter
