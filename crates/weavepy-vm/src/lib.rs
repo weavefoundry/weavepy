@@ -11947,15 +11947,49 @@ impl Interpreter {
                                             && len < cap
                                             && simple_args_prefix(&code.instructions, pc + 2)
                                         {
-                                            let pure_site = match (
-                                                other,
-                                                mslots!(cold_mslots, ext).get(pc + 1),
-                                            ) {
-                                                (Object::Instance(i), Some(ms)) => ms
-                                                    .peek_fn(i.cls_raw().attr_version.get())
-                                                    .is_some_and(|fp| fn_is_leaf(&*fp)),
-                                                _ => false,
-                                            };
+                                            // A site that verified its callee
+                                            // for this class version.
+                                            let mut missed = false;
+                                            if let (Object::Instance(i), Some(ext)) = (other, ext) {
+                                                if let Some(site) = leaf_site_hit(
+                                                    ext,
+                                                    pc + 1,
+                                                    i.cls_raw().attr_version.get(),
+                                                ) {
+                                                    match self.core_leaf_site_call(
+                                                        code,
+                                                        i,
+                                                        other,
+                                                        site,
+                                                        pc + 1,
+                                                        next.arg,
+                                                        lbase,
+                                                        nlocals,
+                                                        consts,
+                                                        sw.depth_cell,
+                                                    ) {
+                                                        SiteCall::Done(v, call_pc) => {
+                                                            base.add(len).write(v);
+                                                            len += 1;
+                                                            last = call_pc;
+                                                            pc = call_pc + 1;
+                                                            continue;
+                                                        }
+                                                        SiteCall::Declined => {}
+                                                        SiteCall::Missed => missed = true,
+                                                    }
+                                                }
+                                            }
+                                            let pure_site = !missed
+                                                && match (
+                                                    other,
+                                                    mslots!(cold_mslots, ext).get(pc + 1),
+                                                ) {
+                                                    (Object::Instance(i), Some(ms)) => ms
+                                                        .peek_fn(i.cls_raw().attr_version.get())
+                                                        .is_some_and(|fp| fn_is_leaf(&*fp)),
+                                                    _ => false,
+                                                };
                                             if pure_site {
                                                 if let Some((v, call_pc)) = self.core_pure_method(
                                                     code,
@@ -15230,7 +15264,103 @@ impl Interpreter {
             self.core_pure_fused_eval(code, fp, call_pc, true, &mut args, nargs + 1, depth_cell)?;
         #[cfg(test)]
         note_literal_argument_call(code, attr_pc + 1, call_pc, true);
+        // Remember a call that needed no defaults, so the next one under
+        // this class version skips the verdicts above.
+        // SAFETY: as in `core_pure_fused_eval`.
+        let f = unsafe { &*fp };
+        let callee: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        let ver = cls.attr_version.get();
+        if nargs + 1 == callee.arg_count as usize {
+            let held = mslots[attr_pc]
+                .get_held(ver)
+                .filter(|h| std::ptr::eq(Rc::as_ptr(h), fp));
+            if let (Some(ext), Some(held)) = (code_vm_ext(code), held) {
+                let func = Rc::downgrade(&held);
+                leaf_site_set(
+                    ext,
+                    code.instructions.len(),
+                    attr_pc,
+                    Some(LeafSiteData {
+                        ver,
+                        func,
+                        code: Rc::as_ptr(callee),
+                        effect: !code_is_pure_leaf(callee),
+                    }),
+                );
+            }
+        }
         Some((r, call_pc))
+    }
+
+    /// [`Self::core_pure_method`] at a site that verified its callee (see
+    /// [`LeafSite`]) for `inst`'s class version: `fp` and `callee` are the
+    /// site's function and code.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn core_leaf_site_call(
+        &self,
+        code: &CodeObject,
+        inst: &PyInstance,
+        recv: &Object,
+        (fp, callee, effect): (*const crate::object::PyFunction, *const CodeObject, bool),
+        attr_pc: usize,
+        name_idx: u32,
+        lbase: *const Object,
+        nlocals: usize,
+        consts: &[Object],
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> SiteCall {
+        // SAFETY: the class holds the function at the site's version (and
+        // the weak handle is live); nothing here runs code.
+        let f = unsafe { &*fp };
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        // The ordinary call's `RecursionError` check.
+        // SAFETY: this thread's own depth cell.
+        if !std::ptr::eq(Rc::as_ptr(code_rc), callee)
+            || !Self::default_getattribute(inst.cls_raw())
+            || inst_may_shadow(inst, code, name_idx)
+            || unsafe { (*depth_cell).get() } >= crate::recursion::recursion_limit()
+        {
+            return SiteCall::Declined;
+        }
+        // Scalars only (small ints): nothing to drop on the way out.
+        let mut scratch = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
+        let mut args: [*const Object; 8] = [std::ptr::null(); 8];
+        args[0] = recv;
+        // SAFETY: the core loop's own locals and constants.
+        let Some((nargs, call_pc)) = (unsafe {
+            Self::core_simple_args(
+                &code.instructions,
+                attr_pc + 1,
+                lbase,
+                nlocals,
+                consts,
+                &mut scratch,
+                &mut args,
+                1,
+            )
+        }) else {
+            return SiteCall::Declined;
+        };
+        let total = nargs + 1;
+        if total != code_rc.arg_count as usize {
+            return SiteCall::Declined;
+        }
+        let r = if effect {
+            self.pure_leaf_eval::<false, true>(code_rc, f, &args[..total])
+        } else {
+            self.pure_leaf_eval::<false, false>(code_rc, f, &args[..total])
+        };
+        let Some(v) = r else {
+            if let Some(ext) = code_vm_ext(code) {
+                leaf_site_set(ext, code.instructions.len(), attr_pc, None);
+            }
+            return SiteCall::Missed;
+        };
+        #[cfg(test)]
+        note_literal_argument_call(code, attr_pc + 1, call_pc, true);
+        SiteCall::Done(v, call_pc)
     }
 
     /// The core loop's fused `LOAD_GLOBAL f; PUSH_NULL; <simple argument
@@ -15437,9 +15567,11 @@ impl Interpreter {
         {
             return None;
         }
-        // A pure leaf has no keyword-only parameters and no `**kwargs`.
+        // A pure leaf has no keyword-only parameters; its `**kwargs`
+        // dictionary, if any, follows the positional ones.
         let total = code_rc.arg_count as usize;
-        if total > 8 {
+        let arity = leaf_arity(code_rc);
+        if arity > 8 {
             return None;
         }
         let mut args: [*const Object; 8] = [std::ptr::null(); 8];
@@ -15448,9 +15580,23 @@ impl Interpreter {
             args[k] = o;
         }
         let kw_vals = &ops[first + eff_argc..ops.len() - 1];
+        let mut varkw: Option<DictData> = None;
         for (j, o) in kw_vals.iter().enumerate() {
             let slot = ((perm >> (4 * j)) & 0xF) as usize;
-            if slot >= total || slot == specialize::KW_TO_VARKW as usize {
+            if slot == specialize::KW_TO_VARKW as usize {
+                // Collected into a fresh dictionary, in call order (the
+                // bind check proved the callee has one).
+                varkw
+                    .get_or_insert_with(|| {
+                        DictData::with_capacity_and_hasher(
+                            kw_vals.len(),
+                            crate::fasthash::FxBuildHasher,
+                        )
+                    })
+                    .insert(DictKey(names.get(j)?.clone()), o.clone());
+                continue;
+            }
+            if slot >= total {
                 return None;
             }
             args[slot] = o;
@@ -15462,7 +15608,40 @@ impl Interpreter {
                     .get(f.defaults.len().checked_sub(total - slot)?)?;
             }
         }
-        self.pure_leaf_eval::<false, false>(code_rc, f, &args[..total])
+        let dict;
+        if code_rc.has_varkeywords {
+            dict = Object::Dict(Rc::new(RefCell::new(varkw.unwrap_or_default())));
+            args[total] = &dict;
+        }
+        self.pure_leaf_eval::<false, false>(code_rc, f, &args[..arity])
+    }
+
+    /// A keyword call's parameters, bound as `kw_names_fill_locals` leaves
+    /// them in `locals` (a `**kwargs` dictionary included), evaluated
+    /// frameless when `f` is a warm pure leaf: its result, or `None`
+    /// having done nothing observable.
+    pub(crate) fn bound_leaf_eval(
+        &self,
+        f: &crate::object::PyFunction,
+        locals: &[Object],
+    ) -> Option<Object> {
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        let arity = leaf_arity(code_rc);
+        if arity > 8
+            || locals.len() < arity
+            || !code_is_pure_leaf(code_rc)
+            || !pure_leaf_warm(code_rc)
+            || !Self::leaf_code_ok(code_rc)
+            || crate::recursion::current_depth() >= crate::recursion::recursion_limit()
+        {
+            return None;
+        }
+        let mut args: [*const Object; 8] = [std::ptr::null(); 8];
+        for (k, o) in locals[..arity].iter().enumerate() {
+            args[k] = o;
+        }
+        self.pure_leaf_eval::<false, false>(code_rc, f, &args[..arity])
     }
 
     /// Borrow a guarded instance-dictionary or slot cache hit. `names` is
@@ -15552,7 +15731,9 @@ impl Interpreter {
         f: &crate::object::PyFunction,
         args: &[*const Object],
     ) -> Option<Object> {
-        if !Self::leaf_call_entry(code) {
+        // A positional call binds no `**kwargs` dictionary: the ordinary
+        // call builds it (see `leaf_arity`).
+        if args.len() != leaf_arity(code) || !Self::leaf_call_entry(code) {
             return None;
         }
         let r = self.leaf_eval::<GETTER, EFFECT>(code, f, args, 0);
@@ -15569,7 +15750,7 @@ impl Interpreter {
         f: &crate::object::PyFunction,
         args: &[*const Object],
     ) -> Option<Object> {
-        if !Self::leaf_call_entry(code) {
+        if args.len() != leaf_arity(code) || !Self::leaf_call_entry(code) {
             return None;
         }
         let ext = code_vm_ext(code)?;
@@ -62055,6 +62236,9 @@ struct CodeConstObjects {
     /// Split-layout attribute shortcuts per `LOAD_ATTR` site (see
     /// [`FieldSlot`]); allocated on the first recorded one.
     field_slots: std::sync::OnceLock<Box<[FieldSlot]>>,
+    /// Verified frameless method calls per method-load site (see
+    /// [`LeafSite`]); allocated on the first recorded one.
+    leaf_sites: std::sync::OnceLock<Box<[LeafSite]>>,
     /// A leaf body's translation for the frameless evaluator (see
     /// [`leaf_plan`]), or `None` when the body has none.
     leaf_plan: std::sync::OnceLock<Option<Box<leaf_plan::LeafPlan>>>,
@@ -62321,6 +62505,73 @@ impl FieldSlot {
         // SAFETY: as `StampSlot::set`.
         unsafe { *self.0.get() = v };
     }
+}
+
+/// A local receiver's `x.m(<simple arguments>)` site whose last call ran
+/// frameless (see `Interpreter::core_leaf_site_call`), keyed at the method
+/// load: under the receiver class's (process-unique) attribute version
+/// `ver`, the method is `func`, whose code was `code`, a pure (or, with
+/// `effect`, an effect) leaf taking exactly the site's arguments. The
+/// class holds the function at that version; `func` is weak all the same,
+/// as [`MethodSlot`]'s are.
+struct LeafSite(std::cell::UnsafeCell<Option<LeafSiteData>>);
+
+struct LeafSiteData {
+    ver: u64,
+    func: crate::sync::Weak<crate::object::PyFunction>,
+    code: *const CodeObject,
+    effect: bool,
+}
+
+// SAFETY: as `StampSlot`.
+unsafe impl Send for LeafSite {}
+unsafe impl Sync for LeafSite {}
+
+impl LeafSite {
+    const fn empty() -> Self {
+        Self(std::cell::UnsafeCell::new(None))
+    }
+}
+
+/// The site at `pc`'s verified callee under `ver`: its function, code and
+/// effect flag.
+#[inline(always)]
+fn leaf_site_hit(
+    ext: &CodeConstObjects,
+    pc: usize,
+    ver: u64,
+) -> Option<(*const crate::object::PyFunction, *const CodeObject, bool)> {
+    // SAFETY: GIL-serialized; the borrow ends before any refill.
+    let site = unsafe { &*ext.leaf_sites.get()?.get(pc)?.0.get() }.as_ref()?;
+    (site.ver == ver && site.func.strong_count() > 0)
+        .then(|| (site.func.as_ptr(), site.code, site.effect))
+}
+
+/// Record (or, with `data` `None`, forget) the site at `pc`'s callee.
+#[inline(never)]
+fn leaf_site_set(ext: &CodeConstObjects, ninstrs: usize, pc: usize, data: Option<LeafSiteData>) {
+    if data.is_none() && ext.leaf_sites.get().is_none() {
+        return;
+    }
+    let sites = ext
+        .leaf_sites
+        .get_or_init(|| (0..ninstrs).map(|_| LeafSite::empty()).collect());
+    if let Some(site) = sites.get(pc) {
+        // SAFETY: GIL-serialized; no reference into the site is live.
+        unsafe { *site.0.get() = data };
+    }
+}
+
+/// What a verified site's call did (see
+/// `Interpreter::core_leaf_site_call`).
+enum SiteCall {
+    /// The result, and the `CALL`'s pc.
+    Done(Object, usize),
+    /// A check failed before anything ran: the ordinary paths decide.
+    Declined,
+    /// The evaluation declined (the site is forgotten): the call takes
+    /// the ordinary, framed path this time.
+    Missed,
 }
 
 /// The attribute `inst` holds for the `LOAD_ATTR` at `pc`, through the
@@ -62913,6 +63164,14 @@ fn code_fast_pairs<'a>(code: &CodeObject, ext: Option<&'a CodeConstObjects>) -> 
     })
 }
 
+/// A leaf's parameter count: its positional parameters, then its
+/// `**kwargs` dictionary when it has one (bound by keyword calls only; a
+/// leaf has no `*args` or keyword-only parameters).
+#[inline(always)]
+pub(crate) fn leaf_arity(code: &CodeObject) -> usize {
+    code.arg_count as usize + usize::from(code.has_varkeywords)
+}
+
 fn code_is_pure_leaf(code: &CodeObject) -> bool {
     // The recorded verdict (see `code_pure_leaf_decide`): one load.
     if let Some(yes) = code.jit_hint.pure_leaf() {
@@ -62941,9 +63200,8 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
         && code.cellvars.is_empty()
         && code.freevars.is_empty()
         && !code.has_varargs
-        && !code.has_varkeywords
         && code.kwonly_count == 0
-        && code.arg_count <= 8
+        && leaf_arity(code) <= 8
         && code.varnames.len() <= 16
         && code.exception_table.is_empty()
         && code.instructions.len() <= 64;
@@ -63262,6 +63520,7 @@ fn code_vm_ext_init(
             pure_leaf: std::sync::atomic::AtomicU8::new(0),
             fast_pairs: std::sync::OnceLock::new(),
             field_slots: std::sync::OnceLock::new(),
+            leaf_sites: std::sync::OnceLock::new(),
             leaf_plan: std::sync::OnceLock::new(),
             returns_none: std::sync::atomic::AtomicU8::new(0),
         })

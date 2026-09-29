@@ -657,7 +657,7 @@ impl Builder<'_> {
         Some(LeafPlan {
             ops: self.ops.into_boxed_slice(),
             consts: self.consts.into_boxed_slice(),
-            nargs: u8::try_from(self.code.arg_count).ok()?,
+            nargs: u8::try_from(crate::leaf_arity(self.code)).ok()?,
             unique_stores: self.stored.is_some() && self.code.arg_count > 0,
         })
     }
@@ -667,7 +667,7 @@ impl Builder<'_> {
 /// body the plan can't express (the ordinary call runs it instead).
 pub(crate) fn build(code: &CodeObject, ext: &CodeConstObjects) -> Option<LeafPlan> {
     let nl = code.varnames.len();
-    let nargs = code.arg_count as usize;
+    let nargs = crate::leaf_arity(code);
     if nl > 16 || nargs > nl || nargs > 8 || code.instructions.len() > u16::MAX as usize {
         return None;
     }
@@ -1152,9 +1152,11 @@ impl Interpreter {
                     let callee = unsafe { &*fp };
                     // SAFETY: GIL-serialized raw read of the code cell.
                     let ccode: &Rc<CodeObject> = unsafe { &*callee.code.as_ptr() };
+                    // (A positional call binds no `**kwargs` dictionary.)
                     if !crate::code_is_pure_leaf(ccode)
                         || !Self::leaf_code_ok(ccode)
-                        || n != ccode.arg_count as usize
+                        || n != crate::leaf_arity(ccode)
+                        || ccode.has_varkeywords
                         || crate::recursion::current_depth() + usize::from(nest) + 1
                             >= crate::recursion::recursion_limit()
                     {

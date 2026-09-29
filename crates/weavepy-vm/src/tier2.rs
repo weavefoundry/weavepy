@@ -8927,6 +8927,12 @@ unsafe fn call_dyn_impl(
         .then(|| unsafe { dyn_kw_site_bind(jf, ctx, &callee, argc, kwc, names) })
         .flatten()
     {
+        // A pure-leaf callee evaluates frameless on the bound locals.
+        if let Some(v) = interp.bound_leaf_eval(&f, &locals) {
+            interp.recycle_scratch(locals);
+            // SAFETY: as above.
+            return unsafe { dyn_call_result(jf, ctx, Ok(v), false, false, int_result) };
+        }
         // Not charged against the native driver: the interpreter's own
         // `CALL_KW` binds through this same permutation and activation,
         // so tier-1 would not run the call any cheaper.
