@@ -1991,6 +1991,15 @@ enum SlotData {
     },
 }
 
+/// Is `key` the slot name `name`? (Interned names usually share the
+/// probe's storage, settled without reading either length.)
+#[inline(always)]
+fn key_named(key: &DictKey, name: &crate::shared_value::SharedStr) -> bool {
+    matches!(&key.0, Object::Str(stored)
+        if crate::shared_value::SharedStr::ptr_eq(stored, name)
+            || slot_name_eq(stored.as_ref(), name.as_ref()))
+}
+
 #[cfg(target_pointer_width = "64")]
 /// `stored == name` for a slot name, without the call into `memcmp`.
 /// Slot names are short (`_data`, `_head`, `x`) and almost always differ
@@ -2241,15 +2250,79 @@ impl SlotStorage {
     /// `get_mut(name)` with a position hint (see [`Self::get_hinted`]).
     #[inline]
     pub fn get_hinted_mut(&mut self, idx: usize, name: &str) -> Option<&mut Object> {
-        let at_hint = matches!(
-            self.get_index(idx),
-            Some((DictKey(Object::Str(stored)), _))
-                if std::ptr::eq(stored.as_ptr(), name.as_ptr()) || slot_name_eq(stored.as_ref(), name)
-        );
-        if at_hint {
-            return self.get_index_mut(idx).map(|(_, v)| v);
+        // One lookup at the hint. (The pointer ends the borrow, so the
+        // name scan below can take its own.)
+        let hit = match self.get_index_mut(idx) {
+            Some((DictKey(Object::Str(stored)), value))
+                if std::ptr::eq(stored.as_ptr(), name.as_ptr())
+                    || slot_name_eq(stored.as_ref(), name) =>
+            {
+                Some(std::ptr::from_mut(value))
+            }
+            _ => None,
+        };
+        match hit {
+            // SAFETY: the value lives in `self`, borrowed mutably for the
+            // returned lifetime; no other reference to it exists.
+            Some(value) => Some(unsafe { &mut *value }),
+            None => self.get_mut(name),
         }
-        self.get_mut(name)
+    }
+
+    /// The values of the first `N` slots when they are named `names`, in
+    /// order (the layout of an instance whose `__init__` assigns them in
+    /// that order): one pass for a native method that reads several
+    /// slots. `None` when the store is laid out otherwise.
+    #[inline]
+    pub fn leading<const N: usize>(
+        &self,
+        names: [&crate::shared_value::SharedStr; N],
+    ) -> Option<[&Object; N]> {
+        match &self.data {
+            SlotData::Small(entries) => {
+                let entries = entries.get(..N)?;
+                if !entries.iter().zip(names).all(|((key, _), name)| key_named(key, name)) {
+                    return None;
+                }
+                Some(std::array::from_fn(|i| &entries[i].1))
+            }
+            SlotData::Fixed { layout, values } => {
+                let (keys, values) = (layout.get(..N)?, values.get(..N)?);
+                if !keys.iter().zip(names).all(|(key, name)| key_named(key, name)) {
+                    return None;
+                }
+                Some(std::array::from_fn(|i| &values[i]))
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Self::leading`], mutably.
+    #[inline]
+    pub fn leading_mut<const N: usize>(
+        &mut self,
+        names: [&crate::shared_value::SharedStr; N],
+    ) -> Option<[&mut Object; N]> {
+        let values: &mut [Object] = match &mut self.data {
+            SlotData::Small(entries) => {
+                let entries = entries.get_mut(..N)?;
+                if !entries.iter().zip(names).all(|((key, _), name)| key_named(key, name)) {
+                    return None;
+                }
+                let mut values = entries.iter_mut().map(|(_, value)| value);
+                return Some(std::array::from_fn(|_| values.next().expect("N entries")));
+            }
+            SlotData::Fixed { layout, values } => {
+                let keys = layout.get(..N)?;
+                if !keys.iter().zip(names).all(|(key, name)| key_named(key, name)) {
+                    return None;
+                }
+                values.get_mut(..N)?
+            }
+            _ => return None,
+        };
+        let mut values = values.iter_mut();
+        Some(std::array::from_fn(|_| values.next().expect("N values")))
     }
 
     /// Mutable access to a populated slot's value, by name.

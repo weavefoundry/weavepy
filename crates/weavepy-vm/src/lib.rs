@@ -14989,7 +14989,11 @@ impl Interpreter {
                 }
                 // SAFETY: `len >= 2`.
                 let (c, k) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
-                if !Self::core_droppable(c) {
+                // (An instance goes to the caller's native subscript, which
+                // grades its own release.)
+                if !matches!(c, Object::List(_) | Object::Tuple(_) | Object::Dict(_) | Object::Str(_))
+                    || !Self::core_droppable(c)
+                {
                     return None;
                 }
                 let r = match (c, k) {
@@ -15288,7 +15292,11 @@ impl Interpreter {
                 // hit must not reject this nonfinal release. The last
                 // owner still takes ordinary teardown, and every store or
                 // weakref operation that requires tracking revokes the flag.
-                Rc::strong_count(i) > 1 && (i.is_gc_deferred() || !gc_trace::note_dropped_marks(v))
+                // Past two owners only a weakref-watched object can be at
+                // its dead line (see `gc_trace::note_dropped_marks`).
+                let sc = Rc::strong_count(i);
+                sc > 2 && !crate::weakref_registry::may_have_weakrefs(Rc::as_ptr(i) as usize as u64)
+                    || sc > 1 && (i.is_gc_deferred() || !gc_trace::note_dropped_marks(v))
             }
             Object::List(l) if Rc::strong_count(l) > 1 => !gc_trace::note_dropped_marks(v),
             Object::Dict(d) if Rc::strong_count(d) > 1 => !gc_trace::note_dropped_marks(v),
@@ -15571,6 +15579,57 @@ impl Interpreter {
         }
     }
 
+    /// [`Self::core_simple_args`] for a native callee, which takes its
+    /// operands as a slice: bitwise copies of the arguments (after the
+    /// receiver in `ops[0]`), never dropped, so no reference moves.
+    /// Returns the argument count and the `CALL`'s pc.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::core_simple_args`].
+    #[inline(always)]
+    unsafe fn core_simple_ops(
+        instrs: &[weavepy_compiler::Instruction],
+        mut pc: usize,
+        lbase: *const Object,
+        nlocals: usize,
+        consts: &[Object],
+        ops: &mut [std::mem::MaybeUninit<Object>; 8],
+    ) -> Option<(usize, usize)> {
+        let mut n = 1;
+        loop {
+            let ins = *instrs.get(pc)?;
+            // (Checked before any copy is taken: a borrowed copy must never
+            // be dropped.)
+            if n == 8 && ins.op != OpCode::Call {
+                return None;
+            }
+            let v = match ins.op {
+                OpCode::LoadFast => {
+                    let i = ins.arg as usize;
+                    if i >= nlocals {
+                        return None;
+                    }
+                    // SAFETY: `i < nlocals` (see the function docs).
+                    let p = unsafe { lbase.add(i) };
+                    if matches!(unsafe { &*p }, Object::Unbound) {
+                        return None;
+                    }
+                    // SAFETY: a borrowed copy of a live local.
+                    unsafe { std::ptr::read(p) }
+                }
+                // SAFETY: a borrowed copy of a live constant.
+                OpCode::LoadConst => unsafe { std::ptr::read(consts.get(ins.arg as usize)?) },
+                OpCode::LoadSmallInt => Object::Int(i64::from(ins.arg)),
+                OpCode::Call if ins.arg as usize == n - 1 => return Some((n - 1, pc)),
+                _ => return None,
+            };
+            ops[n].write(v);
+            n += 1;
+            pc += 1;
+        }
+    }
+
     /// The native fast `__getitem__` the `BINARY_SUBSCR` at `pc` cached for
     /// `ops[0]`'s class (see [`Self::leaf_instance_subscript`]), when both
     /// operands leave by plain decrements.
@@ -15632,20 +15691,21 @@ impl Interpreter {
         if !Self::default_getattribute(cls) {
             return None;
         }
-        let mut scratch = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
-        let mut args: [*const Object; 8] = [std::ptr::null(); 8];
-        args[0] = recv;
+        // Bitwise views of the operands, never dropped: the callee reads
+        // them (and clones what it keeps), and nothing it runs can reach
+        // the locals or constants they alias.
+        let mut ops = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
+        // SAFETY: the receiver is the core loop's local.
+        ops[0].write(unsafe { std::ptr::read(recv) });
         // SAFETY: the core loop's own locals and constants.
         let (nargs, call_pc) = unsafe {
-            Self::core_simple_args(
+            Self::core_simple_ops(
                 &code.instructions,
                 attr_pc + 1,
                 lbase,
                 nlocals,
                 consts,
-                &mut scratch,
-                &mut args,
-                1,
+                &mut ops,
             )
         }?;
         let kind = mslots.get(call_pc)?.get_leaf_ptr(b)?;
@@ -15657,16 +15717,8 @@ impl Interpreter {
         {
             return None;
         }
-        // Bitwise views of the operands, never dropped: the callee reads
-        // them (and clones what it keeps), and nothing it runs can reach
-        // the locals or constants they alias.
         let n = nargs + 1;
-        let mut ops = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
-        for (slot, &p) in ops.iter_mut().zip(&args[..n]) {
-            // SAFETY: each pointer names a live operand (see above).
-            slot.write(unsafe { std::ptr::read(p) });
-        }
-        // SAFETY: the first `n` entries were just written.
+        // SAFETY: the first `n` entries were written.
         let ops = unsafe { std::slice::from_raw_parts(ops.as_ptr().cast::<Object>(), n) };
         let r = match kind {
             LeafKind::Fast(f) => f(ops)?,
