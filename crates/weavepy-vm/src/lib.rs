@@ -19170,12 +19170,96 @@ impl Interpreter {
         Some(result)
     }
 
+    /// A frameless leaf's method load off a builtin receiver at the site
+    /// `slot` (`name_idx` in `code`'s names): the leaf method table's
+    /// body, which that table keeps alive.
+    pub(crate) fn leaf_builtin_method_ptr(
+        &self,
+        slot: &MethodSlot,
+        recv: &Object,
+        code: &CodeObject,
+        name_idx: u16,
+    ) -> Option<*const crate::object::BuiltinFn> {
+        let tag = match recv {
+            Object::List(_) => 1,
+            Object::Dict(_) => 2,
+            Object::Set(_) => 3,
+            Object::Str(_) => 4,
+            _ => return None,
+        };
+        if let Some(b) = slot.get_builtin_ptr(tag) {
+            return Some(b);
+        }
+        let b = self.leaf_builtin_method(recv, code.names.get(usize::from(name_idx))?)?;
+        slot.set_builtin(tag, &b);
+        Some(Rc::as_ptr(&b))
+    }
+
+    /// A frameless leaf's call at `pc` of the builtin `b` (`rc` its owner,
+    /// when the plan borrowed one) on `args`: the result of an admitted
+    /// read-only kind (see [`LeafKind::is_pure_read`]). `None` touched
+    /// nothing; that includes a raise, which the ordinary call repeats.
+    pub(crate) fn leaf_pure_builtin(
+        &self,
+        code: &CodeObject,
+        pc: usize,
+        b: *const crate::object::BuiltinFn,
+        rc: Option<&Rc<crate::object::BuiltinFn>>,
+        args: &[Object],
+    ) -> Option<Object> {
+        let slot = code_method_slot(code, pc as u32);
+        let kind = match slot.and_then(|s| s.get_leaf_ptr(b)) {
+            Some(k) => k,
+            None => self.leaf_pure_builtin_kind(slot, b, rc)?,
+        };
+        if !kind.is_pure_read() {
+            return None;
+        }
+        // SAFETY: the plan's holder (a namespace, or the leaf method
+        // table) keeps the builtin alive, and nothing here releases it.
+        let r = self.leaf_builtin_call(kind, unsafe { &*b }, args)?.ok();
+        #[cfg(test)]
+        if r.is_some() {
+            LEAF_BUILTIN_CALLS.with(|calls| calls.set(calls.get() + 1));
+        }
+        r
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn leaf_pure_builtin_kind(
+        &self,
+        slot: Option<&MethodSlot>,
+        b: *const crate::object::BuiltinFn,
+        rc: Option<&Rc<crate::object::BuiltinFn>>,
+    ) -> Option<LeafKind> {
+        let found;
+        let rc = match rc {
+            Some(rc) => rc,
+            None => {
+                found = self
+                    .leaf_fns()
+                    .methods
+                    .iter()
+                    .find(|(_, _, f)| Rc::as_ptr(f) == b)?
+                    .2
+                    .clone();
+                &found
+            }
+        };
+        let kind = self.leaf_call_kind(rc)?;
+        if let Some(s) = slot {
+            s.set_leaf(rc, kind);
+        }
+        Some(kind)
+    }
+
     /// Call a leaf builtin if `args` (receiver first for methods) has an
     /// admitted shape; `None` sends the call down the full path.
     fn leaf_builtin_call(
-        &mut self,
+        &self,
         kind: LeafKind,
-        b: &Rc<crate::object::BuiltinFn>,
+        b: &crate::object::BuiltinFn,
         args: &[Object],
     ) -> Option<Result<Object, RuntimeError>> {
         use LeafKind as K;
@@ -56464,6 +56548,38 @@ impl LeafKind {
                 | Self::StrSplit
         )
     }
+
+    /// Operations that read their arguments and build a fresh result,
+    /// with nothing else observable: a frameless leaf may run them and
+    /// still decline afterwards (see `Interpreter::leaf_pure_builtin`).
+    fn is_pure_read(self) -> bool {
+        matches!(
+            self,
+            Self::Len
+                | Self::Isinstance
+                | Self::ListCopy
+                | Self::DictGet
+                | Self::DictKeys
+                | Self::DictValues
+                | Self::DictItems
+                | Self::StrStartswith
+                | Self::StrEndswith
+                | Self::StrLower
+                | Self::StrUpper
+                | Self::StrStrip
+                | Self::StrLstrip
+                | Self::StrRstrip
+                | Self::StrFind
+                | Self::StrIsdigit
+                | Self::StrIsalpha
+                | Self::StrIsspace
+                | Self::StrSplit
+                | Self::StrJoin
+                | Self::StrReplace
+                | Self::StrFormat
+                | Self::Scalar
+        )
+    }
 }
 
 /// A receiver's builtin variant, for the method table.
@@ -57094,6 +57210,7 @@ thread_local! {
     static PURE_LITERAL_ARGUMENT_CALLS: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
     static PURE_SLOT_FIELD_READS: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
     static PURE_CACHED_FIELD_PREDICATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static LEAF_BUILTIN_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static PURE_PREDICATE_STAGES: std::cell::Cell<[u64; 9]> = const { std::cell::Cell::new([0; 9]) };
     static PURE_PREDICATE_DROP_MISSES: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
     static NATIVE_SUBSCRIPT_CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -59090,15 +59207,17 @@ fn resolve_field_name(
     let mut value = if base.is_empty() {
         let idx = *auto_idx;
         *auto_idx += 1;
-        positional
-            .get(idx)
-            .cloned()
-            .ok_or_else(|| index_error(format!("Replacement index {idx} out of range")))?
+        positional.get(idx).cloned().ok_or_else(|| {
+            index_error(format!(
+                "Replacement index {idx} out of range for positional args tuple"
+            ))
+        })?
     } else if let Ok(idx) = base.parse::<usize>() {
-        positional
-            .get(idx)
-            .cloned()
-            .ok_or_else(|| index_error(format!("Replacement index {idx} out of range")))?
+        positional.get(idx).cloned().ok_or_else(|| {
+            index_error(format!(
+                "Replacement index {idx} out of range for positional args tuple"
+            ))
+        })?
     } else if let Some(map) = mapping {
         let key = DictKey(Object::from_str(base));
         map.borrow()
@@ -62573,6 +62692,17 @@ impl MethodSlot {
         // SAFETY: as `get`.
         match unsafe { &*self.0.get() } {
             (v, MethodSlotFn::Builtin(f)) if *v == Self::BUILTIN_TAG | tag => Some(f.clone()),
+            _ => None,
+        }
+    }
+
+    /// [`Self::get_builtin`], uncounted: the leaf method table holds the
+    /// body for the interpreter's lifetime.
+    #[inline]
+    fn get_builtin_ptr(&self, tag: u64) -> Option<*const crate::object::BuiltinFn> {
+        // SAFETY: as `get`.
+        match unsafe { &*self.0.get() } {
+            (v, MethodSlotFn::Builtin(f)) if *v == Self::BUILTIN_TAG | tag => Some(Rc::as_ptr(f)),
             _ => None,
         }
     }
@@ -66808,6 +66938,56 @@ assert loop(2000) == 1999000
                         assert!(hits > 1000, "pure slot {name} hits: {hits}");
                     }
                     eprintln!("Pure slot {name} hits: {hits}");
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn leaf_builtin_calls_run_frameless() {
+        const CHILD: &str = "WEAVEPY_LEAF_BUILTIN_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Compiled callers reach the same evaluator; the counter is
+            // required with the JIT off, and semantics in both modes.
+            for jit in ["0", "1"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::leaf_builtin_calls_run_frameless",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("WEAVEPY_JIT", jit)
+                    .status()
+                    .expect("spawn leaf builtin test");
+                assert!(status.success(), "leaf builtin child: {status}");
+            }
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let source = include_str!("../../../tests/regrtest/test_leaf_builtin_calls.py");
+                let module = parse_module(source).unwrap();
+                let code = weavepy_compiler::compile_module_with_source(
+                    &module,
+                    source,
+                    "leaf_builtin_calls.py",
+                )
+                .unwrap();
+                let before = LEAF_BUILTIN_CALLS.with(std::cell::Cell::get);
+                Interpreter::new()
+                    .run_module(&code)
+                    .expect("leaf builtin assertions");
+                let calls = LEAF_BUILTIN_CALLS.with(std::cell::Cell::get) - before;
+                #[cfg(feature = "jit")]
+                let require = crate::tier2::jit_off_for_process();
+                #[cfg(not(feature = "jit"))]
+                let require = true;
+                if require {
+                    assert!(calls > 10_000, "frameless builtin calls: {calls}");
                 }
             })
             .unwrap()

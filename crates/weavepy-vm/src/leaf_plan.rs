@@ -24,6 +24,9 @@ use crate::{CodeConstObjects, Interpreter};
 pub(crate) enum V {
     /// A resolved callee: a function the class or namespace holds.
     Fn(*const crate::object::PyFunction),
+    /// A builtin type's method body, from the leaf method table (which
+    /// holds it for the interpreter's lifetime).
+    Bi(*const crate::object::BuiltinFn),
     /// A call's empty self slot.
     Null,
     /// A heap object, borrowed.
@@ -62,7 +65,7 @@ pub(crate) fn truth(v: V) -> Option<bool> {
             Object::Dict(d) => !unsafe { d.peek() }?.is_empty(),
             _ => return None,
         },
-        V::Fn(_) | V::Null => return None,
+        V::Fn(_) | V::Bi(_) | V::Null => return None,
     })
 }
 
@@ -189,6 +192,7 @@ enum Op {
     Call {
         at: u8,
         argc: u8,
+        pc: u16,
     },
     Return {
         src: u8,
@@ -558,6 +562,7 @@ impl Builder<'_> {
                 self.ops.push(Op::Call {
                     at: r,
                     argc: u8::try_from(argc).ok()?,
+                    pc: u16::try_from(pc).ok()?,
                 });
             }
             OpCode::ReturnValue => {
@@ -771,6 +776,16 @@ impl Drop for Pending {
     }
 }
 
+/// A leaf call's callee: a Python function to evaluate in place, or a
+/// builtin (with its owner, when a namespace holds one).
+enum Callee<'a> {
+    Py(*const crate::object::PyFunction),
+    Native(
+        *const crate::object::BuiltinFn,
+        Option<&'a Rc<crate::object::BuiltinFn>>,
+    ),
+}
+
 /// An owned object for a leaf value (the return value, a buffered
 /// store's value); `None` for the markers that are never values.
 #[inline(always)]
@@ -783,7 +798,7 @@ fn to_object(v: V) -> Option<Object> {
         V::F(x) => Object::Float(x),
         V::B(b) => Object::Bool(b),
         V::N => Object::None,
-        V::Fn(_) | V::Null => return None,
+        V::Fn(_) | V::Bi(_) | V::Null => return None,
     })
 }
 
@@ -976,7 +991,11 @@ impl Interpreter {
                             set!(dst, V::Fn(ms.peek_unbound(cls.attr_version.get())?));
                             set!(dst + 1, V::Null);
                         }
-                        _ => return None,
+                        recv => {
+                            let b = self.leaf_builtin_method_ptr(ms, recv, code, name)?;
+                            set!(dst, V::Bi(b));
+                            set!(dst + 1, V::R(p));
+                        }
                     }
                 }
                 Op::Compare { dst, a, b, kind } => {
@@ -1074,36 +1093,68 @@ impl Interpreter {
                 }
                 Op::Jump { target } => ip = usize::from(target),
                 Op::Decline => return None,
-                Op::Call { at, argc } => {
+                Op::Call { at, argc, pc } => {
                     // A pure-leaf callee, evaluated in place: only while
                     // no store is buffered (it would not see one).
                     if (EFFECT && pend.n > 0) || nest >= NEST {
                         return None;
                     }
-                    let fp = match get!(at) {
-                        V::Fn(fp) => fp,
+                    let callee = match get!(at) {
+                        V::Fn(fp) => Callee::Py(fp),
+                        V::Bi(b) => Callee::Native(b, None),
                         // SAFETY: as `norm`.
                         V::R(p) => match unsafe { &*p } {
-                            Object::Function(func) => Rc::as_ptr(func),
+                            Object::Function(func) => Callee::Py(Rc::as_ptr(func)),
+                            Object::Builtin(b) => Callee::Native(Rc::as_ptr(b), Some(b)),
                             _ => return None,
                         },
                         _ => return None,
                     };
-                    // SAFETY: the class or the namespace holds the callee,
-                    // and nothing here runs code that could release it.
-                    let callee = unsafe { &*fp };
-                    // SAFETY: GIL-serialized raw read of the code cell.
-                    let ccode: &Rc<CodeObject> = unsafe { &*callee.code.as_ptr() };
                     let first = if matches!(get!(at + 1), V::Null) {
                         at + 2
                     } else {
                         at + 1
                     };
                     let n = usize::from(at + 2 + argc - first);
+                    if n > 8 {
+                        return None;
+                    }
+                    let fp = match callee {
+                        Callee::Py(fp) => fp,
+                        Callee::Native(b, rc) => {
+                            // A read-only builtin, on borrowed copies of the
+                            // arguments: never dropped, so no reference moves.
+                            let mut staged =
+                                [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
+                            for k in 0..n {
+                                let o = match get!(first + k as u8) {
+                                    // SAFETY: as `norm`; the copy is forgotten.
+                                    V::R(p) => unsafe { std::ptr::read(p) },
+                                    V::I(i) => Object::Int(i),
+                                    V::F(x) => Object::Float(x),
+                                    V::B(b) => Object::Bool(b),
+                                    V::N => Object::None,
+                                    V::Fn(_) | V::Bi(_) | V::Null => return None,
+                                };
+                                staged[k].write(o);
+                            }
+                            // SAFETY: the first `n` entries were written.
+                            let args = unsafe {
+                                std::slice::from_raw_parts(staged.as_ptr().cast::<Object>(), n)
+                            };
+                            let r = self.leaf_pure_builtin(code, usize::from(pc), b, rc, args)?;
+                            set!(at, owned.own(r)?);
+                            continue;
+                        }
+                    };
+                    // SAFETY: the class or the namespace holds the callee,
+                    // and nothing here runs code that could release it.
+                    let callee = unsafe { &*fp };
+                    // SAFETY: GIL-serialized raw read of the code cell.
+                    let ccode: &Rc<CodeObject> = unsafe { &*callee.code.as_ptr() };
                     if !crate::code_is_pure_leaf(ccode)
                         || !Self::leaf_code_ok(ccode)
                         || n != ccode.arg_count as usize
-                        || n > 8
                         || crate::recursion::current_depth() + usize::from(nest) + 1
                             >= crate::recursion::recursion_limit()
                     {
@@ -1122,7 +1173,7 @@ impl Interpreter {
                             V::F(x) => Object::Float(x),
                             V::B(b) => Object::Bool(b),
                             V::N => Object::None,
-                            V::Fn(_) | V::Null => return None,
+                            V::Fn(_) | V::Bi(_) | V::Null => return None,
                         };
                         ptrs[k] = staged[k].write(o);
                     }
