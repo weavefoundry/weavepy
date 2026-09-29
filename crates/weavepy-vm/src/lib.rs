@@ -12457,6 +12457,39 @@ impl Interpreter {
                                     None => break None,
                                 }
                             }
+                            // A natively served left operand (see
+                            // `stdlib::datetime_native`), out of line.
+                            (Object::Instance(i), _) if i.cls_raw().native_kind.get() != 0 => {
+                                let r = match Self::core_native_binop(kind, a, b) {
+                                    Some(r)
+                                        if Self::core_droppable(a) && Self::core_droppable(b) =>
+                                    {
+                                        r
+                                    }
+                                    _ => break None,
+                                };
+                                // SAFETY: both operands leave by plain
+                                // decrements (checked).
+                                unsafe {
+                                    drop_hot(base.add(len - 1).read());
+                                    drop_hot(base.add(len - 2).read());
+                                }
+                                len -= 2;
+                                match r {
+                                    Ok(v) => {
+                                        // SAFETY: the operands' slots are free.
+                                        unsafe { base.add(len).write(v) };
+                                        len += 1;
+                                        last = pc;
+                                        pc += 1;
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        pc += 1;
+                                        break Some(CoreExit::Stop(LeafStop::Raised(e)));
+                                    }
+                                }
+                            }
                             // String concatenation, repetition and `%`
                             // formatting over scalars, out of line.
                             (Object::Str(_), _) | (Object::Int(_), Object::Str(_)) => {
@@ -12557,6 +12590,32 @@ impl Interpreter {
                                 Some(o) => o,
                                 None => break None,
                             },
+                            // Two natively served instances (see
+                            // `stdlib::datetime_native`), out of line.
+                            (Object::Instance(i), Object::Instance(_))
+                                if i.cls_raw().native_kind.get() != 0 =>
+                            {
+                                let r = match Self::core_native_compare(kind, a, b) {
+                                    Some(Ok(r))
+                                        if Self::core_droppable(a) && Self::core_droppable(b) =>
+                                    {
+                                        r
+                                    }
+                                    _ => break None,
+                                };
+                                // SAFETY: both operands leave by plain
+                                // decrements (checked); the result takes the
+                                // lower one's slot.
+                                unsafe {
+                                    drop_hot(base.add(len - 1).read());
+                                    drop_hot(base.add(len - 2).read());
+                                }
+                                len -= 1;
+                                unsafe { base.add(len - 1).write(r) };
+                                last = pc;
+                                pc += 1;
+                                continue;
+                            }
                             _ => break None,
                         };
                         let r = match kind {
@@ -13817,6 +13876,21 @@ impl Interpreter {
                             }
                             _ => break Some(CoreExit::Helper),
                         };
+                        // A natively served instance's public field (see
+                        // `stdlib::datetime_native`).
+                        if inst.cls_raw().native_kind.get() != 0 {
+                            match Self::core_native_field(ext, inst, ins.arg) {
+                                Some(v) if Self::core_droppable(unsafe { &*top }) => {
+                                    // SAFETY: the receiver (droppable) is
+                                    // replaced in place.
+                                    unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
+                                    last = pc;
+                                    pc += 1;
+                                    continue;
+                                }
+                                _ => break Some(CoreExit::Helper),
+                            }
+                        }
                         // SAFETY: a read between two instructions (see
                         // `GilCell::peek`).
                         if let Some(v) = ext.and_then(|e| unsafe { field_slot_hit(e, pc, inst) }) {
@@ -16176,6 +16250,40 @@ impl Interpreter {
                 CoreAttr::Raised(e)
             }
         }
+    }
+
+    /// [`crate::stdlib::datetime_native::leaf_binop`], out of line.
+    #[inline(never)]
+    fn core_native_binop(
+        kind: BinOpKind,
+        a: &Object,
+        b: &Object,
+    ) -> Option<Result<Object, RuntimeError>> {
+        crate::stdlib::datetime_native::leaf_binop(kind, a, b)
+    }
+
+    /// [`crate::stdlib::datetime_native::leaf_compare`], out of line.
+    #[inline(never)]
+    fn core_native_compare(
+        kind: CompareKind,
+        a: &Object,
+        b: &Object,
+    ) -> Option<Result<Object, RuntimeError>> {
+        crate::stdlib::datetime_native::leaf_compare(kind, a, b)
+    }
+
+    /// A natively served instance's public field (`dt.hour`; see
+    /// [`crate::stdlib::datetime_native::leaf_field`]), or `None`.
+    #[inline(never)]
+    fn core_native_field(
+        ext: Option<&CodeConstObjects>,
+        inst: &PyInstance,
+        name_idx: u32,
+    ) -> Option<Object> {
+        let Object::Str(name) = ext?.name_objs.get(name_idx as usize)? else {
+            return None;
+        };
+        crate::stdlib::datetime_native::leaf_field(inst, name)
     }
 
     /// A module attribute through the `LOAD_ATTR` site's cached index:
