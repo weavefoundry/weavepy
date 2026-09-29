@@ -11313,6 +11313,25 @@ pub(crate) fn substr_find(hay: &str, needle: &str) -> Option<usize> {
         return hay.find(needle);
     }
     let last_start = h.len() - n.len();
+    if n[0].is_ascii() {
+        // An ASCII byte is never inside a multibyte character, so every
+        // hit is a character boundary: scan the bytes directly (no char
+        // searcher) and compare the short rest inline (no `memcmp` call).
+        let mut i = 0;
+        let mut budget = h.len() / n.len() + 32;
+        while i <= last_start {
+            let at = i + memchr::memchr(n[0], &h[i..=last_start])?;
+            if short_bytes_eq(&h[at + 1..at + n.len()], &n[1..]) {
+                return Some(at);
+            }
+            budget -= 1;
+            if budget == 0 {
+                return hay[at + 1..].find(needle).map(|k| k + at + 1);
+            }
+            i = at + 1;
+        }
+        return None;
+    }
     // `str::find(char)` is memchr-backed, so the candidate scan runs at
     // vector width; the manual byte loop it replaced did not.
     let first = needle.chars().next()?;
@@ -11339,6 +11358,13 @@ pub(crate) fn substr_find(hay: &str, needle: &str) -> Option<usize> {
         i = at + step;
     }
     None
+}
+
+/// `a == b` for the short needle tails the substring scans compare, inline
+/// (a `memcmp` call costs more than comparing a few bytes).
+#[inline(always)]
+fn short_bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x == y)
 }
 
 /// [`substr_find`] from the right.
@@ -11378,6 +11404,24 @@ pub(crate) fn substr_count(hay: &str, needle: &str) -> usize {
         return hay.matches(needle).count();
     }
     let last_start = h.len() - n.len();
+    if n[0].is_ascii() {
+        // As `substr_find`'s ASCII scan (every hit is a boundary).
+        let mut count = 0;
+        let mut i = 0;
+        while i <= last_start {
+            let Some(off) = memchr::memchr(n[0], &h[i..=last_start]) else {
+                break;
+            };
+            let at = i + off;
+            if short_bytes_eq(&h[at + 1..at + n.len()], &n[1..]) {
+                count += 1;
+                i = at + n.len();
+            } else {
+                i = at + 1;
+            }
+        }
+        return count;
+    }
     let Some(first) = needle.chars().next() else {
         return 0;
     };

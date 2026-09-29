@@ -12521,6 +12521,7 @@ impl Interpreter {
                     // out of line: arms added here cost the rest of the loop
                     // its register allocation.
                     OpCode::BinarySubscr
+                    | OpCode::BinarySlice
                     | OpCode::StoreSubscr
                     | OpCode::ListAppend
                     | OpCode::UnpackSequence => {
@@ -14347,6 +14348,25 @@ impl Interpreter {
         }
     }
 
+    /// `seq[slice]` for the core loop's `BINARY_SUBSCR` (a list, tuple or
+    /// string over a slice of ints): the full handler's slicing, or
+    /// `None` for it to run (and raise) itself.
+    #[inline(never)]
+    fn core_slice(c: &Object, sl: &crate::object::PySlice) -> Option<Object> {
+        match c {
+            Object::List(items) => {
+                let items = items.try_borrow().ok()?;
+                Some(Object::new_list(slice_seq(&items, sl).ok()?))
+            }
+            Object::Tuple(items) => {
+                let v: Vec<Object> = items.iter().cloned().collect();
+                Some(Object::new_tuple(slice_seq(&v, sl).ok()?))
+            }
+            Object::Str(st) => str_subscript_slice(st, sl).ok(),
+            _ => None,
+        }
+    }
+
     /// The core loop's `BINARY_OP` over strings: `str + str`, a small
     /// `str * int`, and `str % args` over scalar and string arguments
     /// (the leaf arms' string cases). `None` for the full handler, which
@@ -14438,10 +14458,21 @@ impl Interpreter {
                         let d = d.try_borrow().ok()?;
                         clone_hot(d.get(&probe)?)
                     }
+                    // `seq[a:b:c]` with plain int (or omitted) bounds: the
+                    // full handler's own slicing, out of line (a bad step
+                    // declines, and the full handler raises).
+                    (Object::List(_) | Object::Tuple(_) | Object::Str(_), Object::Slice(sl))
+                        if [&sl.start, &sl.stop, &sl.step]
+                            .iter()
+                            .all(|v| matches!(v, Object::None | Object::Int(_))) =>
+                    {
+                        Self::core_slice(c, sl)?
+                    }
                     _ => return None,
                 };
                 // SAFETY: both operand slots are initialized. The key is a
-                // scalar or string and the container a shared value
+                // scalar, a string or a slice of ints, and the container a
+                // shared value
                 // (`core_droppable`), so neither release runs code; the
                 // result takes the container's slot.
                 unsafe {
@@ -14450,6 +14481,43 @@ impl Interpreter {
                     base.add(len - 2).write(r);
                 }
                 Some(len - 1)
+            }
+            // `seq[a:b]` with the bounds on the stack (CPython's
+            // `BINARY_SLICE`): as `BINARY_SUBSCR` over the slice.
+            OpCode::BinarySlice => {
+                if len < 3 {
+                    return None;
+                }
+                // SAFETY: `len >= 3`.
+                let (c, a, b) = unsafe {
+                    (
+                        &*base.add(len - 3),
+                        &*base.add(len - 2),
+                        &*base.add(len - 1),
+                    )
+                };
+                if !matches!(c, Object::List(_) | Object::Tuple(_) | Object::Str(_))
+                    || !Self::core_droppable(c)
+                    || !matches!(a, Object::None | Object::Int(_))
+                    || !matches!(b, Object::None | Object::Int(_))
+                {
+                    return None;
+                }
+                let sl = crate::object::PySlice {
+                    start: a.clone(),
+                    stop: b.clone(),
+                    step: Object::None,
+                };
+                let r = Self::core_slice(c, &sl)?;
+                // SAFETY: the bounds are scalars and the container a
+                // shared value (checked); the result takes its slot.
+                unsafe {
+                    drop_hot(base.add(len - 1).read());
+                    drop_hot(base.add(len - 2).read());
+                    drop_hot(base.add(len - 3).read());
+                    base.add(len - 3).write(r);
+                }
+                Some(len - 2)
             }
             OpCode::StoreSubscr => {
                 if len < 3 {
