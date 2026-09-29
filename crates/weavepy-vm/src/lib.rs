@@ -14077,6 +14077,21 @@ impl Interpreter {
         {
             return false;
         }
+        // A leaf `__init__` (plain stores of its arguments into `self`)
+        // runs frameless, as a leaf method call does.
+        if self.core_leaf_init(
+            frame,
+            &ty,
+            init,
+            code,
+            argc,
+            self_slot,
+            callee_slot,
+            sw.depth_cell,
+        ) {
+            frame.pc = pc as u32 + 1;
+            return true;
+        }
         let Some(cells) = init.lean_cells_ref(code) else {
             return false;
         };
@@ -14129,6 +14144,77 @@ impl Interpreter {
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
         true
+    }
+
+    /// [`Self::core_new`] for an `__init__` that is a pure or effect leaf
+    /// whose every return is `return None`: the new instance, evaluated
+    /// into by [`Self::pure_leaf_eval`] with no activation, replaces the
+    /// call's operands (`frame.stack[callee_slot..]`). `false` touches
+    /// nothing observable (a declined evaluation stores nothing, and the
+    /// unused instance was never seen).
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn core_leaf_init(
+        &self,
+        frame: &mut Frame,
+        ty: &Rc<TypeObject>,
+        init: &Rc<crate::object::PyFunction>,
+        code: &Rc<CodeObject>,
+        argc: usize,
+        self_slot: usize,
+        callee_slot: usize,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> bool {
+        let pure = code_is_pure_leaf(code);
+        if !(pure || code_is_effect_leaf(code))
+            || argc >= 8
+            || !pure_leaf_warm(code)
+            || !code_returns_only_none(code)
+            || ty.flags.is_builtin
+            || ty.native_kind.get() != 0
+            || ty.instances_need_finalize()
+            // The ordinary call's `RecursionError` check.
+            // SAFETY: this thread's own depth cell.
+            || unsafe { (*depth_cell).get() } >= crate::recursion::recursion_limit()
+        {
+            return false;
+        }
+        // The arguments leave by plain decrements (whatever `__init__`
+        // stored holds its own reference).
+        if !frame.stack[self_slot + 1..]
+            .iter()
+            .all(Self::core_droppable)
+        {
+            return false;
+        }
+        let (inst, _) = self.alloc_plain_instance_obj(ty);
+        let mut args: [*const Object; 8] = [std::ptr::null(); 8];
+        args[0] = &inst;
+        for (k, a) in frame.stack[self_slot + 1..].iter().enumerate() {
+            args[k + 1] = a;
+        }
+        let r = if pure {
+            self.pure_leaf_eval::<false, false>(code, init, &args[..=argc])
+        } else {
+            self.leaf_init_eval(code, init, &args[..=argc])
+        };
+        match r {
+            Some(done) => {
+                // Every return is `return None` (checked above).
+                drop(done);
+                frame.stack.truncate(callee_slot);
+                frame.stack.push(inst);
+                true
+            }
+            None => {
+                // A declined `__init__` may have stored into the instance
+                // before it stopped; nothing else ever saw it, so it goes
+                // (the framed call starts over on a fresh one).
+                gc_trace::note_dropped(&inst);
+                drop(inst);
+                false
+            }
+        }
     }
 
     /// The core loop's container instructions: `seq[i]` and `d[key]` over
@@ -15231,6 +15317,45 @@ impl Interpreter {
         f: &crate::object::PyFunction,
         args: &[*const Object],
     ) -> Option<Object> {
+        if !Self::leaf_call_entry(code) {
+            return None;
+        }
+        let r = self.leaf_eval::<GETTER, EFFECT>(code, f, args, 0);
+        Self::leaf_call_exit(code, r.is_some());
+        r
+    }
+
+    /// [`Self::pure_leaf_eval`] for a constructor's leaf `__init__` on the
+    /// fresh instance `args[0]` (see `leaf_run`'s `FRESH`): `None` may
+    /// leave that instance half-initialized, for the caller to discard.
+    fn leaf_init_eval(
+        &self,
+        code: &CodeObject,
+        f: &crate::object::PyFunction,
+        args: &[*const Object],
+    ) -> Option<Object> {
+        if !Self::leaf_call_entry(code) {
+            return None;
+        }
+        let ext = code_vm_ext(code)?;
+        let r = if ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) == 16 {
+            // The setter shape stores at once anyway.
+            self.leaf_eval::<false, true>(code, f, args, 0)
+        } else {
+            let plan = ext
+                .leaf_plan
+                .get_or_init(|| leaf_plan::build(code, ext).map(Box::new))
+                .as_deref()?;
+            self.leaf_run::<false, true, true>(code, ext, plan, f, args, 0)
+        };
+        Self::leaf_call_exit(code, r.is_some());
+        r
+    }
+
+    /// A frameless call's JIT bookkeeping, before it runs: `false` sends
+    /// it to the framed path instead.
+    #[inline(always)]
+    fn leaf_call_entry(code: &CodeObject) -> bool {
         // A frameless call is an activation the JIT's warm-up never sees:
         // count it as a lean one, and credit each interval to the tier-2
         // counter. The call at which a compile falls due goes to the
@@ -15246,7 +15371,7 @@ impl Interpreter {
                     && !crate::tier2::jit_off_for_process()
                 {
                     if crate::tier2::note_frameless_calls(code, n + 1) {
-                        return None;
+                        return false;
                     }
                     hint.defer_lean_compile();
                 } else {
@@ -15254,13 +15379,18 @@ impl Interpreter {
                 }
             }
         }
-        let r = self.leaf_eval::<GETTER, EFFECT>(code, f, args, 0);
-        if r.is_some() {
+        let _ = code;
+        true
+    }
+
+    /// A frameless call's bookkeeping after it ran (`hit`: it finished).
+    #[inline(always)]
+    fn leaf_call_exit(code: &CodeObject, hit: bool) {
+        if hit {
             code.jit_hint.note_leaf_hit();
         } else {
             code.jit_hint.note_leaf_miss();
         }
-        r
     }
 
     /// [`Self::pure_leaf_eval`] at call-nesting depth `nest` (a pure-leaf
@@ -15396,7 +15526,7 @@ impl Interpreter {
             .leaf_plan
             .get_or_init(|| leaf_plan::build(code, ext).map(Box::new))
             .as_deref()?;
-        self.leaf_run::<GETTER, EFFECT>(code, ext, plan, f, args, nest)
+        self.leaf_run::<GETTER, EFFECT, false>(code, ext, plan, f, args, nest)
     }
 
     /// The core loop's `FOR_ITER` over a generator at `pc` of `sw`'s
@@ -16147,6 +16277,14 @@ impl Interpreter {
                     }
                     return false;
                 }
+                // The constructor shape: the attribute is the instance's
+                // next one.
+                // SAFETY: as above; the value moves out of the caller's
+                // stack slot, and a declined append hands the bits back.
+                match unsafe { inst.split_append(idx as usize, std::ptr::read(value)) } {
+                    Ok(()) => return true,
+                    Err(v) => std::mem::forget(v),
+                }
             }
         }
         match code.caches.get(attr_pc as u32) {
@@ -16182,6 +16320,25 @@ impl Interpreter {
             }
             _ => false,
         }
+    }
+
+    /// [`Self::core_store_attr_ready`] through the site's [`FieldSlot`],
+    /// for the next of an effect leaf's stores to one receiver in order
+    /// (`cursor` as [`PyInstance::split_store_ready`]): `None` when the
+    /// shortcut can't answer. A `true` here is a store the shortcut in
+    /// [`Self::core_store_attr`] then performs.
+    fn core_store_attr_ready_split(
+        ext: &CodeConstObjects,
+        inst: &PyInstance,
+        attr_pc: usize,
+        cursor: &mut Option<usize>,
+    ) -> Option<bool> {
+        let (ver, idx) = ext.field_slots.get()?.get(attr_pc)?.get();
+        if inst.cls_raw().attr_version.get() != ver || crate::capi_watchers::dicts_active() {
+            return None;
+        }
+        // SAFETY: a read with nothing running (the commit's check pass).
+        unsafe { inst.split_store_ready(idx as usize, cursor, Self::core_droppable) }
     }
 
     /// Whether [`Self::core_store_attr`] would perform this store right
@@ -16288,6 +16445,15 @@ impl Interpreter {
             match inst.split_store(name, unsafe { std::ptr::read(value) }) {
                 Ok(old) => {
                     drop(old);
+                    // Later stores at this site (to the same position of
+                    // later instances) take the split shortcut.
+                    if let Some(ext) = code_vm_ext(code) {
+                        // SAFETY: a read between two instructions.
+                        let pos = unsafe { inst.dict.split_peek() }.and_then(|s| s.position(name));
+                        if let Some(pos) = pos.and_then(|p| u32::try_from(p).ok()) {
+                            field_slot_note(ext, code.instructions.len(), attr_pc, inst, pos);
+                        }
+                    }
                     return true;
                 }
                 Err(v) => std::mem::forget(v),
@@ -61338,6 +61504,9 @@ struct CodeConstObjects {
     /// A leaf body's translation for the frameless evaluator (see
     /// [`leaf_plan`]), or `None` when the body has none.
     leaf_plan: std::sync::OnceLock<Option<Box<leaf_plan::LeafPlan>>>,
+    /// Whether every return is `return None` (see
+    /// [`code_returns_only_none`]): `0` not yet decided, `1` no, `2` yes.
+    returns_none: std::sync::atomic::AtomicU8,
 }
 
 /// A `CALL` site's inline-call shape (see `Interpreter::core_call`): the
@@ -62360,6 +62529,33 @@ fn effect_setter_shape(code: &CodeObject) -> bool {
             && ret.op == OpCode::ReturnValue)
 }
 
+/// Whether every `RETURN_VALUE` in `code` returns the constant `None`
+/// (what a constructor's `__init__` must return), decided once.
+fn code_returns_only_none(code: &CodeObject) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(ext) = code_vm_ext(code) else {
+        return false;
+    };
+    match ext.returns_none.load(Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    let instrs = &code.instructions;
+    let yes = instrs.iter().enumerate().all(|(pc, ins)| {
+        ins.op != OpCode::ReturnValue
+            || pc
+                .checked_sub(1)
+                .and_then(|p| instrs.get(p))
+                .is_some_and(|prev| {
+                    prev.op == OpCode::LoadConst
+                        && matches!(code.constants.get(prev.arg as usize), Some(Constant::None))
+                })
+    });
+    ext.returns_none.store(if yes { 2 } else { 1 }, Relaxed);
+    yes
+}
+
 /// Whether `code` is an *effect leaf* (see `code_pure_leaf_decide`),
 /// deciding its leaf verdicts on first use.
 #[inline]
@@ -62502,6 +62698,7 @@ fn code_vm_ext_init(
             fast_pairs: std::sync::OnceLock::new(),
             field_slots: std::sync::OnceLock::new(),
             leaf_plan: std::sync::OnceLock::new(),
+            returns_none: std::sync::atomic::AtomicU8::new(0),
         })
     })
 }

@@ -213,6 +213,10 @@ pub(crate) struct LeafPlan {
     consts: Box<[V]>,
     /// Arguments, copied into the first registers on entry.
     nargs: u8,
+    /// Every attribute store goes to the first argument (never
+    /// reassigned), each to a different name: the buffered stores share
+    /// one receiver and each is the latest to its attribute.
+    unique_stores: bool,
 }
 
 // SAFETY: the constants' pointers name the code extension's immutable
@@ -236,6 +240,10 @@ struct Builder<'a> {
     /// Number of locals (registers below it).
     nl: usize,
     stack: Vec<Opnd>,
+    /// The names stored into so far, while every store goes to the
+    /// first argument (see [`LeafPlan::unique_stores`]); `None` once one
+    /// doesn't.
+    stored: Option<Vec<u32>>,
     /// Locals definitely assigned on the current path (bit per local).
     assigned: u32,
     /// Per bytecode target: the stack depth and assigned set on the
@@ -311,6 +319,10 @@ impl Builder<'_> {
         if src != i as u8 {
             self.release_local(i as u8)?;
             self.ops.push(Op::Move { dst: i as u8, src });
+        }
+        if i == 0 {
+            // The first argument no longer names one receiver.
+            self.stored = None;
         }
         self.assigned |= 1 << i;
         Some(())
@@ -556,6 +568,13 @@ impl Builder<'_> {
             OpCode::StoreAttr => {
                 let recv = self.pop()?;
                 let val = self.pop()?;
+                if let Some(names) = &mut self.stored {
+                    if recv != 0 || names.contains(&arg) {
+                        self.stored = None;
+                    } else {
+                        names.push(arg);
+                    }
+                }
                 self.ops.push(Op::StoreAttr {
                     recv,
                     val,
@@ -634,6 +653,7 @@ impl Builder<'_> {
             ops: self.ops.into_boxed_slice(),
             consts: self.consts.into_boxed_slice(),
             nargs: u8::try_from(self.code.arg_count).ok()?,
+            unique_stores: self.stored.is_some() && self.code.arg_count > 0,
         })
     }
 }
@@ -653,6 +673,7 @@ pub(crate) fn build(code: &CodeObject, ext: &CodeConstObjects) -> Option<LeafPla
         consts: Vec::new(),
         nl,
         stack: Vec::new(),
+        stored: Some(Vec::new()),
         assigned: (1u32 << nargs) - 1,
         targets: std::collections::HashMap::new(),
         fixups: Vec::new(),
@@ -772,7 +793,11 @@ impl Interpreter {
     /// result, or `None` having done nothing observable (see
     /// `Interpreter::leaf_eval`).
     #[inline(never)]
-    pub(crate) fn leaf_run<const GETTER: bool, const EFFECT: bool>(
+    ///
+    /// `FRESH`: the first argument is an instance nothing else has seen
+    /// (a constructor's `self`), so a store into it lands at once — a
+    /// later decline leaves it half-built, and the caller discards it.
+    pub(crate) fn leaf_run<const GETTER: bool, const EFFECT: bool, const FRESH: bool>(
         &self,
         code: &CodeObject,
         ext: &CodeConstObjects,
@@ -1112,9 +1137,17 @@ impl Interpreter {
                         // before any does (a decline touched nothing, and
                         // the ordinary call runs the body instead). A
                         // lone store is its own check: it declines whole.
+                        let unique = plan.unique_stores;
                         if pend.n > 1 {
+                            // With one receiver, appends of new attributes
+                            // land in order: `cursor` is its split length
+                            // once the earlier ones have.
+                            let mut cursor = None;
+                            // A store the shortcut can't vouch for may
+                            // move the layout: the rest check in full.
+                            let mut split_ok = unique;
                             for k in 0..pend.n {
-                                if !pend.latest(k) {
+                                if !unique && !pend.latest(k) {
                                     continue;
                                 }
                                 let (rp, spc, name, _) = pend.get(k);
@@ -1122,14 +1155,23 @@ impl Interpreter {
                                 let Object::Instance(inst) = (unsafe { &**rp }) else {
                                     return None;
                                 };
-                                if !Self::core_store_attr_ready(code, inst, *spc as usize, *name) {
+                                let (spc, name) = (*spc as usize, *name);
+                                let ready = if split_ok {
+                                    Self::core_store_attr_ready_split(ext, inst, spc, &mut cursor)
+                                } else {
+                                    None
+                                };
+                                split_ok &= ready.is_some();
+                                if !ready.unwrap_or_else(|| {
+                                    Self::core_store_attr_ready(code, inst, spc, name)
+                                }) {
                                     return None;
                                 }
                             }
                         }
                         let n = pend.n;
                         for k in 0..n {
-                            if !pend.latest(k) {
+                            if !unique && !pend.latest(k) {
                                 continue;
                             }
                             let (rp, spc, name, value) = pend.get(k);
@@ -1164,6 +1206,24 @@ impl Interpreter {
                     };
                     // SAFETY: as `norm`.
                     let recv = unsafe { &*rp };
+                    if FRESH && args.first().is_some_and(|&a| std::ptr::eq(a, rp)) {
+                        let Object::Instance(inst) = recv else {
+                            return None;
+                        };
+                        let value = std::mem::ManuallyDrop::new(to_object(get!(val))?);
+                        // On `true` the value moved into the instance.
+                        if !Self::core_store_attr(
+                            code,
+                            inst,
+                            usize::from(pc),
+                            u32::from(name),
+                            &value,
+                        ) {
+                            drop(std::mem::ManuallyDrop::into_inner(value));
+                            return None;
+                        }
+                        continue;
+                    }
                     if !matches!(recv, Object::Instance(_)) || pend.n == PENDING {
                         return None;
                     }

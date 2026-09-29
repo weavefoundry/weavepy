@@ -380,6 +380,87 @@ impl SplitValues {
         }
     }
 
+    /// Append `value` as the value of position `i` of `keys`, when that
+    /// is the next unset position of values laid out over `keys` (or the
+    /// first value of an instance with none, which adopts `keys` through
+    /// `share`); `Err` hands the value back, touching nothing.
+    #[inline(always)]
+    pub fn append_over(
+        &mut self,
+        keys: &SharedKeys,
+        share: impl FnOnce() -> Rc<SharedKeys>,
+        i: usize,
+        value: Object,
+    ) -> Result<(), Object> {
+        if let Some(b) = self.block {
+            let h = b.as_ptr();
+            // SAFETY: the block is live while owned; slot `len` is inside
+            // the capacity (checked) and uninitialized.
+            unsafe {
+                let len = (*h).len as usize;
+                if std::ptr::eq((*h).keys, keys) && i == len && len < (*h).cap as usize {
+                    Self::values_ptr(h).add(len).write(value);
+                    (*h).len = len as u32 + 1;
+                    return Ok(());
+                }
+                if !(*h).keys.is_null() || len != 0 {
+                    return Err(value);
+                }
+            }
+        }
+        // No value yet (a fresh or recycled instance): adopt the names.
+        if i != 0 || keys.is_empty() {
+            return Err(value);
+        }
+        self.first_push(share, keys.len(), value);
+        Ok(())
+    }
+
+    /// [`Self::push`] for an instance's first value, out of line.
+    #[inline(never)]
+    fn first_push(&mut self, keys: impl FnOnce() -> Rc<SharedKeys>, want: usize, value: Object) {
+        // A recycled block too small for every shared name goes: the
+        // appends after this one then always find room (see
+        // `can_append_at`).
+        if let Some(b) = self.block {
+            // SAFETY: the block is live while owned; with no value and no
+            // names (the caller's state) it owns nothing else.
+            unsafe {
+                let h = b.as_ptr();
+                if ((*h).cap as usize) < want {
+                    debug_assert!((*h).len == 0 && (*h).keys.is_null());
+                    std::alloc::dealloc(h.cast(), Self::layout((*h).cap as usize));
+                    self.block = None;
+                }
+            }
+        }
+        self.push(keys, want, value);
+    }
+
+    /// Whether [`Self::append_over`] of position `i` of `keys` succeeds
+    /// once the positions from the current length up to `i` have been
+    /// appended first (the next of a run of in-order appends).
+    #[inline]
+    pub fn can_append_at(&self, keys: &SharedKeys, i: usize) -> bool {
+        if i >= keys.len() {
+            return false;
+        }
+        match self.block {
+            // SAFETY: the block is live while owned.
+            Some(b) => unsafe {
+                let h = b.as_ptr();
+                if std::ptr::eq((*h).keys, keys) {
+                    i >= (*h).len as usize && i < (*h).cap as usize
+                } else {
+                    // No values yet: the first append sizes the block for
+                    // every name.
+                    (*h).keys.is_null() && (*h).len == 0
+                }
+            },
+            None => true,
+        }
+    }
+
     /// [`Self::get_index`] with the value writable in place.
     #[inline(always)]
     pub fn get_index_mut(&mut self, i: usize) -> Option<(&DictKey, &mut Object)> {
@@ -811,6 +892,71 @@ impl crate::types::PyInstance {
         let keys: *const SharedKeys = self.cls_raw().shared_keys.get()?;
         // SAFETY: forwarded contract.
         unsafe { self.dict.split_peek() }?.get_over(keys, i)
+    }
+
+    /// Set the attribute at position `i` of the class's shared names by
+    /// appending `value`, when the instance's split values stop just
+    /// before `i` and their block has room (the constructor shape, after
+    /// its first store); `Err` hands the value back, touching nothing.
+    /// The caller proved the name at `i` and that a plain `__dict__`
+    /// store is what the assignment means (see `split_store`).
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::sync::GilCell::peek_mut`].
+    #[inline(always)]
+    pub unsafe fn split_append(&self, i: usize, value: Object) -> Result<(), Object> {
+        if self.c_body.get() != 0 || crate::gil::free_threading_enabled() {
+            return Err(value);
+        }
+        let cls = self.cls_raw();
+        let Some(keys) = cls.shared_keys.get() else {
+            return Err(value);
+        };
+        if !value.is_gc_atomic() && self.deferred.get() {
+            // The write barrier, before the values are borrowed (tracking
+            // early is always sound).
+            self.ensure_gc_tracked();
+        }
+        // SAFETY: forwarded contract.
+        let Some(split) = (unsafe { self.dict.split_peek_mut() }) else {
+            return Err(value);
+        };
+        split.append_over(keys, || cls.shared_keys.share(), i, value)
+    }
+
+    /// The split length and whether position `i` of the class's shared
+    /// names is ready for a store: an overwrite of a set value (which
+    /// `droppable` must accept), or the next of a run of in-order appends
+    /// starting at `*cursor` (the split length once the earlier appends
+    /// land; `None` starts it at the current length). `None` when the
+    /// split layout can't say.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::sync::GilCell::peek`].
+    #[inline]
+    pub unsafe fn split_store_ready(
+        &self,
+        i: usize,
+        cursor: &mut Option<usize>,
+        droppable: impl FnOnce(&Object) -> bool,
+    ) -> Option<bool> {
+        if self.c_body.get() != 0 || crate::gil::free_threading_enabled() {
+            return None;
+        }
+        let keys = self.cls_raw().shared_keys.get()?;
+        // SAFETY: forwarded contract.
+        let split = unsafe { self.dict.split_peek() }?;
+        let at = cursor.get_or_insert(split.len());
+        if let Some(v) = split.get_over(keys, i) {
+            return Some(droppable(v));
+        }
+        if i == *at && split.can_append_at(keys, i) {
+            *at += 1;
+            return Some(true);
+        }
+        None
     }
 
     /// [`Self::split_field`] for an in-place overwrite by a value of
