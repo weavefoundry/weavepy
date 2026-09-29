@@ -3325,6 +3325,10 @@ impl Interpreter {
                     return false;
                 }
                 let id = crate::weakref_registry::id_of(v);
+                // Held past every slot and a collector handle: no count.
+                if sc > nlocals + 1 {
+                    return !crate::weakref_registry::may_have_weakrefs(id);
+                }
                 // How many of this frame's slots hold `v`: exact for
                 // small frames (the usual `self` is held once here and
                 // once by the caller), the slot count otherwise.
@@ -3350,9 +3354,16 @@ impl Interpreter {
                     || escaped(v)
                     || matches!(v, Object::Instance(i) if i.dies_by_plain_drop())
                     || Self::atomic_container_dies_plainly(v)
+                    || Self::tracked_container_dies_inertly(v)
             }) {
                 for v in locals {
-                    gc_trace::note_dropped(v);
+                    // A dying tracked container sheds its collector handle
+                    // now (the cascade would find nothing else to do).
+                    if Self::tracked_container_dies_inertly(v) {
+                        gc_trace::untrack_id(crate::weakref_registry::id_of(v));
+                    } else {
+                        gc_trace::note_dropped(v);
+                    }
                 }
                 return;
             }
@@ -3862,6 +3873,41 @@ impl Interpreter {
                 .try_borrow()
                 .is_ok_and(|d| d.len() <= MAX && d.iter().all(|(k, v)| atomic(&k.0) && atomic(v))),
             Object::Tuple(t) => t.len() <= MAX && t.iter().all(atomic),
+            _ => false,
+        }
+    }
+
+    /// A collector-tracked list or dict whose only holders are the caller's
+    /// reference and its collector handle, watched by no weakref, holding
+    /// only values its death can't finalize (atomic ones, or instances
+    /// others still hold): untracking it and dropping the reference is its
+    /// whole teardown, as in CPython's `list_dealloc`.
+    fn tracked_container_dies_inertly(o: &Object) -> bool {
+        const MAX: usize = 16;
+        fn inert(v: &Object) -> bool {
+            matches!(
+                v,
+                Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None | Object::Str(_)
+            ) || gc_trace::drop_survives_plainly(v)
+        }
+        let (sc, id) = match o {
+            Object::List(l) => (Rc::strong_count(l), Rc::as_ptr(l) as usize as u64),
+            Object::Dict(d) => (Rc::strong_count(d), Rc::as_ptr(d) as usize as u64),
+            _ => return false,
+        };
+        if sc != 2
+            || crate::weakref_registry::may_have_weakrefs(id)
+            || !gc_trace::is_tracked(id)
+        {
+            return false;
+        }
+        match o {
+            Object::List(l) => l
+                .try_borrow()
+                .is_ok_and(|v| v.len() <= MAX && v.iter().all(inert)),
+            Object::Dict(d) => d
+                .try_borrow()
+                .is_ok_and(|d| d.len() <= MAX && d.iter().all(|(k, v)| inert(&k.0) && inert(v))),
             _ => false,
         }
     }
@@ -15373,37 +15419,62 @@ impl Interpreter {
     /// for each release.
     #[inline]
     fn core_escaped_locals(locals: &[Object]) -> bool {
-        let mut heap = 0usize;
+        // Each heap local's identity and strong count: up to eight are
+        // compared exactly (how many slots here name each object); past
+        // that, every heap slot is assumed to name every object.
+        const EXACT: usize = 8;
+        let mut heap = [const { std::mem::MaybeUninit::<(u64, usize)>::uninit() }; EXACT];
+        let mut n = 0usize;
         for o in locals {
-            match o {
+            let (id, sc) = match o {
                 Object::Int(_)
                 | Object::Float(_)
                 | Object::Bool(_)
                 | Object::None
                 | Object::Unbound
-                | Object::Str(_) => {}
-                Object::Instance(_) | Object::List(_) | Object::Dict(_) | Object::Tuple(_) => {
-                    heap += 1;
-                }
+                | Object::Str(_) => continue,
+                Object::Instance(i) => (Rc::as_ptr(i) as usize as u64, Rc::strong_count(i)),
+                Object::List(l) => (Rc::as_ptr(l) as usize as u64, Rc::strong_count(l)),
+                Object::Dict(d) => (Rc::as_ptr(d) as usize as u64, Rc::strong_count(d)),
+                Object::Tuple(t) => (
+                    ThinArc::as_ptr(t).cast::<()>() as usize as u64,
+                    ThinArc::strong_count(t),
+                ),
                 _ => return false,
+            };
+            if n < EXACT {
+                heap[n].write((id, sc));
             }
+            n += 1;
         }
-        if heap == 0 {
+        if n == 0 {
             return true;
         }
-        locals.iter().all(|o| {
-            let (sc, id) = match o {
-                Object::Instance(i) => (Rc::strong_count(i), Rc::as_ptr(i) as usize as u64),
-                Object::List(l) => (Rc::strong_count(l), Rc::as_ptr(l) as usize as u64),
-                Object::Dict(d) => (Rc::strong_count(d), Rc::as_ptr(d) as usize as u64),
-                Object::Tuple(t) => (
-                    ThinArc::strong_count(t),
-                    ThinArc::as_ptr(t).cast::<()>() as usize as u64,
-                ),
-                _ => return true,
-            };
-            sc > heap + usize::from(gc_trace::maybe_tracked(id))
-                && !crate::weakref_registry::may_have_weakrefs(id)
+        if n > EXACT {
+            return locals.iter().all(|o| {
+                let (sc, id) = match o {
+                    Object::Instance(i) => (Rc::strong_count(i), Rc::as_ptr(i) as usize as u64),
+                    Object::List(l) => (Rc::strong_count(l), Rc::as_ptr(l) as usize as u64),
+                    Object::Dict(d) => (Rc::strong_count(d), Rc::as_ptr(d) as usize as u64),
+                    Object::Tuple(t) => (
+                        ThinArc::strong_count(t),
+                        ThinArc::as_ptr(t).cast::<()>() as usize as u64,
+                    ),
+                    _ => return true,
+                };
+                sc > n + usize::from(gc_trace::maybe_tracked(id))
+                    && !crate::weakref_registry::may_have_weakrefs(id)
+            });
+        }
+        // SAFETY: the first `n` entries were written.
+        let heap: &[(u64, usize)] = unsafe { std::slice::from_raw_parts(heap.as_ptr().cast(), n) };
+        heap.iter().all(|&(id, sc)| {
+            // Held past every slot here and a collector handle needs no
+            // count of the slots that name it.
+            (sc > n + 1 || {
+                let held = heap.iter().filter(|&&(other, _)| other == id).count();
+                sc > held + usize::from(gc_trace::maybe_tracked(id))
+            }) && !crate::weakref_registry::may_have_weakrefs(id)
         })
     }
 
@@ -16389,6 +16460,30 @@ impl Interpreter {
         } else {
             code.jit_hint.note_leaf_miss();
         }
+    }
+
+    /// [`Self::leaf_eval`] for a leaf plan's own pure-leaf call: the
+    /// callee's result borrowed when it outlives the callee's evaluation
+    /// (see [`leaf_plan::LeafRet`]), which the caller then neither clones
+    /// nor releases.
+    pub(crate) fn leaf_eval_nested(
+        &self,
+        code: &CodeObject,
+        f: &crate::object::PyFunction,
+        args: &[*const Object],
+        nest: u8,
+    ) -> Option<leaf_plan::LeafRet> {
+        let ext = code_vm_ext(code)?;
+        if ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) >= 3 {
+            return self
+                .leaf_eval::<false, false>(code, f, args, nest)
+                .map(leaf_plan::LeafRet::Owned);
+        }
+        let plan = ext
+            .leaf_plan
+            .get_or_init(|| leaf_plan::build(code, ext).map(Box::new))
+            .as_deref()?;
+        self.leaf_run_ret::<false, false, false>(code, ext, plan, f, args, nest)
     }
 
     /// [`Self::pure_leaf_eval`] at call-nesting depth `nest` (a pure-leaf

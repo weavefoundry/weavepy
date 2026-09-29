@@ -716,6 +716,15 @@ impl Owned {
 }
 
 impl Owned {
+    /// Whether `p` names one of the held values.
+    #[inline(always)]
+    fn holds(&self, p: *const Object) -> bool {
+        let base = self.buf.as_ptr().cast::<Object>();
+        // SAFETY: one past the buffer's end.
+        let end = unsafe { base.add(self.buf.len()) };
+        p >= base && p < end
+    }
+
     /// Hold `v` (a scalar needs no holding) and name it.
     #[inline]
     fn own(&mut self, v: Object) -> Option<V> {
@@ -808,6 +817,25 @@ enum Callee<'a> {
     ),
 }
 
+/// A leaf evaluation's result: a value the caller may borrow for the rest
+/// of its own evaluation (an argument, a field of one, a namespace entry
+/// or a constant: nothing the evaluation owned), or an owned object.
+pub(crate) enum LeafRet {
+    Borrowed(V),
+    Owned(Object),
+}
+
+impl LeafRet {
+    /// The result as an owned object (a borrowed value is cloned).
+    #[inline(always)]
+    pub(crate) fn into_object(self) -> Option<Object> {
+        match self {
+            LeafRet::Borrowed(v) => to_object(v),
+            LeafRet::Owned(o) => Some(o),
+        }
+    }
+}
+
 /// An owned object for a leaf value (the return value, a buffered
 /// store's value); `None` for the markers that are never values.
 #[inline(always)]
@@ -829,11 +857,11 @@ impl Interpreter {
     /// on borrowed `args`, at call-nesting depth `nest`: the leaf's
     /// result, or `None` having done nothing observable (see
     /// `Interpreter::leaf_eval`).
-    #[inline(never)]
     ///
     /// `FRESH`: the first argument is an instance nothing else has seen
     /// (a constructor's `self`), so a store into it lands at once — a
     /// later decline leaves it half-built, and the caller discards it.
+    #[inline(always)]
     pub(crate) fn leaf_run<const GETTER: bool, const EFFECT: bool, const FRESH: bool>(
         &self,
         code: &CodeObject,
@@ -843,6 +871,22 @@ impl Interpreter {
         args: &[*const Object],
         nest: u8,
     ) -> Option<Object> {
+        self.leaf_run_ret::<GETTER, EFFECT, FRESH>(code, ext, plan, f, args, nest)?
+            .into_object()
+    }
+
+    /// [`Self::leaf_run`] with its result borrowed when the caller may
+    /// (see [`LeafRet`]).
+    #[inline(never)]
+    pub(crate) fn leaf_run_ret<const GETTER: bool, const EFFECT: bool, const FRESH: bool>(
+        &self,
+        code: &CodeObject,
+        ext: &CodeConstObjects,
+        plan: &LeafPlan,
+        f: &crate::object::PyFunction,
+        args: &[*const Object],
+        nest: u8,
+    ) -> Option<LeafRet> {
         use weavepy_compiler::InlineCache as IC;
         /// Nested leaf calls evaluated in place at most this deep.
         const NEST: u8 = 3;
@@ -1202,11 +1246,23 @@ impl Interpreter {
                         };
                         ptrs[k] = staged[k].write(o);
                     }
-                    let r = self.leaf_eval::<false, false>(ccode, callee, &ptrs[..n], nest + 1)?;
-                    set!(at, owned.own(r)?);
+                    match self.leaf_eval_nested(ccode, callee, &ptrs[..n], nest + 1)? {
+                        // A constructor's stores land at once, so what it
+                        // borrows from its fresh instance could move.
+                        LeafRet::Borrowed(v) if !FRESH => set!(at, v),
+                        LeafRet::Borrowed(v) => set!(at, owned.own(to_object(v)?)?),
+                        LeafRet::Owned(r) => set!(at, owned.own(r)?),
+                    }
                 }
                 Op::Return { src } => {
-                    let r = to_object(get!(src))?;
+                    let v = get!(src);
+                    // A value this evaluation's scratch doesn't hold outlives
+                    // it (a pure body stores nothing), so a nested caller
+                    // borrows it rather than taking a reference to release.
+                    if !EFFECT && !matches!(v, V::R(p) if owned.holds(p)) {
+                        return Some(LeafRet::Borrowed(v));
+                    }
+                    let r = to_object(v)?;
                     if EFFECT && pend.n > 0 {
                         // The latest store to each attribute is the one
                         // that lands; every one of them must go through
@@ -1266,7 +1322,7 @@ impl Interpreter {
                             }
                         }
                     }
-                    return Some(r);
+                    return Some(LeafRet::Owned(r));
                 }
                 Op::StoreAttr {
                     recv,
