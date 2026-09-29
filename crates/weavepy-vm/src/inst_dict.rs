@@ -352,6 +352,34 @@ impl SplitValues {
         Some((k, v))
     }
 
+    /// The `i`th value, when these values are laid out over `keys` (so the
+    /// name at `i` is whatever `keys` published there).
+    #[inline(always)]
+    pub fn get_over(&self, keys: *const SharedKeys, i: usize) -> Option<&Object> {
+        let h = self.block?.as_ptr();
+        // SAFETY: the block is live while owned, and its first `len` values
+        // are initialized.
+        unsafe {
+            if !std::ptr::eq((*h).keys, keys) || i >= (*h).len as usize {
+                return None;
+            }
+            Some(&*Self::values_ptr(h).add(i))
+        }
+    }
+
+    /// [`Self::get_over`], writable in place.
+    #[inline(always)]
+    pub fn get_over_mut(&mut self, keys: *const SharedKeys, i: usize) -> Option<&mut Object> {
+        let h = self.block?.as_ptr();
+        // SAFETY: as `get_over`, and `&mut self` is exclusive.
+        unsafe {
+            if !std::ptr::eq((*h).keys, keys) || i >= (*h).len as usize {
+                return None;
+            }
+            Some(&mut *Self::values_ptr(h).add(i))
+        }
+    }
+
     /// [`Self::get_index`] with the value writable in place.
     #[inline(always)]
     pub fn get_index_mut(&mut self, i: usize) -> Option<(&DictKey, &mut Object)> {
@@ -770,6 +798,39 @@ fn note_materialize(at: &'static std::panic::Location<'static>) {
 }
 
 impl crate::types::PyInstance {
+    /// The attribute at position `i` of the class's shared names, while
+    /// this instance's values are still split over its own class's names:
+    /// the name there is fixed for as long as the class lives, so a
+    /// caller that proved it once needs no name check again.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::sync::GilCell::peek`].
+    #[inline(always)]
+    pub unsafe fn split_field(&self, i: usize) -> Option<&Object> {
+        let keys: *const SharedKeys = self.cls_raw().shared_keys.get()?;
+        // SAFETY: forwarded contract.
+        unsafe { self.dict.split_peek() }?.get_over(keys, i)
+    }
+
+    /// [`Self::split_field`] for an in-place overwrite by a value of
+    /// atomicity `atomic`, whose write barrier runs first (a non-atomic
+    /// value starts tracking a deferred instance).
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::sync::GilCell::peek_mut`].
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn split_field_mut(&self, i: usize, atomic: bool) -> Option<&mut Object> {
+        let keys: *const SharedKeys = self.cls_raw().shared_keys.get()?;
+        if !atomic && self.deferred.get() {
+            self.ensure_gc_tracked();
+        }
+        // SAFETY: forwarded contract.
+        unsafe { self.dict.split_peek_mut() }?.get_over_mut(keys, i)
+    }
+
     /// The `i`th attribute in assignment order, from whichever layout the
     /// instance uses, read without borrow bookkeeping. `None` when it is
     /// absent or the storage is borrowed (take the general path).

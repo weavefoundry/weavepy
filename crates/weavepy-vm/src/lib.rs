@@ -12015,7 +12015,7 @@ impl Interpreter {
                                                 }
                                             }
                                             if let Some(v) = Self::core_local_attr(
-                                                ext.map_or(&[], |t| &t.name_objs),
+                                                ext,
                                                 code,
                                                 other,
                                                 pc + 1,
@@ -13760,6 +13760,19 @@ impl Interpreter {
                             }
                             _ => break Some(CoreExit::Helper),
                         };
+                        // SAFETY: a read between two instructions (see
+                        // `GilCell::peek`).
+                        if let Some(v) = ext.and_then(|e| unsafe { field_slot_hit(e, pc, inst) }) {
+                            if Self::core_droppable(unsafe { &*top }) {
+                                let v = Self::clone_operand(v);
+                                // SAFETY: the receiver (droppable) is replaced
+                                // in place.
+                                unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
+                                last = pc;
+                                pc += 1;
+                                continue;
+                            }
+                        }
                         let IC::LoadAttrInstance { key_idx, ver } = code.caches.get(pc as u32)
                         else {
                             break Some(CoreExit::Helper);
@@ -13779,6 +13792,9 @@ impl Interpreter {
                         };
                         if !slot_name_matches(code, ins.arg, k) {
                             break Some(CoreExit::Helper);
+                        }
+                        if let Some(e) = ext {
+                            field_slot_note(e, ninstrs, pc, inst, key_idx);
                         }
                         let v = Self::clone_operand(v);
                         // SAFETY: the receiver (droppable) is replaced in place.
@@ -15137,13 +15153,18 @@ impl Interpreter {
     /// shared storage and conflicting mutable borrows.
     #[inline(always)]
     unsafe fn leaf_cached_instance_field<'a>(
-        names: &[Object],
+        ext: &CodeConstObjects,
         code: &CodeObject,
         inst: &'a PyInstance,
         cache_pc: u32,
         name_idx: u32,
     ) -> Option<&'a Object> {
         use weavepy_compiler::InlineCache as IC;
+        // SAFETY: forwarded contract.
+        if let Some(v) = unsafe { field_slot_hit(ext, cache_pc as usize, inst) } {
+            return Some(v);
+        }
+        let names: &[Object] = &ext.name_objs;
         let (key_idx, cached, is_slot) = match code.caches.get(cache_pc) {
             IC::LoadAttrInstance { key_idx, ver } => (key_idx, ver, false),
             IC::LoadAttrSlot { key_idx, ver } => (key_idx, ver, true),
@@ -15156,7 +15177,17 @@ impl Interpreter {
         if !is_slot {
             // SAFETY: the caller keeps this rooted read callback-free.
             let (key, value) = unsafe { inst.attr_peek_index(key_idx as usize) }?;
-            slot_name_matches_in(names, code, name_idx, key).then_some(value)
+            if !slot_name_matches_in(names, code, name_idx, key) {
+                return None;
+            }
+            field_slot_note(
+                ext,
+                code.instructions.len(),
+                cache_pc as usize,
+                inst,
+                key_idx,
+            );
+            Some(value)
         } else {
             // SAFETY: the same rooted read as the dictionary path.
             let slots = unsafe { inst.slots.peek() }?;
@@ -15244,7 +15275,10 @@ impl Interpreter {
         use weavepy_compiler::InlineCache as IC;
         /// Nested leaf calls evaluated in place at most this deep.
         const NEST: u8 = 3;
+        // Every payload sits at offset 8 (a primitive representation), so
+        // a copy is two words rather than a byte-wise shuffle.
         #[derive(Clone, Copy)]
+        #[repr(u64)]
         enum V {
             /// A resolved callee: a function the class or namespace holds.
             Fn(*const crate::object::PyFunction),
@@ -15324,7 +15358,7 @@ impl Interpreter {
         let ext = code_vm_ext(code)?;
         let consts: &[Object] = &ext.objects;
         let stamps: &[StampSlot] = ext.stamp_slots.get().map_or(&[], |s| &s[..]);
-        let instrs = &code.instructions;
+        let instrs: &[weavepy_compiler::Instruction] = &code.instructions;
         // Tiny return bodies need no operand stack or owned-value scratch.
         // The shape is certified once, alongside the pure-leaf decision;
         // call, observer, and recursion guards still belong to the caller.
@@ -15381,13 +15415,7 @@ impl Interpreter {
                         // SAFETY: the argument roots the receiver until the
                         // result is retained; nothing here invokes Python.
                         if let Some(value) = unsafe {
-                            Self::leaf_cached_instance_field(
-                                &ext.name_objs,
-                                code,
-                                inst,
-                                pc as u32,
-                                attr.arg,
-                            )
+                            Self::leaf_cached_instance_field(ext, code, inst, pc as u32, attr.arg)
                         } {
                             return Some(clone_hot(value));
                         }
@@ -15411,13 +15439,7 @@ impl Interpreter {
                         let attr = instrs.get(pc)?;
                         // SAFETY: the same rooted, callback-free read.
                         let value = unsafe {
-                            Self::leaf_cached_instance_field(
-                                &ext.name_objs,
-                                code,
-                                inst,
-                                pc as u32,
-                                attr.arg,
-                            )
+                            Self::leaf_cached_instance_field(ext, code, inst, pc as u32, attr.arg)
                         }?;
                         #[cfg(test)]
                         note_predicate_stage(code, if load_pc == start { 6 } else { 7 });
@@ -15542,20 +15564,23 @@ impl Interpreter {
         };
         macro_rules! push {
             ($v:expr) => {{
-                if sp == 8 {
+                let v = $v;
+                if sp >= st.len() {
                     return None;
                 }
-                st[sp] = $v;
+                // SAFETY: `sp < st.len()`, checked just above.
+                unsafe { *st.get_unchecked_mut(sp) = v };
                 sp += 1;
             }};
         }
         macro_rules! pop {
             () => {{
-                if sp == 0 {
+                if sp == 0 || sp > st.len() {
                     return None;
                 }
                 sp -= 1;
-                st[sp]
+                // SAFETY: `sp < st.len()`, checked just above.
+                unsafe { *st.get_unchecked(sp) }
             }};
         }
         // Locals: an argument reads through its pointer until the body
@@ -15668,11 +15693,7 @@ impl Interpreter {
                             // argument or owned scratch; no Python runs.
                             let hit = unsafe {
                                 Self::leaf_cached_instance_field(
-                                    &ext.name_objs,
-                                    code,
-                                    inst,
-                                    pc as u32,
-                                    ins.arg,
+                                    ext, code, inst, pc as u32, ins.arg,
                                 )
                             }
                             .map(std::ptr::from_ref);
@@ -16582,13 +16603,19 @@ impl Interpreter {
     /// code), anything else through [`Self::leaf_fused_local_attr`].
     #[inline(never)]
     fn core_local_attr(
-        names: &[Object],
+        ext: Option<&CodeConstObjects>,
         code: &CodeObject,
         local: &Object,
         attr_pc: usize,
         name_idx: u32,
     ) -> Option<Object> {
         use weavepy_compiler::InlineCache as IC;
+        if let (Some(ext), Object::Instance(inst)) = (ext, local) {
+            // SAFETY: a read between two instructions (see `peek`).
+            if let Some(v) = unsafe { field_slot_hit(ext, attr_pc, inst) } {
+                return Some(Self::clone_operand(v));
+            }
+        }
         if let (IC::LoadAttrInstance { key_idx, ver }, Object::Instance(inst)) =
             (code.caches.get(attr_pc as u32), local)
         {
@@ -16596,9 +16623,16 @@ impl Interpreter {
             if cls.native_kind.get() != 0 || cls.attr_version.get() != ver {
                 return None;
             }
+            let names: &[Object] = ext.map_or(&[], |t| &t.name_objs);
             // SAFETY: a read between two instructions (see `peek`).
             let (k, v) = unsafe { inst.attr_peek_index(key_idx as usize) }?;
-            return slot_name_matches_in(names, code, name_idx, k).then(|| Self::clone_operand(v));
+            if !slot_name_matches_in(names, code, name_idx, k) {
+                return None;
+            }
+            if let Some(ext) = ext {
+                field_slot_note(ext, code.instructions.len(), attr_pc, inst, key_idx);
+            }
+            return Some(Self::clone_operand(v));
         }
         Self::leaf_fused_local_attr(code, local, attr_pc, name_idx)
     }
@@ -16615,6 +16649,7 @@ impl Interpreter {
         attr_pc: usize,
     ) -> Option<(Object, usize)> {
         use weavepy_compiler::InlineCache as IC;
+        let ext = code_vm_ext(code);
         let mut value = root;
         let mut count = 0;
         for pc in attr_pc..attr_pc.saturating_add(8) {
@@ -16627,6 +16662,12 @@ impl Interpreter {
             let Object::Instance(inst) = value else {
                 break;
             };
+            // SAFETY: the rooted, callback-free walk described below.
+            if let Some(next) = ext.and_then(|ext| unsafe { field_slot_hit(ext, pc, inst) }) {
+                value = next;
+                count += 1;
+                continue;
+            }
             let cls = inst.cls_raw();
             if cls.native_kind.get() != 0 {
                 break;
@@ -16665,7 +16706,13 @@ impl Interpreter {
                         IC::LoadAttrInstance {
                             key_idx,
                             ver: cached,
-                        } if ver == cached => indexed(key_idx),
+                        } if ver == cached => {
+                            let hit = indexed(key_idx);
+                            if let (Some(_), Some(ext)) = (hit, ext) {
+                                field_slot_note(ext, code.instructions.len(), pc, inst, key_idx);
+                            }
+                            hit
+                        }
                         _ => None,
                     };
                     primary.or_else(|| {
@@ -16723,6 +16770,26 @@ impl Interpreter {
     ) -> bool {
         use weavepy_compiler::InlineCache as IC;
         let cls = inst.cls_raw();
+        let ext = code_vm_ext(code);
+        if let Some((ver, idx)) = ext
+            .and_then(|e| e.field_slots.get())
+            .and_then(|slots| slots.get(attr_pc))
+            .map(FieldSlot::get)
+        {
+            if cls.attr_version.get() == ver && !crate::capi_watchers::dicts_active() {
+                // SAFETY: a store between two instructions (see `peek_mut`).
+                if let Some(slot) =
+                    unsafe { inst.split_field_mut(idx as usize, value.is_gc_atomic()) }
+                {
+                    if Self::core_droppable(slot) {
+                        // SAFETY: as the indexed store below.
+                        drop(std::mem::replace(slot, unsafe { std::ptr::read(value) }));
+                        return true;
+                    }
+                    return false;
+                }
+            }
+        }
         match code.caches.get(attr_pc as u32) {
             IC::StoreAttrInstance { key_idx, ver } => {
                 if cls.native_kind.get() != 0
@@ -16746,6 +16813,9 @@ impl Interpreter {
                 // and the displaced value was checked droppable above.
                 let old = std::mem::replace(slot, unsafe { std::ptr::read(value) });
                 drop(old);
+                if let Some(ext) = ext {
+                    field_slot_note(ext, code.instructions.len(), attr_pc, inst, key_idx);
+                }
                 true
             }
             IC::StoreAttrNewKey { ver } => {
@@ -61903,6 +61973,9 @@ struct CodeConstObjects {
     /// splits them back apart; the core loop reads one byte to run the
     /// pair as a single dispatch. Empty when the code has no pair.
     fast_pairs: std::sync::OnceLock<Box<[u8]>>,
+    /// Split-layout attribute shortcuts per `LOAD_ATTR` site (see
+    /// [`FieldSlot`]); allocated on the first recorded one.
+    field_slots: std::sync::OnceLock<Box<[FieldSlot]>>,
 }
 
 /// A `CALL` site's inline-call shape (see `Interpreter::core_call`): the
@@ -62131,6 +62204,76 @@ impl StampSlot {
         // SAFETY: GIL-serialized; the exclusive reference lives only for
         // the assignment.
         unsafe { *self.0.get() = v };
+    }
+}
+
+/// A `LOAD_ATTR` site's split-layout shortcut: the receiver class's
+/// attribute version and the attribute's position among the class's
+/// shared names, recorded after a full site read proved the name there
+/// (see [`field_slot_note`]). The names are append-only and the version
+/// is process-unique, so while both match, the value at that position of
+/// a split instance *is* the attribute: no inline-cache decode and no
+/// name comparison.
+struct FieldSlot(std::cell::UnsafeCell<(u64, u32)>);
+
+// SAFETY: as `StampSlot`.
+unsafe impl Send for FieldSlot {}
+unsafe impl Sync for FieldSlot {}
+
+impl FieldSlot {
+    const fn empty() -> Self {
+        Self(std::cell::UnsafeCell::new((0, 0)))
+    }
+
+    #[inline(always)]
+    fn get(&self) -> (u64, u32) {
+        // SAFETY: GIL-serialized; no `&mut` escapes `set`.
+        unsafe { *self.0.get() }
+    }
+
+    #[inline]
+    fn set(&self, v: (u64, u32)) {
+        // SAFETY: as `StampSlot::set`.
+        unsafe { *self.0.get() = v };
+    }
+}
+
+/// The attribute `inst` holds for the `LOAD_ATTR` at `pc`, through the
+/// site's [`FieldSlot`] (never recorded for a slot or native class).
+///
+/// # Safety
+///
+/// As [`crate::sync::GilCell::peek`]: the view must not outlive anything
+/// that could store an attribute or release the receiver.
+#[inline(always)]
+unsafe fn field_slot_hit<'a>(
+    ext: &CodeConstObjects,
+    pc: usize,
+    inst: &'a PyInstance,
+) -> Option<&'a Object> {
+    let (ver, idx) = ext.field_slots.get()?.get(pc)?.get();
+    if inst.cls_raw().attr_version.get() != ver {
+        return None;
+    }
+    // SAFETY: forwarded contract.
+    unsafe { inst.split_field(idx as usize) }
+}
+
+/// Record the [`FieldSlot`] shortcut for the `LOAD_ATTR` at `pc`, after
+/// a guarded read found its name at dictionary position `idx` of `inst`
+/// (whose class passed the site's version check): kept only when that
+/// position is the split layout's, over the class's own names.
+#[inline(never)]
+fn field_slot_note(ext: &CodeConstObjects, ninstrs: usize, pc: usize, inst: &PyInstance, idx: u32) {
+    // SAFETY: a read with nothing running (the caller's own guarded read).
+    if unsafe { inst.split_field(idx as usize) }.is_none() {
+        return;
+    }
+    let slots = ext
+        .field_slots
+        .get_or_init(|| (0..ninstrs).map(|_| FieldSlot::empty()).collect());
+    if let Some(slot) = slots.get(pc) {
+        slot.set((inst.cls_raw().attr_version.get(), idx));
     }
 }
 
@@ -62995,6 +63138,7 @@ fn code_vm_ext_init(
             call_slots: std::sync::OnceLock::new(),
             pure_leaf: std::sync::atomic::AtomicU8::new(0),
             fast_pairs: std::sync::OnceLock::new(),
+            field_slots: std::sync::OnceLock::new(),
         })
     })
 }
