@@ -9288,6 +9288,14 @@ unsafe extern "C" fn wpjit_truth(frame: *mut JitFrame, pin: i64, _reserved: i64)
         Some(p) => p.to_object(),
         None => return 3,
     };
+    // A registered native `__bool__`/`__len__` (or neither): the
+    // interpreter's cached answer, which runs no Python.
+    if matches!(v, Object::Instance(_)) && !crate::gil::free_threading_enabled() {
+        if let Some(b) = interp.leaf_instance_truth(&v) {
+            jf.ret_bits = u64::from(b);
+            return 0;
+        }
+    }
     let pure = match &v {
         Object::Foreign(_) | Object::MappingProxyObj(_) => false,
         Object::Instance(_) => {

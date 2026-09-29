@@ -47,6 +47,43 @@ struct DequeState<'a> {
     data: Rc<RefCell<Vec<Object>>>,
 }
 
+/// The slot names, interned: a slot key stored through the attribute
+/// machinery shares the interned storage, so the hinted lookups settle on
+/// one pointer compare instead of comparing the bytes.
+struct SlotNames {
+    data: crate::shared_value::SharedStr,
+    head: crate::shared_value::SharedStr,
+    maxlen: crate::shared_value::SharedStr,
+    state: crate::shared_value::SharedStr,
+    deq: crate::shared_value::SharedStr,
+    index: crate::shared_value::SharedStr,
+    deq_state: crate::shared_value::SharedStr,
+}
+
+/// The first interpreter thread's interned names (a thread interning
+/// its own copies only misses the pointer compare, never the lookup).
+static NAMES: std::sync::OnceLock<SlotNames> = std::sync::OnceLock::new();
+
+/// The interned slot names.
+#[inline]
+fn names() -> &'static SlotNames {
+    NAMES.get_or_init(|| {
+        let intern = |n: &str| match crate::stdlib::sys::intern_name(n) {
+            Object::Str(s) => s,
+            _ => unreachable!("names intern as strings"),
+        };
+        SlotNames {
+            data: intern("_data"),
+            head: intern("_head"),
+            maxlen: intern("_maxlen"),
+            state: intern("_state"),
+            deq: intern("_deq"),
+            index: intern("_index"),
+            deq_state: intern("_deq_state"),
+        }
+    })
+}
+
 // The slot positions `deque.__init__` assigns in order (hints only; the
 // name is always verified).
 const SLOT_DATA: usize = 0;
@@ -55,14 +92,14 @@ const SLOT_MAXLEN: usize = 2;
 const SLOT_STATE: usize = 3;
 
 fn head_of(slots: &crate::types::SlotStorage) -> usize {
-    match slots.get_hinted(SLOT_HEAD, "_head") {
+    match slots.get_hinted(SLOT_HEAD, &names().head) {
         Some(Object::Int(h)) if *h >= 0 => *h as usize,
         _ => 0,
     }
 }
 
 fn set_head_of(slots: &mut crate::types::SlotStorage, h: usize) {
-    match slots.get_hinted_mut(SLOT_HEAD, "_head") {
+    match slots.get_hinted_mut(SLOT_HEAD, &names().head) {
         Some(slot) => *slot = Object::Int(h as i64),
         None => slots
             .insert("_head", Object::Int(h as i64))
@@ -71,14 +108,14 @@ fn set_head_of(slots: &mut crate::types::SlotStorage, h: usize) {
 }
 
 fn maxlen_of(slots: &crate::types::SlotStorage) -> Option<usize> {
-    match slots.get_hinted(SLOT_MAXLEN, "_maxlen") {
+    match slots.get_hinted(SLOT_MAXLEN, &names().maxlen) {
         Some(Object::Int(m)) if *m >= 0 => Some(*m as usize),
         _ => None,
     }
 }
 
 fn bump_state_of(slots: &mut crate::types::SlotStorage) {
-    match slots.get_hinted_mut(SLOT_STATE, "_state") {
+    match slots.get_hinted_mut(SLOT_STATE, &names().state) {
         Some(Object::Int(s)) => *s = s.wrapping_add(1),
         Some(slot) => *slot = Object::Int(1),
         None => slots.insert("_state", Object::Int(1)).map_or((), drop),
@@ -118,7 +155,7 @@ fn fast_parts(args: &[Object]) -> Option<(&mut crate::types::SlotStorage, &mut V
     // SAFETY: see above — no guard is live on either cell (`peek_mut`
     // checks), and neither reference outlives the native call.
     let slots = unsafe { inst.slots.peek_mut() }?;
-    let Some(Object::List(data)) = slots.get_hinted(SLOT_DATA, "_data") else {
+    let Some(Object::List(data)) = slots.get_hinted(SLOT_DATA, &names().data) else {
         return None;
     };
     // The list lives in its own allocation, held by the `_data` slot,
@@ -158,7 +195,7 @@ fn receiver<'a>(args: &'a [Object], method: &str) -> Result<DequeState<'a>, Runt
         .ok_or_else(|| type_error(format!("unbound method deque.{method}() needs an argument")))?;
     if let Object::Instance(inst) = recv {
         let slots = inst.slots.borrow_mut();
-        if let Some(Object::List(data)) = slots.get_hinted(SLOT_DATA, "_data") {
+        if let Some(Object::List(data)) = slots.get_hinted(SLOT_DATA, &names().data) {
             let data = data.clone();
             return Ok(DequeState { slots, data });
         }
@@ -505,23 +542,27 @@ fn deque_next_fast(iterator: &crate::types::PyInstance, reverse: bool) -> Option
     // Python runs before the last use, and the iterator and its deque are
     // distinct objects.
     let its = unsafe { iterator.slots.peek_mut() }?;
-    let Some(Object::Instance(deque)) = its.get_hinted(IT_DEQ, "_deq") else {
+    let Some(Object::Instance(deque)) = its.get_hinted(IT_DEQ, &names().deq) else {
         return None;
     };
     // The deque lives while the iterator's slot holds it (unchanged here).
     let deque: *const crate::types::PyInstance = Rc::as_ptr(deque);
     let index = its
-        .get_hinted(IT_INDEX, "_index")
+        .get_hinted(IT_INDEX, &names().index)
         .and_then(Object::as_i64)?;
     let it_state = its
-        .get_hinted(IT_STATE, "_deq_state")
+        .get_hinted(IT_STATE, &names().deq_state)
         .and_then(Object::as_i64);
     // SAFETY: as above.
     let ds = unsafe { (*deque).slots.peek() }?;
-    let Some(Object::List(data)) = ds.get_hinted(SLOT_DATA, "_data") else {
+    let Some(Object::List(data)) = ds.get_hinted(SLOT_DATA, &names().data) else {
         return None;
     };
-    if ds.get_hinted(SLOT_STATE, "_state").and_then(Object::as_i64) != it_state {
+    if ds
+        .get_hinted(SLOT_STATE, &names().state)
+        .and_then(Object::as_i64)
+        != it_state
+    {
         return None;
     }
     let h = head_of(ds);
@@ -537,7 +578,7 @@ fn deque_next_fast(iterator: &crate::types::PyInstance, reverse: bool) -> Option
         h + index as usize
     };
     let v = d[slot].clone();
-    *its.get_hinted_mut(IT_INDEX, "_index")? = Object::Int(index + 1);
+    *its.get_hinted_mut(IT_INDEX, &names().index)? = Object::Int(index + 1);
     Some(v)
 }
 
@@ -557,8 +598,9 @@ fn deque_next(args: &[Object], reverse: bool) -> Result<Object, RuntimeError> {
         };
         (
             deque,
-            s.get_hinted(IT_INDEX, "_index").and_then(Object::as_i64),
-            s.get_hinted(IT_STATE, "_deq_state")
+            s.get_hinted(IT_INDEX, &names().index)
+                .and_then(Object::as_i64),
+            s.get_hinted(IT_STATE, &names().deq_state)
                 .and_then(Object::as_i64),
         )
     };

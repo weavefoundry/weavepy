@@ -971,7 +971,7 @@ pub struct Interpreter {
     /// The core loop's last native iterator `__next__`, keyed by the
     /// (process-unique) attribute version of the class that resolved it
     /// (see [`Interpreter::core_leaf_next`]).
-    core_next: ThreadCell<Option<(u64, Rc<crate::object::BuiltinFn>)>>,
+    core_next: ThreadCell<Option<(u64, Option<Rc<crate::object::BuiltinFn>>)>>,
     /// How the last class seen in a boolean context answers it (see
     /// [`Interpreter::leaf_instance_truth`]), by attribute version.
     core_truth: ThreadCell<Option<(u64, NativeTruth)>>,
@@ -12314,6 +12314,12 @@ impl Interpreter {
                                 Some(d) => !d.is_empty(),
                                 None => break None,
                             },
+                            // A registered native `__bool__`/`__len__`, or
+                            // neither (see `leaf_instance_truth`).
+                            Object::Instance(_) => match self.leaf_instance_truth(v) {
+                                Some(b) => b,
+                                None => break None,
+                            },
                             _ => break None,
                         };
                         // SAFETY: the operand (droppable) is replaced in place.
@@ -18326,6 +18332,58 @@ impl Interpreter {
         None
     }
 
+    /// `len(v)` for an instance whose class serves `__len__` with a
+    /// registered native leaf builtin (found through the class's leaf
+    /// attribute cache): the length, or `None` for the full path (which
+    /// raises whatever a missing or misbehaving `__len__` must).
+    fn leaf_instance_len(&self, v: &Object) -> Option<Object> {
+        use crate::types::LeafAttrKind as K;
+        /// The cache key for `__len__` (an address no interned name has).
+        static LEN_KEY: u8 = 0;
+        let Object::Instance(inst) = v else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        if crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let key = std::ptr::addr_of!(LEN_KEY) as usize;
+        let ver = cls.attr_version.get();
+        let b = match cls.leaf_attrs.get(key, ver) {
+            Some(K::BuiltinMethod(b)) => Rc::as_ptr(b),
+            Some(_) => return None,
+            None => {
+                let kind = match cls.lookup("__len__") {
+                    Some(Object::Builtin(b))
+                        if b.binds_instance
+                            && self.leaf_call_kind(&b) == Some(LeafKind::Opaque) =>
+                    {
+                        K::BuiltinMethod(b)
+                    }
+                    _ => K::Other,
+                };
+                let found = matches!(kind, K::BuiltinMethod(_));
+                cls.leaf_attrs.set(key, ver, kind);
+                return if found {
+                    self.leaf_instance_len(v)
+                } else {
+                    None
+                };
+            }
+        };
+        // SAFETY: the cache (and the class) keep the builtin alive through
+        // the call, whose body runs no Python.
+        let b = unsafe { &*b };
+        let r = match b.call_kw.as_ref() {
+            Some(ckw) => ckw(std::slice::from_ref(v), &[]),
+            None => (b.call)(std::slice::from_ref(v)),
+        };
+        match r.ok()? {
+            Object::Int(n) if n >= 0 => Some(Object::Int(n)),
+            _ => None,
+        }
+    }
+
     fn leaf_instance_truth(&self, v: &Object) -> Option<bool> {
         let Object::Instance(inst) = v else {
             return None;
@@ -18773,7 +18831,7 @@ impl Interpreter {
         let ver = inst.cls_raw().attr_version.get();
         if let Some((v, b)) = &*self.core_next.borrow() {
             if *v == ver {
-                return Some(Rc::as_ptr(b));
+                return b.as_ref().map(Rc::as_ptr);
             }
         }
         self.core_leaf_next_resolve(inst, ver)
@@ -18787,16 +18845,19 @@ impl Interpreter {
         inst: &PyInstance,
         ver: u64,
     ) -> Option<Rc<crate::object::BuiltinFn>> {
-        match inst.cls().lookup("__next__")? {
-            Object::Builtin(b)
+        // A miss is remembered too: a Python-level `__next__` class asks
+        // again on every step of a generic iteration.
+        let found = match inst.cls().lookup("__next__") {
+            Some(Object::Builtin(b))
                 if b.binds_instance
                     && matches!(self.leaf_call_kind(&b), Some(LeafKind::Opaque)) =>
             {
-                *self.core_next.borrow_mut() = Some((ver, b.clone()));
                 Some(b)
             }
             _ => None,
-        }
+        };
+        *self.core_next.borrow_mut() = Some((ver, found.clone()));
+        found
     }
 
     /// Which leaf builtin `b` is, if any (pointer identity).
@@ -18895,6 +18956,9 @@ impl Interpreter {
         let leaf_str = |o: &Object| matches!(o, O::Str(_));
         let leaf_int = |o: &Object| matches!(o, O::Int(_) | O::Bool(_));
         let admitted = match kind {
+            K::Len if matches!(args, [O::Instance(_)]) => {
+                return self.leaf_instance_len(&args[0]).map(Ok);
+            }
             K::Len => {
                 args.len() == 1
                     && matches!(
@@ -33444,6 +33508,24 @@ impl Interpreter {
                 Err(e) => Err(e),
             },
             Object::Instance(inst) => {
+                // A registered native leaf `__next__` (the class cache the
+                // core loop's `FOR_ITER` uses): called directly.
+                if !crate::gil::free_threading_enabled() && !crate::trace::any_observers_active() {
+                    if let Some(b) = self.core_leaf_next_ptr(inst) {
+                        // SAFETY: the cache (and the class) keep the builtin
+                        // alive through the call, whose body runs no Python.
+                        let b = unsafe { &*b };
+                        return match (b.call)(std::slice::from_ref(iter)) {
+                            Ok(v) => Ok(Some(v)),
+                            Err(RuntimeError::PyException(exc))
+                                if exc.type_name() == "StopIteration" =>
+                            {
+                                Ok(None)
+                            }
+                            Err(e) => Err(e),
+                        };
+                    }
+                }
                 if let Some(r) = instance_native_dunder(iter, "__next__", None) {
                     return match r {
                         Ok(v) => Ok(Some(v)),

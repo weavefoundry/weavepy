@@ -2243,7 +2243,8 @@ impl SlotStorage {
     pub fn get_hinted_mut(&mut self, idx: usize, name: &str) -> Option<&mut Object> {
         let at_hint = matches!(
             self.get_index(idx),
-            Some((DictKey(Object::Str(stored)), _)) if slot_name_eq(stored.as_ref(), name)
+            Some((DictKey(Object::Str(stored)), _))
+                if std::ptr::eq(stored.as_ptr(), name.as_ptr()) || slot_name_eq(stored.as_ref(), name)
         );
         if at_hint {
             return self.get_index_mut(idx).map(|(_, v)| v);
