@@ -12457,6 +12457,25 @@ impl Interpreter {
                                     None => break None,
                                 }
                             }
+                            // String concatenation, repetition and `%`
+                            // formatting over scalars, out of line.
+                            (Object::Str(_), _) | (Object::Int(_), Object::Str(_)) => {
+                                let Some(r) = Self::core_str_binop(a, b, kind) else {
+                                    break None;
+                                };
+                                // SAFETY: the operands are strings and scalars
+                                // (or a tuple of them): releasing them runs no
+                                // code and frees nothing the collector tracks.
+                                unsafe {
+                                    drop_hot(base.add(len - 1).read());
+                                    drop_hot(base.add(len - 2).read());
+                                }
+                                len -= 1;
+                                unsafe { base.add(len - 1).write(r) };
+                                last = pc;
+                                pc += 1;
+                                continue;
+                            }
                             _ => break None,
                         };
                         // SAFETY: both operands are scalars (no drop owed).
@@ -14252,6 +14271,41 @@ impl Interpreter {
                 false
             }
         }
+    }
+
+    /// The core loop's `BINARY_OP` over strings: `str + str`, a small
+    /// `str * int`, and `str % args` over scalar and string arguments
+    /// (the leaf arms' string cases). `None` for the full handler, which
+    /// also owns every error.
+    #[inline(never)]
+    fn core_str_binop(a: &Object, b: &Object, kind: BinOpKind) -> Option<Object> {
+        Some(match (a, b) {
+            (Object::Str(x), Object::Str(y)) if kind == BinOpKind::Add => {
+                Object::Str(SharedStr::concat(&[x, y]))
+            }
+            (Object::Str(s), Object::Int(k)) | (Object::Int(k), Object::Str(s))
+                if kind == BinOpKind::Mult =>
+            {
+                let times = usize::try_from(*k).unwrap_or(0);
+                if s.len().saturating_mul(times) > 1 << 16 {
+                    return None;
+                }
+                if times == 1 {
+                    // `s * 1` is `s` itself (CPython `unicode_repeat`).
+                    Object::Str(s.clone())
+                } else {
+                    Object::Str(SharedStr::repeat(s, times))
+                }
+            }
+            (Object::Str(t), args)
+                if kind == BinOpKind::Mod
+                    && percent_leaf_args(args)
+                    && !percent_args_need_bridge(args) =>
+            {
+                Object::from_str(percent_format(t, args).ok()?)
+            }
+            _ => return None,
+        })
     }
 
     /// The core loop's container instructions: `seq[i]` and `d[key]` over

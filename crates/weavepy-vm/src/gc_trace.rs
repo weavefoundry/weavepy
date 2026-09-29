@@ -3436,7 +3436,9 @@ pub fn track(obj: Object) {
 /// only in free-threaded mode.
 #[inline(always)]
 fn serial_add(counter: &AtomicUsize, n: usize) {
-    if crate::gil::free_threading_enabled() {
+    // (The debug unit-test binary runs interpreters on concurrent threads
+    // with no GIL between them: it keeps the locked form too.)
+    if cfg!(debug_assertions) || crate::gil::free_threading_enabled() {
         counter.fetch_add(n, Ordering::AcqRel);
     } else {
         let v = counter.load(Ordering::Relaxed);

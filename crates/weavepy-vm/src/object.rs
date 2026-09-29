@@ -4039,7 +4039,18 @@ static DICT_STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 
 #[inline]
 fn next_dict_stamp() -> u64 {
-    DICT_STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    use std::sync::atomic::Ordering::Relaxed;
+    // Dict mutation is serialized by the GIL, so a plain load and store
+    // hands out unique stamps without a locked read-modify-write (drawn on
+    // every mutable dict access). Free-threaded mode needs the real one,
+    // and so does the debug unit-test binary, whose tests run separate
+    // interpreters on concurrent threads with no GIL between them.
+    if cfg!(debug_assertions) || crate::gil::free_threading_enabled() {
+        return DICT_STAMP.fetch_add(1, Relaxed);
+    }
+    let v = DICT_STAMP.load(Relaxed);
+    DICT_STAMP.store(v + 1, Relaxed);
+    v
 }
 
 /// A [`DictMap`] with a mutation stamp: every mutable access (any
