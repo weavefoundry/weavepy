@@ -673,6 +673,8 @@ mod tests {
     fn weak_upgrades_and_shared_text_survive_thread_handoffs() {
         let value = SharedStr::from("shared 🧶 text");
         let weak = SharedStr::downgrade(&value);
+        // As the VM does before starting a thread: counts go atomic.
+        crate::sync::revoke_bias_for_spawn();
         std::thread::scope(|scope| {
             for _ in 0..2 {
                 let weak = weak.clone();

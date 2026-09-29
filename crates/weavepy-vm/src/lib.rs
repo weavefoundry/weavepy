@@ -11132,24 +11132,28 @@ impl Interpreter {
             callee_slot + 1
         };
         let values = &frame.stack[len - 1 - kwc..len - 1];
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
         let bound = Self::lean_bind_keywords(
             f,
             &code,
             frame.stack[first..len - 1 - kwc].iter(),
             names.iter().zip(values),
-        )?;
+            locals,
+        );
         // Past the recursion limit the nested lean path raises.
-        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
-            return None;
+        let guard = match (bound, crate::recursion::enter()) {
+            (Some(()), crate::recursion::Enter::Ok(guard)) => guard,
+            _ => {
+                locals.clear();
+                self.inline_unslot(act);
+                return None;
+            }
         };
         // Committed: the operands leave the stack.
         let callable = Object::Function(f.clone());
-        let operands: Vec<Object> = frame.stack.drain(callee_slot..).collect();
-        self.release_call_operands(operands);
-        let act = self.inline_slot();
-        // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
-        locals.extend(bound);
+        self.release_call_operands(&mut frame.stack, callee_slot);
         fill_unbound(locals, code.varnames.len());
         frame.pc = pc as u32 + 1;
         Some(self.inline_bind(frame, shell, pc, act, code, callable, guard))
@@ -11160,13 +11164,19 @@ impl Interpreter {
     /// temporary the collector tracks (the `**` mapping a call site
     /// built, say) is reaped at once, so what it held is released with
     /// the callee's own references rather than at the next collection.
-    fn release_call_operands(&mut self, operands: Vec<Object>) {
-        let mut operands = operands.into_iter();
-        if let Some(callee) = operands.next() {
-            self.reap_call_receiver(callee);
+    fn release_call_operands(&mut self, stack: &mut Vec<Object>, callee_slot: usize) {
+        let callee = std::mem::replace(&mut stack[callee_slot], Object::Unbound);
+        self.reap_call_receiver(callee);
+        self.reap_call_args(&mut stack[callee_slot + 1..]);
+        stack.truncate(callee_slot);
+    }
+
+    /// Return a parked activation slot [`Self::inline_slot`] handed out but
+    /// the call didn't use (its locals must be empty again).
+    fn inline_unslot(&mut self, act: Box<InlineAct>) {
+        if self.inline_pool.len() < INLINE_POOL_CAP {
+            self.inline_pool.push(act);
         }
-        let mut rest: Vec<Object> = operands.collect();
-        self.reap_call_args(&mut rest);
     }
 
     /// `LOAD_ATTR` of a `property` on a plain instance, from the quiet
@@ -13375,6 +13385,19 @@ impl Interpreter {
                     // A keyword call of a pure leaf through the site's cached
                     // keyword permutation (the full handler's `CallPyKwNames`
                     // hit), evaluated in place like `CALL`'s pure leaves.
+                    // `f(*args, **kwargs)` forwarding binds straight from the
+                    // local mapping (see `core_call_forward`); a decline
+                    // builds the dict as usual.
+                    OpCode::BuildMap if ins.arg == 0 && forward_call_shape(code, pc) => {
+                        // SAFETY: `len <= cap`, every slot initialized.
+                        unsafe { frame.stack.set_len(len) };
+                        frame.pc = pc as u32;
+                        *last_pc = last;
+                        if !self.core_call_forward(sw, pc) && sw.pending.is_none() {
+                            sw.pending = Some(CoreExit::Stop(LeafStop::Step));
+                        }
+                        break Some(CoreExit::Reload);
+                    }
                     // `f(*args)` of a Python callee switches in place (see
                     // `core_call_ex`); anything else takes the full handler.
                     OpCode::CallEx => {
@@ -14379,6 +14402,50 @@ impl Interpreter {
         true
     }
 
+    /// The core loop's `BUILD_MAP 0` at `pc` opening a forwarding call,
+    /// `f(*args, **kwargs)` (see [`forward_call_shape`]): the fresh
+    /// merged dictionary would only be read by the call's binder, so the
+    /// local mapping itself stands in as the call's `**` operand and the
+    /// `CALL_FUNCTION_EX` three instructions on runs inline. `false`
+    /// touches nothing (the instructions run one by one).
+    #[inline(never)]
+    fn core_call_forward(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+        if !self.inline_calls_ok() {
+            return false;
+        }
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch` (as in `core_call`).
+        let act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            let frame = &mut *frame;
+            let local = frame.code.instructions.get(pc + 1).map(|i| i.arg as usize);
+            // SAFETY: GIL-serialized read of the running activation's locals.
+            let locals: &Vec<Object> = &*frame.locals.as_ptr();
+            let mapping = match local.and_then(|i| locals.get(i)) {
+                Some(Object::Dict(d)) => Object::Dict(d.clone()),
+                _ => return false,
+            };
+            frame.stack.push(mapping);
+            let act = self.try_inline_call_ex(frame, &mut *shell.cast::<QuietShell<'_>>(), pc + 3);
+            if act.is_none() {
+                // Declined untouched: the operand leaves again.
+                frame.stack.pop();
+            }
+            act
+        };
+        let Some(mut act) = act else {
+            return false;
+        };
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { (*sw.inl).push(act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
+    }
+
     /// [`Self::core_call_ex`]'s activation: every check first, so a
     /// decline leaves the four `CALL_FUNCTION_EX` operands untouched.
     fn try_inline_call_ex(
@@ -14443,7 +14510,8 @@ impl Interpreter {
         // The spread tuple and a bound method were call temporaries (or
         // are still held elsewhere): grade their releases like any
         // dropped operand.
-        self.release_call_operands(vec![callee, spread, mapping]);
+        self.reap_call_receiver(callee);
+        self.reap_call_args(&mut [spread, mapping]);
         let self_slot = callee_slot + 1;
         let act = self.inline_slot();
         // SAFETY: a parked slot's locals storage is its own, and empty.
@@ -14497,26 +14565,29 @@ impl Interpreter {
             return None;
         }
         f.lean_cells_ref(&code)?;
-        let bound = {
-            let kw = mapping.try_borrow().ok()?;
-            Self::lean_bind_keywords(
-                &f,
-                &code,
-                receiver.iter().chain(items.iter()),
-                kw.iter().map(|(k, v)| (&k.0, v)),
-            )?
-        };
-        // Past the recursion limit the nested lean path raises.
-        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
-            return None;
-        };
-        // Committed: the operands leave the stack.
-        let operands: Vec<Object> = frame.stack.drain(callee_slot..).collect();
-        self.release_call_operands(operands);
+        let kw = mapping.try_borrow().ok()?;
         let act = self.inline_slot();
         // SAFETY: a parked slot's locals storage is its own, and empty.
         let locals = unsafe { &mut *act.frame.locals.as_ptr() };
-        locals.extend(bound);
+        let bound = Self::lean_bind_keywords(
+            &f,
+            &code,
+            receiver.iter().chain(items.iter()),
+            kw.iter().map(|(k, v)| (&k.0, v)),
+            locals,
+        );
+        drop(kw);
+        // Past the recursion limit the nested lean path raises.
+        let guard = match (bound, crate::recursion::enter()) {
+            (Some(()), crate::recursion::Enter::Ok(guard)) => guard,
+            _ => {
+                locals.clear();
+                self.inline_unslot(act);
+                return None;
+            }
+        };
+        // Committed: the operands leave the stack.
+        self.release_call_operands(&mut frame.stack, callee_slot);
         fill_unbound(locals, code.varnames.len());
         frame.pc = pc as u32 + 1;
         Some(self.inline_bind(frame, shell, pc, act, code, Object::Function(f), guard))
@@ -14534,15 +14605,21 @@ impl Interpreter {
         code: &CodeObject,
         positional: impl Iterator<Item = &'a Object>,
         kw: impl Iterator<Item = (&'a Object, &'a Object)>,
-    ) -> Option<Vec<Object>> {
+        out: &mut Vec<Object>,
+    ) -> Option<()> {
         let npos = code.arg_count as usize;
         let total = npos + code.kwonly_count as usize;
         let posonly = code.posonly_count as usize;
-        let mut slots: Vec<Object> = vec![Object::Unbound; total];
+        debug_assert!(out.is_empty());
+        fill_unbound(out, total);
+        // (Every slot written below still holds `Unbound`, which owns
+        // nothing: it is overwritten without drop glue.)
+        let bind =
+            |slot: &mut Object, v: &Object| std::mem::forget(std::mem::replace(slot, v.clone()));
         let mut surplus: Vec<Object> = Vec::new();
         for (i, v) in positional.enumerate() {
             if i < npos {
-                slots[i] = v.clone();
+                bind(&mut out[i], v);
             } else if code.has_varargs {
                 surplus.push(v.clone());
             } else {
@@ -14550,6 +14627,7 @@ impl Interpreter {
             }
         }
         let mut varkw: Option<DictData> = None;
+        let kw_hint = kw.size_hint().0;
         for (key, v) in kw {
             let Object::Str(name) = key else {
                 return None;
@@ -14559,47 +14637,51 @@ impl Interpreter {
                 .position(|n| n.as_str() == &**name)
             {
                 Some(p) => {
-                    let slot = &mut slots[posonly + p];
+                    let slot = &mut out[posonly + p];
                     if !matches!(slot, Object::Unbound) {
                         return None;
                     }
-                    *slot = v.clone();
+                    bind(slot, v);
                 }
                 None if code.has_varkeywords => {
                     varkw
-                        .get_or_insert_with(DictData::default)
+                        .get_or_insert_with(|| {
+                            DictData::with_capacity_and_hasher(
+                                kw_hint.max(1),
+                                crate::fasthash::FxBuildHasher,
+                            )
+                        })
                         .insert(DictKey(key.clone()), v.clone());
                 }
                 None => return None,
             }
         }
         let first_default = npos.checked_sub(f.defaults.len())?;
-        for (i, slot) in slots[..npos].iter_mut().enumerate() {
+        for (i, slot) in out[..npos].iter_mut().enumerate() {
             if matches!(slot, Object::Unbound) {
                 if i < first_default {
                     return None;
                 }
-                *slot = f.defaults[i - first_default].clone();
+                bind(slot, &f.defaults[i - first_default]);
             }
         }
-        for (slot, d) in slots[npos..].iter_mut().zip(Self::kwonly_defaults(f, code)) {
+        for (slot, d) in out[npos..total]
+            .iter_mut()
+            .zip(Self::kwonly_defaults(f, code))
+        {
             if matches!(slot, Object::Unbound) {
-                *slot = d?.clone();
+                bind(slot, d?);
             }
         }
         if code.has_varargs {
-            slots.push(if surplus.is_empty() {
-                Object::new_tuple(Vec::new())
-            } else {
-                Object::new_tuple(surplus)
-            });
+            out.push(Object::new_tuple(surplus));
         }
         if code.has_varkeywords {
-            slots.push(Object::Dict(Rc::new(RefCell::new(
+            out.push(Object::Dict(Rc::new(RefCell::new(
                 varkw.unwrap_or_default(),
             ))));
         }
-        Some(slots)
+        Some(())
     }
 
     /// The core loop's `CALL` of a plain class at `pc` of `sw`'s (synced)
@@ -63938,6 +64020,21 @@ fn code_is_effect_leaf(code: &CodeObject) -> bool {
         code_is_pure_leaf(code);
     }
     code.jit_hint.effect_leaf()
+}
+
+/// Whether the `BUILD_MAP 0` at `pc` opens `f(*args, **kwargs)`'s mapping:
+/// `LOAD_FAST kwargs; DICT_MERGE 1; CALL_FUNCTION_EX` follow.
+#[inline(always)]
+fn forward_call_shape(code: &CodeObject, pc: usize) -> bool {
+    let ops = &code.instructions;
+    matches!(
+        (ops.get(pc + 1), ops.get(pc + 2), ops.get(pc + 3)),
+        (Some(load), Some(merge), Some(call))
+            if matches!(load.op, OpCode::LoadFast | OpCode::LoadFastBorrow)
+                && merge.op == OpCode::DictUpdate
+                && merge.arg == 1
+                && call.op == OpCode::CallEx
+    )
 }
 
 /// Whether the instructions from `pc` could open a simple call's
