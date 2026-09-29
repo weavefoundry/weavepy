@@ -83,6 +83,9 @@ use std::sync::atomic::{
 use crate::object::Object;
 use crate::weakref_registry::{id_of, ObjectId};
 
+/// A set of object ids (addresses), hashed with the address mixer.
+type IdSet = std::collections::HashSet<ObjectId, BuildHasherDefault<ObjectIdHasher>>;
+
 type GcIndex = std::collections::HashMap<
     ObjectId,
     HandleRc<TrackedHandle>,
@@ -1088,7 +1091,7 @@ impl GcState {
     fn collect_child_candidates(&self, obj: &Object, work: &mut Vec<ObjectId>) {
         let mut pending: Vec<Object> = Vec::new();
         traverse_object(obj, &mut |child| pending.push(child.clone()));
-        let mut seen: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+        let mut seen: IdSet = IdSet::default();
         while let Some(child) = pending.pop() {
             let id = id_of(&child);
             if !seen.insert(id) {
@@ -2210,19 +2213,17 @@ impl GcState {
         // (test_callbacks_on_callback: `c.wr`/`d.wr` stay silent while the
         // external `safe_callback` fires). Snapshot the trash ids so the
         // queue loops below can drop callbacks belonging to trash wrappers.
-        let mut trash_ids: std::collections::HashSet<ObjectId> =
-            unreachable.iter().map(|h| h.id).collect();
-        let wrapper_is_trash =
-            |slot: &crate::sync::Rc<crate::weakref_registry::WeakRefSlot>,
-             trash: &std::collections::HashSet<ObjectId>| {
-                slot.py_ref
-                    .borrow()
-                    .as_ref()
-                    .and_then(crate::sync::Weak::upgrade)
-                    .is_none_or(|inst| {
-                        trash.contains(&(crate::sync::Rc::as_ptr(&inst) as usize as u64))
-                    })
-            };
+        let mut trash_ids: IdSet = unreachable.iter().map(|h| h.id).collect();
+        let wrapper_is_trash = |slot: &crate::sync::Rc<crate::weakref_registry::WeakRefSlot>,
+                                trash: &IdSet| {
+            slot.py_ref
+                .borrow()
+                .as_ref()
+                .and_then(crate::sync::Weak::upgrade)
+                .is_none_or(|inst| {
+                    trash.contains(&(crate::sync::Rc::as_ptr(&inst) as usize as u64))
+                })
+        };
 
         if weakref_only {
             let mut weakref_callbacks = Vec::new();
@@ -2475,9 +2476,9 @@ impl GcState {
         // callbacks and recursing into its children. Finalizable orphans are
         // left for a finalizing collection so `__del__` ordering is preserved.
         if !saveall {
-            let dead_ids: std::collections::HashSet<ObjectId> = dead.iter().map(|h| h.id).collect();
+            let dead_ids: IdSet = dead.iter().map(|h| h.id).collect();
             let mut worklist = cascade_seed;
-            let mut seen: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+            let mut seen: IdSet = IdSet::default();
             while let Some(cid) = worklist.pop() {
                 if dead_ids.contains(&cid) || by_id.contains_key(&cid) || !seen.insert(cid) {
                     // Dead (already reaped), a candidate this collection owns,
@@ -3350,13 +3351,16 @@ pub fn zombie_memoryview_refs_to(target: ObjectId) -> usize {
         if handles.is_empty() {
             return 0;
         }
-        let mut zombies: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+        let mut zombies: IdSet = IdSet::default();
         loop {
             // Inbound references each candidate receives from the current
             // zombie set (a dropped chain of sub-views keeps inner views'
             // counts up via exporter edges).
-            let mut inbound: std::collections::HashMap<ObjectId, usize> =
-                std::collections::HashMap::new();
+            let mut inbound: std::collections::HashMap<
+                ObjectId,
+                usize,
+                BuildHasherDefault<ObjectIdHasher>,
+            > = Default::default();
             for h in &handles {
                 if zombies.contains(&h.id) {
                     traverse_object(&h.object, &mut |c| {
@@ -3907,9 +3911,9 @@ struct Suspect {
     budget: u8,
     dormant_probes: u8,
 }
-type SuspectMap = indexmap::IndexMap<ObjectId, Suspect>;
+type SuspectMap = indexmap::IndexMap<ObjectId, Suspect, BuildHasherDefault<ObjectIdHasher>>;
 static SUSPECTS: std::sync::LazyLock<parking_lot::Mutex<SuspectMap>> =
-    std::sync::LazyLock::new(|| parking_lot::Mutex::new(SuspectMap::new()));
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(SuspectMap::default()));
 static SUSPECT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Entries with probe budget remaining. When only dormant entries are
 /// left, [`has_suspects`] admits a sweep every [`DORMANT_STRIDE`]-th
@@ -4637,7 +4641,7 @@ mod tests {
     #[test]
     fn suspect_eviction_preserves_minimum_order_counts_and_release() {
         for mode in 0..6 {
-            let mut suspects = SuspectMap::new();
+            let mut suspects = SuspectMap::default();
             let mut reference = Vec::new();
             let mut handles = std::collections::HashMap::new();
             for index in 0..SUSPECT_CAP {

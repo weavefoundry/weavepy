@@ -25,7 +25,12 @@
 //! failed — test_interpreters TestInterpreterCall after a prior test's
 //! interpreter was torn down).
 
-use std::collections::{HashMap, HashSet};
+/// Address-keyed tables: object ids are aligned addresses, hashed with the
+/// cheap address mixer rather than SipHash (they carry no untrusted input).
+type HashMap<K, V> =
+    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<crate::fasthash::ObjectIdHasher>>;
+type HashSet<K> =
+    std::collections::HashSet<K, std::hash::BuildHasherDefault<crate::fasthash::ObjectIdHasher>>;
 use std::sync::LazyLock;
 
 use crate::object::Object;
@@ -63,13 +68,13 @@ pub struct DescrMeta {
 /// `inspect.getattr_static` (and so `import traceback`, via `_colorize`'s
 /// dataclasses) in any sub-interpreter created off the main thread.
 static DESCR_META: LazyLock<parking_lot::RwLock<HashMap<usize, StoredMeta>>> =
-    LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
+    LazyLock::new(|| parking_lot::RwLock::new(HashMap::default()));
 
 /// Every pointer key any table below has ever been given (and not yet
 /// forgotten). `Drop` consults this one set first, so the common case —
 /// a builtin no table knows — costs a single read-locked hash probe.
 static TAGGED: LazyLock<parking_lot::RwLock<HashSet<usize>>> =
-    LazyLock::new(|| parking_lot::RwLock::new(HashSet::new()));
+    LazyLock::new(|| parking_lot::RwLock::new(HashSet::default()));
 
 fn note_key(k: usize) {
     TAGGED.write().insert(k);
@@ -129,7 +134,7 @@ struct StoredMeta {
 /// `multiprocessing.Queue` feeder thread. The `Rc` pointer key is stable for
 /// the process lifetime and the value is `&'static str`, so sharing is sound.
 static BUILTIN_MODULE: LazyLock<parking_lot::RwLock<HashMap<usize, &'static str>>> =
-    LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
+    LazyLock::new(|| parking_lot::RwLock::new(HashMap::default()));
 
 /// Attribute `obj` (a native builtin function) to module `module`, so its
 /// `__module__` reports that instead of the default `"builtins"`.
@@ -174,7 +179,7 @@ pub fn module_of_builtin(b: &Rc<crate::object::BuiltinFn>) -> Option<&'static st
 /// thread through the module cache, and its descriptors may be read from
 /// any of them.
 static NATIVE_DESCR_ACCESSOR: LazyLock<parking_lot::RwLock<HashSet<usize>>> =
-    LazyLock::new(|| parking_lot::RwLock::new(HashSet::new()));
+    LazyLock::new(|| parking_lot::RwLock::new(HashSet::default()));
 
 /// Type-dict entries that exist for *introspection only* (RFC 0056 WS4):
 /// CPython materializes every slot wrapper in `tp_dict` (`'__lt__' in
@@ -190,7 +195,7 @@ static NATIVE_DESCR_ACCESSOR: LazyLock<parking_lot::RwLock<HashSet<usize>>> =
 /// PROCESS-GLOBAL for the same reason as [`BUILTIN_MODULE`]: the type
 /// singletons and their dict entries are shared across threads.
 static SURFACE_ONLY: LazyLock<parking_lot::RwLock<HashSet<usize>>> =
-    LazyLock::new(|| parking_lot::RwLock::new(HashSet::new()));
+    LazyLock::new(|| parking_lot::RwLock::new(HashSet::default()));
 
 /// The default-allocator `__new__` builtins (`make_default_new` /
 /// `make_owned_new`), by identity. Several *real* constructing builtins
@@ -198,7 +203,7 @@ static SURFACE_ONLY: LazyLock<parking_lot::RwLock<HashSet<usize>>> =
 /// sequences…), so the instantiation path cannot key on the name alone
 /// now that the allocators are stored as raw builtins.
 static DEFAULT_NEW: LazyLock<parking_lot::RwLock<HashSet<usize>>> =
-    LazyLock::new(|| parking_lot::RwLock::new(HashSet::new()));
+    LazyLock::new(|| parking_lot::RwLock::new(HashSet::default()));
 
 /// Tag `obj` as a default-allocator `__new__` (see [`is_default_new`]).
 pub fn mark_default_new(obj: &Object) {
@@ -272,7 +277,7 @@ pub fn is_native_descr_accessor(b: &Rc<crate::object::BuiltinFn>) -> bool {
 /// so `pickle.dumps` failed with "it's not found as
 /// `_multiarray_umath._reconstruct`" (RFC 0076 WS2).
 static BUILTIN_WRITABLE_MODULE: LazyLock<parking_lot::RwLock<HashMap<usize, Object>>> =
-    LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
+    LazyLock::new(|| parking_lot::RwLock::new(HashMap::default()));
 
 /// Record a runtime `__module__` assignment on a builtin function.
 /// Returns `false` if `obj` is not a taggable representation.
@@ -355,7 +360,7 @@ pub fn lookup(obj: &Object) -> Option<DescrMeta> {
 /// name-keyed table in `builtin_text_signature` can't reach.
 /// PROCESS-GLOBAL for the same reason as [`DESCR_META`].
 static TEXT_SIGNATURE: LazyLock<parking_lot::RwLock<HashMap<usize, &'static str>>> =
-    LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
+    LazyLock::new(|| parking_lot::RwLock::new(HashMap::default()));
 
 /// Attach an Argument-Clinic `__text_signature__` string to `obj`.
 pub fn register_text_signature(obj: &Object, sig: &'static str) {
@@ -397,7 +402,7 @@ pub type LiveDocReader = unsafe fn(usize) -> Option<String>;
 /// through the shared module cache. The addresses point into the
 /// extension's method tables, which live for the process lifetime.
 static LIVE_C_DOC: LazyLock<parking_lot::RwLock<HashMap<usize, (usize, LiveDocReader)>>> =
-    LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
+    LazyLock::new(|| parking_lot::RwLock::new(HashMap::default()));
 
 /// Attach a live C-doc reader to `obj` (a bridged method descriptor).
 pub fn register_live_c_doc(obj: &Object, addr: usize, read: LiveDocReader) {

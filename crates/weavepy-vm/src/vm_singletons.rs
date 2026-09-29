@@ -818,8 +818,8 @@ thread_local! {
     /// A queue request for an id in this set is the cascade observing
     /// itself and is dropped; requests for *other* objects (a child body
     /// whose last C pin fell during the teardown) still queue normally.
-    static CASCADING_IDS: RefCell<std::collections::HashSet<u64>> =
-        RefCell::new(std::collections::HashSet::new());
+    static CASCADING_IDS: RefCell<crate::fasthash::FxHashSet<u64>> =
+        RefCell::new(crate::fasthash::FxHashSet::default());
 }
 
 /// RAII marker for one object's trip through the prompt reaper's cascade;

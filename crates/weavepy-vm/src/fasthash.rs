@@ -124,6 +124,11 @@ impl Hasher for ObjectIdHasher {
     fn write_u64(&mut self, word: u64) {
         self.0.write_u64(word);
     }
+
+    #[inline]
+    fn write_usize(&mut self, word: usize) {
+        self.0.write_usize(word);
+    }
 }
 
 /// `BuildHasher` for [`FxHasher`] — usable as the `S` parameter of

@@ -696,7 +696,18 @@ struct Owned {
 }
 
 impl Drop for Owned {
+    // Usually nothing is held: no call for the empty case.
+    #[inline(always)]
     fn drop(&mut self) {
+        if self.n != 0 {
+            self.release();
+        }
+    }
+}
+
+impl Owned {
+    #[inline(never)]
+    fn release(&mut self) {
         for k in 0..self.n {
             // SAFETY: the first `n` entries are initialized.
             crate::drop_hot(unsafe { self.buf[k].assume_init_read() });
@@ -762,7 +773,18 @@ impl Pending {
 }
 
 impl Drop for Pending {
+    // Usually nothing is buffered: no call for the empty case.
+    #[inline(always)]
     fn drop(&mut self) {
+        if self.n != 0 {
+            self.release();
+        }
+    }
+}
+
+impl Pending {
+    #[inline(never)]
+    fn release(&mut self) {
         for k in 0..self.n {
             // SAFETY: the first `n` entries are initialized; a moved value
             // is left in place, not dropped again.
@@ -863,9 +885,10 @@ impl Interpreter {
         loop {
             // SAFETY: every path ends in a return or a jump, and every
             // jump target is an op (checked when the plan was built).
-            let op = unsafe { *ops.get_unchecked(ip) };
+            // Matched in place: each arm loads only its own operands.
+            let op: &Op = unsafe { ops.get_unchecked(ip) };
             ip += 1;
-            match op {
+            match *op {
                 Op::Move { dst, src } => set!(dst, get!(src)),
                 // SAFETY: `k` names a plan constant (the translation).
                 Op::Const { dst, k } => set!(dst, unsafe { *consts.get_unchecked(usize::from(k)) }),
