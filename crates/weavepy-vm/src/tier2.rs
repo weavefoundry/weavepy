@@ -3193,6 +3193,12 @@ struct CallCtx {
     /// the exact chain). `None` for a framed entry — its `Frame`'s
     /// shell is already on the spine.
     frameless_code: Option<Rc<CodeObject>>,
+    /// The last dynamic call's resolved native callee, keyed by the
+    /// function and code identities and the method form: a site calling
+    /// the same function again (a stored bound method, a function held in
+    /// a local) re-enters without re-resolving or rebuilding the handle.
+    /// Taken out for the call's duration and put back after.
+    dyn_callee: Option<(usize, usize, bool, NativeCallee)>,
 }
 
 impl CallCtx {
@@ -4465,6 +4471,7 @@ unsafe fn try_native_call(
             // The native call lanes push no interpreter frame for the
             // callee — keep it observable to callee-side stack walkers.
             frameless_code: Some(nc.code.clone()),
+            dyn_callee: None,
         })
     };
     child.interp = ctx.interp;
@@ -8545,22 +8552,40 @@ unsafe fn try_dyn_native(
     argc: u32,
     int_result: bool,
 ) -> Option<i64> {
-    let (nc, recv) = match callee {
-        Object::Function(pf) => {
-            let fcode = pf.code.borrow().clone();
-            let nc = JIT.with(|c| c.borrow().resolve_native_func(pf, &fcode, false))?;
-            (nc, None)
-        }
+    // A plain function or a bound method's function: the activation's
+    // last resolution when it names the same function and code (see
+    // `CallCtx::dyn_callee`).
+    let plain = match callee {
+        Object::Function(pf) => Some((pf, None)),
         // A deferred special-method dispatch (`redispatch_descriptor`)
         // re-resolves `__get__` at call time — interpreter territory.
-        Object::BoundMethod(bm) if !bm.redispatch_descriptor => {
-            let Object::Function(pf) = &bm.function else {
-                return None;
-            };
-            let fcode = pf.code.borrow().clone();
-            let nc = JIT.with(|c| c.borrow().resolve_native_func(pf, &fcode, true))?;
-            (nc, Some(bm.receiver.clone()))
-        }
+        Object::BoundMethod(bm) if !bm.redispatch_descriptor => match &bm.function {
+            Object::Function(pf) => Some((pf, Some(bm.receiver.clone()))),
+            _ => return None,
+        },
+        _ => None,
+    };
+    if let Some((pf, recv)) = plain {
+        let method = recv.is_some();
+        // SAFETY: GIL-serialized raw read of the function's code cell;
+        // only the pointer is compared.
+        let code_ptr = unsafe { Rc::as_ptr(&*pf.code.as_ptr()) } as usize;
+        let key = (Rc::as_ptr(pf) as usize, code_ptr, method);
+        let nc = match ctx.dyn_callee.take() {
+            Some((f, c, m, nc)) if (f, c, m) == key => nc,
+            _ => {
+                let fcode = pf.code.borrow().clone();
+                JIT.with(|c| c.borrow().resolve_native_func(pf, &fcode, method))?
+            }
+        };
+        // SAFETY: the resolved owners outlive the call, and the same
+        // initialized argument-buffer contract applies to the shared
+        // entry path.
+        let r = unsafe { enter_dyn_native(jf, ctx, interp, &nc, argc, recv.as_ref(), int_result) };
+        ctx.dyn_callee = Some((key.0, key.1, key.2, nc));
+        return r;
+    }
+    let (nc, recv) = match callee {
         Object::Type(t) => {
             // Mirror `resolve_native_callee`'s constructor arm: the
             // memoised instance plan must be current and carry a
@@ -10152,6 +10177,7 @@ pub(crate) fn try_call_native_direct(
         // The frameless direct entry pushes no interpreter frame —
         // keep the activation observable to callee-side stack walkers.
         frameless_code: Some(code.clone()),
+        dyn_callee: None,
     };
     let mut jf = JitFrame {
         locals: locals_buf.as_mut_ptr(),
@@ -10954,6 +10980,7 @@ fn enter_compiled(
         // Framed entry: this activation's `Frame` shell is on the
         // spine already.
         frameless_code: None,
+        dyn_callee: None,
     };
     let mut jf = JitFrame {
         locals: locals_buf.as_mut_ptr(),
@@ -11842,6 +11869,7 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
         // Framed entry (generator resume): the resumed `Frame`'s shell
         // is on the spine already.
         frameless_code: None,
+        dyn_callee: None,
     };
     let mut jf = JitFrame {
         locals: act.locals_buf.as_mut_ptr(),
