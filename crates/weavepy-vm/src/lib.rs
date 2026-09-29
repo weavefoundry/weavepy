@@ -10500,10 +10500,16 @@ impl Interpreter {
         if code.is_generator
             || code.is_coroutine
             || code.is_async_generator
-            || code.has_varargs
-            || code.has_varkeywords
-            || code.kwonly_count != 0
             || !Self::lean_code_ok(&code)
+        {
+            return None;
+        }
+        // Keyword-only parameters bind their compiled defaults (a positional
+        // call supplies none of them); a replaced `__kwdefaults__` takes the
+        // generic binder.
+        if code.kwonly_count != 0
+            && ((f.defaults_maybe_overridden() && f.slot("__kwdefaults__").is_some())
+                || !Self::kwonly_defaults(f, &code).all(|d| d.is_some()))
         {
             return None;
         }
@@ -10522,12 +10528,37 @@ impl Interpreter {
             }
             total - eff_argc
         } else {
-            if total != eff_argc {
+            // Surplus positionals go to `*args`.
+            if total != eff_argc && !code.has_varargs {
                 return None;
             }
             0
         };
         Some((code, missing))
+    }
+
+    /// Whether `code` binds parameters beyond its positional ones: `*args`,
+    /// `**kwargs`, or keyword-only parameters.
+    #[inline(always)]
+    fn has_extended_params(code: &CodeObject) -> bool {
+        code.has_varargs || code.has_varkeywords || code.kwonly_count != 0
+    }
+
+    /// `f`'s compiled default for each of `code`'s keyword-only parameters,
+    /// in parameter order.
+    fn kwonly_defaults<'a>(
+        f: &'a PyFunction,
+        code: &'a CodeObject,
+    ) -> impl Iterator<Item = Option<&'a Object>> + 'a {
+        let npos = code.arg_count as usize;
+        code.varnames[npos..npos + code.kwonly_count as usize]
+            .iter()
+            .map(|name| {
+                f.kw_defaults
+                    .iter()
+                    .find(|(n, _)| n == name.as_str())
+                    .map(|(_, v)| v)
+            })
     }
 
     /// Move a shape-checked lean call's operands off `frame`'s stack: the
@@ -10572,15 +10603,19 @@ impl Interpreter {
         let nlocals = code.varnames.len();
         let first_arg = if has_self { self_slot } else { self_slot + 1 };
         v.reserve(nlocals);
-        v.extend(frame.stack.drain(first_arg..));
-        if missing > 0 {
-            let Object::Function(f) = &frame.stack[callee_slot] else {
-                unreachable!("callee variant checked by the caller")
-            };
-            // Defaults align right-to-left with the declared
-            // positionals, exactly like the generic binder's
-            // missing-tail fill.
-            v.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
+        if Self::has_extended_params(code) {
+            Self::lean_call_fill_extended(frame, code, first_arg, callee_slot, missing, v);
+        } else {
+            v.extend(frame.stack.drain(first_arg..));
+            if missing > 0 {
+                let Object::Function(f) = &frame.stack[callee_slot] else {
+                    unreachable!("callee variant checked by the caller")
+                };
+                // Defaults align right-to-left with the declared
+                // positionals, exactly like the generic binder's
+                // missing-tail fill.
+                v.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
+            }
         }
         fill_unbound(v, nlocals);
         if !has_self {
@@ -10590,6 +10625,49 @@ impl Interpreter {
             .stack
             .pop()
             .expect("callee slot checked by the caller")
+    }
+
+    /// [`Self::lean_call_fill`] for a callee with `*args`, `**kwargs` or
+    /// keyword-only parameters (see [`Self::lean_call_shape`]): the
+    /// positional parameters, their missing defaults, each keyword-only
+    /// parameter's default, the surplus positionals as the `*args` tuple,
+    /// and an empty `**kwargs` dictionary, in the locals' parameter order.
+    #[cold]
+    #[inline(never)]
+    fn lean_call_fill_extended(
+        frame: &mut Frame,
+        code: &CodeObject,
+        first_arg: usize,
+        callee_slot: usize,
+        missing: usize,
+        v: &mut Vec<Object>,
+    ) {
+        let npos = code.arg_count as usize;
+        let direct = (frame.stack.len() - first_arg).min(npos);
+        v.extend(frame.stack.drain(first_arg..first_arg + direct));
+        let star = code.has_varargs.then(|| {
+            if frame.stack.len() == first_arg {
+                // The interned empty tuple.
+                Object::new_tuple(Vec::new())
+            } else {
+                Object::Tuple(crate::tuple_storage::TupleStorage::from_exact_iter(
+                    frame.stack.drain(first_arg..),
+                ))
+            }
+        });
+        let Object::Function(f) = &frame.stack[callee_slot] else {
+            unreachable!("callee variant checked by the caller")
+        };
+        if missing > 0 {
+            v.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
+        }
+        for d in Self::kwonly_defaults(f, code) {
+            v.push(d.cloned().unwrap_or(Object::Unbound));
+        }
+        v.extend(star);
+        if code.has_varkeywords {
+            v.push(Object::Dict(Rc::new(RefCell::new(DictData::default()))));
+        }
     }
 
     /// The inline half of `CALL`: `try_lean_call`'s plain-function shapes
@@ -10995,7 +11073,9 @@ impl Interpreter {
         shell: &mut QuietShell<'_>,
         pc: usize,
     ) -> Option<Box<InlineAct>> {
-        let shape = Self::lean_call_kw_shape(frame, pc)?;
+        let Some(shape) = Self::lean_call_kw_shape(frame, pc) else {
+            return self.try_inline_call_kw_named(frame, shell, pc);
+        };
         // Past the recursion limit the nested lean path raises.
         let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
             return None;
@@ -11008,6 +11088,85 @@ impl Interpreter {
         let callable = Self::lean_call_kw_fill(frame, shape, locals);
         frame.pc = pc as u32 + 1;
         Some(self.inline_bind(frame, shell, pc, act, code, callable, guard))
+    }
+
+    /// [`Self::try_inline_call_kw`] for a callee the site's cached
+    /// permutation can't describe (`*args`, for one): the keywords bind by
+    /// name (see [`Self::lean_bind_keywords`]) before anything is touched.
+    fn try_inline_call_kw_named(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+    ) -> Option<Box<InlineAct>> {
+        use weavepy_compiler::InlineCache as IC;
+        // A first execution still specializes the site.
+        if matches!(frame.code.caches.get(pc as u32), IC::Empty) {
+            return None;
+        }
+        let argc = frame.code.instructions.get(pc)?.arg as usize;
+        let len = frame.stack.len();
+        let Some(Object::Tuple(names)) = frame.stack.last() else {
+            return None;
+        };
+        let kwc = names.len();
+        // Stack: callable, self-or-null, positionals, keyword values, names.
+        let callee_slot = len.checked_sub(kwc + argc + 3)?;
+        let Object::Function(f) = &frame.stack[callee_slot] else {
+            return None;
+        };
+        let code = f.code();
+        if code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || !Self::lean_code_ok(&code)
+            || (f.defaults_maybe_overridden()
+                && (f.slot("__defaults__").is_some() || f.slot("__kwdefaults__").is_some()))
+        {
+            return None;
+        }
+        f.lean_cells_ref(&code)?;
+        let first = if matches!(frame.stack[callee_slot + 1], Object::Unbound) {
+            callee_slot + 2
+        } else {
+            callee_slot + 1
+        };
+        let values = &frame.stack[len - 1 - kwc..len - 1];
+        let bound = Self::lean_bind_keywords(
+            f,
+            &code,
+            frame.stack[first..len - 1 - kwc].iter(),
+            names.iter().zip(values),
+        )?;
+        // Past the recursion limit the nested lean path raises.
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
+            return None;
+        };
+        // Committed: the operands leave the stack.
+        let callable = Object::Function(f.clone());
+        let operands: Vec<Object> = frame.stack.drain(callee_slot..).collect();
+        self.release_call_operands(operands);
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        locals.extend(bound);
+        fill_unbound(locals, code.varnames.len());
+        frame.pc = pc as u32 + 1;
+        Some(self.inline_bind(frame, shell, pc, act, code, callable, guard))
+    }
+
+    /// Release a call's operands (the callee first) once its parameters
+    /// are bound, as the full call handler does after it returns: a
+    /// temporary the collector tracks (the `**` mapping a call site
+    /// built, say) is reaped at once, so what it held is released with
+    /// the callee's own references rather than at the next collection.
+    fn release_call_operands(&mut self, operands: Vec<Object>) {
+        let mut operands = operands.into_iter();
+        if let Some(callee) = operands.next() {
+            self.reap_call_receiver(callee);
+        }
+        let mut rest: Vec<Object> = operands.collect();
+        self.reap_call_args(&mut rest);
     }
 
     /// `LOAD_ATTR` of a `property` on a plain instance, from the quiet
@@ -13216,6 +13375,18 @@ impl Interpreter {
                     // A keyword call of a pure leaf through the site's cached
                     // keyword permutation (the full handler's `CallPyKwNames`
                     // hit), evaluated in place like `CALL`'s pure leaves.
+                    // `f(*args)` of a Python callee switches in place (see
+                    // `core_call_ex`); anything else takes the full handler.
+                    OpCode::CallEx => {
+                        // SAFETY: `len <= cap`, every slot initialized.
+                        unsafe { frame.stack.set_len(len) };
+                        frame.pc = pc as u32;
+                        *last_pc = last;
+                        if !self.core_call_ex(sw, pc) && sw.pending.is_none() {
+                            sw.pending = Some(CoreExit::Stop(LeafStop::Step));
+                        }
+                        break Some(CoreExit::Reload);
+                    }
                     OpCode::CallKw => {
                         let argc = ins.arg as usize;
                         // SAFETY: `len > 0` is checked first; the operands of
@@ -13230,6 +13401,8 @@ impl Interpreter {
                             break None;
                         }
                         let start = len - kwc - argc - 3;
+                        // SAFETY: the callee and its self slot are live.
+                        unsafe { Self::core_instance_callee(base.add(start)) };
                         // SAFETY: `start + kwc + argc + 3 == len`.
                         let ops =
                             unsafe { std::slice::from_raw_parts(base.add(start), len - start) };
@@ -13285,6 +13458,9 @@ impl Interpreter {
                             }
                             break Some(CoreExit::Reload);
                         }
+                        // SAFETY: `len >= argc + 2`: the callee and its self
+                        // slot.
+                        unsafe { Self::core_instance_callee(base.add(len - argc - 2)) };
                         // SAFETY: `len >= argc + 2`.
                         let python = match unsafe { &*base.add(len - argc - 2) } {
                             Object::Function(_) => 1,
@@ -14073,7 +14249,9 @@ impl Interpreter {
                     let act = self.try_inline_call(frame, shell, pc);
                     if let (Some(act), Some((func, has_self, eff_argc))) = (&act, shape) {
                         let code = &act.frame.code;
-                        if let Some(slot) = code_call_slot(&frame.code, pc) {
+                        if let Some(slot) = code_call_slot(&frame.code, pc)
+                            .filter(|_| !Self::has_extended_params(code))
+                        {
                             slot.set(CallShape {
                                 func,
                                 code: Rc::downgrade(code),
@@ -14161,6 +14339,258 @@ impl Interpreter {
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
         true
+    }
+
+    /// The core loop's `CALL_FUNCTION_EX` at `pc` of `sw`'s (synced)
+    /// running activation, for `f(*args)` with no `**` mapping: the tuple
+    /// or list spreads into an ordinary call's operands, and a plain
+    /// Python callee (or a bound method over one) runs as an inline
+    /// activation switched to here. `false` touches nothing.
+    #[inline(never)]
+    fn core_call_ex(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+        if !self.inline_calls_ok() {
+            return false;
+        }
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch` (as in `core_call`).
+        let act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            self.try_inline_call_ex(&mut *frame, &mut *shell.cast::<QuietShell<'_>>(), pc)
+        };
+        let Some(mut act) = act else {
+            return false;
+        };
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { (*sw.inl).push(act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
+    }
+
+    /// [`Self::core_call_ex`]'s activation: every check first, so a
+    /// decline leaves the four `CALL_FUNCTION_EX` operands untouched.
+    fn try_inline_call_ex(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+    ) -> Option<Box<InlineAct>> {
+        const MAX_SPREAD: usize = 16;
+        let n = frame.stack.len();
+        let callee_slot = n.checked_sub(4)?;
+        let [callee, null, spread, mapping] = &frame.stack[callee_slot..] else {
+            return None;
+        };
+        if !matches!(null, Object::Unbound) {
+            return None;
+        }
+        // A non-empty `**` mapping binds by name (see `lean_bind_keywords`).
+        let keywords = match mapping {
+            Object::Unbound => None,
+            Object::Dict(d) => Some(d),
+            _ => return None,
+        };
+        if keywords.is_some_and(|d| !d.borrow().is_empty()) {
+            return self.try_inline_call_ex_keywords(frame, shell, pc);
+        }
+        let items: &[Object] = match spread {
+            Object::Tuple(t) => t,
+            _ => return None,
+        };
+        if items.len() > MAX_SPREAD {
+            return None;
+        }
+        let (f, receiver) = match callee {
+            Object::Function(f) => (f, None),
+            Object::BoundMethod(bm) if !bm.redispatch_descriptor => match &bm.function {
+                Object::Function(f) => (f, Some(&bm.receiver)),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let eff_argc = items.len() + usize::from(receiver.is_some());
+        let (code, missing) = Self::lean_call_shape(f, eff_argc)?;
+        // Past the recursion limit the nested lean path raises.
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
+            return None;
+        };
+        // Committed: the operands become `callee, self-or-null, *items`.
+        let (f, receiver) = (f.clone(), receiver.cloned());
+        // The empty `**` slot (or empty mapping).
+        let mapping = frame.stack.pop().expect("checked above");
+        let spread = frame.stack.pop().expect("checked above");
+        let Object::Tuple(items) = &spread else {
+            unreachable!("checked above")
+        };
+        frame.stack.pop(); // the NULL self slot
+        let callee = frame.stack.pop().expect("checked above");
+        let has_self = receiver.is_some();
+        frame.stack.push(Object::Function(f));
+        frame.stack.push(receiver.unwrap_or(Object::Unbound));
+        frame.stack.extend(items.iter().cloned());
+        // The spread tuple and a bound method were call temporaries (or
+        // are still held elsewhere): grade their releases like any
+        // dropped operand.
+        self.release_call_operands(vec![callee, spread, mapping]);
+        let self_slot = callee_slot + 1;
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let callable = Self::lean_call_fill(
+            frame,
+            &code,
+            has_self,
+            self_slot,
+            callee_slot,
+            missing,
+            locals,
+        );
+        frame.pc = pc as u32 + 1;
+        Some(self.inline_bind(frame, shell, pc, act, code, callable, guard))
+    }
+
+    /// [`Self::try_inline_call_ex`] for `f(*args, **mapping)` with a
+    /// non-empty dictionary: the parameters bind by name (see
+    /// [`Self::lean_bind_keywords`]) before anything is touched. (The
+    /// operands are only borrowed until they leave the stack, so their
+    /// release is graded with their true owner counts.)
+    fn try_inline_call_ex_keywords(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+    ) -> Option<Box<InlineAct>> {
+        let callee_slot = frame.stack.len() - 4;
+        let (f, receiver) = match &frame.stack[callee_slot] {
+            Object::Function(f) => (f.clone(), None),
+            Object::BoundMethod(bm) if !bm.redispatch_descriptor => match &bm.function {
+                Object::Function(f) => (f.clone(), Some(bm.receiver.clone())),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let (Object::Tuple(items), Object::Dict(mapping)) =
+            (&frame.stack[callee_slot + 2], &frame.stack[callee_slot + 3])
+        else {
+            return None;
+        };
+        let code = f.code();
+        if code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || !Self::lean_code_ok(&code)
+            || (f.defaults_maybe_overridden()
+                && (f.slot("__defaults__").is_some() || f.slot("__kwdefaults__").is_some()))
+        {
+            return None;
+        }
+        f.lean_cells_ref(&code)?;
+        let bound = {
+            let kw = mapping.try_borrow().ok()?;
+            Self::lean_bind_keywords(
+                &f,
+                &code,
+                receiver.iter().chain(items.iter()),
+                kw.iter().map(|(k, v)| (&k.0, v)),
+            )?
+        };
+        // Past the recursion limit the nested lean path raises.
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
+            return None;
+        };
+        // Committed: the operands leave the stack.
+        let operands: Vec<Object> = frame.stack.drain(callee_slot..).collect();
+        self.release_call_operands(operands);
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        locals.extend(bound);
+        fill_unbound(locals, code.varnames.len());
+        frame.pc = pc as u32 + 1;
+        Some(self.inline_bind(frame, shell, pc, act, code, Object::Function(f), guard))
+    }
+
+    /// Bind `f(*positional, **kw)` (a plain dictionary) to `code`'s
+    /// parameters as the generic binder would: the positional
+    /// parameters, the keyword-only ones, then `*args` and `**kwargs`
+    /// when present. `None` when anything needs the generic binder: a
+    /// non-string key, a duplicate or unexpected keyword, a missing
+    /// argument, or surplus positionals without `*args`. (Replaced
+    /// defaults are the caller's check.)
+    fn lean_bind_keywords<'a>(
+        f: &PyFunction,
+        code: &CodeObject,
+        positional: impl Iterator<Item = &'a Object>,
+        kw: impl Iterator<Item = (&'a Object, &'a Object)>,
+    ) -> Option<Vec<Object>> {
+        let npos = code.arg_count as usize;
+        let total = npos + code.kwonly_count as usize;
+        let posonly = code.posonly_count as usize;
+        let mut slots: Vec<Object> = vec![Object::Unbound; total];
+        let mut surplus: Vec<Object> = Vec::new();
+        for (i, v) in positional.enumerate() {
+            if i < npos {
+                slots[i] = v.clone();
+            } else if code.has_varargs {
+                surplus.push(v.clone());
+            } else {
+                return None;
+            }
+        }
+        let mut varkw: Option<DictData> = None;
+        for (key, v) in kw {
+            let Object::Str(name) = key else {
+                return None;
+            };
+            match code.varnames[posonly..total]
+                .iter()
+                .position(|n| n.as_str() == &**name)
+            {
+                Some(p) => {
+                    let slot = &mut slots[posonly + p];
+                    if !matches!(slot, Object::Unbound) {
+                        return None;
+                    }
+                    *slot = v.clone();
+                }
+                None if code.has_varkeywords => {
+                    varkw
+                        .get_or_insert_with(DictData::default)
+                        .insert(DictKey(key.clone()), v.clone());
+                }
+                None => return None,
+            }
+        }
+        let first_default = npos.checked_sub(f.defaults.len())?;
+        for (i, slot) in slots[..npos].iter_mut().enumerate() {
+            if matches!(slot, Object::Unbound) {
+                if i < first_default {
+                    return None;
+                }
+                *slot = f.defaults[i - first_default].clone();
+            }
+        }
+        for (slot, d) in slots[npos..].iter_mut().zip(Self::kwonly_defaults(f, code)) {
+            if matches!(slot, Object::Unbound) {
+                *slot = d?.clone();
+            }
+        }
+        if code.has_varargs {
+            slots.push(if surplus.is_empty() {
+                Object::new_tuple(Vec::new())
+            } else {
+                Object::new_tuple(surplus)
+            });
+        }
+        if code.has_varkeywords {
+            slots.push(Object::Dict(Rc::new(RefCell::new(
+                varkw.unwrap_or_default(),
+            ))));
+        }
+        Some(slots)
     }
 
     /// The core loop's `CALL` of a plain class at `pc` of `sw`'s (synced)
@@ -14933,7 +15363,10 @@ impl Interpreter {
         // `PyFunction::code`); only compared, then cloned below.
         let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
         let (missing, slot_self) = slot.hit(Rc::as_ptr(f), Rc::as_ptr(code_rc))?;
-        if slot_self != has_self || !Self::lean_code_ok(code_rc) {
+        if slot_self != has_self
+            || !Self::lean_code_ok(code_rc)
+            || Self::has_extended_params(code_rc)
+        {
             return None;
         }
         let missing = missing as usize;
@@ -17875,6 +18308,45 @@ impl Interpreter {
                     last = pc;
                     pc += 1;
                 }
+                // `{**a}` and `f(**kw)`'s merge of a plain dictionary whose
+                // keys, like the target's, are all `str`: their hashing and
+                // equality are native, so no Python runs. A call's merge
+                // that would repeat a keyword raises in the full handler.
+                OpCode::DictUpdate => {
+                    let depth = (ins.arg >> 1) as usize + 1;
+                    let n = stack.len();
+                    if n < depth + 1 {
+                        break;
+                    }
+                    let (Object::Dict(target), Object::Dict(src)) =
+                        (&stack[n - 1 - depth], &stack[n - 1])
+                    else {
+                        break;
+                    };
+                    let (Ok(mut t), Ok(s)) = (target.try_borrow_mut(), src.try_borrow()) else {
+                        break;
+                    };
+                    let str_keys = |d: &DictData| d.keys().all(|k| matches!(k.0, Object::Str(_)));
+                    if !str_keys(&s)
+                        || !str_keys(&t)
+                        || (ins.arg & 1 != 0 && s.keys().any(|k| t.contains_key(k)))
+                    {
+                        break;
+                    }
+                    for (k, v) in s.iter() {
+                        t.insert(k.clone(), v.clone());
+                    }
+                    drop((t, s));
+                    let other = stack.pop().expect("length checked above");
+                    last = pc;
+                    pc += 1;
+                    if gc_trace::note_dropped_marks(&other) {
+                        gc_trace::mark_maybe_dead();
+                        drop(other);
+                        stop = LeafStop::Marked;
+                        break;
+                    }
+                }
                 OpCode::Swap => {
                     let depth = ins.arg as usize;
                     let n = stack.len();
@@ -18794,6 +19266,62 @@ impl Interpreter {
         match r.ok()? {
             Object::Int(n) if n >= 0 => Some(Object::Int(n)),
             _ => None,
+        }
+    }
+
+    /// A call of an instance whose class's `__call__` is a plain Python
+    /// function: the callee slot at `callee` takes that function and the
+    /// (empty) self slot after it the instance, as `type(obj).__call__(obj,
+    /// ...)`. Anything else is left alone.
+    ///
+    /// # Safety
+    ///
+    /// `callee` and `callee + 1` are a call's initialized callee and self
+    /// slots.
+    #[inline(always)]
+    unsafe fn core_instance_callee(callee: *mut Object) {
+        // SAFETY: the caller's contract.
+        let (Object::Instance(inst), Object::Unbound) =
+            (unsafe { &*callee }, unsafe { &*callee.add(1) })
+        else {
+            return;
+        };
+        let Some(f) = Self::instance_call_function(inst) else {
+            return;
+        };
+        // SAFETY: the instance moves to the (dropless) self slot.
+        unsafe {
+            let obj = callee.read();
+            callee.write(Object::Function(f));
+            callee.add(1).write(obj);
+        }
+    }
+
+    /// `type(inst).__call__` when it is a plain Python function, cached
+    /// on the class under its attribute version.
+    #[inline(never)]
+    fn instance_call_function(inst: &PyInstance) -> Option<Rc<crate::object::PyFunction>> {
+        use crate::types::LeafAttrKind as K;
+        /// The cache key for `__call__` (an address no interned name has).
+        static CALL_KEY: u8 = 0;
+        let cls = inst.cls_raw();
+        let key = std::ptr::addr_of!(CALL_KEY) as usize;
+        let ver = cls.attr_version.get();
+        match cls.leaf_attrs.get(key, ver) {
+            Some(K::Method(w)) => w.upgrade(),
+            Some(_) => None,
+            None => {
+                let kind = match cls.lookup("__call__") {
+                    Some(Object::Function(f)) => K::Method(Rc::downgrade(&f)),
+                    _ => K::Other,
+                };
+                let found = match &kind {
+                    K::Method(w) => w.upgrade(),
+                    _ => None,
+                };
+                cls.leaf_attrs.set(key, ver, kind);
+                found
+            }
         }
     }
 
@@ -23079,14 +23607,18 @@ impl Interpreter {
                 // sits below the self-or-null slot, the args tuple and the
                 // kwargs dict (RFC 0068 WS1's self-or-null convention
                 // pushed it one slot deeper).
-                let kw_error_prefix: String = if is_kw_merge {
-                    frame
-                        .peek_back(depth + 2)
+                // (Rendered only for an error.)
+                let callee = if is_kw_merge {
+                    frame.peek_back(depth + 2).cloned()
+                } else {
+                    None
+                };
+                let kw_error_prefix = || -> String {
+                    callee
+                        .as_ref()
                         .and_then(callable_function_str)
                         .map(|s| format!("{s} "))
                         .unwrap_or_default()
-                } else {
-                    String::new()
                 };
                 let dict = frame.peek_back(depth - 1).cloned().ok_or_else(|| {
                     RuntimeError::Internal("DICT_UPDATE: stack underflow".to_owned())
@@ -23105,7 +23637,8 @@ impl Interpreter {
                         for (k, v) in src.borrow().iter() {
                             if is_kw_merge && t.contains_key(k) {
                                 return Err(type_error(format!(
-                                    "{kw_error_prefix}got multiple values for keyword argument '{}'",
+                                    "{}got multiple values for keyword argument '{}'",
+                                    kw_error_prefix(),
                                     k.0.to_str()
                                 )));
                             }
@@ -23122,7 +23655,8 @@ impl Interpreter {
                                 // "test.test_extcall.h() argument after **
                                 // must be a mapping, not list".
                                 type_error(format!(
-                                    "{kw_error_prefix}argument after ** must be a mapping, not {}",
+                                    "{}argument after ** must be a mapping, not {}",
+                                    kw_error_prefix(),
                                     other.type_name_owned()
                                 ))
                             } else {
@@ -23162,7 +23696,8 @@ impl Interpreter {
                             let key = crate::object::DictKey(k);
                             if is_kw_merge && t.contains_key(&key) {
                                 return Err(type_error(format!(
-                                    "{kw_error_prefix}got multiple values for keyword argument '{}'",
+                                    "{}got multiple values for keyword argument '{}'",
+                                    kw_error_prefix(),
                                     key.0.to_str()
                                 )));
                             }
@@ -48270,9 +48805,14 @@ impl Interpreter {
             // Straight from the argument vector's tail into the tuple's
             // own allocation: collecting the remainder into a `Vec` first
             // was a second allocation and a second move per call.
-            positional[star_idx] = Object::Tuple(
-                crate::tuple_storage::TupleStorage::from_exact_iter(arg_iter.by_ref()),
-            );
+            positional[star_idx] = if arg_iter.len() == 0 {
+                // The interned empty tuple (`() is ()`).
+                Object::new_tuple(Vec::new())
+            } else {
+                Object::Tuple(crate::tuple_storage::TupleStorage::from_exact_iter(
+                    arg_iter.by_ref(),
+                ))
+            };
             filled[star_idx] = true;
         } else if provided > total_args {
             // Mirror CPython's `too_many_positional`: when the callable
@@ -57838,6 +58378,7 @@ static SLOW_LEAF_OPS: [bool; 256] = {
         OpCode::CompareOp,
         OpCode::CopyFreeVars,
         OpCode::CopyTop,
+        OpCode::DictUpdate,
         OpCode::ForIter,
         OpCode::FormatValue,
         OpCode::GetIter,
@@ -57917,6 +58458,7 @@ static CORE_LEAF_OPS: [bool; 256] = {
         OpCode::ToBool,
         OpCode::PopJumpIfNone,
         OpCode::PopJumpIfNotNone,
+        OpCode::CallEx,
     ];
     let mut i = 0;
     while i < ops.len() {

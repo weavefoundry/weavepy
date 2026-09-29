@@ -44,10 +44,29 @@ impl FunctionGuard {
         let Object::Function(function) = value else {
             return false;
         };
-        if Rc::as_ptr(function) != self.function.as_ptr()
-            || Rc::as_ptr(&function.code.borrow()) != self.code.as_ptr()
-        {
+        Rc::as_ptr(function) == self.function.as_ptr() && self.holds_function(function)
+    }
+
+    /// Whether the guarded function is still alive and unchanged.
+    fn holds_live(&self) -> bool {
+        if self.function.strong_count() == 0 {
             return false;
+        }
+        // SAFETY: a live strong count keeps the function allocated, and
+        // nothing here can release it.
+        self.holds_function(unsafe { &*self.function.as_ptr() })
+    }
+
+    /// `function` (the guarded one) still runs the guarded code with its
+    /// compiled defaults.
+    fn holds_function(&self, function: &PyFunction) -> bool {
+        if Rc::as_ptr(&function.code.borrow()) != self.code.as_ptr() {
+            return false;
+        }
+        // Only an assignment to `__defaults__` or `__kwdefaults__` raises
+        // the flag, so the common function skips the slot probes.
+        if !function.defaults_maybe_overridden() {
+            return true;
         }
         let slots = function.slots.borrow();
         !slots.contains_key(&StrKey("__defaults__"))
@@ -412,15 +431,12 @@ impl ClassFunctionsGuard {
     }
 
     fn holds(&self) -> bool {
-        self.class.upgrade().is_some_and(|class| {
-            class.attr_version.get() == self.version
-                && self.functions.iter().all(|guard| {
-                    guard
-                        .function
-                        .upgrade()
-                        .is_some_and(|f| guard.holds(&Object::Function(f)))
-                })
-        })
+        // An unchanged version proves the class holds the same functions;
+        // each one's code and defaults can still change in place.
+        self.class.strong_count() > 0
+            // SAFETY: a live strong count keeps the class allocated.
+            && unsafe { &*self.class.as_ptr() }.attr_version.get() == self.version
+            && self.functions.iter().all(FunctionGuard::holds_live)
     }
 }
 
