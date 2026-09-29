@@ -926,16 +926,12 @@ pub struct Interpreter {
     /// chains keep the ~[`crate::gil::GIL_CHECK_INTERVAL`]-opcode
     /// checkpoint cadence.
     gil_countdown: u32,
-    /// `sum(generator)`'s accumulator (its address), offered to the next
-    /// lean generator resume (see `generator_send_lean`), which pairs it
-    /// with the generator's frame in [`Self::sum_fold`].
-    sum_fold_acc: Option<usize>,
-    /// While a lean resume runs on behalf of `sum()`: the generator's
-    /// frame and the accumulator (addresses). The core loop folds that
-    /// frame's scalar yields into the accumulator and resumes in place
-    /// (see the `YIELD_VALUE` arm) instead of leaving the quiet loop per
-    /// item.
-    sum_fold: Option<(usize, usize)>,
+    /// While a lean resume runs on behalf of a consumer that drains the
+    /// generator (`sum()`, `list()`, see [`FoldSink`]): the generator's
+    /// frame (its address) and the consumer's sink. The core loop folds
+    /// that frame's yields into the sink and resumes in place (see the
+    /// `YIELD_VALUE` arm) instead of leaving the quiet loop per item.
+    sum_fold: Option<(usize, FoldSink)>,
     /// RFC 0061 (WS2b) — set while any observer (trace/profile/PEP 669
     /// tool) is active on this thread. Fused-dispatch arms check it and
     /// fall back to single-step semantics, so instrumentation sees the
@@ -1193,7 +1189,6 @@ impl Default for Interpreter {
             frame_stack_pool: ThreadCell::new(Vec::new()),
             scratch_pool: ThreadCell::new(Vec::new()),
             gil_countdown: crate::gil::GIL_CHECK_INTERVAL,
-            sum_fold_acc: None,
             sum_fold: None,
             fuse_off: false,
             recheck_frame_observed: false,
@@ -1321,7 +1316,6 @@ impl Interpreter {
             frame_stack_pool: ThreadCell::new(Vec::new()),
             scratch_pool: ThreadCell::new(Vec::new()),
             gil_countdown: crate::gil::GIL_CHECK_INTERVAL,
-            sum_fold_acc: None,
             sum_fold: None,
             fuse_off: false,
             recheck_frame_observed: false,
@@ -11095,7 +11089,7 @@ impl Interpreter {
         let saved_pc = frame.pc;
         frame.pc = pc as u32 + 1;
         let pending_self = self.lean_pending_enter(frame, shell, pc);
-        let result = self.generator_send_lean(&g, &Object::None);
+        let result = self.generator_send_lean(&g, &Object::None, None);
         self.lean_pending_exit(pending_self);
         let Some(result) = result else {
             frame.pc = saved_pc;
@@ -13061,20 +13055,28 @@ impl Interpreter {
                     OpCode::YieldValue => {
                         // SAFETY: see `CoreSwitch`.
                         if unsafe { (*sw.inl).is_empty() } {
-                            // `sum()` driving this frame: a scalar yield folds
-                            // into the accumulator and the frame resumes as if
-                            // sent `None` (what `sum` does next), in place.
-                            if let Some((ff, acc)) = self.sum_fold {
+                            // A draining consumer driving this frame: the yield
+                            // folds into its sink and the frame resumes as if
+                            // sent `None` (what the consumer does next), in
+                            // place.
+                            if let Some((ff, sink)) = self.sum_fold {
                                 if ff == sw.cur as usize && len > 0 {
-                                    let acc = acc as *mut SumState;
-                                    // SAFETY: the running total is `do_sum_call`'s
-                                    // local, alive and untouched while the
-                                    // resume runs; `len > 0`.
+                                    // SAFETY: `len > 0`.
                                     let top = unsafe { base.add(len - 1) };
-                                    if unsafe { (*acc).add_scalar(&*top) } {
-                                        // SAFETY: the yielded value is a scalar
-                                        // (no drop glue); the sent `None` takes
-                                        // its slot.
+                                    // SAFETY: the sink is the consumer's local,
+                                    // alive and untouched while the resume runs.
+                                    let folded = match sink {
+                                        // A scalar has no drop glue.
+                                        FoldSink::Sum(acc) => unsafe { (*acc).add_scalar(&*top) },
+                                        FoldSink::Collect(out) => {
+                                            // The yielded value moves out.
+                                            unsafe { (*out).push(top.read()) };
+                                            true
+                                        }
+                                    };
+                                    if folded {
+                                        // SAFETY: the sent `None` takes the
+                                        // (moved or trivially dropped) slot.
                                         unsafe { top.write(Object::None) };
                                         last = pc;
                                         pc += 1;
@@ -30883,6 +30885,22 @@ impl Interpreter {
                 }
                 let it = self.make_iter(v, globals)?;
                 let mut out = Vec::new();
+                if let Object::Generator(g) = &it {
+                    // A lean resume moves each yield straight into `out`
+                    // (see `Interpreter::sum_fold`).
+                    loop {
+                        let sink = FoldSink::Collect(std::ptr::from_mut(&mut out));
+                        match self.generator_send_fold(g, Object::None, Some(sink)) {
+                            Ok(x) => out.push(x),
+                            Err(RuntimeError::PyException(exc))
+                                if exc.type_name() == "StopIteration" =>
+                            {
+                                return Ok(out);
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
                 while let Some(x) = self.iter_next(&it, globals)? {
                     out.push(x);
                 }
@@ -31083,10 +31101,8 @@ impl Interpreter {
                 // A lean resume folds scalar yields straight into `total`
                 // (see `Interpreter::sum_fold`); it returns at the first
                 // yield it cannot fold, or when the generator ends.
-                self.sum_fold_acc = Some(std::ptr::from_mut(&mut total) as usize);
-                let sent = self.generator_send(g, Object::None);
-                self.sum_fold_acc = None;
-                let x = match sent {
+                let sink = FoldSink::Sum(std::ptr::from_mut(&mut total));
+                let x = match self.generator_send_fold(g, Object::None, Some(sink)) {
                     Ok(v) => v,
                     Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
                         self.fire_caught_stop_iteration(&exc)?;
@@ -35999,6 +36015,7 @@ impl Interpreter {
         &mut self,
         gen: &Rc<PyGenerator>,
         sent: &Object,
+        fold: Option<FoldSink>,
     ) -> Option<Result<Object, RuntimeError>> {
         let snap_gen = self.lean_snapshot()?;
         if self.dbg_sample
@@ -36066,12 +36083,10 @@ impl Interpreter {
             crate::tier2::materialize_parked(frame);
             frame.gen_first_resume = first_resume;
             frame.push(sent.clone());
-            // `sum()`'s accumulator, folded at this frame's yields.
+            // The draining consumer's sink, folded at this frame's yields.
             let prev_fold = std::mem::replace(
                 &mut self.sum_fold,
-                self.sum_fold_acc
-                    .take()
-                    .map(|acc| (std::ptr::from_mut(frame) as usize, acc)),
+                fold.map(|sink| (std::ptr::from_mut(frame) as usize, sink)),
             );
             let exc_depth_on_entry = self.exc_info_len();
             let fin_live = gc_trace::has_any_finalizable();
@@ -36211,7 +36226,21 @@ impl Interpreter {
         gen: &Rc<PyGenerator>,
         sent: Object,
     ) -> Result<Object, RuntimeError> {
-        if let Some(r) = self.generator_send_lean(gen, &sent) {
+        self.generator_send_fold(gen, sent, None)
+    }
+
+    /// [`Self::generator_send`] for a consumer that drains the generator:
+    /// a lean resume folds the yields it can into `fold` (see
+    /// [`Self::sum_fold`]) and returns the first it can't. Any other
+    /// resume folds nothing, so a generator it resumes in turn never
+    /// sees the sink.
+    fn generator_send_fold(
+        &mut self,
+        gen: &Rc<PyGenerator>,
+        sent: Object,
+        fold: Option<FoldSink>,
+    ) -> Result<Object, RuntimeError> {
+        if let Some(r) = self.generator_send_lean(gen, &sent, fold) {
             return r;
         }
         // Take the boxed frame; it is run *in place* (RFC 0069 WS4) so
@@ -56952,6 +56981,20 @@ impl CoreSwitch {
 /// compensated float phase taking floats and ints alike, then — once it
 /// is a complex — compensated real and imaginary sums, then generic `+`
 /// for everything after (each phase is left for good).
+/// A draining consumer's sink for a lean generator resume's yields (see
+/// [`Interpreter::sum_fold`]): `sum()`'s running total, which takes
+/// scalars, or `list()`'s item buffer, which takes anything.
+#[derive(Clone, Copy)]
+enum FoldSink {
+    Sum(*mut SumState),
+    Collect(*mut Vec<Object>),
+}
+
+// SAFETY: a sink is installed only while a resume runs on the thread that
+// owns it, and cleared before that resume returns: an interpreter moved
+// between threads never carries a live one.
+unsafe impl Send for FoldSink {}
+
 enum SumState {
     Int(i64),
     Float(CompensatedSum),
