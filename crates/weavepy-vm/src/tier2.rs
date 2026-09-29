@@ -4571,7 +4571,7 @@ unsafe fn try_native_call(
             }
         }
     };
-    note_callee_exit(nc, nctx);
+    note_callee_exit(&nc.art, &nc.code, nctx);
     if !inline_bufs {
         put_u64(u64_buf);
         put_u32(u32_buf);
@@ -5456,30 +5456,27 @@ unsafe extern "C" fn wpjit_self_slow(
     }
 }
 
-/// The generic-call backoff for native-to-native entries (the framed
-/// entries' twin lives in [`note_native_exit`]): a compiled callee whose
+/// The generic-call backoff for native-to-native and frameless direct
+/// entries (the framed entries' twin lives in [`note_native_exit`]): a
+/// compiled callee whose
 /// activations average [`CALLEE_ROUNDTRIP_RETIRE_RATIO`] or more
 /// interpreter calls is a thin native driver around them. Each such call pays pin
 /// traffic, an activation shell and a generic call that the interpreter's
 /// inline call path avoids, so the callee retires to tier-1.
 #[inline]
-fn note_callee_exit(nc: &NativeCallee, child: &CallCtx) {
-    let entries = nc.art.callee_entries.get().saturating_add(1);
-    nc.art.callee_entries.set(entries);
+fn note_callee_exit(art: &Artifacts, code: &Rc<CodeObject>, child: &CallCtx) {
+    let entries = art.callee_entries.get().saturating_add(1);
+    art.callee_entries.set(entries);
     if child.dyn_py_calls == 0 {
         return;
     }
-    let trips = nc
-        .art
-        .callee_roundtrips
-        .get()
-        .saturating_add(child.dyn_py_calls);
-    nc.art.callee_roundtrips.set(trips);
+    let trips = art.callee_roundtrips.get().saturating_add(child.dyn_py_calls);
+    art.callee_roundtrips.set(trips);
     if entries >= GENERIC_RETIRE_MIN_ENTRIES
         && trips / entries >= CALLEE_ROUNDTRIP_RETIRE_RATIO
-        && !nc.code.jit_hint.is_not_jitable()
+        && !code.jit_hint.is_not_jitable()
     {
-        let key = Rc::as_ptr(&nc.code).cast::<CodeObject>();
+        let key = Rc::as_ptr(code).cast::<CodeObject>();
         JIT.with(|cell| {
             let mut st = cell.borrow_mut();
             if let Some(ce) = st.cache.get_mut(&key) {
@@ -5487,7 +5484,7 @@ fn note_callee_exit(nc: &NativeCallee, child: &CallCtx) {
             }
             st.stats.generic_retires += 1;
         });
-        nc.code.jit_hint.mark_not_jitable();
+        code.jit_hint.mark_not_jitable();
     }
 }
 
@@ -10214,6 +10211,11 @@ pub(crate) fn try_call_native_direct(
     };
 
     native_stat(|s| s.direct_calls.set(s.direct_calls.get() + 1));
+    // A direct callee that keeps calling back into the interpreter is
+    // retired like a native-to-native one (deltablue's `incremental_add`
+    // ran each `satisfy` through an activation shell and a framed call,
+    // 6% of the benchmark's instructions).
+    note_callee_exit(&entry.art, code, &ctx);
 
     let out = match status {
         JitStatus::Returned => Ok(unpack_pins(jf.ret_bits, jf.ret_tag, &ctx.pins)),
