@@ -156,8 +156,16 @@ pub use weavepy_parser::ast::expr_name;
 /// clones (a `replace()`d code object may change `constants`, so a
 /// cloned code object starts with an empty slot), never participates in
 /// equality, and is not serialized.
+///
+/// The second field caches the payload's address once it's set (the VM's
+/// hot accessor then reads one thin pointer instead of the fat `dyn`
+/// handle and its alignment arithmetic). The `Arc` in the first field
+/// keeps that address alive for the code object's lifetime.
 #[derive(Default)]
-pub struct VmExt(pub std::sync::OnceLock<std::sync::Arc<dyn std::any::Any + Send + Sync>>);
+pub struct VmExt(
+    pub std::sync::OnceLock<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    pub std::sync::atomic::AtomicPtr<()>,
+);
 
 impl Clone for VmExt {
     fn clone(&self) -> Self {

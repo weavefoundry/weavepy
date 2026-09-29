@@ -263,6 +263,7 @@ impl std::fmt::Debug for Frame {
 }
 
 impl Frame {
+    #[inline]
     fn push(&mut self, v: Object) {
         self.stack.push(v);
     }
@@ -9922,16 +9923,26 @@ impl Interpreter {
             drop(frame.stack.drain(n - 3..));
         }
         let mut act = self.inline_slot();
-        act.gen = Some(g);
-        act.gen_box = Some(boxed);
+        // A pooled slot holds none of these (every path back to the pool
+        // takes them), so they're written without drop glue.
+        debug_assert!(
+            act.gen.is_none()
+                && act.gen_box.is_none()
+                && act.guard.is_none()
+                && act.act.shell.is_none()
+        );
+        // SAFETY: each field is `None` (above), so nothing is leaked.
+        unsafe {
+            std::ptr::write(&raw mut act.gen, Some(g));
+            std::ptr::write(&raw mut act.gen_box, Some(boxed));
+            std::ptr::write(&raw mut act.guard, Some(guard));
+        }
         act.gen_frame = gen_frame;
         act.exhaust_arg = arg;
         act.act.frame = gen_frame;
-        act.act.shell = None;
         act.call_pc = pc;
         act.caller_pending = self.lean_pending_enter(frame, shell, pc);
         act.exc_depth = self.exc_info_len();
-        act.guard = Some(guard);
         Some(act)
     }
 
@@ -11969,11 +11980,8 @@ impl Interpreter {
             // during an activation, and nothing here runs Python code).
             let locals: &mut Vec<Object> = unsafe { &mut *frame.locals.as_ptr() };
             let (lbase, nlocals) = (locals.as_mut_ptr(), locals.len());
-            let (gdict, bdict) = (frame.globals.as_ptr(), frame.builtins.as_ptr());
-            let (gid, bid) = (
-                specialize::rc_id(&frame.globals),
-                specialize::rc_id(&frame.builtins),
-            );
+            // (The namespaces are read off the frame at their uses: holding
+            // them here costs every switch a spill.)
             // The arms' colder per-activation state (the global and class
             // attribute stamps, the method slots) is derived at its first
             // use: every call, return and helper handoff runs this prologue
@@ -13327,11 +13335,11 @@ impl Interpreter {
                         };
                         // SAFETY (raw dict reads): as in the `LOAD_GLOBAL` arm.
                         let v = unsafe {
-                            match (*gdict).get_index_of(&probe) {
-                                Some(i) => (*gdict).get_index(i),
-                                None => (*bdict)
+                            match (*frame.globals.as_ptr()).get_index_of(&probe) {
+                                Some(i) => (*frame.globals.as_ptr()).get_index(i),
+                                None => (*frame.builtins.as_ptr())
                                     .get_index_of(&probe)
-                                    .and_then(|i| (*bdict).get_index(i)),
+                                    .and_then(|i| (*frame.builtins.as_ptr()).get_index(i)),
                             }
                         };
                         // A miss (the full handler's `NameError`) or a key the
@@ -13703,6 +13711,8 @@ impl Interpreter {
                         // SAFETY (raw dict reads): as in `leaf_global` — no dict
                         // borrow is held while bytecode runs, and nothing here
                         // runs code.
+                        let (gdict, bdict) = (frame.globals.as_ptr(), frame.builtins.as_ptr());
+                        let gid = specialize::rc_id(&frame.globals);
                         let g_stamp = unsafe { (*gdict).mutation_stamp() };
                         let hit = match code.caches.get(pc as u32) {
                             IC::LoadGlobalModule {
@@ -13714,7 +13724,7 @@ impl Interpreter {
                             IC::LoadGlobalBuiltin {
                                 builtins_id,
                                 key_idx,
-                            } if builtins_id == bid
+                            } if builtins_id == specialize::rc_id(&frame.builtins)
                                 && !self.globals_missing_any.get()
                                 && slot.get()
                                     == [gid, g_stamp, unsafe { (*bdict).mutation_stamp() }] =>
@@ -16598,7 +16608,8 @@ impl Interpreter {
         drop(gen);
         let call_pc = done.call_pc;
         self.lean_pending_exit(done.caller_pending);
-        done.act.shell = None;
+        // SAFETY: the shell was `None` (checked above): no drop glue owed.
+        unsafe { std::ptr::write(&raw mut done.act.shell, None) };
         done.act.frame = std::ptr::from_mut::<Frame>(&mut done.frame);
         done.caller_pending = None;
         if self.inline_pool.len() < INLINE_POOL_CAP {
@@ -16609,7 +16620,6 @@ impl Interpreter {
         let (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
         // SAFETY: as above.
         unsafe { (*cframe).stack.push(v) };
-        let entry = QuietEntry::Returned { cur_pc: call_pc };
         sw.cur = cframe;
         sw.last = if clast == &raw mut sw.scratch {
             sw.scratch = usize::MAX;
@@ -16617,36 +16627,26 @@ impl Interpreter {
         } else {
             clast
         };
-        match entry {
-            QuietEntry::Returned { cur_pc } => {
-                // SAFETY: as above.
-                unsafe { *sw.last = cur_pc };
-                // The consumer's `Returned` entry protocol (`quiet_frame`).
-                if self.gil_countdown <= 2 {
-                    sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
-                    return true;
-                }
-                self.gil_countdown -= 1;
-                if crate::hot_gates::loop_gen() != snap_gen {
-                    sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
-                    return true;
-                }
-                // SAFETY: see `quiet_run`.
-                if sw.fin && unsafe { (*sw.maybe_dead).get() } {
-                    // SAFETY: as above.
-                    unsafe {
-                        self.flush_lean(&mut *cframe, &mut *cshell.cast::<QuietShell<'_>>());
-                    }
-                    if self.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != snap_gen {
-                        sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
-                    }
-                }
+        // The consumer's `QuietEntry::Returned` protocol (`quiet_frame`).
+        // SAFETY: as above.
+        unsafe { *sw.last = call_pc };
+        if self.gil_countdown <= 2 {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
+            return true;
+        }
+        self.gil_countdown -= 1;
+        if crate::hot_gates::loop_gen() != snap_gen {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
+            return true;
+        }
+        // SAFETY: see `quiet_run`.
+        if sw.fin && unsafe { (*sw.maybe_dead).get() } {
+            // SAFETY: as above.
+            unsafe {
+                self.flush_lean(&mut *cframe, &mut *cshell.cast::<QuietShell<'_>>());
             }
-            QuietEntry::Raised { err, .. } => {
-                sw.pending = Some(CoreExit::Stop(LeafStop::Raised(err)));
-            }
-            QuietEntry::Fresh | QuietEntry::Stop(_) => {
-                unreachable!("inline_gen_deliver returns or raises")
+            if self.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != snap_gen {
+                sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
             }
         }
         true
@@ -37075,6 +37075,11 @@ impl Interpreter {
         // `Running`, which owns nothing) and no guard is live on the cell
         // (`peek_mut` checks).
         match unsafe { gen.state.peek_mut() } {
+            // `Running` owns nothing: no drop glue for the displaced state.
+            // SAFETY: as above.
+            Some(state) if matches!(state, GeneratorState::Running) => unsafe {
+                std::ptr::write(state, GeneratorState::Suspended(boxed));
+            },
             Some(state) => *state = GeneratorState::Suspended(boxed),
             None => *gen.state.borrow_mut() = GeneratorState::Suspended(boxed),
         }
@@ -64156,14 +64161,18 @@ struct BinderLayout {
 
 #[inline]
 fn code_vm_ext(code: &CodeObject) -> Option<&CodeConstObjects> {
-    // The warm read — one acquire load and a cast — is what the dispatch
-    // loop pays per activation, so the table's construction lives out of
-    // line: inlining it here cost 4-7% on call-heavy fixtures.
-    let arc = match code.vm_ext.0.get() {
-        Some(arc) => arc,
-        None => code_vm_ext_init(code),
-    };
-    Some(code_vm_ext_ref(arc))
+    // The warm read — one acquire load of the cached thin pointer — is
+    // what the dispatch loop pays per activation, so the table's
+    // construction lives out of line: inlining it here cost 4-7% on
+    // call-heavy fixtures.
+    let p = code.vm_ext.1.load(std::sync::atomic::Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: only `code_vm_ext_init` stores this pointer: the address
+        // of the `CodeConstObjects` the slot's `Arc` owns, alive as long as
+        // `code`.
+        return Some(unsafe { &*p.cast::<CodeConstObjects>() });
+    }
+    Some(code_vm_ext_ref(code_vm_ext_init(code)))
 }
 
 /// Borrow an already initialized extension without filling any cache.
@@ -64194,6 +64203,19 @@ fn code_vm_ext_ref(arc: &std::sync::Arc<dyn std::any::Any + Send + Sync>) -> &Co
 #[cold]
 #[inline(never)]
 fn code_vm_ext_init(
+    code: &CodeObject,
+) -> &std::sync::Arc<dyn std::any::Any + Send + Sync + 'static> {
+    let arc = code_vm_ext_build(code);
+    let p: *const CodeConstObjects = code_vm_ext_ref(arc);
+    code.vm_ext
+        .1
+        .store(p.cast_mut().cast(), std::sync::atomic::Ordering::Release);
+    arc
+}
+
+#[cold]
+#[inline(never)]
+fn code_vm_ext_build(
     code: &CodeObject,
 ) -> &std::sync::Arc<dyn std::any::Any + Send + Sync + 'static> {
     code.vm_ext.0.get_or_init(|| {
