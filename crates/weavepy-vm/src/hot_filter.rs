@@ -72,8 +72,13 @@ impl AtomicBloom {
     #[inline]
     pub fn insert(&self, id: u64) {
         let ((w1, b1), (w2, b2)) = Self::probes(id);
-        self.bits[w1].fetch_or(b1, Ordering::Relaxed);
-        self.bits[w2].fetch_or(b2, Ordering::Relaxed);
+        // A bit already set needs no locked read-modify-write: bits are
+        // only ever cleared by a rebuild, which inserts never race.
+        for (w, b) in [(w1, b1), (w2, b2)] {
+            if self.bits[w].load(Ordering::Relaxed) & b == 0 {
+                self.bits[w].fetch_or(b, Ordering::Relaxed);
+            }
+        }
     }
 
     /// `false` means *definitely absent* (for every id that went
@@ -126,7 +131,9 @@ impl RebuildableBloom {
     pub fn insert(&self, id: u64) {
         self.filters[0].insert(id);
         self.filters[1].insert(id);
-        self.inserts.fetch_add(1, Ordering::Relaxed);
+        // A staleness estimate: a lost increment only delays a rebuild.
+        let n = self.inserts.load(Ordering::Relaxed);
+        self.inserts.store(n.wrapping_add(1), Ordering::Relaxed);
     }
 
     #[inline]

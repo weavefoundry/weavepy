@@ -3117,7 +3117,7 @@ impl Interpreter {
             // unpickler temporary holding the memo) cascades through the
             // untracked `memo` dict to the tracked argument. The refcount guard
             // below still filters anything that stays externally reachable.
-            let mut children: Vec<std::sync::Arc<gc_trace::TrackedHandle>> = Vec::new();
+            let mut children: Vec<crate::sync::Rc<gc_trace::TrackedHandle>> = Vec::new();
             // Untracked descendants with live weakrefs: CPython clears an
             // object's weakrefs at refcount zero whether or not the GC ever
             // tracked it, but this cascade's "next link" set is (otherwise)
@@ -4694,7 +4694,7 @@ impl Interpreter {
             Some(Object::Module(m)) => m.dict.borrow().iter().map(|(_k, v)| v.clone()).collect(),
             _ => Vec::new(),
         };
-        let mut sys_deferred: Vec<std::sync::Arc<crate::gc_trace::TrackedHandle>> = Vec::new();
+        let mut sys_deferred: Vec<crate::sync::Rc<crate::gc_trace::TrackedHandle>> = Vec::new();
         for _ in 0..8 {
             let candidates = crate::gc_trace::finalization_candidates();
             if candidates.is_empty() {
@@ -4704,7 +4704,7 @@ impl Interpreter {
                 if sys_values.iter().any(|v| v.is_same(&handle.object)) {
                     if !sys_deferred
                         .iter()
-                        .any(|h| std::sync::Arc::ptr_eq(h, &handle))
+                        .any(|h| crate::sync::Rc::ptr_eq(h, &handle))
                     {
                         sys_deferred.push(handle);
                     }
@@ -11381,6 +11381,15 @@ impl Interpreter {
         true
     }
 
+    /// [`Self::lean_code_ok`] for a frameless leaf call from the
+    /// interpreter: compiled code still qualifies (the leaf evaluator
+    /// costs less than entering native code from here; native callers
+    /// take the compiled code through their own call path).
+    #[inline]
+    fn leaf_code_ok(code: &CodeObject) -> bool {
+        !code.wire.as_ref().is_some_and(|w| w.exec_error.is_some())
+    }
+
     /// [`Self::lean_code_ok`] for a generator resume: a compiled
     /// generator whose every loop yields runs at most one iteration per
     /// native resume, and the native resume protocol costs more than
@@ -14912,7 +14921,7 @@ impl Interpreter {
             return None;
         }
         let (missing, slot_self) = code_call_slot(code, call_pc)?.hit(fp, Rc::as_ptr(code_rc))?;
-        if slot_self != has_self || !Self::lean_code_ok(code_rc) {
+        if slot_self != has_self || !Self::leaf_code_ok(code_rc) {
             return None;
         }
         let missing = missing as usize;
@@ -15073,7 +15082,7 @@ impl Interpreter {
         #[cfg(test)]
         note_predicate_stage(code_rc, 2);
         let has_self = !matches!(ops.get(1)?, Object::Unbound);
-        if slot_self != has_self || !Self::lean_code_ok(code_rc) {
+        if slot_self != has_self || !Self::leaf_code_ok(code_rc) {
             return None;
         }
         let missing = missing as usize;
@@ -15187,7 +15196,7 @@ impl Interpreter {
         // `PyFunction::code`); only compared and borrowed below, while the
         // caller's stack keeps the function alive.
         let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
-        if !code_is_pure_leaf(code_rc) || !pure_leaf_warm(code_rc) || !Self::lean_code_ok(code_rc) {
+        if !code_is_pure_leaf(code_rc) || !pure_leaf_warm(code_rc) || !Self::leaf_code_ok(code_rc) {
             return None;
         }
         let (_, covered) = Self::kw_names_bind_cached(code, pc, f, func_id, perm, names, eff_argc)?;

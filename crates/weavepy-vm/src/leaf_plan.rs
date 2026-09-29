@@ -1101,7 +1101,7 @@ impl Interpreter {
                     };
                     let n = usize::from(at + 2 + argc - first);
                     if !crate::code_is_pure_leaf(ccode)
-                        || !Self::lean_code_ok(ccode)
+                        || !Self::leaf_code_ok(ccode)
                         || n != ccode.arg_count as usize
                         || n > 8
                         || crate::recursion::current_depth() + usize::from(nest) + 1

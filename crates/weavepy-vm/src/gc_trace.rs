@@ -32,7 +32,7 @@
 //!   A type's flags decide whether tracking is needed at
 //!   construction time.
 //! - The **eval breaker** triggers a collection when the
-//!   generation-0 counter exceeds the threshold (default 700).
+//!   generation-0 counter exceeds the threshold (default 2000, as in CPython 3.14).
 //!   Collections also happen on explicit `gc.collect()`.
 //!
 //! Today's implementation is *non-incremental*: a full
@@ -73,28 +73,31 @@
 
 use crate::fasthash::ObjectIdHasher;
 use crate::shared_value::ThinArc;
+use crate::sync::Rc as HandleRc;
 use crate::sync::RefCell;
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{
     AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
-use std::sync::Arc;
 
 use crate::object::Object;
 use crate::weakref_registry::{id_of, ObjectId};
 
-type GcIndex =
-    std::collections::HashMap<ObjectId, Arc<TrackedHandle>, BuildHasherDefault<ObjectIdHasher>>;
+type GcIndex = std::collections::HashMap<
+    ObjectId,
+    HandleRc<TrackedHandle>,
+    BuildHasherDefault<ObjectIdHasher>,
+>;
 
 /// The standard CPython generation count (3) and default
-/// thresholds: gen 0 collects when 700 untracked allocations
+/// thresholds (CPython 3.14's): gen 0 collects when 2000 net tracked allocations
 /// have happened; gen 1 every 10 gen 0 collections; gen 2
 /// every 10 gen 1 collections.
 pub const N_GENERATIONS: usize = 3;
 // Color and generation are bounded states; reference counts remain full-width.
 const _: () = assert!(N_GENERATIONS > 0 && N_GENERATIONS <= u8::MAX as usize + 1);
 const MAX_GENERATION: u8 = (N_GENERATIONS - 1) as u8;
-pub const DEFAULT_THRESHOLDS: [usize; N_GENERATIONS] = [700, 10, 10];
+pub const DEFAULT_THRESHOLDS: [usize; N_GENERATIONS] = [2000, 10, 10];
 
 /// Upper bound on the number of mark-sweep passes a single
 /// [`GcState::collect`] runs to reach a fixpoint. Convergence is normally 2–3
@@ -316,7 +319,7 @@ impl TrackedHandle {
 /// in from the end, and its `slot` field is corrected here so the
 /// per-handle position invariant holds after the call.
 #[inline]
-fn swap_remove_handle(vec: &mut Vec<Arc<TrackedHandle>>, slot: usize) {
+fn swap_remove_handle(vec: &mut Vec<HandleRc<TrackedHandle>>, slot: usize) {
     if slot >= vec.len() {
         return;
     }
@@ -333,8 +336,11 @@ fn swap_remove_handle(vec: &mut Vec<Arc<TrackedHandle>>, slot: usize) {
 /// handle was found and removed. O(n) in the generation length, but only ever
 /// taken on the rare stale-cache path — the common case stays O(1).
 #[inline]
-fn remove_handle_by_ptr(vec: &mut Vec<Arc<TrackedHandle>>, handle: &Arc<TrackedHandle>) -> bool {
-    if let Some(pos) = vec.iter().position(|h| Arc::ptr_eq(h, handle)) {
+fn remove_handle_by_ptr(
+    vec: &mut Vec<HandleRc<TrackedHandle>>,
+    handle: &HandleRc<TrackedHandle>,
+) -> bool {
+    if let Some(pos) = vec.iter().position(|h| HandleRc::ptr_eq(h, handle)) {
         swap_remove_handle(vec, pos);
         true
     } else {
@@ -347,7 +353,7 @@ struct Generation {
     /// All tracked handles in this generation. Append-only
     /// during normal allocation; rewritten in place when
     /// objects are promoted or moved to the unreachable list.
-    handles: Vec<Arc<TrackedHandle>>,
+    handles: Vec<HandleRc<TrackedHandle>>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -430,7 +436,7 @@ pub struct GcState {
     /// Frozen handles. `gc.freeze()` moves all tracked objects
     /// here; they are skipped by future collections until
     /// `gc.unfreeze()` runs.
-    frozen: RefCell<Vec<Arc<TrackedHandle>>>,
+    frozen: RefCell<Vec<HandleRc<TrackedHandle>>>,
     /// `gc.garbage` — uncollectable objects (cycles whose
     /// finalisers refused to release).
     pub garbage: RefCell<Vec<Object>>,
@@ -461,7 +467,7 @@ pub struct GcState {
     /// path by scanning *this* small set (not the whole tracked
     /// population) at the interpreter's reference-drop safe points. Keyed
     /// by id like `index`; an object is in both while finalizable.
-    finalizable: RefCell<std::collections::BTreeMap<ObjectId, Arc<TrackedHandle>>>,
+    finalizable: RefCell<std::collections::BTreeMap<ObjectId, HandleRc<TrackedHandle>>>,
     /// Live population of [`Self::finalizable`]. A relaxed load of this
     /// atomic is the gate the interpreter checks before every prompt-
     /// finalization sweep: when it is zero (the overwhelmingly common
@@ -484,7 +490,7 @@ pub struct GcState {
     /// [`Self::finalizable`], so the per-drop scan walks only entries
     /// that could plausibly die this safe point. Membership is mirrored
     /// by each handle's `fin_cold` flag and `fin_hot_slot` index.
-    finalizable_hot: RefCell<Vec<Arc<TrackedHandle>>>,
+    finalizable_hot: RefCell<Vec<HandleRc<TrackedHandle>>>,
     /// `finalizable_hot.len()`, published for the lock-free gate: when
     /// zero, a scan that isn't on the cold stride returns without
     /// borrowing anything — the steady state of a program whose
@@ -511,7 +517,7 @@ impl Drop for GcState {
         // first so the chains are already severed when the handle
         // vectors drop. Safe at this point: the thread is exiting, no
         // Python code will observe the cleared objects.
-        let mut handles: Vec<Arc<TrackedHandle>> = Vec::new();
+        let mut handles: Vec<HandleRc<TrackedHandle>> = Vec::new();
         if let Ok(gens) = self.generations.try_borrow() {
             for g in gens.iter() {
                 handles.extend(g.handles.iter().cloned());
@@ -582,7 +588,7 @@ impl GcState {
     /// Insert `h` into the finalizable index (RFC 0077 WS2: one place
     /// for the population and hot-set bookkeeping). New entries start
     /// hot; the next scan grades them. Returns whether it was new.
-    fn fin_insert(&self, id: ObjectId, h: Arc<TrackedHandle>) -> bool {
+    fn fin_insert(&self, id: ObjectId, h: HandleRc<TrackedHandle>) -> bool {
         let mut fin = self.finalizable.borrow_mut();
         if fin.contains_key(&id) {
             return false;
@@ -601,6 +607,12 @@ impl GcState {
     /// Remove `id` from the finalizable index, if present, keeping the
     /// population and hot set exact.
     fn fin_remove(&self, id: ObjectId) -> bool {
+        // The usual case: nothing finalizable is tracked at all. (Inserts
+        // count after they land, and the same thread removes an id it
+        // inserted.)
+        if self.finalizable_count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
         let removed = self.finalizable.borrow_mut().remove(&id);
         let Some(h) = removed else {
             return false;
@@ -611,7 +623,7 @@ impl GcState {
 
     /// The hot-set and population half of [`Self::fin_remove`], for the
     /// one caller that already holds the finalizable lock.
-    fn fin_remove_bookkeeping(&self, h: &Arc<TrackedHandle>) {
+    fn fin_remove_bookkeeping(&self, h: &HandleRc<TrackedHandle>) {
         self.fin_make_cold(h);
         if self.finalizable_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             // RFC 0065 (WS1): population reached zero — dispatch loops
@@ -621,7 +633,7 @@ impl GcState {
     }
 
     /// Move `h` into the hot set (no-op if already hot).
-    fn fin_make_hot(&self, h: &Arc<TrackedHandle>) {
+    fn fin_make_hot(&self, h: &HandleRc<TrackedHandle>) {
         let mut hot = self.finalizable_hot.borrow_mut();
         if !h.fin_cold.swap(false, Ordering::AcqRel)
             && h.fin_hot_slot.load(Ordering::Relaxed) != usize::MAX
@@ -636,19 +648,19 @@ impl GcState {
 
     /// Move `h` out of the hot set (no-op if already cold). O(1) via
     /// the handle's cached slot, with the swap-remove fixup.
-    fn fin_make_cold(&self, h: &Arc<TrackedHandle>) {
+    fn fin_make_cold(&self, h: &HandleRc<TrackedHandle>) {
         let mut hot = self.finalizable_hot.borrow_mut();
         h.fin_cold.store(true, Ordering::Release);
         let slot = h.fin_hot_slot.swap(usize::MAX, Ordering::AcqRel);
         if slot == usize::MAX {
             return;
         }
-        if slot < hot.len() && Arc::ptr_eq(&hot[slot], h) {
+        if slot < hot.len() && HandleRc::ptr_eq(&hot[slot], h) {
             hot.swap_remove(slot);
             if let Some(moved) = hot.get(slot) {
                 moved.fin_hot_slot.store(slot, Ordering::Relaxed);
             }
-        } else if let Some(pos) = hot.iter().position(|x| Arc::ptr_eq(x, h)) {
+        } else if let Some(pos) = hot.iter().position(|x| HandleRc::ptr_eq(x, h)) {
             hot.swap_remove(pos);
             if let Some(moved) = hot.get(pos) {
                 moved.fin_hot_slot.store(pos, Ordering::Relaxed);
@@ -845,7 +857,7 @@ impl GcState {
             // insert becomes observable (we hold the index borrow, so
             // no prober can race past a fresh registration).
             self.tracked_filter.insert(new_id);
-            let handle = Arc::new(TrackedHandle::new(obj, 0));
+            let handle = HandleRc::new(TrackedHandle::new(obj, 0));
             entry.insert(handle.clone());
             // Enroll finalizable objects in the dedicated prompt-finalization
             // index so the per-safe-point sweep scans only them, not the whole
@@ -877,8 +889,8 @@ impl GcState {
         if !self.finalized_ids.borrow().is_empty() {
             self.finalized_ids.borrow_mut().remove(&new_id);
         }
-        self.tracked_count.fetch_add(1, Ordering::AcqRel);
-        self.tracked_version.fetch_add(1, Ordering::AcqRel);
+        serial_add(&self.tracked_count, 1);
+        serial_add(&self.tracked_version, 1);
         self.note_gen0_alloc();
     }
 
@@ -937,7 +949,10 @@ impl GcState {
         if handle.color.load(Ordering::Acquire) == color::Frozen {
             let mut frozen = self.frozen.borrow_mut();
             let slot = handle.slot.load(Ordering::Acquire);
-            if frozen.get(slot).is_some_and(|h| Arc::ptr_eq(h, &handle)) {
+            if frozen
+                .get(slot)
+                .is_some_and(|h| HandleRc::ptr_eq(h, &handle))
+            {
                 swap_remove_handle(&mut frozen, slot);
             } else {
                 remove_handle_by_ptr(&mut frozen, &handle);
@@ -954,7 +969,7 @@ impl GcState {
             if gens[g]
                 .handles
                 .get(slot)
-                .is_some_and(|h| Arc::ptr_eq(h, &handle))
+                .is_some_and(|h| HandleRc::ptr_eq(h, &handle))
             {
                 swap_remove_handle(&mut gens[g].handles, slot);
             } else if !remove_handle_by_ptr(&mut gens[g].handles, &handle) {
@@ -968,8 +983,8 @@ impl GcState {
                 }
             }
         }
-        self.tracked_count.fetch_sub(1, Ordering::AcqRel);
-        self.tracked_version.fetch_add(1, Ordering::AcqRel);
+        serial_add(&self.tracked_count, usize::MAX);
+        serial_add(&self.tracked_version, 1);
     }
 
     /// Reclaim every tracked object on this thread whose only remaining
@@ -1231,8 +1246,10 @@ impl GcState {
             Hot,
             Cold,
         }
-        let mut out: Vec<Arc<TrackedHandle>> = Vec::new();
-        let mut probe = |h: &Arc<TrackedHandle>, out: &mut Vec<Arc<TrackedHandle>>| -> Grade {
+        let mut out: Vec<HandleRc<TrackedHandle>> = Vec::new();
+        let mut probe = |h: &HandleRc<TrackedHandle>,
+                         out: &mut Vec<HandleRc<TrackedHandle>>|
+         -> Grade {
             probed += 1;
             let sc = strong_count_for(&h.object);
             let cached = h.weak_clones.load(Ordering::Acquire);
@@ -1300,11 +1317,11 @@ impl GcState {
             // Walk the whole index (or a rotating window of it) and
             // re-grade every entry; collect the transitions and apply
             // them after the index borrow ends.
-            let mut to_cold: Vec<Arc<TrackedHandle>> = Vec::new();
-            let mut to_hot: Vec<Arc<TrackedHandle>> = Vec::new();
+            let mut to_cold: Vec<HandleRc<TrackedHandle>> = Vec::new();
+            let mut to_hot: Vec<HandleRc<TrackedHandle>> = Vec::new();
             {
                 let fin = self.finalizable.borrow();
-                let mut grade = |h: &Arc<TrackedHandle>| {
+                let mut grade = |h: &HandleRc<TrackedHandle>| {
                     let was_cold = h.fin_cold.load(Ordering::Relaxed);
                     match probe(h, &mut out) {
                         Grade::Cold if !was_cold => to_cold.push(h.clone()),
@@ -1438,7 +1455,7 @@ impl GcState {
     }
 
     /// O(1) handle lookup by object id (any generation or frozen).
-    pub fn handle_for(&self, id: ObjectId) -> Option<Arc<TrackedHandle>> {
+    pub fn handle_for(&self, id: ObjectId) -> Option<HandleRc<TrackedHandle>> {
         // RFC 0065 (WS4): see `is_tracked`.
         if !self.tracked_filter.may_contain(id) {
             return None;
@@ -1452,9 +1469,9 @@ impl GcState {
     /// finalizers for everything during interpreter teardown, not just
     /// for cyclic garbage. The per-handle `finalized` flag (shared with
     /// the cycle collector) guarantees each `__del__` runs at most once.
-    pub fn finalization_candidates(&self) -> Vec<Arc<TrackedHandle>> {
+    pub fn finalization_candidates(&self) -> Vec<HandleRc<TrackedHandle>> {
         let mut out = Vec::new();
-        let pending = |h: &Arc<TrackedHandle>| {
+        let pending = |h: &HandleRc<TrackedHandle>| {
             !h.finalized.load(Ordering::Acquire)
                 // A finalizer already queued by a collection (but not yet
                 // drained) must not be listed again — the pending queue owns
@@ -1911,7 +1928,7 @@ impl GcState {
         // are not counted as collected — they're dropped when this pass ends,
         // and the underlying iterator is freed by refcount once the real
         // objects in its (dead) cycle are cleared.
-        let mut temp_handles: Vec<Arc<TrackedHandle>> = Vec::new();
+        let mut temp_handles: Vec<HandleRc<TrackedHandle>> = Vec::new();
         {
             // Scan the existing candidate list, then the growing temporary
             // list, preserving discovery order without copying either list.
@@ -2039,7 +2056,7 @@ impl GcState {
                     if by_id.contains_key(&cid) {
                         return;
                     }
-                    let handle = Arc::new(TrackedHandle::new(child.clone(), 0));
+                    let handle = HandleRc::new(TrackedHandle::new(child.clone(), 0));
                     by_id.insert(cid, handle.clone());
                     temp_handles.push(handle);
                 });
@@ -2127,7 +2144,7 @@ impl GcState {
         }
 
         // Phase 5: white objects are unreachable cyclic garbage.
-        let unreachable: Vec<Arc<TrackedHandle>> = candidate_set
+        let unreachable: Vec<HandleRc<TrackedHandle>> = candidate_set
             .iter()
             .filter(|h| h.color.load(Ordering::Acquire) == color::White)
             .cloned()
@@ -2271,8 +2288,8 @@ impl GcState {
         // wasn't resurrected falls into `dead` and is reclaimed (its weakrefs
         // cleared in that second pass, so single-`collect()` weakref tests
         // still observe `ref() is None`).
-        let mut deferred: Vec<Arc<TrackedHandle>> = Vec::new();
-        let mut maybe_dead: Vec<Arc<TrackedHandle>> = Vec::new();
+        let mut deferred: Vec<HandleRc<TrackedHandle>> = Vec::new();
+        let mut maybe_dead: Vec<HandleRc<TrackedHandle>> = Vec::new();
         for h in &unreachable {
             let pending_finalizer =
                 has_finalizer(&h.object) && !h.finalized.load(Ordering::Acquire);
@@ -2372,7 +2389,7 @@ impl GcState {
 
         // Whatever stayed White after the resurrection re-mark and the finalizer
         // subgraph protection is genuinely dead this pass.
-        let dead: Vec<Arc<TrackedHandle>> = maybe_dead
+        let dead: Vec<HandleRc<TrackedHandle>> = maybe_dead
             .into_iter()
             .filter(|h| h.color.load(Ordering::Acquire) == color::White)
             .collect();
@@ -2431,7 +2448,7 @@ impl GcState {
             // every other dead object has released its references, a
             // dict held only by dead holders is down to one owner and
             // the retry clears it (a live holder keeps it intact).
-            let mut shared_dict_holders: Vec<&Arc<TrackedHandle>> = Vec::new();
+            let mut shared_dict_holders: Vec<&HandleRc<TrackedHandle>> = Vec::new();
             for h in &dead {
                 if !clear_object_fields(&h.object) {
                     shared_dict_holders.push(h);
@@ -2565,7 +2582,7 @@ impl GcState {
         reported
     }
 
-    fn snapshot_for_collection(&self, upto: usize) -> Vec<Arc<TrackedHandle>> {
+    fn snapshot_for_collection(&self, upto: usize) -> Vec<HandleRc<TrackedHandle>> {
         let gens = self.generations.borrow();
         let selected = &gens[..=upto.min(N_GENERATIONS - 1)];
         let mut out = Vec::with_capacity(selected.iter().map(|g| g.handles.len()).sum());
@@ -2575,7 +2592,7 @@ impl GcState {
         out
     }
 
-    fn rebuild_generations(&self, upto: usize, candidates: &[Arc<TrackedHandle>]) {
+    fn rebuild_generations(&self, upto: usize, candidates: &[HandleRc<TrackedHandle>]) {
         // Lock order MUST match `track` (index before generations): the
         // collector and a mutator thread can both reach the GC under the
         // shared, process-global state, and acquiring these two cells in
@@ -3310,7 +3327,7 @@ pub fn with_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
 /// well away from `getrefcount`-hot paths like pandas'.
 pub fn zombie_memoryview_refs_to(target: ObjectId) -> usize {
     with_state(|s| {
-        let mut handles: Vec<Arc<TrackedHandle>> = Vec::new();
+        let mut handles: Vec<HandleRc<TrackedHandle>> = Vec::new();
         {
             let Ok(gens) = s.generations.try_borrow() else {
                 return 0;
@@ -3412,6 +3429,19 @@ pub fn track(obj: Object) {
         with_state(|s| s.track(dict));
     }
     with_state(|s| s.track(obj));
+}
+
+/// `counter += n` (wrapping) for a collector counter: a plain load and
+/// store while the GIL serializes every writer, a locked read-modify-write
+/// only in free-threaded mode.
+#[inline(always)]
+fn serial_add(counter: &AtomicUsize, n: usize) {
+    if crate::gil::free_threading_enabled() {
+        counter.fetch_add(n, Ordering::AcqRel);
+    } else {
+        let v = counter.load(Ordering::Relaxed);
+        counter.store(v.wrapping_add(n), Ordering::Release);
+    }
 }
 
 /// Deferred instance tracking.
@@ -3709,7 +3739,7 @@ pub fn maybe_auto_collect() -> bool {
 
 /// Convenience: find a tracked handle by object id (O(1) via the
 /// id index, which covers all generations plus the frozen set).
-pub fn find_handle(id: ObjectId) -> Option<Arc<TrackedHandle>> {
+pub fn find_handle(id: ObjectId) -> Option<HandleRc<TrackedHandle>> {
     with_state(|s| s.handle_for(id))
 }
 
@@ -3745,7 +3775,7 @@ pub fn complete_finalizer(id: ObjectId) {
 
 /// Convenience: snapshot all tracked objects with an unrun `__del__`
 /// in the shared GC (see [`GcState::finalization_candidates`]).
-pub fn finalization_candidates() -> Vec<Arc<TrackedHandle>> {
+pub fn finalization_candidates() -> Vec<HandleRc<TrackedHandle>> {
     with_state(|s| s.finalization_candidates())
 }
 
@@ -3871,7 +3901,7 @@ const SUSPECT_DORMANT_PROBES: u8 = 16;
 /// One enrolled suspect: its handle, remaining active probe budget, and
 /// (once dormant) the number of stride probes it has survived.
 struct Suspect {
-    handle: Arc<TrackedHandle>,
+    handle: HandleRc<TrackedHandle>,
     budget: u8,
     dormant_probes: u8,
 }
@@ -4089,7 +4119,7 @@ pub fn active_suspects_present() -> bool {
 /// Enroll a cascade-skipped tracked object for later deadness re-probes.
 /// Deduplicated; silently dropped when the list is full (the next full
 /// collection reclaims it instead).
-pub fn note_suspect(h: Arc<TrackedHandle>) {
+pub fn note_suspect(h: HandleRc<TrackedHandle>) {
     static NO_SUSPECTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *NO_SUSPECTS.get_or_init(|| std::env::var_os("WEAVEPY_NO_SUSPECTS").is_some()) {
         return;
@@ -4618,9 +4648,9 @@ mod tests {
                     _ => u8::MAX,
                 };
                 let object = Object::List(Rc::new(RefCell::new(Vec::new())));
-                let handle = Arc::new(TrackedHandle::new(object, 0));
+                let handle = HandleRc::new(TrackedHandle::new(object, 0));
                 let id = handle.id;
-                handles.insert(id, Arc::downgrade(&handle));
+                handles.insert(id, HandleRc::downgrade(&handle));
                 suspects.insert(
                     id,
                     Suspect {

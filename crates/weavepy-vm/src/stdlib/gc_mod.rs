@@ -16,7 +16,7 @@ use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 thread_local! {
     static GC_ENABLED: RefCell<bool> = const { RefCell::new(true) };
     static GC_DEBUG: RefCell<i64> = const { RefCell::new(0) };
-    static GC_THRESHOLD: RefCell<(i64, i64, i64)> = const { RefCell::new((700, 10, 10)) };
+    static GC_THRESHOLD: RefCell<(i64, i64, i64)> = const { RefCell::new((2000, 10, 10)) };
 }
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
@@ -169,7 +169,7 @@ fn get_threshold(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn set_threshold(args: &[Object]) -> Result<Object, RuntimeError> {
-    let mut vals = [700i64, 10, 10];
+    let mut vals = [2000i64, 10, 10];
     for (slot, v) in vals.iter_mut().zip(args.iter()) {
         if let Object::Int(n) = v {
             *slot = *n;
