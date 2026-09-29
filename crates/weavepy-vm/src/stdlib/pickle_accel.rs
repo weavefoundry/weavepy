@@ -944,6 +944,10 @@ struct Probe<'a, 'c, const RECORD_OPCODES: bool> {
     builds: Vec<(StateNodes, Option<u32>)>,
     context: &'c dyn Fn() -> Option<DecodeContext>,
     resolved: Option<DecodeContext>,
+    /// The `__slots__` members already verified in this stream (see
+    /// `classes::is_member_slot`): every instance of a class names the
+    /// same ones.
+    member_slots: Vec<(*const TypeObject, &'a str)>,
 }
 
 impl<'a, 'c, const RECORD_OPCODES: bool> Probe<'a, 'c, RECORD_OPCODES> {
@@ -955,7 +959,26 @@ impl<'a, 'c, const RECORD_OPCODES: bool> Probe<'a, 'c, RECORD_OPCODES> {
             builds: Vec::new(),
             context,
             resolved: None,
+            member_slots: Vec::new(),
         }
+    }
+
+    /// [`classes::is_member_slot`], remembered for this stream. (No Python
+    /// runs during the probe, so the class can't change in between.)
+    fn is_member_slot(&mut self, class: &Rc<TypeObject>, name: &'a str) -> bool {
+        let key = Rc::as_ptr(class);
+        if self
+            .member_slots
+            .iter()
+            .any(|&(c, n)| c == key && n == name)
+        {
+            return true;
+        }
+        let yes = classes::is_member_slot(class, name);
+        if yes && self.member_slots.len() < 64 {
+            self.member_slots.push((key, name));
+        }
+        yes
     }
 
     /// Count the references to each node that the result keeps: the root,
@@ -1259,10 +1282,11 @@ impl<'a, const RECORD_OPCODES: bool> Sink<'a> for Probe<'a, '_, RECORD_OPCODES> 
         }
         if let Some(slots) = nodes.slots {
             // `setattr` must reach a member descriptor of `__slots__`.
-            if !self
-                .state_keys(slots)?
-                .iter()
-                .all(|name| classes::is_member_slot(&class.class, name))
+            let names = self.state_keys(slots)?.to_vec();
+            let class = class.class.clone();
+            if !names
+                .into_iter()
+                .all(|name| self.is_member_slot(&class, name))
             {
                 return None;
             }

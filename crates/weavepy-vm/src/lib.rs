@@ -13729,6 +13729,15 @@ impl Interpreter {
                                                 Object::Dict(d) => {
                                                     d.try_borrow().ok().map(|d| d.len())
                                                 }
+                                                // A native `__len__` (a deque's).
+                                                v @ Object::Instance(_) => {
+                                                    match self.leaf_instance_len(v) {
+                                                        Some(Object::Int(n)) => {
+                                                            usize::try_from(n).ok()
+                                                        }
+                                                        _ => None,
+                                                    }
+                                                }
                                                 _ => None,
                                             };
                                             if let Some(n) = n.and_then(|n| i64::try_from(n).ok()) {
