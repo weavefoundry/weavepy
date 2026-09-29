@@ -1437,7 +1437,19 @@ impl<'a> Sink<'a> for Objects {
         let Object::Type(class) = class else {
             return None;
         };
-        // `object.__new__(cls)`, including its cycle-collector registration.
+        // `object.__new__(cls)`, including its cycle-collector registration:
+        // deferred, as for a plain class's ordinary construction, until the
+        // instance could hold a non-atomic value (the state paths below
+        // track it then).
+        if class.native_kind.get() == 0
+            && !class.flags.is_builtin
+            && !class.instances_need_finalize()
+        {
+            self.next_node += 1;
+            return Some(Object::Instance(crate::types::PyInstance::new_deferred(
+                class.clone(),
+            )));
+        }
         let instance = Object::Instance(Rc::new(crate::types::PyInstance::new(class.clone())));
         self.created(&instance);
         Some(instance)
@@ -1468,8 +1480,12 @@ impl<'a> Sink<'a> for Objects {
             }
         }
         if let Some(slots) = slots {
-            // `setattr(inst, key, value)` on a verified member descriptor.
-            instance.ensure_gc_tracked();
+            // `setattr(inst, key, value)` on a verified member descriptor,
+            // whose write barrier tracks a deferred instance at its first
+            // non-atomic value.
+            if slots.borrow().iter().any(|(_, v)| !v.is_gc_atomic()) {
+                instance.ensure_gc_tracked();
+            }
             let mut storage = instance.slots.borrow_mut();
             if movable.slots.is_some() {
                 let data = std::mem::take(&mut *slots.borrow_mut());

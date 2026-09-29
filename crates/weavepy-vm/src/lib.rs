@@ -2978,6 +2978,17 @@ impl Interpreter {
         // test below keeps `strong` above the dead threshold and leaves
         // the cycle to the tracing collector.
         let mut work = vec![dropped];
+        // Each node's scratch, emptied per node and allocated once per
+        // cascade (a dead graph of many small containers paid four
+        // allocations and a hash set per node).
+        let mut children: Vec<crate::sync::Rc<gc_trace::TrackedHandle>> = Vec::new();
+        let mut weakref_candidates: Vec<Object> = Vec::new();
+        let mut pool_candidates: Vec<Object> = Vec::new();
+        let mut scan_through: Vec<Object> = Vec::new();
+        let mut scanned: std::collections::HashSet<
+            crate::weakref_registry::ObjectId,
+            std::hash::BuildHasherDefault<crate::fasthash::ObjectIdHasher>,
+        > = std::collections::HashSet::default();
         loop {
             let Some(obj) = work.pop() else {
                 // Freeing the objects above may have parked C-side dealloc
@@ -3112,7 +3123,7 @@ impl Interpreter {
             // unpickler temporary holding the memo) cascades through the
             // untracked `memo` dict to the tracked argument. The refcount guard
             // below still filters anything that stays externally reachable.
-            let mut children: Vec<crate::sync::Rc<gc_trace::TrackedHandle>> = Vec::new();
+            debug_assert!(children.is_empty());
             // Untracked descendants with live weakrefs: CPython clears an
             // object's weakrefs at refcount zero whether or not the GC ever
             // tracked it, but this cascade's "next link" set is (otherwise)
@@ -3127,18 +3138,15 @@ impl Interpreter {
             // `has_reference()` flips to False). Collect them during the
             // scan and run the dead ones through the cascade so their
             // weakrefs clear at death, like any tracked link.
-            let mut weakref_candidates: Vec<Object> = Vec::new();
+            debug_assert!(weakref_candidates.is_empty());
             // Plain-tuple children about to die with `obj` are recycled
             // through the tuple pool (see `maybe_donate_tuple`): the plain
             // `Rc` drop below frees them invisibly, and this cascade is
             // where the common `f(*args)`-shaped temporaries actually die
             // (the argument tuple is anchored by a dead list/frame local).
-            let mut pool_candidates: Vec<Object> = Vec::new();
-            let mut scan_through: Vec<Object> = vec![obj.clone()];
-            let mut scanned: std::collections::HashSet<
-                crate::weakref_registry::ObjectId,
-                std::hash::BuildHasherDefault<crate::fasthash::ObjectIdHasher>,
-            > = std::collections::HashSet::default();
+            debug_assert!(pool_candidates.is_empty());
+            scan_through.push(obj.clone());
+            scanned.clear();
             while let Some(parent) = scan_through.pop() {
                 gc_trace::traverse_object(&parent, &mut |c| {
                     // Scalars are never tracked, weakly referenced, or
@@ -3231,14 +3239,14 @@ impl Interpreter {
             // A tuple child whose last holder was `obj` is now ours alone
             // (strong count 1 = the scan's clone); park its allocation.
             // Anything still referenced elsewhere just sheds the clone.
-            for cand in pool_candidates {
+            for cand in pool_candidates.drain(..) {
                 if matches!(&cand, Object::Tuple(t) if ThinArc::strong_count(t) == 1) {
                     self.maybe_donate_tuple(cand);
                 }
             }
             // Any tracked child that just lost its last program reference
             // is the next link in the chain.
-            for h in children {
+            for h in children.drain(..) {
                 if !h.untracked.load(std::sync::atomic::Ordering::Acquire) {
                     let weak = crate::weakref_registry::strong_clone_count(h.id);
                     // `h.object` is the GC's own strong reference; the
@@ -3265,7 +3273,7 @@ impl Interpreter {
             // its weakrefs clear now (the refcount guard at the top of the
             // loop re-checks liveness — our `weakref_candidates` clone is
             // accounted for by the cascade's `extra` slack of 1).
-            for cand in weakref_candidates {
+            for cand in weakref_candidates.drain(..) {
                 if Self::is_refcount_dead(&cand, 1) {
                     work.push(cand);
                 }
@@ -12305,6 +12313,41 @@ impl Interpreter {
                                             continue;
                                         }
                                     }
+                                    // `x.m(...)` of a container's site-cached
+                                    // leaf method on the borrowed local.
+                                    if matches!(
+                                        other,
+                                        Object::List(_)
+                                            | Object::Dict(_)
+                                            | Object::Set(_)
+                                            | Object::Str(_)
+                                    ) && pc + 1 < ninstrs
+                                        && len < cap
+                                        && (*instrs.add(pc + 1)).op == OpCode::LoadMethodAttr
+                                    {
+                                        if let Some((r, call_pc)) = self.core_builtin_method(
+                                            code,
+                                            other,
+                                            pc + 1,
+                                            mslots!(cold_mslots, ext),
+                                            lbase,
+                                            nlocals,
+                                            consts,
+                                        ) {
+                                            last = call_pc;
+                                            pc = call_pc + 1;
+                                            match r {
+                                                Ok(v) => {
+                                                    base.add(len).write(v);
+                                                    len += 1;
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    break Some(CoreExit::Stop(LeafStop::Raised(e)));
+                                                }
+                                            }
+                                        }
+                                    }
                                     clone_hot(other)
                                 }
                             };
@@ -15804,6 +15847,58 @@ impl Interpreter {
                 None => (b.call)(ops),
             },
         };
+        Some((r, call_pc))
+    }
+
+    /// The core loop's fused `LOAD_FAST x; LOAD_ATTR m (method); <simple
+    /// argument loads>; CALL k` on a local `list`, `dict`, `set` or `str`
+    /// whose method the `LOAD_ATTR` site cached under the receiver's tag and
+    /// the `CALL` site admitted as a leaf kind: called on bitwise views of
+    /// the borrowed operands, as [`Self::core_native_method`] does, so no
+    /// receiver clone is pushed and released (a release the collector
+    /// grades). `None` (nothing touched) runs the instructions one by one.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn core_builtin_method(
+        &self,
+        code: &CodeObject,
+        recv: &Object,
+        attr_pc: usize,
+        mslots: &[MethodSlot],
+        lbase: *const Object,
+        nlocals: usize,
+        consts: &[Object],
+    ) -> Option<(Result<Object, RuntimeError>, usize)> {
+        let tag = match recv {
+            Object::List(_) => 1,
+            Object::Dict(_) => 2,
+            Object::Set(_) => 3,
+            Object::Str(_) => 4,
+            _ => return None,
+        };
+        let b = mslots.get(attr_pc)?.get_builtin_ptr(tag)?;
+        // Bitwise views, never dropped (see `core_native_method`).
+        let mut ops = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
+        // SAFETY: the receiver is the core loop's local.
+        ops[0].write(unsafe { std::ptr::read(recv) });
+        // SAFETY: the core loop's own locals and constants.
+        let (nargs, call_pc) = unsafe {
+            Self::core_simple_ops(
+                &code.instructions,
+                attr_pc + 1,
+                lbase,
+                nlocals,
+                consts,
+                &mut ops,
+            )
+        }?;
+        let kind = mslots.get(call_pc)?.get_leaf_ptr(b)?;
+        // SAFETY: the first `nargs + 1` entries were written.
+        let ops =
+            unsafe { std::slice::from_raw_parts(ops.as_ptr().cast::<Object>(), nargs + 1) };
+        // SAFETY: the slot (and the builtin type) holds the method for the
+        // call, which runs no Python code.
+        let r = self.leaf_builtin_call(kind, unsafe { &*b }, ops)?;
         Some((r, call_pc))
     }
 
