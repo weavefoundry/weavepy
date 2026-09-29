@@ -13674,7 +13674,15 @@ impl Interpreter {
                                                 ),
                                                 _ => None,
                                             }) {
-                                            Some(f) => Object::Function(f),
+                                            Some(f) => {
+                                                // The site remembers this
+                                                // class too (see
+                                                // `MethodSlot::poly_remember`),
+                                                // so its fused leaf-call
+                                                // path serves it next time.
+                                                ms.set(ver, &f);
+                                                Object::Function(f)
+                                            }
                                             None => break Some(CoreExit::Helper),
                                         },
                                     },
@@ -13759,6 +13767,20 @@ impl Interpreter {
                                     .and_then(|s| class_attr_hit(s, cls))
                                 {
                                     Some(v) if Rc::strong_count(cls) > 1 => {
+                                        // SAFETY: the receiver is replaced in place.
+                                        unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
+                                        last = pc;
+                                        pc += 1;
+                                        continue;
+                                    }
+                                    _ => break Some(CoreExit::Helper),
+                                }
+                            }
+                            // `module.name` off the site's cached index (a
+                            // shared module leaves by a plain decrement).
+                            Object::Module(m) => {
+                                match Self::core_module_attr(code, m, pc, ins.arg) {
+                                    Some(v) if !gc_trace::note_dropped_marks(unsafe { &*top }) => {
                                         // SAFETY: the receiver is replaced in place.
                                         unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
                                         last = pc;
@@ -16094,6 +16116,28 @@ impl Interpreter {
                 CoreAttr::Raised(e)
             }
         }
+    }
+
+    /// A module attribute through the `LOAD_ATTR` site's cached index:
+    /// the value, cloned, or `None` for the helper's full path.
+    #[inline]
+    fn core_module_attr(
+        code: &CodeObject,
+        m: &crate::object::PyModule,
+        pc: usize,
+        name_idx: u32,
+    ) -> Option<Object> {
+        use weavepy_compiler::InlineCache as IC;
+        let IC::LoadAttrModule { module_id, key_idx } = code.caches.get(pc as u32) else {
+            return None;
+        };
+        if specialize::rc_id(&m.dict) != module_id {
+            return None;
+        }
+        // SAFETY: a read between two instructions (see `GilCell::peek`).
+        let dict = unsafe { m.dict.peek() }?;
+        let (k, v) = dict.get_index(key_idx as usize)?;
+        slot_name_matches(code, name_idx, k).then(|| Self::clone_operand(v))
     }
 
     /// The core loop's `x.attr` on a local receiver: the cached
@@ -18776,8 +18820,9 @@ impl Interpreter {
             return None;
         }
         Some(match fast {
-            Some(f) => LeafKind::Fast(*f),
-            None => LeafKind::Opaque,
+            leaf_builtins::Entry::Fast(f) => LeafKind::Fast(*f),
+            leaf_builtins::Entry::Opaque => LeafKind::Opaque,
+            leaf_builtins::Entry::Scalar => LeafKind::Scalar,
         })
     }
 
@@ -19051,6 +19096,9 @@ impl Interpreter {
                 return Some(Ok(inst));
             }
             K::Opaque => true,
+            K::Scalar => args
+                .iter()
+                .all(|a| matches!(a, O::Int(_) | O::Float(_) | O::Bool(_))),
             // The fast half decides (and declines untouched).
             K::Fast(f) => return f(args),
         };
@@ -56034,6 +56082,9 @@ enum LeafKind {
     StrFormat,
     /// A registered leaf builtin (see [`leaf_builtins`]): any arguments.
     Opaque,
+    /// A registered leaf builtin over plain `int`/`float`/`bool`
+    /// arguments (see [`leaf_builtins::Entry::Scalar`]).
+    Scalar,
 }
 
 impl LeafKind {
@@ -56046,6 +56097,7 @@ impl LeafKind {
         matches!(
             self,
             Self::Opaque
+                | Self::Scalar
                 | Self::Fast(_)
                 | Self::Isinstance
                 | Self::Len
@@ -56785,25 +56837,44 @@ pub(crate) mod leaf_builtins {
     )
         -> Option<Result<crate::object::Object, crate::error::RuntimeError>>;
 
-    static REGISTRY: parking_lot::Mutex<Vec<(Weak<crate::object::BuiltinFn>, Option<Fast>)>> =
+    /// What a registration vouches for.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Entry {
+        /// The whole body is a leaf, for any arguments.
+        Opaque,
+        /// This pure fast half (see [`Fast`]).
+        Fast(Fast),
+        /// The whole body is a leaf when every argument is a plain `int`,
+        /// `float` or `bool` (numeric functions that reach Python code only
+        /// through another object's conversion hooks).
+        Scalar,
+    }
+
+    static REGISTRY: parking_lot::Mutex<Vec<(Weak<crate::object::BuiltinFn>, Entry)>> =
         parking_lot::Mutex::new(Vec::new());
     static GENERATION: AtomicU64 = AtomicU64::new(1);
 
     /// Vouch for `b` (by identity): its whole body is a leaf.
     pub(crate) fn register(b: &Rc<crate::object::BuiltinFn>) {
-        push(b, None);
+        push(b, Entry::Opaque);
     }
 
     /// Vouch for `fast` as `b`'s leaf half: the dispatch loop calls it
     /// inline and takes the full path when it declines.
     pub(crate) fn register_fast(b: &Rc<crate::object::BuiltinFn>, fast: Fast) {
-        push(b, Some(fast));
+        push(b, Entry::Fast(fast));
     }
 
-    fn push(b: &Rc<crate::object::BuiltinFn>, fast: Option<Fast>) {
+    /// Vouch for `b`'s whole body as a leaf over scalar arguments (see
+    /// [`Entry::Scalar`]).
+    pub(crate) fn register_scalar(b: &Rc<crate::object::BuiltinFn>) {
+        push(b, Entry::Scalar);
+    }
+
+    fn push(b: &Rc<crate::object::BuiltinFn>, entry: Entry) {
         let mut reg = REGISTRY.lock();
         reg.retain(|(w, _)| w.strong_count() > 0);
-        reg.push((Rc::downgrade(b), fast));
+        reg.push((Rc::downgrade(b), entry));
         GENERATION.fetch_add(1, Ordering::Release);
     }
 
@@ -56823,7 +56894,7 @@ pub(crate) mod leaf_builtins {
 
     pub(crate) type LeafMap = std::collections::HashMap<
         usize,
-        (Weak<crate::object::BuiltinFn>, Option<Fast>),
+        (Weak<crate::object::BuiltinFn>, Entry),
         crate::fasthash::FxBuildHasher,
     >;
 }

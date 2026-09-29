@@ -268,6 +268,14 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             builtin("acosh", math_acosh),
         );
     }
+    // Every function's body is a leaf over plain numbers: only another
+    // object's `__float__`/`__index__`/`__ceil__`-style hooks run Python
+    // code, and the dispatch loop admits scalar arguments only.
+    for v in dict.borrow().values() {
+        if let Object::Builtin(b) = v {
+            crate::leaf_builtins::register_scalar(b);
+        }
+    }
     Rc::new(PyModule {
         name: "math".to_owned(),
         filename: None,
