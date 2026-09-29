@@ -2155,6 +2155,11 @@ fn drain_activation_pins(interp: &mut super::Interpreter, pins: &mut PinTable) -
             Pin::List(list, _) => Object::List(list),
             Pin::Obj(o) => o,
         };
+        // The common pin, a receiver or argument others still hold,
+        // releases plainly (the grades below would conclude the same).
+        if crate::gc_trace::drop_survives_plainly(&o) {
+            continue;
+        }
         if super::Interpreter::local_needs_prompt_reap(&o)
             && super::Interpreter::looks_reapable_temporary(&o)
         {
@@ -2179,6 +2184,9 @@ fn defer_activation_pins(pins: &mut PinTable) {
             Pin::List(list, _) => Object::List(list),
             Pin::Obj(obj) => obj,
         };
+        if crate::gc_trace::drop_survives_plainly(&obj) {
+            continue;
+        }
         if super::Interpreter::local_needs_prompt_reap(&obj)
             && super::Interpreter::looks_reapable_temporary(&obj)
         {

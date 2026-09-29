@@ -11991,11 +11991,7 @@ impl Interpreter {
             //
             // The fused local pairs below, one byte per instruction (empty
             // for code that has none).
-            let fast_pairs: &[u8] = if crate::hot_gates::env_flags::no_pairs() {
-                &[]
-            } else {
-                code_fast_pairs(code, ext)
-            };
+            let fast_pairs: &[u8] = code_fast_pairs(code, ext);
             let stack = &mut frame.stack;
             let base = stack.as_mut_ptr();
             let cap = stack.capacity();
@@ -15304,9 +15300,9 @@ impl Interpreter {
                 // weakref operation that requires tracking revokes the flag.
                 // Past two owners only a weakref-watched object can be at
                 // its dead line (see `gc_trace::note_dropped_marks`).
-                let sc = Rc::strong_count(i);
-                sc > 2 && !crate::weakref_registry::may_have_weakrefs(Rc::as_ptr(i) as usize as u64)
-                    || sc > 1 && (i.is_gc_deferred() || !gc_trace::note_dropped_marks(v))
+                gc_trace::drop_survives_plainly(v)
+                    || Rc::strong_count(i) > 1
+                        && (i.is_gc_deferred() || !gc_trace::note_dropped_marks(v))
             }
             Object::List(l) if Rc::strong_count(l) > 1 => !gc_trace::note_dropped_marks(v),
             Object::Dict(d) if Rc::strong_count(d) > 1 => !gc_trace::note_dropped_marks(v),
@@ -63826,6 +63822,10 @@ pub(crate) fn code_is_pure_leaf_pub(code: &CodeObject) -> bool {
 fn code_fast_pairs<'a>(code: &CodeObject, ext: Option<&'a CodeConstObjects>) -> &'a [u8] {
     let Some(ext) = ext else { return &[] };
     ext.fast_pairs.get_or_init(|| {
+        // (`WEAVEPY_NO_PAIRS`, a bisection aid, leaves every table empty.)
+        if crate::hot_gates::env_flags::no_pairs() {
+            return Box::new([]);
+        }
         let ops = &code.instructions;
         let mut any = false;
         let mut kinds = vec![0u8; ops.len()];

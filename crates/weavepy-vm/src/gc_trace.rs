@@ -4463,6 +4463,24 @@ pub fn note_dropped_marks(obj: &crate::object::Object) -> bool {
     }
 }
 
+/// Does dropping this reference to `obj` leave an instance that others
+/// still hold, with no weakref watching it? Past two owners only a
+/// weakref-watched object can be at its dead line (see
+/// [`note_dropped_counted`]), so such a drop needs neither a prompt reap
+/// nor a mark: the cheap test ahead of the full grades.
+#[inline(always)]
+pub fn drop_survives_plainly(obj: &crate::object::Object) -> bool {
+    match obj {
+        crate::object::Object::Instance(i) => {
+            crate::sync::Rc::strong_count(i) > 2
+                && !crate::weakref_registry::may_have_weakrefs(
+                    crate::sync::Rc::as_ptr(i) as usize as u64,
+                )
+        }
+        _ => false,
+    }
+}
+
 /// How many elements a dying container may hold and still be graded by
 /// inspection (see [`inert_death`]). Capped so the grade stays O(1) on a
 /// path that runs for every discarded heap value.
