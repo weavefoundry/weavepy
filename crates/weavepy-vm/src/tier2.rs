@@ -7480,7 +7480,7 @@ fn key_is(key: &DictKey, name: &SharedStr) -> bool {
 /// A site guard's class check: the receiver's class still carries the
 /// compiled `attr_version` (read without a borrow guard when only one
 /// thread runs Python; nothing here runs code).
-#[inline]
+#[inline(always)]
 fn attr_class_ok(inst: &crate::types::PyInstance, ver: u64) -> bool {
     if crate::gil::free_threading_enabled() {
         return inst.class.borrow().attr_version.get() == ver;
@@ -7664,6 +7664,29 @@ unsafe extern "C" fn wpjit_attr_get(frame: *mut JitFrame, pin: i64, site: i64) -
     let jf = unsafe { &mut *frame };
     #[allow(clippy::cast_ptr_alignment)]
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // The common shape first: a scalar field of an indexed site, read
+    // straight off the instance (the full path below re-derives it).
+    if let (Some(Pin::Obj(Object::Instance(inst))), Some(g)) = (
+        ctx.pins.get(pin as usize),
+        ctx.attr_guards.get(site as usize),
+    ) {
+        if let (AttrStorage::Indexed(key_idx), JitType::Int | JitType::Float | JitType::Bool) =
+            (g.storage, g.lane)
+        {
+            if attr_class_ok(inst, g.ver) {
+                // SAFETY: a read between two native ops; nothing here runs
+                // code (see `GilCell::peek`).
+                if let Some((k, v)) = unsafe { inst.attr_peek_index(key_idx as usize) } {
+                    if key_is(k, &g.name) {
+                        if let Some(bits) = pack(v, g.lane) {
+                            jf.ret_bits = bits;
+                            return 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Scoped so the receiver borrow of `ctx.pins` ends before an
     // object-lane result appends a fresh pin (RFC 0070 WS1).
     let outcome: Result<u64, Object> = {
@@ -8260,6 +8283,35 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
     let Some(g) = ctx.attr_guards.get(site as usize) else {
         return 1;
     };
+    // The common shape first: a scalar value over a scalar field of an
+    // indexed site (no write barrier, nothing to reap).
+    if let (AttrStorage::Indexed(key_idx), Some(Pin::Obj(Object::Instance(inst)))) =
+        (g.storage, ctx.pins.get(pin as usize))
+    {
+        let v = match g.lane {
+            JitType::Int => Some(Object::Int(jf.ret_bits as i64)),
+            JitType::Float => Some(Object::Float(f64::from_bits(jf.ret_bits))),
+            JitType::Bool => Some(Object::Bool(jf.ret_bits != 0)),
+            _ => None,
+        };
+        if let Some(v) = v {
+            if attr_class_ok(inst, g.ver) {
+                // SAFETY: nothing below runs code while the view is live.
+                if let Some((k, dst)) = unsafe { inst.attr_peek_index_mut(key_idx as usize, true) }
+                {
+                    if key_is(k, &g.name)
+                        && matches!(
+                            dst,
+                            Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+                        )
+                    {
+                        *dst = v;
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
     let v = match g.lane {
         JitType::Int => Object::Int(jf.ret_bits as i64),
         JitType::Float => Object::Float(f64::from_bits(jf.ret_bits)),
