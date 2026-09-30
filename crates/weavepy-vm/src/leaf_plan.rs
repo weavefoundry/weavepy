@@ -197,6 +197,12 @@ enum Op {
     Return {
         src: u8,
     },
+    /// `regs[dst]` a new empty list (`BUILD_LIST 0`) or, with `dict`,
+    /// an empty dict (`BUILD_MAP 0`), held by the owned scratch.
+    New {
+        dst: u8,
+        dict: bool,
+    },
     /// Abandon the evaluation: the path reached an instruction the plan
     /// can't run.
     Decline,
@@ -217,6 +223,8 @@ pub(crate) struct LeafPlan {
     consts: Box<[V]>,
     /// Arguments, copied into the first registers on entry.
     nargs: u8,
+    /// Registers the plan uses (the locals, then its deepest stack).
+    nregs: u8,
     /// Every attribute store goes to the first argument (never
     /// reassigned), each to a different name: the buffered stores share
     /// one receiver and each is the latest to its attribute.
@@ -257,11 +265,14 @@ struct Builder<'a> {
     fixups: Vec<(usize, usize)>,
     /// The op index each bytecode instruction starts at.
     starts: Vec<u16>,
+    /// One past the highest register handed out.
+    top: std::cell::Cell<usize>,
 }
 
 impl Builder<'_> {
     fn slot(&self, pos: usize) -> Option<u8> {
         let r = self.nl + pos;
+        self.top.set(self.top.get().max(r + 1));
         (r < REGS).then_some(r as u8)
     }
 
@@ -388,6 +399,13 @@ impl Builder<'_> {
             }
             OpCode::LoadSmallInt => self.constant(V::I(i64::from(arg)))?,
             OpCode::PushNull => self.constant(V::Null)?,
+            OpCode::BuildList | OpCode::BuildMap if arg == 0 => {
+                let dst = self.push_new()?;
+                self.ops.push(Op::New {
+                    dst,
+                    dict: ins.op == OpCode::BuildMap,
+                });
+            }
             OpCode::LoadGlobal => {
                 let dst = self.push_new()?;
                 self.ops.push(Op::Global {
@@ -659,6 +677,7 @@ impl Builder<'_> {
             ops: self.ops.into_boxed_slice(),
             consts: self.consts.into_boxed_slice(),
             nargs: u8::try_from(crate::leaf_arity(self.code)).ok()?,
+            nregs: u8::try_from(self.top.get().clamp(self.nl, REGS)).ok()?,
             unique_stores: self.stored.is_some() && self.code.arg_count > 0,
         })
     }
@@ -684,15 +703,20 @@ pub(crate) fn build(code: &CodeObject, ext: &CodeConstObjects) -> Option<LeafPla
         targets: std::collections::HashMap::new(),
         fixups: Vec::new(),
         starts: Vec::with_capacity(code.instructions.len()),
+        top: std::cell::Cell::new(nl),
     }
     .build()
 }
+
+/// How many owned values one evaluation (its callee frames included)
+/// may hold.
+const OWNED: usize = 8;
 
 /// Values a leaf path hands back owned (a polymorphic or class read, a
 /// nested call's result) stay here until the evaluation ends; registers
 /// point in.
 struct Owned {
-    buf: [std::mem::MaybeUninit<Object>; 4],
+    buf: [std::mem::MaybeUninit<Object>; OWNED],
     n: usize,
 }
 
@@ -729,21 +753,24 @@ impl Owned {
     /// Hold `v` (a scalar needs no holding) and name it.
     #[inline]
     fn own(&mut self, v: Object) -> Option<V> {
-        Some(match v {
+        let scalar = match v {
             Object::Int(i) => V::I(i),
             Object::Float(x) => V::F(x),
             Object::Bool(b) => V::B(b),
             Object::None => V::N,
-            v => {
+            _ => {
                 if self.n == self.buf.len() {
                     return None;
                 }
                 let slot = &mut self.buf[self.n];
                 slot.write(v);
                 self.n += 1;
-                V::R(slot.as_ptr())
+                return Some(V::R(slot.as_ptr()));
             }
-        })
+        };
+        // A scalar owns nothing: no drop glue to run.
+        std::mem::forget(v);
+        Some(scalar)
     }
 }
 
@@ -891,14 +918,31 @@ impl Interpreter {
         use weavepy_compiler::InlineCache as IC;
         /// Nested leaf calls evaluated in place at most this deep.
         const NEST: u8 = 3;
+        /// A pure-leaf callee runs as a frame of this evaluation: its
+        /// registers are the next `REGS` window, and its caller's state
+        /// waits here until its return.
+        struct Caller<'p> {
+            ip: usize,
+            code: &'p CodeObject,
+            ext: &'p CodeConstObjects,
+            plan: &'p LeafPlan,
+            f: &'p crate::object::PyFunction,
+            /// The caller's register for the result.
+            at: u8,
+            /// The caller's registers (its plan's `nregs`).
+            saved: [std::mem::MaybeUninit<V>; REGS],
+        }
         let nargs = usize::from(plan.nargs);
         if args.len() != nargs {
             return None;
         }
+        let (mut code, mut ext, mut plan, mut f) = (code, ext, plan, f);
         let mut regs = [const { std::mem::MaybeUninit::<V>::uninit() }; REGS];
         for (k, &a) in args.iter().enumerate() {
             regs[k].write(norm(a));
         }
+        let mut callers = [const { std::mem::MaybeUninit::<Caller<'_>>::uninit() }; NEST as usize];
+        let mut depth = 0usize;
         // The translation proves every register is written before it's
         // read, and that every index is below `REGS`.
         macro_rules! get {
@@ -914,10 +958,10 @@ impl Interpreter {
                 unsafe { regs.get_unchecked_mut(usize::from($r)).write(v) };
             }};
         }
-        let consts: &[V] = &plan.consts;
-        let stamps: &[crate::StampSlot] = ext.stamp_slots.get().map_or(&[], |s| &s[..]);
+        let mut consts: &[V] = &plan.consts;
+        let mut stamps: &[crate::StampSlot] = ext.stamp_slots.get().map_or(&[], |s| &s[..]);
         let mut owned = Owned {
-            buf: [const { std::mem::MaybeUninit::uninit() }; 4],
+            buf: [const { std::mem::MaybeUninit::uninit() }; OWNED],
             n: 0,
         };
         let mut pend = Pending {
@@ -925,7 +969,7 @@ impl Interpreter {
             n: 0,
             moved: 0,
         };
-        let ops: &[Op] = &plan.ops;
+        let mut ops: &[Op] = &plan.ops;
         let mut ip = 0usize;
         loop {
             // SAFETY: every path ends in a return or a jump, and every
@@ -1160,11 +1204,33 @@ impl Interpreter {
                     }
                 }
                 Op::Jump { target } => ip = usize::from(target),
+                Op::New { dst, dict } => {
+                    // Tracked like the core loop's; an allocation that
+                    // would trigger a collection is left to it.
+                    if crate::stdlib::tracemalloc_real::is_tracking()
+                        || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+                        || crate::gc_trace::auto_collect_due()
+                    {
+                        return None;
+                    }
+                    let obj = if dict {
+                        Object::Dict(Rc::new(crate::sync::RefCell::new(
+                            crate::object::DictData::with_capacity_and_hasher(
+                                0,
+                                crate::fasthash::FxBuildHasher,
+                            ),
+                        )))
+                    } else {
+                        Object::new_list(Vec::new())
+                    };
+                    crate::gc_trace::track(obj.clone());
+                    set!(dst, owned.own(obj)?);
+                }
                 Op::Decline => return None,
                 Op::Call { at, argc, pc } => {
                     // A pure-leaf callee, evaluated in place: only while
                     // no store is buffered (it would not see one).
-                    if (EFFECT && pend.n > 0) || nest >= NEST {
+                    if (EFFECT && pend.n > 0) || usize::from(nest) + depth >= usize::from(NEST) {
                         return None;
                     }
                     let callee = match get!(at) {
@@ -1226,10 +1292,57 @@ impl Interpreter {
                         || !Self::leaf_code_ok(ccode)
                         || n != crate::leaf_arity(ccode)
                         || ccode.has_varkeywords
-                        || crate::recursion::current_depth() + usize::from(nest) + 1
+                        || crate::recursion::current_depth() + usize::from(nest) + depth + 1
                             >= crate::recursion::recursion_limit()
                     {
                         return None;
+                    }
+                    if !GETTER {
+                        // The callee runs as a frame of this evaluation:
+                        // the caller's registers wait in its record, and
+                        // the arguments (normalized already) become the
+                        // callee's first registers.
+                        let cext = crate::code_vm_ext(ccode)?;
+                        let cplan = cext
+                            .leaf_plan
+                            .get_or_init(|| build(ccode, cext).map(Box::new))
+                            .as_deref()?;
+                        let mut cargs = [V::N; 8];
+                        for (k, slot) in cargs.iter_mut().enumerate().take(n) {
+                            let v = get!(first + k as u8);
+                            if matches!(v, V::Fn(_) | V::Bi(_) | V::Null) {
+                                return None;
+                            }
+                            *slot = v;
+                        }
+                        // SAFETY: `depth < NEST` (checked above).
+                        let c = unsafe { callers.get_unchecked_mut(depth) }.as_mut_ptr();
+                        // SAFETY: `c` is this frame's record; the saved
+                        // registers are the caller plan's own, all below
+                        // `REGS`.
+                        unsafe {
+                            std::ptr::addr_of_mut!((*c).ip).write(ip);
+                            std::ptr::addr_of_mut!((*c).code).write(code);
+                            std::ptr::addr_of_mut!((*c).ext).write(ext);
+                            std::ptr::addr_of_mut!((*c).plan).write(plan);
+                            std::ptr::addr_of_mut!((*c).f).write(f);
+                            std::ptr::addr_of_mut!((*c).at).write(at);
+                            std::ptr::copy_nonoverlapping(
+                                regs.as_ptr(),
+                                std::ptr::addr_of_mut!((*c).saved).cast(),
+                                usize::from(plan.nregs),
+                            );
+                        }
+                        for (k, &v) in cargs.iter().enumerate().take(n) {
+                            regs[k].write(v);
+                        }
+                        depth += 1;
+                        (code, ext, plan, f) = (&**ccode, cext, cplan, callee);
+                        consts = &plan.consts;
+                        stamps = ext.stamp_slots.get().map_or(&[], |s| &s[..]);
+                        ops = &plan.ops;
+                        ip = 0;
+                        continue;
                     }
                     // Scalar arguments are staged as objects (no drop glue).
                     let mut staged = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
@@ -1258,6 +1371,34 @@ impl Interpreter {
                 }
                 Op::Return { src } => {
                     let v = get!(src);
+                    if depth > 0 {
+                        // Back to the caller's frame, the result in its
+                        // register. A constructor's stores land at once,
+                        // so what it borrows from its fresh instance could
+                        // move: it holds its own reference.
+                        let v = match v {
+                            V::R(p) if FRESH && !owned.holds(p) => owned.own(to_object(v)?)?,
+                            v => v,
+                        };
+                        depth -= 1;
+                        // SAFETY: frame `depth`'s record was written at its
+                        // call (its registers as far as its `nregs`).
+                        let c = unsafe { &*callers.get_unchecked(depth).as_ptr() };
+                        (ip, code, ext, plan, f) = (c.ip, c.code, c.ext, c.plan, c.f);
+                        consts = &plan.consts;
+                        stamps = ext.stamp_slots.get().map_or(&[], |s| &s[..]);
+                        ops = &plan.ops;
+                        // SAFETY: as above.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                c.saved.as_ptr(),
+                                regs.as_mut_ptr(),
+                                usize::from(plan.nregs),
+                            );
+                        }
+                        set!(c.at, v);
+                        continue;
+                    }
                     // A value this evaluation's scratch doesn't hold outlives
                     // it (a pure body stores nothing), so a nested caller
                     // borrows it rather than taking a reference to release.

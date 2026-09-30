@@ -10624,6 +10624,22 @@ impl Interpreter {
         code.has_varargs || code.has_varkeywords || code.kwonly_count != 0
     }
 
+    /// How many trailing positional defaults a call of `f` (running
+    /// `code`) with `given` positional arguments, self included, takes
+    /// from `f.defaults`. `None` when too many arguments come, too few
+    /// for the defaults to fill, or `__defaults__` was rebound.
+    #[inline]
+    fn missing_defaults(f: &PyFunction, code: &CodeObject, given: usize) -> Option<usize> {
+        let missing = (code.arg_count as usize).checked_sub(given)?;
+        if missing > 0
+            && (f.defaults.len() < missing
+                || (f.defaults_maybe_overridden() && f.slot("__defaults__").is_some()))
+        {
+            return None;
+        }
+        Some(missing)
+    }
+
     /// `f`'s compiled default for each of `code`'s keyword-only parameters,
     /// in parameter order.
     fn kwonly_defaults<'a>(
@@ -11544,12 +11560,12 @@ impl Interpreter {
         if !std::ptr::eq(
             unsafe { Rc::as_ptr(&*init.code.as_ptr()) },
             Rc::as_ptr(code),
-        ) || code.arg_count as usize != args.len() + 1
-            || !Self::lean_code_ok(code)
+        ) || !Self::lean_code_ok(code)
             || crate::stdlib::testinternalcapi_mod::nomem_alloc_fails()
         {
             return None;
         }
+        let missing = Self::missing_defaults(init, code, args.len() + 1)?;
         let cells = init.lean_cells_ref(code)?;
         let snap_gen = self.lean_snapshot()?;
         let code = code.clone();
@@ -11570,6 +11586,11 @@ impl Interpreter {
                 let v = unsafe { &mut *rc.as_ptr() };
                 v.push(inst.clone());
                 v.extend(args.iter().cloned());
+                v.extend(
+                    init.defaults[init.defaults.len() - missing..]
+                        .iter()
+                        .cloned(),
+                );
                 v.resize(nlocals, Object::Unbound);
             }
             rc
@@ -14929,11 +14950,13 @@ impl Interpreter {
         if !std::ptr::eq(
             unsafe { Rc::as_ptr(&*init.code.as_ptr()) },
             Rc::as_ptr(code),
-        ) || code.arg_count as usize != argc + 1
-            || !Self::lean_code_ok(code)
+        ) || !Self::lean_code_ok(code)
         {
             return false;
         }
+        let Some(missing) = Self::missing_defaults(init, code, argc + 1) else {
+            return false;
+        };
         // A leaf `__init__` (plain stores of its arguments into `self`)
         // runs frameless, as a leaf method call does.
         if self.core_leaf_init(
@@ -14942,6 +14965,7 @@ impl Interpreter {
             init,
             code,
             argc,
+            missing,
             self_slot,
             callee_slot,
             sw.depth_cell,
@@ -14969,9 +14993,14 @@ impl Interpreter {
         // SAFETY: a parked slot's locals storage is its own, and empty.
         let locals = unsafe { &mut *act.frame.locals.as_ptr() };
         let nlocals = code.varnames.len();
-        locals.reserve(nlocals.max(argc + 1));
+        locals.reserve(nlocals.max(argc + 1 + missing));
         locals.push(inst.clone());
         locals.extend(frame.stack.drain(self_slot + 1..));
+        locals.extend(
+            init.defaults[init.defaults.len() - missing..]
+                .iter()
+                .cloned(),
+        );
         fill_unbound(locals, nlocals);
         // The NULL self slot and the class.
         frame.stack.truncate(callee_slot);
@@ -15018,13 +15047,14 @@ impl Interpreter {
         init: &Rc<crate::object::PyFunction>,
         code: &Rc<CodeObject>,
         argc: usize,
+        missing: usize,
         self_slot: usize,
         callee_slot: usize,
         depth_cell: *const std::cell::Cell<usize>,
     ) -> bool {
         let pure = code_is_pure_leaf(code);
         if !(pure || code_is_effect_leaf(code))
-            || argc >= 8
+            || argc + missing >= 8
             || !pure_leaf_warm(code)
             || !code_returns_only_none(code)
             || ty.flags.is_builtin
@@ -15050,10 +15080,15 @@ impl Interpreter {
         for (k, a) in frame.stack[self_slot + 1..].iter().enumerate() {
             args[k + 1] = a;
         }
+        let defaults = &init.defaults[init.defaults.len() - missing..];
+        for (k, d) in defaults.iter().enumerate() {
+            args[argc + 1 + k] = d;
+        }
+        let args = &args[..=argc + missing];
         let r = if pure {
-            self.pure_leaf_eval::<false, false>(code, init, &args[..=argc])
+            self.pure_leaf_eval::<false, false>(code, init, args)
         } else {
-            self.leaf_init_eval(code, init, &args[..=argc])
+            self.leaf_init_eval(code, init, args)
         };
         match r {
             Some(done) => {
@@ -64208,9 +64243,14 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
         && code.varnames.len() <= 16
         && code.exception_table.is_empty()
         && code.instructions.len() <= 64;
-    let pure_op = |op: OpCode| {
+    let pure_op = |ins: &weavepy_compiler::Instruction| {
+        // A fresh empty list or dict is unobservable until stored, so
+        // a declined evaluation that made one still did nothing.
+        if matches!(ins.op, OpCode::BuildList | OpCode::BuildMap) {
+            return ins.arg == 0;
+        }
         matches!(
-            op,
+            ins.op,
             OpCode::Resume
                 | OpCode::Nop
                 | OpCode::NotTaken
@@ -64246,7 +64286,7 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
                 | OpCode::ReturnValue
         )
     };
-    let ok = structural && code.instructions.iter().all(|i| pure_op(i.op));
+    let ok = structural && code.instructions.iter().all(pure_op);
     // An effect leaf: a pure leaf but for attribute stores, which its
     // evaluation buffers and commits at the return (see
     // `Interpreter::pure_leaf_eval`).
@@ -64255,7 +64295,7 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
         && code
             .instructions
             .iter()
-            .all(|i| pure_op(i.op) || i.op == OpCode::StoreAttr)
+            .all(|i| pure_op(i) || i.op == OpCode::StoreAttr)
         && code.instructions.iter().any(|i| i.op == OpCode::StoreAttr);
     let shape = if ok {
         let body = code.instructions.as_slice();

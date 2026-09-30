@@ -3259,7 +3259,9 @@ fn run_finalizer(obj: &Object) {
 /// blocks — CPython's `gen_dealloc` behavior).
 fn has_finalizer(obj: &Object) -> bool {
     match obj {
-        Object::Instance(inst) => inst.cls().lookup("__del__").is_some(),
+        // The class's cached `__del__` verdict (reset whenever `__del__`
+        // or the MRO changes), not an MRO walk per tracked instance.
+        Object::Instance(inst) => inst.cls().instances_need_finalize(),
         // RFC 0065 (WS4, item 3) tried gating this on "close can run
         // user code" (empty exception table ⇒ skip enrollment) so
         // `yield`-loop workloads could reach the fully-quiet dispatch
