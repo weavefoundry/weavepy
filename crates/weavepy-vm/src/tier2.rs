@@ -4920,6 +4920,7 @@ fn finish_deopted(
         pending_lasti: None,
         suppress_call_event: true,
         gen_first_resume: false,
+        sent_consumed: false,
         shell_cache: None,
         parked_native: None,
     };

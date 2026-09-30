@@ -54,6 +54,7 @@ pub mod foreign;
 pub mod frozen_code_cache;
 pub mod frozen_table;
 pub mod gc_trace;
+mod gen_fast;
 pub mod gil;
 pub mod hot_filter;
 pub mod hot_gates;
@@ -234,6 +235,10 @@ pub struct Frame {
     /// for later resumptions. Set by `generator_send` when unparking a
     /// `Created` frame; consumed (reset) by `run_frame`'s entry event.
     gen_first_resume: bool,
+    /// A suspended generator frame whose last resume already consumed its
+    /// sent value (a fast step stopped partway; see `gen_fast`): the next
+    /// resume pushes none.
+    sent_consumed: bool,
     /// RFC 0061 (WS3c): the generator-family activation's `FrameShell`,
     /// kept across suspensions. A suspended frame survives inside the
     /// generator object, so its shell — whose immutable fields (code,
@@ -5714,6 +5719,7 @@ impl Interpreter {
             pending_lasti: None,
             suppress_call_event: false,
             gen_first_resume: false,
+            sent_consumed: false,
             shell_cache: None,
             #[cfg(feature = "jit")]
             parked_native: None,
@@ -9881,6 +9887,7 @@ impl Interpreter {
             fr.agen_yielded_value = true;
             fr.suppress_call_event = false;
             fr.gen_first_resume = false;
+            fr.sent_consumed = false;
             #[cfg(feature = "jit")]
             {
                 fr.parked_native = None;
@@ -9973,7 +9980,10 @@ impl Interpreter {
         #[cfg(feature = "jit")]
         crate::tier2::materialize_parked(gf);
         gf.gen_first_resume = first_resume;
-        gf.push(Object::None);
+        // (A fast step that stopped partway already consumed it.)
+        if !std::mem::take(&mut gf.sent_consumed) {
+            gf.push(Object::None);
+        }
         let gen_frame: *mut Frame = gf;
         frame.pc = pc as u32 + 1;
         if next_call {
@@ -11432,6 +11442,7 @@ impl Interpreter {
             pending_lasti: None,
             suppress_call_event: false,
             gen_first_resume: false,
+            sent_consumed: false,
             shell_cache: None,
             #[cfg(feature = "jit")]
             parked_native: None,
@@ -13036,7 +13047,21 @@ impl Interpreter {
                             }
                             // A generator resumes inline, switched to in place
                             // (the quiet loop's lean path when it declines).
-                            Object::Generator(_) => {
+                            Object::Generator(g) => {
+                                // A simple body runs to its next yield in
+                                // place, without switching (see `gen_fast`).
+                                let g = g.clone();
+                                if let gen_fast::GenNext::Yielded(v) =
+                                    self.gen_fast_next(&g, snap_gen, 0)
+                                {
+                                    // SAFETY: `len < cap` (checked above).
+                                    unsafe { base.add(len).write(v) };
+                                    len += 1;
+                                    last = pc;
+                                    pc += 1;
+                                    continue;
+                                }
+                                drop(g);
                                 // SAFETY: `len <= cap`, every slot initialized.
                                 unsafe { frame.stack.set_len(len) };
                                 frame.pc = pc as u32;
@@ -36374,6 +36399,8 @@ impl Interpreter {
         // exception machinery below both read them.
         #[cfg(feature = "jit")]
         crate::tier2::materialize_parked(&mut frame);
+        // A frame a fast step left partway takes the exception at its pc.
+        frame.sent_consumed = false;
         // PEP 3134: an exception thrown into a generator suspended inside
         // an `except`/`with` block chains to the exception that block was
         // handling. Done before delegation/handling so the `__context__`
@@ -37135,22 +37162,39 @@ impl Interpreter {
             #[cfg(feature = "jit")]
             crate::tier2::materialize_parked(frame);
             frame.gen_first_resume = first_resume;
-            frame.push(sent.clone());
-            // The draining consumer's sink, folded at this frame's yields.
-            let prev_fold = std::mem::replace(
-                &mut self.sum_fold,
-                fold.map(|sink| (std::ptr::from_mut(frame) as usize, sink)),
-            );
-            let exc_depth_on_entry = self.exc_info_len();
-            let fin_live = gc_trace::has_any_finalizable();
-            let fin = fin_live || gc_trace::active_suspects_present();
-            let mut act = LeanAct {
-                frame: std::ptr::from_mut(frame),
-                shell: None,
-            };
-            let mut prev_pc: Option<usize> = None;
-            let run = if guard.depth() % 4 == 0 {
-                stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+            if !std::mem::take(&mut frame.sent_consumed) {
+                frame.push(sent.clone());
+            }
+            // A simple body runs to its next yield in place (see
+            // `gen_fast`), folding the draining consumer's yields as it goes.
+            if let Some(v) = self.gen_fast_run(frame, snap_gen, fold) {
+                Ok(FrameOutcome::Yielded(v))
+            } else {
+                // The draining consumer's sink, folded at this frame's yields.
+                let prev_fold = std::mem::replace(
+                    &mut self.sum_fold,
+                    fold.map(|sink| (std::ptr::from_mut(frame) as usize, sink)),
+                );
+                let exc_depth_on_entry = self.exc_info_len();
+                let fin_live = gc_trace::has_any_finalizable();
+                let fin = fin_live || gc_trace::active_suspects_present();
+                let mut act = LeanAct {
+                    frame: std::ptr::from_mut(frame),
+                    shell: None,
+                };
+                let mut prev_pc: Option<usize> = None;
+                let run = if guard.depth() % 4 == 0 {
+                    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+                        self.quiet_run(
+                            frame,
+                            QuietShell::Lazy(&mut act),
+                            snap_gen,
+                            fin,
+                            fin_live,
+                            &mut prev_pc,
+                        )
+                    })
+                } else {
                     self.quiet_run(
                         frame,
                         QuietShell::Lazy(&mut act),
@@ -37159,53 +37203,44 @@ impl Interpreter {
                         fin_live,
                         &mut prev_pc,
                     )
-                })
-            } else {
-                self.quiet_run(
-                    frame,
-                    QuietShell::Lazy(&mut act),
-                    snap_gen,
-                    fin,
-                    fin_live,
-                    &mut prev_pc,
-                )
-            };
-            self.sum_fold = prev_fold;
-            match (run, act.shell) {
-                (
-                    QuietExit::Outcome {
-                        stepped: Ok(StepOutcome::Yield(v)),
-                        ..
-                    },
-                    None,
-                ) => Ok(FrameOutcome::Yielded(v)),
-                (
-                    QuietExit::Outcome {
-                        stepped: Ok(StepOutcome::Return(v)),
-                        ..
-                    },
-                    None,
-                ) => Ok(FrameOutcome::Returned(v)),
-                // Everything else finishes in the general loop (which
-                // saves a suspended generator's handler state, as the
-                // general prologue's twin epilogue does).
-                (exit, shell) => {
-                    let shell = match shell {
-                        Some(shell) => shell,
-                        None => {
-                            self.flush_pending_callers();
-                            let shell = self.push_frame_shell(frame);
-                            if frame.shell_cache.is_none() {
-                                frame.shell_cache = Some(shell.clone());
+                };
+                self.sum_fold = prev_fold;
+                match (run, act.shell) {
+                    (
+                        QuietExit::Outcome {
+                            stepped: Ok(StepOutcome::Yield(v)),
+                            ..
+                        },
+                        None,
+                    ) => Ok(FrameOutcome::Yielded(v)),
+                    (
+                        QuietExit::Outcome {
+                            stepped: Ok(StepOutcome::Return(v)),
+                            ..
+                        },
+                        None,
+                    ) => Ok(FrameOutcome::Returned(v)),
+                    // Everything else finishes in the general loop (which
+                    // saves a suspended generator's handler state, as the
+                    // general prologue's twin epilogue does).
+                    (exit, shell) => {
+                        let shell = match shell {
+                            Some(shell) => shell,
+                            None => {
+                                self.flush_pending_callers();
+                                let shell = self.push_frame_shell(frame);
+                                if frame.shell_cache.is_none() {
+                                    frame.shell_cache = Some(shell.clone());
+                                }
+                                shell
                             }
-                            shell
-                        }
-                    };
-                    let pending = match exit {
-                        QuietExit::Yield => None,
-                        QuietExit::Outcome { stepped, cur_pc } => Some((stepped, cur_pc)),
-                    };
-                    self.run_activation(frame, shell, None, exc_depth_on_entry, false, pending)
+                        };
+                        let pending = match exit {
+                            QuietExit::Yield => None,
+                            QuietExit::Outcome { stepped, cur_pc } => Some((stepped, cur_pc)),
+                        };
+                        self.run_activation(frame, shell, None, exc_depth_on_entry, false, pending)
+                    }
                 }
             }
         };
@@ -37370,7 +37405,14 @@ impl Interpreter {
             // CPython 3.13 prologue: RETURN_GENERATOR / POP_TOP / RESUME —
             // *every* resume pushes the sent value; the first activation's
             // None lands in the prologue's POP_TOP.
-            let sent_for_frame = Some(if first_resume { Object::None } else { sent });
+            // (A fast step that stopped partway already consumed it.)
+            let sent_for_frame = (!std::mem::take(&mut frame.sent_consumed)).then(|| {
+                if first_resume {
+                    Object::None
+                } else {
+                    sent
+                }
+            });
             self.run_until_yield_or_return(frame, sent_for_frame)
         };
         match outcome {
@@ -50411,6 +50453,7 @@ impl Interpreter {
             pending_lasti: None,
             suppress_call_event: false,
             gen_first_resume: false,
+            sent_consumed: false,
             shell_cache: None,
             #[cfg(feature = "jit")]
             parked_native: None,
@@ -57801,6 +57844,7 @@ impl InlineAct {
                 pending_lasti: None,
                 suppress_call_event: false,
                 gen_first_resume: false,
+                sent_consumed: false,
                 shell_cache: None,
                 #[cfg(feature = "jit")]
                 parked_native: None,
@@ -63117,6 +63161,9 @@ struct CodeConstObjects {
     /// splits them back apart; the core loop reads one byte to run the
     /// pair as a single dispatch. Empty when the code has no pair.
     fast_pairs: std::sync::OnceLock<Box<[u8]>>,
+    /// Whether the code is a generator body fast steps run (see
+    /// `gen_fast`): 0 not yet scanned, 1 no, 2 yes.
+    gen_fast: std::sync::atomic::AtomicU8,
     /// Split-layout attribute shortcuts per `LOAD_ATTR` site (see
     /// [`FieldSlot`]); allocated on the first recorded one.
     field_slots: std::sync::OnceLock<Box<[FieldSlot]>>,
@@ -64439,6 +64486,7 @@ fn code_vm_ext_build(
             call_slots: std::sync::OnceLock::new(),
             pure_leaf: std::sync::atomic::AtomicU8::new(0),
             fast_pairs: std::sync::OnceLock::new(),
+            gen_fast: std::sync::atomic::AtomicU8::new(0),
             field_slots: std::sync::OnceLock::new(),
             leaf_sites: std::sync::OnceLock::new(),
             leaf_plan: std::sync::OnceLock::new(),
