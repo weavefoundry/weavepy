@@ -1297,12 +1297,14 @@ impl Interpreter {
                     {
                         return None;
                     }
-                    if !GETTER {
+                    let cext = crate::code_vm_ext(ccode)?;
+                    // A tiny certified shape (a constant or field return,
+                    // a field comparison) keeps its dedicated evaluator.
+                    if !GETTER && cext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) < 3 {
                         // The callee runs as a frame of this evaluation:
                         // the caller's registers wait in its record, and
                         // the arguments (normalized already) become the
                         // callee's first registers.
-                        let cext = crate::code_vm_ext(ccode)?;
                         let cplan = cext
                             .leaf_plan
                             .get_or_init(|| build(ccode, cext).map(Box::new))
