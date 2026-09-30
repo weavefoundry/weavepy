@@ -3914,8 +3914,29 @@ struct Suspect {
     dormant_probes: u8,
 }
 type SuspectMap = indexmap::IndexMap<ObjectId, Suspect, BuildHasherDefault<ObjectIdHasher>>;
-static SUSPECTS: std::sync::LazyLock<parking_lot::Mutex<SuspectMap>> =
-    std::sync::LazyLock::new(|| parking_lot::Mutex::new(SuspectMap::default()));
+/// The enrolled suspects, split by phase: entries with probe budget left
+/// (re-probed at every sweep) and aged-out dormant ones (re-probed only on
+/// the stride), so an ordinary sweep never walks the dormant population.
+#[derive(Default)]
+struct Suspects {
+    /// Every entry has budget remaining.
+    active: SuspectMap,
+    /// Every entry's budget is spent.
+    dormant: SuspectMap,
+}
+impl Suspects {
+    fn len(&self) -> usize {
+        self.active.len() + self.dormant.len()
+    }
+    fn contains_key(&self, id: ObjectId) -> bool {
+        self.active.contains_key(&id) || self.dormant.contains_key(&id)
+    }
+    fn values(&self) -> impl Iterator<Item = &Suspect> {
+        self.active.values().chain(self.dormant.values())
+    }
+}
+static SUSPECTS: std::sync::LazyLock<parking_lot::Mutex<Suspects>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(Suspects::default()));
 static SUSPECT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Entries with probe budget remaining. When only dormant entries are
 /// left, [`has_suspects`] admits a sweep every [`DORMANT_STRIDE`]-th
@@ -4069,46 +4090,38 @@ fn residual_suspects() -> Vec<(String, usize)> {
         .collect()
 }
 
-/// Publish the count gates after the locked suspect map changed.
-/// `active` is the caller's count of budget-remaining entries (kept
-/// incrementally; RFC 0077 WS2 retired the O(n) recount this used to
-/// do on every enrollment and removal).
-fn publish_suspect_counts(s: &SuspectMap, active: usize) {
+/// Publish the count gates after the locked suspect maps changed.
+fn publish_suspect_counts(s: &Suspects) {
+    let active = s.active.len();
     let was_active = SUSPECT_ACTIVE.swap(active, Ordering::AcqRel) > 0;
     let was_present = SUSPECT_COUNT.swap(s.len(), Ordering::AcqRel) > 0;
     // RFC 0065 (WS1): the dispatch loops' quiet-path snapshots consult
     // `active_suspects_present` / the population gates, so a
     // transition of either invalidates them. Same-state churn (one
     // active suspect replacing another) doesn't.
-    if was_active != (active > 0) || was_present != (!s.is_empty()) {
+    if was_active != (active > 0) || was_present != (s.len() > 0) {
         crate::hot_gates::bump_loop_gen();
     }
 }
 
-/// Evict the first minimum-budget entry, preserving `min_by_key`'s tie
-/// order. Zero is the minimum possible budget, so scanning can stop there.
-/// The caller holds the map lock and its exact active count throughout.
-fn evict_lowest_budget_suspect(s: &mut SuspectMap, active: &mut usize) -> bool {
-    let Some((_, first)) = s.get_index(0) else {
+/// Evict the entry that has had the most chances to die: the oldest
+/// dormant one, or with none, the first lowest-budget active one. The
+/// caller holds the maps' lock and republishes the counts.
+fn evict_lowest_budget_suspect(s: &mut Suspects) -> bool {
+    if !s.dormant.is_empty() {
+        s.dormant.shift_remove_index(0);
+        return true;
+    }
+    let Some(victim) = s
+        .active
+        .values()
+        .enumerate()
+        .min_by_key(|(_, entry)| entry.budget)
+        .map(|(index, _)| index)
+    else {
         return false;
     };
-    let mut victim = 0;
-    let mut budget = first.budget;
-    if budget > 0 {
-        for (index, entry) in s.values().enumerate().skip(1) {
-            if entry.budget < budget {
-                victim = index;
-                budget = entry.budget;
-                if budget == 0 {
-                    break;
-                }
-            }
-        }
-    }
-    let (_, removed) = s
-        .swap_remove_index(victim)
-        .expect("selected suspect exists");
-    *active = active.saturating_sub(usize::from(removed.budget > 0));
+    s.active.swap_remove_index(victim);
     true
 }
 
@@ -4133,7 +4146,7 @@ pub fn note_suspect(h: HandleRc<TrackedHandle>) {
         return;
     }
     let mut s = SUSPECTS.lock();
-    if s.contains_key(&h.id) {
+    if s.contains_key(h.id) {
         return;
     }
     // RFC 0065 (WS4): publish to the miss-filter before the enrollment
@@ -4150,7 +4163,6 @@ pub fn note_suspect(h: HandleRc<TrackedHandle>) {
         crate::weakref_registry::strong_clone_count(h.id),
         Ordering::Release,
     );
-    let mut active = SUSPECT_ACTIVE.load(Ordering::Relaxed);
     if s.len() >= SUSPECT_CAP {
         // Full: evict the most-probed entry (lowest remaining budget,
         // dormant first) — it has had the most chances to die and is
@@ -4160,12 +4172,12 @@ pub fn note_suspect(h: HandleRc<TrackedHandle>) {
         // arrived after ~200 module-teardown stragglers and was never
         // re-probed, pinning the Timeout→Task→frame web the test_ssl
         // leak tests watch).
-        if !evict_lowest_budget_suspect(&mut s, &mut active) {
+        if !evict_lowest_budget_suspect(&mut s) {
             return;
         }
     }
     floor_stats::bump(&floor_stats::SUSPECT_ENROLLED, 1);
-    s.insert(
+    s.active.insert(
         h.id,
         Suspect {
             handle: h,
@@ -4173,7 +4185,7 @@ pub fn note_suspect(h: HandleRc<TrackedHandle>) {
             dormant_probes: 0,
         },
     );
-    publish_suspect_counts(&s, active + 1);
+    publish_suspect_counts(&s);
 }
 
 /// Cheap gate for the eval loop's safe point: always sweep while an
@@ -4215,14 +4227,9 @@ pub fn remove_suspect(id: ObjectId) {
         return;
     }
     let mut s = SUSPECTS.lock();
-    if let Some(removed) = s.swap_remove(&id) {
-        let active = SUSPECT_ACTIVE.load(Ordering::Relaxed);
-        let active = if removed.budget > 0 {
-            active.saturating_sub(1)
-        } else {
-            active
-        };
-        publish_suspect_counts(&s, active);
+    let removed = s.active.swap_remove(&id).is_some() || s.dormant.swap_remove(&id).is_some();
+    if removed {
+        publish_suspect_counts(&s);
     }
 }
 
@@ -4235,24 +4242,21 @@ pub fn take_dead_suspects() -> Vec<Object> {
     let mut s = SUSPECTS.lock();
     // With only dormant entries left, `has_suspects` already stride-gated
     // this sweep; with actives present the stride ticks here instead.
-    let probe_dormant = SUSPECT_ACTIVE.load(Ordering::Relaxed) == 0
+    let probe_dormant = s.active.is_empty()
         || SUSPECT_TICK
             .fetch_add(1, Ordering::Relaxed)
             .is_multiple_of(DORMANT_STRIDE);
     floor_stats::bump(&floor_stats::SUSPECT_SWEEPS, 1);
-    let mut active = 0usize;
     let mut probed = 0u64;
-    s.retain(|_, e| {
-        // Dormant (aged-out) entries only pay on the stride tick.
-        if e.budget == 0 && !probe_dormant {
-            return true;
-        }
+    // A suspect whose last reference is gone (beyond the handle and any
+    // weakref strong clones) goes to `out`. Returns whether it stays.
+    let mut dead = |e: &Suspect, out: &mut Vec<Object>| -> Option<usize> {
         probed += 1;
         let h = &e.handle;
         // RFC 0061 (WS1b): the handle self-identifies as reclaimed (set
         // in lock-step with every index removal) — no registry lookup.
         if h.untracked.load(Ordering::Acquire) {
-            return false; // already reclaimed elsewhere
+            return None; // already reclaimed elsewhere
         }
         // Fast reject via the cached weakref-clone upper bound (refreshed
         // at enrollment): more strong refs than the handle plus every
@@ -4265,31 +4269,52 @@ pub fn take_dead_suspects() -> Vec<Object> {
             let weak = crate::weakref_registry::strong_clone_count(h.id);
             if sc <= 1 + weak {
                 out.push(h.object.clone());
-                return false;
+                return None;
             }
         }
-        // A dormant entry still well above its dead line, or one that has
-        // sat through its dormant allowance, is plainly alive: drop it
-        // from the map (see `SUSPECT_LIVE_MARGIN` / `SUSPECT_DORMANT_PROBES`).
-        if e.budget == 0 {
-            e.dormant_probes = e.dormant_probes.saturating_add(1);
-            if sc > 1 + cached + SUSPECT_LIVE_MARGIN || e.dormant_probes > SUSPECT_DORMANT_PROBES {
-                floor_stats::bump(&floor_stats::SUSPECT_FORGOTTEN, 1);
-                return false;
-            }
-            return true;
+        Some(sc.saturating_sub(1 + cached))
+    };
+    // Active entries spend a probe; one whose budget runs out turns
+    // dormant after this sweep (it isn't stride-probed in the same one).
+    let mut aged = Vec::new();
+    s.active.retain(|&id, e| {
+        if dead(e, &mut out).is_none() {
+            return false;
         }
         e.budget -= 1;
-        if e.budget > 0 {
-            active += 1;
+        if e.budget == 0 {
+            aged.push((
+                id,
+                Suspect {
+                    handle: e.handle.clone(),
+                    budget: 0,
+                    dormant_probes: e.dormant_probes,
+                },
+            ));
+            return false;
         }
         true
     });
+    if probe_dormant {
+        // A dormant entry still well above its dead line, or one that has
+        // sat through its dormant allowance, is plainly alive: drop it
+        // from the map (see `SUSPECT_LIVE_MARGIN` / `SUSPECT_DORMANT_PROBES`).
+        s.dormant.retain(|_, e| {
+            let Some(excess) = dead(e, &mut out) else {
+                return false;
+            };
+            e.dormant_probes = e.dormant_probes.saturating_add(1);
+            if excess > SUSPECT_LIVE_MARGIN || e.dormant_probes > SUSPECT_DORMANT_PROBES {
+                floor_stats::bump(&floor_stats::SUSPECT_FORGOTTEN, 1);
+                return false;
+            }
+            true
+        });
+    }
+    s.dormant.extend(aged);
     floor_stats::bump(&floor_stats::SUSPECT_PROBED, probed);
     floor_stats::bump(&floor_stats::SUSPECT_DEAD, out.len() as u64);
-    // Entries skipped as dormant stayed dormant; entries probed were
-    // recounted above, so `active` is exact.
-    publish_suspect_counts(&s, active);
+    publish_suspect_counts(&s);
     out
 }
 
@@ -4659,57 +4684,39 @@ mod tests {
     use crate::object::DictData;
 
     #[test]
-    fn suspect_eviction_preserves_minimum_order_counts_and_release() {
-        for mode in 0..6 {
-            let mut suspects = SuspectMap::default();
-            let mut reference = Vec::new();
-            let mut handles = std::collections::HashMap::new();
-            for index in 0..SUSPECT_CAP {
-                let budget = match mode {
-                    0 => 0,
-                    1 => SUSPECT_BUDGET,
-                    2 => u8::from(index + 1 != SUSPECT_CAP),
-                    3 => ((SUSPECT_CAP - index) % 16 + 1) as u8,
-                    4 => ((index * 37 + 113) % 17) as u8,
-                    _ => u8::MAX,
-                };
-                let object = Object::List(Rc::new(RefCell::new(Vec::new())));
-                let handle = HandleRc::new(TrackedHandle::new(object, 0));
-                let id = handle.id;
-                handles.insert(id, HandleRc::downgrade(&handle));
-                suspects.insert(
-                    id,
-                    Suspect {
-                        handle,
-                        budget,
-                        dormant_probes: (index % 16) as u8,
-                    },
-                );
-                reference.push((id, budget));
+    fn suspect_eviction_takes_dormant_then_lowest_budget_and_releases() {
+        let mut suspects = Suspects::default();
+        let mut handles = Vec::new();
+        for index in 0..8usize {
+            let object = Object::List(Rc::new(RefCell::new(Vec::new())));
+            let handle = HandleRc::new(TrackedHandle::new(object, 0));
+            handles.push((handle.id, HandleRc::downgrade(&handle)));
+            let budget = [0, 5, 0, 3, 9, 3, 0, 1][index];
+            let entry = Suspect {
+                handle,
+                budget,
+                dormant_probes: 0,
+            };
+            if budget == 0 {
+                suspects.dormant.insert(handles[index].0, entry);
+            } else {
+                suspects.active.insert(handles[index].0, entry);
             }
-            let mut active = reference.iter().filter(|(_, b)| *b > 0).count();
-            while !reference.is_empty() {
-                // The old policy is the oracle, including the first tied
-                // minimum and the order produced by each swap removal.
-                let victim = reference
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, (_, budget))| *budget)
-                    .map(|(index, _)| index)
-                    .unwrap();
-                let (removed_id, _) = reference.swap_remove(victim);
-                assert!(evict_lowest_budget_suspect(&mut suspects, &mut active));
-                assert_eq!(active, reference.iter().filter(|(_, b)| *b > 0).count());
-                let actual: Vec<_> = suspects
-                    .iter()
-                    .map(|(id, entry)| (*id, entry.budget))
-                    .collect();
-                assert_eq!(actual, reference);
-                assert!(handles[&removed_id].upgrade().is_none());
-            }
-            assert!(!evict_lowest_budget_suspect(&mut suspects, &mut active));
-            assert_eq!(active, 0);
         }
+        // Dormant entries go first, oldest first.
+        for expected in [0, 2, 6] {
+            assert!(evict_lowest_budget_suspect(&mut suspects));
+            assert!(!suspects.contains_key(handles[expected].0));
+            assert!(handles[expected].1.upgrade().is_none());
+        }
+        // Then active ones by budget: 1, the first 3, the other 3, 5, 9.
+        for expected in [7, 3, 5, 1, 4] {
+            assert!(evict_lowest_budget_suspect(&mut suspects));
+            assert!(!suspects.contains_key(handles[expected].0));
+            assert!(handles[expected].1.upgrade().is_none());
+        }
+        assert_eq!(suspects.len(), 0);
+        assert!(!evict_lowest_budget_suspect(&mut suspects));
     }
 
     #[test]
