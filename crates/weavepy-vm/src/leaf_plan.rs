@@ -596,6 +596,7 @@ impl Builder<'_> {
         let instrs = &self.code.instructions;
         // Whether the previous instruction falls through to this one.
         let mut live = true;
+        #[allow(clippy::needless_range_loop)]
         for pc in 0..instrs.len() {
             if let Some(&(depth, assigned)) = self.targets.get(&pc) {
                 if live {
@@ -1193,6 +1194,7 @@ impl Interpreter {
                             // arguments: never dropped, so no reference moves.
                             let mut staged =
                                 [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
+                            #[allow(clippy::needless_range_loop)]
                             for k in 0..n {
                                 let o = match get!(first + k as u8) {
                                     // SAFETY: as `norm`; the copy is forgotten.

@@ -570,7 +570,11 @@ fn encode_with_context(
         slot_name_caches: Vec::new(),
     };
     let done = (|| {
-        encoder.writer.output.try_reserve(hint.clamp(64, MAX_OUTPUT_HINT)).ok()?;
+        encoder
+            .writer
+            .output
+            .try_reserve(hint.clamp(64, MAX_OUTPUT_HINT))
+            .ok()?;
         extend(&mut encoder.writer.output, &[0x80, protocol])?;
         encoder.save(value, 0)?;
         encoder.writer.write(b".")?;

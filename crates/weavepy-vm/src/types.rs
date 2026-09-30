@@ -2281,14 +2281,22 @@ impl SlotStorage {
         match &self.data {
             SlotData::Small(entries) => {
                 let entries = entries.get(..N)?;
-                if !entries.iter().zip(names).all(|((key, _), name)| key_named(key, name)) {
+                if !entries
+                    .iter()
+                    .zip(names)
+                    .all(|((key, _), name)| key_named(key, name))
+                {
                     return None;
                 }
                 Some(std::array::from_fn(|i| &entries[i].1))
             }
             SlotData::Fixed { layout, values } => {
                 let (keys, values) = (layout.get(..N)?, values.get(..N)?);
-                if !keys.iter().zip(names).all(|(key, name)| key_named(key, name)) {
+                if !keys
+                    .iter()
+                    .zip(names)
+                    .all(|(key, name)| key_named(key, name))
+                {
                     return None;
                 }
                 Some(std::array::from_fn(|i| &values[i]))
@@ -2306,7 +2314,11 @@ impl SlotStorage {
         let values: &mut [Object] = match &mut self.data {
             SlotData::Small(entries) => {
                 let entries = entries.get_mut(..N)?;
-                if !entries.iter().zip(names).all(|((key, _), name)| key_named(key, name)) {
+                if !entries
+                    .iter()
+                    .zip(names)
+                    .all(|((key, _), name)| key_named(key, name))
+                {
                     return None;
                 }
                 let mut values = entries.iter_mut().map(|(_, value)| value);
@@ -2314,7 +2326,11 @@ impl SlotStorage {
             }
             SlotData::Fixed { layout, values } => {
                 let keys = layout.get(..N)?;
-                if !keys.iter().zip(names).all(|(key, name)| key_named(key, name)) {
+                if !keys
+                    .iter()
+                    .zip(names)
+                    .all(|(key, name)| key_named(key, name))
+                {
                     return None;
                 }
                 values.get_mut(..N)?

@@ -3360,7 +3360,7 @@ pub fn zombie_memoryview_refs_to(target: ObjectId) -> usize {
                 ObjectId,
                 usize,
                 BuildHasherDefault<ObjectIdHasher>,
-            > = Default::default();
+            > = std::collections::HashMap::default();
             for h in &handles {
                 if zombies.contains(&h.id) {
                     traverse_object(&h.object, &mut |c| {
@@ -4474,7 +4474,7 @@ pub fn drop_survives_plainly(obj: &crate::object::Object) -> bool {
         crate::object::Object::Instance(i) => {
             crate::sync::Rc::strong_count(i) > 2
                 && !crate::weakref_registry::may_have_weakrefs(
-                    crate::sync::Rc::as_ptr(i) as usize as u64,
+                    crate::sync::Rc::as_ptr(i) as usize as u64
                 )
         }
         _ => false,

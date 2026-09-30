@@ -307,6 +307,8 @@ impl SplitValues {
             let new_layout = Self::layout(new_cap);
             // SAFETY: a nonzero-size layout; a grown block keeps its
             // header and initialized prefix (realloc copies them).
+            // (The block is allocated with the header's alignment.)
+            #[allow(clippy::cast_ptr_alignment)]
             let h = unsafe {
                 match self.block {
                     Some(b) => {
@@ -686,7 +688,8 @@ impl InstDict {
         let off = std::mem::offset_of!(crate::types::PyInstance, dict);
         // SAFETY: an `InstDict` exists only as `PyInstance::dict`, so the
         // containing instance starts `off` bytes before it and outlives
-        // this borrow.
+        // this borrow (and is aligned as a `PyInstance`).
+        #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             &*std::ptr::from_ref(self)
                 .cast::<u8>()
@@ -1004,6 +1007,7 @@ impl crate::types::PyInstance {
     ///
     /// As [`crate::sync::GilCell::peek_mut`].
     #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
     pub unsafe fn attr_peek_index_mut(
         &self,
         i: usize,
@@ -1018,7 +1022,7 @@ impl crate::types::PyInstance {
                 } else {
                     d.map_mut_value_store()
                 };
-                map.get_index_mut(i).map(|(k, v)| (&*k, v))
+                map.get_index_mut(i)
             }
             None => {
                 if !atomic && self.deferred.get() {

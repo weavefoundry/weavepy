@@ -3903,10 +3903,7 @@ impl Interpreter {
             Object::Dict(d) => (Rc::strong_count(d), Rc::as_ptr(d) as usize as u64),
             _ => return false,
         };
-        if sc != 2
-            || crate::weakref_registry::may_have_weakrefs(id)
-            || !gc_trace::is_tracked(id)
-        {
+        if sc != 2 || crate::weakref_registry::may_have_weakrefs(id) || !gc_trace::is_tracked(id) {
             return false;
         }
         match o {
@@ -12343,7 +12340,9 @@ impl Interpreter {
                                                     continue;
                                                 }
                                                 Err(e) => {
-                                                    break Some(CoreExit::Stop(LeafStop::Raised(e)));
+                                                    break Some(CoreExit::Stop(LeafStop::Raised(
+                                                        e,
+                                                    )));
                                                 }
                                             }
                                         }
@@ -14972,7 +14971,7 @@ impl Interpreter {
         }
         let (inst, _) = self.alloc_plain_instance_obj(ty);
         let mut args: [*const Object; 8] = [std::ptr::null(); 8];
-        args[0] = &inst;
+        args[0] = &raw const inst;
         for (k, a) in frame.stack[self_slot + 1..].iter().enumerate() {
             args[k + 1] = a;
         }
@@ -15086,8 +15085,10 @@ impl Interpreter {
                 let (c, k) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
                 // (An instance goes to the caller's native subscript, which
                 // grades its own release.)
-                if !matches!(c, Object::List(_) | Object::Tuple(_) | Object::Dict(_) | Object::Str(_))
-                    || !Self::core_droppable(c)
+                if !matches!(
+                    c,
+                    Object::List(_) | Object::Tuple(_) | Object::Dict(_) | Object::Str(_)
+                ) || !Self::core_droppable(c)
                 {
                     return None;
                 }
@@ -15894,8 +15895,7 @@ impl Interpreter {
         }?;
         let kind = mslots.get(call_pc)?.get_leaf_ptr(b)?;
         // SAFETY: the first `nargs + 1` entries were written.
-        let ops =
-            unsafe { std::slice::from_raw_parts(ops.as_ptr().cast::<Object>(), nargs + 1) };
+        let ops = unsafe { std::slice::from_raw_parts(ops.as_ptr().cast::<Object>(), nargs + 1) };
         // SAFETY: the slot (and the builtin type) holds the method for the
         // call, which runs no Python code.
         let r = self.leaf_builtin_call(kind, unsafe { &*b }, ops)?;
@@ -16359,7 +16359,7 @@ impl Interpreter {
         let dict;
         if code_rc.has_varkeywords {
             dict = Object::Dict(Rc::new(RefCell::new(varkw.unwrap_or_default())));
-            args[total] = &dict;
+            args[total] = &raw const dict;
         }
         self.pure_leaf_eval::<false, false>(code_rc, f, &args[..arity])
     }

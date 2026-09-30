@@ -280,6 +280,7 @@ fn as_int(o: &Object) -> Option<i64> {
 // The field readers take a natively built instance's values straight
 // from the shared layout; any other storage is read by name.
 
+#[allow(clippy::index_refutable_slice)]
 fn td_fields(i: &PyInstance, st: &State) -> Option<(i64, i64, i64)> {
     let n = &st.names;
     let s = i.slots.try_borrow().ok()?;
@@ -301,6 +302,7 @@ fn td_us(f: (i64, i64, i64)) -> i128 {
     (i128::from(f.0) * 86_400 + i128::from(f.1)) * 1_000_000 + i128::from(f.2)
 }
 
+#[allow(clippy::index_refutable_slice)]
 fn date_fields(i: &PyInstance, st: &State) -> Option<(i64, i64, i64)> {
     let n = &st.names;
     let s = i.slots.try_borrow().ok()?;

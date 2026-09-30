@@ -4023,7 +4023,7 @@ unsafe fn call_py_with_gaps(
         if kwargs.is_empty() && args.len() == j {
             args.push(v);
         } else if let Some(name) = code.varnames.get(j) {
-            kwargs.push((name.to_string(), v));
+            kwargs.push((name.clone(), v));
         }
     }
     let res = call_with_activation_shell(interp, ctx, jf, |i| {
@@ -5478,7 +5478,10 @@ fn note_callee_exit(art: &Artifacts, code: &Rc<CodeObject>, child: &CallCtx) {
     if child.dyn_py_calls == 0 {
         return;
     }
-    let trips = art.callee_roundtrips.get().saturating_add(child.dyn_py_calls);
+    let trips = art
+        .callee_roundtrips
+        .get()
+        .saturating_add(child.dyn_py_calls);
     art.callee_roundtrips.set(trips);
     if entries >= GENERIC_RETIRE_MIN_ENTRIES
         && trips / entries >= CALLEE_ROUNDTRIP_RETIRE_RATIO

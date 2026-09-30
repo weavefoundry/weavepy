@@ -1204,10 +1204,9 @@ pub fn materialize_stack_at(stack: &FrameStack, idx: usize) -> Option<Rc<PyFrame
                 py
             }
             None => {
-                let py = shell.materialize(back);
                 // Materialised while live on the stack: count the
                 // activation so `frame.clear()` refuses it.
-                py
+                shell.materialize(back)
             }
         };
         back = Some(py);
