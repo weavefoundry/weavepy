@@ -113,10 +113,46 @@ fn code_ok(code: &CodeObject) -> bool {
         && !code.is_async_generator
         && code.cellvars.is_empty()
         && code.freevars.is_empty()
-        && code.instructions.iter().all(|i| op_supported(i.op));
+        && code.instructions.iter().all(|i| op_supported(i.op))
+        && in_bounds(code, ext.objects.len());
     ext.gen_fast
         .store(if ok { 2 } else { 1 }, Ordering::Relaxed);
     ok
+}
+
+/// Whether every jump, local and constant `code`'s instructions name is
+/// in range, and the last instruction can't fall through: the step then
+/// reads instructions, locals and constants without per-use checks.
+fn in_bounds(code: &CodeObject, nconsts: usize) -> bool {
+    let instrs = &code.instructions;
+    let (n, nvars) = (instrs.len(), code.varnames.len());
+    let terminal = |op| {
+        matches!(
+            op,
+            OpCode::ReturnValue | OpCode::Reraise | OpCode::JumpBackward | OpCode::JumpForward
+        )
+    };
+    if instrs.last().is_none_or(|i| !terminal(i.op)) {
+        return false;
+    }
+    instrs.iter().enumerate().all(|(p, i)| {
+        let arg = i.arg as usize;
+        match i.op {
+            OpCode::PopJumpIfFalse
+            | OpCode::PopJumpIfTrue
+            | OpCode::JumpForward
+            | OpCode::ForIter => p + 1 + arg < n,
+            OpCode::LoadFast
+            | OpCode::LoadFastBorrow
+            | OpCode::LoadFastCheck
+            | OpCode::StoreFast => arg < nvars,
+            OpCode::LoadFastLoadFast | OpCode::LoadFastBorrowLoadFastBorrow => {
+                arg >> 4 < nvars && arg & 15 < nvars
+            }
+            OpCode::LoadConst => arg < nconsts,
+            _ => true,
+        }
+    })
 }
 
 /// A machine scalar: its release owes nothing.
@@ -143,6 +179,7 @@ fn copy(v: &Object) -> Object {
 
 /// The result of `a <kind> b` for machine scalars, when it can't raise or
 /// leave the machine range.
+#[inline(always)]
 fn scalar_binop(kind: BinOpKind, a: &Object, b: &Object) -> Option<Object> {
     Some(match (a, b) {
         (Object::Int(a), Object::Int(b)) => {
@@ -198,6 +235,7 @@ fn scalar_binop(kind: BinOpKind, a: &Object, b: &Object) -> Option<Object> {
 }
 
 /// `a <kind> b` for machine scalars (NaN and mixed shapes decline).
+#[inline(always)]
 fn scalar_compare(kind: CompareKind, a: &Object, b: &Object) -> Option<bool> {
     let ord = match (a, b) {
         (Object::Int(a), Object::Int(b)) => a.cmp(b),
@@ -276,13 +314,18 @@ impl Interpreter {
         let Some(ext) = crate::code_vm_ext(code) else {
             return GenStep::Bail;
         };
-        let (cbase, nconsts) = (ext.objects.as_ptr(), ext.objects.len());
+        let cbase = ext.objects.as_ptr();
         // SAFETY: no guard is live on the locals (`peek_mut` checks), and
         // nothing below runs code that could reach them.
         let Some(locals) = (unsafe { frame.locals.peek_mut() }) else {
             return GenStep::Bail;
         };
-        let (lbase, nlocals) = (locals.as_mut_ptr(), locals.len());
+        // (The scan checked every local index against the code's
+        // variables, which the frame's locals cover.)
+        if locals.len() < code.varnames.len() {
+            return GenStep::Bail;
+        }
+        let lbase = locals.as_mut_ptr();
         let stack = &mut frame.stack;
         if stack.capacity() - stack.len() < 8 {
             stack.reserve(8);
@@ -290,13 +333,15 @@ impl Interpreter {
         let (base, cap) = (stack.as_mut_ptr(), stack.capacity());
         let mut len = stack.len();
         let mut pc = frame.pc as usize;
-        // SAFETY (throughout): `lbase`/`base`/`cbase` index only below
-        // `nlocals`/`len` (initialized) or `cap`/`nconsts` as checked, and
-        // `instrs` only below `ninstrs`.
+        if pc >= ninstrs {
+            return GenStep::Bail;
+        }
+        // SAFETY (throughout): `base` indexes only below `len` (initialized)
+        // or `cap` as checked; `lbase`, `cbase` and `instrs` only at the
+        // indices and pcs the eligibility scan proved in range (`in_bounds`:
+        // every jump lands on an instruction and the last can't fall
+        // through, so `pc < ninstrs` whenever an instruction is read).
         let yielded = loop {
-            if pc >= ninstrs {
-                break None;
-            }
             let ins = unsafe { *instrs.add(pc) };
             match ins.op {
                 OpCode::Nop | OpCode::NotTaken | OpCode::Resume => pc += 1,
@@ -316,7 +361,7 @@ impl Interpreter {
                 }
                 OpCode::LoadFast | OpCode::LoadFastBorrow | OpCode::LoadFastCheck => {
                     let i = ins.arg as usize;
-                    if i >= nlocals || len == cap {
+                    if len == cap {
                         break None;
                     }
                     let v = unsafe { &*lbase.add(i) };
@@ -329,7 +374,7 @@ impl Interpreter {
                 }
                 OpCode::LoadFastLoadFast | OpCode::LoadFastBorrowLoadFastBorrow => {
                     let (i, j) = ((ins.arg >> 4) as usize, (ins.arg & 15) as usize);
-                    if i >= nlocals || j >= nlocals || len + 2 > cap {
+                    if len + 2 > cap {
                         break None;
                     }
                     let (a, b) = unsafe { (&*lbase.add(i), &*lbase.add(j)) };
@@ -347,7 +392,7 @@ impl Interpreter {
                 }
                 OpCode::StoreFast => {
                     let i = ins.arg as usize;
-                    if i >= nlocals || len == 0 {
+                    if len == 0 {
                         break None;
                     }
                     let slot = unsafe { lbase.add(i) };
@@ -377,11 +422,10 @@ impl Interpreter {
                     pc += 1;
                 }
                 OpCode::LoadConst => {
-                    let i = ins.arg as usize;
-                    if i >= nconsts || len == cap {
+                    if len == cap {
                         break None;
                     }
-                    unsafe { base.add(len).write(copy(&*cbase.add(i))) };
+                    unsafe { base.add(len).write(copy(&*cbase.add(ins.arg as usize))) };
                     len += 1;
                     pc += 1;
                 }
@@ -680,6 +724,7 @@ impl Interpreter {
         frame.gen_first_resume = first_resume;
         let start = frame.pc;
         frame.stack.push(Object::None);
+        debug_assert!(!frame.stack.is_empty());
         let out = match self.gen_fast_step(frame, snap_gen, depth, None) {
             GenStep::Yielded(v) => GenNext::Yielded(v),
             GenStep::Bail if frame.pc == start => {
