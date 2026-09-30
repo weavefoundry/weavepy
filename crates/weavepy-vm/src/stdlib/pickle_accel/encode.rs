@@ -23,8 +23,12 @@ use crate::types::{PyInstance, TypeObject};
 const FRAME_TARGET: usize = 65_536;
 const MAX_DEPTH: usize = 128;
 
+#[inline(always)]
 fn extend(output: &mut Vec<u8>, data: &[u8]) -> Option<()> {
-    output.try_reserve(data.len()).ok()?;
+    // (The fallible reservation only when the buffer is short.)
+    if output.capacity() - output.len() < data.len() {
+        output.try_reserve(data.len()).ok()?;
+    }
     output.extend_from_slice(data);
     Some(())
 }
@@ -36,6 +40,7 @@ struct Framer {
 }
 
 impl Framer {
+    #[inline]
     fn write(&mut self, data: &[u8]) -> Option<()> {
         if self.frame_start.is_none() {
             let start = self.output.len();

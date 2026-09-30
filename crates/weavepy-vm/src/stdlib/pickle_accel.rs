@@ -609,8 +609,12 @@ trait Sink<'a> {
     fn build(&mut self, target: &Self::Value, state: Self::Value) -> Option<()>;
 }
 
+#[inline(always)]
 fn push<T>(items: &mut Vec<T>, value: T) -> Option<()> {
-    items.try_reserve(1).ok()?;
+    // (The fallible reservation only when the vector is full.)
+    if items.len() == items.capacity() {
+        items.try_reserve(1).ok()?;
+    }
     items.push(value);
     Some(())
 }
