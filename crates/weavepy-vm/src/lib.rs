@@ -12190,6 +12190,48 @@ impl Interpreter {
                                             && len < cap
                                             && simple_args_prefix(&code.instructions, pc + 2)
                                         {
+                                            // A native method the site cached
+                                            // for this class version: straight
+                                            // to its fused call (the Python
+                                            // leaf probes below would miss).
+                                            if let (Object::Instance(i), Some(ms)) =
+                                                (other, mslots!(cold_mslots, ext).get(pc + 1))
+                                            {
+                                                if ms
+                                                    .peek_inst_builtin(
+                                                        i.cls_raw().attr_version.get(),
+                                                    )
+                                                    .is_some()
+                                                {
+                                                    if let Some((r, call_pc)) = self
+                                                        .core_native_method(
+                                                            code,
+                                                            other,
+                                                            pc + 1,
+                                                            next.arg,
+                                                            mslots!(cold_mslots, ext),
+                                                            lbase,
+                                                            nlocals,
+                                                            consts,
+                                                        )
+                                                    {
+                                                        last = call_pc;
+                                                        pc = call_pc + 1;
+                                                        match r {
+                                                            Ok(v) => {
+                                                                base.add(len).write(v);
+                                                                len += 1;
+                                                                continue;
+                                                            }
+                                                            Err(e) => {
+                                                                break Some(CoreExit::Stop(
+                                                                    LeafStop::Raised(e),
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             // A site that verified its callee
                                             // for this class version.
                                             let mut missed = false;
@@ -15775,6 +15817,32 @@ impl Interpreter {
                 // SAFETY: a borrowed copy of a live constant.
                 OpCode::LoadConst => unsafe { std::ptr::read(consts.get(ins.arg as usize)?) },
                 OpCode::LoadSmallInt => Object::Int(i64::from(ins.arg)),
+                // `x.m(i + 1)`: an int operation on the two latest
+                // arguments folds into one (scalars: the copies own nothing).
+                OpCode::BinaryOp if n >= 3 => {
+                    // SAFETY: entries `1..n` were written.
+                    let (a, b) =
+                        unsafe { (ops[n - 2].assume_init_ref(), ops[n - 1].assume_init_ref()) };
+                    let (&Object::Int(a), &Object::Int(b)) = (a, b) else {
+                        return None;
+                    };
+                    // SAFETY: `BinOpKind` is `repr(u8)` and the compiler only
+                    // emits valid kinds.
+                    let kind: BinOpKind = unsafe { std::mem::transmute(ins.arg as u8) };
+                    let r = match kind {
+                        BinOpKind::Add => a.checked_add(b)?,
+                        BinOpKind::Sub => a.checked_sub(b)?,
+                        BinOpKind::Mult => a.checked_mul(b)?,
+                        BinOpKind::BitAnd => a & b,
+                        BinOpKind::BitOr => a | b,
+                        BinOpKind::BitXor => a ^ b,
+                        _ => return None,
+                    };
+                    ops[n - 2].write(Object::Int(r));
+                    n -= 1;
+                    pc += 1;
+                    continue;
+                }
                 OpCode::Call if ins.arg as usize == n - 1 => return Some((n - 1, pc)),
                 _ => return None,
             };
