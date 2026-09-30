@@ -8,6 +8,8 @@ For the latest object metadata, numeric text, and enumeration changes,
 see [Runtime metadata and numeric text performance](PERFORMANCE-RUNTIME-METADATA.md).
 For the subsequent dispatch, allocation, and garbage-collection changes,
 see [Dispatch, allocation, and memory performance](PERFORMANCE-DISPATCH-MEMORY.md).
+For the branch comparing WeavePy with CPython 3.14 across the benchmark
+fixtures, startup, and imports, see [CPython parity performance](PERFORMANCE-CPYTHON-PARITY.md).
 
 The September 8, 2026, optimization pass reduces warm-cache process startup
 from 50.7 ms to 32.3 ms on the measured macOS ARM64 host. Across all 24 existing
