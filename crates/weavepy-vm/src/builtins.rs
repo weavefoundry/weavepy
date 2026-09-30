@@ -12444,8 +12444,8 @@ fn list_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(1)
         .ok_or_else(|| type_error("__getitem__ expected 1 argument"))?;
     if let Object::Slice(s) = key {
-        let seq = l.borrow().clone();
-        return Ok(Object::new_list(crate::slice_seq(&seq, s)?));
+        let sliced = crate::slice_seq(&l.borrow(), s)?;
+        return Ok(Object::new_list(sliced));
     }
     let l = l.borrow();
     let n = list_index_arg(l.len(), key, "__getitem__")?;

@@ -15119,10 +15119,7 @@ impl Interpreter {
                 let items = items.try_borrow().ok()?;
                 Some(Object::new_list(slice_seq(&items, sl).ok()?))
             }
-            Object::Tuple(items) => {
-                let v: Vec<Object> = items.iter().cloned().collect();
-                Some(Object::new_tuple(slice_seq(&v, sl).ok()?))
-            }
+            Object::Tuple(items) => Some(Object::new_tuple(slice_seq(&items[..], sl).ok()?)),
             Object::Str(st) => str_subscript_slice(st, sl).ok(),
             _ => None,
         }
@@ -42944,24 +42941,13 @@ impl Interpreter {
                 Ok(Object::new_list(sliced))
             }
             (Object::Tuple(items), Object::Slice(s)) => {
-                let v: Vec<Object> = items.iter().cloned().collect();
-                let sliced = slice_seq(&v, s)?;
-                Ok(Object::new_tuple(sliced))
+                Ok(Object::new_tuple(slice_seq(&items[..], s)?))
             }
             (Object::Str(s), Object::Slice(slc)) => str_subscript_slice(s, slc),
             (Object::WStr(cps), Object::Slice(slc)) => {
                 // Slice over code points, then canonicalise: a slice that drops
                 // every surrogate becomes a plain `Str` again.
-                let items: Vec<Object> = cps.iter().map(|&c| Object::Int(i64::from(c))).collect();
-                let sliced = slice_seq(&items, slc)?;
-                let out: Vec<u32> = sliced
-                    .iter()
-                    .map(|o| match o {
-                        Object::Int(n) => *n as u32,
-                        _ => unreachable!("slice of int vec yields ints"),
-                    })
-                    .collect();
-                Ok(Object::str_from_codepoints(out))
+                Ok(Object::str_from_codepoints(slice_seq(&cps[..], slc)?))
             }
             (Object::Range(r), Object::Int(_) | Object::Long(_)) => {
                 // Full-width arithmetic: `Object::len()` raises
@@ -43003,28 +42989,11 @@ impl Interpreter {
                 Ok(Object::Int(i64::from(buf[idx])))
             }
             (Object::Bytes(buf), Object::Slice(slc)) => {
-                let as_objs: Vec<Object> = buf.iter().map(|b| Object::Int(i64::from(*b))).collect();
-                let sliced = slice_seq(&as_objs, slc)?;
-                let mut out = Vec::with_capacity(sliced.len());
-                for o in sliced {
-                    match o {
-                        Object::Int(i) => out.push(i as u8),
-                        _ => return Err(type_error("bytes slice produced non-int")),
-                    }
-                }
+                let out = slice_seq(&buf[..], slc)?;
                 Ok(Object::Bytes(SharedSlice::from(out.as_slice())))
             }
             (Object::ByteArray(buf), Object::Slice(slc)) => {
-                let buf = buf.borrow();
-                let as_objs: Vec<Object> = buf.iter().map(|b| Object::Int(i64::from(*b))).collect();
-                let sliced = slice_seq(&as_objs, slc)?;
-                let mut out = Vec::with_capacity(sliced.len());
-                for o in sliced {
-                    match o {
-                        Object::Int(i) => out.push(i as u8),
-                        _ => return Err(type_error("bytearray slice produced non-int")),
-                    }
-                }
+                let out = slice_seq(&buf.borrow()[..], slc)?;
                 Ok(Object::ByteArray(Rc::new(RefCell::new(out))))
             }
             (Object::MemoryView(mv), Object::Int(i)) => {
@@ -57136,16 +57105,17 @@ pub(crate) fn str_subscript_slice(s: &SharedStr, slc: &PySlice) -> Result<Object
             return Ok(Object::from_str(s[bstart..bstop].to_string()));
         }
     }
-    // General path: negative bounds or non-unit step. Materialising the
-    // code points here is acceptable — these forms are rare and never the
-    // tokeniser hot path.
-    let obj_chars: Vec<Object> = s.chars().map(|c| Object::from_str(c.to_string())).collect();
-    let sliced = slice_seq(&obj_chars, slc)?;
-    let out: String = sliced.iter().map(|o| o.to_str()).collect();
-    Ok(Object::from_str(out))
+    // General path: negative bounds or non-unit step, over the code points.
+    let chars: Vec<char> = s.chars().collect();
+    Ok(Object::from_str(
+        slice_seq(&chars, slc)?.into_iter().collect::<String>(),
+    ))
 }
 
-pub(crate) fn slice_seq(seq: &[Object], s: &PySlice) -> Result<Vec<Object>, RuntimeError> {
+/// The elements of `seq` that slice `s` selects, in order: CPython's
+/// `PySlice_Unpack` + `PySlice_AdjustIndices` over any element type (a
+/// list's objects, a `bytes` buffer, a string's code points).
+pub(crate) fn slice_seq<T: Clone>(seq: &[T], s: &PySlice) -> Result<Vec<T>, RuntimeError> {
     let len = seq.len() as i64;
     let step = match &s.step {
         Object::None => 1i64,
@@ -57218,6 +57188,14 @@ pub(crate) fn slice_seq(seq: &[Object], s: &PySlice) -> Result<Vec<Object>, Runt
             ))
         }
     };
+    if step == 1 {
+        // Both bounds are within `0..=len` here: one contiguous copy.
+        return Ok(if start < stop {
+            seq[start as usize..stop as usize].to_vec()
+        } else {
+            Vec::new()
+        });
+    }
     let mut i = start;
     let mut out = Vec::new();
     if step > 0 {
