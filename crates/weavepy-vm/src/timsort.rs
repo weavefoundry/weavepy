@@ -170,7 +170,7 @@ where
             let (mut l, mut r) = (0, ok);
             let pivot = unsafe { a.add(ok) };
             while l < r {
-                let m = (l + r) >> 1;
+                let m = usize::midpoint(l, r);
                 if self.lt(pivot, unsafe { a.add(m) })? {
                     r = m;
                 } else {

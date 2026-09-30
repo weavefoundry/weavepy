@@ -29,8 +29,8 @@ use weavepy_vm::object::Object;
 
 use crate::embed::PyInitFn;
 use crate::initconfig::{
-    self, EmbedConfig, PyConfig, PyConfig_InitIsolatedConfig, PyStatus, PyWideStringList,
-    _PyStatus_TYPE_ERROR, _PyStatus_TYPE_EXIT,
+    self, _PyStatus_TYPE_ERROR, _PyStatus_TYPE_EXIT, EmbedConfig, PyConfig,
+    PyConfig_InitIsolatedConfig, PyStatus, PyWideStringList,
 };
 use crate::object::PyObject;
 

@@ -112,16 +112,16 @@ const FROZEN_HEADER_LEN: usize = 20;
 /// matter combined with an equal length).
 fn fnv1a(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut words = s.as_bytes().chunks_exact(8);
+    let (words, rest) = s.as_bytes().as_chunks::<8>();
     let mut mix = |w: u64| {
         h ^= w;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     };
-    for w in &mut words {
-        mix(u64::from_le_bytes(w.try_into().expect("an 8-byte chunk")));
+    for w in words {
+        mix(u64::from_le_bytes(*w));
     }
     let mut tail = [0u8; 8];
-    tail[..words.remainder().len()].copy_from_slice(words.remainder());
+    tail[..rest.len()].copy_from_slice(rest);
     mix(u64::from_le_bytes(tail));
     h
 }
