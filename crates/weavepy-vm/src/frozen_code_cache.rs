@@ -43,10 +43,6 @@ use std::sync::OnceLock;
 
 use weavepy_compiler::CodeObject;
 
-use crate::object::Object;
-use crate::stdlib::marshal_mod;
-use crate::sync::Rc;
-
 thread_local! {
     static CACHE: RefCell<HashMap<&'static str, CodeObject>> = RefCell::new(HashMap::new());
 }
@@ -95,27 +91,38 @@ pub fn insert(name: &str, code: &CodeObject) {
 // persists the marshalled `CodeObject`s in a per-user cache directory
 // so warm process starts skip parse + compile entirely.
 //
-// Artifact layout: `<cache_dir>/weavepy/frozen-<CACHE_TAG>/<name>` with
-// a 20-byte header — magic `WPYF`, reserved flags word, source length,
-// and an FNV-1a 64 source hash — followed by `marshal.dumps(code)`.
-// The `CACHE_TAG` in the directory name invalidates on bytecode-format
-// revisions (same lever as `.pyc`); the length + hash pair invalidates
+// Artifact layout: `<cache_dir>/weavepy/frozen-<CACHE_TAG>-n<VERSION>/<name>`
+// with a 20-byte header — magic `WPYN`, reserved flags word, source
+// length, and a 64-bit source hash — followed by the code in
+// `weavepy_compiler::native_code` form, which loads without the CPython
+// bytecode transcoding a `marshal` payload needs. The `CACHE_TAG` and
+// native-format `VERSION` in the directory name invalidate on bytecode or
+// layout revisions (and keep binaries of different formats from
+// rewriting each other's artifacts); the length + hash pair invalidates
 // when the embedded source itself changes (a rebuilt binary with edited
 // stdlib). Corrupt or mismatched artifacts are treated as misses.
 
 /// Header magic for frozen-cache artifacts (distinct from `.pyc`'s
-/// CPython magic — these files are WeavePy-internal).
-const FROZEN_MAGIC: &[u8; 4] = b"WPYF";
+/// CPython magic: these files are WeavePy-internal).
+const FROZEN_MAGIC: &[u8; 4] = b"WPYN";
 const FROZEN_HEADER_LEN: usize = 20;
 
-/// FNV-1a 64-bit — tiny, dependency-free, and plenty for cache
-/// validation (collisions only matter combined with an equal length).
+/// FNV-1a 64-bit over 8-byte words (the tail zero-padded): tiny,
+/// dependency-free, and plenty for cache validation (collisions only
+/// matter combined with an equal length).
 fn fnv1a(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.bytes() {
-        h ^= u64::from(b);
+    let mut words = s.as_bytes().chunks_exact(8);
+    let mut mix = |w: u64| {
+        h ^= w;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for w in &mut words {
+        mix(u64::from_le_bytes(w.try_into().expect("an 8-byte chunk")));
     }
+    let mut tail = [0u8; 8];
+    tail[..words.remainder().len()].copy_from_slice(words.remainder());
+    mix(u64::from_le_bytes(tail));
     h
 }
 
@@ -144,10 +151,11 @@ fn disk_dir() -> Option<&'static PathBuf> {
                 base
             }
         };
-        Some(
-            base.join("weavepy")
-                .join(format!("frozen-{}", crate::pycache::CACHE_TAG)),
-        )
+        Some(base.join("weavepy").join(format!(
+            "frozen-{}-n{}",
+            crate::pycache::CACHE_TAG,
+            weavepy_compiler::native_code::VERSION
+        )))
     })
     .as_ref()
 }
@@ -172,20 +180,11 @@ pub fn get_disk(name: &str, source: &str, filename: &str) -> Option<CodeObject> 
     if len as usize != source.len() || hash != fnv1a(source) {
         return None;
     }
-    match marshal_mod::load_from_bytes(&bytes[FROZEN_HEADER_LEN..]).ok()? {
-        Object::Code(c) => {
-            let mut code = crate::pycache::own_decoded_code(c);
-            if code.filename != filename {
-                crate::pycache::rewrite_filenames(&mut code, filename);
-            }
-            // Not mirrored into the in-memory cache: a later interpreter
-            // reads the same artifact again, and a resident clone of every
-            // loaded module's code would double its footprint in the
-            // (usual) single-interpreter process.
-            Some(code)
-        }
-        _ => None,
-    }
+    // Not mirrored into the in-memory cache: a later interpreter reads the
+    // same artifact again, and a resident clone of every loaded module's
+    // code would double its footprint in the (usual) single-interpreter
+    // process.
+    weavepy_compiler::native_code::decode(&bytes[FROZEN_HEADER_LEN..], filename)
 }
 
 /// Persist a freshly-compiled frozen module to the disk cache.
@@ -198,15 +197,15 @@ pub fn write_disk(name: &str, source: &str, code: &CodeObject) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let mut bytes = Vec::with_capacity(FROZEN_HEADER_LEN + 4096);
+    // A code object the native form doesn't carry just isn't cached.
+    let Some(payload) = weavepy_compiler::native_code::encode(code) else {
+        return;
+    };
+    let mut bytes = Vec::with_capacity(FROZEN_HEADER_LEN + payload.len());
     bytes.extend_from_slice(FROZEN_MAGIC);
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&(source.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&fnv1a(source).to_le_bytes());
-    let Ok(Object::Bytes(payload)) = marshal_mod::b_dumps(&[Object::Code(Rc::new(code.clone()))])
-    else {
-        return;
-    };
     bytes.extend_from_slice(&payload);
     // Atomic-ish: temp + rename so concurrent starts never observe a
     // half-written artifact.

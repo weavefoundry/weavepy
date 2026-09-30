@@ -40,6 +40,7 @@ pub mod cpython_code;
 mod flowgraph;
 mod intern;
 mod mangle;
+pub mod native_code;
 mod validate;
 
 pub use bytecode::{
