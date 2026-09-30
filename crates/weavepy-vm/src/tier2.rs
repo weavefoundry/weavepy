@@ -203,16 +203,17 @@ impl MathGuard {
 /// probes are skipped (a resume or entry then costs two stamp reads).
 struct GuardSnapshot {
     entries: Vec<(String, Object)>,
-    /// `(globals id, globals stamp, builtins id, builtins stamp)` of the
-    /// last full validation that held; all-zero until one has.
-    last_ok: std::cell::Cell<(usize, u64, usize, u64)>,
+    /// `(globals id, globals stamp, builtins id, builtins stamp, global
+    /// value epoch)` of the last full validation that held; all-zero
+    /// until one has.
+    last_ok: std::cell::Cell<(usize, u64, usize, u64, u64)>,
 }
 
 impl GuardSnapshot {
     fn new(entries: Vec<(String, Object)>) -> Self {
         Self {
             entries,
-            last_ok: std::cell::Cell::new((0, 0, 0, 0)),
+            last_ok: std::cell::Cell::new((0, 0, 0, 0, 0)),
         }
     }
 }
@@ -3311,6 +3312,8 @@ fn guards_hold(
         unsafe { (*globals.as_ptr()).mutation_stamp() },
         Rc::as_ptr(builtins) as usize,
         unsafe { (*builtins.as_ptr()).mutation_stamp() },
+        // A rebinding in place leaves the stamps alone (see `STORE_GLOBAL`).
+        crate::object::global_value_epoch(),
     );
     if guard_snapshot.last_ok.get() != key || interp.globals_missing_any.get() {
         for (name, expected) in guard_snapshot.entries.iter() {

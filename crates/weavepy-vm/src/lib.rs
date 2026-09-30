@@ -13613,7 +13613,9 @@ impl Interpreter {
                     // Rebinding an existing module-scope name whose old value
                     // leaves by a plain drop; a new name, a finalizer's
                     // candidate or a watched dict takes the full handler.
-                    OpCode::StoreName if self.core_name_scope(frame) => {
+                    OpCode::StoreName | OpCode::StoreGlobal
+                        if ins.op == OpCode::StoreGlobal || self.core_name_scope(frame) =>
+                    {
                         if len == 0 || crate::capi_watchers::dicts_active() {
                             break None;
                         }
@@ -13635,9 +13637,12 @@ impl Interpreter {
                         {
                             break None;
                         }
-                        let Some((_, slot)) = (**g).get_index_mut(i) else {
+                        // The key layout stays: no stamp (every cached global
+                        // load stands), but the value epoch moves.
+                        let Some((_, slot)) = g.map_mut_value_store().get_index_mut(i) else {
                             break None;
                         };
+                        crate::object::bump_global_value_epoch();
                         // SAFETY: `len > 0`; the value moves into the binding and
                         // the displaced one was checked droppable.
                         let old = std::mem::replace(slot, unsafe { base.add(len - 1).read() });
@@ -22393,7 +22398,19 @@ impl Interpreter {
                     let old = if let Some(ns) = &frame.class_namespace {
                         ns.borrow_mut().insert(DictKey(key), v)
                     } else {
-                        frame.globals.borrow_mut().insert(DictKey(key), v)
+                        // A module-level rebinding keeps the key layout (see
+                        // `STORE_GLOBAL`).
+                        let key = DictKey(key);
+                        let mut g = frame.globals.borrow_mut();
+                        match g.get_index_of(&key) {
+                            Some(i) => {
+                                crate::object::bump_global_value_epoch();
+                                g.map_mut_value_store()
+                                    .get_index_mut(i)
+                                    .map(|(_, slot)| std::mem::replace(slot, v))
+                            }
+                            None => g.insert(key, v),
+                        }
                     };
                     if let Some(old) = old {
                         if Self::local_needs_prompt_reap(&old) {
@@ -22408,7 +22425,22 @@ impl Interpreter {
                     Some(n @ Object::Str(_)) => n.clone(),
                     _ => Object::from_str(self.name_at(&frame.code, ins.arg)?),
                 };
-                let old = frame.globals.borrow_mut().insert(DictKey(key), v);
+                // Rebinding an existing global keeps the dict's key layout, so
+                // it leaves the stamp (and every cached global load) standing;
+                // only a new name stamps it.
+                let key = DictKey(key);
+                let old = {
+                    let mut g = frame.globals.borrow_mut();
+                    match g.get_index_of(&key) {
+                        Some(i) => {
+                            crate::object::bump_global_value_epoch();
+                            g.map_mut_value_store()
+                                .get_index_mut(i)
+                                .map(|(_, slot)| std::mem::replace(slot, v))
+                        }
+                        None => g.insert(key, v),
+                    }
+                };
                 // Rebinding a global that uniquely held a finalizable runs its
                 // `__del__` now, matching the `DeleteGlobal` path and CPython's
                 // decref-on-store (module-scope `handle = None`).

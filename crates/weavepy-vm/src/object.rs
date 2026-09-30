@@ -4036,6 +4036,23 @@ pub type DictMap = indexmap::IndexMap<DictKey, Object, crate::fasthash::FxBuildH
 /// replaced in place.
 static DICT_STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Advanced by every global rebinding that replaces a value in place
+/// without stamping the dict (see `STORE_GLOBAL`): caches that burn in a
+/// global's *value* rather than its position watch it alongside the stamps.
+static GLOBAL_VALUE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current [`GLOBAL_VALUE_EPOCH`].
+#[inline]
+pub fn global_value_epoch() -> u64 {
+    GLOBAL_VALUE_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Advance [`GLOBAL_VALUE_EPOCH`].
+#[inline]
+pub fn bump_global_value_epoch() {
+    GLOBAL_VALUE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[inline]
 fn next_dict_stamp() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
