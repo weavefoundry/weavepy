@@ -20554,10 +20554,44 @@ impl Interpreter {
                     )
             }
             K::Isinstance => return Self::core_isinstance(args),
-            K::ListAppend => args.len() == 2 && matches!(args[0], O::List(_)),
+            // `list.append` and `list.pop` in line (as `list_append` and
+            // `list_pop` do them).
+            K::ListAppend => {
+                let [O::List(l), item] = args else {
+                    return None;
+                };
+                l.try_borrow_mut().ok()?.push(item.clone());
+                return Some(Ok(O::None));
+            }
             K::ListPop => {
-                (args.len() == 1 || (args.len() == 2 && leaf_int(&args[1])))
-                    && matches!(args[0], O::List(_))
+                let (O::List(l), index) = (&args[0], args.get(1)) else {
+                    return None;
+                };
+                let mut l = l.try_borrow_mut().ok()?;
+                let i = match index {
+                    None => l.len().checked_sub(1),
+                    Some(O::Int(_) | O::Bool(_)) if args.len() == 2 => {
+                        let i = &match args[1] {
+                            O::Bool(b) => i64::from(b),
+                            O::Int(i) => i,
+                            _ => unreachable!("matched above"),
+                        };
+                        let len = l.len() as i64;
+                        let n = if *i < 0 { i + len } else { *i };
+                        if l.is_empty() {
+                            None
+                        } else if n < 0 || n >= len {
+                            return Some(Err(index_error("pop index out of range")));
+                        } else {
+                            Some(n as usize)
+                        }
+                    }
+                    _ => return None,
+                };
+                return Some(match i {
+                    Some(i) => Ok(l.remove(i)),
+                    None => Err(index_error("pop from empty list")),
+                });
             }
             K::ListInsert => args.len() == 3 && matches!(args[0], O::List(_)) && leaf_int(&args[1]),
             K::ListReverse | K::ListCopy => args.len() == 1 && matches!(args[0], O::List(_)),

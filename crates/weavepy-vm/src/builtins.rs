@@ -12518,7 +12518,11 @@ fn list_pop(args: &[Object]) -> Result<Object, RuntimeError> {
     let l = list_self(args)?;
     let mut l = l.borrow_mut();
     let idx = if args.len() > 1 {
-        match &args[1] {
+        let index = match &args[1] {
+            Object::Bool(b) => Object::Int(i64::from(*b)),
+            other => other.clone(),
+        };
+        match &index {
             Object::Int(i) => {
                 if l.is_empty() {
                     return Err(index_error("pop from empty list"));
