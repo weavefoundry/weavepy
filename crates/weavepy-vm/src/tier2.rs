@@ -578,6 +578,61 @@ struct JitState {
 static JIT_PROCESS_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// The `WEAVEPY_JIT` / free-threading verdict shared by every thread.
+/// Warm the code generator on a background thread (see
+/// [`prewarm_codegen`]), once per process: when the CLI starts a program
+/// file or module, and otherwise when the first code object is halfway
+/// to its compile threshold (so `-c pass` doesn't pay for it).
+pub(crate) fn spawn_codegen_prewarm_if_enabled() {
+    if jit_enabled_by_config() {
+        spawn_codegen_prewarm();
+    }
+}
+
+fn spawn_codegen_prewarm() {
+    static SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SPAWNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("weavepy-jit-warm".to_owned())
+        .spawn(prewarm_codegen);
+}
+
+/// Compile, on a throwaway engine, a small counted loop of the shape hot
+/// code takes, and discard it. A process's first compile otherwise pays
+/// the code generator's cold start (its code paged in and its tables
+/// built: about 0.7 ms on the development host, most of the first
+/// compile) on the thread that needs the compiled code. Touches no
+/// interpreter state.
+fn prewarm_codegen() {
+    const SOURCE: &str =
+        "def f(n):\n    t = 0\n    for i in range(n):\n        t = t + i * 2\n    return t\n";
+    let _ = std::panic::catch_unwind(|| {
+        let Ok(module) = weavepy_parser::parse_module(SOURCE) else {
+            return;
+        };
+        let Ok(code) = weavepy_compiler::compile_module(&module) else {
+            return;
+        };
+        let Some(f) = code.constants.iter().find_map(|c| match c {
+            weavepy_compiler::Constant::Code(f) => Some(f.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(mut engine) = JitEngine::new() else {
+            return;
+        };
+        let _ = engine.compile(&f, &mut |name| {
+            if name == "range" {
+                weavepy_jit::ResolvedGlobal::RangeBuiltin
+            } else {
+                weavepy_jit::ResolvedGlobal::Opaque
+            }
+        });
+    });
+}
+
 fn jit_enabled_by_config() -> bool {
     // RFC 0067 WS3 — the tier-2 JIT is on by default; `WEAVEPY_JIT=0`
     // (or `off`, or an empty value) restores the pure interpreter.
@@ -905,6 +960,9 @@ impl JitState {
                 Tier::NotJitable => return None,
                 Tier::Cold => {
                     entry.counter += 1;
+                    if entry.counter == self.threshold / 2 && self.engine.is_none() {
+                        spawn_codegen_prewarm();
+                    }
                     if entry.counter < self.threshold
                         || !compile_allowed(entry.counter, self.threshold)
                     {
