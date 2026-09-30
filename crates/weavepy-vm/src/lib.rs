@@ -12184,6 +12184,52 @@ impl Interpreter {
                                     }
                                 }
                             }
+                            // A branch on a local, read in place (nothing is
+                            // pushed, so nothing is cloned or released).
+                            3 | 4 => {
+                                // SAFETY: `i < nlocals` (checked above), and a
+                                // pair kind is only recorded where the branch
+                                // instruction exists.
+                                let v = unsafe { &*lbase.add(i) };
+                                let jump_pc = pc + 1 + usize::from(fast_pairs[pc] == 4);
+                                let jump = unsafe { *instrs.add(jump_pc) };
+                                let taken = match (jump.op, v) {
+                                    (_, Object::Unbound) => None,
+                                    (OpCode::PopJumpIfNone, v) => Some(matches!(v, Object::None)),
+                                    (OpCode::PopJumpIfNotNone, v) => {
+                                        Some(!matches!(v, Object::None))
+                                    }
+                                    (op, v) => {
+                                        let truthy = match v {
+                                            Object::Bool(b) => Some(*b),
+                                            Object::Int(n) => Some(*n != 0),
+                                            Object::None => Some(false),
+                                            Object::Float(f) => Some(*f != 0.0),
+                                            Object::Str(s) => Some(!s.is_empty()),
+                                            Object::Tuple(t) => Some(!t.is_empty()),
+                                            // SAFETY: a read between two instructions.
+                                            Object::List(l) => {
+                                                unsafe { l.peek() }.map(|l| !l.is_empty())
+                                            }
+                                            _ => None,
+                                        };
+                                        truthy.map(|t| t == (op == OpCode::PopJumpIfTrue))
+                                    }
+                                };
+                                if let Some(taken) = taken {
+                                    last = jump_pc;
+                                    pc = jump_pc + 1;
+                                    if taken {
+                                        pc += jump.arg as usize;
+                                    } else if pc < ninstrs
+                                        // SAFETY: `pc < ninstrs`.
+                                        && unsafe { (*instrs.add(pc)).op } == OpCode::NotTaken
+                                    {
+                                        pc += 1;
+                                    }
+                                    continue;
+                                }
+                            }
                             _ => {}
                         }
                         // SAFETY: `i < nlocals`, `len < cap`.
@@ -12355,6 +12401,18 @@ impl Interpreter {
                                                     len += 1;
                                                     last = end;
                                                     pc = end + 1;
+                                                    continue;
+                                                }
+                                            } else if let (Some(ext), Object::Instance(inst)) =
+                                                (ext, other)
+                                            {
+                                                // The site's field shortcut, in line (the
+                                                // common monomorphic read).
+                                                if let Some(v) = field_slot_hit(ext, pc + 1, inst) {
+                                                    base.add(len).write(clone_hot(v));
+                                                    len += 1;
+                                                    last = pc + 1;
+                                                    pc += 2;
                                                     continue;
                                                 }
                                             }
@@ -12604,8 +12662,16 @@ impl Interpreter {
                             break None;
                         }
                         len -= 1;
+                        // A scalar just leaves (tested apart from the drop,
+                        // or the scalar case folds into the drop glue call).
                         // SAFETY: the slot is initialized and leaves the stack.
-                        unsafe { drop_hot(base.add(len).read()) };
+                        if !matches!(
+                            unsafe { &*base.add(len) },
+                            Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+                        ) {
+                            // SAFETY: as above.
+                            unsafe { drop_hot(base.add(len).read()) };
+                        }
                         last = pc;
                         pc += 1;
                     }
@@ -12715,6 +12781,11 @@ impl Interpreter {
                         pc += 1;
                         if is_none == (ins.op == OpCode::PopJumpIfNone) {
                             pc += ins.arg as usize;
+                        } else if pc < ninstrs
+                            // SAFETY: `pc < ninstrs`.
+                            && unsafe { (*instrs.add(pc)).op } == OpCode::NotTaken
+                        {
+                            pc += 1;
                         }
                     }
                     OpCode::BinaryOp => {
@@ -13021,6 +13092,11 @@ impl Interpreter {
                         pc += 1;
                         if truthy == (ins.op == OpCode::PopJumpIfTrue) {
                             pc += ins.arg as usize;
+                        } else if pc < ninstrs
+                            // SAFETY: `pc < ninstrs`.
+                            && unsafe { (*instrs.add(pc)).op } == OpCode::NotTaken
+                        {
+                            pc += 1;
                         }
                     }
                     OpCode::JumpForward => {
@@ -17471,6 +17547,18 @@ impl Interpreter {
             if let Some(v) = unsafe { field_slot_hit(ext, attr_pc, inst) } {
                 return Some(Self::clone_operand(v));
             }
+            // A scalar class attribute the instance doesn't shadow (see
+            // `leaf_attr_resolve_site`).
+            if let Some(v) = ext
+                .stamp_slots
+                .get()
+                .and_then(|s| s.get(attr_pc))
+                .and_then(|s| class_attr_hit_via(s, inst.cls_raw(), CLASS_ATTR_VIA_INSTANCE))
+            {
+                if !inst_may_shadow(inst, code, name_idx) {
+                    return Some(v);
+                }
+            }
         }
         if let (IC::LoadAttrInstance { key_idx, ver }, Object::Instance(inst)) =
             (code.caches.get(attr_pc as u32), local)
@@ -20824,6 +20912,15 @@ impl Interpreter {
         name_idx: u32,
     ) -> Option<Object> {
         use weavepy_compiler::InlineCache as IC;
+        // A scalar class attribute read through an instance that doesn't
+        // shadow it (the stamp was filled below, at this class version).
+        if let Some(v) = code_stamp_slot(code, cache_pc)
+            .and_then(|s| class_attr_hit_via(s, inst.cls_raw(), CLASS_ATTR_VIA_INSTANCE))
+        {
+            if !inst_may_shadow(inst, code, name_idx) {
+                return Some(v);
+            }
+        }
         let poly = code_attr_poly(code, cache_pc);
         let ver = inst.cls_raw().attr_version.get();
         // A never-specialized site resolves once and takes the indexed
@@ -20843,6 +20940,15 @@ impl Interpreter {
                     } else if let Some(p) = poly {
                         p.record(ver, ix);
                     }
+                } else {
+                    // Found on the class: remember a scalar for this site.
+                    class_attr_fill_via(
+                        code,
+                        inst.cls_raw(),
+                        cache_pc as usize,
+                        &v,
+                        CLASS_ATTR_VIA_INSTANCE,
+                    );
                 }
                 Some(v)
             }
@@ -63688,11 +63794,26 @@ const CLASS_ATTR_NONE: u64 = 0x5ca1_a770_0000_0004;
 /// `cls`'s current version (see [`class_attr_fill`]).
 #[inline(always)]
 fn class_attr_hit(slot: &StampSlot, cls: &crate::types::TypeObject) -> Option<Object> {
+    class_attr_hit_via(slot, cls, 0)
+}
+
+/// Marks a stamp remembered for a read through an *instance* of the
+/// class, which also needs the instance not to shadow the name.
+const CLASS_ATTR_VIA_INSTANCE: u64 = 0x100;
+
+/// [`class_attr_hit`] for a stamp filled with `via` (`0`, or
+/// [`CLASS_ATTR_VIA_INSTANCE`]).
+#[inline(always)]
+fn class_attr_hit_via(
+    slot: &StampSlot,
+    cls: &crate::types::TypeObject,
+    via: u64,
+) -> Option<Object> {
     let [ver, tag, bits] = slot.get();
     if ver != cls.attr_version.get() {
         return None;
     }
-    match tag {
+    match tag ^ via {
         CLASS_ATTR_INT => Some(Object::Int(bits as i64)),
         CLASS_ATTR_FLOAT => Some(Object::Float(f64::from_bits(bits))),
         CLASS_ATTR_BOOL => Some(Object::Bool(bits != 0)),
@@ -63707,6 +63828,17 @@ fn class_attr_hit(slot: &StampSlot, cls: &crate::types::TypeObject) -> Option<Ob
 /// that could alter the resolution, so an equal version later means the
 /// same value.
 fn class_attr_fill(code: &CodeObject, cls: &crate::types::TypeObject, pc: usize, v: &Object) {
+    class_attr_fill_via(code, cls, pc, v, 0);
+}
+
+/// [`class_attr_fill`], marked with `via` (see [`class_attr_hit_via`]).
+fn class_attr_fill_via(
+    code: &CodeObject,
+    cls: &crate::types::TypeObject,
+    pc: usize,
+    v: &Object,
+    via: u64,
+) {
     let (tag, bits) = match v {
         Object::Int(x) => (CLASS_ATTR_INT, *x as u64),
         Object::Float(x) => (CLASS_ATTR_FLOAT, x.to_bits()),
@@ -63715,7 +63847,7 @@ fn class_attr_fill(code: &CodeObject, cls: &crate::types::TypeObject, pc: usize,
         _ => return,
     };
     if let Some(slot) = code_stamp_slot(code, pc as u32) {
-        slot.set([cls.attr_version.get(), tag, bits]);
+        slot.set([cls.attr_version.get(), tag ^ via, bits]);
     }
 }
 
@@ -64167,6 +64299,17 @@ fn code_fast_pairs<'a>(code: &CodeObject, ext: Option<&'a CodeConstObjects>) -> 
                     Some(OpCode::LoadAttr | OpCode::StoreAttr | OpCode::LoadMethodAttr)
                 )),
                 Some(OpCode::StoreFast) => 2,
+                // A local's `is None` / `is not None` test.
+                Some(OpCode::PopJumpIfNone | OpCode::PopJumpIfNotNone) => 3,
+                // A local's truth test.
+                Some(OpCode::ToBool)
+                    if matches!(
+                        ops.get(pc + 2).map(|i| i.op),
+                        Some(OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue)
+                    ) =>
+                {
+                    4
+                }
                 _ => 0,
             };
             kinds[pc] = kind;
