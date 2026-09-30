@@ -37405,7 +37405,29 @@ impl Interpreter {
             }
             // A simple body runs to its next yield in place (see
             // `gen_fast`), folding the draining consumer's yields as it goes.
-            if let Some(v) = self.gen_fast_run(frame, snap_gen, fold) {
+            let mut fast = self.gen_fast_run(frame, snap_gen, fold);
+            // Fast steps stop at the eval breaker; a draining consumer's
+            // single send would then finish the whole generator on the
+            // slow path. Service the breaker here (as the quiet loop's
+            // checkpoint does) and keep stepping.
+            while fast.is_none()
+                && self.gil_countdown <= 1
+                && crate::hot_gates::loop_gen() == snap_gen
+                && !frame.sent_consumed
+            {
+                self.gil_countdown = crate::gil::GIL_CHECK_INTERVAL;
+                if !gc_trace::active_suspects_present() && gc_trace::has_suspects() {
+                    for obj in gc_trace::take_dead_suspects() {
+                        self.reap_dead_subgraph(obj);
+                    }
+                }
+                crate::gil::yield_checkpoint();
+                if crate::hot_gates::loop_gen() != snap_gen {
+                    break;
+                }
+                fast = self.gen_fast_run(frame, snap_gen, fold);
+            }
+            if let Some(v) = fast {
                 Ok(FrameOutcome::Yielded(v))
             } else {
                 // The draining consumer's sink, folded at this frame's yields.

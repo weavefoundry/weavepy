@@ -712,9 +712,12 @@ impl Interpreter {
             return GenNext::Declined;
         };
         let first_resume = matches!(*state, GeneratorState::Created(_));
-        if boxed.sent_consumed || !Self::gen_fast_frame_ok(boxed) {
+        if !Self::gen_fast_frame_ok(boxed) {
             return GenNext::Declined;
         }
+        // A body an earlier fast step left partway (at the eval breaker,
+        // say) continues where it stopped, with no value sent.
+        let partial = boxed.sent_consumed;
         let prev = std::mem::replace(state, GeneratorState::Running);
         let (GeneratorState::Suspended(mut boxed) | GeneratorState::Created(mut boxed)) = prev
         else {
@@ -723,13 +726,21 @@ impl Interpreter {
         let frame: &mut Frame = &mut boxed;
         frame.gen_first_resume = first_resume;
         let start = frame.pc;
-        frame.stack.push(Object::None);
+        if partial {
+            frame.sent_consumed = false;
+        } else {
+            frame.stack.push(Object::None);
+        }
         debug_assert!(!frame.stack.is_empty());
         let out = match self.gen_fast_step(frame, snap_gen, depth, None) {
             GenStep::Yielded(v) => GenNext::Yielded(v),
             GenStep::Bail if frame.pc == start => {
                 // Nothing ran: the resume is undone.
-                frame.stack.pop();
+                if partial {
+                    frame.sent_consumed = true;
+                } else {
+                    frame.stack.pop();
+                }
                 GenNext::Declined
             }
             GenStep::Bail => {

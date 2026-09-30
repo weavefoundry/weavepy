@@ -7,6 +7,7 @@ consumers.
 """
 
 import sys
+import threading
 import unittest
 
 
@@ -185,6 +186,38 @@ class FastStepTests(unittest.TestCase):
         finally:
             sys.settrace(None)
         self.assertTrue(seen)
+
+    def test_long_nested_pipelines(self):
+        # Long enough to cross many eval-breaker checkpoints, which stop
+        # a fast step partway through the inner generators.
+        n = 20000
+        self.assertEqual(sum(evens(squares(counter(n)))),
+                         sum(x * x for x in range(n) if x * x % 2 == 0))
+        self.assertEqual(sum(x + 1 for x in counter(n)), n * (n + 1) // 2)
+        self.assertEqual(list(squares(over_range(n)))[-1], ((n - 1) * 3) ** 2)
+        total = 0
+        for x in squares(squares(counter(3000))):
+            total += x
+        self.assertEqual(total, sum(x ** 4 for x in range(3000)))
+
+    def test_other_threads_run_during_a_folded_pipeline(self):
+        progress = []
+        stop = threading.Event()
+
+        def worker():
+            while not stop.is_set():
+                progress.append(1)
+
+        t = threading.Thread(target=worker)
+        t.start()
+        try:
+            before = len(progress)
+            sum(evens(squares(counter(300000))))
+            during = len(progress) - before
+        finally:
+            stop.set()
+            t.join()
+        self.assertGreater(during, 0)
 
     def test_recursion_depth(self):
         def chain(depth):
