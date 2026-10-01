@@ -67,6 +67,30 @@ pub(super) struct Native {
     #[allow(clippy::vec_box)]
     _frames: Vec<Box<Frame>>,
     _keep: Vec<(crate::sync::Weak<PyFunction>, Rc<CodeObject>)>,
+    /// The attribute and global sites' caches, which the code addresses.
+    #[allow(clippy::vec_box)]
+    _fields: Vec<Box<FieldCache>>,
+    #[allow(clippy::vec_box)]
+    _globals: Vec<Box<GlobalCache>>,
+}
+
+/// An attribute site's split-field positions by receiver class version:
+/// a site several classes reach (methods a base class shares) keeps one
+/// for each. A version names one class in one state, and a class's shared
+/// names never move, so a hit needs only the instance to hold the field.
+#[derive(Default)]
+pub(super) struct FieldCache {
+    entries: [std::cell::Cell<(u64, u32)>; 4],
+    next: std::cell::Cell<u8>,
+}
+
+/// A global site's resolution: the globals and builtins stamps it was
+/// found under (process-unique, so they name the dicts and their key
+/// layouts), which of the two holds it, and at what index.
+#[derive(Default)]
+pub(super) struct GlobalCache {
+    stamps: std::cell::Cell<(u64, u64)>,
+    at: std::cell::Cell<(bool, u32)>,
 }
 
 // SAFETY: the descriptors name immutable code objects and reserved
@@ -265,18 +289,47 @@ unsafe extern "C" fn h_global(
     ctx: *mut Ctx<'static>,
     fr: *const Frame,
     slot: *const crate::StampSlot,
+    cache: *const GlobalCache,
     pc: u32,
 ) -> u32 {
-    // SAFETY: called by native code with its context, a live frame, and
-    // the site's stamp slot (its code keeps the table).
-    let (c, (code, _, f), slot) = unsafe { (cx(ctx), (*fr).parts(), &*slot) };
-    match c.interp.plan_global_at(code, slot, f, pc as u16) {
-        Some(v) => {
-            c.put(v);
-            0
+    // SAFETY: called by native code with its context, a live frame, the
+    // site's stamp slot (its code keeps the table), and its cache.
+    let (c, (code, _, f), slot, cache) = unsafe { (cx(ctx), (*fr).parts(), &*slot, &*cache) };
+    // SAFETY (raw dict reads): nothing runs code here.
+    let (gs, bs) = unsafe {
+        (
+            (*f.globals.as_ptr()).mutation_stamp(),
+            (*f.builtins.as_ptr()).mutation_stamp(),
+        )
+    };
+    if cache.stamps.get() == (gs, bs) {
+        let (builtin, idx) = cache.at.get();
+        let dict = if builtin { &f.builtins } else { &f.globals };
+        // SAFETY: as above.
+        if let Some((_, v)) = unsafe { (*dict.as_ptr()).get_index(idx as usize) } {
+            c.put(norm(v));
+            return 0;
         }
-        None => 1,
     }
+    let Some(v) = c.interp.plan_global_at(code, slot, f, pc as u16) else {
+        return 1;
+    };
+    // Remember where the value lives (the site's inline cache says which
+    // namespace), under the stamps it was read with.
+    use weavepy_compiler::InlineCache as IC;
+    match code.caches.get(pc) {
+        IC::LoadGlobalModule { key_idx, .. } => {
+            cache.stamps.set((gs, bs));
+            cache.at.set((false, key_idx));
+        }
+        IC::LoadGlobalBuiltin { key_idx, .. } => {
+            cache.stamps.set((gs, bs));
+            cache.at.set((true, key_idx));
+        }
+        _ => {}
+    }
+    c.put(v);
+    0
 }
 
 unsafe extern "C" fn h_attr<const EFFECT: bool>(
@@ -307,34 +360,59 @@ unsafe extern "C" fn h_attr<const EFFECT: bool>(
     }
 }
 
-/// [`h_attr`] with the site's field slot in hand: a cached split field of
-/// a plain instance answers without the general read.
+/// [`h_attr`] through the site's [`FieldCache`]: a split field of a plain
+/// instance whose class the site has seen answers without the general
+/// read; a general read that found the instance's own field remembers it.
 unsafe extern "C" fn h_field<const EFFECT: bool>(
     ctx: *mut Ctx<'static>,
     fr: *const Frame,
-    slot: *const crate::FieldSlot,
+    cache: *const FieldCache,
     t: u64,
     p: u64,
     pc_name: u32,
 ) -> u32 {
-    // SAFETY: called by native code with its context.
-    let c = unsafe { cx(ctx) };
-    if t == T_R && (!EFFECT || c.pend.n == 0) {
-        // SAFETY: as `norm`; the slot's code keeps the table.
-        if let (Object::Instance(inst), slot) = unsafe { (&*(p as *const Object), &*slot) } {
-            let (ver, idx) = slot.get();
-            if inst.cls_raw().attr_version.get() == ver {
+    // SAFETY: called by native code with its context and the site's
+    // cache.
+    let (c, cache) = unsafe { (cx(ctx), &*cache) };
+    // SAFETY: as `norm`.
+    let inst = match (t == T_R).then(|| unsafe { &*(p as *const Object) }) {
+        Some(Object::Instance(inst)) => Some(inst),
+        _ => None,
+    };
+    if let Some(inst) = inst.filter(|_| !EFFECT || c.pend.n == 0) {
+        let ver = inst.cls_raw().attr_version.get();
+        for e in &cache.entries {
+            let (v, idx) = e.get();
+            if v == ver && v != 0 {
                 // SAFETY: the receiver is rooted and nothing runs code
                 // while the view is read.
                 if let Some(v) = unsafe { inst.split_field(idx as usize) } {
                     c.put(norm(v));
                     return 0;
                 }
+                break;
             }
         }
     }
     // SAFETY: forwarded.
-    unsafe { h_attr::<EFFECT>(ctx, fr, t, p, pc_name) }
+    let status = unsafe { h_attr::<EFFECT>(ctx, fr, t, p, pc_name) };
+    if let (0, Some(inst)) = (status, inst) {
+        // SAFETY: a live frame.
+        let (code, _, _) = unsafe { (*fr).parts() };
+        let ver = inst.cls_raw().attr_version.get();
+        // The instance's own field (not a class value or descriptor),
+        // from its split layout.
+        if let Some((_, Some(idx))) =
+            Interpreter::leaf_resolve_instance_attr_ix(code, inst, pc_name >> 16)
+        {
+            if ver != 0 && inst.dict.published().is_none() {
+                let k = usize::from(cache.next.get()) % cache.entries.len();
+                cache.entries[k].set((ver, idx));
+                cache.next.set(cache.next.get().wrapping_add(1));
+            }
+        }
+    }
+    status
 }
 
 unsafe extern "C" fn h_method(
@@ -673,6 +751,8 @@ fn compile_with(
             depth: 0,
             frames: Vec::new(),
             keep: Vec::new(),
+            fields: Vec::new(),
+            globals: Vec::new(),
         };
         let done = lower.lower(code, ext, plan);
         let Lower {
@@ -680,14 +760,16 @@ fn compile_with(
             depth,
             frames,
             keep,
+            fields,
+            globals,
             ..
         } = lower;
         done.map(|()| {
             b.finalize();
-            (depth, frames, keep)
+            (depth, frames, keep, fields, globals)
         })
     };
-    let Some((depth, frames, keep)) = lowered else {
+    let Some((depth, frames, keep, fields, globals)) = lowered else {
         // An unfinished function leaves the builder's state behind.
         engine.fbctx = FunctionBuilderContext::new();
         engine.module.clear_context(&mut engine.ctx);
@@ -712,6 +794,8 @@ fn compile_with(
         depth,
         _frames: frames,
         _keep: keep,
+        _fields: fields,
+        _globals: globals,
     })
 }
 
@@ -754,6 +838,10 @@ struct Lower<'b> {
     #[allow(clippy::vec_box)]
     frames: Vec<Box<Frame>>,
     keep: Vec<(crate::sync::Weak<PyFunction>, Rc<CodeObject>)>,
+    #[allow(clippy::vec_box)]
+    fields: Vec<Box<FieldCache>>,
+    #[allow(clippy::vec_box)]
+    globals: Vec<Box<GlobalCache>>,
 }
 
 impl Lower<'_> {
@@ -1033,36 +1121,35 @@ impl Lower<'_> {
                     .b
                     .ins()
                     .iconst(self.ptr, std::ptr::from_ref(slot) as i64);
+                let cache = Box::<GlobalCache>::default();
+                let cache_v = self
+                    .b
+                    .ins()
+                    .iconst(self.ptr, std::ptr::from_ref(&*cache) as i64);
+                self.globals.push(cache);
                 let pc = self.u32c(u32::from(pc));
-                let st = self.call(h_global as *const () as usize, &[self.ctx, fl.fr, slot, pc]);
+                let st = self.call(
+                    h_global as *const () as usize,
+                    &[self.ctx, fl.fr, slot, cache_v, pc],
+                );
                 self.check(st);
                 self.set_out(fl, dst, 0);
             }
             Op::Attr { dst, src, pc, name } => {
                 let (t, p) = self.get(fl, src);
                 let pn = self.u32c(u32::from(pc) | u32::from(name) << 16);
-                let st = match crate::code_field_slot(fl.code, u32::from(pc)) {
-                    Some(slot) => {
-                        let slot = self
-                            .b
-                            .ins()
-                            .iconst(self.ptr, std::ptr::from_ref(slot) as i64);
-                        let addr = if effect {
-                            h_field::<true> as *const () as usize
-                        } else {
-                            h_field::<false> as *const () as usize
-                        };
-                        self.call(addr, &[self.ctx, fl.fr, slot, t, p, pn])
-                    }
-                    None => {
-                        let addr = if effect {
-                            h_attr::<true> as *const () as usize
-                        } else {
-                            h_attr::<false> as *const () as usize
-                        };
-                        self.call(addr, &[self.ctx, fl.fr, t, p, pn])
-                    }
+                let cache = Box::<FieldCache>::default();
+                let cache_v = self
+                    .b
+                    .ins()
+                    .iconst(self.ptr, std::ptr::from_ref(&*cache) as i64);
+                self.fields.push(cache);
+                let addr = if effect {
+                    h_field::<true> as *const () as usize
+                } else {
+                    h_field::<false> as *const () as usize
                 };
+                let st = self.call(addr, &[self.ctx, fl.fr, cache_v, t, p, pn]);
                 self.check(st);
                 self.set_out(fl, dst, 0);
             }

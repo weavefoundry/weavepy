@@ -61161,19 +61161,6 @@ fn drop_hot(v: Object) {
     }
 }
 
-/// The field slot for `cache_pc`, allocating the table on first use.
-#[inline]
-fn code_field_slot(code: &CodeObject, cache_pc: u32) -> Option<&FieldSlot> {
-    let ext = code_vm_ext(code)?;
-    ext.field_slots
-        .get_or_init(|| {
-            (0..code.instructions.len())
-                .map(|_| FieldSlot::empty())
-                .collect()
-        })
-        .get(cache_pc as usize)
-}
-
 /// The stamp slot for `cache_pc`, allocating the table on first use.
 #[inline]
 fn code_stamp_slot(code: &CodeObject, cache_pc: u32) -> Option<&StampSlot> {
