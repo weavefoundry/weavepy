@@ -2330,6 +2330,17 @@ pub fn track(obj: &Object) {
     with_state(|s| s.track(obj));
 }
 
+/// Track a list or dict that native code filled before publishing it (the
+/// unpickler's results) as if it had been tracked at birth, while still
+/// empty: it joins the deferred containers. Every collection promotes the
+/// deferred containers that can anchor a cycle before its mark phase, so
+/// the collector still sees every cycle.
+pub fn track_built(obj: &Object) {
+    if !with_state(|s| s.defer_container(obj)) {
+        track(obj);
+    }
+}
+
 /// `counter += n` (wrapping) for a collector counter: a plain load and
 /// store while the GIL serializes every writer, a locked read-modify-write
 /// only in free-threaded mode.
