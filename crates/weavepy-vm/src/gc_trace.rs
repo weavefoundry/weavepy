@@ -595,6 +595,20 @@ impl GcState {
         })
     }
 
+    /// [`Self::track`] for a container its builder knows holds only
+    /// atomic values (a `str.split` result): deferred whatever its size,
+    /// without the element scan, which `track` caps at `SCAN_CAP`
+    /// elements and so registers every longer list eagerly.
+    pub fn track_inert(&self, obj: &Object) {
+        debug_assert!(match obj {
+            Object::List(l) => l.borrow().iter().all(element_is_inert),
+            _ => false,
+        });
+        if !self.defer_container(obj) {
+            self.track_now(obj);
+        }
+    }
+
     /// Remember `obj` weakly instead of tracking it. Returns `false` when
     /// the kind has no deferred form (the caller tracks it as before).
     ///

@@ -1939,7 +1939,7 @@ pub(crate) fn sizeof_estimate(o: &Object) -> i64 {
         // wide struct, plus len+1 units of the kind width
         // (test_str.test_raiseMemError pins all four kinds).
         Object::Str(s) => {
-            let len = crate::builtins::str_char_len(s) as i64;
+            let len = crate::object::str_char_len(s) as i64;
             match s.chars().map(u32::from).max().unwrap_or(0) {
                 0..=0x7f => 40 + len + 1,
                 0x80..=0xff => 56 + (len + 1),

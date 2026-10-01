@@ -42,46 +42,13 @@ const _: () = {
     assert_sync::<Object>();
 };
 
-/// Number of slots in the per-thread code-point-length cache.
-const STR_LEN_CACHE_CAP: usize = 1024;
-
-thread_local! {
-    /// Direct-mapped cache of `SharedStr` heap identity -> code-point length.
-    ///
-    /// WeavePy stores `str` as UTF-8, so counting code points — needed by
-    /// `len(s)`, index/slice bounds, and `re` span clamping — is O(n).
-    /// Scanners and tokenisers touch the *same* large string repeatedly, so
-    /// without memoisation an otherwise-linear pass degrades to O(n^2) (the
-    /// cause of `test_json`'s deep-recursion cases hanging). Each slot holds
-    /// the source `Rc` so a freed allocation cannot be reused at the same
-    /// address and alias a stale length; collisions simply recompute and
-    /// overwrite, so the cache is always correct and bounded to CAP entries.
-    static STR_LEN_CACHE: std::cell::RefCell<Vec<Option<(usize, SharedStr, usize)>>> =
-        std::cell::RefCell::new(vec![None; STR_LEN_CACHE_CAP]);
-}
-
-/// Code-point length of a UTF-8 `str`, memoised by heap identity. O(1) on a
-/// cache hit; O(n) (and caches the result) on a miss. Strings of 0 or 1
-/// bytes are counted directly — they are necessarily 0 or 1 code points, so
-/// caching them would only evict useful entries.
+/// Code-point length of a `str`: O(1) from the count memoised in the
+/// string itself (see [`SharedStr::char_count`]). WeavePy stores `str` as
+/// UTF-8, so the first count is a scan; scanners and tokenisers that ask
+/// for the length of the same large string repeatedly stay linear.
+#[inline]
 pub(crate) fn str_char_len(s: &SharedStr) -> usize {
-    let bytes = s.len();
-    if bytes <= 1 {
-        return bytes;
-    }
-    let ptr = SharedStr::as_ptr(s).cast::<u8>() as usize;
-    let slot = (ptr / 8) % STR_LEN_CACHE_CAP;
-    STR_LEN_CACHE.with(|c| {
-        let mut cache = c.borrow_mut();
-        if let Some((p, _, n)) = &cache[slot] {
-            if *p == ptr {
-                return *n;
-            }
-        }
-        let n = s.chars().count();
-        cache[slot] = Some((ptr, s.clone(), n));
-        n
-    })
+    SharedStr::char_count(s)
 }
 
 /// A Python value as seen by the interpreter.

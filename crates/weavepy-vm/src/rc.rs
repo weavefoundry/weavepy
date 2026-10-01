@@ -119,6 +119,55 @@ pub(crate) unsafe fn try_release_shared<T: ?Sized>(value: *const T) -> bool {
     true
 }
 
+/// Free the `Arc` allocation holding `value` when this is its last owner
+/// and no weak reference exists, with plain loads instead of `Arc`'s two
+/// locked decrements (strong, then the implicit weak). Only for payloads
+/// with no destructor, so nothing runs while the counts still read one.
+/// Returns `false`, having changed nothing, when another owner or a weak
+/// reference exists (or the bias is off); the caller must then drop an
+/// `Arc` normally.
+///
+/// While the bias holds, this thread is the only one that can touch the
+/// counts, and with no weak reference nobody else can reach the payload.
+///
+/// # Safety
+///
+/// `value` must point at the payload of a live `Arc` allocation, and the
+/// caller must own one of its strong references, which this consumes on
+/// success.
+#[inline(always)]
+pub(crate) unsafe fn try_free_last<T: ?Sized>(value: *const T) -> bool {
+    debug_assert!(!std::mem::needs_drop::<T>());
+    if !refcounts_biased() {
+        return false;
+    }
+    // SAFETY: live allocation, per the caller; the weak count is the
+    // word after the strong count (`ArcInner` is `repr(C)`).
+    let (strong, weak) = unsafe {
+        let strong = strong_word(value);
+        (&*strong, &*strong.add(1))
+    };
+    if strong.load(Ordering::Relaxed) != 1 || weak.load(Ordering::Relaxed) != 1 {
+        return false;
+    }
+    // `Arc` sizes its allocation as the two counters followed by the
+    // payload's layout, padded (`arcinner_layout_for_value_layout`).
+    // SAFETY: as above; the payload is live until the deallocation.
+    let payload = std::alloc::Layout::for_value(unsafe { &*value });
+    let (inner, _) = std::alloc::Layout::new::<[usize; 2]>()
+        .extend(payload)
+        .expect("Arc layout");
+    // SAFETY: the sole owner frees the allocation it owns, with the layout
+    // `Arc` allocated it with; the payload needs no drop.
+    unsafe {
+        std::alloc::dealloc(
+            ptr::from_ref(strong).cast::<u8>().cast_mut(),
+            inner.pad_to_align(),
+        );
+    }
+    true
+}
+
 /// Convert an [`Rc`] to one of an unsized type, such as a trait object:
 /// `rc_unsize!(rc => dyn Trait)`. Stable Rust only coerces its own smart
 /// pointers, so the conversion passes through `Arc`.

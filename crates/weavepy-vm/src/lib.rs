@@ -35975,9 +35975,11 @@ impl Interpreter {
             // Surrogate-aware printf: a `WStr` template (and any `WStr`
             // argument resolved via `%s`) bridges its lone surrogates into
             // the PUA window for the UTF-8 engine, then maps them back.
-            let template = match a {
-                Object::WStr(cps) => crate::builtins::bridge_encode_cps(cps),
-                _ => a.to_str(),
+            // An exact `str` template is borrowed, not copied per call.
+            let template: std::borrow::Cow<'_, str> = match a {
+                Object::Str(s) => std::borrow::Cow::Borrowed(s),
+                Object::WStr(cps) => crate::builtins::bridge_encode_cps(cps).into(),
+                _ => a.to_str().into(),
             };
             let bridged = matches!(a, Object::WStr(_)) || percent_args_need_bridge(b);
             let mut resolve = |obj: &Object, kind: char| -> Result<Option<String>, RuntimeError> {
@@ -54688,7 +54690,8 @@ pub(crate) fn str_subscript_slice(s: &SharedStr, slc: &PySlice) -> Result<Object
             let blen = s.len();
             // ASCII (code-point count == byte count): byte offset == code
             // point index, so locate both ends in O(1) instead of walking.
-            let (bstart, bstop) = if crate::object::str_char_len(s) == blen {
+            let ascii = SharedStr::is_ascii(s);
+            let (bstart, bstop) = if ascii {
                 (start.min(blen), stop.unwrap_or(blen).min(blen))
             } else {
                 str_byte_span(s, start, stop)
@@ -54696,7 +54699,17 @@ pub(crate) fn str_subscript_slice(s: &SharedStr, slc: &PySlice) -> Result<Object
             if bstart >= bstop {
                 return Ok(Object::from_static(""));
             }
-            return Ok(Object::from_str(s[bstart..bstop].to_string()));
+            // The whole string is the string itself (CPython's
+            // `PyUnicode_Substring` returns an exact `str` unchanged).
+            if bstop - bstart == blen {
+                return Ok(Object::Str(s.clone()));
+            }
+            let piece = &s[bstart..bstop];
+            return Ok(Object::Str(if ascii {
+                SharedStr::from_ascii(piece)
+            } else {
+                SharedStr::from(piece)
+            }));
         }
     }
     // General path: negative bounds or non-unit step, over the code points.
@@ -58451,9 +58464,12 @@ pub(crate) fn percent_format_with(
                     return Err(value_error("incomplete format"));
                 }
             }
-            // Codepoint index of the conversion char, for error messages.
-            let kind_index = template[..i].chars().count();
-            let kind = bytes[i] as char;
+            // Byte offset of the conversion char; its code-point index (for
+            // error messages only) is counted when one is raised.
+            let kind_at = i;
+            // The whole character, so a non-ASCII one is reported by its
+            // code point rather than its first UTF-8 byte.
+            let kind = template[i..].chars().next().unwrap_or(char::from(bytes[i]));
             i += 1;
             // `%%` is a literal percent only when the two `%` are adjacent;
             // any intervening flag/width/precision/mapping makes the second
@@ -58471,7 +58487,10 @@ pub(crate) fn percent_format_with(
                     if mapping_key.is_none() && idx >= positional.len() {
                         return Err(type_error("not enough arguments for format string"));
                     }
-                    return Err(unsupported_format_char('%', kind_index));
+                    return Err(unsupported_format_char(
+                        '%',
+                        template[..kind_at].chars().count(),
+                    ));
                 }
                 out.push('%');
                 continue;
@@ -58848,12 +58867,18 @@ pub(crate) fn percent_format_with(
                         &spec.replace('c', "s"),
                     )?
                 }
-                _ => return Err(unsupported_format_char(kind, kind_index)),
+                _ => {
+                    return Err(unsupported_format_char(
+                        kind,
+                        template[..kind_at].chars().count(),
+                    ))
+                }
             };
             out.push_str(&rendered);
         } else {
-            let ch_len = utf8_seq_len(bytes[i]);
-            let end = (i + ch_len).min(bytes.len());
+            // The literal run up to the next `%` (ASCII, so always a
+            // character boundary), copied at once.
+            let end = memchr::memchr(b'%', &bytes[i..]).map_or(bytes.len(), |k| i + k);
             out.push_str(&template[i..end]);
             i = end;
         }
@@ -62764,7 +62789,7 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             // points); the byte-level allocation can still exceed memory
             // and must surface as MemoryError, not OverflowError
             // ('é' * (maxsize) in test_str.test_raiseMemError).
-            let times = checked_repeat_count(crate::builtins::str_char_len(x), *n, "string")?;
+            let times = checked_repeat_count(crate::object::str_char_len(x), *n, "string")?;
             let mut out = String::new();
             if x.len()
                 .checked_mul(times)
