@@ -7140,7 +7140,7 @@ unsafe extern "C" fn wpjit_build_list(
     // (`gc.is_tracked([])` is True and any list can close a cycle by
     // later mutation); a natively built list is no different, and a
     // comprehension accumulator in particular always escapes.
-    crate::gc_trace::track(Object::List(list.clone()));
+    crate::gc_trace::track(&Object::List(list.clone()));
     let idx = ctx.pins.len() as i64;
     ctx.pins.push(Pin::List(list, elem));
     idx
@@ -7333,7 +7333,7 @@ unsafe extern "C" fn wpjit_build_map(frame: *mut JitFrame, n: i64) -> i64 {
     let obj = Object::Dict(Rc::new(GilRefCell::new(d)));
     // The interpreter tracks every dict it builds; a natively built
     // dict is no different.
-    crate::gc_trace::track(obj.clone());
+    crate::gc_trace::track(&obj);
     let idx = ctx.pins.len() as i64;
     ctx.pins.push(Pin::Obj(obj));
     idx
@@ -7377,7 +7377,7 @@ unsafe extern "C" fn wpjit_list_repeat(frame: *mut JitFrame, pin: i64, count: i6
     drop(items);
     let fresh = Rc::new(crate::sync::RefCell::new(out));
     // See `wpjit_build_list`: every built list is GC-tracked.
-    crate::gc_trace::track(Object::List(fresh.clone()));
+    crate::gc_trace::track(&Object::List(fresh.clone()));
     let idx = ctx.pins.len() as i64;
     ctx.pins.push(Pin::List(fresh, elem));
     idx
@@ -7409,7 +7409,7 @@ unsafe extern "C" fn wpjit_list_from_range(frame: *mut JitFrame, start: i64, sto
     let items: Vec<Object> = (start..start + len).map(Object::Int).collect();
     let list = Rc::new(crate::sync::RefCell::new(items));
     let obj = Object::List(list.clone());
-    crate::gc_trace::track(obj.clone());
+    crate::gc_trace::track(&obj);
     if crate::stdlib::tracemalloc_real::is_tracking() {
         crate::stdlib::tracemalloc_real::track_new_object(&obj);
     }
@@ -7465,7 +7465,7 @@ unsafe extern "C" fn wpjit_list_slice(
     drop(items);
     let fresh = Rc::new(crate::sync::RefCell::new(out));
     // See `wpjit_build_list`: every built list is GC-tracked.
-    crate::gc_trace::track(Object::List(fresh.clone()));
+    crate::gc_trace::track(&Object::List(fresh.clone()));
     let idx = ctx.pins.len() as i64;
     ctx.pins.push(Pin::List(fresh, elem));
     idx

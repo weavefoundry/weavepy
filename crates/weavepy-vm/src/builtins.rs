@@ -7013,7 +7013,7 @@ fn b_list(args: &[Object]) -> Result<Object, RuntimeError> {
     let obj = Object::new_list(out);
     // CPython tracks every list; keep `list(...)` consistent with the
     // `[]` literal path so `gc.is_tracked` and cycle collection agree.
-    crate::gc_trace::track(obj.clone());
+    crate::gc_trace::track(&obj);
     // tracemalloc parity with the `[]` literal path
     // (`test_tracemalloc.test_reset_peak` builds `list(range(100000))`
     // and expects the peak to reflect it).
@@ -7047,7 +7047,7 @@ fn b_tuple(args: &[Object]) -> Result<Object, RuntimeError> {
 fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
         let obj = Object::new_dict();
-        crate::gc_trace::track(obj.clone());
+        crate::gc_trace::track(&obj);
         return Ok(obj);
     }
     if args.len() > 1 {
@@ -7063,7 +7063,7 @@ fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
         // Clone the stored table so copying never rehashes user keys.
         let d = src.borrow().clone();
         let obj = Object::Dict(Rc::new(RefCell::new(d)));
-        crate::gc_trace::track(obj.clone());
+        crate::gc_trace::track(&obj);
         return Ok(obj);
     }
     // Mapping path for user-defined classes (`__keys__` style) is
@@ -7117,7 +7117,7 @@ fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
         i += 1;
     }
     let obj = Object::Dict(Rc::new(RefCell::new(d)));
-    crate::gc_trace::track(obj.clone());
+    crate::gc_trace::track(&obj);
     Ok(obj)
 }
 
@@ -7154,7 +7154,7 @@ fn b_set(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let obj = Object::Set(Rc::new(RefCell::new(out)));
     // CPython tracks every set (`gc.is_tracked(set())` is True).
-    crate::gc_trace::track(obj.clone());
+    crate::gc_trace::track(&obj);
     Ok(obj)
 }
 
@@ -8243,7 +8243,7 @@ fn b_sorted(args: &[Object]) -> Result<Object, RuntimeError> {
         crate::compare_op(a, b, weavepy_compiler::CompareKind::Lt)
     })?;
     let obj = Object::new_list(buf);
-    crate::gc_trace::track(obj.clone());
+    crate::gc_trace::track(&obj);
     Ok(obj)
 }
 
@@ -10904,7 +10904,7 @@ fn str_split_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
 /// through either the interpreter or a native string helper.
 fn new_str_split_list(items: Vec<Object>) -> Object {
     let result = Object::new_list(items);
-    crate::gc_trace::track(result.clone());
+    crate::gc_trace::track(&result);
     result
 }
 
@@ -13447,7 +13447,7 @@ fn dict_copy(args: &[Object]) -> Result<Object, RuntimeError> {
     // CPython's `PyDict_Copy` preserves GC tracking: the copy is tracked
     // iff the source is (test_dict `test_copy_maintains_tracking`).
     if crate::gc_trace::is_tracked(crate::weakref_registry::id_of(&Object::Dict(d))) {
-        crate::gc_trace::track(out.clone());
+        crate::gc_trace::track(&out);
     }
     Ok(out)
 }
@@ -13539,7 +13539,7 @@ fn dict_or(args: &[Object]) -> Result<Object, RuntimeError> {
         out.insert(k.clone(), v.clone());
     }
     let obj = Object::Dict(Rc::new(RefCell::new(out)));
-    crate::gc_trace::track(obj.clone());
+    crate::gc_trace::track(&obj);
     Ok(obj)
 }
 
@@ -13554,7 +13554,7 @@ fn dict_ror(args: &[Object]) -> Result<Object, RuntimeError> {
         out.insert(k.clone(), v.clone());
     }
     let obj = Object::Dict(Rc::new(RefCell::new(out)));
-    crate::gc_trace::track(obj.clone());
+    crate::gc_trace::track(&obj);
     Ok(obj)
 }
 

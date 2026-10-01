@@ -304,7 +304,7 @@ pub fn build_with_state(
         // pinned its whole importlib graph (and everything reachable from
         // it) for the life of the process.
         let tracked = |o: Object| {
-            crate::gc_trace::track(o.clone());
+            crate::gc_trace::track(&o);
             o
         };
         d.insert(

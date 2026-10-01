@@ -504,7 +504,7 @@ fn object_is_tracked(target: &Object) -> bool {
         // answers as CPython's (always tracked) and is tracked from here on.
         Object::Instance(inst) => {
             inst.ensure_gc_tracked();
-            gc_trace::with_state(|s| s.is_tracked(id_of(target)))
+            gc_trace::with_state(|s| s.is_tracked_instance(id_of(target)))
         }
         // A list/dict/set born holding only scalars has its tracking
         // deferred; CPython tracks it from birth, so answer as CPython
@@ -513,7 +513,7 @@ fn object_is_tracked(target: &Object) -> bool {
             let id = id_of(target);
             gc_trace::with_state(|s| {
                 if !s.is_tracked(id) {
-                    s.track_now(target.clone());
+                    s.track_now(&target);
                 }
                 s.is_tracked(id)
             })
@@ -585,7 +585,7 @@ fn get_stats(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn track_obj(args: &[Object]) -> Result<Object, RuntimeError> {
     if let Some(o) = args.first() {
-        gc_trace::track(o.clone());
+        gc_trace::track(&o);
     }
     Ok(Object::None)
 }

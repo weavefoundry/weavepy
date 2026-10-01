@@ -381,6 +381,14 @@ pub struct GcState {
     deferred: RefCell<Vec<DeferredContainer>>,
     /// Length at which [`GcState::sweep_deferred`] compacts `deferred`.
     deferred_limit: AtomicUsize,
+    /// Instances born since the last collection, held weakly: most die
+    /// young, and registering one with the collector (an index entry and
+    /// a handle) costs far more than its life. Their births count toward
+    /// the gen-0 threshold as eager registration's would, and every
+    /// collection, reflective API and finalization pass first hands the
+    /// collector the ones still alive ([`GcState::flush_young`]), so it
+    /// sees exactly the population eager tracking would have shown it.
+    young: RefCell<Vec<crate::sync::Weak<crate::types::PyInstance>>>,
     /// Frozen handles. `gc.freeze()` moves all tracked objects
     /// here; they are skipped by future collections until
     /// `gc.unfreeze()` runs.
@@ -428,6 +436,7 @@ impl GcState {
             gen0_gauge: AtomicU64::new(DEFAULT_THRESHOLDS[0] as u64),
             deferred: RefCell::new(Vec::new()),
             deferred_limit: AtomicUsize::new(DEFERRED_FLOOR),
+            young: RefCell::new(Vec::new()),
             frozen: RefCell::new(Vec::new()),
             garbage: RefCell::new(Vec::new()),
             callbacks: RefCell::new(Vec::new()),
@@ -464,6 +473,7 @@ impl GcState {
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).thresholds));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).counts));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).deferred));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).young));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).frozen));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).garbage));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).callbacks));
@@ -502,15 +512,87 @@ impl GcState {
 
     /// Track `obj` for cycle detection. Idempotent — if `obj`
     /// is already tracked, this is a no-op.
-    pub fn track(&self, obj: Object) {
+    pub fn track(&self, obj: &Object) {
         // A container holding only atomic values cannot anchor a cycle
         // yet, so it stays off the GC's books until it holds something
         // that could close one. `defer_container` remembers it so the
         // next collection can promote it first.
-        if !container_can_cycle(&obj) && self.defer_container(&obj) {
+        if !container_can_cycle(obj) && self.defer_container(obj) {
             return;
         }
+        if let Object::Instance(inst) = obj {
+            if self.nurse(inst) {
+                return;
+            }
+        }
         self.track_now(obj);
+    }
+
+    /// Register a newborn instance in the young set (see [`Self::young`]).
+    /// `false` leaves it to eager registration.
+    fn nurse(&self, inst: &crate::Rc<crate::types::PyInstance>) -> bool {
+        let over = {
+            // SAFETY: nothing below runs code while the set is borrowed
+            // (a dead predecessor's release only frees memory).
+            let Some(young) = (unsafe { self.young.peek_mut() }) else {
+                // A flush is walking the set, or cells are shared.
+                return false;
+            };
+            // Churn (a loop that builds an object and drops the previous
+            // one) leaves its dead predecessors at the tail: reclaim them
+            // here, so the set neither grows nor parks dead allocations.
+            let n = young.len();
+            for i in (n.saturating_sub(2)..n).rev() {
+                if young[i].strong_count() == 0 {
+                    young.swap_remove(i);
+                }
+            }
+            young.push(crate::Rc::downgrade(inst));
+            young.len() >= YOUNG_CAP
+        };
+        // As in `track_now`: an id recycled from a finalized object starts
+        // un-finalized (a finalizer that runs from here on is recorded).
+        // SAFETY: a read that runs no code.
+        if unsafe { self.finalized_ids.peek() }.is_none_or(|f| !f.is_empty()) {
+            let id = crate::Rc::as_ptr(inst) as usize as ObjectId;
+            self.finalized_ids.borrow_mut().remove(&id);
+        }
+        self.note_gen0_alloc();
+        if over {
+            self.flush_young();
+        }
+        true
+    }
+
+    /// Register the young instances still alive with the collector.
+    fn flush_young(&self) {
+        let young = match self.young.try_borrow_mut() {
+            Ok(mut young) if !young.is_empty() => std::mem::take(&mut *young),
+            _ => return,
+        };
+        for w in young {
+            if let Some(inst) = w.upgrade() {
+                self.register(&Object::Instance(inst), false);
+            }
+        }
+    }
+
+    /// The young instances still alive (the dead ones are dropped).
+    fn young_live(&self) -> usize {
+        let Ok(mut young) = self.young.try_borrow_mut() else {
+            return 0;
+        };
+        young.retain(|w| w.strong_count() > 0);
+        young.len()
+    }
+
+    /// Whether the instance `id` is in the young set.
+    fn is_young(&self, id: ObjectId) -> bool {
+        self.young.try_borrow().is_ok_and(|young| {
+            young
+                .iter()
+                .any(|w| w.as_ptr() as usize as ObjectId == id && w.strong_count() > 0)
+        })
     }
 
     /// Remember `obj` weakly instead of tracking it. Returns `false` when
@@ -563,6 +645,7 @@ impl GcState {
     /// enough for the collector to see every cycle it would have seen
     /// with eager tracking.
     fn sweep_deferred(&self, promote_all: bool) {
+        self.flush_young();
         let mut promote: Vec<Object> = Vec::new();
         {
             let Ok(mut deferred) = self.deferred.try_borrow_mut() else {
@@ -590,7 +673,7 @@ impl GcState {
             );
         }
         for obj in promote {
-            self.track_now(obj);
+            self.track_now(&obj);
         }
     }
 
@@ -603,44 +686,71 @@ impl GcState {
     /// [`Self::track`] without the deferral filter: register `obj` with the
     /// collector unconditionally. For objects the caller has already decided
     /// must be tracked (a promoted deferral, `gc.is_tracked`, `gc.get_objects`).
-    pub fn track_now(&self, obj: Object) {
-        let new_id = id_of(&obj);
+    pub fn track_now(&self, obj: &Object) {
+        if self.register(obj, true) {
+            self.note_gen0_alloc();
+        }
+    }
+
+    /// Enter `obj` in the index and generation 0 (`false`: it was already
+    /// there, or has no heap allocation of its own). A `fresh` object's id
+    /// may be a finalized one's, recycled; a young instance's own
+    /// finalizer may already have run, and its entry says so.
+    fn register(&self, obj: &Object, fresh: bool) -> bool {
+        let new_id = id_of(obj);
         {
             let mut index = self.index.borrow_mut();
             // One probe decides the dedupe and the insert. An entry whose
             // object died can't sit at this address: its weak handle keeps
             // the allocation reserved until the entry is pruned.
             let entry = match index.entry(new_id) {
-                std::collections::hash_map::Entry::Occupied(_) => return,
+                std::collections::hash_map::Entry::Occupied(_) => return false,
                 std::collections::hash_map::Entry::Vacant(e) => e,
             };
-            let Some(handle) = TrackedHandle::new(&obj, 0) else {
-                return;
+            let Some(handle) = TrackedHandle::new(obj, 0) else {
+                return false;
             };
             let handle = HandleRc::new(handle);
             // Publish to the miss-filter *before* the insert becomes
             // observable (we hold the index borrow).
             self.tracked_filter.insert(new_id);
             entry.insert(handle.clone());
+            // `finalized_ids` is keyed by object id (a pointer), which the
+            // allocator recycles. A freshly tracked object at a recycled
+            // address must start *un*-finalized (`test_is_finalized`).
+            // Almost always empty (only `__del__`-bearing objects ever land
+            // there).
+            if !self.finalized_ids.borrow().is_empty() {
+                if fresh {
+                    self.finalized_ids.borrow_mut().remove(&new_id);
+                } else if self.finalized_ids.borrow().contains(&new_id) {
+                    handle.finalized.store(true, Ordering::Release);
+                }
+            }
             let mut gens = self.generations.borrow_mut();
             handle.slot.store(gens[0].handles.len(), Ordering::Release);
             gens[0].handles.push(handle);
         }
-        // `finalized_ids` is keyed by object id (a pointer), which the
-        // allocator recycles. A freshly tracked object at a recycled address
-        // must start *un*-finalized (`test_is_finalized`). Almost always
-        // empty (only `__del__`-bearing objects ever land there).
-        if !self.finalized_ids.borrow().is_empty() {
-            self.finalized_ids.borrow_mut().remove(&new_id);
-        }
         serial_add(&self.tracked_count, 1);
         serial_add(&self.tracked_version, 1);
-        self.note_gen0_alloc();
+        true
     }
 
     /// Stop tracking `obj`. Backs the explicit `gc._untrack(obj)` extension
     /// and the C-API `PyObject_GC_UnTrack`.
     pub fn untrack_id(&self, id: ObjectId) {
+        if let Ok(mut young) = self.young.try_borrow_mut() {
+            if let Some(i) = young
+                .iter()
+                .position(|w| w.as_ptr() as usize as ObjectId == id)
+            {
+                young.swap_remove(i);
+                let mut counts = self.counts.borrow_mut();
+                counts[0] = counts[0].saturating_sub(1);
+                self.sync_gen0_gauge(counts[0], None);
+                return;
+            }
+        }
         let Some(handle) = self.index.borrow_mut().remove(&id) else {
             return;
         };
@@ -772,6 +882,11 @@ impl GcState {
         self.index.borrow().contains_key(&id)
     }
 
+    /// [`Self::is_tracked`] for an instance, which may be young.
+    pub fn is_tracked_instance(&self, id: ObjectId) -> bool {
+        self.is_tracked(id) || self.is_young(id)
+    }
+
     /// O(1) handle lookup by object id (any generation or frozen).
     pub fn handle_for(&self, id: ObjectId) -> Option<HandleRc<TrackedHandle>> {
         if !self.tracked_filter.may_contain(id) {
@@ -785,6 +900,7 @@ impl GcState {
     /// finalize objects that are still alive at exit. The per-handle
     /// `finalized` flag guarantees each `__del__` runs at most once.
     pub fn finalization_candidates(&self) -> Vec<(HandleRc<TrackedHandle>, Object)> {
+        self.flush_young();
         let mut out = Vec::new();
         let mut consider = |h: &HandleRc<TrackedHandle>| {
             // A finalizer already queued by a collection (but not yet
@@ -852,7 +968,14 @@ impl GcState {
     /// every allocation site polls `maybe_auto_collect` itself
     /// (`MAKE_FUNCTION`, `list(it)`, …).
     fn note_gen0_alloc(&self) {
-        self.bump_count(0);
+        // SAFETY: nothing runs while the counts are updated.
+        match unsafe { self.counts.peek_mut() } {
+            Some(counts) => {
+                counts[0] = counts[0].saturating_add(1);
+                self.sync_gen0_gauge(counts[0], None);
+            }
+            None => self.bump_count(0),
+        }
         let gauge = self.gen0_gauge.load(Ordering::Relaxed);
         let threshold = gauge & 0xffff_ffff;
         if threshold != 0 && (gauge >> 32) == threshold && self.is_enabled() {
@@ -919,7 +1042,7 @@ impl GcState {
         if !due {
             return false;
         }
-        let live = self.prune();
+        let live = self.prune() + self.young_live();
         if live < threshold0 / 2 {
             let mut counts = self.counts.borrow_mut();
             counts[0] = live;
@@ -934,6 +1057,7 @@ impl GcState {
 
     /// Total population (across all generations + frozen).
     pub fn population(&self) -> usize {
+        self.flush_young();
         let gens = self.generations.borrow();
         let mut n = 0;
         for g in gens.iter() {
@@ -966,6 +1090,7 @@ impl GcState {
     /// `gc.freeze()` — mark every currently-tracked object as
     /// frozen so it is ignored by future collections.
     pub fn freeze_all(&self) {
+        self.flush_young();
         let mut gens = self.generations.borrow_mut();
         let mut frozen = self.frozen.borrow_mut();
         for g in gens.iter_mut() {
@@ -2161,8 +2286,8 @@ pub fn with_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
 }
 
 /// Convenience: track `obj` in the shared, process-global GC.
-pub fn track(obj: Object) {
-    if let Object::Instance(inst) = &obj {
+pub fn track(obj: &Object) {
+    if let Object::Instance(inst) = obj {
         // The instance may have been born with deferred tracking; its
         // `__dict__` no longer needs to guard it.
         inst.clear_deferred_tracking();
@@ -2181,12 +2306,12 @@ pub fn track(obj: Object) {
     // that never went through BuildMap) would otherwise never be a
     // candidate. CPython tracks every dict; we pair the tracking with
     // the objects that make the dict cycle-capable.
-    if let Object::Module(m) = &obj {
+    if let Object::Module(m) = obj {
         let dict = Object::Dict(m.dict.clone());
-        with_state(|s| s.track(dict));
-    } else if let Object::Function(f) = &obj {
+        with_state(|s| s.track(&dict));
+    } else if let Object::Function(f) = obj {
         let dict = Object::Dict(f.globals.clone());
-        with_state(|s| s.track(dict));
+        with_state(|s| s.track(&dict));
     }
     with_state(|s| s.track(obj));
 }
@@ -2241,7 +2366,7 @@ pub fn track_deferred_owner(owner: usize) {
     // instance's so `is_gc_deferred` stops claiming the collector has
     // never seen it.
     inst.deferred.set(false);
-    track(Object::Instance(inst));
+    track(&Object::Instance(inst));
 }
 
 /// True while a collection (mark/sweep or weakref-only pass) is in
@@ -2331,6 +2456,10 @@ pub fn is_atomic(obj: &Object) -> bool {
 /// The smallest deferral population worth compacting: below this, the
 /// sweep's fixed cost outweighs what it reclaims.
 const DEFERRED_FLOOR: usize = 4096;
+
+/// How many young instances wait before the set is handed to the
+/// collector regardless (collections normally flush it well before).
+const YOUNG_CAP: usize = 8192;
 
 /// How many containers may stay deferred at once. Past this the sweep
 /// hands the whole set to the collector, which both bounds the weak
@@ -2438,13 +2567,13 @@ fn container_can_cycle(obj: &Object) -> bool {
 pub fn track_memoryview_exporter(mv: &Object, exporter: &Object) {
     debug_assert!(matches!(mv, Object::MemoryView(_)));
     if !is_atomic(exporter) {
-        track(mv.clone());
+        track(&mv);
     }
 }
 
 pub fn track_if_cyclic(obj: &Object) -> bool {
     if container_can_cycle(obj) {
-        track(obj.clone());
+        track(&obj);
         true
     } else {
         false
@@ -2611,7 +2740,7 @@ mod tests {
                 .map(|_| Object::Dict(Rc::new(RefCell::new(DictData::default()))))
                 .collect();
             for root in &roots {
-                state.track_now(root.clone());
+                state.track_now(&root);
             }
             if frozen {
                 state.freeze_all();
@@ -2661,7 +2790,7 @@ mod tests {
             .collect();
         for root in &roots {
             // See `track_and_untrack` on `track_now`.
-            state.track_now(root.clone());
+            state.track_now(&root);
         }
         for (collection, expected) in [(0, 1), (1, 2), (2, 2), (2, 2)] {
             assert_eq!(state.collect(collection), 0);
@@ -2713,7 +2842,7 @@ mod tests {
         // `track_now`, not `track`: an empty dict holds nothing that could
         // close a cycle, so `track` would defer it (see `defer_container`).
         // This test is about the index's bookkeeping, not that policy.
-        s.track_now(d.clone());
+        s.track_now(&d);
         assert!(s.is_tracked(id_of(&d)));
         s.untrack_id(id_of(&d));
         assert!(!s.is_tracked(id_of(&d)));
@@ -2724,7 +2853,7 @@ mod tests {
         let s = GcState::new();
         let dict = Rc::new(RefCell::new(DictData::default()));
         let outer = Object::Dict(dict.clone());
-        s.track_now(outer.clone());
+        s.track_now(&outer);
         // The dict references itself: a 1-cycle.
         dict.borrow_mut().insert(
             crate::object::DictKey(Object::from_static("self")),
@@ -2745,7 +2874,7 @@ mod tests {
         let s = GcState::new();
         let dict = Rc::new(RefCell::new(DictData::default()));
         let obj = Object::Dict(dict.clone());
-        s.track_now(obj.clone());
+        s.track_now(&obj);
         let weak = Rc::downgrade(&dict);
         drop(obj);
         drop(dict);
@@ -2761,7 +2890,7 @@ mod tests {
         let s = GcState::new();
         let d = Object::Dict(Rc::new(RefCell::new(DictData::default())));
         // See `track_and_untrack` on `track_now`.
-        s.track_now(d.clone());
+        s.track_now(&d);
         s.freeze_all();
         assert_eq!(s.freeze_count(), 1);
         s.unfreeze_all();

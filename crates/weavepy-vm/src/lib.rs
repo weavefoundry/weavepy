@@ -9822,17 +9822,30 @@ impl Interpreter {
                             burst_stats::note_site(&frame.code.qualname, frame.pc, ins.op, recv);
                         }
                     }
-                    // A cached property site skips the helper's resolution.
+                    // A cached property site skips the helper's resolution: a
+                    // pure leaf getter is evaluated in place, any other runs
+                    // as an inline activation.
                     let pc = frame.pc as usize;
                     if frame
                         .code
                         .instructions
                         .get(pc)
                         .is_some_and(|i| i.op == OpCode::LoadAttr)
-                        && Self::cached_property_getter(frame, pc).is_some()
-                        && self.core_property(sw)
                     {
-                        continue;
+                        if let Some((getter, code)) = Self::cached_property_getter(frame, pc) {
+                            // SAFETY: as above.
+                            let last_pc = unsafe { &mut *sw.last };
+                            if self.core_leaf_property(frame, last_pc, pc, &getter, &code) {
+                                // SAFETY: the running thread's own flag.
+                                if unsafe { (*sw.maybe_dead).get() } {
+                                    return LeafStop::Marked;
+                                }
+                                continue;
+                            }
+                            if self.core_property(sw) {
+                                continue;
+                            }
+                        }
                     }
                     // SAFETY: as above (`core_property` declined untouched).
                     let (frame, last_pc) = unsafe { (&mut *sw.cur, &mut *sw.last) };
@@ -10570,7 +10583,7 @@ impl Interpreter {
                             .collect();
                         len -= n;
                         let obj = Object::new_list(items);
-                        gc_trace::track(obj.clone());
+                        gc_trace::track(&obj);
                         // SAFETY: `len < cap` (the operands' slots were freed).
                         unsafe { base.add(len).write(obj) };
                         len += 1;
@@ -12527,6 +12540,40 @@ impl Interpreter {
         let bm = std::mem::replace(&mut frame.stack[callee_slot], Object::Function(f));
         frame.stack[self_slot] = receiver;
         drop(bm);
+    }
+
+    /// The `LOAD_ATTR` at `pc` of `frame` of a property whose cached
+    /// getter is a pure leaf: the getter evaluated on the receiver at TOS
+    /// (no activation), its result replacing the receiver. `false`
+    /// touches nothing.
+    #[inline(never)]
+    fn core_leaf_property(
+        &self,
+        frame: &mut Frame,
+        last_pc: &mut usize,
+        pc: usize,
+        getter: &PyFunction,
+        code: &Rc<CodeObject>,
+    ) -> bool {
+        if !code_is_pure_leaf(code)
+            || !pure_leaf_warm(code)
+            || crate::recursion::current_depth() >= crate::recursion::recursion_limit()
+        {
+            return false;
+        }
+        let Some(recv) = frame.stack.last() else {
+            return false;
+        };
+        let Some(v) = self.pure_leaf_eval::<false, false>(code, getter, &[std::ptr::from_ref(recv)])
+        else {
+            return false;
+        };
+        if let Some(top) = frame.stack.last_mut() {
+            drop_hot(std::mem::replace(top, v));
+        }
+        *last_pc = pc;
+        frame.pc = pc as u32 + 1;
+        true
     }
 
     /// The core loop's `LOAD_ATTR` of a `property` at `sw`'s (synced)
@@ -16506,7 +16553,7 @@ impl Interpreter {
                     }
                     let items = stack.split_off(stack.len() - n);
                     let obj = Object::new_list(items);
-                    gc_trace::track(obj.clone());
+                    gc_trace::track(&obj);
                     stack.push(obj);
                     last = pc;
                     pc += 1;
@@ -16543,7 +16590,7 @@ impl Interpreter {
                     }
                     stack.truncate(split);
                     let obj = Object::Dict(Rc::new(RefCell::new(d)));
-                    gc_trace::track(obj.clone());
+                    gc_trace::track(&obj);
                     stack.push(obj);
                     last = pc;
                     pc += 1;
@@ -17885,7 +17932,7 @@ impl Interpreter {
                 _ => return None,
             };
             let obj = Object::new_list(items);
-            gc_trace::track(obj.clone());
+            gc_trace::track(&obj);
             return Some(obj);
         }
         None
@@ -21294,7 +21341,7 @@ impl Interpreter {
                 // missed entirely. Track unconditionally so the collector both
                 // reports it via `gc.get_objects()`/`is_tracked` and can break
                 // the cycle when it becomes unreachable.
-                gc_trace::track(obj.clone());
+                gc_trace::track(&obj);
                 frame.push(obj);
                 if gc_trace::maybe_auto_collect() {
                     self.run_pending_finalizers();
@@ -21351,7 +21398,7 @@ impl Interpreter {
                 self.record_alloc(&obj);
                 // CPython tracks every set (`gc.is_tracked(set())` is True);
                 // track unconditionally like lists.
-                gc_trace::track(obj.clone());
+                gc_trace::track(&obj);
                 frame.push(obj);
                 if gc_trace::maybe_auto_collect() {
                     self.run_pending_finalizers();
@@ -21383,7 +21430,7 @@ impl Interpreter {
                 self.record_alloc(&obj);
                 // CPython tracks dicts at creation; track unconditionally so a
                 // dict that becomes cyclic (`d = {}; d[0] = d`) is collectable.
-                gc_trace::track(obj.clone());
+                gc_trace::track(&obj);
                 frame.push(obj);
                 if gc_trace::maybe_auto_collect() {
                     self.run_pending_finalizers();
@@ -21962,7 +22009,7 @@ impl Interpreter {
                 // `gc.collect()` can reclaim those cycles and `gc.is_tracked(f)`
                 // reports True, matching CPython (functions are GC objects).
                 let obj = Object::Function(Rc::new(f));
-                gc_trace::track(obj.clone());
+                gc_trace::track(&obj);
                 // PEP 590-era function watchers: PyFunction_EVENT_CREATE
                 // fires from `PyFunction_New*` (test_capi.test_watchers).
                 if crate::capi_watchers::funcs_active() {
@@ -22046,7 +22093,7 @@ impl Interpreter {
                     }
                 }
                 let obj = Object::Function(pf);
-                gc_trace::track(obj.clone());
+                gc_trace::track(&obj);
                 frame.push(obj);
             }
             // RFC 0068 — CPython prologue unit; WeavePy's frame setup
@@ -29456,7 +29503,7 @@ impl Interpreter {
             // literal and `b_list` paths, or a cycle closed through the
             // result (`x = list(...); x[0].back = x`) is never collected.
             let obj = Object::new_list(collected);
-            gc_trace::track(obj.clone());
+            gc_trace::track(&obj);
             Ok(obj)
         } else {
             Ok(Object::new_tuple(collected))
@@ -29477,7 +29524,7 @@ impl Interpreter {
         // match the `{}` literal and `b_dict` paths so a cycle through
         // the copy is collectable.
         if let Some(d) = &out {
-            gc_trace::track(d.clone());
+            gc_trace::track(&d);
         }
         Ok(out)
     }
@@ -30839,7 +30886,7 @@ impl Interpreter {
             .find_map(|(k, v)| (k == "key").then(|| v.clone()));
         self.sort_with_key(&mut items, key_fn.as_ref(), reverse, globals)?;
         let obj = Object::new_list(items);
-        gc_trace::track(obj.clone());
+        gc_trace::track(&obj);
         Ok(obj)
     }
 
@@ -37744,7 +37791,7 @@ impl Interpreter {
                             // on the instance must join the cycle collector
                             // (see `generic_setattr_instance`).
                             if matches!(val, Object::BoundMethod(_)) {
-                                gc_trace::track(val.clone());
+                                gc_trace::track(&val);
                             }
                             // The slot still exists; reach in by index and
                             // overwrite, recovering the displaced value. We
@@ -37797,7 +37844,7 @@ impl Interpreter {
                             // method escaping into an instance attribute
                             // joins the cycle collector.
                             if matches!(val, Object::BoundMethod(_)) {
-                                gc_trace::track(val.clone());
+                                gc_trace::track(&val);
                             }
                             let watch_value = if crate::capi_watchers::dicts_active() {
                                 Some(val.clone())
@@ -39335,7 +39382,7 @@ impl Interpreter {
                     // is reclaimable and the drop-time "unclosed file"
                     // `ResourceWarning` still fires
                     // (test_io `test_garbage_collection`).
-                    gc_trace::track(obj.clone());
+                    gc_trace::track(&obj);
                     Ok(())
                 }
             },
@@ -39812,7 +39859,7 @@ impl Interpreter {
         // instance attribute so the cycle collector can reclaim them
         // (CPython's `method` type is always GC-tracked — `test_method`).
         if matches!(value, Object::BoundMethod(_)) {
-            gc_trace::track(value.clone());
+            gc_trace::track(&value);
         }
         // `insert` returns the value this store displaces; reap it if the
         // slot held its last live binding, mirroring CPython's decref of the
@@ -45436,7 +45483,7 @@ impl Interpreter {
             )
         } else {
             let inst = Object::Instance(Rc::new(PyInstance::new(cls.clone())));
-            gc_trace::track(inst.clone());
+            gc_trace::track(&inst);
             (inst, true)
         }
     }
@@ -46064,7 +46111,7 @@ impl Interpreter {
                         })?;
                     }
                     let out = Object::Dict(Rc::new(RefCell::new(d)));
-                    crate::gc_trace::track(out.clone());
+                    crate::gc_trace::track(&out);
                     return Ok(out);
                 }
             }
@@ -46111,7 +46158,7 @@ impl Interpreter {
                     })?;
                 }
                 let out = Object::Dict(Rc::new(RefCell::new(d)));
-                crate::gc_trace::track(out.clone());
+                crate::gc_trace::track(&out);
                 return Ok(out);
             }
             // `int(x)` / `float(x)` honour the user's `__int__` /
@@ -46356,7 +46403,7 @@ impl Interpreter {
                 // type whose `tp_traverse` is non-NULL — for us that's
                 // every Python-defined class (they all carry a dict).
                 if !deferred {
-                    gc_trace::track(inst.clone());
+                    gc_trace::track(&inst);
                 }
                 // CPython's allocator runs a threshold-driven young
                 // collection right here; without it the tracked set
@@ -46714,7 +46761,7 @@ impl Interpreter {
         // `KeyError('k')`, every internal `raise`) stays off the GC books,
         // matching the container-untracking fast path used for list/dict/set.
         if exception_holds_nonatomic(&obj) {
-            crate::gc_trace::track(obj.clone());
+            crate::gc_trace::track(&obj);
         }
         obj
     }
@@ -47327,7 +47374,7 @@ impl Interpreter {
                     // RFC 0024: generator frames can participate in
                     // reference cycles (a local that holds the generator
                     // itself), so track them like instances.
-                    gc_trace::track(obj.clone());
+                    gc_trace::track(&obj);
                     // Threshold-driven young collection at the
                     // allocation site, as in the instance path.
                     if gc_trace::maybe_auto_collect() {
@@ -47391,7 +47438,7 @@ impl Interpreter {
                 } else {
                     Object::Generator(gen)
                 };
-                gc_trace::track(obj.clone());
+                gc_trace::track(&obj);
                 if gc_trace::maybe_auto_collect() {
                     self.run_pending_finalizers();
                 }

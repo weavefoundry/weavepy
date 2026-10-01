@@ -1370,7 +1370,7 @@ fn new_container(owned: &mut Owned, dict: bool) -> Option<V> {
     } else {
         Object::new_list(Vec::new())
     };
-    crate::gc_trace::track(obj.clone());
+    crate::gc_trace::track(&obj);
     owned.own(obj)
 }
 

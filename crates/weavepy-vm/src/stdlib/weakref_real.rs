@@ -1215,7 +1215,7 @@ fn make_ref_object_with_class(
     // is its own callback) and bound methods are tracked as well.
     let callback_can_cycle = !matches!(&callback, None | Some(Object::Builtin(_)));
     if callback_can_cycle {
-        crate::gc_trace::track(wrapper.clone());
+        crate::gc_trace::track(&wrapper);
     }
     wrapper
 }

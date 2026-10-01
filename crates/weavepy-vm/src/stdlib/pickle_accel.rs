@@ -1323,7 +1323,7 @@ impl Objects {
                 Object::List(_) | Object::Dict(_) | Object::Instance(_)
             )
         {
-            crate::gc_trace::track(value.clone());
+            crate::gc_trace::track(&value);
         }
     }
 

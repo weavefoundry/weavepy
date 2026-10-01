@@ -1341,7 +1341,7 @@ fn future_iter_new(fut: &Object) -> Object {
     // collector by hand: a suspended `await` parks this iterator on the
     // coroutine's value stack, and its strong `fut` edge must be
     // subtractable for task↔future cycles to collapse.
-    crate::gc_trace::track(out.clone());
+    crate::gc_trace::track(&out);
     out
 }
 

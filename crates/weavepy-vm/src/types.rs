@@ -1107,7 +1107,7 @@ impl TypeObject {
         // free it — and weakrefs to it (or to methods in its dict)
         // would never clear. Built-ins are immortal; skip them.
         if !ty.flags.is_builtin {
-            crate::gc_trace::track(Object::Type(ty.clone()));
+            crate::gc_trace::track(&Object::Type(ty.clone()));
         }
         Ok(ty)
     }
@@ -1544,12 +1544,20 @@ impl TypeObject {
     /// conservative `true` on any borrow conflict: a spurious resurrection
     /// is harmless because `Vm::invoke_finalizer` simply no-ops when the
     /// instance turns out to have no `__del__`.
+    #[inline]
     pub fn instances_need_finalize(&self) -> bool {
         match self.has_del.get() {
-            1 => return false,
-            2 => return true,
-            _ => {}
+            1 => false,
+            2 => true,
+            _ => self.instances_need_finalize_slow(),
         }
+    }
+
+    /// [`Self::instances_need_finalize`] with no cached verdict: the MRO
+    /// walk, which caches one.
+    #[cold]
+    #[inline(never)]
+    fn instances_need_finalize_slow(&self) -> bool {
         let Ok(mro) = self.mro.try_borrow() else {
             return true;
         };

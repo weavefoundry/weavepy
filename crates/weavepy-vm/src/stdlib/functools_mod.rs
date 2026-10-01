@@ -311,7 +311,7 @@ fn lru_cache_wrapper_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // wrapper counted as an external root that made that namespace
     // immortal.
     let wrapper = Object::Instance(inst);
-    crate::gc_trace::track(wrapper.clone());
+    crate::gc_trace::track(&wrapper);
     Ok(wrapper)
 }
 

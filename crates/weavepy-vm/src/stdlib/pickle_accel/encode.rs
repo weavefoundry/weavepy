@@ -520,7 +520,7 @@ impl Encoder<'_> {
                 continue;
             }
             let names = Object::new_list(names);
-            crate::gc_trace::track(names.clone());
+            crate::gc_trace::track(&names);
             dict.insert(DictKey(Object::from_static("__slotnames__")), names);
             drop(dict);
             class.bump_attr_version();

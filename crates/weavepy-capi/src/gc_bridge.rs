@@ -212,7 +212,7 @@ pub unsafe extern "C" fn PyObject_GC_Track(op: *mut c_void) {
     }
     let obj = unsafe { crate::object::clone_object(op as *mut PyObject) };
     if matches!(obj, Object::Instance(_)) {
-        weavepy_vm::gc_trace::track(obj);
+        weavepy_vm::gc_trace::track(&obj);
     }
 }
 

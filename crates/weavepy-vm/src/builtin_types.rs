@@ -428,7 +428,7 @@ impl BuiltinTypes {
                             );
                             pi.dict = dict.into();
                             let inst = Object::Instance(Rc::new(pi));
-                            crate::gc_trace::track(inst.clone());
+                            crate::gc_trace::track(&inst);
                             return Ok(inst);
                         }
                     }
@@ -491,7 +491,7 @@ impl BuiltinTypes {
                             let mut pi = crate::types::PyInstance::with_native(cls.clone(), ns);
                             pi.dict = dict.into();
                             let inst = Object::Instance(Rc::new(pi));
-                            crate::gc_trace::track(inst.clone());
+                            crate::gc_trace::track(&inst);
                             return Ok(inst);
                         }
                     }
@@ -500,7 +500,7 @@ impl BuiltinTypes {
                     // through a closure cell is a cycle the collector must
                     // see (test_interpreters' captured_thread_exception
                     // left its Thread in `threading._dangling`).
-                    crate::gc_trace::track(ns.clone());
+                    crate::gc_trace::track(&ns);
                     Ok(ns)
                 };
             let mut ns_dict = simple_namespace_.dict.borrow_mut();
@@ -1834,7 +1834,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::new_tuple(new_args.to_vec()),
         );
         let obj = Object::Instance(inst);
-        crate::gc_trace::track(obj.clone());
+        crate::gc_trace::track(&obj);
         return Ok(obj);
     }
     // `tuple.__new__(tuple, it)` / `int.__new__(int, x)` … on the *built-in
@@ -1846,7 +1846,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // name/doc seeding lives in `module.__init__` only).
     if cls.is_subclass_of(&builtin_types().module_) {
         let inst = Object::Instance(Rc::new(PyInstance::new(cls)));
-        crate::gc_trace::track(inst.clone());
+        crate::gc_trace::track(&inst);
         return Ok(inst);
     }
     // A `type` subclass reaching the generic allocator is a wrong-arity
@@ -1929,7 +1929,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
                     let interp = unsafe { &mut *ptr };
                     let s = interp.type_call_default(&bt.str_, &args[1..], &[])?;
                     let inst = Object::Instance(Rc::new(PyInstance::with_native(cls.clone(), s)));
-                    crate::gc_trace::track(inst.clone());
+                    crate::gc_trace::track(&inst);
                     return Ok(inst);
                 }
             }
@@ -1955,7 +1955,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
                     let interp = unsafe { &mut *ptr };
                     let v = interp.type_call_default(&bt.int_, &args[1..], &[])?;
                     let inst = Object::Instance(Rc::new(PyInstance::with_native(cls.clone(), v)));
-                    crate::gc_trace::track(inst.clone());
+                    crate::gc_trace::track(&inst);
                     return Ok(inst);
                 }
             }
@@ -1970,7 +1970,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // `__init__` / `__setstate__` / the `_reconstruct` append-and-update loop.
     if let Some(native) = native_seed_for_new(&cls, args.get(1)) {
         let inst = Object::Instance(Rc::new(PyInstance::with_native(cls, native)));
-        crate::gc_trace::track(inst.clone());
+        crate::gc_trace::track(&inst);
         return Ok(inst);
     }
     // RFC 0024: explicit `object.__new__(cls)` / `super().__new__(cls)`
@@ -1982,7 +1982,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // A natively served class's instances are never tracked (see
     // `stdlib::datetime_native`).
     if !native {
-        crate::gc_trace::track(inst.clone());
+        crate::gc_trace::track(&inst);
     }
     Ok(inst)
 }
@@ -5237,7 +5237,7 @@ pub(crate) fn exception_group_new(
     // An exception group always anchors other exception instances, so
     // it can participate in reference cycles — GC-track it like
     // `build_exception_instance` does for enriched exceptions.
-    crate::gc_trace::track(inst.clone());
+    crate::gc_trace::track(&inst);
     Ok(inst)
 }
 
@@ -5817,7 +5817,7 @@ fn int_new_kw(
         return Some(Ok(v));
     }
     let inst = Object::Instance(Rc::new(PyInstance::with_native(cls.clone(), v)));
-    crate::gc_trace::track(inst.clone());
+    crate::gc_trace::track(&inst);
     Some(Ok(inst))
 }
 
