@@ -96,8 +96,11 @@ fn op_supported(op: OpCode) -> bool {
     )
 }
 
-/// Whether `code` is a plain generator whose every instruction is one a
-/// fast step runs (cached in the code's extension table).
+/// Whether `code` is a plain generator whose steady state, everything a
+/// resume can reach from a `yield`, is instructions a fast step runs
+/// (cached in the code's extension table). The prologue may hold others
+/// (`range(n)` built before the loop): the first resume's step stops at
+/// them, and the general loop runs them once.
 fn code_ok(code: &CodeObject) -> bool {
     use std::sync::atomic::Ordering;
     let Some(ext) = crate::code_vm_ext(code) else {
@@ -113,11 +116,44 @@ fn code_ok(code: &CodeObject) -> bool {
         && !code.is_async_generator
         && code.cellvars.is_empty()
         && code.freevars.is_empty()
-        && code.instructions.iter().all(|i| op_supported(i.op))
-        && in_bounds(code, ext.objects.len());
+        && in_bounds(code, ext.objects.len())
+        && steady_state_supported(code);
     ext.gen_fast
         .store(if ok { 2 } else { 1 }, Ordering::Relaxed);
     ok
+}
+
+/// Whether every instruction a resume reaches from one of `code`'s yields
+/// is one a fast step runs (jump targets are in range: see [`in_bounds`]).
+fn steady_state_supported(code: &CodeObject) -> bool {
+    let instrs = &code.instructions;
+    let n = instrs.len();
+    let mut seen = vec![false; n];
+    let mut work: Vec<usize> = (0..n)
+        .filter(|&p| instrs[p].op == OpCode::YieldValue)
+        .map(|p| p + 1)
+        .collect();
+    while let Some(p) = work.pop() {
+        if p >= n || std::mem::replace(&mut seen[p], true) {
+            continue;
+        }
+        let ins = instrs[p];
+        if !op_supported(ins.op) {
+            return false;
+        }
+        let arg = ins.arg as usize;
+        match ins.op {
+            OpCode::ReturnValue | OpCode::Reraise => {}
+            OpCode::JumpForward => work.push(p + 1 + arg),
+            OpCode::JumpBackward => work.push((p + 1).saturating_sub(arg)),
+            OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue | OpCode::ForIter => {
+                work.push(p + 1);
+                work.push(p + 1 + arg);
+            }
+            _ => work.push(p + 1),
+        }
+    }
+    true
 }
 
 /// Whether every jump, local and constant `code`'s instructions name is
