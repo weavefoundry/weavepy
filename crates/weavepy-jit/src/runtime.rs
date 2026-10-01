@@ -122,7 +122,15 @@ pub enum SlotTag {
     /// exit, or a provably-`None` method-call result). The bits are
     /// ignored; the embedder rebuilds `Object::None`.
     None = 6,
+    /// A call argument slot a keyword call skipped: the call helper
+    /// binds the callee's default there before anything reads it. Only
+    /// ever appears in a call marshal buffer under [`CALL_GAPS`].
+    Default = 7,
 }
+
+/// Set in a `wpjit_call_py` argument count when some marshaled slots
+/// are tagged [`SlotTag::Default`].
+pub const CALL_GAPS: u32 = 1 << 31;
 
 impl SlotTag {
     /// Decode a raw tag written by native code.
@@ -136,6 +144,7 @@ impl SlotTag {
             4 => SlotTag::ListPin,
             5 => SlotTag::ObjPin,
             6 => SlotTag::None,
+            7 => SlotTag::Default,
             _ => SlotTag::Int,
         }
     }
@@ -239,6 +248,57 @@ pub fn register_call_py_helper(helper: CallPyHelper) {
 #[must_use]
 pub(crate) fn call_py_helper_addr() -> usize {
     CALL_PY_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The embedder's direct self-call helpers (see
+/// `engine::self_direct_eligible`): a scalar frame calls itself natively,
+/// its callee's [`JitFrame`] on the native stack and the caller's
+/// embedder context shared.
+///
+/// - [`SelfEnterHelper`] charges one activation (recursion depth, GIL
+///   countdown) before the call: `0` to call directly, non-zero to take
+///   the ordinary `wpjit_call_py` path instead (nothing charged).
+/// - [`SelfExitHelper`] releases the charge after the callee returns.
+/// - [`SelfSlowHelper`] finishes a callee that did not return: its
+///   [`JitStatus`] (`Deopt` or `Raised`) with its frame still live.
+///   Returns a [`CallStatus`] for the caller, as the call helper does.
+pub type SelfEnterHelper = unsafe extern "C" fn(frame: *mut JitFrame) -> i64;
+/// See [`SelfEnterHelper`].
+pub type SelfExitHelper = unsafe extern "C" fn(frame: *mut JitFrame) -> i64;
+/// See [`SelfEnterHelper`].
+pub type SelfSlowHelper = unsafe extern "C" fn(
+    frame: *mut JitFrame,
+    callee: *mut JitFrame,
+    status: i64,
+    token: i64,
+    expect_tag: i64,
+) -> i64;
+
+static SELF_ENTER_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SELF_EXIT_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SELF_SLOW_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the direct self-call helpers (see [`SelfEnterHelper`]).
+pub fn register_self_call_helpers(
+    enter: SelfEnterHelper,
+    exit: SelfExitHelper,
+    slow: SelfSlowHelper,
+) {
+    use std::sync::atomic::Ordering::Release;
+    SELF_ENTER_HELPER.store(enter as usize, Release);
+    SELF_EXIT_HELPER.store(exit as usize, Release);
+    SELF_SLOW_HELPER.store(slow as usize, Release);
+}
+
+/// The registered self-call helpers' addresses (enter, exit, slow), or
+/// `None` when any is absent.
+#[must_use]
+pub(crate) fn self_call_helper_addrs() -> Option<(usize, usize, usize)> {
+    use std::sync::atomic::Ordering::Acquire;
+    let a = SELF_ENTER_HELPER.load(Acquire);
+    let b = SELF_EXIT_HELPER.load(Acquire);
+    let c = SELF_SLOW_HELPER.load(Acquire);
+    (a != 0 && b != 0 && c != 0).then_some((a, b, c))
 }
 
 /// RFC 0061 WS5 — the embedder's pinned-list *read* helper. `pin`

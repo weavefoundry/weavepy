@@ -37,10 +37,18 @@ fn simplequeue_put(args: &[Object]) -> Result<Object, RuntimeError> {
     let dq = interp.load_attr_public(&recv, "_queue")?;
     let append = interp.load_attr_public(&dq, "append")?;
     interp.call(&append, &[item], &[], &g)?;
+    // The flag's test, clear and release are one step, as CPython's
+    // critical section makes them without the GIL: two putters that both
+    // saw it set would release the gate twice (`release unlocked lock`).
+    // (Nothing inside runs Python code; the append above, which may
+    // collect, stays outside.)
+    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _held = GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if interp.load_attr_public(&recv, "_locked")?.is_truthy() {
-        // Clear the flag before releasing: a second putter that runs in
-        // between must not release the gate twice (`release unlocked
-        // lock`), and the woken getter sets it again itself.
+        // Clear the flag before releasing: the woken getter sets it again
+        // itself.
         interp.store_attr_public(&recv, "_locked", Object::Bool(false))?;
         let lock = interp.load_attr_public(&recv, "_lock")?;
         let release = interp.load_attr_public(&lock, "release")?;

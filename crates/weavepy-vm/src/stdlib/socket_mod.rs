@@ -3908,6 +3908,8 @@ fn resolve_ipv4(name: &str, who: &str) -> Result<Vec<String>, RuntimeError> {
         // SAFETY: rc == 0 guarantees a valid chain until `freeaddrinfo`.
         let ai = unsafe { &*cur };
         if ai.ai_family == libc::AF_INET && !ai.ai_addr.is_null() {
+            // (getaddrinfo returns suitably aligned address storage.)
+            #[allow(clippy::cast_ptr_alignment)]
             let sin = unsafe { &*ai.ai_addr.cast::<libc::sockaddr_in>() };
             let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)).to_string();
             if !ips.contains(&ip) {
@@ -4316,6 +4318,8 @@ fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
         cur = ai.ai_next;
         let addr_tuple = match ai.ai_family {
             f if f == libc::AF_INET => {
+                // (getaddrinfo returns suitably aligned address storage.)
+                #[allow(clippy::cast_ptr_alignment)]
                 let sin = unsafe { &*ai.ai_addr.cast::<libc::sockaddr_in>() };
                 let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
                 Object::new_tuple_array([
@@ -4324,6 +4328,8 @@ fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
                 ])
             }
             f if f == libc::AF_INET6 => {
+                // (getaddrinfo returns suitably aligned address storage.)
+                #[allow(clippy::cast_ptr_alignment)]
                 let sin6 = unsafe { &*ai.ai_addr.cast::<libc::sockaddr_in6>() };
                 let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
                 Object::new_tuple_array([
@@ -4621,6 +4627,8 @@ fn mod_getnameinfo(args: &[Object]) -> Result<Object, RuntimeError> {
     // SAFETY: rc == 0 guarantees a valid chain until `freeaddrinfo`.
     let ai = unsafe { &*res };
     if ai.ai_family == libc::AF_INET6 {
+        // (getaddrinfo returns suitably aligned address storage.)
+        #[allow(clippy::cast_ptr_alignment)]
         let sin6 = unsafe { &mut *ai.ai_addr.cast::<libc::sockaddr_in6>() };
         sin6.sin6_flowinfo = (flowinfo as u32).to_be();
         sin6.sin6_scope_id = scope_id;

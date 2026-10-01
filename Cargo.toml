@@ -141,6 +141,7 @@ unicode_names2        = "2.0"
 memmap2               = "0.9"
 memchr                = "2.8"
 libc                  = "0.2"
+libmimalloc-sys       = { version = "0.1.49", default-features = false }
 rustls                = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types      = "1.7"
 # PKCS#8 "ENCRYPTED PRIVATE KEY" (PBES2) decryption for password-protected
@@ -317,7 +318,9 @@ opt-level = 1
 
 [profile.release]
 opt-level     = 3
-lto           = "thin"
+# Fat LTO inlines across the VM, compiler, and JIT crates: 1-10% faster
+# on the benchmark fixtures for about a third more build time.
+lto           = "fat"
 codegen-units = 1
 debug         = "line-tables-only"
 strip         = "debuginfo"

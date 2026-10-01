@@ -10,7 +10,7 @@ gc enabled: True
 disabled: False
 re-enabled: True
 collected is int: True
-threshold: (700, 10, 10)
+threshold: (2000, 10, 10)
 threshold: (800, 12, 14)
 count len: 3
 objects is list: True

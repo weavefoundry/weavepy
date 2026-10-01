@@ -113,7 +113,13 @@ impl<T: ?Sized + ThinPayload> ThinArc<T> {
 impl<T: ?Sized + ThinPayload> Clone for ThinArc<T> {
     #[inline]
     fn clone(&self) -> Self {
-        Self::from_arc(Arc::clone(&self.arc_view()))
+        // SAFETY: this owner keeps the payload alive; the copy accounts for
+        // the added strong reference.
+        unsafe { crate::rc::increment_strong(self.raw()) };
+        Self {
+            data: self.data,
+            ownership: PhantomData,
+        }
     }
 }
 
@@ -122,7 +128,11 @@ impl<T: ?Sized + ThinPayload> Drop for ThinArc<T> {
     fn drop(&mut self) {
         // SAFETY: release this owner's one strong reference exactly once.
         // Arc drops the payload and handles remaining weak references normally.
-        unsafe { drop(Arc::from_raw(self.raw())) }
+        unsafe {
+            if !crate::rc::try_release_shared(self.raw()) {
+                drop(Arc::from_raw(self.raw()))
+            }
+        }
     }
 }
 
@@ -663,6 +673,8 @@ mod tests {
     fn weak_upgrades_and_shared_text_survive_thread_handoffs() {
         let value = SharedStr::from("shared 🧶 text");
         let weak = SharedStr::downgrade(&value);
+        // As the VM does before starting a thread: counts go atomic.
+        crate::sync::revoke_bias_for_spawn();
         std::thread::scope(|scope| {
             for _ in 0..2 {
                 let weak = weak.clone();

@@ -873,9 +873,9 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // sharing the interpreter's host sinks, so `print()` and
         // direct writes via `sys.stdout.write(...)` agree.
         let stdout_sink: Rc<RefCell<dyn std::io::Write + Send + Sync>> =
-            Rc::new(RefCell::new(std::io::stdout()));
+            Rc::from_arc(std::sync::Arc::new(RefCell::new(std::io::stdout())));
         let stderr_sink: Rc<RefCell<dyn std::io::Write + Send + Sync>> =
-            Rc::new(RefCell::new(std::io::stderr()));
+            Rc::from_arc(std::sync::Arc::new(RefCell::new(std::io::stderr())));
         // CPython's `init_sys_streams`: a standard stream whose fd is
         // closed at startup (e.g. spawned with `os.close(0)` in a
         // preexec hook) is `None`, not a broken file object

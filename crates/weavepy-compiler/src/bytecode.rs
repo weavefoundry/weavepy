@@ -954,6 +954,16 @@ pub struct Instruction {
     pub arg: u32,
 }
 
+impl OpCode {
+    /// The opcode numbered `b` (variants count up from zero in
+    /// declaration order), if there is one.
+    pub fn from_u8(b: u8) -> Option<Self> {
+        // SAFETY: `OpCode` is `repr(u8)` with implicit, contiguous
+        // discriminants, the last of which is `StoreFastMaybeNull`.
+        (b <= Self::StoreFastMaybeNull as u8).then(|| unsafe { std::mem::transmute::<u8, Self>(b) })
+    }
+}
+
 impl Instruction {
     #[inline]
     pub const fn new(op: OpCode, arg: u32) -> Self {

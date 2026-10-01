@@ -410,7 +410,7 @@ fn state_cell(inst: &Rc<PyInstance>) -> Result<Rc<RefCell<MmapState>>, RuntimeEr
 /// `None` for a closed mapping.
 pub fn shared_buffer(inst: &Rc<PyInstance>) -> Option<Rc<dyn SharedMemBuffer>> {
     let cell = state_cell(inst).ok()?;
-    let region: Rc<dyn SharedMemBuffer> = cell.borrow().region.clone();
+    let region = crate::rc_unsize!(cell.borrow().region.clone() => dyn SharedMemBuffer);
     Some(region)
 }
 

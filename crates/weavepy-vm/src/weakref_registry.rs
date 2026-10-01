@@ -37,9 +37,9 @@
 use crate::fasthash::ObjectIdHasher;
 use crate::shared_value::{SharedSlice, SharedStr, ThinArc};
 use crate::sync::RefCell;
+use crate::sync::{Rc as Arc, Weak};
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
 
 use crate::object::{DictKey, Object, StrKey};
 
@@ -548,7 +548,7 @@ pub fn queue_callbacks(cleared: Vec<(Arc<WeakRefSlot>, Option<Object>)>) {
             .py_ref
             .borrow()
             .as_ref()
-            .and_then(std::sync::Weak::upgrade)
+            .and_then(Weak::upgrade)
             .map(Object::Instance);
         if let Some(wr) = wr {
             crate::vm_singletons::push_pending_weakref_callback(cb, wr);

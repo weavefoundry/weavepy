@@ -32,7 +32,7 @@
 //!   A type's flags decide whether tracking is needed at
 //!   construction time.
 //! - The **eval breaker** triggers a collection when the
-//!   generation-0 counter exceeds the threshold (default 700).
+//!   generation-0 counter exceeds the threshold (default 2000, as in CPython 3.14).
 //!   Collections also happen on explicit `gc.collect()`.
 //!
 //! Today's implementation is *non-incremental*: a full
@@ -73,28 +73,34 @@
 
 use crate::fasthash::ObjectIdHasher;
 use crate::shared_value::ThinArc;
+use crate::sync::Rc as HandleRc;
 use crate::sync::RefCell;
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{
     AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
-use std::sync::Arc;
 
 use crate::object::Object;
 use crate::weakref_registry::{id_of, ObjectId};
 
-type GcIndex =
-    std::collections::HashMap<ObjectId, Arc<TrackedHandle>, BuildHasherDefault<ObjectIdHasher>>;
+/// A set of object ids (addresses), hashed with the address mixer.
+type IdSet = std::collections::HashSet<ObjectId, BuildHasherDefault<ObjectIdHasher>>;
+
+type GcIndex = std::collections::HashMap<
+    ObjectId,
+    HandleRc<TrackedHandle>,
+    BuildHasherDefault<ObjectIdHasher>,
+>;
 
 /// The standard CPython generation count (3) and default
-/// thresholds: gen 0 collects when 700 untracked allocations
+/// thresholds (CPython 3.14's): gen 0 collects when 2000 net tracked allocations
 /// have happened; gen 1 every 10 gen 0 collections; gen 2
 /// every 10 gen 1 collections.
 pub const N_GENERATIONS: usize = 3;
 // Color and generation are bounded states; reference counts remain full-width.
 const _: () = assert!(N_GENERATIONS > 0 && N_GENERATIONS <= u8::MAX as usize + 1);
 const MAX_GENERATION: u8 = (N_GENERATIONS - 1) as u8;
-pub const DEFAULT_THRESHOLDS: [usize; N_GENERATIONS] = [700, 10, 10];
+pub const DEFAULT_THRESHOLDS: [usize; N_GENERATIONS] = [2000, 10, 10];
 
 /// Upper bound on the number of mark-sweep passes a single
 /// [`GcState::collect`] runs to reach a fixpoint. Convergence is normally 2–3
@@ -316,7 +322,7 @@ impl TrackedHandle {
 /// in from the end, and its `slot` field is corrected here so the
 /// per-handle position invariant holds after the call.
 #[inline]
-fn swap_remove_handle(vec: &mut Vec<Arc<TrackedHandle>>, slot: usize) {
+fn swap_remove_handle(vec: &mut Vec<HandleRc<TrackedHandle>>, slot: usize) {
     if slot >= vec.len() {
         return;
     }
@@ -333,8 +339,11 @@ fn swap_remove_handle(vec: &mut Vec<Arc<TrackedHandle>>, slot: usize) {
 /// handle was found and removed. O(n) in the generation length, but only ever
 /// taken on the rare stale-cache path — the common case stays O(1).
 #[inline]
-fn remove_handle_by_ptr(vec: &mut Vec<Arc<TrackedHandle>>, handle: &Arc<TrackedHandle>) -> bool {
-    if let Some(pos) = vec.iter().position(|h| Arc::ptr_eq(h, handle)) {
+fn remove_handle_by_ptr(
+    vec: &mut Vec<HandleRc<TrackedHandle>>,
+    handle: &HandleRc<TrackedHandle>,
+) -> bool {
+    if let Some(pos) = vec.iter().position(|h| HandleRc::ptr_eq(h, handle)) {
         swap_remove_handle(vec, pos);
         true
     } else {
@@ -347,7 +356,7 @@ struct Generation {
     /// All tracked handles in this generation. Append-only
     /// during normal allocation; rewritten in place when
     /// objects are promoted or moved to the unreachable list.
-    handles: Vec<Arc<TrackedHandle>>,
+    handles: Vec<HandleRc<TrackedHandle>>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -430,7 +439,7 @@ pub struct GcState {
     /// Frozen handles. `gc.freeze()` moves all tracked objects
     /// here; they are skipped by future collections until
     /// `gc.unfreeze()` runs.
-    frozen: RefCell<Vec<Arc<TrackedHandle>>>,
+    frozen: RefCell<Vec<HandleRc<TrackedHandle>>>,
     /// `gc.garbage` — uncollectable objects (cycles whose
     /// finalisers refused to release).
     pub garbage: RefCell<Vec<Object>>,
@@ -461,7 +470,7 @@ pub struct GcState {
     /// path by scanning *this* small set (not the whole tracked
     /// population) at the interpreter's reference-drop safe points. Keyed
     /// by id like `index`; an object is in both while finalizable.
-    finalizable: RefCell<std::collections::BTreeMap<ObjectId, Arc<TrackedHandle>>>,
+    finalizable: RefCell<std::collections::BTreeMap<ObjectId, HandleRc<TrackedHandle>>>,
     /// Live population of [`Self::finalizable`]. A relaxed load of this
     /// atomic is the gate the interpreter checks before every prompt-
     /// finalization sweep: when it is zero (the overwhelmingly common
@@ -484,7 +493,7 @@ pub struct GcState {
     /// [`Self::finalizable`], so the per-drop scan walks only entries
     /// that could plausibly die this safe point. Membership is mirrored
     /// by each handle's `fin_cold` flag and `fin_hot_slot` index.
-    finalizable_hot: RefCell<Vec<Arc<TrackedHandle>>>,
+    finalizable_hot: RefCell<Vec<HandleRc<TrackedHandle>>>,
     /// `finalizable_hot.len()`, published for the lock-free gate: when
     /// zero, a scan that isn't on the cold stride returns without
     /// borrowing anything — the steady state of a program whose
@@ -511,7 +520,7 @@ impl Drop for GcState {
         // first so the chains are already severed when the handle
         // vectors drop. Safe at this point: the thread is exiting, no
         // Python code will observe the cleared objects.
-        let mut handles: Vec<Arc<TrackedHandle>> = Vec::new();
+        let mut handles: Vec<HandleRc<TrackedHandle>> = Vec::new();
         if let Ok(gens) = self.generations.try_borrow() {
             for g in gens.iter() {
                 handles.extend(g.handles.iter().cloned());
@@ -582,7 +591,7 @@ impl GcState {
     /// Insert `h` into the finalizable index (RFC 0077 WS2: one place
     /// for the population and hot-set bookkeeping). New entries start
     /// hot; the next scan grades them. Returns whether it was new.
-    fn fin_insert(&self, id: ObjectId, h: Arc<TrackedHandle>) -> bool {
+    fn fin_insert(&self, id: ObjectId, h: HandleRc<TrackedHandle>) -> bool {
         let mut fin = self.finalizable.borrow_mut();
         if fin.contains_key(&id) {
             return false;
@@ -601,6 +610,12 @@ impl GcState {
     /// Remove `id` from the finalizable index, if present, keeping the
     /// population and hot set exact.
     fn fin_remove(&self, id: ObjectId) -> bool {
+        // The usual case: nothing finalizable is tracked at all. (Inserts
+        // count after they land, and the same thread removes an id it
+        // inserted.)
+        if self.finalizable_count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
         let removed = self.finalizable.borrow_mut().remove(&id);
         let Some(h) = removed else {
             return false;
@@ -611,7 +626,7 @@ impl GcState {
 
     /// The hot-set and population half of [`Self::fin_remove`], for the
     /// one caller that already holds the finalizable lock.
-    fn fin_remove_bookkeeping(&self, h: &Arc<TrackedHandle>) {
+    fn fin_remove_bookkeeping(&self, h: &HandleRc<TrackedHandle>) {
         self.fin_make_cold(h);
         if self.finalizable_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             // RFC 0065 (WS1): population reached zero — dispatch loops
@@ -621,7 +636,7 @@ impl GcState {
     }
 
     /// Move `h` into the hot set (no-op if already hot).
-    fn fin_make_hot(&self, h: &Arc<TrackedHandle>) {
+    fn fin_make_hot(&self, h: &HandleRc<TrackedHandle>) {
         let mut hot = self.finalizable_hot.borrow_mut();
         if !h.fin_cold.swap(false, Ordering::AcqRel)
             && h.fin_hot_slot.load(Ordering::Relaxed) != usize::MAX
@@ -636,19 +651,19 @@ impl GcState {
 
     /// Move `h` out of the hot set (no-op if already cold). O(1) via
     /// the handle's cached slot, with the swap-remove fixup.
-    fn fin_make_cold(&self, h: &Arc<TrackedHandle>) {
+    fn fin_make_cold(&self, h: &HandleRc<TrackedHandle>) {
         let mut hot = self.finalizable_hot.borrow_mut();
         h.fin_cold.store(true, Ordering::Release);
         let slot = h.fin_hot_slot.swap(usize::MAX, Ordering::AcqRel);
         if slot == usize::MAX {
             return;
         }
-        if slot < hot.len() && Arc::ptr_eq(&hot[slot], h) {
+        if slot < hot.len() && HandleRc::ptr_eq(&hot[slot], h) {
             hot.swap_remove(slot);
             if let Some(moved) = hot.get(slot) {
                 moved.fin_hot_slot.store(slot, Ordering::Relaxed);
             }
-        } else if let Some(pos) = hot.iter().position(|x| Arc::ptr_eq(x, h)) {
+        } else if let Some(pos) = hot.iter().position(|x| HandleRc::ptr_eq(x, h)) {
             hot.swap_remove(pos);
             if let Some(moved) = hot.get(pos) {
                 moved.fin_hot_slot.store(pos, Ordering::Relaxed);
@@ -760,6 +775,16 @@ impl GcState {
                 // queue onto a list we cannot touch.
                 return false;
             };
+            // The churn shape — a loop that builds a container and drops
+            // the previous one — leaves its dead predecessors just below
+            // the tail: reclaim them here, so steady churn neither grows
+            // the list nor parks dead allocations until a sweep.
+            let n = deferred.len();
+            for i in (n.saturating_sub(2)..n).rev() {
+                if deferred[i].is_dead() {
+                    deferred.swap_remove(i);
+                }
+            }
             deferred.push(weak);
             deferred.len() >= self.deferred_limit.load(Ordering::Relaxed)
         };
@@ -835,7 +860,7 @@ impl GcState {
             // insert becomes observable (we hold the index borrow, so
             // no prober can race past a fresh registration).
             self.tracked_filter.insert(new_id);
-            let handle = Arc::new(TrackedHandle::new(obj, 0));
+            let handle = HandleRc::new(TrackedHandle::new(obj, 0));
             entry.insert(handle.clone());
             // Enroll finalizable objects in the dedicated prompt-finalization
             // index so the per-safe-point sweep scans only them, not the whole
@@ -867,8 +892,8 @@ impl GcState {
         if !self.finalized_ids.borrow().is_empty() {
             self.finalized_ids.borrow_mut().remove(&new_id);
         }
-        self.tracked_count.fetch_add(1, Ordering::AcqRel);
-        self.tracked_version.fetch_add(1, Ordering::AcqRel);
+        serial_add(&self.tracked_count, 1);
+        serial_add(&self.tracked_version, 1);
         self.note_gen0_alloc();
     }
 
@@ -927,7 +952,10 @@ impl GcState {
         if handle.color.load(Ordering::Acquire) == color::Frozen {
             let mut frozen = self.frozen.borrow_mut();
             let slot = handle.slot.load(Ordering::Acquire);
-            if frozen.get(slot).is_some_and(|h| Arc::ptr_eq(h, &handle)) {
+            if frozen
+                .get(slot)
+                .is_some_and(|h| HandleRc::ptr_eq(h, &handle))
+            {
                 swap_remove_handle(&mut frozen, slot);
             } else {
                 remove_handle_by_ptr(&mut frozen, &handle);
@@ -944,7 +972,7 @@ impl GcState {
             if gens[g]
                 .handles
                 .get(slot)
-                .is_some_and(|h| Arc::ptr_eq(h, &handle))
+                .is_some_and(|h| HandleRc::ptr_eq(h, &handle))
             {
                 swap_remove_handle(&mut gens[g].handles, slot);
             } else if !remove_handle_by_ptr(&mut gens[g].handles, &handle) {
@@ -958,8 +986,8 @@ impl GcState {
                 }
             }
         }
-        self.tracked_count.fetch_sub(1, Ordering::AcqRel);
-        self.tracked_version.fetch_add(1, Ordering::AcqRel);
+        serial_add(&self.tracked_count, usize::MAX);
+        serial_add(&self.tracked_version, 1);
     }
 
     /// Reclaim every tracked object on this thread whose only remaining
@@ -1063,7 +1091,7 @@ impl GcState {
     fn collect_child_candidates(&self, obj: &Object, work: &mut Vec<ObjectId>) {
         let mut pending: Vec<Object> = Vec::new();
         traverse_object(obj, &mut |child| pending.push(child.clone()));
-        let mut seen: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+        let mut seen: IdSet = IdSet::default();
         while let Some(child) = pending.pop() {
             let id = id_of(&child);
             if !seen.insert(id) {
@@ -1221,8 +1249,10 @@ impl GcState {
             Hot,
             Cold,
         }
-        let mut out: Vec<Arc<TrackedHandle>> = Vec::new();
-        let mut probe = |h: &Arc<TrackedHandle>, out: &mut Vec<Arc<TrackedHandle>>| -> Grade {
+        let mut out: Vec<HandleRc<TrackedHandle>> = Vec::new();
+        let mut probe = |h: &HandleRc<TrackedHandle>,
+                         out: &mut Vec<HandleRc<TrackedHandle>>|
+         -> Grade {
             probed += 1;
             let sc = strong_count_for(&h.object);
             let cached = h.weak_clones.load(Ordering::Acquire);
@@ -1290,11 +1320,11 @@ impl GcState {
             // Walk the whole index (or a rotating window of it) and
             // re-grade every entry; collect the transitions and apply
             // them after the index borrow ends.
-            let mut to_cold: Vec<Arc<TrackedHandle>> = Vec::new();
-            let mut to_hot: Vec<Arc<TrackedHandle>> = Vec::new();
+            let mut to_cold: Vec<HandleRc<TrackedHandle>> = Vec::new();
+            let mut to_hot: Vec<HandleRc<TrackedHandle>> = Vec::new();
             {
                 let fin = self.finalizable.borrow();
-                let mut grade = |h: &Arc<TrackedHandle>| {
+                let mut grade = |h: &HandleRc<TrackedHandle>| {
                     let was_cold = h.fin_cold.load(Ordering::Relaxed);
                     match probe(h, &mut out) {
                         Grade::Cold if !was_cold => to_cold.push(h.clone()),
@@ -1428,7 +1458,7 @@ impl GcState {
     }
 
     /// O(1) handle lookup by object id (any generation or frozen).
-    pub fn handle_for(&self, id: ObjectId) -> Option<Arc<TrackedHandle>> {
+    pub fn handle_for(&self, id: ObjectId) -> Option<HandleRc<TrackedHandle>> {
         // RFC 0065 (WS4): see `is_tracked`.
         if !self.tracked_filter.may_contain(id) {
             return None;
@@ -1442,9 +1472,9 @@ impl GcState {
     /// finalizers for everything during interpreter teardown, not just
     /// for cyclic garbage. The per-handle `finalized` flag (shared with
     /// the cycle collector) guarantees each `__del__` runs at most once.
-    pub fn finalization_candidates(&self) -> Vec<Arc<TrackedHandle>> {
+    pub fn finalization_candidates(&self) -> Vec<HandleRc<TrackedHandle>> {
         let mut out = Vec::new();
-        let pending = |h: &Arc<TrackedHandle>| {
+        let pending = |h: &HandleRc<TrackedHandle>| {
             !h.finalized.load(Ordering::Acquire)
                 // A finalizer already queued by a collection (but not yet
                 // drained) must not be listed again — the pending queue owns
@@ -1901,7 +1931,7 @@ impl GcState {
         // are not counted as collected — they're dropped when this pass ends,
         // and the underlying iterator is freed by refcount once the real
         // objects in its (dead) cycle are cleared.
-        let mut temp_handles: Vec<Arc<TrackedHandle>> = Vec::new();
+        let mut temp_handles: Vec<HandleRc<TrackedHandle>> = Vec::new();
         {
             // Scan the existing candidate list, then the growing temporary
             // list, preserving discovery order without copying either list.
@@ -2029,7 +2059,7 @@ impl GcState {
                     if by_id.contains_key(&cid) {
                         return;
                     }
-                    let handle = Arc::new(TrackedHandle::new(child.clone(), 0));
+                    let handle = HandleRc::new(TrackedHandle::new(child.clone(), 0));
                     by_id.insert(cid, handle.clone());
                     temp_handles.push(handle);
                 });
@@ -2117,7 +2147,7 @@ impl GcState {
         }
 
         // Phase 5: white objects are unreachable cyclic garbage.
-        let unreachable: Vec<Arc<TrackedHandle>> = candidate_set
+        let unreachable: Vec<HandleRc<TrackedHandle>> = candidate_set
             .iter()
             .filter(|h| h.color.load(Ordering::Acquire) == color::White)
             .cloned()
@@ -2183,19 +2213,17 @@ impl GcState {
         // (test_callbacks_on_callback: `c.wr`/`d.wr` stay silent while the
         // external `safe_callback` fires). Snapshot the trash ids so the
         // queue loops below can drop callbacks belonging to trash wrappers.
-        let mut trash_ids: std::collections::HashSet<ObjectId> =
-            unreachable.iter().map(|h| h.id).collect();
-        let wrapper_is_trash =
-            |slot: &Arc<crate::weakref_registry::WeakRefSlot>,
-             trash: &std::collections::HashSet<ObjectId>| {
-                slot.py_ref
-                    .borrow()
-                    .as_ref()
-                    .and_then(std::sync::Weak::upgrade)
-                    .is_none_or(|inst| {
-                        trash.contains(&(crate::sync::Rc::as_ptr(&inst) as usize as u64))
-                    })
-            };
+        let mut trash_ids: IdSet = unreachable.iter().map(|h| h.id).collect();
+        let wrapper_is_trash = |slot: &crate::sync::Rc<crate::weakref_registry::WeakRefSlot>,
+                                trash: &IdSet| {
+            slot.py_ref
+                .borrow()
+                .as_ref()
+                .and_then(crate::sync::Weak::upgrade)
+                .is_none_or(|inst| {
+                    trash.contains(&(crate::sync::Rc::as_ptr(&inst) as usize as u64))
+                })
+        };
 
         if weakref_only {
             let mut weakref_callbacks = Vec::new();
@@ -2217,7 +2245,7 @@ impl GcState {
                     .py_ref
                     .borrow()
                     .as_ref()
-                    .and_then(std::sync::Weak::upgrade)
+                    .and_then(crate::sync::Weak::upgrade)
                     .map(crate::object::Object::Instance);
                 if let Some(wr) = wr {
                     crate::vm_singletons::push_pending_weakref_callback(cb, wr);
@@ -2261,8 +2289,8 @@ impl GcState {
         // wasn't resurrected falls into `dead` and is reclaimed (its weakrefs
         // cleared in that second pass, so single-`collect()` weakref tests
         // still observe `ref() is None`).
-        let mut deferred: Vec<Arc<TrackedHandle>> = Vec::new();
-        let mut maybe_dead: Vec<Arc<TrackedHandle>> = Vec::new();
+        let mut deferred: Vec<HandleRc<TrackedHandle>> = Vec::new();
+        let mut maybe_dead: Vec<HandleRc<TrackedHandle>> = Vec::new();
         for h in &unreachable {
             let pending_finalizer =
                 has_finalizer(&h.object) && !h.finalized.load(Ordering::Acquire);
@@ -2362,7 +2390,7 @@ impl GcState {
 
         // Whatever stayed White after the resurrection re-mark and the finalizer
         // subgraph protection is genuinely dead this pass.
-        let dead: Vec<Arc<TrackedHandle>> = maybe_dead
+        let dead: Vec<HandleRc<TrackedHandle>> = maybe_dead
             .into_iter()
             .filter(|h| h.color.load(Ordering::Acquire) == color::White)
             .collect();
@@ -2421,7 +2449,7 @@ impl GcState {
             // every other dead object has released its references, a
             // dict held only by dead holders is down to one owner and
             // the retry clears it (a live holder keeps it intact).
-            let mut shared_dict_holders: Vec<&Arc<TrackedHandle>> = Vec::new();
+            let mut shared_dict_holders: Vec<&HandleRc<TrackedHandle>> = Vec::new();
             for h in &dead {
                 if !clear_object_fields(&h.object) {
                     shared_dict_holders.push(h);
@@ -2448,9 +2476,9 @@ impl GcState {
         // callbacks and recursing into its children. Finalizable orphans are
         // left for a finalizing collection so `__del__` ordering is preserved.
         if !saveall {
-            let dead_ids: std::collections::HashSet<ObjectId> = dead.iter().map(|h| h.id).collect();
+            let dead_ids: IdSet = dead.iter().map(|h| h.id).collect();
             let mut worklist = cascade_seed;
-            let mut seen: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+            let mut seen: IdSet = IdSet::default();
             while let Some(cid) = worklist.pop() {
                 if dead_ids.contains(&cid) || by_id.contains_key(&cid) || !seen.insert(cid) {
                     // Dead (already reaped), a candidate this collection owns,
@@ -2520,7 +2548,7 @@ impl GcState {
                 .py_ref
                 .borrow()
                 .as_ref()
-                .and_then(std::sync::Weak::upgrade)
+                .and_then(crate::sync::Weak::upgrade)
                 .map(crate::object::Object::Instance);
             if let Some(wr) = wr {
                 crate::vm_singletons::push_pending_weakref_callback(cb, wr);
@@ -2555,7 +2583,7 @@ impl GcState {
         reported
     }
 
-    fn snapshot_for_collection(&self, upto: usize) -> Vec<Arc<TrackedHandle>> {
+    fn snapshot_for_collection(&self, upto: usize) -> Vec<HandleRc<TrackedHandle>> {
         let gens = self.generations.borrow();
         let selected = &gens[..=upto.min(N_GENERATIONS - 1)];
         let mut out = Vec::with_capacity(selected.iter().map(|g| g.handles.len()).sum());
@@ -2565,7 +2593,7 @@ impl GcState {
         out
     }
 
-    fn rebuild_generations(&self, upto: usize, candidates: &[Arc<TrackedHandle>]) {
+    fn rebuild_generations(&self, upto: usize, candidates: &[HandleRc<TrackedHandle>]) {
         // Lock order MUST match `track` (index before generations): the
         // collector and a mutator thread can both reach the GC under the
         // shared, process-global state, and acquiring these two cells in
@@ -2749,7 +2777,15 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             // `dict -> instance -> class -> method -> __globals__` cycle
             // in a dead ModuleType namespace would be immortal
             // (test_module.test_clear_dict_in_ref_cycle).
-            if let Some(dict) = i.dict.get_shared() {
+            if i.dict.published().is_none() {
+                // Split values: the instance's own children.
+                if let Ok(split) = i.dict.split_cell().try_borrow() {
+                    for (k, v) in split.iter() {
+                        visit(&k.0);
+                        visit(v);
+                    }
+                }
+            } else if let Some(dict) = i.dict.get_shared() {
                 let dict_obj = Object::Dict(dict);
                 if is_tracked(id_of(&dict_obj)) {
                     visit(&dict_obj);
@@ -2954,7 +2990,7 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
                     }
                 }
             }
-            if let Ok(attrs_rc) = f.attrs.try_borrow() {
+            if let Some(attrs_rc) = f.attrs.try_borrow().ok().and_then(|a| a.clone()) {
                 if let Ok(attrs) = attrs_rc.try_borrow() {
                     for (k, v) in attrs.iter() {
                         visit(&k.0);
@@ -3116,12 +3152,21 @@ pub fn clear_object_fields(obj: &Object) -> bool {
             if let Ok(mut slots) = i.slots.try_borrow_mut() {
                 *slots = crate::types::SlotStorage::default();
             }
+            if i.dict.published().is_none() {
+                let values = i
+                    .dict
+                    .split_cell()
+                    .try_borrow_mut()
+                    .map(|mut s| s.take())
+                    .unwrap_or_default();
+                drop(values);
+            }
             if i.dict.strong_count() > 1 {
                 // Shared `__dict__`: leave its contents to the other
                 // holder (see the doc comment).
                 return false;
             }
-            if let Some(dict) = i.dict.get() {
+            if let Some(dict) = i.dict.published() {
                 if let Ok(mut m) = dict.try_borrow_mut() {
                     m.clear();
                 }
@@ -3159,7 +3204,7 @@ pub fn clear_object_fields(obj: &Object) -> bool {
             // dict (a module's `__dict__` or the `exec` target), reclaimed as
             // its own candidate if it too is unreachable — clearing it here
             // could wipe a live module.
-            if let Ok(attrs_rc) = f.attrs.try_borrow() {
+            if let Some(attrs_rc) = f.attrs.try_borrow().ok().and_then(|a| a.clone()) {
                 if let Ok(mut attrs) = attrs_rc.try_borrow_mut() {
                     attrs.clear();
                 }
@@ -3214,7 +3259,9 @@ fn run_finalizer(obj: &Object) {
 /// blocks — CPython's `gen_dealloc` behavior).
 fn has_finalizer(obj: &Object) -> bool {
     match obj {
-        Object::Instance(inst) => inst.cls().lookup("__del__").is_some(),
+        // The class's cached `__del__` verdict (reset whenever `__del__`
+        // or the MRO changes), not an MRO walk per tracked instance.
+        Object::Instance(inst) => inst.cls().instances_need_finalize(),
         // RFC 0065 (WS4, item 3) tried gating this on "close can run
         // user code" (empty exception table ⇒ skip enrollment) so
         // `yield`-loop workloads could reach the fully-quiet dispatch
@@ -3283,7 +3330,7 @@ pub fn with_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
 /// well away from `getrefcount`-hot paths like pandas'.
 pub fn zombie_memoryview_refs_to(target: ObjectId) -> usize {
     with_state(|s| {
-        let mut handles: Vec<Arc<TrackedHandle>> = Vec::new();
+        let mut handles: Vec<HandleRc<TrackedHandle>> = Vec::new();
         {
             let Ok(gens) = s.generations.try_borrow() else {
                 return 0;
@@ -3306,13 +3353,16 @@ pub fn zombie_memoryview_refs_to(target: ObjectId) -> usize {
         if handles.is_empty() {
             return 0;
         }
-        let mut zombies: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+        let mut zombies: IdSet = IdSet::default();
         loop {
             // Inbound references each candidate receives from the current
             // zombie set (a dropped chain of sub-views keeps inner views'
             // counts up via exporter edges).
-            let mut inbound: std::collections::HashMap<ObjectId, usize> =
-                std::collections::HashMap::new();
+            let mut inbound: std::collections::HashMap<
+                ObjectId,
+                usize,
+                BuildHasherDefault<ObjectIdHasher>,
+            > = std::collections::HashMap::default();
             for h in &handles {
                 if zombies.contains(&h.id) {
                     traverse_object(&h.object, &mut |c| {
@@ -3385,6 +3435,21 @@ pub fn track(obj: Object) {
         with_state(|s| s.track(dict));
     }
     with_state(|s| s.track(obj));
+}
+
+/// `counter += n` (wrapping) for a collector counter: a plain load and
+/// store while the GIL serializes every writer, a locked read-modify-write
+/// only in free-threaded mode.
+#[inline(always)]
+fn serial_add(counter: &AtomicUsize, n: usize) {
+    // (The debug unit-test binary runs interpreters on concurrent threads
+    // with no GIL between them: it keeps the locked form too.)
+    if cfg!(debug_assertions) || crate::gil::free_threading_enabled() {
+        counter.fetch_add(n, Ordering::AcqRel);
+    } else {
+        let v = counter.load(Ordering::Relaxed);
+        counter.store(v.wrapping_add(n), Ordering::Release);
+    }
 }
 
 /// Deferred instance tracking.
@@ -3548,9 +3613,9 @@ const DEFERRED_CAP: usize = 4096;
 /// weak `Object`, because `Object`'s payload `Arc` is what has to stay
 /// weak — holding the `Object` itself would pin the container alive.
 enum DeferredContainer {
-    List(std::sync::Weak<crate::RefCell<Vec<Object>>>),
-    Dict(std::sync::Weak<crate::RefCell<crate::object::DictData>>),
-    Set(std::sync::Weak<crate::RefCell<crate::object::SetData>>),
+    List(crate::sync::Weak<crate::RefCell<Vec<Object>>>),
+    Dict(crate::sync::Weak<crate::RefCell<crate::object::DictData>>),
+    Set(crate::sync::Weak<crate::RefCell<crate::object::SetData>>),
 }
 
 impl DeferredContainer {
@@ -3561,6 +3626,16 @@ impl DeferredContainer {
             Object::Dict(d) => Some(Self::Dict(crate::Rc::downgrade(d))),
             Object::Set(s) => Some(Self::Set(crate::Rc::downgrade(s))),
             _ => None,
+        }
+    }
+
+    /// Whether the container has died.
+    #[inline]
+    fn is_dead(&self) -> bool {
+        match self {
+            Self::List(w) => w.strong_count() == 0,
+            Self::Dict(w) => w.strong_count() == 0,
+            Self::Set(w) => w.strong_count() == 0,
         }
     }
 
@@ -3672,7 +3747,7 @@ pub fn maybe_auto_collect() -> bool {
 
 /// Convenience: find a tracked handle by object id (O(1) via the
 /// id index, which covers all generations plus the frozen set).
-pub fn find_handle(id: ObjectId) -> Option<Arc<TrackedHandle>> {
+pub fn find_handle(id: ObjectId) -> Option<HandleRc<TrackedHandle>> {
     with_state(|s| s.handle_for(id))
 }
 
@@ -3708,7 +3783,7 @@ pub fn complete_finalizer(id: ObjectId) {
 
 /// Convenience: snapshot all tracked objects with an unrun `__del__`
 /// in the shared GC (see [`GcState::finalization_candidates`]).
-pub fn finalization_candidates() -> Vec<Arc<TrackedHandle>> {
+pub fn finalization_candidates() -> Vec<HandleRc<TrackedHandle>> {
     with_state(|s| s.finalization_candidates())
 }
 
@@ -3834,13 +3909,34 @@ const SUSPECT_DORMANT_PROBES: u8 = 16;
 /// One enrolled suspect: its handle, remaining active probe budget, and
 /// (once dormant) the number of stride probes it has survived.
 struct Suspect {
-    handle: Arc<TrackedHandle>,
+    handle: HandleRc<TrackedHandle>,
     budget: u8,
     dormant_probes: u8,
 }
-type SuspectMap = indexmap::IndexMap<ObjectId, Suspect>;
-static SUSPECTS: std::sync::LazyLock<parking_lot::Mutex<SuspectMap>> =
-    std::sync::LazyLock::new(|| parking_lot::Mutex::new(SuspectMap::new()));
+type SuspectMap = indexmap::IndexMap<ObjectId, Suspect, BuildHasherDefault<ObjectIdHasher>>;
+/// The enrolled suspects, split by phase: entries with probe budget left
+/// (re-probed at every sweep) and aged-out dormant ones (re-probed only on
+/// the stride), so an ordinary sweep never walks the dormant population.
+#[derive(Default)]
+struct Suspects {
+    /// Every entry has budget remaining.
+    active: SuspectMap,
+    /// Every entry's budget is spent.
+    dormant: SuspectMap,
+}
+impl Suspects {
+    fn len(&self) -> usize {
+        self.active.len() + self.dormant.len()
+    }
+    fn contains_key(&self, id: ObjectId) -> bool {
+        self.active.contains_key(&id) || self.dormant.contains_key(&id)
+    }
+    fn values(&self) -> impl Iterator<Item = &Suspect> {
+        self.active.values().chain(self.dormant.values())
+    }
+}
+static SUSPECTS: std::sync::LazyLock<parking_lot::Mutex<Suspects>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(Suspects::default()));
 static SUSPECT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Entries with probe budget remaining. When only dormant entries are
 /// left, [`has_suspects`] admits a sweep every [`DORMANT_STRIDE`]-th
@@ -3994,46 +4090,38 @@ fn residual_suspects() -> Vec<(String, usize)> {
         .collect()
 }
 
-/// Publish the count gates after the locked suspect map changed.
-/// `active` is the caller's count of budget-remaining entries (kept
-/// incrementally; RFC 0077 WS2 retired the O(n) recount this used to
-/// do on every enrollment and removal).
-fn publish_suspect_counts(s: &SuspectMap, active: usize) {
+/// Publish the count gates after the locked suspect maps changed.
+fn publish_suspect_counts(s: &Suspects) {
+    let active = s.active.len();
     let was_active = SUSPECT_ACTIVE.swap(active, Ordering::AcqRel) > 0;
     let was_present = SUSPECT_COUNT.swap(s.len(), Ordering::AcqRel) > 0;
     // RFC 0065 (WS1): the dispatch loops' quiet-path snapshots consult
     // `active_suspects_present` / the population gates, so a
     // transition of either invalidates them. Same-state churn (one
     // active suspect replacing another) doesn't.
-    if was_active != (active > 0) || was_present != (!s.is_empty()) {
+    if was_active != (active > 0) || was_present != (s.len() > 0) {
         crate::hot_gates::bump_loop_gen();
     }
 }
 
-/// Evict the first minimum-budget entry, preserving `min_by_key`'s tie
-/// order. Zero is the minimum possible budget, so scanning can stop there.
-/// The caller holds the map lock and its exact active count throughout.
-fn evict_lowest_budget_suspect(s: &mut SuspectMap, active: &mut usize) -> bool {
-    let Some((_, first)) = s.get_index(0) else {
+/// Evict the entry that has had the most chances to die: the oldest
+/// dormant one, or with none, the first lowest-budget active one. The
+/// caller holds the maps' lock and republishes the counts.
+fn evict_lowest_budget_suspect(s: &mut Suspects) -> bool {
+    if !s.dormant.is_empty() {
+        s.dormant.shift_remove_index(0);
+        return true;
+    }
+    let Some(victim) = s
+        .active
+        .values()
+        .enumerate()
+        .min_by_key(|(_, entry)| entry.budget)
+        .map(|(index, _)| index)
+    else {
         return false;
     };
-    let mut victim = 0;
-    let mut budget = first.budget;
-    if budget > 0 {
-        for (index, entry) in s.values().enumerate().skip(1) {
-            if entry.budget < budget {
-                victim = index;
-                budget = entry.budget;
-                if budget == 0 {
-                    break;
-                }
-            }
-        }
-    }
-    let (_, removed) = s
-        .swap_remove_index(victim)
-        .expect("selected suspect exists");
-    *active = active.saturating_sub(usize::from(removed.budget > 0));
+    s.active.swap_remove_index(victim);
     true
 }
 
@@ -4052,13 +4140,13 @@ pub fn active_suspects_present() -> bool {
 /// Enroll a cascade-skipped tracked object for later deadness re-probes.
 /// Deduplicated; silently dropped when the list is full (the next full
 /// collection reclaims it instead).
-pub fn note_suspect(h: Arc<TrackedHandle>) {
+pub fn note_suspect(h: HandleRc<TrackedHandle>) {
     static NO_SUSPECTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *NO_SUSPECTS.get_or_init(|| std::env::var_os("WEAVEPY_NO_SUSPECTS").is_some()) {
         return;
     }
     let mut s = SUSPECTS.lock();
-    if s.contains_key(&h.id) {
+    if s.contains_key(h.id) {
         return;
     }
     // RFC 0065 (WS4): publish to the miss-filter before the enrollment
@@ -4075,7 +4163,6 @@ pub fn note_suspect(h: Arc<TrackedHandle>) {
         crate::weakref_registry::strong_clone_count(h.id),
         Ordering::Release,
     );
-    let mut active = SUSPECT_ACTIVE.load(Ordering::Relaxed);
     if s.len() >= SUSPECT_CAP {
         // Full: evict the most-probed entry (lowest remaining budget,
         // dormant first) — it has had the most chances to die and is
@@ -4085,12 +4172,12 @@ pub fn note_suspect(h: Arc<TrackedHandle>) {
         // arrived after ~200 module-teardown stragglers and was never
         // re-probed, pinning the Timeout→Task→frame web the test_ssl
         // leak tests watch).
-        if !evict_lowest_budget_suspect(&mut s, &mut active) {
+        if !evict_lowest_budget_suspect(&mut s) {
             return;
         }
     }
     floor_stats::bump(&floor_stats::SUSPECT_ENROLLED, 1);
-    s.insert(
+    s.active.insert(
         h.id,
         Suspect {
             handle: h,
@@ -4098,7 +4185,7 @@ pub fn note_suspect(h: Arc<TrackedHandle>) {
             dormant_probes: 0,
         },
     );
-    publish_suspect_counts(&s, active + 1);
+    publish_suspect_counts(&s);
 }
 
 /// Cheap gate for the eval loop's safe point: always sweep while an
@@ -4140,14 +4227,9 @@ pub fn remove_suspect(id: ObjectId) {
         return;
     }
     let mut s = SUSPECTS.lock();
-    if let Some(removed) = s.swap_remove(&id) {
-        let active = SUSPECT_ACTIVE.load(Ordering::Relaxed);
-        let active = if removed.budget > 0 {
-            active.saturating_sub(1)
-        } else {
-            active
-        };
-        publish_suspect_counts(&s, active);
+    let removed = s.active.swap_remove(&id).is_some() || s.dormant.swap_remove(&id).is_some();
+    if removed {
+        publish_suspect_counts(&s);
     }
 }
 
@@ -4160,24 +4242,21 @@ pub fn take_dead_suspects() -> Vec<Object> {
     let mut s = SUSPECTS.lock();
     // With only dormant entries left, `has_suspects` already stride-gated
     // this sweep; with actives present the stride ticks here instead.
-    let probe_dormant = SUSPECT_ACTIVE.load(Ordering::Relaxed) == 0
+    let probe_dormant = s.active.is_empty()
         || SUSPECT_TICK
             .fetch_add(1, Ordering::Relaxed)
             .is_multiple_of(DORMANT_STRIDE);
     floor_stats::bump(&floor_stats::SUSPECT_SWEEPS, 1);
-    let mut active = 0usize;
     let mut probed = 0u64;
-    s.retain(|_, e| {
-        // Dormant (aged-out) entries only pay on the stride tick.
-        if e.budget == 0 && !probe_dormant {
-            return true;
-        }
+    // A suspect whose last reference is gone (beyond the handle and any
+    // weakref strong clones) goes to `out`. Returns whether it stays.
+    let mut dead = |e: &Suspect, out: &mut Vec<Object>| -> Option<usize> {
         probed += 1;
         let h = &e.handle;
         // RFC 0061 (WS1b): the handle self-identifies as reclaimed (set
         // in lock-step with every index removal) — no registry lookup.
         if h.untracked.load(Ordering::Acquire) {
-            return false; // already reclaimed elsewhere
+            return None; // already reclaimed elsewhere
         }
         // Fast reject via the cached weakref-clone upper bound (refreshed
         // at enrollment): more strong refs than the handle plus every
@@ -4190,31 +4269,52 @@ pub fn take_dead_suspects() -> Vec<Object> {
             let weak = crate::weakref_registry::strong_clone_count(h.id);
             if sc <= 1 + weak {
                 out.push(h.object.clone());
-                return false;
+                return None;
             }
         }
-        // A dormant entry still well above its dead line, or one that has
-        // sat through its dormant allowance, is plainly alive: drop it
-        // from the map (see `SUSPECT_LIVE_MARGIN` / `SUSPECT_DORMANT_PROBES`).
-        if e.budget == 0 {
-            e.dormant_probes = e.dormant_probes.saturating_add(1);
-            if sc > 1 + cached + SUSPECT_LIVE_MARGIN || e.dormant_probes > SUSPECT_DORMANT_PROBES {
-                floor_stats::bump(&floor_stats::SUSPECT_FORGOTTEN, 1);
-                return false;
-            }
-            return true;
+        Some(sc.saturating_sub(1 + cached))
+    };
+    // Active entries spend a probe; one whose budget runs out turns
+    // dormant after this sweep (it isn't stride-probed in the same one).
+    let mut aged = Vec::new();
+    s.active.retain(|&id, e| {
+        if dead(e, &mut out).is_none() {
+            return false;
         }
         e.budget -= 1;
-        if e.budget > 0 {
-            active += 1;
+        if e.budget == 0 {
+            aged.push((
+                id,
+                Suspect {
+                    handle: e.handle.clone(),
+                    budget: 0,
+                    dormant_probes: e.dormant_probes,
+                },
+            ));
+            return false;
         }
         true
     });
+    if probe_dormant {
+        // A dormant entry still well above its dead line, or one that has
+        // sat through its dormant allowance, is plainly alive: drop it
+        // from the map (see `SUSPECT_LIVE_MARGIN` / `SUSPECT_DORMANT_PROBES`).
+        s.dormant.retain(|_, e| {
+            let Some(excess) = dead(e, &mut out) else {
+                return false;
+            };
+            e.dormant_probes = e.dormant_probes.saturating_add(1);
+            if excess > SUSPECT_LIVE_MARGIN || e.dormant_probes > SUSPECT_DORMANT_PROBES {
+                floor_stats::bump(&floor_stats::SUSPECT_FORGOTTEN, 1);
+                return false;
+            }
+            true
+        });
+    }
+    s.dormant.extend(aged);
     floor_stats::bump(&floor_stats::SUSPECT_PROBED, probed);
     floor_stats::bump(&floor_stats::SUSPECT_DEAD, out.len() as u64);
-    // Entries skipped as dormant stayed dormant; entries probed were
-    // recounted above, so `active` is exact.
-    publish_suspect_counts(&s, active);
+    publish_suspect_counts(&s);
     out
 }
 
@@ -4378,11 +4478,33 @@ pub fn note_dropped_marks(obj: &crate::object::Object) -> bool {
             crate::sync::Rc::strong_count(f),
             crate::sync::Rc::as_ptr(f) as usize as u64,
         ),
+        O::Type(t) => note_dropped_counted(
+            crate::sync::Rc::strong_count(t),
+            crate::sync::Rc::as_ptr(t) as usize as u64,
+        ),
         O::Tuple(t) => note_dropped_counted(
             ThinArc::strong_count(t),
             ThinArc::as_ptr(t).cast::<()>() as usize as u64,
         ),
         _ => note_dropped_marks_other(obj),
+    }
+}
+
+/// Does dropping this reference to `obj` leave an instance that others
+/// still hold, with no weakref watching it? Past two owners only a
+/// weakref-watched object can be at its dead line (see
+/// [`note_dropped_counted`]), so such a drop needs neither a prompt reap
+/// nor a mark: the cheap test ahead of the full grades.
+#[inline(always)]
+pub fn drop_survives_plainly(obj: &crate::object::Object) -> bool {
+    match obj {
+        crate::object::Object::Instance(i) => {
+            crate::sync::Rc::strong_count(i) > 2
+                && !crate::weakref_registry::may_have_weakrefs(
+                    crate::sync::Rc::as_ptr(i) as usize as u64
+                )
+        }
+        _ => false,
     }
 }
 
@@ -4562,57 +4684,39 @@ mod tests {
     use crate::object::DictData;
 
     #[test]
-    fn suspect_eviction_preserves_minimum_order_counts_and_release() {
-        for mode in 0..6 {
-            let mut suspects = SuspectMap::new();
-            let mut reference = Vec::new();
-            let mut handles = std::collections::HashMap::new();
-            for index in 0..SUSPECT_CAP {
-                let budget = match mode {
-                    0 => 0,
-                    1 => SUSPECT_BUDGET,
-                    2 => u8::from(index + 1 != SUSPECT_CAP),
-                    3 => ((SUSPECT_CAP - index) % 16 + 1) as u8,
-                    4 => ((index * 37 + 113) % 17) as u8,
-                    _ => u8::MAX,
-                };
-                let object = Object::List(Rc::new(RefCell::new(Vec::new())));
-                let handle = Arc::new(TrackedHandle::new(object, 0));
-                let id = handle.id;
-                handles.insert(id, Arc::downgrade(&handle));
-                suspects.insert(
-                    id,
-                    Suspect {
-                        handle,
-                        budget,
-                        dormant_probes: (index % 16) as u8,
-                    },
-                );
-                reference.push((id, budget));
+    fn suspect_eviction_takes_dormant_then_lowest_budget_and_releases() {
+        let mut suspects = Suspects::default();
+        let mut handles = Vec::new();
+        for index in 0..8usize {
+            let object = Object::List(Rc::new(RefCell::new(Vec::new())));
+            let handle = HandleRc::new(TrackedHandle::new(object, 0));
+            handles.push((handle.id, HandleRc::downgrade(&handle)));
+            let budget = [0, 5, 0, 3, 9, 3, 0, 1][index];
+            let entry = Suspect {
+                handle,
+                budget,
+                dormant_probes: 0,
+            };
+            if budget == 0 {
+                suspects.dormant.insert(handles[index].0, entry);
+            } else {
+                suspects.active.insert(handles[index].0, entry);
             }
-            let mut active = reference.iter().filter(|(_, b)| *b > 0).count();
-            while !reference.is_empty() {
-                // The old policy is the oracle, including the first tied
-                // minimum and the order produced by each swap removal.
-                let victim = reference
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, (_, budget))| *budget)
-                    .map(|(index, _)| index)
-                    .unwrap();
-                let (removed_id, _) = reference.swap_remove(victim);
-                assert!(evict_lowest_budget_suspect(&mut suspects, &mut active));
-                assert_eq!(active, reference.iter().filter(|(_, b)| *b > 0).count());
-                let actual: Vec<_> = suspects
-                    .iter()
-                    .map(|(id, entry)| (*id, entry.budget))
-                    .collect();
-                assert_eq!(actual, reference);
-                assert!(handles[&removed_id].upgrade().is_none());
-            }
-            assert!(!evict_lowest_budget_suspect(&mut suspects, &mut active));
-            assert_eq!(active, 0);
         }
+        // Dormant entries go first, oldest first.
+        for expected in [0, 2, 6] {
+            assert!(evict_lowest_budget_suspect(&mut suspects));
+            assert!(!suspects.contains_key(handles[expected].0));
+            assert!(handles[expected].1.upgrade().is_none());
+        }
+        // Then active ones by budget: 1, the first 3, the other 3, 5, 9.
+        for expected in [7, 3, 5, 1, 4] {
+            assert!(evict_lowest_budget_suspect(&mut suspects));
+            assert!(!suspects.contains_key(handles[expected].0));
+            assert!(handles[expected].1.upgrade().is_none());
+        }
+        assert_eq!(suspects.len(), 0);
+        assert!(!evict_lowest_budget_suspect(&mut suspects));
     }
 
     #[test]
@@ -4627,7 +4731,7 @@ mod tests {
         let slots: Vec<_> = roots
             .iter()
             .map(|target| {
-                let slot = Arc::new(WeakRefSlot::new(
+                let slot = Rc::new(WeakRefSlot::new(
                     id_of(target),
                     target.clone(),
                     false,

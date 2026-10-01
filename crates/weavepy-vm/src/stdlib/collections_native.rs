@@ -35,7 +35,6 @@ use crate::sync::RefCell;
 use crate::error::{index_error, runtime_error, stop_iteration, type_error, RuntimeError};
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
-use crate::types::PyInstance;
 
 /// The receiver must be a deque instance (any class whose `_data` slot
 /// is the backing list). CPython's method descriptor rejects a foreign
@@ -48,6 +47,43 @@ struct DequeState<'a> {
     data: Rc<RefCell<Vec<Object>>>,
 }
 
+/// The slot names, interned: a slot key stored through the attribute
+/// machinery shares the interned storage, so the hinted lookups settle on
+/// one pointer compare instead of comparing the bytes.
+struct SlotNames {
+    data: crate::shared_value::SharedStr,
+    head: crate::shared_value::SharedStr,
+    maxlen: crate::shared_value::SharedStr,
+    state: crate::shared_value::SharedStr,
+    deq: crate::shared_value::SharedStr,
+    index: crate::shared_value::SharedStr,
+    deq_state: crate::shared_value::SharedStr,
+}
+
+/// The first interpreter thread's interned names (a thread interning
+/// its own copies only misses the pointer compare, never the lookup).
+static NAMES: std::sync::OnceLock<SlotNames> = std::sync::OnceLock::new();
+
+/// The interned slot names.
+#[inline]
+fn names() -> &'static SlotNames {
+    NAMES.get_or_init(|| {
+        let intern = |n: &str| match crate::stdlib::sys::intern_name(n) {
+            Object::Str(s) => s,
+            _ => unreachable!("names intern as strings"),
+        };
+        SlotNames {
+            data: intern("_data"),
+            head: intern("_head"),
+            maxlen: intern("_maxlen"),
+            state: intern("_state"),
+            deq: intern("_deq"),
+            index: intern("_index"),
+            deq_state: intern("_deq_state"),
+        }
+    })
+}
+
 // The slot positions `deque.__init__` assigns in order (hints only; the
 // name is always verified).
 const SLOT_DATA: usize = 0;
@@ -56,14 +92,14 @@ const SLOT_MAXLEN: usize = 2;
 const SLOT_STATE: usize = 3;
 
 fn head_of(slots: &crate::types::SlotStorage) -> usize {
-    match slots.get_hinted(SLOT_HEAD, "_head") {
+    match slots.get_hinted(SLOT_HEAD, &names().head) {
         Some(Object::Int(h)) if *h >= 0 => *h as usize,
         _ => 0,
     }
 }
 
 fn set_head_of(slots: &mut crate::types::SlotStorage, h: usize) {
-    match slots.get_hinted_mut(SLOT_HEAD, "_head") {
+    match slots.get_hinted_mut(SLOT_HEAD, &names().head) {
         Some(slot) => *slot = Object::Int(h as i64),
         None => slots
             .insert("_head", Object::Int(h as i64))
@@ -72,14 +108,14 @@ fn set_head_of(slots: &mut crate::types::SlotStorage, h: usize) {
 }
 
 fn maxlen_of(slots: &crate::types::SlotStorage) -> Option<usize> {
-    match slots.get_hinted(SLOT_MAXLEN, "_maxlen") {
+    match slots.get_hinted(SLOT_MAXLEN, &names().maxlen) {
         Some(Object::Int(m)) if *m >= 0 => Some(*m as usize),
         _ => None,
     }
 }
 
 fn bump_state_of(slots: &mut crate::types::SlotStorage) {
-    match slots.get_hinted_mut(SLOT_STATE, "_state") {
+    match slots.get_hinted_mut(SLOT_STATE, &names().state) {
         Some(Object::Int(s)) => *s = s.wrapping_add(1),
         Some(slot) => *slot = Object::Int(1),
         None => slots.insert("_state", Object::Int(1)).map_or((), drop),
@@ -112,14 +148,16 @@ impl DequeState<'_> {
 // unguarded (`peek_mut` returns `None` if any guard is live) and neither
 // reference outlives the native call, which runs no Python.
 #[allow(clippy::mut_from_ref)]
-fn fast_parts(args: &[Object]) -> Option<(&mut crate::types::SlotStorage, &mut Vec<Object>)> {
+fn fast_parts(args: &[Object]) -> Option<Fast<'_>> {
     let Object::Instance(inst) = args.first()? else {
         return None;
     };
     // SAFETY: see above — no guard is live on either cell (`peek_mut`
     // checks), and neither reference outlives the native call.
     let slots = unsafe { inst.slots.peek_mut() }?;
-    let Some(Object::List(data)) = slots.get_hinted(SLOT_DATA, "_data") else {
+    let n = names();
+    let [data, head, maxlen, state] = slots.leading_mut([&n.data, &n.head, &n.maxlen, &n.state])?;
+    let Object::List(data) = data else {
         return None;
     };
     // The list lives in its own allocation, held by the `_data` slot,
@@ -127,30 +165,77 @@ fn fast_parts(args: &[Object]) -> Option<(&mut crate::types::SlotStorage, &mut V
     let data: *const RefCell<Vec<Object>> = Rc::as_ptr(data);
     // SAFETY: as above.
     let d = unsafe { (*data).peek_mut() }?;
-    Some((slots, d))
+    Some(Fast {
+        d,
+        head,
+        maxlen,
+        state,
+    })
 }
 
-/// [`popleft_locked`] over the unguarded parts (see [`fast_parts`]).
-fn popleft_fast(
-    slots: &mut crate::types::SlotStorage,
-    d: &mut Vec<Object>,
-) -> Result<Object, RuntimeError> {
-    let mut h = head_of(slots);
-    if h >= d.len() {
-        return Err(index_error("pop from an empty deque"));
+/// A deque's backing list and its `_head`, `_maxlen` and `_state` slots,
+/// borrowed unguarded (see [`fast_parts`]) and found in one pass over
+/// the slot store.
+struct Fast<'a> {
+    d: &'a mut Vec<Object>,
+    head: &'a mut Object,
+    maxlen: &'a Object,
+    state: &'a mut Object,
+}
+
+impl Fast<'_> {
+    #[inline]
+    fn head(&self) -> usize {
+        match *self.head {
+            Object::Int(h) if h >= 0 => h as usize,
+            _ => 0,
+        }
     }
-    bump_state_of(slots);
-    let x = std::mem::replace(&mut d[h], Object::None);
-    h += 1;
-    if h >= d.len() {
-        d.clear();
-        h = 0;
-    } else if h >= 32 && h * 2 >= d.len() {
-        d.drain(..h);
-        h = 0;
+
+    #[inline]
+    fn set_head(&mut self, h: usize) {
+        match &mut *self.head {
+            Object::Int(slot) => *slot = h as i64,
+            slot => *slot = Object::Int(h as i64),
+        }
     }
-    set_head_of(slots, h);
-    Ok(x)
+
+    #[inline]
+    fn maxlen(&self) -> Option<usize> {
+        match *self.maxlen {
+            Object::Int(m) if m >= 0 => Some(m as usize),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn bump_state(&mut self) {
+        match &mut *self.state {
+            Object::Int(s) => *s = s.wrapping_add(1),
+            slot => *slot = Object::Int(1),
+        }
+    }
+
+    /// [`popleft_locked`] over the unguarded parts.
+    fn popleft(&mut self) -> Result<Object, RuntimeError> {
+        let mut h = self.head();
+        let d = &mut *self.d;
+        if h >= d.len() {
+            return Err(index_error("pop from an empty deque"));
+        }
+        let x = std::mem::replace(&mut d[h], Object::None);
+        h += 1;
+        if h >= d.len() {
+            d.clear();
+            h = 0;
+        } else if h >= 32 && h * 2 >= d.len() {
+            d.drain(..h);
+            h = 0;
+        }
+        self.bump_state();
+        self.set_head(h);
+        Ok(x)
+    }
 }
 
 fn receiver<'a>(args: &'a [Object], method: &str) -> Result<DequeState<'a>, RuntimeError> {
@@ -159,7 +244,7 @@ fn receiver<'a>(args: &'a [Object], method: &str) -> Result<DequeState<'a>, Runt
         .ok_or_else(|| type_error(format!("unbound method deque.{method}() needs an argument")))?;
     if let Object::Instance(inst) = recv {
         let slots = inst.slots.borrow_mut();
-        if let Some(Object::List(data)) = slots.get_hinted(SLOT_DATA, "_data") {
+        if let Some(Object::List(data)) = slots.get_hinted(SLOT_DATA, &names().data) {
             let data = data.clone();
             return Ok(DequeState { slots, data });
         }
@@ -172,13 +257,6 @@ fn receiver<'a>(args: &'a [Object], method: &str) -> Result<DequeState<'a>, Runt
 
 /// Read-only helper for the iterator paths that still address the
 /// instance directly.
-fn head(inst: &PyInstance) -> usize {
-    match inst.slot_get("_head") {
-        Some(Object::Int(h)) if h >= 0 => h as usize,
-        _ => 0,
-    }
-}
-
 fn popleft_locked(st: &mut DequeState<'_>, d: &mut Vec<Object>) -> Result<Object, RuntimeError> {
     let mut h = st.head();
     if h >= d.len() {
@@ -200,11 +278,11 @@ fn popleft_locked(st: &mut DequeState<'_>, d: &mut Vec<Object>) -> Result<Object
 
 fn deque_append(args: &[Object]) -> Result<Object, RuntimeError> {
     if let [_, x] = args {
-        if let Some((slots, d)) = fast_parts(args) {
-            bump_state_of(slots);
-            d.push(x.clone());
-            let trimmed = match maxlen_of(slots) {
-                Some(m) if d.len() - head_of(slots) > m => Some(popleft_fast(slots, d)?),
+        if let Some(mut f) = fast_parts(args) {
+            f.bump_state();
+            f.d.push(x.clone());
+            let trimmed = match f.maxlen() {
+                Some(m) if f.d.len() - f.head() > m => Some(f.popleft()?),
                 _ => None,
             };
             if trimmed.is_some() {
@@ -250,6 +328,28 @@ fn deque_append(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn deque_appendleft(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let [_, x] = args {
+        if let Some(mut f) = fast_parts(args) {
+            f.bump_state();
+            let mut h = f.head().min(f.d.len());
+            if h == 0 {
+                h = std::cmp::max(8, f.d.len() / 2);
+                f.d.splice(0..0, std::iter::repeat_n(Object::None, h));
+            }
+            h -= 1;
+            f.d[h] = x.clone();
+            f.set_head(h);
+            let trimmed = match f.maxlen() {
+                Some(m) if f.d.len() - h > m => f.d.pop(),
+                _ => None,
+            };
+            if trimmed.is_some() {
+                crate::gc_trace::mark_maybe_dead();
+            }
+            drop(trimmed);
+            return Ok(Object::None);
+        }
+    }
     let mut st = receiver(args, "appendleft")?;
     let x = match args {
         [_, x] => x.clone(),
@@ -288,14 +388,16 @@ fn deque_appendleft(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn deque_pop(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() == 1 {
-        if let Some((slots, d)) = fast_parts(args) {
-            let h = head_of(slots);
-            if d.len() > h {
-                bump_state_of(slots);
-                let x = d.pop().expect("len checked");
-                if d.len() == h && h != 0 {
-                    d.clear();
-                    set_head_of(slots, 0);
+        if let Some(mut f) = fast_parts(args) {
+            let h = f.head();
+            if f.d.len() > h {
+                f.bump_state();
+                let x = f.d.pop().expect("len checked");
+                // An emptied deque keeps a short free prefix for the next
+                // `appendleft` instead of splicing a new one.
+                if f.d.len() == h && h > 32 {
+                    f.d.clear();
+                    f.set_head(0);
                 }
                 return Ok(x);
             }
@@ -325,9 +427,9 @@ fn deque_pop(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn deque_popleft(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() == 1 {
-        if let Some((slots, d)) = fast_parts(args) {
-            if head_of(slots) < d.len() {
-                return popleft_fast(slots, d);
+        if let Some(mut f) = fast_parts(args) {
+            if f.head() < f.d.len() {
+                return f.popleft();
             }
         }
     }
@@ -345,8 +447,8 @@ fn deque_popleft(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn deque_len(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() == 1 {
-        if let Some((slots, d)) = fast_parts(args) {
-            return Ok(Object::Int(d.len().saturating_sub(head_of(slots)) as i64));
+        if let Some(f) = fast_parts(args) {
+            return Ok(Object::Int(f.d.len().saturating_sub(f.head()) as i64));
         }
     }
     let st = receiver(args, "__len__")?;
@@ -359,8 +461,8 @@ fn deque_len(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn deque_bool(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() == 1 {
-        if let Some((slots, d)) = fast_parts(args) {
-            return Ok(Object::Bool(d.len() > head_of(slots)));
+        if let Some(f) = fast_parts(args) {
+            return Ok(Object::Bool(f.d.len() > f.head()));
         }
     }
     let st = receiver(args, "__bool__")?;
@@ -372,6 +474,16 @@ fn deque_bool(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn deque_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let [_, Object::Int(i)] = args {
+        if let Some(f) = fast_parts(args) {
+            let h = f.head();
+            let n = f.d.len().saturating_sub(h) as i64;
+            let index = if *i < 0 { *i + n } else { *i };
+            if (0..n).contains(&index) {
+                return Ok(f.d[h + index as usize].clone());
+            }
+        }
+    }
     let [_, index] = args else {
         receiver(args, "__getitem__")?;
         return Err(type_error("deque.__getitem__() takes one argument"));
@@ -464,39 +576,123 @@ fn deque_reverse_iterator_next(args: &[Object]) -> Result<Object, RuntimeError> 
     deque_next(args, true)
 }
 
+// The iterator classes' slot positions as their `__init__` assigns them
+// (hints, like the deque's own).
+const IT_DEQ: usize = 0;
+const IT_INDEX: usize = 1;
+const IT_STATE: usize = 2;
+
+/// [`deque_next`]'s common case over unguarded views (see
+/// [`fast_parts`]): a live iterator over an unmutated deque with an item
+/// left. `None` (nothing touched) leaves every other case to the full
+/// body.
+fn deque_next_fast(iterator: &crate::types::PyInstance, reverse: bool) -> Option<Object> {
+    // SAFETY: no guard is live on the cells (`peek`/`peek_mut` check), no
+    // Python runs before the last use, and the iterator and its deque are
+    // distinct objects.
+    let its = unsafe { iterator.slots.peek_mut() }?;
+    let n = names();
+    let [deque, index, it_state] = its.leading_mut([&n.deq, &n.index, &n.deq_state])?;
+    let Object::Instance(deque) = deque else {
+        return None;
+    };
+    // The deque lives while the iterator's slot holds it (unchanged here).
+    let deque: *const crate::types::PyInstance = Rc::as_ptr(deque);
+    let Object::Int(i) = index else {
+        return None;
+    };
+    // SAFETY: as above.
+    let ds = unsafe { (*deque).slots.peek() }?;
+    let [data, head, _, state] = ds.leading([&n.data, &n.head, &n.maxlen, &n.state])?;
+    let Object::List(data) = data else {
+        return None;
+    };
+    if state.as_i64() != it_state.as_i64() {
+        return None;
+    }
+    let h = match *head {
+        Object::Int(h) if h >= 0 => h as usize,
+        _ => 0,
+    };
+    // SAFETY: as above.
+    let d = unsafe { data.peek() }?;
+    let h = h.min(d.len());
+    let index = *i;
+    if index < 0 || index as usize >= d.len() - h {
+        return None;
+    }
+    let slot = if reverse {
+        d.len() - 1 - index as usize
+    } else {
+        h + index as usize
+    };
+    let v = d[slot].clone();
+    *i = index + 1;
+    Some(v)
+}
+
 fn deque_next(args: &[Object], reverse: bool) -> Result<Object, RuntimeError> {
     let [Object::Instance(iterator)] = args else {
         return Err(type_error("deque iterator __next__ requires one iterator"));
     };
-    let deque = match iterator.slot_get("_deq") {
-        Some(Object::Instance(deque)) => deque,
-        Some(Object::None) => return Err(stop_iteration()),
-        _ => return Err(type_error("deque iterator expected")),
+    if let Some(v) = deque_next_fast(iterator, reverse) {
+        return Ok(v);
+    }
+    let (deque, index, it_state) = {
+        let s = iterator.slots.borrow();
+        let deque = match s.get_hinted(IT_DEQ, "_deq") {
+            Some(Object::Instance(deque)) => deque.clone(),
+            Some(Object::None) => return Err(stop_iteration()),
+            _ => return Err(type_error("deque iterator expected")),
+        };
+        (
+            deque,
+            s.get_hinted(IT_INDEX, &names().index)
+                .and_then(Object::as_i64),
+            s.get_hinted(IT_STATE, &names().deq_state)
+                .and_then(Object::as_i64),
+        )
     };
-    let Some(Object::List(data)) = deque.slot_get("_data") else {
-        return Err(type_error("deque expected"));
+    let (data, h, state) = {
+        let s = deque.slots.borrow();
+        let Some(Object::List(data)) = s.get_hinted(SLOT_DATA, "_data") else {
+            return Err(type_error("deque expected"));
+        };
+        (
+            data.clone(),
+            head_of(&s),
+            s.get_hinted(SLOT_STATE, "_state").and_then(Object::as_i64),
+        )
     };
     // Serialize the state check, cursor advance, and item read with deque
     // end operations, including simultaneous next() calls under gil=0.
     // The local deque reference outlives the guard, so clearing _deq can't
     // finalize its items while the backing list is borrowed.
     let d = data.borrow();
-    if deque.slot_get("_state").and_then(|s| s.as_i64())
-        != iterator.slot_get("_deq_state").and_then(|s| s.as_i64())
-    {
+    if state != it_state {
         iterator.slot_set("_deq", Object::None);
         return Err(runtime_error("deque mutated during iteration"));
     }
-    let h = head(&deque).min(d.len());
-    let index = iterator
-        .slot_get("_index")
-        .and_then(|i| i.as_i64())
-        .ok_or_else(|| type_error("invalid deque iterator index"))?;
+    let h = h.min(d.len());
+    let index = index.ok_or_else(|| type_error("invalid deque iterator index"))?;
     if index < 0 || index as usize >= d.len() - h {
         iterator.slot_set("_deq", Object::None);
         return Err(stop_iteration());
     }
-    iterator.slot_set("_index", Object::Int(index + 1));
+    let advanced = match iterator
+        .slots
+        .borrow_mut()
+        .get_hinted_mut(IT_INDEX, "_index")
+    {
+        Some(slot) => {
+            *slot = Object::Int(index + 1);
+            true
+        }
+        None => false,
+    };
+    if !advanced {
+        iterator.slot_set("_index", Object::Int(index + 1));
+    }
     let slot = if reverse {
         d.len() - 1 - index as usize
     } else {

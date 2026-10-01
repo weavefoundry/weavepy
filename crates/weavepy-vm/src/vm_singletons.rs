@@ -174,6 +174,12 @@ fn make_singleton(cls: Rc<TypeObject>) -> Object {
 /// `NotImplementedType` (an `object` subclass), so `type(NotImplemented)`
 /// and the MRO match CPython.
 pub fn not_implemented() -> Object {
+    not_implemented_ref().clone()
+}
+
+/// [`not_implemented`] by reference. The singleton is process-wide, built
+/// on the first thread to ask, whose type registry supplies its class.
+fn not_implemented_ref() -> &'static Object {
     static SLOT: OnceLock<Object> = OnceLock::new();
     SLOT.get_or_init(|| {
         let cls = crate::builtin_types::builtin_types()
@@ -181,18 +187,35 @@ pub fn not_implemented() -> Object {
             .clone();
         make_singleton(cls)
     })
-    .clone()
 }
 
 /// Same idea for `Ellipsis` (the value of `...`); its class is the
 /// registry's `ellipsis` type.
 pub fn ellipsis() -> Object {
+    ellipsis_ref().clone()
+}
+
+/// [`ellipsis`] by reference (see [`not_implemented_ref`]).
+fn ellipsis_ref() -> &'static Object {
     static SLOT: OnceLock<Object> = OnceLock::new();
     SLOT.get_or_init(|| {
         let cls = crate::builtin_types::builtin_types().ellipsis_.clone();
         make_singleton(cls)
     })
-    .clone()
+}
+
+/// Whether `obj` is the process-wide singleton `single`, or another
+/// instance of its type or of this thread's registry type `cls` (a thread
+/// with its own registry, or a C-API proxy, sees the same singleton).
+fn is_singleton_of(obj: &Object, single: &Object, cls: &Rc<TypeObject>) -> bool {
+    let (Object::Instance(inst), Object::Instance(one)) = (obj, single) else {
+        return false;
+    };
+    if Rc::ptr_eq(inst, one) {
+        return true;
+    }
+    let ty = inst.cls();
+    Rc::ptr_eq(&ty, cls) || Rc::ptr_eq(&ty, &one.cls())
 }
 
 /// `True` if `obj` is the canonical `Ellipsis` singleton — an instance of
@@ -203,26 +226,24 @@ pub fn ellipsis() -> Object {
 /// (numpy's `prepare_index`) takes the right branch rather than rejecting a
 /// freshly-boxed proxy with "only integers, slices … are valid indices".
 pub fn is_ellipsis(obj: &Object) -> bool {
-    if let Object::Instance(inst) = obj {
-        return Rc::ptr_eq(
-            &inst.cls(),
+    matches!(obj, Object::Instance(_))
+        && is_singleton_of(
+            obj,
+            ellipsis_ref(),
             &crate::builtin_types::builtin_types().ellipsis_,
-        );
-    }
-    false
+        )
 }
 
 /// `True` if `obj` is the canonical `NotImplemented` singleton. The C-API
 /// bridge maps it to the static `_Py_NotImplementedStruct` so extensions
 /// that compare against `Py_NotImplemented` by pointer behave correctly.
 pub fn is_not_implemented(obj: &Object) -> bool {
-    if let Object::Instance(inst) = obj {
-        return Rc::ptr_eq(
-            &inst.cls(),
+    matches!(obj, Object::Instance(_))
+        && is_singleton_of(
+            obj,
+            not_implemented_ref(),
             &crate::builtin_types::builtin_types().not_implemented_type_,
-        );
-    }
-    false
+        )
 }
 
 /// CPython's `help`/`copyright`/`license`/`credits` builtins are
@@ -295,7 +316,7 @@ pub fn publish_interpreter_seed(interp: &crate::Interpreter) {
     let mut slot = seed_slot().lock();
     *slot = Some(interp.fork_for_thread());
     drop(slot);
-    *seed_types_slot().lock() = Some(crate::builtin_types::builtin_types());
+    *seed_types_slot().lock() = Some(crate::builtin_types::builtin_types_rc());
 }
 
 /// Run `f` (typically a `Interpreter::new()` for a *sub*-interpreter)
@@ -797,8 +818,8 @@ thread_local! {
     /// A queue request for an id in this set is the cascade observing
     /// itself and is dropped; requests for *other* objects (a child body
     /// whose last C pin fell during the teardown) still queue normally.
-    static CASCADING_IDS: RefCell<std::collections::HashSet<u64>> =
-        RefCell::new(std::collections::HashSet::new());
+    static CASCADING_IDS: RefCell<crate::fasthash::FxHashSet<u64>> =
+        RefCell::new(crate::fasthash::FxHashSet::default());
 }
 
 /// RAII marker for one object's trip through the prompt reaper's cascade;

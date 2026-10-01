@@ -312,7 +312,7 @@ fn get_threshold(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn set_threshold(args: &[Object]) -> Result<Object, RuntimeError> {
-    let mut vals = [700usize, 10, 10];
+    let mut vals = [2000usize, 10, 10];
     for (slot, v) in vals.iter_mut().zip(args.iter()) {
         if let Object::Int(n) = v {
             *slot = (*n).max(0) as usize;

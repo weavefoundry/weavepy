@@ -2655,7 +2655,7 @@ fn slot_sizeof(args: &[Object]) -> Result<Object, RuntimeError> {
                     return Ok(Object::Int(28 + 4 * ndigits));
                 }
             }
-            16 + 8 * inst.dict.get().map_or(0, |dict| dict.borrow().len()) as i64
+            16 + 8 * inst.attr_count() as i64
         }
         // CPython's compact-unicode layout (test_str.test_raiseMemError):
         // ASCII is a 40-byte struct + len+1 one-byte units; anything wider
@@ -4117,12 +4117,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                 if let Some(v) = f.slot(name) {
                     return Some(v);
                 }
-            } else if let Some(v) = f
-                .attrs()
-                .borrow()
-                .get(&crate::object::DictKey(Object::from_str(name)))
-                .cloned()
-            {
+            } else if let Some(v) = f.attr_get(name) {
                 return Some(v);
             }
             // Synthetic dunders. Mirror `Vm::load_attr`'s function
@@ -8244,17 +8239,9 @@ fn b_sorted(args: &[Object]) -> Result<Object, RuntimeError> {
     while let Some(v) = it.next_value() {
         buf.push(v);
     }
-    let mut err: Option<RuntimeError> = None;
-    buf.sort_by(|a: &Object, b: &Object| match a.cmp(b) {
-        Ok(o) => o,
-        Err(e) => {
-            err = Some(e);
-            std::cmp::Ordering::Equal
-        }
-    });
-    if let Some(e) = err {
-        return Err(e);
-    }
+    crate::timsort::sort(&mut buf, |a, b| {
+        crate::compare_op(a, b, weavepy_compiler::CompareKind::Lt)
+    })?;
     let obj = Object::new_list(buf);
     crate::gc_trace::track(obj.clone());
     Ok(obj)
@@ -8562,7 +8549,7 @@ pub(crate) fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object 
             d
         }))
         .into(),
-        native: std::sync::OnceLock::new(),
+        native: crate::sync::OnceBox::new(),
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
         hash_cache: crate::sync::CachedHash::new(None),
@@ -8641,7 +8628,7 @@ pub(crate) fn build_super_proxy(
             d
         }))
         .into(),
-        native: std::sync::OnceLock::new(),
+        native: crate::sync::OnceBox::new(),
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
         hash_cache: crate::sync::CachedHash::new(None),
@@ -9276,7 +9263,7 @@ pub fn ensure_hashable(obj: &Object) -> Result<(), RuntimeError> {
         // container lookup runs (test_import's unhashable-`__name__`
         // str subclass in set membership).
         Object::Instance(inst) => {
-            if matches!(inst.cls().lookup("__hash__"), Some(Object::None)) {
+            if inst.class_dunder(crate::types::Dunder::Hash).is_none() {
                 return Err(type_error(format!(
                     "unhashable type: '{}'",
                     inst.cls().name
@@ -9555,9 +9542,11 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
             // transplants pytest marks onto its wrapper that way, so a dir
             // that hid `f.pytestmark` silently dropped every
             // `@pytest.mark.parametrize` stacked under `@given`.
-            for k in f.attrs().borrow().keys() {
-                if let Object::Str(s) = &k.0 {
-                    names.insert(s.to_string());
+            if let Some(attrs) = f.attrs.borrow().as_ref() {
+                for k in attrs.borrow().keys() {
+                    if let Object::Str(s) = &k.0 {
+                        names.insert(s.to_string());
+                    }
                 }
             }
             for n in [
@@ -10434,7 +10423,7 @@ fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
         closure: f.closure.clone(),
         // Shared, not copied: `func.__dict__` mutations stay visible on
         // both, matching CPython where the function object is the same.
-        attrs: RefCell::new(f.attrs()),
+        attrs: RefCell::new(Some(f.attrs())),
         slots: RefCell::new(f.slots.borrow().clone()),
         closure_cells: std::sync::OnceLock::new(),
         // The copied slot store carries any override along.
@@ -11324,6 +11313,25 @@ pub(crate) fn substr_find(hay: &str, needle: &str) -> Option<usize> {
         return hay.find(needle);
     }
     let last_start = h.len() - n.len();
+    if n[0].is_ascii() {
+        // An ASCII byte is never inside a multibyte character, so every
+        // hit is a character boundary: scan the bytes directly (no char
+        // searcher) and compare the short rest inline (no `memcmp` call).
+        let mut i = 0;
+        let mut budget = h.len() / n.len() + 32;
+        while i <= last_start {
+            let at = i + memchr::memchr(n[0], &h[i..=last_start])?;
+            if short_bytes_eq(&h[at + 1..at + n.len()], &n[1..]) {
+                return Some(at);
+            }
+            budget -= 1;
+            if budget == 0 {
+                return hay[at + 1..].find(needle).map(|k| k + at + 1);
+            }
+            i = at + 1;
+        }
+        return None;
+    }
     // `str::find(char)` is memchr-backed, so the candidate scan runs at
     // vector width; the manual byte loop it replaced did not.
     let first = needle.chars().next()?;
@@ -11350,6 +11358,13 @@ pub(crate) fn substr_find(hay: &str, needle: &str) -> Option<usize> {
         i = at + step;
     }
     None
+}
+
+/// `a == b` for the short needle tails the substring scans compare, inline
+/// (a `memcmp` call costs more than comparing a few bytes).
+#[inline(always)]
+fn short_bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x == y)
 }
 
 /// [`substr_find`] from the right.
@@ -11389,6 +11404,24 @@ pub(crate) fn substr_count(hay: &str, needle: &str) -> usize {
         return hay.matches(needle).count();
     }
     let last_start = h.len() - n.len();
+    if n[0].is_ascii() {
+        // As `substr_find`'s ASCII scan (every hit is a boundary).
+        let mut count = 0;
+        let mut i = 0;
+        while i <= last_start {
+            let Some(off) = memchr::memchr(n[0], &h[i..=last_start]) else {
+                break;
+            };
+            let at = i + off;
+            if short_bytes_eq(&h[at + 1..at + n.len()], &n[1..]) {
+                count += 1;
+                i = at + n.len();
+            } else {
+                i = at + 1;
+            }
+        }
+        return count;
+    }
     let Some(first) = needle.chars().next() else {
         return 0;
     };
@@ -12411,8 +12444,8 @@ fn list_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(1)
         .ok_or_else(|| type_error("__getitem__ expected 1 argument"))?;
     if let Object::Slice(s) = key {
-        let seq = l.borrow().clone();
-        return Ok(Object::new_list(crate::slice_seq(&seq, s)?));
+        let sliced = crate::slice_seq(&l.borrow(), s)?;
+        return Ok(Object::new_list(sliced));
     }
     let l = l.borrow();
     let n = list_index_arg(l.len(), key, "__getitem__")?;
@@ -12485,7 +12518,11 @@ fn list_pop(args: &[Object]) -> Result<Object, RuntimeError> {
     let l = list_self(args)?;
     let mut l = l.borrow_mut();
     let idx = if args.len() > 1 {
-        match &args[1] {
+        let index = match &args[1] {
+            Object::Bool(b) => Object::Int(i64::from(*b)),
+            other => other.clone(),
+        };
+        match &index {
             Object::Int(i) => {
                 if l.is_empty() {
                     return Err(index_error("pop from empty list"));
@@ -12873,18 +12910,9 @@ fn range_count(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn list_sort(args: &[Object]) -> Result<Object, RuntimeError> {
     let l = list_self(args)?;
-    let mut err: Option<RuntimeError> = None;
-    l.borrow_mut()
-        .sort_by(|a: &Object, b: &Object| match a.cmp(b) {
-            Ok(o) => o,
-            Err(e) => {
-                err = Some(e);
-                std::cmp::Ordering::Equal
-            }
-        });
-    if let Some(e) = err {
-        return Err(e);
-    }
+    crate::timsort::sort(&mut l.borrow_mut(), |a, b| {
+        crate::compare_op(a, b, weavepy_compiler::CompareKind::Lt)
+    })?;
     Ok(Object::None)
 }
 
@@ -12969,6 +12997,17 @@ pub(crate) fn dict_lookup(
     d: &Rc<RefCell<DictData>>,
     key: &Object,
 ) -> Result<Option<Object>, RuntimeError> {
+    // A `str` or `int` key settles by native equality unless the table
+    // compared it with a key of another kind.
+    if let Some(probe) = crate::object::LeafProbe::new(key) {
+        if let Ok(m) = d.try_borrow() {
+            match m.get(&probe) {
+                Some(v) => return Ok(Some(v.clone())),
+                None if probe.miss_is_exact() => return Ok(None),
+                None => {}
+            }
+        }
+    }
     if crate::object::dict_key_is_reentrant(key) {
         return crate::object::dict_reentrant_get(d, key);
     }

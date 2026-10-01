@@ -23,8 +23,12 @@ use crate::types::{PyInstance, TypeObject};
 const FRAME_TARGET: usize = 65_536;
 const MAX_DEPTH: usize = 128;
 
+#[inline(always)]
 fn extend(output: &mut Vec<u8>, data: &[u8]) -> Option<()> {
-    output.try_reserve(data.len()).ok()?;
+    // (The fallible reservation only when the buffer is short.)
+    if output.capacity() - output.len() < data.len() {
+        output.try_reserve(data.len()).ok()?;
+    }
     output.extend_from_slice(data);
     Some(())
 }
@@ -36,6 +40,7 @@ struct Framer {
 }
 
 impl Framer {
+    #[inline]
     fn write(&mut self, data: &[u8]) -> Option<()> {
         if self.frame_start.is_none() {
             let start = self.output.len();
@@ -550,9 +555,17 @@ fn encode_with_context(
     if !matches!(protocol, 4 | 5) {
         return None;
     }
+    // The previous call's memo table (emptied, its capacity kept) and
+    // output size: a `dumps` loop then neither regrows the table nor
+    // copies the output as it doubles.
+    let memo = SPARE_MEMO.with(std::cell::Cell::take).unwrap_or_default();
+    let hint = OUTPUT_HINT.with(std::cell::Cell::get);
     let mut encoder = Encoder {
-        writer: Framer::default(),
-        memo: FxHashMap::default(),
+        writer: Framer {
+            output: Vec::new(),
+            frame_start: None,
+        },
+        memo,
         anonymous: 0,
         active: Vec::new(),
         python_headroom,
@@ -561,12 +574,37 @@ fn encode_with_context(
         classes: FxHashMap::default(),
         slot_name_caches: Vec::new(),
     };
-    extend(&mut encoder.writer.output, &[0x80, protocol])?;
-    encoder.save(value, 0)?;
-    encoder.writer.write(b".")?;
-    encoder.writer.commit(true);
-    encoder.publish_slot_name_caches();
+    let done = (|| {
+        encoder
+            .writer
+            .output
+            .try_reserve(hint.clamp(64, MAX_OUTPUT_HINT))
+            .ok()?;
+        extend(&mut encoder.writer.output, &[0x80, protocol])?;
+        encoder.save(value, 0)?;
+        encoder.writer.write(b".")?;
+        encoder.writer.commit(true);
+        encoder.publish_slot_name_caches();
+        Some(())
+    })();
+    let mut memo = std::mem::take(&mut encoder.memo);
+    if memo.capacity() <= MAX_SPARE_MEMO {
+        memo.clear();
+        SPARE_MEMO.with(|spare| spare.set(Some(memo)));
+    }
+    done?;
+    OUTPUT_HINT.with(|h| h.set(encoder.writer.output.len()));
     Some(encoder.writer.output)
+}
+
+/// The largest memo table and output reservation kept between calls.
+const MAX_SPARE_MEMO: usize = 1 << 14;
+const MAX_OUTPUT_HINT: usize = 1 << 20;
+
+thread_local! {
+    static SPARE_MEMO: std::cell::Cell<Option<FxHashMap<i64, (u32, Object)>>> =
+        const { std::cell::Cell::new(None) };
+    static OUTPUT_HINT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

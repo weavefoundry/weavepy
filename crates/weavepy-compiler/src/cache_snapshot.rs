@@ -97,8 +97,15 @@ impl SelectStorage for Select<false> {
 
 // Avoid portable-atomic's global-lock fallback. An inherited global lock can
 // belong to a vanished writer after fork; advisory caches can simply miss.
-pub(crate) type CacheSnapshot =
-    <Select<{ portable_atomic::AtomicU128::is_always_lock_free() }> as SelectStorage>::Storage;
+//
+// On x86_64 without AVX enabled at compile time, portable-atomic picks its
+// 128-bit load at run time, so every cache read is an out-of-line indirect
+// call. The epoch snapshot's loads are plain inline moves there, and cache
+// reads vastly outnumber cache writes.
+const NATIVE_SNAPSHOT: bool = portable_atomic::AtomicU128::is_always_lock_free()
+    && !(cfg!(target_arch = "x86_64") && !cfg!(target_feature = "avx"));
+
+pub(crate) type CacheSnapshot = <Select<NATIVE_SNAPSHOT> as SelectStorage>::Storage;
 
 #[cfg(test)]
 mod tests {

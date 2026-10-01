@@ -44,10 +44,29 @@ impl FunctionGuard {
         let Object::Function(function) = value else {
             return false;
         };
-        if Rc::as_ptr(function) != self.function.as_ptr()
-            || Rc::as_ptr(&function.code.borrow()) != self.code.as_ptr()
-        {
+        Rc::as_ptr(function) == self.function.as_ptr() && self.holds_function(function)
+    }
+
+    /// Whether the guarded function is still alive and unchanged.
+    fn holds_live(&self) -> bool {
+        if self.function.strong_count() == 0 {
             return false;
+        }
+        // SAFETY: a live strong count keeps the function allocated, and
+        // nothing here can release it.
+        self.holds_function(unsafe { &*self.function.as_ptr() })
+    }
+
+    /// `function` (the guarded one) still runs the guarded code with its
+    /// compiled defaults.
+    fn holds_function(&self, function: &PyFunction) -> bool {
+        if Rc::as_ptr(&function.code.borrow()) != self.code.as_ptr() {
+            return false;
+        }
+        // Only an assignment to `__defaults__` or `__kwdefaults__` raises
+        // the flag, so the common function skips the slot probes.
+        if !function.defaults_maybe_overridden() {
+            return true;
         }
         let slots = function.slots.borrow();
         !slots.contains_key(&StrKey("__defaults__"))
@@ -412,15 +431,12 @@ impl ClassFunctionsGuard {
     }
 
     fn holds(&self) -> bool {
-        self.class.upgrade().is_some_and(|class| {
-            class.attr_version.get() == self.version
-                && self.functions.iter().all(|guard| {
-                    guard
-                        .function
-                        .upgrade()
-                        .is_some_and(|f| guard.holds(&Object::Function(f)))
-                })
-        })
+        // An unchanged version proves the class holds the same functions;
+        // each one's code and defaults can still change in place.
+        self.class.strong_count() > 0
+            // SAFETY: a live strong count keeps the class allocated.
+            && unsafe { &*self.class.as_ptr() }.attr_version.get() == self.version
+            && self.functions.iter().all(FunctionGuard::holds_live)
     }
 }
 
@@ -593,8 +609,12 @@ trait Sink<'a> {
     fn build(&mut self, target: &Self::Value, state: Self::Value) -> Option<()>;
 }
 
+#[inline(always)]
 fn push<T>(items: &mut Vec<T>, value: T) -> Option<()> {
-    items.try_reserve(1).ok()?;
+    // (The fallible reservation only when the vector is full.)
+    if items.len() == items.capacity() {
+        items.try_reserve(1).ok()?;
+    }
     items.push(value);
     Some(())
 }
@@ -928,6 +948,10 @@ struct Probe<'a, 'c, const RECORD_OPCODES: bool> {
     builds: Vec<(StateNodes, Option<u32>)>,
     context: &'c dyn Fn() -> Option<DecodeContext>,
     resolved: Option<DecodeContext>,
+    /// The `__slots__` members already verified in this stream (see
+    /// `classes::is_member_slot`): every instance of a class names the
+    /// same ones.
+    member_slots: Vec<(*const TypeObject, &'a str)>,
 }
 
 impl<'a, 'c, const RECORD_OPCODES: bool> Probe<'a, 'c, RECORD_OPCODES> {
@@ -939,7 +963,26 @@ impl<'a, 'c, const RECORD_OPCODES: bool> Probe<'a, 'c, RECORD_OPCODES> {
             builds: Vec::new(),
             context,
             resolved: None,
+            member_slots: Vec::new(),
         }
+    }
+
+    /// [`classes::is_member_slot`], remembered for this stream. (No Python
+    /// runs during the probe, so the class can't change in between.)
+    fn is_member_slot(&mut self, class: &Rc<TypeObject>, name: &'a str) -> bool {
+        let key = Rc::as_ptr(class);
+        if self
+            .member_slots
+            .iter()
+            .any(|&(c, n)| c == key && n == name)
+        {
+            return true;
+        }
+        let yes = classes::is_member_slot(class, name);
+        if yes && self.member_slots.len() < 64 {
+            self.member_slots.push((key, name));
+        }
+        yes
     }
 
     /// Count the references to each node that the result keeps: the root,
@@ -1243,10 +1286,11 @@ impl<'a, const RECORD_OPCODES: bool> Sink<'a> for Probe<'a, '_, RECORD_OPCODES> 
         }
         if let Some(slots) = nodes.slots {
             // `setattr` must reach a member descriptor of `__slots__`.
-            if !self
-                .state_keys(slots)?
-                .iter()
-                .all(|name| classes::is_member_slot(&class.class, name))
+            let names = self.state_keys(slots)?.to_vec();
+            let class = class.class.clone();
+            if !names
+                .into_iter()
+                .all(|name| self.is_member_slot(&class, name))
             {
                 return None;
             }
@@ -1397,7 +1441,19 @@ impl<'a> Sink<'a> for Objects {
         let Object::Type(class) = class else {
             return None;
         };
-        // `object.__new__(cls)`, including its cycle-collector registration.
+        // `object.__new__(cls)`, including its cycle-collector registration:
+        // deferred, as for a plain class's ordinary construction, until the
+        // instance could hold a non-atomic value (the state paths below
+        // track it then).
+        if class.native_kind.get() == 0
+            && !class.flags.is_builtin
+            && !class.instances_need_finalize()
+        {
+            self.next_node += 1;
+            return Some(Object::Instance(crate::types::PyInstance::new_deferred(
+                class.clone(),
+            )));
+        }
         let instance = Object::Instance(Rc::new(crate::types::PyInstance::new(class.clone())));
         self.created(&instance);
         Some(instance)
@@ -1428,8 +1484,12 @@ impl<'a> Sink<'a> for Objects {
             }
         }
         if let Some(slots) = slots {
-            // `setattr(inst, key, value)` on a verified member descriptor.
-            instance.ensure_gc_tracked();
+            // `setattr(inst, key, value)` on a verified member descriptor,
+            // whose write barrier tracks a deferred instance at its first
+            // non-atomic value.
+            if slots.borrow().iter().any(|(_, v)| !v.is_gc_atomic()) {
+                instance.ensure_gc_tracked();
+            }
             let mut storage = instance.slots.borrow_mut();
             if movable.slots.is_some() {
                 let data = std::mem::take(&mut *slots.borrow_mut());

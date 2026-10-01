@@ -37,6 +37,90 @@ static NEXT_TYPE_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// cached entry (RFC 0077 WS4, [`type_cache`]). Reads are relaxed atomic
 /// loads — the previous `Cell<u32>` paid a `GilCell` lock round-trip on
 /// every inline-cache guard.
+/// Dunders whose resolution [`TypeObject::dunder`] memoises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dunder {
+    Eq,
+    Hash,
+    GetAttr,
+    GetAttribute,
+}
+
+impl Dunder {
+    pub const COUNT: usize = 4;
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Eq => "__eq__",
+            Self::Hash => "__hash__",
+            Self::GetAttr => "__getattr__",
+            Self::GetAttribute => "__getattribute__",
+        }
+    }
+}
+
+/// How a type resolves one dunder, as a set of flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DunderInfo(u8);
+
+impl DunderInfo {
+    const VALID: u8 = 1;
+    const PRESENT: u8 = 1 << 1;
+    const NONE: u8 = 1 << 2;
+    const FUNCTION: u8 = 1 << 3;
+    const BUILTIN_OWNER: u8 = 1 << 4;
+    const OBJECT_OWNER: u8 = 1 << 5;
+
+    fn resolve(found: Option<(Object, Rc<TypeObject>)>) -> Self {
+        let Some((value, owner)) = found else {
+            return Self(Self::VALID);
+        };
+        let mut bits = Self::VALID | Self::PRESENT;
+        match value {
+            Object::None => bits |= Self::NONE,
+            Object::Function(_) | Object::BoundMethod(_) => bits |= Self::FUNCTION,
+            _ => {}
+        }
+        if owner.flags.is_builtin {
+            bits |= Self::BUILTIN_OWNER;
+        }
+        if Rc::ptr_eq(&owner, &crate::builtin_types::builtin_types().object_) {
+            bits |= Self::OBJECT_OWNER;
+        }
+        Self(bits)
+    }
+
+    /// The MRO defines the dunder (possibly as `None`).
+    pub fn present(self) -> bool {
+        self.0 & Self::PRESENT != 0
+    }
+
+    /// The dunder is set to `None` (the unhashable marker for `__hash__`).
+    pub fn is_none(self) -> bool {
+        self.0 & Self::NONE != 0
+    }
+
+    /// The dunder is a Python function or bound method.
+    pub fn is_function(self) -> bool {
+        self.0 & Self::FUNCTION != 0
+    }
+
+    /// The defining class is a built-in type.
+    pub fn builtin_owner(self) -> bool {
+        self.0 & Self::BUILTIN_OWNER != 0
+    }
+
+    /// The defining class is `object`.
+    pub fn object_owner(self) -> bool {
+        self.0 & Self::OBJECT_OWNER != 0
+    }
+
+    /// A non-`None` definition supplied by a class written in Python.
+    pub fn user_defined(self) -> bool {
+        self.present() && !self.is_none() && !self.builtin_owner()
+    }
+}
+
 pub struct AttrVersion(std::sync::atomic::AtomicU64);
 
 impl AttrVersion {
@@ -574,6 +658,9 @@ pub struct TypeObject {
     /// (capped): new instances' dicts are presized to it, so `__init__`'s
     /// stores do not regrow them.
     pub inst_dict_hint: std::sync::atomic::AtomicU32,
+    /// The attribute names this class's split instance dictionaries share
+    /// (see [`crate::inst_dict`]), created at the first split store.
+    pub shared_keys: crate::sync::LazyArc<crate::inst_dict::SharedKeys>,
     /// Non-zero for an exact class whose hot methods have native
     /// implementations (see `stdlib::datetime_native`): its instances
     /// are never cycle-collector tracked (like CPython's C types without
@@ -582,6 +669,9 @@ pub struct TypeObject {
     /// Native-implementation state for such a class (see
     /// `stdlib::datetime_native`), set once.
     pub native_ext: std::sync::OnceLock<Rc<dyn std::any::Any + Send + Sync>>,
+    /// An `abc.ABCMeta` class's registry and caches (see
+    /// [`crate::stdlib::abc_mod`]).
+    pub abc_state: std::sync::OnceLock<Box<crate::stdlib::abc_mod::AbcState>>,
     /// Cached "do instances of this type carry a `__del__` finalizer
     /// anywhere in their MRO?" answer, so [`crate::object::PyInstance`]'s
     /// `Drop` safety net can skip an MRO walk on the hot per-instance drop
@@ -590,13 +680,9 @@ pub struct TypeObject {
     /// `__del__` is assigned to / deleted from a type's dict or the MRO is
     /// recomputed (`__bases__` assignment).
     pub has_del: Cell<u8>,
-    /// Memoised `__eq__` resolution for instances of this type, packed
-    /// as `attr_version << 2 | kind` (`0` = not yet computed): kind `1` =
-    /// `object`'s identity default (or no `__eq__`), `2` = a Python-level
-    /// override, `3` = a built-in type's own override (Python dispatch
-    /// only for instances without a native payload). A stale version
-    /// recomputes. See `object::instance_has_custom_eq`.
-    pub eq_kind: Cell<u64>,
+    /// Memoised resolution of the dunders in [`Dunder`], one slot each,
+    /// packed as `attr_version << 8 | DunderInfo` (see [`Self::dunder`]).
+    pub dunder_memo: [Cell<u64>; Dunder::COUNT],
     /// Memoised instantiation plan (`type(…)` call protocol resolution:
     /// `__new__`/`__init__`/native-payload classification), stamped with
     /// the [`Self::attr_version`] observed when it was built. Rebuilt
@@ -979,8 +1065,10 @@ impl TypeObject {
             metaclass: RefCell::new(None),
             leaf_attrs: LeafAttrCache::new(),
             inst_dict_hint: std::sync::atomic::AtomicU32::new(0),
+            shared_keys: crate::sync::LazyArc::new(),
             native_kind: Cell::new(0),
             native_ext: std::sync::OnceLock::new(),
+            abc_state: std::sync::OnceLock::new(),
             slot_names: RefCell::new(Vec::new()),
             declares_slots: Cell::new(false),
             forbids_dict: false,
@@ -990,7 +1078,7 @@ impl TypeObject {
             mro_kind: std::sync::atomic::AtomicU8::new(0),
             attr_version: AttrVersion::fresh(),
             has_del: Cell::new(0),
-            eq_kind: Cell::new(0),
+            dunder_memo: Default::default(),
             instance_plan: RefCell::new(None),
             c_tp_name: crate::sync::RefCell::new(None),
             c_sq_item: Cell::new(false),
@@ -1092,7 +1180,7 @@ impl TypeObject {
     /// CPython `best_base`: the base contributing the instance layout —
     /// the one whose solid base is the most derived. Ties resolve to the
     /// first base (matching `type_new`'s left-to-right scan).
-    pub fn best_base(self: &Rc<Self>) -> Option<Rc<TypeObject>> {
+    pub fn best_base(&self) -> Option<Rc<TypeObject>> {
         let bases = self.bases.borrow();
         let mut best: Option<Rc<TypeObject>> = None;
         for b in bases.iter() {
@@ -1118,8 +1206,8 @@ impl TypeObject {
     /// CPython `compatible_for_assignment`'s `newbase`/`oldbase` walk:
     /// climb the `best_base` chain past every level that doesn't change
     /// the struct, returning the most-derived type that *does*.
-    pub fn layout_struct_base(self: &Rc<Self>) -> Rc<TypeObject> {
-        let mut cur = self.clone();
+    pub fn layout_struct_base(this: &Rc<Self>) -> Rc<TypeObject> {
+        let mut cur = this.clone();
         while !cur.changes_layout() {
             match cur.best_base() {
                 Some(b) => cur = b,
@@ -1537,6 +1625,22 @@ impl TypeObject {
         crate::builtin_types::builtin_types().type_.clone()
     }
 
+    /// Whether [`Self::metaclass_or_type`] is `type` itself, without
+    /// cloning the metaclass handle.
+    pub fn metaclass_is_type(&self) -> bool {
+        let ext = self.c_ext_ptr.get();
+        if ext != 0 {
+            if let Some(h) = METACLASS_DRIFT_HOOK.get() {
+                h(ext, self);
+            }
+        }
+        let ty = &crate::builtin_types::builtin_types().type_;
+        match self.metaclass.borrow().as_ref() {
+            Some(m) => Rc::ptr_eq(m, ty),
+            None => true,
+        }
+    }
+
     /// `True` when `self` is a subclass of `other` (including itself).
     pub fn is_subclass_of(&self, other: &TypeObject) -> bool {
         let other_ptr = std::ptr::from_ref::<TypeObject>(other);
@@ -1578,6 +1682,22 @@ impl TypeObject {
     /// the attribute. Lets callers distinguish a dunder *supplied by a
     /// user class* from one inherited off a built-in (e.g. `object`'s
     /// identity `__hash__`).
+    /// How this type resolves `dunder`, memoised until the type or a base
+    /// changes. Hot paths that only need to know whether a dunder is
+    /// overridden, and by whom, use this instead of an MRO lookup by name.
+    #[inline]
+    pub fn dunder(&self, dunder: Dunder) -> DunderInfo {
+        let version = self.attr_version.get();
+        let slot = &self.dunder_memo[dunder as usize];
+        let memo = slot.get();
+        if memo & u64::from(DunderInfo::VALID) != 0 && memo >> 8 == version {
+            return DunderInfo(memo as u8);
+        }
+        let info = DunderInfo::resolve(self.lookup_with_owner(dunder.name()));
+        slot.set(version << 8 | u64::from(info.0));
+        info
+    }
+
     pub fn lookup_with_owner(&self, name: &str) -> Option<(Object, Rc<TypeObject>)> {
         // Fast pass — see `lookup` for the gate rationale.
         if !crate::object::exotic_str_keys_possible() {
@@ -1871,6 +1991,15 @@ enum SlotData {
     },
 }
 
+/// Is `key` the slot name `name`? (Interned names usually share the
+/// probe's storage, settled without reading either length.)
+#[inline(always)]
+fn key_named(key: &DictKey, name: &crate::shared_value::SharedStr) -> bool {
+    matches!(&key.0, Object::Str(stored)
+        if crate::shared_value::SharedStr::ptr_eq(stored, name)
+            || slot_name_eq(stored.as_ref(), name.as_ref()))
+}
+
 #[cfg(target_pointer_width = "64")]
 /// `stored == name` for a slot name, without the call into `memcmp`.
 /// Slot names are short (`_data`, `_head`, `x`) and almost always differ
@@ -1896,6 +2025,29 @@ fn slot_name_eq(stored: &str, name: &str) -> bool {
         i += 1;
     }
     true
+}
+
+/// The key for a newly populated slot `name`. The slots every raise
+/// populates (`args`, `__traceback__`, the chaining links) share one
+/// interned key each instead of allocating a string per exception.
+fn slot_key(name: &str) -> DictKey {
+    const COMMON: [&str; 6] = [
+        "args",
+        "__traceback__",
+        "__context__",
+        "__cause__",
+        "__suppress_context__",
+        "message",
+    ];
+    static KEYS: std::sync::OnceLock<[Object; 6]> = std::sync::OnceLock::new();
+    if let Some(i) = COMMON.iter().position(|c| *c == name) {
+        let keys = KEYS.get_or_init(|| COMMON.map(crate::stdlib::sys::intern_name));
+        return DictKey(keys[i].clone());
+    }
+    // Interned, as instance-dict keys are: a guard holding the interned
+    // name settles a slot's key by identity, and no instance allocates
+    // its own copy of the name.
+    DictKey(crate::stdlib::sys::intern_name(name))
 }
 
 impl SlotStorage {
@@ -2098,14 +2250,95 @@ impl SlotStorage {
     /// `get_mut(name)` with a position hint (see [`Self::get_hinted`]).
     #[inline]
     pub fn get_hinted_mut(&mut self, idx: usize, name: &str) -> Option<&mut Object> {
-        let at_hint = matches!(
-            self.get_index(idx),
-            Some((DictKey(Object::Str(stored)), _)) if slot_name_eq(stored.as_ref(), name)
-        );
-        if at_hint {
-            return self.get_index_mut(idx).map(|(_, v)| v);
+        // One lookup at the hint. (The pointer ends the borrow, so the
+        // name scan below can take its own.)
+        let hit = match self.get_index_mut(idx) {
+            Some((DictKey(Object::Str(stored)), value))
+                if std::ptr::eq(stored.as_ptr(), name.as_ptr())
+                    || slot_name_eq(stored.as_ref(), name) =>
+            {
+                Some(std::ptr::from_mut(value))
+            }
+            _ => None,
+        };
+        match hit {
+            // SAFETY: the value lives in `self`, borrowed mutably for the
+            // returned lifetime; no other reference to it exists.
+            Some(value) => Some(unsafe { &mut *value }),
+            None => self.get_mut(name),
         }
-        self.get_mut(name)
+    }
+
+    /// The values of the first `N` slots when they are named `names`, in
+    /// order (the layout of an instance whose `__init__` assigns them in
+    /// that order): one pass for a native method that reads several
+    /// slots. `None` when the store is laid out otherwise.
+    #[inline]
+    pub fn leading<const N: usize>(
+        &self,
+        names: [&crate::shared_value::SharedStr; N],
+    ) -> Option<[&Object; N]> {
+        match &self.data {
+            SlotData::Small(entries) => {
+                let entries = entries.get(..N)?;
+                if !entries
+                    .iter()
+                    .zip(names)
+                    .all(|((key, _), name)| key_named(key, name))
+                {
+                    return None;
+                }
+                Some(std::array::from_fn(|i| &entries[i].1))
+            }
+            SlotData::Fixed { layout, values } => {
+                let (keys, values) = (layout.get(..N)?, values.get(..N)?);
+                if !keys
+                    .iter()
+                    .zip(names)
+                    .all(|(key, name)| key_named(key, name))
+                {
+                    return None;
+                }
+                Some(std::array::from_fn(|i| &values[i]))
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Self::leading`], mutably.
+    #[inline]
+    pub fn leading_mut<const N: usize>(
+        &mut self,
+        names: [&crate::shared_value::SharedStr; N],
+    ) -> Option<[&mut Object; N]> {
+        let values: &mut [Object] = match &mut self.data {
+            SlotData::Small(entries) => {
+                let entries = entries.get_mut(..N)?;
+                if !entries
+                    .iter()
+                    .zip(names)
+                    .all(|((key, _), name)| key_named(key, name))
+                {
+                    return None;
+                }
+                let mut values = entries.iter_mut().map(|(_, value)| value);
+                return Some(std::array::from_fn(|_| values.next().expect("N entries")));
+            }
+            SlotData::Fixed { layout, values } => {
+                let keys = layout.get(..N)?;
+                if !keys
+                    .iter()
+                    .zip(names)
+                    .all(|(key, name)| key_named(key, name))
+                {
+                    return None;
+                }
+                values.get_mut(..N)?
+            }
+            _ => return None,
+        };
+        let mut values = values.iter_mut();
+        Some(std::array::from_fn(|_| values.next().expect("N values")))
     }
 
     /// Mutable access to a populated slot's value, by name.
@@ -2130,9 +2363,7 @@ impl SlotStorage {
     }
 
     pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {
-        self.insert_with_key(name, value, || {
-            DictKey(Object::Str(crate::shared_value::SharedStr::from(name)))
-        })
+        self.insert_with_key(name, value, || slot_key(name))
     }
 
     /// Reuse an existing name allocation when populating a new slot.
@@ -2284,9 +2515,7 @@ impl SlotStorage {
     }
 
     pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {
-        self.insert_with_key(name, value, || {
-            DictKey(Object::Str(crate::shared_value::SharedStr::from(name)))
-        })
+        self.insert_with_key(name, value, || slot_key(name))
     }
 
     /// Share the name allocation only for a newly populated slot.
@@ -2332,7 +2561,7 @@ pub struct PyInstance {
     pub class: RefCell<Rc<TypeObject>>,
     /// Instance attributes, allocated on the first write or exported handle.
     /// Reads through `get()` preserve the absence of an unused dictionary.
-    pub dict: crate::sync::LazyArc<RefCell<DictData>>,
+    pub dict: crate::inst_dict::InstDict,
     /// For instances of a subclass of an immutable built-in
     /// (`int`, `str`, `float`, `bytes`, `tuple`, …) this holds the
     /// underlying primitive value the instance *is* — the moral
@@ -2344,7 +2573,7 @@ pub struct PyInstance {
     /// inline body by the extension's `tp_new` chain after allocation).
     /// Unwrapped by the numeric / comparison / hashing / conversion
     /// fast paths so e.g. `class C(int)` instances behave like real ints.
-    pub native: std::sync::OnceLock<Object>,
+    pub native: crate::sync::OnceBox<Object>,
     /// Mirrors CPython 3.13's "inline values" state observable through
     /// `_testinternalcapi.has_inline_values`: starts `true` for ordinary
     /// instances (native fixed weakrefs start `false`) and is
@@ -2417,8 +2646,8 @@ impl PyInstance {
     pub fn new(class: Rc<TypeObject>) -> Self {
         Self {
             class: RefCell::new(class),
-            dict: crate::sync::LazyArc::new(),
-            native: std::sync::OnceLock::new(),
+            dict: crate::inst_dict::InstDict::new(),
+            native: crate::sync::OnceBox::new(),
             inline_values: Cell::new(true),
             slots: RefCell::new(SlotStorage::default()),
             hash_cache: crate::sync::CachedHash::new(None),
@@ -2433,8 +2662,8 @@ impl PyInstance {
     pub fn with_native(class: Rc<TypeObject>, native: Object) -> Self {
         Self {
             class: RefCell::new(class),
-            dict: crate::sync::LazyArc::new(),
-            native: std::sync::OnceLock::from(native),
+            dict: crate::inst_dict::InstDict::new(),
+            native: crate::sync::OnceBox::from(native),
             inline_values: Cell::new(true),
             slots: RefCell::new(SlotStorage::default()),
             hash_cache: crate::sync::CachedHash::new(None),
@@ -2464,7 +2693,7 @@ impl PyInstance {
                 *m.class.get_mut() = class;
                 m.deferred.set(true);
                 if hint > 0 {
-                    if let Some(dict) = m.dict.get() {
+                    if let Some(dict) = m.dict.published() {
                         if let Ok(mut d) = dict.try_borrow_mut() {
                             if d.capacity() < hint {
                                 d.map_mut_atomic_store().reserve(hint);
@@ -2533,10 +2762,13 @@ impl PyInstance {
         if m.native.get().is_some() || m.finalize_ran.get() || m.c_body.get() != 0 {
             return;
         }
+        // Split values are atomic (the instance is deferred): clearing
+        // them runs no code. The allocation stays for the next tenant.
+        m.dict.split_mut().reset();
         // An instance that never grew a `__dict__` is the common case
         // now and needs no reset; one that did keeps it for the next
         // tenant, cleared and carrying a fresh owner record.
-        if let Some(dict) = m.dict.get() {
+        if let Some(dict) = m.dict.published() {
             // The dict must be private too: `vars(obj)` / `obj.__dict__`
             // hand out the same `Arc`, and a holder must keep seeing the
             // dead instance's attributes, not the next tenant's.
@@ -2602,7 +2834,7 @@ impl PyInstance {
     #[inline]
     pub(crate) fn clear_deferred_tracking(&self) {
         self.deferred.set(false);
-        if let Some(d) = self.dict.get() {
+        if let Some(d) = self.dict.published() {
             match d.try_borrow() {
                 Ok(d) => {
                     d.take_deferred_owner();
@@ -2622,7 +2854,7 @@ impl PyInstance {
         // Retire the dict's copy of the record so the write barrier does
         // not track a second time, then track from the instance itself —
         // which works whether or not a `__dict__` was ever created.
-        if let Some(d) = self.dict.get() {
+        if let Some(d) = self.dict.published() {
             if let Ok(d) = d.try_borrow() {
                 d.take_deferred_owner();
             }
@@ -2656,6 +2888,17 @@ impl PyInstance {
         debug_assert!(!crate::gil::free_threading_enabled());
         // SAFETY: see above — no writer can run while the burst reads.
         unsafe { &*self.class.as_ptr() }
+    }
+
+    /// How this instance's class resolves `dunder` (see
+    /// [`TypeObject::dunder`]).
+    #[inline]
+    pub fn class_dunder(&self, dunder: Dunder) -> DunderInfo {
+        if crate::gil::free_threading_enabled() {
+            self.cls().dunder(dunder)
+        } else {
+            self.cls_raw().dunder(dunder)
+        }
     }
 
     /// Re-point the instance at a new class (`obj.__class__ = C`).
@@ -2712,7 +2955,7 @@ impl Drop for PyInstance {
     fn drop(&mut self) {
         // A deferred-tracking record names this instance; the dict may
         // outlive it (`d = obj.__dict__`), so retire the record first.
-        if let Some(d) = self.dict.get() {
+        if let Some(d) = self.dict.published() {
             match d.try_borrow() {
                 Ok(d) => {
                     d.take_deferred_owner();
@@ -2768,8 +3011,8 @@ impl Drop for PyInstance {
             class: RefCell::new(self.cls()),
             dict: self.dict.clone(),
             native: match self.native.get() {
-                Some(v) => std::sync::OnceLock::from(v.clone()),
-                None => std::sync::OnceLock::new(),
+                Some(v) => crate::sync::OnceBox::from(v.clone()),
+                None => crate::sync::OnceBox::new(),
             },
             inline_values: Cell::new(self.inline_values.get()),
             slots: RefCell::new(self.slots.borrow().clone()),
@@ -2794,7 +3037,9 @@ mod slot_storage_tests {
     #[test]
     fn shared_layout_keeps_slot_storage_compact() {
         assert_eq!(std::mem::size_of::<SlotStorage>(), 32);
-        assert_eq!(std::mem::size_of::<PyInstance>(), 128);
+        // The split `__dict__` values pointer and its cell: with the
+        // allocator's header the instance stays in the 160-byte class.
+        assert_eq!(std::mem::size_of::<PyInstance>(), 136);
     }
 
     #[test]

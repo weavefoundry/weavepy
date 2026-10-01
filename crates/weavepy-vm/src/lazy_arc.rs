@@ -3,12 +3,12 @@
 //! A published pointer is never reset through shared access. Every borrowed
 //! value remains live until its owner can be exclusively destroyed or replaced.
 
+use crate::sync::Rc as Arc;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::Arc;
 
 pub struct LazyArc<T> {
     pointer: AtomicPtr<T>,
@@ -157,6 +157,96 @@ impl<T> Drop for LazyArc<T> {
             // The original published count is released exactly once here.
             unsafe { drop(Arc::from_raw(pointer)) };
         }
+    }
+}
+
+/// A write-once value behind one pointer: `OnceLock<T>` for a field that
+/// is rarely set, where the lock's state word and an inline `T` would
+/// enlarge every owner.
+pub struct OnceBox<T> {
+    pointer: AtomicPtr<T>,
+    owner: PhantomData<Box<T>>,
+}
+
+// SAFETY: publication is a single release compare-exchange of an owned
+// box, and readers only take shared references; the published value is
+// never replaced through shared access.
+unsafe impl<T: Send + Sync> Sync for OnceBox<T> {}
+// SAFETY: as above.
+unsafe impl<T: Send> Send for OnceBox<T> {}
+
+impl<T> OnceBox<T> {
+    pub const fn new() -> Self {
+        Self {
+            pointer: AtomicPtr::new(ptr::null_mut()),
+            owner: PhantomData,
+        }
+    }
+
+    /// The value, if one was set.
+    #[inline]
+    pub fn get(&self) -> Option<&T> {
+        // SAFETY: a published pointer owns a box that lives until `&mut`
+        // access destroys it.
+        unsafe { self.pointer.load(Ordering::Acquire).as_ref() }
+    }
+
+    /// Set the value once; a second set hands the value back.
+    pub fn set(&self, value: T) -> Result<(), T> {
+        let fresh = Box::into_raw(Box::new(value));
+        match self.pointer.compare_exchange(
+            ptr::null_mut(),
+            fresh,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            // SAFETY: the unpublished box is still ours alone.
+            Err(_) => Err(*unsafe { Box::from_raw(fresh) }),
+        }
+    }
+
+    /// Remove the value.
+    pub fn take(&mut self) -> Option<T> {
+        let pointer = std::mem::replace(self.pointer.get_mut(), ptr::null_mut());
+        // SAFETY: exclusive access; the published box is released once.
+        (!pointer.is_null()).then(|| *unsafe { Box::from_raw(pointer) })
+    }
+}
+
+impl<T> Default for OnceBox<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> From<T> for OnceBox<T> {
+    fn from(value: T) -> Self {
+        Self {
+            pointer: AtomicPtr::new(Box::into_raw(Box::new(value))),
+            owner: PhantomData,
+        }
+    }
+}
+
+impl<T: Clone> Clone for OnceBox<T> {
+    fn clone(&self) -> Self {
+        match self.get() {
+            Some(v) => Self::from(v.clone()),
+            None => Self::new(),
+        }
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for OnceBox<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("OnceBox").field(&self.get()).finish()
+    }
+}
+
+impl<T> Drop for OnceBox<T> {
+    fn drop(&mut self) {
+        drop(self.take());
     }
 }
 

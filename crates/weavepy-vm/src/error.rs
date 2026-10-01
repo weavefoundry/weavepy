@@ -11,12 +11,30 @@ use thiserror::Error;
 
 use crate::object::Object;
 
-/// A traceback frame captured as the exception unwinds.
+/// A traceback frame captured as the exception unwinds: the frame's code
+/// object (shared, so a raise copies no strings) and its line.
 #[derive(Debug, Clone)]
 pub struct TracebackEntry {
-    pub filename: String,
-    pub funcname: String,
+    pub code: crate::sync::Rc<weavepy_compiler::CodeObject>,
     pub lineno: u32,
+}
+
+impl TracebackEntry {
+    pub fn filename(&self) -> &str {
+        &self.code.filename
+    }
+
+    pub fn funcname(&self) -> &str {
+        &self.code.name
+    }
+}
+
+impl PartialEq for TracebackEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.lineno == other.lineno
+            && self.filename() == other.filename()
+            && self.funcname() == other.funcname()
+    }
 }
 
 /// A Python-visible exception. The wrapped [`Object`] is always an

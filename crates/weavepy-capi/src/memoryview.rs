@@ -329,7 +329,9 @@ pub unsafe extern "C" fn PyMemoryView_FromObjectAndFlags(
                 Some(obj.clone())
             };
             PyMemoryView {
-                buffer: MemoryViewBuffer::Shared(weavepy_vm::sync::Rc::new(region)),
+                buffer: MemoryViewBuffer::Shared(
+                    weavepy_vm::rc_unsize!(weavepy_vm::sync::Rc::new(region) => dyn SharedMemBuffer),
+                ),
                 start: Cell::new(start),
                 len: Cell::new(view_len),
                 readonly: Cell::new(readonly),
@@ -403,7 +405,9 @@ pub unsafe extern "C" fn PyMemoryView_FromMemory(
         readonly,
     };
     let mv = PyMemoryView::contiguous_1d(
-        MemoryViewBuffer::Shared(weavepy_vm::sync::Rc::new(region)),
+        MemoryViewBuffer::Shared(
+            weavepy_vm::rc_unsize!(weavepy_vm::sync::Rc::new(region) => dyn SharedMemBuffer),
+        ),
         len,
         readonly,
         "B".to_owned(),
@@ -486,7 +490,9 @@ pub unsafe extern "C" fn PyMemoryView_FromBuffer(view: *const Py_buffer) -> *mut
         readonly,
     };
     let mv = PyMemoryView {
-        buffer: MemoryViewBuffer::Shared(weavepy_vm::sync::Rc::new(region)),
+        buffer: MemoryViewBuffer::Shared(
+            weavepy_vm::rc_unsize!(weavepy_vm::sync::Rc::new(region) => dyn SharedMemBuffer),
+        ),
         start: Cell::new(0),
         len: Cell::new(len),
         readonly: Cell::new(readonly),

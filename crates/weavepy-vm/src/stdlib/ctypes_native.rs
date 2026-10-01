@@ -327,11 +327,12 @@ fn b_memoryview_at(args: &[Object]) -> Result<Object, RuntimeError> {
     if addr == 0 && size != 0 {
         return Err(value_error("memoryview_at: NULL pointer access"));
     }
-    let region: Rc<dyn crate::object::SharedMemBuffer> = Rc::new(RawRegion {
-        ptr: addr,
-        len: size as usize,
-        readonly,
-    });
+    let region: Rc<dyn crate::object::SharedMemBuffer> =
+        Rc::from_arc(std::sync::Arc::new(RawRegion {
+            ptr: addr,
+            len: size as usize,
+            readonly,
+        }));
     Ok(Object::MemoryView(Rc::new(
         crate::object::PyMemoryView::from_shared(region),
     )))

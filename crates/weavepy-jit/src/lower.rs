@@ -13,8 +13,8 @@
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
-    types, AbiParam, Block, BlockArg, Function, InstBuilder, MemFlags, SigRef, Signature, Type,
-    Value,
+    types, AbiParam, Block, BlockArg, FuncRef, Function, InstBuilder, MemFlags, SigRef, Signature,
+    StackSlot, StackSlotData, StackSlotKind, Type, Value,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
@@ -32,6 +32,20 @@ const OFF_STACK_TAGS: i32 = core::mem::offset_of!(JitFrame, stack_tags) as i32;
 const OFF_STACK_LEN: i32 = core::mem::offset_of!(JitFrame, stack_len) as i32;
 const OFF_CALL_ARGS: i32 = core::mem::offset_of!(JitFrame, call_args) as i32;
 const OFF_CALL_TAGS: i32 = core::mem::offset_of!(JitFrame, call_tags) as i32;
+const OFF_N_LOCALS: i32 = core::mem::offset_of!(JitFrame, n_locals) as i32;
+const OFF_STACK_CAP: i32 = core::mem::offset_of!(JitFrame, stack_cap) as i32;
+const OFF_CTX: i32 = core::mem::offset_of!(JitFrame, ctx) as i32;
+
+/// A call token whose sites may enter a compiled scalar leaf directly
+/// (see `engine::CompiledFrame::direct_leaf`): the leaf's function in
+/// this module, its frame layout, and its parameter lanes.
+pub(crate) struct LeafTarget {
+    pub token: u32,
+    pub func: FuncRef,
+    pub n_locals: u32,
+    pub max_stack: u32,
+    pub params: Vec<JitType>,
+}
 
 /// Build the Cranelift function body for `tfunc` into `func`.
 pub(crate) fn build_function(
@@ -39,9 +53,13 @@ pub(crate) fn build_function(
     fbctx: &mut FunctionBuilderContext,
     tfunc: &TFunc,
     ptr_ty: Type,
+    self_func: Option<FuncRef>,
+    leaves: Vec<LeafTarget>,
 ) {
     let mut builder = FunctionBuilder::new(func, fbctx);
     let mut lc = Lowerer::new(&mut builder, tfunc, ptr_ty);
+    lc.self_func = self_func;
+    lc.leaves = leaves;
     lc.build();
     builder.seal_all_blocks();
     builder.finalize();
@@ -100,6 +118,19 @@ struct Lowerer<'a, 'b> {
     poll_countdown: Option<Variable>,
     /// The abstract operand stack: SSA value + lane.
     vstack: Vec<(Value, JitType)>,
+    /// This function itself, for direct self calls (see
+    /// `engine::self_direct_eligible`); `None` when it makes none.
+    self_func: Option<FuncRef>,
+    /// The callee frame of a direct self call (lazy): its `JitFrame`
+    /// then its buffers.
+    self_slot: Option<StackSlot>,
+    /// Imported signatures of the self-call helpers (lazy): `(frame) ->
+    /// i64` and the slow path's `(frame, callee, status, token, tag) ->
+    /// i64`.
+    self_sig: Option<SigRef>,
+    self_slow_sig: Option<SigRef>,
+    /// Direct scalar-leaf call targets by token.
+    leaves: Vec<LeafTarget>,
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
@@ -130,6 +161,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             poll_sig: None,
             poll_countdown: None,
             vstack: Vec::new(),
+            self_func: None,
+            self_slot: None,
+            self_sig: None,
+            self_slow_sig: None,
+            leaves: Vec::new(),
         }
     }
 
@@ -948,14 +984,28 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let depth = self.vstack.len() - 2;
                 self.emit_int_to_float(depth, guarded, stmt.pc);
             }
-            TOp::CallPy { token, argc, ret } => self.emit_call_py(token, argc, 0, 0, ret, stmt.pc),
+            TOp::CallPy {
+                token,
+                argc,
+                ret,
+                is_self,
+            } => {
+                if is_self && self.self_func.is_some() {
+                    self.emit_call_self(token, argc, ret, stmt.pc);
+                } else if let Some(ix) = self.leaf_for(token, argc) {
+                    self.emit_call_leaf(ix, token, argc, ret, stmt.pc);
+                } else {
+                    self.emit_call_py(token, argc, 0, 0, 0, ret, stmt.pc);
+                }
+            }
             TOp::CallPyKw {
                 token,
                 argc,
                 kwc,
                 perm,
+                gaps,
                 ret,
-            } => self.emit_call_py(token, argc, kwc, perm, ret, stmt.pc),
+            } => self.emit_call_py(token, argc, kwc, perm, gaps, ret, stmt.pc),
             TOp::ListGet { elem } => self.emit_list_get(elem, stmt.pc),
             TOp::ListSet => self.emit_list_set(stmt.pc),
             TOp::CellGet { idx, lane } => self.emit_cell_get(idx, lane, stmt.pc),
@@ -3089,9 +3139,343 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// (4 bits each, tier-1's `CallPyKwNames` packing). The analyzer
     /// validated the filled set to be exactly `0..argc+kwc`, so the
     /// helper still sees a plain positional prefix.
-    fn emit_call_py(&mut self, token: u32, argc: u8, kwc: u8, perm: u32, ret: JitType, pc: u32) {
+    /// Lower a direct self call (see `engine::self_direct_eligible`):
+    /// charge the activation through the enter helper, fill a callee
+    /// `JitFrame` on this function's native stack frame (the arguments
+    /// in its first locals, the caller's embedder context shared), call
+    /// this function itself, and release the charge. A callee that
+    /// deopts or raises finishes through the slow helper, whose
+    /// [`crate::runtime::CallStatus`] the caller handles as it does the
+    /// call helper's. When the enter helper declines (recursion limit,
+    /// pending interpreter work, observers), the ordinary call runs.
+    fn emit_call_self(&mut self, token: u32, argc: u8, ret: JitType, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let (enter_addr, exit_addr, slow_addr) =
+            runtime::self_call_helper_addrs().expect("checked by the engine");
+        let n = argc as usize;
+        let base = self.vstack.len() - n;
+        let args: Vec<(Value, JitType)> = self.vstack[base..].to_vec();
+        self.vstack.truncate(base);
+        let snapshot = self.vstack.clone();
+        self.writeback_locals();
+        self.store_call_site_pc(pc);
+
+        let sig = self.self_sig();
+        let enter = self.b.ins().iconst(self.ptr_ty, enter_addr as i64);
+        let call = self.b.ins().call_indirect(sig, enter, &[self.frame_ptr]);
+        let declined = self.b.inst_results(call)[0];
+
+        let direct_b = self.b.create_block();
+        let generic_b = self.b.create_block();
+        let join_b = self.b.create_block();
+        self.b.append_block_param(join_b, Self::cl_ty(ret));
+        let go = self.b.ins().icmp_imm(IntCC::Equal, declined, 0);
+        self.b.ins().brif(go, direct_b, &[], generic_b, &[]);
+
+        // Declined: the ordinary call helper.
+        self.b.switch_to_block(generic_b);
+        self.vstack.extend(args.iter().copied());
+        self.emit_call_py(token, argc, 0, 0, 0, ret, pc);
+        let (v, _) = self.vstack.pop().expect("the call's result");
+        self.b.ins().jump(join_b, &[v.into()]);
+
+        // Direct: the callee frame and buffers, laid out in one slot.
+        self.b.switch_to_block(direct_b);
+        let n_locals = self.tfunc.n_locals.max(1) as i32;
+        let cap = self.tfunc.max_stack as i32 + 1;
+        let call_cap = self.tfunc.max_call_args.max(1) as i32;
+        let frame_size = core::mem::size_of::<JitFrame>() as i32;
+        let off_locals = frame_size;
+        let off_spill = off_locals + n_locals * 8;
+        let off_tags = off_spill + cap * 8;
+        let off_call_args = (off_tags + cap * 4 + 7) & !7;
+        let off_call_tags = off_call_args + call_cap * 8;
+        let size = off_call_tags + call_cap * 4;
+        let slot = match self.self_slot {
+            Some(slot) => slot,
+            None => {
+                let slot = self.b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    size as u32,
+                    3,
+                ));
+                self.self_slot = Some(slot);
+                slot
+            }
+        };
+        let fp = self.b.ins().stack_addr(self.ptr_ty, slot, 0);
+        let at = |b: &mut FunctionBuilder<'_>, ptr_ty: Type, off: i32| {
+            b.ins().stack_addr(ptr_ty, slot, off)
+        };
+        let locals = at(self.b, self.ptr_ty, off_locals);
+        let spill = at(self.b, self.ptr_ty, off_spill);
+        let tags = at(self.b, self.ptr_ty, off_tags);
+        let cargs = at(self.b, self.ptr_ty, off_call_args);
+        let ctags = at(self.b, self.ptr_ty, off_call_tags);
+        let ctx = self
+            .b
+            .ins()
+            .load(self.ptr_ty, trusted, self.frame_ptr, OFF_CTX);
+        let zero64 = self.b.ins().iconst(types::I64, 0);
+        let zero32 = self.b.ins().iconst(types::I32, 0);
+        self.b.ins().store(trusted, locals, fp, OFF_LOCALS);
+        let nl = self.b.ins().iconst(types::I32, i64::from(n_locals));
+        self.b.ins().store(trusted, nl, fp, OFF_N_LOCALS);
+        self.b.ins().store(trusted, zero32, fp, OFF_ENTRY_PC);
+        self.b.ins().store(trusted, zero64, fp, OFF_RET_BITS);
+        self.b.ins().store(trusted, zero32, fp, OFF_RET_TAG);
+        self.b.ins().store(trusted, zero32, fp, OFF_DEOPT_PC);
+        self.b.ins().store(trusted, spill, fp, OFF_STACK_SPILL);
+        self.b.ins().store(trusted, tags, fp, OFF_STACK_TAGS);
+        self.b.ins().store(trusted, zero32, fp, OFF_STACK_LEN);
+        let capv = self.b.ins().iconst(types::I32, i64::from(cap));
+        self.b.ins().store(trusted, capv, fp, OFF_STACK_CAP);
+        self.b.ins().store(trusted, ctx, fp, OFF_CTX);
+        self.b.ins().store(trusted, cargs, fp, OFF_CALL_ARGS);
+        self.b.ins().store(trusted, ctags, fp, OFF_CALL_TAGS);
+        // The arguments bind the first locals (their lanes are the
+        // parameters' own); every other local starts zeroed, as the
+        // framed entries leave it.
+        for slot_ix in 0..n_locals {
+            let off = slot_ix * 8;
+            match args.get(slot_ix as usize) {
+                Some(&(v, _)) => {
+                    self.b.ins().store(trusted, v, locals, off);
+                }
+                None => {
+                    self.b.ins().store(trusted, zero64, locals, off);
+                }
+            }
+        }
+        let self_func = self.self_func.expect("checked by the caller");
+        let call = self.b.ins().call(self_func, &[fp]);
+        let status = self.b.inst_results(call)[0];
+        let exit = self.b.ins().iconst(self.ptr_ty, exit_addr as i64);
+        self.b.ins().call_indirect(sig, exit, &[self.frame_ptr]);
+
+        let returned_b = self.b.create_block();
+        let slow_b = self.b.create_block();
+        let is_ret = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, status, JitStatus::Returned as i64);
+        self.b.ins().brif(is_ret, returned_b, &[], slow_b, &[]);
+
+        self.b.switch_to_block(returned_b);
+        let v = self
+            .b
+            .ins()
+            .load(Self::cl_ty(ret), trusted, fp, OFF_RET_BITS);
+        self.b.ins().jump(join_b, &[v.into()]);
+
+        // Deopted or raised: finished by the slow helper.
+        self.b.switch_to_block(slow_b);
+        let slow_sig = self.self_slow_sig();
+        let slow = self.b.ins().iconst(self.ptr_ty, slow_addr as i64);
+        let tokenv = self.b.ins().iconst(types::I64, i64::from(token));
+        let tagv = self.b.ins().iconst(types::I64, Self::tag(ret));
+        let call =
+            self.b
+                .ins()
+                .call_indirect(slow_sig, slow, &[self.frame_ptr, fp, status, tokenv, tagv]);
+        let cstatus = self.b.inst_results(call)[0];
+        let ok_b = self.b.create_block();
+        let bad_b = self.b.create_block();
+        let is_ok = self.b.ins().icmp_imm(IntCC::Equal, cstatus, 0);
+        self.b.ins().brif(is_ok, ok_b, &[], bad_b, &[]);
+        self.b.switch_to_block(bad_b);
+        let raised_b = self.b.create_block();
+        let boxed_b = self.b.create_block();
+        let is_raised = self.b.ins().icmp_imm(IntCC::Equal, cstatus, 1);
+        self.b.ins().brif(is_raised, raised_b, &[], boxed_b, &[]);
+        self.b.switch_to_block(raised_b);
+        self.emit_exit(pc, &snapshot, JitStatus::Raised);
+        self.b.switch_to_block(boxed_b);
+        self.emit_exit(pc + 1, &snapshot, JitStatus::Deopt);
+        self.b.switch_to_block(ok_b);
+        let v = self
+            .b
+            .ins()
+            .load(Self::cl_ty(ret), trusted, self.frame_ptr, OFF_RET_BITS);
+        self.b.ins().jump(join_b, &[v.into()]);
+
+        self.b.switch_to_block(join_b);
+        let v = self.b.block_params(join_b)[0];
+        self.vstack.push((v, ret));
+    }
+
+    /// The direct leaf target of `token` when this site's argument lanes
+    /// are exactly the leaf's parameter lanes.
+    fn leaf_for(&self, token: u32, argc: u8) -> Option<usize> {
+        let ix = self.leaves.iter().position(|l| l.token == token)?;
+        let base = self.vstack.len().checked_sub(argc as usize)?;
+        let lanes = self.vstack[base..].iter().map(|&(_, ty)| ty);
+        lanes
+            .eq(self.leaves[ix].params.iter().copied())
+            .then_some(ix)
+    }
+
+    /// Lower a direct call of a compiled scalar leaf (see [`LeafTarget`]):
+    /// charge the activation through the self-call enter helper, fill the
+    /// leaf's `JitFrame` on this function's native stack frame, call it,
+    /// and release the charge. The leaf only computes, so when the enter
+    /// helper declines or the leaf deopts (an overflow, a zero divisor),
+    /// the ordinary call helper runs the call from the start.
+    fn emit_call_leaf(&mut self, ix: usize, token: u32, argc: u8, ret: JitType, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let (enter_addr, exit_addr, _) =
+            runtime::self_call_helper_addrs().expect("checked by the engine");
+        let n = argc as usize;
+        let base = self.vstack.len() - n;
+        let args: Vec<(Value, JitType)> = self.vstack[base..].to_vec();
+        self.vstack.truncate(base);
+        self.writeback_locals();
+        self.store_call_site_pc(pc);
+
+        let sig = self.self_sig();
+        let enter = self.b.ins().iconst(self.ptr_ty, enter_addr as i64);
+        let call = self.b.ins().call_indirect(sig, enter, &[self.frame_ptr]);
+        let declined = self.b.inst_results(call)[0];
+
+        let direct_b = self.b.create_block();
+        let generic_b = self.b.create_block();
+        let join_b = self.b.create_block();
+        self.b.append_block_param(join_b, Self::cl_ty(ret));
+        let go = self.b.ins().icmp_imm(IntCC::Equal, declined, 0);
+        self.b.ins().brif(go, direct_b, &[], generic_b, &[]);
+
+        // The leaf's frame and buffers, in one slot per site.
+        self.b.switch_to_block(direct_b);
+        let leaf = &self.leaves[ix];
+        let (func, n_locals, cap) = (
+            leaf.func,
+            leaf.n_locals.max(1) as i32,
+            leaf.max_stack as i32 + 1,
+        );
+        let frame_size = core::mem::size_of::<JitFrame>() as i32;
+        let off_locals = frame_size;
+        let off_spill = off_locals + n_locals * 8;
+        let off_tags = off_spill + cap * 8;
+        let size = off_tags + cap * 4;
+        let slot = self.b.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            size as u32,
+            3,
+        ));
+        let fp = self.b.ins().stack_addr(self.ptr_ty, slot, 0);
+        let locals = self.b.ins().stack_addr(self.ptr_ty, slot, off_locals);
+        let spill = self.b.ins().stack_addr(self.ptr_ty, slot, off_spill);
+        let tags = self.b.ins().stack_addr(self.ptr_ty, slot, off_tags);
+        let null = self.b.ins().iconst(self.ptr_ty, 0);
+        let zero64 = self.b.ins().iconst(types::I64, 0);
+        let zero32 = self.b.ins().iconst(types::I32, 0);
+        self.b.ins().store(trusted, locals, fp, OFF_LOCALS);
+        let nl = self.b.ins().iconst(types::I32, i64::from(n_locals));
+        self.b.ins().store(trusted, nl, fp, OFF_N_LOCALS);
+        self.b.ins().store(trusted, zero32, fp, OFF_ENTRY_PC);
+        self.b.ins().store(trusted, zero64, fp, OFF_RET_BITS);
+        self.b.ins().store(trusted, zero32, fp, OFF_RET_TAG);
+        self.b.ins().store(trusted, zero32, fp, OFF_DEOPT_PC);
+        self.b.ins().store(trusted, spill, fp, OFF_STACK_SPILL);
+        self.b.ins().store(trusted, tags, fp, OFF_STACK_TAGS);
+        self.b.ins().store(trusted, zero32, fp, OFF_STACK_LEN);
+        let capv = self.b.ins().iconst(types::I32, i64::from(cap));
+        self.b.ins().store(trusted, capv, fp, OFF_STACK_CAP);
+        // A scalar leaf reads no embedder context and marshals no calls.
+        self.b.ins().store(trusted, null, fp, OFF_CTX);
+        self.b.ins().store(trusted, null, fp, OFF_CALL_ARGS);
+        self.b.ins().store(trusted, null, fp, OFF_CALL_TAGS);
+        for slot_ix in 0..n_locals {
+            let v = args.get(slot_ix as usize).map_or(zero64, |&(v, _)| v);
+            self.b.ins().store(trusted, v, locals, slot_ix * 8);
+        }
+        let call = self.b.ins().call(func, &[fp]);
+        let status = self.b.inst_results(call)[0];
+        let exit = self.b.ins().iconst(self.ptr_ty, exit_addr as i64);
+        self.b.ins().call_indirect(sig, exit, &[self.frame_ptr]);
+        let returned_b = self.b.create_block();
+        let is_ret = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, status, JitStatus::Returned as i64);
+        self.b.ins().brif(is_ret, returned_b, &[], generic_b, &[]);
+        self.b.switch_to_block(returned_b);
+        let v = self
+            .b
+            .ins()
+            .load(Self::cl_ty(ret), trusted, fp, OFF_RET_BITS);
+        self.b.ins().jump(join_b, &[v.into()]);
+
+        // Declined or deopted: the ordinary call, from the start.
+        self.b.switch_to_block(generic_b);
+        self.vstack.extend(args.iter().copied());
+        self.emit_call_py(token, argc, 0, 0, 0, ret, pc);
+        let (v, _) = self.vstack.pop().expect("the call's result");
+        self.b.ins().jump(join_b, &[v.into()]);
+
+        self.b.switch_to_block(join_b);
+        let v = self.b.block_params(join_b)[0];
+        self.vstack.push((v, ret));
+    }
+
+    /// The `(frame) -> i64` signature of the self-call enter/exit
+    /// helpers (lazy).
+    fn self_sig(&mut self) -> SigRef {
+        if let Some(sig) = self.self_sig {
+            return sig;
+        }
+        let mut sig = Signature::new(self.b.func.signature.call_conv);
+        sig.params.push(AbiParam::new(self.ptr_ty));
+        sig.returns.push(AbiParam::new(types::I64));
+        let r = self.b.import_signature(sig);
+        self.self_sig = Some(r);
+        r
+    }
+
+    /// The slow self-call helper's signature (lazy).
+    fn self_slow_sig(&mut self) -> SigRef {
+        if let Some(sig) = self.self_slow_sig {
+            return sig;
+        }
+        let mut sig = Signature::new(self.b.func.signature.call_conv);
+        sig.params.push(AbiParam::new(self.ptr_ty)); // frame
+        sig.params.push(AbiParam::new(self.ptr_ty)); // callee frame
+        sig.params.push(AbiParam::new(types::I64)); // callee status
+        sig.params.push(AbiParam::new(types::I64)); // token
+        sig.params.push(AbiParam::new(types::I64)); // expected tag
+        sig.returns.push(AbiParam::new(types::I64)); // call status
+        let r = self.b.import_signature(sig);
+        self.self_slow_sig = Some(r);
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_call_py(
+        &mut self,
+        token: u32,
+        argc: u8,
+        kwc: u8,
+        perm: u32,
+        gaps: u32,
+        ret: JitType,
+        pc: u32,
+    ) {
         let trusted = MemFlags::trusted();
         let n = argc as usize + kwc as usize;
+        // Skipped defaulted slots: the helper binds them (see
+        // `SlotTag::Default`).
+        let mut g = gaps;
+        while g != 0 {
+            let slot = g.trailing_zeros() as i32;
+            g &= g - 1;
+            let tagv = self
+                .b
+                .ins()
+                .iconst(types::I32, runtime::SlotTag::Default as i64);
+            self.b
+                .ins()
+                .store(trusted, tagv, self.call_tags_base, slot * 4);
+        }
         let base = self.vstack.len() - n;
         for (j, &(v, ty)) in self.vstack[base..].iter().enumerate() {
             let dst = if j < argc as usize {
@@ -3121,9 +3505,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .iconst(self.ptr_ty, runtime::call_py_helper_addr() as i64);
         let tokenv = self.b.ins().iconst(types::I32, i64::from(token));
-        // The helper receives the *filled* count — keyword values were
-        // shuffled into a contiguous positional prefix above.
-        let argcv = self.b.ins().iconst(types::I32, n as i64);
+        // The helper receives the prefix length — keyword values were
+        // shuffled into parameter slots above, with any skipped
+        // defaulted slots flagged.
+        let filled = if gaps == 0 {
+            n as i64
+        } else {
+            i64::from((n as u32 + gaps.count_ones()) | runtime::CALL_GAPS)
+        };
+        let argcv = self.b.ins().iconst(types::I32, filled);
         let expect = self.b.ins().iconst(types::I32, Self::tag(ret));
         let call =
             self.b

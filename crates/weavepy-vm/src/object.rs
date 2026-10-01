@@ -1204,10 +1204,9 @@ pub fn materialize_stack_at(stack: &FrameStack, idx: usize) -> Option<Rc<PyFrame
                 py
             }
             None => {
-                let py = shell.materialize(back);
                 // Materialised while live on the stack: count the
                 // activation so `frame.clear()` refuses it.
-                py
+                shell.materialize(back)
             }
         };
         back = Some(py);
@@ -3052,11 +3051,16 @@ impl indexmap::Equivalent<DictKey> for LeafNameProbe<'_> {
 /// A dict probe for the leaf burst: a `str` or `int` key that matches a
 /// stored key only by exact native equality. It never runs Python — an
 /// exotic stored key sharing the bucket (a `__eq__` that could equate)
-/// reads as a miss, and the burst leaves every miss to the full path.
-#[derive(Debug, Clone, Copy)]
+/// reads as a miss, and the burst leaves every miss to the full path
+/// unless [`LeafProbe::miss_is_exact`] proves no such key was seen.
+#[derive(Debug)]
 pub struct LeafProbe<'a> {
     pub key: &'a Object,
     pub hash: i64,
+    /// Set when the table compared this probe with a stored key of another
+    /// kind, whose equality to the probe might need Python (`1.0`, `True`,
+    /// a `str` subclass, an instance with `__eq__`).
+    foreign: std::cell::Cell<bool>,
 }
 
 impl<'a> LeafProbe<'a> {
@@ -3068,7 +3072,21 @@ impl<'a> LeafProbe<'a> {
             Object::Int(_) => py_hash_value(key)?,
             _ => return None,
         };
-        Some(Self { key, hash })
+        Some(Self {
+            key,
+            hash,
+            foreign: std::cell::Cell::new(false),
+        })
+    }
+
+    /// After a lookup that found nothing: whether no stored key can equal
+    /// this one, so inserting it natively is exact. Any key that Python
+    /// would compare with the probe has an equal hash, so the table
+    /// compared it with the probe, and a key of another kind set
+    /// `foreign`.
+    #[inline]
+    pub fn miss_is_exact(&self) -> bool {
+        !self.foreign.get()
     }
 }
 
@@ -3085,7 +3103,10 @@ impl indexmap::Equivalent<DictKey> for LeafProbe<'_> {
         match (self.key, &key.0) {
             (Object::Str(a), Object::Str(b)) => a.as_bytes() == b.as_bytes(),
             (Object::Int(a), Object::Int(b)) => a == b,
-            _ => false,
+            _ => {
+                self.foreign.set(true);
+                false
+            }
         }
     }
 }
@@ -3152,74 +3173,37 @@ fn current_interp_eq(a: &Object, b: &Object) -> Option<bool> {
 /// `name` dunder (a real Python `def`, not the inherited identity default).
 /// Used to gate the reentrant `__eq__` dispatch so plain instances keep the
 /// native identity fast path.
-pub(crate) fn instance_has_custom_dunder(obj: &Object, name: &str) -> bool {
+pub(crate) fn instance_has_custom_dunder(obj: &Object, dunder: crate::types::Dunder) -> bool {
     let Object::Instance(inst) = obj else {
         return false;
     };
-    match inst.cls().lookup_with_owner(name) {
-        Some((Object::Function(_) | Object::BoundMethod(_), _)) => true,
-        Some((Object::None, _)) | None => false,
-        // A non-function dunder. A user class supplying it (e.g.
-        // `unittest.mock` installs `Mock` instances as `__hash__` /
-        // `__eq__` on per-instance subclasses) needs Python dispatch.
-        Some((_, owner)) if !owner.flags.is_builtin => true,
-        // A built-in type that *overrides* the dunder in its own dict
-        // rather than inheriting `object`'s identity default needs Python
-        // dispatch too: `weakref` compares/hashes by referent, so its
-        // `ref` objects can't be keyed by the native identity path
-        // (`test_weakref`/`test_weakset` rely on `ref(a) == ref(a)` and
-        // matching hashes finding the same set slot). `object`'s own
-        // `__eq__`/`__hash__` — where every *plain* instance resolves —
-        // stay native so ordinary objects keep identity semantics, and
-        // value-wrapping subclasses (`class C(int)`, struct sequences)
-        // keep their native structural comparison via `native`.
-        Some((_, owner)) => {
-            inst.native.get().is_none()
-                && !Rc::ptr_eq(&owner, &crate::builtin_types::builtin_types().object_)
-        }
+    let info = inst.class_dunder(dunder);
+    if !info.present() || info.is_none() {
+        return false;
     }
+    // A Python function, or any other object a user class supplies (e.g.
+    // `unittest.mock` installs `Mock` instances as `__hash__` / `__eq__`
+    // on per-instance subclasses), needs Python dispatch.
+    if info.is_function() || !info.builtin_owner() {
+        return true;
+    }
+    // A built-in type that *overrides* the dunder in its own dict rather
+    // than inheriting `object`'s identity default needs Python dispatch
+    // too: `weakref` compares/hashes by referent, so its `ref` objects
+    // can't be keyed by the native identity path (`test_weakref`/
+    // `test_weakset` rely on `ref(a) == ref(a)` and matching hashes
+    // finding the same set slot). `object`'s own `__eq__`/`__hash__` —
+    // where every *plain* instance resolves — stay native so ordinary
+    // objects keep identity semantics, and value-wrapping subclasses
+    // (`class C(int)`, struct sequences) keep their native structural
+    // comparison via `native`.
+    inst.native.get().is_none() && !info.object_owner()
 }
 
-/// [`instance_has_custom_dunder`]`(obj, "__eq__")`, memoised per class:
-/// membership tests and `list.remove`/`index`/`count` ask it for every
-/// element they compare.
+/// [`instance_has_custom_dunder`] for `__eq__`: membership tests and
+/// `list.remove`/`index`/`count` ask it for every element they compare.
 pub(crate) fn instance_has_custom_eq(obj: &Object) -> bool {
-    let Object::Instance(inst) = obj else {
-        return false;
-    };
-    if crate::gil::free_threading_enabled() {
-        return custom_eq_of(&inst.cls(), inst);
-    }
-    // Under the GIL nothing reassigns `__class__` while this reads it
-    // (the lookup below runs no Python code).
-    custom_eq_of(inst.cls_raw(), inst)
-}
-
-fn custom_eq_of(cls: &crate::types::TypeObject, inst: &crate::types::PyInstance) -> bool {
-    let ver = cls.attr_version.get();
-    let memo = cls.eq_kind.get();
-    let kind = if memo != 0 && memo >> 2 == ver {
-        memo & 3
-    } else {
-        let kind = match cls.lookup_with_owner("__eq__") {
-            Some((Object::Function(_) | Object::BoundMethod(_), _)) => 2,
-            Some((Object::None, _)) | None => 1,
-            Some((_, owner)) if !owner.flags.is_builtin => 2,
-            Some((_, owner))
-                if Rc::ptr_eq(&owner, &crate::builtin_types::builtin_types().object_) =>
-            {
-                1
-            }
-            Some(_) => 3,
-        };
-        cls.eq_kind.set(ver << 2 | kind);
-        kind
-    };
-    match kind {
-        1 => false,
-        2 => true,
-        _ => inst.native.get().is_none(),
-    }
+    instance_has_custom_dunder(obj, crate::types::Dunder::Eq)
 }
 
 /// `a == b` can only be `object`'s identity default: each side is a
@@ -3275,7 +3259,7 @@ pub(crate) fn key_needs_interp_eq(obj: &Object) -> bool {
         // `_UnionGenericAlias` — structural namespace equality can't
         // express either (RFC 0076 WS5).
         Object::SimpleNamespace(_) => crate::is_pep604_union(obj).is_some(),
-        _ => instance_has_custom_dunder(obj, "__eq__"),
+        _ => instance_has_custom_dunder(obj, crate::types::Dunder::Eq),
     }
 }
 
@@ -3604,11 +3588,8 @@ fn key_eq_defer_active() -> bool {
 pub(crate) fn dict_key_is_reentrant(key: &Object) -> bool {
     match key {
         Object::Instance(inst) => {
-            let py_dunder = |name: &str| match inst.cls().lookup_with_owner(name) {
-                Some((Object::None, _)) | None => false,
-                Some((_, owner)) => !owner.flags.is_builtin,
-            };
-            py_dunder("__eq__") || py_dunder("__hash__")
+            inst.class_dunder(crate::types::Dunder::Eq).user_defined()
+                || inst.class_dunder(crate::types::Dunder::Hash).user_defined()
         }
         Object::Tuple(items) => items.iter().any(dict_key_is_reentrant),
         _ => false,
@@ -4055,9 +4036,37 @@ pub type DictMap = indexmap::IndexMap<DictKey, Object, crate::fasthash::FxBuildH
 /// replaced in place.
 static DICT_STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Advanced by every global rebinding that replaces a value in place
+/// without stamping the dict (see `STORE_GLOBAL`): caches that burn in a
+/// global's *value* rather than its position watch it alongside the stamps.
+static GLOBAL_VALUE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current [`GLOBAL_VALUE_EPOCH`].
+#[inline]
+pub fn global_value_epoch() -> u64 {
+    GLOBAL_VALUE_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Advance [`GLOBAL_VALUE_EPOCH`].
+#[inline]
+pub fn bump_global_value_epoch() {
+    GLOBAL_VALUE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[inline]
 fn next_dict_stamp() -> u64 {
-    DICT_STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    use std::sync::atomic::Ordering::Relaxed;
+    // Dict mutation is serialized by the GIL, so a plain load and store
+    // hands out unique stamps without a locked read-modify-write (drawn on
+    // every mutable dict access). Free-threaded mode needs the real one,
+    // and so does the debug unit-test binary, whose tests run separate
+    // interpreters on concurrent threads with no GIL between them.
+    if cfg!(debug_assertions) || crate::gil::free_threading_enabled() {
+        return DICT_STAMP.fetch_add(1, Relaxed);
+    }
+    let v = DICT_STAMP.load(Relaxed);
+    DICT_STAMP.store(v + 1, Relaxed);
+    v
 }
 
 /// A [`DictMap`] with a mutation stamp: every mutable access (any
@@ -4077,6 +4086,10 @@ pub struct DictData {
     /// value (every `DerefMut`) tracks the owner first; the owner clears
     /// it when it is tracked by other means or dies.
     deferred_owner: std::sync::atomic::AtomicUsize,
+    /// A one-bit-per-hash-class summary of the `str` keys (see
+    /// [`Self::may_hold_str_hash`]); `0` until built, and reset by every
+    /// access that stamps.
+    key_filter: std::sync::atomic::AtomicU64,
 }
 
 impl Clone for DictData {
@@ -4085,6 +4098,7 @@ impl Clone for DictData {
             map: self.map.clone(),
             stamp: self.stamp,
             deferred_owner: std::sync::atomic::AtomicUsize::new(0),
+            key_filter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -4096,6 +4110,7 @@ impl DictData {
             map: DictMap::with_capacity_and_hasher(n, h),
             stamp: next_dict_stamp(),
             deferred_owner: std::sync::atomic::AtomicUsize::new(0),
+            key_filter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -4106,6 +4121,7 @@ impl DictData {
             map: DictMap::default(),
             stamp: next_dict_stamp(),
             deferred_owner: std::sync::atomic::AtomicUsize::new(owner),
+            key_filter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -4118,6 +4134,7 @@ impl DictData {
             map: DictMap::with_capacity_and_hasher(n, crate::fasthash::FxBuildHasher),
             stamp: next_dict_stamp(),
             deferred_owner: std::sync::atomic::AtomicUsize::new(owner),
+            key_filter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -4151,6 +4168,7 @@ impl DictData {
     #[inline]
     pub fn map_mut_atomic_store(&mut self) -> &mut DictMap {
         self.stamp = next_dict_stamp();
+        *self.key_filter.get_mut() = 0;
         &mut self.map
     }
 
@@ -4165,6 +4183,39 @@ impl DictData {
     #[inline]
     pub fn mutation_stamp(&self) -> u64 {
         self.stamp
+    }
+
+    /// Whether a `str` key with Python hash `hash` may be present: `false`
+    /// proves it absent. The summary is built once per key layout (value
+    /// stores in place leave it standing, so an instance dict's summary
+    /// survives its attribute updates). Bit 63 marks a built summary, so
+    /// the hash class it shares always answers "maybe"; a non-`str` key
+    /// makes every hash possible.
+    #[inline]
+    pub fn may_hold_str_hash(&self, hash: i64) -> bool {
+        let mut bits = self.key_filter.load(std::sync::atomic::Ordering::Relaxed);
+        if bits == 0 {
+            bits = self.build_key_filter();
+        }
+        bits & (1u64 << (hash as u64 & 63)) != 0
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn build_key_filter(&self) -> u64 {
+        let mut bits = 1u64 << 63;
+        for k in self.map.keys() {
+            match &k.0 {
+                Object::Str(s) => bits |= 1u64 << (SharedStr::hash_cached(s) as u64 & 63),
+                _ => {
+                    bits = u64::MAX;
+                    break;
+                }
+            }
+        }
+        self.key_filter
+            .store(bits, std::sync::atomic::Ordering::Relaxed);
+        bits
     }
 
     /// Mutable access for replacing an existing key's value in place: the
@@ -4196,6 +4247,7 @@ impl Default for DictData {
             map: DictMap::default(),
             stamp: next_dict_stamp(),
             deferred_owner: std::sync::atomic::AtomicUsize::new(0),
+            key_filter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -4216,6 +4268,7 @@ impl std::ops::DerefMut for DictData {
             self.track_deferred_owner();
         }
         self.stamp = next_dict_stamp();
+        *self.key_filter.get_mut() = 0;
         &mut self.map
     }
 }
@@ -4232,6 +4285,7 @@ impl From<DictMap> for DictData {
             map,
             stamp: next_dict_stamp(),
             deferred_owner: std::sync::atomic::AtomicUsize::new(0),
+            key_filter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -4302,7 +4356,8 @@ pub struct PyFunction {
     /// CPython's `func_set_dict` *aliases* the assigned dict
     /// (`f.__dict__ = d; f.__dict__ is d` — test_funcattrs), so the
     /// whole payload must be swappable, not just its contents.
-    pub attrs: RefCell<Rc<RefCell<DictData>>>,
+    /// Allocated on first use: most functions never get a `__dict__`.
+    pub attrs: RefCell<Option<Rc<RefCell<DictData>>>>,
     /// CPython function *getset/member slots* (`__name__`,
     /// `__qualname__`, `__doc__`, `__module__`, `__annotations__`,
     /// `__type_params__`, …). These live outside `__dict__`: they're
@@ -4421,7 +4476,22 @@ impl PyFunction {
 
     /// The live `__dict__` payload (honours `f.__dict__ = d` swapping).
     pub fn attrs(&self) -> Rc<RefCell<DictData>> {
-        self.attrs.borrow().clone()
+        if let Some(d) = self.attrs.borrow().as_ref() {
+            return d.clone();
+        }
+        let d = Rc::new(RefCell::new(DictData::default()));
+        *self.attrs.borrow_mut() = Some(d.clone());
+        d
+    }
+
+    /// A `__dict__` entry, without allocating an empty dictionary.
+    pub fn attr_get(&self, name: &str) -> Option<Object> {
+        self.attrs
+            .borrow()
+            .as_ref()?
+            .borrow()
+            .get(&StrKey(name))
+            .cloned()
     }
 
     /// Read a slot value if one has been stored (explicitly assigned or
@@ -4672,7 +4742,7 @@ impl PyGenerator {
         qualname: impl Into<String>,
         kind: CoroutineKind,
         code: Object,
-        frame: Box<dyn std::any::Any + Send + Sync>,
+        frame: Box<crate::Frame>,
     ) -> Self {
         Self {
             name: RefCell::new(Object::from_str(name.into())),
@@ -4694,7 +4764,7 @@ impl PyGenerator {
         qualname: Object,
         kind: CoroutineKind,
         code: Object,
-        frame: Box<dyn std::any::Any + Send + Sync>,
+        frame: Box<crate::Frame>,
     ) -> Self {
         Self {
             name: RefCell::new(name),
@@ -4812,9 +4882,9 @@ impl CoroutineKind {
 pub enum GeneratorState {
     /// Created but not yet started — body hasn't executed past the
     /// initial `RETURN_GENERATOR`.
-    Created(Box<dyn std::any::Any + Send + Sync>),
+    Created(Box<crate::Frame>),
     /// Paused at a `YIELD_VALUE`.
-    Suspended(Box<dyn std::any::Any + Send + Sync>),
+    Suspended(Box<crate::Frame>),
     /// Body returned (cleanly or via exception). Subsequent
     /// `next`/`send` raise `StopIteration`.
     Finished,
@@ -11906,7 +11976,7 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             // A user-defined `__hash__` outranks the wrapped value's hash —
             // e.g. functools' `_HashedSeq(list)` caches its hash precisely so
             // the (unhashable) list payload is never consulted.
-            if instance_has_custom_dunder(obj, "__hash__") {
+            if instance_has_custom_dunder(obj, crate::types::Dunder::Hash) {
                 // When the instance wraps an *immutable* builtin value (an
                 // `int`/`str`/`tuple`/… subclass), the value can't change, so
                 // a custom `__hash__` is genuinely constant and may be

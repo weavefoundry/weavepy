@@ -1179,7 +1179,7 @@ mod kqueue_impl {
     /// closed, matching CPython's `kqueue_queue_traverse`/at-fork sweep).
     /// `Rc` is `Arc` here (the RFC 0025 shared heap), so a process-global
     /// registry of `Weak<PyInstance>` is sound.
-    static LIVE_KQUEUES: std::sync::Mutex<Vec<std::sync::Weak<PyInstance>>> =
+    static LIVE_KQUEUES: std::sync::Mutex<Vec<crate::sync::Weak<PyInstance>>> =
         std::sync::Mutex::new(Vec::new());
 
     fn store_kqueue(inst: &Rc<PyInstance>, fd: libc::c_int) {
@@ -1205,7 +1205,7 @@ mod kqueue_impl {
     /// observes `kq.closed == True` and `kq.fileno()` raising. We mirror
     /// that here (`test_kqueue.test_fork`).
     pub(super) fn close_all_in_child() {
-        let drained: Vec<std::sync::Weak<PyInstance>> = match LIVE_KQUEUES.lock() {
+        let drained: Vec<crate::sync::Weak<PyInstance>> = match LIVE_KQUEUES.lock() {
             Ok(mut reg) => reg.drain(..).collect(),
             // A poisoned lock can't happen across `fork` (single thread in
             // the child), but recover defensively rather than panic.

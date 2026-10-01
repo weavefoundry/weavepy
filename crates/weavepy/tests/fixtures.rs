@@ -105,7 +105,7 @@ fn run_fixture(py_path: &Path) {
 
     let mut interp = vm::Interpreter::new();
     let buf: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
-    let sink: vm::Stdout = buf.clone() as Rc<RefCell<dyn Write + Send + Sync>>;
+    let sink: vm::Stdout = vm::rc_unsize!(buf.clone() => RefCell<dyn Write + Send + Sync>);
     interp.set_stdout(sink);
     // Sibling files in the fixtures directory must be importable so
     // multi-file tests (e.g. `import _helper`) work.

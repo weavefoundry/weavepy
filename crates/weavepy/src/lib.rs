@@ -87,7 +87,9 @@ impl Error {
                         let _ = writeln!(
                             s,
                             "  File \"{}\", line {}, in {}",
-                            entry.filename, entry.lineno, entry.funcname
+                            entry.filename(),
+                            entry.lineno,
+                            entry.funcname()
                         );
                     }
                 }

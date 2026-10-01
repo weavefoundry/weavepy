@@ -91,7 +91,7 @@ assert events.index(("cb1", "start")) < events.index(("cb1", "stop")), events
 
 
 # ---------------------------------------------------------------------------
-# Generational thresholds round-trip (CPython default is (700, 10, 10)).
+# Generational thresholds round-trip (CPython 3.14 defaults to (2000, 10, 10)).
 # ---------------------------------------------------------------------------
 
 saved = gc.get_threshold()

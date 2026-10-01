@@ -36,11 +36,22 @@ use tracing_subscriber::EnvFilter;
 
 use weavepy::{InterpreterFlags, RunOptions};
 
-/// The process allocator: the system allocator behind per-thread
-/// small-block caches (see `weavepy_vm::tcache`), enabled on the VM's
-/// own threads.
+mod alloc;
+
+/// The process allocator. The interpreter allocates and frees small blocks
+/// constantly; mimalloc serves them from per-thread free lists, several
+/// times faster than the system allocator on macOS.
+#[cfg(not(all(feature = "alloc-profile", target_os = "macos")))]
 #[global_allocator]
-static GLOBAL_ALLOC: weavepy::vm::tcache::ThreadCacheAlloc = weavepy::vm::tcache::ThreadCacheAlloc;
+static GLOBAL_ALLOC: alloc::Mimalloc = alloc::Mimalloc;
+
+#[cfg(all(feature = "alloc-profile", target_os = "macos"))]
+mod alloc_profile;
+
+/// The allocation-site profiler's allocator (see [`alloc_profile`]).
+#[cfg(all(feature = "alloc-profile", target_os = "macos"))]
+#[global_allocator]
+static GLOBAL_ALLOC: alloc_profile::Profiled = alloc_profile::Profiled;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -721,7 +732,6 @@ fn run_on_large_stack(entry: fn() -> i32) -> i32 {
     weavepy::vm::stdlib::signal_mod::block_async_signals_current_thread();
 
     let vm_entry = move || -> i32 {
-        weavepy::vm::tcache::enable_for_current_thread();
         // Opt-in (`WEAVEPY_CRASH_BT`): register the native crash handler +
         // per-thread sigaltstack on the VM thread itself so a stack-overflow
         // SIGSEGV can be caught and reported (no-op stub on Windows).
@@ -745,8 +755,12 @@ fn run_on_large_stack(entry: fn() -> i32) -> i32 {
         // fork-warning check measures additional threads against.
         weavepy::vm::stdlib::os_process::capture_thread_baseline();
         pcprof::start();
+        #[cfg(all(feature = "alloc-profile", target_os = "macos"))]
+        alloc_profile::start();
         let code = entry();
         pcprof::finish();
+        #[cfg(all(feature = "alloc-profile", target_os = "macos"))]
+        alloc_profile::finish();
         code
     };
 
@@ -1066,6 +1080,7 @@ fn real_main() -> Result<i32> {
 
     if let Some(module) = cli.module.clone() {
         let extra = cli.args.clone();
+        weavepy::vm::spawn_jit_codegen_prewarm();
         run_module(&module, extra, &flags, &extra_path)?;
         return Ok(0);
     }
@@ -1078,6 +1093,9 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Some(path) => {
+            // A program file: warm the JIT's code generator off the main
+            // thread while it starts.
+            weavepy::vm::spawn_jit_codegen_prewarm();
             run_path(path, trailing.clone(), &flags, &extra_path)?;
             Ok(0)
         }

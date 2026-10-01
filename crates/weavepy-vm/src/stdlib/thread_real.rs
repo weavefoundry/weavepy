@@ -708,7 +708,7 @@ fn make_lock_object(lock: Arc<RealLock>) -> Object {
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(lock_type()),
         dict: dict.into(),
-        native: std::sync::OnceLock::new(),
+        native: crate::sync::OnceBox::new(),
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
         hash_cache: crate::sync::CachedHash::new(None),
@@ -893,7 +893,7 @@ fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(rlock_type()),
         dict: dict.into(),
-        native: std::sync::OnceLock::new(),
+        native: crate::sync::OnceBox::new(),
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
         hash_cache: crate::sync::CachedHash::new(None),
@@ -1345,11 +1345,12 @@ fn spawn_python_worker(
     // deep recursion. A 64 MiB starting reserve keeps early-startup
     // segment churn low while letting hundreds of workers coexist.
     const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+                                                        // The worker clones and drops objects before it first takes the GIL.
+    crate::rc::revoke_refcount_bias();
     let handle = std::thread::Builder::new()
         .name(format!("weavepy-worker-{}", synth_id))
         .stack_size(WORKER_STACK_BYTES)
         .spawn(move || {
-            crate::tcache::enable_for_current_thread();
             crate::vm_singletons::install_worker_thread_id(synth_id);
             // RFC 0040 WS4: record this worker's pthread_t so
             // `signal.pthread_kill(ident, sig)` can target it.
@@ -1830,7 +1831,7 @@ fn make_thread_handle_object(state: Arc<ThreadHandleState>, ident: Object) -> Ob
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(thread_handle_type()),
         dict: dict.into(),
-        native: std::sync::OnceLock::new(),
+        native: crate::sync::OnceBox::new(),
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
         hash_cache: crate::sync::CachedHash::new(None),
