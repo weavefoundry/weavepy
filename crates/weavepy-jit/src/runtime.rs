@@ -150,6 +150,73 @@ impl SlotTag {
     }
 }
 
+/// Where the embedder keeps what a pinned instance's field read or write
+/// touches, so compiled code can do the common one in line: byte offsets
+/// (from the pointer named in each field's doc), the object tags, and the
+/// address of the flag that says borrow-free reads are off. The embedder
+/// measures and checks them; compiled code falls back to its helpers on
+/// anything else.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ObjLayout {
+    /// [`JitFrame::ctx`] → the pin table's buffer pointer and length.
+    pub ctx_pins_ptr: i32,
+    pub ctx_pins_len: i32,
+    /// A pin: its size, its discriminant byte and the object pin's value,
+    /// and where that object sits in it.
+    pub pin_size: i32,
+    pub pin_tag: i32,
+    pub pin_obj_tag: u8,
+    pub pin_obj: i32,
+    /// [`JitFrame::ctx`] → the attribute guards' shared pointer; that
+    /// pointer → the guard array.
+    pub ctx_guards: i32,
+    pub guards_buf: i32,
+    /// A guard: its size, its class version (`u64`), and the split-values
+    /// index its name sits at (`u32`, `u32::MAX` for none).
+    pub guard_size: i32,
+    pub guard_ver: i32,
+    pub guard_split_idx: i32,
+    /// Object tags (the first byte of a value); a word payload is at 8, a
+    /// `bool`'s at 1.
+    pub tag_instance: u8,
+    pub tag_int: u8,
+    pub tag_float: u8,
+    pub tag_bool: u8,
+    pub tag_none: u8,
+    /// An instance value's payload pointer → the instance's class pointer,
+    /// its published dict pointer (null while split), its split values'
+    /// borrow counter (`i32`) and block pointer (null while empty).
+    pub inst_class: i32,
+    pub inst_dict_lazy: i32,
+    pub inst_split_borrow: i32,
+    pub inst_split_block: i32,
+    /// A class pointer → its attribute version (`u64`) and its shared
+    /// names' pointer.
+    pub type_attr_version: i32,
+    pub type_shared_keys: i32,
+    /// A split block → its names' pointer, its length (`u32`) and its
+    /// first value.
+    pub split_keys: i32,
+    pub split_len: i32,
+    pub split_values: i32,
+    /// The byte that is nonzero once cells are shared between threads.
+    pub cells_unguarded: usize,
+}
+
+static OBJ_LAYOUT: std::sync::OnceLock<ObjLayout> = std::sync::OnceLock::new();
+
+/// Publish the embedder's object layout (once; later calls are ignored).
+/// Frames compiled from then on read pinned instances' fields in line.
+pub fn set_obj_layout(layout: ObjLayout) {
+    let _ = OBJ_LAYOUT.set(layout);
+}
+
+/// The published object layout.
+#[must_use]
+pub(crate) fn obj_layout() -> Option<&'static ObjLayout> {
+    OBJ_LAYOUT.get()
+}
+
 /// The exchange buffer the VM passes to a compiled frame.
 ///
 /// The VM owns the backing storage (`Vec<u64>` / `Vec<u32>`); this

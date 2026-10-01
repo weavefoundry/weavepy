@@ -18,6 +18,9 @@ pub struct LazyArc<T: 'static> {
 }
 
 impl<T: 'static> LazyArc<T> {
+    /// Where the payload pointer (null until set) sits, for native code.
+    pub(crate) const POINTER_OFFSET: usize = std::mem::offset_of!(Self, pointer);
+
     pub const fn new() -> Self {
         Self {
             pointer: AtomicPtr::new(ptr::null_mut()),

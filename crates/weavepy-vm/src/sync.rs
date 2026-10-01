@@ -346,6 +346,12 @@ fn cells_unguarded() -> bool {
     CELLS_UNGUARDED.load(Ordering::Relaxed)
 }
 
+/// The flag [`GilCell::peek`] tests, for native code that peeks (a byte:
+/// nonzero once cells are shared between threads).
+pub(crate) fn cells_unguarded_flag() -> *const bool {
+    CELLS_UNGUARDED.as_ptr()
+}
+
 /// Whether reference counts must be updated atomically: set whenever the
 /// cell bias is revoked, and also before spawning a thread that may touch
 /// objects before it registers (see [`crate::rc`]). Never cleared.
@@ -658,6 +664,11 @@ impl fmt::Display for BorrowMutError {
 impl std::error::Error for BorrowMutError {}
 
 impl<T> GilCell<T> {
+    /// Where the borrow counter (an `i32`: negative while mutably
+    /// borrowed) and the payload sit, for native code that peeks.
+    pub(crate) const BORROW_OFFSET: usize = std::mem::offset_of!(Self, borrow);
+    pub(crate) const DATA_OFFSET: usize = std::mem::offset_of!(Self, data);
+
     /// Build a cell holding `value`. `const`-callable so the
     /// codebase's existing `thread_local!{ static FOO: RefCell<…> =
     /// const { RefCell::new(None) }; }` patterns keep working.

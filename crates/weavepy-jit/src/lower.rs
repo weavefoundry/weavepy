@@ -2719,6 +2719,36 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let trusted = MemFlags::trusted();
         let snapshot = self.vstack.clone();
         let (pin, _) = self.pop();
+        // A scalar field of a split-layout instance, read in line; any
+        // other shape takes the helper below.
+        let inline = match (runtime::obj_layout(), out) {
+            (Some(l), JitType::Int | JitType::Float | JitType::Bool) => Some(*l),
+            _ => None,
+        };
+        let mut join = None;
+        if let Some(l) = inline {
+            let miss = self.b.create_block();
+            let done = self.b.create_block();
+            self.b.append_block_param(done, Self::cl_ty(out));
+            let addr = self.split_field_addr(&l, pin, site, miss, true);
+            let (want, off, ty) = match out {
+                JitType::Int => (l.tag_int, 8, types::I64),
+                JitType::Float => (l.tag_float, 8, types::F64),
+                _ => (l.tag_bool, 1, types::I8),
+            };
+            let tag = self.b.ins().uload8(types::I32, trusted, addr, 0);
+            let other = self.b.ins().icmp_imm(IntCC::NotEqual, tag, i64::from(want));
+            self.miss_if(other, miss);
+            let v = self.b.ins().load(ty, trusted, addr, off);
+            let v = if ty == types::I8 {
+                self.b.ins().uextend(types::I64, v)
+            } else {
+                v
+            };
+            self.b.ins().jump(done, &[BlockArg::from(v)]);
+            self.b.switch_to_block(miss);
+            join = Some(done);
+        }
         let sig = self.list_helper_sig();
         let helper = self
             .b
@@ -2737,7 +2767,95 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .b
             .ins()
             .load(Self::cl_ty(out), trusted, self.frame_ptr, OFF_RET_BITS);
+        let res = match join {
+            Some(done) => {
+                self.b.ins().jump(done, &[BlockArg::from(res)]);
+                self.b.switch_to_block(done);
+                self.b.block_params(done)[0]
+            }
+            None => res,
+        };
         self.vstack.push((res, out));
+    }
+
+    /// Branch to `miss` when `cond`; continue in a fresh block otherwise.
+    fn miss_if(&mut self, cond: Value, miss: Block) {
+        let ok = self.b.create_block();
+        self.b.ins().brif(cond, miss, &[], ok, &[]);
+        self.b.switch_to_block(ok);
+    }
+
+    /// The address of the field the attribute guard of `site` names in the
+    /// pinned instance `pin`'s split values (see [`runtime::ObjLayout`]):
+    /// an instance pin whose class still has the guard's version, whose
+    /// values are split over its class's names, unborrowed (`read`) or
+    /// unborrowed and exclusive (a write), and hold the guard's index.
+    /// Anything else branches to `miss`.
+    fn split_field_addr(
+        &mut self,
+        l: &runtime::ObjLayout,
+        pin: Value,
+        site: u32,
+        miss: Block,
+        read: bool,
+    ) -> Value {
+        let t = MemFlags::trusted();
+        let ptr = self.ptr_ty;
+        let ctx = self.b.ins().load(ptr, t, self.frame_ptr, OFF_CTX);
+        // The pin.
+        let n = self.b.ins().load(types::I64, t, ctx, l.ctx_pins_len);
+        let out = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, pin, n);
+        self.miss_if(out, miss);
+        let buf = self.b.ins().load(ptr, t, ctx, l.ctx_pins_ptr);
+        let off = self.b.ins().imul_imm(pin, i64::from(l.pin_size));
+        let p = self.b.ins().iadd(buf, off);
+        let ptag = self.b.ins().uload8(types::I32, t, p, l.pin_tag);
+        let not_obj = self.b.ins().icmp_imm(IntCC::NotEqual, ptag, i64::from(l.pin_obj_tag));
+        self.miss_if(not_obj, miss);
+        let otag = self.b.ins().uload8(types::I32, t, p, l.pin_obj);
+        let not_inst = self.b.ins().icmp_imm(IntCC::NotEqual, otag, i64::from(l.tag_instance));
+        self.miss_if(not_inst, miss);
+        let inst = self.b.ins().load(ptr, t, p, l.pin_obj + 8);
+        // The guard.
+        let guards = self.b.ins().load(ptr, t, ctx, l.ctx_guards);
+        let gbuf = self.b.ins().load(ptr, t, guards, l.guards_buf);
+        let g = self
+            .b
+            .ins()
+            .iadd_imm(gbuf, i64::from(site) * i64::from(l.guard_size));
+        let ver = self.b.ins().load(types::I64, t, g, l.guard_ver);
+        let idx = self.b.ins().uload32(t, g, l.guard_split_idx);
+        // The class.
+        let cls = self.b.ins().load(ptr, t, inst, l.inst_class);
+        let cver = self.b.ins().load(types::I64, t, cls, l.type_attr_version);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, cver, ver);
+        self.miss_if(stale, miss);
+        // The split values.
+        let lazy = self.b.ins().load(ptr, t, inst, l.inst_dict_lazy);
+        self.miss_if(lazy, miss);
+        let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+        let shared = self.b.ins().uload8(types::I32, t, flag, 0);
+        self.miss_if(shared, miss);
+        let borrow = self.b.ins().sload32(t, inst, l.inst_split_borrow);
+        let busy = if read {
+            self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0)
+        } else {
+            self.b.ins().icmp_imm(IntCC::NotEqual, borrow, 0)
+        };
+        self.miss_if(busy, miss);
+        let block = self.b.ins().load(ptr, t, inst, l.inst_split_block);
+        let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
+        self.miss_if(empty, miss);
+        let keys = self.b.ins().load(ptr, t, block, l.split_keys);
+        let ckeys = self.b.ins().load(ptr, t, cls, l.type_shared_keys);
+        let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
+        self.miss_if(foreign, miss);
+        let len = self.b.ins().uload32(t, block, l.split_len);
+        let absent = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
+        self.miss_if(absent, miss);
+        let off = self.b.ins().ishl_imm(idx, 4);
+        let at = self.b.ins().iadd(block, off);
+        self.b.ins().iadd_imm(at, i64::from(l.split_values))
     }
 
     /// Consecutive callback-free reads can replay from the first read on a
@@ -2892,7 +3010,41 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let trusted = MemFlags::trusted();
         let snapshot = self.vstack.clone();
         let (pin, _) = self.pop();
-        let (val, _) = self.pop();
+        let (val, lane) = self.pop();
+        // A scalar over a scalar field of a split-layout instance, stored
+        // in line (no release, no collector bookkeeping); any other shape
+        // takes the helper below.
+        let inline = match (runtime::obj_layout(), lane) {
+            (Some(l), JitType::Int | JitType::Float | JitType::Bool) => Some(*l),
+            _ => None,
+        };
+        let mut done = None;
+        if let Some(l) = inline {
+            let miss = self.b.create_block();
+            let stored = self.b.create_block();
+            let addr = self.split_field_addr(&l, pin, site, miss, false);
+            let old = self.b.ins().uload8(types::I64, trusted, addr, 0);
+            let one = self.b.ins().iconst(types::I64, 1);
+            let bit = self.b.ins().ishl(one, old);
+            let scalars = (1i64 << l.tag_int)
+                | (1i64 << l.tag_float)
+                | (1i64 << l.tag_bool)
+                | (1i64 << l.tag_none);
+            let m = self.b.ins().band_imm(bit, scalars);
+            let heap = self.b.ins().icmp_imm(IntCC::Equal, m, 0);
+            self.miss_if(heap, miss);
+            let (tag, off, v) = match lane {
+                JitType::Int => (l.tag_int, 8, val),
+                JitType::Float => (l.tag_float, 8, val),
+                _ => (l.tag_bool, 1, self.b.ins().ireduce(types::I8, val)),
+            };
+            let tagv = self.b.ins().iconst(types::I8, i64::from(tag));
+            self.b.ins().store(trusted, tagv, addr, 0);
+            self.b.ins().store(trusted, v, addr, off);
+            self.b.ins().jump(stored, &[]);
+            self.b.switch_to_block(miss);
+            done = Some(stored);
+        }
         self.b
             .ins()
             .store(trusted, val, self.frame_ptr, OFF_RET_BITS);
@@ -2910,6 +3062,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
+        if let Some(stored) = done {
+            self.b.ins().jump(stored, &[]);
+            self.b.switch_to_block(stored);
+        }
     }
 
     /// RFC 0076 WS6 — closure-cell read via `wpjit_cell_get`. The cell

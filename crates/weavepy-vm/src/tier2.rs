@@ -88,6 +88,11 @@ struct AttrGuard {
     /// The class value can't acquire descriptor hooks independently of
     /// the receiver's class version. Only native scalar updates use this.
     stable_descriptor: bool,
+    /// The index the name holds in its class's shared names, when the
+    /// site's index is that one (`u32::MAX` otherwise): compiled code
+    /// reads and writes a split-layout instance's field there in line
+    /// (see [`obj_layout`]).
+    split_idx: u32,
     /// The value lane the site was compiled with.
     lane: JitType,
     /// The class's `attr_version` at compile time. Tokens are globally unique
@@ -2165,6 +2170,9 @@ fn method_ret_info(
 /// slot bits tagged [`SlotTag::ListPin`] / [`SlotTag::ObjPin`] index
 /// this table, which keeps the object alive and reachable for the
 /// access helpers and the deopt rebuild.
+// `repr(C, u8)`: compiled code reads an object pin's discriminant and
+// value in place (see `obj_layout`).
+#[repr(C, u8)]
 enum Pin {
     /// A pinned list plus the element lane the compile assumed.
     List(Rc<GilRefCell<Vec<Object>>>, JitType),
@@ -2614,6 +2622,7 @@ fn attr_site_guard(
             lane: site.lane,
             ver: cls.attr_version.get(),
             storage: AttrStorage::Indexed(*field_idx),
+            split_idx: split_index(&cls, AttrStorage::Indexed(*field_idx), &site.name),
             last_result_pin: Cell::new(usize::MAX),
         });
     }
@@ -2632,7 +2641,7 @@ fn attr_site_guard(
         else {
             return None;
         };
-        let Object::Instance(_) = &recv else {
+        let Object::Instance(inst) = &recv else {
             return None;
         };
         return Some(AttrGuard {
@@ -2642,6 +2651,7 @@ fn attr_site_guard(
             lane: site.lane,
             ver,
             storage: AttrStorage::Indexed(field_idx),
+            split_idx: split_index(&inst.cls(), AttrStorage::Indexed(field_idx), &site.name),
             last_result_pin: Cell::new(usize::MAX),
         });
     }
@@ -2660,6 +2670,10 @@ fn attr_site_guard(
         && matches!(storage, AttrStorage::Indexed(_))
         && scalar_field_update_shape(&frame.code)
         && scalar_update_class_value_stable(&recv, &site.name, ver);
+    let split_idx = match &recv {
+        Object::Instance(inst) => split_index(&inst.cls(), storage, &site.name),
+        _ => u32::MAX,
+    };
     Some(AttrGuard {
         name: shared_name(),
         name_hash: crate::object::py_str_hash(&site.name),
@@ -2667,7 +2681,158 @@ fn attr_site_guard(
         lane: site.lane,
         ver,
         storage,
+        split_idx,
         last_result_pin: Cell::new(usize::MAX),
+    })
+}
+
+/// [`AttrGuard::split_idx`] for an indexed site of `cls`: the index, when
+/// the class's shared names hold `name` there (they never move).
+fn split_index(cls: &TypeObject, storage: AttrStorage, name: &str) -> u32 {
+    let AttrStorage::Indexed(i) = storage else {
+        return u32::MAX;
+    };
+    match cls.shared_keys.get().and_then(|keys| keys.get(i as usize)) {
+        Some(DictKey(Object::Str(s))) if &**s == name => i,
+        _ => u32::MAX,
+    }
+}
+
+/// Measure where pinned instances keep what compiled code's in-line field
+/// reads and writes touch (see [`weavepy_jit::ObjLayout`]), check every
+/// offset against `obj` (a live instance), and publish the layout. Once:
+/// later calls return straight away.
+fn ensure_obj_layout(obj: &Object) {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Object::Instance(inst) = obj else {
+        return;
+    };
+    DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(layout) = obj_layout(obj, inst) {
+        weavepy_jit::set_obj_layout(layout);
+    }
+}
+
+/// The layout [`ensure_obj_layout`] publishes, `None` when any offset
+/// doesn't read back what the safe accessors say about `obj`.
+fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weavepy_jit::ObjLayout> {
+    use crate::inst_dict::{InstDict, SplitValues};
+    use crate::sync::GilCell;
+    use crate::types::PyInstance;
+    if crate::gil::free_threading_enabled() || std::env::var_os("WEAVEPY_JIT_NO_INLINE_ATTRS").is_some() {
+        return None;
+    }
+    let word = |p: *const u8, off: usize| -> usize {
+        // SAFETY: every read below is inside a live object the caller
+        // holds, at an offset measured from its own type.
+        unsafe { p.add(off).cast::<usize>().read_unaligned() }
+    };
+    let tag = |v: &Object| -> u8 {
+        // SAFETY: `Object` is `repr(u8)`: its first byte is the tag.
+        unsafe { *std::ptr::from_ref(v).cast::<u8>() }
+    };
+    let obj_p = std::ptr::from_ref(obj).cast::<u8>();
+    // The payload word is the `Arc` allocation; the instance follows its
+    // two counts.
+    let arc = word(obj_p, 8);
+    let data = Rc::as_ptr(inst) as usize;
+    let arc_data = data.checked_sub(arc)?;
+    let i32_of = |v: usize| i32::try_from(v).ok();
+    let inst_class = arc_data + std::mem::offset_of!(PyInstance, class) + GilCell::<Rc<TypeObject>>::DATA_OFFSET;
+    let dict = arc_data + std::mem::offset_of!(PyInstance, dict);
+    let inst_dict_lazy = dict + InstDict::LAZY_OFFSET;
+    let inst_split_borrow = dict + InstDict::SPLIT_OFFSET + GilCell::<SplitValues>::BORROW_OFFSET;
+    let inst_split_block =
+        dict + InstDict::SPLIT_OFFSET + GilCell::<SplitValues>::DATA_OFFSET + SplitValues::BLOCK_OFFSET;
+    let arc_p = arc as *const u8;
+    // The class pointer is its `Arc` allocation too.
+    let cls = inst.cls();
+    let cls_arc = word(arc_p, inst_class);
+    if cls_arc + arc_data != Rc::as_ptr(&cls) as usize {
+        return None;
+    }
+    let type_attr_version = arc_data + std::mem::offset_of!(TypeObject, attr_version);
+    let type_shared_keys = arc_data
+        + std::mem::offset_of!(TypeObject, shared_keys)
+        + crate::sync::LazyArc::<crate::inst_dict::SharedKeys>::POINTER_OFFSET;
+    let cls_p = cls_arc as *const u8;
+    // SAFETY: as `word`, a `u64` field.
+    let ver = unsafe { cls_p.add(type_attr_version).cast::<u64>().read_unaligned() };
+    let keys = cls.shared_keys.get().map_or(0, |k| std::ptr::from_ref(k) as usize);
+    let published = inst.dict.published().is_some();
+    if ver != cls.attr_version.get()
+        || word(cls_p, type_shared_keys) != keys
+        || (word(arc_p, inst_dict_lazy) != 0) != published
+    {
+        return None;
+    }
+    // SAFETY: as `word`, the `i32` borrow counter.
+    let borrow = unsafe { arc_p.add(inst_split_borrow).cast::<i32>().read_unaligned() };
+    if borrow != 0 {
+        return None;
+    }
+    // A pin: `repr(C, u8)`.
+    let sample = Pin::Obj(obj.clone());
+    let sample_p = std::ptr::from_ref(&sample).cast::<u8>();
+    let pin_obj = match &sample {
+        Pin::Obj(o) => std::ptr::from_ref(o) as usize - sample_p as usize,
+        Pin::List(..) => return None,
+    };
+    // SAFETY: the discriminant byte of a `repr(C, u8)` enum.
+    let pin_obj_tag = unsafe { *sample_p };
+    if word(sample_p, pin_obj + 8) != arc {
+        return None;
+    }
+    drop(sample);
+    // A vector's buffer pointer and length, measured on one whose three
+    // words all differ.
+    let mut v: Vec<Pin> = Vec::with_capacity(4);
+    v.push(Pin::Obj(Object::None));
+    let vp = std::ptr::from_ref(&v).cast::<u8>();
+    let find = |want: usize| (0..3).map(|k| k * 8).find(|&off| word(vp, off) == want);
+    let (vec_ptr, vec_len) = (find(v.as_ptr() as usize)?, find(1)?);
+    drop(v);
+    let guards: StdRc<Vec<AttrGuard>> = StdRc::new(Vec::with_capacity(2));
+    let rc_box = {
+        // SAFETY: `std::rc::Rc` is one pointer to its allocation.
+        unsafe { std::mem::transmute_copy::<StdRc<Vec<AttrGuard>>, usize>(&guards) }
+    };
+    let guards_vec = std::ptr::from_ref::<Vec<AttrGuard>>(&guards) as usize - rc_box;
+    let guards_buf = guards_vec + vec_ptr;
+    if word(rc_box as *const u8, guards_buf) != guards.as_ptr() as usize {
+        return None;
+    }
+    let ctx_pins = std::mem::offset_of!(CallCtx, pins);
+    Some(weavepy_jit::ObjLayout {
+        ctx_pins_ptr: i32_of(ctx_pins + vec_ptr)?,
+        ctx_pins_len: i32_of(ctx_pins + vec_len)?,
+        pin_size: i32_of(std::mem::size_of::<Pin>())?,
+        pin_tag: 0,
+        pin_obj_tag,
+        pin_obj: i32_of(pin_obj)?,
+        ctx_guards: i32_of(std::mem::offset_of!(CallCtx, attr_guards))?,
+        guards_buf: i32_of(guards_buf)?,
+        guard_size: i32_of(std::mem::size_of::<AttrGuard>())?,
+        guard_ver: i32_of(std::mem::offset_of!(AttrGuard, ver))?,
+        guard_split_idx: i32_of(std::mem::offset_of!(AttrGuard, split_idx))?,
+        tag_instance: tag(obj),
+        tag_int: tag(&Object::Int(0)),
+        tag_float: tag(&Object::Float(0.0)),
+        tag_bool: tag(&Object::Bool(false)),
+        tag_none: tag(&Object::None),
+        inst_class: i32_of(inst_class)?,
+        inst_dict_lazy: i32_of(inst_dict_lazy)?,
+        inst_split_borrow: i32_of(inst_split_borrow)?,
+        inst_split_block: i32_of(inst_split_block)?,
+        type_attr_version: i32_of(type_attr_version)?,
+        type_shared_keys: i32_of(type_shared_keys)?,
+        split_keys: i32_of(SplitValues::KEYS_OFFSET)?,
+        split_len: i32_of(SplitValues::LEN_OFFSET)?,
+        split_values: i32_of(SplitValues::VALUES_OFFSET)?,
+        cells_unguarded: crate::sync::cells_unguarded_flag() as usize,
     })
 }
 
@@ -2790,6 +2955,7 @@ fn attr_fingerprint_obj(
     let Object::Instance(inst) = obj else {
         return None;
     };
+    ensure_obj_layout(obj);
     // RFC 0070 WS3 / RFC 0071 WS2 — the tier-1 predicate classifies
     // the storage: an indexed instance-dict hit, a `__slots__` member
     // (read and written through the slot side table by name), or the

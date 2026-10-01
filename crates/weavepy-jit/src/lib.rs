@@ -42,6 +42,7 @@ pub use ir::{
     TOp, TStmt, TTerm,
 };
 pub use runtime::{
+    set_obj_layout, ObjLayout,
     register_attr_get_chain_helper, register_attr_helpers, register_build_map_helper,
     register_build_set_helper, register_cached_attr_chain_helper, register_call_dyn_helper,
     register_call_dyn_int_helper, register_call_method_helper, register_call_py_helper,

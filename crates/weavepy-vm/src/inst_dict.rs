@@ -225,6 +225,14 @@ impl Drop for SplitValues {
 }
 
 impl SplitValues {
+    /// Where native code finds a split block's parts: the block pointer
+    /// (null when empty) within the values, and the shared names' pointer,
+    /// the `u32` length and the first value within a block.
+    pub(crate) const BLOCK_OFFSET: usize = std::mem::offset_of!(Self, block);
+    pub(crate) const KEYS_OFFSET: usize = std::mem::offset_of!(SplitHeader, keys);
+    pub(crate) const LEN_OFFSET: usize = std::mem::offset_of!(SplitHeader, len);
+    pub(crate) const VALUES_OFFSET: usize = std::mem::size_of::<SplitHeader>();
+
     #[inline]
     fn layout(cap: usize) -> std::alloc::Layout {
         std::alloc::Layout::new::<SplitHeader>()
@@ -675,6 +683,12 @@ impl std::fmt::Debug for InstDict {
 }
 
 impl InstDict {
+    /// Where native code finds the published dictionary's pointer (null
+    /// while the values are split) and the split values' cell.
+    pub(crate) const LAZY_OFFSET: usize =
+        std::mem::offset_of!(Self, lazy) + LazyArc::<RefCell<DictData>>::POINTER_OFFSET;
+    pub(crate) const SPLIT_OFFSET: usize = std::mem::offset_of!(Self, split);
+
     pub fn new() -> Self {
         Self {
             lazy: LazyArc::new(),
