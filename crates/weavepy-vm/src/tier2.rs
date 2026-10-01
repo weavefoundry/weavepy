@@ -2702,7 +2702,8 @@ fn split_index(cls: &TypeObject, storage: AttrStorage, name: &str) -> u32 {
 /// reads and writes touch (see [`weavepy_jit::ObjLayout`]), check every
 /// offset against `obj` (a live instance), and publish the layout. Once:
 /// later calls return straight away.
-fn ensure_obj_layout(obj: &Object) {
+#[inline]
+pub(crate) fn ensure_obj_layout(obj: &Object) {
     static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if DONE.load(std::sync::atomic::Ordering::Relaxed) {
         return;
@@ -2712,8 +2713,17 @@ fn ensure_obj_layout(obj: &Object) {
     };
     DONE.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(layout) = obj_layout(obj, inst) {
+        let _ = PUBLISHED_LAYOUT.set(layout);
         weavepy_jit::set_obj_layout(layout);
     }
+}
+
+static PUBLISHED_LAYOUT: std::sync::OnceLock<weavepy_jit::ObjLayout> = std::sync::OnceLock::new();
+
+/// The object layout [`ensure_obj_layout`] published, for the VM's other
+/// native code (the leaf plans').
+pub(crate) fn published_obj_layout() -> Option<&'static weavepy_jit::ObjLayout> {
+    PUBLISHED_LAYOUT.get()
 }
 
 /// The layout [`ensure_obj_layout`] publishes, `None` when any offset

@@ -196,6 +196,14 @@ impl Ctx<'_> {
 /// `ctx.top`'s offset (native code passes the evaluation's own frame by
 /// address).
 const TOP_OFFSET: i32 = 32;
+/// Where native code finds the count of buffered stores, and a field
+/// cache's first entry's version and position.
+const PEND_N_OFFSET: i32 =
+    (std::mem::offset_of!(Ctx<'static>, pend) + std::mem::offset_of!(Pending, n)) as i32;
+const FIELD_VER_OFFSET: i32 = (std::mem::offset_of!(FieldCache, entries)
+    + std::mem::offset_of!((u64, u32), 0)) as i32;
+const FIELD_IDX_OFFSET: i32 = (std::mem::offset_of!(FieldCache, entries)
+    + std::mem::offset_of!((u64, u32), 1)) as i32;
 const _: () = assert!(std::mem::offset_of!(Ctx<'static>, top) == TOP_OFFSET as usize);
 
 /// Run `plan`'s native code for one evaluation, compiling it once it is
@@ -889,6 +897,96 @@ impl Lower<'_> {
         self.b.def_var(fl.pays[r], p);
     }
 
+    /// Branch to `miss` when `cond`; continue in a fresh block otherwise.
+    fn miss_if(&mut self, cond: Value, miss: Block) {
+        let ok = self.b.create_block();
+        self.b.ins().brif(cond, miss, &[], ok, &[]);
+        self.b.switch_to_block(ok);
+    }
+
+    /// [`h_field`]'s first cache entry in line: the receiver register
+    /// `(t, p)` is a plain instance whose class has the entry's version
+    /// and whose values are split over its class's names, holding the
+    /// entry's position; the field's value as register words. Anything
+    /// else (and, with buffered stores, everything) branches to `miss`.
+    fn inline_field(
+        &mut self,
+        l: &weavepy_jit::ObjLayout,
+        t: Value,
+        p: Value,
+        cache: i64,
+        effect: bool,
+        miss: Block,
+    ) -> (Value, Value) {
+        let f = MemFlags::trusted();
+        let ptr = self.ptr;
+        // (The checks are grouped by what each group's loads need proven:
+        // fewer blocks compile faster.)
+        let not_ref = self.b.ins().icmp_imm(IntCC::NotEqual, t, T_R as i64);
+        self.miss_if(not_ref, miss);
+        let otag = self.b.ins().uload8(types::I32, f, p, 0);
+        let mut bad = self.b.ins().icmp_imm(IntCC::NotEqual, otag, i64::from(l.tag_instance));
+        if effect {
+            let n = self.b.ins().load(types::I64, f, self.ctx, PEND_N_OFFSET);
+            let pending = self.b.ins().icmp_imm(IntCC::NotEqual, n, 0);
+            bad = self.b.ins().bor(bad, pending);
+        }
+        self.miss_if(bad, miss);
+        // An instance: its class, its split values, and the site's entry.
+        let inst = self.b.ins().load(ptr, f, p, 8);
+        let cls = self.b.ins().load(ptr, f, inst, l.inst_class);
+        let ver = self.b.ins().load(types::I64, f, cls, l.type_attr_version);
+        let at = self.b.ins().iconst(ptr, cache);
+        let want = self.b.ins().load(types::I64, f, at, FIELD_VER_OFFSET);
+        let idx = self.b.ins().uload32(f, at, FIELD_IDX_OFFSET);
+        let lazy = self.b.ins().load(ptr, f, inst, l.inst_dict_lazy);
+        let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+        let shared = self.b.ins().uload8(types::I64, f, flag, 0);
+        let borrow = self.b.ins().sload32(f, inst, l.inst_split_borrow);
+        let block = self.b.ins().load(ptr, f, inst, l.inst_split_block);
+        let unset = self.b.ins().icmp_imm(IntCC::Equal, want, 0);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, ver, want);
+        let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+        let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
+        let other = self.b.ins().bor(lazy, shared);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+        let bad = self.b.ins().bor(unset, stale);
+        let bad = self.b.ins().bor(bad, busy);
+        let bad = self.b.ins().bor(bad, empty);
+        let bad = self.b.ins().bor(bad, other);
+        self.miss_if(bad, miss);
+        // A block over the class's names that holds the position.
+        let keys = self.b.ins().load(ptr, f, block, l.split_keys);
+        let ckeys = self.b.ins().load(ptr, f, cls, l.type_shared_keys);
+        let len = self.b.ins().uload32(f, block, l.split_len);
+        let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
+        let absent = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
+        let bad = self.b.ins().bor(foreign, absent);
+        self.miss_if(bad, miss);
+        let off = self.b.ins().ishl_imm(idx, 4);
+        let v = self.b.ins().iadd(block, off);
+        let v = self.b.ins().iadd_imm(v, i64::from(l.split_values));
+        // `norm`: the scalars by value, anything else by reference.
+        let vt = self.b.ins().uload8(types::I64, f, v, 0);
+        let word = self.b.ins().load(types::I64, f, v, 8);
+        let byte = self.b.ins().uload8(types::I64, f, v, 1);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        let mut rt = self.b.ins().iconst(types::I64, T_R as i64);
+        let mut rp = v;
+        for (tag, vtag, pay) in [
+            (l.tag_int, T_I, word),
+            (l.tag_float, T_F, word),
+            (l.tag_bool, T_B, byte),
+            (l.tag_none, T_N, zero),
+        ] {
+            let hit = self.b.ins().icmp_imm(IntCC::Equal, vt, i64::from(tag));
+            let tv = self.b.ins().iconst(types::I64, vtag as i64);
+            rt = self.b.ins().select(hit, tv, rt);
+            rp = self.b.ins().select(hit, pay, rp);
+        }
+        (rt, rp)
+    }
+
     /// Load the result words a helper left at `ctx.out[k..k + 2]` into `r`.
     fn set_out(&mut self, fl: &FrameLower<'_>, r: u8, k: i32) {
         let flags = MemFlags::trusted();
@@ -1139,11 +1237,19 @@ impl Lower<'_> {
                 let (t, p) = self.get(fl, src);
                 let pn = self.u32c(u32::from(pc) | u32::from(name) << 16);
                 let cache = Box::<FieldCache>::default();
-                let cache_v = self
-                    .b
-                    .ins()
-                    .iconst(self.ptr, std::ptr::from_ref(&*cache) as i64);
+                let cache_at = std::ptr::from_ref(&*cache) as i64;
+                let cache_v = self.b.ins().iconst(self.ptr, cache_at);
                 self.fields.push(cache);
+                // The site's most recent field, read in line.
+                let done = self.b.create_block();
+                self.b.append_block_param(done, types::I64);
+                self.b.append_block_param(done, types::I64);
+                if let Some(l) = crate::tier2::published_obj_layout() {
+                    let slow = self.b.create_block();
+                    let (vt, vp) = self.inline_field(l, t, p, cache_at, effect, slow);
+                    self.b.ins().jump(done, &[vt.into(), vp.into()]);
+                    self.b.switch_to_block(slow);
+                }
                 let addr = if effect {
                     h_field::<true> as *const () as usize
                 } else {
@@ -1151,7 +1257,13 @@ impl Lower<'_> {
                 };
                 let st = self.call(addr, &[self.ctx, fl.fr, cache_v, t, p, pn]);
                 self.check(st);
-                self.set_out(fl, dst, 0);
+                let flags = MemFlags::trusted();
+                let rt = self.b.ins().load(types::I64, flags, self.ctx, 0);
+                let rp = self.b.ins().load(types::I64, flags, self.ctx, 8);
+                self.b.ins().jump(done, &[rt.into(), rp.into()]);
+                self.b.switch_to_block(done);
+                let (rt, rp) = (self.b.block_params(done)[0], self.b.block_params(done)[1]);
+                self.set(fl, dst, rt, rp);
             }
             Op::Method { dst, src, pc, name } => {
                 let Some(ms) = crate::code_method_slot(fl.code, u32::from(pc)) else {

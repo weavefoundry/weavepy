@@ -2810,11 +2810,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let off = self.b.ins().imul_imm(pin, i64::from(l.pin_size));
         let p = self.b.ins().iadd(buf, off);
         let ptag = self.b.ins().uload8(types::I32, t, p, l.pin_tag);
-        let not_obj = self.b.ins().icmp_imm(IntCC::NotEqual, ptag, i64::from(l.pin_obj_tag));
-        self.miss_if(not_obj, miss);
         let otag = self.b.ins().uload8(types::I32, t, p, l.pin_obj);
+        let not_obj = self.b.ins().icmp_imm(IntCC::NotEqual, ptag, i64::from(l.pin_obj_tag));
         let not_inst = self.b.ins().icmp_imm(IntCC::NotEqual, otag, i64::from(l.tag_instance));
-        self.miss_if(not_inst, miss);
+        let bad = self.b.ins().bor(not_obj, not_inst);
+        self.miss_if(bad, miss);
         let inst = self.b.ins().load(ptr, t, p, l.pin_obj + 8);
         // The guard.
         let guards = self.b.ins().load(ptr, t, ctx, l.ctx_guards);
@@ -2825,34 +2825,35 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .iadd_imm(gbuf, i64::from(site) * i64::from(l.guard_size));
         let ver = self.b.ins().load(types::I64, t, g, l.guard_ver);
         let idx = self.b.ins().uload32(t, g, l.guard_split_idx);
-        // The class.
+        // The class and the split values (grouped by what each group's
+        // loads need proven: fewer blocks compile faster).
         let cls = self.b.ins().load(ptr, t, inst, l.inst_class);
         let cver = self.b.ins().load(types::I64, t, cls, l.type_attr_version);
-        let stale = self.b.ins().icmp(IntCC::NotEqual, cver, ver);
-        self.miss_if(stale, miss);
-        // The split values.
         let lazy = self.b.ins().load(ptr, t, inst, l.inst_dict_lazy);
-        self.miss_if(lazy, miss);
         let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
-        let shared = self.b.ins().uload8(types::I32, t, flag, 0);
-        self.miss_if(shared, miss);
+        let shared = self.b.ins().uload8(types::I64, t, flag, 0);
         let borrow = self.b.ins().sload32(t, inst, l.inst_split_borrow);
+        let block = self.b.ins().load(ptr, t, inst, l.inst_split_block);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, cver, ver);
         let busy = if read {
             self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0)
         } else {
             self.b.ins().icmp_imm(IntCC::NotEqual, borrow, 0)
         };
-        self.miss_if(busy, miss);
-        let block = self.b.ins().load(ptr, t, inst, l.inst_split_block);
         let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
-        self.miss_if(empty, miss);
+        let other = self.b.ins().bor(lazy, shared);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+        let bad = self.b.ins().bor(stale, busy);
+        let bad = self.b.ins().bor(bad, empty);
+        let bad = self.b.ins().bor(bad, other);
+        self.miss_if(bad, miss);
         let keys = self.b.ins().load(ptr, t, block, l.split_keys);
         let ckeys = self.b.ins().load(ptr, t, cls, l.type_shared_keys);
-        let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
-        self.miss_if(foreign, miss);
         let len = self.b.ins().uload32(t, block, l.split_len);
+        let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
         let absent = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
-        self.miss_if(absent, miss);
+        let bad = self.b.ins().bor(foreign, absent);
+        self.miss_if(bad, miss);
         let off = self.b.ins().ishl_imm(idx, 4);
         let at = self.b.ins().iadd(block, off);
         self.b.ins().iadd_imm(at, i64::from(l.split_values))
