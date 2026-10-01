@@ -2738,22 +2738,16 @@ fn stdlib_module_names_value() -> Object {
 }
 
 /// `sys.getrefcount(obj)` — best-effort, derived from the real
-/// `Rc::strong_count` of the payload. Infrastructure references
-/// (the cycle-GC registry's handle, weakref slots' strong clones)
-/// are discounted so the number tracks *program-visible* bindings;
-/// `+1` accounts for the argument reference, like CPython. The
+/// `Rc::strong_count` of the payload. The collector and the weakref
+/// registry hold no strong references; clones held only by the C-API
+/// layer's caches are discounted so the number tracks *program-visible*
+/// bindings. `+1` accounts for the argument reference, like CPython. The
 /// exact number is implementation-specific even in CPython.
 fn sys_getrefcount(args: &[Object]) -> Result<Object, RuntimeError> {
     let Some(obj) = args.first() else {
         return Err(type_error("getrefcount() takes exactly 1 argument"));
     };
     let strong = crate::gc_trace::strong_count_for(obj);
-    let id = crate::weakref_registry::id_of(obj);
-    let registry = usize::from(crate::gc_trace::is_tracked(id));
-    let weak_clones = crate::weakref_registry::strong_clone_count(id);
-    // A dropped-but-registry-pinned memoryview (dead under CPython
-    // refcounting) must not count through its exporter edge.
-    let zombie_refs = crate::gc_trace::zombie_memoryview_refs_to(id);
     // Clones held only by the C-API layer's pin caches (a parked
     // argument-pinned identity box, a dead-except-pin scalar/tuple pin —
     // RFC 0076 WS1) are infrastructure too: on CPython the corresponding
@@ -2768,9 +2762,6 @@ fn sys_getrefcount(args: &[Object]) -> Result<Object, RuntimeError> {
     // unless CPython wouldn't have taken one at all (a borrowed load).
     let borrowed = borrowed_argument_discount(obj);
     let visible = strong
-        .saturating_sub(registry)
-        .saturating_sub(weak_clones)
-        .saturating_sub(zombie_refs)
         .saturating_sub(pinned)
         .saturating_sub(borrowed)
         .saturating_add(extra_c);

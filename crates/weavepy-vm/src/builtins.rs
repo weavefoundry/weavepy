@@ -12470,7 +12470,7 @@ fn list_setitem(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         let replaced = crate::apply_slice_assignment(&mut l.borrow_mut(), s, replacement)?;
         for old in replaced {
-            queue_removed(old);
+            drop(old);
         }
         return Ok(Object::None);
     }
@@ -12479,7 +12479,7 @@ fn list_setitem(args: &[Object]) -> Result<Object, RuntimeError> {
         let n = list_index_arg(l.len(), key, "__setitem__")?;
         std::mem::replace(&mut l[n], val.clone())
     };
-    queue_removed(old);
+    drop(old);
     Ok(Object::None)
 }
 
@@ -12493,7 +12493,7 @@ fn list_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
         let mut indices = crate::slice_indices(l.len(), s)?;
         indices.sort_unstable();
         for i in indices.into_iter().rev() {
-            queue_removed(l.remove(i));
+            drop(l.remove(i));
         }
         return Ok(Object::None);
     }
@@ -12502,7 +12502,7 @@ fn list_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
         let n = list_index_arg(l.len(), key, "__delitem__")?;
         l.remove(n)
     };
-    queue_removed(removed);
+    drop(removed);
     Ok(Object::None)
 }
 
@@ -12672,7 +12672,7 @@ fn list_remove(args: &[Object]) -> Result<Object, RuntimeError> {
                 }
             };
             if let Some(removed) = removed {
-                queue_removed(removed);
+                drop(removed);
             }
             return Ok(Object::None);
         }
@@ -12931,7 +12931,7 @@ fn list_clear(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let evicted: Vec<Object> = std::mem::take(&mut *list_self(args)?.borrow_mut());
     for v in evicted {
-        queue_removed(v);
+        drop(v);
     }
     Ok(Object::None)
 }
@@ -13141,7 +13141,7 @@ fn dict_setitem(args: &[Object]) -> Result<Object, RuntimeError> {
     ensure_dict_key(key)?;
     let old = dict_insert(&d, key.clone(), val.clone())?;
     if let Some(old) = old {
-        queue_removed(old);
+        drop(old);
     }
     Ok(Object::None)
 }
@@ -13160,15 +13160,6 @@ fn dict_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
     found.ok_or_else(|| key_error_object(key.clone()))
 }
 
-/// Route a key/value evicted by a container mutator to the prompt-reap
-/// queue (see [`crate::vm_singletons::queue_container_removed`]) before
-/// dropping our reference. The queue holds a clone; the eval loop reaps it
-/// at the next between-bytecodes safe point if the eviction was its last
-/// program-visible reference.
-pub(crate) fn queue_removed(v: Object) {
-    crate::vm_singletons::queue_container_removed(&v);
-}
-
 fn dict_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
     let key = args
@@ -13177,8 +13168,8 @@ fn dict_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
     ensure_dict_key(key)?;
     let removed = dict_remove(&d, key)?;
     if let Some((k, v)) = removed {
-        queue_removed(k);
-        queue_removed(v);
+        drop(k);
+        drop(v);
         Ok(Object::None)
     } else {
         Err(key_error_object(key.clone()))
@@ -13255,7 +13246,7 @@ fn dict_pop(args: &[Object]) -> Result<Object, RuntimeError> {
     if let Some((k, v)) = removed {
         // The *stored* key (equal to, but possibly distinct from, the
         // lookup key) is evicted too; the value is returned to the caller.
-        queue_removed(k);
+        drop(k);
         Ok(v)
     } else if let Some(default) = args.get(2).cloned() {
         Ok(default)
@@ -13294,7 +13285,7 @@ fn dict_update(args: &[Object]) -> Result<Object, RuntimeError> {
                 let src_len = entries.len();
                 for (k, v) in entries {
                     if let Some(old) = dict_insert(&d, k.0, v)? {
-                        queue_removed(old);
+                        drop(old);
                     }
                     // CPython's `PyDict_Merge` re-checks the source size
                     // *after* every insert: a key `__eq__` that mutates the
@@ -13315,7 +13306,7 @@ fn dict_update(args: &[Object]) -> Result<Object, RuntimeError> {
                 let mut dst = d.borrow_mut();
                 for (k, v) in entries {
                     if let Some(old) = dst.insert(k, v) {
-                        queue_removed(old);
+                        drop(old);
                     }
                 }
             }
@@ -13337,8 +13328,8 @@ fn dict_clear(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     }
     for (k, v) in evicted {
-        queue_removed(k.0);
-        queue_removed(v);
+        drop(k.0);
+        drop(v);
     }
     Ok(Object::None)
 }
@@ -13582,7 +13573,7 @@ fn dict_ior(args: &[Object]) -> Result<Object, RuntimeError> {
             .collect();
         for (k, v) in entries {
             if let Some(old) = dict_insert(&d, k.0, v)? {
-                queue_removed(old);
+                drop(old);
             }
         }
         return Ok(args[0].clone());
@@ -13630,7 +13621,7 @@ fn dict_ior(args: &[Object]) -> Result<Object, RuntimeError> {
         let (k, v) = (kv.next().unwrap(), kv.next().unwrap());
         ensure_dict_key(&k)?;
         if let Some(old) = dict_insert(&d, k, v)? {
-            queue_removed(old);
+            drop(old);
         }
         i += 1;
     }
@@ -13675,12 +13666,12 @@ fn apply_set_inplace_op(s: &mut crate::object::SetData, op: SetInplaceOp) {
         }
         SetInplaceOp::Discard(k) => {
             if let Some(removed) = s.swap_take(&k) {
-                queue_removed(removed.0);
+                drop(removed.0);
             }
         }
         SetInplaceOp::Clear => {
             for k in s.drain(..) {
-                queue_removed(k.0);
+                drop(k.0);
             }
         }
     }

@@ -1128,10 +1128,17 @@ impl crate::types::PyInstance {
     /// layout, no materializing).
     pub fn attr_position_str(&self, name: &str) -> Option<u32> {
         let i = match self.dict.published() {
-            Some(d) => d
-                .try_borrow()
-                .ok()?
-                .get_index_of(&crate::object::StrKey(name))?,
+            Some(d) => {
+                // Never runs Python: a stored key only a user `__eq__`
+                // could equate leaves the position unknown.
+                let probe =
+                    crate::object::LeafNameProbe::new(name, crate::object::py_str_hash(name));
+                let i = d.try_borrow().ok()?.get_index_of(&probe);
+                if probe.saw_exotic() {
+                    return None;
+                }
+                i?
+            }
             None => self
                 .dict
                 .split_cell()

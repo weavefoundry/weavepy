@@ -741,6 +741,13 @@ pub struct TypeObject {
     pub exc_families: Cell<u64>,
 }
 
+/// A dying TypeObject clears the weak references watching it.
+impl Drop for TypeObject {
+    fn drop(&mut self) {
+        crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
+    }
+}
+
 /// Per-class resolution of the `type.__call__` protocol, cached on the
 /// class ([`TypeObject::instance_plan`]) and invalidated by
 /// [`TypeObject::attr_version`]. Everything here is a pure function of
@@ -2605,13 +2612,7 @@ pub struct PyInstance {
     /// `_PyGC_FINALIZED` bit. Set by `Vm::invoke_finalizer` the moment the
     /// finalizer is dispatched; read by [`PyInstance`]'s `Drop` to decide
     /// whether the dying instance still needs its `__del__` resurrected onto
-    /// the pending-finalizer queue. Without this, an acyclic finalizable
-    /// instance whose last `Arc` is dropped on a code path that *didn't*
-    /// route through the prompt-reap cascade (e.g. a cross-thread handoff
-    /// where a transient clone briefly inflated the refcount so the reap
-    /// bailed) is freed silently, skipping `__del__` (RFC 0040:
-    /// `test_multiprocessing_*` `test_release_task_refs` leaked one
-    /// `CountedObject` per race).
+    /// the pending-finalizer queue.
     pub finalize_ran: Cell<bool>,
     /// Cycle-collector tracking is still deferred: the collector has
     /// never seen this instance, and it holds only atomic values (see
@@ -2939,19 +2940,8 @@ impl PyInstance {
 }
 
 impl Drop for PyInstance {
-    /// Last-resort finalizer safety net, mirroring
-    /// [`crate::object::PyGenerator`]'s `Drop`. WeavePy normally runs an
-    /// instance's `__del__` through the prompt-reap cascade the instant its
-    /// last program reference is dropped (matching CPython's refcount
-    /// timing). But that cascade is driven from specific eval-loop sites and
-    /// is gated on a refcount-dead test; when the final `Arc` is released
-    /// somewhere else — most often a cross-thread object handoff where a
-    /// transient clone on another thread briefly inflated the strong count so
-    /// the reap conservatively bailed — the instance would otherwise be freed
-    /// by a plain `Arc` drop with its `__del__` silently skipped (the cycle
-    /// collector never revisits acyclic objects). Catch that here: resurrect
-    /// a shallow copy that shares the dying instance's `__dict__`/slots/native
-    /// value onto the VM's pending-finalizer queue so `__del__` still runs.
+    /// An instance dies when its last reference goes, as in CPython, and
+    /// the weak references watching it clear.
     fn drop(&mut self) {
         // A deferred-tracking record names this instance; the dict may
         // outlive it (`d = obj.__dict__`), so retire the record first.
@@ -2968,12 +2958,6 @@ impl Drop for PyInstance {
                 }
             }
         }
-        if crate::hot_gates::env_flags::reap_trace() {
-            let name = self.cls().name.clone();
-            if name.contains("Block") || name.contains("DataFrame") {
-                eprintln!("[INST-DROP] {name} body={:#x}", self.c_body.get());
-            }
-        }
         // RFC 0045 (wave 3): release the faithful C inline body this
         // instance owns, if it ever crossed into a C extension that reads
         // its fields at fixed `tp_basicsize` offsets. Runs before the
@@ -2988,44 +2972,9 @@ impl Drop for PyInstance {
                 free(body);
             }
         }
-        // Already finalized (cascade/GC/this net's resurrected copy): the
-        // common case for finalizable instances and the *only* path for the
-        // overwhelmingly common finalizer-free instance — a single `Cell`
-        // read keeps the hot drop path cheap.
-        if self.finalize_ran.get() {
-            return;
-        }
-        // No `__del__` anywhere in the MRO ⇒ nothing to do. Cached on the
-        // type, so this is one more `Cell` read after the first instance.
-        if !self.cls().instances_need_finalize() {
-            return;
-        }
-        // CPython runs `tp_finalize` once: claim it so the resurrected copy
-        // (and any re-drop after the finalizer completes) can't loop.
-        self.finalize_ran.set(true);
-        // Can't run Python from `Drop`; resurrect onto the pending queue. The
-        // copy shares `dict`/`slots`/`native` (cloning the `Arc`s/contents),
-        // so `__del__` observes the same attributes; `try_*` tolerates TLS
-        // teardown and re-entrant borrows by dropping the request.
-        let resurrected = Object::Instance(Rc::new(PyInstance {
-            class: RefCell::new(self.cls()),
-            dict: self.dict.clone(),
-            native: match self.native.get() {
-                Some(v) => crate::sync::OnceBox::from(v.clone()),
-                None => crate::sync::OnceBox::new(),
-            },
-            inline_values: Cell::new(self.inline_values.get()),
-            slots: RefCell::new(self.slots.borrow().clone()),
-            hash_cache: crate::sync::CachedHash::new(self.hash_cache.get()),
-            // This copy still owes its queued invocation. Dispatch claims
-            // its flag atomically; a failed enqueue suppresses its Drop.
-            finalize_ran: Cell::new(false),
-            // The resurrected copy is a distinct object that owns no C
-            // body (the dying `self` already freed its own above).
-            deferred: crate::sync::Cell::new(false),
-            c_body: CBody::default(),
-        }));
-        crate::vm_singletons::try_push_pending_finalizer(resurrected);
+        // A finalizer, if the class has one, already ran: `rc::Rc`'s `Drop`
+        // queued this instance for it at its last release.
+        crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
     }
 }
 

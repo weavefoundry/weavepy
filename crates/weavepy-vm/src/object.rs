@@ -2026,6 +2026,7 @@ pub fn c_contiguous_strides(shape: &[usize], itemsize: usize) -> Vec<isize> {
 impl Drop for PyMemoryView {
     fn drop(&mut self) {
         self.release();
+        crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
     }
 }
 
@@ -2878,6 +2879,13 @@ pub struct PyModule {
     pub name: String,
     pub filename: Option<String>,
     pub dict: Rc<RefCell<DictData>>,
+}
+
+/// A dying PyModule clears the weak references watching it.
+impl Drop for PyModule {
+    fn drop(&mut self) {
+        crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
+    }
 }
 
 impl fmt::Debug for PyModule {
@@ -4402,6 +4410,13 @@ pub struct PyFunction {
     pub defaults_override: OverrideFlag,
 }
 
+/// A dying PyFunction clears the weak references watching it.
+impl Drop for PyFunction {
+    fn drop(&mut self) {
+        crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
+    }
+}
+
 /// A clonable set-once flag (see [`PyFunction::defaults_override`]).
 #[derive(Debug, Default)]
 pub struct OverrideFlag(std::sync::atomic::AtomicBool);
@@ -4576,6 +4591,13 @@ pub struct BoundMethod {
     /// (`_MAYBE_EXPAND_METHOD` checks `PyMethod_Type`). Irrelevant when
     /// `function` is a Python function (always `method`).
     pub py_method: bool,
+}
+
+/// A dying BoundMethod clears the weak references watching it.
+impl Drop for BoundMethod {
+    fn drop(&mut self) {
+        crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
+    }
 }
 
 impl BoundMethod {
@@ -4827,54 +4849,24 @@ impl fmt::Debug for PyGenerator {
 
 impl Drop for PyGenerator {
     fn drop(&mut self) {
-        // CPython finalizes a generator the moment its refcount dies:
-        // a *suspended* frame gets `GeneratorExit` thrown in so
-        // `finally:`/`with` cleanup runs. We can't run Python from
-        // `Drop`, so resurrect the live frame into the VM's
-        // pending-finalizer queue; `gc.collect()` and the module-exit
-        // path drain it. Created-but-never-started frames have run no
-        // user code, so (like CPython's `gen_close`) they are simply
-        // marked completed.
-        let Ok(mut state) = self.state.try_borrow_mut() else {
-            return;
-        };
-        let prev = std::mem::replace(&mut *state, GeneratorState::Finished);
-        drop(state);
-        match prev {
-            GeneratorState::Suspended(frame) => {
-                // Finalized once already (CPython's `_PyGC_FINALIZED` bit):
-                // drop the frame for real instead of looping forever
-                // through resurrection → finalize → drop.
-                if self.finalize_ran.get() {
-                    defer_generator_state_drop(GeneratorState::Suspended(frame));
-                    return;
-                }
-                let resurrected = Rc::new(PyGenerator {
-                    name: RefCell::new(self.name.borrow().clone()),
-                    qualname: RefCell::new(self.qualname.borrow().clone()),
-                    kind: self.kind,
-                    code: self.code.clone(),
-                    state: RefCell::new(GeneratorState::Suspended(frame)),
-                    origin: RefCell::new(self.origin.borrow().clone()),
-                    hooks_inited: crate::sync::Cell::new(self.hooks_inited.get()),
-                    finalizer: RefCell::new(self.finalizer.borrow().clone()),
-                    finalize_ran: crate::sync::Cell::new(self.finalize_ran.get()),
-                });
-                let obj = match self.kind {
-                    CoroutineKind::Generator => Object::Generator(resurrected),
-                    CoroutineKind::Coroutine => Object::Coroutine(resurrected),
-                    CoroutineKind::AsyncGenerator => Object::AsyncGenerator(resurrected),
-                };
-                crate::vm_singletons::try_push_pending_finalizer(obj);
+        // A suspended generator's `close()` (and a never-awaited
+        // coroutine's warning) already ran: `rc::Rc`'s `Drop` queued the
+        // generator for it at its last release. A created or suspended
+        // frame still owns locals that can hold the *next* generator of a
+        // pipeline (`chain(chain(chain(…)))`); dropping it inline recurses
+        // one native stack frame per link and overflows on long chains, so
+        // route it through the iterative trampoline below.
+        if let Ok(mut state) = self.state.try_borrow_mut() {
+            let prev = std::mem::replace(&mut *state, GeneratorState::Finished);
+            drop(state);
+            if matches!(
+                prev,
+                GeneratorState::Suspended(_) | GeneratorState::Created(_)
+            ) {
+                defer_generator_state_drop(prev);
             }
-            // A never-started frame still owns locals that can hold the
-            // *next* generator of a pipeline (`chain(chain(chain(…)))`).
-            // Dropping it inline recurses one native stack frame per
-            // link and overflows on long chains, so route it through
-            // the iterative trampoline below.
-            state @ GeneratorState::Created(_) => defer_generator_state_drop(state),
-            GeneratorState::Finished | GeneratorState::Running => {}
         }
+        crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
     }
 }
 
@@ -7695,6 +7687,7 @@ impl fmt::Debug for PyFile {
 
 impl Drop for PyFile {
     fn drop(&mut self) {
+        crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
         // CPython's fileio/buffered/textio deallocators emit a
         // `ResourceWarning("unclosed file %R")` when an *open*, fd-backed
         // stream is reclaimed without an explicit `close()`/`with`
@@ -11995,9 +11988,7 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             // The common case first: a plain instance whose `__hash__` is
             // `object`'s hashes by identity, with no interpreter round trip.
             if inst.native.get().is_none()
-                && inst
-                    .class_dunder(crate::types::Dunder::Hash)
-                    .object_owner()
+                && inst.class_dunder(crate::types::Dunder::Hash).object_owner()
             {
                 return Some(identity_hash(obj));
             }

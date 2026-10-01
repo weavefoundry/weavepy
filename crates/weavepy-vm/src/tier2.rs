@@ -2198,62 +2198,20 @@ const RUNTIME_PIN_CAP: usize = 1 << 16;
 const RUNTIME_PIN_SOFT_LIMIT: usize = 1 << 12;
 
 /// Retire every pin after the activation's result or complete interpreter
-/// state has been reconstructed. Entry pins can also become dead temporaries
-/// when native code replaces a local or detaches an object from its owner.
-/// Give them the same prompt-reap treatment as runtime pins and interpreter
-/// locals. A suspended native activation must keep its entire table instead.
-/// Returns `true` when a cascade could have run Python, requiring the caller
-/// to revalidate its compiled resolutions.
-fn drain_activation_pins(interp: &mut super::Interpreter, pins: &mut PinTable) -> bool {
-    let mut dirty = false;
-    for p in pins.drain(..) {
-        // Fresh lists are tracked just like interpreter-built lists.
-        // Dropping only the native pin leaves the collector's strong
-        // handle retaining a dead temporary until a later collection.
-        let o = match p {
-            Pin::List(list, _) => Object::List(list),
-            Pin::Obj(o) => o,
-        };
-        // The common pin, a receiver or argument others still hold,
-        // releases plainly (the grades below would conclude the same).
-        if crate::gc_trace::drop_survives_plainly(&o) {
-            continue;
-        }
-        if super::Interpreter::local_needs_prompt_reap(&o)
-            && super::Interpreter::looks_reapable_temporary(&o)
-        {
-            dirty = true;
-            interp.maybe_prompt_reap_replaced(o);
-        } else {
-            crate::gc_trace::note_dropped(&o);
-        }
-    }
-    dirty
+/// state has been reconstructed. A pin that held an object's last
+/// reference frees it; a dying object only queues work for the next safe
+/// point, so no Python runs here. Returns whether Python could have run
+/// (it can't), for the callers that revalidate their compiled resolutions.
+/// A suspended native activation must keep its entire table instead.
+fn drain_activation_pins(_interp: &mut super::Interpreter, pins: &mut PinTable) -> bool {
+    pins.clear();
+    false
 }
 
-/// Retire an activation's pins after its complete
-/// interpreter frame has been rebuilt. Leaves can drop immediately, but
-/// a dying container or finalizable object must wait for the interpreter
-/// to install that frame and charge its recursion tick. The existing
-/// pending-drop queue runs its cascade at the next bytecode safe point.
-/// No Python runs here, and all live values already have rebuilt roots.
+/// Retire an activation's pins after its complete interpreter frame has
+/// been rebuilt (see [`drain_activation_pins`]).
 fn defer_activation_pins(pins: &mut PinTable) {
-    for pin in pins.drain(..) {
-        let obj = match pin {
-            Pin::List(list, _) => Object::List(list),
-            Pin::Obj(obj) => obj,
-        };
-        if crate::gc_trace::drop_survives_plainly(&obj) {
-            continue;
-        }
-        if super::Interpreter::local_needs_prompt_reap(&obj)
-            && super::Interpreter::looks_reapable_temporary(&obj)
-        {
-            crate::vm_singletons::queue_parked_drop(&obj);
-        } else {
-            crate::gc_trace::note_dropped(&obj);
-        }
-    }
+    pins.clear();
 }
 
 /// Reconstruct an [`Object`] from a `(bits, tag)` slot. `Boxed` never
@@ -2903,13 +2861,7 @@ pub(crate) fn gc_sweep() {
             let dead: Vec<*const CodeObject> = st
                 .cache
                 .iter()
-                .filter(|(key, e)| {
-                    // Python weakref slots temporarily hold strong clones;
-                    // the collector discounts those from reachability too.
-                    let weak_clones =
-                        crate::weakref_registry::strong_clone_count(**key as usize as u64);
-                    Rc::strong_count(&e.code) == 1 + weak_clones
-                })
+                .filter(|(_, e)| Rc::strong_count(&e.code) == 1)
                 .map(|(k, _)| *k)
                 .collect();
             for k in dead {
@@ -4803,8 +4755,15 @@ unsafe fn try_native_ctor(
     // `__init__` is a procedure: its `None` rides the procedure lane.
     // A `try_native_call` rejection discards the fresh (empty, never
     // `__init__`-ed) instance and re-allocates on the interpreter path.
-    let status =
-        unsafe { try_native_call(jf, ctx, interp, nc, argc, SlotTag::None as u32, Some(&inst)) }?;
+    // Python never saw it, so it dies without its finalizer.
+    let Some(status) =
+        (unsafe { try_native_call(jf, ctx, interp, nc, argc, SlotTag::None as u32, Some(&inst)) })
+    else {
+        if let Object::Instance(i) = &inst {
+            i.finalize_ran.set(true);
+        }
+        return None;
+    };
     if status == CallStatus::Raised as i64 {
         // A raising `__init__` discards the instance (CPython's
         // `type_call` propagates before returning it).
@@ -6643,25 +6602,11 @@ unsafe extern "C" fn wpjit_dict_set(
     let Some((d, key)) = dict_pin_and_key(ctx, pin, key_bits, key_tag) else {
         return 1;
     };
-    // Python-free pre-probe: displaced-value discipline + deferral
-    // detection (a deferral means the insert below could run Python).
-    let old = match dict_probe_native(&d, &key) {
-        Ok(f) => f,
-        Err(()) => return 1,
-    };
-    if let Some(old) = &old {
-        if !matches!(
-            old,
-            Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
-        ) && super::Interpreter::local_needs_prompt_reap(old)
-            && super::Interpreter::looks_reapable_temporary(old)
-        {
-            return 1;
-        }
+    // Python-free pre-probe: a deferral means the insert below could run
+    // Python.
+    if dict_probe_native(&d, &key).is_err() {
+        return 1;
     }
-    // The displaced value (probed non-reapable above) drops by plain
-    // refcount, exactly like the no-op arm of the interpreter's
-    // prompt-reap check.
     match crate::builtins::dict_insert(&d, key, v) {
         Ok(_) => 0,
         Err(_) => 1,
@@ -6700,21 +6645,9 @@ unsafe extern "C" fn wpjit_dict_del(
         Ok(Some(v)) => v,
         _ => return 1,
     };
-    if !matches!(
-        old,
-        Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
-    ) && super::Interpreter::local_needs_prompt_reap(&old)
-        && super::Interpreter::looks_reapable_temporary(&old)
-    {
-        return 1;
-    }
     drop(old);
     match crate::builtins::dict_remove(&d, &key) {
-        Ok(Some((k, v))) => {
-            crate::vm_singletons::queue_container_removed(&k);
-            crate::vm_singletons::queue_container_removed(&v);
-            0
-        }
+        Ok(Some(_)) => 0,
         _ => 1,
     }
 }
@@ -8450,14 +8383,6 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
             // and the reap; otherwise the overwrite drops it by plain
             // refcount, exactly like the no-op arm of
             // `maybe_prompt_reap_replaced`.
-            if !matches!(
-                dst,
-                Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
-            ) && super::Interpreter::local_needs_prompt_reap(dst)
-                && super::Interpreter::looks_reapable_temporary(dst)
-            {
-                return 1;
-            }
             let old = std::mem::replace(dst, v);
             drop(old);
             0
@@ -8476,18 +8401,8 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
             // The split layout (see `Interpreter::core_store_new_attr`).
             let v = if inst.dict.published().is_none() {
                 // SAFETY: a read between two native ops.
-                let Some(split) = (unsafe { inst.dict.split_cell().peek() }) else {
+                if unsafe { inst.dict.split_cell().peek() }.is_none() {
                     return 1;
-                };
-                if let Some(dst) = split.get(&g.name) {
-                    if !matches!(
-                        dst,
-                        Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
-                    ) && super::Interpreter::local_needs_prompt_reap(dst)
-                        && super::Interpreter::looks_reapable_temporary(dst)
-                    {
-                        return 1;
-                    }
                 }
                 match inst.split_store(&g.name, v) {
                     Ok(old) => {
@@ -8521,14 +8436,6 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
                 RawEntryMut::Occupied(mut entry) => {
                     let dst = entry.get_mut();
                     // The displaced-value discipline of the indexed arm.
-                    if !matches!(
-                        dst,
-                        Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
-                    ) && super::Interpreter::local_needs_prompt_reap(dst)
-                        && super::Interpreter::looks_reapable_temporary(dst)
-                    {
-                        return 1;
-                    }
                     Some(std::mem::replace(dst, v))
                 }
                 RawEntryMut::Vacant(entry) => {
@@ -11606,11 +11513,6 @@ impl NativeActivation {
             let o = p.to_object();
             visit(&o);
         }
-    }
-
-    /// The pinned objects, cloned (for [`super::frame_reapables`]).
-    pub(crate) fn pinned_objects(&self) -> impl Iterator<Item = Object> + '_ {
-        self.pins.iter().map(Pin::to_object)
     }
 }
 

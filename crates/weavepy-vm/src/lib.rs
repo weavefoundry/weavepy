@@ -90,6 +90,7 @@ pub mod types;
 pub mod unicode_case;
 pub mod unicode_numeric;
 pub mod vm_singletons;
+pub mod weak_object;
 pub mod weakref_registry;
 
 use crate::builtin_types::{builtin_types, instance_is_subclass, make_exception_with_class};
@@ -489,63 +490,6 @@ fn py_traceback_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             visit(&Object::Traceback(n.clone()));
         }
     }
-}
-
-/// Snapshot the objects in a generator's suspended frame that will
-/// need finalization when the frame is dropped (instances with a
-/// `__del__`). Captured *before* `close()` tears the frame down so
-/// the caller can emulate CPython's prompt refcount-driven
-/// finalization afterwards.
-fn frame_reapables(g: &Rc<PyGenerator>) -> Vec<Object> {
-    let Ok(state) = g.state.try_borrow() else {
-        return Vec::new();
-    };
-    let boxed = match &*state {
-        GeneratorState::Created(b) | GeneratorState::Suspended(b) => b,
-        _ => return Vec::new(),
-    };
-    let frame: &Frame = boxed;
-    // CPython clears a generator's frame the instant it finishes/closes
-    // (`gen_send`/`gen_close` → `_PyFrame_ClearExceptCode`), so every
-    // local and value-stack entry is decref'd promptly. WeavePy mirrors
-    // that by running each prompt-reapable entry through the cascade
-    // after the frame is torn down — not just `__del__`-bearing
-    // instances but anything that anchors a finalizable acyclic
-    // subgraph *or* whose only surviving reference (once the frame is
-    // gone) is a weakref slot's strong clone in our registry. The
-    // latter is what lets `weakref.ref(obj)` zero out by refcount the
-    // way CPython's does: without it a suspended generator that
-    // referenced `obj` would keep `obj` pinned through the registry's
-    // clone until the next cyclic collection (RFC 0040:
-    // `test_concurrent_futures.test_init` leaked semaphores because the
-    // `_assert_logged`/`sleeping_retry` generators pinned the test
-    // instance → its `multiprocessing.Queue` → SemLocks).
-    let mut out: Vec<Object> = Vec::new();
-    let mut seen: std::collections::HashSet<crate::weakref_registry::ObjectId> =
-        std::collections::HashSet::new();
-    let locals = frame.locals.borrow();
-    for o in locals.iter().chain(frame.stack.iter()) {
-        if (Interpreter::local_needs_prompt_reap(o)
-            || crate::weakref_registry::count_for(crate::weakref_registry::id_of(o)) > 0)
-            && seen.insert(crate::weakref_registry::id_of(o))
-        {
-            out.push(o.clone());
-        }
-    }
-    // RFC 0073 WS4 — a parked native activation's pin table holds the
-    // live values (the locals above are the stale park-time snapshot).
-    #[cfg(feature = "jit")]
-    if let Some(act) = &frame.parked_native {
-        for o in act.pinned_objects() {
-            if (Interpreter::local_needs_prompt_reap(&o)
-                || crate::weakref_registry::count_for(crate::weakref_registry::id_of(&o)) > 0)
-                && seen.insert(crate::weakref_registry::id_of(&o))
-            {
-                out.push(o);
-            }
-        }
-    }
-    out
 }
 
 /// Warm the JIT's code generator on a background thread when the JIT
@@ -2451,16 +2395,13 @@ impl Interpreter {
         result
     }
 
-    /// Emulate CPython's prompt refcount-driven death for an object
-    /// whose binding was just dropped (a `del` statement, or a frame
-    /// torn down by `close()`). If `dropped` holds the last
-    /// program-visible reference — everything else is the GC
-    /// registry's handle and weakref slots' strong clones — run its
-    /// finalizer now and clear its weakrefs, exactly as CPython's
-    /// `tp_dealloc` would. Conservative: any extra reference anywhere
-    /// (containers, caches, other bindings) skips the reap and leaves
-    /// the object to the cycle collector.
-    fn prompt_reap_dropped(&mut self, dropped: Object) {
+    /// Release `dropped`: CPython's `Py_DECREF` at the end of a binding.
+    /// Objects die by reference count (the collector and the weakref
+    /// registry hold no strong references), so this is a plain drop, plus
+    /// the deallocation side effects a `Drop` impl can't produce itself,
+    /// plus the freelists, which take a dead plain instance's or tuple's
+    /// allocation for the next one.
+    fn release(&self, dropped: Object) {
         // C-API watcher probes (test_capi.test_watchers): a watched dict
         // losing its last binding fires PyDict_EVENT_DEALLOCATED; a dying
         // function fires PyFunction_EVENT_DESTROY. Both gates are relaxed
@@ -2474,1256 +2415,39 @@ impl Interpreter {
         if crate::stdlib::testinternalcapi_mod::reftrace_print_active() {
             println!("DESTROY {}", dropped.type_name_owned());
         }
-        // A discarded never-driven `asend`/`athrow`/`aclose` awaitable
-        // warns at finalization (gh-113753; CPython's
-        // `async_gen_asend_finalize` family).
-        if let Object::AsyncGenAwait(a) = &dropped {
-            if !a.started.get() && !a.consumed.get() && Rc::strong_count(a) <= 1 {
-                a.consumed.set(true);
-                let method = match a.kind {
-                    crate::object::AgenAwaitKind::Send => "asend",
-                    crate::object::AgenAwaitKind::Throw => "athrow",
-                    crate::object::AgenAwaitKind::Close => "aclose",
-                };
-                let qualname = match &a.agen {
-                    Object::AsyncGenerator(g) => g.qualname.borrow().to_str(),
-                    other => other.type_name_owned(),
-                };
-                let _ = self.emit_runtime_warning(format!(
-                    "coroutine method '{method}' of '{qualname}' was never awaited"
-                ));
-            }
-            return;
-        }
-        // A `BoundMethod` is itself untracked and carries no finalizer, so
-        // the fast-path early-return below would merely `Rc`-drop it —
-        // reclaiming the method object but leaving a *tracked* receiver
-        // pinned by its own GC handle (the early-return only accounts for
-        // *untracked* children a value anchors). Release the method's hold
-        // and run the receiver through the cascade, exactly as
-        // `reap_call_receiver` does for call temporaries. CPython decrefs a
-        // `method`'s `__self__` the instant the method object dies; this is
-        // what reaps a stored bound `__exit__` — the compiler's `.with_exit`
-        // synthetic local, dropped by `DeleteFast` on every `with` exit path
-        // — when the context manager is a plain instance that anchors
-        // resources. `unittest._AssertRaisesContext` holds the test case,
-        // which in `test_concurrent_futures.test_init` pinned the log
-        // `Queue` and its SemLocks until the next cyclic collection
-        // (RFC 0040: resource-tracker exited nonzero on leaked semaphores).
-        if matches!(&dropped, Object::BoundMethod(_)) {
-            // A bound method that escaped into an instance attribute
-            // (`self.cb = self.handler`) was GC-tracked at store time (see
-            // `generic_setattr_instance`); merely dropping our clone would
-            // leave it pinned by its own collector handle — and, through
-            // `__self__`, its receiver too. Route it through the cascade,
-            // which untracks and frees it. pickle's `_Unpickler` is the
-            // motivating case: it stores `self.append = self.stack.append`
-            // and rebinds it on every `load`, and the displaced method
-            // otherwise pinned the previous stack list and every
-            // freshly-unpickled object on it until the next cyclic
-            // collection (test_concurrent_futures
-            // `test_ressources_gced_in_workers`).
-            //
-            // Receivers can themselves be bound methods, arbitrarily deep
-            // (`f = f.__call__` wrapper towers — test_descr
-            // test_wrapper_segfault builds a million of them), so the walk
-            // is a loop, not recursion, and stops as soon as a link is
-            // still referenced elsewhere (its receiver isn't dead).
-            let mut cur = dropped;
-            loop {
-                let (tracked, alive, recv) = {
-                    let Object::BoundMethod(bm) = &cur else { break };
-                    let id = crate::weakref_registry::id_of(&cur);
-                    // `cur` is our only handle when nothing else holds the
-                    // Rc (modulo registry strong clones); a method still
-                    // aliased — e.g. as an outer wrapper's `__self__` —
-                    // keeps its receiver alive, so the cascade must not
-                    // descend into it.
-                    let alive =
-                        Rc::strong_count(bm) > 1 + crate::weakref_registry::strong_clone_count(id);
-                    (gc_trace::is_tracked(id), alive, bm.receiver.clone())
-                };
-                if tracked {
-                    self.reap_dead_subgraph(cur);
-                    return;
-                }
-                if alive {
-                    return;
-                }
-                drop(cur);
-                if !(Self::local_needs_prompt_reap(&recv) && Self::looks_reapable_temporary(&recv))
-                {
-                    return;
-                }
-                cur = recv;
-            }
-            self.prompt_reap_dropped(cur);
-            return;
-        }
-        // A tuple of scalars anchors nothing, is never GC-tracked at
-        // birth (the filter has no false negatives) and can't be weakly
-        // referenced: the freelist (or the plain drop) is its teardown.
-        if let Object::Tuple(t) = &dropped {
-            if t.iter().all(Object::is_gc_atomic)
-                && !gc_trace::maybe_tracked(crate::weakref_registry::id_of(&dropped))
-            {
-                self.maybe_donate_tuple(dropped);
-                return;
-            }
-        }
-        // A deferred-tracking instance holds only atomic values, has no
-        // weakref (creating one tracks it) and no collector handle: the
-        // plain `Rc` drop is its whole teardown.
-        if let Object::Instance(i) = &dropped {
-            if i.dies_by_plain_drop() {
-                if let Object::Instance(i) = dropped {
-                    PyInstance::try_recycle(i);
-                }
-                return;
-            }
-        }
-        let id0 = crate::weakref_registry::id_of(&dropped);
-        // Nothing parked on this object needs prompt handling: no
-        // finalizer to run, no weakref to clear, and no cycle-GC strong
-        // handle pinning it. Ordinary `Rc` drop reclaims it (and any
-        // *untracked* children it anchors, recursively, by refcount).
-        //
-        // An instance that escaped into a C extension (`c_body != 0`) is
-        // excluded from this fast path even when untracked/unwatched: its
-        // `tp_dealloc` releases references held in *C struct fields*
-        // (invisible to the plain `Rc` drop's recursion), and a *tracked*
-        // child freed that way is left pinned by its own GC handle unless
-        // the cascade below walks to it and reaps it in turn. pandas'
-        // chained `df[cols].iloc[rows]` is the motivating case: the
-        // discarded `_iLocIndexer` temporary holds the intermediate
-        // DataFrame only through Cython's `self->obj` field, and the
-        // intermediate's weakref (`subset._is_copy`) must clear the
-        // instant the indexer dies, as it does on CPython.
-        if !Self::object_is_finalizable(&dropped)
-            && crate::weakref_registry::count_for(id0) == 0
-            && !gc_trace::is_tracked(id0)
-            && !Self::instance_escaped_to_c(&dropped)
-        {
-            // One more container-shaped exception to the fast path: an
-            // *untracked* container can be the sole holder of a *tracked*
-            // child, and the plain `Rc` drop below would leave that child
-            // refcount-dead but pinned by its own collector handle until
-            // the next cyclic collection. Tuples are the canonical case —
-            // they are never GC-tracked at `BuildTuple` time — and
-            // `multiprocessing`'s wire format is exactly this shape:
-            // `conn.recv()` unpickles `('#ERROR', exc)`, the manager proxy
-            // re-raises `exc`, and the handled exception must die at
-            // handler exit even with `gc.disable()` in force
-            // (test_multiprocessing_* `TestManagerExceptions.test_queue_get`,
-            // gh-106558). Route such containers through the cascade, which
-            // recurses through untracked containers to reap the tracked
-            // descendants.
-            //
-            // Untracked *instances* are the same shape (RFC 0076 WS3): the
-            // canonical case is a dying handled exception. `except E as e:`
-            // compiles to POP_EXCEPT (while `e` still binds the exception —
-            // the reap there sees it alive) followed by `e = None; del e`,
-            // so the actual death site is the STORE displacing `e` — this
-            // path. The exception is untracked and non-finalizable, but
-            // through `__traceback__` → frame → locals it is routinely the
-            // *sole* holder of tracked instances from the unwound frames.
-            // Pillow's `Image.open` is the motivating case: each failed
-            // plugin candidate (`ImImageFile(fp)` raising SyntaxError in
-            // `__init__`) lives only in the constructor frame the traceback
-            // pins; skipping the cascade here left the candidates handle-
-            // pinned holding `fp`, so the "unclosed file" ResourceWarning
-            // fired at the next amortized acyclic sweep instead of at
-            // handler exit (mpo/psd/spider/tiff `test_unclosed_file`).
-            // The deadness pre-check keeps the common alive-rebind
-            // (`self.x = ...` displacing a shared value) at two cheap
-            // lookups; `anchors_tracked_child` is node-capped.
-            if !(matches!(
-                dropped,
-                Object::Tuple(_)
-                    | Object::List(_)
-                    | Object::Dict(_)
-                    | Object::Set(_)
-                    | Object::FrozenSet(_)
-                    | Object::Instance(_)
-                    | Object::Frame(_)
-            )
-                // A container of nothing but scalars anchors no tracked
-                // child by inspection, so it can skip both the deadness
-                // test and the traversal — the shape most temporaries
-                // have, and (since tracking such a container is deferred)
-                // the one that reaches here most.
-                && !Self::is_scalar_leaf_container(&dropped)
-                && Self::is_refcount_dead(&dropped, 1)
-                && Self::anchors_tracked_child(&dropped, 6))
-            {
-                // A dead plain tuple's allocation is recycled (CPython's
-                // tuple freelist; see `maybe_donate_tuple`).
-                if matches!(dropped, Object::Tuple(_)) && Self::is_refcount_dead(&dropped, 1) {
-                    self.maybe_donate_tuple(dropped);
-                }
-                return;
-            }
-        }
-        // Is `dropped` actually dead — i.e. is this its last
-        // program-visible reference? The caller still holds `dropped`
-        // (one reference), the GC may hold a handle, and weakrefs may
-        // hold strong clones; anything beyond that is a live binding and
-        // we must leave the object to the cycle collector.
-        if !Self::is_refcount_dead(&dropped, 1) {
-            // Still referenced — but possibly only by Rust-side transients
-            // that die between safe points (the same shape the cascade's
-            // child check handles via `note_suspect`, but at the *root*: a
-            // `del obj` racing another thread's in-flight teardown clones).
-            // A weakly-referenced tracked root that misses its reap here is
-            // user-visible — the weakref never clears
-            // (test_threading.test_no_refcycle_through_target under load) —
-            // so enroll borderline cases for the eval loop's re-probe.
-            // Finalizable objects stay excluded, as everywhere on the
-            // suspect path: their `__del__` must not fire from a probe.
-            return;
-        }
-        self.reap_dead_subgraph(dropped);
-    }
-
-    /// The cascade's commonest root, settled without it: a refcount-dead
-    /// plain instance (no `__del__`, no weakref, no C body or native
-    /// value, no `__slots__` values) whose every attribute is a scalar
-    /// leaf, a value that outlives it, or a scalar-leaf container only it
-    /// holds. Nothing in that subgraph finalizes, clears a weakref or
-    /// anchors a tracked object the drop would strand, so untracking the
-    /// instance and those containers (the cascade's next links, which it
-    /// would retire the same way) and dropping it is the whole teardown.
-    /// A tracked attribute value near its dead line (the cascade enrolls
-    /// those as suspects) or anything else the cascade walks into hands
-    /// `dropped` back in `Err`.
-    fn reap_plain_instance(dropped: Object) -> Result<(), Object> {
-        let Some((leaves, n)) = Self::plain_instance_leaves(&dropped) else {
-            return Err(dropped);
-        };
-        for cid in &leaves[..n] {
-            gc_trace::with_state(|s| s.untrack_id(*cid));
-        }
-        let id = crate::weakref_registry::id_of(&dropped);
-        if gc_trace::is_tracked(id) {
-            gc_trace::with_state(|s| s.untrack_id(id));
-        }
-        drop(dropped);
-        Ok(())
-    }
-
-    /// A dead function (a rebound lambda or closure — CPython frees it by
-    /// refcount on the spot) whose death strands nothing: no weakref, and
-    /// every edge it releases — namespaces, defaults, closure cells, its
-    /// `__dict__` and getset slots — either outlives it or holds only
-    /// scalars. Untracking and dropping it is then the whole teardown.
-    fn plain_function_dies_alone(obj: &Object) -> bool {
-        let Object::Function(f) = obj else {
-            return false;
-        };
-        if crate::vm_singletons::cext_call_active()
-            || crate::vm_singletons::has_pending_cext_drops()
-            || crate::weakref_registry::may_have_weakrefs(crate::weakref_registry::id_of(obj))
-        {
-            return false;
-        }
-        // A value this function held: fine when it holds nothing a cascade
-        // would visit, or when another reference keeps it alive past the
-        // suspect band (a collector handle is one of the references).
-        fn released_ok(v: &Object) -> bool {
-            if gc_trace::is_atomic(v) {
-                return true;
-            }
-            let id = crate::weakref_registry::id_of(v);
-            if crate::weakref_registry::may_have_weakrefs(id) {
-                return false;
-            }
-            let sc = gc_trace::strong_count_for(v);
-            if gc_trace::is_tracked(id) {
-                sc > 4
-            } else {
-                sc >= 2
-            }
-        }
-        // The namespaces are module-owned in every ordinary case.
-        let namespaces = [&f.globals, &f.builtins];
-        if namespaces.iter().any(|d| Rc::strong_count(d) < 3) {
-            return false;
-        }
-        if !f.defaults.iter().all(released_ok) || !f.kw_defaults.iter().all(|(_, v)| released_ok(v))
-        {
-            return false;
-        }
-        // A closure cell only this function holds dies with it.
-        if !f.closure.iter().all(|c| match c {
-            Object::Cell(cell) => {
-                Rc::strong_count(cell) >= 2
-                    || cell.try_borrow().is_ok_and(|v| gc_trace::is_atomic(&v))
-            }
-            other => released_ok(other),
-        }) {
-            return false;
-        }
-        let Ok(attrs) = f.attrs.try_borrow() else {
-            return false;
-        };
-        if let Some(attrs) = attrs.as_ref() {
-            if Rc::strong_count(attrs) == 1 && !attrs.try_borrow().is_ok_and(|d| d.is_empty()) {
-                return false;
-            }
-        }
-        let Ok(slots) = f.slots.try_borrow() else {
-            return false;
-        };
-        slots
-            .iter()
-            .all(|(k, v)| gc_trace::is_atomic(&k.0) && released_ok(v))
-    }
-
-    /// [`Self::reap_plain_instance`]'s test: the tracked scalar-leaf
-    /// containers `obj` alone holds (ids, count), or `None` when the
-    /// general cascade must run.
-    fn plain_instance_leaves(
-        obj: &Object,
-    ) -> Option<([crate::weakref_registry::ObjectId; 4], usize)> {
-        let Object::Instance(inst) = obj else {
-            return None;
-        };
-        if inst.c_body.get() != 0
-            || inst.native.get().is_some()
-            || crate::vm_singletons::cext_call_active()
-            || crate::vm_singletons::has_pending_cext_drops()
-            || crate::weakref_registry::may_have_weakrefs(crate::weakref_registry::id_of(obj))
-        {
-            return None;
-        }
-        match inst.class.try_borrow() {
-            Ok(cls) if cls.native_kind.get() == 0 && !cls.instances_need_finalize() => {}
-            _ => return None,
-        }
-        if !inst
-            .slots
-            .try_borrow()
-            .is_ok_and(|s| s.iter().next().is_none())
-        {
-            return None;
-        }
-        let mut leaves = [0; 4];
-        let mut n = 0;
-        // A dict shared through `vars(obj)` outlives the instance, and
-        // with it every value.
-        let split;
-        let d;
-        let attrs: &mut dyn Iterator<Item = (&DictKey, &Object)> = match inst.dict.published() {
-            Some(dict) if inst.dict.strong_count() == 1 => {
-                d = dict.try_borrow().ok()?;
-                &mut d.iter()
-            }
-            Some(_) => return Some((leaves, n)),
-            None => {
-                split = inst.dict.split_cell().try_borrow().ok()?;
-                &mut split.iter()
-            }
-        };
-        for (k, v) in attrs {
-            if !gc_trace::is_atomic(&k.0) {
-                return None;
-            }
-            if gc_trace::is_atomic(v) {
-                continue;
-            }
-            let cid = crate::weakref_registry::id_of(v);
-            if crate::weakref_registry::may_have_weakrefs(cid) {
-                return None;
-            }
-            let sc = gc_trace::strong_count_for(v);
-            if gc_trace::is_tracked(cid) {
-                // Past the cascade's suspect band: stays alive.
-                if sc > 4 {
-                    continue;
-                }
-                // Its handle and this dict: it dies here, and a container
-                // of scalars is retired by untracking.
-                if sc == 2 && n < leaves.len() && Self::is_scalar_leaf_container(v) {
-                    leaves[n] = cid;
-                    n += 1;
-                    continue;
-                }
-                return None;
-            }
-            // Untracked: another holder keeps it alive, or it dies by
-            // plain drop holding nothing but scalars.
-            if sc >= 2
-                || Self::is_scalar_leaf_container(v)
-                || matches!(v, Object::Tuple(t) if t.iter().all(gc_trace::is_atomic))
-            {
-                continue;
-            }
-            return None;
-        }
-        Some((leaves, n))
-    }
-
-    /// The dead-acyclic-subgraph cascade — the shared tail of
-    /// [`Self::prompt_reap_dropped`], split out so a call site that has
-    /// already established `dropped` is refcount-dead and anchors
-    /// finalizable/tracked children, yet is itself an untracked,
-    /// non-finalizable *leaf* the fast-path early-return in
-    /// `prompt_reap_dropped` would skip, can drive the cascade directly.
-    /// The motivating case is a handled exception cleared at `POP_EXCEPT`:
-    /// an `AttributeError` carries no `__del__` and is not GC-tracked, but
-    /// it anchors `AttributeError.obj` (and values reachable only through
-    /// its saved `__traceback__` frames) whose `__del__` must run at
-    /// handler exit, matching CPython's refcount timing. Every node is
-    /// independently refcount-guarded, so anything that stays externally
-    /// reachable is left to the cycle collector.
-    fn reap_dead_subgraph(&mut self, dropped: Object) {
-        if !Self::is_refcount_dead(&dropped, 1) {
-            return;
-        }
-        let Err(dropped) = Self::reap_plain_instance(dropped) else {
-            return;
-        };
-        if Self::plain_function_dies_alone(&dropped) {
-            let id = crate::weakref_registry::id_of(&dropped);
-            if gc_trace::is_tracked(id) {
-                gc_trace::with_state(|s| s.untrack_id(id));
-            }
-            drop(dropped);
-            return;
-        }
-        // RFC 0045 (wave 5): if the dead subgraph contains any instance
-        // that has escaped into a C extension (owns a faithful inline
-        // body), reclaiming it is only safe when no extension frame is
-        // live on this thread. The reaper's deadness test is
-        // `Rc`-refcount only and cannot see a *borrowed* C reference — a
-        // raw body pointer an extension holds across a re-entrant call
-        // (pandas caches `Index._engine` and reads it back through
-        // `PyDict_GetItem` as a borrowed ref; an `Index`/`DataFrame` holds
-        // its `ndarray`/`BlockManager` the same way). Freeing a body such
-        // a borrow still points at hands the slot to the next `ndarray`
-        // and the extension's pointer becomes a type-confused
-        // use-after-free (`'ndarray' has no attribute 'is_unique'` in
-        // `Index.unique` during `merge`).
-        //
-        // A borrowed pointer, however, can only be *in flight* while the
-        // extension's own stack frame is: C-owned references are always
-        // visible to the deadness test (an inline body's C refcount pins
-        // the instance through the capi `STRONG` map; an identity box
-        // pins through its strong payload), so a refcount-dead object has
-        // no C *owner*, and with no extension frame below us no borrow
-        // can outlive its owner either (the one C idiom that stashes a
-        // raw pointer past refcount zero — Cython's `@cython.freelist` —
-        // is neutralised at the dealloc bridge). `cext_call_active()`
-        // distinguishes the two: `weavepy-capi` marks every bridged C
-        // invocation for its duration, including bytecode the extension
-        // re-enters. At depth 0 — plain bytecode, the overwhelmingly
-        // common site of a `del`/rebind/frame-exit reap — the full
-        // cascade below is exactly CPython's refcount-driven
-        // `tp_dealloc` chain, and pandas *depends* on that timing: a
-        // chained `df[cols][rows]` stamps the subset with
-        // `_is_copy = weakref.ref(intermediate)` and the indexer
-        // temporary holds the intermediate in a Cython C field, so the
-        // intermediate only dies (and its weakref only reads `None`,
-        // which is what `_check_setitem_copy` accepts) if the indexer's
-        // `tp_dealloc` runs promptly and releases that C field.
-        //
-        // Inside a live C call the memory must wait for the tracing
-        // cycle collector — but the object is still *semantically* dead,
-        // and CPython runs `tp_finalize` and clears weakrefs the instant
-        // the refcount hits zero regardless. So run the root's finalizer
-        // and clear its weakrefs now, leaving the GC handle (and
-        // therefore the allocation) in place. Inert for pure-Python
-        // programs (no instance ever owns a body).
-        if crate::vm_singletons::cext_call_active() && Self::subgraph_contains_escaped(&dropped) {
-            let id = crate::weakref_registry::id_of(&dropped);
-            if Self::object_is_finalizable(&dropped) {
-                let claimed = if gc_trace::is_tracked(id) {
-                    gc_trace::mark_finalized(id)
-                } else {
-                    true
-                };
-                if claimed {
-                    crate::vm_singletons::push_pending_finalizer(dropped.clone());
-                    self.run_pending_finalizers();
-                    if !Self::is_refcount_dead(&dropped, 1) {
-                        return; // resurrected by its own __del__
-                    }
+        match dropped {
+            // A discarded never-driven `asend`/`athrow`/`aclose` awaitable
+            // warns at finalization (gh-113753; CPython's
+            // `async_gen_asend_finalize` family), at the next safe point.
+            Object::AsyncGenAwait(a) => {
+                if !a.started.get() && !a.consumed.get() && Rc::strong_count(&a) <= 1 {
+                    a.consumed.set(true);
+                    crate::vm_singletons::push_pending_finalizer(Object::AsyncGenAwait(a));
                 }
             }
-            crate::weakref_registry::queue_callbacks(crate::weakref_registry::notify_clear(id));
-            self.run_pending_finalizers();
-            // The allocation itself is parked (GC handle / this queue clone
-            // keep it alive while C may still borrow into its subgraph), but
-            // CPython would have freed the whole chain inside the extension
-            // call. Requeue it for the between-bytecodes safe point — the
-            // first moment with no extension frame live — where the drain
-            // re-runs this cascade and the full teardown proceeds. Without
-            // this, a temporary that died *inside* a C call (pandas'
-            // `mgr.iget` dropping its transient wrappers) pins everything it
-            // anchors (the manager, its `blocks` tuple, the `Block`s and
-            // their weakrefs) until the next full collection — and pandas'
-            // `_is_view_after_cow_rules` reads a stale live Block weakref
-            // within the very statement that dropped the intermediate.
-            //
-            // The *unfiltered* queue entry: the park must accept every
-            // object kind the reaper handles. A closure function (the
-            // compiler's `<genexpr>`/`<listcomp>` temporary) is GC-tracked
-            // and holds `cell(self)`, but fell through the C-drop kind
-            // filter — the discarded park left it handle-pinned, leaking
-            // one `self` reference per C-initiated call of any method
-            // whose parameter is promoted to a cell (pandas'
-            // `BlockManager.shape` via Cython's `PyObject_GetAttr`).
-            crate::vm_singletons::queue_parked_drop(&dropped);
-            return;
-        }
-        // RFC 0039 (WS4): cascade through the dead *acyclic* subgraph,
-        // emulating CPython's refcount-driven `tp_dealloc` chain. Freeing
-        // `dropped` drops the last reference to its tracked children,
-        // which become dead in turn; each is finalized (in `tp_finalize`
-        // order — `__del__` before the object's contents are released)
-        // and untracked here instead of lingering in the GC's tracked set
-        // pinned by its own handle. Without this, a deep acyclic chain of
-        // finalizable/tracked objects (`test_gc.test_trashcan_threads`,
-        // `test_weakref`'s len-race) is only drained one layer per
-        // O(heap) collection — quadratic, and easily never finished for a
-        // quiescing interpreter. A reference *cycle* never enters the
-        // cascade: its members reference one another, so the refcount
-        // test below keeps `strong` above the dead threshold and leaves
-        // the cycle to the tracing collector.
-        let mut work = vec![dropped];
-        // Each node's scratch, emptied per node and allocated once per
-        // cascade (a dead graph of many small containers paid four
-        // allocations and a hash set per node).
-        let mut children: Vec<crate::sync::Rc<gc_trace::TrackedHandle>> = Vec::new();
-        let mut weakref_candidates: Vec<Object> = Vec::new();
-        let mut pool_candidates: Vec<Object> = Vec::new();
-        let mut scan_through: Vec<Object> = Vec::new();
-        let mut scanned: std::collections::HashSet<
-            crate::weakref_registry::ObjectId,
-            std::hash::BuildHasherDefault<crate::fasthash::ObjectIdHasher>,
-        > = std::collections::HashSet::default();
-        loop {
-            let Some(obj) = work.pop() else {
-                // Freeing the objects above may have parked C-side dealloc
-                // products in the pending-drop queue: `free_mirror` queues a
-                // container a C `tp_dealloc` just released (a Cython
-                // `BlockManager`'s `blocks` tuple), and identity boxes minted
-                // transiently by this very cascade (`run_external_traverse`)
-                // queue their payloads. CPython runs those dealloc chains
-                // inside the same instruction, so pull them into this cascade
-                // rather than leaving them for the next between-bytecodes
-                // safe point — pandas' `_check_setitem_copy` /
-                // `_is_view_after_cow_rules` read the dropped intermediate's
-                // `Block` weakref *within the statement* that dropped it
-                // (`zed["eyes"]["right"].fillna(..., inplace=True)`), one
-                // bytecode too early for the deferred drain. Deadness-guarded
-                // exactly like the safe-point drain: anything still alive
-                // just sheds the queue's clone. Skipped while an extension
-                // frame is live — the safe-point path owns that case (the
-                // escaped-subgraph park above).
-                if crate::hot_gates::env_flags::reap_trace() {
-                    eprintln!(
-                        "[DRAIN] cext_active={} pending={}",
-                        crate::vm_singletons::cext_call_active(),
-                        crate::vm_singletons::has_pending_cext_drops()
-                    );
-                }
-                if crate::vm_singletons::cext_call_active()
-                    || !crate::vm_singletons::has_pending_cext_drops()
-                {
-                    break;
-                }
-                for d in crate::vm_singletons::drain_pending_cext_drops() {
-                    if crate::hot_gates::env_flags::reap_trace() {
-                        eprintln!(
-                            "[DRAIN-ITEM] {} sc={} dead={}",
-                            d.type_name_owned(),
-                            gc_trace::strong_count_for(&d),
-                            Self::is_refcount_dead(&d, 1)
-                        );
-                    }
-                    if Self::is_refcount_dead(&d, 1) {
-                        work.push(d);
-                    }
-                }
-                continue;
-            };
-            let id = crate::weakref_registry::id_of(&obj);
-            // RFC 0077 (WS2): a dead exact `list`/`dict`/`set` holding only
-            // scalar leaves is CPython's `list_dealloc` of a list of ints:
-            // untrack and free, nothing else. Every step of the cascade
-            // body below is a no-op for it — no `__del__` (only instances
-            // and unfinished generators finalize), no weakrefs (the
-            // registry filter says so), no child that could be tracked or
-            // anchor one (scalars never are), and no C crossing to guard
-            // with the cascade marker — yet the body still paid a
-            // cascade-set insert, a weakref clear, two finalizer drains
-            // and a per-element `id_of`/`handle_for` traversal. Since
-            // every list is GC-tracked, that overhead was the dominant
-            // cost of *dying* for the commonest containers in the language
-            // (`list(range(n))` / `[...]` temporaries measured at ~35% of
-            // the fannkuch fixture once `list(it)` results were tracked).
-            // `try_borrow` failing (a re-entrant mutation in flight) just
-            // takes the general path.
-            if Self::is_scalar_leaf_container(&obj) && crate::weakref_registry::count_for(id) == 0 {
-                if gc_trace::is_tracked(id) {
-                    gc_trace::with_state(|s| s.untrack_id(id));
-                }
-                drop(obj);
-                continue;
+            // A dead plain tuple's allocation is recycled (CPython's tuple
+            // freelist; see `maybe_donate_tuple`).
+            dropped @ Object::Tuple(_) => self.maybe_donate_tuple(dropped),
+            // Likewise a dead instance's (see `PyInstance::try_recycle`).
+            Object::Instance(i) if Rc::strong_count(&i) == 1 && i.dies_by_plain_drop() => {
+                PyInstance::try_recycle(i);
             }
-            // Mark `obj` as mid-cascade for the rest of this iteration: the
-            // teardown below crosses it back into C (the GC bridge's
-            // `tp_traverse` mints and releases a transient self box), and
-            // that release must not re-queue the object into the pending
-            // C-drop queue — the queued clone would make the deadness
-            // re-checks see it as alive, abort the teardown, and restart
-            // the cascade from the drain: a livelock (RFC 0047, wave 5).
-            let _cascade_guard = crate::vm_singletons::enter_cascade(id);
-            let finalizable = Self::object_is_finalizable(&obj);
-            // Run `__del__` once, while `obj` and its children are still
-            // intact (CPython runs `tp_finalize` before `tp_clear`). A
-            // tracked object claims its finalizer via the GC handle's
-            // one-shot flag; an untracked finalizable object (a generator
-            // the GC never saw) runs directly.
-            if finalizable {
-                let claimed = if gc_trace::is_tracked(id) {
-                    gc_trace::mark_finalized(id)
-                } else {
-                    true
-                };
-                if claimed {
-                    crate::vm_singletons::push_pending_finalizer(obj.clone());
-                    self.run_pending_finalizers();
-                    // The finalizer ran arbitrary Python and may have
-                    // resurrected `obj` (stashed it somewhere reachable).
-                    // If so it is alive again: leave it tracked and stop
-                    // cascading through it.
-                    if !Self::is_refcount_dead(&obj, 1) {
-                        continue;
-                    }
-                }
-            }
-            // Clear weakrefs and queue their callbacks (CPython clears
-            // weakrefs after `tp_finalize`).
-            crate::weakref_registry::queue_callbacks(crate::weakref_registry::notify_clear(id));
-            self.run_pending_finalizers();
-            if !Self::is_refcount_dead(&obj, 1) {
-                continue;
-            }
-            // Snapshot the tracked children before `obj` is freed: those
-            // are the only ones a strong GC handle would otherwise pin
-            // (untracked children are reclaimed by ordinary `Rc` drop).
-            //
-            // Crucially, recurse *through* untracked containers to reach the
-            // tracked descendants hidden behind them. A container is left
-            // GC-untracked either because it was built all-scalar
-            // (`BuildTuple`/`BuildSet`) or — the subtler case — because it was
-            // created *empty* (so `container_can_cycle` saw nothing to track)
-            // and only later populated with objects: a dict literal `{}` grown
-            // by `d[k] = obj` is the canonical example, and
-            // `pickle._Unpickler.memo` (`self.memo = {}`, then memoized objects
-            // stuffed in) is exactly that. When such a container is the sole
-            // holder of a tracked, finalizable object, freeing the container by
-            // refcount drops that object to "GC handle only" — refcount-dead,
-            // but pinned by its own handle and so invisible to the next link of
-            // this cascade unless we walk into the container here. RFC 0040:
-            // `test_concurrent_futures.test_ressources_gced_in_workers` submits
-            // an object whose `__del__` signals a `Manager` event; the worker
-            // unpickles it (memoized in `_Unpickler.memo`), runs the job, and
-            // `del`s the `_CallItem`, expecting the argument's `__del__` to have
-            // fired — which only happens if dropping the call item (and the
-            // unpickler temporary holding the memo) cascades through the
-            // untracked `memo` dict to the tracked argument. The refcount guard
-            // below still filters anything that stays externally reachable.
-            debug_assert!(children.is_empty());
-            // Untracked descendants with live weakrefs: CPython clears an
-            // object's weakrefs at refcount zero whether or not the GC ever
-            // tracked it, but this cascade's "next link" set is (otherwise)
-            // tracked-only, and a plain `Rc` drop cannot clear weakref
-            // slots — the registry's strong slot clones would keep the
-            // referent alive and the weakref reading it forever. The
-            // canonical victims are C-minted Cython instances (RFC 0047):
-            // `PyType_GenericAlloc` bodies are not GC-tracked on the VM
-            // side, and pandas' `Block`s — weakly referenced by every
-            // `BlockValuesRefs` — die exactly this way when a setter drops
-            // the old `blocks` tuple (`test_consolidate` asserts
-            // `has_reference()` flips to False). Collect them during the
-            // scan and run the dead ones through the cascade so their
-            // weakrefs clear at death, like any tracked link.
-            debug_assert!(weakref_candidates.is_empty());
-            // Plain-tuple children about to die with `obj` are recycled
-            // through the tuple pool (see `maybe_donate_tuple`): the plain
-            // `Rc` drop below frees them invisibly, and this cascade is
-            // where the common `f(*args)`-shaped temporaries actually die
-            // (the argument tuple is anchored by a dead list/frame local).
-            debug_assert!(pool_candidates.is_empty());
-            scan_through.push(obj.clone());
-            scanned.clear();
-            while let Some(parent) = scan_through.pop() {
-                gc_trace::traverse_object(&parent, &mut |c| {
-                    // Scalars are never tracked, weakly referenced, or
-                    // anchors of anything; a deferred-tracking instance
-                    // holds only scalars and has no collector handle.
-                    // Neither can lead the cascade anywhere, which matters
-                    // for the commonest large death: a list of plain
-                    // objects falling out of scope.
-                    if gc_trace::is_atomic(c) {
-                        return;
-                    }
-                    if let Object::Instance(i) = c {
-                        if i.is_gc_deferred() && i.c_body.get() == 0 {
-                            let cid = crate::weakref_registry::id_of(c);
-                            if crate::weakref_registry::count_for(cid) > 0 && scanned.insert(cid) {
-                                weakref_candidates.push(c.clone());
-                            }
-                            return;
-                        }
-                    }
-                    let cid = crate::weakref_registry::id_of(c);
-                    if let Object::Tuple(t) = c {
-                        if !t.is_empty()
-                            && t.len() <= 16
-                            && !gc_trace::is_tracked(cid)
-                            && crate::weakref_registry::count_for(cid) == 0
-                        {
-                            pool_candidates.push(c.clone());
-                        }
-                    }
-                    if let Some(h) = gc_trace::find_handle(cid) {
-                        children.push(h);
-                    } else if matches!(
-                        c,
-                        Object::Tuple(_)
-                            | Object::FrozenSet(_)
-                            | Object::Dict(_)
-                            | Object::List(_)
-                            | Object::Set(_)
-                            | Object::MappingProxy(_)
-                            | Object::SimpleNamespace(_)
-                            // An *untracked instance* (and `Cell`/`BoundMethod`
-                            // hop) can sit between `obj` and a tracked
-                            // finalizable just like an untracked container does.
-                            // The canonical case: a caught exception stashed on
-                            // an instance attribute — `unittest`'s
-                            // `_AssertRaisesContext.exception` — where the
-                            // `AttributeError` is itself untracked yet anchors
-                            // `AttributeError.obj` (a finalizable io temporary).
-                            // When the context manager is the sole holder,
-                            // dropping it frees the exception by `Rc`, which
-                            // drops the temporary to "GC handle only" —
-                            // refcount-dead but pinned by its own handle, and
-                            // invisible to the next cascade link unless we walk
-                            // into the untracked instance here
-                            // (`test_io.test_error_through_destructor`). The
-                            // refcount guard below still filters anything that
-                            // stays externally reachable.
-                            | Object::Instance(_)
-                            | Object::Cell(_)
-                            | Object::BoundMethod(_)
-                            // A dying exception owns its traceback, and the
-                            // traceback's frames own the unwound activations'
-                            // locals — where a cancelled asyncio call chain
-                            // keeps its transports and SSL contexts. CPython
-                            // frees all of it by refcount the moment the
-                            // exception dies; walk through so the tracked
-                            // descendants become the cascade's next links
-                            // (test_ssl.test_handshake_timeout_handler_leak).
-                            // Live frames (still on the stack / owned by a
-                            // suspended generator) survive the per-child
-                            // refcount guard below unharmed.
-                            | Object::Traceback(_)
-                            | Object::Frame(_)
-                    ) && scanned.insert(cid)
-                    {
-                        if crate::weakref_registry::count_for(cid) > 0 {
-                            weakref_candidates.push(c.clone());
-                        }
-                        scan_through.push(c.clone());
-                    }
-                });
-            }
-            // Drop the GC's strong handle, then our own reference: `obj`
-            // is reclaimed by `Rc` here and its children lose a reference.
-            if gc_trace::is_tracked(id) {
-                gc_trace::with_state(|s| s.untrack_id(id));
-            }
-            drop(obj);
-            // A tuple child whose last holder was `obj` is now ours alone
-            // (strong count 1 = the scan's clone); park its allocation.
-            // Anything still referenced elsewhere just sheds the clone.
-            for cand in pool_candidates.drain(..) {
-                if matches!(&cand, Object::Tuple(t) if ThinArc::strong_count(t) == 1) {
-                    self.maybe_donate_tuple(cand);
-                }
-            }
-            // Any tracked child that just lost its last program reference
-            // is the next link in the chain.
-            for h in children.drain(..) {
-                if !h.untracked.load(std::sync::atomic::Ordering::Acquire) {
-                    let weak = crate::weakref_registry::strong_clone_count(h.id);
-                    // `h.object` is the GC's own strong reference; the
-                    // child is dead iff nothing beyond that handle and its
-                    // weakref clones still points at it.
-                    let sc = gc_trace::strong_count_for(&h.object);
-                    if sc <= 1 + weak {
-                        work.push(h.object.clone());
-                    } else if sc <= 4 + weak && !Self::object_is_finalizable(&h.object) {
-                        // Still referenced — but only just. The extra refs are
-                        // often Rust-side transients (an in-flight `PyException`
-                        // clone in the task machinery, a native call's argument)
-                        // that die between safe points, where no opcode-level
-                        // reap can see the drop. Enroll for the eval loop's
-                        // suspect re-probe so the object still dies at CPython's
-                        // refcount timing (asyncio cancellation chains:
-                        // test_ssl.test_handshake_timeout_handler_leak).
-                        gc_trace::note_suspect(h.clone());
-                    }
-                }
-            }
-            // An untracked, weakly-referenced descendant whose last
-            // program reference just died: push it through the cascade so
-            // its weakrefs clear now (the refcount guard at the top of the
-            // loop re-checks liveness — our `weakref_candidates` clone is
-            // accounted for by the cascade's `extra` slack of 1).
-            for cand in weakref_candidates.drain(..) {
-                if Self::is_refcount_dead(&cand, 1) {
-                    work.push(cand);
-                }
-            }
+            dropped => drop(dropped),
         }
     }
 
-    /// CPython finalizes a frame's locals by refcount the instant the
-    /// frame is torn down: a local holding the *last* reference to a
-    /// finalizable object runs its `__del__` / weakref callback promptly
-    /// on `return`, not at the next cycle collection. WeavePy otherwise
-    /// only reaps on an explicit rebind (`STORE_FAST` over a live slot,
-    /// `del`), so a function that lets a finalizable local fall out of
-    /// scope by *returning* (`tempfile.NamedTemporaryFile` with
-    /// `delete=True`, `test_tempfile.test_del_by_finalizer`) leaked the
-    /// reclamation to the tracing GC. Move each interesting local out and
-    /// run it through the prompt-reap cascade; the refcount guard inside
-    /// leaves anything still reachable (including the return value, which
-    /// the caller still holds) untouched.
-    ///
-    /// Gated to the object kinds that can carry a finalizer (or anchor a
-    /// finalizable acyclic subgraph) so the common all-scalars frame pays
-    /// nothing on the hot return path.
-    fn reap_frame_locals_on_exit(&mut self, frame: &mut Frame, retval: Option<&Object>) {
-        // Class/module bodies keep their names in a namespace dict, not in
-        // fast locals, so this is a no-op for them; only real function
-        // activations (incl. comprehensions/lambdas) carry fast locals.
-        // Operands still on the stack at `RETURN_VALUE` (an iterator the
-        // compiler unwinds past, a `with` exit pair) are dropped with the
-        // frame too; grade them like the slots below.
-        for v in &frame.stack {
-            gc_trace::note_dropped(v);
-        }
-        let nlocals = frame.locals.borrow().len();
-        if nlocals == 0 && frame.cells.is_empty() {
-            return;
-        }
-        let _ = retval;
-        // Fast path: no local can be at its dead line. A candidate the
-        // cascade below could reap has nothing but this frame's slots, its
-        // collector handle, and weakref clones holding it, so its strong
-        // count is at most `nlocals + 1` when no weakref watches it.
-        // Every candidate above that (the usual `self`, an argument the
-        // caller still holds) is plainly escaped, which the passes below
-        // would conclude too, one allocation and two scans later. Grading
-        // each slot is all that is left to do.
-        // (An escaped `PyFrame` sharing the locals storage keeps the
-        // slot-clearing passes below.)
-        if frame.code.cellvars.is_empty() && Rc::strong_count(&frame.locals) == 1 {
-            // SAFETY: RFC 0065 (WS3) — see `load_fast_value`; nothing in
-            // this block runs Python code or touches the locals storage
-            // through another path.
-            let locals: &Vec<Object> = unsafe { &*frame.locals.as_ptr() };
-            let escaped = |v: &Object| {
-                let sc = gc_trace::strong_count_for(v);
-                if sc <= 1 {
-                    return false;
-                }
-                let id = crate::weakref_registry::id_of(v);
-                // Held past every slot and a collector handle: no count.
-                if sc > nlocals + 1 {
-                    return !crate::weakref_registry::may_have_weakrefs(id);
-                }
-                // How many of this frame's slots hold `v`: exact for
-                // small frames (the usual `self` is held once here and
-                // once by the caller), the slot count otherwise.
-                let held_here = if nlocals <= 8 {
-                    locals
-                        .iter()
-                        .filter(|w| {
-                            std::mem::discriminant(*w) == std::mem::discriminant(v)
-                                && crate::weakref_registry::id_of(w) == id
-                        })
-                        .count()
-                } else {
-                    nlocals
-                };
-                // A tracked object's collector handle is one more holder
-                // (the miss-filter answer: a false positive only sends
-                // the value down the careful path below).
-                let handle = usize::from(gc_trace::maybe_tracked(id));
-                sc > held_here + handle && !crate::weakref_registry::may_have_weakrefs(id)
-            };
-            if locals.iter().all(|v| {
-                !(Self::local_needs_prompt_reap(v) || matches!(v, Object::Function(_)))
-                    || escaped(v)
-                    || matches!(v, Object::Instance(i) if i.dies_by_plain_drop())
-                    || Self::atomic_container_dies_plainly(v)
-                    || Self::tracked_container_dies_inertly(v)
-            }) {
-                for v in locals {
-                    // A dying tracked container sheds its collector handle
-                    // now (the cascade would find nothing else to do).
-                    if Self::tracked_container_dies_inertly(v) {
-                        gc_trace::untrack_id(crate::weakref_registry::id_of(v));
-                    } else {
-                        gc_trace::note_dropped(v);
-                    }
-                }
-                return;
-            }
-        }
-        // Pass 1: move every candidate local out of its slot. A *closure
-        // function* local is a candidate too: it is GC-tracked
-        // (`MakeFunction`), so merely dropping the frame's `Rc` leaves it
-        // pinned by its own GC handle — and still holding its captured
-        // cells — until the next cyclic collection. Routing a
-        // uniquely-held (non-escaped) function through the cascade
-        // untracks and frees it now, releasing its share of this frame's
-        // cells so the cellvar sweep below can reclaim a captured-but-
-        // unescaped finalizable (`test_tempfile.test_writelines_rollover`).
-        //
-        // Two slots naming the *same* object (`x = C(); for y in [x]: …`,
-        // or test_interpreters' `second = create(); for interp in
-        // list_all(): …`) each see the other's reference and would both
-        // fail the escaped-value pre-filter below, so the object would
-        // fall to the plain `Rc` drop — whose `Drop` net queues `__del__`
-        // *after* the weakrefs have been cleared (CPython's
-        // `subtype_dealloc` finalizes first). Dedupe by identity here so
-        // the frame contributes exactly one reference per object.
-        //
-        // The locals borrow is released before any cascade runs: the
-        // cascade can execute arbitrary `__del__` code, which may
-        // re-enter this very frame's shared locals storage (e.g. via a
-        // traceback's `f_locals`).
-        let mut candidates: Vec<Object> = Vec::new();
-        {
-            let mut locals = frame.locals.borrow_mut();
-            for i in 0..nlocals {
-                let needs = Self::local_needs_prompt_reap(&locals[i])
-                    || matches!(locals[i], Object::Function(_));
-                if !needs {
-                    // RFC 0077 (WS2): `RETURN_VALUE` is exempt from the
-                    // eval loop's coarse stack-shrink mark; the frame's
-                    // slots are the references it actually releases, so
-                    // grade each one here (no-op for scalar locals).
-                    gc_trace::note_dropped(&locals[i]);
-                    continue;
-                }
-                let v = std::mem::replace(&mut locals[i], Object::Unbound);
-                if candidates.iter().any(|c| c.is_same(&v)) {
-                    // Duplicate slot: releasing this clone is the frame
-                    // letting go of its second reference.
-                    drop(v);
-                } else {
-                    candidates.push(v);
-                }
-            }
-        }
-        // Pass 2: cheap pre-filter, then cascade. A candidate holding the
-        // *last* program reference has `strong_count == our clone (1) + GC
-        // handle (<=1)`, plus any weakref slots' strong clones (which the
-        // cascade discounts, so an object reachable *only* through
-        // `weakref.ref(obj)` is still dead). Anything larger means the
-        // value escaped (it was returned, stored on an instance, captured
-        // by a closure, …), so leave it alone without paying for the full
-        // refcount/weakref test or a cascade. Keeps the hot return path of
-        // scalar-only frames free.
-        for v in candidates {
-            if Self::looks_reapable_temporary(&v) {
-                self.prompt_reap_dropped(v);
-            } else {
-                gc_trace::note_dropped(&v);
-            }
-        }
-        // A value captured by a nested closure does not live in a fast local
-        // — it lives in one of this frame's *cell variables*, and that cell is
-        // shared with the closure object(s) that closed over it. CPython
-        // decrefs the frame's cells together with those closures when the
-        // frame is torn down, so a captured-but-unescaped finalizable dies
-        // promptly. The locals sweep above has already reaped the dying
-        // closures (functions, and generators/coroutines via
-        // `local_needs_prompt_reap`), dropping their share of the cells; now
-        // reap any *own* cellvar (never a freevar, which belongs to an
-        // enclosing frame) that is left uniquely held by this frame and whose
-        // contents are a dead finalizable.
-        let ncellvars = frame.code.cellvars.len();
-        if ncellvars == 0 || ncellvars > frame.cells.len() {
-            return;
-        }
-        for idx in 0..ncellvars {
-            let cell = frame.cells[idx].clone();
-            // Only a cell uniquely held by this frame can have its contents
-            // die with the frame; one still shared with an escaped closure
-            // (returned/stored) keeps `strong_count > 1` (our local `cell`
-            // clone is the +1 we account for).
-            if Rc::strong_count(&cell) > 2 {
-                continue;
-            }
-            let reapable = {
-                let guard = cell.borrow();
-                Self::local_needs_prompt_reap(&guard) && Self::looks_reapable_temporary(&guard)
-            };
-            if reapable {
-                let v = std::mem::replace(&mut *cell.borrow_mut(), Object::Unbound);
-                self.prompt_reap_dropped(v);
-            }
-        }
-    }
-
-    /// Reap a generator/coroutine frame the instant it *finishes* (a
-    /// normal return, an exhausting `next()`, or an exception escaping
-    /// the body). CPython clears the frame on completion, so a local or
-    /// value-stack entry holding the last reference to a finalizable
-    /// object dies promptly — and, in WeavePy's `Rc`-rooted model, an
-    /// object whose only other reference is a weakref slot's strong
-    /// clone in the registry becomes refcount-dead, which clears its
-    /// weakref (so `weakref.ref(obj)()` zeroes out without waiting for a
-    /// cyclic collection). The reapables are moved *out* of the frame
-    /// first so the frame no longer counts toward their refcount when
-    /// the cascade's deadness test runs; the frame is dropped (now
-    /// holding `Unbound` placeholders) by the caller. Mirrors
-    /// [`Self::reap_frame_locals_on_exit`] for the suspended-frame world.
-    fn reap_dead_frame(&mut self, frame: &mut Frame) {
-        let mut reap: Vec<Object> = Vec::new();
-        // Same-object slots collapse to one entry (see
-        // `reap_frame_locals_on_exit`): the deadness test must see the
-        // frame as a single reference.
-        let take = |slot: &mut Object, reap: &mut Vec<Object>| {
-            if Self::local_needs_prompt_reap(slot)
-                || crate::weakref_registry::count_for(crate::weakref_registry::id_of(slot)) > 0
-            {
-                let v = std::mem::replace(slot, Object::Unbound);
-                if !reap.iter().any(|c| c.is_same(&v)) {
-                    reap.push(v);
-                }
-            } else {
-                gc_trace::note_dropped(slot);
-            }
-        };
-        {
-            let mut locals = frame.locals.borrow_mut();
-            for slot in locals.iter_mut() {
-                take(slot, &mut reap);
-            }
-        }
-        for slot in &mut frame.stack {
-            take(slot, &mut reap);
-        }
-        for v in reap {
-            self.prompt_reap_dropped(v);
-        }
-    }
-
-    /// After a bound-method call returns, give the receiver a prompt-reap
-    /// chance. While the call executed, the `BoundMethod` object held a
-    /// strong reference to its receiver, so the callee's frame-exit reaping
-    /// of the `self` local saw the receiver as still-referenced and left it
-    /// to the cycle collector. Now that the method object is being
-    /// discarded, a receiver that was only a *temporary* — `Maker().make()`,
-    /// or `_Unpickler(buf).load()` inside `pickle.loads` — becomes
-    /// refcount-dead and must run its (or its referents') finalizers
-    /// immediately, mirroring CPython decref'ing a `method`'s `__self__` the
-    /// instant the call frame is torn down. RFC 0040:
-    /// `test_concurrent_futures.test_ressources_gced_in_workers` submits an
-    /// object whose `__del__` signals a `Manager` event; the worker unpickles
-    /// its `_CallItem`, runs it, and `del`s it expecting the argument's
-    /// `__del__` to have fired — but the unpickler's `memo` (pinned by the
-    /// unpickler temporary, in turn pinned only by the GC handle once the
-    /// `loads` bound-method call returns) kept the argument alive until the
-    /// next cyclic collection.
-    ///
-    /// Cheap on the hot path: only `BoundMethod` callables pay anything, and
-    /// a receiver still bound elsewhere (the overwhelmingly common `self`)
-    /// fails the `strong_count` pre-check without touching the GC's maps.
-    fn reap_call_receiver(&mut self, callable: Object) {
-        match &callable {
-            Object::BoundMethod(bm) => {
-                // A native method can release references the interpreter
-                // never sees (`lst.clear()`, `d.pop(k)`, `sys.setprofile(f)`
-                // dropping the previous hook — test_sys_setprofile's
-                // `test_reentrancy` expects the displaced hook's `__del__`
-                // to have run by the next statement). `CALL` no longer
-                // takes the coarse stack-shrink mark (RFC 0077 WS2), so
-                // native callees keep it explicitly; the mark is a
-                // thread-local flag and the scan it schedules is the
-                // hot-set-only pass.
-                if matches!(bm.function, Object::Builtin(_)) {
-                    gc_trace::mark_maybe_dead();
-                }
-                let recv = bm.receiver.clone();
-                // End the borrow and release the BoundMethod's hold on the
-                // receiver so `strong_count` reflects only real bindings + the
-                // GC handle.
-                drop(callable);
-                // `recv` (1) + the GC's tracking handle (<=1) + any weakref
-                // clones is the fingerprint of a dead temporary; anything
-                // larger means a live binding still holds it. The
-                // authoritative refcount/weakref test lives in
-                // `prompt_reap_dropped`; this is just a cheap pre-filter.
-                if Self::local_needs_prompt_reap(&recv) && Self::looks_reapable_temporary(&recv) {
-                    self.prompt_reap_dropped(recv);
-                } else {
-                    gc_trace::note_dropped(&recv);
-                }
-            }
-            // A *function* built as a call temporary — the canonical case is a
-            // comprehension's anonymous `<listcomp>`/`<setcomp>`/`<dictcomp>`/
-            // `<genexpr>`, emitted by `MakeFunction` and consumed by the very
-            // next `Call` — is GC-tracked when it captures cells (its closure).
-            // A plain `Rc` drop then leaves it pinned by its own GC handle,
-            // still holding those cells and, through them, the enclosing locals
-            // it closed over (e.g. `self` in `[self.submit(x) for x in it]`,
-            // promoted to a cell). That defers the finalization of anything
-            // uniquely reachable through the capture until the next cyclic
-            // collection. RFC 0040: `ThreadPoolExecutor.map`'s `result_iterator`
-            // closes over the list comprehension's `self`, so each `map` call
-            // leaked one reference to the executor — `del executor` then never
-            // dropped its refcount to zero, so the weakref callback that wakes
-            // idle workers never fired and `test_concurrent_futures`
-            // `test_del_shutdown` (and the other prompt-finalization shutdown
-            // cases) hung. Route a uniquely-held (non-escaped) function through
-            // the same cascade the frame-exit locals sweep uses for
-            // closure-function *locals*, so its cells — and any finalizable they
-            // uniquely hold — are released now, matching CPython's refcount
-            // timing. A function still bound elsewhere (a global `foo` in
-            // `foo()`, an escaped/returned closure) keeps `strong_count` above
-            // the dead threshold and fails the cheap pre-filter untouched, so
-            // the hot path of ordinary named-function calls pays only a single
-            // `strong_count` read. `prompt_reap_dropped` early-returns for an
-            // untracked function (no cells to leak), so it is reclaimed by the
-            // ordinary `Rc` drop of `callable` here.
-            Object::Function(_) => {
-                if Self::looks_reapable_temporary(&callable) {
-                    self.prompt_reap_dropped(callable);
-                } else {
-                    gc_trace::note_dropped(&callable);
-                }
-            }
-            // A callable *instance* temporary — `C()()` dispatching
-            // `__call__` — is GC-tracked and would otherwise stay pinned
-            // by its own collector handle until the next cyclic
-            // collection, exactly like the bound-method receiver above.
-            // CPython decrefs the callee operand as the CALL completes.
-            Object::Instance(_) => {
-                if Self::local_needs_prompt_reap(&callable)
-                    && Self::looks_reapable_temporary(&callable)
-                {
-                    self.prompt_reap_dropped(callable);
-                } else {
-                    gc_trace::note_dropped(&callable);
-                }
-            }
-            // Native function: same reasoning as the builtin-method arm
-            // above (`sys.setprofile(f)` is a module-level `Builtin`).
-            Object::Builtin(_) => gc_trace::mark_maybe_dead(),
-            // RFC 0077 (WS2): `CALL` is exempt from the eval loop's coarse
-            // stack-shrink mark (see `note_dropped`); every operand it
-            // discards is graded here or in `reap_call_args` instead.
-            _ => gc_trace::note_dropped(&callable),
-        }
-    }
-
-    /// After a call returns, give each *argument temporary* a prompt-reap
-    /// chance. While the call executed, the caller's argument vector held a
-    /// strong reference to every argument, so the callee's frame-exit reaping
-    /// of the corresponding parameter local saw the value as still-referenced
-    /// and left it to the cycle collector. Now that the caller is dropping its
-    /// argument vector, an argument that was only a *temporary* — `f(Make())`,
-    /// `runner.run(test_class('m'))` — becomes refcount-dead and must run its
-    /// (or its referents') finalizers immediately, mirroring CPython clearing
-    /// a call's stack slots the instant the call returns. RFC 0040:
-    /// `test_concurrent_futures.test_init` runs a child test inline as
-    /// `runner.run(test_class(...))`; the test case is never bound to a name,
-    /// so without reaping it here its `ProcessPoolExecutor` (and the log
-    /// `Queue`'s SemLocks) lingered to the next cyclic collection and the
-    /// resource tracker reported leaked semaphores. Moves each dead-looking
-    /// argument *out* of the vector before reaping so the vector slot no
-    /// longer inflates its refcount.
+    /// Release a finished call's arguments now, before the caller handles
+    /// the result (CPython's `CALL` decrefs its operands first): an
+    /// argument only the call held dies here, finalizers and all.
     fn reap_call_args(&mut self, args: &mut [Object]) {
         for a in args {
-            // `Function` mirrors `reap_call_receiver`'s comprehension-function
-            // arm, for a function consumed as an *argument*: the canonical
-            // case is `__build_class__(<class body fn>, name, *bases)` — the
-            // body function is GC-tracked when it captures cells (any `class`
-            // in a closure-bearing scope) and CPython frees it the instant the
-            // call returns, while a plain drop left it pinned by its own
-            // collector handle. test_descr `test_slots` observes exactly that:
-            // `len(gc.get_objects())` taken before/after a compare loop
-            // differed by the stale `G` body function dying in between.
-            // `prompt_reap_dropped` early-returns for untracked functions.
-            if (Self::local_needs_prompt_reap(a) || matches!(a, Object::Function(_)))
-                && Self::looks_reapable_temporary(a)
-            {
-                let v = std::mem::replace(a, Object::Unbound);
-                self.prompt_reap_dropped(v);
-            } else {
-                gc_trace::note_dropped(a);
-            }
+            drop(std::mem::replace(a, Object::Unbound));
         }
     }
 
-    /// Prompt-reap the value an assignment just displaced. CPython decrefs
-    /// the previous attribute/subscript value the instant a store
-    /// overwrites it (`self.x = y` decrefs the old `self.x`); a value whose
-    /// last program-visible binding was that slot dies immediately, running
-    /// its `__del__`/weakref callbacks rather than waiting for the next
-    /// cyclic collection. The crucial case is a slot holding the only
-    /// strong reference to an object that *itself* anchors a weakref false
-    /// cycle: `ExecutorMixin.tearDown` does `self.executor = None` after
-    /// `shutdown()`, and the `ProcessPoolExecutor`↔`_ExecutorManagerThread`
-    /// pair is only kept reachable by the thread's `weakref.ref(executor)`
-    /// (a registry strong-clone in WeavePy's `Rc` model). Reaping the
-    /// displaced executor clears that weakref, breaks the cycle, and
-    /// cascades through the manager thread into the call/result queues so
-    /// their SemLocks unlink before the test stops the resource tracker
-    /// (RFC 0040: `test_concurrent_futures.test_init`
-    /// `FailingInitializerResourcesTest`). The cheap `local_needs_prompt_reap`
-    /// gate keeps scalar stores (`self.n = i` in a loop) off this path.
-    fn maybe_prompt_reap_replaced(&mut self, old: Object) {
-        static NO_STORE_REAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let reap = !*NO_STORE_REAP.get_or_init(|| std::env::var_os("WP_NO_STORE_REAP").is_some());
-        if reap && Self::local_needs_prompt_reap(&old) && Self::looks_reapable_temporary(&old) {
-            self.prompt_reap_dropped(old);
-        } else {
-            // RFC 0077 (WS2): the specialized `STORE_ATTR` hits are exempt
-            // from the coarse stack-shrink mark; the displaced value is
-            // the reference they release.
-            gc_trace::note_dropped(&old);
-        }
-    }
-
-    /// Cheap "looks like a dead temporary" pre-filter shared by the
-    /// prompt-reap call sites. An object holding the single program reference
-    /// about to be dropped has `strong_count == that reference (1) + the GC's
-    /// tracking handle (<=1)`. A live weakref additionally keeps one strong
-    /// *clone* per slot in the registry (see [`crate::weakref_registry`]);
-    /// the cascade discounts those (an object reachable only through
-    /// `weakref.ref(obj)` is dead in CPython too), so they must not veto the
-    /// reap here. Anything beyond `2 + weak_clones` is a live binding. The
-    /// registry lookup is skipped on the common `strong_count <= 2` fast path.
     /// Park a dead tuple's allocation in [`Self::tuple_pool`] (CPython's
-    /// tuple freelist analogue). Only called from the prompt reaper's
-    /// fast path, which has already established the tuple carries no
-    /// finalizer, no weakref slot, no GC handle, and anchors no tracked
-    /// child; the `strong_count == 1` check here (we own the only
-    /// handle) plus `Rc::get_mut` (which additionally refuses if weak
+    /// tuple freelist analogue). The `strong_count == 1` check (we own the
+    /// only handle) plus `Rc::get_mut` (which additionally refuses if weak
     /// references exist) make the park equivalent to a free. Elements
     /// are cleared in place so their refcounts fall now, exactly as a
     /// plain drop would.
@@ -3799,493 +2523,6 @@ impl Interpreter {
         Object::new_tuple_array(items)
     }
 
-    /// Is an exhausted iterator's backing list refcount-dead — held only by
-    /// the iterator itself (plus the cycle collector's tracking handle,
-    /// which `BuildList` installs on every list, and any weakref slots'
-    /// strong clones)? True exactly when the loop iterated a temporary —
-    /// `for x in f():` — so the elements die with the iterator, and CPython
-    /// would free them by refcount right now.
-    fn iter_backing_list_dead(items: &Rc<RefCell<Vec<Object>>>) -> bool {
-        let probe = Object::List(items.clone());
-        let id = crate::weakref_registry::id_of(&probe);
-        // 2 = the iterator's own handle + our `probe` clone.
-        let spare = 2
-            + usize::from(gc_trace::is_tracked(id))
-            + crate::weakref_registry::strong_clone_count(id);
-        Rc::strong_count(items) <= spare
-    }
-
-    /// Prompt-reap the elements of an exhausted `FOR_ITER` iterator's
-    /// backing list, harvested at exhaustion because the iterator held the
-    /// last reference (the loop iterated a call-expression temporary).
-    /// CPython frees these by refcount the moment the iterator dies; our
-    /// detach-and-`Rc`-drop path skipped `__del__`s. Each element is
-    /// independently refcount-guarded by the cascade, so one still bound
-    /// (e.g. the final loop variable) is left alone.
-    fn reap_iter_backing(&mut self, items: Vec<Object>) {
-        for v in items {
-            if !(Self::local_needs_prompt_reap(&v) && Self::looks_reapable_temporary(&v)) {
-                continue;
-            }
-            if Self::exc_has_finalizable(&v, 4) {
-                // A finalizable behind an untracked container (a tuple of
-                // instances) would be skipped by `prompt_reap_dropped`'s
-                // fast path; drive the cascade directly.
-                self.reap_dead_subgraph(v);
-            } else {
-                self.prompt_reap_dropped(v);
-            }
-        }
-    }
-
-    /// Whether the caller's reference to `o` may be its last program
-    /// reference: nothing holds it beyond the caller, its collector
-    /// handle (when tracked), and weakref-registry clones.
-    #[inline]
-    fn looks_reapable_temporary(o: &Object) -> bool {
-        let sc = gc_trace::strong_count_for(o);
-        if sc <= 1 {
-            return true;
-        }
-        let id = crate::weakref_registry::id_of(o);
-        let handle = usize::from(gc_trace::maybe_tracked(id));
-        if sc <= 1 + handle {
-            return true;
-        }
-        crate::weakref_registry::may_have_weakrefs(id)
-            && sc <= 1 + handle + crate::weakref_registry::strong_clone_count(id)
-    }
-
-    /// Whether a frame local is worth running through the prompt-reap
-    /// cascade on frame exit. Mirrors the `PopTop` discard gate: instances
-    /// (possible `__del__` / weakref finalizer), and live
-    /// generators/coroutines/async-generators (their `close()` delivers
-    /// `GeneratorExit`). Kept deliberately narrow so the hot return path of
-    /// scalar-only frames pays a single cheap `matches!` per local.
-    /// A small untracked list, tuple or dict of atomic values held only
-    /// here: its release frees nothing a reap would visit (no finalizer,
-    /// weakref or collector handle can hang off it or its values).
-    fn atomic_container_dies_plainly(o: &Object) -> bool {
-        const MAX: usize = 16;
-        fn atomic(o: &Object) -> bool {
-            matches!(
-                o,
-                Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None | Object::Str(_)
-            )
-        }
-        let (sc, id) = match o {
-            Object::List(l) => (Rc::strong_count(l), Rc::as_ptr(l) as usize as u64),
-            Object::Dict(d) => (Rc::strong_count(d), Rc::as_ptr(d) as usize as u64),
-            Object::Tuple(t) => (
-                ThinArc::strong_count(t),
-                ThinArc::as_ptr(t).cast::<()>() as usize as u64,
-            ),
-            _ => return false,
-        };
-        if sc != 1 || gc_trace::maybe_tracked(id) || crate::weakref_registry::may_have_weakrefs(id)
-        {
-            return false;
-        }
-        match o {
-            Object::List(l) => l
-                .try_borrow()
-                .is_ok_and(|v| v.len() <= MAX && v.iter().all(atomic)),
-            Object::Dict(d) => d
-                .try_borrow()
-                .is_ok_and(|d| d.len() <= MAX && d.iter().all(|(k, v)| atomic(&k.0) && atomic(v))),
-            Object::Tuple(t) => t.len() <= MAX && t.iter().all(atomic),
-            _ => false,
-        }
-    }
-
-    /// A collector-tracked list or dict whose only holders are the caller's
-    /// reference and its collector handle, watched by no weakref, holding
-    /// only values its death can't finalize (atomic ones, or instances
-    /// others still hold): untracking it and dropping the reference is its
-    /// whole teardown, as in CPython's `list_dealloc`.
-    fn tracked_container_dies_inertly(o: &Object) -> bool {
-        const MAX: usize = 16;
-        fn inert(v: &Object) -> bool {
-            matches!(
-                v,
-                Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None | Object::Str(_)
-            ) || gc_trace::drop_survives_plainly(v)
-        }
-        let (sc, id) = match o {
-            Object::List(l) => (Rc::strong_count(l), Rc::as_ptr(l) as usize as u64),
-            Object::Dict(d) => (Rc::strong_count(d), Rc::as_ptr(d) as usize as u64),
-            _ => return false,
-        };
-        if sc != 2 || crate::weakref_registry::may_have_weakrefs(id) || !gc_trace::is_tracked(id) {
-            return false;
-        }
-        match o {
-            Object::List(l) => l
-                .try_borrow()
-                .is_ok_and(|v| v.len() <= MAX && v.iter().all(inert)),
-            Object::Dict(d) => d
-                .try_borrow()
-                .is_ok_and(|d| d.len() <= MAX && d.iter().all(|(k, v)| inert(&k.0) && inert(v))),
-            _ => false,
-        }
-    }
-
-    fn local_needs_prompt_reap(o: &Object) -> bool {
-        matches!(
-            o,
-            Object::Instance(_)
-                | Object::Generator(_)
-                | Object::Coroutine(_)
-                | Object::AsyncGenerator(_)
-                | Object::AsyncGenAwait(_)
-                // A container local can anchor a finalizable acyclic subgraph
-                // that dies with the frame: pickle's `_dict_op` builds
-                // `items = [key, value]` via `_pop_to_mark`, stuffs it into a
-                // dict, and lets `items` fall out of scope at return — leaving
-                // the only non-GC reference to a freshly-unpickled, finalizable
-                // `value` on a dead list local. CPython frees it by refcount on
-                // return; reap it here so its `__del__` runs promptly instead of
-                // lingering to the next cyclic collection (RFC 0040:
-                // `test_concurrent_futures.test_ressources_gced_in_workers`).
-                // The `strong_count` pre-filter at the call site keeps escaped
-                // containers off the cascade.
-                | Object::List(_)
-                | Object::Dict(_)
-                | Object::Set(_)
-                | Object::Tuple(_)
-                | Object::FrozenSet(_)
-                // A bound method anchors its receiver (`__self__`); a dead
-                // one must release it promptly — and a *stored* one
-                // (GC-tracked at attribute-store time) must shed its own
-                // collector handle. See the `BoundMethod` arm of
-                // `prompt_reap_dropped`.
-                | Object::BoundMethod(_)
-                // A function is GC-tracked: a rebound lambda or closure must
-                // shed its collector handle (and whatever it alone holds)
-                // now, as CPython frees it by refcount.
-                | Object::Function(_)
-                // An escaped frame owns locals after its activation exits.
-                // Releasing the last frame alias must retire those locals,
-                // including tracked containers and weakly held instances.
-                | Object::Frame(_)
-        )
-    }
-
-    /// Does `obj` carry a finalizer that prompt reclamation must run
-    /// before freeing it? Instances with `__del__`, and unfinished
-    /// generators/coroutines/async-generators (their `close()` delivers
-    /// `GeneratorExit`).
-    fn object_is_finalizable(obj: &Object) -> bool {
-        match obj {
-            // Cached per class (`TypeObject::has_del`), invalidated on
-            // `__del__` assignment / MRO changes — the uncached
-            // `lookup("__del__")` walk clones the MRO on every reaped
-            // instance and dominated the prompt-reap path.
-            Object::Instance(i) => i.cls().instances_need_finalize(),
-            // An unstarted generator has nothing to finalize: closing it
-            // runs no Python (see `gc_trace::has_finalizer`). A coroutine
-            // still does — the never-awaited RuntimeWarning.
-            Object::Generator(g) => !g.is_finished() && !g.is_unstarted(),
-            Object::Coroutine(g) | Object::AsyncGenerator(g) => !g.is_finished(),
-            _ => false,
-        }
-    }
-
-    /// An exact builtin `list`/`dict`/`set` whose every element (and key)
-    /// is a scalar leaf ([`gc_trace::is_atomic`]): a container that can
-    /// neither finalize nor anchor anything the prompt reaper would have
-    /// to cascade into. Subclass instances are `Object::Instance` and never
-    /// match. A container that is currently borrowed reports `false` so
-    /// the caller takes the general path.
-    fn is_scalar_leaf_container(obj: &Object) -> bool {
-        // Capped like `anchors_tracked_child`'s node budget: the answer is
-        // an optimisation, never a correctness input, and an unbounded
-        // scan would make dropping a large container O(len) on a path that
-        // runs for every displaced binding.
-        const SCAN_CAP: usize = 64;
-        match obj {
-            Object::List(l) => l
-                .try_borrow()
-                .map(|v| v.len() <= SCAN_CAP && v.iter().all(gc_trace::is_atomic))
-                .unwrap_or(false),
-            Object::Set(s) => s
-                .try_borrow()
-                .map(|m| m.len() <= SCAN_CAP && m.iter().all(|k| gc_trace::is_atomic(&k.0)))
-                .unwrap_or(false),
-            Object::Dict(d) => d
-                .try_borrow()
-                .map(|m| {
-                    m.len() <= SCAN_CAP
-                        && m.iter()
-                            .all(|(k, v)| gc_trace::is_atomic(&k.0) && gc_trace::is_atomic(v))
-                })
-                .unwrap_or(false),
-            _ => false,
-        }
-    }
-
-    /// The common handled exception, recognized without the reap walks: a
-    /// class with no finalizer, no instance dict, and slots holding only
-    /// atomic values, a tuple of them (`args`), or a traceback whose frames
-    /// are all still executing. Neither `exc_has_finalizable` nor
-    /// `anchors_tracked_child` can find anything in it.
-    fn exc_plainly_inert(obj: &Object) -> bool {
-        let Object::Instance(inst) = obj else {
-            return false;
-        };
-        if inst.cls().instances_need_finalize()
-            || inst
-                .dict
-                .get()
-                .is_some_and(|d| d.try_borrow().map_or(true, |d| !d.is_empty()))
-        {
-            return false;
-        }
-        let Ok(slots) = inst.slots.try_borrow() else {
-            return false;
-        };
-        // (Bound, not returned directly: the iterator borrows `slots`.)
-        #[allow(clippy::let_and_return)]
-        let inert = slots.iter().all(|(_, v)| match v {
-            Object::Tuple(t) => t.iter().all(Object::is_gc_atomic),
-            Object::Traceback(tb) => {
-                let mut cur = Some(tb.clone());
-                while let Some(node) = cur {
-                    if node.frame.on_stack.get() == 0 {
-                        return false;
-                    }
-                    cur = node.next.borrow().clone();
-                }
-                true
-            }
-            other => other.is_gc_atomic(),
-        });
-        inert
-    }
-
-    /// Cheap, allocation-free pre-check for the `POP_EXCEPT` reap: does the
-    /// acyclic subgraph rooted at `obj` contain a finalizable object
-    /// (`__del__` / an unfinished generator) reachable through value
-    /// containers and user instances, up to `depth` links? The
-    /// overwhelmingly common handled exception — `ValueError(i)`,
-    /// `KeyError(k)`, scalar/`str` args, no `__del__` anywhere — returns
-    /// `false` here in pure recursion (no heap traffic, no weakref-registry
-    /// work), so the hot handler-exit path stays at baseline cost and only
-    /// an exception that actually anchors a destructor pays for the full
-    /// [`Self::reap_dead_subgraph`] cascade. Tracebacks/frames are
-    /// deliberately *not* traversed: walking the captured call stack on
-    /// every caught exception would dominate the path, and a finalizable
-    /// pinned only by a traceback frame is left to the cycle collector
-    /// (CPython's own traceback-clearing is likewise lazy here).
-    fn exc_has_finalizable(obj: &Object, depth: u8) -> bool {
-        if Self::object_is_finalizable(obj) {
-            return true;
-        }
-        if depth == 0 {
-            return false;
-        }
-        if matches!(
-            obj,
-            Object::Tuple(_)
-                | Object::List(_)
-                | Object::Dict(_)
-                | Object::Set(_)
-                | Object::FrozenSet(_)
-                | Object::Instance(_)
-                | Object::Cell(_)
-                | Object::MappingProxy(_)
-                | Object::SimpleNamespace(_)
-        ) {
-            let mut found = false;
-            crate::gc_trace::traverse_object(obj, &mut |c| {
-                if !found && Self::exc_has_finalizable(c, depth - 1) {
-                    found = true;
-                }
-            });
-            return found;
-        }
-        false
-    }
-
-    /// Does the container subgraph rooted at `root` contain a *GC-tracked*
-    /// child within `depth` links? Used by [`Self::prompt_reap_dropped`] to
-    /// decide whether an untracked, unwatched, non-finalizable container is
-    /// still worth the cascade: a plain `Rc` drop frees the container but
-    /// leaves a tracked child it solely anchored pinned by its own
-    /// collector handle (weakrefs unclear, `__del__` deferred to the next
-    /// cyclic collection). Bounded — both in depth and in total nodes
-    /// visited — so a huge scalar container (a million-int list dying at
-    /// frame exit) costs a few dozen `is_tracked` lookups at most; hitting
-    /// the cap conservatively reports `false` (skip the prompt reap; the
-    /// tracing collector reclaims later).
-    fn anchors_tracked_child(root: &Object, depth: u8) -> bool {
-        const NODE_CAP: usize = 64;
-        fn walk(obj: &Object, depth: u8, budget: &mut usize) -> bool {
-            if depth == 0 || *budget == 0 {
-                return false;
-            }
-            let mut found = false;
-            crate::gc_trace::traverse_object(obj, &mut |c| {
-                // Scalars are never tracked and hold nothing; a frame still
-                // on the stack keeps its locals whatever dies here (a
-                // traceback leads to the very frame that is handling it).
-                if found
-                    || *budget == 0
-                    || c.is_gc_atomic()
-                    || matches!(c, Object::Frame(f) if f.on_stack.get() > 0)
-                    || matches!(c, Object::Instance(i) if i.is_gc_deferred() && i.c_body.get() == 0)
-                {
-                    return;
-                }
-                *budget -= 1;
-                if crate::gc_trace::is_tracked(crate::weakref_registry::id_of(c)) {
-                    found = true;
-                    return;
-                }
-                if matches!(
-                    c,
-                    Object::Tuple(_)
-                        | Object::List(_)
-                        | Object::Dict(_)
-                        | Object::Set(_)
-                        | Object::FrozenSet(_)
-                        | Object::Instance(_)
-                        | Object::Cell(_)
-                        // Follow `__traceback__` → frame → locals: a dying
-                        // exception is routinely the last holder of tracked
-                        // objects that live only in the frames it unwound.
-                        | Object::Traceback(_)
-                        | Object::Frame(_)
-                ) && walk(c, depth - 1, budget)
-                {
-                    found = true;
-                }
-            });
-            found
-        }
-        let mut budget = NODE_CAP;
-        walk(root, depth, &mut budget)
-    }
-
-    /// Is `obj` dead in refcount terms — does the caller hold its last
-    /// program-visible reference? `local_refs` is the number of strong
-    /// references the caller itself holds (the binding being dropped, or
-    /// a work-list entry). The GC's own handle and weakref strong clones
-    /// are discounted: neither is a program-visible binding.
-    fn is_refcount_dead(obj: &Object, local_refs: usize) -> bool {
-        let id = crate::weakref_registry::id_of(obj);
-        let registry_holds = usize::from(gc_trace::is_tracked(id));
-        let weak_clones = crate::weakref_registry::strong_clone_count(id);
-        gc_trace::strong_count_for(obj) <= local_refs + registry_holds + weak_clones
-    }
-
-    /// Has `obj` escaped into a C extension — does it own a faithful
-    /// inline instance body (RFC 0045, `c_body != 0`)? Such an instance's
-    /// pointer may be held *borrowed* (uncounted) by a C extension across
-    /// a re-entrant call into the VM, so the prompt reaper — whose
-    /// deadness test sees only VM `Rc` references — must not reclaim it
-    /// (that would free the body and let the allocator reuse it under the
-    /// extension's live pointer). The tracing cycle collector reclaims it
-    /// later, once C's transient borrows are gone. A single `Cell` read;
-    /// `false` for every pure-Python instance and non-instance object.
-    #[inline]
-    fn instance_escaped_to_c(obj: &Object) -> bool {
-        matches!(obj, Object::Instance(inst) if inst.c_body.get() != 0)
-    }
-
-    /// Does the acyclic subgraph rooted at `root` contain any instance
-    /// that has escaped into a C extension (see [`instance_escaped_to_c`])?
-    /// Used by the prompt reaper to leave such subgraphs to the tracing
-    /// cycle collector (a C extension may hold a borrowed pointer into one
-    /// of the bodies). A bounded breadth-first walk over the same edges
-    /// `gc_trace::traverse_object` exposes, deduplicated by object id and
-    /// capped so a pathological structure can never make frame exit
-    /// quadratic; hitting the cap conservatively reports `true` (skip the
-    /// reap — always safe). Returns immediately for the overwhelmingly
-    /// common all-scalar / pure-Python subgraph.
-    fn subgraph_contains_escaped(root: &Object) -> bool {
-        // Fast path: a root that can hold no references (scalar, string,
-        // …) trivially has no escaped instance in its subgraph. This
-        // covers the overwhelming majority of reaped temporaries at zero
-        // allocation cost.
-        if Self::instance_escaped_to_c(root) {
-            return true;
-        }
-        if !Self::object_can_hold_refs(root) {
-            return false;
-        }
-        // Bounded DFS reusing a thread-local scratch stack + visited set so
-        // the hot reap path allocates nothing. Cap chosen well above
-        // pandas' shallow `_cache`/`__dict__` fan-out; on overflow we
-        // proceed with the reap (return `false`) — the only structures big
-        // enough to hit it are large escaped-free graphs, and a pandas
-        // escaped body is always shallow.
-        const VISIT_CAP: usize = 2048;
-        thread_local! {
-            static SCRATCH: std::cell::RefCell<(
-                Vec<Object>,
-                std::collections::HashSet<crate::weakref_registry::ObjectId>,
-            )> = std::cell::RefCell::new((Vec::new(), std::collections::HashSet::new()));
-        }
-        SCRATCH.with(|cell| {
-            let Ok(mut guard) = cell.try_borrow_mut() else {
-                // Re-entrant (a finalizer walked here): fall back to a
-                // conservative "skip the reap" rather than risk aliasing
-                // the scratch buffers.
-                return true;
-            };
-            let (stack, seen) = &mut *guard;
-            stack.clear();
-            seen.clear();
-            gc_trace::traverse_object(root, &mut |child| stack.push(child.clone()));
-            let mut visited = 0usize;
-            let mut found = false;
-            while let Some(obj) = stack.pop() {
-                if !seen.insert(crate::weakref_registry::id_of(&obj)) {
-                    continue;
-                }
-                if Self::instance_escaped_to_c(&obj) {
-                    found = true;
-                    break;
-                }
-                visited += 1;
-                if visited > VISIT_CAP {
-                    break;
-                }
-                if Self::object_can_hold_refs(&obj) {
-                    gc_trace::traverse_object(&obj, &mut |child| stack.push(child.clone()));
-                }
-            }
-            stack.clear();
-            seen.clear();
-            found
-        })
-    }
-
-    /// Cheap discriminator: can `obj` hold references to other objects
-    /// (and therefore possibly reach an escaped instance)? `false` for
-    /// scalars/strings/bytes and other leaves, letting
-    /// [`subgraph_contains_escaped`] skip the walk entirely.
-    #[inline]
-    fn object_can_hold_refs(obj: &Object) -> bool {
-        matches!(
-            obj,
-            Object::List(_)
-                | Object::Tuple(_)
-                | Object::Dict(_)
-                | Object::Set(_)
-                | Object::FrozenSet(_)
-                | Object::MappingProxy(_)
-                | Object::SimpleNamespace(_)
-                | Object::Instance(_)
-                | Object::Cell(_)
-                | Object::BoundMethod(_)
-                | Object::Function(_)
-                | Object::Type(_)
-                | Object::Frame(_)
-        )
-    }
-
     /// Emulate CPython deleting a terminating thread's thread-state
     /// dict: drop `ident`'s slot from every `_threading_local.local`.
     /// Run from the native worker teardown (`spawn_python_worker`) the
@@ -4338,63 +2575,17 @@ impl Interpreter {
         self.run_pending_finalizers();
     }
 
-    /// Invoke any `__del__` finalizers queued by the cycle GC.
-    /// Each finalizer runs at most once. Exceptions from a
-    /// finalizer are routed through `sys.unraisablehook` (the
-    /// default hook prints `Exception ignored in: …` to stderr,
-    /// exactly like CPython) so they don't propagate.
-    /// Prompt (deterministic) finalization driver — the interpreter half of
-    /// RFC 0040's GC arc. CPython runs an object's `__del__` the instant its
-    /// refcount reaches zero; weavepy's tracing collector pins every tracked
-    /// object on a strong handle, so a refcount-dead finalizable object would
-    /// otherwise linger until the next cyclic collection. This closes that gap
-    /// by, at each reference-drop safe point, running `__del__` for objects
-    /// whose last *program* reference just dropped (`strong_count <= 1`).
-    ///
-    /// Drives a small fixpoint loop: queue the dead finalizables' `__del__`,
-    /// run them, reclaim the (non-resurrected) corpses — which cascades the
-    /// refcount drop into their referents and can expose the next layer of
-    /// now-dead finalizables — and repeat until quiescent. Bounded by
-    /// `MAX_COLLECT_PASSES` against a pathological `__del__` that keeps
-    /// resurrecting and re-killing objects.
-    ///
-    /// Gated by [`gc_trace::has_any_finalizable`] at every call site, so when
-    /// no `__del__`-bearing object is live (the common case) it costs one
-    /// relaxed atomic load. Re-entrancy is suppressed via a thread-local: a
-    /// `__del__` body re-enters the eval loop, whose own safe points would
-    /// otherwise recurse here.
+    /// Run the work queued for this safe point: finalizers a dying
+    /// object's `Drop` resurrected, and weakref callbacks.
     pub fn drain_prompt_finalizers(&mut self) {
-        thread_local! {
-            static IN_PROMPT_FINALIZE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        }
-        if IN_PROMPT_FINALIZE.with(std::cell::Cell::get) {
-            return;
-        }
-        IN_PROMPT_FINALIZE.with(|c| c.set(true));
-        for _ in 0..gc_trace::MAX_COLLECT_PASSES {
-            let progressed = gc_trace::reap_dead_finalizable();
-            if progressed == 0 {
-                break;
-            }
-            // Run the `__del__`s and weakref callbacks just queued. They may
-            // drop the last reference to — or resurrect — other finalizables,
-            // which the next pass re-evaluates.
-            self.run_pending_finalizers();
-            // Cascade through *non*-finalizable tracked objects too: freeing
-            // a `__del__`-bearing object often exposes a chain of plain
-            // containers (transport → protocol → context dicts) that CPython's
-            // refcounting would free in the same instant, and whose survival
-            // would keep further finalizables/weakref targets alive past this
-            // drain (asyncio's SSL leak tests watch such a chain). Only runs
-            // on the rare "a finalizable just died" path, so the O(tracked)
-            // scan stays off the hot loop; amortized further when the
-            // tracked population itself is huge (see
-            // `reap_dead_acyclic_amortized`).
-            gc_trace::reap_dead_acyclic_amortized();
-        }
-        IN_PROMPT_FINALIZE.with(|c| c.set(false));
+        self.run_pending_finalizers();
     }
 
+    /// Invoke any `__del__` finalizers and weakref callbacks queued by a
+    /// dying object's `Drop` or by the cycle collector. Each finalizer runs
+    /// at most once. Exceptions from a finalizer are routed through
+    /// `sys.unraisablehook` (the default hook prints `Exception ignored
+    /// in: …` to stderr, exactly like CPython) so they don't propagate.
     pub fn run_pending_finalizers(&mut self) -> usize {
         // RFC 0077 (WS2): the prompt reaper drains after every node it
         // tears down, and for the overwhelming majority nothing was
@@ -4753,19 +2944,20 @@ impl Interpreter {
             Some(Object::Module(m)) => m.dict.borrow().iter().map(|(_k, v)| v.clone()).collect(),
             _ => Vec::new(),
         };
-        let mut sys_deferred: Vec<crate::sync::Rc<crate::gc_trace::TrackedHandle>> = Vec::new();
+        let mut sys_deferred: Vec<(crate::sync::Rc<crate::gc_trace::TrackedHandle>, Object)> =
+            Vec::new();
         for _ in 0..8 {
             let candidates = crate::gc_trace::finalization_candidates();
             if candidates.is_empty() {
                 break;
             }
-            for handle in candidates {
-                if sys_values.iter().any(|v| v.is_same(&handle.object)) {
+            for (handle, obj) in candidates {
+                if sys_values.iter().any(|v| v.is_same(&obj)) {
                     if !sys_deferred
                         .iter()
-                        .any(|h| crate::sync::Rc::ptr_eq(h, &handle))
+                        .any(|(h, _)| crate::sync::Rc::ptr_eq(h, &handle))
                     {
-                        sys_deferred.push(handle);
+                        sys_deferred.push((handle, obj));
                     }
                     continue;
                 }
@@ -4777,21 +2969,21 @@ impl Interpreter {
                 {
                     continue;
                 }
-                self.invoke_finalizer(&handle.object);
+                self.invoke_finalizer(&obj);
             }
             // A finalizer may have queued cyclic finalizers of its own.
             self.run_pending_finalizers();
         }
         if !sys_deferred.is_empty() {
             crate::vm_singletons::set_unraisable_silenced(true);
-            for handle in sys_deferred {
+            for (handle, obj) in sys_deferred {
                 if handle
                     .finalized
                     .swap(true, std::sync::atomic::Ordering::AcqRel)
                 {
                     continue;
                 }
-                self.invoke_finalizer(&handle.object);
+                self.invoke_finalizer(&obj);
             }
             crate::vm_singletons::set_unraisable_silenced(false);
         }
@@ -4826,9 +3018,6 @@ impl Interpreter {
         if std::env::var_os("WEAVEPY_VM_STATS").is_some() {
             let snap = crate::specialize::snapshot();
             eprint!("{}", crate::specialize::format_stats_markdown(&snap));
-            if let Some(md) = gc_trace::floor_stats::markdown() {
-                eprint!("{md}");
-            }
             if let Some(md) = jit_stats_markdown() {
                 eprint!("{md}");
             }
@@ -4864,6 +3053,23 @@ impl Interpreter {
     /// prompt, collector, and shutdown requests may refer to the same object.
     /// Only the winning request may publish finalizer completion.
     fn invoke_finalizer(&mut self, obj: &Object) -> bool {
+        // A discarded never-driven `asend`/`athrow`/`aclose` awaitable (see
+        // `release`).
+        if let Object::AsyncGenAwait(a) = obj {
+            let method = match a.kind {
+                crate::object::AgenAwaitKind::Send => "asend",
+                crate::object::AgenAwaitKind::Throw => "athrow",
+                crate::object::AgenAwaitKind::Close => "aclose",
+            };
+            let qualname = match &a.agen {
+                Object::AsyncGenerator(g) => g.qualname.borrow().to_str(),
+                other => other.type_name_owned(),
+            };
+            let _ = self.emit_runtime_warning(format!(
+                "coroutine method '{method}' of '{qualname}' was never awaited"
+            ));
+            return true;
+        }
         let finalize_ran = match obj {
             Object::Instance(inst) => &inst.finalize_ran,
             Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
@@ -5731,7 +3937,6 @@ impl Interpreter {
     fn run_frame(&mut self, frame: &mut Frame) -> Result<Object, RuntimeError> {
         match self.run_until_yield_or_return(frame, None)? {
             FrameOutcome::Returned(v) => {
-                self.reap_frame_locals_on_exit(frame, Some(&v));
                 self.recycle_frame_allocs(frame);
                 Ok(v)
             }
@@ -6176,12 +4381,6 @@ impl Interpreter {
         let quiet_off = self.quiet_off;
         let mut loop_snap_gen: u64 = 0; // stale → first iteration derives
         let mut loop_quiet = false;
-        let mut loop_fin_quiet = false;
-        // Within fin-quiet mode: is a finalizable object live (the coarse
-        // stack-shrink drop heuristic applies), or only active suspects
-        // (which the full prologue probes at marked safe points without
-        // it)?
-        let mut loop_coarse = false;
         // The loops are off only because a frame object is observed (see
         // `frame_object_observed`): re-derive once nothing outside the
         // activation holds it any more (an `except` clause dropped the
@@ -6197,21 +4396,6 @@ impl Interpreter {
             self.gil_countdown = self.gil_countdown.wrapping_sub(1);
             if self.gil_countdown == 0 {
                 self.gil_countdown = crate::gil::GIL_CHECK_INTERVAL;
-                // RFC 0065 (WS1): the quiet paths skip the per-
-                // instruction suspect probes, so aged-out (dormant)
-                // suspects are instead re-probed on this ~128-
-                // instruction cadence. `has_suspects` keeps its
-                // dormant-stride admission, so a dormant-only
-                // population pays two relaxed loads here and a real
-                // probe only every DORMANT_STRIDE-th checkpoint.
-                if (loop_quiet || loop_fin_quiet)
-                    && !gc_trace::active_suspects_present()
-                    && gc_trace::has_suspects()
-                {
-                    for obj in gc_trace::take_dead_suspects() {
-                        self.reap_dead_subgraph(obj);
-                    }
-                }
                 crate::gil::yield_checkpoint();
             }
             // RFC 0065 (WS1): re-derive the prologue snapshot only when
@@ -6236,27 +4420,7 @@ impl Interpreter {
                 let frame_observed =
                     Self::frame_object_observed(&shell, py_frame_slot.as_ref(), frame);
                 frame_blocks_quiet = unobserved && frame_observed;
-                let base_quiet = unobserved && !frame_observed;
-                // Graded: fully quiet when no finalizable object exists
-                // anywhere; "fin-quiet" — everything cold except the
-                // CPython-timing-bearing prompt-finalization probe —
-                // when the only live input is the finalizable
-                // population (in practice ≥ 1 in any real program: the
-                // ABC machinery keeps a weakref-callback-enrolled type
-                // alive for the process lifetime).
-                let fin_live = gc_trace::has_any_finalizable();
-                // An *active* suspect (one still inside its probe budget)
-                // is the same kind of input: it is re-probed at every
-                // marked drop safe point, which is exactly the fin-quiet
-                // path's `take_maybe_dead` gate. Pinning the loop to the
-                // full prologue for it instead made every instruction of
-                // a drop-free hot loop pay that prologue for as long as
-                // the suspect's budget lasted, since nothing there probes
-                // it.
-                let suspects_live = gc_trace::active_suspects_present();
-                loop_quiet = base_quiet && !fin_live && !suspects_live;
-                loop_fin_quiet = base_quiet && (fin_live || suspects_live);
-                loop_coarse = fin_live;
+                loop_quiet = unobserved && !frame_observed;
             }
             // The leaf burst: while the loop is quiet, run the straight
             // run of leaf instructions at `frame.pc` in one tight loop
@@ -6268,43 +4432,24 @@ impl Interpreter {
                 && !crate::gil::free_threading_enabled();
             let cur_pc: usize;
             let mut instruction_ran = false;
-            let watch_drops: bool;
-            let stack_before: usize;
-            let op_before: Option<OpCode>;
             let stepped = if let Some((stepped, at)) = pending.take() {
                 // An outcome produced before this loop took over (see the
                 // method docs). Its producer ran the per-instruction
-                // protocol, drop heuristic included.
-                watch_drops = false;
-                stack_before = 0;
-                op_before = None;
+                // protocol.
                 cur_pc = at;
                 instruction_ran = true;
                 stepped
-            } else if loop_quiet || loop_fin_quiet {
-                // The quiet paths: nothing is pending, nobody is
-                // watching. Semantically identical to the full prologue
-                // with the corresponding gates cold — each gate's
-                // producer bumps the loop generation before its gate
-                // can read hot, so the full prologue resumes on the
-                // very next instruction.
-                // The one live subsystem in fin-quiet mode: prompt
-                // finalization. Same probe order and cadence as the full
-                // prologue's finalizable arm (`take_maybe_dead` gate, then
-                // the finalizer drain, then the stride-gated suspect
-                // re-probe), and the same drop-watch bookkeeping in the
-                // shared tail below.
-                let drained = loop_fin_quiet && self.drain_if_maybe_dead();
-                // Nothing pending: hand the frame to the quiet loop proper.
-                // (After a drain the finalizers may have changed any loop
-                // input, so that iteration single-steps.)
-                let quiet_exit = if burst_ok && !drained {
+            } else if loop_quiet {
+                // The quiet path: nothing is pending, nobody is watching.
+                // Semantically identical to the full prologue with the
+                // corresponding gates cold — each gate's producer bumps the
+                // loop generation before its gate can read hot, so the full
+                // prologue resumes on the very next instruction.
+                let quiet_exit = if burst_ok {
                     Some(self.quiet_run(
                         frame,
                         QuietShell::Ready(&shell),
                         loop_snap_gen,
-                        loop_fin_quiet,
-                        loop_coarse,
                         &mut prev_pc,
                     ))
                 } else {
@@ -6335,25 +4480,11 @@ impl Interpreter {
                         stepped,
                         cur_pc: at,
                     }) => {
-                        // `quiet_run` already applied the drop heuristic.
-                        watch_drops = false;
-                        stack_before = 0;
-                        op_before = None;
                         cur_pc = at;
                         instruction_ran = true;
                         stepped
                     }
                     None => {
-                        if loop_fin_quiet && loop_coarse {
-                            watch_drops = true;
-                            stack_before = frame.stack.len();
-                            op_before =
-                                frame.code.instructions.get(frame.pc as usize).map(|i| i.op);
-                        } else {
-                            watch_drops = false;
-                            stack_before = 0;
-                            op_before = None;
-                        }
                         cur_pc = frame.pc as usize;
                         shell
                             .lasti
@@ -6379,42 +4510,13 @@ impl Interpreter {
                 // Each bit-guarded arm below re-checks its subsystem's
                 // precise gate, so a stale-set bit is harmless.
                 let hot = crate::hot_gates::load();
-                // RFC 0040 (GC arc): prompt finalization. Between bytecodes — a
-                // safe point with no outstanding container borrows — run `__del__`
-                // and fire callback-weakrefs for any object whose last reference
-                // dropped during the previous instruction, matching CPython's
-                // refcount-driven `tp_dealloc` timing. Two gates keep this free in
-                // the common case: a finalizable object must be live *and* the
-                // previous instruction must have dropped a reference (`take_maybe_
-                // _dead`, made variant-precise by RFC 0059 WS1b), so a hot loop
-                // that neither allocates `__del__` objects nor drops heap-graph
-                // references pays only the relaxed loads.
-                let any_finalizable = gc_trace::has_any_finalizable();
-                if (any_finalizable || gc_trace::has_suspects()) && gc_trace::take_maybe_dead() {
-                    if any_finalizable {
-                        self.drain_prompt_finalizers();
-                    }
-                    // Re-probe cascade-skipped suspects (see `note_suspect`): a
-                    // Rust-side transient that pinned one during its cascade has
-                    // typically died by now, and CPython would have freed the
-                    // object (and everything it anchors) at that instant.
-                    if gc_trace::has_suspects() {
-                        for obj in gc_trace::take_dead_suspects() {
-                            self.reap_dead_subgraph(obj);
-                        }
-                    }
-                } else if hot & crate::hot_gates::PENDING_FINALIZERS != 0
-                    && crate::vm_singletons::has_pending_finalizers()
-                {
-                    // An *untracked* finalizable instance freed by a plain `Rc`
-                    // drop (its container temporary died between bytecodes — a
-                    // `for k, v in d.items()` loop rebinding its tuple, dropping
-                    // the overwritten value) parks its `__del__` via
-                    // `PyInstance::drop`'s resurrection net. It never appears in
-                    // the finalizable index, so the gate above stays cold; run
-                    // the parked finalizers here to keep CPython's refcount
-                    // timing (`test_dict.test_oob_indexing_dictiter_iternextitem`
-                    // clears the dict from such a `__del__` mid-iteration).
+                // Prompt finalization. Between bytecodes — a safe point with no
+                // outstanding container borrows — run the `__del__`s and
+                // weakref callbacks queued by objects that died during the
+                // previous instruction (their `Drop` raised the gate),
+                // matching CPython's refcount-driven `tp_dealloc` timing.
+                if hot & crate::hot_gates::PENDING_FINALIZERS != 0 {
+                    gc_trace::take_maybe_dead();
                     self.run_pending_finalizers();
                 }
                 // A tracking site crossed the young threshold without polling
@@ -6425,58 +4527,19 @@ impl Interpreter {
                         self.run_pending_finalizers();
                     }
                 }
-                // RFC 0047 (wave 5): reap objects whose last C-side reference
-                // was dropped *inside* an extension call since the previous
-                // instruction (a Cython setter decref'ing the old value of a
-                // `cdef` field). CPython would have run their dealloc chains in
-                // the call itself; the capi boundary parks them instead, and
-                // this between-bytecodes safe point — the first moment with no
-                // extension frame live — runs the refcount-guarded reap so
-                // weakrefs to anything that died clear before the next
-                // instruction can observe them. Gated on one thread-local read.
-                //
-                // Crucially, the drain waits for `cext_call_active()` to clear:
-                // bytecode a C extension re-enters (a Cython module-exec, a
-                // `PyObject_Call` back into Python) hits this safe point too,
-                // where every parked escaped subgraph would just be re-parked
-                // by `reap_dead_subgraph`'s C-frame guard after an O(subgraph)
-                // escape scan — re-scanning the whole queue on *every bytecode*
-                // of the re-entered code (pandas' import runs minutes long
-                // under that quadratic churn). Draining only at depth 0 runs
-                // each parked object through the cascade exactly once.
-                // Probe order matters: `has_pending_cext_drops` is one
-                // relaxed load when empty (the overwhelming case), while
-                // `cext_call_active` is a thread-local read — so ask
-                // "is there anything to do" before "may we do it".
-                // Native side exits share this queue: their obsolete pins
-                // can be reaped now that the continuation's frame is on
-                // the stack and its recursion depth is accounted for.
+                // Release the references C extension code dropped since the
+                // previous instruction (RFC 0047, wave 5). The capi boundary
+                // parks them rather than releasing them inside the call,
+                // where C may still borrow a body they back; this safe point
+                // with no extension frame live is the first moment they can
+                // go (`has_pending_cext_drops` is the cheap probe, so it
+                // comes first).
                 if hot & crate::hot_gates::PENDING_CEXT != 0
                     && crate::vm_singletons::has_pending_cext_drops()
                     && !crate::vm_singletons::cext_call_active()
                 {
-                    static REAP_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                    let reap_trace = *REAP_TRACE
-                        .get_or_init(|| std::env::var_os("WEAVEPY_REAP_TRACE").is_some());
                     for dropped in crate::vm_singletons::drain_pending_cext_drops() {
-                        if reap_trace {
-                            let dead = Self::is_refcount_dead(&dropped, 1);
-                            let sc = gc_trace::strong_count_for(&dropped);
-                            eprintln!(
-                                "[CEXT-REAP] {} id={:#x} sc={} dead={}",
-                                dropped.type_name_owned(),
-                                crate::weakref_registry::id_of(&dropped),
-                                sc,
-                                dead
-                            );
-                        }
-                        // Straight to the cascade: `prompt_reap_dropped`'s
-                        // fast-path early return would plain-drop an untracked,
-                        // finalizer-free container — but a C-dropped container
-                        // (the old `blocks` tuple) is queued here precisely
-                        // because its *tracked children* (Cython `Block`s) need
-                        // the cascade to clear their weakrefs.
-                        self.reap_dead_subgraph(dropped);
+                        self.release(dropped);
                     }
                 }
                 // RFC 0040 (WS7): surface any "unclosed file" `ResourceWarning`
@@ -6659,21 +4722,6 @@ impl Interpreter {
                 // always — stays free. Feeding any handler-raised error
                 // through the same arm as `step`'s `Err` keeps it catchable
                 // by a surrounding `try/except`, exactly as CPython.
-                // RFC 0040 (GC arc): note whether this instruction can drop the
-                // last reference to a finalizable object, so the next safe point's
-                // prompt-finalization sweep runs only when warranted. Gated on a
-                // live finalizable so non-`__del__` workloads pay nothing. A
-                // dropped reference shows up either as the operand stack shrinking
-                // (`POP_TOP`, every `STORE_*`/`*_SUBSCR`, `POP_EXCEPT`, `END_FOR`,
-                // a net-consuming `CALL`, …) or as one of the stack-neutral
-                // `DELETE_*`-name opcodes.
-                watch_drops = gc_trace::has_any_finalizable();
-                stack_before = if watch_drops { frame.stack.len() } else { 0 };
-                op_before = if watch_drops {
-                    frame.code.instructions.get(frame.pc as usize).map(|i| i.op)
-                } else {
-                    None
-                };
                 // `PyThreadState_SetAsyncExc`: an exception scheduled for this
                 // thread from another thread (or itself) is raised here, at the
                 // next instruction boundary — CPython's eval-breaker async-exc
@@ -6778,39 +4826,6 @@ impl Interpreter {
                // exc) leave `prev_pc` untouched.
             if instruction_ran {
                 prev_pc = Some(cur_pc);
-            }
-            // RFC 0059 WS1b: opcodes whose handlers account for every value
-            // they discard via `gc_trace::note_dropped` (audited: `POP_TOP`,
-            // `STORE_FAST`, and the `BINARY_OP`/`COMPARE_OP` arms — the
-            // specialized scalar fast paths of the latter two consume only
-            // pure-leaf variants by construction) are exempt from the coarse
-            // stack-shrink heuristic, so scalar-churning hot loops stop
-            // scheduling finalizer sweeps. Every other opcode keeps the
-            // conservative mark.
-            // RFC 0077 (WS2) widened the audited set to the opcodes the
-            // deltablue census showed driving ~95% of the coarse marks:
-            // `CALL` (operands graded by `reap_call_receiver`/`reap_call_
-            // args`, moved arguments by the callee's frame-exit sweep, the
-            // raise path re-marks), `RETURN_VALUE` (the frame-exit sweep
-            // grades every slot), `STORE_ATTR` (receiver + displaced value
-            // on the instance hits; slot/generic paths re-mark), the
-            // `POP_JUMP_IF_*` family and `IS_OP` (operands noted in the
-            // handlers).
-            // One table byte per opcode (RFC 0077 WS3): bit 0 marks the
-            // audited (exempt) set above, bit 1 the stack-neutral
-            // `DELETE_*` opcodes that count as a drop regardless.
-            let drop_class = match op_before {
-                Some(op) => COARSE_DROP_CLASS[op as u8 as usize],
-                None => 0,
-            };
-            if watch_drops
-                && drop_class & COARSE_EXEMPT == 0
-                && (frame.stack.len() < stack_before || drop_class & COARSE_DELETE != 0)
-            {
-                if crate::specialize::stats_enabled() {
-                    gc_trace::floor_stats::coarse_mark(op_before.map_or("?", OpCode::name));
-                }
-                gc_trace::mark_maybe_dead();
             }
             match stepped {
                 Ok(StepOutcome::Continue) => {
@@ -7108,9 +5123,6 @@ impl Interpreter {
                                         break 'activation Err(e);
                                     }
                                 }
-                                // The frame's locals and operands drop
-                                // wholesale below; see `mark_bulk_drop`.
-                                gc_trace::mark_bulk_drop();
                                 break Err(e);
                             }
                         }
@@ -7731,27 +5743,15 @@ impl Interpreter {
                     }
                     // Tear down the never-started generator: its frame
                     // locals (bound arguments) die now, like CPython's
-                    // refcount-driven dealloc. Drop the snapshot's own
-                    // strong clones (mirror, materialised dict) *first*
-                    // so the reap sees the true remaining refcount.
-                    let caps = frame_reapables(&g);
+                    // refcount-driven dealloc.
                     *g.state.borrow_mut() = GeneratorState::Finished;
                     Self::wipe_frame_locals(py);
-                    for cap in caps {
-                        self.prompt_reap_dropped(cap);
-                    }
                     return Ok(Object::None);
                 }
                 _ => {}
             }
         }
         Self::wipe_frame_locals(py);
-        // The wiped locals were pinned by a traceback until now
-        // (unittest's `assertRaises` clears them on exit); any of them
-        // may have been the last holder of a finalizable the hot/cold
-        // gate already demoted. Re-grade the whole index at the next
-        // safe point (see `gc_trace::mark_bulk_drop`).
-        gc_trace::mark_bulk_drop();
         Ok(Object::None)
     }
 
@@ -8881,8 +6881,6 @@ impl Interpreter {
             // consume the thread-local flag before the operands
             // actually drop — and before the `?`, so the error path's
             // unwind drop is covered too.
-            gc_trace::note_dropped(&a);
-            gc_trace::note_dropped(&b);
             let r = r_res?;
             // tracemalloc: a binary op that built a fresh container /
             // string / bytes (`b'x' * n`, `s1 + s2`, `list * 3`) is an
@@ -8918,15 +6916,7 @@ impl Interpreter {
     /// keeps bound containers off the cascade.
     #[inline]
     fn retire_operand(&mut self, o: Object) {
-        match &o {
-            Object::Instance(_) => self.prompt_reap_dropped(o),
-            Object::List(_) | Object::Dict(_) | Object::Set(_) => {
-                if Self::looks_reapable_temporary(&o) {
-                    self.prompt_reap_dropped(o);
-                }
-            }
-            _ => {}
-        }
+        self.release(o);
     }
 
     /// The `COMPARE_OP` handler body, split out of `step`.
@@ -8953,8 +6943,6 @@ impl Interpreter {
             let r_res = self.rich_compare_obj(&a, &b, kind, &frame.globals);
             // RFC 0059 WS1b: same operand accounting (and ordering)
             // as BINARY_OP above.
-            gc_trace::note_dropped(&a);
-            gc_trace::note_dropped(&b);
             let r = r_res?;
             let r = if to_bool && !matches!(r, Object::Bool(_)) {
                 let truthy = match &r {
@@ -9065,7 +7053,6 @@ impl Interpreter {
         // coarse stack-shrink mark; note the discarded value here
         // (no-op for pure leaves — e.g. a discarded expression
         // statement's int/str result).
-        gc_trace::note_dropped(&v);
         // Discarding the last reference to a temporary mirrors
         // CPython's refcount-driven finalization (`f()` as a
         // statement finalizes the result immediately). This covers
@@ -9089,9 +7076,7 @@ impl Interpreter {
         // and `frame.locals` always reflects live bindings — the
         // refcount guard therefore cannot false-positive on a value
         // still bound to a local.
-        if Self::local_needs_prompt_reap(&v) {
-            self.prompt_reap_dropped(v);
-        }
+        self.release(v);
         Ok(())
     }
 
@@ -9143,9 +7128,7 @@ impl Interpreter {
                         }
                     }
                 };
-                if let Some(stale) = stale {
-                    gc_trace::note_dropped(&stale);
-                }
+                drop(stale);
                 return Ok(());
             }
         }
@@ -9175,7 +7158,6 @@ impl Interpreter {
             // loop's coarse stack-shrink mark, so the displaced value
             // must be noted here (no-op for pure-leaf rebinds — loop
             // counters, accumulators, first bindings over `Unbound`).
-            gc_trace::note_dropped(&old);
             // CPython decrefs the value previously bound to the local;
             // when that was the last reference to a finalizable object
             // its `__del__` runs at the rebind, not at frame exit
@@ -9192,10 +7174,7 @@ impl Interpreter {
             // held elsewhere" rebind (`for t in tasks:` displacing
             // the previous element) on one strong-count load before
             // the cascade's registry probes (RFC 0077 WS2).
-            if Self::local_needs_prompt_reap(&old) && Self::looks_reapable_temporary(&old) {
-                self.sync_py_locals(frame);
-                self.prompt_reap_dropped(old);
-            }
+            self.release(old);
         }
         Ok(())
     }
@@ -9216,15 +7195,13 @@ impl Interpreter {
         let truthy = match &v {
             Object::Instance(_) | Object::MappingProxyObj(_) => {
                 let g = frame.globals.clone();
-                self.obj_truthy(&v, &g)
-                    .inspect_err(|_| gc_trace::mark_maybe_dead())?
+                self.obj_truthy(&v, &g)?
             }
             _ => v.is_truthy(),
         };
         // RFC 0077 (WS2): the POP_JUMP family audits its one
         // discarded operand (exempt from the coarse stack-shrink
         // mark); the usual `bool` is a leaf and schedules nothing.
-        gc_trace::note_dropped(&v);
         if truthy == when {
             frame.pc += arg;
         }
@@ -9295,8 +7272,6 @@ impl Interpreter {
         frame: &mut Frame,
         mut shell: QuietShell<'_>,
         snap_gen: u64,
-        fin: bool,
-        coarse: bool,
         prev_pc: &mut Option<usize>,
     ) -> QuietExit {
         // SAFETY (for the reads in `quiet_frame`): the flag is this
@@ -9315,7 +7290,6 @@ impl Interpreter {
             root: frame,
             root_shell: (&raw mut shell).cast(),
             root_last: &raw mut last,
-            fin,
             maybe_dead,
         };
         let mut entry = QuietEntry::Fresh;
@@ -9330,7 +7304,6 @@ impl Interpreter {
                         &mut *roots.root,
                         &mut *roots.root_shell.cast::<QuietShell<'_>>(),
                         snap_gen,
-                        coarse,
                         prev_pc,
                         &mut *roots.root_last,
                         entry,
@@ -9354,7 +7327,6 @@ impl Interpreter {
                         top_frame,
                         &mut top_shell,
                         snap_gen,
-                        coarse,
                         &mut top_prev,
                         &mut top_last,
                         entry,
@@ -9407,7 +7379,7 @@ impl Interpreter {
                     } else {
                         let result = self.inline_finish(&mut done, exit);
                         match inl.last_mut() {
-                            None => self.inline_deliver(frame, shell, done, result),
+                            None => self.inline_deliver(frame, done, result),
                             Some(caller) => {
                                 let caller = &mut **caller;
                                 // SAFETY: as above.
@@ -9416,8 +7388,7 @@ impl Interpreter {
                                 } else {
                                     &mut caller.frame
                                 };
-                                let mut caller_shell = QuietShell::Lazy(&mut caller.act);
-                                self.inline_deliver(caller_frame, &mut caller_shell, done, result)
+                                self.inline_deliver(caller_frame, done, result)
                             }
                         }
                     }
@@ -9436,13 +7407,12 @@ impl Interpreter {
         frame: &mut Frame,
         shell: &mut QuietShell<'_>,
         snap_gen: u64,
-        coarse: bool,
         prev_pc: &mut Option<usize>,
         last: &mut usize,
         entry: QuietEntry,
         roots: &SwitchRoots,
     ) -> FrameEv {
-        let (fin, maybe_dead) = (roots.fin, roots.maybe_dead);
+        let maybe_dead = roots.maybe_dead;
         // A burst's stop handed over from the activation it moved away
         // from (see `FrameEv::Switched`).
         let mut pending: Option<LeafStop> = None;
@@ -9462,7 +7432,7 @@ impl Interpreter {
                         break 'run QuietExit::Yield;
                     }
                     // SAFETY: see `quiet_run`.
-                    if fin && unsafe { (*maybe_dead).get() } {
+                    if unsafe { (*maybe_dead).get() } {
                         self.flush_lean(frame, shell);
                         if self.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != snap_gen {
                             break 'run QuietExit::Yield;
@@ -9472,7 +7442,6 @@ impl Interpreter {
                 QuietEntry::Raised { err, cur_pc } => {
                     // The raise path drops the staged operands wholesale
                     // (see the `CALL` arm of `step`).
-                    gc_trace::mark_maybe_dead();
                     self.flush_lean(frame, shell);
                     if *last != usize::MAX {
                         *prev_pc = Some(*last);
@@ -9499,7 +7468,6 @@ impl Interpreter {
                     LeafStop::Breaker => break 'run QuietExit::Yield,
                     LeafStop::Raised(err) => {
                         // The `CALL` arm of `step` marks on the raise path.
-                        gc_trace::mark_maybe_dead();
                         self.flush_lean(frame, shell);
                         let cur_pc = frame.pc as usize - 1;
                         if *last != usize::MAX {
@@ -9511,12 +7479,10 @@ impl Interpreter {
                         });
                     }
                     LeafStop::Marked => {
-                        if fin {
-                            // Finalizers are arbitrary code: the spine must be
-                            // complete before they run.
-                            self.flush_lean(frame, shell);
-                            self.drain_if_maybe_dead();
-                        }
+                        // Finalizers are arbitrary code: the spine must be
+                        // complete before they run.
+                        self.flush_lean(frame, shell);
+                        self.drain_if_maybe_dead();
                         // The drop may also have queued work of its own (an
                         // unclosed file's ResourceWarning), which CPython
                         // delivers at the instruction that dropped it.
@@ -9584,7 +7550,6 @@ impl Interpreter {
                         if let Err(err) = called {
                             // The raise path drops the staged operands
                             // wholesale (see the `CALL` arm of `step`).
-                            gc_trace::mark_maybe_dead();
                             self.flush_lean(frame, shell);
                             if *last != usize::MAX {
                                 *prev_pc = Some(*last);
@@ -9603,7 +7568,7 @@ impl Interpreter {
                             break 'run QuietExit::Yield;
                         }
                         // SAFETY: see `quiet_run`.
-                        if fin && unsafe { (*maybe_dead).get() } {
+                        if unsafe { (*maybe_dead).get() } {
                             self.flush_lean(frame, shell);
                             if self.drain_if_maybe_dead()
                                 && crate::hot_gates::loop_gen() != snap_gen
@@ -9641,7 +7606,6 @@ impl Interpreter {
                     };
                     if let Some(loaded) = loaded {
                         if let Err(err) = loaded {
-                            gc_trace::mark_maybe_dead();
                             self.flush_lean(frame, shell);
                             if *last != usize::MAX {
                                 *prev_pc = Some(*last);
@@ -9660,7 +7624,7 @@ impl Interpreter {
                             break 'run QuietExit::Yield;
                         }
                         // SAFETY: see `quiet_run`.
-                        if fin && unsafe { (*maybe_dead).get() } {
+                        if unsafe { (*maybe_dead).get() } {
                             self.flush_lean(frame, shell);
                             if self.drain_if_maybe_dead()
                                 && crate::hot_gates::loop_gen() != snap_gen
@@ -9689,22 +7653,10 @@ impl Interpreter {
                     }
                 }
                 let live_shell = self.flush_lean(frame, shell);
-                let stack_before = frame.stack.len();
                 live_shell
                     .lasti
                     .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
                 let stepped = self.step_hot(frame);
-                if coarse {
-                    let drop_class = match op_before {
-                        Some(op) => COARSE_DROP_CLASS[op as u8 as usize],
-                        None => 0,
-                    };
-                    if drop_class & COARSE_EXEMPT == 0
-                        && (frame.stack.len() < stack_before || drop_class & COARSE_DELETE != 0)
-                    {
-                        gc_trace::mark_maybe_dead();
-                    }
-                }
                 if !matches!(stepped, Ok(StepOutcome::Continue)) {
                     return FrameEv::Exit(QuietExit::Outcome { stepped, cur_pc });
                 }
@@ -9718,8 +7670,7 @@ impl Interpreter {
                     break 'run QuietExit::Yield;
                 }
                 // SAFETY: see `quiet_run`.
-                if fin
-                    && unsafe { (*maybe_dead).get() }
+                if unsafe { (*maybe_dead).get() }
                     && self.drain_if_maybe_dead()
                     && crate::hot_gates::loop_gen() != snap_gen
                 {
@@ -10078,7 +8029,6 @@ impl Interpreter {
             Ok(FrameOutcome::Returned(v)) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
                 let frame: &mut Frame = &mut boxed;
-                self.reap_dead_frame(frame);
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(&gen);
                 Ok(GenStep::Exhausted(v))
@@ -10093,7 +8043,6 @@ impl Interpreter {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
                 let escaped = self.pep479_escape(&gen, err);
                 let frame: &mut Frame = &mut boxed;
-                self.reap_dead_frame(frame);
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(&gen);
                 Err(escaped)
@@ -10139,7 +8088,6 @@ impl Interpreter {
                 // The exhausted generator leaves the stack (a full handler
                 // takes the coarse mark for it).
                 drop(it);
-                gc_trace::mark_maybe_dead();
                 QuietEntry::Returned { cur_pc: call_pc }
             }
             Err(err) => QuietEntry::Raised {
@@ -10235,10 +8183,7 @@ impl Interpreter {
             }
         };
         let result = match outcome {
-            Ok(FrameOutcome::Returned(v)) => {
-                self.reap_frame_locals_on_exit(frame, Some(&v));
-                Ok(v)
-            }
+            Ok(FrameOutcome::Returned(v)) => Ok(v),
             Ok(FrameOutcome::Yielded(_)) => Err(RuntimeError::Internal(
                 "lean frame yielded to a non-generator caller".to_owned(),
             )),
@@ -10257,7 +8202,6 @@ impl Interpreter {
     fn inline_deliver(
         &mut self,
         frame: &mut Frame,
-        shell: &mut QuietShell<'_>,
         done: Box<InlineAct>,
         result: Result<Object, RuntimeError>,
     ) -> QuietEntry {
@@ -10284,7 +8228,7 @@ impl Interpreter {
         match result {
             Ok(v) => {
                 frame.stack.push(v);
-                self.drop_lean_callable(frame, shell, callable);
+                self.release(callable);
                 QuietEntry::Returned { cur_pc: call_pc }
             }
             Err(err) => {
@@ -10294,49 +8238,6 @@ impl Interpreter {
                     cur_pc: call_pc,
                 }
             }
-        }
-    }
-
-    /// Release a lean call's callable after a normal return
-    /// (`reap_call_receiver`'s function arm): a function that was only a
-    /// call temporary goes through the cascade (which can run arbitrary
-    /// code); a bound one is just graded. The usual callee — a function
-    /// its namespace still holds (our clone, that binding, its collector
-    /// handle: three or more) with no weakref — needs neither.
-    #[inline(always)]
-    fn drop_lean_callable(
-        &mut self,
-        frame: &mut Frame,
-        shell: &mut QuietShell<'_>,
-        callable: Object,
-    ) {
-        let alive_elsewhere = match &callable {
-            Object::Function(f) => {
-                Rc::strong_count(f) > 2
-                    && !crate::weakref_registry::may_have_weakrefs(Rc::as_ptr(f) as usize as u64)
-            }
-            _ => false,
-        };
-        if alive_elsewhere {
-            drop_hot(callable);
-        } else {
-            self.drop_lean_callable_slow(frame, shell, callable);
-        }
-    }
-
-    /// [`Self::drop_lean_callable`] for a callable that may die here.
-    #[inline(never)]
-    fn drop_lean_callable_slow(
-        &mut self,
-        frame: &mut Frame,
-        shell: &mut QuietShell<'_>,
-        callable: Object,
-    ) {
-        if Self::looks_reapable_temporary(&callable) {
-            self.flush_lean(frame, shell);
-            self.prompt_reap_dropped(callable);
-        } else {
-            gc_trace::note_dropped(&callable);
         }
     }
 
@@ -10562,7 +8463,7 @@ impl Interpreter {
         Some(match result {
             Ok(v) => {
                 frame.stack.push(v);
-                self.drop_lean_callable(frame, shell, callable);
+                self.release(callable);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -10817,11 +8718,6 @@ impl Interpreter {
         if let Some((f, receiver)) = bound {
             let bm = std::mem::replace(&mut frame.stack[callee_slot], Object::Function(f));
             frame.stack[self_slot] = receiver;
-            // The bound method was a call temporary (or is still held
-            // elsewhere): grade its release like any dropped operand.
-            if gc_trace::note_dropped_marks(&bm) {
-                gc_trace::mark_maybe_dead();
-            }
             drop(bm);
         }
         let has_self = !matches!(frame.stack[self_slot], Object::Unbound);
@@ -11043,7 +8939,7 @@ impl Interpreter {
         Some(match result {
             Ok(v) => {
                 frame.stack.push(v);
-                self.drop_lean_callable(frame, shell, callable);
+                self.release(callable);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -11262,7 +9158,7 @@ impl Interpreter {
     /// the callee's own references rather than at the next collection.
     fn release_call_operands(&mut self, stack: &mut Vec<Object>, callee_slot: usize) {
         let callee = std::mem::replace(&mut stack[callee_slot], Object::Unbound);
-        self.reap_call_receiver(callee);
+        self.release(callee);
         self.reap_call_args(&mut stack[callee_slot + 1..]);
         stack.truncate(callee_slot);
     }
@@ -11329,8 +9225,7 @@ impl Interpreter {
         let result = self.run_lean_fn(frame, shell, snap_gen, pc, &getter, code, receiver);
         Some(result.map(|v| {
             if let Some(top) = frame.stack.last_mut() {
-                let old = std::mem::replace(top, v);
-                gc_trace::note_dropped(&old);
+                *top = v;
             }
         }))
     }
@@ -11372,7 +9267,6 @@ impl Interpreter {
                 // The exhausted generator leaves the stack (a full handler
                 // takes the coarse mark for it).
                 drop(it);
-                gc_trace::mark_maybe_dead();
                 Ok(())
             }
             Err(e) => Err(e),
@@ -11754,21 +9648,12 @@ impl Interpreter {
             crate::tier2::warm_compile(self, frame);
         }
         let exc_depth_on_entry = self.exc_info_len();
-        let fin_live = gc_trace::has_any_finalizable();
-        let fin = fin_live || gc_trace::active_suspects_present();
         let mut act = LeanAct {
             frame: std::ptr::from_mut(frame),
             shell: None,
         };
         let mut prev_pc: Option<usize> = None;
-        let exit = self.quiet_run(
-            frame,
-            QuietShell::Lazy(&mut act),
-            snap_gen,
-            fin,
-            fin_live,
-            &mut prev_pc,
-        );
+        let exit = self.quiet_run(frame, QuietShell::Lazy(&mut act), snap_gen, &mut prev_pc);
         let outcome = match (exit, act.shell) {
             // The whole activation ran without ever needing its shell.
             (
@@ -11816,7 +9701,6 @@ impl Interpreter {
         match outcome {
             FrameOutcome::Returned(v) => {
                 // The owner retires the frame (`retire_lean_frame`).
-                self.reap_frame_locals_on_exit(frame, Some(&v));
                 Ok(v)
             }
             FrameOutcome::Yielded(_) => Err(RuntimeError::Internal(
@@ -11836,14 +9720,7 @@ impl Interpreter {
         if !gc_trace::take_maybe_dead() {
             return false;
         }
-        if gc_trace::has_any_finalizable() {
-            self.drain_prompt_finalizers();
-        }
-        if gc_trace::has_suspects() {
-            for obj in gc_trace::take_dead_suspects() {
-                self.reap_dead_subgraph(obj);
-            }
-        }
+        self.run_pending_finalizers();
         true
     }
 
@@ -11891,8 +9768,13 @@ impl Interpreter {
                         }
                     }
                     match self.leaf_core_helper(frame, last_pc) {
+                        // A released receiver or argument may have queued
+                        // a finalizer (see `after_release!` in the core).
+                        // SAFETY: the running thread's own flag.
+                        CoreAttr::Done if unsafe { (*sw.maybe_dead).get() } => {
+                            return LeafStop::Marked;
+                        }
                         CoreAttr::Done => continue,
-                        CoreAttr::Marked => return LeafStop::Marked,
                         CoreAttr::Raised(e) => return LeafStop::Raised(e),
                         CoreAttr::Full => return LeafStop::Step,
                         CoreAttr::Decline => {}
@@ -11904,6 +9786,8 @@ impl Interpreter {
             // SAFETY: as above.
             let (frame, last_pc) = unsafe { (&mut *sw.cur, &mut *sw.last) };
             match self.leaf_burst_slow(frame, snap_gen, last_pc) {
+                // SAFETY: as above.
+                LeafStop::Core if unsafe { (*sw.maybe_dead).get() } => return LeafStop::Marked,
                 LeafStop::Core => {}
                 stop => return stop,
             }
@@ -11966,7 +9850,7 @@ impl Interpreter {
             _ => self.leaf_core_attr(frame, ins, pc),
         };
         match done {
-            CoreAttr::Done | CoreAttr::Marked => {
+            CoreAttr::Done => {
                 *last_pc = pc;
                 frame.pc = pc as u32 + 1;
             }
@@ -12089,6 +9973,23 @@ impl Interpreter {
             let mut len = stack.len();
             let mut pc = frame.pc as usize;
             let mut last = *last_pc;
+            let pending_work = sw.maybe_dead;
+            // A dying object's `Drop` queued a finalizer or callback: the
+            // quiet loop runs it before the next instruction, as CPython
+            // does inside the releasing one's `Py_DECREF`. Checked after the
+            // arms that end a binding; any other release is noticed at the
+            // next back edge, call or return (queueing bumps the loop
+            // generation).
+            macro_rules! after_release {
+                () => {
+                    // SAFETY: the running thread's own flag (see `quiet_run`).
+                    #[allow(unused_unsafe)]
+                    let queued = unsafe { (*pending_work).get() };
+                    if queued {
+                        break Some(CoreExit::Stop(LeafStop::Marked));
+                    }
+                };
+            }
             let stop = loop {
                 if pc >= ninstrs {
                     break Some(CoreExit::Stop(LeafStop::Step));
@@ -12553,76 +10454,20 @@ impl Interpreter {
                                 // Overwriting a scalar needs no drop.
                                 len -= 1;
                                 slot.write(base.add(len).read());
-                            } else if Self::core_shared_instance(&*slot) {
-                                // A shared instance: the grading below would
-                                // answer "escaped, no mark"; its release is a
-                                // bare decrement.
-                                len -= 1;
-                                drop(std::mem::replace(&mut *slot, base.add(len).read()));
                             } else {
-                                // A displaced heap value the full arm would
-                                // reap stays there — except a deferred-tracking
-                                // instance, whose teardown is its plain drop
-                                // (recycled when this was its last reference);
-                                // any other is graded like every burst drop.
-                                if Self::local_needs_prompt_reap(&*slot)
-                                    && Self::looks_reapable_temporary(&*slot)
-                                {
-                                    match &*slot {
-                                        Object::Instance(i) if i.dies_by_plain_drop() => {
-                                            len -= 1;
-                                            if let Object::Instance(i) =
-                                                std::mem::replace(&mut *slot, base.add(len).read())
-                                            {
-                                                PyInstance::try_recycle(i);
-                                            }
-                                            last = pc;
-                                            pc += 1;
-                                            continue;
-                                        }
-                                        // A tuple of scalars: the freelist is
-                                        // its teardown (see `prompt_reap_dropped`).
-                                        Object::Tuple(t)
-                                            if t.iter().all(Object::is_gc_atomic)
-                                                && !gc_trace::maybe_tracked(
-                                                    crate::weakref_registry::id_of(&*slot),
-                                                ) =>
-                                        {
-                                            len -= 1;
-                                            let old =
-                                                std::mem::replace(&mut *slot, base.add(len).read());
-                                            self.maybe_donate_tuple(old);
-                                            last = pc;
-                                            pc += 1;
-                                            continue;
-                                        }
-                                        // An untracked container of scalars:
-                                        // a plain drop.
-                                        Object::List(_) | Object::Dict(_)
-                                            if Self::core_plain_last_container(&*slot) =>
-                                        {
-                                            len -= 1;
-                                            drop(std::mem::replace(
-                                                &mut *slot,
-                                                base.add(len).read(),
-                                            ));
-                                            last = pc;
-                                            pc += 1;
-                                            continue;
-                                        }
-                                        _ => break None,
-                                    }
+                                // The displaced value dies here if this was
+                                // its last reference (the freelists take a
+                                // dead plain instance's or tuple's
+                                // allocation).
+                                if !Self::core_droppable(&*slot) {
+                                    break None;
                                 }
                                 len -= 1;
-                                let old = std::mem::replace(&mut *slot, base.add(len).read());
-                                let marked = gc_trace::note_dropped_marks(&old);
-                                drop(old);
-                                if marked {
-                                    gc_trace::mark_maybe_dead();
-                                    last = pc;
-                                    pc += 1;
-                                    break Some(CoreExit::Stop(LeafStop::Marked));
-                                }
+                                self.release(std::mem::replace(&mut *slot, base.add(len).read()));
+                                last = pc;
+                                pc += 1;
+                                after_release!();
+                                continue;
                             }
                         }
                         last = pc;
@@ -12671,6 +10516,10 @@ impl Interpreter {
                         ) {
                             // SAFETY: as above.
                             unsafe { drop_hot(base.add(len).read()) };
+                            last = pc;
+                            pc += 1;
+                            after_release!();
+                            continue;
                         }
                         last = pc;
                         pc += 1;
@@ -12974,6 +10823,7 @@ impl Interpreter {
                                 len = n;
                                 last = pc;
                                 pc += 1;
+                                after_release!();
                             }
                             // An instance whose class's `__getitem__` is a
                             // native fast subscript the site cached.
@@ -13007,6 +10857,7 @@ impl Interpreter {
                                         len += 1;
                                         last = pc;
                                         pc += 1;
+                                        after_release!();
                                     }
                                     Err(e) => {
                                         pc += 1;
@@ -13259,11 +11110,7 @@ impl Interpreter {
                                         *index += 1;
                                         v
                                     }
-                                    None if unique
-                                        && owner.is_none()
-                                        && Rc::strong_count(items) >= 2
-                                        && !Self::iter_backing_list_dead(items) =>
-                                    {
+                                    None if unique && owner.is_none() => {
                                         retire = true;
                                         Object::None
                                     }
@@ -13454,11 +11301,7 @@ impl Interpreter {
                             // `POP_ITER` pair (the full handler's shape).
                             len -= 1;
                             // SAFETY: the iterator slot leaves the stack.
-                            let it = unsafe { base.add(len).read() };
-                            let marked =
-                                gc_trace::maybe_tracked(crate::weakref_registry::id_of(&it))
-                                    && gc_trace::note_dropped_marks(&it);
-                            drop(it);
+                            drop(unsafe { base.add(len).read() });
                             last = pc;
                             pc += 1 + ins.arg as usize;
                             let op_at = |pc: usize| {
@@ -13470,10 +11313,6 @@ impl Interpreter {
                                 if matches!(op_at(pc), Some(OpCode::PopIter | OpCode::PopTop)) {
                                     pc += 1;
                                 }
-                            }
-                            if marked {
-                                gc_trace::mark_maybe_dead();
-                                break Some(CoreExit::Stop(LeafStop::Marked));
                             }
                             continue;
                         }
@@ -14380,7 +12219,7 @@ impl Interpreter {
                             // shared module leaves by a plain decrement).
                             Object::Module(m) => {
                                 match Self::core_module_attr(code, m, pc, ins.arg) {
-                                    Some(v) if !gc_trace::note_dropped_marks(unsafe { &*top }) => {
+                                    Some(v) => {
                                         // SAFETY: the receiver is replaced in place.
                                         unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
                                         last = pc;
@@ -14609,11 +12448,6 @@ impl Interpreter {
         };
         let bm = std::mem::replace(&mut frame.stack[callee_slot], Object::Function(f));
         frame.stack[self_slot] = receiver;
-        // The bound method was a call temporary (or is still held
-        // elsewhere): grade its release like any dropped operand.
-        if gc_trace::note_dropped_marks(&bm) {
-            gc_trace::mark_maybe_dead();
-        }
         drop(bm);
     }
 
@@ -14781,7 +12615,7 @@ impl Interpreter {
         // The spread tuple and a bound method were call temporaries (or
         // are still held elsewhere): grade their releases like any
         // dropped operand.
-        self.reap_call_receiver(callee);
+        self.release(callee);
         self.reap_call_args(&mut [spread, mapping]);
         let self_slot = callee_slot + 1;
         let act = self.inline_slot();
@@ -15183,7 +13017,6 @@ impl Interpreter {
                 // A declined `__init__` may have stored into the instance
                 // before it stopped; nothing else ever saw it, so it goes
                 // (the framed call starts over on a fresh one).
-                gc_trace::note_dropped(&inst);
                 drop(inst);
                 false
             }
@@ -15565,53 +13398,18 @@ impl Interpreter {
         DictStep::Item(item.0, item.1)
     }
 
-    /// Whether the core loop may release `v` with a plain drop: a scalar,
-    /// a string (freeing one runs no code), or a shared heap value whose
-    /// release is a bare decrement the collector need not hear about (the
-    /// leaf arms' `note_dropped_marks` grade answers no).
+    /// Whether the core loop may release `v` with a plain drop. Releasing
+    /// a value never runs Python (a dying object's `Drop` only queues work
+    /// for the next safe point), so only the fixtures that observe deaths
+    /// as they happen (the C-API dict/function watchers, the reftrace
+    /// printer) send the release to the full path.
     #[inline(always)]
     fn core_droppable(v: &Object) -> bool {
-        match v {
-            Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None | Object::Str(_) => {
-                true
-            }
-            Object::Instance(i) => {
-                // Deferred tracking is an exact proof that the collector
-                // and weakref registry hold no owner. A stale Bloom-filter
-                // hit must not reject this nonfinal release. The last
-                // owner still takes ordinary teardown, and every store or
-                // weakref operation that requires tracking revokes the flag.
-                // Past two owners only a weakref-watched object can be at
-                // its dead line (see `gc_trace::note_dropped_marks`).
-                gc_trace::drop_survives_plainly(v)
-                    || Rc::strong_count(i) > 1
-                        && (i.is_gc_deferred() || !gc_trace::note_dropped_marks(v))
-            }
-            Object::List(l) if Rc::strong_count(l) > 1 => !gc_trace::note_dropped_marks(v),
-            Object::Dict(d) if Rc::strong_count(d) > 1 => !gc_trace::note_dropped_marks(v),
-            // The last owner of a container the collector never took, and
-            // no weakref watches, holding only scalars: freeing it runs no
-            // code (`prompt_reap_dropped` reaches the same plain drop the
-            // long way round).
-            Object::List(_) | Object::Dict(_) => Self::core_plain_last_container(v),
-            Object::Tuple(t) => ThinArc::strong_count(t) > 1 && !gc_trace::note_dropped_marks(v),
-            Object::Function(f) => Rc::strong_count(f) > 1 && !gc_trace::note_dropped_marks(v),
-            Object::Type(t) => Rc::strong_count(t) > 1 && !gc_trace::note_dropped_marks(v),
-            _ => false,
-        }
-    }
-
-    /// [`Self::core_droppable`] for the last owner of an exact `list` or
-    /// `dict`: untracked (the miss filter proves it), unwatched, and
-    /// holding only scalars.
-    #[inline(never)]
-    fn core_plain_last_container(v: &Object) -> bool {
-        let id = crate::weakref_registry::id_of(v);
-        !gc_trace::maybe_tracked(id)
-            && !crate::weakref_registry::may_have_weakrefs(id)
+        // (A never-driven `asend` awaitable warns as it goes.)
+        !matches!(v, Object::AsyncGenAwait(_))
             && !crate::capi_watchers::dicts_active()
+            && !crate::capi_watchers::funcs_active()
             && !crate::stdlib::testinternalcapi_mod::reftrace_print_active()
-            && Self::is_scalar_leaf_container(v)
     }
 
     /// Module scope for the core loop's `LOAD_NAME` / `STORE_NAME` arms:
@@ -15713,21 +13511,6 @@ impl Interpreter {
                 sc > held + usize::from(gc_trace::maybe_tracked(id))
             }) && !crate::weakref_registry::may_have_weakrefs(id)
         })
-    }
-
-    /// Whether `v` is an instance the frame-slot and drop graders would
-    /// both pass over (`looks_reapable_temporary` false and
-    /// `note_dropped_marks` false): held elsewhere beyond the collector's
-    /// handle and watched by no weakref — its release is a bare decrement.
-    #[inline(always)]
-    fn core_shared_instance(v: &Object) -> bool {
-        let Object::Instance(i) = v else {
-            return false;
-        };
-        let sc = Rc::strong_count(i);
-        let id = Rc::as_ptr(i) as usize as u64;
-        (sc >= 3 || (sc == 2 && !gc_trace::maybe_tracked(id)))
-            && !crate::weakref_registry::may_have_weakrefs(id)
     }
 
     /// The `(function, has_self, effective argc)` of a plain-function
@@ -16441,11 +14224,10 @@ impl Interpreter {
                         if values[index] == 0 {
                             if let Object::Instance(instance) = operand {
                                 let id = Rc::as_ptr(instance) as usize as u64;
-                                eprintln!("First predicate instance drop miss: owners={}, deferred={}, maybe_tracked={}, tracked={}, weakrefs={}, weak_clones={}",
+                                eprintln!("First predicate instance drop miss: owners={}, deferred={}, maybe_tracked={}, tracked={}, weakrefs={}",
                                     Rc::strong_count(instance), instance.is_gc_deferred(),
                                     gc_trace::maybe_tracked(id), gc_trace::is_tracked(id),
-                                    crate::weakref_registry::may_have_weakrefs(id),
-                                    crate::weakref_registry::strong_clone_count(id));
+                                    crate::weakref_registry::may_have_weakrefs(id));
                             }
                         }
                         values[index] += 1;
@@ -17045,7 +14827,7 @@ impl Interpreter {
             return true;
         }
         // SAFETY: see `quiet_run`.
-        if sw.fin && unsafe { (*sw.maybe_dead).get() } {
+        if unsafe { (*sw.maybe_dead).get() } {
             // SAFETY: as above.
             unsafe {
                 self.flush_lean(&mut *cframe, &mut *cshell.cast::<QuietShell<'_>>());
@@ -17124,11 +14906,7 @@ impl Interpreter {
             // SAFETY: as above.
             unsafe {
                 (*cframe).stack.push(v);
-                self.drop_lean_callable(
-                    &mut *cframe,
-                    &mut *cshell.cast::<QuietShell<'_>>(),
-                    callable,
-                );
+                self.release(callable);
             }
             entry = QuietEntry::Returned { cur_pc: call_pc };
         } else {
@@ -17152,14 +14930,7 @@ impl Interpreter {
             // SAFETY: the caller is the innermost remaining activation.
             (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
             // SAFETY: as above.
-            entry = unsafe {
-                self.inline_deliver(
-                    &mut *cframe,
-                    &mut *cshell.cast::<QuietShell<'_>>(),
-                    done,
-                    result,
-                )
-            };
+            entry = unsafe { self.inline_deliver(&mut *cframe, done, result) };
         }
         sw.cur = cframe;
         sw.last = if clast == &raw mut sw.scratch {
@@ -17183,7 +14954,7 @@ impl Interpreter {
                     return true;
                 }
                 // SAFETY: see `quiet_run`.
-                if sw.fin && unsafe { (*sw.maybe_dead).get() } {
+                if unsafe { (*sw.maybe_dead).get() } {
                     // SAFETY: as above.
                     unsafe {
                         self.flush_lean(&mut *cframe, &mut *cshell.cast::<QuietShell<'_>>());
@@ -17244,11 +15015,6 @@ impl Interpreter {
                     return CoreAttr::Decline;
                 };
                 let v = std::mem::replace(top, it);
-                if gc_trace::note_dropped_marks(&v) {
-                    gc_trace::mark_maybe_dead();
-                    drop(v);
-                    return CoreAttr::Marked;
-                }
                 drop(v);
                 CoreAttr::Done
             }
@@ -17289,11 +15055,6 @@ impl Interpreter {
                     return CoreAttr::Decline;
                 };
                 let receiver = std::mem::replace(top, v);
-                if gc_trace::note_dropped_marks(&receiver) {
-                    gc_trace::mark_maybe_dead();
-                    drop(receiver);
-                    return CoreAttr::Marked;
-                }
                 drop(receiver);
                 CoreAttr::Done
             }
@@ -17309,15 +15070,8 @@ impl Interpreter {
                 let Some(old) = Self::leaf_store_attr(code, stack, pc as u32, ins.arg) else {
                     return CoreAttr::Decline;
                 };
-                let receiver = stack.pop().expect("receiver checked above");
-                let marked = gc_trace::note_dropped_marks(&receiver)
-                    | old.as_ref().is_some_and(gc_trace::note_dropped_marks);
-                drop(receiver);
+                drop(stack.pop().expect("receiver checked above"));
                 drop(old);
-                if marked {
-                    gc_trace::mark_maybe_dead();
-                    return CoreAttr::Marked;
-                }
                 CoreAttr::Done
             }
             OpCode::LoadMethodAttr => {
@@ -17342,11 +15096,6 @@ impl Interpreter {
                                 };
                                 let cls = std::mem::replace(top, v);
                                 stack.push(Object::Unbound);
-                                if gc_trace::note_dropped_marks(&cls) {
-                                    gc_trace::mark_maybe_dead();
-                                    drop(cls);
-                                    return CoreAttr::Marked;
-                                }
                                 drop(cls);
                                 return CoreAttr::Done;
                             }
@@ -17408,16 +15157,8 @@ impl Interpreter {
             let Some(v) = self.leaf_type_call(ty, &stack[first..]) else {
                 return CoreAttr::Decline;
             };
-            let mut marked = false;
-            for arg in stack.drain(self_slot..) {
-                marked |= gc_trace::note_dropped_marks(&arg);
-            }
-            stack.pop(); // the callee
+            stack.truncate(callee_slot);
             stack.push(v);
-            if marked {
-                gc_trace::mark_maybe_dead();
-                return CoreAttr::Marked;
-            }
             return CoreAttr::Done;
         }
         let r = if argc == 0
@@ -17455,24 +15196,12 @@ impl Interpreter {
         let stack = &mut frame.stack;
         match r {
             Ok(v) => {
-                // The operands leave the stack: grade each one (the callee
-                // is a builtin: a leaf). A registered native body marks for
-                // any reference it releases itself (its registration
-                // contract).
-                let mut marked = false;
+                // The operands leave the stack.
                 for arg in stack.drain(self_slot..) {
-                    marked |= gc_trace::note_dropped_marks(&arg);
                     drop_operand(arg);
-                }
-                if matches!(stack[callee_slot], Object::BoundMethod(_)) {
-                    marked |= gc_trace::note_dropped_marks(&stack[callee_slot]);
                 }
                 stack.pop(); // the callee
                 stack.push(v);
-                if marked {
-                    gc_trace::mark_maybe_dead();
-                    return CoreAttr::Marked;
-                }
                 CoreAttr::Done
             }
             Err(e) => {
@@ -18219,79 +15948,20 @@ impl Interpreter {
                     if matches!(new, Object::Cell(_)) {
                         break;
                     }
-                    // A displaced value the full handler would run through
-                    // the prompt-reap cascade stays there too — except a
-                    // deferred-tracking instance, whose teardown is its
-                    // plain drop (recycled when this was its last ref).
-                    if Self::local_needs_prompt_reap(old) && Self::looks_reapable_temporary(old) {
-                        // A container of nothing but scalars, untracked and
-                        // unwatched, frees nothing that could finalize: the
-                        // plain drop below is its whole teardown, so the
-                        // burst need not end for a cascade that would find
-                        // nothing. This is the shape a `x = [i, i]` loop
-                        // displaces on every iteration.
-                        if !gc_trace::dies_inert(old) {
-                            match old {
-                                Object::Instance(i) if i.dies_by_plain_drop() => {
-                                    let Some(v) = stack.pop() else { break };
-                                    if let Object::Instance(i) =
-                                        std::mem::replace(&mut locals[slot], v)
-                                    {
-                                        PyInstance::try_recycle(i);
-                                    }
-                                    last = pc;
-                                    pc += 1;
-                                    continue;
-                                }
-                                _ => break,
-                            }
-                        }
+                    if !Self::core_droppable(old) {
+                        break;
                     }
                     let Some(v) = stack.pop() else { break };
                     let old = std::mem::replace(&mut locals[slot], v);
                     last = pc;
                     pc += 1;
-                    // The usual displaced value is an unboxed scalar: no
-                    // heap to release, nothing to grade (`Object` has no
-                    // `Drop` of its own).
-                    if matches!(
-                        old,
-                        Object::Int(_)
-                            | Object::Float(_)
-                            | Object::Bool(_)
-                            | Object::None
-                            | Object::Unbound
-                    ) {
-                        std::mem::forget(old);
-                    } else if gc_trace::note_dropped_marks(&old) {
-                        gc_trace::mark_maybe_dead();
-                        drop(old);
-                        stop = LeafStop::Marked;
-                        break;
-                    }
+                    self.release(old);
                 }
                 OpCode::PopTop => {
-                    // Only pure leaves: every other discard runs the full
-                    // handler's prompt-reap gate.
                     match stack.last() {
-                        Some(
-                            Object::None
-                            | Object::Bool(_)
-                            | Object::Int(_)
-                            | Object::Float(_)
-                            | Object::Str(_),
-                        ) => {
-                            drop_operand(stack.pop().expect("checked above"));
-                        }
-                        Some(Object::Instance(_)) => {
-                            if !Self::leaf_pop_instance(stack) {
-                                break;
-                            }
-                        }
-                        Some(Object::List(l)) if Rc::strong_count(l) == 2 => {
-                            if !Self::leaf_pop_dead_list(stack) {
-                                break;
-                            }
+                        Some(v) if Self::core_droppable(v) => {
+                            let v = stack.pop().expect("checked above");
+                            self.release(v);
                         }
                         _ => break,
                     }
@@ -18545,12 +16215,6 @@ impl Interpreter {
                     if is_none == (ins.op == OpCode::PopJumpIfNone) {
                         pc += ins.arg as usize;
                     }
-                    if gc_trace::note_dropped_marks(&v) {
-                        gc_trace::mark_maybe_dead();
-                        drop(v);
-                        stop = LeafStop::Marked;
-                        break;
-                    }
                 }
                 OpCode::JumpForward => {
                     last = pc;
@@ -18617,7 +16281,6 @@ impl Interpreter {
                             }
                             // The iterator leaves the stack (a full handler
                             // takes the coarse mark for it).
-                            gc_trace::mark_maybe_dead();
                             drop(it);
                             stop = LeafStop::Marked;
                             break;
@@ -18680,9 +16343,7 @@ impl Interpreter {
                                     // plain drop.
                                     range_done = it_unique
                                         && owner.is_none()
-                                        && items.try_borrow().is_ok_and(|xs| *index >= xs.len())
-                                        && Rc::strong_count(items) >= 2
-                                        && !Self::iter_backing_list_dead(items);
+                                        && items.try_borrow().is_ok_and(|xs| *index >= xs.len());
                                 }
                                 v
                             }
@@ -18735,8 +16396,6 @@ impl Interpreter {
                         // An untracked iterator holds nothing whose death it
                         // could cause (its list survives, see above); any
                         // other is graded like every burst drop.
-                        let marked = gc_trace::maybe_tracked(crate::weakref_registry::id_of(&it))
-                            && gc_trace::note_dropped_marks(&it);
                         drop(it);
                         last = pc;
                         pc += 1 + ins.arg as usize;
@@ -18748,11 +16407,6 @@ impl Interpreter {
                             ) {
                                 pc += 1;
                             }
-                        }
-                        if marked {
-                            gc_trace::mark_maybe_dead();
-                            stop = LeafStop::Marked;
-                            break;
                         }
                         continue;
                     };
@@ -18897,15 +16551,9 @@ impl Interpreter {
                         t.insert(k.clone(), v.clone());
                     }
                     drop((t, s));
-                    let other = stack.pop().expect("length checked above");
+                    drop(stack.pop().expect("length checked above"));
                     last = pc;
                     pc += 1;
-                    if gc_trace::note_dropped_marks(&other) {
-                        gc_trace::mark_maybe_dead();
-                        drop(other);
-                        stop = LeafStop::Marked;
-                        break;
-                    }
                 }
                 OpCode::Swap => {
                     let depth = ins.arg as usize;
@@ -19062,15 +16710,9 @@ impl Interpreter {
                         _ => break,
                     };
                     stack.truncate(n - 1);
-                    let container = std::mem::replace(&mut stack[n - 2], r);
+                    stack[n - 2] = r;
                     last = pc;
                     pc += 1;
-                    if gc_trace::note_dropped_marks(&container) {
-                        gc_trace::mark_maybe_dead();
-                        drop(container);
-                        stop = LeafStop::Marked;
-                        break;
-                    }
                 }
                 OpCode::StoreSubscr => {
                     // Stack: value, container, key (TOS). `list[int] = v`
@@ -19096,11 +16738,6 @@ impl Interpreter {
                                 break;
                             }
                             let slot = &mut xs[i as usize];
-                            if Self::local_needs_prompt_reap(slot)
-                                && Self::looks_reapable_temporary(slot)
-                            {
-                                break;
-                            }
                             let v = std::mem::replace(value_slot, Object::Unbound);
                             std::mem::replace(slot, v)
                         }
@@ -19116,11 +16753,6 @@ impl Interpreter {
                             };
                             let (old, changed) = match d.get_mut(&probe) {
                                 Some(slot) => {
-                                    if Self::local_needs_prompt_reap(slot)
-                                        && Self::looks_reapable_temporary(slot)
-                                    {
-                                        break;
-                                    }
                                     let v = std::mem::replace(value_slot, Object::Unbound);
                                     let old = std::mem::replace(slot, v);
                                     let changed = !old.is_same(slot);
@@ -19149,15 +16781,8 @@ impl Interpreter {
                     drop(key);
                     last = pc;
                     pc += 1;
-                    let marked = gc_trace::note_dropped_marks(&container)
-                        | gc_trace::note_dropped_marks(&old);
                     drop(container);
                     drop(old);
-                    if marked {
-                        gc_trace::mark_maybe_dead();
-                        stop = LeafStop::Marked;
-                        break;
-                    }
                 }
                 OpCode::LoadAttr => {
                     // The instance-dict, slot, and module cache hits: a
@@ -19196,15 +16821,9 @@ impl Interpreter {
                         },
                     };
                     let Some(top) = stack.last_mut() else { break };
-                    let receiver = std::mem::replace(top, v);
+                    *top = v;
                     last = pc;
                     pc += 1;
-                    if gc_trace::note_dropped_marks(&receiver) {
-                        gc_trace::mark_maybe_dead();
-                        drop(receiver);
-                        stop = LeafStop::Marked;
-                        break;
-                    }
                 }
                 OpCode::LoadSuperAttr => {
                     // Zero-argument `super().name` where the name resolves
@@ -19343,19 +16962,11 @@ impl Interpreter {
                         let Some(v) = self.leaf_type_call(ty, &stack[first..]) else {
                             break;
                         };
-                        let mut marked = false;
-                        for arg in stack.drain(self_slot..) {
-                            marked |= gc_trace::note_dropped_marks(&arg);
-                        }
+                        stack.truncate(self_slot);
                         stack.pop(); // the callee
                         stack.push(v);
                         last = pc;
                         pc += 1;
-                        if marked {
-                            gc_trace::mark_maybe_dead();
-                            stop = LeafStop::Marked;
-                            break;
-                        }
                         continue;
                     }
                     let r = if argc == 0
@@ -19396,23 +17007,13 @@ impl Interpreter {
                             // (the callee is a builtin: a leaf). A registered
                             // native body marks for any reference it
                             // releases itself (its registration contract).
-                            let mut marked = false;
                             for arg in stack.drain(self_slot..) {
-                                marked |= gc_trace::note_dropped_marks(&arg);
                                 drop_operand(arg);
-                            }
-                            if matches!(stack[callee_slot], Object::BoundMethod(_)) {
-                                marked |= gc_trace::note_dropped_marks(&stack[callee_slot]);
                             }
                             stack.pop(); // the callee
                             stack.push(v);
                             last = pc;
                             pc += 1;
-                            if marked {
-                                gc_trace::mark_maybe_dead();
-                                stop = LeafStop::Marked;
-                                break;
-                            }
                         }
                         Err(e) => {
                             // As the full handler: the staged operands drop
@@ -19443,15 +17044,8 @@ impl Interpreter {
                     let receiver = stack.pop().expect("receiver checked above");
                     last = pc;
                     pc += 1;
-                    let marked = gc_trace::note_dropped_marks(&receiver)
-                        | old.as_ref().is_some_and(gc_trace::note_dropped_marks);
                     drop(receiver);
                     drop(old);
-                    if marked {
-                        gc_trace::mark_maybe_dead();
-                        stop = LeafStop::Marked;
-                        break;
-                    }
                 }
                 OpCode::UnpackSequence => {
                     let n = ins.arg as usize;
@@ -19467,16 +17061,10 @@ impl Interpreter {
                         _ => None,
                     };
                     let Some(items) = pushed else { break };
-                    let seq = stack.pop().expect("sequence checked above");
+                    drop(stack.pop().expect("sequence checked above"));
                     stack.extend(items);
                     last = pc;
                     pc += 1;
-                    if gc_trace::note_dropped_marks(&seq) {
-                        gc_trace::mark_maybe_dead();
-                        drop(seq);
-                        stop = LeafStop::Marked;
-                        break;
-                    }
                 }
                 OpCode::BuildTuple => {
                     // Tuples are never collector-tracked at build time and
@@ -19524,15 +17112,9 @@ impl Interpreter {
                     };
                     let it = Object::Iter(Rc::new(RefCell::new(it)));
                     let Some(top) = stack.last_mut() else { break };
-                    let v = std::mem::replace(top, it);
+                    *top = it;
                     last = pc;
                     pc += 1;
-                    if gc_trace::note_dropped_marks(&v) {
-                        gc_trace::mark_maybe_dead();
-                        drop(v);
-                        stop = LeafStop::Marked;
-                        break;
-                    }
                 }
                 OpCode::UnaryOp => {
                     // SAFETY: as in the full handler.
@@ -19593,15 +17175,8 @@ impl Interpreter {
                     let a = std::mem::replace(&mut stack[n - 2], Object::Bool(r));
                     last = pc;
                     pc += 1;
-                    let marked =
-                        gc_trace::note_dropped_marks(&a) | gc_trace::note_dropped_marks(&b);
                     drop(a);
                     drop(b);
-                    if marked {
-                        gc_trace::mark_maybe_dead();
-                        stop = LeafStop::Marked;
-                        break;
-                    }
                 }
                 OpCode::ContainsOp => {
                     let n = stack.len();
@@ -19616,15 +17191,8 @@ impl Interpreter {
                     let item = std::mem::replace(&mut stack[n - 2], Object::Bool(r));
                     last = pc;
                     pc += 1;
-                    let marked = gc_trace::note_dropped_marks(&item)
-                        | gc_trace::note_dropped_marks(&container);
                     drop(item);
                     drop(container);
-                    if marked {
-                        gc_trace::mark_maybe_dead();
-                        stop = LeafStop::Marked;
-                        break;
-                    }
                 }
                 OpCode::LoadDeref => {
                     let v = match cells.get(ins.arg as usize) {
@@ -19643,14 +17211,7 @@ impl Interpreter {
                     let Some(cell) = cells.get(ins.arg as usize) else {
                         break;
                     };
-                    let reap = match cell.try_borrow() {
-                        Ok(old) => {
-                            Self::local_needs_prompt_reap(&old)
-                                || matches!(*old, Object::Function(_))
-                        }
-                        Err(_) => true,
-                    };
-                    if reap {
+                    if cell.try_borrow().is_err() {
                         break;
                     }
                     let Some(v) = stack.pop() else { break };
@@ -19658,14 +17219,9 @@ impl Interpreter {
                         Ok(mut slot) => std::mem::replace(&mut *slot, v),
                         Err(_) => break,
                     };
+                    drop(old);
                     last = pc;
                     pc += 1;
-                    if gc_trace::note_dropped_marks(&old) {
-                        gc_trace::mark_maybe_dead();
-                        drop(old);
-                        stop = LeafStop::Marked;
-                        break;
-                    }
                 }
                 _ => break,
             }
@@ -19996,20 +17552,12 @@ impl Interpreter {
                         fast
                     }
                     LeafKind::Opaque => {
-                        if Self::looks_reapable_temporary(&args[0]) {
-                            return None;
-                        }
                         return Some((builtin.call)(args));
                     }
                     _ => return None,
                 }
             }
         };
-        // The full handler promptly reaps a consumed temporary and any
-        // finalizable contents. Decline before the read can do work.
-        if Self::looks_reapable_temporary(&args[0]) {
-            return None;
-        }
         let completed = fast(args)?;
         #[cfg(test)]
         NATIVE_FAST_SUBSCRIPTS.with(|calls| calls.set(calls.get() + 1));
@@ -20418,11 +17966,6 @@ impl Interpreter {
         };
         if !kind.retains_bound_receiver() {
             slot.set_non_leaf(bm);
-            return None;
-        }
-        // Collector handles and weakref-registry clones aren't program
-        // owners. Use the same conservative proof as prompt reaping.
-        if Self::looks_reapable_temporary(callable) {
             return None;
         }
         let Some(result) = self.leaf_builtin_call(kind, b, std::slice::from_ref(&bm.receiver))
@@ -21401,11 +18944,6 @@ impl Interpreter {
                 let displaced = match slots.get_index_mut(key_idx as usize) {
                     Some((key, slot)) if matches!(&key.0, Object::Str(stored) if stored.as_ref() == name.as_str()) =>
                     {
-                        if Self::local_needs_prompt_reap(slot)
-                            && Self::looks_reapable_temporary(slot)
-                        {
-                            return None;
-                        }
                         let val = std::mem::replace(value_slot, Object::Unbound);
                         inst.note_slot_store(&val);
                         Some(std::mem::replace(slot, val))
@@ -21471,13 +19009,8 @@ impl Interpreter {
                         {
                             // SAFETY: a leaf store runs no code while the
                             // views below are live.
-                            let (k, old) = unsafe { inst.attr_peek_index(key_idx as usize) }?;
+                            let (k, _) = unsafe { inst.attr_peek_index(key_idx as usize) }?;
                             if !slot_name_matches(code, name_idx, k) {
-                                return None;
-                            }
-                            if Self::local_needs_prompt_reap(old)
-                                && Self::looks_reapable_temporary(old)
-                            {
                                 return None;
                             }
                         }
@@ -21494,18 +19027,8 @@ impl Interpreter {
                         let Some(Object::Str(shared)) = code_name_obj(code, name_idx) else {
                             return None;
                         };
-                        {
-                            // SAFETY: as above.
-                            let split = unsafe { inst.dict.split_cell().peek() }?;
-                            if let Some(i) = split.position(shared) {
-                                let old = &split.values()[i];
-                                if Self::local_needs_prompt_reap(old)
-                                    && Self::looks_reapable_temporary(old)
-                                {
-                                    return None;
-                                }
-                            }
-                        }
+                        // SAFETY: as above.
+                        unsafe { inst.dict.split_cell().peek() }?;
                         let val = std::mem::replace(value_slot, Object::Unbound);
                         match inst.split_store(shared, val) {
                             Ok(old) => old,
@@ -21548,11 +19071,6 @@ impl Interpreter {
                             &mut **d
                         };
                         if let Some((_, slot)) = found.and_then(|i| d.get_index_mut(i)) {
-                            if Self::local_needs_prompt_reap(slot)
-                                && Self::looks_reapable_temporary(slot)
-                            {
-                                return None;
-                            }
                             let val = std::mem::replace(value_slot, Object::Unbound);
                             let old = std::mem::replace(slot, val);
                             // The name is in the dict: the indexed shape
@@ -21592,57 +19110,6 @@ impl Interpreter {
         // stays at TOS for the caller.
         stack.remove(n - 2);
         Some(displaced)
-    }
-
-    /// `POP_TOP` of an instance whose tracking is still deferred: it
-    /// holds only atomic values and has no weakref or collector handle,
-    /// so its last reference frees (here: recycles) it. `false` leaves
-    /// the discard to the full handler's prompt-reap gate. Out of line
-    /// to keep the burst's `POP_TOP` arm as small as it was.
-    #[inline(never)]
-    fn leaf_pop_instance(stack: &mut Vec<Object>) -> bool {
-        match stack.last() {
-            Some(Object::Instance(i)) if i.dies_by_plain_drop() => {
-                if let Some(Object::Instance(i)) = stack.pop() {
-                    PyInstance::try_recycle(i);
-                }
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// `POP_TOP` of a list held only by the stack and its collector
-    /// handle, with no weakref and only atomic elements (a discarded
-    /// comprehension, a `list(range(...))` temporary): untracked and
-    /// freed here, the way CPython's decref frees it, instead of the
-    /// prompt-reap cascade. `false` leaves the discard to the full handler.
-    #[inline(never)]
-    fn leaf_pop_dead_list(stack: &mut Vec<Object>) -> bool {
-        let Some(Object::List(l)) = stack.last() else {
-            return false;
-        };
-        let id = Rc::as_ptr(l) as usize as u64;
-        if crate::weakref_registry::may_have_weakrefs(id)
-            || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
-        {
-            return false;
-        }
-        {
-            let Ok(items) = l.try_borrow() else {
-                return false;
-            };
-            if items.len() > 64 || !items.iter().all(Object::is_gc_atomic) {
-                return false;
-            }
-        }
-        if !gc_trace::is_tracked(id) {
-            return false;
-        }
-        let obj = stack.pop().expect("checked above");
-        gc_trace::untrack(&obj);
-        drop(obj);
-        true
     }
 
     /// Float arithmetic the leaf burst may run inline: the operators that
@@ -21784,7 +19251,6 @@ impl Interpreter {
                 specialize::record_dispatch();
                 frame.pc = pc + 1;
                 let v = frame.pop()?;
-                gc_trace::note_dropped(&v);
                 if matches!(v, Object::None) == (ins.op == OpCode::PopJumpIfNone) {
                     frame.pc += ins.arg;
                 }
@@ -21970,7 +19436,7 @@ impl Interpreter {
         // Without this, the temp stayed pinned by its weakref
         // slot's strong clone until the next cyclic collection.
         if matches!(&v, Object::Instance(_)) {
-            self.prompt_reap_dropped(v);
+            self.release(v);
         }
         Ok(())
     }
@@ -22072,7 +19538,7 @@ impl Interpreter {
         // container as STORE_SUBSCR retires its stack operand,
         // and its weakrefs must clear on that refcount edge.
         if matches!(&target, Object::Instance(_)) {
-            self.prompt_reap_dropped(target);
+            self.release(target);
         }
         Ok(())
     }
@@ -22378,7 +19844,7 @@ impl Interpreter {
                     // the binding's removal from `prompt_reap_dropped`'s
                     // refcount test.
                     self.sync_py_locals(frame);
-                    self.prompt_reap_dropped(old);
+                    self.release(old);
                 }
             }
             OpCode::StoreName => {
@@ -22452,9 +19918,7 @@ impl Interpreter {
                         }
                     };
                     if let Some(old) = old {
-                        if Self::local_needs_prompt_reap(&old) {
-                            self.prompt_reap_dropped(old);
-                        }
+                        self.release(old);
                     }
                 }
             }
@@ -22484,9 +19948,7 @@ impl Interpreter {
                 // `__del__` now, matching the `DeleteGlobal` path and CPython's
                 // decref-on-store (module-scope `handle = None`).
                 if let Some(old) = old {
-                    if Self::local_needs_prompt_reap(&old) {
-                        self.prompt_reap_dropped(old);
-                    }
+                    self.release(old);
                 }
             }
             OpCode::DeleteName => {
@@ -22517,7 +19979,7 @@ impl Interpreter {
                     .borrow_mut()
                     .shift_remove(&DictKey(Object::from_str(name)));
                 if let Some(old) = old {
-                    self.prompt_reap_dropped(old);
+                    self.release(old);
                 }
             }
             OpCode::DeleteGlobal => {
@@ -22527,7 +19989,7 @@ impl Interpreter {
                     .borrow_mut()
                     .shift_remove(&DictKey(Object::from_str(name)));
                 if let Some(old) = old {
-                    self.prompt_reap_dropped(old);
+                    self.release(old);
                 }
             }
             OpCode::LoadDeref => {
@@ -22565,10 +20027,7 @@ impl Interpreter {
                 // `_formatArray` breaks its recurser cycle this way and
                 // test_arrayprint's test_refcount asserts the array's
                 // refcount recovers without a collect (RFC 0076 WS1).
-                if Self::local_needs_prompt_reap(&old) || matches!(old, Object::Function(_)) {
-                    self.sync_py_locals(frame);
-                    self.prompt_reap_dropped(old);
-                }
+                self.release(old);
             }
             OpCode::DeleteDeref => {
                 // `del NAME` for a cell/free var empties the cell WITHOUT
@@ -22583,7 +20042,7 @@ impl Interpreter {
                     return Err(Self::unbound_deref(&frame.code, ins.arg as usize));
                 }
                 let old = std::mem::replace(&mut *cell.borrow_mut(), Object::Unbound);
-                self.prompt_reap_dropped(old);
+                self.release(old);
             }
             OpCode::MakeCell => {
                 let slot = ins.arg as usize;
@@ -22658,13 +20117,13 @@ impl Interpreter {
                                     | Object::Coroutine(_)
                                     | Object::AsyncGenerator(_)
                             ) {
-                                self.prompt_reap_dropped(r);
+                                self.release(r);
                             }
                         }
                     }
                     Err(e) => {
                         if let Some(r) = receiver {
-                            self.prompt_reap_dropped(r);
+                            self.release(r);
                         }
                         return Err(e);
                     }
@@ -22819,7 +20278,7 @@ impl Interpreter {
                 frame.push(r);
                 // Operand retirement, as for BINARY_OP.
                 if matches!(&v, Object::Instance(_)) {
-                    self.prompt_reap_dropped(v);
+                    self.release(v);
                 }
             }
             OpCode::CompareOp => {
@@ -22833,8 +20292,6 @@ impl Interpreter {
                 // RFC 0077 (WS2): audited operand drops (exempt from the
                 // coarse stack-shrink mark). `x is None` grades one leaf and
                 // one live binding and schedules nothing.
-                gc_trace::note_dropped(&a);
-                gc_trace::note_dropped(&b);
                 frame.push(Object::Bool(result));
             }
             OpCode::ContainsOp => {
@@ -22854,11 +20311,7 @@ impl Interpreter {
                 // next cyclic collection (pdb's `'__return__' in
                 // frame.f_locals` leaked one FrameLocalsProxy per stop —
                 // test_pdb's test_pdb_frame_refleak counts the referrers).
-                if Self::local_needs_prompt_reap(&container)
-                    && Self::looks_reapable_temporary(&container)
-                {
-                    self.prompt_reap_dropped(container);
-                }
+                self.release(container);
                 let result = if ins.arg == 1 { !found } else { found };
                 frame.push(Object::Bool(result));
             }
@@ -22910,9 +20363,6 @@ impl Interpreter {
                 // or the callee's own frame-exit sweep for moved
                 // arguments); the raise path drops the staged operands
                 // wholesale on unwind, so it keeps the coarse mark.
-                if r.is_err() {
-                    gc_trace::mark_maybe_dead();
-                }
                 r?;
             }
             OpCode::PushNull => {
@@ -23026,13 +20476,13 @@ impl Interpreter {
                                     | Object::Coroutine(_)
                                     | Object::AsyncGenerator(_)
                             ) {
-                                self.prompt_reap_dropped(r);
+                                self.release(r);
                             }
                         }
                     }
                     Err(e) => {
                         if let Some(r) = receiver {
-                            self.prompt_reap_dropped(r);
+                            self.release(r);
                         }
                         return Err(e);
                     }
@@ -23155,7 +20605,7 @@ impl Interpreter {
                                 let callable = frame.pop()?;
                                 let r = self.run_py_exact_nofree(&f, locals)?;
                                 frame.push(r);
-                                self.reap_call_receiver(callable);
+                                self.release(callable);
                                 return Ok(StepOutcome::Continue);
                             }
                             None => {
@@ -23249,7 +20699,7 @@ impl Interpreter {
                     let f = f.clone();
                     let r = self.call_python_owned(&f, std::mem::take(&mut pos_args), kw_pairs)?;
                     frame.push(r);
-                    self.reap_call_receiver(callable);
+                    self.release(callable);
                     return Ok(StepOutcome::Continue);
                 }
                 let mut kw_pairs = kw_pairs;
@@ -23277,7 +20727,7 @@ impl Interpreter {
                 }
                 let r = result?;
                 frame.push(r);
-                self.reap_call_receiver(callable);
+                self.release(callable);
                 self.reap_call_args(&mut pos_args);
                 for (_, v) in &mut kw_pairs {
                     self.reap_call_args(std::slice::from_mut(v));
@@ -23320,7 +20770,7 @@ impl Interpreter {
                     if let (Object::Instance(inst), Object::Tuple(_)) = (&callable, &args_obj) {
                         if crate::stdlib::testcapi_call::instance_call_returns_args_tuple(inst) {
                             frame.push(args_obj);
-                            self.reap_call_receiver(callable);
+                            self.release(callable);
                             return Ok(StepOutcome::Continue);
                         }
                     }
@@ -23411,7 +20861,7 @@ impl Interpreter {
                                 let r =
                                     self.call_c_profiled(&ctor, &call_args, &[], &frame.globals)?;
                                 frame.push(r);
-                                self.reap_call_receiver(callable);
+                                self.release(callable);
                                 self.reap_call_args(&mut pos_args);
                                 return Ok(StepOutcome::Continue);
                             }
@@ -23436,7 +20886,7 @@ impl Interpreter {
                                 let r =
                                     self.call_c_profiled(&raw, &call_args, &[], &frame.globals)?;
                                 frame.push(r);
-                                self.reap_call_receiver(callable);
+                                self.release(callable);
                                 self.reap_call_args(&mut pos_args);
                                 return Ok(StepOutcome::Continue);
                             }
@@ -23568,7 +21018,7 @@ impl Interpreter {
                 }
                 let r = result?;
                 frame.push(r);
-                self.reap_call_receiver(callable);
+                self.release(callable);
                 self.reap_call_args(&mut pos_args);
                 for (_, v) in &mut kw_pairs {
                     self.reap_call_args(std::slice::from_mut(v));
@@ -23587,10 +21037,10 @@ impl Interpreter {
                 // deadness guard inside leaves a still-referenced mapping
                 // untouched, so a user-held dict passed as `**d` is safe.
                 if let Some(kw) = kwargs_obj {
-                    self.prompt_reap_dropped(kw);
+                    self.release(kw);
                 }
                 // Same for the `*args` sequence temporary.
-                self.prompt_reap_dropped(args_obj);
+                self.release(args_obj);
             }
             OpCode::ReturnValue => {
                 return Ok(StepOutcome::Return(frame.pop()?));
@@ -23603,14 +21053,12 @@ impl Interpreter {
             }
             OpCode::PopJumpIfNone => {
                 let v = frame.pop()?;
-                gc_trace::note_dropped(&v);
                 if matches!(v, Object::None) {
                     frame.pc += ins.arg;
                 }
             }
             OpCode::PopJumpIfNotNone => {
                 let v = frame.pop()?;
-                gc_trace::note_dropped(&v);
                 if !matches!(v, Object::None) {
                     frame.pc += ins.arg;
                 }
@@ -23659,37 +21107,6 @@ impl Interpreter {
                 // CPython frees a *temporary* iterable's elements by refcount
                 // the instant the exhausted FOR_ITER pops the iterator (the
                 // iterator held the last reference to the list). Our
-                // `next_value` detaches the backing list on exhaustion with a
-                // plain `Rc` drop, which skips finalizers — so a
-                // `for x in f():` loop over a list of `__del__`-bearing
-                // objects never ran them promptly (test_interpreters
-                // test_channels.test_list_all_closed: ChannelID handles from
-                // `_channels.list_all()` must decref their channels at loop
-                // end). Harvest a uniquely-held backing list's elements
-                // before the detach and run them through the reap cascade.
-                let harvested: Option<Vec<Object>> = match &it_obj {
-                    Object::Iter(it) => {
-                        let guard = it.borrow();
-                        if let crate::object::PyIterator::List {
-                            items,
-                            index,
-                            owner,
-                        } = &*guard
-                        {
-                            if owner.is_none()
-                                && *index >= items.borrow().len()
-                                && Self::iter_backing_list_dead(items)
-                            {
-                                Some(std::mem::take(&mut *items.borrow_mut()))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                };
                 let next = match &it_obj {
                     Object::Iter(it) => it.borrow_mut().next_value_checked()?,
                     Object::LazyIter(l) => {
@@ -23763,9 +21180,6 @@ impl Interpreter {
                         frame.pop()?;
                         frame.pc += ins.arg;
                         frame.skip_end_for();
-                        if let Some(items) = harvested {
-                            self.reap_iter_backing(items);
-                        }
                     }
                 }
             }
@@ -24899,104 +22313,14 @@ impl Interpreter {
                 // discarded).
                 let _prev = frame.pop()?;
                 let popped = frame.exc_handlers.pop();
-                // Drop the interpreter-wide `sys.exc_info()` entry first so
-                // its clone of the instance is gone before we test liveness.
                 drop(self.exc_info_stack.borrow_mut().pop());
                 // CPython clears the just-handled exception at the end of an
                 // `except` block (the implicit `del` of the bound name plus
-                // the per-frame exc-state pop). When that exception held the
-                // last reference to a finalizable object — `AttributeError.obj`,
-                // or an exception wrapping a file/process/lock in its args —
-                // its `__del__` must run *now*, matching CPython's refcount
-                // timing rather than waiting for the next cyclic collection
-                // (RFC 0040 deterministic-finalization arc: `test_io` /
-                // `test_subprocess` destructor-timing cases).
+                // the per-frame exc-state pop): it dies here unless something
+                // else holds it.
                 self.recheck_frame_observed = true;
                 if let Some((_, pe)) = popped {
-                    // Deconstruct the handler's `PyException` *first*: its
-                    // `context`/`cause` boxes and traceback entries hold
-                    // their own strong clones of the chained exceptions and
-                    // frames. Held across the reap below, they make the
-                    // `__context__` chain look externally referenced and the
-                    // cascade stops at the outer instance — leaving e.g. the
-                    // `CancelledError` behind asyncio's `TimeoutError` (and
-                    // every frame its traceback pins) to the next full
-                    // collection (test_ssl.test_handshake_timeout_handler_leak).
-                    let PyException {
-                        instance,
-                        traceback,
-                        context,
-                        cause,
-                        ..
-                    } = pe;
-                    drop(traceback);
-                    drop(context);
-                    drop(cause);
-                    let pe_instance = instance;
-                    // A handled exception is itself an untracked,
-                    // non-finalizable leaf, so it slips past the fast-path
-                    // early-return in `prompt_reap_dropped`; when it anchors a
-                    // finalizable object (`AttributeError.obj`, an exception
-                    // wrapping a file/process) drive the cascade directly so
-                    // that `__del__` runs at handler exit like CPython.
-                    //
-                    // A *weakref* to the exception (or, equivalently, to a
-                    // value reachable only through it) must likewise observe
-                    // the death now: CPython frees the just-handled exception
-                    // by refcount the instant the `except` block ends, so
-                    // `weakref.ref(e)()` is already `None` on the next line —
-                    // even with the cycle GC disabled. `test_multiprocessing`'s
-                    // `TestManagerExceptions` (bpo-106558, "Manager exceptions
-                    // avoid creating cyclic references") asserts exactly this
-                    // under `gc.disable()` with a *non-finalizable* `Empty()`
-                    // /`RemoteError`, which the finalizable-only pre-check would
-                    // leave pinned on its GC handle until the next collection.
-                    //
-                    // Both pre-checks keep the hot path cheap: the
-                    // overwhelmingly common scalar-arg exception that nothing
-                    // weakly references and has nothing to finalize skips the
-                    // allocating cascade entirely (the O(1) `count_for` probe
-                    // short-circuits before the depth-bounded
-                    // `exc_has_finalizable` walk). Binding the exception to an
-                    // outer name (`except E as e: saved = e`) or a pending
-                    // re-raise keeps its refcount above the dead threshold, and
-                    // every cascade node is independently refcount-guarded, so
-                    // the reap is a no-op in those cases too.
-                    // A GC-*tracked* exception must also reap: dead, it is
-                    // otherwise pinned by its collector handle until the
-                    // next cycle collection — and through its traceback it
-                    // pins every frame (and their locals) it unwound.
-                    // `pickle.load` ends with `except _Stop: return
-                    // stopinst.value`, so a lingering `_Stop` kept the
-                    // whole `_Unpickler` (memo included, i.e. every
-                    // unpickled object) alive; `concurrent.futures`'
-                    // `_process_worker` then never finalized call-item
-                    // arguments after `del call_item`
-                    // (test_concurrent_futures
-                    // `test_ressources_gced_in_workers`).
-                    let id = crate::weakref_registry::id_of(&pe_instance);
-                    let weakly_observed = crate::weakref_registry::count_for(id) > 0;
-                    // `anchors_tracked_child` too: an *untracked* exception
-                    // can be the last holder of a GC-tracked one — via
-                    // `__cause__`/`__context__`, or via its traceback's
-                    // frames — asyncio's `TimeoutError` raised `from` the
-                    // tracked `CancelledError` whose traceback pins the
-                    // whole cancelled call chain (frames, transports, the
-                    // SSLContext). A plain `Rc` drop frees the outer
-                    // exception but leaves the tracked descendants on their
-                    // collector handles until the next full collection
-                    // (test_ssl.test_handshake_timeout_handler_leak). Only
-                    // probed when the exception is actually about to die,
-                    // so an `except E as e: saved = e` pays nothing.
-                    if weakly_observed
-                        || gc_trace::is_tracked(id)
-                        || (!Self::exc_plainly_inert(&pe_instance)
-                            && (Self::exc_has_finalizable(&pe_instance, 6)
-                                || (Self::is_refcount_dead(&pe_instance, 1)
-                                    && Self::anchors_tracked_child(&pe_instance, 5))))
-                    {
-                        self.reap_dead_subgraph(pe_instance);
-                    }
+                    self.release(pe.instance);
                 }
             }
             OpCode::PrepReraiseStar => {
@@ -25028,8 +22352,8 @@ impl Interpreter {
                 // test_exception_refcycles_errors asserts
                 // `gc.get_referrers(exc) == []` without a collect).
                 drop(items);
-                self.prompt_reap_dropped(excs);
-                self.prompt_reap_dropped(orig);
+                self.release(excs);
+                self.release(orig);
             }
             OpCode::Reraise => {
                 // CPython 3.13 `RERAISE n`: the exception is TOS; when
@@ -26544,20 +23868,9 @@ impl Interpreter {
             let Some(Object::Dict(d)) = inst.native.get() else {
                 return true;
             };
-            // The instance's own slot (+ the collector's handle, if the
-            // dict is tracked) is the "unreferenced" baseline for the dict.
-            let dict_id = crate::weakref_registry::id_of(&Object::Dict(d.clone()));
-            let dict_allow = 1 + usize::from(gc_trace::is_tracked(dict_id));
-            if Rc::strong_count(d) > dict_allow {
-                return true;
-            }
-            let obj = Object::Instance(inst.clone());
-            let id = crate::weakref_registry::id_of(&obj);
-            // This table + `obj` + the collector's handle + weakref slots.
-            let allow = 2
-                + usize::from(gc_trace::is_tracked(id))
-                + crate::weakref_registry::strong_clone_count(id);
-            Rc::strong_count(inst) > allow
+            // The instance's own slot is the "unreferenced" baseline for
+            // the dict, and this table's for the instance.
+            Rc::strong_count(d) > 1 || Rc::strong_count(inst) > 1
         });
     }
 
@@ -33039,7 +30352,7 @@ impl Interpreter {
         };
         // The temporary result is released before hash() returns, including
         // an integer subclass with a finalizer. External references survive.
-        self.maybe_prompt_reap_replaced(result);
+        self.release(result);
         match value {
             Some(value) => Ok(Object::Int(if value == -1 { -2 } else { value })),
             None => Err(type_error("__hash__ method should return an integer")),
@@ -33748,10 +31061,10 @@ impl Interpreter {
         if reverse {
             decorated.reverse();
         }
-        // Undecorate, then promptly reap the dying key objects: CPython
-        // decrefs the keys inside `list.sort` while the list is still
-        // detached, so a key `__del__` that mutates the list is caught by
-        // the caller's mutation check (test_sort.test_key_with_mutating_del).
+        // Undecorate, then release the keys and run their finalizers now:
+        // CPython decrefs the keys inside `list.sort` while the list is
+        // still detached, so a key `__del__` that mutates the list is caught
+        // by the caller's mutation check (test_sort.test_key_with_mutating_del).
         let mut dead_keys: Vec<Object> = Vec::with_capacity(decorated.len());
         *items = decorated
             .into_iter()
@@ -33760,18 +31073,8 @@ impl Interpreter {
                 v
             })
             .collect();
-        for k in dead_keys {
-            if matches!(
-                k,
-                Object::Instance(_)
-                    | Object::Generator(_)
-                    | Object::Coroutine(_)
-                    | Object::AsyncGenerator(_)
-            ) && Self::is_refcount_dead(&k, 1)
-            {
-                self.reap_dead_subgraph(k);
-            }
-        }
+        drop(dead_keys);
+        self.run_pending_finalizers();
         result
     }
 
@@ -36924,21 +34227,7 @@ impl Interpreter {
                 return Ok(Object::None);
             }
         }
-        // Snapshot reapable locals/stack before the frame is torn down:
-        // CPython's refcounting runs their `__del__` (and clears their
-        // weakrefs) the moment `close()` drops the frame (gh-142766),
-        // and tests assert on that promptness.
-        let frame_caps = match receiver {
-            Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
-                frame_reapables(g)
-            }
-            _ => Vec::new(),
-        };
-        let result = self.gen_method_close_inner(receiver);
-        for cap in frame_caps {
-            self.prompt_reap_dropped(cap);
-        }
-        result
+        self.gen_method_close_inner(receiver)
     }
 
     /// CPython `gen_close`'s fast paths: a never-started generator, or
@@ -36991,7 +34280,6 @@ impl Interpreter {
         else {
             unreachable!("checked above");
         };
-        self.reap_dead_frame(&mut boxed);
         self.recycle_frame_allocs(&mut boxed);
         Self::release_finished_gen(g);
         drop(boxed);
@@ -37455,11 +34743,6 @@ impl Interpreter {
                 && !frame.sent_consumed
             {
                 self.gil_countdown = crate::gil::GIL_CHECK_INTERVAL;
-                if !gc_trace::active_suspects_present() && gc_trace::has_suspects() {
-                    for obj in gc_trace::take_dead_suspects() {
-                        self.reap_dead_subgraph(obj);
-                    }
-                }
                 crate::gil::yield_checkpoint();
                 if crate::hot_gates::loop_gen() != snap_gen {
                     break;
@@ -37475,8 +34758,6 @@ impl Interpreter {
                     fold.map(|sink| (std::ptr::from_mut(frame) as usize, sink)),
                 );
                 let exc_depth_on_entry = self.exc_info_len();
-                let fin_live = gc_trace::has_any_finalizable();
-                let fin = fin_live || gc_trace::active_suspects_present();
                 let mut act = LeanAct {
                     frame: std::ptr::from_mut(frame),
                     shell: None,
@@ -37484,24 +34765,10 @@ impl Interpreter {
                 let mut prev_pc: Option<usize> = None;
                 let run = if guard.depth() % 4 == 0 {
                     stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
-                        self.quiet_run(
-                            frame,
-                            QuietShell::Lazy(&mut act),
-                            snap_gen,
-                            fin,
-                            fin_live,
-                            &mut prev_pc,
-                        )
+                        self.quiet_run(frame, QuietShell::Lazy(&mut act), snap_gen, &mut prev_pc)
                     })
                 } else {
-                    self.quiet_run(
-                        frame,
-                        QuietShell::Lazy(&mut act),
-                        snap_gen,
-                        fin,
-                        fin_live,
-                        &mut prev_pc,
-                    )
+                    self.quiet_run(frame, QuietShell::Lazy(&mut act), snap_gen, &mut prev_pc)
                 };
                 self.sum_fold = prev_fold;
                 match (run, act.shell) {
@@ -37552,7 +34819,6 @@ impl Interpreter {
             Ok(FrameOutcome::Returned(v)) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
                 let frame: &mut Frame = &mut boxed;
-                self.reap_dead_frame(frame);
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(gen);
                 Err(stop_iteration_with(v))
@@ -37567,7 +34833,6 @@ impl Interpreter {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
                 let escaped = self.pep479_escape(gen, err);
                 let frame: &mut Frame = &mut boxed;
-                self.reap_dead_frame(frame);
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(gen);
                 Err(escaped)
@@ -37729,7 +34994,6 @@ impl Interpreter {
                 // "")`.
                 *gen.state.borrow_mut() = GeneratorState::Finished;
                 let frame: &mut Frame = &mut boxed;
-                self.reap_dead_frame(frame);
                 // RFC 0059 WS4: the exhausted frame's storage is dead —
                 // donate it back to the frame pools.
                 self.recycle_frame_allocs(frame);
@@ -37746,7 +35010,6 @@ impl Interpreter {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
                 let escaped = self.pep479_escape(gen, err);
                 let frame: &mut Frame = &mut boxed;
-                self.reap_dead_frame(frame);
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(gen);
                 Err(escaped)
@@ -39777,7 +37040,7 @@ impl Interpreter {
                         normalize_index_msg(idx, xs.len(), "list assignment index out of range")?;
                     std::mem::replace(&mut xs[i], value)
                 };
-                crate::vm_singletons::queue_container_removed(&evicted);
+                drop(evicted);
                 specialize::record_hit(op_idx);
                 Ok(true)
             }
@@ -39790,10 +37053,7 @@ impl Interpreter {
                 frame.stack.truncate(len - 2);
                 let value = frame.pop()?;
                 crate::builtins::ensure_dict_key(&key)?;
-                let old = crate::builtins::dict_insert(&d, key, value)?;
-                if let Some(old) = old {
-                    crate::vm_singletons::queue_container_removed(&old);
-                }
+                drop(crate::builtins::dict_insert(&d, key, value)?);
                 specialize::record_hit(op_idx);
                 Ok(true)
             }
@@ -40341,7 +37601,6 @@ impl Interpreter {
         // hits; the slot and generic paths (descriptors, `__setattr__`,
         // `member_set`) release values out of sight and keep the coarse
         // mark.
-        gc_trace::note_dropped(&receiver);
         match cache {
             IC::StoreAttrInstance { key_idx, ver } => {
                 if let Object::Instance(inst) = &receiver {
@@ -40383,7 +37642,7 @@ impl Interpreter {
                                 specialize::record_hit(op_idx);
                                 // CPython decrefs the overwritten value now;
                                 // reap it if this was its last live binding.
-                                self.maybe_prompt_reap_replaced(old);
+                                self.release(old);
                                 return Ok(());
                             }
                         }
@@ -40429,6 +37688,9 @@ impl Interpreter {
                             // (the core loop's `STORE_ATTR` arm serves it).
                             let mut upgrade_idx = false;
                             let mut val = Some(val);
+                            // A value whose store met a stored key only a
+                            // user `__eq__` could equate to the name.
+                            let mut exotic = None;
                             let old = 'store: {
                                 // The split layout (see `core_store_new_attr`).
                                 if watch_value.is_none() && inst.dict.published().is_none() {
@@ -40448,12 +37710,22 @@ impl Interpreter {
                                 } else {
                                     &mut **dict
                                 };
-                                let probe = code_name_key(code, name_idx);
-                                let slot = match probe {
-                                    Some(k) => dict.get_mut(&k),
-                                    None => dict.get_mut(&crate::object::StrKey(name.as_str())),
+                                // Never run Python under the borrow: the
+                                // generic store compares an exotic key once,
+                                // with nothing borrowed.
+                                let probe = match code_name_key(code, name_idx) {
+                                    Some(k) => crate::object::LeafNameProbe::new(k.s, k.hash),
+                                    None => crate::object::LeafNameProbe::new(
+                                        name.as_str(),
+                                        crate::object::py_str_hash(name.as_str()),
+                                    ),
                                 };
-                                if let Some(slot) = slot {
+                                let idx = dict.get_index_of(&probe);
+                                if probe.saw_exotic() {
+                                    exotic = Some(val);
+                                    break 'store None;
+                                }
+                                if let Some((_, slot)) = idx.and_then(|i| dict.get_index_mut(i)) {
                                     let old = std::mem::replace(slot, val);
                                     upgrade_idx = true;
                                     Some(old)
@@ -40470,6 +37742,11 @@ impl Interpreter {
                                     None
                                 }
                             };
+                            if let Some(val) = exotic {
+                                frame.push(val);
+                                return self
+                                    .deopt_store_attr_taken(frame, cache_pc, name_idx, receiver);
+                            }
                             // Watched instance `__dict__` (test_watchers
                             // test_object_dict): same events as the slow path.
                             if let Some(v) = watch_value {
@@ -40483,11 +37760,16 @@ impl Interpreter {
                             }
                             specialize::record_hit(op_idx);
                             if upgrade_idx {
-                                use crate::specialize::DictDataExt;
+                                let probe = crate::object::LeafNameProbe::new(
+                                    name.as_str(),
+                                    crate::object::py_str_hash(name.as_str()),
+                                );
                                 let idx = inst
                                     .dict_cell()
                                     .borrow()
-                                    .index_of_key_str(name.as_str())
+                                    .get_index_of(&probe)
+                                    .filter(|_| !probe.saw_exotic())
+                                    .and_then(|i| u32::try_from(i).ok())
                                     .map(|i| (i, inst.class.borrow().attr_version.get()));
                                 if let Some((key_idx, ver)) = idx {
                                     frame
@@ -40497,7 +37779,7 @@ impl Interpreter {
                                 }
                             }
                             if let Some(old) = old {
-                                self.maybe_prompt_reap_replaced(old);
+                                self.release(old);
                             }
                             return Ok(());
                         }
@@ -40539,7 +37821,6 @@ impl Interpreter {
                                 }
                             };
                             drop(old);
-                            gc_trace::mark_maybe_dead();
                             specialize::record_hit(op_idx);
                             return Ok(());
                         }
@@ -40558,7 +37839,6 @@ impl Interpreter {
                     specialize::record_specialize_success(op_idx);
                 }
                 let val = frame.pop()?;
-                gc_trace::mark_maybe_dead();
                 self.store_attr(&receiver, &name, val)
             }
             IC::Cooldown(n) => {
@@ -40570,13 +37850,11 @@ impl Interpreter {
                 frame.code.caches.set(cache_pc, next);
                 let val = frame.pop()?;
                 let name = self.name_at(&frame.code, name_idx)?;
-                gc_trace::mark_maybe_dead();
                 self.store_attr(&receiver, &name, val)
             }
             _ => {
                 let val = frame.pop()?;
                 let name = self.name_at(&frame.code, name_idx)?;
-                gc_trace::mark_maybe_dead();
                 self.store_attr(&receiver, &name, val)
             }
         }
@@ -40599,7 +37877,6 @@ impl Interpreter {
             .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(COOLDOWN));
         let val = frame.pop()?;
         let name = self.name_at(&frame.code, name_idx)?;
-        gc_trace::mark_maybe_dead();
         self.store_attr(&receiver, &name, val)
     }
 
@@ -40629,12 +37906,7 @@ impl Interpreter {
         match cache {
             IC::ForIterList => {
                 let mut it = it_handle.borrow_mut();
-                if let crate::object::PyIterator::List {
-                    items,
-                    index,
-                    owner,
-                } = &mut *it
-                {
+                if let crate::object::PyIterator::List { items, index, .. } = &mut *it {
                     let next = items.borrow().get(*index).cloned();
                     if let Some(v) = next {
                         *index += 1;
@@ -40648,24 +37920,11 @@ impl Interpreter {
                         // generic path detaches but this fast path leaks a
                         // live cursor (test_list.test_exhausted_iterator,
                         // test_tier2_invalidates_iterator).
-                        //
-                        // A uniquely-held backing list (the loop iterated a
-                        // temporary) has its elements harvested for the
-                        // prompt-reap cascade — CPython frees them by
-                        // refcount here (see the generic FOR_ITER arm).
-                        let harvested = if owner.is_none() && Self::iter_backing_list_dead(items) {
-                            Some(std::mem::take(&mut *items.borrow_mut()))
-                        } else {
-                            None
-                        };
                         *items = Rc::new(RefCell::new(Vec::new()));
                         drop(it);
                         frame.pop()?;
                         frame.pc += jump_arg;
                         frame.skip_end_for();
-                        if let Some(items) = harvested {
-                            self.reap_iter_backing(items);
-                        }
                     }
                     specialize::record_hit(op_idx);
                     return Ok(true);
@@ -41660,7 +38919,7 @@ impl Interpreter {
                 // close their files) the instant the log does
                 // (test_tempfile.test_warnings_on_cleanup).
                 if let Some(old) = old {
-                    self.maybe_prompt_reap_replaced(old);
+                    self.release(old);
                 }
                 Ok(())
             }
@@ -42483,7 +39742,7 @@ impl Interpreter {
             );
         }
         if let Some(old) = old {
-            self.maybe_prompt_reap_replaced(old);
+            self.release(old);
         }
         Ok(())
     }
@@ -42583,7 +39842,7 @@ impl Interpreter {
                     .borrow_mut()
                     .shift_remove(&DictKey(Object::from_str(name)));
                 if let Some(old) = removed {
-                    self.maybe_prompt_reap_replaced(old);
+                    self.release(old);
                     Ok(())
                 } else {
                     Err(attribute_error(format!(
@@ -42619,7 +39878,7 @@ impl Interpreter {
                 if let Some(old) = removed {
                     // Same decref-at-removal semantics as the store arm
                     // above / `DeleteGlobal`.
-                    self.maybe_prompt_reap_replaced(old);
+                    self.release(old);
                     Ok(())
                 } else {
                     Err(attribute_error(format!(
@@ -42908,7 +40167,7 @@ impl Interpreter {
         // `del self._target, self._args, self._kwargs` releases the
         // thread's hold on its argument cycle without waiting for a GC
         // pass (`test_threading.test_no_refcycle_through_target`).
-        self.prompt_reap_dropped(removed);
+        self.release(removed);
         Ok(())
     }
 
@@ -43453,7 +40712,7 @@ impl Interpreter {
                         normalize_index_msg(*i, items.len(), "list assignment index out of range")?;
                     std::mem::replace(&mut items[idx], value)
                 };
-                crate::vm_singletons::queue_container_removed(&evicted);
+                drop(evicted);
                 Ok(())
             }
             (Object::List(items), Object::Slice(s)) => {
@@ -43476,9 +40735,7 @@ impl Interpreter {
                     let mut data = items.borrow_mut();
                     apply_slice_assignment(&mut data, s, replacement)?
                 };
-                for old in &evicted {
-                    crate::vm_singletons::queue_container_removed(old);
-                }
+                drop(evicted);
                 // The RHS was only read from — its *elements* were spliced in,
                 // and the RHS container itself is discarded right here. A
                 // literal RHS (`xs[-2:] = [obj]`) is GC-tracked the moment it
@@ -43492,17 +40749,12 @@ impl Interpreter {
                 // gh-106558). Elements stay alive through the target list;
                 // an RHS still bound elsewhere fails the deadness test
                 // untouched.
-                if Self::local_needs_prompt_reap(&value) && Self::looks_reapable_temporary(&value) {
-                    self.prompt_reap_dropped(value);
-                }
+                self.release(value);
                 Ok(())
             }
             (Object::Dict(d), key) => {
                 crate::builtins::ensure_dict_key(key)?;
-                let old = crate::builtins::dict_insert(d, key.clone(), value)?;
-                if let Some(old) = old {
-                    crate::vm_singletons::queue_container_removed(&old);
-                }
+                drop(crate::builtins::dict_insert(d, key.clone(), value)?);
                 Ok(())
             }
             (Object::ByteArray(b), Object::Int(i)) => {
@@ -43894,24 +41146,20 @@ impl Interpreter {
                         normalize_index_msg(*i, items.len(), "list assignment index out of range")?;
                     items.remove(idx)
                 };
-                crate::vm_singletons::queue_container_removed(&removed);
+                drop(removed);
                 Ok(())
             }
             (Object::List(items), Object::Slice(s)) => {
                 let removed = apply_slice_deletion(&mut items.borrow_mut(), s)?;
-                for v in &removed {
-                    crate::vm_singletons::queue_container_removed(v);
-                }
+                drop(removed);
                 Ok(())
             }
             (Object::Dict(d), key) => {
                 crate::builtins::ensure_dict_key(key)?;
                 let removed = crate::builtins::dict_remove(d, key)?;
-                let Some((k, v)) = removed else {
+                if removed.is_none() {
                     return Err(key_error_object(key.clone()));
-                };
-                crate::vm_singletons::queue_container_removed(&k);
-                crate::vm_singletons::queue_container_removed(&v);
+                }
                 Ok(())
             }
             (Object::ByteArray(b), Object::Int(i)) => {
@@ -44608,27 +41856,6 @@ impl Interpreter {
                     // drain the queue synchronously, matching CPython
                     // semantics where `gc.collect()` returns *after*
                     // every finaliser has fired.
-                    // Heap introspection must observe CPython's *refcount*
-                    // timing, not our deferred one: an object whose last
-                    // program reference died a few instructions ago may still
-                    // sit on the suspect list (its cascade was skipped while a
-                    // Rust-side transient pinned it — see `note_suspect`).
-                    // CPython would have freed it already, so
-                    // `gc.get_objects()` / `gc.get_referrers()` must not
-                    // enumerate it — worse, the returned snapshot list would
-                    // *pin* the corpse through the caller's inspection loop,
-                    // decaying its probe budget until it is evicted and leaks
-                    // for good (test_taskgroups.test_exception_refcycles_*
-                    // call `gc.get_referrers` right after an `except*` block
-                    // and assert the handled group's ctor list is gone).
-                    // Settle the pending reaps before taking the snapshot.
-                    if matches!(b.name, ".gc.get_objects" | ".gc.get_referrers")
-                        && gc_trace::has_suspects()
-                    {
-                        for obj in gc_trace::take_dead_suspects() {
-                            self.reap_dead_subgraph(obj);
-                        }
-                    }
                     if b.name == ".gc.collect" {
                         // `generation` may be positional or the `generation=`
                         // keyword (CPython accepts both). Validate it the way
@@ -49864,7 +47091,7 @@ impl Interpreter {
             // collection).
             let mut positional = positional;
             for v in positional.drain(..) {
-                self.maybe_prompt_reap_replaced(v);
+                self.release(v);
             }
             self.recycle_scratch(positional);
             return result;
@@ -50181,7 +47408,7 @@ impl Interpreter {
                         )?;
                     }
                     frame.push(r);
-                    self.reap_call_receiver(callable);
+                    self.release(callable);
                     self.reap_call_args(&mut args);
                     return Ok(());
                 }
@@ -50532,7 +47759,7 @@ impl Interpreter {
         // Shared tail (skipped via early `?` only on error): reap the
         // bound-method receiver and any dead argument temporaries now that
         // the call has returned and the operands are about to be dropped.
-        self.reap_call_receiver(callable);
+        self.release(callable);
         self.reap_call_args(&mut args);
         self.recycle_scratch(args);
         Ok(())
@@ -57782,54 +55009,6 @@ fn normalize_bool_index(n: Object) -> Object {
     }
 }
 
-/// Bit 0 of [`COARSE_DROP_CLASS`]: the opcode's handler grades every
-/// reference it releases through `gc_trace::note_dropped` and is exempt
-/// from the eval loop's coarse stack-shrink mark.
-const COARSE_EXEMPT: u8 = 1;
-/// Bit 1 of [`COARSE_DROP_CLASS`]: a stack-neutral `DELETE_*` opcode that
-/// releases a binding and counts as a drop regardless of stack depth.
-const COARSE_DELETE: u8 = 2;
-
-/// Per-opcode classification for the coarse maybe-dead mark in
-/// `run_until_yield_or_return_impl` (RFC 0077 WS3): one byte load
-/// replaces two `Option<OpCode>` match chains on every instruction.
-static COARSE_DROP_CLASS: [u8; 256] = {
-    let mut t = [0u8; 256];
-    let exempt = [
-        OpCode::PopTop,
-        OpCode::StoreFast,
-        OpCode::BinaryOp,
-        OpCode::CompareOp,
-        OpCode::Call,
-        OpCode::ReturnValue,
-        OpCode::StoreAttr,
-        OpCode::PopJumpIfFalse,
-        OpCode::PopJumpIfTrue,
-        OpCode::PopJumpIfNone,
-        OpCode::PopJumpIfNotNone,
-        OpCode::IsOp,
-        // The yielded value moves to the consumer; nothing is released.
-        OpCode::YieldValue,
-    ];
-    let mut i = 0;
-    while i < exempt.len() {
-        t[exempt[i] as u8 as usize] |= COARSE_EXEMPT;
-        i += 1;
-    }
-    let deletes = [
-        OpCode::DeleteFast,
-        OpCode::DeleteName,
-        OpCode::DeleteGlobal,
-        OpCode::DeleteDeref,
-    ];
-    let mut i = 0;
-    while i < deletes.len() {
-        t[deletes[i] as u8 as usize] |= COARSE_DELETE;
-        i += 1;
-    }
-    t
-};
-
 /// What [`Interpreter::leaf_resolve_instance_attr`] found.
 enum LeafAttr {
     /// A plain value: the instance's own, or a non-descriptor class value.
@@ -58237,7 +55416,7 @@ struct SwitchRoots {
     root: *mut Frame,
     root_shell: *mut QuietShell<'static>,
     root_last: *mut usize,
-    fin: bool,
+    /// This thread's pending-work flag (see `gc_trace::maybe_dead_flag`).
     maybe_dead: *const std::cell::Cell<bool>,
 }
 
@@ -58274,7 +55453,6 @@ struct CoreSwitch {
     /// The last-executed-pc slot of inline activations other than the
     /// entry (never read back).
     scratch: usize,
-    fin: bool,
     maybe_dead: *const std::cell::Cell<bool>,
     /// This thread's recursion-depth cell (see `recursion::depth_cell`).
     depth_cell: *const std::cell::Cell<usize>,
@@ -58308,7 +55486,6 @@ impl CoreSwitch {
             entry_dead: false,
             pending: None,
             scratch: usize::MAX,
-            fin: roots.fin,
             maybe_dead: roots.maybe_dead,
             depth_cell: crate::recursion::depth_cell(),
         }
@@ -58983,7 +56160,8 @@ enum LeafStop {
     /// A back edge found the GIL countdown spent or the loop generation
     /// changed: the outer prologue must run.
     Breaker,
-    /// The last leaf instruction's discard scheduled a finalization sweep.
+    /// A dying object queued work (a finalizer, a weakref callback) for
+    /// the next safe point.
     Marked,
     /// A leaf builtin raised; `frame.pc` is past the call.
     Raised(RuntimeError),
@@ -59017,8 +56195,6 @@ enum CoreExit {
 enum CoreAttr {
     /// Executed.
     Done,
-    /// Executed, and a discard scheduled a finalization sweep.
-    Marked,
     /// Not a cache hit: nothing touched.
     Decline,
     /// The site's first execution: the full handler must run (and
@@ -67411,7 +64587,7 @@ mod tests {
     static HEAP_SNAPSHOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn finalizer_queue_claims_once_and_preserves_drop_fallback() {
+    fn finalizer_queue_claims_once_and_keeps_identity_on_last_release() {
         let code = compile_module(
             &parse_module(
                 r"
@@ -67471,15 +64647,17 @@ next(gen)
             );
             inst
         };
-        // An untracked last-Arc drop must still queue and run its copy once.
+        // The last release moves the reference itself into the queue, so
+        // the finalizer sees the same object, which dies after it runs.
         let dropped = drop_instance("drop");
         let weak = Rc::downgrade(&dropped);
         drop(dropped);
-        assert!(weak.upgrade().is_none());
+        assert!(weak.upgrade().is_some());
         assert_eq!(interp.run_pending_finalizers(), 1);
+        assert!(weak.upgrade().is_none());
         assert_eq!(events.borrow().len(), 3);
-        // A queue borrow that prevents Drop from scheduling must release the
-        // unscheduled copy without recursively resurrecting it again.
+        // A queue borrow that prevents Drop from scheduling releases the
+        // object without its finalizer.
         let rejected = drop_instance("rejected");
         let weak = Rc::downgrade(&rejected);
         crate::vm_singletons::PENDING_FINALIZERS.with(|queue| {

@@ -477,10 +477,10 @@ fn strong_count_dbg(args: &[Object]) -> Result<Object, RuntimeError> {
         .first()
         .ok_or_else(|| type_error("_strong_count() requires 1 argument"))?;
     let strong = gc_trace::strong_count_for(target) as i64;
-    let weak = crate::weakref_registry::strong_clone_count(id_of(target)) as i64;
+    // The registry holds its referents weakly: no strong clones.
     Ok(Object::new_tuple_array([
         Object::Int(strong),
-        Object::Int(weak),
+        Object::Int(0),
     ]))
 }
 

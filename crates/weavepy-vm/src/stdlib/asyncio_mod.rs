@@ -1340,11 +1340,8 @@ fn future_iter_new(fut: &Object) -> Object {
     // Built outside the ordinary instantiation path, so enrol with the
     // collector by hand: a suspended `await` parks this iterator on the
     // coroutine's value stack, and its strong `fut` edge must be
-    // subtractable for task↔future cycles to collapse. Prompt-reclaim
-    // enrollment keeps its death by "refcount" observable — a lingering
-    // iterator pins the awaited Task, its coroutine frame, and every local
-    // in it (test_ssl's weakref leak tests watch exactly that chain).
-    crate::gc_trace::track_prompt_reclaim(out.clone());
+    // subtractable for task↔future cycles to collapse.
+    crate::gc_trace::track(out.clone());
     out
 }
 

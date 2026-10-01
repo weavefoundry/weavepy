@@ -285,9 +285,6 @@ fn deque_append(args: &[Object]) -> Result<Object, RuntimeError> {
                 Some(m) if f.d.len() - f.head() > m => Some(f.popleft()?),
                 _ => None,
             };
-            if trimmed.is_some() {
-                crate::gc_trace::mark_maybe_dead();
-            }
             drop(trimmed);
             return Ok(Object::None);
         }
@@ -319,10 +316,6 @@ fn deque_append(args: &[Object]) -> Result<Object, RuntimeError> {
         };
     }
     drop(st);
-    if trimmed.is_some() {
-        // A bounded deque released its oldest item (leaf contract).
-        crate::gc_trace::mark_maybe_dead();
-    }
     drop(trimmed);
     Ok(Object::None)
 }
@@ -343,9 +336,6 @@ fn deque_appendleft(args: &[Object]) -> Result<Object, RuntimeError> {
                 Some(m) if f.d.len() - h > m => f.d.pop(),
                 _ => None,
             };
-            if trimmed.is_some() {
-                crate::gc_trace::mark_maybe_dead();
-            }
             drop(trimmed);
             return Ok(Object::None);
         }
@@ -379,9 +369,6 @@ fn deque_appendleft(args: &[Object]) -> Result<Object, RuntimeError> {
         };
     }
     drop(st);
-    if trimmed.is_some() {
-        crate::gc_trace::mark_maybe_dead();
-    }
     drop(trimmed);
     Ok(Object::None)
 }

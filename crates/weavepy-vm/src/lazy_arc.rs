@@ -10,14 +10,14 @@ use std::mem::ManuallyDrop;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-pub struct LazyArc<T> {
+pub struct LazyArc<T: 'static> {
     pointer: AtomicPtr<T>,
     // AtomicPtr alone would allow Send/Sync regardless of T. Match Arc<T>'s
     // ownership, drop checking, and thread-safety requirements instead.
     owner: PhantomData<Arc<T>>,
 }
 
-impl<T> LazyArc<T> {
+impl<T: 'static> LazyArc<T> {
     pub const fn new() -> Self {
         Self {
             pointer: AtomicPtr::new(ptr::null_mut()),
@@ -101,7 +101,7 @@ impl<T> LazyArc<T> {
     }
 }
 
-impl<T: Default> LazyArc<T> {
+impl<T: Default + 'static> LazyArc<T> {
     #[inline]
     pub fn share(&self) -> Arc<T> {
         let pointer = self.get_or_init_ptr(|| Arc::new(T::default()));
@@ -113,13 +113,13 @@ impl<T: Default> LazyArc<T> {
     }
 }
 
-impl<T> Default for LazyArc<T> {
+impl<T: 'static> Default for LazyArc<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T> From<Arc<T>> for LazyArc<T> {
+impl<T: 'static> From<Arc<T>> for LazyArc<T> {
     fn from(value: Arc<T>) -> Self {
         Self {
             pointer: AtomicPtr::new(Arc::into_raw(value).cast_mut()),
@@ -135,7 +135,7 @@ impl<T> From<Arc<T>> for LazyArc<T> {
 // (`PyInstance::dict_cell` for the instance dictionary), so every
 // creator is visible at the call site.
 
-impl<T: Default> Clone for LazyArc<T> {
+impl<T: Default + 'static> Clone for LazyArc<T> {
     fn clone(&self) -> Self {
         // A shallow instance clone must share even a previously empty dict:
         // subsequent writes through either owner must reach the same object.
@@ -143,13 +143,13 @@ impl<T: Default> Clone for LazyArc<T> {
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for LazyArc<T> {
+impl<T: fmt::Debug + 'static> fmt::Debug for LazyArc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("LazyArc").field(&self.get()).finish()
     }
 }
 
-impl<T> Drop for LazyArc<T> {
+impl<T: 'static> Drop for LazyArc<T> {
     fn drop(&mut self) {
         let pointer = *self.pointer.get_mut();
         if !pointer.is_null() {

@@ -30,6 +30,11 @@ mod sealed {
 /// Constructors must preserve this invariant for every live strong reference.
 pub unsafe trait ThinPayload: sealed::Sealed {
     type View: ?Sized;
+    /// Release the last reference to a payload. A payload whose release
+    /// can release more containers goes through `rc::release_nested`.
+    fn release_last(last: Arc<Self>) {
+        drop(last);
+    }
     fn pointer(data: *const usize, len: usize) -> *const Self;
     fn view(&self) -> &Self::View;
 }
@@ -130,7 +135,7 @@ impl<T: ?Sized + ThinPayload> Drop for ThinArc<T> {
         // Arc drops the payload and handles remaining weak references normally.
         unsafe {
             if !crate::rc::try_release_shared(self.raw()) {
-                drop(Arc::from_raw(self.raw()))
+                T::release_last(Arc::from_raw(self.raw()));
             }
         }
     }
@@ -567,6 +572,9 @@ impl sealed::Sealed for crate::tuple_storage::TupleStorage {}
 // initialized [Object] tail. Only its constructors create these Arc payloads;
 // unique mutation changes elements/hash, never slice length or metadata.
 unsafe impl ThinPayload for crate::tuple_storage::TupleStorage {
+    fn release_last(last: Arc<Self>) {
+        crate::rc::release_nested(last);
+    }
     type View = Self;
     fn pointer(data: *const usize, len: usize) -> *const Self {
         ptr::slice_from_raw_parts(data.cast::<crate::object::Object>(), len) as *const Self

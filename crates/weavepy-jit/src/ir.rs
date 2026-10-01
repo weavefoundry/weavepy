@@ -236,7 +236,7 @@ pub enum TOp {
     /// (staged through `ret_bits`) and write it into closure cell
     /// `idx` through the registered `wpjit_cell_set` helper. A
     /// displaced heap value must drop on the interpreter's store path
-    /// (prompt reap, parked finalizers), so the helper deopts before
+    /// (which runs any finalizer it queues), so the helper deopts before
     /// the store in that case and the interpreter re-executes it.
     CellSet { idx: u32, lane: JitType },
     /// RFC 0065 WS5 — `x.append(v)` on a pinned list: pops the value
@@ -349,16 +349,16 @@ pub enum TOp {
     /// interpreted per the trained `val` lane), and calls the
     /// registered `wpjit_dict_set` helper — the interpreter's own
     /// `dict_insert` chokepoint, so PEP 509 / watcher discipline is
-    /// identical. A displaced value that would run the prompt-reap
-    /// cascade deopts *before* the store (the `wpjit_attr_set`
+    /// identical. A displaced value whose release could run a
+    /// finalizer deopts *before* the store (the `wpjit_attr_set`
     /// discipline), as do active C-API dict watchers and any key-lane
     /// surprise.
     DictSet { key: JitType, val: JitType },
     /// `del d[k]` on a pinned exact `dict`: pops the key (`key` lane)
     /// and the dict pin, and calls the registered `wpjit_dict_del`
     /// helper — the interpreter's own `dict_remove` chokepoint. A
-    /// missing key, a displaced value that would run the prompt-reap
-    /// cascade, active C-API dict watchers, or any key-lane surprise
+    /// missing key, a displaced value whose release could run a
+    /// finalizer, active C-API dict watchers, or any key-lane surprise
     /// deopts *before* the delete, and the interpreter re-executes it
     /// (raising the exact `KeyError`).
     DictDel { key: JitType },

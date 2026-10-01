@@ -1,10 +1,9 @@
 //! Insert-only atomic bloom pre-filters — RFC 0065 (WS4).
 //!
-//! Three registries (the weakref registry, the GC tracked-object
-//! index, the prompt-reap suspect map) sit behind `GilCell`/mutex
-//! borrows but are consulted on *usually-miss* probes from the
-//! interpreter's drop paths: "is anything watching this object?",
-//! "is this object tracked?", "is this id enrolled as a suspect?".
+//! Registries (the weakref registry, the GC tracked-object index) sit
+//! behind `GilCell`/mutex borrows but are consulted on *usually-miss*
+//! probes from the interpreter's drop paths: "is anything watching this
+//! object?", "is this object tracked?".
 //! RFC 0061 measured the borrow machinery of those misses at ~5%
 //! of drop-heavy fixtures. An [`AtomicBloom`] answers the miss with
 //! two relaxed loads, no lock, no TLS.
