@@ -51,12 +51,15 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
-/// Process-wide count of parked `__del__` requests across all threads'
-/// [`PENDING_FINALIZERS`] queues (RFC 0058 WS2). The eval loop probes
-/// for pending finalizers *every instruction*; a macOS thread-local
+/// Process-wide count of parked `__del__` requests and weakref callbacks
+/// across all threads' [`PENDING_FINALIZERS`] and
+/// [`PENDING_WEAKREF_CALLBACKS`] queues (RFC 0058 WS2). The eval loop
+/// probes for pending work *every instruction*; a macOS thread-local
 /// access plus a `RefCell` borrow there is measurably expensive, so
-/// this relaxed atomic is the fast gate and the thread-local queue
-/// stays the precise, per-thread source of truth.
+/// this relaxed atomic is the fast gate and the thread-local queues
+/// stay the precise, per-thread source of truth. A drain re-raises the
+/// shared hot gate while it's nonzero, so one thread's drain never
+/// strands work another thread queued.
 static PENDING_FINALIZER_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -195,6 +198,7 @@ pub fn push_pending_weakref_callback(callback: Object, weakref_obj: Object) {
         })
         .unwrap_or(false);
     if pushed {
+        PENDING_FINALIZER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Release);
         crate::hot_gates::set(crate::hot_gates::PENDING_FINALIZERS);
         crate::gc_trace::mark_maybe_dead();
     }
@@ -212,7 +216,11 @@ pub fn has_pending_weakref_callbacks() -> bool {
 
 /// Drain the pending weakref-callback queue.
 pub fn drain_pending_weakref_callbacks() -> Vec<(Object, Object)> {
-    PENDING_WEAKREF_CALLBACKS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+    let taken = PENDING_WEAKREF_CALLBACKS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    if !taken.is_empty() {
+        PENDING_FINALIZER_COUNT.fetch_sub(taken.len(), std::sync::atomic::Ordering::Release);
+    }
+    taken
 }
 
 /// Build a singleton instance of the given built-in registry type.
@@ -456,7 +464,13 @@ pub fn clear_thread_python_tls() {
             PENDING_FINALIZER_COUNT.fetch_sub(n, std::sync::atomic::Ordering::Release);
         }
     }
-    let _ = PENDING_WEAKREF_CALLBACKS.try_with(|cell| cell.borrow_mut().clear());
+    let dropped_callbacks =
+        PENDING_WEAKREF_CALLBACKS.try_with(|cell| std::mem::take(&mut *cell.borrow_mut()).len());
+    if let Ok(n) = dropped_callbacks {
+        if n > 0 {
+            PENDING_FINALIZER_COUNT.fetch_sub(n, std::sync::atomic::Ordering::Release);
+        }
+    }
     let _ = CURRENT_THREAD_HANDLES.try_with(|cell| cell.borrow_mut().clear());
     let dropped_cext =
         PENDING_CEXT_DROPS.try_with(|cell| std::mem::take(&mut *cell.borrow_mut()).len());

@@ -7595,8 +7595,14 @@ impl Interpreter {
                         return FrameEv::Call(act);
                     }
                 }
-                // `inst.prop` for a plain `property`: its getter runs as a
-                // lean activation, like a lean call; `for x in gen` resumes
+                // `inst.prop` for a plain `property`: its getter runs as an
+                // inline activation, like an inline call.
+                if op_before == Some(OpCode::LoadAttr) && self.inline_calls_ok() {
+                    if let Some(act) = self.try_inline_property(frame, shell, cur_pc) {
+                        return FrameEv::Call(act);
+                    }
+                }
+                // Otherwise as a lean activation; `for x in gen` resumes
                 // the generator as one.
                 if matches!(op_before, Some(OpCode::LoadAttr | OpCode::ForIter)) {
                     let loaded = if op_before == Some(OpCode::LoadAttr) {
@@ -9171,9 +9177,65 @@ impl Interpreter {
         }
     }
 
+    /// The getter of the `property` that the `LOAD_ATTR` at `pc` of
+    /// `frame` loads off the plain instance at TOS, when it's a plain
+    /// one-argument Python function a lean activation can run.
+    fn lean_property_getter(
+        frame: &Frame,
+        pc: usize,
+    ) -> Option<(
+        Rc<crate::object::PyProperty>,
+        Rc<PyFunction>,
+        Rc<CodeObject>,
+    )> {
+        use weavepy_compiler::InlineCache as IC;
+        let name_idx = frame.code.instructions.get(pc)?.arg;
+        // A first execution still specializes the site.
+        if matches!(frame.code.caches.get(pc as u32), IC::Empty) {
+            return None;
+        }
+        let Some(Object::Instance(inst)) = frame.stack.last() else {
+            return None;
+        };
+        // A getter's `AttributeError` falls back to `__getattr__`, which
+        // the inline return can't do.
+        if inst
+            .cls_raw()
+            .dunder(crate::types::Dunder::GetAttr)
+            .present()
+        {
+            return None;
+        }
+        let LeafAttr::Property(prop) =
+            Self::leaf_resolve_instance_attr(&frame.code, inst, name_idx)?
+        else {
+            return None;
+        };
+        // SAFETY: GIL-serialized raw read of the getter cell (the burst is
+        // off in free-threaded mode); the clone is taken before anything
+        // else runs.
+        let Object::Function(f) = (unsafe { &*prop.fget.as_ptr() }) else {
+            return None;
+        };
+        let code = f.code();
+        if code.arg_count != 1
+            || code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || code.has_varargs
+            || code.has_varkeywords
+            || code.kwonly_count != 0
+            || !Self::lean_code_ok(&code)
+        {
+            return None;
+        }
+        f.lean_cells_ref(&code)?;
+        let f = f.clone();
+        Some((prop, f, code))
+    }
+
     /// `LOAD_ATTR` of a `property` on a plain instance, from the quiet
-    /// loop: the getter — a plain one-argument Python function the lean
-    /// path can run — is called with the receiver, and its result
+    /// loop: the getter is called with the receiver, and its result
     /// replaces the receiver at TOS. `None` leaves the load to the full
     /// handler with nothing touched.
     fn try_lean_property(
@@ -9183,44 +9245,7 @@ impl Interpreter {
         snap_gen: u64,
         pc: usize,
     ) -> Option<Result<(), RuntimeError>> {
-        use weavepy_compiler::InlineCache as IC;
-        let name_idx = frame.code.instructions.get(pc)?.arg;
-        // A first execution still specializes the site.
-        if matches!(frame.code.caches.get(pc as u32), IC::Empty) {
-            return None;
-        }
-        let getter = {
-            let Some(Object::Instance(inst)) = frame.stack.last() else {
-                return None;
-            };
-            let LeafAttr::Property(prop) =
-                Self::leaf_resolve_instance_attr(&frame.code, inst, name_idx)?
-            else {
-                return None;
-            };
-            // SAFETY: GIL-serialized raw read of the getter cell (the
-            // burst is off in free-threaded mode); the clone is taken
-            // before anything else runs.
-            let Object::Function(f) = (unsafe { &*prop.fget.as_ptr() }) else {
-                return None;
-            };
-            let f = f.clone();
-            let code = f.code();
-            if code.arg_count != 1
-                || code.is_generator
-                || code.is_coroutine
-                || code.is_async_generator
-                || code.has_varargs
-                || code.has_varkeywords
-                || code.kwonly_count != 0
-                || !Self::lean_code_ok(&code)
-            {
-                return None;
-            }
-            f.lean_cells_ref(&code)?;
-            (f, code)
-        };
-        let (getter, code) = (getter.0, getter.1);
+        let (_, getter, code) = Self::lean_property_getter(frame, pc)?;
         let receiver = frame.stack.last()?.clone();
         let result = self.run_lean_fn(frame, shell, snap_gen, pc, &getter, code, receiver);
         Some(result.map(|v| {
@@ -9228,6 +9253,56 @@ impl Interpreter {
                 *top = v;
             }
         }))
+    }
+
+    /// The getter the `LOAD_ATTR` site at `pc` of `frame` cached for the
+    /// class of the instance at TOS (see [`MethodSlot::getter`]).
+    #[inline]
+    fn cached_property_getter(
+        frame: &Frame,
+        pc: usize,
+    ) -> Option<(Rc<PyFunction>, Rc<CodeObject>)> {
+        let Some(Object::Instance(inst)) = frame.stack.last() else {
+            return None;
+        };
+        let slot = code_vm_ext(&frame.code)?.method_slots.get()?.get(pc)?;
+        slot.getter(inst.cls_raw().attr_version.get())
+    }
+
+    /// [`Self::try_lean_property`] as an inline activation (CPython's
+    /// `LOAD_ATTR_PROPERTY`): the receiver leaves the stack as the
+    /// getter's argument, and the getter's return pushes its result.
+    fn try_inline_property(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+    ) -> Option<Box<InlineAct>> {
+        let (getter, code) = match Self::cached_property_getter(frame, pc) {
+            Some(hit) => hit,
+            None => {
+                let (prop, getter, code) = Self::lean_property_getter(frame, pc)?;
+                if let (Some(Object::Instance(inst)), Some(slot)) =
+                    (frame.stack.last(), code_method_slot(&frame.code, pc as u32))
+                {
+                    slot.set_getter(inst.cls_raw().attr_version.get(), &prop, &getter, &code);
+                }
+                (getter, code)
+            }
+        };
+        // Past the recursion limit the nested lean path raises.
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
+            return None;
+        };
+        // Committed.
+        let receiver = frame.stack.pop()?;
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        locals.push(receiver);
+        fill_unbound(locals, code.varnames.len());
+        frame.pc = pc as u32 + 1;
+        Some(self.inline_bind(frame, shell, pc, act, code, Object::Function(getter), guard))
     }
 
     /// `FOR_ITER` over a generator, from the quiet loop: the generator
@@ -9759,7 +9834,7 @@ impl Interpreter {
                 CoreExit::Helper => {
                     // SAFETY: see `CoreSwitch` (the running activation's
                     // handles; nothing else borrows them here).
-                    let (frame, last_pc) = unsafe { (&mut *sw.cur, &mut *sw.last) };
+                    let frame = unsafe { &mut *sw.cur };
                     if burst_stats::enabled() {
                         if let Some(ins) = frame.code.instructions.get(frame.pc as usize) {
                             burst_stats::note_helper(ins.op);
@@ -9767,6 +9842,20 @@ impl Interpreter {
                             burst_stats::note_site(&frame.code.qualname, frame.pc, ins.op, recv);
                         }
                     }
+                    // A cached property site skips the helper's resolution.
+                    let pc = frame.pc as usize;
+                    if frame
+                        .code
+                        .instructions
+                        .get(pc)
+                        .is_some_and(|i| i.op == OpCode::LoadAttr)
+                        && Self::cached_property_getter(frame, pc).is_some()
+                        && self.core_property(sw)
+                    {
+                        continue;
+                    }
+                    // SAFETY: as above (`core_property` declined untouched).
+                    let (frame, last_pc) = unsafe { (&mut *sw.cur, &mut *sw.last) };
                     match self.leaf_core_helper(frame, last_pc) {
                         // A released receiver or argument may have queued
                         // a finalizer (see `after_release!` in the core).
@@ -9777,7 +9866,16 @@ impl Interpreter {
                         CoreAttr::Done => continue,
                         CoreAttr::Raised(e) => return LeafStop::Raised(e),
                         CoreAttr::Full => return LeafStop::Step,
-                        CoreAttr::Decline => {}
+                        CoreAttr::Decline => {
+                            let load_attr = frame
+                                .code
+                                .instructions
+                                .get(frame.pc as usize)
+                                .is_some_and(|i| i.op == OpCode::LoadAttr);
+                            if load_attr && self.core_property(sw) {
+                                continue;
+                            }
+                        }
                     }
                 }
                 CoreExit::Slow => {}
@@ -12449,6 +12547,35 @@ impl Interpreter {
         let bm = std::mem::replace(&mut frame.stack[callee_slot], Object::Function(f));
         frame.stack[self_slot] = receiver;
         drop(bm);
+    }
+
+    /// The core loop's `LOAD_ATTR` of a `property` at `sw`'s (synced)
+    /// running activation's pc: the getter's activation
+    /// ([`Self::try_inline_property`]) is pushed and made the running one,
+    /// as [`Self::core_call`] does for a call. `false` touches nothing.
+    #[inline(never)]
+    fn core_property(&mut self, sw: &mut CoreSwitch) -> bool {
+        if !self.inline_calls_ok() {
+            return false;
+        }
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch` (as in `core_call`).
+        let act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            let pc = (*frame).pc as usize;
+            self.try_inline_property(&mut *frame, &mut *shell.cast::<QuietShell<'_>>(), pc)
+        };
+        let Some(mut act) = act else {
+            return false;
+        };
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { (*sw.inl).push(act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
     }
 
     /// [`Self::core_call`] for the `CALL_KW` at `pc`: the quiet loop's
@@ -17639,7 +17766,11 @@ impl Interpreter {
                 if let Some(Object::Builtin(f)) = b.get(&crate::object::StrKey("next")) {
                     next_ptr = Rc::as_ptr(f) as usize;
                 }
-                for (name, kind) in [("len", LeafKind::Len), ("isinstance", LeafKind::Isinstance)] {
+                for (name, kind) in [
+                    ("len", LeafKind::Len),
+                    ("isinstance", LeafKind::Isinstance),
+                    ("getattr", LeafKind::GetAttr),
+                ] {
                     if let Some(Object::Builtin(f)) = b.get(&crate::object::StrKey(name)) {
                         calls.insert(Rc::as_ptr(f) as usize, kind);
                         if name == "len" {
@@ -18068,6 +18199,59 @@ impl Interpreter {
         Some(kind)
     }
 
+    /// `getattr(obj, name[, default])` on a plain instance whose lookup
+    /// runs no code: an instance attribute, a plain class value, or a
+    /// method to bind, and for a missing attribute with no `__getattr__`,
+    /// the default. `None` for anything else (descriptors, dunders, a
+    /// missing attribute's `AttributeError`), which the full call handles.
+    fn leaf_getattr(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+        let (Object::Instance(inst), Object::Str(name)) = (args.first()?, args.get(1)?) else {
+            return None;
+        };
+        let name: &str = name;
+        if args.len() > 3 || name.starts_with("__") || crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let cls = inst.cls_raw();
+        if cls.native_kind.get() != 0
+            || inst.native.get().is_some()
+            || !Self::default_getattribute(cls)
+        {
+            return None;
+        }
+        // Only class values without `__get__` (or a function, which binds)
+        // leave the instance dictionary in charge.
+        let on_class = cls.lookup(name);
+        if !matches!(
+            on_class,
+            None | Some(
+                Object::Function(_)
+                    | Object::Int(_)
+                    | Object::Float(_)
+                    | Object::Bool(_)
+                    | Object::None
+                    | Object::Str(_)
+                    | Object::Bytes(_)
+                    | Object::Tuple(_)
+            )
+        ) {
+            return None;
+        }
+        if let Some(v) = inst.attr_get_str(name) {
+            return Some(Ok(v));
+        }
+        Some(Ok(match on_class {
+            Some(f @ Object::Function(_)) => {
+                Object::BoundMethod(Rc::new(BoundMethod::new(args[0].clone(), f)))
+            }
+            Some(v) => v,
+            None if args.len() == 3 && !cls.dunder(crate::types::Dunder::GetAttr).present() => {
+                args[2].clone()
+            }
+            None => return None,
+        }))
+    }
+
     /// Call a leaf builtin if `args` (receiver first for methods) has an
     /// admitted shape; `None` sends the call down the full path.
     fn leaf_builtin_call(
@@ -18102,6 +18286,7 @@ impl Interpreter {
                     )
             }
             K::Isinstance => return Self::core_isinstance(args),
+            K::GetAttr => return Self::leaf_getattr(args),
             // `list.append` and `list.pop` in line (as `list_append` and
             // `list_pop` do them).
             K::ListAppend => {
@@ -36115,6 +36300,22 @@ impl Interpreter {
         if let Some(r) = native_scalar_compare(a, b, op) {
             return Ok(Object::Bool(r));
         }
+        // Two instances of one class whose comparison dunder is a Python
+        // function: the forward call runs directly, with no bound method
+        // and none of the special operand shapes below. A `NotImplemented`
+        // answer continues the full protocol, past the forward call.
+        let mut forward_ran = false;
+        if let (Object::Instance(ia), Object::Instance(ib)) = (a, b) {
+            if std::ptr::eq(ia.cls_raw(), ib.cls_raw()) {
+                if let Some(f @ Object::Function(_)) = ia.cls_raw().lookup(cmp_dunder(op).0) {
+                    let r = self.call(&f, &[a.clone(), b.clone()], &[], globals)?;
+                    if !r.is_same(&crate::vm_singletons::not_implemented()) {
+                        return Ok(r);
+                    }
+                    forward_ran = true;
+                }
+            }
+        }
         // An object-backed `mappingproxy` compares as the wrapped mapping
         // (CPython `mappingproxy_richcompare` delegates unconditionally).
         if matches!(a, Object::MappingProxyObj(_)) || matches!(b, Object::MappingProxyObj(_)) {
@@ -36264,7 +36465,9 @@ impl Interpreter {
                 Err(e) => return Err(e),
             }
         }
-        if let Some(method) = self.cmp_method(a, dunder, globals) {
+        if forward_ran {
+            a_slot_ran = true;
+        } else if let Some(method) = self.cmp_method(a, dunder, globals) {
             a_slot_ran = true;
             let r = self.call(&method, std::slice::from_ref(b), &[], globals)?;
             if !r.is_same(&not_impl) {
@@ -55041,6 +55244,8 @@ enum LeafKind {
     ObjectNew,
     Len,
     Isinstance,
+    /// `getattr` (see `Interpreter::leaf_getattr`).
+    GetAttr,
     ListAppend,
     ListPop,
     ListInsert,
@@ -61171,6 +61376,14 @@ enum MethodSlotFn {
     /// A rejected native bound-call body, weakly held so a call site
     /// doesn't extend its lifetime. The key is the registry generation.
     NonLeaf(crate::sync::Weak<crate::object::BoundMethod>),
+    /// A `LOAD_ATTR` site's `property` getter for instances of the class
+    /// at the key's version, and the code it was checked against (see
+    /// `Interpreter::try_inline_property`).
+    Getter {
+        prop: crate::sync::Weak<crate::object::PyProperty>,
+        func: crate::sync::Weak<crate::object::PyFunction>,
+        code: crate::sync::Weak<CodeObject>,
+    },
 }
 
 // SAFETY: read and written only from the dispatch loop with the GIL
@@ -61336,6 +61549,16 @@ impl MethodSlot {
         }
     }
 
+    /// The plain function the slot resolved last, if it's still alive: a
+    /// compiler's guess at what the site will call next.
+    pub(crate) fn last_fn(&self) -> Option<Rc<crate::object::PyFunction>> {
+        // SAFETY: GIL-serialized; no `&mut` escapes `set`.
+        match unsafe { &*self.0.get() } {
+            (_, MethodSlotFn::Py(w)) => w.upgrade(),
+            _ => None,
+        }
+    }
+
     /// [`Self::peek_fn`] for a class receiver: a plain function or a
     /// static method's function, either called with an empty self slot.
     #[inline]
@@ -61479,6 +61702,52 @@ impl MethodSlot {
             ) if *v == ver && *g == generation => Some(*fast),
             _ => None,
         }
+    }
+
+    /// The property getter the slot names for instances of the class at
+    /// `ver`, while the property still holds that function and the
+    /// function that code. The class holds the property for as long as it
+    /// reads `ver` (see `get_held`), so no upgrade is needed.
+    #[inline]
+    fn getter(&self, ver: u64) -> Option<(Rc<crate::object::PyFunction>, Rc<CodeObject>)> {
+        // SAFETY: GIL-serialized; no `&mut` escapes `set_getter`.
+        let (v, MethodSlotFn::Getter { prop, func, code }) = (unsafe { &*self.0.get() }) else {
+            return None;
+        };
+        if *v != ver || prop.strong_count() == 0 {
+            return None;
+        }
+        // SAFETY: the class holds the property (see above); a raw read of
+        // its getter cell, compared before anything runs.
+        let Object::Function(f) = (unsafe { &*(*prop.as_ptr()).fget.as_ptr() }) else {
+            return None;
+        };
+        if Rc::as_ptr(f) != func.as_ptr() {
+            return None;
+        }
+        let c = f.code();
+        (Rc::as_ptr(&c) == code.as_ptr()).then(|| (f.clone(), c))
+    }
+
+    #[inline]
+    fn set_getter(
+        &self,
+        ver: u64,
+        prop: &Rc<crate::object::PyProperty>,
+        func: &Rc<crate::object::PyFunction>,
+        code: &Rc<CodeObject>,
+    ) {
+        // SAFETY: as `set`.
+        unsafe {
+            *self.0.get() = (
+                ver,
+                MethodSlotFn::Getter {
+                    prop: Rc::downgrade(prop),
+                    func: Rc::downgrade(func),
+                    code: Rc::downgrade(code),
+                },
+            );
+        };
     }
 
     #[inline]

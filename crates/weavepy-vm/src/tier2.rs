@@ -2499,13 +2499,8 @@ fn attr_chain_step(obj: &Object, name: &str) -> Option<Object> {
     };
     let v = match storage {
         AttrStorage::Slot(_) => inst.slot_get(name)?,
-        AttrStorage::Indexed(key_idx) => inst
-            .dict
-            .get()?
-            .borrow()
-            .get_index(key_idx as usize)?
-            .1
-            .clone(),
+        // Either layout, without materializing a split one.
+        AttrStorage::Indexed(key_idx) => inst.attr_index_map(key_idx as usize, |_, v| v.clone())?,
         AttrStorage::NewKey => return None,
     };
     matches!(v, Object::Instance(_)).then_some(v)
@@ -2707,11 +2702,9 @@ fn probe_method_entry(
     if crate::specialize::type_has_attr_override(&cls) {
         return None;
     }
-    if inst
-        .dict
-        .get()
-        .is_some_and(|dict| dict.borrow().get(&StrKey(name)).is_some())
-    {
+    // Read without materializing a split layout: a probe must not change
+    // how the instance stores its attributes.
+    if inst.attr_get_str(name).is_some() {
         return None;
     }
     let Some(Object::Function(f)) = cls.lookup(name) else {
