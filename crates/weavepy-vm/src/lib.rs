@@ -4501,6 +4501,25 @@ impl Interpreter {
                         self.step_hot(frame)
                     }
                 }
+            } else if frame_blocks_quiet {
+                // Quiet but for a frame object something outside holds (an
+                // exception's traceback, while its handler runs): nothing
+                // the full prologue serves is pending, so each instruction
+                // only brings the frame's `lasti` current before it runs.
+                cur_pc = frame.pc as usize;
+                shell
+                    .lasti
+                    .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
+                if shell
+                    .has_materialized
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    self.ensure_top_py_frame(&mut py_frame_slot)
+                        .lasti
+                        .set(frame.pc);
+                }
+                instruction_ran = true;
+                self.step_hot(frame)
             } else {
                 // RFC 0059 (WS2): the unified eval-breaker word. One relaxed
                 // load answers "is *any* deferred work pending?" for the six
@@ -23630,6 +23649,14 @@ impl Interpreter {
     }
 
     fn exception_matches(&self, exc: &Object, ty: &Object) -> Result<bool, RuntimeError> {
+        // The commonest handler names the raised exception's own class,
+        // which (being raised) derives from BaseException.
+        if let (Object::Instance(inst), Object::Type(t)) = (exc, ty) {
+            if !crate::gil::free_threading_enabled() && std::ptr::eq(inst.cls_raw(), Rc::as_ptr(t))
+            {
+                return Ok(true);
+            }
+        }
         // Every entry must be a BaseException subclass *before* any
         // matching happens — `except (ValueError, 42):` is a TypeError
         // even when the raised exception would match ValueError
