@@ -7673,21 +7673,38 @@ unsafe extern "C" fn wpjit_attr_get(frame: *mut JitFrame, pin: i64, site: i64) -
         ctx.pins.get(pin as usize),
         ctx.attr_guards.get(site as usize),
     ) {
-        if let (AttrStorage::Indexed(key_idx), JitType::Int | JitType::Float | JitType::Bool) =
-            (g.storage, g.lane)
-        {
-            if attr_class_ok(inst, g.ver) {
-                // SAFETY: a read between two native ops; nothing here runs
-                // code (see `GilCell::peek`).
-                if let Some((k, v)) = unsafe { inst.attr_peek_index(key_idx as usize) } {
-                    if key_is(k, &g.name) {
-                        if let Some(bits) = pack(v, g.lane) {
-                            jf.ret_bits = bits;
-                            return 0;
+        match (g.storage, g.lane) {
+            (AttrStorage::Indexed(key_idx), JitType::Int | JitType::Float | JitType::Bool) => {
+                if attr_class_ok(inst, g.ver) {
+                    // SAFETY: a read between two native ops; nothing here
+                    // runs code (see `GilCell::peek`).
+                    if let Some((k, v)) = unsafe { inst.attr_peek_index(key_idx as usize) } {
+                        if key_is(k, &g.name) {
+                            if let Some(bits) = pack(v, g.lane) {
+                                jf.ret_bits = bits;
+                                return 0;
+                            }
                         }
                     }
                 }
             }
+            // A `__slots__` field at its usual position.
+            (AttrStorage::Slot(key_idx), JitType::Int | JitType::Float | JitType::Bool) => {
+                if attr_class_ok(inst, g.ver) {
+                    // SAFETY: as above.
+                    if let Some((k, v)) =
+                        unsafe { inst.slots.peek() }.and_then(|s| s.get_index(key_idx as usize))
+                    {
+                        if key_is(k, &g.name) {
+                            if let Some(bits) = pack(v, g.lane) {
+                                jf.ret_bits = bits;
+                                return 0;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     // Scoped so the receiver borrow of `ctx.pins` ends before an
