@@ -85,7 +85,12 @@ pub(crate) fn str_char_len(s: &SharedStr) -> usize {
 }
 
 /// A Python value as seen by the interpreter.
+///
+/// `repr(u8)` fixes the layout native code relies on (see `frame_jit`):
+/// the variant's index in a tag byte at offset 0, and each payload at its
+/// natural alignment after it (every payload is one word or smaller).
 #[derive(Clone)]
+#[repr(u8)]
 pub enum Object {
     None,
     /// The "no value" marker for local-variable slots — CPython's NULL
@@ -12884,3 +12889,7 @@ mod tests {
         assert!(d.is_none());
     }
 }
+
+// Every payload is one word or smaller, so a value is a tag and a word.
+const _: () = assert!(std::mem::size_of::<Object>() == 16);
+const _: () = assert!(std::mem::size_of::<Option<Object>>() == 16);
