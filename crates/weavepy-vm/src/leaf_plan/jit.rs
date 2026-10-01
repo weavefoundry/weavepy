@@ -673,6 +673,10 @@ impl Engine {
         flags.set("use_colocated_libcalls", "false").ok()?;
         flags.set("is_pic", "false").ok()?;
         flags.set("opt_level", "speed").ok()?;
+        if std::env::var_os("WEAVEPY_JIT_QUICK").is_some() {
+            flags.set("opt_level", "none").ok()?;
+            flags.set("regalloc_algorithm", "single_pass").ok()?;
+        }
         if !cfg!(debug_assertions) && !verify() {
             flags.set("enable_verifier", "false").ok()?;
         }
@@ -712,6 +716,7 @@ fn compile(
     plan: &LeafPlan,
     effect: bool,
 ) -> Option<Native> {
+    crate::tier2::ensure_obj_layout();
     let mut guard = ENGINE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

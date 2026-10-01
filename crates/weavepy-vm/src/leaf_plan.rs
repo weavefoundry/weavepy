@@ -1489,10 +1489,6 @@ impl Interpreter {
         }
         match recv {
             Object::Instance(inst) => {
-                // (Native plans read fields in line once the layout is
-                // known.)
-                #[cfg(feature = "jit")]
-                crate::tier2::ensure_obj_layout(recv);
                 if GETTER && inst.cls_raw().native_kind.get() != 0 {
                     return None;
                 }

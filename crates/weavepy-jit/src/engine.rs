@@ -250,6 +250,10 @@ impl JitEngine {
         flag_builder.set("is_pic", "false").ok()?;
         // Favour fast compiles over the last few percent of codegen.
         flag_builder.set("opt_level", "speed").ok()?;
+        if std::env::var_os("WEAVEPY_JIT_QUICK").is_some() {
+            flag_builder.set("opt_level", "none").ok()?;
+            flag_builder.set("regalloc_algorithm", "single_pass").ok()?;
+        }
         // The IR verifier re-checks every function it compiles: a debug
         // aid whose cost lands on every warm-up in release builds.
         if !cfg!(debug_assertions) {

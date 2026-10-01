@@ -595,6 +595,40 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // args, and a header deopt spills it.
                 let snapshot = self.vstack.clone();
                 let args = self.block_args();
+                // A scalar element of a scalar-lane list, or the end of
+                // the list, in line.
+                let got_b = self.b.create_block();
+                self.b.append_block_param(got_b, Self::cl_ty(elem));
+                let mut native_done = None;
+                if let (Some(l), JitType::Int | JitType::Float | JitType::Bool) =
+                    (runtime::obj_layout(), elem)
+                {
+                    let l = *l;
+                    let miss = self.b.create_block();
+                    let (items, len, _) = self.pinned_list(&l, seq, &[elem], miss, true);
+                    let negative = self.b.ins().icmp_imm(IntCC::SignedLessThan, idx, 0);
+                    self.miss_if(negative, miss);
+                    let at_end = self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, idx, len);
+                    let more = self.b.create_block();
+                    let end = self.b.create_block();
+                    self.b.ins().brif(at_end, end, &[], more, &[]);
+                    self.b.switch_to_block(more);
+                    let off = self.b.ins().ishl_imm(idx, 4);
+                    let e = self.b.ins().iadd(items, off);
+                    let (want, voff, ty) = Self::lane_tag(&l, elem).expect("scalar lane");
+                    let tag = self.b.ins().uload8(types::I32, trusted, e, 0);
+                    let other = self.b.ins().icmp_imm(IntCC::NotEqual, tag, i64::from(want));
+                    self.miss_if(other, miss);
+                    let v = self.b.ins().load(ty, trusted, e, voff);
+                    let v = if ty == types::I8 {
+                        self.b.ins().uextend(types::I64, v)
+                    } else {
+                        v
+                    };
+                    self.b.ins().jump(got_b, &[BlockArg::from(v)]);
+                    self.b.switch_to_block(miss);
+                    native_done = Some(end);
+                }
                 let sig = self.list_helper_sig();
                 let helper = self
                     .b
@@ -605,15 +639,23 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .ins()
                     .call_indirect(sig, helper, &[self.frame_ptr, seq, idx]);
                 let status = self.b.inst_results(call)[0];
-                let got_b = self.b.create_block();
+                let fetched = self.b.create_block();
                 let rest_b = self.b.create_block();
                 let is_got = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
-                self.b.ins().brif(is_got, got_b, &[], rest_b, &[]);
-                self.b.switch_to_block(got_b);
+                self.b.ins().brif(is_got, fetched, &[], rest_b, &[]);
+                self.b.switch_to_block(fetched);
                 let res =
                     self.b
                         .ins()
                         .load(Self::cl_ty(elem), trusted, self.frame_ptr, OFF_RET_BITS);
+                self.b.ins().jump(got_b, &[BlockArg::from(res)]);
+                if let Some(end) = native_done {
+                    self.b.switch_to_block(end);
+                    let eb = self.cl_blocks[exit];
+                    self.b.ins().jump(eb, &args);
+                }
+                self.b.switch_to_block(got_b);
+                let res = self.b.block_params(got_b)[0];
                 self.b.def_var(loop_var, res);
                 let next = self.b.ins().iadd_imm(idx, 1);
                 self.b.def_var(idx_var, next);
@@ -2656,6 +2698,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let snapshot = self.vstack.clone();
         let (val, ty) = self.pop();
         let (pin, _) = self.pop();
+        let appended = self.inline_list_append(pin, val, ty);
         self.b
             .ins()
             .store(trusted, val, self.frame_ptr, OFF_RET_BITS);
@@ -2676,8 +2719,49 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
+        if let Some(done) = appended {
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(done);
+        }
         // `append` returns `None`, which the following `POP_TOP`
         // consumes — neither ever exists on the native stack.
+    }
+
+    /// `append` of a scalar to a pinned list with room for it, in line;
+    /// the block to continue at, with the current block the helper's
+    /// path (`None` when not in line).
+    fn inline_list_append(&mut self, pin: Value, val: Value, ty: JitType) -> Option<Block> {
+        let l = *runtime::obj_layout()?;
+        // The lanes the helper boxes this scalar into.
+        let lanes: &[JitType] = match ty {
+            JitType::Int => &[JitType::Int, JitType::Obj],
+            JitType::Float => &[JitType::Float, JitType::Obj],
+            JitType::Bool => &[JitType::Obj],
+            _ => return None,
+        };
+        let t = MemFlags::trusted();
+        let miss = self.b.create_block();
+        let done = self.b.create_block();
+        let (items, len, list) = self.pinned_list(&l, pin, lanes, miss, false);
+        let cap = self.b.ins().load(types::I64, t, list, l.list_cap);
+        let full = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, len, cap);
+        self.miss_if(full, miss);
+        let off = self.b.ins().ishl_imm(len, 4);
+        let at = self.b.ins().iadd(items, off);
+        let (tag, voff, _) = Self::lane_tag(&l, ty).expect("scalar lane");
+        let v = if ty == JitType::Bool {
+            self.b.ins().ireduce(types::I8, val)
+        } else {
+            val
+        };
+        let tagv = self.b.ins().iconst(types::I8, i64::from(tag));
+        self.b.ins().store(t, tagv, at, 0);
+        self.b.ins().store(t, v, at, voff);
+        let len1 = self.b.ins().iadd_imm(len, 1);
+        self.b.ins().store(t, len1, list, l.list_len);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(miss);
+        Some(done)
     }
 
     /// RFC 0073 WS1 — `LIST_APPEND` inside an inlined comprehension:
@@ -2802,6 +2886,17 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let t = MemFlags::trusted();
         let ptr = self.ptr_ty;
         let ctx = self.b.ins().load(ptr, t, self.frame_ptr, OFF_CTX);
+        // The guard first: a site whose field has no split position (a
+        // `__slots__` member) leaves straight away.
+        let guards = self.b.ins().load(ptr, t, ctx, l.ctx_guards);
+        let gbuf = self.b.ins().load(ptr, t, guards, l.guards_buf);
+        let g = self
+            .b
+            .ins()
+            .iadd_imm(gbuf, i64::from(site) * i64::from(l.guard_size));
+        let idx = self.b.ins().uload32(t, g, l.guard_split_idx);
+        let none = self.b.ins().icmp_imm(IntCC::Equal, idx, i64::from(u32::MAX));
+        self.miss_if(none, miss);
         // The pin.
         let n = self.b.ins().load(types::I64, t, ctx, l.ctx_pins_len);
         let out = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, pin, n);
@@ -2816,15 +2911,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let bad = self.b.ins().bor(not_obj, not_inst);
         self.miss_if(bad, miss);
         let inst = self.b.ins().load(ptr, t, p, l.pin_obj + 8);
-        // The guard.
-        let guards = self.b.ins().load(ptr, t, ctx, l.ctx_guards);
-        let gbuf = self.b.ins().load(ptr, t, guards, l.guards_buf);
-        let g = self
-            .b
-            .ins()
-            .iadd_imm(gbuf, i64::from(site) * i64::from(l.guard_size));
         let ver = self.b.ins().load(types::I64, t, g, l.guard_ver);
-        let idx = self.b.ins().uload32(t, g, l.guard_split_idx);
         // The class and the split values (grouped by what each group's
         // loads need proven: fewer blocks compile faster).
         let cls = self.b.ins().load(ptr, t, inst, l.inst_class);
@@ -2857,6 +2944,78 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let off = self.b.ins().ishl_imm(idx, 4);
         let at = self.b.ins().iadd(block, off);
         self.b.ins().iadd_imm(at, i64::from(l.split_values))
+    }
+
+    /// The pinned list `pin`'s items (buffer pointer and length; and its
+    /// capacity, and where the length lives, for an append): a list pin
+    /// whose element lane is one of `lanes`, unborrowed (`read`) or
+    /// unborrowed and exclusive (a write). Anything else branches to
+    /// `miss`.
+    fn pinned_list(
+        &mut self,
+        l: &runtime::ObjLayout,
+        pin: Value,
+        lanes: &[JitType],
+        miss: Block,
+        read: bool,
+    ) -> (Value, Value, Value) {
+        let t = MemFlags::trusted();
+        let ptr = self.ptr_ty;
+        let ctx = self.b.ins().load(ptr, t, self.frame_ptr, OFF_CTX);
+        let n = self.b.ins().load(types::I64, t, ctx, l.ctx_pins_len);
+        let out = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, pin, n);
+        self.miss_if(out, miss);
+        let buf = self.b.ins().load(ptr, t, ctx, l.ctx_pins_ptr);
+        let off = self.b.ins().imul_imm(pin, i64::from(l.pin_size));
+        let p = self.b.ins().iadd(buf, off);
+        let ptag = self.b.ins().uload8(types::I32, t, p, l.pin_tag);
+        let lane = self.b.ins().uload8(types::I32, t, p, l.pin_list_elem);
+        let mut bad = self.b.ins().icmp_imm(IntCC::NotEqual, ptag, i64::from(l.pin_list_tag));
+        let mut ok_lane = self.b.ins().iconst(types::I8, 0);
+        for &want in lanes {
+            let hit = self.b.ins().icmp_imm(IntCC::Equal, lane, want as i64);
+            ok_lane = self.b.ins().bor(ok_lane, hit);
+        }
+        let wrong_lane = self.b.ins().bxor_imm(ok_lane, 1);
+        bad = self.b.ins().bor(bad, wrong_lane);
+        self.miss_if(bad, miss);
+        let list = self.b.ins().load(ptr, t, p, l.pin_list);
+        let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+        let shared = self.b.ins().uload8(types::I32, t, flag, 0);
+        let borrow = self.b.ins().sload32(t, list, l.list_borrow);
+        let busy = if read {
+            self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0)
+        } else {
+            self.b.ins().icmp_imm(IntCC::NotEqual, borrow, 0)
+        };
+        let shared = self.b.ins().icmp_imm(IntCC::NotEqual, shared, 0);
+        let bad = self.b.ins().bor(busy, shared);
+        self.miss_if(bad, miss);
+        let items = self.b.ins().load(ptr, t, list, l.list_ptr);
+        let len = self.b.ins().load(types::I64, t, list, l.list_len);
+        (items, len, list)
+    }
+
+    /// The element address for a (possibly negative) in-range `idx` of
+    /// `len` items at `items`; out of range branches to `miss`.
+    fn list_elem(&mut self, items: Value, len: Value, idx: Value, miss: Block) -> Value {
+        let neg = self.b.ins().icmp_imm(IntCC::SignedLessThan, idx, 0);
+        let wrapped = self.b.ins().iadd(idx, len);
+        let i = self.b.ins().select(neg, wrapped, idx);
+        let out = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, i, len);
+        self.miss_if(out, miss);
+        let off = self.b.ins().ishl_imm(i, 4);
+        self.b.ins().iadd(items, off)
+    }
+
+    /// The object tag of a scalar lane.
+    fn lane_tag(l: &runtime::ObjLayout, lane: JitType) -> Option<(u8, i32, Type)> {
+        match lane {
+            JitType::Int => Some((l.tag_int, 8, types::I64)),
+            JitType::Float => Some((l.tag_float, 8, types::F64)),
+            JitType::Bool => Some((l.tag_bool, 1, types::I8)),
+            _ => None,
+        }
     }
 
     /// Consecutive callback-free reads can replay from the first read on a
@@ -3212,6 +3371,24 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let snapshot = self.vstack.clone();
         let (idx, _) = self.pop();
         let (pin, _) = self.pop();
+        // A scalar element of a scalar-lane list, read in line.
+        let mut join = None;
+        if let (Some(l), JitType::Int | JitType::Float) = (runtime::obj_layout(), elem) {
+            let l = *l;
+            let miss = self.b.create_block();
+            let done = self.b.create_block();
+            self.b.append_block_param(done, Self::cl_ty(elem));
+            let (items, len, _) = self.pinned_list(&l, pin, &[elem], miss, true);
+            let e = self.list_elem(items, len, idx, miss);
+            let (want, off, ty) = Self::lane_tag(&l, elem).expect("scalar lane");
+            let tag = self.b.ins().uload8(types::I32, trusted, e, 0);
+            let other = self.b.ins().icmp_imm(IntCC::NotEqual, tag, i64::from(want));
+            self.miss_if(other, miss);
+            let v = self.b.ins().load(ty, trusted, e, off);
+            self.b.ins().jump(done, &[BlockArg::from(v)]);
+            self.b.switch_to_block(miss);
+            join = Some(done);
+        }
         let sig = self.list_helper_sig();
         let helper = self
             .b
@@ -3229,6 +3406,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .b
             .ins()
             .load(Self::cl_ty(elem), trusted, self.frame_ptr, OFF_RET_BITS);
+        let res = match join {
+            Some(done) => {
+                self.b.ins().jump(done, &[BlockArg::from(res)]);
+                self.b.switch_to_block(done);
+                self.b.block_params(done)[0]
+            }
+            None => res,
+        };
         self.vstack.push((res, elem));
     }
 
@@ -3240,7 +3425,21 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let snapshot = self.vstack.clone();
         let (idx, _) = self.pop();
         let (pin, _) = self.pop();
-        let (val, _) = self.pop();
+        let (val, vty) = self.pop();
+        // A scalar over a scalar element of a list of that lane, stored in
+        // line (no release).
+        let mut stored = None;
+        if let (Some(l), JitType::Int | JitType::Float) = (runtime::obj_layout(), vty) {
+            let l = *l;
+            let miss = self.b.create_block();
+            let done = self.b.create_block();
+            let (items, len, _) = self.pinned_list(&l, pin, &[vty], miss, false);
+            let e = self.list_elem(items, len, idx, miss);
+            self.store_scalar_over_scalar(&l, e, val, vty, miss);
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(miss);
+            stored = Some(done);
+        }
         // Typed store: an F64 value lands as its bit pattern.
         self.b
             .ins()
@@ -3258,6 +3457,43 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
+        if let Some(done) = stored {
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(done);
+        }
+    }
+
+    /// Store the scalar `val` (of `lane`) over the value at `at` when that
+    /// one is a scalar too (nothing to release); otherwise branch to
+    /// `miss`, untouched.
+    fn store_scalar_over_scalar(
+        &mut self,
+        l: &runtime::ObjLayout,
+        at: Value,
+        val: Value,
+        lane: JitType,
+        miss: Block,
+    ) {
+        let t = MemFlags::trusted();
+        let old = self.b.ins().uload8(types::I64, t, at, 0);
+        let one = self.b.ins().iconst(types::I64, 1);
+        let bit = self.b.ins().ishl(one, old);
+        let scalars = (1i64 << l.tag_int)
+            | (1i64 << l.tag_float)
+            | (1i64 << l.tag_bool)
+            | (1i64 << l.tag_none);
+        let m = self.b.ins().band_imm(bit, scalars);
+        let heap = self.b.ins().icmp_imm(IntCC::Equal, m, 0);
+        self.miss_if(heap, miss);
+        let (tag, off, _) = Self::lane_tag(l, lane).expect("scalar lane");
+        let v = if lane == JitType::Bool {
+            self.b.ins().ireduce(types::I8, val)
+        } else {
+            val
+        };
+        let tagv = self.b.ins().iconst(types::I8, i64::from(tag));
+        self.b.ins().store(t, tagv, at, 0);
+        self.b.ins().store(t, v, at, off);
     }
 
     /// The shared `(frame, pin, idx) -> status` signature of the

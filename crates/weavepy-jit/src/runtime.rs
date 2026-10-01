@@ -201,6 +201,17 @@ pub struct ObjLayout {
     pub split_values: i32,
     /// The byte that is nonzero once cells are shared between threads.
     pub cells_unguarded: usize,
+    /// A list pin: its discriminant byte's value, where the list pointer
+    /// and the element lane (a [`crate::JitType`] byte) sit in it.
+    pub pin_list_tag: u8,
+    pub pin_list: i32,
+    pub pin_list_elem: i32,
+    /// A list pointer → its cell's borrow counter (`i32`), and its items'
+    /// buffer pointer, length and capacity.
+    pub list_borrow: i32,
+    pub list_ptr: i32,
+    pub list_len: i32,
+    pub list_cap: i32,
 }
 
 static OBJ_LAYOUT: std::sync::OnceLock<ObjLayout> = std::sync::OnceLock::new();

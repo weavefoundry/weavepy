@@ -1237,6 +1237,7 @@ impl JitState {
                     _ => None,
                 }
             };
+            ensure_obj_layout();
             let r = engine.compile_frame_direct(code, &mut classify, &mut jit_probes, &mut direct);
             if let Some(t0) = t0 {
                 eprintln!("jit compile-time {:?} {:?}", code.name, t0.elapsed());
@@ -2703,16 +2704,24 @@ fn split_index(cls: &TypeObject, storage: AttrStorage, name: &str) -> u32 {
 /// offset against `obj` (a live instance), and publish the layout. Once:
 /// later calls return straight away.
 #[inline]
-pub(crate) fn ensure_obj_layout(obj: &Object) {
+pub(crate) fn ensure_obj_layout() {
     static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if DONE.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let Object::Instance(inst) = obj else {
-        return;
-    };
     DONE.store(true, std::sync::atomic::Ordering::Relaxed);
-    if let Some(layout) = obj_layout(obj, inst) {
+    publish_obj_layout();
+}
+
+#[cold]
+#[inline(never)]
+fn publish_obj_layout() {
+    // A private instance of `object` to measure against (never seen by
+    // Python code; nothing tracks it).
+    let cls = crate::builtin_types::builtin_types().object_.clone();
+    let inst = Rc::new(crate::types::PyInstance::new(cls));
+    let obj = Object::Instance(inst.clone());
+    if let Some(layout) = obj_layout(&obj, &inst) {
         let _ = PUBLISHED_LAYOUT.set(layout);
         weavepy_jit::set_obj_layout(layout);
     }
@@ -2797,14 +2806,56 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
         return None;
     }
     drop(sample);
-    // A vector's buffer pointer and length, measured on one whose three
-    // words all differ.
+    // A vector's buffer pointer, length and capacity, measured on one
+    // whose three words all differ.
     let mut v: Vec<Pin> = Vec::with_capacity(4);
     v.push(Pin::Obj(Object::None));
     let vp = std::ptr::from_ref(&v).cast::<u8>();
     let find = |want: usize| (0..3).map(|k| k * 8).find(|&off| word(vp, off) == want);
-    let (vec_ptr, vec_len) = (find(v.as_ptr() as usize)?, find(1)?);
+    let (vec_ptr, vec_len, vec_cap) = (find(v.as_ptr() as usize)?, find(1)?, find(v.capacity())?);
     drop(v);
+    // A list pin: the list's `Arc` allocation and its element lane.
+    let list = Rc::new(GilRefCell::new(vec![Object::Int(1)]));
+    let list_arc = {
+        // SAFETY: `Rc` is one pointer to its allocation.
+        unsafe { std::mem::transmute_copy::<Rc<GilRefCell<Vec<Object>>>, usize>(&list) }
+    };
+    let sample = Pin::List(list.clone(), JitType::Float);
+    let sample_p = std::ptr::from_ref(&sample).cast::<u8>();
+    // SAFETY: the discriminant byte of a `repr(C, u8)` enum.
+    let pin_list_tag = unsafe { *sample_p };
+    let (pin_list, pin_list_elem) = match &sample {
+        Pin::List(l, e) => (
+            std::ptr::from_ref(l) as usize - sample_p as usize,
+            std::ptr::from_ref(e) as usize - sample_p as usize,
+        ),
+        Pin::Obj(_) => return None,
+    };
+    // SAFETY: the element lane's byte.
+    let lane_byte = unsafe { *sample_p.add(pin_list_elem) };
+    if word(sample_p, pin_list) != list_arc
+        || lane_byte != JitType::Float as u8
+        || pin_list_tag == pin_obj_tag
+        || std::mem::size_of::<JitType>() != 1
+    {
+        return None;
+    }
+    drop(sample);
+    let list_data = list_arc_data(&list, list_arc)?;
+    let list_borrow = list_data + GilCell::<Vec<Object>>::BORROW_OFFSET;
+    let list_vec = list_data + GilCell::<Vec<Object>>::DATA_OFFSET;
+    let list_p = list_arc as *const u8;
+    // SAFETY: as `word`, the `i32` borrow counter.
+    let list_free = unsafe { list_p.add(list_borrow).cast::<i32>().read_unaligned() } == 0;
+    let items = list.borrow();
+    if !list_free
+        || word(list_p, list_vec + vec_ptr) != items.as_ptr() as usize
+        || word(list_p, list_vec + vec_len) != items.len()
+        || word(list_p, list_vec + vec_cap) != items.capacity()
+    {
+        return None;
+    }
+    drop(items);
     let guards: StdRc<Vec<AttrGuard>> = StdRc::new(Vec::with_capacity(2));
     let rc_box = {
         // SAFETY: `std::rc::Rc` is one pointer to its allocation.
@@ -2843,7 +2894,19 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
         split_len: i32_of(SplitValues::LEN_OFFSET)?,
         split_values: i32_of(SplitValues::VALUES_OFFSET)?,
         cells_unguarded: crate::sync::cells_unguarded_flag() as usize,
+        pin_list_tag,
+        pin_list: i32_of(pin_list)?,
+        pin_list_elem: i32_of(pin_list_elem)?,
+        list_borrow: i32_of(list_borrow)?,
+        list_ptr: i32_of(list_vec + vec_ptr)?,
+        list_len: i32_of(list_vec + vec_len)?,
+        list_cap: i32_of(list_vec + vec_cap)?,
     })
+}
+
+/// Where a list's cell sits in its `Arc` allocation at `arc`.
+fn list_arc_data(list: &Rc<GilRefCell<Vec<Object>>>, arc: usize) -> Option<usize> {
+    (Rc::as_ptr(list) as usize).checked_sub(arc)
 }
 
 /// RFC 0069 WS1 — the compile-time method probe: resolve `name` on the
@@ -2965,7 +3028,6 @@ fn attr_fingerprint_obj(
     let Object::Instance(inst) = obj else {
         return None;
     };
-    ensure_obj_layout(obj);
     // RFC 0070 WS3 / RFC 0071 WS2 — the tier-1 predicate classifies
     // the storage: an indexed instance-dict hit, a `__slots__` member
     // (read and written through the slot side table by name), or the
