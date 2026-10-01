@@ -23,8 +23,9 @@ use crate::object::{Object, PyFunction};
 use crate::sync::Rc;
 use crate::{CodeConstObjects, Interpreter};
 use cranelift_codegen::ir::{
-    condcodes::IntCC, types, AbiParam, Block, InstBuilder, MemFlags, SigRef, Signature,
-    StackSlotData, StackSlotKind, Value,
+    condcodes::{FloatCC, IntCC},
+    types, AbiParam, Block, InstBuilder, MemFlags, SigRef, Signature, StackSlotData, StackSlotKind,
+    Value,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -260,10 +261,16 @@ fn stamps(ext: &CodeConstObjects) -> &[crate::StampSlot] {
     ext.stamp_slots.get().map_or(&[], |s| &s[..])
 }
 
-unsafe extern "C" fn h_global(ctx: *mut Ctx<'static>, fr: *const Frame, pc: u32) -> u32 {
-    // SAFETY: called by native code with its context and a live frame.
-    let (c, (code, ext, f)) = unsafe { (cx(ctx), (*fr).parts()) };
-    match c.interp.plan_global(code, stamps(ext), f, pc as u16) {
+unsafe extern "C" fn h_global(
+    ctx: *mut Ctx<'static>,
+    fr: *const Frame,
+    slot: *const crate::StampSlot,
+    pc: u32,
+) -> u32 {
+    // SAFETY: called by native code with its context, a live frame, and
+    // the site's stamp slot (its code keeps the table).
+    let (c, (code, _, f), slot) = unsafe { (cx(ctx), (*fr).parts(), &*slot) };
+    match c.interp.plan_global_at(code, slot, f, pc as u16) {
         Some(v) => {
             c.put(v);
             0
@@ -300,17 +307,48 @@ unsafe extern "C" fn h_attr<const EFFECT: bool>(
     }
 }
 
-unsafe extern "C" fn h_method(
+/// [`h_attr`] with the site's field slot in hand: a cached split field of
+/// a plain instance answers without the general read.
+unsafe extern "C" fn h_field<const EFFECT: bool>(
     ctx: *mut Ctx<'static>,
     fr: *const Frame,
+    slot: *const crate::FieldSlot,
     t: u64,
     p: u64,
     pc_name: u32,
 ) -> u32 {
-    // SAFETY: called by native code with its context and a live frame.
-    let (c, (code, _, _)) = unsafe { (cx(ctx), (*fr).parts()) };
-    let (pc, name) = (pc_name as u16, (pc_name >> 16) as u16);
-    match c.interp.plan_method(code, value(t, p), pc, name) {
+    // SAFETY: called by native code with its context.
+    let c = unsafe { cx(ctx) };
+    if t == T_R && (!EFFECT || c.pend.n == 0) {
+        // SAFETY: as `norm`; the slot's code keeps the table.
+        if let (Object::Instance(inst), slot) = unsafe { (&*(p as *const Object), &*slot) } {
+            let (ver, idx) = slot.get();
+            if inst.cls_raw().attr_version.get() == ver {
+                // SAFETY: the receiver is rooted and nothing runs code
+                // while the view is read.
+                if let Some(v) = unsafe { inst.split_field(idx as usize) } {
+                    c.put(norm(v));
+                    return 0;
+                }
+            }
+        }
+    }
+    // SAFETY: forwarded.
+    unsafe { h_attr::<EFFECT>(ctx, fr, t, p, pc_name) }
+}
+
+unsafe extern "C" fn h_method(
+    ctx: *mut Ctx<'static>,
+    fr: *const Frame,
+    ms: *const crate::MethodSlot,
+    t: u64,
+    p: u64,
+    name: u32,
+) -> u32 {
+    // SAFETY: called by native code with its context, a live frame, and
+    // the site's method slot (its code keeps the table).
+    let (c, (code, _, _), ms) = unsafe { (cx(ctx), (*fr).parts(), &*ms) };
+    match c.interp.plan_method_at(code, ms, value(t, p), name as u16) {
         Some((func, recv)) => {
             let [a, b] = words(func);
             let [d, e] = words(recv);
@@ -778,6 +816,11 @@ impl Lower<'_> {
         self.set(fl, r, t, p);
     }
 
+    /// A payload word as the float it holds.
+    fn as_f64(&mut self, p: Value) -> Value {
+        self.b.ins().bitcast(types::F64, MemFlags::new(), p)
+    }
+
     fn u32c(&mut self, x: u32) -> Value {
         self.b.ins().iconst(types::I32, i64::from(x))
     }
@@ -982,27 +1025,59 @@ impl Lower<'_> {
                 self.set(fl, dst, t, p);
             }
             Op::Global { dst, pc } => {
+                let Some(slot) = crate::code_stamp_slot(fl.code, u32::from(pc)) else {
+                    self.b.ins().jump(self.decline, &[]);
+                    return Some(false);
+                };
+                let slot = self
+                    .b
+                    .ins()
+                    .iconst(self.ptr, std::ptr::from_ref(slot) as i64);
                 let pc = self.u32c(u32::from(pc));
-                let st = self.call(h_global as *const () as usize, &[self.ctx, fl.fr, pc]);
+                let st = self.call(h_global as *const () as usize, &[self.ctx, fl.fr, slot, pc]);
                 self.check(st);
                 self.set_out(fl, dst, 0);
             }
             Op::Attr { dst, src, pc, name } => {
                 let (t, p) = self.get(fl, src);
                 let pn = self.u32c(u32::from(pc) | u32::from(name) << 16);
-                let addr = if effect {
-                    h_attr::<true> as *const () as usize
-                } else {
-                    h_attr::<false> as *const () as usize
+                let st = match crate::code_field_slot(fl.code, u32::from(pc)) {
+                    Some(slot) => {
+                        let slot = self
+                            .b
+                            .ins()
+                            .iconst(self.ptr, std::ptr::from_ref(slot) as i64);
+                        let addr = if effect {
+                            h_field::<true> as *const () as usize
+                        } else {
+                            h_field::<false> as *const () as usize
+                        };
+                        self.call(addr, &[self.ctx, fl.fr, slot, t, p, pn])
+                    }
+                    None => {
+                        let addr = if effect {
+                            h_attr::<true> as *const () as usize
+                        } else {
+                            h_attr::<false> as *const () as usize
+                        };
+                        self.call(addr, &[self.ctx, fl.fr, t, p, pn])
+                    }
                 };
-                let st = self.call(addr, &[self.ctx, fl.fr, t, p, pn]);
                 self.check(st);
                 self.set_out(fl, dst, 0);
             }
             Op::Method { dst, src, pc, name } => {
+                let Some(ms) = crate::code_method_slot(fl.code, u32::from(pc)) else {
+                    self.b.ins().jump(self.decline, &[]);
+                    return Some(false);
+                };
                 let (t, p) = self.get(fl, src);
-                let pn = self.u32c(u32::from(pc) | u32::from(name) << 16);
-                let st = self.call(h_method as *const () as usize, &[self.ctx, fl.fr, t, p, pn]);
+                let ms = self.b.ins().iconst(self.ptr, std::ptr::from_ref(ms) as i64);
+                let nm = self.u32c(u32::from(name));
+                let st = self.call(
+                    h_method as *const () as usize,
+                    &[self.ctx, fl.fr, ms, t, p, nm],
+                );
                 self.check(st);
                 self.set_out(fl, dst, 0);
                 self.set_out(fl, dst + 1, 2);
@@ -1019,17 +1094,41 @@ impl Lower<'_> {
                     k if k == CompareKind::GtE as u8 => IntCC::SignedGreaterThanOrEqual,
                     _ => return None,
                 };
-                // Two ints compare in line.
+                let fcc = match kind {
+                    k if k == CompareKind::Lt as u8 => FloatCC::LessThan,
+                    k if k == CompareKind::LtE as u8 => FloatCC::LessThanOrEqual,
+                    k if k == CompareKind::Eq as u8 => FloatCC::Equal,
+                    k if k == CompareKind::NotEq as u8 => FloatCC::NotEqual,
+                    k if k == CompareKind::Gt as u8 => FloatCC::GreaterThan,
+                    _ => FloatCC::GreaterThanOrEqual,
+                };
+                // Two ints, or two floats, compare in line.
                 let ia = self.b.ins().icmp_imm(IntCC::Equal, ta, T_I as i64);
                 let ib = self.b.ins().icmp_imm(IntCC::Equal, tb, T_I as i64);
                 let both = self.b.ins().band(ia, ib);
                 let fast = self.b.create_block();
+                let not_int = self.b.create_block();
+                let float = self.b.create_block();
                 let slow = self.b.create_block();
                 let merge = self.b.create_block();
                 self.b.append_block_param(merge, types::I8);
-                self.b.ins().brif(both, fast, &[], slow, &[]);
+                self.b.ins().brif(both, fast, &[], not_int, &[]);
                 self.b.switch_to_block(fast);
                 let bit = self.b.ins().icmp(cc, pa, pb);
+                self.b.ins().jump(merge, &[bit.into()]);
+                self.b.switch_to_block(not_int);
+                let fa = self.b.ins().icmp_imm(IntCC::Equal, ta, T_F as i64);
+                let fb = self.b.ins().icmp_imm(IntCC::Equal, tb, T_F as i64);
+                let both = self.b.ins().band(fa, fb);
+                self.b.ins().brif(both, float, &[], slow, &[]);
+                self.b.switch_to_block(float);
+                let (xa, xb) = (self.as_f64(pa), self.as_f64(pb));
+                // A NaN declines, as the interpreter's `compare` does.
+                let nan = self.b.ins().fcmp(FloatCC::Unordered, xa, xb);
+                let ordered = self.b.create_block();
+                self.b.ins().brif(nan, self.decline, &[], ordered, &[]);
+                self.b.switch_to_block(ordered);
+                let bit = self.b.ins().fcmp(fcc, xa, xb);
                 self.b.ins().jump(merge, &[bit.into()]);
                 self.b.switch_to_block(slow);
                 let k = self.u32c(u32::from(kind));
@@ -1069,6 +1168,7 @@ impl Lower<'_> {
                 let int_op = [BinOpKind::Add, BinOpKind::Sub, BinOpKind::Mult]
                     .into_iter()
                     .find(|k| *k as u8 == kind);
+                let float_div = kind == BinOpKind::Div as u8;
                 let merge = self.b.create_block();
                 self.b.append_block_param(merge, types::I64);
                 self.b.append_block_param(merge, types::I64);
@@ -1080,7 +1180,8 @@ impl Lower<'_> {
                     let ib = self.b.ins().icmp_imm(IntCC::Equal, tb, T_I as i64);
                     let both = self.b.ins().band(ia, ib);
                     let fast = self.b.create_block();
-                    self.b.ins().brif(both, fast, &[], slow, &[]);
+                    let not_int = self.b.create_block();
+                    self.b.ins().brif(both, fast, &[], not_int, &[]);
                     self.b.switch_to_block(fast);
                     let (r, ovf) = match k {
                         BinOpKind::Add => {
@@ -1109,6 +1210,51 @@ impl Lower<'_> {
                     self.b.switch_to_block(ok);
                     let ti = self.b.ins().iconst(types::I64, T_I as i64);
                     self.b.ins().jump(merge, &[ti.into(), r.into()]);
+                    // Two floats in line too; a NaN result takes the helper
+                    // (which gives it its identity).
+                    self.b.switch_to_block(not_int);
+                    let fa = self.b.ins().icmp_imm(IntCC::Equal, ta, T_F as i64);
+                    let fb = self.b.ins().icmp_imm(IntCC::Equal, tb, T_F as i64);
+                    let both = self.b.ins().band(fa, fb);
+                    let float = self.b.create_block();
+                    self.b.ins().brif(both, float, &[], slow, &[]);
+                    self.b.switch_to_block(float);
+                    let (xa, xb) = (self.as_f64(pa), self.as_f64(pb));
+                    let r = match k {
+                        BinOpKind::Add => self.b.ins().fadd(xa, xb),
+                        BinOpKind::Sub => self.b.ins().fsub(xa, xb),
+                        _ => self.b.ins().fmul(xa, xb),
+                    };
+                    let nan = self.b.ins().fcmp(FloatCC::Unordered, r, r);
+                    let fine = self.b.create_block();
+                    self.b.ins().brif(nan, slow, &[], fine, &[]);
+                    self.b.switch_to_block(fine);
+                    let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), r);
+                    let tf = self.b.ins().iconst(types::I64, T_F as i64);
+                    self.b.ins().jump(merge, &[tf.into(), bits.into()]);
+                } else if float_div {
+                    // Two floats divide in line by a nonzero divisor; a NaN
+                    // result takes the helper.
+                    let fa = self.b.ins().icmp_imm(IntCC::Equal, ta, T_F as i64);
+                    let fb = self.b.ins().icmp_imm(IntCC::Equal, tb, T_F as i64);
+                    let both = self.b.ins().band(fa, fb);
+                    let float = self.b.create_block();
+                    self.b.ins().brif(both, float, &[], slow, &[]);
+                    self.b.switch_to_block(float);
+                    let (xa, xb) = (self.as_f64(pa), self.as_f64(pb));
+                    let zero = self.b.ins().f64const(0.0);
+                    let by_zero = self.b.ins().fcmp(FloatCC::Equal, xb, zero);
+                    let nonzero = self.b.create_block();
+                    self.b.ins().brif(by_zero, slow, &[], nonzero, &[]);
+                    self.b.switch_to_block(nonzero);
+                    let r = self.b.ins().fdiv(xa, xb);
+                    let nan = self.b.ins().fcmp(FloatCC::Unordered, r, r);
+                    let fine = self.b.create_block();
+                    self.b.ins().brif(nan, slow, &[], fine, &[]);
+                    self.b.switch_to_block(fine);
+                    let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), r);
+                    let tf = self.b.ins().iconst(types::I64, T_F as i64);
+                    self.b.ins().jump(merge, &[tf.into(), bits.into()]);
                 } else {
                     self.b.ins().jump(slow, &[]);
                 }

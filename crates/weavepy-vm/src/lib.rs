@@ -7049,33 +7049,8 @@ impl Interpreter {
     #[inline]
     fn pop_top_step(&mut self, frame: &mut Frame) -> Result<(), RuntimeError> {
         let v = frame.pop()?;
-        // RFC 0059 WS1b: POP_TOP is exempt from the eval loop's
-        // coarse stack-shrink mark; note the discarded value here
-        // (no-op for pure leaves — e.g. a discarded expression
-        // statement's int/str result).
-        // Discarding the last reference to a temporary mirrors
-        // CPython's refcount-driven finalization (`f()` as a
-        // statement finalizes the result immediately). This covers
-        // not just directly-finalizable values (instances with
-        // `__del__`, live generators/coroutines) but *containers*
-        // that anchor a dead finalizable acyclic subgraph: a
-        // discarded `pool.map(...)` returns a `list` of unpickled,
-        // GC-tracked result copies, and if it isn't reaped here the
-        // copies linger as dead-but-tracked garbage until *some*
-        // thread's next collection finalizes them — which, across the
-        // statement's trailing `del`/`sleep`, is frequently a
-        // background pool thread, so the copies' `__del__` then races
-        // the main thread's (CPython runs every one on the thread that
-        // dropped the ref). The `local_needs_prompt_reap` kinds match
-        // `reap_frame_locals_on_exit`; `prompt_reap_dropped`'s refcount
-        // guard leaves anything still referenced elsewhere alone
-        // (RFC 0040: `test_multiprocessing_*` `test_release_task_refs`).
-        // No `sync_py_locals` is needed: a discarded statement result
-        // is an operand-stack temporary that was never a frame local,
-        // so the live-locals mirror cannot hold a stale clone of it,
-        // and `frame.locals` always reflects live bindings — the
-        // refcount guard therefore cannot false-positive on a value
-        // still bound to a local.
+        // A discarded temporary dies here, finalizers and all (`f()` as a
+        // statement finalizes its result at once, as in CPython).
         self.release(v);
         Ok(())
     }
@@ -8123,31 +8098,17 @@ impl Interpreter {
                 None,
             ) => {
                 // Only leaf instructions and inline calls ran here, so the
-                // frame's other fields are untouched. Scalar-only locals
-                // (and no leftover operands or cells) owe the exit reap
-                // nothing: they die here with no drop glue.
+                // frame's other fields are untouched: with no leftover
+                // operands or cells, the locals are released here.
                 done.clean = true;
                 if frame.stack.is_empty()
                     && frame.code.cellvars.is_empty()
                     && Rc::strong_count(&frame.locals) == 1
                 {
                     // SAFETY: sole owner; nothing else reaches the vector.
-                    let locals = unsafe { &mut *frame.locals.as_ptr() };
-                    if locals.iter().all(|o| {
-                        matches!(
-                            o,
-                            Object::Int(_)
-                                | Object::Float(_)
-                                | Object::Bool(_)
-                                | Object::None
-                                | Object::Unbound
-                        )
-                    }) {
-                        // SAFETY: scalars own nothing (no drop skipped).
-                        unsafe { locals.set_len(0) };
-                        drop(done.guard.take());
-                        return Ok(v);
-                    }
+                    unsafe { (*frame.locals.as_ptr()).clear() };
+                    drop(done.guard.take());
+                    return Ok(v);
                 }
                 Ok(FrameOutcome::Returned(v))
             }
@@ -13573,73 +13534,6 @@ impl Interpreter {
         Some(Ok(Object::Bool(r)))
     }
 
-    /// Whether a returning frame's `locals` owe the exit reap
-    /// (`reap_frame_locals_on_exit`) nothing: scalars and strings, and
-    /// instances or containers held beyond every slot of the frame that
-    /// could name them plus the collector's handle, with no weakref
-    /// watching — the reap's own "escaped" verdict, and a grade of no mark
-    /// for each release.
-    #[inline]
-    fn core_escaped_locals(locals: &[Object]) -> bool {
-        // Each heap local's identity and strong count: up to eight are
-        // compared exactly (how many slots here name each object); past
-        // that, every heap slot is assumed to name every object.
-        const EXACT: usize = 8;
-        let mut heap = [const { std::mem::MaybeUninit::<(u64, usize)>::uninit() }; EXACT];
-        let mut n = 0usize;
-        for o in locals {
-            let (id, sc) = match o {
-                Object::Int(_)
-                | Object::Float(_)
-                | Object::Bool(_)
-                | Object::None
-                | Object::Unbound
-                | Object::Str(_) => continue,
-                Object::Instance(i) => (Rc::as_ptr(i) as usize as u64, Rc::strong_count(i)),
-                Object::List(l) => (Rc::as_ptr(l) as usize as u64, Rc::strong_count(l)),
-                Object::Dict(d) => (Rc::as_ptr(d) as usize as u64, Rc::strong_count(d)),
-                Object::Tuple(t) => (
-                    ThinArc::as_ptr(t).cast::<()>() as usize as u64,
-                    ThinArc::strong_count(t),
-                ),
-                _ => return false,
-            };
-            if n < EXACT {
-                heap[n].write((id, sc));
-            }
-            n += 1;
-        }
-        if n == 0 {
-            return true;
-        }
-        if n > EXACT {
-            return locals.iter().all(|o| {
-                let (sc, id) = match o {
-                    Object::Instance(i) => (Rc::strong_count(i), Rc::as_ptr(i) as usize as u64),
-                    Object::List(l) => (Rc::strong_count(l), Rc::as_ptr(l) as usize as u64),
-                    Object::Dict(d) => (Rc::strong_count(d), Rc::as_ptr(d) as usize as u64),
-                    Object::Tuple(t) => (
-                        ThinArc::strong_count(t),
-                        ThinArc::as_ptr(t).cast::<()>() as usize as u64,
-                    ),
-                    _ => return true,
-                };
-                sc > n + usize::from(gc_trace::maybe_tracked(id))
-                    && !crate::weakref_registry::may_have_weakrefs(id)
-            });
-        }
-        // SAFETY: the first `n` entries were written.
-        let heap: &[(u64, usize)] = unsafe { std::slice::from_raw_parts(heap.as_ptr().cast(), n) };
-        heap.iter().all(|&(id, sc)| {
-            // Held past every slot here and a collector handle needs no
-            // count of the slots that name it.
-            (sc > n + 1 || {
-                let held = heap.iter().filter(|&&(other, _)| other == id).count();
-                sc > held + usize::from(gc_trace::maybe_tracked(id))
-            }) && !crate::weakref_registry::may_have_weakrefs(id)
-        })
-    }
-
     /// The `(function, has_self, effective argc)` of a plain-function
     /// `CALL` at `pc` (the shapes [`Self::core_call_cached`] serves).
     #[inline]
@@ -15003,20 +14897,17 @@ impl Interpreter {
             sw.entry_dead = true;
         }
         // `inline_finish`'s shell-less return, its common case in line: no
-        // leftover operands or cells, and locals that die here with no drop
-        // glue (scalars) or whose release the exit reap would pass over
-        // (see `core_escaped_locals`).
+        // leftover operands or cells, and locals only this activation
+        // holds. They are released here; an object that dies with them
+        // queues its finalizer, which runs below before the caller goes on.
         let clean = frame.stack.is_empty()
             && frame.code.cellvars.is_empty()
-            && Rc::strong_count(&frame.locals) == 1
-            // SAFETY: sole owner; nothing else reaches the vector.
-            && Self::core_escaped_locals(unsafe { &*frame.locals.as_ptr() });
+            && Rc::strong_count(&frame.locals) == 1;
         let mut tmp = None;
         let (cframe, clast, cshell, entry);
         if clean && done.init_inst.is_none() {
             done.clean = true;
-            // SAFETY: as above; the values drop by plain decrements (or
-            // own nothing).
+            // SAFETY: as above.
             for v in unsafe { (*frame.locals.as_ptr()).drain(..) } {
                 drop_hot(v);
             }
@@ -61241,6 +61132,19 @@ fn drop_hot(v: Object) {
         Object::Str(s) => drop(s),
         other => drop(other),
     }
+}
+
+/// The field slot for `cache_pc`, allocating the table on first use.
+#[inline]
+fn code_field_slot(code: &CodeObject, cache_pc: u32) -> Option<&FieldSlot> {
+    let ext = code_vm_ext(code)?;
+    ext.field_slots
+        .get_or_init(|| {
+            (0..code.instructions.len())
+                .map(|_| FieldSlot::empty())
+                .collect()
+        })
+        .get(cache_pc as usize)
 }
 
 /// The stamp slot for `cache_pc`, allocating the table on first use.

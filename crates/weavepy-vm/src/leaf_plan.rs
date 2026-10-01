@@ -1417,9 +1417,20 @@ impl Interpreter {
         f: &crate::object::PyFunction,
         pc: u16,
     ) -> Option<V> {
+        self.plan_global_at(code, stamps.get(usize::from(pc))?, f, pc)
+    }
+
+    /// [`Self::plan_global`] with the site's stamp slot in hand.
+    #[inline(always)]
+    fn plan_global_at(
+        &self,
+        code: &CodeObject,
+        slot: &crate::StampSlot,
+        f: &crate::object::PyFunction,
+        pc: u16,
+    ) -> Option<V> {
         use weavepy_compiler::InlineCache as IC;
         let pc = usize::from(pc);
-        let slot = stamps.get(pc)?;
         let (gdict, bdict) = (f.globals.as_ptr(), f.builtins.as_ptr());
         let gid = crate::specialize::rc_id(&f.globals);
         // SAFETY (raw dict reads): nothing runs code here.
@@ -1520,10 +1531,22 @@ impl Interpreter {
     /// the core loop's arm).
     #[inline(always)]
     fn plan_method(&self, code: &CodeObject, src: V, pc: u16, name: u16) -> Option<(V, V)> {
+        let ms = crate::code_method_slot(code, u32::from(pc))?;
+        self.plan_method_at(code, ms, src, name)
+    }
+
+    /// [`Self::plan_method`] with the site's method slot in hand.
+    #[inline(always)]
+    fn plan_method_at(
+        &self,
+        code: &CodeObject,
+        ms: &crate::MethodSlot,
+        src: V,
+        name: u16,
+    ) -> Option<(V, V)> {
         let V::R(p) = src else {
             return None;
         };
-        let ms = crate::code_method_slot(code, u32::from(pc))?;
         // SAFETY: as `norm`.
         match unsafe { &*p } {
             Object::Instance(inst) => {
