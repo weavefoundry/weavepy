@@ -3064,12 +3064,19 @@ pub struct LeafProbe<'a> {
 }
 
 impl<'a> LeafProbe<'a> {
-    /// `None` unless `key` is a `str` or a machine `int`.
+    /// `None` unless `key` is a `str`, a machine `int`, or a plain
+    /// instance hashed by identity (its `__hash__` is `object`'s).
     #[inline]
     pub fn new(key: &'a Object) -> Option<Self> {
         let hash = match key {
             Object::Str(s) => SharedStr::hash_cached(s),
             Object::Int(_) => py_hash_value(key)?,
+            Object::Instance(i)
+                if i.native.get().is_none()
+                    && i.class_dunder(crate::types::Dunder::Hash).object_owner() =>
+            {
+                identity_hash(key)
+            }
             _ => return None,
         };
         Some(Self {
@@ -3103,6 +3110,9 @@ impl indexmap::Equivalent<DictKey> for LeafProbe<'_> {
         match (self.key, &key.0) {
             (Object::Str(a), Object::Str(b)) => a.as_bytes() == b.as_bytes(),
             (Object::Int(a), Object::Int(b)) => a == b,
+            // Identity settles an instance probe (CPython compares keys
+            // with `is` first); any other pairing may need `__eq__`.
+            (Object::Instance(a), Object::Instance(b)) if Rc::ptr_eq(a, b) => true,
             _ => {
                 self.foreign.set(true);
                 false
@@ -3200,6 +3210,13 @@ pub(crate) fn instance_has_custom_dunder(obj: &Object, dunder: crate::types::Dun
     inst.native.get().is_none() && !info.object_owner()
 }
 
+/// A plain instance compared by identity: no native payload, and its
+/// `__eq__` is `object`'s.
+#[inline]
+pub(crate) fn plain_identity_eq(inst: &crate::types::PyInstance) -> bool {
+    inst.native.get().is_none() && inst.class_dunder(crate::types::Dunder::Eq).object_owner()
+}
+
 /// [`instance_has_custom_dunder`] for `__eq__`: membership tests and
 /// `list.remove`/`index`/`count` ask it for every element they compare.
 pub(crate) fn instance_has_custom_eq(obj: &Object) -> bool {
@@ -3281,6 +3298,14 @@ pub(crate) fn key_needs_interp_eq(obj: &Object) -> bool {
 pub(crate) fn member_eq(a: &Object, b: &Object) -> Result<bool, RuntimeError> {
     if a.is_same(b) {
         return Ok(true);
+    }
+    // Two distinct plain instances (`object.__eq__` on both sides) are
+    // unequal: both comparisons return `NotImplemented`. Settled before
+    // the general path, which resolves each side's `__eq__` twice.
+    if let (Object::Instance(x), Object::Instance(y)) = (a, b) {
+        if plain_identity_eq(x) && plain_identity_eq(y) {
+            return Ok(false);
+        }
     }
     // Dispatch the full Python comparison whenever an operand can carry
     // custom `__eq__` semantics: a pure-Python instance with a user dunder,
@@ -11967,6 +11992,15 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             })))
         }
         Object::Instance(inst) => {
+            // The common case first: a plain instance whose `__hash__` is
+            // `object`'s hashes by identity, with no interpreter round trip.
+            if inst.native.get().is_none()
+                && inst
+                    .class_dunder(crate::types::Dunder::Hash)
+                    .object_owner()
+            {
+                return Some(identity_hash(obj));
+            }
             // A `weakref.ref` hashes as its referent (CPython `weakref_hash`),
             // computed natively and memoised so the hot `DictKey` path never
             // pays a reentrant `__hash__` dispatch — see `weakref_native_hash`.

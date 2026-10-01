@@ -15303,6 +15303,11 @@ impl Interpreter {
                         let d = d.try_borrow().ok()?;
                         clone_hot(d.get(&probe)?)
                     }
+                    (Object::Dict(d), Object::Instance(_)) if Self::core_droppable(k) => {
+                        let probe = crate::object::LeafProbe::new(k)?;
+                        let d = d.try_borrow().ok()?;
+                        clone_hot(d.get(&probe)?)
+                    }
                     // `seq[a:b:c]` with plain int (or omitted) bounds: the
                     // full handler's own slicing, out of line (a bad step
                     // declines, and the full handler raises).
@@ -15316,10 +15321,10 @@ impl Interpreter {
                     _ => return None,
                 };
                 // SAFETY: both operand slots are initialized. The key is a
-                // scalar, a string or a slice of ints, and the container a
-                // shared value
-                // (`core_droppable`), so neither release runs code; the
-                // result takes the container's slot.
+                // scalar, a string, a slice of ints or a droppable instance,
+                // and the container a shared value (`core_droppable`), so
+                // neither release runs code; the result takes the
+                // container's slot.
                 unsafe {
                     drop_hot(base.add(len - 1).read());
                     drop_hot(base.add(len - 2).read());
