@@ -2435,6 +2435,15 @@ impl Interpreter {
             // A dead plain tuple's allocation is recycled (CPython's tuple
             // freelist; see `maybe_donate_tuple`).
             dropped @ Object::Tuple(_) => self.maybe_donate_tuple(dropped),
+            // A natively served `datetime` value goes back to its pool
+            // (see `stdlib::datetime_native::recycle`).
+            Object::Instance(i)
+                if Rc::strong_count(&i) == 1 && crate::stdlib::datetime_native::pooled_kind(&i) =>
+            {
+                if let Err(i) = crate::stdlib::datetime_native::recycle(i) {
+                    drop(i);
+                }
+            }
             // Likewise a dead instance's (see `PyInstance::try_recycle`).
             Object::Instance(i) if Rc::strong_count(&i) == 1 && i.dies_by_plain_drop() => {
                 PyInstance::try_recycle(i);
@@ -11699,8 +11708,15 @@ impl Interpreter {
                         // SAFETY: `start + kwc + argc + 3 == len`.
                         let ops =
                             unsafe { std::slice::from_raw_parts(base.add(start), len - start) };
-                        let Some(r) = self.core_pure_kw_call(code, pc, ops, argc, sw.depth_cell)
-                        else {
+                        let r = match &ops[0] {
+                            // A natively served class's constructor (see
+                            // `stdlib::datetime_native`).
+                            Object::Type(ty) if ty.native_kind.get() != 0 => {
+                                Self::core_native_ctor_kw(ops, argc, true)
+                            }
+                            _ => self.core_pure_kw_call(code, pc, ops, argc, sw.depth_cell),
+                        };
+                        let Some(r) = r else {
                             // A plain Python callee switches in place, as
                             // `CALL`'s does (see `core_call_kw`).
                             if !matches!(&ops[0], Object::Function(_)) {
@@ -11787,6 +11803,29 @@ impl Interpreter {
                                     pc += 1;
                                     continue;
                                 }
+                            }
+                        }
+                        // A natively served class's constructor (see
+                        // `stdlib::datetime_native`), in place.
+                        if python == 2 {
+                            let start = len - argc - 2;
+                            // SAFETY: `len >= argc + 2`: the call's operands.
+                            let ops =
+                                unsafe { std::slice::from_raw_parts(base.add(start), argc + 2) };
+                            if let Some(r) = Self::core_native_ctor_kw(ops, argc, false) {
+                                // SAFETY: every operand was checked to leave by a
+                                // plain decrement; the result takes the callee's
+                                // slot.
+                                unsafe {
+                                    for k in start..len {
+                                        drop_hot(base.add(k).read());
+                                    }
+                                    base.add(start).write(r);
+                                }
+                                len = start + 1;
+                                last = pc;
+                                pc += 1;
+                                continue;
                             }
                         }
                         if python != 0 {
@@ -15504,6 +15543,38 @@ impl Interpreter {
         crate::stdlib::datetime_native::leaf_compare(kind, a, b)
     }
 
+    /// `cls(*args, **kwargs)` for a natively served class (see
+    /// [`crate::stdlib::datetime_native::construct_names`]): `ops` is the
+    /// core loop's `CALL` operands (callee, self slot, `argc` positional),
+    /// or with `kw` its `CALL_KW` operands (the keyword values and the
+    /// names tuple follow). The new instance, or `None` (nothing touched)
+    /// for the full handler, which also raises every error.
+    #[inline(never)]
+    fn core_native_ctor_kw(ops: &[Object], argc: usize, kw: bool) -> Option<Object> {
+        let (Object::Type(cls), Object::Unbound) = (ops.first()?, ops.get(1)?) else {
+            return None;
+        };
+        if cls.native_kind.get() == 0 {
+            return None;
+        }
+        let args = ops.get(2..2 + argc)?;
+        let (names, values): (&[Object], &[Object]) = if kw {
+            let Object::Tuple(names) = ops.last()? else {
+                return None;
+            };
+            (names, ops.get(2 + argc..ops.len() - 1)?)
+        } else {
+            (&[], &[])
+        };
+        if !ops
+            .iter()
+            .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
+        {
+            return None;
+        }
+        crate::stdlib::datetime_native::construct_names(cls, args, names, values)?.ok()
+    }
+
     /// A natively served instance's public field (`dt.hour`; see
     /// [`crate::stdlib::datetime_native::leaf_field`]), or `None`.
     #[inline(never)]
@@ -19137,6 +19208,19 @@ impl Interpreter {
         // attribute hooks are opaque here.)
         if (cls.c_ext_ptr.get() != 0 && !cls.flags.is_builtin) || !Self::plain_metaclass(cls) {
             return None;
+        }
+        // A natively served class method (`datetime.fromisoformat`; see
+        // `stdlib::datetime_native`), bound as `classmethod.__get__`
+        // binds it.
+        if cls.native_kind.get() != 0 {
+            if let Some(Object::Str(name)) = code_name_obj(code, name_idx) {
+                if let Some(f) = crate::stdlib::datetime_native::type_classmethod(cls, name) {
+                    return Some(Object::BoundMethod(Rc::new(BoundMethod::py_method(
+                        Object::Type(cls.clone()),
+                        f,
+                    ))));
+                }
+            }
         }
         match Self::leaf_class_attr(code, cls, name_idx)? {
             LeafAttr::Method(f) => {

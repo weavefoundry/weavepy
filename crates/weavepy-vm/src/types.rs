@@ -2004,7 +2004,15 @@ enum SlotData {
         layout: SharedSlice<DictKey>,
         values: Box<[Object]>,
     },
+    /// A natively built `datetime` value's fields, packed into words (see
+    /// [`crate::stdlib::datetime_native::PackedSlots`]). Readers that
+    /// need `&Object`s get a lazily built copy; any write first converts
+    /// to [`Self::Fixed`].
+    Packed(crate::stdlib::datetime_native::PackedSlots),
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<SlotStorage>() == 32);
 
 /// Is `key` the slot name `name`? (Interned names usually share the
 /// probe's storage, settled without reading either length.)
@@ -2109,6 +2117,7 @@ impl SlotStorage {
             SlotData::Fixed { layout, values } if SharedSlice::ptr_eq(layout, expected) => {
                 Some(values)
             }
+            SlotData::Packed(p) if SharedSlice::ptr_eq(p.layout(), expected) => Some(p.values()),
             _ => None,
         }
     }
@@ -2117,6 +2126,7 @@ impl SlotStorage {
         &mut self,
         expected: &SharedSlice<DictKey>,
     ) -> Option<&mut [Object]> {
+        self.unpack();
         match &mut self.data {
             SlotData::Fixed { layout, values } if SharedSlice::ptr_eq(layout, expected) => {
                 Some(values)
@@ -2125,9 +2135,58 @@ impl SlotStorage {
         }
     }
 
+    /// Storage holding a natively packed value (see [`SlotData::Packed`]).
+    pub(crate) fn from_packed(packed: crate::stdlib::datetime_native::PackedSlots) -> Self {
+        Self {
+            data: SlotData::Packed(packed),
+        }
+    }
+
+    /// The packed value, while the storage still holds one.
+    #[inline]
+    pub(crate) fn as_packed(&self) -> Option<&crate::stdlib::datetime_native::PackedSlots> {
+        match &self.data {
+            SlotData::Packed(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// [`Self::as_packed`], mutably.
+    #[inline]
+    pub(crate) fn as_packed_mut(
+        &mut self,
+    ) -> Option<&mut crate::stdlib::datetime_native::PackedSlots> {
+        match &mut self.data {
+            SlotData::Packed(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Turn a [`SlotData::Packed`] storage into [`SlotData::Fixed`]
+    /// (before a slot is written).
+    #[inline]
+    fn unpack(&mut self) {
+        if let SlotData::Packed(_) = &self.data {
+            self.unpack_slow();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn unpack_slow(&mut self) {
+        if let SlotData::Packed(p) = std::mem::take(self).data {
+            let layout = p.layout().clone();
+            self.data = SlotData::Fixed {
+                layout,
+                values: p.into_values(),
+            };
+        }
+    }
+
     /// Turn a [`SlotData::Fixed`] storage into the per-key form (before
     /// a key is added or removed).
     fn unfix(&mut self) {
+        self.unpack();
         if let SlotData::Fixed { layout, values } = &mut self.data {
             let values = std::mem::take(values);
             let entries: Vec<(DictKey, Object)> =
@@ -2153,6 +2212,24 @@ impl SlotStorage {
     /// Storage holding `values` under `layout` (see the 64-bit variant).
     pub fn from_layout(layout: SharedSlice<DictKey>, values: Vec<Object>) -> Self {
         Self::from_entries(layout.iter().cloned().zip(values).collect())
+    }
+
+    /// Storage holding a packed value's slots (stored per key here).
+    pub(crate) fn from_packed(packed: crate::stdlib::datetime_native::PackedSlots) -> Self {
+        let layout = packed.layout().clone();
+        Self::from_layout(layout, packed.into_values().into_vec())
+    }
+
+    #[inline]
+    pub(crate) fn as_packed(&self) -> Option<&crate::stdlib::datetime_native::PackedSlots> {
+        None
+    }
+
+    #[inline]
+    pub(crate) fn as_packed_mut(
+        &mut self,
+    ) -> Option<&mut crate::stdlib::datetime_native::PackedSlots> {
+        None
     }
 }
 
@@ -2201,6 +2278,13 @@ impl SlotStorage {
                     |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
                 )
                 .map(|index| index as u32),
+            SlotData::Packed(p) => p
+                .layout()
+                .iter()
+                .position(
+                    |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
+                )
+                .map(|index| index as u32),
         }
     }
 
@@ -2213,12 +2297,14 @@ impl SlotStorage {
             SlotData::Small(entries) => entries.get(index).map(|(key, value)| (key, value)),
             SlotData::Many(table) => table.get_index(index),
             SlotData::Fixed { layout, values } => layout.get(index).zip(values.get(index)),
+            SlotData::Packed(p) => p.layout().get(index).zip(p.values().get(index)),
             _ => None,
         }
     }
 
     #[inline]
     pub fn get_index_mut(&mut self, index: usize) -> Option<(&DictKey, &mut Object)> {
+        self.unpack();
         match &mut self.data {
             SlotData::Single { key, value } if index == 0 => key.as_ref().map(|key| (key, value)),
             SlotData::Small(entries) => entries.get_mut(index).map(|(key, value)| (&*key, value)),
@@ -2244,6 +2330,13 @@ impl SlotStorage {
                     |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
                 )
                 .and_then(|i| values.get(i)),
+            SlotData::Packed(p) => p
+                .layout()
+                .iter()
+                .position(
+                    |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
+                )
+                .and_then(|i| p.values().get(i)),
             _ => None,
         }
     }
@@ -2307,6 +2400,17 @@ impl SlotStorage {
             }
             SlotData::Fixed { layout, values } => {
                 let (keys, values) = (layout.get(..N)?, values.get(..N)?);
+                if !keys
+                    .iter()
+                    .zip(names)
+                    .all(|(key, name)| key_named(key, name))
+                {
+                    return None;
+                }
+                Some(std::array::from_fn(|i| &values[i]))
+            }
+            SlotData::Packed(p) => {
+                let (keys, values) = (p.layout().get(..N)?, p.values().get(..N)?);
                 if !keys
                     .iter()
                     .zip(names)
@@ -2385,6 +2489,7 @@ impl SlotStorage {
         &mut self,
         names: [&crate::shared_value::SharedStr; N],
     ) -> Option<[&mut Object; N]> {
+        self.unpack();
         let values: &mut [Object] = match &mut self.data {
             SlotData::Small(entries) => {
                 let entries = entries.get_mut(..N)?;
@@ -2417,6 +2522,7 @@ impl SlotStorage {
 
     /// Mutable access to a populated slot's value, by name.
     pub fn get_mut(&mut self, name: &str) -> Option<&mut Object> {
+        self.unpack();
         match &mut self.data {
             SlotData::Single {
                 key: Some(DictKey(Object::Str(stored))),
@@ -2456,6 +2562,7 @@ impl SlotStorage {
         value: Object,
         make_key: impl FnOnce() -> DictKey,
     ) -> Option<Object> {
+        self.unpack();
         if let SlotData::Fixed { .. } = &self.data {
             if let Some(slot) = self.get_mut(name) {
                 return Some(std::mem::replace(slot, value));
@@ -2542,7 +2649,8 @@ impl SlotStorage {
             }
             SlotData::Small(entries) => (None, Some(entries), None, None),
             SlotData::Many(table) => (None, None, Some(table), None),
-            SlotData::Fixed { layout, values } => (None, None, None, Some((layout, values))),
+            SlotData::Fixed { layout, values } => (None, None, None, Some((layout, &values[..]))),
+            SlotData::Packed(p) => (None, None, None, Some((p.layout(), p.values()))),
         };
         single
             .into_iter()
@@ -2823,6 +2931,13 @@ impl PyInstance {
     /// The caller established that `obj` is its only reference, the
     /// instance is still deferred and owns no C body.
     pub fn try_recycle(mut inst: Rc<Self>) {
+        // SAFETY: the caller holds the only reference.
+        if unsafe { &*inst.class.as_ptr() }.native_kind.get() != 0 {
+            if let Err(inst) = crate::stdlib::datetime_native::recycle(inst) {
+                drop(Rc::into_arc(inst));
+            }
+            return;
+        }
         let Some(m) = Rc::get_mut(&mut inst) else {
             return;
         };

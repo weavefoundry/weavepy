@@ -342,7 +342,7 @@ fn cells_shared() -> bool {
 static CELLS_UNGUARDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[inline]
-fn cells_unguarded() -> bool {
+pub(crate) fn cells_unguarded() -> bool {
     CELLS_UNGUARDED.load(Ordering::Relaxed)
 }
 

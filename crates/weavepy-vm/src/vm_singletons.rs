@@ -121,6 +121,20 @@ pub(crate) fn finalize_on_last_release<T: ?Sized + 'static>(arc: std::sync::Arc<
     if t == TypeId::of::<PyInstance>() {
         // SAFETY: `T` is `PyInstance` (the cast drops no metadata).
         let inst = unsafe { Arc::from_raw(Arc::into_raw(arc).cast::<PyInstance>()) };
+        // A natively served `datetime` value: back to its pool (see
+        // `stdlib::datetime_native::recycle`). With no weak reference the
+        // last owner is the only one who can reach the class.
+        let inst = if Arc::weak_count(&inst) == 0
+            // SAFETY: as above.
+            && unsafe { &*inst.class.as_ptr() }.native_kind.get() != 0
+        {
+            match crate::stdlib::datetime_native::recycle(Rc::from_arc(inst)) {
+                Ok(()) => return,
+                Err(inst) => Rc::into_arc(inst),
+            }
+        } else {
+            inst
+        };
         let owes = !inst.finalize_ran.get()
             && inst
                 .class
