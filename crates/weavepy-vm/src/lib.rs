@@ -10894,6 +10894,9 @@ impl Interpreter {
                                     }
                                     _ => break None,
                                 };
+                                if let Some(e) = ext {
+                                    native_site_note(e, ninstrs, pc);
+                                }
                                 // SAFETY: both operands leave by plain
                                 // decrements (checked).
                                 unsafe {
@@ -11059,6 +11062,9 @@ impl Interpreter {
                                     }
                                     _ => break None,
                                 };
+                                if let Some(e) = ext {
+                                    native_site_note(e, ninstrs, pc);
+                                }
                                 // SAFETY: both operands leave by plain
                                 // decrements (checked); the result takes the
                                 // lower one's slot.
@@ -15607,7 +15613,7 @@ impl Interpreter {
         // the fast half reads them (and clones what it keeps).
         let mut views = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
         // SAFETY: the method and the core loop's stack keep them alive.
-        views[0].write(unsafe { std::ptr::read(&bm.receiver) });
+        views[0].write(unsafe { std::ptr::read(&raw const bm.receiver) });
         for (v, a) in views[1..].iter_mut().zip(args) {
             // SAFETY: as above.
             v.write(unsafe { std::ptr::read(a) });
@@ -61404,6 +61410,11 @@ struct CodeConstObjects {
     /// Split-layout attribute shortcuts per `LOAD_ATTR` site (see
     /// [`FieldSlot`]); allocated on the first recorded one.
     field_slots: std::sync::OnceLock<Box<[FieldSlot]>>,
+    /// The `BINARY_OP` and `COMPARE_OP` sites the core loop has run on a
+    /// natively served operand (see `stdlib::datetime_native`), for the
+    /// frame compiler to send through its helpers instead of the scalar
+    /// arms; allocated on the first recorded one.
+    native_sites: std::sync::OnceLock<Box<[std::sync::atomic::AtomicBool]>>,
     /// Verified frameless method calls per method-load site (see
     /// [`LeafSite`]); allocated on the first recorded one.
     leaf_sites: std::sync::OnceLock<Box<[LeafSite]>>,
@@ -61812,6 +61823,33 @@ fn field_slot_note(ext: &CodeConstObjects, ninstrs: usize, pc: usize, inst: &PyI
     if let Some(slot) = slots.get(pc) {
         slot.set((inst.cls_raw().attr_version.get(), idx));
     }
+}
+
+/// Record that the operator at `pc` ran on a natively served operand (see
+/// [`CodeConstObjects::native_sites`]).
+#[inline]
+fn native_site_note(ext: &CodeConstObjects, ninstrs: usize, pc: usize) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    if let Some(site) = ext.native_sites.get().and_then(|s| s.get(pc)) {
+        if !site.load(Ordering::Relaxed) {
+            site.store(true, Ordering::Relaxed);
+        }
+        return;
+    }
+    let sites = ext
+        .native_sites
+        .get_or_init(|| (0..ninstrs).map(|_| AtomicBool::new(false)).collect());
+    if let Some(site) = sites.get(pc) {
+        site.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Whether the operator at `pc` has run on a natively served operand.
+pub(crate) fn native_site(ext: &CodeConstObjects, pc: usize) -> bool {
+    ext.native_sites
+        .get()
+        .and_then(|s| s.get(pc))
+        .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// `v.clone()` with the scalars copied and the common heap variants'
@@ -62865,6 +62903,7 @@ fn code_vm_ext_build(
             fast_pairs: std::sync::OnceLock::new(),
             gen_fast: std::sync::atomic::AtomicU8::new(0),
             field_slots: std::sync::OnceLock::new(),
+            native_sites: std::sync::OnceLock::new(),
             leaf_sites: std::sync::OnceLock::new(),
             leaf_plan: std::sync::OnceLock::new(),
             returns_none: std::sync::atomic::AtomicU8::new(0),

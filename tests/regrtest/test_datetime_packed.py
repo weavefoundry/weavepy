@@ -204,4 +204,80 @@ for i in range(1000):
     datetime(2000, 1, 1) + timedelta(seconds=i)
 assert keep[-1] == datetime(2000, 10, 26) and len(set(keep)) == 300
 
+
+# Hot loops (compiled to native code) over datetime operators and fields,
+# and operator sites that see datetimes and other operands in turn.
+def walk(n):
+    cur = base = datetime(2024, 1, 1, tzinfo=utc)
+    step = timedelta(minutes=37, seconds=11)
+    day = timedelta(days=1)
+    hours = days = resets = 0
+    for i in range(n):
+        cur = cur + step
+        if cur - base > day * 30:
+            base = base + day
+            resets += 1
+        if cur.hour == 12:
+            hours += 1
+        days += cur.weekday()
+    return cur, base, hours, days, resets
+
+
+assert walk(20000) == (datetime(2025, 5, 31, 10, 26, 40, tzinfo=utc),
+                       datetime(2025, 5, 2, tzinfo=utc), 835, 59850, 487)
+
+
+def add(a, b, n):
+    out = None
+    for i in range(n):
+        out = a + b
+    return out
+
+
+def less(a, b, n):
+    out = None
+    for i in range(n):
+        out = a < b
+    return out
+
+
+def hour(obj, n):
+    out = None
+    for i in range(n):
+        out = obj.hour
+    return out
+
+
+class Clock:
+    def __init__(self):
+        self.hour = 7
+
+
+for _ in range(2):
+    assert add(1, 2, 3000) == 3
+    assert add(base, step, 3000) == base + step
+    assert add(2**62, 2**62, 3000) == 2**63
+    assert add("a", "b", 3000) == "ab"
+    assert add(1.5, 2, 3000) == 3.5
+    assert add(step, step, 3000) == timedelta(minutes=74, seconds=22)
+    assert less(1, 2, 3000) is True
+    assert less(step, timedelta(0), 3000) is False
+    assert less(2.5, 1.0, 3000) is False
+    assert less(base, base + step, 3000) is True
+    try:
+        less(datetime(2024, 1, 1), base, 3000)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("naive/aware ordering accepted")
+    try:
+        add(datetime(9999, 12, 31), timedelta(days=1), 3000)
+    except OverflowError:
+        pass
+    else:
+        raise AssertionError("out-of-range datetime accepted")
+    assert hour(base, 3000) == 8
+    assert hour(Clock(), 3000) == 7
+    assert hour(datetime(2020, 1, 1, 23), 3000) == 23
+
 print("datetime packed values: ok")

@@ -621,10 +621,17 @@ fn verify_slow(st: &State, cls: &TypeObject, kind: u8, ver: u64) -> bool {
     ok
 }
 
-// SAFETY-free: `State` is reached from an exact class through its
-// `native_ext` slot (see `state_of`).
+/// The [`State`] a class marked by [`install`] carries in its
+/// `native_ext` slot.
+#[inline]
+#[allow(clippy::cast_ptr_alignment)]
 fn state_of_cls(cls: &TypeObject) -> Option<&State> {
-    cls.native_ext.get()?.downcast_ref::<State>()
+    let ext = cls.native_ext.get()?;
+    debug_assert!(ext.downcast_ref::<State>().is_some());
+    // SAFETY: only `install` fills `native_ext`, always with a `State`
+    // (checked above in debug builds), so the payload pointer is a
+    // `State`'s, aligned for it; the cast drops the vtable.
+    Some(unsafe { &*Rc::as_ptr(ext).cast::<State>() })
 }
 
 #[inline]
@@ -1206,7 +1213,7 @@ fn pool_ok() -> bool {
 }
 
 impl Pool {
-    #[inline]
+    #[inline(always)]
     fn with<R>(&self, kind: u8, f: impl FnOnce(&mut Vec<Rc<PyInstance>>) -> R) -> Option<R> {
         if !pool_ok() {
             return None;

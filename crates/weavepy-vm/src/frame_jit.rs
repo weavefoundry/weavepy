@@ -694,6 +694,114 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
     0
 }
 
+/// `BINARY_OP` of `kind` over the values at `a` and `b` (a local's or a
+/// constant's, read in place) for a site that has seen a natively served
+/// operand (see `crate::native_site`): `0` the result written to the free
+/// slot `dst`, anything else declined untouched (the core loop then runs
+/// the instruction, and raises its errors).
+unsafe extern "C" fn h_binop_ref(
+    dst: *mut Object,
+    a: *const Object,
+    b: *const Object,
+    kind: u32,
+) -> u32 {
+    // SAFETY: the code passes a free stack slot, two initialized values
+    // that outlive the call (nothing it runs can reach them), and a kind
+    // the compiler emitted (`BinOpKind` is `repr(u8)`).
+    unsafe {
+        let (a, b) = (&*a, &*b);
+        let num = |o: &Object| match *o {
+            Object::Int(i) => Some(crate::leaf_plan::V::I(i)),
+            Object::Float(x) => Some(crate::leaf_plan::V::F(x)),
+            _ => None,
+        };
+        let r = if let (Some(x), Some(y)) = (num(a), num(b)) {
+            match crate::leaf_plan::binary(x, y, kind as u8) {
+                Some(crate::leaf_plan::V::I(i)) => Object::Int(i),
+                Some(crate::leaf_plan::V::F(f)) => Object::Float(f),
+                _ => return 1,
+            }
+        } else {
+            let kind: BinOpKind = std::mem::transmute(kind as u8);
+            match a {
+                Object::Instance(i) if i.cls_raw().native_kind.get() != 0 => {
+                    match Interpreter::core_native_binop(kind, a, b) {
+                        Some(Ok(r)) => r,
+                        _ => return 1,
+                    }
+                }
+                _ => return 1,
+            }
+        };
+        dst.write(r);
+    }
+    0
+}
+
+/// The field `name` (a `str`) of the natively served instance at `recv`
+/// (see `stdlib::datetime_native::leaf_field`): `0` the value written to
+/// the free slot `dst`, anything else declined untouched.
+unsafe extern "C" fn h_field(dst: *mut Object, recv: *const Object, name: *const Object) -> u32 {
+    // SAFETY: the code passes a free stack slot, an initialized local and
+    // one of its code's names; reading the field runs no code.
+    unsafe {
+        let (Object::Instance(i), Object::Str(name)) = (&*recv, &*name) else {
+            return 1;
+        };
+        if i.cls_raw().native_kind.get() == 0 {
+            return 1;
+        }
+        match crate::stdlib::datetime_native::leaf_field(i, name) {
+            Some(v) => {
+                dst.write(v);
+                0
+            }
+            None => 1,
+        }
+    }
+}
+
+/// `COMPARE_OP` with oparg `arg` over the values at `at` and above it, for
+/// the shapes the core loop's arm runs (two ints, two floats, two natively
+/// served instances): `0` the `bool` at `at` (the operands released),
+/// anything else declined untouched.
+unsafe extern "C" fn h_compare(at: *mut Object, arg: u32) -> u32 {
+    // SAFETY: the code passes two initialized stack slots, and the oparg
+    // the compiler emitted (as `compare_op_step` reads it).
+    unsafe {
+        let (a, b) = (&*at, &*at.add(1));
+        let kind: CompareKind = std::mem::transmute((arg & !COMPARE_OP_TO_BOOL_FLAG) as u8);
+        let ord = match (a, b) {
+            (Object::Int(x), Object::Int(y)) => x.cmp(y),
+            (Object::Float(x), Object::Float(y)) => match x.partial_cmp(y) {
+                Some(o) => o,
+                None => return 1,
+            },
+            (Object::Instance(i), Object::Instance(_)) if i.cls_raw().native_kind.get() != 0 => {
+                let r = match Interpreter::core_native_compare(kind, a, b) {
+                    Some(Ok(r)) if droppable(a) && droppable(b) => r,
+                    _ => return 1,
+                };
+                crate::drop_hot(at.add(1).read());
+                crate::drop_hot(at.read());
+                at.write(r);
+                return 0;
+            }
+            _ => return 1,
+        };
+        let r = match kind {
+            CompareKind::Lt => ord.is_lt(),
+            CompareKind::LtE => ord.is_le(),
+            CompareKind::Eq => ord.is_eq(),
+            CompareKind::NotEq => ord.is_ne(),
+            CompareKind::Gt => ord.is_gt(),
+            CompareKind::GtE => ord.is_ge(),
+        };
+        at.write(Object::Bool(r));
+    }
+    0
+}
+
 /// `LOAD_FAST x` (the `pc`th instruction of `code`) and the call
 /// `x.m(<simple arguments>)` after it, as the core loop's fused arm runs it
 /// (see `Interpreter::core_local_method`), on a stack `len` deep: `0` the
@@ -2207,8 +2315,17 @@ impl<'a> Lower<'a> {
         let bi = self.pop();
         let ai = self.pop();
         // A value on the stack (a call's result, an element) is as likely
-        // a heap value as a number: the helper takes every shape.
-        if matches!(ai, Item::Mem(_)) || matches!(bi, Item::Mem(_)) {
+        // a heap value as a number: the helper takes every shape. So does
+        // a site the core loop has run on a natively served operand
+        // (`datetime`'s; see `crate::native_site`).
+        let native = crate::native_site(self.ext, pc);
+        if native
+            && matches!(ai, Item::Local(_) | Item::Const(_))
+            && matches!(bi, Item::Local(_) | Item::Const(_))
+        {
+            return self.binary_borrowed(pc, kind, ai, bi);
+        }
+        if matches!(ai, Item::Mem(_)) || matches!(bi, Item::Mem(_)) || native {
             return self.binary_helper(pc, kind, ai, bi);
         }
         let (Some(a), Some(b)) = (self.operand(ai), self.operand(bi)) else {
@@ -2332,6 +2449,83 @@ impl<'a> Lower<'a> {
         let k = self.b.ins().iconst(types::I32, i64::from(kind));
         let r = self
             .call(h_binop as *const () as usize, &[at, k], true)
+            .expect("returns");
+        let out = self.exit_with(pc, &[Item::Mem(slot), Item::Mem(slot + 1)], INTERP);
+        self.branch_out(r, out);
+        self.push(Item::Mem(slot));
+        self.set_last(pc);
+        true
+    }
+
+    /// The address of a local's or a constant's value (`None` for any
+    /// other item).
+    fn item_addr(&mut self, item: Item) -> Option<Value> {
+        match item {
+            Item::Local(i) => Some(self.local_addr(i)),
+            Item::Const(k) => Some(self.const_addr(k)),
+            _ => None,
+        }
+    }
+
+    /// `BINARY_OP` of two locals or constants through [`h_binop_ref`],
+    /// which reads them in place (no references taken or released): the
+    /// result in the next free slot.
+    fn binary_borrowed(&mut self, pc: usize, kind: u8, ai: Item, bi: Item) -> bool {
+        let (Some(a), Some(b)) = (self.item_addr(ai), self.item_addr(bi)) else {
+            return self.binary_helper(pc, kind, ai, bi);
+        };
+        let slot = self.depth;
+        let dst = self.slot_addr(slot);
+        let k = self.b.ins().iconst(types::I32, i64::from(kind));
+        let r = self
+            .call(h_binop_ref as *const () as usize, &[dst, a, b, k], true)
+            .expect("returns");
+        let out = self.exit_with(pc, &[ai, bi], INTERP);
+        self.branch_out(r, out);
+        self.push(Item::Mem(slot));
+        self.set_last(pc);
+        true
+    }
+
+    /// `LOAD_ATTR` of a local where no split-layout field was seen: a
+    /// natively served instance's field through [`h_field`], anything
+    /// else in the core loop.
+    fn native_field(&mut self, pc: usize, arg: u32) -> bool {
+        let item = self.pop();
+        let (Item::Local(i), Some(name @ Object::Str(_))) =
+            (item, self.ext.name_objs.get(arg as usize))
+        else {
+            self.push(item);
+            self.exit(INTERP, pc);
+            return false;
+        };
+        let at = self.local_addr(i);
+        let slot = self.depth;
+        let dst = self.slot_addr(slot);
+        let name = self
+            .b
+            .ins()
+            .iconst(self.ptr, std::ptr::from_ref(name) as i64);
+        let r = self
+            .call(h_field as *const () as usize, &[dst, at, name], true)
+            .expect("returns");
+        let out = self.exit_with(pc, &[item], INTERP);
+        self.branch_out(r, out);
+        self.push(Item::Mem(slot));
+        self.set_last(pc);
+        true
+    }
+
+    /// `COMPARE_OP` through [`h_compare`]: the operands onto the stack,
+    /// and the result in the lower one's slot.
+    fn compare_helper(&mut self, pc: usize, arg: u32, ai: Item, bi: Item) -> bool {
+        let slot = self.depth;
+        self.materialize(ai, slot);
+        self.materialize(bi, slot + 1);
+        let at = self.slot_addr(slot);
+        let k = self.b.ins().iconst(types::I32, i64::from(arg));
+        let r = self
+            .call(h_compare as *const () as usize, &[at, k], true)
             .expect("returns");
         let out = self.exit_with(pc, &[Item::Mem(slot), Item::Mem(slot + 1)], INTERP);
         self.branch_out(r, out);
@@ -2501,6 +2695,11 @@ impl<'a> Lower<'a> {
         };
         let bi = self.pop();
         let ai = self.pop();
+        // A site the core loop has run on natively served operands: through
+        // the helper (see `binary`).
+        if crate::native_site(self.ext, pc) {
+            return self.compare_helper(pc, arg, ai, bi);
+        }
         let (Some(a), Some(b)) = (self.operand(ai), self.operand(bi)) else {
             self.push(ai);
             self.push(bi);
@@ -2713,10 +2912,9 @@ impl<'a> Lower<'a> {
     /// scalar copied, anything else with a reference taken); a stack
     /// receiver is released after. Anything else, and a miss, is the core
     /// loop's.
-    fn load_attr(&mut self, pc: usize, _arg: u32) -> bool {
+    fn load_attr(&mut self, pc: usize, arg: u32) -> bool {
         let (Some(l), Some(cache_slot)) = (self.layout, self.field_slots.get(pc)) else {
-            self.exit(INTERP, pc);
-            return false;
+            return self.native_field(pc, arg);
         };
         let l = *l;
         let item = self.pop();
@@ -2729,7 +2927,16 @@ impl<'a> Lower<'a> {
                 return false;
             }
         };
-        let miss = self.exit_with(pc, &[item], INTERP);
+        let exit = self.exit_with(pc, &[item], INTERP);
+        // A local natively served instance's field (`dt.hour`; see
+        // `stdlib::datetime_native::leaf_field`) through [`h_field`] before
+        // the core loop.
+        let name = self.ext.name_objs.get(arg as usize);
+        let native = match (item, name) {
+            (Item::Local(_), Some(Object::Str(_))) => Some(self.b.create_block()),
+            _ => None,
+        };
+        let miss = native.unwrap_or(exit);
         let otag = self.tag_at(at);
         let not_inst = self
             .b
@@ -2778,6 +2985,21 @@ impl<'a> Lower<'a> {
             Item::Local(_) => {
                 // The receiver is the local's: the value just takes a copy.
                 self.copy_value(dst, v);
+                if let (Some(native), Some(name)) = (native, name) {
+                    let done = self.b.create_block();
+                    self.b.ins().jump(done, &[]);
+                    self.b.switch_to_block(native);
+                    let dst = self.slot_addr(slot);
+                    let name = self
+                        .b
+                        .ins()
+                        .iconst(self.ptr, std::ptr::from_ref(name) as i64);
+                    let r = self
+                        .call(h_field as *const () as usize, &[dst, at, name], true)
+                        .expect("returns");
+                    self.b.ins().brif(r, exit, &[], done, &[]);
+                    self.b.switch_to_block(done);
+                }
             }
             _ => {
                 // The receiver is the stack's: the value goes above it
