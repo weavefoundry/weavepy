@@ -10211,7 +10211,7 @@ impl Interpreter {
             #[cfg(feature = "jit")]
             if pc == 0 && !NATIVE {
                 if let Some(ext) = ext {
-                    ext.frame_jit.warm(code, ext, nlocals, 0);
+                    ext.frame_jit.warm(code, ext, nlocals, frame_jit::Heat::Call);
                 }
             }
             #[cfg(feature = "jit")]
@@ -11120,7 +11120,7 @@ impl Interpreter {
                         #[cfg(feature = "jit")]
                         if !NATIVE {
                             if let Some(ext) = ext {
-                                ext.frame_jit.warm(code, ext, nlocals, last);
+                                ext.frame_jit.warm(code, ext, nlocals, frame_jit::Heat::BackEdge(last));
                                 if ext.frame_jit.get(nlocals).is_some() {
                                     break Some(CoreExit::Switch);
                                 }

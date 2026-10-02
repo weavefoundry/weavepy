@@ -186,12 +186,10 @@ impl Slot {
         }
     }
 
-    /// Count one activation or back edge of code without native code,
-    /// compiling it once it is hot.
+    /// Count one activation, back edge or generator step of code without
+    /// native code, compiling it once it is hot.
     #[inline(always)]
-    /// Count a call (`at` 0) or a back edge (`at` its pc) toward
-    /// compiling `code`.
-    pub(crate) fn warm(&self, code: &CodeObject, ext: &CodeConstObjects, nlocals: usize, at: usize) {
+    pub(crate) fn warm(&self, code: &CodeObject, ext: &CodeConstObjects, nlocals: usize, at: Heat) {
         if self.native.get().is_some() {
             return;
         }
@@ -206,15 +204,17 @@ impl Slot {
 
     #[cold]
     #[inline(never)]
-    fn try_compile(&self, code: &CodeObject, ext: &CodeConstObjects, nlocals: usize, at: usize) {
+    fn try_compile(&self, code: &CodeObject, ext: &CodeConstObjects, nlocals: usize, at: Heat) {
         if !enabled() {
             let _ = self.native.set(None);
             return;
         }
         // Loops the tier-2 compiler may still take keep their back edges'
-        // consultation in the core loop.
+        // consultation in the core loop (a generator body the fast steps
+        // run never reaches it).
         let hint = &code.jit_hint;
-        if !(hint.is_not_jitable()
+        if !(matches!(at, Heat::Step)
+            || hint.is_not_jitable()
             || crate::tier2::jit_off_for_process()
             || hint.loop_free(code)
             || hint.is_backedge_quiet())
@@ -245,13 +245,24 @@ impl Slot {
     }
 }
 
-/// Whether the loop of `code` whose back edge is at `at` (any loop, for
-/// a call) runs mostly in native code: each
+/// What warmed a code object.
+#[derive(Clone, Copy)]
+pub(crate) enum Heat {
+    /// An activation.
+    Call,
+    /// The back edge at this pc.
+    BackEdge(usize),
+    /// A generator's fast step (see `gen_fast`).
+    Step,
+}
+
+/// Whether the loop of `code` that got hot (any loop, for a call or a
+/// generator step) runs mostly in native code: each
 /// instruction the core loop runs costs a round trip out of the native
 /// code and back, so a loop of calls and global loads gains nothing from
 /// compiling (nor does a loop-free body, whose entry costs as much as the
 /// little it would save).
-fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: usize) -> bool {
+fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool {
     use weavepy_compiler::OpCode;
     let ins = &code.instructions;
     // A method call on a local runs through a helper without leaving, when
@@ -268,9 +279,12 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: usize) -> bool
             }
         }
     }
-    let at_loop = ins.get(at).is_some_and(|i| i.op == OpCode::JumpBackward);
+    let at_loop = match at {
+        Heat::BackEdge(pc) => Some(pc).filter(|&pc| ins.get(pc).is_some_and(|i| i.op == OpCode::JumpBackward)),
+        Heat::Call | Heat::Step => None,
+    };
     ins.iter().enumerate().any(|(pc, i)| {
-        if i.op != OpCode::JumpBackward || (at_loop && pc != at) {
+        if i.op != OpCode::JumpBackward || at_loop.is_some_and(|at| pc != at) {
             return false;
         }
         let top = (pc + 1).saturating_sub(i.arg as usize);

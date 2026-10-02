@@ -378,7 +378,7 @@ impl Interpreter {
         let native = {
             let nlocals = locals.len();
             if ext.frame_jit.get(nlocals).is_none() {
-                ext.frame_jit.warm(code, ext, nlocals, 0);
+                ext.frame_jit.warm(code, ext, nlocals, crate::frame_jit::Heat::Step);
             }
             ext.frame_jit.get(nlocals)
         };
