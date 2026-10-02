@@ -68,7 +68,9 @@ struct SiteCall {
     gaps: u32,
 }
 
-/// Build the Cranelift function body for `tfunc` into `func`.
+/// Build the Cranelift function body for `tfunc` into `func`; `false` when
+/// the body assigned a local the write-back plan missed (the build must be
+/// discarded).
 pub(crate) fn build_function(
     func: &mut Function,
     fbctx: &mut FunctionBuilderContext,
@@ -76,15 +78,16 @@ pub(crate) fn build_function(
     ptr_ty: Type,
     self_func: Option<FuncRef>,
     leaves: Vec<LeafTarget>,
-) {
+) -> bool {
     let mut builder = FunctionBuilder::new(func, fbctx);
     let mut lc = Lowerer::new(&mut builder, tfunc, ptr_ty);
     lc.self_func = self_func;
     lc.leaves = leaves;
     lc.build();
-    lc.prune_writebacks();
+    let sound = !lc.unlisted_assignment;
     builder.seal_all_blocks();
     builder.finalize();
+    sound
 }
 
 struct Lowerer<'a, 'b> {
@@ -153,13 +156,64 @@ struct Lowerer<'a, 'b> {
     self_slow_sig: Option<SigRef>,
     /// Direct scalar-leaf call targets by token.
     leaves: Vec<LeafTarget>,
-    /// Per variable (by index), whether the body ever assigns it after
-    /// the entry loads it from the frame.
-    assigned: Vec<bool>,
-    /// Every local write-back store, by variable: a variable the body
-    /// never assigns still holds the frame's own value, so its stores are
-    /// dropped once the body is built (see [`Self::def_local`]).
-    writebacks: Vec<(Variable, cranelift_codegen::ir::Inst)>,
+    /// Per local slot, whether the body assigns it (see
+    /// [`assigned_slots`]): a local it never assigns still holds the
+    /// frame's own value, so exits and calls don't write it back.
+    assignable: Vec<bool>,
+    /// The slot each local's variable stands for, by variable index.
+    var_slots: Vec<u32>,
+    /// Set when the body assigned a local [`assigned_slots`] missed: the
+    /// build is then unsound and `build_function` reports it.
+    unlisted_assignment: bool,
+}
+
+/// Which local slots `tfunc`'s body assigns after the entry loads them:
+/// every operation and loop step that defines a local's variable (see
+/// [`Lowerer::def_local`], which checks the list).
+fn assigned_slots(tfunc: &TFunc) -> Vec<bool> {
+    let mut out = vec![false; tfunc.n_locals as usize];
+    let mut mark = |slot: u32| {
+        if let Some(a) = out.get_mut(slot as usize) {
+            *a = true;
+        }
+    };
+    for b in &tfunc.blocks {
+        for st in &b.stmts {
+            match st.op {
+                TOp::StoreLocal(slot)
+                | TOp::IterCapture {
+                    iter_slot: slot, ..
+                }
+                | TOp::DictIterNew { iter_slot: slot } => mark(slot),
+                _ => {}
+            }
+        }
+        match b.term {
+            TTerm::ForRange {
+                cur_slot, var_slot, ..
+            } => {
+                mark(cur_slot);
+                mark(var_slot);
+            }
+            TTerm::ForList {
+                idx_slot, var_slot, ..
+            } => {
+                mark(idx_slot);
+                mark(var_slot);
+            }
+            TTerm::ForIter { var_slot, .. } => mark(var_slot),
+            TTerm::ForIterPair {
+                var1_slot,
+                var2_slot,
+                ..
+            } => {
+                mark(var1_slot);
+                mark(var2_slot);
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
@@ -195,18 +249,24 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             self_sig: None,
             self_slow_sig: None,
             leaves: Vec::new(),
-            assigned: Vec::new(),
-            writebacks: Vec::new(),
+            assignable: Vec::new(),
+            var_slots: Vec::new(),
+            unlisted_assignment: false,
         }
     }
 
     /// Assign the managed local `var` (anything but its entry load).
     fn def_local(&mut self, var: Variable, v: Value) {
-        let i = var.index();
-        if self.assigned.len() <= i {
-            self.assigned.resize(i + 1, false);
+        let listed = self
+            .var_slots
+            .get(var.index())
+            .and_then(|&slot| self.assignable.get(slot as usize))
+            .copied()
+            .unwrap_or(false);
+        if !listed {
+            debug_assert!(false, "an assignment `assigned_slots` doesn't list");
+            self.unlisted_assignment = true;
         }
-        self.assigned[i] = true;
         self.b.def_var(var, v);
     }
 
@@ -319,6 +379,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
         // Declare + initialise a variable per managed local.
         self.vars = vec![None; self.tfunc.n_locals as usize];
+        self.assignable = assigned_slots(self.tfunc);
         for slot in 0..self.tfunc.local_types.len() {
             if let Some(ty) = self.tfunc.local_types[slot] {
                 let cl = Self::cl_ty(ty);
@@ -327,6 +388,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let v = self.b.ins().load(cl, trusted, self.locals_base, off);
                 self.b.def_var(var, v);
                 self.vars[slot] = Some(var);
+                if self.var_slots.len() <= var.index() {
+                    self.var_slots.resize(var.index() + 1, u32::MAX);
+                }
+                self.var_slots[var.index()] = slot as u32;
             }
         }
 
@@ -3114,11 +3179,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .iadd_imm(gbuf, i64::from(site) * i64::from(l.guard_size));
         let idx = self.b.ins().uload32(t, g, l.guard_split_idx);
         let none = self.b.ins().icmp_imm(IntCC::Equal, idx, i64::from(u32::MAX));
-        self.miss_if(none, miss);
         // The pin.
         let n = self.b.ins().load(types::I64, t, ctx, l.ctx_pins_len);
         let out = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, pin, n);
-        self.miss_if(out, miss);
+        let bad = self.b.ins().bor(none, out);
+        self.miss_if(bad, miss);
         let buf = self.b.ins().load(ptr, t, ctx, l.ctx_pins_ptr);
         let off = self.b.ins().imul_imm(pin, i64::from(l.pin_size));
         let p = self.b.ins().iadd(buf, off);
@@ -3184,10 +3249,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .iadd_imm(gbuf, i64::from(site) * i64::from(l.guard_size));
         let idx = self.b.ins().uload32(t, g, l.guard_split_idx);
         let none = self.b.ins().icmp_imm(IntCC::Equal, idx, i64::from(u32::MAX));
-        self.miss_if(none, miss);
         let n = self.b.ins().load(types::I64, t, ctx, l.ctx_pins_len);
         let out = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, pin, n);
-        self.miss_if(out, miss);
+        let bad = self.b.ins().bor(none, out);
+        self.miss_if(bad, miss);
         let buf = self.b.ins().load(ptr, t, ctx, l.ctx_pins_ptr);
         let off = self.b.ins().imul_imm(pin, i64::from(l.pin_size));
         let p = self.b.ins().iadd(buf, off);
@@ -4635,25 +4700,19 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     }
 
     /// Write back every managed local into the frame's locals buffer.
+    /// Store the locals the body assigns back to the frame (the others
+    /// still hold the values the entry loaded: reading one here would only
+    /// keep it live to every exit and call).
     fn writeback_locals(&mut self) {
         let trusted = MemFlags::trusted();
         for slot in 0..self.vars.len() {
             if let Some(var) = self.vars[slot] {
+                if !self.assignable.get(slot).copied().unwrap_or(true) {
+                    continue;
+                }
                 let v = self.b.use_var(var);
                 let off = (slot as i32) * 8;
-                let st = self.b.ins().store(trusted, v, self.locals_base, off);
-                self.writebacks.push((var, st));
-            }
-        }
-    }
-
-    /// Drop the write-backs of locals the body never assigns: the frame
-    /// already holds their values, and keeping each one live to every
-    /// exit only costs registers.
-    fn prune_writebacks(&mut self) {
-        for (var, st) in std::mem::take(&mut self.writebacks) {
-            if !self.assigned.get(var.index()).copied().unwrap_or(false) {
-                self.b.func.layout.remove_inst(st);
+                self.b.ins().store(trusted, v, self.locals_base, off);
             }
         }
     }

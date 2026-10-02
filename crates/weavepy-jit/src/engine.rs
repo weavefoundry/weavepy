@@ -591,7 +591,7 @@ impl JitEngine {
             }
         }
 
-        build_function(
+        let sound = build_function(
             &mut self.ctx.func,
             &mut self.fbctx,
             tfunc,
@@ -609,6 +609,13 @@ impl JitEngine {
                 })
                 .collect(),
         );
+        if !sound {
+            self.module.clear_context(&mut self.ctx);
+            return Err(JitVerdict::NotConverged);
+        }
+        if std::env::var_os("WEAVEPY_JIT_CLIF_DUMP").is_some() {
+            eprintln!("jit clif {name}:\n{}", self.ctx.func.display());
+        }
         if std::env::var_os("WEAVEPY_JIT_CLIF_STATS").is_some() {
             let f = &self.ctx.func;
             let insts: usize = f.layout.blocks().map(|b| f.layout.block_insts(b).count()).sum();
