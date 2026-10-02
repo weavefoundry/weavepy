@@ -453,6 +453,15 @@ struct CacheEntry {
     /// (it would observe the same frame state); other entries still
     /// do, with their own live values.
     probe_misses: Vec<u32>,
+    /// A compiled frame took a cold exit (see `CompiledFrame::cold_exits`):
+    /// the code after it was unsupported *with the values live when it was
+    /// compiled* (typically a later loop's receiver, still unbound when an
+    /// earlier loop triggered the compile). The next OSR request at a loop
+    /// header the frame can't enter recompiles from there, with that
+    /// loop's live values, at most [`COLD_RECOMPILE_BUDGET`] times.
+    recompile_at_osr: bool,
+    /// Recompiles taken for [`Self::recompile_at_osr`].
+    cold_recompiles: u8,
     /// Native side exits taken by this code's compiled frame. Healthy
     /// compiled code exits by *returning* (deopt is exceptional — a
     /// type-lane surprise or invalidated guard), so a frame that keeps
@@ -1024,6 +1033,8 @@ impl JitState {
                 native_entries: 0,
                 generic_dyn_calls: 0,
                 probe_misses: Vec::new(),
+                recompile_at_osr: false,
+                cold_recompiles: 0,
                 native: None,
                 method_native: None,
                 direct: None,
@@ -1034,7 +1045,22 @@ impl JitState {
                 // compile even when an individual activation is short.
                 entry.defer_osr = false;
             }
+            // A cold exit handed the activation to the interpreter, which
+            // now asks to enter a loop the frame can't: compile again from
+            // here (see `CacheEntry::recompile_at_osr`).
+            let recompile = entry.recompile_at_osr
+                && entry_pc != 0
+                && matches!(&entry.tier, Tier::Compiled(a)
+                    if !a.cf.osr_entries.iter().any(|e| e.pc == entry_pc));
+            if recompile {
+                entry.recompile_at_osr = false;
+                entry.cold_recompiles = entry.cold_recompiles.saturating_add(1);
+                entry.osr_failures = 0;
+                entry.tier = Tier::Cold;
+                entry.counter = entry.counter.max(self.threshold);
+            }
             match &entry.tier {
+                Tier::Cold if recompile => {}
                 Tier::Compiled(a) => {
                     let out = CompiledEntry {
                         cf: a.cf.clone(),
@@ -1749,6 +1775,8 @@ impl JitState {
             native_entries: 0,
             generic_dyn_calls: 0,
             probe_misses: Vec::new(),
+            recompile_at_osr: false,
+            cold_recompiles: 0,
             native: None,
             method_native: None,
             direct: None,
@@ -3445,6 +3473,8 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
             native_entries: 0,
             generic_dyn_calls: 0,
             probe_misses: Vec::new(),
+            recompile_at_osr: false,
+            cold_recompiles: 0,
             native: None,
             method_native: None,
             direct: None,
@@ -6447,6 +6477,12 @@ fn retire_native_driver(ctx: &CallCtx) {
     // the field docs).
     unsafe { (*ctx.code_ptr).jit_hint.mark_not_jitable() };
 }
+
+/// Recompiles one code object may take after cold exits (see
+/// `CacheEntry::recompile_at_osr`): one per later loop is the common
+/// shape (a function running several loops over containers it builds in
+/// turn), and the budget bounds compile cost for anything else.
+const COLD_RECOMPILE_BUDGET: u8 = 3;
 
 /// Generic native-callee calls one activation may make between two
 /// loop polls before its code retires (see [`charge_native_roundtrip`]).
@@ -12630,6 +12666,12 @@ fn note_native_exit(
         st.stats.native_entries += 1;
         if cold_exit {
             st.stats.cold_exits += 1;
+            let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
+            if let Some(ce) = st.cache.get_mut(&key) {
+                if ce.cold_recompiles < COLD_RECOMPILE_BUDGET {
+                    ce.recompile_at_osr = true;
+                }
+            }
             return;
         }
         if pin_pressure_exit {
