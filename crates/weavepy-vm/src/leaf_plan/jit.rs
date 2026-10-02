@@ -33,8 +33,12 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 use weavepy_compiler::{BinOpKind, CodeObject, CompareKind};
 
-/// Evaluations of a plan (per effect mode) before it is compiled.
-const WARM_RUNS: u32 = 64;
+/// Evaluations of a plan (per effect mode) before it is compiled. A
+/// compile costs millions of instructions and saves tens to hundreds per
+/// evaluation, so a plan compiles once interpreting it has cost about
+/// what compiling would (the rent-or-buy rule): a short run doesn't pay
+/// for code it never amortizes, and a long one loses little.
+const WARM_RUNS: u32 = 20_000;
 
 /// How deep callee plans are compiled in line.
 const INLINE_DEPTH: u8 = 2;
