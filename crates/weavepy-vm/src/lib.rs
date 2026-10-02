@@ -56135,6 +56135,8 @@ thread_local! {
     static SCALAR_FIELD_UPDATE_BOXED_RETURNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     #[cfg(feature = "jit")]
     static SCALAR_FIELD_UPDATE_NATIVE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    #[cfg(feature = "jit")]
+    static SCALAR_FIELD_UPDATE_ARMED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 
     static PURE_LITERAL_ARGUMENT_CALLS: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
     static PURE_SLOT_FIELD_READS: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
@@ -65977,7 +65979,9 @@ assert loop(2000) == 1999000
                     );
                     let native = SCALAR_FIELD_UPDATE_NATIVE_CALLS.with(std::cell::Cell::get);
                     let attempts = SCALAR_FIELD_UPDATE_ATTEMPTS.with(std::cell::Cell::get);
+                    let armed = SCALAR_FIELD_UPDATE_ARMED.with(std::cell::Cell::get);
                     run(&mut interp, &source);
+                    let armed = SCALAR_FIELD_UPDATE_ARMED.with(std::cell::Cell::get) - armed;
                     let native =
                         SCALAR_FIELD_UPDATE_NATIVE_CALLS.with(std::cell::Cell::get) - native;
                     eprintln!("Completed scalar field update {kind} calls: native {native}");
@@ -65986,7 +65990,15 @@ assert loop(2000) == 1999000
                     if crate::tier2::jit_off_for_process() {
                         assert_eq!(native, 0, "native entry requires JIT");
                         assert_eq!(attempts, 0, "interpreted calls use their ordinary path");
-                    } else if matches!(kind, "parameter" | "constant" | "default" | "alias") {
+                        assert_eq!(armed, 0, "in-line updates require JIT");
+                    } else if matches!(kind, "parameter" | "constant") {
+                        // The helper runs the update until it arms the
+                        // method entry; compiled code runs the rest in line.
+                        assert!(
+                            native > 100 || (armed > 0 && native > 0),
+                            "compiled {kind} native update coverage: {native} (armed {armed})"
+                        );
+                    } else if matches!(kind, "default" | "slots" | "alias") {
                         assert!(
                             native > 100,
                             "compiled {kind} native update coverage: {native}"
@@ -66014,15 +66026,20 @@ assert loop(2000) == 1999000
                     ),
                 ] {
                     let native = SCALAR_FIELD_UPDATE_NATIVE_CALLS.with(std::cell::Cell::get);
+                    let armed = SCALAR_FIELD_UPDATE_ARMED.with(std::cell::Cell::get);
                     run(
                         &mut interp,
                         &format!("__name__ = 'update_coverage'\n{fixture}\nbench({work})\n"),
                     );
                     let native =
                         SCALAR_FIELD_UPDATE_NATIVE_CALLS.with(std::cell::Cell::get) - native;
-                    eprintln!("Application {name} completed updates: native {native}");
+                    let armed = SCALAR_FIELD_UPDATE_ARMED.with(std::cell::Cell::get) - armed;
+                    eprintln!("Application {name} completed updates: native {native}, armed {armed}");
                     if name == "richards" && !crate::tier2::jit_off_for_process() {
-                        assert!(native > 100, "Richards native update coverage: {native}");
+                        assert!(
+                            native > 100 || (armed > 0 && native > 0),
+                            "Richards native update coverage: {native} (armed {armed})"
+                        );
                     }
                     if crate::tier2::jit_off_for_process() {
                         assert_eq!(native, 0, "{name} ordinary interpreter dispatch");

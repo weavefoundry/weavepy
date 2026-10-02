@@ -4473,6 +4473,8 @@ unsafe fn native_scalar_field_update(
         let (_, slot) = slots.get_index_mut(index as usize)?;
         // An exact integer owns no destructor or GC edge.
         *slot = Object::Int(value);
+        #[cfg(test)]
+        crate::SCALAR_FIELD_UPDATE_NATIVE_CALLS.with(|hits| hits.set(hits.get() + 1));
         return Some(value);
     }
     // SAFETY: no callback, allocation, or Python execution can overlap this
@@ -4534,6 +4536,8 @@ fn arm_update(entry: &MethodEntry, nc: &NativeCallee, receiver: &Object, argc: u
     // SAFETY: `Rc` is one pointer, compared and never dereferenced.
     u.code.set(unsafe { std::mem::transmute_copy::<Rc<CodeObject>, usize>(&entry.code) });
     u.idx.set(guard.split_idx);
+    #[cfg(test)]
+    crate::SCALAR_FIELD_UPDATE_ARMED.with(|armed| armed.set(armed.get() + 1));
 }
 
 /// Bind the slots a keyword call skipped (tagged [`SlotTag::Default`]
