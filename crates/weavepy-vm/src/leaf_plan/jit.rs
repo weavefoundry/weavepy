@@ -589,6 +589,10 @@ unsafe extern "C" fn h_subscr(ctx: *mut Ctx<'static>, ta: u64, pa: u64, tb: u64,
 }
 
 /// The evaluation's own `recv.name = val` (only the top frame stores).
+/// A store nothing after it can decline (`last`, decided when the plan
+/// compiled), with no store buffered before it, lands at once: the
+/// evaluation can no longer abandon it. Any other store is buffered for
+/// the return to commit.
 unsafe extern "C" fn h_store(
     ctx: *mut Ctx<'static>,
     tr: u64,
@@ -596,6 +600,7 @@ unsafe extern "C" fn h_store(
     tv: u64,
     pv: u64,
     pc_name: u32,
+    last: u32,
 ) -> u32 {
     // SAFETY: called by native code with its context.
     let c = unsafe { cx(ctx) };
@@ -603,6 +608,29 @@ unsafe extern "C" fn h_store(
         return 1;
     };
     let (pc, name) = (pc_name as u16, (pc_name >> 16) as u16);
+    if last != 0 && c.pend.n == 0 {
+        // SAFETY: as `norm`; the receiver is rooted by an argument or a
+        // field of one, and nothing has run since it was read. A handle
+        // of its own keeps it while the store runs (a field's slot may
+        // move when the store grows the instance holding it).
+        let inst = match unsafe { &*rp } {
+            Object::Instance(inst) => inst.clone(),
+            _ => return 1,
+        };
+        let Some(v) = super::to_object(value(tv, pv)) else {
+            return 1;
+        };
+        // SAFETY: the evaluation's own frame (its code is alive).
+        let (code, _, _) = unsafe { c.top.parts() };
+        // On `true` the value moved into the instance; a declined store
+        // touched nothing, and the evaluation declines whole.
+        let v = std::mem::ManuallyDrop::new(v);
+        if Interpreter::core_store_attr(code, &inst, usize::from(pc), u32::from(name), &v) {
+            return 0;
+        }
+        drop(std::mem::ManuallyDrop::into_inner(v));
+        return 1;
+    }
     match plan_store(
         c.args,
         &mut c.owned,
@@ -1889,14 +1917,25 @@ impl Lower<'_> {
                 let (tr, pr) = self.get(fl, recv);
                 let (tv, pv) = self.get(fl, val);
                 let pn = self.u32c(u32::from(pc) | u32::from(name) << 16);
+                let last = self.u32c(u32::from(Self::infallible_after(fl.plan, i)));
                 let st = self.call(
                     h_store as *const () as usize,
-                    &[self.ctx, tr, pr, tv, pv, pn],
+                    &[self.ctx, tr, pr, tv, pv, pn, last],
                 );
                 self.check(st);
             }
         }
         Some(true)
+    }
+
+    /// Whether nothing after op `i` can decline the evaluation: every
+    /// later op is a move, a constant, a return or a forward jump.
+    fn infallible_after(plan: &LeafPlan, i: usize) -> bool {
+        plan.ops.iter().enumerate().skip(i + 1).all(|(k, op)| match *op {
+            Op::Move { .. } | Op::Const { .. } | Op::Return { .. } => true,
+            Op::Jump { target } => usize::from(target) > k,
+            _ => false,
+        })
     }
 
     /// A `CALL` (op `i`): the callee its site last resolved in line behind

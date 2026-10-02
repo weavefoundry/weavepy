@@ -913,7 +913,7 @@ impl LeafRet {
 /// An owned object for a leaf value (the return value, a buffered
 /// store's value); `None` for the markers that are never values.
 #[inline(always)]
-fn to_object(v: V) -> Option<Object> {
+pub(super) fn to_object(v: V) -> Option<Object> {
     Some(match v {
         // SAFETY: as `norm` (an owned value is cloned before its holder
         // drops).
