@@ -253,15 +253,25 @@ struct GuardSnapshot {
     /// value epoch)` of the last full validation that held; all-zero
     /// until one has.
     last_ok: std::cell::Cell<(usize, u64, usize, u64, u64)>,
+    /// Callees whose defaults the compiled code may have burned in (a
+    /// direct leaf call that leaves parameters out): they must keep them.
+    defaults: Vec<Rc<PyFunction>>,
 }
 
 impl GuardSnapshot {
-    fn new(entries: Vec<(String, Object)>) -> Self {
+    fn new(entries: Vec<(String, Object)>, defaults: Vec<Rc<PyFunction>>) -> Self {
         Self {
             entries,
             last_ok: std::cell::Cell::new((0, 0, 0, 0, 0)),
+            defaults,
         }
     }
+}
+
+/// Whether `f.__defaults__` no longer is the tuple `f` was defined with.
+#[inline]
+fn defaults_overridden(f: &PyFunction) -> bool {
+    f.defaults_maybe_overridden() && f.slot("__defaults__").is_some()
 }
 
 impl std::ops::Deref for GuardSnapshot {
@@ -1267,16 +1277,39 @@ impl JitState {
             // A callee already compiled as a guard-free scalar leaf is
             // entered directly by native code (its identity is guarded
             // with the callee table like any burned-in callee).
+            // A site that leaves trailing parameters out binds the
+            // function's scalar defaults there (guarded through
+            // `GuardSnapshot::defaults`).
             let mut direct = |token: u32| {
                 let callees = callees.borrow();
-                let (Object::Function(_), fcode) = callees.get(token as usize)? else {
+                let (Object::Function(f), fcode) = callees.get(token as usize)? else {
                     return None;
                 };
                 let k = Rc::as_ptr(fcode).cast::<CodeObject>();
-                match &cache_ref.get(&k)?.tier {
-                    Tier::Compiled(a) => a.cf.direct_leaf(fcode.arg_count),
-                    _ => None,
+                let leaf = match &cache_ref.get(&k)?.tier {
+                    Tier::Compiled(a) => a.cf.direct_leaf(fcode.arg_count)?,
+                    _ => return None,
+                };
+                if f.defaults.is_empty() || defaults_overridden(f) {
+                    return Some(leaf);
                 }
+                let n = leaf.params().len();
+                let first = n.saturating_sub(f.defaults.len());
+                let defaults = (0..n)
+                    .map(|i| {
+                        let d = f.defaults.get((i + f.defaults.len()).checked_sub(n)?)?;
+                        let lane = leaf.params()[i];
+                        // `bool` is not `int` here (the lanes are exact).
+                        let exact = matches!(
+                            (lane, d),
+                            (JitType::Int, Object::Int(_))
+                                | (JitType::Float, Object::Float(_))
+                                | (JitType::Bool, Object::Bool(_))
+                        );
+                        (i >= first && exact).then(|| pack(d, lane)).flatten()
+                    })
+                    .collect();
+                Some(leaf.with_defaults(defaults))
             };
             ensure_obj_layout();
             let r = engine.compile_frame_direct(code, &mut classify, &mut jit_probes, &mut direct);
@@ -1374,10 +1407,23 @@ impl JitState {
                     }
                     let scalar_update =
                         scalar_field_update_plan(code, &cf, &attr_guards).map(Box::new);
+                    // Every callee whose defaults a direct leaf call could
+                    // have bound (see `direct` above).
+                    let burned_defaults = callees
+                        .iter()
+                        .filter_map(|(f, _)| match f {
+                            Object::Function(f)
+                                if !f.defaults.is_empty() && !defaults_overridden(f) =>
+                            {
+                                Some(f.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect();
                     let artifacts = StdRc::new(Artifacts {
                         cf: StdRc::new(cf),
                         scalar_update,
-                        snap: StdRc::new(GuardSnapshot::new(snap)),
+                        snap: StdRc::new(GuardSnapshot::new(snap, burned_defaults)),
                         callees: StdRc::new(callees),
                         obj_globals: StdRc::new(obj_globals),
                         attr_guards: StdRc::new(attr_guards),
@@ -3642,7 +3688,9 @@ fn guards_hold(
     {
         return false;
     }
-    (callees.is_empty() || callee_guards_hold(interp, callees)) && math.iter().all(MathGuard::holds)
+    (callees.is_empty() || callee_guards_hold(interp, callees))
+        && math.iter().all(MathGuard::holds)
+        && !guard_snapshot.defaults.iter().any(|f| defaults_overridden(f))
 }
 
 /// [`guards_hold`]'s globals, resolved name by name (and remembered as

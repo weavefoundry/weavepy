@@ -45,6 +45,26 @@ pub(crate) struct LeafTarget {
     pub n_locals: u32,
     pub max_stack: u32,
     pub params: Vec<JitType>,
+    /// Per parameter, the default a call that leaves it out binds.
+    pub defaults: Vec<Option<u64>>,
+}
+
+/// Where a direct leaf call takes one parameter from: the call's `j`th
+/// value (positionals, then keyword values), or a burned-in default.
+#[derive(Clone, Copy)]
+enum LeafArg {
+    Arg(usize),
+    Default(u64),
+}
+
+/// A `CallPy`/`CallPyKw` site's operands, for its ordinary call.
+#[derive(Clone, Copy)]
+struct SiteCall {
+    token: u32,
+    argc: u8,
+    kwc: u8,
+    perm: u32,
+    gaps: u32,
 }
 
 /// Build the Cranelift function body for `tfunc` into `func`.
@@ -1034,8 +1054,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             } => {
                 if is_self && self.self_func.is_some() {
                     self.emit_call_self(token, argc, ret, stmt.pc);
-                } else if let Some(ix) = self.leaf_for(token, argc) {
-                    self.emit_call_leaf(ix, token, argc, ret, stmt.pc);
+                } else if let Some((ix, from)) = self.leaf_for(token, argc, 0, 0) {
+                    let call = SiteCall {
+                        token,
+                        argc,
+                        kwc: 0,
+                        perm: 0,
+                        gaps: 0,
+                    };
+                    self.emit_call_leaf(ix, &from, call, ret, stmt.pc);
                 } else {
                     self.emit_call_py(token, argc, 0, 0, 0, ret, stmt.pc);
                 }
@@ -1047,7 +1074,20 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 perm,
                 gaps,
                 ret,
-            } => self.emit_call_py(token, argc, kwc, perm, gaps, ret, stmt.pc),
+            } => {
+                if let Some((ix, from)) = self.leaf_for(token, argc, kwc, perm) {
+                    let call = SiteCall {
+                        token,
+                        argc,
+                        kwc,
+                        perm,
+                        gaps,
+                    };
+                    self.emit_call_leaf(ix, &from, call, ret, stmt.pc);
+                } else {
+                    self.emit_call_py(token, argc, kwc, perm, gaps, ret, stmt.pc);
+                }
+            }
             TOp::ListGet { elem } => self.emit_list_get(elem, stmt.pc),
             TOp::ListSet => self.emit_list_set(stmt.pc),
             TOp::CellGet { idx, lane } => self.emit_cell_get(idx, lane, stmt.pc),
@@ -3854,28 +3894,50 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.vstack.push((v, ret));
     }
 
-    /// The direct leaf target of `token` when this site's argument lanes
-    /// are exactly the leaf's parameter lanes.
-    fn leaf_for(&self, token: u32, argc: u8) -> Option<usize> {
+    /// The direct leaf target of `token`, and where each of its
+    /// parameters comes from, when this site's `argc` positional and `kwc`
+    /// keyword values (keyword `j` binding slot `(perm >> 4j) & 0xF`) have
+    /// the leaf's parameter lanes and every parameter they leave out has a
+    /// default the leaf carries.
+    fn leaf_for(&self, token: u32, argc: u8, kwc: u8, perm: u32) -> Option<(usize, Vec<LeafArg>)> {
         let ix = self.leaves.iter().position(|l| l.token == token)?;
-        let base = self.vstack.len().checked_sub(argc as usize)?;
-        let lanes = self.vstack[base..].iter().map(|&(_, ty)| ty);
-        lanes
-            .eq(self.leaves[ix].params.iter().copied())
-            .then_some(ix)
+        let leaf = &self.leaves[ix];
+        let n = argc as usize + kwc as usize;
+        let base = self.vstack.len().checked_sub(n)?;
+        let mut from: Vec<Option<LeafArg>> = vec![None; leaf.params.len()];
+        for j in 0..n {
+            let slot = if j < argc as usize {
+                j
+            } else {
+                ((perm >> (4 * (j - argc as usize))) & 0xF) as usize
+            };
+            let at = from.get_mut(slot)?;
+            if at.is_some() || self.vstack[base + j].1 != leaf.params[slot] {
+                return None;
+            }
+            *at = Some(LeafArg::Arg(j));
+        }
+        let from = from
+            .iter()
+            .zip(&leaf.defaults)
+            .map(|(&f, &d)| f.or(d.map(LeafArg::Default)))
+            .collect::<Option<Vec<_>>>()?;
+        Some((ix, from))
     }
 
     /// Lower a direct call of a compiled scalar leaf (see [`LeafTarget`]):
     /// charge the activation through the self-call enter helper, fill the
-    /// leaf's `JitFrame` on this function's native stack frame, call it,
-    /// and release the charge. The leaf only computes, so when the enter
-    /// helper declines or the leaf deopts (an overflow, a zero divisor),
-    /// the ordinary call helper runs the call from the start.
-    fn emit_call_leaf(&mut self, ix: usize, token: u32, argc: u8, ret: JitType, pc: u32) {
+    /// leaf's `JitFrame` on this function's native stack frame (the
+    /// parameters from the call's values and the leaf's burned-in
+    /// defaults, per `from`), call it, and release the charge. The leaf
+    /// only computes, so when the enter helper declines or the leaf deopts
+    /// (an overflow, a zero divisor), the ordinary call helper runs the
+    /// call from the start.
+    fn emit_call_leaf(&mut self, ix: usize, from: &[LeafArg], call: SiteCall, ret: JitType, pc: u32) {
         let trusted = MemFlags::trusted();
         let (enter_addr, exit_addr, _) =
             runtime::self_call_helper_addrs().expect("checked by the engine");
-        let n = argc as usize;
+        let n = call.argc as usize + call.kwc as usize;
         let base = self.vstack.len() - n;
         let args: Vec<(Value, JitType)> = self.vstack[base..].to_vec();
         self.vstack.truncate(base);
@@ -3884,8 +3946,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
         let sig = self.self_sig();
         let enter = self.b.ins().iconst(self.ptr_ty, enter_addr as i64);
-        let call = self.b.ins().call_indirect(sig, enter, &[self.frame_ptr]);
-        let declined = self.b.inst_results(call)[0];
+        let c = self.b.ins().call_indirect(sig, enter, &[self.frame_ptr]);
+        let declined = self.b.inst_results(c)[0];
 
         let direct_b = self.b.create_block();
         let generic_b = self.b.create_block();
@@ -3936,11 +3998,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.b.ins().store(trusted, null, fp, OFF_CALL_ARGS);
         self.b.ins().store(trusted, null, fp, OFF_CALL_TAGS);
         for slot_ix in 0..n_locals {
-            let v = args.get(slot_ix as usize).map_or(zero64, |&(v, _)| v);
+            let v = match from.get(slot_ix as usize) {
+                Some(&LeafArg::Arg(j)) => args[j].0,
+                Some(&LeafArg::Default(bits)) => self.b.ins().iconst(types::I64, bits as i64),
+                None => zero64,
+            };
             self.b.ins().store(trusted, v, locals, slot_ix * 8);
         }
-        let call = self.b.ins().call(func, &[fp]);
-        let status = self.b.inst_results(call)[0];
+        let c = self.b.ins().call(func, &[fp]);
+        let status = self.b.inst_results(c)[0];
         let exit = self.b.ins().iconst(self.ptr_ty, exit_addr as i64);
         self.b.ins().call_indirect(sig, exit, &[self.frame_ptr]);
         let returned_b = self.b.create_block();
@@ -3959,7 +4025,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // Declined or deopted: the ordinary call, from the start.
         self.b.switch_to_block(generic_b);
         self.vstack.extend(args.iter().copied());
-        self.emit_call_py(token, argc, 0, 0, 0, ret, pc);
+        self.emit_call_py(call.token, call.argc, call.kwc, call.perm, call.gaps, ret, pc);
         let (v, _) = self.vstack.pop().expect("the call's result");
         self.b.ins().jump(join_b, &[v.into()]);
 

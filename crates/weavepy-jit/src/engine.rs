@@ -133,6 +133,26 @@ pub struct DirectLeaf {
     max_stack: u32,
     params: Vec<JitType>,
     ret: JitType,
+    /// Per parameter, the bits of the default a call that leaves it out
+    /// binds (in the parameter's lane), when the caller burns it in.
+    defaults: Vec<Option<u64>>,
+}
+
+impl DirectLeaf {
+    /// The lanes of the leaf's parameters.
+    #[must_use]
+    pub fn params(&self) -> &[JitType] {
+        &self.params
+    }
+
+    /// Let calls that leave parameters out bind `defaults` (per
+    /// parameter, the default's bits in its lane): the embedder guards
+    /// that they stay the function's defaults.
+    #[must_use]
+    pub fn with_defaults(mut self, defaults: Vec<Option<u64>>) -> Self {
+        self.defaults = defaults;
+        self
+    }
 }
 
 impl CompiledFrame {
@@ -168,6 +188,7 @@ impl CompiledFrame {
             func_id: self.func_id,
             n_locals: self.n_locals,
             max_stack: self.max_stack,
+            defaults: vec![None; params.len()],
             params,
             ret,
         })
@@ -530,20 +551,29 @@ impl JitEngine {
         let mut leaves: Vec<(u32, FuncRef, DirectLeaf)> = Vec::new();
         if runtime::self_call_helper_addrs().is_some() {
             for stmt in tfunc.blocks.iter().flat_map(|b| &b.stmts) {
-                let TOp::CallPy {
-                    token,
-                    argc,
-                    ret,
-                    is_self: false,
-                } = stmt.op
-                else {
-                    continue;
+                // A site that leaves parameters out binds the defaults the
+                // leaf carries (checked per site by the lowering).
+                let (token, argc, ret) = match stmt.op {
+                    TOp::CallPy {
+                        token,
+                        argc,
+                        ret,
+                        is_self: false,
+                    } => (token, argc, ret),
+                    TOp::CallPyKw {
+                        token,
+                        argc,
+                        kwc,
+                        ret,
+                        ..
+                    } => (token, argc + kwc, ret),
+                    _ => continue,
                 };
                 if leaves.iter().any(|(t, ..)| *t == token) {
                     continue;
                 }
                 if let Some(leaf) = direct(token) {
-                    if leaf.params.len() == argc as usize && leaf.ret == ret {
+                    if leaf.params.len() >= argc as usize && leaf.ret == ret {
                         let fref = self
                             .module
                             .declare_func_in_func(leaf.func_id, &mut self.ctx.func);
@@ -567,6 +597,7 @@ impl JitEngine {
                     n_locals: leaf.n_locals,
                     max_stack: leaf.max_stack,
                     params: leaf.params,
+                    defaults: leaf.defaults,
                 })
                 .collect(),
         );
