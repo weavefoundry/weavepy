@@ -63070,6 +63070,11 @@ const EXC_FAMILIES: [&str; 9] = [
     "UnicodeTranslateError",
 ];
 
+/// [`EXC_FAMILIES`] bits that Rust-side raise sites test directly.
+pub(crate) const EXC_FAM_STOP_ITERATION: u16 = 1 << 0;
+pub(crate) const EXC_FAM_SYNTAX_ERROR: u16 = 1 << 4;
+pub(crate) const EXC_FAM_IMPORT_ERROR: u16 = 1 << 5;
+
 /// `name`'s bit in an [`exc_family_flags`] set (`0` for a name that is
 /// not a family — never asked in practice).
 #[inline]
@@ -63082,7 +63087,7 @@ fn exc_family_bit(name: &str) -> u16 {
 
 /// Which exception families `cls` inherits from, memoised on the type
 /// against its attribute version (an MRO reshape bumps it).
-fn exc_family_flags(cls: &crate::types::TypeObject) -> u16 {
+pub(crate) fn exc_family_flags(cls: &crate::types::TypeObject) -> u16 {
     let ver = cls.attr_version.get();
     let memo = cls.exc_families.get();
     if memo & 1 != 0 && memo >> 11 == ver {

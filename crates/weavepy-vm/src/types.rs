@@ -2053,7 +2053,7 @@ fn slot_name_eq(stored: &str, name: &str) -> bool {
 /// The key for a newly populated slot `name`. The slots every raise
 /// populates (`args`, `__traceback__`, the chaining links) share one
 /// interned key each instead of allocating a string per exception.
-fn slot_key(name: &str) -> DictKey {
+pub(crate) fn slot_key(name: &str) -> DictKey {
     const COMMON: [&str; 6] = [
         "args",
         "__traceback__",
