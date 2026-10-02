@@ -13706,38 +13706,33 @@ impl Interpreter {
         let [obj, spec] = ops else {
             return None;
         };
-        // One class with no `__instancecheck__` of its own; `None` when
-        // the full call must decide (an instance whose class doesn't
-        // match may still claim the class through `__class__`).
-        let check = |cls: &Rc<TypeObject>| -> Option<bool> {
+        // One class, or a flat tuple of them (`isinstance(x, (str, int))`
+        // asks each in turn).
+        let classes: &[Object] = match spec {
+            Object::Type(_) => std::slice::from_ref(spec),
+            Object::Tuple(items) if items.len() <= 8 => items,
+            _ => return None,
+        };
+        let mut hit = false;
+        for cls in classes {
+            let Object::Type(cls) = cls else {
+                return None;
+            };
             if !cls.metaclass_is_type() {
                 return None;
             }
-            match obj {
-                Object::Instance(inst) => inst.cls_raw().is_subclass_of(cls).then_some(true),
-                Object::File(_) => None,
-                obj => Some(builtins::class_of(obj).is_subclass_of(cls)),
-            }
-        };
-        let r = match spec {
-            Object::Type(cls) => check(cls)?,
-            // A tuple of plain classes, matched in order.
-            Object::Tuple(items) => {
-                let mut found = false;
-                for item in items.iter() {
-                    let Object::Type(cls) = item else {
-                        return None;
-                    };
-                    if check(cls)? {
-                        found = true;
-                        break;
-                    }
-                }
-                found
-            }
-            _ => return None,
-        };
-        Some(Ok(Object::Bool(r)))
+            hit |= match obj {
+                // A miss on an instance is left to the full check, which
+                // also consults `__class__`.
+                Object::Instance(inst) => inst.cls_raw().is_subclass_of(cls),
+                Object::File(_) => return None,
+                obj => builtins::class_of(obj).is_subclass_of(cls),
+            };
+        }
+        if !hit && matches!(obj, Object::Instance(_)) {
+            return None;
+        }
+        Some(Ok(Object::Bool(hit)))
     }
 
     /// The `(function, has_self, effective argc)` of a plain-function
