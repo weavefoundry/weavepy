@@ -178,5 +178,82 @@ class InlineMethodTests(unittest.TestCase):
         self.assertEqual(c.n, self.N + 50)
 
 
+class Slotted:
+    __slots__ = ("n", "m")
+
+    def __init__(self):
+        self.n = 0
+        self.m = 0
+
+    def tick(self):
+        self.n += 1
+        return self.n
+
+    def bump(self, by):
+        self.m += by
+        return self.m
+
+
+class SlottedUpdateTests(unittest.TestCase):
+    N = 3000
+
+    def test_updates(self):
+        s = Slotted()
+        self.assertEqual(tick_loop(s, self.N), triangle(1, self.N))
+        self.assertEqual(bump_loop(s, self.N), triangle(2, self.N))
+        self.assertEqual((s.n, s.m), (self.N, 2 * self.N))
+
+    def test_deleted_slot(self):
+        s = Slotted()
+        self.assertEqual(tick_loop(s, self.N), triangle(1, self.N))
+        del s.n
+        with self.assertRaises(AttributeError):
+            tick_loop(s, 1)
+        s.n = 5
+        self.assertEqual(tick_loop(s, 2), 6 + 7)
+
+    def test_slot_value_types(self):
+        s = Slotted()
+        self.assertEqual(bump_loop(s, self.N), triangle(2, self.N))
+        s.m = 0.25
+        self.assertEqual(bump_loop(s, 2), 2.25 + 4.25)
+        s.m = sys.maxsize
+        self.assertEqual(bump_loop(s, 1), sys.maxsize + 2)
+        s.m = "x"
+        with self.assertRaises(TypeError):
+            bump_loop(s, 1)
+
+    def test_class_replaces_the_slot(self):
+        class S:
+            __slots__ = ("n",)
+
+            def __init__(self):
+                self.n = 0
+
+            def tick(self):
+                self.n += 1
+                return self.n
+
+        s = S()
+        self.assertEqual(tick_loop(s, self.N), triangle(1, self.N))
+        slot = S.n
+        seen = []
+        S.n = property(lambda self: 100, lambda self, v: seen.append(v))
+        self.assertEqual(tick_loop(s, 2), 200)
+        self.assertEqual(seen, [101, 101])
+        S.n = slot
+        self.assertEqual(tick_loop(s, 1), self.N + 1)
+
+    def test_subclass_with_dict(self):
+        class D(Slotted):
+            pass
+
+        d = D()
+        self.assertEqual(tick_loop(d, self.N), triangle(1, self.N))
+        d.tick = lambda: -1
+        self.assertEqual(tick_loop(d, 3), -3)
+        self.assertEqual(tick_all([Slotted(), D(), Slotted()], 5), [5, 5, 5])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2755,9 +2755,12 @@ fn attr_site_guard(
         return None;
     }
     let stable_descriptor = site.store
-        && matches!(storage, AttrStorage::Indexed(_))
         && scalar_field_update_shape(&frame.code)
-        && scalar_update_class_value_stable(&recv, &site.name, ver);
+        && match storage {
+            AttrStorage::Indexed(_) => scalar_update_class_value_stable(&recv, &site.name, ver),
+            AttrStorage::Slot(_) => scalar_update_slot_stable(&recv, &site.name, ver),
+            AttrStorage::NewKey => false,
+        };
     let split_idx = match &recv {
         Object::Instance(inst) => split_index(&inst.cls(), storage, &site.name),
         _ => u32::MAX,
@@ -4150,6 +4153,23 @@ fn scalar_update_class_value_stable(receiver: &Object, name: &str, ver: u64) -> 
                     | Object::Complex(_)
             )
         )
+        && cls.attr_version.get() == ver
+}
+
+/// [`scalar_update_class_value_stable`] for a `__slots__` member: the
+/// class value is the member's own slot descriptor, which has no hooks a
+/// class mutation wouldn't version.
+fn scalar_update_slot_stable(receiver: &Object, name: &str, ver: u64) -> bool {
+    if crate::object::exotic_str_keys_possible() {
+        return false;
+    }
+    let Object::Instance(inst) = receiver else {
+        return false;
+    };
+    let cls = inst.cls();
+    cls.native_kind.get() == 0
+        && super::Interpreter::default_getattribute(&cls)
+        && matches!(cls.lookup(name), Some(Object::SlotDescriptor(sd)) if sd.name == name)
         && cls.attr_version.get() == ver
 }
 
