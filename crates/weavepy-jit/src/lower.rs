@@ -3164,6 +3164,86 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.b.ins().iadd_imm(at, i64::from(l.split_values))
     }
 
+    /// The address the new-key store at `site` appends its field to, in
+    /// the pinned instance `pin`'s split values (see
+    /// [`runtime::ObjLayout`]), having counted it in: an ordinary instance
+    /// pin whose class still has the guard's version, whose values are
+    /// split over its class's names, unborrowed and exclusive, hold exactly
+    /// the names before the guard's index and have room for one more, with
+    /// no dict watcher active. Anything else branches to `miss` before
+    /// anything is written.
+    fn split_append_addr(&mut self, l: &runtime::ObjLayout, pin: Value, site: u32, miss: Block) -> Value {
+        let t = MemFlags::trusted();
+        let ptr = self.ptr_ty;
+        let ctx = self.b.ins().load(ptr, t, self.frame_ptr, OFF_CTX);
+        let guards = self.b.ins().load(ptr, t, ctx, l.ctx_guards);
+        let gbuf = self.b.ins().load(ptr, t, guards, l.guards_buf);
+        let g = self
+            .b
+            .ins()
+            .iadd_imm(gbuf, i64::from(site) * i64::from(l.guard_size));
+        let idx = self.b.ins().uload32(t, g, l.guard_split_idx);
+        let none = self.b.ins().icmp_imm(IntCC::Equal, idx, i64::from(u32::MAX));
+        self.miss_if(none, miss);
+        let n = self.b.ins().load(types::I64, t, ctx, l.ctx_pins_len);
+        let out = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, pin, n);
+        self.miss_if(out, miss);
+        let buf = self.b.ins().load(ptr, t, ctx, l.ctx_pins_ptr);
+        let off = self.b.ins().imul_imm(pin, i64::from(l.pin_size));
+        let p = self.b.ins().iadd(buf, off);
+        let ptag = self.b.ins().uload8(types::I32, t, p, l.pin_tag);
+        let otag = self.b.ins().uload8(types::I32, t, p, l.pin_obj);
+        let not_obj = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, ptag, i64::from(l.pin_obj_tag));
+        let not_inst = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, otag, i64::from(l.tag_instance));
+        let bad = self.b.ins().bor(not_obj, not_inst);
+        self.miss_if(bad, miss);
+        let inst = self.b.ins().load(ptr, t, p, l.pin_obj + 8);
+        let ver = self.b.ins().load(types::I64, t, g, l.guard_ver);
+        let cls = self.b.ins().load(ptr, t, inst, l.inst_class);
+        let cver = self.b.ins().load(types::I64, t, cls, l.type_attr_version);
+        let lazy = self.b.ins().load(ptr, t, inst, l.inst_dict_lazy);
+        let body = self.b.ins().load(ptr, t, inst, l.inst_c_body);
+        let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+        let shared = self.b.ins().uload8(types::I64, t, flag, 0);
+        let watchers = self.b.ins().iconst(ptr, l.dict_watchers as i64);
+        let watchers = self.b.ins().uload8(types::I64, t, watchers, 0);
+        let borrow = self.b.ins().sload32(t, inst, l.inst_split_borrow);
+        let block = self.b.ins().load(ptr, t, inst, l.inst_split_block);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, cver, ver);
+        let busy = self.b.ins().icmp_imm(IntCC::NotEqual, borrow, 0);
+        let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
+        let other = self.b.ins().bor(lazy, body);
+        let other = self.b.ins().bor(other, shared);
+        let other = self.b.ins().bor(other, watchers);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+        let bad = self.b.ins().bor(stale, busy);
+        let bad = self.b.ins().bor(bad, empty);
+        let bad = self.b.ins().bor(bad, other);
+        self.miss_if(bad, miss);
+        let keys = self.b.ins().load(ptr, t, block, l.split_keys);
+        let ckeys = self.b.ins().load(ptr, t, cls, l.type_shared_keys);
+        let len = self.b.ins().uload32(t, block, l.split_len);
+        let cap = self.b.ins().uload32(t, block, l.split_cap);
+        let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
+        let elsewhere = self.b.ins().icmp(IntCC::NotEqual, idx, len);
+        let full = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, len, cap);
+        let bad = self.b.ins().bor(foreign, elsewhere);
+        let bad = self.b.ins().bor(bad, full);
+        self.miss_if(bad, miss);
+        let len1 = self.b.ins().iadd_imm(len, 1);
+        let len1 = self.b.ins().ireduce(types::I32, len1);
+        self.b.ins().store(t, len1, block, l.split_len);
+        let off = self.b.ins().ishl_imm(idx, 4);
+        let at = self.b.ins().iadd(block, off);
+        self.b.ins().iadd_imm(at, i64::from(l.split_values))
+    }
+
     /// The pinned list `pin`'s items (buffer pointer and length; and its
     /// capacity, and where the length lives, for an append): a list pin
     /// whose element lane is one of `lanes`, unborrowed (`read`) or
@@ -3396,8 +3476,29 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             (Some(l), JitType::Int | JitType::Float | JitType::Bool) => Some(*l),
             _ => None,
         };
+        let new_key = self
+            .tfunc
+            .attr_sites
+            .get(site as usize)
+            .is_some_and(|s| s.new_key);
         let mut done = None;
-        if let Some(l) = inline {
+        if let (Some(l), true) = (inline, new_key) {
+            // The constructor pattern: a fresh instance's next field.
+            let miss = self.b.create_block();
+            let stored = self.b.create_block();
+            let addr = self.split_append_addr(&l, pin, site, miss);
+            let (tag, off, v) = match lane {
+                JitType::Int => (l.tag_int, 8, val),
+                JitType::Float => (l.tag_float, 8, val),
+                _ => (l.tag_bool, 1, self.b.ins().ireduce(types::I8, val)),
+            };
+            let tagv = self.b.ins().iconst(types::I8, i64::from(tag));
+            self.b.ins().store(trusted, tagv, addr, 0);
+            self.b.ins().store(trusted, v, addr, off);
+            self.b.ins().jump(stored, &[]);
+            self.b.switch_to_block(miss);
+            done = Some(stored);
+        } else if let Some(l) = inline {
             let miss = self.b.create_block();
             let stored = self.b.create_block();
             let addr = self.split_field_addr(&l, pin, site, miss, false);

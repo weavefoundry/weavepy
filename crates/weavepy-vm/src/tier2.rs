@@ -2785,9 +2785,23 @@ fn attr_site_guard(
 
 /// [`AttrGuard::split_idx`] for an indexed site of `cls`: the index, when
 /// the class's shared names hold `name` there (they never move).
+///
+/// A new-key site's is the name's position among its class's shared names
+/// (compiled code appends the field there, in line, while a fresh instance
+/// sets its fields in the class's order).
 fn split_index(cls: &TypeObject, storage: AttrStorage, name: &str) -> u32 {
-    let AttrStorage::Indexed(i) = storage else {
-        return u32::MAX;
+    let i = match storage {
+        AttrStorage::Indexed(i) => i,
+        AttrStorage::NewKey if cls.native_kind.get() == 0 => {
+            let Some(keys) = cls.shared_keys.get() else {
+                return u32::MAX;
+            };
+            match u32::try_from(keys.names_before(name, crate::object::py_str_hash(name))) {
+                Ok(i) => i,
+                Err(_) => return u32::MAX,
+            }
+        }
+        _ => return u32::MAX,
     };
     match cls.shared_keys.get().and_then(|keys| keys.get(i as usize)) {
         Some(DictKey(Object::Str(s))) if &**s == name => i,
@@ -2868,6 +2882,19 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
     let cls_arc = word(arc_p, inst_class);
     if cls_arc + arc_data != Rc::as_ptr(&cls) as usize {
         return None;
+    }
+    // The native body's word: a `Cell<usize>` alone in its wrapper,
+    // checked on a sample.
+    let inst_c_body = arc_data + std::mem::offset_of!(PyInstance, c_body);
+    {
+        let sample = crate::types::CBody::default();
+        sample.set(0x5eed_c0de);
+        if std::mem::size_of::<crate::types::CBody>() != 8
+            || word(std::ptr::from_ref(&sample).cast::<u8>(), 0) != 0x5eed_c0de
+            || word(arc as *const u8, inst_c_body) != inst.c_body.get()
+        {
+            return None;
+        }
     }
     let type_attr_version = arc_data + std::mem::offset_of!(TypeObject, attr_version);
     let type_shared_keys = arc_data
@@ -3001,6 +3028,8 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
         type_shared_keys: i32_of(type_shared_keys)?,
         split_keys: i32_of(SplitValues::KEYS_OFFSET)?,
         split_len: i32_of(SplitValues::LEN_OFFSET)?,
+        split_cap: i32_of(SplitValues::CAP_OFFSET)?,
+        inst_c_body: i32_of(inst_c_body)?,
         split_values: i32_of(SplitValues::VALUES_OFFSET)?,
         cells_unguarded: crate::sync::cells_unguarded_flag() as usize,
         pin_list_tag,
@@ -4986,26 +5015,47 @@ unsafe fn try_native_call(
         })
     };
 
-    // The common return: a scalar in the expected lane from a callee that
-    // ran no Python. Nothing needs revalidating.
-    if status == JitStatus::Returned
-        && njf.ret_tag == expect_tag
-        && !child.dirty
-        && matches!(
-            SlotTag::from_raw(expect_tag),
-            SlotTag::Int | SlotTag::Float | SlotTag::Bool | SlotTag::None
-        )
-    {
-        note_callee_exit(&nc.art, &nc.code, &child);
-        if !inline_bufs {
-            put_u64(u64_buf);
-            put_u32(u32_buf);
+    // The common returns, from a callee that ran no Python (nothing needs
+    // revalidating): a scalar in the expected lane, or `None` or an
+    // instance on the object lane where the site takes `None` (the
+    // procedure shape) or an object.
+    if status == JitStatus::Returned && !child.dirty {
+        let expect = SlotTag::from_raw(expect_tag);
+        let ret = if njf.ret_tag == expect_tag
+            && matches!(expect, SlotTag::Int | SlotTag::Float | SlotTag::Bool | SlotTag::None)
+        {
+            Some(njf.ret_bits)
+        } else if njf.ret_tag == SlotTag::ObjPin as u32 && njf.ret_bits == u64::MAX {
+            // `None`.
+            match expect {
+                SlotTag::None => Some(0),
+                SlotTag::ObjPin => Some(u64::MAX),
+                _ => None,
+            }
+        } else if njf.ret_tag == SlotTag::ObjPin as u32 && expect == SlotTag::ObjPin {
+            // An instance pins into this activation's table (a method
+            // returning `self` finds its existing pin).
+            match child.pins.get(njf.ret_bits as usize) {
+                Some(Pin::Obj(v @ Object::Instance(_))) => {
+                    pin_reusing(v, &mut ctx.pins, &mut ctx.pin_memo)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(bits) = ret {
+            note_callee_exit(&nc.art, &nc.code, &child);
+            if !inline_bufs {
+                put_u64(u64_buf);
+                put_u32(u32_buf);
+            }
+            child.pins.clear();
+            ctx.child = Some(child);
+            jf.ret_bits = bits;
+            jf.ret_tag = expect_tag;
+            return Some(CallStatus::Ok as i64);
         }
-        child.pins.clear();
-        ctx.child = Some(child);
-        jf.ret_bits = njf.ret_bits;
-        jf.ret_tag = njf.ret_tag;
-        return Some(CallStatus::Ok as i64);
     }
     // SAFETY: as above; the buffers are the ones the callee ran on.
     let status = unsafe {

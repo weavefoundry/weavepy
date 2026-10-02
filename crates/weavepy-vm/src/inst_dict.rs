@@ -239,6 +239,7 @@ impl SplitValues {
     pub(crate) const BLOCK_OFFSET: usize = std::mem::offset_of!(Self, block);
     pub(crate) const KEYS_OFFSET: usize = std::mem::offset_of!(SplitHeader, keys);
     pub(crate) const LEN_OFFSET: usize = std::mem::offset_of!(SplitHeader, len);
+    pub(crate) const CAP_OFFSET: usize = std::mem::offset_of!(SplitHeader, cap);
     pub(crate) const VALUES_OFFSET: usize = std::mem::size_of::<SplitHeader>();
 
     #[inline]

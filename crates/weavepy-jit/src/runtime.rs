@@ -194,11 +194,15 @@ pub struct ObjLayout {
     /// names' pointer.
     pub type_attr_version: i32,
     pub type_shared_keys: i32,
-    /// A split block → its names' pointer, its length (`u32`) and its
-    /// first value.
+    /// A split block → its names' pointer, its length and capacity
+    /// (`u32`s) and its first value.
     pub split_keys: i32,
     pub split_len: i32,
+    pub split_cap: i32,
     pub split_values: i32,
+    /// An instance value's payload pointer → its native body's pointer
+    /// (a word; zero for an ordinary instance).
+    pub inst_c_body: i32,
     /// The byte that is nonzero once cells are shared between threads.
     pub cells_unguarded: usize,
     /// A list pin: its discriminant byte's value, where the list pointer
