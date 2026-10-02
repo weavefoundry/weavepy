@@ -2341,6 +2341,19 @@ pub fn track_built(obj: &Object) {
     }
 }
 
+/// [`track`] for a fresh list, dict or set its builder knows holds only
+/// atomic values (a `list(range(..))`): such a container is deferred
+/// whatever it holds, so the element scan [`container_can_cycle`] would
+/// make first is skipped.
+pub fn track_inert(obj: &Object) {
+    debug_assert!(!container_can_cycle(obj));
+    with_state(|s| {
+        if !s.defer_container(obj) {
+            s.track_now(obj);
+        }
+    });
+}
+
 /// `counter += n` (wrapping) for a collector counter: a plain load and
 /// store while the GIL serializes every writer, a locked read-modify-write
 /// only in free-threaded mode.

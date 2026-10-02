@@ -3615,6 +3615,8 @@ impl CallCtx {
 /// code-rebindable; a swap invalidates arity/lane assumptions), and
 /// each burned-in math intrinsic's `name.attr` still resolves to the
 /// snapshotted function (RFC 0069 WS2 — module dicts are mutable).
+/// In line up to the namespaces' stamps, which settle the common case.
+#[inline]
 fn guards_hold(
     interp: &super::Interpreter,
     globals: &Rc<GilRefCell<DictData>>,
@@ -3635,16 +3637,38 @@ fn guards_hold(
         // A rebinding in place leaves the stamps alone (see `STORE_GLOBAL`).
         crate::object::global_value_epoch(),
     );
-    if guard_snapshot.last_ok.get() != key || interp.globals_missing_any.get() {
-        for (name, expected) in guard_snapshot.entries.iter() {
-            let ok = resolve_plain_dicts(interp, globals, builtins, name)
-                .is_some_and(|cur| cur.is_same(expected));
-            if !ok {
-                return false;
-            }
-        }
-        guard_snapshot.last_ok.set(key);
+    if (guard_snapshot.last_ok.get() != key || interp.globals_missing_any.get())
+        && !global_guards_hold(interp, globals, builtins, guard_snapshot, key)
+    {
+        return false;
     }
+    (callees.is_empty() || callee_guards_hold(interp, callees)) && math.iter().all(MathGuard::holds)
+}
+
+/// [`guards_hold`]'s globals, resolved name by name (and remembered as
+/// holding at `key` when they do).
+#[inline(never)]
+fn global_guards_hold(
+    interp: &super::Interpreter,
+    globals: &Rc<GilRefCell<DictData>>,
+    builtins: &Rc<GilRefCell<DictData>>,
+    guard_snapshot: &GuardSnapshot,
+    key: (usize, u64, usize, u64, u64),
+) -> bool {
+    for (name, expected) in guard_snapshot.entries.iter() {
+        let ok = resolve_plain_dicts(interp, globals, builtins, name)
+            .is_some_and(|cur| cur.is_same(expected));
+        if !ok {
+            return false;
+        }
+    }
+    guard_snapshot.last_ok.set(key);
+    true
+}
+
+/// [`guards_hold`]'s burned-in callees.
+#[inline(never)]
+fn callee_guards_hold(interp: &super::Interpreter, callees: &CalleeTable) -> bool {
     for (f, code_snap) in callees {
         match f {
             Object::Function(pf) => {
@@ -3674,11 +3698,6 @@ fn guards_hold(
                 }
             }
             _ => return false,
-        }
-    }
-    for guard in math {
-        if !guard.holds() {
-            return false;
         }
     }
     true
@@ -4651,9 +4670,11 @@ unsafe fn try_native_call(
     // callee whatever its shape. A tiny *method* that stores — the
     // attribute fixtures' `tick` — is not, and its loop keeps its
     // native lane.
-    if crate::code_is_pure_leaf_pub(&nc.code)
-        || (recv.is_none() && nc.code.instructions.len() <= TINY_CALLEE_OPS)
-    {
+    let pure_leaf = match nc.code.jit_hint.pure_leaf() {
+        Some(known) => known,
+        None => crate::code_is_pure_leaf_pub(&nc.code),
+    };
+    if pure_leaf || (recv.is_none() && nc.code.instructions.len() <= TINY_CALLEE_OPS) {
         ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
     }
     // The framed native call below is itself expensive (buffers, pins, a
@@ -4741,11 +4762,104 @@ unsafe fn try_native_call(
     let (locals_buf, rest) = u64s.split_at_mut(n_locals);
     let (spill, call_args) = rest.split_at_mut(cap);
     let (tags, call_tags) = u32s.split_at_mut(cap);
-    // The cached child's (drained) pin table keeps its capacity.
-    let mut pins: PinTable = match ctx.child.as_deref_mut() {
-        Some(c) => std::mem::take(&mut c.pins),
-        None => Vec::new(),
+    let callee_key = Rc::as_ptr(&nc.code).cast::<CodeObject>();
+    // The callee's context: this activation's cached child when it was
+    // built for this very callee (same code, artifact tables and
+    // namespaces — the child holds those handles, so pointer identity
+    // is sound), else a fresh one. Reuse resets only the per-activation
+    // state; the handles and resolved tables carry over (stale tables
+    // re-resolve on demand, as for any long-lived activation).
+    let reusable = ctx.child.as_deref().is_some_and(|c| {
+        c.code_ptr == callee_key
+            && StdRc::ptr_eq(&c.callees, &nc.callees)
+            && StdRc::ptr_eq(&c.guard_snapshot, &nc.snap)
+            && Rc::ptr_eq(&c.globals, &nc.func.globals)
+            && Rc::ptr_eq(&c.builtins, &nc.func.builtins)
+    });
+    let mut child: Box<CallCtx> = if reusable {
+        let mut c = ctx.child.take().expect("checked above");
+        // (A previous call left `parked`/`raised` empty.)
+        if !c.const_pins.is_empty() {
+            c.const_pins.clear();
+        }
+        c.pin_pressure_exit = false;
+        if !c.obj_global_pins.is_empty() {
+            c.obj_global_pins.clear();
+        }
+        c.cf = StdRc::as_ptr(&nc.cf);
+        c.dirty = false;
+        c.interp_calls = 0;
+        c.dyn_py_calls = 0;
+        c.native_calls = 0;
+        c.polls = 0;
+        c
+    } else {
+        // Self-recursion reuses this activation's own tables. An immutable
+        // compilation with no call tokens needs no resolution, even when
+        // another function compiles and advances the cache generation.
+        // Nonempty tables retain the generation-checked cache lookup.
+        let (native, method_native) = if callee_key == ctx.code_ptr {
+            (ctx.native.clone(), ctx.method_native.clone())
+        } else {
+            (
+                if nc.callees.is_empty() {
+                    None
+                } else {
+                    resolved_native_table(callee_key)
+                },
+                if nc.methods.is_empty() {
+                    None
+                } else {
+                    resolved_method_native_table(callee_key)
+                },
+            )
+        };
+        let table_gen = if callee_key == ctx.code_ptr {
+            ctx.table_gen
+        } else {
+            current_compile_gen()
+        };
+        Box::new(CallCtx {
+            interp: ctx.interp,
+            callees: nc.callees.clone(),
+            cf: StdRc::as_ptr(&nc.cf),
+            guard_snapshot: nc.snap.clone(),
+            globals: nc.func.globals.clone(),
+            builtins: nc.func.builtins.clone(),
+            // Native callees are cell-free by `py_callee_ok`.
+            cells: crate::object::empty_cells(),
+            parked: None,
+            raised: None,
+            const_pins: Vec::new(),
+            pins: Vec::new(),
+            entry_pin_count: 0,
+            pin_pressure_exit: false,
+            obj_globals: nc.obj_globals.clone(),
+            obj_global_pins: Vec::new(),
+            attr_guards: nc.attr_guards.clone(),
+            methods: nc.methods.clone(),
+            math: nc.math.clone(),
+            dirty: false,
+            interp_calls: 0,
+            dyn_py_calls: 0,
+            native_calls: 0,
+            polls: 0,
+            child: None,
+            depth_cell: ctx.depth_cell,
+            code_ptr: callee_key,
+            native,
+            method_native,
+            table_gen,
+            // The native call lanes push no interpreter frame for the
+            // callee — keep it observable to callee-side stack walkers.
+            frameless_code: Some(nc.code.clone()),
+            dyn_callee: None,
+            pin_memo: [u32::MAX; PIN_MEMO],
+        })
     };
+    // The callee's pins: the receiver, then the arguments' objects (the
+    // reused child's drained table keeps its capacity).
+    let pins = &mut child.pins;
     if !pins.is_empty() {
         pins.clear();
     }
@@ -4807,104 +4921,7 @@ unsafe fn try_native_call(
             _ => 0,
         };
     }
-    let entry_pin_count = pins.len();
-    let callee_key = Rc::as_ptr(&nc.code).cast::<CodeObject>();
-    // The callee's context: this activation's cached child when it was
-    // built for this very callee (same code, artifact tables and
-    // namespaces — the child holds those handles, so pointer identity
-    // is sound), else a fresh one. Reuse resets only the per-activation
-    // state; the handles and resolved tables carry over (stale tables
-    // re-resolve on demand, as for any long-lived activation).
-    let reusable = ctx.child.as_deref().is_some_and(|c| {
-        c.code_ptr == callee_key
-            && StdRc::ptr_eq(&c.callees, &nc.callees)
-            && StdRc::ptr_eq(&c.guard_snapshot, &nc.snap)
-            && Rc::ptr_eq(&c.globals, &nc.func.globals)
-            && Rc::ptr_eq(&c.builtins, &nc.func.builtins)
-    });
-    let mut child: Box<CallCtx> = if reusable {
-        let mut c = ctx.child.take().expect("checked above");
-        // (A previous call left `parked`/`raised` empty.)
-        if !c.const_pins.is_empty() {
-            c.const_pins.clear();
-        }
-        c.pins = pins;
-        c.entry_pin_count = entry_pin_count;
-        c.pin_pressure_exit = false;
-        if !c.obj_global_pins.is_empty() {
-            c.obj_global_pins.clear();
-        }
-        c.cf = StdRc::as_ptr(&nc.cf);
-        c.dirty = false;
-        c.interp_calls = 0;
-        c.dyn_py_calls = 0;
-        c.native_calls = 0;
-        c.polls = 0;
-        c
-    } else {
-        // Self-recursion reuses this activation's own tables. An immutable
-        // compilation with no call tokens needs no resolution, even when
-        // another function compiles and advances the cache generation.
-        // Nonempty tables retain the generation-checked cache lookup.
-        let (native, method_native) = if callee_key == ctx.code_ptr {
-            (ctx.native.clone(), ctx.method_native.clone())
-        } else {
-            (
-                if nc.callees.is_empty() {
-                    None
-                } else {
-                    resolved_native_table(callee_key)
-                },
-                if nc.methods.is_empty() {
-                    None
-                } else {
-                    resolved_method_native_table(callee_key)
-                },
-            )
-        };
-        let table_gen = if callee_key == ctx.code_ptr {
-            ctx.table_gen
-        } else {
-            current_compile_gen()
-        };
-        Box::new(CallCtx {
-            interp: ctx.interp,
-            callees: nc.callees.clone(),
-            cf: StdRc::as_ptr(&nc.cf),
-            guard_snapshot: nc.snap.clone(),
-            globals: nc.func.globals.clone(),
-            builtins: nc.func.builtins.clone(),
-            // Native callees are cell-free by `py_callee_ok`.
-            cells: crate::object::empty_cells(),
-            parked: None,
-            raised: None,
-            const_pins: Vec::new(),
-            pins,
-            entry_pin_count,
-            pin_pressure_exit: false,
-            obj_globals: nc.obj_globals.clone(),
-            obj_global_pins: Vec::new(),
-            attr_guards: nc.attr_guards.clone(),
-            methods: nc.methods.clone(),
-            math: nc.math.clone(),
-            dirty: false,
-            interp_calls: 0,
-            dyn_py_calls: 0,
-            native_calls: 0,
-            polls: 0,
-            child: None,
-            depth_cell: ctx.depth_cell,
-            code_ptr: callee_key,
-            native,
-            method_native,
-            table_gen,
-            // The native call lanes push no interpreter frame for the
-            // callee — keep it observable to callee-side stack walkers.
-            frameless_code: Some(nc.code.clone()),
-            dyn_callee: None,
-            pin_memo: [u32::MAX; PIN_MEMO],
-        })
-    };
+    child.entry_pin_count = child.pins.len();
     child.interp = ctx.interp;
     let nctx: &mut CallCtx = &mut child;
     let mut njf = JitFrame {
@@ -5902,13 +5919,20 @@ unsafe extern "C" fn wpjit_self_slow(
 /// interpreter calls is a thin native driver around them. Each such call pays pin
 /// traffic, an activation shell and a generic call that the interpreter's
 /// inline call path avoids, so the callee retires to tier-1.
-#[inline]
+#[inline(always)]
 fn note_callee_exit(art: &Artifacts, code: &Rc<CodeObject>, child: &CallCtx) {
     let entries = art.callee_entries.get().saturating_add(1);
     art.callee_entries.set(entries);
-    if child.dyn_py_calls == 0 {
-        return;
+    if child.dyn_py_calls != 0 {
+        note_callee_roundtrips(art, code, child, entries);
     }
+}
+
+/// [`note_callee_exit`] for an activation that made interpreter
+/// round-trips, out of line.
+#[cold]
+#[inline(never)]
+fn note_callee_roundtrips(art: &Artifacts, code: &Rc<CodeObject>, child: &CallCtx, entries: u32) {
     let trips = art
         .callee_roundtrips
         .get()
@@ -7837,7 +7861,13 @@ unsafe extern "C" fn wpjit_list_from_range(frame: *mut JitFrame, start: i64, sto
     let items: Vec<Object> = (start..start + len).map(Object::Int).collect();
     let list = Rc::new(crate::sync::RefCell::new(items));
     let obj = Object::List(list.clone());
-    crate::gc_trace::track(&obj);
+    // A short list of integers can't close a cycle (a long one is
+    // registered without the scan as well).
+    if len <= 32 {
+        crate::gc_trace::track_inert(&obj);
+    } else {
+        crate::gc_trace::track(&obj);
+    }
     if crate::stdlib::tracemalloc_real::is_tracking() {
         crate::stdlib::tracemalloc_real::track_new_object(&obj);
     }
