@@ -9616,6 +9616,14 @@ unsafe fn call_dyn_impl(
             return status;
         }
     }
+    // A keyword call of a warm pure leaf evaluates frameless on its
+    // marshaled values (no Python runs, so nothing needs revalidating).
+    if kwc > 0 {
+        // SAFETY: per the function contract — same live buffers.
+        if let Some(v) = unsafe { dyn_kw_pure_leaf(jf, ctx, interp, &callee, argc, kwc, names) } {
+            return dyn_leaf_result(jf, ctx, v, int_result);
+        }
+    }
     // A keyword call of a plain function whose site carries the
     // interpreter's `CallPyKwNames` permutation binds through it, as the
     // `CALL_KW` handler's hit does: no name strings, no generic binder.
@@ -9743,6 +9751,86 @@ unsafe fn dyn_call_result(
             CallStatus::Boxed as i64
         }
     }
+}
+
+/// A dynamic keyword call of a warm pure-leaf function (or a bound method
+/// over one), evaluated frameless on the marshaled operands through the
+/// call site's `CallPyKwNames` permutation (see
+/// [`super::Interpreter::kw_pure_leaf_call`]): its result, or `None`
+/// having done nothing observable.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`]; the call site's pc is in
+/// `jf.deopt_pc` (stored before every call helper runs).
+unsafe fn dyn_kw_pure_leaf(
+    jf: &JitFrame,
+    ctx: &CallCtx,
+    interp: &super::Interpreter,
+    callee: &Object,
+    argc: u32,
+    kwc: u32,
+    names: u32,
+) -> Option<Object> {
+    const MAX: usize = 9;
+    // SAFETY: per the function contract, the activation keeps its code
+    // object alive.
+    let code = unsafe { &*ctx.code_ptr };
+    let Some(Object::Tuple(name_items)) = crate::code_const_objects(code).get(names as usize)
+    else {
+        return None;
+    };
+    let (f, recv) = match callee {
+        Object::Function(f) => (f, None),
+        Object::BoundMethod(bm) if !bm.redispatch_descriptor => match &bm.function {
+            Object::Function(f) => (f, Some(&bm.receiver)),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let n = (argc + kwc) as usize;
+    let eff_argc = argc as usize + usize::from(recv.is_some());
+    if n + usize::from(recv.is_some()) > MAX || name_items.len() != kwc as usize {
+        return None;
+    }
+    let mut vals: [Object; MAX] = std::array::from_fn(|_| Object::None);
+    let offset = usize::from(recv.is_some());
+    if let Some(r) = recv {
+        vals[0] = r.clone();
+    }
+    for j in 0..n {
+        // SAFETY: native code wrote `argc + kwc` entries, and the buffers
+        // are `max_call_args` wide.
+        let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
+        vals[offset + j] = unpack_pins(bits, tag, &ctx.pins);
+    }
+    interp.kw_pure_leaf_call(
+        code,
+        jf.deopt_pc as usize,
+        f,
+        name_items,
+        &vals[..offset + n],
+        eff_argc,
+        ctx.depth_cell,
+    )
+}
+
+/// Deliver a pure leaf's result at a dynamic call site: it ran no Python,
+/// so the activation's guards still hold.
+fn dyn_leaf_result(jf: &mut JitFrame, ctx: &mut CallCtx, v: Object, int_result: bool) -> i64 {
+    if int_result {
+        if let Object::Int(value) = &v {
+            jf.ret_bits = *value as u64;
+            jf.ret_tag = SlotTag::Int as u32;
+            return CallStatus::Ok as i64;
+        }
+    } else if let Some(bits) = pin_any(v.clone(), &mut ctx.pins) {
+        jf.ret_bits = bits;
+        jf.ret_tag = SlotTag::ObjPin as u32;
+        return CallStatus::Ok as i64;
+    }
+    ctx.parked = Some(v);
+    CallStatus::Boxed as i64
 }
 
 /// Bind a dynamic keyword call's marshaled operands for a plain function

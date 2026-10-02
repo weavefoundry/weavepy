@@ -14493,6 +14493,104 @@ impl Interpreter {
         self.pure_leaf_eval::<false, false>(code_rc, f, &args[..arity])
     }
 
+    /// A tier-2 keyword call (the `CALL_KW` at `pc` of `caller`) of the warm
+    /// pure leaf `f`, bound straight onto the evaluation's argument list:
+    /// `vals` holds the positional run (a bound receiver first) and then
+    /// the keyword values in call order, `names` the keywords. The site's
+    /// `CallPyKwNames` permutation places them, as [`Self::core_pure_kw_call`]
+    /// does for the interpreter. Its result, or `None` having done nothing
+    /// observable.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn kw_pure_leaf_call(
+        &self,
+        caller: &CodeObject,
+        pc: usize,
+        f: &Rc<crate::object::PyFunction>,
+        names: &[Object],
+        vals: &[Object],
+        eff_argc: usize,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<Object> {
+        use weavepy_compiler::InlineCache as IC;
+        let IC::CallPyKwNames {
+            func_id,
+            perm,
+            argc: ca,
+            kwc: ck,
+        } = caller.caches.get(pc as u32)
+        else {
+            return None;
+        };
+        let kwc = names.len();
+        if ca as usize != eff_argc
+            || ck as usize != kwc
+            || vals.len() != eff_argc + kwc
+            || !fn_is_pure_leaf(f)
+            || !vals.iter().all(Self::core_droppable)
+        {
+            return None;
+        }
+        // SAFETY: GIL-serialized raw read of the function's code cell; the
+        // caller keeps the function alive across the evaluation.
+        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        if !code_is_pure_leaf(code_rc) || !pure_leaf_warm(code_rc) || !Self::leaf_code_ok(code_rc) {
+            return None;
+        }
+        let (_, covered) =
+            Self::kw_names_bind_cached(caller, pc, f, func_id, perm, names, eff_argc)?;
+        // The ordinary call's `RecursionError` check.
+        // SAFETY: this thread's own depth cell.
+        if unsafe { (*depth_cell).get() } >= crate::recursion::recursion_limit() {
+            return None;
+        }
+        // A pure leaf has no keyword-only parameters; its `**kwargs`
+        // dictionary, if any, follows the positional ones.
+        let total = code_rc.arg_count as usize;
+        let arity = leaf_arity(code_rc);
+        if arity > 8 {
+            return None;
+        }
+        let mut args: [*const Object; 8] = [std::ptr::null(); 8];
+        for (k, o) in vals[..eff_argc].iter().enumerate() {
+            args[k] = o;
+        }
+        // The `**kwargs` dictionary is built where it lives: no move of a
+        // filled table into its cell.
+        let varkw = code_rc.has_varkeywords.then(|| {
+            Object::Dict(Rc::new(RefCell::new(DictData::with_capacity_and_hasher(
+                kwc,
+                crate::fasthash::FxBuildHasher,
+            ))))
+        });
+        for (j, o) in vals[eff_argc..].iter().enumerate() {
+            let slot = ((perm >> (4 * j)) & 0xF) as usize;
+            if slot == specialize::KW_TO_VARKW as usize {
+                // The bind check proved the callee collects it.
+                let Some(Object::Dict(d)) = &varkw else {
+                    return None;
+                };
+                d.borrow_mut()
+                    .insert(DictKey(names.get(j)?.clone()), o.clone());
+                continue;
+            }
+            if slot >= total {
+                return None;
+            }
+            args[slot] = o;
+        }
+        for (slot, arg) in args.iter_mut().enumerate().take(total).skip(eff_argc) {
+            if covered & (1 << slot) == 0 {
+                *arg = f
+                    .defaults
+                    .get(f.defaults.len().checked_sub(total - slot)?)?;
+            }
+        }
+        if let Some(d) = &varkw {
+            args[total] = d;
+        }
+        self.pure_leaf_eval::<false, false>(code_rc, f, &args[..arity])
+    }
+
     /// A keyword call's parameters, bound as `kw_names_fill_locals` leaves
     /// them in `locals` (a `**kwargs` dictionary included), evaluated
     /// frameless when `f` is a warm pure leaf: its result, or `None`

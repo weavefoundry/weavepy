@@ -611,13 +611,27 @@ impl JitEngine {
             );
         }
 
+        let stats = std::env::var_os("WEAVEPY_JIT_CLIF_STATS").is_some();
+        if stats {
+            drop(cranelift_codegen::timing::take_current());
+        }
+        let t0 = stats.then(std::time::Instant::now);
         self.module
             .define_function(id, &mut self.ctx)
             .map_err(|_| JitVerdict::NotConverged)?;
+        let t1 = stats.then(std::time::Instant::now);
         self.module.clear_context(&mut self.ctx);
         self.module
             .finalize_definitions()
             .map_err(|_| JitVerdict::NotConverged)?;
+        if let (Some(t0), Some(t1)) = (t0, t1) {
+            eprintln!(
+                "jit define {name}: {:?}, finalize {:?}\n{}",
+                t1 - t0,
+                t1.elapsed(),
+                cranelift_codegen::timing::take_current()
+            );
+        }
 
         let code_ptr = self.module.get_finalized_function(id);
         // SAFETY: `code_ptr` is a finalized function with exactly the
