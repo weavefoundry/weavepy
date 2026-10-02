@@ -19,7 +19,6 @@ use crate::fasthash::FxHashMap;
 use crate::object::{DictData, DictKey, Object, StrKey};
 use crate::sync::{Rc, RefCell};
 use crate::types::{PyInstance, TypeObject};
-use std::collections::hash_map::Entry;
 
 const FRAME_TARGET: usize = 65_536;
 const MAX_DEPTH: usize = 128;
@@ -126,7 +125,7 @@ struct ClassPlan {
 struct Encoder<'a> {
     writer: Framer,
     // Memo positions by object identity.
-    memo: FxHashMap<i64, u32>,
+    memo: MemoTable,
     // Pins prevent another thread's container mutation from releasing an
     // already memoized value and reusing its address during this operation.
     // While one thread owns every object, nothing else can mutate the graph,
@@ -144,6 +143,120 @@ struct Encoder<'a> {
     slot_name_caches: Vec<(Rc<TypeObject>, Vec<Object>)>,
     // An empty vector for the next instance's slot state.
     spare_slots: Vec<(Object, Object)>,
+}
+
+/// The memo: memo positions by object identity (an address, never 0), in an
+/// open-addressing table with linear probing. Each entry records the
+/// generation of the call that wrote it, so the next call clears the table
+/// by starting a new generation.
+#[derive(Default)]
+struct MemoTable {
+    entries: Vec<MemoEntry>,
+    len: usize,
+    generation: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct MemoEntry {
+    id: i64,
+    index: u32,
+    generation: u32,
+}
+
+impl MemoTable {
+    const MIN_CAPACITY: usize = 64;
+
+    /// The first slot to probe for `id`, in a table of `capacity` slots (a
+    /// power of two): a multiplicative hash spreads aligned addresses.
+    #[inline]
+    fn home(id: i64, capacity: usize) -> usize {
+        let hash = (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (hash >> (64 - capacity.trailing_zeros())) as usize
+    }
+
+    #[inline]
+    fn get(&self, id: i64) -> Option<u32> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let mask = self.entries.len() - 1;
+        let mut slot = Self::home(id, self.entries.len());
+        loop {
+            let entry = &self.entries[slot];
+            if entry.generation != self.generation {
+                return None;
+            }
+            if entry.id == id {
+                return Some(entry.index);
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    /// `id`'s memo position, or else the slot at which to insert it. Makes
+    /// room for one more entry first; `None` only when that fails.
+    #[inline]
+    fn find(&mut self, id: i64) -> Option<Result<u32, usize>> {
+        if (self.len + 1) * 2 > self.entries.len() {
+            self.grow()?;
+        }
+        let mask = self.entries.len() - 1;
+        let mut slot = Self::home(id, self.entries.len());
+        loop {
+            let entry = &self.entries[slot];
+            if entry.generation != self.generation {
+                return Some(Err(slot));
+            }
+            if entry.id == id {
+                return Some(Ok(entry.index));
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    /// Insert at a slot that [`Self::find`] returned.
+    #[inline]
+    fn insert(&mut self, slot: usize, id: i64, index: u32) {
+        self.entries[slot] = MemoEntry {
+            id,
+            index,
+            generation: self.generation,
+        };
+        self.len += 1;
+    }
+
+    #[cold]
+    fn grow(&mut self) -> Option<()> {
+        if self.generation == 0 {
+            // A fresh table: generation 0 marks every slot empty.
+            self.generation = 1;
+        }
+        let capacity = (self.entries.len() * 2).max(Self::MIN_CAPACITY);
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(capacity).ok()?;
+        entries.resize(capacity, MemoEntry::default());
+        let old = std::mem::replace(&mut self.entries, entries);
+        let mask = capacity - 1;
+        for entry in old.into_iter().filter(|e| e.generation == self.generation) {
+            let mut slot = Self::home(entry.id, capacity);
+            while self.entries[slot].generation == self.generation {
+                slot = (slot + 1) & mask;
+            }
+            self.entries[slot] = entry;
+        }
+        Some(())
+    }
+
+    /// Empty the table, keeping its storage.
+    fn clear(&mut self) {
+        self.len = 0;
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            // The generations wrapped: every stale entry must go.
+            self.entries.fill(MemoEntry::default());
+            self.generation = 1;
+        }
+    }
 }
 
 /// `id(value)` for the kinds of value the encoder memoizes.
@@ -165,11 +278,12 @@ fn identity(value: &Object) -> i64 {
 
 impl Encoder<'_> {
     fn next_index(&self) -> Option<u32> {
-        u32::try_from(self.memo.len())
+        u32::try_from(self.memo.len)
             .ok()?
             .checked_add(self.anonymous)
     }
 
+    #[inline]
     fn pin(&mut self, value: &Object) -> Option<()> {
         if let Some(pins) = &mut self.pins {
             pins.try_reserve(1).ok()?;
@@ -181,8 +295,9 @@ impl Encoder<'_> {
     /// MEMOIZE for `value`, just written, whose identity is `id`.
     fn memoize(&mut self, value: &Object, id: i64) -> Option<()> {
         let index = self.next_index()?;
-        self.memo.try_reserve(1).ok()?;
-        self.memo.insert(id, index);
+        if let Err(slot) = self.memo.find(id)? {
+            self.memo.insert(slot, id, index);
+        }
         self.pin(value)?;
         self.writer.write(&[0x94])
     }
@@ -197,16 +312,14 @@ impl Encoder<'_> {
         write: impl FnOnce(&mut Framer) -> Option<()>,
     ) -> Option<bool> {
         let next = self.next_index()?;
-        self.memo.try_reserve(1).ok()?;
-        match self.memo.entry(id) {
-            Entry::Occupied(entry) => {
-                let index = *entry.get();
+        match self.memo.find(id)? {
+            Ok(index) => {
                 self.get(index)?;
                 Some(true)
             }
-            Entry::Vacant(entry) => {
+            Err(slot) => {
                 write(&mut self.writer)?;
-                entry.insert(next);
+                self.memo.insert(slot, id, next);
                 self.pin(value)?;
                 self.writer.write(&[0x94])?;
                 Some(false)
@@ -283,8 +396,8 @@ impl Encoder<'_> {
         if self.active.contains(&id) {
             return None;
         }
-        match self.memo.get(&id) {
-            Some(&index) => self.get(index).map(|()| true),
+        match self.memo.get(id) {
+            Some(index) => self.get(index).map(|()| true),
             None => Some(false),
         }
     }
@@ -539,14 +652,22 @@ impl Encoder<'_> {
         if !plan.slot_names.is_empty() {
             let storage = instance.slots.borrow();
             slots.try_reserve_exact(plan.slot_names.len()).ok()?;
-            for name in &plan.slot_names {
+            for (index, name) in plan.slot_names.iter().enumerate() {
                 let Object::Str(text) = name else {
                     return None;
                 };
                 let repeated = slots
                     .iter()
                     .any(|(seen, _)| matches!(seen, Object::Str(seen) if seen == text));
-                if let (false, Some(value)) = (repeated, storage.get(text)) {
+                if repeated {
+                    continue;
+                }
+                // Storage usually holds the slots in declaration order.
+                let value = match storage.get_index(index) {
+                    Some((DictKey(Object::Str(stored)), value)) if stored == text => Some(value),
+                    _ => storage.get(text),
+                };
+                if let Some(value) = value {
                     slots.push((name.clone(), value.clone()));
                 }
             }
@@ -586,7 +707,7 @@ impl Encoder<'_> {
         self.writer.commit(false);
         let value = Object::Type(class.clone());
         let id = identity(&value);
-        if let Some(&index) = self.memo.get(&id) {
+        if let Some(index) = self.memo.get(id) {
             return self.get(index);
         }
         self.save(&plan.module, depth + 1)?;
@@ -760,7 +881,7 @@ fn encode_with_context(
         Some(())
     })();
     let mut memo = std::mem::take(&mut encoder.memo);
-    if memo.capacity() <= MAX_SPARE_MEMO {
+    if memo.entries.len() <= MAX_SPARE_MEMO {
         memo.clear();
         SPARE_MEMO.with(|spare| spare.set(Some(memo)));
     }
@@ -774,7 +895,7 @@ const MAX_SPARE_MEMO: usize = 1 << 14;
 const MAX_OUTPUT_HINT: usize = 1 << 20;
 
 thread_local! {
-    static SPARE_MEMO: std::cell::Cell<Option<FxHashMap<i64, u32>>> =
+    static SPARE_MEMO: std::cell::Cell<Option<MemoTable>> =
         const { std::cell::Cell::new(None) };
     static OUTPUT_HINT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
