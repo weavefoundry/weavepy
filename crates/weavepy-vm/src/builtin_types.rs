@@ -1536,12 +1536,8 @@ fn exc_slot_readonly(name: &str, class_name: &str, default: Object) -> Object {
 /// applied by an old pickle, or `self.args = …` in a shadowing
 /// `__init__` that ran before the class descriptor was reachable).
 pub(crate) fn exc_attr(inst: &crate::types::PyInstance, name: &str) -> Option<Object> {
-    inst.slot_get(name).or_else(|| {
-        inst.dict_cell()
-            .borrow()
-            .get(&crate::object::StrKey(name))
-            .cloned()
-    })
+    // Read without publishing a `__dict__` the instance never needed.
+    inst.slot_get(name).or_else(|| inst.attr_get_str(name))
 }
 
 /// Construct an exception instance of `class_name` with `message` as

@@ -486,7 +486,12 @@ fn py_frame_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
 /// test_ssl.test_handshake_timeout_handler_leak).
 fn py_traceback_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
     let Object::Traceback(tb) = obj else { return };
-    visit(&Object::Frame(tb.frame.clone()));
+    // A lazy entry's activation is still running (its locals are roots
+    // the collector reaches through the spine); materializing here would
+    // only add a frame object for the traversal to find.
+    if let Some(frame) = tb.frame_if_ready() {
+        visit(&Object::Frame(frame));
+    }
     if let Ok(next) = tb.next.try_borrow() {
         if let Some(n) = next.as_ref() {
             visit(&Object::Traceback(n.clone()));
@@ -3314,7 +3319,7 @@ impl Interpreter {
             let mut cur = Some(tb);
             while let Some(node) = cur {
                 entries.push(crate::error::TracebackEntry {
-                    code: node.frame.code.clone(),
+                    code: node.code(),
                     lineno: node.lineno,
                 });
                 cur = node.next.borrow().clone();
@@ -4489,6 +4494,10 @@ impl Interpreter {
                     if let Some(py) = shell.materialized.borrow().as_ref() {
                         py.lasti.set(at);
                     }
+                } else if let Some(exit) = &quiet_exit {
+                    // Likewise the shell a lazy traceback entry will
+                    // materialize from (see `pop_frame_shell`).
+                    Self::sync_lazy_tb_lasti(Some(&shell), &frame.code, exit);
                 }
                 match quiet_exit {
                     Some(QuietExit::Yield) => continue,
@@ -5035,35 +5044,7 @@ impl Interpreter {
                 Ok(StepOutcome::StartGenerator) => break Ok(FrameOutcome::StartGenerator),
                 Err(err) => {
                     if let RuntimeError::PyException(mut exc) = err {
-                        // CPython's `_PyErr_SetObject` chains *every*
-                        // fresh exception — including ones raised from C
-                        // (here: Rust opcodes and builtins) — to the
-                        // currently handled exception. `RAISE_VARARGS`
-                        // already did this at the raise site
-                        // (`context_settled`); a fresh Rust-raised error
-                        // has empty traceback and unset context/cause.
-                        if !exc.context_settled
-                            && exc.context.is_none()
-                            && exc.cause.is_none()
-                            && exc.traceback.is_empty()
-                            && !exc.suppress_tb_once
-                            && !instance_has_nonnull_attr(&exc.instance, "__context__")
-                        {
-                            self.attach_implicit_context(&mut exc);
-                            if exc.context.is_some() {
-                                Self::sync_exc_attrs(&exc);
-                            }
-                        } else if exc.traceback.is_empty()
-                            && (exc.cause.is_some() || exc.context.is_some())
-                        {
-                            // A fresh Rust-raised error that already carries an
-                            // explicit `cause`/`context` (e.g. `_io` chaining a
-                            // misbehaving raw `readinto`'s `TypeError` into an
-                            // `OSError`, `test_bad_readinto_type`) must still
-                            // mirror those onto the instance dict so Python's
-                            // `except` sees `e.__cause__`.
-                            Self::sync_exc_attrs(&exc);
-                        }
+                        self.chain_fresh_exception(&mut exc);
                         // CPython's RERAISE fires the separate RERAISE
                         // monitoring event, which `sys.settrace` does
                         // *not* subscribe to — only fresh raises
@@ -5435,6 +5416,7 @@ impl Interpreter {
             lasti: std::sync::atomic::AtomicU32::new(frame.pc),
             has_materialized: std::sync::atomic::AtomicBool::new(materialized.is_some()),
             materialized: RefCell::new(materialized),
+            tb_refs: std::sync::atomic::AtomicU32::new(0),
         });
         self.frame_stack.borrow_mut().push(shell.clone());
         shell
@@ -5606,6 +5588,7 @@ impl Interpreter {
             on_stack: Cell::new(0),
             extra_locals: RefCell::new(None),
             cleared: Cell::new(false),
+            lazy_back: RefCell::new(None),
         })
     }
 
@@ -5961,7 +5944,80 @@ impl Interpreter {
         }
     }
 
+    /// A quiet loop leaves its shell's `lasti` behind the instruction it
+    /// stopped on. A lazy traceback entry materializes from the shell
+    /// once the activation leaves the spine (see `pop_frame_shell`), so
+    /// bring it current for the frame object's final `f_lineno`.
+    /// A `RERAISE` leaves the restored raise site there itself (PEP 626).
+    #[inline]
+    fn sync_lazy_tb_lasti(
+        shell: Option<&crate::object::FrameShell>,
+        code: &CodeObject,
+        exit: &QuietExit,
+    ) {
+        if let (Some(shell), QuietExit::Outcome { cur_pc, stepped }) = (shell, exit) {
+            if shell.tb_refs.load(std::sync::atomic::Ordering::Relaxed) != 0
+                && !(stepped.is_err()
+                    && code
+                        .instructions
+                        .get(*cur_pc)
+                        .is_some_and(|i| i.op == OpCode::Reraise))
+            {
+                shell
+                    .lasti
+                    .store(*cur_pc as u32, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Materialize the departing top activation for the lazy references
+    /// that outlive it (see `pop_frame_shell`). Its `f_back` is its
+    /// caller's frame object when one exists, else a lazy link to the
+    /// caller's shell (CPython's `take_ownership` links `f_back` at exit
+    /// too, but its frame objects cost nothing to keep current; here a
+    /// materialized caller would leave its quiet loop).
+    #[cold]
+    #[inline(never)]
+    fn materialize_departing_top(&self) {
+        let (top, caller) = {
+            let stack = self.frame_stack.borrow();
+            let n = stack.len();
+            (
+                stack[n - 1].clone(),
+                n.checked_sub(2).map(|i| stack[i].clone()),
+            )
+        };
+        let py = top.materialize_departing(None);
+        let Some(caller) = caller else { return };
+        let existing = caller.materialized.borrow().clone();
+        match existing {
+            Some(back) => {
+                // A new holder of the caller's frame object: its loop
+                // re-derives whether the object is observed.
+                caller.refresh_materialized(&back);
+                py.set_back(Some(back));
+                crate::hot_gates::bump_loop_gen();
+            }
+            None => {
+                *py.lazy_back.borrow_mut() = Some(crate::object::LazyShellRef::new(caller));
+            }
+        }
+    }
+
     fn pop_frame_shell(&self) -> Option<Rc<crate::object::FrameShell>> {
+        // A lazy reference to this activation (a traceback entry, see
+        // `PyTraceback::new_lazy`, or a callee frame's `f_back`) still
+        // lives: build the frame object CPython would have by now, while
+        // the shell is still whole.
+        let lazy_top = self.frame_stack.borrow().last().is_some_and(|top| {
+            top.tb_refs.load(std::sync::atomic::Ordering::Relaxed) != 0
+                && !top
+                    .has_materialized
+                    .load(std::sync::atomic::Ordering::Relaxed)
+        });
+        if lazy_top {
+            self.materialize_departing_top();
+        }
         let popped = self.frame_stack.borrow_mut().pop();
         if let Some(shell) = &popped {
             // Borrowed slots (see `FrameSlot`) read through the frame,
@@ -5988,7 +6044,7 @@ impl Interpreter {
                 // generator-family frames are re-entered and observed
                 // while suspended.
                 if shell.is_gen {
-                    *py.back.borrow_mut() = None;
+                    py.set_back(None);
                 }
             }
         }
@@ -6518,13 +6574,14 @@ impl Interpreter {
             _ => None,
         };
         let tb_arg = if synthesize_head {
-            Object::Traceback(Rc::new(PyTraceback {
-                lineno: py_frame.last_line.get().unwrap_or(1),
-                lasti: py_frame.lasti.get(),
-                frame: py_frame.clone(),
-                raw_lasti: None,
-                next: RefCell::new(inherited_tb.clone()),
-            }))
+            let tb = PyTraceback::new(
+                py_frame.clone(),
+                py_frame.last_line.get().unwrap_or(1),
+                py_frame.lasti.get(),
+                None,
+            );
+            *tb.next.borrow_mut() = inherited_tb.clone();
+            Object::Traceback(Rc::new(tb))
         } else {
             inherited_tb.clone().map_or(Object::None, Object::Traceback)
         };
@@ -7449,18 +7506,21 @@ impl Interpreter {
                         }
                     }
                 }
-                QuietEntry::Raised { err, cur_pc } => {
-                    // The raise path drops the staged operands wholesale
-                    // (see the `CALL` arm of `step`).
-                    self.flush_lean(frame, shell);
-                    if *last != usize::MAX {
-                        *prev_pc = Some(*last);
+                QuietEntry::Raised { err, cur_pc } => match self.quiet_catch(frame, shell, err) {
+                    Ok(()) => *last = cur_pc,
+                    Err(err) => {
+                        // The raise path drops the staged operands wholesale
+                        // (see the `CALL` arm of `step`).
+                        self.flush_lean(frame, shell);
+                        if *last != usize::MAX {
+                            *prev_pc = Some(*last);
+                        }
+                        return FrameEv::Exit(QuietExit::Outcome {
+                            stepped: Err(err),
+                            cur_pc,
+                        });
                     }
-                    return FrameEv::Exit(QuietExit::Outcome {
-                        stepped: Err(err),
-                        cur_pc,
-                    });
-                }
+                },
             }
             loop {
                 let stop = match pending.take() {
@@ -7477,9 +7537,16 @@ impl Interpreter {
                 match stop {
                     LeafStop::Breaker => break 'run QuietExit::Yield,
                     LeafStop::Raised(err) => {
+                        let cur_pc = frame.pc as usize - 1;
+                        let err = match self.quiet_catch(frame, shell, err) {
+                            Ok(()) => {
+                                *last = cur_pc;
+                                continue;
+                            }
+                            Err(err) => err,
+                        };
                         // The `CALL` arm of `step` marks on the raise path.
                         self.flush_lean(frame, shell);
-                        let cur_pc = frame.pc as usize - 1;
                         if *last != usize::MAX {
                             *prev_pc = Some(*last);
                         }
@@ -7558,6 +7625,13 @@ impl Interpreter {
                     };
                     if let Some(called) = called {
                         if let Err(err) = called {
+                            let err = match self.quiet_catch(frame, shell, err) {
+                                Ok(()) => {
+                                    *last = cur_pc;
+                                    continue;
+                                }
+                                Err(err) => err,
+                            };
                             // The raise path drops the staged operands
                             // wholesale (see the `CALL` arm of `step`).
                             self.flush_lean(frame, shell);
@@ -7622,6 +7696,13 @@ impl Interpreter {
                     };
                     if let Some(loaded) = loaded {
                         if let Err(err) = loaded {
+                            let err = match self.quiet_catch(frame, shell, err) {
+                                Ok(()) => {
+                                    *last = cur_pc;
+                                    continue;
+                                }
+                                Err(err) => err,
+                            };
                             self.flush_lean(frame, shell);
                             if *last != usize::MAX {
                                 *prev_pc = Some(*last);
@@ -7672,7 +7753,13 @@ impl Interpreter {
                 live_shell
                     .lasti
                     .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
-                let stepped = self.step_hot(frame);
+                let stepped = match self.step_hot(frame) {
+                    Err(err) => match self.quiet_catch(frame, shell, err) {
+                        Ok(()) => Ok(StepOutcome::Continue),
+                        Err(err) => Err(err),
+                    },
+                    stepped => stepped,
+                };
                 if !matches!(stepped, Ok(StepOutcome::Continue)) {
                     return FrameEv::Exit(QuietExit::Outcome { stepped, cur_pc });
                 }
@@ -8123,6 +8210,7 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         let exc_depth = done.exc_depth;
         let frame: &mut Frame = &mut done.frame;
+        Self::sync_lazy_tb_lasti(done.act.shell.as_deref(), &frame.code, &exit);
         let outcome = match (exit, done.act.shell.take()) {
             // The whole activation ran without ever needing its shell.
             (
@@ -8157,11 +8245,26 @@ impl Interpreter {
             ) if !shell
                 .has_materialized
                 .load(std::sync::atomic::Ordering::Relaxed)
+                && shell.tb_refs.load(std::sync::atomic::Ordering::Relaxed) == 0
                 && self.exc_info_len() <= exc_depth =>
             {
                 self.pop_frame_shell();
                 self.recycle_frame_shell(shell);
                 Ok(FrameOutcome::Returned(v))
+            }
+            // An exception leaving an unobserved activation with no handler
+            // for it: the general loop's unwind, without entering it.
+            (
+                QuietExit::Outcome {
+                    stepped: Err(RuntimeError::PyException(exc)),
+                    ..
+                },
+                Some(shell),
+            ) if !crate::trace::any_observers_active()
+                && find_handler(&frame.code.exception_table, frame.pc.wrapping_sub(1))
+                    .is_none() =>
+            {
+                Err(self.quiet_unwind(frame, shell, exc, exc_depth))
             }
             // Everything else finishes in the general loop, which takes
             // over exactly where the quiet loop stopped.
@@ -8376,6 +8479,7 @@ impl Interpreter {
             lasti: std::sync::atomic::AtomicU32::new(lasti),
             has_materialized: std::sync::atomic::AtomicBool::new(false),
             materialized: RefCell::new(None),
+            tb_refs: std::sync::atomic::AtomicU32::new(0),
         });
         self.frame_stack.borrow_mut().push(shell.clone());
         shell
@@ -9725,6 +9829,7 @@ impl Interpreter {
         };
         let mut prev_pc: Option<usize> = None;
         let exit = self.quiet_run(frame, QuietShell::Lazy(&mut act), snap_gen, &mut prev_pc);
+        Self::sync_lazy_tb_lasti(act.shell.as_deref(), &frame.code, &exit);
         let outcome = match (exit, act.shell) {
             // The whole activation ran without ever needing its shell.
             (
@@ -9744,6 +9849,7 @@ impl Interpreter {
             ) if !shell
                 .has_materialized
                 .load(std::sync::atomic::Ordering::Relaxed)
+                && shell.tb_refs.load(std::sync::atomic::Ordering::Relaxed) == 0
                 && self.exc_info_len() <= exc_depth_on_entry =>
             {
                 self.pop_frame_shell();
@@ -10993,6 +11099,17 @@ impl Interpreter {
                             // An instance whose class's `__getitem__` is a
                             // native fast subscript the site cached.
                             None if ins.op == OpCode::BinarySubscr && len >= 2 => {
+                                // A plain dict without the key raises its
+                                // KeyError here, for the quiet loop's handler
+                                // dispatch (the `try: d[k] except KeyError:`
+                                // idiom).
+                                // SAFETY: the `len >= 2` operand slots are
+                                // initialized; on a raise both are consumed.
+                                if let Some(e) = unsafe { Self::core_dict_miss(base, len) } {
+                                    len -= 2;
+                                    pc += 1;
+                                    break Some(CoreExit::Stop(LeafStop::Raised(e)));
+                                }
                                 let Some(fast) = self.core_native_subscript(
                                     code,
                                     pc,
@@ -13975,6 +14092,40 @@ impl Interpreter {
         }
     }
 
+    /// `dict[key]` on the two operand slots ending at `len` when a plain
+    /// dict misses a str or int key: the full handler's `KeyError(key)`,
+    /// with both operands released. `None` (nothing touched) otherwise.
+    ///
+    /// # Safety
+    ///
+    /// The `len >= 2` slots at `base` are initialized; on `Some` the top
+    /// two are moved out (the caller drops them from its count).
+    #[cold]
+    #[inline(never)]
+    unsafe fn core_dict_miss(base: *mut Object, len: usize) -> Option<RuntimeError> {
+        // SAFETY: the caller's contract.
+        let (c, k) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
+        let (Object::Dict(d), Object::Str(_) | Object::Int(_)) = (c, k) else {
+            return None;
+        };
+        if !Self::core_droppable(c) {
+            return None;
+        }
+        let probe = crate::object::LeafProbe::new(k)?;
+        // A stored key of another kind sharing the bucket might equal the
+        // probe through Python (`__eq__`, which may also raise): only a
+        // miss that met none is the full lookup's miss.
+        if d.try_borrow().ok()?.get(&probe).is_some() || !probe.miss_is_exact() {
+            return None;
+        }
+        // SAFETY: both slots are initialized and leave the stack here; the
+        // key is a str or int and the container a shared dict, so neither
+        // release runs code.
+        let (c, k) = unsafe { (base.add(len - 2).read(), base.add(len - 1).read()) };
+        drop_hot(c);
+        Some(crate::error::key_error_object(k))
+    }
+
     /// The native fast `__getitem__` the `BINARY_SUBSCR` at `pc` cached for
     /// `ops[0]`'s class (see [`Self::leaf_instance_subscript`]), when both
     /// operands leave by plain decrements.
@@ -16279,6 +16430,7 @@ impl Interpreter {
             globals,
             builtins,
             builtins_obj,
+            exc_handlers,
             ..
         } = frame;
         let code: &CodeObject = code_rc;
@@ -17662,12 +17814,98 @@ impl Interpreter {
                     last = pc;
                     pc += 1;
                 }
+                // An `except` clause's entry and exit (the full handlers'
+                // common shapes; see `step`): an exception instance on
+                // entry, class operands that are BaseException subclasses.
+                OpCode::PushExcInfo => {
+                    if !matches!(stack.last(), Some(Object::Instance(_))) {
+                        break;
+                    }
+                    let exc = stack.pop().expect("checked above");
+                    let prev = self
+                        .exc_info_stack
+                        .borrow()
+                        .last()
+                        .map_or(Object::None, |pe| pe.instance.clone());
+                    stack.push(prev);
+                    stack.push(exc.clone());
+                    let pe = PyException::new(exc);
+                    exc_handlers.push((ins.arg, pe.clone()));
+                    self.exc_info_stack.borrow_mut().push(pe);
+                    last = pc;
+                    pc += 1;
+                }
+                OpCode::CheckExcMatch => {
+                    let n = stack.len();
+                    if n < 2 {
+                        break;
+                    }
+                    let Some(matched) = Self::leaf_exc_match(&stack[n - 2], &stack[n - 1]) else {
+                        break;
+                    };
+                    let ty = std::mem::replace(&mut stack[n - 1], Object::Bool(matched));
+                    last = pc;
+                    pc += 1;
+                    self.release(ty);
+                }
+                OpCode::PopExcept => {
+                    let Some(prev) = stack.pop() else { break };
+                    let popped = exc_handlers.pop();
+                    let top = self.exc_info_stack.borrow_mut().pop();
+                    // See the full handler: the handled exception dies
+                    // here unless something else holds it.
+                    self.recheck_frame_observed = true;
+                    last = pc;
+                    pc += 1;
+                    drop(top);
+                    if let Some((_, pe)) = popped {
+                        self.release(pe.instance);
+                    }
+                    self.release(prev);
+                }
                 _ => break,
             }
         }
         frame.pc = pc as u32;
         *last_pc = last;
         stop
+    }
+
+    /// `CHECK_EXC_MATCH` of the exception instance `exc` against `ty`, a
+    /// class or a tuple of classes, when every class derives from
+    /// BaseException (`None` leaves the full handler its TypeError).
+    #[inline]
+    fn leaf_exc_match(exc: &Object, ty: &Object) -> Option<bool> {
+        let Object::Instance(inst) = exc else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        let base = &builtin_types().base_exception;
+        match ty {
+            Object::Type(t) => {
+                if std::ptr::eq(cls, Rc::as_ptr(t)) {
+                    return Some(true);
+                }
+                if !t.is_subclass_of(base) {
+                    return None;
+                }
+                Some(cls.is_subclass_of(t))
+            }
+            Object::Tuple(items) => {
+                let mut matched = false;
+                for t in items.iter() {
+                    let Object::Type(t) = t else {
+                        return None;
+                    };
+                    if !t.is_subclass_of(base) {
+                        return None;
+                    }
+                    matched = matched || cls.is_subclass_of(t);
+                }
+                Some(matched)
+            }
+            _ => None,
+        }
     }
 
     /// The truth of an instance when it is settled natively: a class with
@@ -22756,13 +22994,7 @@ impl Interpreter {
                                 .get(raised_at as usize)
                                 .copied()
                                 .unwrap_or(0);
-                            let tb = Rc::new(PyTraceback {
-                                frame: py_frame,
-                                lineno,
-                                lasti: raised_at,
-                                raw_lasti: None,
-                                next: RefCell::new(None),
-                            });
+                            let tb = Rc::new(PyTraceback::new(py_frame, lineno, raised_at, None));
                             inst.slot_set("__traceback__", Object::Traceback(tb));
                         }
                         (wrapper, Object::None)
@@ -23626,6 +23858,111 @@ impl Interpreter {
 
     // ---------- exception handling ----------
 
+    /// The raise-site half of the general loop's exception path, for an
+    /// exception arriving at a frame: CPython's `_PyErr_SetObject` chains
+    /// *every* fresh exception, including ones raised from C (here: Rust
+    /// opcodes and builtins), to the currently handled exception.
+    /// `RAISE_VARARGS` already did this at the raise site
+    /// (`context_settled`); a fresh Rust-raised error has empty traceback
+    /// and unset context/cause.
+    fn chain_fresh_exception(&self, exc: &mut PyException) {
+        if !exc.context_settled
+            && exc.context.is_none()
+            && exc.cause.is_none()
+            && exc.traceback.is_empty()
+            && !exc.suppress_tb_once
+            && !instance_has_nonnull_attr(&exc.instance, "__context__")
+        {
+            self.attach_implicit_context(exc);
+            if exc.context.is_some() {
+                Self::sync_exc_attrs(exc);
+            }
+        } else if exc.traceback.is_empty() && (exc.cause.is_some() || exc.context.is_some()) {
+            // A fresh Rust-raised error that already carries an
+            // explicit `cause`/`context` (e.g. `_io` chaining a
+            // misbehaving raw `readinto`'s `TypeError` into an
+            // `OSError`, `test_bad_readinto_type`) must still
+            // mirror those onto the instance dict so Python's
+            // `except` sees `e.__cause__`.
+            Self::sync_exc_attrs(exc);
+        }
+    }
+
+    /// The quiet loop's exception path: `err`, raised by the instruction
+    /// before `frame.pc` in the running activation, goes to this frame's
+    /// handler without leaving the loop, exactly as the general loop's
+    /// path does when nothing observes the frame (no trace or monitoring
+    /// callback to fire, so no `'exception'`/RERAISE/EXCEPTION_HANDLED
+    /// event either). Hands `err` back when the frame has no handler for
+    /// it: the activation then finishes, and the exception propagates,
+    /// through the general loop as before.
+    #[inline(never)]
+    fn quiet_catch(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        err: RuntimeError,
+    ) -> Result<(), RuntimeError> {
+        let RuntimeError::PyException(mut exc) = err else {
+            return Err(err);
+        };
+        let raise_pc = frame.pc.wrapping_sub(1);
+        if find_handler(&frame.code.exception_table, raise_pc).is_none()
+            || crate::trace::any_observers_active()
+        {
+            return Err(RuntimeError::PyException(exc));
+        }
+        self.chain_fresh_exception(&mut exc);
+        // The traceback entry records this activation's shell, and the
+        // handler's instructions run through `step`, which needs it.
+        self.flush_lean(frame, shell)
+            .lasti
+            .store(raise_pc, std::sync::atomic::Ordering::Relaxed);
+        match self.handle_exception(frame, exc) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The general loop's unwind of an inline activation that `exc`
+    /// leaves, when nothing observes the frame and no handler in it covers
+    /// the raise (see `quiet_catch`): this frame's traceback entry, then
+    /// `run_activation`'s epilogue for an exceptional exit. Returns the
+    /// propagating error.
+    #[inline(never)]
+    fn quiet_unwind(
+        &mut self,
+        frame: &mut Frame,
+        shell: Rc<crate::object::FrameShell>,
+        mut exc: PyException,
+        exc_depth: usize,
+    ) -> RuntimeError {
+        self.chain_fresh_exception(&mut exc);
+        let err = match self.handle_exception(frame, exc) {
+            Err(e) => e,
+            Ok(_) => RuntimeError::Internal("quiet unwind found a handler".to_owned()),
+        };
+        self.pop_frame_shell();
+        if shell
+            .has_materialized
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            // An exceptional exit leaves a frame object that outlives the
+            // activation (its traceback) at the last instruction, with
+            // its `f_locals` brought up to date.
+            let py = shell.materialized.borrow().clone();
+            if let Some(py) = py {
+                shell.refresh_materialized(&py);
+                py.invalidate_locals();
+            }
+        }
+        if self.exc_info_len() > exc_depth {
+            self.exc_info_stack.borrow_mut().truncate(exc_depth);
+        }
+        self.recycle_frame_shell(shell);
+        err
+    }
+
     /// Look up a handler for `exc` at the current pc. If found,
     /// truncate the stack and jump to the handler. Otherwise propagate.
     fn handle_exception(
@@ -23722,51 +24059,68 @@ impl Interpreter {
         // out-of-range `tb_lasti` values that made `traceback`'s
         // `_get_code_position` StopIterate (RFC 0054: asyncio cancellation
         // tracebacks crashed `format_exc` with PEP 479 RuntimeError).
-        let py_frame = frame
-            .py_frame
-            .clone()
-            .or_else(|| {
-                // Materialise this activation's shell — the traceback
-                // must reference *this* frame's snapshot, and it must be
-                // the *same* object the live stack holds so
-                // `frame.clear()` can refuse to wipe an executing frame
-                // (its shared locals storage!). Activation identity is
-                // the shared locals storage, which is exact even under
-                // recursion (the code object is shared). Searching the
-                // whole spine (not just the top) matters when a trace
-                // callback raises: the exception unwinds while the stack
-                // still holds dispatch-machinery entries above the frame
-                // being annotated (test_sys_settrace jump-from-'call').
-                let idx = self
-                    .frame_stack
-                    .borrow()
-                    .iter()
-                    .rposition(|shell| Rc::ptr_eq(&shell.locals, &frame.locals));
-                idx.and_then(|idx| crate::object::materialize_stack_at(&self.frame_stack, idx))
-            })
-            .unwrap_or_else(|| {
-                // Fall back to a fresh snapshot when neither source
-                // matches (e.g. a not-yet-entered generator frame
-                // receiving a throw, or an empty stack) so the chain
-                // stays non-empty. Cache it on generator-family frames
-                // so `gi_frame` keeps a stable identity.
-                let py = self.build_py_frame(frame, None);
-                py.lasti.set(lasti);
-                if frame.code.is_generator
-                    || frame.code.is_coroutine
-                    || frame.code.is_async_generator
-                {
-                    frame.py_frame = Some(py.clone());
+        let new_tb = match frame.py_frame.clone() {
+            Some(py_frame) => PyTraceback::new(py_frame, lineno, lasti, None),
+            None => {
+                // This activation's shell: the traceback must reference
+                // *this* frame's snapshot, and it must be the *same*
+                // object the live stack holds so `frame.clear()` can
+                // refuse to wipe an executing frame (its shared locals
+                // storage!). Activation identity is the shared locals
+                // storage, which is exact even under recursion (the code
+                // object is shared). Searching the whole spine (not just
+                // the top) matters when a trace callback raises: the
+                // exception unwinds while the stack still holds
+                // dispatch-machinery entries above the frame being
+                // annotated (test_sys_settrace jump-from-'call').
+                let found = {
+                    let stack = self.frame_stack.borrow();
+                    stack
+                        .iter()
+                        .rposition(|shell| Rc::ptr_eq(&shell.locals, &frame.locals))
+                        .map(|idx| (idx, stack[idx].clone()))
+                };
+                match found {
+                    // An ordinary activation nobody has looked at yet
+                    // records its shell: the frame object is built only
+                    // if something reads `tb_frame` or the entry outlives
+                    // the activation (see `PyTraceback::new_lazy`).
+                    Some((_, shell))
+                        if !shell.is_gen
+                            && !shell
+                                .has_materialized
+                                .load(std::sync::atomic::Ordering::Relaxed) =>
+                    {
+                        PyTraceback::new_lazy(shell, lineno, lasti)
+                    }
+                    found => {
+                        let py_frame = found
+                            .and_then(|(idx, _)| {
+                                crate::object::materialize_stack_at(&self.frame_stack, idx)
+                            })
+                            .unwrap_or_else(|| {
+                                // Fall back to a fresh snapshot when neither
+                                // source matches (e.g. a not-yet-entered
+                                // generator frame receiving a throw, or an
+                                // empty stack) so the chain stays non-empty.
+                                // Cache it on generator-family frames so
+                                // `gi_frame` keeps a stable identity.
+                                let py = self.build_py_frame(frame, None);
+                                py.lasti.set(lasti);
+                                if frame.code.is_generator
+                                    || frame.code.is_coroutine
+                                    || frame.code.is_async_generator
+                                {
+                                    frame.py_frame = Some(py.clone());
+                                }
+                                py
+                            });
+                        PyTraceback::new(py_frame, lineno, lasti, None)
+                    }
                 }
-                py
-            });
-        let new_tb = Rc::new(PyTraceback {
-            frame: py_frame,
-            lineno,
-            lasti,
-            raw_lasti: None,
-            next: RefCell::new(None),
-        });
+            }
+        };
+        let new_tb = Rc::new(new_tb);
         // CPython chains outward: the catching frame ends up at the
         // *head*; `tb_next` walks toward the raise site. Each
         // propagation prepends the current frame's `tb` to the
@@ -23805,13 +24159,12 @@ impl Interpreter {
         let Some(py_frame) = self.materialize_top_py_frame() else {
             return;
         };
-        let new_tb = Rc::new(PyTraceback {
-            lineno: py_frame.last_line.get().unwrap_or(1),
-            lasti: py_frame.lasti.get(),
-            frame: py_frame,
-            raw_lasti: None,
-            next: RefCell::new(None),
-        });
+        let new_tb = Rc::new(PyTraceback::new(
+            py_frame.clone(),
+            py_frame.last_line.get().unwrap_or(1),
+            py_frame.lasti.get(),
+            None,
+        ));
         inst.slot_set("__traceback__", Object::Traceback(new_tb));
     }
 
@@ -25322,6 +25675,7 @@ impl Interpreter {
                     // it suspends (see `pop_frame_shell`); a later resume
                     // re-derives it here, from the live spine.
                     if fr.back.borrow().is_none()
+                        && fr.lazy_back.borrow().is_none()
                         && fr.on_stack.get() > 0
                         && (fr.code.is_generator
                             || fr.code.is_coroutine
@@ -25338,8 +25692,8 @@ impl Interpreter {
                             crate::object::materialize_stack_at(&self.frame_stack, idx);
                         }
                     }
-                    match fr.back.borrow().as_ref() {
-                        Some(parent) => Ok(Object::Frame(parent.clone())),
+                    match fr.back_frame() {
+                        Some(parent) => Ok(Object::Frame(parent)),
                         None => Ok(Object::None),
                     }
                 }
@@ -25402,11 +25756,11 @@ impl Interpreter {
                 ))),
             },
             Object::Traceback(tb) => match name {
-                "tb_frame" => Ok(Object::Frame(tb.frame.clone())),
+                "tb_frame" => Ok(Object::Frame(tb.frame())),
                 "tb_lineno" => Ok(Object::Int(i64::from(tb.lineno))),
                 "tb_lasti" => Ok(match tb.raw_lasti {
                     Some(v) => Object::Int(v),
-                    None => Object::Int(i64::from(tb.frame.code.cpython_lasti(tb.lasti))),
+                    None => Object::Int(i64::from(tb.code().cpython_lasti(tb.lasti))),
                 }),
                 "tb_next" => match tb.next.borrow().as_ref() {
                     Some(n) => Ok(Object::Traceback(n.clone())),
@@ -34777,7 +35131,7 @@ impl Interpreter {
             if line != 0 {
                 py.last_line.set(Some(line));
             }
-            *py.back.borrow_mut() = self.materialize_top_py_frame();
+            py.set_back(self.materialize_top_py_frame());
             self.push_materialized_frame(&py);
             let hook_result = self
                 .fire_call_event(&py, crate::trace::EVENT_PY_THROW, exc.instance.clone())
@@ -34854,7 +35208,7 @@ impl Interpreter {
                         frame.py_frame = Some(py.clone());
                         py
                     });
-                    *py.back.borrow_mut() = self.materialize_top_py_frame();
+                    py.set_back(self.materialize_top_py_frame());
                     self.push_materialized_frame(&py);
                     let exc_obj = match &err {
                         RuntimeError::PyException(pe) => pe.instance.clone(),
@@ -35002,13 +35356,12 @@ impl Interpreter {
                     if let (Object::Instance(inst), Object::Frame(pf)) =
                         (&pyexc.instance, &frame_obj)
                     {
-                        let tb = Rc::new(PyTraceback {
-                            frame: pf.clone(),
-                            lineno: pf.last_line.get().unwrap_or(1),
-                            lasti: pf.lasti.get(),
-                            raw_lasti: None,
-                            next: RefCell::new(None),
-                        });
+                        let tb = Rc::new(PyTraceback::new(
+                            pf.clone(),
+                            pf.last_line.get().unwrap_or(1),
+                            pf.lasti.get(),
+                            None,
+                        ));
                         inst.slot_set("__traceback__", Object::Traceback(tb));
                     }
                 }
@@ -35134,7 +35487,7 @@ impl Interpreter {
             py
         });
         py.lasti.set(frame.pc);
-        *py.back.borrow_mut() = self.materialize_top_py_frame();
+        py.set_back(self.materialize_top_py_frame());
         self.push_materialized_frame(&py);
         let hook_result =
             self.fire_monitoring_event(&py, crate::trace::EVENT_EXCEPTION_HANDLED, inst);
@@ -46479,17 +46832,18 @@ impl Interpreter {
                             "TracebackType() lasti/lineno must be ints".to_owned(),
                         ));
                     };
-                    return Ok(Object::Traceback(Rc::new(crate::object::PyTraceback {
-                        frame: frame.clone(),
-                        lineno: u32::try_from(*lineno).unwrap_or(0),
-                        lasti: u32::try_from(*lasti).unwrap_or(0),
+                    let tb = crate::object::PyTraceback::new(
+                        frame.clone(),
+                        u32::try_from(*lineno).unwrap_or(0),
+                        u32::try_from(*lasti).unwrap_or(0),
                         // Explicit construction stores the given lasti
                         // verbatim (test_raise TestTracebackType): it's
                         // already a CPython-style byte offset, not a
                         // WeavePy instruction index to remap on read.
-                        raw_lasti: Some(*lasti),
-                        next: RefCell::new(next),
-                    })));
+                        Some(*lasti),
+                    );
+                    *tb.next.borrow_mut() = next;
+                    return Ok(Object::Traceback(Rc::new(tb)));
                 }
                 // `types.MethodType(func, obj)` — bind `func` to `obj`,
                 // producing a callable bound method (CPython `method`).
@@ -56971,6 +57325,7 @@ static SLOW_LEAF_OPS: [bool; 256] = {
         OpCode::BuildString,
         OpCode::BuildTuple,
         OpCode::Call,
+        OpCode::CheckExcMatch,
         OpCode::CompareOp,
         OpCode::CopyFreeVars,
         OpCode::CopyTop,
@@ -56996,8 +57351,10 @@ static SLOW_LEAF_OPS: [bool; 256] = {
         OpCode::PopJumpIfFalse,
         OpCode::PopJumpIfNone,
         OpCode::PopJumpIfNotNone,
+        OpCode::PopExcept,
         OpCode::PopJumpIfTrue,
         OpCode::PopTop,
+        OpCode::PushExcInfo,
         OpCode::PushNull,
         OpCode::Resume,
         OpCode::StoreAttr,
@@ -57809,12 +58166,11 @@ fn unbound_gen_method_sentinel(ty: &Rc<TypeObject>, name: &str) -> Option<&'stat
 /// overwrite it.
 fn instance_has_nonnull_attr(instance: &Object, name: &str) -> bool {
     match instance {
+        // Read without publishing a `__dict__` the instance never needed
+        // (every fresh exception asks).
         Object::Instance(i) => {
             matches!(i.slot_get(name), Some(v) if !matches!(v, Object::None))
-                || matches!(
-                    i.dict_cell().borrow().get(&crate::object::StrKey(name)),
-                    Some(v) if !matches!(v, Object::None)
-                )
+                || matches!(i.attr_get_str(name), Some(v) if !matches!(v, Object::None))
         }
         _ => false,
     }
@@ -71066,9 +71422,26 @@ for _ in range(10):
     fn jit_native_string_arguments_validate_and_preserve_values() {
         std::thread::spawn(|| {
             crate::tier2::force_enable_for_test(2);
-            let out = run(include_str!(
+            // The fixture's case functions are loop-free, so calls from a
+            // quiet loop run them as inline activations, which never enter
+            // compiled code. Dispatch every call through the general path
+            // (its exact-arity `CALL` enters compiled callees directly), as
+            // a frame the quiet loops leave does: the driver loop's frame
+            // used to, once its first caught exception materialized it.
+            let module = parse_module(include_str!(
                 "../../../tests/regrtest/test_native_string_arguments.py"
-            ));
+            ))
+            .expect("parse");
+            let code = compile_module(&module).expect("compile");
+            let mut interp = Interpreter::new();
+            interp.quiet_off = true;
+            let buf: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+            let writer: Stdout = crate::rc_unsize!(buf.clone() => RefCell<dyn Write + Send + Sync>);
+            interp.set_stdout(writer);
+            interp
+                .run_module(&code)
+                .unwrap_or_else(|error| panic!("run: {error}"));
+            let out = String::from_utf8(buf.borrow().clone()).expect("utf-8");
             assert_eq!(out, "ok\n");
             assert!(
                 crate::tier2::direct_call_count_for_test() >= 1,

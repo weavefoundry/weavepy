@@ -450,6 +450,35 @@ pub struct PyFrame {
     /// CPython clearing the cell slots out of `f_localsplus` while
     /// the cell objects live on in the closures that captured them.
     pub cleared: Cell<bool>,
+    /// `f_back` while it is still a live activation nobody has looked at:
+    /// a frame object materialized as its activation leaves the spine
+    /// (for a traceback entry that outlives it) links its caller lazily,
+    /// so the caller's own frame object is built only if `f_back` is read
+    /// or the caller leaves the spine while this link lives. Resolved
+    /// into [`Self::back`] by [`Self::back_frame`].
+    pub(crate) lazy_back: RefCell<Option<LazyShellRef>>,
+}
+
+impl PyFrame {
+    /// `f_back`, materializing a lazy link (see [`Self::lazy_back`]).
+    pub fn back_frame(&self) -> Option<Rc<PyFrame>> {
+        let shell = match self.lazy_back.borrow().as_ref() {
+            None => return self.back.borrow().clone(),
+            Some(lazy) => lazy.0.clone(),
+        };
+        let py = materialize_shell(&shell);
+        *self.back.borrow_mut() = Some(py.clone());
+        *self.lazy_back.borrow_mut() = None;
+        Some(py)
+    }
+
+    /// Replace `f_back` (dropping any lazy link).
+    pub fn set_back(&self, back: Option<Rc<PyFrame>>) {
+        *self.back.borrow_mut() = back;
+        if self.lazy_back.borrow().is_some() {
+            *self.lazy_back.borrow_mut() = None;
+        }
+    }
 }
 
 impl fmt::Debug for PyFrame {
@@ -465,6 +494,25 @@ impl fmt::Debug for PyFrame {
 
 impl Drop for PyFrame {
     fn drop(&mut self) {
+        // A dead frame's locals die with its frame object, and CPython's
+        // `frame_dealloc` releases them from the top of the value stack
+        // down, before `f_back`: finalizers observe that order (the
+        // innermost frame of a dropped traceback frees its last local
+        // first).
+        if let Some(locals) = self.locals_mirror.get_mut().take() {
+            if Rc::strong_count(&locals) == 1 {
+                if let Ok(mut values) = locals.try_borrow_mut() {
+                    while let Some(value) = values.pop() {
+                        drop(values);
+                        drop(value);
+                        values = match locals.try_borrow_mut() {
+                            Ok(values) => values,
+                            Err(_) => break,
+                        };
+                    }
+                }
+            }
+        }
         // Iteratively tear down the `back` chain. A plain recursive drop
         // would drop this frame's `back` Arc, whose own drop drops the
         // *next* frame's `back`, and so on — one native stack frame per
@@ -921,6 +969,10 @@ pub struct FrameShell {
     pub has_materialized: std::sync::atomic::AtomicBool,
     /// The real Python frame object, once someone asked for it.
     pub materialized: RefCell<Option<Rc<PyFrame>>>,
+    /// Live traceback entries that recorded this activation without
+    /// materializing it (see `PyTraceback::new_lazy`). The pop
+    /// materializes a shell that still has some. Zero for a parked shell.
+    pub tb_refs: std::sync::atomic::AtomicU32,
 }
 
 /// Metadata in a live frame shell. Recycled shells leave these slots
@@ -1044,6 +1096,7 @@ impl FrameShell {
             lasti: std::sync::atomic::AtomicU32::new(py.lasti.get()),
             has_materialized: std::sync::atomic::AtomicBool::new(true),
             materialized: RefCell::new(Some(py.clone())),
+            tb_refs: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -1064,11 +1117,23 @@ impl FrameShell {
     }
 
     pub fn materialize(&self, back: Option<Rc<PyFrame>>) -> Rc<PyFrame> {
+        let py = self.materialize_departing(back);
+        // RFC 0065 (WS1): a freshly materialized frame must kick its
+        // dispatch loop off the quiet path so the per-instruction
+        // `lasti`-cell sync resumes.
+        crate::hot_gates::bump_loop_gen();
+        py
+    }
+
+    /// [`Self::materialize`] for an activation that is leaving the spine:
+    /// no dispatch loop will run it again, so none needs kicking off its
+    /// quiet path.
+    pub fn materialize_departing(&self, back: Option<Rc<PyFrame>>) -> Rc<PyFrame> {
         if let Some(existing) = self.materialized.borrow().as_ref() {
+            // (`materialize` still bumps: the new holder may keep it, and
+            // a quiet loop running this activation re-derives, finding it
+            // observed if so.)
             self.refresh_materialized(existing);
-            // The new holder may keep it: a quiet loop running this
-            // activation re-derives, and finds it observed if so.
-            crate::hot_gates::bump_loop_gen();
             return existing.clone();
         }
         let py = Rc::new(PyFrame {
@@ -1094,14 +1159,11 @@ impl FrameShell {
             on_stack: Cell::new(1),
             extra_locals: RefCell::new(None),
             cleared: Cell::new(false),
+            lazy_back: RefCell::new(None),
         });
         *self.materialized.borrow_mut() = Some(py.clone());
         self.has_materialized
             .store(true, std::sync::atomic::Ordering::Release);
-        // RFC 0065 (WS1): a freshly materialized frame must kick its
-        // dispatch loop off the quiet path so the per-instruction
-        // `lasti`-cell sync resumes.
-        crate::hot_gates::bump_loop_gen();
         py
     }
 
@@ -1172,7 +1234,7 @@ pub fn materialize_stack_at(stack: &FrameStack, idx: usize) -> Option<Rc<PyFrame
             Some(py) => {
                 shell.refresh_materialized(&py);
                 refreshed = true;
-                *py.back.borrow_mut() = back;
+                py.set_back(back);
                 py
             }
             None => {
@@ -1205,7 +1267,10 @@ pub fn materialize_stack_top(stack: &FrameStack) -> Option<Rc<PyFrame>> {
 /// unwind machinery and chained outward through [`Self::next`].
 #[derive(Debug)]
 pub struct PyTraceback {
-    pub frame: Rc<PyFrame>,
+    /// The frame this entry records: the frame object, or the live
+    /// activation's spine shell until something asks for the object
+    /// (see [`TbFrame`]). Read through [`Self::frame`].
+    frame: RefCell<TbFrame>,
     pub lineno: u32,
     pub lasti: u32,
     /// `types.TracebackType(…)` stores the caller-supplied `tb_lasti`
@@ -1213,6 +1278,143 @@ pub struct PyTraceback {
     /// the instruction index through `cpython_lasti` on read.
     pub raw_lasti: Option<i64>,
     pub next: RefCell<Option<Rc<PyTraceback>>>,
+}
+
+/// A traceback entry's frame.
+///
+/// CPython creates the frame object for every traceback entry, but its
+/// frame objects are cheap; WeavePy's materialization links the whole
+/// `f_back` chain and takes the running activation off its quiet path.
+/// An exception caught and dropped in the frame that raised it (the
+/// `try: d[k] except KeyError:` idiom) never shows anyone that frame,
+/// so an entry recorded while its activation runs keeps the spine
+/// shell instead and materializes from it on first use. While the
+/// activation is live, materializing then is what materializing at the
+/// raise would have produced by now (the object tracks the running
+/// frame either way); when the activation leaves the spine with lazy
+/// entries still alive, `pop_frame_shell` materializes it on the way
+/// out, so the object exists exactly as CPython's would.
+#[derive(Debug)]
+enum TbFrame {
+    Ready(Rc<PyFrame>),
+    Lazy(LazyShellRef),
+}
+
+/// A hold on a live activation's shell standing for its frame object
+/// until someone asks for it: a lazy traceback entry (see [`TbFrame`]) or
+/// a frame's lazy `f_back` (see [`PyFrame::lazy_back`]). Counted in
+/// [`FrameShell::tb_refs`] so the activation's pop knows to materialize.
+#[derive(Debug)]
+pub(crate) struct LazyShellRef(Rc<FrameShell>);
+
+impl LazyShellRef {
+    pub(crate) fn new(shell: Rc<FrameShell>) -> Self {
+        shell
+            .tb_refs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(shell)
+    }
+}
+
+impl Drop for LazyShellRef {
+    fn drop(&mut self) {
+        self.0
+            .tb_refs
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl PyTraceback {
+    /// An entry for an existing frame object.
+    pub fn new(frame: Rc<PyFrame>, lineno: u32, lasti: u32, raw_lasti: Option<i64>) -> Self {
+        Self {
+            frame: RefCell::new(TbFrame::Ready(frame)),
+            lineno,
+            lasti,
+            raw_lasti,
+            next: RefCell::new(None),
+        }
+    }
+
+    /// An entry for the activation `shell` stands for, which must be
+    /// live on this thread's spine and not yet materialized (see
+    /// [`TbFrame`]).
+    pub fn new_lazy(shell: Rc<FrameShell>, lineno: u32, lasti: u32) -> Self {
+        Self {
+            frame: RefCell::new(TbFrame::Lazy(LazyShellRef::new(shell))),
+            lineno,
+            lasti,
+            raw_lasti: None,
+            next: RefCell::new(None),
+        }
+    }
+
+    /// `tb_frame`: the frame object, materialized on first use.
+    pub fn frame(&self) -> Rc<PyFrame> {
+        let shell = match &*self.frame.borrow() {
+            TbFrame::Ready(py) => return py.clone(),
+            TbFrame::Lazy(lazy) => lazy.0.clone(),
+        };
+        let py = materialize_shell(&shell);
+        *self.frame.borrow_mut() = TbFrame::Ready(py.clone());
+        py
+    }
+
+    /// The frame object if one exists already (no materialization).
+    pub fn frame_if_ready(&self) -> Option<Rc<PyFrame>> {
+        match &*self.frame.borrow() {
+            TbFrame::Ready(py) => Some(py.clone()),
+            TbFrame::Lazy(lazy) => lazy.0.materialized.borrow().clone(),
+        }
+    }
+
+    /// The entry's code object, without materializing its frame.
+    pub fn code(&self) -> Rc<CodeObject> {
+        match &*self.frame.borrow() {
+            TbFrame::Ready(py) => py.code.clone(),
+            TbFrame::Lazy(lazy) => (*lazy.0.code).clone(),
+        }
+    }
+}
+
+/// The frame object for `shell`, a lazy traceback entry's activation:
+/// the one it already has, else materialized where it sits on this
+/// thread's spine (linking `f_back` like any other materialization).
+pub(crate) fn materialize_shell(shell: &Rc<FrameShell>) -> Rc<PyFrame> {
+    if let Some(handles) = crate::vm_singletons::current_thread_handles() {
+        let idx = handles
+            .frame_stack
+            .borrow()
+            .iter()
+            .rposition(|s| Rc::ptr_eq(s, shell));
+        if let Some(idx) = idx {
+            if let Some(py) = materialize_stack_at(&handles.frame_stack, idx) {
+                return py;
+            }
+        }
+    }
+    if let Some(py) = shell.materialized.borrow().as_ref() {
+        shell.refresh_materialized(py);
+        return py.clone();
+    }
+    // Live on another thread's spine (an exception from
+    // `sys._current_exceptions()`): materialize it there, as
+    // `sys._current_frames()` does; peer threads are parked under the GIL.
+    for (_, stack, _) in crate::stdlib::faulthandler_mod::thread_snapshots() {
+        let idx = stack
+            .try_borrow()
+            .ok()
+            .and_then(|s| s.iter().rposition(|s| Rc::ptr_eq(s, shell)));
+        if let Some(idx) = idx {
+            if let Some(py) = materialize_stack_at(&stack, idx) {
+                return py;
+            }
+        }
+    }
+    // A greenlet's parked spine: the shell's slots are valid while the
+    // activation lives, but the `f_back` chain belongs to that stack. Its
+    // pop decrements `on_stack` as for any materialization.
+    shell.materialize(None)
 }
 
 impl Drop for PyTraceback {

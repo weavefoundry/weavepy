@@ -5896,10 +5896,13 @@ fn call_with_activation_shell<T>(
         lasti: std::sync::atomic::AtomicU32::new(jf.deopt_pc),
         has_materialized: std::sync::atomic::AtomicBool::new(false),
         materialized: GilRefCell::new(None),
+        tb_refs: std::sync::atomic::AtomicU32::new(0),
     });
     interp.frame_stack.borrow_mut().push(shell);
     let out = f(interp);
-    interp.frame_stack.borrow_mut().pop();
+    // The general pop: a traceback entry or a callee frame's `f_back` may
+    // hold the shell lazily, and gets its frame object on the way out.
+    interp.pop_frame_shell();
     out
 }
 
