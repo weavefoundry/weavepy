@@ -3,8 +3,10 @@
 //! A plan that keeps running is compiled, once per effect mode, into a
 //! function over the same registers: each register is a pair of SSA
 //! variables holding the [`V`] tag and payload words; moves, constants,
-//! jumps, and scalar compares, truth tests and arithmetic run in line; and
-//! every other operation calls a helper that runs the interpreter's own
+//! jumps, and scalar compares, truth tests and arithmetic run in line; so
+//! do the common hits of a site's caches (an instance field, a method, a
+//! class constant, a module global), which their helpers fill; and every
+//! other operation calls a helper that runs the interpreter's own
 //! implementation of it. Whatever the native code or a helper can't
 //! settle declines the evaluation exactly where the interpreter's runner
 //! would, so a native plan keeps the runner's contract: a result, or
@@ -76,6 +78,8 @@ pub(super) struct Native {
     _fields: Vec<Box<FieldCache>>,
     #[allow(clippy::vec_box)]
     _globals: Vec<Box<GlobalCache>>,
+    #[allow(clippy::vec_box)]
+    _methods: Vec<Box<MethodCache>>,
 }
 
 /// An attribute site's split-field positions by receiver class version:
@@ -88,14 +92,57 @@ pub(super) struct FieldCache {
     next: std::cell::Cell<u8>,
 }
 
-/// A global site's resolution: the globals and builtins stamps it was
-/// found under (process-unique, so they name the dicts and their key
-/// layouts), which of the two holds it, and at what index.
+/// A module global site's value as register words, with the globals
+/// stamp it was read under (process-unique, so it names the dict and its
+/// key layout: the entry stays put) and the global value epoch (which an
+/// in-place rebinding advances). Native code reads it in line.
 #[derive(Default)]
+#[repr(C)]
 pub(super) struct GlobalCache {
-    stamps: std::cell::Cell<(u64, u64)>,
-    at: std::cell::Cell<(bool, u32)>,
+    stamp: std::cell::Cell<u64>,
+    epoch: std::cell::Cell<u64>,
+    tag: std::cell::Cell<u64>,
+    pay: std::cell::Cell<u64>,
 }
+
+const GC_STAMP: i32 = std::mem::offset_of!(GlobalCache, stamp) as i32;
+const GC_EPOCH: i32 = std::mem::offset_of!(GlobalCache, epoch) as i32;
+const GC_TAG: i32 = std::mem::offset_of!(GlobalCache, tag) as i32;
+const GC_PAY: i32 = std::mem::offset_of!(GlobalCache, pay) as i32;
+/// Where native code finds the evaluation's own function.
+const TOP_F_OFFSET: i32 = TOP_OFFSET + std::mem::offset_of!(Frame, f) as i32;
+
+/// A class-attribute stamp's scalar tags (see `class_attr_fill`) and the
+/// register tags of the values they hold.
+const CLASS_ATTR_SCALARS: [(u64, u64); 4] = [
+    (crate::CLASS_ATTR_INT, T_I),
+    (crate::CLASS_ATTR_FLOAT, T_F),
+    (crate::CLASS_ATTR_BOOL, T_B),
+    (crate::CLASS_ATTR_NONE, T_N),
+];
+
+/// A method site's latest resolutions, which native code reads in line:
+/// for an instance receiver, its class's version, the function, and how
+/// many of the class's shared names (from the first) come before the
+/// method's name, so an instance holding no more fields than that can't
+/// shadow it; for a class receiver, its version and the function called
+/// with an empty self slot. Versions are process-unique (one class in one
+/// state), so an equal one means the same resolution.
+#[derive(Default)]
+#[repr(C)]
+pub(super) struct MethodCache {
+    inst_ver: std::cell::Cell<u64>,
+    inst_func: std::cell::Cell<u64>,
+    inst_limit: std::cell::Cell<u64>,
+    type_ver: std::cell::Cell<u64>,
+    type_func: std::cell::Cell<u64>,
+}
+
+const MC_INST_VER: i32 = std::mem::offset_of!(MethodCache, inst_ver) as i32;
+const MC_INST_FUNC: i32 = std::mem::offset_of!(MethodCache, inst_func) as i32;
+const MC_INST_LIMIT: i32 = std::mem::offset_of!(MethodCache, inst_limit) as i32;
+const MC_TYPE_VER: i32 = std::mem::offset_of!(MethodCache, type_ver) as i32;
+const MC_TYPE_FUNC: i32 = std::mem::offset_of!(MethodCache, type_func) as i32;
 
 // SAFETY: the descriptors name immutable code objects and reserved
 // function allocations; native code is only entered with the GIL held.
@@ -204,10 +251,10 @@ const TOP_OFFSET: i32 = 32;
 /// cache's first entry's version and position.
 const PEND_N_OFFSET: i32 =
     (std::mem::offset_of!(Ctx<'static>, pend) + std::mem::offset_of!(Pending, n)) as i32;
-const FIELD_VER_OFFSET: i32 = (std::mem::offset_of!(FieldCache, entries)
-    + std::mem::offset_of!((u64, u32), 0)) as i32;
-const FIELD_IDX_OFFSET: i32 = (std::mem::offset_of!(FieldCache, entries)
-    + std::mem::offset_of!((u64, u32), 1)) as i32;
+const FIELD_VER_OFFSET: i32 =
+    (std::mem::offset_of!(FieldCache, entries) + std::mem::offset_of!((u64, u32), 0)) as i32;
+const FIELD_IDX_OFFSET: i32 =
+    (std::mem::offset_of!(FieldCache, entries) + std::mem::offset_of!((u64, u32), 1)) as i32;
 const _: () = assert!(std::mem::offset_of!(Ctx<'static>, top) == TOP_OFFSET as usize);
 
 /// Run `plan`'s native code for one evaluation, compiling it once it is
@@ -235,8 +282,17 @@ pub(super) fn run<const EFFECT: bool>(
             {
                 return None;
             }
-            slot.get_or_init(|| compile(code, ext, plan, EFFECT))
-                .as_ref()?
+            slot.get_or_init(|| {
+                // SAFETY: a function value is always an `Rc` allocation
+                // (`Object::Function`), alive for this evaluation: the
+                // count taken here is released with the handle.
+                let f = unsafe {
+                    Rc::increment_strong_count(std::ptr::from_ref(f));
+                    Rc::from_raw(std::ptr::from_ref(f))
+                };
+                compile(code, ext, plan, &f, EFFECT)
+            })
+            .as_ref()?
         }
     };
     // In-line callees run where the interpreter would nest frames: near
@@ -307,38 +363,23 @@ unsafe extern "C" fn h_global(
     // SAFETY: called by native code with its context, a live frame, the
     // site's stamp slot (its code keeps the table), and its cache.
     let (c, (code, _, f), slot, cache) = unsafe { (cx(ctx), (*fr).parts(), &*slot, &*cache) };
-    // SAFETY (raw dict reads): nothing runs code here.
-    let (gs, bs) = unsafe {
-        (
-            (*f.globals.as_ptr()).mutation_stamp(),
-            (*f.builtins.as_ptr()).mutation_stamp(),
-        )
-    };
-    if cache.stamps.get() == (gs, bs) {
-        let (builtin, idx) = cache.at.get();
-        let dict = if builtin { &f.builtins } else { &f.globals };
-        // SAFETY: as above.
-        if let Some((_, v)) = unsafe { (*dict.as_ptr()).get_index(idx as usize) } {
-            c.put(norm(v));
-            return 0;
-        }
-    }
     let Some(v) = c.interp.plan_global_at(code, slot, f, pc as u16) else {
         return 1;
     };
-    // Remember where the value lives (the site's inline cache says which
-    // namespace), under the stamps it was read with.
-    use weavepy_compiler::InlineCache as IC;
-    match code.caches.get(pc) {
-        IC::LoadGlobalModule { key_idx, .. } => {
-            cache.stamps.set((gs, bs));
-            cache.at.set((false, key_idx));
-        }
-        IC::LoadGlobalBuiltin { key_idx, .. } => {
-            cache.stamps.set((gs, bs));
-            cache.at.set((true, key_idx));
-        }
-        _ => {}
+    // A module global's value is remembered for the in-line read (a
+    // builtin's also depends on the globals not gaining the name, which
+    // the helper checks).
+    if matches!(
+        code.caches.get(pc),
+        weavepy_compiler::InlineCache::LoadGlobalModule { .. }
+    ) {
+        // SAFETY (raw dict read): nothing runs code here.
+        let gs = unsafe { (*f.globals.as_ptr()).mutation_stamp() };
+        let [t, p] = words(v);
+        cache.stamp.set(gs);
+        cache.epoch.set(crate::object::global_value_epoch());
+        cache.tag.set(t);
+        cache.pay.set(p);
     }
     c.put(v);
     0
@@ -431,22 +472,42 @@ unsafe extern "C" fn h_method(
     ctx: *mut Ctx<'static>,
     fr: *const Frame,
     ms: *const crate::MethodSlot,
+    cache: *const MethodCache,
     t: u64,
     p: u64,
     name: u32,
 ) -> u32 {
-    // SAFETY: called by native code with its context, a live frame, and
-    // the site's method slot (its code keeps the table).
-    let (c, (code, _, _), ms) = unsafe { (cx(ctx), (*fr).parts(), &*ms) };
-    match c.interp.plan_method_at(code, ms, value(t, p), name as u16) {
-        Some((func, recv)) => {
-            let [a, b] = words(func);
-            let [d, e] = words(recv);
-            c.out = [a, b, d, e];
-            0
+    // SAFETY: called by native code with its context, a live frame, the
+    // site's method slot (its code keeps the table), and its cache.
+    let (c, (code, ext, _), ms, cache) = unsafe { (cx(ctx), (*fr).parts(), &*ms, &*cache) };
+    let Some((func, recv)) = c.interp.plan_method_at(code, ms, value(t, p), name as u16) else {
+        return 1;
+    };
+    let [a, b] = words(func);
+    let [d, e] = words(recv);
+    c.out = [a, b, d, e];
+    // Remember the resolution for the in-line check.
+    // SAFETY: the method load succeeded on a heap receiver (as `norm`).
+    match (func, unsafe { &*(p as *const Object) }) {
+        (V::Fn(fp), Object::Instance(inst)) if inst.dict.published().is_none() => {
+            let cls = inst.cls_raw();
+            let i = name as usize;
+            if let (Some(Object::Str(n)), Some(&hash)) =
+                (ext.name_objs.get(i), ext.name_hashes.get(i))
+            {
+                let limit = cls.shared_keys.get().map_or(0, |k| k.names_before(n, hash));
+                cache.inst_ver.set(cls.attr_version.get());
+                cache.inst_func.set(fp as u64);
+                cache.inst_limit.set(limit as u64);
+            }
         }
-        None => 1,
+        (V::Fn(fp), Object::Type(cls)) if matches!(recv, V::Null) => {
+            cache.type_ver.set(cls.attr_version.get());
+            cache.type_func.set(fp as u64);
+        }
+        _ => {}
     }
+    0
 }
 
 /// `0`/`1` for the comparison's result, `2` to decline.
@@ -731,6 +792,7 @@ fn compile(
     code: &CodeObject,
     ext: &CodeConstObjects,
     plan: &LeafPlan,
+    f: &Rc<PyFunction>,
     effect: bool,
 ) -> Option<Native> {
     crate::tier2::ensure_obj_layout();
@@ -739,7 +801,7 @@ fn compile(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let engine = guard.get_or_insert_with(Engine::new).as_mut()?;
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        compile_with(engine, code, ext, plan, effect)
+        compile_with(engine, code, ext, plan, f, effect)
     }));
     match built {
         Ok(native) => native,
@@ -755,6 +817,7 @@ fn compile_with(
     code: &CodeObject,
     ext: &CodeConstObjects,
     plan: &LeafPlan,
+    f: &Rc<PyFunction>,
     effect: bool,
 ) -> Option<Native> {
     engine.module.clear_context(&mut engine.ctx);
@@ -783,8 +846,9 @@ fn compile_with(
             keep: Vec::new(),
             fields: Vec::new(),
             globals: Vec::new(),
+            methods: Vec::new(),
         };
-        let done = lower.lower(code, ext, plan);
+        let done = lower.lower(code, ext, plan, f);
         let Lower {
             b,
             depth,
@@ -792,14 +856,15 @@ fn compile_with(
             keep,
             fields,
             globals,
+            methods,
             ..
         } = lower;
         done.map(|()| {
             b.finalize();
-            (depth, frames, keep, fields, globals)
+            (depth, frames, keep, fields, globals, methods)
         })
     };
-    let Some((depth, frames, keep, fields, globals)) = lowered else {
+    let Some((depth, frames, keep, fields, globals, methods)) = lowered else {
         // An unfinished function leaves the builder's state behind.
         engine.fbctx = FunctionBuilderContext::new();
         engine.module.clear_context(&mut engine.ctx);
@@ -826,6 +891,7 @@ fn compile_with(
         _keep: keep,
         _fields: fields,
         _globals: globals,
+        _methods: methods,
     })
 }
 
@@ -853,6 +919,10 @@ struct FrameLower<'p> {
     /// Whether an attribute store may have run before an op (only the
     /// evaluation's own frame stores).
     may_store: Vec<bool>,
+    /// The function the frame runs: an in-line callee's (its guard proved
+    /// it), or the one the plan was compiled for (the evaluation's own
+    /// may be another with the same code).
+    func: *const PyFunction,
 }
 
 struct Lower<'b> {
@@ -872,6 +942,8 @@ struct Lower<'b> {
     fields: Vec<Box<FieldCache>>,
     #[allow(clippy::vec_box)]
     globals: Vec<Box<GlobalCache>>,
+    #[allow(clippy::vec_box)]
+    methods: Vec<Box<MethodCache>>,
 }
 
 impl Lower<'_> {
@@ -947,7 +1019,10 @@ impl Lower<'_> {
         let not_ref = self.b.ins().icmp_imm(IntCC::NotEqual, t, T_R as i64);
         self.miss_if(not_ref, miss);
         let otag = self.b.ins().uload8(types::I32, f, p, 0);
-        let mut bad = self.b.ins().icmp_imm(IntCC::NotEqual, otag, i64::from(l.tag_instance));
+        let mut bad = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, otag, i64::from(l.tag_instance));
         if effect {
             let n = self.b.ins().load(types::I64, f, self.ctx, PEND_N_OFFSET);
             let pending = self.b.ins().icmp_imm(IntCC::NotEqual, n, 0);
@@ -982,7 +1057,10 @@ impl Lower<'_> {
         let ckeys = self.b.ins().load(ptr, f, cls, l.type_shared_keys);
         let len = self.b.ins().uload32(f, block, l.split_len);
         let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
-        let absent = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
+        let absent = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
         let bad = self.b.ins().bor(foreign, absent);
         self.miss_if(bad, miss);
         let off = self.b.ins().ishl_imm(idx, 4);
@@ -1007,6 +1085,186 @@ impl Lower<'_> {
             rp = self.b.ins().select(hit, pay, rp);
         }
         (rt, rp)
+    }
+
+    /// [`h_method`]'s cache in line, for the receiver register `(t, p)`: an
+    /// instance whose class has the cached version and that holds none of
+    /// the class's names from the method's on (in its split values over
+    /// the class's names, with no dictionary of its own), or a class with
+    /// the cached version. Jumps to `done` with the function's and the
+    /// self slot's words, or to `slow`.
+    fn inline_method(
+        &mut self,
+        l: &weavepy_jit::ObjLayout,
+        t: Value,
+        p: Value,
+        cache: i64,
+        done: Block,
+        slow: Block,
+    ) {
+        let f = MemFlags::trusted();
+        let ptr = self.ptr;
+        let not_ref = self.b.ins().icmp_imm(IntCC::NotEqual, t, T_R as i64);
+        self.miss_if(not_ref, slow);
+        let otag = self.b.ins().uload8(types::I32, f, p, 0);
+        let at = self.b.ins().iconst(ptr, cache);
+        let is_inst = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, otag, i64::from(l.tag_instance));
+        let inst_b = self.b.create_block();
+        let other = self.b.create_block();
+        self.b.ins().brif(is_inst, inst_b, &[], other, &[]);
+        // A class: its version.
+        self.b.switch_to_block(other);
+        let is_type = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, otag, i64::from(l.tag_type));
+        let type_b = self.b.create_block();
+        self.b.ins().brif(is_type, type_b, &[], slow, &[]);
+        self.b.switch_to_block(type_b);
+        let cls = self.b.ins().load(ptr, f, p, 8);
+        let ver = self.b.ins().load(types::I64, f, cls, l.type_attr_version);
+        let want = self.b.ins().load(types::I64, f, at, MC_TYPE_VER);
+        let func = self.b.ins().load(types::I64, f, at, MC_TYPE_FUNC);
+        let unset = self.b.ins().icmp_imm(IntCC::Equal, want, 0);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, ver, want);
+        let bad = self.b.ins().bor(unset, stale);
+        self.miss_if(bad, slow);
+        let tf = self.b.ins().iconst(types::I64, T_FN as i64);
+        let tn = self.b.ins().iconst(types::I64, T_NULL as i64);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        self.b
+            .ins()
+            .jump(done, &[tf.into(), func.into(), tn.into(), zero.into()]);
+        // An instance: its class's version, and its fields.
+        self.b.switch_to_block(inst_b);
+        let inst = self.b.ins().load(ptr, f, p, 8);
+        let cls = self.b.ins().load(ptr, f, inst, l.inst_class);
+        let ver = self.b.ins().load(types::I64, f, cls, l.type_attr_version);
+        let want = self.b.ins().load(types::I64, f, at, MC_INST_VER);
+        let func = self.b.ins().load(types::I64, f, at, MC_INST_FUNC);
+        let limit = self.b.ins().load(types::I64, f, at, MC_INST_LIMIT);
+        let lazy = self.b.ins().load(ptr, f, inst, l.inst_dict_lazy);
+        let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+        let shared = self.b.ins().uload8(types::I64, f, flag, 0);
+        let borrow = self.b.ins().sload32(f, inst, l.inst_split_borrow);
+        let block = self.b.ins().load(ptr, f, inst, l.inst_split_block);
+        let unset = self.b.ins().icmp_imm(IntCC::Equal, want, 0);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, ver, want);
+        let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+        let other = self.b.ins().bor(lazy, shared);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+        let bad = self.b.ins().bor(unset, stale);
+        let bad = self.b.ins().bor(bad, busy);
+        let bad = self.b.ins().bor(bad, other);
+        self.miss_if(bad, slow);
+        let tf = self.b.ins().iconst(types::I64, T_FN as i64);
+        let tr = self.b.ins().iconst(types::I64, T_R as i64);
+        let hit_args = [tf.into(), func.into(), tr.into(), p.into()];
+        // No fields at all, or none from the method's name on.
+        let fields = self.b.create_block();
+        let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
+        self.b.ins().brif(empty, done, &hit_args, fields, &[]);
+        self.b.switch_to_block(fields);
+        let keys = self.b.ins().load(ptr, f, block, l.split_keys);
+        let ckeys = self.b.ins().load(ptr, f, cls, l.type_shared_keys);
+        let len = self.b.ins().uload32(f, block, l.split_len);
+        let len = self.b.ins().uextend(types::I64, len);
+        let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
+        let shadows = self.b.ins().icmp(IntCC::UnsignedGreaterThan, len, limit);
+        let bad = self.b.ins().bor(foreign, shadows);
+        self.miss_if(bad, slow);
+        self.b.ins().jump(done, &hit_args);
+    }
+
+    /// [`h_global`]'s cache in line: the frame runs its compile-time
+    /// function, whose globals still have the cached stamp, under the
+    /// cached value epoch. Jumps to `done` with the value's words, or to
+    /// `slow`.
+    fn inline_global(&mut self, fl: &FrameLower<'_>, cache: i64, done: Block, slow: Block) {
+        let f = MemFlags::trusted();
+        let ptr = self.ptr;
+        if fl.depth == 0 {
+            // The evaluation's own function may be another with this code.
+            let top = self.b.ins().load(ptr, f, self.ctx, TOP_F_OFFSET);
+            let other = self.b.ins().icmp_imm(IntCC::NotEqual, top, fl.func as i64);
+            self.miss_if(other, slow);
+        }
+        // SAFETY: the frame's function is alive while its code runs (see
+        // `FrameLower::func`), and so its globals.
+        let stamp_at =
+            unsafe { (*fl.func).globals.as_ptr() } as usize + crate::object::DictData::STAMP_OFFSET;
+        let stamp_at = self.b.ins().iconst(ptr, stamp_at as i64);
+        let epoch_at = self
+            .b
+            .ins()
+            .iconst(ptr, crate::object::global_value_epoch_ptr() as i64);
+        let at = self.b.ins().iconst(ptr, cache);
+        let stamp = self.b.ins().load(types::I64, f, stamp_at, 0);
+        let epoch = self.b.ins().load(types::I64, f, epoch_at, 0);
+        let want = self.b.ins().load(types::I64, f, at, GC_STAMP);
+        let want_epoch = self.b.ins().load(types::I64, f, at, GC_EPOCH);
+        let t = self.b.ins().load(types::I64, f, at, GC_TAG);
+        let p = self.b.ins().load(types::I64, f, at, GC_PAY);
+        let unset = self.b.ins().icmp_imm(IntCC::Equal, want, 0);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, stamp, want);
+        let moved = self.b.ins().icmp(IntCC::NotEqual, epoch, want_epoch);
+        let bad = self.b.ins().bor(unset, stale);
+        let bad = self.b.ins().bor(bad, moved);
+        self.miss_if(bad, slow);
+        self.b.ins().jump(done, &[t.into(), p.into()]);
+    }
+
+    /// A class attribute the site's stamp remembers, in line: the receiver
+    /// register `(t, p)` is a class at the stamp's version, which resolved
+    /// the name to a scalar (see `class_attr_fill`). Jumps to `done` with
+    /// its words, or to `slow`.
+    fn inline_class_attr(
+        &mut self,
+        l: &weavepy_jit::ObjLayout,
+        t: Value,
+        p: Value,
+        slot: i64,
+        done: Block,
+        slow: Block,
+    ) {
+        let f = MemFlags::trusted();
+        let ptr = self.ptr;
+        let not_ref = self.b.ins().icmp_imm(IntCC::NotEqual, t, T_R as i64);
+        self.miss_if(not_ref, slow);
+        let otag = self.b.ins().uload8(types::I32, f, p, 0);
+        let not_type = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, otag, i64::from(l.tag_type));
+        self.miss_if(not_type, slow);
+        let cls = self.b.ins().load(ptr, f, p, 8);
+        let ver = self.b.ins().load(types::I64, f, cls, l.type_attr_version);
+        let at = self.b.ins().iconst(ptr, slot);
+        let want = self.b.ins().load(types::I64, f, at, 0);
+        let tag = self.b.ins().load(types::I64, f, at, 8);
+        let bits = self.b.ins().load(types::I64, f, at, 16);
+        let unset = self.b.ins().icmp_imm(IntCC::Equal, want, 0);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, ver, want);
+        let bad = self.b.ins().bor(unset, stale);
+        self.miss_if(bad, slow);
+        for (stamp, vtag) in CLASS_ATTR_SCALARS {
+            let next = self.b.create_block();
+            let hit = self.b.ins().icmp_imm(IntCC::Equal, tag, stamp as i64);
+            let tv = self.b.ins().iconst(types::I64, vtag as i64);
+            let pay = if vtag == T_N {
+                self.b.ins().iconst(types::I64, 0)
+            } else {
+                bits
+            };
+            self.b
+                .ins()
+                .brif(hit, done, &[tv.into(), pay.into()], next, &[]);
+            self.b.switch_to_block(next);
+        }
+        self.b.ins().jump(slow, &[]);
     }
 
     /// Load the result words a helper left at `ctx.out[k..k + 2]` into `r`.
@@ -1077,7 +1335,13 @@ impl Lower<'_> {
         self.b.block_params(merge)[0]
     }
 
-    fn lower(&mut self, code: &CodeObject, ext: &CodeConstObjects, plan: &LeafPlan) -> Option<()> {
+    fn lower(
+        &mut self,
+        code: &CodeObject,
+        ext: &CodeConstObjects,
+        plan: &LeafPlan,
+        f: &Rc<PyFunction>,
+    ) -> Option<()> {
         let entry = self.b.create_block();
         self.b.append_block_params_for_function_params(entry);
         self.b.switch_to_block(entry);
@@ -1085,7 +1349,8 @@ impl Lower<'_> {
         let argw = self.b.block_params(entry)[1];
         self.decline = self.b.create_block();
         let fr = self.b.ins().iadd_imm(self.ctx, i64::from(TOP_OFFSET));
-        let fl = self.frame(plan, code, ext, fr, 0, None);
+        let fl = self.frame(plan, code, ext, fr, 0, None, Rc::as_ptr(f));
+        self.keep.push((Rc::downgrade(f), f.code()));
         let flags = MemFlags::trusted();
         for k in 0..usize::from(plan.nargs) {
             let t = self.b.ins().load(types::I64, flags, argw, (16 * k) as i32);
@@ -1114,6 +1379,7 @@ impl Lower<'_> {
         fr: Value,
         depth: u8,
         ret: Option<(Variable, Variable, Block)>,
+        func: *const PyFunction,
     ) -> FrameLower<'p> {
         let nregs = usize::from(plan.nregs);
         let mut tags = Vec::with_capacity(nregs);
@@ -1150,6 +1416,7 @@ impl Lower<'_> {
             blocks,
             ret,
             may_store,
+            func,
         }
     }
 
@@ -1242,18 +1509,28 @@ impl Lower<'_> {
                     .ins()
                     .iconst(self.ptr, std::ptr::from_ref(slot) as i64);
                 let cache = Box::<GlobalCache>::default();
-                let cache_v = self
-                    .b
-                    .ins()
-                    .iconst(self.ptr, std::ptr::from_ref(&*cache) as i64);
+                let cache_at = std::ptr::from_ref(&*cache) as i64;
                 self.globals.push(cache);
+                let done = self.b.create_block();
+                self.b.append_block_param(done, types::I64);
+                self.b.append_block_param(done, types::I64);
+                let slow = self.b.create_block();
+                self.inline_global(fl, cache_at, done, slow);
+                self.b.switch_to_block(slow);
+                let cache_v = self.b.ins().iconst(self.ptr, cache_at);
                 let pc = self.u32c(u32::from(pc));
                 let st = self.call(
                     h_global as *const () as usize,
                     &[self.ctx, fl.fr, slot, cache_v, pc],
                 );
                 self.check(st);
-                self.set_out(fl, dst, 0);
+                let flags = MemFlags::trusted();
+                let t = self.b.ins().load(types::I64, flags, self.ctx, 0);
+                let p = self.b.ins().load(types::I64, flags, self.ctx, 8);
+                self.b.ins().jump(done, &[t.into(), p.into()]);
+                self.b.switch_to_block(done);
+                let (t, p) = (self.b.block_params(done)[0], self.b.block_params(done)[1]);
+                self.set(fl, dst, t, p);
             }
             Op::Attr { dst, src, pc, name } => {
                 let (t, p) = self.get(fl, src);
@@ -1271,6 +1548,12 @@ impl Lower<'_> {
                     let (vt, vp) = self.inline_field(l, t, p, cache_at, effect, slow);
                     self.b.ins().jump(done, &[vt.into(), vp.into()]);
                     self.b.switch_to_block(slow);
+                    if let Some(slot) = crate::code_stamp_slot(fl.code, u32::from(pc)) {
+                        let slow = self.b.create_block();
+                        let slot = std::ptr::from_ref(slot) as i64;
+                        self.inline_class_attr(l, t, p, slot, done, slow);
+                        self.b.switch_to_block(slow);
+                    }
                 }
                 let addr = if effect {
                     h_field::<true> as *const () as usize
@@ -1293,15 +1576,37 @@ impl Lower<'_> {
                     return Some(false);
                 };
                 let (t, p) = self.get(fl, src);
+                let cache = Box::<MethodCache>::default();
+                let cache_at = std::ptr::from_ref(&*cache) as i64;
+                self.methods.push(cache);
+                let done = self.b.create_block();
+                for _ in 0..4 {
+                    self.b.append_block_param(done, types::I64);
+                }
+                let slow = self.b.create_block();
+                if let Some(l) = crate::tier2::published_obj_layout() {
+                    self.inline_method(l, t, p, cache_at, done, slow);
+                } else {
+                    self.b.ins().jump(slow, &[]);
+                }
+                self.b.switch_to_block(slow);
                 let ms = self.b.ins().iconst(self.ptr, std::ptr::from_ref(ms) as i64);
+                let cache_v = self.b.ins().iconst(self.ptr, cache_at);
                 let nm = self.u32c(u32::from(name));
                 let st = self.call(
                     h_method as *const () as usize,
-                    &[self.ctx, fl.fr, ms, t, p, nm],
+                    &[self.ctx, fl.fr, ms, cache_v, t, p, nm],
                 );
                 self.check(st);
-                self.set_out(fl, dst, 0);
-                self.set_out(fl, dst + 1, 2);
+                let flags = MemFlags::trusted();
+                let w: Vec<_> = (0..4)
+                    .map(|k| self.b.ins().load(types::I64, flags, self.ctx, 8 * k).into())
+                    .collect();
+                self.b.ins().jump(done, &w);
+                self.b.switch_to_block(done);
+                let ps = self.b.block_params(done).to_vec();
+                self.set(fl, dst, ps[0], ps[1]);
+                self.set(fl, dst + 1, ps[2], ps[3]);
             }
             Op::Compare { dst, a, b, kind } => {
                 let (ta, pa) = self.get(fl, a);
@@ -1629,7 +1934,7 @@ impl Lower<'_> {
             let depth = fl.depth + 1;
             self.depth = self.depth.max(depth);
             let ret = Some((fl.tags[usize::from(at)], fl.pays[usize::from(at)], cont));
-            let cfl = self.frame(cplan, &ccode, cext, fr, depth, ret);
+            let cfl = self.frame(cplan, &ccode, cext, fr, depth, ret, Rc::as_ptr(&f));
             // The receiver and the arguments become the callee's first
             // registers.
             for k in 0..=usize::from(argc) {

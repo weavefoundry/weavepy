@@ -2993,6 +2993,11 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
     if cls_arc + arc_data != Rc::as_ptr(&cls) as usize {
         return None;
     }
+    // A class value's payload is the same allocation pointer.
+    let cls_obj = Object::Type(cls.clone());
+    if word(std::ptr::from_ref(&cls_obj).cast::<u8>(), 8) != cls_arc {
+        return None;
+    }
     // The native body's word: a `Cell<usize>` alone in its wrapper,
     // checked on a sample.
     let inst_c_body = arc_data + std::mem::offset_of!(PyInstance, c_body);
@@ -3130,6 +3135,7 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
         tag_float: tag(&Object::Float(0.0)),
         tag_bool: tag(&Object::Bool(false)),
         tag_none: tag(&Object::None),
+        tag_type: tag(&cls_obj),
         inst_class: i32_of(inst_class)?,
         inst_dict_lazy: i32_of(inst_dict_lazy)?,
         inst_split_borrow: i32_of(inst_split_borrow)?,

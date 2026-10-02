@@ -195,6 +195,8 @@ pub struct ObjLayout {
     pub tag_float: u8,
     pub tag_bool: u8,
     pub tag_none: u8,
+    /// A class value's tag (its payload pointer is the class pointer).
+    pub tag_type: u8,
     /// An instance value's payload pointer → the instance's class pointer,
     /// its published dict pointer (null while split), its split values'
     /// borrow counter (`i32`) and block pointer (null while empty).

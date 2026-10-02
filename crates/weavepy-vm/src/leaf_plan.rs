@@ -1571,7 +1571,14 @@ impl Interpreter {
                     .and_then(|s| crate::class_attr_hit(s, cls))
                 {
                     Some(v) => owned.own(v),
-                    None => owned.own(Self::leaf_load_type_attr(code, cls, pc, name)?),
+                    None => {
+                        let v = Self::leaf_load_type_attr(code, cls, pc, name)?;
+                        // A scalar is a plain class value (see
+                        // `leaf_load_type_attr`): remembered for the next
+                        // read, which native code makes in line.
+                        crate::class_attr_fill(code, cls, pc as usize, &v);
+                        owned.own(v)
+                    }
                 }
             }
             Object::Module(module) => {

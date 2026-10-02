@@ -4058,6 +4058,11 @@ pub fn global_value_epoch() -> u64 {
     GLOBAL_VALUE_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Where [`GLOBAL_VALUE_EPOCH`] lives (native code reads it in line).
+pub(crate) fn global_value_epoch_ptr() -> *const u64 {
+    GLOBAL_VALUE_EPOCH.as_ptr()
+}
+
 /// Advance [`GLOBAL_VALUE_EPOCH`].
 #[inline]
 pub fn bump_global_value_epoch() {
@@ -4189,6 +4194,9 @@ impl DictData {
         let owner = std::mem::replace(self.deferred_owner.get_mut(), 0);
         crate::gc_trace::track_deferred_owner(owner);
     }
+
+    /// Where the stamp sits in a dict (native code reads it in line).
+    pub(crate) const STAMP_OFFSET: usize = std::mem::offset_of!(DictData, stamp);
 
     /// The stamp of the dict's current state (see the type docs).
     #[inline]

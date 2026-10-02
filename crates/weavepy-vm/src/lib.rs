@@ -61636,6 +61636,7 @@ fn code_attr_poly(code: &CodeObject, cache_pc: u32) -> Option<&AttrPoly> {
 /// and (for a builtin hit) the builtins dict's stamp. While all three
 /// match, the dicts are exactly as they were when the site last ran its
 /// full guards, so the cached index can be read straight away.
+#[repr(transparent)]
 struct StampSlot(std::cell::UnsafeCell<[u64; 3]>);
 
 // SAFETY: as `MethodSlot`: read and written only from the dispatch loop
