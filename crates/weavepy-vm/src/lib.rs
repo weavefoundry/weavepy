@@ -16317,6 +16317,59 @@ impl Interpreter {
                     last = pc;
                     pc += 1;
                 }
+                // A `def` or `lambda` (CPython 3.14's bare `MAKE_FUNCTION`):
+                // the function, with the defaults and closure the
+                // `SET_FUNCTION_ATTRIBUTE`s right after it attach built in
+                // (each takes the value next below the function). No Python
+                // runs, unless a function watcher would see the creation.
+                OpCode::MakeFunction if ins.arg == 0 => {
+                    let n = stack.len();
+                    if crate::capi_watchers::funcs_active()
+                        || !matches!(stack.last(), Some(Object::Code(_)))
+                    {
+                        break;
+                    }
+                    let mut defaults: Option<Vec<Object>> = None;
+                    let mut closure: Option<Vec<Object>> = None;
+                    let mut k = 0;
+                    while let (Some(next), Some(value)) =
+                        (instrs.get(pc + 1 + k), n.checked_sub(2 + k).map(|i| &stack[i]))
+                    {
+                        let (Object::Tuple(items), OpCode::SetFunctionAttribute) = (value, next.op)
+                        else {
+                            break;
+                        };
+                        let field = match next.arg {
+                            0x01 => &mut defaults,
+                            0x08 => &mut closure,
+                            _ => break,
+                        };
+                        if field.is_some() {
+                            break;
+                        }
+                        *field = Some(items.iter().cloned().collect());
+                        k += 1;
+                    }
+                    let Some(Object::Code(code)) = stack.pop() else {
+                        unreachable!("checked above")
+                    };
+                    for _ in 0..k {
+                        let v = stack.pop().expect("checked above");
+                        self.release(v);
+                    }
+                    let obj = new_function(
+                        code,
+                        globals,
+                        builtins,
+                        defaults.unwrap_or_default(),
+                        Vec::new(),
+                        closure.unwrap_or_default(),
+                        None,
+                    );
+                    stack.push(obj);
+                    last = pc + k;
+                    pc += 1 + k;
+                }
                 OpCode::LoadConst => {
                     let Some(v) = consts.get(ins.arg as usize) else {
                         break;
@@ -22318,84 +22371,15 @@ impl Interpreter {
                         defaults = items.iter().cloned().collect();
                     }
                 }
-                let name = code.name.clone();
-                // Function getset slots live *outside* `__dict__`
-                // (`f.__dict__` starts empty in CPython; only genuine
-                // user attributes land there).
-                let slots = RefCell::new(DictData::with_capacity_and_hasher(4, Default::default()));
-                // Stamp __module__ from globals['__name__'] (mirrors CPython's
-                // function dispatch). Pickle relies on this to serialise the
-                // function by qualified name.
-                let keys = fn_slot_keys();
-                if let Some(name_obj) = frame
-                    .globals
-                    .borrow()
-                    .get(&DictKey(keys[1].clone()))
-                    .cloned()
-                {
-                    slots
-                        .borrow_mut()
-                        .insert(DictKey(keys[0].clone()), name_obj);
-                }
-                // Pin __name__ and __qualname__ as stable objects so
-                // repeated `func.__name__` reads (and delegated reads
-                // through classmethod/staticmethod wrappers) return the
-                // *same* object — CPython exposes these as slots with
-                // stable identity, which `assertIs(wrapper.__name__,
-                // func.__name__)` in test_decorators relies on.
-                // Both come from the code object (see
-                // `CodeConstObjects::fn_names`), so two functions made
-                // from one `def` share them exactly as CPython's do.
-                let (name_obj, qualname_obj) = match code_vm_ext(&code) {
-                    Some(ext) => ext
-                        .fn_names
-                        .get_or_init(|| {
-                            (
-                                Object::from_str(code.name.clone()),
-                                Object::from_str(code.qualname.clone()),
-                            )
-                        })
-                        .clone(),
-                    None => (
-                        Object::from_str(name.clone()),
-                        Object::from_str(code.qualname.clone()),
-                    ),
-                };
-                {
-                    let mut sl = slots.borrow_mut();
-                    sl.insert(DictKey(keys[1].clone()), name_obj);
-                    // `__qualname__` is the code object's PEP 3155 dotted
-                    // name (computed at compile time from lexical
-                    // nesting), not the bare `__name__`.
-                    sl.insert(DictKey(keys[2].clone()), qualname_obj);
-                    if let Some(ann) = annotations_obj {
-                        sl.insert(DictKey(keys[3].clone()), ann);
-                    }
-                }
-                let f = PyFunction {
-                    name,
-                    code: RefCell::new(code),
-                    globals: frame.globals.clone(),
-                    // The defining frame's builtins, not a fresh
-                    // resolution: same mapping CPython's
-                    // `PyFunction_New` snapshots (framestate's
-                    // f_builtins came from the same globals).
-                    builtins: frame.builtins.clone(),
+                let obj = new_function(
+                    code,
+                    &frame.globals,
+                    &frame.builtins,
                     defaults,
                     kw_defaults,
                     closure,
-                    attrs: RefCell::new(None),
-                    slots,
-                    closure_cells: std::sync::OnceLock::new(),
-                    defaults_override: crate::object::OverrideFlag::new(false),
-                };
-                // A function participates in cycles through its globals
-                // (`exec(src, d)` builds `d -> f -> d`), its `__dict__`, and
-                // any closure cell that closes over the function. Track it so
-                // `gc.collect()` can reclaim those cycles and `gc.is_tracked(f)`
-                // reports True, matching CPython (functions are GC objects).
-                let obj = Object::Function(Rc::new(f));
-                gc_trace::track(&obj);
+                    annotations_obj,
+                );
                 // PEP 590-era function watchers: PyFunction_EVENT_CREATE
                 // fires from `PyFunction_New*` (test_capi.test_watchers).
                 if crate::capi_watchers::funcs_active() {
@@ -61387,6 +61371,10 @@ struct CodeConstObjects {
     /// Inline-call shapes per `CALL` site (see [`CallSlot`]); allocated
     /// on the first inline call in this code object.
     call_slots: std::sync::OnceLock<Box<[CallSlot]>>,
+    /// The getset slots of a function made from this code (see
+    /// [`function_slots`]): the module name they were built for, and the
+    /// entries, copied into each new function.
+    fn_slots: std::sync::OnceLock<(Option<Object>, crate::object::DictMap)>,
     /// Whether this code is a *pure leaf* (see [`code_is_pure_leaf`]):
     /// `0` not yet decided, `1` no, `2` general leaf, `3` argument return,
     /// `4` constant return, `5` small-int return, `6` attribute return,
@@ -61422,10 +61410,6 @@ struct CodeConstObjects {
     /// The code's native form for the core loop (see [`frame_jit`]).
     #[cfg(feature = "jit")]
     frame_jit: frame_jit::Slot,
-    /// The `__name__` and `__qualname__` objects of the functions made
-    /// from this code, shared by all of them (as CPython's share the code
-    /// object's `co_name` and `co_qualname`).
-    fn_names: std::sync::OnceLock<(Object, Object)>,
 }
 
 /// A `CALL` site's inline-call shape (see `Interpreter::core_call`): the
@@ -61469,14 +61453,18 @@ unsafe impl Send for CallSlot {}
 unsafe impl Sync for CallSlot {}
 
 impl CallShape {
+    /// The shape for a call of `code`: it depends only on the code and
+    /// the site (every caller still checks the function's own defaults),
+    /// so a fresh function made from the same `def` or `lambda` hits too.
+    /// (The weak handle keeps the code's allocation reserved, so an equal
+    /// address is the same code object.)
     #[inline]
     fn matches(
         &self,
-        func: *const crate::object::PyFunction,
+        _func: *const crate::object::PyFunction,
         code: *const CodeObject,
     ) -> Option<(u32, bool)> {
-        (std::ptr::eq(self.func.as_ptr(), func) && std::ptr::eq(self.code.as_ptr(), code))
-            .then_some((self.missing, self.has_self))
+        std::ptr::eq(self.code.as_ptr(), code).then_some((self.missing, self.has_self))
     }
 }
 
@@ -62895,6 +62883,7 @@ fn code_vm_ext_build(
             stamp_slots: std::sync::OnceLock::new(),
             attr_poly: std::sync::OnceLock::new(),
             call_slots: std::sync::OnceLock::new(),
+            fn_slots: std::sync::OnceLock::new(),
             pure_leaf: std::sync::atomic::AtomicU8::new(0),
             fast_pairs: std::sync::OnceLock::new(),
             gen_fast: std::sync::atomic::AtomicU8::new(0),
@@ -62905,7 +62894,6 @@ fn code_vm_ext_build(
             returns_none: std::sync::atomic::AtomicU8::new(0),
             #[cfg(feature = "jit")]
             frame_jit: frame_jit::Slot::default(),
-            fn_names: std::sync::OnceLock::new(),
         })
     })
 }
@@ -62963,6 +62951,99 @@ fn code_names_anywhere(code: &CodeObject, name: &str) -> bool {
 /// The function getset-slot keys, interned once: a fresh
 /// `Object::from_static` would allocate the text and recompute its hash
 /// at every `MAKE_FUNCTION`.
+/// `MAKE_FUNCTION`'s function: `code` with the defining frame's globals
+/// and builtins, and the operands the instruction's flags popped.
+#[allow(clippy::too_many_arguments)]
+fn new_function(
+    code: Rc<CodeObject>,
+    globals: &Rc<RefCell<DictData>>,
+    builtins: &Rc<RefCell<DictData>>,
+    defaults: Vec<Object>,
+    kw_defaults: Vec<(String, Object)>,
+    closure: Vec<Object>,
+    annotations: Option<Object>,
+) -> Object {
+    // Function getset slots live *outside* `__dict__` (`f.__dict__`
+    // starts empty in CPython; only genuine user attributes land there):
+    // `__module__` (pickle serialises a function by qualified name),
+    // and `__name__` and `__qualname__` as stable objects, so repeated
+    // `func.__name__` reads (and delegated reads through classmethod or
+    // staticmethod wrappers) return the *same* object, which
+    // `assertIs(wrapper.__name__, func.__name__)` in test_decorators
+    // relies on.
+    let mut slots = function_slots(&code, globals);
+    if let Some(ann) = annotations {
+        slots.insert(DictKey(fn_slot_keys()[3].clone()), ann);
+    }
+    let f = PyFunction {
+        name: code.name.clone(),
+        code: RefCell::new(code),
+        globals: globals.clone(),
+        // The defining frame's builtins, not a fresh resolution: the same
+        // mapping CPython's `PyFunction_New` snapshots (the frame's
+        // builtins came from the same globals).
+        builtins: builtins.clone(),
+        defaults,
+        kw_defaults,
+        closure,
+        attrs: RefCell::new(None),
+        slots: RefCell::new(slots),
+        closure_cells: std::sync::OnceLock::new(),
+        defaults_override: crate::object::OverrideFlag::new(false),
+    };
+    // A function participates in cycles through its globals (`exec(src,
+    // d)` builds `d -> f -> d`), its `__dict__`, and any closure cell that
+    // closes over the function. Tracked so `gc.collect()` can reclaim
+    // those cycles and `gc.is_tracked(f)` reports True, matching CPython
+    // (functions are GC objects).
+    let obj = Object::Function(Rc::new(f));
+    gc_trace::track(&obj);
+    obj
+}
+
+/// The getset slots a new function made from `code` in `globals` starts
+/// with: `__module__` (the globals' `__name__`, when set), `__name__` and
+/// `__qualname__`. Built once per code object (for the module name it
+/// first sees) and copied into each function after, so two functions made
+/// from one `def` share their name objects, as CPython's do.
+fn function_slots(code: &CodeObject, globals: &Rc<RefCell<DictData>>) -> DictData {
+    let keys = fn_slot_keys();
+    let module = globals.borrow().get(&DictKey(keys[1].clone())).cloned();
+    let build = |module: Option<Object>| {
+        let mut map = crate::object::DictMap::with_capacity_and_hasher(
+            3,
+            crate::fasthash::FxBuildHasher,
+        );
+        if let Some(m) = module {
+            map.insert(DictKey(keys[0].clone()), m);
+        }
+        map.insert(
+            DictKey(keys[1].clone()),
+            Object::from_str(code.name.clone()),
+        );
+        // `__qualname__` is the code object's PEP 3155 dotted name
+        // (computed at compile time from lexical nesting), not the bare
+        // `__name__`.
+        map.insert(
+            DictKey(keys[2].clone()),
+            Object::from_str(code.qualname.clone()),
+        );
+        map
+    };
+    let same = |a: &Option<Object>, b: &Option<Object>| match (a, b) {
+        (Some(a), Some(b)) => a.is_same(b),
+        (None, None) => true,
+        _ => false,
+    };
+    if let Some(ext) = code_vm_ext(code) {
+        let (built_for, map) = ext.fn_slots.get_or_init(|| (module.clone(), build(module.clone())));
+        if same(built_for, &module) {
+            return DictData::from(map.clone());
+        }
+    }
+    DictData::from(build(module))
+}
+
 fn fn_slot_keys() -> &'static [Object; 4] {
     static KEYS: std::sync::OnceLock<[Object; 4]> = std::sync::OnceLock::new();
     KEYS.get_or_init(|| {
