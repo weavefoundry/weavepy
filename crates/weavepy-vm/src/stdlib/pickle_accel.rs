@@ -663,11 +663,14 @@ impl<'a> Reader<'a> {
     }
 
     /// Whether the current frame (or the data outside one) continues with
-    /// `bytes`.
-    #[inline]
-    fn next_is(&self, bytes: &[u8]) -> bool {
-        self.limit - self.pos >= bytes.len()
-            && self.data.get(self.pos..self.pos + bytes.len()) == Some(bytes)
+    /// `bytes`, compared byte by byte (not with a call to `memcmp`).
+    #[inline(always)]
+    fn next_is<const N: usize>(&self, bytes: [u8; N]) -> bool {
+        self.limit - self.pos >= N
+            && bytes
+                .iter()
+                .enumerate()
+                .all(|(i, byte)| self.data.get(self.pos + i) == Some(byte))
     }
 
     #[inline(always)]
@@ -1039,7 +1042,7 @@ impl<'c> Decoder<'c> {
     /// writes.
     #[inline(always)]
     fn memoize_next(&mut self, reader: &mut Reader<'_>, stack: &[Entry]) -> Option<()> {
-        if reader.next_is(&[0x94]) {
+        if reader.next_is([0x94]) {
             reader.pos += 1;
             self.opcode(0x94);
             self.memoize(stack.last()?)?;
@@ -1563,7 +1566,7 @@ impl<'c> Decoder<'c> {
                     push(stack, (Object::new_tuple(Vec::new()), node))?;
                 }
                 // The pickler writes a state with `__slots__` this way.
-                0x86 if reader.next_is(&[0x94, BUILD]) => {
+                0x86 if reader.next_is([0x94, BUILD]) => {
                     reader.pos += 2;
                     self.opcode(0x94);
                     self.opcode(BUILD);
