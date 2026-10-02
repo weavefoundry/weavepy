@@ -45,6 +45,9 @@ from . import _compiler, _parser
 from . import _engine
 import functools
 import _sre
+# WeavePy: `_compile(pattern, flags)` answered natively from `_cache2` on a
+# hit (see `_compile_front` below); a miss calls `_compile`.
+from _sre import compile_cached as _compile_cached
 
 
 # public symbols
@@ -83,17 +86,17 @@ PatternError = error = _compiler.PatternError
 def match(pattern, string, flags=0):
     """Try to apply the pattern at the start of the string, returning
     a Match object, or None if no match was found."""
-    return _compile(pattern, flags).match(string)
+    return _compile_cached(_compile_front, pattern, flags).match(string)
 
 def fullmatch(pattern, string, flags=0):
     """Try to apply the pattern to all of the string, returning
     a Match object, or None if no match was found."""
-    return _compile(pattern, flags).fullmatch(string)
+    return _compile_cached(_compile_front, pattern, flags).fullmatch(string)
 
 def search(pattern, string, flags=0):
     """Scan through string looking for a match to the pattern, returning
     a Match object, or None if no match was found."""
-    return _compile(pattern, flags).search(string)
+    return _compile_cached(_compile_front, pattern, flags).search(string)
 
 class _ZeroSentinel(int):
     pass
@@ -128,7 +131,7 @@ def sub(pattern, repl, string, *args, count=_zero_sentinel, flags=_zero_sentinel
     if flags is _zero_sentinel:
         flags = 0
 
-    return _compile(pattern, flags).sub(repl, string, count)
+    return _compile_cached(_compile_front, pattern, flags).sub(repl, string, count)
 sub.__text_signature__ = '(pattern, repl, string, count=0, flags=0)'
 
 def subn(pattern, repl, string, *args, count=_zero_sentinel, flags=_zero_sentinel):
@@ -162,7 +165,7 @@ def subn(pattern, repl, string, *args, count=_zero_sentinel, flags=_zero_sentine
     if flags is _zero_sentinel:
         flags = 0
 
-    return _compile(pattern, flags).subn(repl, string, count)
+    return _compile_cached(_compile_front, pattern, flags).subn(repl, string, count)
 subn.__text_signature__ = '(pattern, repl, string, count=0, flags=0)'
 
 def split(pattern, string, *args, maxsplit=_zero_sentinel, flags=_zero_sentinel):
@@ -195,7 +198,7 @@ def split(pattern, string, *args, maxsplit=_zero_sentinel, flags=_zero_sentinel)
     if flags is _zero_sentinel:
         flags = 0
 
-    return _compile(pattern, flags).split(string, maxsplit)
+    return _compile_cached(_compile_front, pattern, flags).split(string, maxsplit)
 split.__text_signature__ = '(pattern, string, maxsplit=0, flags=0)'
 
 def findall(pattern, string, flags=0):
@@ -206,18 +209,18 @@ def findall(pattern, string, flags=0):
     has more than one group.
 
     Empty matches are included in the result."""
-    return _compile(pattern, flags).findall(string)
+    return _compile_cached(_compile_front, pattern, flags).findall(string)
 
 def finditer(pattern, string, flags=0):
     """Return an iterator over all non-overlapping matches in the
     string.  For each match, the iterator returns a Match object.
 
     Empty matches are included in the result."""
-    return _compile(pattern, flags).finditer(string)
+    return _compile_cached(_compile_front, pattern, flags).finditer(string)
 
 def compile(pattern, flags=0):
     "Compile a regular expression pattern, returning a Pattern object."
-    return _compile(pattern, flags)
+    return _compile_cached(_compile_front, pattern, flags)
 
 def purge():
     "Clear the regular expression caches"
@@ -298,6 +301,10 @@ def _compile(pattern, flags):
             pass
     _cache2[key] = p
     return p
+
+# What `_compile_cached` needs: the FIFO cache it reads, the full lookup it
+# falls back to, and the flag type `_compile` normalizes.
+_compile_front = (_cache2, _compile, RegexFlag)
 
 # register myself for pickling
 

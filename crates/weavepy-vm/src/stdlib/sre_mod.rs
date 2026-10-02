@@ -86,6 +86,11 @@ const OP_LITERAL_UNI_IGNORE: u32 = 40;
 const OP_NOT_LITERAL_UNI_IGNORE: u32 = 41;
 const OP_RANGE_UNI_IGNORE: u32 = 42;
 
+// INFO block flags.
+const SRE_INFO_PREFIX: u32 = 1;
+const SRE_INFO_LITERAL: u32 = 2;
+const SRE_INFO_CHARSET: u32 = 4;
+
 // AT codes.
 const AT_BEGINNING: u32 = 0;
 const AT_BEGINNING_LINE: u32 = 1;
@@ -134,9 +139,13 @@ const MAX_DEPTH: u32 = 200_000;
 // Compiled-pattern registry
 // ---------------------------------------------------------------------------
 
-struct CompiledCode {
-    code: Vec<u32>,
-    groups: usize,
+pub(crate) struct CompiledCode {
+    pub(crate) code: Vec<u32>,
+    pub(crate) groups: usize,
+    /// Whether the pattern was a `str` (`Some(true)`) or a bytes-like
+    /// object (`Some(false)`); `None` for a pattern compiled from a parsed
+    /// tree (`re.Scanner`), which, like CPython's, accepts either subject.
+    pub(crate) is_str: Option<bool>,
 }
 
 /// Process-global compiled-pattern registry.
@@ -148,11 +157,47 @@ struct CompiledCode {
 /// thread tries to `exec` it (e.g. `threading`/`logging` module-level
 /// regexes used from a `Thread.run`). Handles are indices that only
 /// ever grow, so they stay valid across threads; `CompiledCode` is
-/// immutable after compilation, so sharing it is race-free.
-fn registry() -> &'static parking_lot::Mutex<Vec<Rc<CompiledCode>>> {
-    static REGISTRY: std::sync::OnceLock<parking_lot::Mutex<Vec<Rc<CompiledCode>>>> =
+/// immutable after compilation, so sharing it is race-free. Entries are
+/// never removed, so each one is leaked once and shared by reference.
+fn registry() -> &'static parking_lot::Mutex<Vec<&'static CompiledCode>> {
+    static REGISTRY: std::sync::OnceLock<parking_lot::Mutex<Vec<&'static CompiledCode>>> =
         std::sync::OnceLock::new();
     REGISTRY.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
+thread_local! {
+    /// This thread's copy of the registry's prefix, so a lookup takes no
+    /// lock (entries never change once registered).
+    static LOCAL_CODES: std::cell::RefCell<Vec<&'static CompiledCode>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Register compiled code; the handle indexes the registry.
+pub(crate) fn register_code(code: Vec<u32>, groups: usize, is_str: Option<bool>) -> i64 {
+    let cc: &'static CompiledCode = Box::leak(Box::new(CompiledCode {
+        code,
+        groups,
+        is_str,
+    }));
+    let mut reg = registry().lock();
+    reg.push(cc);
+    (reg.len() - 1) as i64
+}
+
+/// The compiled code behind `handle`.
+#[inline]
+pub(crate) fn compiled(handle: i64) -> Option<&'static CompiledCode> {
+    let idx = usize::try_from(handle).ok()?;
+    LOCAL_CODES.with(|local| {
+        if let Some(cc) = local.borrow().get(idx) {
+            return Some(*cc);
+        }
+        let mut local = local.borrow_mut();
+        let reg = registry().lock();
+        let have = local.len();
+        local.extend_from_slice(reg.get(have..)?);
+        local.get(idx).copied()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +305,9 @@ fn loc_word(ch: u32) -> bool {
 }
 
 fn uni_digit(ch: u32) -> bool {
+    if ch < 128 {
+        return ascii_digit(ch);
+    }
     match char::from_u32(ch) {
         // Py_UNICODE_ISDECIMAL — decimal digits: ASCII `0`-`9` plus the
         // Unicode Decimal_Number (Nd) category for non-ASCII scripts.
@@ -294,6 +342,10 @@ fn nd_digit(c: char) -> bool {
 }
 
 fn uni_space(ch: u32) -> bool {
+    if ch < 128 {
+        // `char::is_whitespace` over ASCII.
+        return matches!(ch, 0x09..=0x0d | 0x20);
+    }
     match char::from_u32(ch) {
         Some(c) => c.is_whitespace(),
         None => false,
@@ -301,8 +353,8 @@ fn uni_space(ch: u32) -> bool {
 }
 
 fn uni_word(ch: u32) -> bool {
-    if ch == u32::from(b'_') {
-        return true;
+    if ch < 128 {
+        return ascii_word(ch);
     }
     match char::from_u32(ch) {
         Some(c) => c.is_alphanumeric(),
@@ -345,9 +397,22 @@ fn category(chcode: u32, ch: u32) -> bool {
 // The matcher
 // ---------------------------------------------------------------------------
 
+/// A subject code unit: a byte (`bytes`, or an ASCII `str` matched over
+/// its UTF-8 bytes in place) or a code point.
+pub(crate) trait SreChar: Copy + Into<u32> {}
+impl SreChar for u8 {}
+impl SreChar for u32 {}
+
+#[inline(always)]
+fn cu<C: SreChar>(c: C) -> u32 {
+    c.into()
+}
+
+/// Saved capture state (CPython's `LASTMARK_SAVE`, plus `MARK_PUSH` of
+/// the marks themselves while a `REPEAT` is active).
 #[derive(Clone)]
 struct MarkSnapshot {
-    marks: Vec<isize>,
+    marks: Option<Vec<isize>>,
     lastmark: isize,
     lastindex: isize,
 }
@@ -360,8 +425,8 @@ struct RepeatCtx {
     prev: Option<usize>,
 }
 
-struct Matcher<'a> {
-    s: &'a [u32],
+struct Matcher<'a, C: SreChar> {
+    s: &'a [C],
     code: &'a [u32],
     beginning: usize,
     start: usize,
@@ -482,8 +547,9 @@ fn code_range_has_mark(code: &[u32], start: usize, end: usize) -> bool {
     false
 }
 
-impl<'a> Matcher<'a> {
-    fn new(s: &'a [u32], code: &'a [u32], groups: usize) -> Self {
+impl<'a, C: SreChar> Matcher<'a, C> {
+    /// A matcher over `s`; `marks` holds `2 * groups` entries, all `-1`.
+    fn new(s: &'a [C], code: &'a [u32], marks: Vec<isize>) -> Self {
         Matcher {
             s,
             code,
@@ -491,7 +557,7 @@ impl<'a> Matcher<'a> {
             start: 0,
             end: s.len(),
             ptr: 0,
-            marks: vec![-1; groups * 2],
+            marks,
             lastmark: -1,
             lastindex: -1,
             must_advance: false,
@@ -512,10 +578,16 @@ impl<'a> Matcher<'a> {
         self.lastindex = -1;
     }
 
+    /// Save the capture state before a choice point. Outside any `REPEAT`
+    /// only `lastmark`/`lastindex` are saved, as in CPython: a failed
+    /// alternative can only have set marks above the saved `lastmark`
+    /// (each group's marks appear once in the code, and nothing loops
+    /// back outside a repeat), and restoring `lastmark` invalidates
+    /// those. Inside a repeat the marks themselves are saved too.
     #[inline]
     fn snapshot(&self) -> MarkSnapshot {
         MarkSnapshot {
-            marks: self.marks.clone(),
+            marks: self.cur_repeat.is_some().then(|| self.marks.clone()),
             lastmark: self.lastmark,
             lastindex: self.lastindex,
         }
@@ -523,7 +595,9 @@ impl<'a> Matcher<'a> {
 
     #[inline]
     fn restore(&mut self, snap: &MarkSnapshot) {
-        self.marks.clone_from(&snap.marks);
+        if let Some(marks) = &snap.marks {
+            self.marks.clone_from(marks);
+        }
         self.lastmark = snap.lastmark;
         self.lastindex = snap.lastindex;
     }
@@ -728,9 +802,9 @@ impl<'a> Matcher<'a> {
         let s = self.s;
         match atcode {
             AT_BEGINNING | AT_BEGINNING_STRING => ptr == self.beginning,
-            AT_BEGINNING_LINE => ptr == self.beginning || is_linebreak(s[ptr - 1]),
-            AT_END => (self.end - ptr == 1 && is_linebreak(s[ptr])) || ptr == self.end,
-            AT_END_LINE => ptr == self.end || is_linebreak(s[ptr]),
+            AT_BEGINNING_LINE => ptr == self.beginning || is_linebreak(cu(s[ptr - 1])),
+            AT_END => (self.end - ptr == 1 && is_linebreak(cu(s[ptr]))) || ptr == self.end,
+            AT_END_LINE => ptr == self.end || is_linebreak(cu(s[ptr])),
             AT_END_STRING => ptr == self.end,
             AT_BOUNDARY => self.word_boundary(ptr, ascii_word),
             // 3.14 (gh-124130): `\B` matches the empty string again (the
@@ -757,8 +831,8 @@ impl<'a> Matcher<'a> {
     /// its exact complement (CPython `SRE_AT_NON_BOUNDARY`).
     #[inline]
     fn word_boundary_raw(&self, ptr: usize, is_word: fn(u32) -> bool) -> bool {
-        let thatp = ptr > self.beginning && is_word(self.s[ptr - 1]);
-        let thisp = ptr < self.end && is_word(self.s[ptr]);
+        let thatp = ptr > self.beginning && is_word(cu(self.s[ptr - 1]));
+        let thisp = ptr < self.end && is_word(cu(self.s[ptr]));
         thisp != thatp
     }
 
@@ -859,14 +933,14 @@ impl<'a> Matcher<'a> {
         let counted = match op {
             OP_IN => {
                 let mut p = ptr;
-                while p < end && self.charset(pat + 2, s[p]) {
+                while p < end && self.charset(pat + 2, cu(s[p])) {
                     p += 1;
                 }
                 p - ptr
             }
             OP_ANY => {
                 let mut p = ptr;
-                while p < end && !is_linebreak(s[p]) {
+                while p < end && !is_linebreak(cu(s[p])) {
                     p += 1;
                 }
                 p - ptr
@@ -875,7 +949,7 @@ impl<'a> Matcher<'a> {
             OP_LITERAL => {
                 let chr = code[pat + 1];
                 let mut p = ptr;
-                while p < end && s[p] == chr {
+                while p < end && cu(s[p]) == chr {
                     p += 1;
                 }
                 p - ptr
@@ -883,7 +957,7 @@ impl<'a> Matcher<'a> {
             OP_NOT_LITERAL => {
                 let chr = code[pat + 1];
                 let mut p = ptr;
-                while p < end && s[p] != chr {
+                while p < end && cu(s[p]) != chr {
                     p += 1;
                 }
                 p - ptr
@@ -891,7 +965,7 @@ impl<'a> Matcher<'a> {
             OP_LITERAL_IGNORE => {
                 let chr = code[pat + 1];
                 let mut p = ptr;
-                while p < end && lower_ascii(s[p]) == chr {
+                while p < end && lower_ascii(cu(s[p])) == chr {
                     p += 1;
                 }
                 p - ptr
@@ -899,7 +973,7 @@ impl<'a> Matcher<'a> {
             OP_LITERAL_UNI_IGNORE => {
                 let chr = code[pat + 1];
                 let mut p = ptr;
-                while p < end && lower_unicode(s[p]) == chr {
+                while p < end && lower_unicode(cu(s[p])) == chr {
                     p += 1;
                 }
                 p - ptr
@@ -907,7 +981,7 @@ impl<'a> Matcher<'a> {
             OP_LITERAL_LOC_IGNORE => {
                 let chr = code[pat + 1];
                 let mut p = ptr;
-                while p < end && char_loc_ignore(chr, s[p]) {
+                while p < end && char_loc_ignore(chr, cu(s[p])) {
                     p += 1;
                 }
                 p - ptr
@@ -915,7 +989,7 @@ impl<'a> Matcher<'a> {
             OP_NOT_LITERAL_IGNORE => {
                 let chr = code[pat + 1];
                 let mut p = ptr;
-                while p < end && lower_ascii(s[p]) != chr {
+                while p < end && lower_ascii(cu(s[p])) != chr {
                     p += 1;
                 }
                 p - ptr
@@ -923,7 +997,7 @@ impl<'a> Matcher<'a> {
             OP_NOT_LITERAL_UNI_IGNORE => {
                 let chr = code[pat + 1];
                 let mut p = ptr;
-                while p < end && lower_unicode(s[p]) != chr {
+                while p < end && lower_unicode(cu(s[p])) != chr {
                     p += 1;
                 }
                 p - ptr
@@ -931,7 +1005,7 @@ impl<'a> Matcher<'a> {
             OP_NOT_LITERAL_LOC_IGNORE => {
                 let chr = code[pat + 1];
                 let mut p = ptr;
-                while p < end && !char_loc_ignore(chr, s[p]) {
+                while p < end && !char_loc_ignore(chr, cu(s[p])) {
                     p += 1;
                 }
                 p - ptr
@@ -967,10 +1041,15 @@ impl<'a> Matcher<'a> {
         }
         // Segmented stack growth: linear-depth backtracking (one native
         // frame per repetition) must not overflow the OS stack before
-        // reaching MAX_DEPTH.
-        let r = stacker::maybe_grow(128 * 1024, 4 * 1024 * 1024, || {
+        // reaching MAX_DEPTH. Checking at every eighth level is enough:
+        // eight frames stay far inside the 128 KiB red zone.
+        let r = if self.depth % 8 == 1 {
+            stacker::maybe_grow(128 * 1024, 4 * 1024 * 1024, || {
+                self.do_match_inner(pat, toplevel)
+            })
+        } else {
             self.do_match_inner(pat, toplevel)
-        });
+        };
         self.depth -= 1;
         r
     }
@@ -1011,14 +1090,14 @@ impl<'a> Matcher<'a> {
                     pat += 1;
                 }
                 OP_LITERAL => {
-                    if ptr >= end || self.s[ptr] != code[pat] {
+                    if ptr >= end || cu(self.s[ptr]) != code[pat] {
                         return Ok(false);
                     }
                     pat += 1;
                     ptr += 1;
                 }
                 OP_NOT_LITERAL => {
-                    if ptr >= end || self.s[ptr] == code[pat] {
+                    if ptr >= end || cu(self.s[ptr]) == code[pat] {
                         return Ok(false);
                     }
                     pat += 1;
@@ -1041,14 +1120,14 @@ impl<'a> Matcher<'a> {
                     pat += 1;
                 }
                 OP_CATEGORY => {
-                    if ptr >= end || !category(code[pat], self.s[ptr]) {
+                    if ptr >= end || !category(code[pat], cu(self.s[ptr])) {
                         return Ok(false);
                     }
                     pat += 1;
                     ptr += 1;
                 }
                 OP_ANY => {
-                    if ptr >= end || is_linebreak(self.s[ptr]) {
+                    if ptr >= end || is_linebreak(cu(self.s[ptr])) {
                         return Ok(false);
                     }
                     ptr += 1;
@@ -1060,70 +1139,70 @@ impl<'a> Matcher<'a> {
                     ptr += 1;
                 }
                 OP_IN => {
-                    if ptr >= end || !self.charset(pat + 1, self.s[ptr]) {
+                    if ptr >= end || !self.charset(pat + 1, cu(self.s[ptr])) {
                         return Ok(false);
                     }
                     pat += code[pat] as usize;
                     ptr += 1;
                 }
                 OP_LITERAL_IGNORE => {
-                    if ptr >= end || lower_ascii(self.s[ptr]) != code[pat] {
+                    if ptr >= end || lower_ascii(cu(self.s[ptr])) != code[pat] {
                         return Ok(false);
                     }
                     pat += 1;
                     ptr += 1;
                 }
                 OP_LITERAL_UNI_IGNORE => {
-                    if ptr >= end || lower_unicode(self.s[ptr]) != code[pat] {
+                    if ptr >= end || lower_unicode(cu(self.s[ptr])) != code[pat] {
                         return Ok(false);
                     }
                     pat += 1;
                     ptr += 1;
                 }
                 OP_LITERAL_LOC_IGNORE => {
-                    if ptr >= end || !char_loc_ignore(code[pat], self.s[ptr]) {
+                    if ptr >= end || !char_loc_ignore(code[pat], cu(self.s[ptr])) {
                         return Ok(false);
                     }
                     pat += 1;
                     ptr += 1;
                 }
                 OP_NOT_LITERAL_IGNORE => {
-                    if ptr >= end || lower_ascii(self.s[ptr]) == code[pat] {
+                    if ptr >= end || lower_ascii(cu(self.s[ptr])) == code[pat] {
                         return Ok(false);
                     }
                     pat += 1;
                     ptr += 1;
                 }
                 OP_NOT_LITERAL_UNI_IGNORE => {
-                    if ptr >= end || lower_unicode(self.s[ptr]) == code[pat] {
+                    if ptr >= end || lower_unicode(cu(self.s[ptr])) == code[pat] {
                         return Ok(false);
                     }
                     pat += 1;
                     ptr += 1;
                 }
                 OP_NOT_LITERAL_LOC_IGNORE => {
-                    if ptr >= end || char_loc_ignore(code[pat], self.s[ptr]) {
+                    if ptr >= end || char_loc_ignore(code[pat], cu(self.s[ptr])) {
                         return Ok(false);
                     }
                     pat += 1;
                     ptr += 1;
                 }
                 OP_IN_IGNORE => {
-                    if ptr >= end || !self.charset(pat + 1, lower_ascii(self.s[ptr])) {
+                    if ptr >= end || !self.charset(pat + 1, lower_ascii(cu(self.s[ptr]))) {
                         return Ok(false);
                     }
                     pat += code[pat] as usize;
                     ptr += 1;
                 }
                 OP_IN_UNI_IGNORE => {
-                    if ptr >= end || !self.charset(pat + 1, lower_unicode(self.s[ptr])) {
+                    if ptr >= end || !self.charset(pat + 1, lower_unicode(cu(self.s[ptr]))) {
                         return Ok(false);
                     }
                     pat += code[pat] as usize;
                     ptr += 1;
                 }
                 OP_IN_LOC_IGNORE => {
-                    if ptr >= end || !self.charset_loc_ignore(pat + 1, self.s[ptr]) {
+                    if ptr >= end || !self.charset_loc_ignore(pat + 1, cu(self.s[ptr])) {
                         return Ok(false);
                     }
                     pat += code[pat] as usize;
@@ -1137,13 +1216,13 @@ impl<'a> Matcher<'a> {
                     while code[pat] != 0 {
                         // Fast skip when the branch can't possibly match.
                         if code[pat + 1] == OP_LITERAL
-                            && (ptr >= end || self.s[ptr] != code[pat + 2])
+                            && (ptr >= end || cu(self.s[ptr]) != code[pat + 2])
                         {
                             pat += code[pat] as usize;
                             continue;
                         }
                         if code[pat + 1] == OP_IN
-                            && (ptr >= end || !self.charset(pat + 3, self.s[ptr]))
+                            && (ptr >= end || !self.charset(pat + 3, cu(self.s[ptr])))
                         {
                             pat += code[pat] as usize;
                             continue;
@@ -1192,7 +1271,7 @@ impl<'a> Matcher<'a> {
                         loop {
                             while cnt >= pmin_i && {
                                 let pos = orig + cnt as usize;
-                                pos >= end || self.s[pos] != chr
+                                pos >= end || cu(self.s[pos]) != chr
                             } {
                                 cnt -= 1;
                             }
@@ -1567,8 +1646,8 @@ impl<'a> Matcher<'a> {
             if ptr >= end {
                 return false;
             }
-            let a = self.s[ptr];
-            let b = self.s[p];
+            let a = cu(self.s[ptr]);
+            let b = cu(self.s[p]);
             let eq = match kind {
                 GroupRefKind::Exact => a == b,
                 GroupRefKind::Ascii => lower_ascii(a) == lower_ascii(b),
@@ -1587,46 +1666,177 @@ impl<'a> Matcher<'a> {
 
     /// `SRE(search)` — scan for the leftmost match at or after
     /// `self.start`. Returns the start position of the match on success.
+    ///
+    /// Like CPython's, it uses the pattern's `INFO` block: a literal
+    /// prefix is found with its overlap table (and is the whole match
+    /// for a literal pattern), a leading character set skips the
+    /// positions that cannot start a match, and the minimum width stops
+    /// the scan early.
     fn search(&mut self) -> Result<Option<usize>, RuntimeError> {
-        // Determine where the real pattern starts (after any INFO block)
-        // for the anchored-pattern fast reject.
-        let mut p = 0usize;
-        let mut min = 0usize;
-        if self.code[0] == OP_INFO {
-            min = self.code[3] as usize;
-            p = 1 + self.code[1] as usize;
-        }
-        let anchored = self.code.get(p) == Some(&OP_AT)
-            && matches!(
-                self.code.get(p + 1).copied(),
-                Some(AT_BEGINNING) | Some(AT_BEGINNING_STRING)
-            );
-
+        let code = self.code;
         let mut ptr = self.start;
-        let mut first = true;
-        loop {
-            if min != 0 && self.end.saturating_sub(ptr) < min {
+        let mut end = self.end;
+        if ptr > end {
+            return Ok(None);
+        }
+        let mut pat = 0usize;
+        let mut flags = 0u32;
+        let mut prefix_len = 0usize;
+        let mut prefix_skip = 0usize;
+        let mut charset = None;
+        if code[0] == OP_INFO {
+            // <INFO> <1=skip> <2=flags> <3=min> <4=max> <5=prefix info>
+            flags = code[2];
+            let min = code[3] as usize;
+            if min != 0 && end - ptr < min {
                 return Ok(None);
             }
+            if min > 1 {
+                // Leave at least one character, so the literal search
+                // works.
+                end -= min - 1;
+                if end <= ptr {
+                    end = ptr;
+                }
+            }
+            if flags & SRE_INFO_PREFIX != 0 {
+                // <length> <skip> <prefix data> <overlap data>
+                prefix_len = code[5] as usize;
+                prefix_skip = code[6] as usize;
+            } else if flags & SRE_INFO_CHARSET != 0 {
+                charset = Some(5);
+            }
+            pat = 1 + code[1] as usize;
+        }
+
+        if prefix_len == 1 {
+            // The pattern starts with a literal character.
+            let c = code[7];
+            let end = self.end;
+            self.must_advance = false;
+            while ptr < end {
+                while cu(self.s[ptr]) != c {
+                    ptr += 1;
+                    if ptr >= end {
+                        return Ok(None);
+                    }
+                }
+                self.start = ptr;
+                self.ptr = ptr + prefix_skip;
+                if flags & SRE_INFO_LITERAL != 0 {
+                    return Ok(Some(ptr));
+                }
+                if self.do_match(pat + 2 * prefix_skip, false)? {
+                    return Ok(Some(ptr));
+                }
+                ptr += 1;
+                self.reset_capture();
+            }
+            return Ok(None);
+        }
+
+        if prefix_len > 1 {
+            // The pattern starts with a known prefix: use the overlap
+            // table to skip forward as fast as possible.
+            let prefix = &code[7..7 + prefix_len];
+            let overlap = &code[7 + prefix_len - 1..];
+            let end = self.end;
+            if prefix_len > end - ptr {
+                return Ok(None);
+            }
+            while ptr < end {
+                let c = prefix[0];
+                loop {
+                    let ch = cu(self.s[ptr]);
+                    ptr += 1;
+                    if ch == c {
+                        break;
+                    }
+                    if ptr >= end {
+                        return Ok(None);
+                    }
+                }
+                if ptr >= end {
+                    return Ok(None);
+                }
+                let mut i = 1usize;
+                self.must_advance = false;
+                loop {
+                    if cu(self.s[ptr]) == prefix[i] {
+                        i += 1;
+                        if i != prefix_len {
+                            ptr += 1;
+                            if ptr >= end {
+                                return Ok(None);
+                            }
+                            continue;
+                        }
+                        // A potential match.
+                        let start = ptr - (prefix_len - 1);
+                        self.start = start;
+                        self.ptr = ptr - (prefix_len - prefix_skip - 1);
+                        if flags & SRE_INFO_LITERAL != 0 {
+                            return Ok(Some(start));
+                        }
+                        if self.do_match(pat + 2 * prefix_skip, false)? {
+                            return Ok(Some(start));
+                        }
+                        // Close, but no match: try again.
+                        ptr += 1;
+                        if ptr >= end {
+                            return Ok(None);
+                        }
+                        self.reset_capture();
+                    }
+                    i = overlap[i] as usize;
+                    if i == 0 {
+                        break;
+                    }
+                }
+            }
+            return Ok(None);
+        }
+
+        if let Some(set) = charset {
+            // The pattern starts with a character from a known set.
+            let end = self.end;
+            self.must_advance = false;
+            loop {
+                while ptr < end && !self.charset(set, cu(self.s[ptr])) {
+                    ptr += 1;
+                }
+                if ptr >= end {
+                    return Ok(None);
+                }
+                self.start = ptr;
+                self.ptr = ptr;
+                if self.do_match(pat, false)? {
+                    return Ok(Some(ptr));
+                }
+                ptr += 1;
+                self.reset_capture();
+            }
+        }
+
+        // The general case.
+        self.start = ptr;
+        self.ptr = ptr;
+        let mut matched = self.do_match(pat, true)?;
+        self.must_advance = false;
+        if !matched
+            && code[pat] == OP_AT
+            && (code[pat + 1] == AT_BEGINNING || code[pat + 1] == AT_BEGINNING_STRING)
+        {
+            return Ok(None);
+        }
+        while !matched && ptr < end {
+            ptr += 1;
+            self.reset_capture();
             self.start = ptr;
             self.ptr = ptr;
-            self.reset_capture();
-            let matched = self.do_match(0, true)?;
-            if first {
-                self.must_advance = false;
-                first = false;
-            }
-            if matched {
-                return Ok(Some(ptr));
-            }
-            if anchored {
-                return Ok(None);
-            }
-            if ptr >= self.end {
-                return Ok(None);
-            }
-            ptr += 1;
+            matched = self.do_match(pat, false)?;
         }
+        Ok(matched.then_some(ptr))
     }
 }
 
@@ -1764,7 +1974,7 @@ fn subject_cache_key(obj: &Object) -> Option<usize> {
 
 /// Decode the subject into code points, reusing the thread-local cache when
 /// the same immutable subject is matched repeatedly.
-fn decode_subject_cached(obj: &Object) -> Result<Rc<Vec<u32>>, RuntimeError> {
+pub(crate) fn decode_subject_cached(obj: &Object) -> Result<Rc<Vec<u32>>, RuntimeError> {
     let Some(key) = subject_cache_key(obj) else {
         return Ok(Rc::new(subject_to_vec(obj)?));
     };
@@ -1790,44 +2000,79 @@ fn sre_compile(args: &[Object]) -> Result<Object, RuntimeError> {
             .ok_or_else(|| type_error("_sre.compile: code"))?,
     )?;
     let groups = arg_i64(args, 1, "groups")?.max(0) as usize;
-    let handle = {
-        let mut reg = registry().lock();
-        reg.push(Rc::new(CompiledCode { code, groups }));
-        reg.len() - 1
-    };
-    Ok(Object::Int(handle as i64))
+    Ok(Object::Int(register_code(code, groups, None)))
 }
 
-/// `_sre.exec(handle, string, pos, endpos, mode, must_advance)`.
+/// `_sre.compile_code(pattern, code, groups)`: [`sre_compile`] for a
+/// pattern whose source (`str`, bytes-like, or `None`) fixes the subject
+/// type it accepts.
+pub(crate) fn compile_code(
+    pattern: &Object,
+    code: &Object,
+    groups: &Object,
+) -> Result<i64, RuntimeError> {
+    let code = codeseq_to_vec(code)?;
+    let groups = groups
+        .as_i64()
+        .ok_or_else(|| type_error("_sre: expected int for groups"))?
+        .max(0) as usize;
+    let is_str = match pattern {
+        Object::None => None,
+        Object::Str(_) | Object::WStr(_) => Some(true),
+        other => Some(matches!(
+            other.native_value(),
+            Some(Object::Str(_) | Object::WStr(_))
+        )),
+    };
+    Ok(register_code(code, groups, is_str))
+}
+
+/// One `SRE(match)` / `SRE(search)` over `subject[pos..endpos]`.
 ///
-/// Returns `None` on no match, otherwise a tuple
-/// `(start, end, lastindex, marks)` where `marks` is a tuple of
-/// `2 * groups` code-point indices (`-1` for an unset group).
-fn sre_exec(args: &[Object]) -> Result<Object, RuntimeError> {
-    let handle = arg_i64(args, 0, "handle")? as usize;
-    let cc = registry().lock().get(handle).cloned();
-    let cc = cc.ok_or_else(|| value_error("_sre.exec: invalid pattern handle"))?;
-    let subject =
-        decode_subject_cached(args.get(1).ok_or_else(|| type_error("_sre.exec: string"))?)?;
-    let slen = subject.len() as i64;
-    let pos = arg_i64(args, 2, "pos")?.clamp(0, slen) as usize;
-    let endpos = arg_i64(args, 3, "endpos")?.clamp(0, slen) as usize;
-    let mode = arg_i64(args, 4, "mode")?;
-    let must_advance = args
-        .get(5)
-        .map(|o| o.as_i64().unwrap_or(0) != 0)
-        .unwrap_or(false);
-
+/// `mode` 0 searches, 1 matches at `pos`, 2 must match all of
+/// `[pos, endpos)`. On a match, `marks` receives the match span followed
+/// by each group's span, with `-1` for a group that did not take part
+/// (normalized the way CPython's `pattern_new_match` does), and the
+/// result is `Some(lastindex)` (`-1` for none).
+pub(crate) fn exec_marks<C: SreChar>(
+    cc: &CompiledCode,
+    subject: &[C],
+    pos: usize,
+    endpos: usize,
+    mode: i64,
+    must_advance: bool,
+    marks: &mut Vec<i64>,
+) -> Result<Option<isize>, RuntimeError> {
+    marks.clear();
     if pos > endpos {
-        return Ok(Object::None);
+        return Ok(None);
     }
-
-    let mut m = Matcher::new(&subject[..], &cc.code, cc.groups);
+    // The matcher's mark array comes from this thread's spare (taken, so
+    // a match started while this one runs gets its own).
+    let mut buf = SPARE_MARKS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+    buf.clear();
+    buf.resize(cc.groups * 2, -1);
+    let mut m = Matcher::new(subject, &cc.code, buf);
     m.end = endpos;
     m.start = pos;
     m.ptr = pos;
     m.must_advance = must_advance;
+    let r = run_exec(&mut m, pos, mode, cc.groups, marks);
+    SPARE_MARKS.with(|s| *s.borrow_mut() = std::mem::take(&mut m.marks));
+    r
+}
 
+thread_local! {
+    static SPARE_MARKS: std::cell::RefCell<Vec<isize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn run_exec<C: SreChar>(
+    m: &mut Matcher<'_, C>,
+    pos: usize,
+    mode: i64,
+    groups: usize,
+    marks: &mut Vec<i64>,
+) -> Result<Option<isize>, RuntimeError> {
     let (mstart, ok) = match mode {
         // 1 = match (anchored at pos)
         1 => {
@@ -1846,26 +2091,61 @@ fn sre_exec(args: &[Object]) -> Result<Object, RuntimeError> {
             None => (0, false),
         },
     };
-
     if !ok {
-        return Ok(Object::None);
+        return Ok(None);
     }
-
-    let mend = m.ptr;
-    let mut marks_out: Vec<Object> = Vec::with_capacity(cc.groups * 2);
-    for i in 0..cc.groups * 2 {
-        let v = if (i as isize) <= m.lastmark {
-            m.marks[i]
+    marks.reserve(2 + groups * 2);
+    marks.push(mstart as i64);
+    marks.push(m.ptr as i64);
+    for g in 0..groups {
+        let j = 2 * g;
+        if (j + 1) as isize <= m.lastmark && m.marks[j] >= 0 && m.marks[j + 1] >= 0 {
+            marks.push(m.marks[j] as i64);
+            marks.push(m.marks[j + 1] as i64);
         } else {
-            -1
-        };
-        marks_out.push(Object::Int(v as i64));
+            marks.push(-1);
+            marks.push(-1);
+        }
     }
+    Ok(Some(m.lastindex))
+}
+
+/// `_sre.exec(handle, string, pos, endpos, mode, must_advance)`.
+///
+/// Returns `None` on no match, otherwise a tuple
+/// `(start, end, lastindex, marks)` where `marks` is a tuple of
+/// `2 * groups` code-point indices (`-1` for an unset group).
+fn sre_exec(args: &[Object]) -> Result<Object, RuntimeError> {
+    let handle = arg_i64(args, 0, "handle")?;
+    let cc = compiled(handle).ok_or_else(|| value_error("_sre.exec: invalid pattern handle"))?;
+    let subject =
+        decode_subject_cached(args.get(1).ok_or_else(|| type_error("_sre.exec: string"))?)?;
+    let slen = subject.len() as i64;
+    let pos = arg_i64(args, 2, "pos")?.clamp(0, slen) as usize;
+    let endpos = arg_i64(args, 3, "endpos")?.clamp(0, slen) as usize;
+    let mode = arg_i64(args, 4, "mode")?;
+    let must_advance = args
+        .get(5)
+        .map(|o| o.as_i64().unwrap_or(0) != 0)
+        .unwrap_or(false);
+    let mut marks = Vec::new();
+    let Some(lastindex) = exec_marks(
+        cc,
+        &subject[..],
+        pos,
+        endpos,
+        mode,
+        must_advance,
+        &mut marks,
+    )?
+    else {
+        return Ok(Object::None);
+    };
     Ok(Object::new_tuple_array([
-        Object::Int(mstart as i64),
-        Object::Int(mend as i64),
-        Object::Int(m.lastindex as i64),
-        Object::new_tuple(marks_out),
+        Object::Int(marks[0]),
+        Object::Int(marks[1]),
+        Object::Int(lastindex as i64),
+        Object::new_tuple(marks[2..].iter().map(|&v| Object::Int(v)).collect()),
     ]))
 }
 
@@ -1944,6 +2224,21 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             b("compile", sre_compile),
         );
         d.insert(DictKey(Object::from_static("exec")), b("exec", sre_exec));
+        for (name, f) in [
+            (
+                "install",
+                super::sre_objects::install as fn(&[Object]) -> Result<Object, RuntimeError>,
+            ),
+            ("make_pattern", super::sre_objects::make_pattern),
+            ("exec_match", super::sre_objects::exec_match),
+            ("clear_templates", super::sre_objects::clear_templates),
+        ] {
+            d.insert(DictKey(Object::from_static(name)), b(name, f));
+        }
+        d.insert(
+            DictKey(Object::from_static("compile_cached")),
+            super::sre_objects::compile_cached_builtin(),
+        );
         d.insert(
             DictKey(Object::from_static("ascii_tolower")),
             b("ascii_tolower", sre_ascii_tolower),
