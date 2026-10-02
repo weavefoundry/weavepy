@@ -22122,7 +22122,7 @@ impl Interpreter {
                 // Function getset slots live *outside* `__dict__`
                 // (`f.__dict__` starts empty in CPython; only genuine
                 // user attributes land there).
-                let slots = RefCell::new(DictData::default());
+                let slots = RefCell::new(DictData::with_capacity_and_hasher(4, Default::default()));
                 // Stamp __module__ from globals['__name__'] (mirrors CPython's
                 // function dispatch). Pickle relies on this to serialise the
                 // function by qualified name.
@@ -22146,10 +22146,21 @@ impl Interpreter {
                 // Both come from the code object (see
                 // `CodeConstObjects::fn_names`), so two functions made
                 // from one `def` share them exactly as CPython's do.
-                let (name_obj, qualname_obj) = (
-                    Object::from_str(name.clone()),
-                    Object::from_str(code.qualname.clone()),
-                );
+                let (name_obj, qualname_obj) = match code_vm_ext(&code) {
+                    Some(ext) => ext
+                        .fn_names
+                        .get_or_init(|| {
+                            (
+                                Object::from_str(code.name.clone()),
+                                Object::from_str(code.qualname.clone()),
+                            )
+                        })
+                        .clone(),
+                    None => (
+                        Object::from_str(name.clone()),
+                        Object::from_str(code.qualname.clone()),
+                    ),
+                };
                 {
                     let mut sl = slots.borrow_mut();
                     sl.insert(DictKey(keys[1].clone()), name_obj);
@@ -61177,6 +61188,10 @@ struct CodeConstObjects {
     /// The code's native form for the core loop (see [`frame_jit`]).
     #[cfg(feature = "jit")]
     frame_jit: frame_jit::Slot,
+    /// The `__name__` and `__qualname__` objects of the functions made
+    /// from this code, shared by all of them (as CPython's share the code
+    /// object's `co_name` and `co_qualname`).
+    fn_names: std::sync::OnceLock<(Object, Object)>,
 }
 
 /// A `CALL` site's inline-call shape (see `Interpreter::core_call`): the
@@ -62627,6 +62642,7 @@ fn code_vm_ext_build(
             returns_none: std::sync::atomic::AtomicU8::new(0),
             #[cfg(feature = "jit")]
             frame_jit: frame_jit::Slot::default(),
+            fn_names: std::sync::OnceLock::new(),
         })
     })
 }
