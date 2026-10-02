@@ -7139,6 +7139,8 @@ fn b_set(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let out = if args.is_empty() {
         crate::object::SetData::default()
+    } else if let Some(out) = simple_key_set(&args[0]) {
+        out
     } else {
         // `set([[]])` raises `TypeError: unhashable type: 'list'` — check
         // each element as it is admitted, like CPython's `set_init`. A
@@ -7156,6 +7158,35 @@ fn b_set(args: &[Object]) -> Result<Object, RuntimeError> {
     // CPython tracks every set (`gc.is_tracked(set())` is True).
     crate::gc_trace::track(&obj);
     Ok(obj)
+}
+
+/// The set of a list's or tuple's items when every item is an `int`,
+/// `str`, `float`, `bool` or `None` (whose hashing and comparison run no
+/// Python and can't fail): sized once and filled without the per-insert
+/// error scope. `None` leaves the general path to it.
+fn simple_key_set(src: &Object) -> Option<crate::object::SetData> {
+    fn build(items: &[Object]) -> Option<crate::object::SetData> {
+        let simple = |v: &Object| {
+            matches!(
+                v,
+                Object::Int(_) | Object::Str(_) | Object::Float(_) | Object::Bool(_) | Object::None
+            )
+        };
+        if !items.iter().all(simple) {
+            return None;
+        }
+        let mut out =
+            crate::object::SetData::with_capacity_and_hasher(items.len(), Default::default());
+        for v in items {
+            out.insert(DictKey(v.clone()));
+        }
+        Some(out)
+    }
+    match src {
+        Object::List(l) => build(&l.try_borrow().ok()?),
+        Object::Tuple(t) => build(t),
+        _ => None,
+    }
 }
 
 fn b_frozenset(args: &[Object]) -> Result<Object, RuntimeError> {
