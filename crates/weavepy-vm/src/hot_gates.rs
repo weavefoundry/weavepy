@@ -92,6 +92,13 @@ pub fn loop_gen() -> u64 {
     LOOP_GEN.load(Ordering::Relaxed)
 }
 
+/// The loop generation's address, for native code that compares it at
+/// its back edges.
+#[cfg(feature = "jit")]
+pub(crate) fn loop_gen_ptr() -> *const u64 {
+    LOOP_GEN.as_ptr()
+}
+
 /// Invalidate every dispatch loop's cached prologue snapshot
 /// (RFC 0065 WS1). Cheap (one relaxed RMW); call from any mutation
 /// site whose state the loop prologue consults.

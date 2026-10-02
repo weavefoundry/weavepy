@@ -280,6 +280,13 @@ impl JitHint {
         true
     }
 
+    /// Whether the tier-2 state has no further interest in this code's
+    /// back edges (see [`Self::set_backedge_quiet`]).
+    #[inline]
+    pub fn is_backedge_quiet(&self) -> bool {
+        self.backedge_quiet.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn set_backedge_quiet(&self) {
         self.backedge_quiet
             .store(true, std::sync::atomic::Ordering::Relaxed);

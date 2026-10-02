@@ -372,12 +372,62 @@ impl Interpreter {
         if pc >= ninstrs {
             return GenStep::Bail;
         }
+        // The body's native form (see `frame_jit`), run from every pc the
+        // arms below leave it at; a hot body compiles.
+        #[cfg(feature = "jit")]
+        let native = {
+            let nlocals = locals.len();
+            if ext.frame_jit.get(nlocals).is_none() {
+                ext.frame_jit.warm(code, ext, nlocals, 0);
+            }
+            ext.frame_jit.get(nlocals)
+        };
+        #[cfg(feature = "jit")]
+        let mut nst = crate::frame_jit::State {
+            locals: lbase,
+            stack: base,
+            len,
+            cap,
+            pc,
+            last: pc,
+            countdown: std::ptr::addr_of_mut!(self.gil_countdown),
+            snap_gen,
+            // (Only read when the native form runs.)
+            maybe_dead: if native.is_some() {
+                crate::gc_trace::maybe_dead_flag()
+            } else {
+                std::ptr::null()
+            },
+            interp: std::ptr::from_ref(self),
+            out: 0,
+            depth_cell: std::ptr::null(),
+            err: None,
+        };
+        #[cfg(feature = "jit")]
+        let mut handed = usize::MAX;
         // SAFETY (throughout): `base` indexes only below `len` (initialized)
         // or `cap` as checked; `lbase`, `cbase` and `instrs` only at the
         // indices and pcs the eligibility scan proved in range (`in_bounds`:
         // every jump lands on an instruction and the last can't fall
         // through, so `pc < ninstrs` whenever an instruction is read).
         let yielded = loop {
+            #[cfg(feature = "jit")]
+            if pc != handed {
+                if let Some(native) = native.filter(|n| n.enters_at(pc)) {
+                    nst.len = len;
+                    nst.pc = pc;
+                    // SAFETY: the body's activation state, as this loop
+                    // holds it (its locals count checked above). A queued
+                    // finalizer waits for the general loop's next check.
+                    let _ = unsafe { native.run(&mut nst) };
+                    len = nst.len;
+                    pc = nst.pc;
+                    handed = pc;
+                    if pc >= ninstrs {
+                        break None;
+                    }
+                }
+            }
             let ins = unsafe { *instrs.add(pc) };
             match ins.op {
                 OpCode::Nop | OpCode::NotTaken | OpCode::Resume => pc += 1,

@@ -1480,7 +1480,7 @@ fn encode_exception_table(code: &CodeObject, starts: &[usize]) -> Vec<u8> {
 /// depths for inlined comprehensions; entries the walk never reaches
 /// stay -1. Handlers whose depth is still the sentinel do not seed
 /// the walk (their depth is exactly what's being computed).
-pub(crate) fn compute_startdepths(code: &CodeObject) -> Vec<i64> {
+pub fn compute_startdepths(code: &CodeObject) -> Vec<i64> {
     use OpCode as O;
     let n = code.instructions.len();
     let mut startdepth: Vec<i64> = vec![-1; n];

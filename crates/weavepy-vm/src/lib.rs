@@ -61,6 +61,8 @@ pub mod hot_gates;
 pub mod import;
 pub mod import_time;
 pub mod inst_dict;
+#[cfg(feature = "jit")]
+mod frame_jit;
 mod lazy_arc;
 mod leaf_plan;
 pub mod linejump;
@@ -9808,8 +9810,25 @@ impl Interpreter {
     /// the full leaf arms and hands back at the next core instruction.
     #[inline(never)]
     fn leaf_burst(&mut self, sw: &mut CoreSwitch, snap_gen: u64) -> LeafStop {
+        // Which copy of the core loop runs: the native one drives the
+        // running code's native form (see `frame_jit`).
+        #[cfg(feature = "jit")]
+        let mut native = false;
         loop {
-            match self.leaf_core(sw, snap_gen) {
+            #[cfg(feature = "jit")]
+            let exit = if native {
+                self.leaf_core::<true>(sw, snap_gen)
+            } else {
+                self.leaf_core::<false>(sw, snap_gen)
+            };
+            #[cfg(not(feature = "jit"))]
+            let exit = self.leaf_core::<false>(sw, snap_gen);
+            match exit {
+                #[cfg(feature = "jit")]
+                CoreExit::Switch => {
+                    native = !native;
+                    continue;
+                }
                 CoreExit::Stop(stop) => return stop,
                 CoreExit::Helper => {
                     // SAFETY: see `CoreSwitch` (the running activation's
@@ -9953,6 +9972,104 @@ impl Interpreter {
         done
     }
 
+    /// The core loop's `LOAD_FAST x` (at `pc`, of the heap local `other`)
+    /// followed by `x.m(<simple arguments>)`: a native method the site
+    /// cached for the receiver's class, a leaf method the site verified,
+    /// a pure leaf method, or a container's site-cached leaf method,
+    /// called on the borrowed operands. Returns the call's result and the
+    /// `CALL`'s pc; `None` touches nothing (the instructions run one by
+    /// one).
+    ///
+    /// # Safety
+    ///
+    /// `lbase` is the running activation's `nlocals` locals; nothing else
+    /// borrows them.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn core_local_method(
+        &self,
+        code: &CodeObject,
+        ext: Option<&CodeConstObjects>,
+        other: &Object,
+        pc: usize,
+        lbase: *mut Object,
+        nlocals: usize,
+        consts: &[Object],
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<(Result<Object, RuntimeError>, usize)> {
+        let next = *code.instructions.get(pc + 1)?;
+        let mslots: &[MethodSlot] = ext
+            .and_then(|e| e.method_slots.get())
+            .map_or(&[][..], |s| &s[..]);
+        match other {
+            Object::Instance(_) | Object::Module(_) => {
+                // `x.m(...)` of a pure leaf method with simple arguments: its
+                // result, evaluated on the borrowed operands.
+                if !simple_args_prefix(&code.instructions, pc + 2) {
+                    return None;
+                }
+                // A native method the site cached for this class version:
+                // straight to its fused call (the Python leaf probes below
+                // would miss).
+                if let (Object::Instance(i), Some(ms)) = (other, mslots.get(pc + 1)) {
+                    if ms
+                        .peek_inst_builtin(i.cls_raw().attr_version.get())
+                        .is_some()
+                    {
+                        if let Some(hit) = self.core_native_method(
+                            code, other, pc + 1, next.arg, mslots, lbase, nlocals, consts,
+                        ) {
+                            return Some(hit);
+                        }
+                    }
+                }
+                // A site that verified its callee for this class version.
+                let mut missed = false;
+                if let (Object::Instance(i), Some(ext)) = (other, ext) {
+                    if let Some(site) = leaf_site_hit(ext, pc + 1, i.cls_raw().attr_version.get()) {
+                        match self.core_leaf_site_call(
+                            code,
+                            i,
+                            other,
+                            site,
+                            pc + 1,
+                            next.arg,
+                            lbase,
+                            nlocals,
+                            consts,
+                            depth_cell,
+                        ) {
+                            SiteCall::Done(v, call_pc) => return Some((Ok(v), call_pc)),
+                            SiteCall::Declined => {}
+                            SiteCall::Missed => missed = true,
+                        }
+                    }
+                }
+                let pure_site = !missed
+                    && match (other, mslots.get(pc + 1)) {
+                        (Object::Instance(i), Some(ms)) => ms
+                            .peek_fn(i.cls_raw().attr_version.get())
+                            // SAFETY: the slot's function is alive (its class
+                            // version matched).
+                            .is_some_and(|fp| fn_is_leaf(unsafe { &*fp })),
+                        _ => false,
+                    };
+                if pure_site {
+                    let (v, call_pc) = self.core_pure_method(
+                        code, other, pc + 1, next.arg, mslots, lbase, nlocals, consts, depth_cell,
+                    )?;
+                    return Some((Ok(v), call_pc));
+                }
+                self.core_native_method(code, other, pc + 1, next.arg, mslots, lbase, nlocals, consts)
+            }
+            // A container's site-cached leaf method.
+            Object::List(_) | Object::Dict(_) | Object::Set(_) | Object::Str(_) => {
+                self.core_builtin_method(code, other, pc + 1, mslots, lbase, nlocals, consts)
+            }
+            _ => None,
+        }
+    }
+
     /// [`Self::leaf_fused_len`] for the `LOAD_GLOBAL` at `pc` of `frame`,
     /// when the four-instruction `len(x)` shape is there.
     #[inline]
@@ -9995,7 +10112,7 @@ impl Interpreter {
     /// the frame first and reload everything after (see
     /// [`Self::core_call`], [`Self::core_return`]).
     #[inline(always)]
-    fn leaf_core(&mut self, sw: &mut CoreSwitch, snap_gen: u64) -> CoreExit {
+    fn leaf_core<const NATIVE: bool>(&mut self, sw: &mut CoreSwitch, snap_gen: u64) -> CoreExit {
         #[inline(always)]
         fn scalar(v: &Object) -> bool {
             matches!(
@@ -10081,7 +10198,63 @@ impl Interpreter {
                     }
                 };
             }
+            // The code's native form (see `frame_jit`): the native copy of
+            // this loop runs it from every pc the arms below leave it at,
+            // and the arms only run the instructions it returns at.
+            #[cfg(feature = "jit")]
+            let native = ext.and_then(|e| e.frame_jit.get(nlocals));
+            #[cfg(feature = "jit")]
+            if NATIVE != native.is_some() {
+                // (The activation is synced at every reload.)
+                return CoreExit::Switch;
+            }
+            #[cfg(feature = "jit")]
+            if pc == 0 && !NATIVE {
+                if let Some(ext) = ext {
+                    ext.frame_jit.warm(code, ext, nlocals, 0);
+                }
+            }
+            #[cfg(feature = "jit")]
+            let mut nst = frame_jit::State {
+                locals: lbase,
+                stack: base,
+                len,
+                cap,
+                pc,
+                last,
+                countdown: std::ptr::addr_of_mut!(self.gil_countdown),
+                snap_gen,
+                maybe_dead: pending_work,
+                interp: std::ptr::from_ref(self),
+                out: 0,
+                depth_cell: sw.depth_cell,
+                err: None,
+            };
+            // The pc the native code last returned at (the arms run it).
+            #[cfg(feature = "jit")]
+            let mut handed = usize::MAX;
             let stop = loop {
+                #[cfg(feature = "jit")]
+                if NATIVE && pc != handed {
+                    if let Some(native) = native.filter(|n| n.enters_at(pc)) {
+                        nst.len = len;
+                        nst.pc = pc;
+                        nst.last = last;
+                        // SAFETY: the running activation's state, as this
+                        // loop holds it (its locals count checked above).
+                        let status = unsafe { native.run(&mut nst) };
+                        len = nst.len;
+                        pc = nst.pc;
+                        last = nst.last;
+                        if status == frame_jit::MARKED {
+                            break Some(CoreExit::Stop(LeafStop::Marked));
+                        }
+                        if let Some(e) = nst.err.take() {
+                            break Some(CoreExit::Stop(LeafStop::Raised(e)));
+                        }
+                        handed = pc;
+                    }
+                }
                 if pc >= ninstrs {
                     break Some(CoreExit::Stop(LeafStop::Step));
                 }
@@ -10238,148 +10411,42 @@ impl Interpreter {
                                     // off the local (no receiver clone pushed and
                                     // released); a miss loads the receiver and
                                     // leaves `LOAD_ATTR` to its own arm.
+                                    // `x.m(...)` of a leaf or native method on the
+                                    // borrowed local (see `core_local_method`).
+                                    if pc + 1 < ninstrs
+                                        && len < cap
+                                        && (*instrs.add(pc + 1)).op == OpCode::LoadMethodAttr
+                                    {
+                                        if let Some((r, call_pc)) = self.core_local_method(
+                                            code,
+                                            ext,
+                                            other,
+                                            pc,
+                                            lbase,
+                                            nlocals,
+                                            consts,
+                                            sw.depth_cell,
+                                        ) {
+                                            last = call_pc;
+                                            pc = call_pc + 1;
+                                            match r {
+                                                Ok(v) => {
+                                                    base.add(len).write(v);
+                                                    len += 1;
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    break Some(CoreExit::Stop(LeafStop::Raised(
+                                                        e,
+                                                    )));
+                                                }
+                                            }
+                                        }
+                                    }
                                     if matches!(other, Object::Instance(_) | Object::Module(_))
                                         && pc + 1 < ninstrs
                                     {
                                         let next = *instrs.add(pc + 1);
-                                        // `x.m(...)` of a pure leaf method with
-                                        // simple arguments: its result,
-                                        // evaluated on the borrowed operands.
-                                        if next.op == OpCode::LoadMethodAttr
-                                            && len < cap
-                                            && simple_args_prefix(&code.instructions, pc + 2)
-                                        {
-                                            // A native method the site cached
-                                            // for this class version: straight
-                                            // to its fused call (the Python
-                                            // leaf probes below would miss).
-                                            if let (Object::Instance(i), Some(ms)) =
-                                                (other, mslots!(cold_mslots, ext).get(pc + 1))
-                                            {
-                                                if ms
-                                                    .peek_inst_builtin(
-                                                        i.cls_raw().attr_version.get(),
-                                                    )
-                                                    .is_some()
-                                                {
-                                                    if let Some((r, call_pc)) = self
-                                                        .core_native_method(
-                                                            code,
-                                                            other,
-                                                            pc + 1,
-                                                            next.arg,
-                                                            mslots!(cold_mslots, ext),
-                                                            lbase,
-                                                            nlocals,
-                                                            consts,
-                                                        )
-                                                    {
-                                                        last = call_pc;
-                                                        pc = call_pc + 1;
-                                                        match r {
-                                                            Ok(v) => {
-                                                                base.add(len).write(v);
-                                                                len += 1;
-                                                                continue;
-                                                            }
-                                                            Err(e) => {
-                                                                break Some(CoreExit::Stop(
-                                                                    LeafStop::Raised(e),
-                                                                ));
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            // A site that verified its callee
-                                            // for this class version.
-                                            let mut missed = false;
-                                            if let (Object::Instance(i), Some(ext)) = (other, ext) {
-                                                if let Some(site) = leaf_site_hit(
-                                                    ext,
-                                                    pc + 1,
-                                                    i.cls_raw().attr_version.get(),
-                                                ) {
-                                                    match self.core_leaf_site_call(
-                                                        code,
-                                                        i,
-                                                        other,
-                                                        site,
-                                                        pc + 1,
-                                                        next.arg,
-                                                        lbase,
-                                                        nlocals,
-                                                        consts,
-                                                        sw.depth_cell,
-                                                    ) {
-                                                        SiteCall::Done(v, call_pc) => {
-                                                            base.add(len).write(v);
-                                                            len += 1;
-                                                            last = call_pc;
-                                                            pc = call_pc + 1;
-                                                            continue;
-                                                        }
-                                                        SiteCall::Declined => {}
-                                                        SiteCall::Missed => missed = true,
-                                                    }
-                                                }
-                                            }
-                                            let pure_site = !missed
-                                                && match (
-                                                    other,
-                                                    mslots!(cold_mslots, ext).get(pc + 1),
-                                                ) {
-                                                    (Object::Instance(i), Some(ms)) => ms
-                                                        .peek_fn(i.cls_raw().attr_version.get())
-                                                        .is_some_and(|fp| fn_is_leaf(&*fp)),
-                                                    _ => false,
-                                                };
-                                            if pure_site {
-                                                if let Some((v, call_pc)) = self.core_pure_method(
-                                                    code,
-                                                    other,
-                                                    pc + 1,
-                                                    next.arg,
-                                                    mslots!(cold_mslots, ext),
-                                                    lbase,
-                                                    nlocals,
-                                                    consts,
-                                                    sw.depth_cell,
-                                                ) {
-                                                    base.add(len).write(v);
-                                                    len += 1;
-                                                    last = call_pc;
-                                                    pc = call_pc + 1;
-                                                    continue;
-                                                }
-                                            } else if let Some((r, call_pc)) = self
-                                                .core_native_method(
-                                                    code,
-                                                    other,
-                                                    pc + 1,
-                                                    next.arg,
-                                                    mslots!(cold_mslots, ext),
-                                                    lbase,
-                                                    nlocals,
-                                                    consts,
-                                                )
-                                            {
-                                                last = call_pc;
-                                                pc = call_pc + 1;
-                                                match r {
-                                                    Ok(v) => {
-                                                        base.add(len).write(v);
-                                                        len += 1;
-                                                        continue;
-                                                    }
-                                                    Err(e) => {
-                                                        break Some(CoreExit::Stop(
-                                                            LeafStop::Raised(e),
-                                                        ));
-                                                    }
-                                                }
-                                            }
-                                        }
                                         if next.op == OpCode::LoadAttr {
                                             if code
                                                 .instructions
@@ -10440,43 +10507,6 @@ impl Interpreter {
                                             last = pc + 1;
                                             pc += 2;
                                             continue;
-                                        }
-                                    }
-                                    // `x.m(...)` of a container's site-cached
-                                    // leaf method on the borrowed local.
-                                    if matches!(
-                                        other,
-                                        Object::List(_)
-                                            | Object::Dict(_)
-                                            | Object::Set(_)
-                                            | Object::Str(_)
-                                    ) && pc + 1 < ninstrs
-                                        && len < cap
-                                        && (*instrs.add(pc + 1)).op == OpCode::LoadMethodAttr
-                                    {
-                                        if let Some((r, call_pc)) = self.core_builtin_method(
-                                            code,
-                                            other,
-                                            pc + 1,
-                                            mslots!(cold_mslots, ext),
-                                            lbase,
-                                            nlocals,
-                                            consts,
-                                        ) {
-                                            last = call_pc;
-                                            pc = call_pc + 1;
-                                            match r {
-                                                Ok(v) => {
-                                                    base.add(len).write(v);
-                                                    len += 1;
-                                                    continue;
-                                                }
-                                                Err(e) => {
-                                                    break Some(CoreExit::Stop(LeafStop::Raised(
-                                                        e,
-                                                    )));
-                                                }
-                                            }
                                         }
                                     }
                                     clone_hot(other)
@@ -11085,6 +11115,17 @@ impl Interpreter {
                         self.gil_countdown -= 1;
                         last = pc;
                         pc = (pc + 1).saturating_sub(ins.arg as usize);
+                        // A hot loop compiles its code, and switches to the
+                        // native copy of this loop on the spot.
+                        #[cfg(feature = "jit")]
+                        if !NATIVE {
+                            if let Some(ext) = ext {
+                                ext.frame_jit.warm(code, ext, nlocals, last);
+                                if ext.frame_jit.get(nlocals).is_some() {
+                                    break Some(CoreExit::Switch);
+                                }
+                            }
+                        }
                     }
                     OpCode::ForIter => {
                         // A range iterator's next value; anything else (another
@@ -55986,7 +56027,7 @@ enum QuietShell<'a> {
 
 #[cfg(test)]
 thread_local! {
-    static NATIVE_FAST_SUBSCRIPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static NATIVE_FAST_SUBSCRIPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static LEAF_SET_REMOVALS: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0; 2]) };
     static SAVED_NATIVE_LEAF_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static SAVED_NATIVE_REJECTED_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -56372,6 +56413,11 @@ enum CoreExit {
     /// (Inside [`Interpreter::leaf_core`] only.) An in-loop call or
     /// return synced and moved the running activation: reload.
     Reload,
+    /// The running activation (synced) has native code and the loop is
+    /// its interpreted copy, or the other way round: run the other copy
+    /// (see `frame_jit`).
+    #[cfg(feature = "jit")]
+    Switch,
 }
 
 /// How [`Interpreter::leaf_core_attr`] ran its instruction.
@@ -60827,6 +60873,9 @@ struct CodeConstObjects {
     /// Whether every return is `return None` (see
     /// [`code_returns_only_none`]): `0` not yet decided, `1` no, `2` yes.
     returns_none: std::sync::atomic::AtomicU8,
+    /// The code's native form for the core loop (see [`frame_jit`]).
+    #[cfg(feature = "jit")]
+    frame_jit: frame_jit::Slot,
 }
 
 /// A `CALL` site's inline-call shape (see `Interpreter::core_call`): the
@@ -61127,6 +61176,32 @@ fn leaf_site_hit(
     let site = unsafe { &*ext.leaf_sites.get()?.get(pc)?.0.get() }.as_ref()?;
     (site.ver == ver && site.func.strong_count() > 0)
         .then(|| (site.func.as_ptr(), site.code, site.effect))
+}
+
+/// Whether the method call whose `LOAD_ATTR` is at `pc` last resolved to
+/// a callee the core loop runs in place (a builtin, or a leaf function),
+/// without an activation of its own.
+#[cfg(feature = "jit")]
+pub(crate) fn method_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
+    // SAFETY: GIL-serialized; the borrows end before any refill.
+    let leaf = ext
+        .leaf_sites
+        .get()
+        .and_then(|s| s.get(pc))
+        .and_then(|s| unsafe { &*s.0.get() }.as_ref())
+        .is_some_and(|site| site.func.strong_count() > 0);
+    leaf || ext
+        .method_slots
+        .get()
+        .and_then(|s| s.get(pc))
+        .is_some_and(|slot| match unsafe { &(*slot.0.get()).1 } {
+            MethodSlotFn::Builtin(_) | MethodSlotFn::Leaf(..) => true,
+            MethodSlotFn::Py(w) | MethodSlotFn::Static(w) => {
+                // SAFETY: the function is alive while the upgrade holds it.
+                w.upgrade().is_some_and(|f| fn_is_leaf(&f))
+            }
+            _ => false,
+        })
 }
 
 /// Record (or, with `data` `None`, forget) the site at `pc`'s callee.
@@ -62248,6 +62323,8 @@ fn code_vm_ext_build(
             leaf_sites: std::sync::OnceLock::new(),
             leaf_plan: std::sync::OnceLock::new(),
             returns_none: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(feature = "jit")]
+            frame_jit: frame_jit::Slot::default(),
         })
     })
 }
