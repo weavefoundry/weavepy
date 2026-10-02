@@ -11805,14 +11805,20 @@ impl Interpreter {
                                 }
                             }
                         }
-                        // A natively served class's constructor (see
-                        // `stdlib::datetime_native`), in place.
-                        if python == 2 {
+                        // A natively served class's constructor or bound
+                        // class method (see `stdlib::datetime_native`), in
+                        // place.
+                        if python != 1 {
                             let start = len - argc - 2;
                             // SAFETY: `len >= argc + 2`: the call's operands.
                             let ops =
                                 unsafe { std::slice::from_raw_parts(base.add(start), argc + 2) };
-                            if let Some(r) = Self::core_native_ctor_kw(ops, argc, false) {
+                            let r = match &ops[0] {
+                                Object::Type(_) => Self::core_native_ctor_kw(ops, argc, false),
+                                Object::BoundMethod(_) => Self::core_native_bound_call(ops),
+                                _ => None,
+                            };
+                            if let Some(r) = r {
                                 // SAFETY: every operand was checked to leave by a
                                 // plain decrement; the result takes the callee's
                                 // slot.
@@ -15573,6 +15579,43 @@ impl Interpreter {
             return None;
         }
         crate::stdlib::datetime_native::construct_names(cls, args, names, values)?.ok()
+    }
+
+    /// A call of a bound natively served class method
+    /// (`datetime.fromisoformat(s)`; see
+    /// [`crate::stdlib::datetime_native::bound_fast`]): `ops` is the core
+    /// loop's `CALL` operands (the bound method, an empty self slot and
+    /// the arguments). The result, or `None` (nothing touched) for the
+    /// full handler, which also raises every error.
+    #[inline(never)]
+    fn core_native_bound_call(ops: &[Object]) -> Option<Object> {
+        let (Object::BoundMethod(bm), Object::Unbound) = (ops.first()?, ops.get(1)?) else {
+            return None;
+        };
+        let args = &ops[2..];
+        if args.len() > 7 || bm.redispatch_descriptor {
+            return None;
+        }
+        let fast = crate::stdlib::datetime_native::bound_fast(&bm.function, &bm.receiver)?;
+        if !ops
+            .iter()
+            .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
+        {
+            return None;
+        }
+        // Bitwise views of the receiver and the arguments, never dropped:
+        // the fast half reads them (and clones what it keeps).
+        let mut views = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
+        // SAFETY: the method and the core loop's stack keep them alive.
+        views[0].write(unsafe { std::ptr::read(&bm.receiver) });
+        for (v, a) in views[1..].iter_mut().zip(args) {
+            // SAFETY: as above.
+            v.write(unsafe { std::ptr::read(a) });
+        }
+        // SAFETY: the first `args.len() + 1` entries were written.
+        let views =
+            unsafe { std::slice::from_raw_parts(views.as_ptr().cast::<Object>(), args.len() + 1) };
+        fast(views)?.ok()
     }
 
     /// A natively served instance's public field (`dt.hour`; see

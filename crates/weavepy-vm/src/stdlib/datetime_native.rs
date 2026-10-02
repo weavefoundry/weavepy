@@ -2353,6 +2353,22 @@ pub(crate) fn type_classmethod(cls: &TypeObject, name: &SharedStr) -> Option<Obj
     st.fromiso.get().cloned()
 }
 
+/// The fast half of `function` bound to `receiver` when that is a native
+/// class method of its exact class (see [`type_classmethod`]); the
+/// caller passes the receiver first.
+pub(crate) fn bound_fast(function: &Object, receiver: &Object) -> Option<Fast> {
+    let (Object::Builtin(f), Object::Type(cls)) = (function, receiver) else {
+        return None;
+    };
+    if cls.native_kind.get() != KIND_DATETIME {
+        return None;
+    }
+    match state_of_cls(cls)?.fromiso.get()? {
+        Object::Builtin(g) if Rc::ptr_eq(f, g) => Some(dt_fromisoformat),
+        _ => None,
+    }
+}
+
 /// A public field (`dt.hour`, `d.year`, …) of a natively served instance
 /// whose class still has its original property.
 pub(crate) fn leaf_field(i: &PyInstance, name: &SharedStr) -> Option<Object> {
@@ -2376,8 +2392,16 @@ pub(crate) fn leaf_field(i: &PyInstance, name: &SharedStr) -> Option<Object> {
         } else {
             return None;
         };
-        let (d, s, us) = td_fields(i, st)?;
-        return Some(Object::Int([d, s, us][ix]));
+        // The public slots themselves (a Python-built value's are written
+        // apart from the private ones).
+        return with_slots(i, |s| match s.as_packed() {
+            Some(p) if p.kind() == KIND_TIMEDELTA => {
+                let (d, s, us) = p.td();
+                Some(Object::Int([d, s, us][ix]))
+            }
+            Some(_) => None,
+            None => Some(s.get_hinted(4 + ix, name)?.clone()),
+        });
     }
     let (idx, slot) = if SharedStr::ptr_eq(name, &n.f_year) {
         (D_YEAR, &n.year)
