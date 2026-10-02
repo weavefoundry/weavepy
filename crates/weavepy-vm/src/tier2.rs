@@ -11442,6 +11442,42 @@ unsafe extern "C" fn wpjit_iter_next_pair(
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
     let interp = unsafe { &mut *ctx.interp };
+    // A `dict.items()` step yields the key and value straight into the
+    // two lanes, without the tuple; no Python runs, so the header's poll
+    // covers it.
+    let items = match ctx.pins.get(pin as usize) {
+        Some(Pin::Obj(Object::Iter(cell))) => cell
+            .try_borrow_mut()
+            .ok()
+            .and_then(|mut it| it.next_item_pair()),
+        _ => None,
+    };
+    if let Some(step) = items {
+        return match step {
+            Err(err) => {
+                ctx.raised = Some(err);
+                4
+            }
+            Ok(None) => 1,
+            Ok(Some((k, v))) => {
+                let b1 = pack_iter_elem(&k, tag1, &mut ctx.pins, &mut ctx.pin_memo);
+                let b2 =
+                    b1.and_then(|_| pack_iter_elem(&v, tag2, &mut ctx.pins, &mut ctx.pin_memo));
+                if let (Some(b1), Some(b2)) = (b1, b2) {
+                    jf.ret_bits = b1;
+                    // SAFETY: the marshal buffer is at least one slot
+                    // wide (`max_call_args.max(1)`).
+                    unsafe { *jf.call_args = b2 };
+                    return 0;
+                }
+                // Not in the lanes: the pair surrenders as the tuple the
+                // erased `UNPACK_SEQUENCE` consumes.
+                ctx.pins.push(Pin::Obj(Object::new_tuple_array([k, v])));
+                jf.ret_bits = (ctx.pins.len() - 1) as u64;
+                3
+            }
+        };
+    }
     // The loop's poll point — see `wpjit_iter_next`.
     crate::gil::yield_checkpoint();
     if crate::hot_gates::load() != 0 || crate::trace::any_observers_active() {

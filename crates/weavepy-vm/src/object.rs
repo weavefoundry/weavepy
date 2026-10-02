@@ -8521,25 +8521,10 @@ impl PyIterator {
         }
     }
 
-    /// Like [`next_value`], but enforces CPython's "container changed
-    /// size during iteration" invariant before yielding. Used on the
-    /// *user-visible* `__next__` boundaries (`FOR_ITER`, the `next()`
-    /// builtin, `iter.__next__()`); the many internal consumers that
-    /// drain a freshly-built iterator without mutating its source can
-    /// keep calling the cheaper [`next_value`].
-    pub fn next_value_checked(&mut self) -> Result<Option<Object>, RuntimeError> {
-        if let PyIterator::Set { set, len, index } = self {
-            // `setiter_iternext`: a size change since creation is fatal,
-            // even on the step that would otherwise raise StopIteration.
-            if set.borrow().len() != *len {
-                // Sticky, like CPython's `si_used = -1`: every further
-                // `next()` keeps raising, and `__length_hint__` reports 0
-                // (test_iterlen.test_immutable_during_iteration).
-                *len = usize::MAX;
-                *index = usize::MAX;
-                return Err(runtime_error("Set changed size during iteration"));
-            }
-        }
+    /// A dict iterator's mutation guards, before each checked step:
+    /// `Ok(true)` when the step must end silently; an error once the dict
+    /// changed under it. Nothing for any other iterator.
+    fn dict_iter_guard(&mut self) -> Result<bool, RuntimeError> {
         if let PyIterator::DictKeys {
             dict: Some(d),
             len,
@@ -8571,13 +8556,80 @@ impl PyIterator {
                         // array leaves `di_pos` past `dk_nentries`, which
                         // is a silent StopIteration, not an error.
                         *index = 0;
-                        return Ok(None);
+                        return Ok(true);
                     }
                     return Err(runtime_error("dictionary keys changed during iteration"));
                 }
                 None => *watch = Some(DictWatch::new(d)),
                 _ => {}
             }
+        }
+        Ok(false)
+    }
+
+    /// The checked step of a forward `dict.items()` iterator without its
+    /// `(key, value)` tuple, for a consumer that unpacks it at once (a
+    /// native tuple-target loop). `None` for any other iterator.
+    pub fn next_item_pair(&mut self) -> Option<Result<Option<(Object, Object)>, RuntimeError>> {
+        if !matches!(
+            self,
+            PyIterator::DictKeys {
+                kind: DictViewKind::Items,
+                reverse: false,
+                ..
+            }
+        ) {
+            return None;
+        }
+        match self.dict_iter_guard() {
+            Err(e) => return Some(Err(e)),
+            Ok(true) => return Some(Ok(None)),
+            Ok(false) => {}
+        }
+        let PyIterator::DictKeys {
+            index, dict, owner, ..
+        } = self
+        else {
+            return None;
+        };
+        let Some(d) = dict.as_ref() else {
+            return Some(Ok(None));
+        };
+        let entry = d
+            .borrow()
+            .get_index(*index)
+            .map(|(k, v)| (k.0.clone(), v.clone()));
+        if entry.is_some() {
+            *index += 1;
+        } else {
+            // Exhausted: detached, as `next_value` leaves it.
+            *dict = None;
+            *owner = None;
+        }
+        Some(Ok(entry))
+    }
+
+    /// Like [`next_value`], but enforces CPython's "container changed
+    /// size during iteration" invariant before yielding. Used on the
+    /// *user-visible* `__next__` boundaries (`FOR_ITER`, the `next()`
+    /// builtin, `iter.__next__()`); the many internal consumers that
+    /// drain a freshly-built iterator without mutating its source can
+    /// keep calling the cheaper [`next_value`].
+    pub fn next_value_checked(&mut self) -> Result<Option<Object>, RuntimeError> {
+        if let PyIterator::Set { set, len, index } = self {
+            // `setiter_iternext`: a size change since creation is fatal,
+            // even on the step that would otherwise raise StopIteration.
+            if set.borrow().len() != *len {
+                // Sticky, like CPython's `si_used = -1`: every further
+                // `next()` keeps raising, and `__length_hint__` reports 0
+                // (test_iterlen.test_immutable_during_iteration).
+                *len = usize::MAX;
+                *index = usize::MAX;
+                return Err(runtime_error("Set changed size during iteration"));
+            }
+        }
+        if self.dict_iter_guard()? {
+            return Ok(None);
         }
         if let PyIterator::File { file } = self {
             // Surface read errors (OSError, decode errors) at the
