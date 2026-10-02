@@ -144,18 +144,18 @@ unsafe impl Send for Native {}
 unsafe impl Sync for Native {}
 
 impl Native {
-    /// Run from `st.pc` until an instruction the core loop must run.
-    ///
-    /// # Safety
-    ///
-    /// `st` is the running activation of the code this was compiled
-    /// from, as the core loop holds it, with `nlocals` locals.
     /// Whether entering at `pc` gets anywhere.
     #[inline(always)]
     pub(crate) fn enters_at(&self, pc: usize) -> bool {
         self.entries.get(pc).copied().unwrap_or(false)
     }
 
+    /// Run from `st.pc` until an instruction the core loop must run.
+    ///
+    /// # Safety
+    ///
+    /// `st` is the running activation of the code this was compiled
+    /// from, as the core loop holds it, with `nlocals` locals.
     #[inline(always)]
     pub(crate) unsafe fn run(&self, st: &mut State) -> u32 {
         let from = st.pc;
@@ -790,14 +790,10 @@ impl Engine {
         flags.set("use_colocated_libcalls", "false").ok()?;
         flags.set("is_pic", "false").ok()?;
         // The lowering already does the optimizing that pays here (operands
-        // kept unboxed and in registers); Cranelift's own passes cost more
-        // to run than they save. `WEAVEPY_FRAME_JIT_OPT` turns them on.
-        if std::env::var_os("WEAVEPY_FRAME_JIT_OPT").is_some() {
-            flags.set("opt_level", "speed").ok()?;
-        } else {
-            flags.set("opt_level", "none").ok()?;
-            flags.set("regalloc_algorithm", "single_pass").ok()?;
-        }
+        // kept unboxed and in registers): Cranelift's mid-end costs more to
+        // run than it saves. Its register allocator pays for itself (the
+        // single-pass one spills around every helper call).
+        flags.set("opt_level", "none").ok()?;
         if !cfg!(debug_assertions) && !verify() {
             flags.set("enable_verifier", "false").ok()?;
         }
