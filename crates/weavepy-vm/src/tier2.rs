@@ -115,9 +115,12 @@ struct AttrGuard {
 /// instance-dict shadowing, and `__code__` rebinding introduced after
 /// compilation stay exact.
 struct MethodEntry {
-    func: Rc<PyFunction>,
-    /// The function's `__code__` at compile time (rebindable).
-    code: Rc<CodeObject>,
+    /// What the class resolves the name to.
+    callee: MethodCallee,
+    /// The class forbids an instance `__dict__` (its `__slots__` cover
+    /// every base), so no instance attribute can shadow the method: the
+    /// guard skips that probe.
+    no_dict: bool,
     /// The method name (for the shadow check and the span rebuild).
     name: String,
     /// `hash(name)`, so the per-call shadow probe hashes nothing.
@@ -174,8 +177,36 @@ impl InlineUpdate {
     }
 }
 
+/// The callee a burned-in method site resolved to.
+enum MethodCallee {
+    /// A plain Python function and its `__code__` at compile time
+    /// (rebindable, so the guard compares it per call).
+    Py {
+        func: Rc<PyFunction>,
+        code: Rc<CodeObject>,
+    },
+    /// A native accelerator's method: a builtin that binds its instance,
+    /// registered as a leaf and opted into this lane
+    /// (`leaf_builtins::register_jit_method`), such as `deque.append`.
+    /// Its body runs no Python code, so the helper calls it directly
+    /// with no interpreter frame; `fast` is its pure fast half when the
+    /// full body may reach Python (an argument's `__index__`).
+    Native {
+        builtin: Rc<crate::object::BuiltinFn>,
+        fast: Option<crate::leaf_builtins::Fast>,
+        /// The builtin's direct operation
+        /// (`collections_native::fast_op`), `0` for none.
+        op: u8,
+    },
+}
+
 /// One slot per method token (parallel to `cf.method_sites`).
 type MethodTable = Vec<MethodEntry>;
+
+/// The widest positional arity a native method site admits (receiver
+/// included). The builtin validates its own arity, so this only bounds
+/// the marshal buffer.
+const NATIVE_METHOD_MAX_ARGS: u32 = 8;
 
 /// One burned-in math intrinsic. The ordinary global snapshot guards the
 /// module's identity; this guard reads its current attribute by a checked
@@ -930,6 +961,11 @@ impl JitState {
         weavepy_jit::register_self_call_helpers(wpjit_self_enter, wpjit_self_exit, wpjit_self_slow);
         // RFC 0069 WS1 — the guarded method-call lane.
         weavepy_jit::register_call_method_helper(wpjit_call_method);
+        weavepy_jit::register_call_native_method_helper(wpjit_call_native_method);
+        // Native container subscripts (`deque.__getitem__`) and native
+        // method-site load guards.
+        weavepy_jit::register_obj_getitem_helper(wpjit_obj_getitem);
+        weavepy_jit::register_guard_method_helper(wpjit_guard_method);
         // RFC 0073 WS3 — the native `str`-method lane.
         weavepy_jit::register_str_method_helper(wpjit_str_method);
         // RFC 0069 WS2 — the libm sin/cos intrinsics and the Python-
@@ -1199,6 +1235,7 @@ impl JitState {
                             arg_count: e.arg_count,
                             min_args: e.min_args,
                             ret: e.ret,
+                            native: matches!(e.callee, MethodCallee::Native { .. }),
                         });
                     }
                     let e = method(slot, path, name)?;
@@ -1209,6 +1246,7 @@ impl JitState {
                         arg_count: e.arg_count,
                         min_args: e.min_args,
                         ret: e.ret,
+                        native: matches!(e.callee, MethodCallee::Native { .. }),
                     };
                     methods.push(e);
                     Some(res)
@@ -1575,7 +1613,10 @@ impl JitState {
         };
         let table: NativeTable = methods
             .iter()
-            .map(|m| self.resolve_native_func(&m.func, &m.code, true))
+            .map(|m| match &m.callee {
+                MethodCallee::Py { func, code } => self.resolve_native_func(func, code, true),
+                MethodCallee::Native { .. } => None,
+            })
             .collect();
         let tbl = StdRc::new(table);
         if let Some(entry) = self.cache.get_mut(&key) {
@@ -3138,8 +3179,40 @@ fn probe_method_entry(
     if inst.attr_get_str(name).is_some() {
         return None;
     }
-    let Some(Object::Function(f)) = cls.lookup(name) else {
-        return None;
+    let f = match cls.lookup(name) {
+        // The analyzer probes `__getitem__` for native subscripts only
+        // (`TOp::ObjGetItem`); a Python-level one must not take a token
+        // that no site would use.
+        Some(Object::Function(_)) if name == "__getitem__" => return None,
+        Some(Object::Function(f)) => f,
+        // A native accelerator's leaf method (`deque.append`): any
+        // positional arity (the body validates it and raises exactly),
+        // and an object-lane result (`None` rides the nullable `-1`, so a
+        // procedure's result costs no pin).
+        Some(Object::Builtin(b)) if b.binds_instance => {
+            let op = crate::leaf_builtins::jit_method_op(&b)?;
+            let fast = match interp.leaf_call_kind(&b)? {
+                super::LeafKind::Opaque => None,
+                super::LeafKind::Fast(fast) => Some(fast),
+                _ => return None,
+            };
+            return Some(MethodEntry {
+                callee: MethodCallee::Native {
+                    builtin: b,
+                    fast,
+                    op,
+                },
+                no_dict: cls.forbids_dict,
+                name: name.to_owned(),
+                name_hash: crate::object::py_str_hash(name),
+                arg_count: NATIVE_METHOD_MAX_ARGS,
+                min_args: 1,
+                ret: MethodRet::Scalar(JitType::Obj),
+                ver: cls.attr_version.get(),
+                update: InlineUpdate::unarmed(),
+            });
+        }
+        _ => return None,
     };
     let fcode = f.code.borrow().clone();
     if !py_callee_ok(&fcode) || fcode.arg_count == 0 {
@@ -3163,8 +3236,11 @@ fn probe_method_entry(
     let ver = cls.attr_version.get();
     let arg_count = fcode.arg_count;
     Some(MethodEntry {
-        func: f,
-        code: fcode,
+        callee: MethodCallee::Py {
+            func: f,
+            code: fcode,
+        },
+        no_dict: cls.forbids_dict,
         name: name.to_owned(),
         name_hash: crate::object::py_str_hash(name),
         arg_count,
@@ -4555,6 +4631,10 @@ fn arm_update(entry: &MethodEntry, nc: &NativeCallee, receiver: &Object, argc: u
     let Some(plan) = nc.scalar_update.as_deref() else {
         return;
     };
+    // (A native method's body is no field update.)
+    let MethodCallee::Py { func, code } = &entry.callee else {
+        return;
+    };
     let Some(guard) = nc.attr_guards.get(plan.store_token) else {
         return;
     };
@@ -4582,9 +4662,9 @@ fn arm_update(entry: &MethodEntry, nc: &NativeCallee, receiver: &Object, argc: u
     u.shadow.set(u32::try_from(shadow).unwrap_or(0));
     u.from_arg.set(from_arg);
     u.inc.set(inc);
-    u.code_at.set(entry.func.code.as_ptr() as usize);
+    u.code_at.set(func.code.as_ptr() as usize);
     // SAFETY: `Rc` is one pointer, compared and never dereferenced.
-    u.code.set(unsafe { std::mem::transmute_copy::<Rc<CodeObject>, usize>(&entry.code) });
+    u.code.set(unsafe { std::mem::transmute_copy::<Rc<CodeObject>, usize>(code) });
     u.idx.set(guard.split_idx);
     #[cfg(test)]
     crate::SCALAR_FIELD_UPDATE_ARMED.with(|armed| armed.set(armed.get() + 1));
@@ -6459,6 +6539,9 @@ unsafe extern "C" fn wpjit_call_method(
     // SAFETY: the `&mut Interpreter` that entered native code is dormant
     // while the helper runs; this is the only live path to it.
     let interp = unsafe { &mut *ctx.interp };
+    // A native site's deferred-guard miss (see `wpjit_call_native_method`)
+    // takes the surprise-receiver lane below.
+    let token = token & !(weavepy_jit::METHOD_GUARD_AT_CALL | weavepy_jit::METHOD_NATIVE);
     native_stat(|s| s.method_calls.set(s.method_calls.get() + 1));
     let guard_miss = || {
         native_stat(|s| s.method_guard_misses.set(s.method_guard_misses.get() + 1));
@@ -6486,9 +6569,13 @@ unsafe extern "C" fn wpjit_call_method(
             // code (see `GilCell::peek`).
             attr_class_ok(inst, entry.ver)
                 && unsafe { inst.attr_peek_has(probe.s, probe.hash) } == Some(false)
-                && match unsafe { entry.func.code.peek() } {
-                    Some(code) => Rc::ptr_eq(code, &entry.code),
-                    None => Rc::ptr_eq(&entry.func.code.borrow(), &entry.code),
+                && match &entry.callee {
+                    MethodCallee::Py { func, code: burned } => match unsafe { func.code.peek() } {
+                        Some(code) => Rc::ptr_eq(code, burned),
+                        None => Rc::ptr_eq(&func.code.borrow(), burned),
+                    },
+                    // Only a native site's deferred-guard miss gets here.
+                    MethodCallee::Native { .. } => false,
                 }
         }
         _ => false,
@@ -6520,6 +6607,9 @@ unsafe extern "C" fn wpjit_call_method(
         });
         return finish_interp_call(jf, ctx, interp, res, expect_tag);
     }
+    let MethodCallee::Py { func, code } = &entry.callee else {
+        unreachable!("native methods returned above");
+    };
 
     // A pure-leaf method (a getter, a predicate) evaluates frameless.
     // SAFETY: `argc` marshaled entries are live (the function contract),
@@ -6529,8 +6619,8 @@ unsafe extern "C" fn wpjit_call_method(
             jf,
             ctx,
             interp,
-            &entry.func,
-            &entry.code,
+            func,
+            code,
             Some(&raw const recv),
             argc,
             expect_tag,
@@ -6549,9 +6639,9 @@ unsafe extern "C" fn wpjit_call_method(
         .and_then(Option::as_ref)
     {
         if nc.scalar_update.is_some()
-            && entry.code.arg_count == argc + 1
-            && Rc::ptr_eq(&nc.func, &entry.func)
-            && Rc::ptr_eq(&nc.code, &entry.code)
+            && code.arg_count == argc + 1
+            && Rc::ptr_eq(&nc.func, func)
+            && Rc::ptr_eq(&nc.code, code)
         {
             // SAFETY: the method guard above pinned the binding; the update
             // checks its receiver, argument lane, and observers itself.
@@ -6587,7 +6677,7 @@ unsafe extern "C" fn wpjit_call_method(
             .and_then(|t| t.get(token as usize))
             .and_then(Option::as_ref)
         {
-            if Rc::ptr_eq(&nc.func, &entry.func) && Rc::ptr_eq(&nc.code, &entry.code) {
+            if Rc::ptr_eq(&nc.func, func) && Rc::ptr_eq(&nc.code, code) {
                 // SAFETY: `jf`/`ctx` are this activation's live buffers
                 // (see the function contract) and `nc` came from this
                 // thread's tier cache via the activation's resolved table.
@@ -6620,7 +6710,7 @@ unsafe extern "C" fn wpjit_call_method(
             .set(s.method_call_fallbacks.get() + 1);
     });
     ctx.dirty = true;
-    let callee = Object::Function(entry.func.clone());
+    let callee = Object::Function(func.clone());
     let mut args: Vec<Object> = Vec::with_capacity(argc as usize + 1);
     args.push(recv.clone());
     for j in 0..argc as usize {
@@ -6636,6 +6726,446 @@ unsafe extern "C" fn wpjit_call_method(
         i.call(&callee, &args, &[], &ctx.globals)
     });
     finish_interp_call(jf, ctx, interp, res, expect_tag)
+}
+
+/// Deliver a native method's or subscript's completed result `v` to
+/// the compiled caller on its `expect_tag` lane: `None` for the
+/// procedure lane, an unboxed scalar, or an object-lane pin (`None`
+/// rides the nullable `-1`, so a procedure's result costs no pin). A
+/// value the lane can't carry, or pin pressure, parks `v` (`Boxed`: the
+/// caller resumes after the operation, which never runs again).
+#[inline(always)]
+fn deliver_native_result(jf: &mut JitFrame, ctx: &mut CallCtx, v: Object, expect_tag: u32) -> i64 {
+    // The scalar arms own nothing, so they skip `v`'s drop glue.
+    match (SlotTag::from_raw(expect_tag), &v) {
+        (SlotTag::None, Object::None) => {
+            std::mem::forget(v);
+            return CallStatus::Ok as i64;
+        }
+        (SlotTag::Int, &Object::Int(value)) => {
+            std::mem::forget(v);
+            jf.ret_bits = value as u64;
+            jf.ret_tag = expect_tag;
+            return CallStatus::Ok as i64;
+        }
+        (SlotTag::ObjPin, Object::None) => {
+            std::mem::forget(v);
+            jf.ret_bits = u64::MAX;
+            jf.ret_tag = expect_tag;
+            return CallStatus::Ok as i64;
+        }
+        (SlotTag::ObjPin, _) => {
+            if ctx.temporary_pin_limit_reached() {
+                ctx.pin_pressure_exit = true;
+            } else if ctx.pins.len() < RUNTIME_PIN_CAP {
+                jf.ret_bits = ctx.pins.len() as u64;
+                jf.ret_tag = expect_tag;
+                ctx.pins.push(Pin::Obj(v));
+                return CallStatus::Ok as i64;
+            }
+        }
+        _ => {}
+    }
+    ctx.parked = Some(v);
+    CallStatus::Boxed as i64
+}
+
+/// A bitwise view of one marshaled argument: scalars rebuild by value
+/// and an object pin aliases its pinned object without taking a
+/// reference (the pin owns it for the whole activation). The view must
+/// never be dropped. `None` for a lane it can't alias (a list pin).
+#[inline(always)]
+fn arg_view(bits: u64, tag: u32, pins: &PinTable) -> Option<Object> {
+    Some(match SlotTag::from_raw(tag) {
+        SlotTag::Int => Object::Int(bits as i64),
+        SlotTag::Float => Object::Float(f64::from_bits(bits)),
+        SlotTag::Bool => Object::Bool(bits != 0),
+        SlotTag::ObjPin if bits == u64::MAX => Object::None,
+        SlotTag::ObjPin => match pins.get(bits as usize)? {
+            // SAFETY: a bitwise alias, never dropped (see above).
+            Pin::Obj(o) => unsafe { std::ptr::read(o) },
+            Pin::List(..) => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// A native leaf body's direct call on bitwise views of the receiver pin
+/// and the marshaled arguments (see [`arg_view`]): no references are
+/// taken or released around the call, which runs no Python code. `None`
+/// (nothing ran) when an argument has no view, the arity exceeds the
+/// inline buffer, or the fast half declines.
+///
+/// # Safety
+///
+/// `argc` marshal entries are initialized (the helper contract).
+#[inline(always)]
+unsafe fn direct_native_call(
+    jf: &JitFrame,
+    ctx: &CallCtx,
+    builtin: &crate::object::BuiltinFn,
+    fast: Option<crate::leaf_builtins::Fast>,
+    recv_pin: i64,
+    argc: u32,
+) -> Option<Result<Object, RuntimeError>> {
+    const N: usize = 4;
+    let n = argc as usize + 1;
+    if n > N {
+        return None;
+    }
+    let mut views = [const { std::mem::MaybeUninit::<Object>::uninit() }; N];
+    match ctx.pins.get(usize::try_from(recv_pin).ok()?)? {
+        // SAFETY: a bitwise alias, never dropped (the pin owns it).
+        Pin::Obj(o) => views[0].write(unsafe { std::ptr::read(o) }),
+        Pin::List(..) => return None,
+    };
+    for j in 0..argc as usize {
+        // SAFETY: native code wrote `argc` entries.
+        let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
+        views[j + 1].write(arg_view(bits, tag, &ctx.pins)?);
+    }
+    // SAFETY: the first `n` entries were written; they are views, so the
+    // `MaybeUninit` array never drops them.
+    let args = unsafe { std::slice::from_raw_parts(views.as_ptr().cast::<Object>(), n) };
+    match fast {
+        Some(fast) => fast(args),
+        None => Some(match builtin.call_kw.as_ref() {
+            Some(ckw) => ckw(args, &[]),
+            None => (builtin.call)(args),
+        }),
+    }
+}
+
+/// A native method's direct operation (`collections_native::fast_op`) on
+/// the receiver pin and at most one marshaled argument, viewed in place
+/// (see [`arg_view`]). `None` (nothing ran) sends the call to the full
+/// body.
+///
+/// # Safety
+///
+/// `argc` marshal entries are initialized (the helper contract).
+#[inline(always)]
+unsafe fn direct_native_op(
+    jf: &JitFrame,
+    ctx: &CallCtx,
+    op: u8,
+    recv_pin: i64,
+    argc: u32,
+) -> Option<Object> {
+    let Pin::Obj(recv) = ctx.pins.get(usize::try_from(recv_pin).ok()?)? else {
+        return None;
+    };
+    match argc {
+        0 => crate::stdlib::collections_native::fast_op(op, recv, None),
+        1 => {
+            // SAFETY: native code wrote one entry.
+            let (bits, tag) = unsafe { (*jf.call_args, *jf.call_tags) };
+            let arg = std::mem::ManuallyDrop::new(arg_view(bits, tag, &ctx.pins)?);
+            crate::stdlib::collections_native::fast_op(op, recv, Some(&arg))
+        }
+        _ => None,
+    }
+}
+
+/// A burned-in native leaf method (see [`MethodCallee::Native`]),
+/// called directly on the receiver bound at its load and the marshaled
+/// arguments. No Python runs on the direct path, so the activation stays
+/// clean and no round trip is charged.
+///
+/// A fast half that declines (an argument whose conversion could run
+/// Python), or an active profiler or tracer that must see the call,
+/// needs the interpreter, and Python must see this activation's locals,
+/// which live lane-packed in the native frame. While the receiver still
+/// resolves the name to this builtin, the call rejects, and the
+/// interpreter performs it (and the attribute load, which binds the same
+/// builtin) on a materialized frame. A class rebound by the argument
+/// evaluation since the load calls the builtin bound there through the
+/// interpreter's profiled call path instead.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_method`]; `entry` lives in the
+/// activation's method table.
+unsafe fn call_native_method(
+    jf: &mut JitFrame,
+    ctx: &mut CallCtx,
+    interp: &mut super::Interpreter,
+    entry: &MethodEntry,
+    recv_pin: i64,
+    argc: u32,
+    expect_tag: u32,
+) -> i64 {
+    let MethodCallee::Native { op, .. } = &entry.callee else {
+        return CallStatus::Reject as i64;
+    };
+    if *op != 0 && !crate::trace::any_observers_active() {
+        // SAFETY: per the function contract.
+        if let Some(v) = unsafe { direct_native_op(jf, ctx, *op, recv_pin, argc) } {
+            return deliver_native_result(jf, ctx, v, expect_tag);
+        }
+    }
+    // SAFETY: per the function contract.
+    unsafe { call_native_body(jf, ctx, interp, entry, recv_pin, argc, expect_tag) }
+}
+
+/// [`call_native_method`] past its direct operation: the builtin's body
+/// (or fast half) on views of the operands, else the interpreter.
+///
+/// # Safety
+///
+/// Same contract as [`call_native_method`].
+#[cold]
+#[inline(never)]
+unsafe fn call_native_body(
+    jf: &mut JitFrame,
+    ctx: &mut CallCtx,
+    interp: &mut super::Interpreter,
+    entry: &MethodEntry,
+    recv_pin: i64,
+    argc: u32,
+    expect_tag: u32,
+) -> i64 {
+    let MethodCallee::Native { builtin, fast, .. } = &entry.callee else {
+        return CallStatus::Reject as i64;
+    };
+    if !crate::trace::any_observers_active() {
+        // SAFETY: per the function contract.
+        match unsafe { direct_native_call(jf, ctx, builtin, *fast, recv_pin, argc) } {
+            Some(Ok(v)) => return deliver_native_result(jf, ctx, v, expect_tag),
+            Some(Err(err)) => {
+                ctx.raised = Some(err);
+                return CallStatus::Raised as i64;
+            }
+            None => {}
+        }
+    }
+    let Some(recv) = ctx.pins.get(recv_pin as usize).map(Pin::to_object) else {
+        return CallStatus::Reject as i64;
+    };
+    if matches!(&recv, Object::Instance(inst) if method_guard_ok(entry, inst)) {
+        return CallStatus::Reject as i64;
+    }
+    let mut args: Vec<Object> = Vec::with_capacity(argc as usize);
+    for j in 0..argc as usize {
+        // SAFETY: native code wrote `argc` entries, and the buffers are
+        // `max_call_args` wide.
+        let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
+        args.push(unpack_pins(bits, tag, &ctx.pins));
+    }
+    ctx.dirty = true;
+    let bound = Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+        recv,
+        Object::Builtin(builtin.clone()),
+    )));
+    let res = call_with_activation_shell(interp, ctx, jf, |i| {
+        i.call_c_profiled(&bound, &args, &[], &ctx.globals)
+    });
+    finish_interp_call(jf, ctx, interp, res, expect_tag)
+}
+
+/// The `wpjit_call_native_method` helper: [`wpjit_call_method`] for a
+/// site that resolved a native leaf method (`METHOD_NATIVE` in the
+/// token), kept apart so the common call pays none of the Python path's
+/// setup. The method was guarded and bound at its load
+/// (`TOp::GuardMethod`), or, when nothing ran in between, is guarded
+/// here (`METHOD_GUARD_AT_CALL`): call the builtin bound there. A
+/// deferred guard's miss is exactly the load the interpreter would
+/// perform now, so it takes the generic helper's surprise-receiver lane.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_method`].
+unsafe extern "C" fn wpjit_call_native_method(
+    frame: *mut JitFrame,
+    token: u32,
+    recv_pin: i64,
+    argc: u32,
+    expect_tag: u32,
+) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    let guard_at_call = token & weavepy_jit::METHOD_GUARD_AT_CALL != 0;
+    let index =
+        (token & !(weavepy_jit::METHOD_GUARD_AT_CALL | weavepy_jit::METHOD_NATIVE)) as usize;
+    // The common case in one pass: the entry's direct operation on the
+    // receiver pin (read once) and at most one argument view.
+    if let Some(
+        entry @ MethodEntry {
+            callee: MethodCallee::Native { op, .. },
+            ..
+        },
+    ) = ctx.methods.get(index)
+    {
+        if let Some(Pin::Obj(recv)) = ctx.pins.get(recv_pin as usize) {
+            let bound = !guard_at_call
+                || matches!(recv, Object::Instance(inst) if method_guard_ok(entry, inst));
+            if bound && *op != 0 && argc <= 1 && !crate::trace::any_observers_active() {
+                let arg = if argc == 1 {
+                    // SAFETY: native code wrote one entry.
+                    let (bits, tag) = unsafe { (*jf.call_args, *jf.call_tags) };
+                    arg_view(bits, tag, &ctx.pins).map(std::mem::ManuallyDrop::new)
+                } else {
+                    None
+                };
+                if argc == 0 || arg.is_some() {
+                    let arg = arg.as_deref();
+                    if let Some(v) = crate::stdlib::collections_native::fast_op(*op, recv, arg) {
+                        return deliver_native_result(jf, ctx, v, expect_tag);
+                    }
+                }
+            }
+        }
+    }
+    // SAFETY: per the function contract.
+    unsafe { call_native_method_slow(frame, token, recv_pin, argc, expect_tag) }
+}
+
+/// [`wpjit_call_native_method`] past its direct operation (see there).
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_method`].
+#[cold]
+#[inline(never)]
+unsafe fn call_native_method_slow(
+    frame: *mut JitFrame,
+    token: u32,
+    recv_pin: i64,
+    argc: u32,
+    expect_tag: u32,
+) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    let guard_at_call = token & weavepy_jit::METHOD_GUARD_AT_CALL != 0;
+    let index =
+        (token & !(weavepy_jit::METHOD_GUARD_AT_CALL | weavepy_jit::METHOD_NATIVE)) as usize;
+    if let Some(
+        entry @ MethodEntry {
+            callee: MethodCallee::Native { .. },
+            ..
+        },
+    ) = ctx.methods.get(index)
+    {
+        let bound = !guard_at_call
+            || matches!(
+                ctx.pins.get(recv_pin as usize),
+                Some(Pin::Obj(Object::Instance(inst))) if method_guard_ok(entry, inst)
+            );
+        if bound {
+            let entry: *const MethodEntry = entry;
+            // SAFETY: the `&mut Interpreter` that entered native code is
+            // dormant while the helper runs; the activation's method table
+            // (and so the entry) lives until the activation ends.
+            return unsafe {
+                let interp = &mut *ctx.interp;
+                call_native_method(jf, ctx, interp, &*entry, recv_pin, argc, expect_tag)
+            };
+        }
+    }
+    // SAFETY: per the function contract.
+    unsafe { wpjit_call_method(frame, token, recv_pin, argc, expect_tag) }
+}
+
+/// The `wpjit_guard_method` helper (see `TOp::GuardMethod`): `0` when the
+/// receiver pin is an instance of the class version the native method
+/// site `token` burned, with no instance attribute shadowing the name;
+/// `1` sends the load to the interpreter (nothing has run).
+///
+/// # Safety
+///
+/// Same live-activation contract as [`wpjit_call_py`].
+unsafe extern "C" fn wpjit_guard_method(frame: *mut JitFrame, pin: i64, token: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &*jf.ctx.cast::<CallCtx>() };
+    let Some(entry) = usize::try_from(token).ok().and_then(|t| ctx.methods.get(t)) else {
+        return 1;
+    };
+    let Some(Pin::Obj(Object::Instance(inst))) =
+        usize::try_from(pin).ok().and_then(|p| ctx.pins.get(p))
+    else {
+        return 1;
+    };
+    i64::from(!method_guard_ok(entry, inst))
+}
+
+/// A burned method entry still describes `inst`: the class version it
+/// was resolved against (which pins the MRO hit), and no instance
+/// attribute shadowing the name.
+#[inline(always)]
+fn method_guard_ok(entry: &MethodEntry, inst: &crate::types::PyInstance) -> bool {
+    attr_class_ok(inst, entry.ver)
+        && (entry.no_dict
+            // SAFETY: a read between two native ops; nothing here runs
+            // code (see `GilCell::peek`).
+            || unsafe { inst.attr_peek_has(&entry.name, entry.name_hash) } == Some(false))
+}
+
+/// The `wpjit_obj_getitem` helper: `container[index]` on an object-lane
+/// container whose class resolved `__getitem__` to a native leaf method
+/// (`deque.__getitem__`) at compile time. Shares the method helper's
+/// shape: `token` names the burned resolution and the index rides
+/// `call_args[0]`. Unlike a method call, a guard miss (another class, a
+/// non-instance) or a fast half that declines rejects, so the
+/// interpreter re-executes the `BINARY_SUBSCR` itself: nothing has run.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_method`]; `argc` is 1.
+unsafe extern "C" fn wpjit_obj_getitem(
+    frame: *mut JitFrame,
+    token: u32,
+    recv_pin: i64,
+    argc: u32,
+    expect_tag: u32,
+) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    if argc != 1 || crate::trace::any_observers_active() {
+        return CallStatus::Reject as i64;
+    }
+    let Some(MethodEntry {
+        callee: MethodCallee::Native { builtin, fast, op },
+        ver,
+        ..
+    }) = ctx.methods.get(token as usize)
+    else {
+        return CallStatus::Reject as i64;
+    };
+    // Subscription looks the dunder up on the type: no instance
+    // shadowing check.
+    let recv = match ctx.pins.get(recv_pin as usize) {
+        Some(Pin::Obj(recv @ Object::Instance(inst))) if attr_class_ok(inst, *ver) => recv,
+        _ => return CallStatus::Reject as i64,
+    };
+    if *op != 0 {
+        // SAFETY: native code wrote one entry (the index).
+        let (bits, tag) = unsafe { (*jf.call_args, *jf.call_tags) };
+        if let Some(index) = arg_view(bits, tag, &ctx.pins).map(std::mem::ManuallyDrop::new) {
+            if let Some(v) = crate::stdlib::collections_native::fast_op(*op, recv, Some(&index)) {
+                return deliver_native_result(jf, ctx, v, expect_tag);
+            }
+        }
+    }
+    let (builtin, fast) = (Rc::as_ptr(builtin), *fast);
+    // SAFETY: the activation's method table keeps the builtin alive; one
+    // marshaled argument (the index).
+    match unsafe { direct_native_call(jf, ctx, &*builtin, fast, recv_pin, 1) } {
+        Some(Ok(v)) => deliver_native_result(jf, ctx, v, expect_tag),
+        Some(Err(err)) => {
+            ctx.raised = Some(err);
+            CallStatus::Raised as i64
+        }
+        // A declined fast half ran nothing: the interpreter re-executes.
+        None => CallStatus::Reject as i64,
+    }
 }
 
 /// RFC 0073 WS3 — the per-method resolved `str` builtin bodies,
@@ -7576,10 +8106,25 @@ unsafe extern "C" fn wpjit_tuple_len(frame: *mut JitFrame, pin: i64) -> i64 {
     let jf = unsafe { &mut *frame };
     #[allow(clippy::cast_ptr_alignment)]
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
-    let Some(Pin::Obj(Object::Tuple(items))) = ctx.pins.get(pin as usize) else {
-        return -1;
-    };
-    items.len() as i64
+    match ctx.pins.get(pin as usize) {
+        Some(Pin::Obj(Object::Tuple(items))) => items.len() as i64,
+        // An instance whose class's `__len__` is a registered native leaf
+        // (`deque.__len__`): its body runs no Python and has no effects,
+        // so anything but a plain length deopts for the interpreter to
+        // call it again.
+        Some(Pin::Obj(obj @ Object::Instance(_))) if !crate::gil::free_threading_enabled() => {
+            // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
+            let interp = unsafe { &*ctx.interp };
+            match interp
+                .leaf_instance_dunder(obj, "__len__")
+                .map(|b| (b.call)(std::slice::from_ref(obj)))
+            {
+                Some(Ok(Object::Int(n))) if n >= 0 => n,
+                _ => -1,
+            }
+        }
+        _ => -1,
+    }
 }
 
 #[cfg(test)]
@@ -7786,6 +8331,38 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
     // SAFETY: the `&mut Interpreter` that entered native code is
     // dormant while the helper runs.
     let interp = unsafe { &mut *ctx.interp };
+    // A native deque iterator's step runs no Python: no checkpoint (the
+    // loop header's countdown poll covers the back edge), and the element
+    // is read in place through the pin.
+    if let Some(Pin::Obj(it @ Object::Instance(inst))) = ctx.pins.get(pin as usize) {
+        if !crate::gil::free_threading_enabled()
+            && crate::hot_gates::load() == 0
+            && !crate::trace::any_observers_active()
+            && super::Interpreter::default_getattribute(inst.cls_raw())
+            && !crate::object::exotic_str_keys_possible()
+        {
+            if let Some((_, op)) = interp.core_leaf_next_op(inst) {
+                if op != 0 {
+                    if let Some(v) = crate::stdlib::collections_native::fast_op(op, it, None) {
+                        if let Some(bits) =
+                            pack_iter_elem(&v, elem_tag, &mut ctx.pins, &mut ctx.pin_memo)
+                        {
+                            jf.ret_bits = bits;
+                            return 0;
+                        }
+                        // Consumed but outside the lane: resume at the store.
+                        jf.ret_bits = if matches!(v, Object::None) {
+                            u64::MAX
+                        } else {
+                            ctx.pins.push(Pin::Obj(v));
+                            (ctx.pins.len() - 1) as u64
+                        };
+                        return 3;
+                    }
+                }
+            }
+        }
+    }
     // The loop's poll point (the header's countdown poll covers the
     // native back edge; this covers the Python the step may run):
     // pending interpreter work and active observers route the loop
@@ -7796,12 +8373,17 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
     }
     let it = match ctx.pins.get(pin as usize) {
         Some(Pin::Obj(o @ (Object::Generator(_) | Object::Iter(_)))) => o.clone(),
+        // An instance iterator whose `__next__` is a registered native
+        // leaf (a `deque` iterator): stepped below without Python.
+        Some(Pin::Obj(o @ Object::Instance(_))) if !crate::gil::free_threading_enabled() => {
+            o.clone()
+        }
         _ => return 2,
     };
     // A builtin-iterator step is pure native code; everything else
     // (generator resume) runs arbitrary Python on behalf of this
     // activation.
-    let runs_python = !matches!(it, Object::Iter(_));
+    let runs_python = matches!(it, Object::Generator(_));
     if runs_python {
         ctx.dirty = true;
         // A generator resume from native code rebuilds a whole interpreter
@@ -7810,7 +8392,25 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
         // drives a generator retires at the next poll (see `wpjit_poll`).
         ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
     }
-    match interp.iter_next(&it, &ctx.globals) {
+    let step = if let Object::Instance(inst) = &it {
+        // The core loop's cached `__next__` resolution (by class version).
+        // Any other `__next__` belongs to the interpreter (nothing was
+        // consumed).
+        if !super::Interpreter::default_getattribute(inst.cls_raw())
+            || crate::object::exotic_str_keys_possible()
+        {
+            return 2;
+        }
+        match interp.leaf_next_step(&it, inst) {
+            None => return 2,
+            Some(Ok(v)) => Ok(Some(v)),
+            Some(Err(RuntimeError::PyException(e))) if e.type_name() == "StopIteration" => Ok(None),
+            Some(Err(e)) => Err(e),
+        }
+    } else {
+        interp.iter_next(&it, &ctx.globals)
+    };
+    match step {
         Err(err) => {
             ctx.raised = Some(err);
             4
@@ -10274,18 +10874,21 @@ unsafe extern "C" fn wpjit_truth(frame: *mut JitFrame, pin: i64, _reserved: i64)
         jf.ret_bits = 0;
         return 0;
     }
+    // A registered native `__bool__`/`__len__` (or neither): the
+    // interpreter's cached answer, which runs no Python (read through the
+    // pin: the table owns the object throughout).
+    if let Some(Pin::Obj(obj @ Object::Instance(_))) = ctx.pins.get(pin as usize) {
+        if !crate::gil::free_threading_enabled() {
+            if let Some(b) = interp.leaf_instance_truth(obj) {
+                jf.ret_bits = u64::from(b);
+                return 0;
+            }
+        }
+    }
     let v = match ctx.pins.get(pin as usize) {
         Some(p) => p.to_object(),
         None => return 3,
     };
-    // A registered native `__bool__`/`__len__` (or neither): the
-    // interpreter's cached answer, which runs no Python.
-    if matches!(v, Object::Instance(_)) && !crate::gil::free_threading_enabled() {
-        if let Some(b) = interp.leaf_instance_truth(&v) {
-            jf.ret_bits = u64::from(b);
-            return 0;
-        }
-    }
     let pure = match &v {
         Object::Foreign(_) | Object::MappingProxyObj(_) => false,
         Object::Instance(_) => {
@@ -10300,6 +10903,12 @@ unsafe extern "C" fn wpjit_truth(frame: *mut JitFrame, pin: i64, _reserved: i64)
     if pure {
         jf.ret_bits = u64::from(v.is_truthy());
         return 0;
+    }
+    // A Python `__bool__`/`__len__` may inspect its caller's frame, whose
+    // locals live lane-packed in the native activation: the interpreter
+    // re-executes the test with a materialized frame.
+    if matches!(v, Object::Instance(_)) {
+        return 3;
     }
     ctx.dirty = true;
     match interp.obj_truthy(&v, &ctx.globals) {

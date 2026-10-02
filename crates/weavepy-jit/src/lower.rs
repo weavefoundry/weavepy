@@ -1211,6 +1211,39 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::CallMethod { token, argc, ret } => {
                 self.emit_call_method(token, argc, ret, stmt.pc);
             }
+            TOp::GuardMethod { token } => {
+                let snapshot = self.vstack.clone();
+                let &(pin, _) = self.vstack.last().expect("guard on empty stack");
+                let sig = self.list_helper_sig();
+                let helper = self
+                    .b
+                    .ins()
+                    .iconst(self.ptr_ty, runtime::guard_method_helper_addr() as i64);
+                let tokenv = self.b.ins().iconst(types::I64, i64::from(token));
+                let call = self
+                    .b
+                    .ins()
+                    .call_indirect(sig, helper, &[self.frame_ptr, pin, tokenv]);
+                let status = self.b.inst_results(call)[0];
+                let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
+                let cont = self.guard(bad, stmt.pc, &snapshot);
+                self.b.switch_to_block(cont);
+            }
+            TOp::ObjGetItem { token, int_result } => {
+                let ret = MethodRet::Scalar(if int_result {
+                    JitType::Int
+                } else {
+                    JitType::Obj
+                });
+                self.emit_method_helper_call(
+                    runtime::obj_getitem_helper_addr(),
+                    token,
+                    1,
+                    ret,
+                    stmt.pc,
+                    false,
+                );
+            }
             TOp::CallStrMethod { site, argc, ret } => {
                 self.emit_call_str_method(site, argc, ret, stmt.pc);
             }
@@ -2620,6 +2653,29 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     ///   the bound method + `Unbound` pair), so the interpreter
     ///   re-executes the call generically.
     fn emit_call_method(&mut self, token: u32, argc: u8, ret: MethodRet, pc: u32) {
+        let native = token & runtime::METHOD_NATIVE != 0;
+        let helper = if native {
+            runtime::call_native_method_helper_addr()
+        } else {
+            runtime::call_method_helper_addr()
+        };
+        self.emit_method_helper_call(helper, token, argc, ret, pc, !native);
+    }
+
+    /// [`Self::emit_call_method`]'s body over any helper sharing the
+    /// method helper's shape and status protocol (`wpjit_obj_getitem`
+    /// stages its index as the one argument). `writeback` stores the
+    /// locals first, for a helper that may run Python on this
+    /// activation's behalf.
+    fn emit_method_helper_call(
+        &mut self,
+        helper_addr: usize,
+        token: u32,
+        argc: u8,
+        ret: MethodRet,
+        pc: u32,
+        writeback: bool,
+    ) {
         let trusted = MemFlags::trusted();
         let n = argc as usize;
         // Snapshot *including* receiver + args: the Reject exit re-runs
@@ -2645,9 +2701,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let snapshot = self.vstack.clone();
 
         // A method whose body is a field update, run in line once the
-        // helper has armed it; anything else takes the helper below.
+        // helper has armed it (a Python method's helper only); anything
+        // else takes the helper below.
         let inline = match (runtime::obj_layout(), ret, update_arg) {
-            (Some(l), MethodRet::Scalar(JitType::Int), Some(arg)) => Some((*l, arg)),
+            (Some(l), MethodRet::Scalar(JitType::Int), Some(arg))
+                if helper_addr == runtime::call_method_helper_addr() =>
+            {
+                Some((*l, arg))
+            }
             _ => None,
         };
         let mut join = None;
@@ -2661,7 +2722,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             join = Some(done);
         }
 
-        self.writeback_locals();
+        if writeback {
+            self.writeback_locals();
+        }
         self.store_call_site_pc(pc);
 
         let expect = match ret {
@@ -2669,10 +2732,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             MethodRet::Scalar(t) => Self::tag(t),
         };
         let sig = self.call_method_helper_sig();
-        let helper = self
-            .b
-            .ins()
-            .iconst(self.ptr_ty, runtime::call_method_helper_addr() as i64);
+        let helper = self.b.ins().iconst(self.ptr_ty, helper_addr as i64);
         let tokenv = self.b.ins().iconst(types::I32, i64::from(token));
         let argcv = self.b.ins().iconst(types::I32, i64::from(argc));
         let expectv = self.b.ins().iconst(types::I32, expect);

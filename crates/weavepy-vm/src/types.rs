@@ -2320,6 +2320,65 @@ impl SlotStorage {
         }
     }
 
+    /// Whether the first `N` keys of a small store are the given
+    /// interned names themselves (pointer identity, as attribute stores
+    /// intern them).
+    #[inline(always)]
+    fn leads_with_interned<const N: usize>(
+        &self,
+        names: &[&crate::shared_value::SharedStr; N],
+    ) -> bool {
+        let SlotData::Small(entries) = &self.data else {
+            return false;
+        };
+        if entries.len() < N {
+            return false;
+        }
+        let mut same = true;
+        for (i, name) in names.iter().enumerate() {
+            same &= matches!(&entries[i].0 .0, Object::Str(s)
+                if crate::shared_value::SharedStr::ptr_eq(s, name));
+        }
+        same
+    }
+
+    /// [`Self::leading`] for its common shape, inlined: a small store
+    /// whose first `N` keys are the given interned names themselves. Any
+    /// other shape takes the full comparison.
+    #[inline(always)]
+    pub fn leading_interned<const N: usize>(
+        &self,
+        names: [&crate::shared_value::SharedStr; N],
+    ) -> Option<[&Object; N]> {
+        if !self.leads_with_interned(&names) {
+            return self.leading(names);
+        }
+        let SlotData::Small(entries) = &self.data else {
+            return None;
+        };
+        let base = entries.as_ptr();
+        // SAFETY: the store holds at least `N` entries (checked above).
+        Some(std::array::from_fn(|i| unsafe { &(*base.add(i)).1 }))
+    }
+
+    /// [`Self::leading_interned`], mutably.
+    #[inline(always)]
+    pub fn leading_interned_mut<const N: usize>(
+        &mut self,
+        names: [&crate::shared_value::SharedStr; N],
+    ) -> Option<[&mut Object; N]> {
+        if !self.leads_with_interned(&names) {
+            return self.leading_mut(names);
+        }
+        let SlotData::Small(entries) = &mut self.data else {
+            return None;
+        };
+        let base = entries.as_mut_ptr();
+        // SAFETY: the store holds at least `N` entries (checked above),
+        // and each index yields a distinct entry.
+        Some(std::array::from_fn(|i| unsafe { &mut (*base.add(i)).1 }))
+    }
+
     /// [`Self::leading`], mutably.
     #[inline]
     pub fn leading_mut<const N: usize>(

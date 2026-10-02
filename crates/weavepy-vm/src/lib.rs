@@ -927,7 +927,7 @@ pub struct Interpreter {
     /// The core loop's last native iterator `__next__`, keyed by the
     /// (process-unique) attribute version of the class that resolved it
     /// (see [`Interpreter::core_leaf_next`]).
-    core_next: ThreadCell<Option<(u64, Option<Rc<crate::object::BuiltinFn>>)>>,
+    core_next: ThreadCell<Option<(u64, Option<Rc<crate::object::BuiltinFn>>, u8)>>,
     /// `_seqtools`' lazy `map` and `filter` classes, once imported (see
     /// [`Interpreter::seqtools_step`]).
     seqtools: std::cell::OnceCell<Option<SeqTools>>,
@@ -11173,12 +11173,10 @@ impl Interpreter {
                             // the full arm, which asks again (a leaf iterator
                             // stays exhausted) and ends the loop.
                             obj @ Object::Instance(inst) => {
-                                let Some(b) = self.core_leaf_next_ptr(inst) else {
+                                let Some(step) = self.leaf_next_step(obj, inst) else {
                                     break None;
                                 };
-                                // SAFETY: the cache and the class keep the
-                                // builtin alive; its body runs no Python.
-                                match unsafe { ((*b).call)(std::slice::from_ref(obj)) } {
+                                match step {
                                     Ok(v) => {
                                         // SAFETY: `len < cap`.
                                         unsafe { base.add(len).write(v) };
@@ -17705,20 +17703,41 @@ impl Interpreter {
             return None;
         }
         let ver = cls.attr_version.get();
-        let fresh = !matches!(&*self.core_truth.borrow(), Some((v, _)) if *v == ver);
-        if fresh {
-            let t = self.native_truth_of(v, cls);
-            *self.core_truth.borrow_mut() = Some((ver, t));
-        }
         // The cache (and the class) keep the builtin alive through the
         // call, whose body runs no Python.
-        let (b, is_len): (*const crate::object::BuiltinFn, bool) = match &*self.core_truth.borrow()
-        {
-            Some((_, NativeTruth::AlwaysTrue)) => return Some(true),
-            Some((_, NativeTruth::Bool(b))) => (Rc::as_ptr(b), false),
-            Some((_, NativeTruth::Len(b))) => (Rc::as_ptr(b), true),
-            _ => return None,
+        let lookup =
+            |t: &NativeTruth| -> Result<(*const crate::object::BuiltinFn, bool, u8), bool> {
+                match t {
+                    NativeTruth::AlwaysTrue => Err(true),
+                    NativeTruth::Bool(b, op) => Ok((Rc::as_ptr(b), false, *op)),
+                    NativeTruth::Len(b) => Ok((Rc::as_ptr(b), true, 0)),
+                    NativeTruth::Decline => Err(false),
+                }
+            };
+        let cached = match &*self.core_truth.borrow() {
+            Some((v, t)) if *v == ver => Some(lookup(t)),
+            _ => None,
         };
+        let found = match cached {
+            Some(found) => found,
+            None => {
+                let t = self.native_truth_of(v, cls);
+                let found = lookup(&t);
+                *self.core_truth.borrow_mut() = Some((ver, t));
+                found
+            }
+        };
+        let (b, is_len, op) = match found {
+            Ok(found) => found,
+            Err(true) => return Some(true),
+            Err(false) => return None,
+        };
+        // A deque's `__bool__`: its direct operation, without the call.
+        if op == crate::stdlib::collections_native::OP_BOOL {
+            if let Some(Object::Bool(b)) = crate::stdlib::collections_native::fast_op(op, v, None) {
+                return Some(b);
+            }
+        }
         // SAFETY: see above.
         let b = unsafe { &*b };
         let r = match b.call_kw.as_ref() {
@@ -17751,7 +17770,8 @@ impl Interpreter {
                     return if is_len {
                         NativeTruth::Len(b)
                     } else {
-                        NativeTruth::Bool(b)
+                        let op = leaf_builtins::jit_method_op(&b).unwrap_or(0);
+                        NativeTruth::Bool(b, op)
                     };
                 }
                 Some(_) => return NativeTruth::Decline,
@@ -18136,14 +18156,43 @@ impl Interpreter {
     /// lookup.
     #[inline]
     fn core_leaf_next_ptr(&self, inst: &PyInstance) -> Option<*const crate::object::BuiltinFn> {
+        self.core_leaf_next_op(inst).map(|(b, _)| b)
+    }
+
+    /// [`Self::core_leaf_next_ptr`] with the builtin's direct operation
+    /// (`collections_native::fast_op`, `0` for none).
+    #[inline]
+    fn core_leaf_next_op(
+        &self,
+        inst: &PyInstance,
+    ) -> Option<(*const crate::object::BuiltinFn, u8)> {
         let ver = inst.cls_raw().attr_version.get();
-        if let Some((v, b)) = &*self.core_next.borrow() {
+        if let Some((v, b, op)) = &*self.core_next.borrow() {
             if *v == ver {
-                return b.as_ref().map(Rc::as_ptr);
+                return b.as_ref().map(|b| (Rc::as_ptr(b), *op));
             }
         }
         self.core_leaf_next_resolve(inst, ver)
-            .map(|b| Rc::as_ptr(&b))
+    }
+
+    /// A native iterator step through [`Self::core_leaf_next_op`]: the
+    /// direct operation when it applies, else the builtin. `None` when the
+    /// class's `__next__` is not a registered leaf.
+    #[inline]
+    fn leaf_next_step(
+        &self,
+        it: &Object,
+        inst: &PyInstance,
+    ) -> Option<Result<Object, RuntimeError>> {
+        let (b, op) = self.core_leaf_next_op(inst)?;
+        if op != 0 {
+            if let Some(v) = crate::stdlib::collections_native::fast_op(op, it, None) {
+                return Some(Ok(v));
+            }
+        }
+        // SAFETY: the cache and the class keep the builtin alive; its body
+        // runs no Python.
+        Some(unsafe { ((*b).call)(std::slice::from_ref(it)) })
     }
 
     #[cold]
@@ -18152,7 +18201,7 @@ impl Interpreter {
         &self,
         inst: &PyInstance,
         ver: u64,
-    ) -> Option<Rc<crate::object::BuiltinFn>> {
+    ) -> Option<(*const crate::object::BuiltinFn, u8)> {
         // A miss is remembered too: a Python-level `__next__` class asks
         // again on every step of a generic iteration.
         let found = match inst.cls().lookup("__next__") {
@@ -18164,8 +18213,13 @@ impl Interpreter {
             }
             _ => None,
         };
-        *self.core_next.borrow_mut() = Some((ver, found.clone()));
-        found
+        let op = found
+            .as_ref()
+            .and_then(leaf_builtins::jit_method_op)
+            .unwrap_or(0);
+        let out = found.as_ref().map(|b| (Rc::as_ptr(b), op));
+        *self.core_next.borrow_mut() = Some((ver, found, op));
+        out
     }
 
     /// Which leaf builtin `b` is, if any (pointer identity).
@@ -56454,6 +56508,35 @@ pub(crate) mod leaf_builtins {
         GENERATION.load(Ordering::Acquire)
     }
 
+    /// Builtins opted into the JIT's native method lane (see
+    /// `tier2::MethodCallee::Native`), each with its direct operation.
+    static JIT_METHODS: parking_lot::Mutex<Vec<(Weak<crate::object::BuiltinFn>, u8)>> =
+        parking_lot::Mutex::new(Vec::new());
+
+    /// Opt `b` (already registered as a leaf, binding its instance) into
+    /// the JIT's native method lane: a compiled caller may call its body
+    /// directly on a receiver whose class resolves to it, with no
+    /// interpreter frame. The body must also be safe to call with a
+    /// receiver that is a subclass instance or any other object (it
+    /// validates its receiver). A nonzero `op` names the operation's
+    /// direct form (`collections_native::fast_op`), which the caller
+    /// tries first.
+    pub(crate) fn register_jit_method(b: &Rc<crate::object::BuiltinFn>, op: u8) {
+        let mut reg = JIT_METHODS.lock();
+        reg.retain(|(w, _)| w.strong_count() > 0);
+        reg.push((Rc::downgrade(b), op));
+    }
+
+    /// `b`'s direct operation when it opted into the JIT's native method
+    /// lane (by identity; probed at compile time only), `0` for none.
+    pub(crate) fn jit_method_op(b: &Rc<crate::object::BuiltinFn>) -> Option<u8> {
+        JIT_METHODS
+            .lock()
+            .iter()
+            .find(|(w, _)| std::ptr::eq(w.as_ptr(), Rc::as_ptr(b)) && w.strong_count() > 0)
+            .map(|&(_, op)| op)
+    }
+
     /// The live registrations, keyed by address.
     pub(crate) fn snapshot() -> LeafMap {
         REGISTRY
@@ -62769,8 +62852,9 @@ fn code_name_obj(code: &CodeObject, name_idx: u32) -> Option<&Object> {
 enum NativeTruth {
     /// Neither `__bool__` nor `__len__`: always true.
     AlwaysTrue,
-    /// A registered native `__bool__`.
-    Bool(Rc<crate::object::BuiltinFn>),
+    /// A registered native `__bool__`, with its direct operation
+    /// (`collections_native::fast_op`, `0` for none).
+    Bool(Rc<crate::object::BuiltinFn>, u8),
     /// A registered native `__len__`.
     Len(Rc<crate::object::BuiltinFn>),
     /// Anything else: the full path decides.

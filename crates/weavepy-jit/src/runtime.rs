@@ -132,6 +132,18 @@ pub enum SlotTag {
 /// are tagged [`SlotTag::Default`].
 pub const CALL_GAPS: u32 = 1 << 31;
 
+/// Set in a [`crate::TOp::CallMethod`] token when a native method site's
+/// guard runs at the call instead of at its load: nothing between the
+/// two can run code (see `TOp::GuardMethod`), so the call helper checks
+/// the receiver itself and resolves a miss generically.
+pub const METHOD_GUARD_AT_CALL: u32 = 1 << 31;
+
+/// Set in a [`crate::TOp::CallMethod`] token when the site resolved a
+/// native leaf method: its helper never runs Python on this activation's
+/// behalf (any call that would leaves through a side exit, which writes
+/// the locals back itself), so the call skips the locals write-back.
+pub const METHOD_NATIVE: u32 = 1 << 30;
+
 impl SlotTag {
     /// Decode a raw tag written by native code.
     #[inline]
@@ -1145,6 +1157,57 @@ pub fn register_call_method_helper(helper: CallMethodHelper) {
 #[must_use]
 pub(crate) fn call_method_helper_addr() -> usize {
     CALL_METHOD_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The native method-site load guard (see [`crate::TOp::GuardMethod`]):
+/// `0` when the receiver pin still matches the site's burned
+/// resolution, anything else to deopt at the load.
+pub type GuardMethodHelper =
+    unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, token: i64) -> i64;
+
+static GUARD_METHOD_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide native method-site load guard. Must precede
+/// the first compile of a frame containing `GuardMethod` ops.
+pub fn register_guard_method_helper(helper: GuardMethodHelper) {
+    GUARD_METHOD_HELPER.store(helper as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn guard_method_helper_addr() -> usize {
+    GUARD_METHOD_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static CALL_NATIVE_METHOD_HELPER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide native method-call helper: the
+/// [`CallMethodHelper`] for a [`crate::TOp::CallMethod`] whose token
+/// carries [`METHOD_NATIVE`]. Must precede the first compile of a frame
+/// containing such a call.
+pub fn register_call_native_method_helper(helper: CallMethodHelper) {
+    CALL_NATIVE_METHOD_HELPER.store(helper as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn call_native_method_helper_addr() -> usize {
+    CALL_NATIVE_METHOD_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static OBJ_GETITEM_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide native-subscript helper (see
+/// [`crate::TOp::ObjGetItem`]). Shares [`CallMethodHelper`]'s shape: the
+/// `token` names the burned `__getitem__` resolution and the index rides
+/// the marshal buffer as the one argument. Must precede the first
+/// compile of a frame containing `ObjGetItem` ops.
+pub fn register_obj_getitem_helper(helper: CallMethodHelper) {
+    OBJ_GETITEM_HELPER.store(helper as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn obj_getitem_helper_addr() -> usize {
+    OBJ_GETITEM_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
 static STR_METHOD_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

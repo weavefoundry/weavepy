@@ -49,6 +49,10 @@ pub struct MethodResolution {
     pub arg_count: u32,
     pub min_args: u32,
     pub ret: MethodRet,
+    /// The callee is a native accelerator's leaf method (`deque.pop`):
+    /// its object-lane result is a container element, so arithmetic on
+    /// it speculates the integer lane (see [`SE::num_hint`]).
+    pub native: bool,
 }
 
 /// Maximum receiver path retained by analysis. The final attribute read adds
@@ -2781,6 +2785,8 @@ struct MethodMark {
     ret: MethodRet,
     /// The method-form `LOAD_ATTR` pc.
     load_pc: u32,
+    /// See [`MethodResolution::native`].
+    native: bool,
 }
 
 /// RFC 0073 WS3 — a burned-in native `str` method riding on its
@@ -2852,6 +2858,12 @@ struct SE {
     /// native method (the [`Self::method`] discipline, statically
     /// resolved).
     str_method: Option<StrMethodMark>,
+    /// An object-lane element read from a native accelerator's container
+    /// (a `deque` subscript or end operation). Arithmetic combining two
+    /// object-lane operands speculates the integer lane when either
+    /// carries this hint: each operand is guarded exactly like the
+    /// integral-peer case, so a miss resumes at the operation itself.
+    num_hint: bool,
 }
 
 impl SE {
@@ -2871,6 +2883,7 @@ impl SE {
             ctor: None,
             elem_of: None,
             str_method: None,
+            num_hint: false,
         }
     }
 
@@ -3984,8 +3997,15 @@ fn step_abstract(
                 stack.push(SE::known(a.ty));
                 return Ok(());
             }
+            let hinted = a.num_hint || b.num_hint;
             let (a, b) = resolve_pair(a, b, local_types, changed);
-            let res = bin_result_type(kind, a.ty, b.ty)?;
+            // Two native container elements (`q[0] + q[-1]`): both
+            // operands are guarded as integers at emission.
+            let res = if hinted && a.ty == JitType::Obj && b.ty == JitType::Obj {
+                bin_result_type(kind, JitType::Int, JitType::Int)?
+            } else {
+                bin_result_type(kind, a.ty, b.ty)?
+            };
             stack.push(SE::known(res));
         }
         OpCode::CompareOp => {
@@ -4160,9 +4180,11 @@ fn step_abstract(
             // RFC 0069 WS1 — a class-resolved method on a pinned
             // instance receiver: the receiver stays on the abstract
             // stack (its pin is the native value), re-marked with the
-            // resolution. `.append` keeps its dedicated list path.
-            // RFC 0071 WS3 admits attribute-chain receivers.
-            if name != "append" {
+            // resolution. `.append` keeps its dedicated list path (a
+            // list receiver never resolves here: the probe answers
+            // instances only). RFC 0071 WS3 admits attribute-chain
+            // receivers.
+            if name != "append" || !recv.ty.is_list() {
                 if let Some((slot, path)) = obj_recv_ref(recv.ty, recv.src, recv.path, probes.paths)
                 {
                     let names = probes.paths.names(path);
@@ -4188,6 +4210,7 @@ fn step_abstract(
                                 min_args: res.min_args,
                                 ret: res.ret,
                                 load_pc: i as u32,
+                                native: res.native,
                             }),
                             ..recv
                         });
@@ -4341,7 +4364,10 @@ fn step_abstract(
                         poison: true,
                         ..SE::known(JitType::Unknown)
                     }),
-                    MethodRet::Scalar(ty) => stack.push(SE::known(ty)),
+                    MethodRet::Scalar(ty) => stack.push(SE {
+                        num_hint: m.native && ty == JitType::Obj,
+                        ..SE::known(ty)
+                    }),
                 }
                 return Ok(());
             }
@@ -4600,6 +4626,21 @@ fn step_abstract(
             // RFC 0071 WS6 — `bytes[i]` reads a byte as an `Int`.
             if cont.ty == JitType::Bytes {
                 stack.push(SE::known(JitType::Int));
+                return Ok(());
+            }
+            // A native container element (`q[0]` on a `deque`): the
+            // container's class resolves `__getitem__` to a native leaf
+            // method (see `TOp::ObjGetItem`).
+            if native_getitem(&cont, probes).is_some() {
+                if cont.path.is_none() && cont.ty == JitType::Unknown {
+                    if let Some(slot) = cont.src {
+                        set_local(local_types, slot, JitType::Obj, changed)?;
+                    }
+                }
+                stack.push(SE {
+                    num_hint: true,
+                    ..SE::known(JitType::Obj)
+                });
                 return Ok(());
             }
             // RFC 0073 WS3 — `s[i]` reads a single-codepoint `str`
@@ -5508,8 +5549,84 @@ fn bin_result_type(kind: ArithKind, a: JitType, b: JitType) -> Result<JitType, J
     }
 }
 
+/// Move a native method site's load guard to its call: when every
+/// statement emitted since the site's `GuardMethod` (at `load_pc`, in
+/// this block) is a plain local, constant, or scalar-arithmetic
+/// operation, no code can have run between the load and the call, so the
+/// call helper may check the receiver itself. The load keeps only the
+/// inline `None` fence. Returns whether the guard moved.
+fn defer_method_guard(stmts: &mut [TStmt], load_pc: u32) -> bool {
+    for k in (0..stmts.len()).rev() {
+        match stmts[k].op {
+            TOp::GuardMethod { .. } if stmts[k].pc == load_pc => {
+                stmts[k].op = TOp::GuardNotNone;
+                return true;
+            }
+            TOp::LoadLocal(_)
+            | TOp::PushConstInt(_)
+            | TOp::PushConstFloat(_)
+            | TOp::PushConstBool(_)
+            | TOp::PushNone
+            | TOp::IntArith(_)
+            | TOp::FloatArith(_)
+            | TOp::IntNeg
+            | TOp::FloatNeg
+            | TOp::IntInvert
+            | TOp::IntToFloatTos { .. }
+            | TOp::IntToFloatSecond { .. }
+            | TOp::UnboxInt { .. } => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The burned `__getitem__` resolution for a subscript container on the
+/// object lane (or an untyped local): the root local and the embedder's
+/// method probe, when the class resolves the dunder to a native leaf
+/// method (`deque.__getitem__`). Python-level `__getitem__` methods stay
+/// out: the helper calls the native body directly.
+fn native_getitem(cont: &SE, probes: &mut Probes<'_>) -> Option<(u32, MethodResolution)> {
+    if !matches!(cont.ty, JitType::Obj | JitType::Unknown) {
+        return None;
+    }
+    let (slot, path) = obj_recv_ref(cont.ty, cont.src, cont.path, probes.paths)?;
+    let names = probes.paths.names(path);
+    let res = (probes.method)(slot, &names, "__getitem__")?;
+    res.native.then_some((slot, res))
+}
+
+/// Fuse an integer consumer at `pc` into the object-lane producer that
+/// ran immediately before it (the instruction at `pc - 1`): the producer
+/// then hands over an exact `int` unboxed, and anything else leaves
+/// through the producer's own completed-result exit (a generic call or a
+/// native method parks its result and resumes here; a pure native
+/// subscript is simply re-executed by the interpreter). Returns whether
+/// the producer took the consumer's guard. `native` admits a burned-in
+/// method call, which only a native method's hinted result asks for.
+fn fuse_int_result(stmts: &mut [TStmt], pc: u32, native: bool) -> bool {
+    let Some(previous) = stmts.last_mut() else {
+        return false;
+    };
+    if previous.pc.checked_add(1) != Some(pc) {
+        return false;
+    }
+    match &mut previous.op {
+        TOp::CallDyn { int_result, .. } | TOp::ObjGetItem { int_result, .. } => {
+            *int_result = true;
+            true
+        }
+        TOp::CallMethod { ret, .. } if native && *ret == MethodRet::Scalar(JitType::Obj) => {
+            *ret = MethodRet::Scalar(JitType::Int);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// An integral peer provides a useful speculative lane for an opaque
-/// operand. Two opaque operands have no such evidence and stay generic.
+/// operand. Two opaque operands have no such evidence and stay generic
+/// unless one is a native container element (see [`SE::num_hint`]).
 /// The depth is measured from TOS, so only 0 and 1 can be returned.
 fn integer_operand_guard(a: JitType, b: JitType) -> Option<u8> {
     if a.is_integral() && b == JitType::Obj {
@@ -5671,6 +5788,8 @@ struct ESlot {
     /// RFC 0073 WS3 — a pinned `str` receiver carrying a burned-in
     /// native method (see [`SE::str_method`]).
     str_method: Option<StrMethodMark>,
+    /// See [`SE::num_hint`].
+    num_hint: bool,
 }
 
 impl ESlot {
@@ -5689,6 +5808,7 @@ impl ESlot {
             slice: None,
             const_slice: false,
             str_method: None,
+            num_hint: false,
         }
     }
 
@@ -6493,21 +6613,31 @@ fn emit_instr(
         }
         OpCode::BinaryOp => {
             let kind = bin_kind(ins.arg)?;
+            let b_hint = stack.last().is_some_and(|s| s.num_hint);
+            let hinted = b_hint || (stack.len() >= 2 && stack[stack.len() - 2].num_hint);
             let mut b = pop_val(stack)?;
             let mut a = pop_val(stack)?;
+            // Two native container elements (see `SE::num_hint`): the top
+            // operand is guarded (or its producer fused) like the
+            // integral-peer case below, then the lower one at depth 1.
+            if hinted && a == JitType::Obj && b == JitType::Obj {
+                if !fuse_int_result(stmts, pc, b_hint) {
+                    stack.push(ESlot::val(a));
+                    stack.push(ESlot::val(b));
+                    push(TOp::UnboxInt { depth: 0 }, None, stack, stmts);
+                    stack.pop();
+                    stack.pop();
+                }
+                b = JitType::Int;
+                stack.push(ESlot::val(a));
+                stack.push(ESlot::val(b));
+                push(TOp::UnboxInt { depth: 1 }, None, stack, stmts);
+                stack.pop();
+                stack.pop();
+                a = JitType::Int;
+            }
             if let Some(depth) = integer_operand_guard(a, b) {
-                let fused = depth == 0
-                    && stmts.last_mut().is_some_and(|previous| {
-                        if previous.pc.checked_add(1) != Some(pc) {
-                            return false;
-                        }
-                        if let TOp::CallDyn { int_result, .. } = &mut previous.op {
-                            *int_result = true;
-                            true
-                        } else {
-                            false
-                        }
-                    });
+                let fused = depth == 0 && fuse_int_result(stmts, pc, b_hint);
                 // Re-model both original operands for the guard. A miss
                 // restores the boxed value at this BINARY_OP, never its
                 // producer, so calls and callbacks aren't repeated.
@@ -6892,8 +7022,10 @@ fn emit_instr(
             let names = probes.paths.names(path);
             // RFC 0069 WS1 — a class-resolved method: re-mark the
             // receiver in place (its pin stays the native value) and
-            // record the site under the probe's token.
-            if name != "append" {
+            // record the site under the probe's token (an object-lane
+            // `.append`, such as `deque.append`, included: the list
+            // shape returned above).
+            if name != "append" || !top.ty.is_list() {
                 // RFC 0073 WS1 (element residue) — mirror the
                 // inference fallback: an unbound receiver local
                 // resolves against an exemplar element of its source
@@ -6927,7 +7059,17 @@ fn emit_instr(
                     // fence out `None` here (deopt at this pc, receiver
                     // still on the stack) so the interpreter re-executes
                     // the load and raises the exact `AttributeError`.
-                    push(TOp::GuardNotNone, None, stack, stmts);
+                    // A native method binds at this load: its whole guard
+                    // (class version, no instance shadowing, `None`
+                    // fenced) runs here, and the call then uses the
+                    // builtin bound here even when argument evaluation
+                    // rebinds the class attribute, exactly as the
+                    // interpreter's bound method would.
+                    if res.native {
+                        push(TOp::GuardMethod { token: res.token }, None, stack, stmts);
+                    } else {
+                        push(TOp::GuardNotNone, None, stack, stmts);
+                    }
                     let last = stack.len() - 1;
                     stack[last].method = Some(MethodMark {
                         token: res.token,
@@ -6935,6 +7077,7 @@ fn emit_instr(
                         min_args: res.min_args,
                         ret: res.ret,
                         load_pc: pc,
+                        native: res.native,
                     });
                     stack.push(ESlot {
                         null: Some((pc, plan.hidden_at(i) + stack.len() as u32)),
@@ -7220,6 +7363,15 @@ fn emit_instr(
                     token: Some(m.token),
                 });
                 *max_call_args = (*max_call_args).max(argc as u32);
+                // A native site whose arguments ran no code since the load
+                // checks its guard at the call (one helper call, not two).
+                let mut token = m.token;
+                if m.native {
+                    token |= crate::runtime::METHOD_NATIVE;
+                    if defer_method_guard(stmts, m.load_pc) {
+                        token |= crate::runtime::METHOD_GUARD_AT_CALL;
+                    }
+                }
                 // Re-model the receiver + args for the statement
                 // (`CallMethod` pops `argc` scalars and the pin).
                 stack.push(ESlot::val(f.ty));
@@ -7228,7 +7380,7 @@ fn emit_instr(
                 }
                 push(
                     TOp::CallMethod {
-                        token: m.token,
+                        token,
                         argc: argc as u8,
                         ret: m.ret,
                     },
@@ -7252,7 +7404,10 @@ fn emit_instr(
                         if !ty.is_representable() || (ty.is_pinned() && ty != JitType::Obj) {
                             return Err(JitVerdict::TypeUnknown);
                         }
-                        stack.push(ESlot::val(ty));
+                        stack.push(ESlot {
+                            num_hint: m.native && ty == JitType::Obj,
+                            ..ESlot::val(ty)
+                        });
                     }
                 }
                 *max_stack = (*max_stack).max(stack.len() as u32);
@@ -8074,6 +8229,45 @@ fn emit_instr(
             if cont == JitType::Bytes {
                 push(TOp::BytesGetItem, Some(JitType::Int), stack, stmts);
                 return Ok(());
+            }
+            // A native container element (see the inference arm): the
+            // site records the burned `__getitem__` resolution under its
+            // probe token, like a method site.
+            if cont == JitType::Obj {
+                let probe = SE {
+                    src: cont_slot.src,
+                    path: cont_slot.path,
+                    ..SE::known(cont)
+                };
+                if let Some((slot, res)) = native_getitem(&probe, probes) {
+                    let idx = res.token as usize;
+                    if method_sites.len() <= idx {
+                        method_sites.resize(idx + 1, None);
+                    }
+                    method_sites[idx] = Some(MethodSiteMeta {
+                        slot,
+                        name: "__getitem__".to_owned(),
+                        arg_count: res.arg_count,
+                        min_args: res.min_args,
+                        ret: res.ret,
+                    });
+                    *max_call_args = (*max_call_args).max(1);
+                    push(
+                        TOp::ObjGetItem {
+                            token: res.token,
+                            int_result: false,
+                        },
+                        None,
+                        stack,
+                        stmts,
+                    );
+                    stack.push(ESlot {
+                        num_hint: true,
+                        ..ESlot::val(JitType::Obj)
+                    });
+                    *max_stack = (*max_stack).max(stack.len() as u32);
+                    return Ok(());
+                }
             }
             // RFC 0073 WS3 — `s[i]` through the registered helper
             // (ASCII-only O(1); anything else deopts there).

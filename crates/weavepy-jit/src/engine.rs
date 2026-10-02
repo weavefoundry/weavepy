@@ -769,7 +769,10 @@ fn op_mix(tfunc: &TFunc) -> OpMix {
                 TOp::CallDyn { .. } => mix.dyn_calls += 1,
                 TOp::DynAttrGet { .. } | TOp::DynAttrSet { .. } => mix.dyn_attrs += 1,
                 TOp::ContainsDyn { .. } => mix.dyn_other += 1,
-                TOp::CallPy { .. } | TOp::CallPyKw { .. } | TOp::CallMethod { .. } => {
+                TOp::CallPy { .. }
+                | TOp::CallPyKw { .. }
+                | TOp::CallMethod { .. }
+                | TOp::ObjGetItem { .. } => {
                     mix.guarded_calls += 1;
                 }
                 _ => {}

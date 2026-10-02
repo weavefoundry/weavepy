@@ -312,6 +312,27 @@ pub enum TOp {
         argc: u8,
         ret: MethodRet,
     },
+    /// `container[index]` (`BINARY_SUBSCR`) on an object-lane container
+    /// whose class resolved `__getitem__` to a native leaf method at
+    /// compile time (`deque.__getitem__`): pops the `int` index and the
+    /// container pin and calls the registered `wpjit_obj_getitem` helper
+    /// with the method-site `token` (the [`TOp::CallMethod`] protocol,
+    /// index staged as the one argument). A guard miss or a declined
+    /// fast half deopts *at* this pc with both operands spilled (nothing
+    /// ran; the interpreter re-executes the subscript). The result rides
+    /// the object lane, or the `int` lane when `int_result` fuses the
+    /// immediately following integer consumer (any other value parks and
+    /// resumes at that consumer).
+    ObjGetItem { token: u32, int_result: bool },
+    /// The method-form `LOAD_ATTR` of a burned-in native method site
+    /// (see [`TOp::CallMethod`]): peeks the receiver pin and calls the
+    /// registered `wpjit_guard_method` helper with the site's `token`,
+    /// which checks the receiver's class version and that no instance
+    /// attribute shadows the name. A miss (or `None`) deopts *at* this
+    /// pc with the receiver spilled, so the interpreter performs the
+    /// load itself. The `CALL` then needs no guard: the method was bound
+    /// here.
+    GuardMethod { token: u32 },
     /// RFC 0071 WS6 — `==`/`!=` on two pinned `str` values: pops both
     /// pins, calls the registered `wpjit_str_eq` helper (identical-pin
     /// and pointer equality answer before a content compare), and
@@ -1486,6 +1507,8 @@ impl TOp {
                 | TOp::CallPy { .. }
                 | TOp::CallPyKw { .. }
                 | TOp::CallMethod { .. }
+                | TOp::ObjGetItem { .. }
+                | TOp::GuardMethod { .. }
                 | TOp::MathIntrinsic(_)
                 | TOp::FloatArith(ArithKind::FloorDiv | ArithKind::Mod | ArithKind::Pow)
                 | TOp::ListGet { .. }
