@@ -11172,9 +11172,10 @@ impl Interpreter {
                             Object::Generator(g) => {
                                 // A simple body runs to its next yield in
                                 // place, without switching (see `gen_fast`).
-                                let g = g.clone();
+                                // (The stack slot keeps `g` alive: the step
+                                // runs no code that could reach this frame.)
                                 if let gen_fast::GenNext::Yielded(v) =
-                                    self.gen_fast_next(&g, snap_gen, 0)
+                                    self.gen_fast_next(g, snap_gen, 0, pending_work)
                                 {
                                     // SAFETY: `len < cap` (checked above).
                                     unsafe { base.add(len).write(v) };
@@ -11183,7 +11184,6 @@ impl Interpreter {
                                     pc += 1;
                                     continue;
                                 }
-                                drop(g);
                                 // SAFETY: `len <= cap`, every slot initialized.
                                 unsafe { frame.stack.set_len(len) };
                                 frame.pc = pc as u32;

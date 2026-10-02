@@ -335,13 +335,15 @@ impl Interpreter {
     /// back when it ends.
     ///
     /// With `fold` (a draining consumer's sink, top level only), a yield
-    /// the sink takes resumes the body at once with `None` sent.
+    /// the sink takes resumes the body at once with `None` sent. `dead` is
+    /// the thread's queued-finalizer flag (`gc_trace::maybe_dead_flag`).
     pub(crate) fn gen_fast_step(
         &mut self,
         frame: &mut Frame,
         snap_gen: u64,
         depth: u8,
         fold: Option<FoldSink>,
+        dead: *const std::cell::Cell<bool>,
     ) -> GenStep {
         // SAFETY: the frame's code is immutable and outlives the step (the
         // frame holds it, and nothing here replaces it).
@@ -392,12 +394,7 @@ impl Interpreter {
             last: pc,
             countdown: std::ptr::addr_of_mut!(self.gil_countdown),
             snap_gen,
-            // (Only read when the native form runs.)
-            maybe_dead: if native.is_some() {
-                crate::gc_trace::maybe_dead_flag()
-            } else {
-                std::ptr::null()
-            },
+            maybe_dead: dead,
             interp: std::ptr::from_ref(self),
             out: 0,
             depth_cell: std::ptr::null(),
@@ -620,7 +617,7 @@ impl Interpreter {
                             }
                         }
                     }
-                    match self.gen_fast_for_iter(top, snap_gen, depth) {
+                    match self.gen_fast_for_iter(top, snap_gen, depth, dead) {
                         ForNext::Value(v) => {
                             unsafe { base.add(len).write(v) };
                             len += 1;
@@ -691,7 +688,13 @@ impl Interpreter {
     /// value, a range's end (when the loop alone holds it), or a fast
     /// generator's next yield.
     #[inline(never)]
-    fn gen_fast_for_iter(&mut self, top: &Object, snap_gen: u64, depth: u8) -> ForNext {
+    fn gen_fast_for_iter(
+        &mut self,
+        top: &Object,
+        snap_gen: u64,
+        depth: u8,
+        dead: *const std::cell::Cell<bool>,
+    ) -> ForNext {
         match top {
             Object::Iter(it) => {
                 let unique = Rc::strong_count(it) == 1;
@@ -742,9 +745,10 @@ impl Interpreter {
                     _ => ForNext::Bail,
                 }
             }
+            // (The stack slot keeps `g` alive: the inner step runs no code
+            // that could reach this frame.)
             Object::Generator(g) => {
-                let g = g.clone();
-                match self.gen_fast_next(&g, snap_gen, depth + 1) {
+                match self.gen_fast_next(g, snap_gen, depth + 1, dead) {
                     GenNext::Yielded(v) => ForNext::Value(v),
                     GenNext::Declined | GenNext::Partial => ForNext::Bail,
                 }
@@ -766,7 +770,7 @@ impl Interpreter {
         if !Self::gen_fast_frame_ok(frame) {
             return None;
         }
-        match self.gen_fast_step(frame, snap_gen, 0, fold) {
+        match self.gen_fast_step(frame, snap_gen, 0, fold, crate::gc_trace::maybe_dead_flag()) {
             GenStep::Yielded(v) => Some(v),
             GenStep::Bail => None,
         }
@@ -780,6 +784,7 @@ impl Interpreter {
         g: &Rc<PyGenerator>,
         snap_gen: u64,
         depth: u8,
+        dead: *const std::cell::Cell<bool>,
     ) -> GenNext {
         if depth > MAX_DEPTH
             || crate::recursion::current_depth() + usize::from(depth) + 2
@@ -818,7 +823,7 @@ impl Interpreter {
             frame.stack.push(Object::None);
         }
         debug_assert!(!frame.stack.is_empty());
-        let out = match self.gen_fast_step(frame, snap_gen, depth, None) {
+        let out = match self.gen_fast_step(frame, snap_gen, depth, None, dead) {
             GenStep::Yielded(v) => GenNext::Yielded(v),
             GenStep::Bail if frame.pc == start => {
                 // Nothing ran: the resume is undone.
