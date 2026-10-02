@@ -4681,7 +4681,7 @@ fn install_wire_code(nc: &mut weavepy_compiler::CodeObject, bytes: Vec<u8>) {
             // instruction count; line info defaults to the first line.
             let first = nc.linetable.iter().copied().find(|l| *l > 0).unwrap_or(1);
             nc.linetable = vec![first; instructions.len()];
-            nc.coltable = Vec::new();
+            nc.coltable = Vec::new().into();
             nc.caches = weavepy_compiler::CacheTable::with_len(instructions.len());
             nc.instructions = instructions;
             nc.exception_table = Vec::new();
@@ -4869,7 +4869,7 @@ pub(crate) fn code_type_call(
             nc.caches = weavepy_compiler::CacheTable::with_len(decoded.instructions.len());
             nc.instructions = decoded.instructions;
             nc.linetable = decoded.linetable;
-            nc.coltable = decoded.coltable;
+            nc.coltable = decoded.coltable.into();
             nc.exception_table = decoded.exception_table;
             nc.no_interrupt_jumps = decoded.no_interrupt_jumps;
         }

@@ -1417,8 +1417,10 @@ fn sys_setrecursionlimit(args: &[Object]) -> Result<Object, RuntimeError> {
 // (pickle's `load_build` inserts `sys.intern(k)` keys —
 // test_pickle test_attribute_name_interning).
 thread_local! {
-    static INTERN_POOL: RefCell<std::collections::HashSet<SharedStr>> =
-        RefCell::new(std::collections::HashSet::new());
+    // (Fx-hashed: interning runs for every name of every code object a
+    // module loads, and SipHash showed in import profiles.)
+    static INTERN_POOL: RefCell<std::collections::HashSet<SharedStr, crate::fasthash::FxBuildHasher>> =
+        RefCell::new(std::collections::HashSet::with_hasher(Default::default()));
 }
 
 /// Canonicalize `name` through the interpreter's intern pool, seeding it
