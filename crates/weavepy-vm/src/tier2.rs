@@ -2557,8 +2557,14 @@ fn probe_list_lane(frame: &super::Frame, slot: u32) -> Option<JitType> {
     if items.is_empty() {
         return Some(JitType::Unknown);
     }
+    list_elem_lane(&items)
+}
+
+/// The uniform element lane of a non-empty list's `items` (see
+/// [`probe_list_lane`]), `None` for a mixed or unsupported list.
+fn list_elem_lane(items: &[Object]) -> Option<JitType> {
     let mut lane: Option<JitType> = None;
-    for it in items.iter() {
+    for it in items {
         let t = match it {
             Object::Int(_) => JitType::Int,
             Object::Float(_) => JitType::Float,
@@ -3596,9 +3602,23 @@ fn resolve_plain_dicts(
 /// ops (`CallDyn`, `DynAttrGet`/`Set`, iterator capture) apply and
 /// every other access helper deopts on the lane surprise. The identity
 /// guard makes the grade stable for the compilation's whole life.
+///
+/// A non-empty list with a uniform element lane rides its pinned-list
+/// lane, as a list local does (see [`probe_list_lane`]): the identity
+/// guard keeps the list object, and every element access re-validates
+/// the element lane, so later changes to the list's contents deopt.
 fn grade_obj_global(obj: &Object) -> JitType {
     match obj {
         Object::Str(_) => JitType::Str,
+        Object::List(l) => {
+            let items = l.borrow();
+            if items.is_empty() {
+                return JitType::Obj;
+            }
+            list_elem_lane(&items)
+                .and_then(JitType::list_of)
+                .unwrap_or(JitType::Obj)
+        }
         _ => JitType::Obj,
     }
 }
@@ -8365,6 +8385,22 @@ unsafe extern "C" fn wpjit_get_iter(frame: *mut JitFrame, pin: i64) -> i64 {
 /// # Safety
 ///
 /// Same contract as [`wpjit_call_py`].
+/// One step of a list, tuple or range iterator, without the generic
+/// dispatch: the next item, or `None` once exhausted (the iterator then
+/// detached as [`PyIterator::next_value`] leaves it). `None` outside for
+/// any other iterator, or one already borrowed.
+#[inline]
+fn builtin_seq_step(cell: &Rc<GilRefCell<crate::object::PyIterator>>) -> Option<Option<Object>> {
+    use crate::object::PyIterator;
+    let mut it = cell.try_borrow_mut().ok()?;
+    match &*it {
+        PyIterator::List { .. } | PyIterator::Tuple { .. } | PyIterator::Range { .. } => {
+            Some(it.next_value())
+        }
+        _ => None,
+    }
+}
+
 unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i64) -> i64 {
     // SAFETY: see wpjit_call_py — same live-buffer contract.
     let jf = unsafe { &mut *frame };
@@ -8405,52 +8441,65 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
             }
         }
     }
-    // The loop's poll point (the header's countdown poll covers the
-    // native back edge; this covers the Python the step may run):
-    // pending interpreter work and active observers route the loop
-    // through the interpreter.
-    crate::gil::yield_checkpoint();
-    if crate::hot_gates::load() != 0 || crate::trace::any_observers_active() {
-        return 2;
-    }
-    let it = match ctx.pins.get(pin as usize) {
-        Some(Pin::Obj(o @ (Object::Generator(_) | Object::Iter(_)))) => o.clone(),
-        // An instance iterator whose `__next__` is a registered native
-        // leaf (a `deque` iterator): stepped below without Python.
-        Some(Pin::Obj(o @ Object::Instance(_))) if !crate::gil::free_threading_enabled() => {
-            o.clone()
-        }
-        _ => return 2,
+    // A list, tuple or range iterator steps in place: no Python runs, so
+    // the header's countdown poll covers the step, and nothing needs the
+    // iterator cloned.
+    let fast = match ctx.pins.get(pin as usize) {
+        Some(Pin::Obj(Object::Iter(cell))) => builtin_seq_step(cell),
+        _ => None,
     };
-    // A builtin-iterator step is pure native code; everything else
-    // (generator resume) runs arbitrary Python on behalf of this
-    // activation.
-    let runs_python = matches!(it, Object::Generator(_));
-    if runs_python {
-        ctx.dirty = true;
-        // A generator resume from native code rebuilds a whole interpreter
-        // activation, several times what the interpreter's own inline
-        // resume costs: charged like an interpreter call, so a loop that
-        // drives a generator retires at the next poll (see `wpjit_poll`).
-        ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
-    }
-    let step = if let Object::Instance(inst) = &it {
-        // The core loop's cached `__next__` resolution (by class version).
-        // Any other `__next__` belongs to the interpreter (nothing was
-        // consumed).
-        if !super::Interpreter::default_getattribute(inst.cls_raw())
-            || crate::object::exotic_str_keys_possible()
-        {
-            return 2;
+    let (step, runs_python) = match fast {
+        Some(step) => (Ok(step), false),
+        None => {
+            // The loop's poll point (the header's countdown poll covers the
+            // native back edge; this covers the Python the step may run):
+            // pending interpreter work and active observers route the loop
+            // through the interpreter.
+            crate::gil::yield_checkpoint();
+            if crate::hot_gates::load() != 0 || crate::trace::any_observers_active() {
+                return 2;
+            }
+            let it = match ctx.pins.get(pin as usize) {
+                Some(Pin::Obj(o @ (Object::Generator(_) | Object::Iter(_)))) => o.clone(),
+                // An instance iterator whose `__next__` is a registered native
+                // leaf (a `deque` iterator): stepped below without Python.
+                Some(Pin::Obj(o @ Object::Instance(_))) if !crate::gil::free_threading_enabled() => {
+                    o.clone()
+                }
+                _ => return 2,
+            };
+            // A builtin-iterator step is pure native code; everything else
+            // (generator resume) runs arbitrary Python on behalf of this
+            // activation.
+            let runs_python = matches!(it, Object::Generator(_));
+            if runs_python {
+                ctx.dirty = true;
+                // A generator resume from native code rebuilds a whole interpreter
+                // activation, several times what the interpreter's own inline
+                // resume costs: charged like an interpreter call, so a loop that
+                // drives a generator retires at the next poll (see `wpjit_poll`).
+                ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
+            }
+            let step = if let Object::Instance(inst) = &it {
+                // The core loop's cached `__next__` resolution (by class version).
+                // Any other `__next__` belongs to the interpreter (nothing was
+                // consumed).
+                if !super::Interpreter::default_getattribute(inst.cls_raw())
+                    || crate::object::exotic_str_keys_possible()
+                {
+                    return 2;
+                }
+                match interp.leaf_next_step(&it, inst) {
+                    None => return 2,
+                    Some(Ok(v)) => Ok(Some(v)),
+                    Some(Err(RuntimeError::PyException(e))) if e.type_name() == "StopIteration" => Ok(None),
+                    Some(Err(e)) => Err(e),
+                }
+            } else {
+                interp.iter_next(&it, &ctx.globals)
+            };
+            (step, runs_python)
         }
-        match interp.leaf_next_step(&it, inst) {
-            None => return 2,
-            Some(Ok(v)) => Ok(Some(v)),
-            Some(Err(RuntimeError::PyException(e))) if e.type_name() == "StopIteration" => Ok(None),
-            Some(Err(e)) => Err(e),
-        }
-    } else {
-        interp.iter_next(&it, &ctx.globals)
     };
     match step {
         Err(err) => {
@@ -9957,6 +10006,9 @@ unsafe extern "C" fn wpjit_global_obj(frame: *mut JitFrame, token: i64) -> i64 {
     let jf = unsafe { &mut *frame };
     #[allow(clippy::cast_ptr_alignment)]
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // A list-lane global's element lane rides the high word (see
+    // `weavepy_jit::global_obj_list_code`).
+    let elem = weavepy_jit::global_obj_list_elem(token);
     let token = token as u32;
     if let Some(&(_, pin)) = ctx.obj_global_pins.iter().find(|&&(t, _)| t == token) {
         return pin as i64;
@@ -9971,7 +10023,11 @@ unsafe extern "C" fn wpjit_global_obj(frame: *mut JitFrame, token: i64) -> i64 {
         return -2;
     }
     let pin = ctx.pins.len() as u64;
-    ctx.pins.push(Pin::Obj(obj));
+    match (elem, obj) {
+        (Some(elem), Object::List(l)) => ctx.pins.push(Pin::List(l, elem)),
+        (Some(_), _) => return -2,
+        (None, obj) => ctx.pins.push(Pin::Obj(obj)),
+    }
     ctx.obj_global_pins.push((token, pin));
     pin as i64
 }

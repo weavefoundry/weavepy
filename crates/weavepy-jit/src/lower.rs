@@ -1334,7 +1334,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .b
             .ins()
             .iconst(self.ptr_ty, runtime::global_obj_helper_addr() as i64);
-        let tokenv = self.b.ins().iconst(types::I64, i64::from(token));
+        let tokenv = self
+            .b
+            .ins()
+            .iconst(types::I64, runtime::global_obj_list_code(token, lane));
         let call = self
             .b
             .ins()

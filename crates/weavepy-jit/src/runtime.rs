@@ -1473,6 +1473,36 @@ pub(crate) fn global_obj_helper_addr() -> usize {
     GLOBAL_OBJ_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// The obj-global helper's argument for `token` on `lane`: a pinned-list
+/// lane's element lane rides the high word (`1` int, `2` float, `3`
+/// object, `4` float list), so the helper pins the list as a list.
+#[must_use]
+pub(crate) fn global_obj_list_code(token: u32, lane: crate::JitType) -> i64 {
+    use crate::JitType;
+    let elem = match lane.elem_lane() {
+        Some(JitType::Int) => 1,
+        Some(JitType::Float) => 2,
+        Some(JitType::Obj) => 3,
+        Some(JitType::ListFloat) => 4,
+        _ => 0,
+    };
+    i64::from(token) | (elem << 32)
+}
+
+/// Inverse of [`global_obj_list_code`]: the element lane a list-lane
+/// global pins with, `None` for an object pin.
+#[must_use]
+pub fn global_obj_list_elem(code: i64) -> Option<crate::JitType> {
+    use crate::JitType;
+    match code >> 32 {
+        1 => Some(JitType::Int),
+        2 => Some(JitType::Float),
+        3 => Some(JitType::Obj),
+        4 => Some(JitType::ListFloat),
+        _ => None,
+    }
+}
+
 static ITER_NEW_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Register the process-wide *generic* iterator-capture helper (RFC
