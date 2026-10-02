@@ -71,6 +71,18 @@ fn hot() -> u32 {
     })
 }
 
+/// How many times [`hot`] a code object's heat must reach: compiling
+/// costs about the same for every instruction of the code, while what it
+/// saves comes from the loop that got hot alone, so a long body (a
+/// driver's setup around a short loop) waits longer to earn its compile.
+#[inline(always)]
+fn size_factor(code: &CodeObject) -> u32 {
+    (code.instructions.len() / SIZE_UNIT).max(1) as u32
+}
+
+/// The code length [`hot`] alone covers.
+const SIZE_UNIT: usize = 16;
+
 /// The longest code compiled.
 const MAX_INSTRUCTIONS: usize = 4096;
 
@@ -196,7 +208,7 @@ impl Slot {
         // (A racing thread losing a count is harmless.)
         let h = self.heat.load(Ordering::Relaxed) + 1;
         self.heat.store(h, Ordering::Relaxed);
-        if h >= hot() {
+        if h >= hot().saturating_mul(size_factor(code)) {
             self.heat.store(0, Ordering::Relaxed);
             self.try_compile(code, ext, nlocals, at);
         }
