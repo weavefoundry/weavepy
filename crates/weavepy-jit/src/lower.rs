@@ -16,6 +16,7 @@ use cranelift_codegen::ir::{
     types, AbiParam, Block, BlockArg, FuncRef, Function, InstBuilder, MemFlags, SigRef, Signature,
     StackSlot, StackSlotData, StackSlotKind, Type, Value,
 };
+use cranelift_codegen::entity::EntityRef;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
 use crate::ir::{ArithKind, CmpKind, MathFunc, MethodRet, SliceOrigin, TFunc, TOp, TStmt, TTerm};
@@ -81,6 +82,7 @@ pub(crate) fn build_function(
     lc.self_func = self_func;
     lc.leaves = leaves;
     lc.build();
+    lc.prune_writebacks();
     builder.seal_all_blocks();
     builder.finalize();
 }
@@ -151,6 +153,13 @@ struct Lowerer<'a, 'b> {
     self_slow_sig: Option<SigRef>,
     /// Direct scalar-leaf call targets by token.
     leaves: Vec<LeafTarget>,
+    /// Per variable (by index), whether the body ever assigns it after
+    /// the entry loads it from the frame.
+    assigned: Vec<bool>,
+    /// Every local write-back store, by variable: a variable the body
+    /// never assigns still holds the frame's own value, so its stores are
+    /// dropped once the body is built (see [`Self::def_local`]).
+    writebacks: Vec<(Variable, cranelift_codegen::ir::Inst)>,
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
@@ -186,7 +195,19 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             self_sig: None,
             self_slow_sig: None,
             leaves: Vec::new(),
+            assigned: Vec::new(),
+            writebacks: Vec::new(),
         }
+    }
+
+    /// Assign the managed local `var` (anything but its entry load).
+    fn def_local(&mut self, var: Variable, v: Value) {
+        let i = var.index();
+        if self.assigned.len() <= i {
+            self.assigned.resize(i + 1, false);
+        }
+        self.assigned[i] = true;
+        self.b.def_var(var, v);
     }
 
     fn cl_ty(ty: JitType) -> Type {
@@ -581,9 +602,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let eb = self.cl_blocks[exit];
                 self.b.ins().brif(cond, body_pre, &[], eb, &[]);
                 self.b.switch_to_block(body_pre);
-                self.b.def_var(loop_var, cur);
+                self.def_local(loop_var, cur);
                 let next = self.b.ins().iadd_imm(cur, 1);
-                self.b.def_var(cur_var, next);
+                self.def_local(cur_var, next);
                 let bb = self.cl_blocks[body];
                 self.b.ins().jump(bb, &[]);
             }
@@ -676,9 +697,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 }
                 self.b.switch_to_block(got_b);
                 let res = self.b.block_params(got_b)[0];
-                self.b.def_var(loop_var, res);
+                self.def_local(loop_var, res);
                 let next = self.b.ins().iadd_imm(idx, 1);
-                self.b.def_var(idx_var, next);
+                self.def_local(idx_var, next);
                 let bb = self.cl_blocks[body];
                 self.b.ins().jump(bb, &args);
                 self.b.switch_to_block(rest_b);
@@ -746,7 +767,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     self.b
                         .ins()
                         .load(Self::cl_ty(elem), trusted, self.frame_ptr, OFF_RET_BITS);
-                self.b.def_var(loop_var, res);
+                self.def_local(loop_var, res);
                 let bb = self.cl_blocks[body];
                 self.b.ins().jump(bb, &args);
                 self.b.switch_to_block(rest_b);
@@ -834,12 +855,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     self.b
                         .ins()
                         .load(Self::cl_ty(elem1), trusted, self.frame_ptr, OFF_RET_BITS);
-                self.b.def_var(var1, e1);
+                self.def_local(var1, e1);
                 let e2 = self
                     .b
                     .ins()
                     .load(Self::cl_ty(elem2), trusted, self.call_args_base, 0);
-                self.b.def_var(var2, e2);
+                self.def_local(var2, e2);
                 let bb = self.cl_blocks[body];
                 self.b.ins().jump(bb, &args);
                 self.b.switch_to_block(rest_b);
@@ -990,7 +1011,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::StoreLocal(slot) => {
                 let (v, _) = self.pop();
                 let var = self.vars[slot as usize].expect("managed local");
-                self.b.def_var(var, v);
+                self.def_local(var, v);
             }
             TOp::IntArith(kind) => self.emit_int_arith(kind, stmt.pc),
             TOp::FloatArith(kind) => self.emit_float_arith(kind, stmt.pc),
@@ -1250,7 +1271,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
         let iter_var = self.vars[iter_slot as usize].expect("managed iter slot");
-        self.b.def_var(iter_var, res);
+        self.def_local(iter_var, res);
     }
 
     /// RFC 0074 WS2 — the opaque-call lane via `wpjit_call_dyn`:
@@ -1748,7 +1769,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
         let iter_var = self.vars[iter_slot as usize].expect("managed iter slot");
-        self.b.def_var(iter_var, pin);
+        self.def_local(iter_var, pin);
     }
 
     /// RFC 0073 WS2 — the dict-loop capture behind an erased
@@ -1774,7 +1795,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
         let iter_var = self.vars[iter_slot as usize].expect("managed iter slot");
-        self.b.def_var(iter_var, res);
+        self.def_local(iter_var, res);
     }
 
     /// RFC 0071 WS4 — `BUILD_LIST k`: the elements are staged through
@@ -4519,7 +4540,19 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             if let Some(var) = self.vars[slot] {
                 let v = self.b.use_var(var);
                 let off = (slot as i32) * 8;
-                self.b.ins().store(trusted, v, self.locals_base, off);
+                let st = self.b.ins().store(trusted, v, self.locals_base, off);
+                self.writebacks.push((var, st));
+            }
+        }
+    }
+
+    /// Drop the write-backs of locals the body never assigns: the frame
+    /// already holds their values, and keeping each one live to every
+    /// exit only costs registers.
+    fn prune_writebacks(&mut self) {
+        for (var, st) in std::mem::take(&mut self.writebacks) {
+            if !self.assigned.get(var.index()).copied().unwrap_or(false) {
+                self.b.func.layout.remove_inst(st);
             }
         }
     }

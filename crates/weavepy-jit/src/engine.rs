@@ -601,6 +601,15 @@ impl JitEngine {
                 })
                 .collect(),
         );
+        if std::env::var_os("WEAVEPY_JIT_CLIF_STATS").is_some() {
+            let f = &self.ctx.func;
+            let insts: usize = f.layout.blocks().map(|b| f.layout.block_insts(b).count()).sum();
+            eprintln!(
+                "jit clif {name}: {} blocks, {insts} insts, {} values",
+                f.layout.blocks().count(),
+                f.dfg.num_values()
+            );
+        }
 
         self.module
             .define_function(id, &mut self.ctx)
