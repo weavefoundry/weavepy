@@ -2287,6 +2287,47 @@ impl Pin {
 /// One activation's pinned objects (RFC 0061/0065 WS5).
 type PinTable = Vec<Pin>;
 
+/// Whether a pin holds an object that something else keeps alive too (or
+/// one that owns nothing): releasing it would free nothing and finalize
+/// nothing, so holding it costs only the table's slot.
+fn pin_is_shared(p: &Pin) -> bool {
+    match p {
+        Pin::List(l, _) => Rc::strong_count(l) > 1,
+        Pin::Obj(o) => match o {
+            Object::None | Object::Int(_) | Object::Float(_) | Object::Bool(_) => true,
+            Object::Instance(i) => Rc::strong_count(i) > 1,
+            Object::List(l) => Rc::strong_count(l) > 1,
+            _ => false,
+        },
+    }
+}
+
+/// At the soft pin limit, decide whether the activation may keep going:
+/// the limit bounds how many objects a long activation keeps alive past
+/// their last other reference (delaying their release and finalizers), so
+/// pins whose objects are still referenced elsewhere (a loop over a list's
+/// elements, results stored as they're made) don't count. When few of the
+/// temporaries are last references, the limit rises by another soft
+/// limit's worth (up to half the hard cap); otherwise the poll leaves.
+/// Each pin is counted once, when the limit is first reached past it.
+fn relax_pin_limit(ctx: &mut CallCtx) -> bool {
+    let from = ctx.pins_counted.max(ctx.entry_pin_count);
+    if let Some(fresh) = ctx.pins.get(from..) {
+        ctx.last_ref_pins += fresh.iter().filter(|p| !pin_is_shared(p)).count();
+    }
+    ctx.pins_counted = ctx.pins.len();
+    let temporaries = ctx.pins.len().saturating_sub(ctx.entry_pin_count);
+    // Half the hard cap stays free: a poll interval that pins heavily
+    // must still reach the next poll before the helpers refuse to pin.
+    if ctx.last_ref_pins < RUNTIME_PIN_SOFT_LIMIT / 2
+        && ctx.pins.len() + RUNTIME_PIN_SOFT_LIMIT <= RUNTIME_PIN_CAP / 2
+    {
+        ctx.pin_limit = temporaries + RUNTIME_PIN_SOFT_LIMIT;
+        return true;
+    }
+    false
+}
+
 /// RFC 0070 WS1 — hard cap on an activation's pin table. Object-lane
 /// attribute loads append pins for changing results (a list traversal
 /// appends one per node), so an unbounded loop needs a bound: at the cap the
@@ -3527,6 +3568,14 @@ struct CallCtx {
     pins: PinTable,
     /// Entry roots do not count toward the temporary-pin soft limit.
     entry_pin_count: usize,
+    /// How many temporary pins this activation may hold before its next
+    /// poll leaves (see [`relax_pin_limit`]): the soft limit, raised while
+    /// most of them aren't the last reference to their object.
+    pin_limit: usize,
+    /// The temporary pins [`relax_pin_limit`] has counted so far, and how
+    /// many of those held their object's last reference when it did.
+    pins_counted: usize,
+    last_ref_pins: usize,
     /// Set only when a helper is committed to a reconstruction exit.
     /// Generated code exits before another native operation can run.
     pin_pressure_exit: bool,
@@ -3674,7 +3723,7 @@ fn pin_reusing(v: &Object, pins: &mut PinTable, memo: &mut [u32; PIN_MEMO]) -> O
 
 impl CallCtx {
     fn temporary_pin_limit_reached(&self) -> bool {
-        self.pins.len().saturating_sub(self.entry_pin_count) >= RUNTIME_PIN_SOFT_LIMIT
+        self.pins.len().saturating_sub(self.entry_pin_count) >= self.pin_limit
     }
 
     /// RFC 0073 WS1 — re-resolve this activation's native-callee
@@ -4087,7 +4136,7 @@ unsafe extern "C" fn wpjit_poll(frame: *mut JitFrame) -> i64 {
         ) {
             return 1;
         }
-        if ctx.temporary_pin_limit_reached() {
+        if ctx.temporary_pin_limit_reached() && !relax_pin_limit(ctx) {
             // The generated poll immediately spills live locals and the
             // boundary stack, then exits. No pin is freed while native
             // registers can still refer to its index.
@@ -4906,6 +4955,9 @@ unsafe fn try_native_call(
             c.const_pins.clear();
         }
         c.pin_pressure_exit = false;
+        c.pin_limit = RUNTIME_PIN_SOFT_LIMIT;
+        c.pins_counted = 0;
+        c.last_ref_pins = 0;
         if !c.obj_global_pins.is_empty() {
             c.obj_global_pins.clear();
         }
@@ -5206,6 +5258,9 @@ fn fresh_child(ctx: &CallCtx, nc: &NativeCallee, callee_key: *const CodeObject) 
         pins: Vec::new(),
         entry_pin_count: 0,
         pin_pressure_exit: false,
+        pin_limit: RUNTIME_PIN_SOFT_LIMIT,
+        pins_counted: 0,
+        last_ref_pins: 0,
         obj_globals: nc.obj_globals.clone(),
         obj_global_pins: Vec::new(),
         attr_guards: nc.attr_guards.clone(),
@@ -11008,6 +11063,9 @@ pub(crate) fn try_call_native_direct(
         pins,
         entry_pin_count,
         pin_pressure_exit: false,
+        pin_limit: RUNTIME_PIN_SOFT_LIMIT,
+        pins_counted: 0,
+        last_ref_pins: 0,
         obj_globals: entry.art.obj_globals.clone(),
         obj_global_pins: Vec::new(),
         attr_guards: entry.art.attr_guards.clone(),
@@ -11817,6 +11875,9 @@ fn enter_compiled(
         pins,
         entry_pin_count,
         pin_pressure_exit: false,
+        pin_limit: RUNTIME_PIN_SOFT_LIMIT,
+        pins_counted: 0,
+        last_ref_pins: 0,
         obj_globals: entry.obj_globals.clone(),
         obj_global_pins: Vec::new(),
         attr_guards: entry.attr_guards.clone(),
@@ -12703,6 +12764,9 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
         pins,
         entry_pin_count: act.entry_pin_count,
         pin_pressure_exit: false,
+        pin_limit: RUNTIME_PIN_SOFT_LIMIT,
+        pins_counted: 0,
+        last_ref_pins: 0,
         obj_globals: entry.obj_globals.clone(),
         obj_global_pins: std::mem::take(&mut act.obj_global_pins),
         attr_guards: entry.attr_guards.clone(),
