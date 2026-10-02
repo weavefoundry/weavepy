@@ -928,6 +928,9 @@ pub struct Interpreter {
     /// (process-unique) attribute version of the class that resolved it
     /// (see [`Interpreter::core_leaf_next`]).
     core_next: ThreadCell<Option<(u64, Option<Rc<crate::object::BuiltinFn>>)>>,
+    /// `_seqtools`' lazy `map` and `filter` classes, once imported (see
+    /// [`Interpreter::seqtools_step`]).
+    seqtools: std::cell::OnceCell<Option<SeqTools>>,
     /// How the last class seen in a boolean context answers it (see
     /// [`Interpreter::leaf_instance_truth`]), by attribute version.
     core_truth: ThreadCell<Option<(u64, NativeTruth)>>,
@@ -1160,6 +1163,7 @@ impl Default for Interpreter {
             leaf_fns: std::cell::OnceCell::new(),
             leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
             core_next: ThreadCell::new(None),
+            seqtools: std::cell::OnceCell::new(),
             core_truth: ThreadCell::new(None),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
         };
@@ -1287,6 +1291,7 @@ impl Interpreter {
             leaf_fns: std::cell::OnceCell::new(),
             leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
             core_next: ThreadCell::new(None),
+            seqtools: std::cell::OnceCell::new(),
             core_truth: ThreadCell::new(None),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
         }
@@ -21409,7 +21414,11 @@ impl Interpreter {
                         }
                         Err(e) => return Err(e),
                     },
-                    Object::Instance(_) => {
+                    Object::Instance(_) => 'next: {
+                        // `map` and `filter` step natively when they can.
+                        if let Some(r) = self.seqtools_step(&it_obj, &frame.globals) {
+                            break 'next r?;
+                        }
                         // Call __next__; treat StopIteration as exhaustion.
                         let next = match instance_native_dunder(&it_obj, "__next__", None) {
                             Some(r) => Some(r),
@@ -29909,6 +29918,13 @@ impl Interpreter {
         kwargs: &[(String, Object)],
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Option<Object>, RuntimeError> {
+        // The common shape is built here (what its `__new__` would build):
+        // a callable over native containers or iterators, no keywords.
+        if kwargs.is_empty() {
+            if let Some(it) = self.seqtools_new(class_name, args, globals) {
+                return Ok(Some(it));
+            }
+        }
         let module = match self.do_import("_seqtools", &Object::None, 0, globals) {
             Ok(m) => m,
             Err(_) => return Ok(None),
@@ -29924,6 +29940,130 @@ impl Interpreter {
         match cls {
             Some(cls) => Ok(Some(self.call(&cls, args, kwargs, globals)?)),
             None => Ok(None),
+        }
+    }
+
+    /// The `_seqtools` classes, importing them on first use.
+    fn seqtools(&mut self, globals: &Rc<RefCell<DictData>>) -> Option<&SeqTools> {
+        if self.seqtools.get().is_none() {
+            let module = self.do_import("_seqtools", &Object::None, 0, globals).ok();
+            let class = |name: &str| match &module {
+                Some(Object::Module(m)) => match m.dict.borrow().get(&DictKey(Object::from_str(name))) {
+                    Some(Object::Type(t)) => Some(t.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let tools = class("_MapIter")
+                .zip(class("_FilterIter"))
+                .map(|(map, filter)| SeqTools { map, filter });
+            let _ = self.seqtools.set(tools);
+        }
+        self.seqtools.get()?.as_ref()
+    }
+
+    /// A `map(func, *iterables)` or `filter(func, iterable)` instance
+    /// built without running its class's `__new__`, when every iterable is
+    /// a list, tuple, string or range (iterated natively) or already an
+    /// iterator; `None` leaves the call to the class.
+    fn seqtools_new(
+        &mut self,
+        class_name: &str,
+        args: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Option<Object> {
+        let filter = match class_name {
+            "_MapIter" => false,
+            "_FilterIter" => true,
+            _ => return None,
+        };
+        let (func, sources) = args.split_first()?;
+        if sources.is_empty() || (filter && sources.len() != 1) {
+            return None;
+        }
+        let mut iters = Vec::with_capacity(sources.len());
+        for s in sources {
+            iters.push(match s {
+                Object::Iter(_) | Object::Generator(_) => s.clone(),
+                Object::List(_) | Object::Tuple(_) | Object::Str(_) | Object::Range(..) => {
+                    Object::Iter(Rc::new(RefCell::new(s.make_iter().ok()?)))
+                }
+                _ => return None,
+            });
+        }
+        let tools = self.seqtools(globals)?;
+        let cls = if filter { &tools.filter } else { &tools.map };
+        let inst = crate::types::PyInstance::new(cls.clone());
+        inst.slot_set("_func", func.clone());
+        if filter {
+            inst.slot_set("_it", iters.pop()?);
+        } else {
+            inst.slot_set("_iters", Object::new_tuple(iters));
+            inst.slot_set("_strict", Object::Bool(false));
+        }
+        let obj = Object::Instance(Rc::new(inst));
+        gc_trace::track(&obj);
+        Some(obj)
+    }
+
+    /// The next value of an exact `map` or `filter` over one native
+    /// iterator, stepped here rather than through its `__next__`:
+    /// `Some(Ok(None))` at exhaustion, `None` when the class's own
+    /// `__next__` must run.
+    fn seqtools_step(
+        &mut self,
+        it: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Option<Result<Option<Object>, RuntimeError>> {
+        let Object::Instance(inst) = it else {
+            return None;
+        };
+        let tools = self.seqtools.get()?.as_ref()?;
+        let cls = inst.cls_raw();
+        let filter = if std::ptr::eq(cls, &*tools.map) {
+            false
+        } else if std::ptr::eq(cls, &*tools.filter) {
+            true
+        } else {
+            return None;
+        };
+        if crate::trace::any_observers_active() {
+            return None;
+        }
+        let func = inst.slot_get("_func")?;
+        let source = if filter {
+            inst.slot_get("_it")?
+        } else {
+            match inst.slot_get("_iters")? {
+                Object::Tuple(t) if t.len() == 1 => t[0].clone(),
+                _ => return None,
+            }
+        };
+        let Object::Iter(cursor) = &source else {
+            return None;
+        };
+        loop {
+            let item = match cursor.borrow_mut().next_value_checked() {
+                Ok(Some(v)) => v,
+                Ok(None) => return Some(Ok(None)),
+                Err(e) => return Some(Err(e)),
+            };
+            if !filter {
+                return Some(self.call(&func, std::slice::from_ref(&item), &[], globals).map(Some));
+            }
+            let keep = match &func {
+                Object::None => self.op_truth(&item),
+                Object::Type(t) if Rc::ptr_eq(t, &builtin_types().bool_) => self.op_truth(&item),
+                f => match self.call(f, std::slice::from_ref(&item), &[], globals) {
+                    Ok(r) => self.op_truth(&r),
+                    Err(e) => Err(e),
+                },
+            };
+            match keep {
+                Ok(true) => return Some(Ok(Some(item))),
+                Ok(false) => {}
+                Err(e) => return Some(Err(e)),
+            }
         }
     }
 
@@ -32785,6 +32925,9 @@ impl Interpreter {
                 Err(e) => Err(e),
             },
             Object::Instance(inst) => {
+                if let Some(r) = self.seqtools_step(iter, globals) {
+                    return r;
+                }
                 // A registered native leaf `__next__` (the class cache the
                 // core loop's `FOR_ITER` uses): called directly.
                 if !crate::gil::free_threading_enabled() && !crate::trace::any_observers_active() {
@@ -72276,4 +72419,10 @@ print("native pickle coverage: ok")
         );
         assert_eq!(run(src), "small\nsmall\nlarge\n");
     }
+}
+
+/// The `_seqtools` classes behind `map` and `filter`.
+struct SeqTools {
+    map: Rc<TypeObject>,
+    filter: Rc<TypeObject>,
 }
