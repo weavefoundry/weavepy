@@ -10907,6 +10907,33 @@ impl Interpreter {
                                     }
                                 }
                             }
+                            // Arithmetic on a big int: the full handler's own
+                            // bignum path (exact ints run no Python), out of
+                            // line.
+                            (Object::Long(_), Object::Int(_) | Object::Long(_))
+                            | (Object::Int(_), Object::Long(_)) => {
+                                let r = core_bignum_op(a, b, kind);
+                                // SAFETY: ints leave by plain decrements.
+                                unsafe {
+                                    drop_hot(base.add(len - 1).read());
+                                    drop_hot(base.add(len - 2).read());
+                                }
+                                len -= 2;
+                                match r {
+                                    Ok(v) => {
+                                        // SAFETY: the operands' slots are free.
+                                        unsafe { base.add(len).write(v) };
+                                        len += 1;
+                                        last = pc;
+                                        pc += 1;
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        pc += 1;
+                                        break Some(CoreExit::Stop(LeafStop::Raised(e)));
+                                    }
+                                }
+                            }
                             // String concatenation, repetition and `%`
                             // formatting over scalars, out of line.
                             (Object::Str(_), _) | (Object::Int(_), Object::Str(_)) => {
@@ -64073,6 +64100,12 @@ fn bigint_true_div(x: &num_bigint::BigInt, y: &num_bigint::BigInt) -> f64 {
 /// Bignum-aware integer arithmetic for `int`-flavoured operands.
 /// Both inputs are guaranteed `int`/`long`/`bool` by the caller; the
 /// fast path stays in `i64` until an overflow forces promotion.
+/// [`bignum_op`] for the core loop, kept out of its body.
+#[inline(never)]
+fn core_bignum_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeError> {
+    bignum_op(a, b, op)
+}
+
 fn bignum_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeError> {
     use BinOpKind as B;
 
