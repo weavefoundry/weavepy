@@ -107,6 +107,14 @@ impl SharedKeys {
         })
     }
 
+    /// How many leading names are not `name` (Python hash `hash`): its
+    /// position, or all of them when none is. An instance holding no more
+    /// values than this has no attribute `name`.
+    pub(crate) fn names_before(&self, name: &str, hash: i64) -> usize {
+        let n = self.len();
+        self.position_hashed(n, name, hash).unwrap_or(n)
+    }
+
     /// Publish the `str` name `name` as the next name; `None` when the
     /// table is full. The caller holds the GIL outside free-threaded mode.
     fn push(&self, name: &SharedStr) -> Option<usize> {

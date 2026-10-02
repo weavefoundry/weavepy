@@ -2507,9 +2507,33 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             let tagv = self.b.ins().iconst(types::I32, Self::tag(ty));
             self.b.ins().store(trusted, tagv, self.call_tags_base, toff);
         }
+        // What a field update would add: the `int` argument, or (none
+        // passed) the method's literal.
+        let update_arg = match &self.vstack[base..] {
+            [] => Some(None),
+            [(v, JitType::Int)] => Some(Some(*v)),
+            _ => None,
+        };
         self.vstack.truncate(base);
         let (pin, _) = self.pop();
         let snapshot = self.vstack.clone();
+
+        // A method whose body is a field update, run in line once the
+        // helper has armed it; anything else takes the helper below.
+        let inline = match (runtime::obj_layout(), ret, update_arg) {
+            (Some(l), MethodRet::Scalar(JitType::Int), Some(arg)) => Some((*l, arg)),
+            _ => None,
+        };
+        let mut join = None;
+        if let Some((l, arg)) = inline {
+            let miss = self.b.create_block();
+            let done = self.b.create_block();
+            self.b.append_block_param(done, types::I64);
+            let v = self.inline_method_update(&l, pin, token, arg, miss);
+            self.b.ins().jump(done, &[BlockArg::from(v)]);
+            self.b.switch_to_block(miss);
+            join = Some(done);
+        }
 
         self.writeback_locals();
         self.store_call_site_pc(pc);
@@ -2562,8 +2586,141 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 .b
                 .ins()
                 .load(Self::cl_ty(t), trusted, self.frame_ptr, OFF_RET_BITS);
+            let res = match join {
+                Some(done) => {
+                    self.b.ins().jump(done, &[BlockArg::from(res)]);
+                    self.b.switch_to_block(done);
+                    self.b.block_params(done)[0]
+                }
+                None => res,
+            };
             self.vstack.push((res, t));
         }
+    }
+
+    /// The armed field update of method token `token` on the pinned
+    /// receiver `pin` (see [`runtime::ObjLayout::method_upd_idx`]): the
+    /// updated field's new value, with the current block continuing past
+    /// the store. A receiver of another class version, values not split
+    /// over the class's names or numerous enough to shadow the method, a
+    /// swapped `__code__`, a non-`int` field, an overflow, or an active
+    /// observer, dict watcher or exotic key branches to `miss` (the helper,
+    /// which runs the call exactly) before anything is stored.
+    fn inline_method_update(
+        &mut self,
+        l: &runtime::ObjLayout,
+        pin: Value,
+        token: u32,
+        arg: Option<Value>,
+        miss: Block,
+    ) -> Value {
+        let t = MemFlags::trusted();
+        let ptr = self.ptr_ty;
+        let ctx = self.b.ins().load(ptr, t, self.frame_ptr, OFF_CTX);
+        // The entry: armed, for this call's increment form.
+        let methods = self.b.ins().load(ptr, t, ctx, l.ctx_methods);
+        let n = self.b.ins().load(types::I64, t, methods, l.methods_len);
+        let out = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::UnsignedLessThanOrEqual, n, i64::from(token));
+        self.miss_if(out, miss);
+        let mbuf = self.b.ins().load(ptr, t, methods, l.methods_buf);
+        let e = self
+            .b
+            .ins()
+            .iadd_imm(mbuf, i64::from(token) * i64::from(l.method_size));
+        let idx = self.b.ins().uload32(t, e, l.method_upd_idx);
+        let from_arg = self.b.ins().uload32(t, e, l.method_upd_from_arg);
+        let unarmed = self.b.ins().icmp_imm(IntCC::Equal, idx, i64::from(u32::MAX));
+        let form = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, from_arg, i64::from(arg.is_some()));
+        // The function's code, and the gates.
+        let code_at = self.b.ins().load(ptr, t, e, l.method_upd_code_at);
+        let want = self.b.ins().load(ptr, t, e, l.method_upd_code);
+        let observers = self.b.ins().iconst(ptr, l.observers as i64);
+        let observers = self.b.ins().load(types::I64, t, observers, 0);
+        let watchers = self.b.ins().iconst(ptr, l.dict_watchers as i64);
+        let watchers = self.b.ins().uload8(types::I64, t, watchers, 0);
+        let exotic = self.b.ins().iconst(ptr, l.exotic_keys as i64);
+        let exotic = self.b.ins().load(types::I64, t, exotic, 0);
+        let gates = self.b.ins().bor(observers, watchers);
+        let gates = self.b.ins().bor(gates, exotic);
+        let gated = self.b.ins().icmp_imm(IntCC::NotEqual, gates, 0);
+        let bad = self.b.ins().bor(unarmed, form);
+        let bad = self.b.ins().bor(bad, gated);
+        self.miss_if(bad, miss);
+        let code = self.b.ins().load(ptr, t, code_at, 0);
+        let swapped = self.b.ins().icmp(IntCC::NotEqual, code, want);
+        self.miss_if(swapped, miss);
+        // The pin: an instance.
+        let n = self.b.ins().load(types::I64, t, ctx, l.ctx_pins_len);
+        let out = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, pin, n);
+        self.miss_if(out, miss);
+        let buf = self.b.ins().load(ptr, t, ctx, l.ctx_pins_ptr);
+        let off = self.b.ins().imul_imm(pin, i64::from(l.pin_size));
+        let p = self.b.ins().iadd(buf, off);
+        let ptag = self.b.ins().uload8(types::I32, t, p, l.pin_tag);
+        let otag = self.b.ins().uload8(types::I32, t, p, l.pin_obj);
+        let not_obj = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, ptag, i64::from(l.pin_obj_tag));
+        let not_inst = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, otag, i64::from(l.tag_instance));
+        let bad = self.b.ins().bor(not_obj, not_inst);
+        self.miss_if(bad, miss);
+        let inst = self.b.ins().load(ptr, t, p, l.pin_obj + 8);
+        // Its class and split values, as `split_field_addr` checks them
+        // for a write, against the entry's version.
+        let ver = self.b.ins().load(types::I64, t, e, l.method_ver);
+        let cls = self.b.ins().load(ptr, t, inst, l.inst_class);
+        let cver = self.b.ins().load(types::I64, t, cls, l.type_attr_version);
+        let lazy = self.b.ins().load(ptr, t, inst, l.inst_dict_lazy);
+        let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+        let shared = self.b.ins().uload8(types::I64, t, flag, 0);
+        let borrow = self.b.ins().sload32(t, inst, l.inst_split_borrow);
+        let block = self.b.ins().load(ptr, t, inst, l.inst_split_block);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, cver, ver);
+        let busy = self.b.ins().icmp_imm(IntCC::NotEqual, borrow, 0);
+        let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
+        let other = self.b.ins().bor(lazy, shared);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+        let bad = self.b.ins().bor(stale, busy);
+        let bad = self.b.ins().bor(bad, empty);
+        let bad = self.b.ins().bor(bad, other);
+        self.miss_if(bad, miss);
+        // The class's names, holding the field but not the method's name.
+        let keys = self.b.ins().load(ptr, t, block, l.split_keys);
+        let ckeys = self.b.ins().load(ptr, t, cls, l.type_shared_keys);
+        let len = self.b.ins().uload32(t, block, l.split_len);
+        let shadow = self.b.ins().uload32(t, e, l.method_upd_shadow);
+        let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
+        let absent = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
+        let shadowed = self.b.ins().icmp(IntCC::UnsignedGreaterThan, len, shadow);
+        let bad = self.b.ins().bor(foreign, absent);
+        let bad = self.b.ins().bor(bad, shadowed);
+        self.miss_if(bad, miss);
+        let off = self.b.ins().ishl_imm(idx, 4);
+        let at = self.b.ins().iadd(block, off);
+        let at = self.b.ins().iadd_imm(at, i64::from(l.split_values));
+        // An `int` field, plus the increment without overflow.
+        let tag = self.b.ins().uload8(types::I32, t, at, 0);
+        let not_int = self.b.ins().icmp_imm(IntCC::NotEqual, tag, i64::from(l.tag_int));
+        self.miss_if(not_int, miss);
+        let old = self.b.ins().load(types::I64, t, at, 8);
+        let inc = match arg {
+            Some(a) => a,
+            None => self.b.ins().load(types::I64, t, e, l.method_upd_inc),
+        };
+        let (new, overflow) = self.checked_add(old, inc);
+        self.miss_if(overflow, miss);
+        self.b.ins().store(t, new, at, 8);
+        new
     }
 
     /// RFC 0073 WS3 — burned-in native `str`-method call via the

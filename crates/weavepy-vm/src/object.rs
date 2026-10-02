@@ -3127,6 +3127,12 @@ pub fn exotic_str_keys_possible() -> bool {
     EXOTIC_CLASS_KEYS.load(std::sync::atomic::Ordering::Acquire) != 0
 }
 
+/// The counter [`exotic_str_keys_possible`] reads, for native code that
+/// reads it in line (a `usize`: nonzero once exotic keys are possible).
+pub(crate) fn exotic_str_keys_flag() -> *const usize {
+    EXOTIC_CLASS_KEYS.as_ptr()
+}
+
 /// Reach for the running interpreter to compute a user instance's Python
 /// `__hash__`. `DictKey`'s `Hash`/`Eq` impls have no interpreter handle, so
 /// they borrow the thread's published interpreter pointer — the same bridge

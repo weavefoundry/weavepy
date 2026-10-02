@@ -212,6 +212,32 @@ pub struct ObjLayout {
     pub list_ptr: i32,
     pub list_len: i32,
     pub list_cap: i32,
+    /// [`JitFrame::ctx`] → the method entries' shared pointer; that
+    /// pointer → the entry array and its length.
+    pub ctx_methods: i32,
+    pub methods_buf: i32,
+    pub methods_len: i32,
+    /// A method entry: its size, its class version (`u64`), and its
+    /// in-line field update: the field's split index (`u32`, `u32::MAX`
+    /// while unarmed), the most split values a receiver may hold without
+    /// shadowing the method (`u32`), whether the increment is the call's
+    /// argument (`u32`: `1`, else `0`), the literal increment (`i64`),
+    /// where the function keeps its code pointer and the code pointer that
+    /// must be there (words).
+    pub method_size: i32,
+    pub method_ver: i32,
+    pub method_upd_idx: i32,
+    pub method_upd_shadow: i32,
+    pub method_upd_from_arg: i32,
+    pub method_upd_inc: i32,
+    pub method_upd_code_at: i32,
+    pub method_upd_code: i32,
+    /// Words (or a byte, for `dict_watchers`) that are nonzero while a
+    /// call can't be skipped: an observer may be active, a dict watcher
+    /// is, or a class may hold an exotic key.
+    pub observers: usize,
+    pub dict_watchers: usize,
+    pub exotic_keys: usize,
 }
 
 static OBJ_LAYOUT: std::sync::OnceLock<ObjLayout> = std::sync::OnceLock::new();

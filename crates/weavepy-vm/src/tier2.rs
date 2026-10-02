@@ -131,6 +131,47 @@ struct MethodEntry {
     /// A globally unique resolution token. The live receiver owns the class
     /// checked at access; this cached method must not keep that class alive.
     ver: u64,
+    /// What compiled code needs to run this method's callback-free field
+    /// update (`self.n += k; return self.n`) in line, armed by
+    /// `wpjit_call_method` once the helper has run it (see [`arm_update`]).
+    update: InlineUpdate,
+}
+
+/// [`MethodEntry::update`]: compiled code reads these in place (see
+/// [`obj_layout`]) and calls the helper unless the receiver's class still
+/// has the entry's version, its values are split over the class's names
+/// and are too few to shadow the method's name, the function still wears
+/// the entry's code, and no observer or exotic key could tell.
+#[repr(C)]
+struct InlineUpdate {
+    /// The split index of the field the update adds to (`u32::MAX` while
+    /// unarmed).
+    idx: Cell<u32>,
+    /// A receiver holding more split values than this may shadow the
+    /// method's name.
+    shadow: Cell<u32>,
+    /// `1` when the increment is the call's argument; `0` when it's
+    /// [`Self::inc`].
+    from_arg: Cell<u32>,
+    /// The literal increment.
+    inc: Cell<i64>,
+    /// Where the function keeps its code pointer, and the entry's code
+    /// pointer it must equal.
+    code_at: Cell<usize>,
+    code: Cell<usize>,
+}
+
+impl InlineUpdate {
+    fn unarmed() -> Self {
+        Self {
+            idx: Cell::new(u32::MAX),
+            shadow: Cell::new(0),
+            from_arg: Cell::new(0),
+            inc: Cell::new(0),
+            code_at: Cell::new(0),
+            code: Cell::new(0),
+        }
+    }
 }
 
 /// One slot per method token (parallel to `cf.method_sites`).
@@ -2866,6 +2907,19 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
     if word(rc_box as *const u8, guards_buf) != guards.as_ptr() as usize {
         return None;
     }
+    // The method entries hang off the same shape of shared vector.
+    let methods: StdRc<MethodTable> = StdRc::new(Vec::with_capacity(3));
+    let methods_box = {
+        // SAFETY: as for the guards above.
+        unsafe { std::mem::transmute_copy::<StdRc<MethodTable>, usize>(&methods) }
+    };
+    let methods_vec = std::ptr::from_ref::<MethodTable>(&methods) as usize - methods_box;
+    if word(methods_box as *const u8, methods_vec + vec_ptr) != methods.as_ptr() as usize
+        || word(methods_box as *const u8, methods_vec + vec_len) != 0
+    {
+        return None;
+    }
+    let update = std::mem::offset_of!(MethodEntry, update);
     let ctx_pins = std::mem::offset_of!(CallCtx, pins);
     Some(weavepy_jit::ObjLayout {
         ctx_pins_ptr: i32_of(ctx_pins + vec_ptr)?,
@@ -2901,6 +2955,20 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
         list_ptr: i32_of(list_vec + vec_ptr)?,
         list_len: i32_of(list_vec + vec_len)?,
         list_cap: i32_of(list_vec + vec_cap)?,
+        ctx_methods: i32_of(std::mem::offset_of!(CallCtx, methods))?,
+        methods_buf: i32_of(methods_vec + vec_ptr)?,
+        methods_len: i32_of(methods_vec + vec_len)?,
+        method_size: i32_of(std::mem::size_of::<MethodEntry>())?,
+        method_ver: i32_of(std::mem::offset_of!(MethodEntry, ver))?,
+        method_upd_idx: i32_of(update + std::mem::offset_of!(InlineUpdate, idx))?,
+        method_upd_shadow: i32_of(update + std::mem::offset_of!(InlineUpdate, shadow))?,
+        method_upd_from_arg: i32_of(update + std::mem::offset_of!(InlineUpdate, from_arg))?,
+        method_upd_inc: i32_of(update + std::mem::offset_of!(InlineUpdate, inc))?,
+        method_upd_code_at: i32_of(update + std::mem::offset_of!(InlineUpdate, code_at))?,
+        method_upd_code: i32_of(update + std::mem::offset_of!(InlineUpdate, code))?,
+        observers: crate::trace::observer_count_flag() as usize,
+        dict_watchers: crate::capi_watchers::dicts_active_flag() as usize,
+        exotic_keys: crate::object::exotic_str_keys_flag() as usize,
     })
 }
 
@@ -2978,6 +3046,7 @@ fn probe_method_entry(
         min_args,
         ret,
         ver,
+        update: InlineUpdate::unarmed(),
     })
 }
 
@@ -3449,6 +3518,74 @@ struct CallCtx {
     /// a local) re-enters without re-resolving or rebuilding the handle.
     /// Taken out for the call's duration and put back after.
     dyn_callee: Option<(usize, usize, bool, NativeCallee)>,
+    /// Pin indices recently handed out for instances and strings, by
+    /// object address (see [`pin_reusing`]): a loop over the same few
+    /// objects reuses their pins instead of growing the table. Advisory;
+    /// every hit is checked against the pin it names.
+    pin_memo: [u32; PIN_MEMO],
+}
+
+/// The size of [`CallCtx::pin_memo`].
+const PIN_MEMO: usize = 16;
+
+/// The identity [`pin_reusing`] keys an object by (`0` for objects whose
+/// pins aren't reused).
+#[inline]
+fn pin_identity(v: &Object) -> usize {
+    match v {
+        Object::Instance(i) => Rc::as_ptr(i) as usize,
+        Object::Str(s) => SharedStr::as_ptr(s).cast::<u8>() as usize,
+        _ => 0,
+    }
+}
+
+/// The [`CallCtx::pin_memo`] entry for an object identity.
+#[inline]
+fn pin_memo_slot(id: usize) -> usize {
+    (id >> 4 ^ id >> 9) % PIN_MEMO
+}
+
+/// The pin that already holds this very object, when `memo` remembers
+/// one. A pin only owns its object, so two sites that pin the same object
+/// can share one.
+#[inline]
+fn pin_memo_hit(v: &Object, pins: &PinTable, memo: &[u32; PIN_MEMO]) -> Option<u64> {
+    let id = pin_identity(v);
+    if id == 0 {
+        return None;
+    }
+    let hint = memo[pin_memo_slot(id)] as usize;
+    match pins.get(hint) {
+        Some(Pin::Obj(p)) if pin_identity(p) == id => Some(hint as u64),
+        _ => None,
+    }
+}
+
+/// Remember that pin `ix` will hold `p`'s object.
+#[inline]
+fn pin_memo_note(p: &Pin, ix: usize, memo: &mut [u32; PIN_MEMO]) {
+    if let Pin::Obj(v) = p {
+        let id = pin_identity(v);
+        if id != 0 {
+            memo[pin_memo_slot(id)] = ix as u32;
+        }
+    }
+}
+
+/// Pin `v` in `pins`, reusing the pin that already holds this very object
+/// (see [`pin_memo_hit`]); `None` at the pin cap.
+#[inline]
+fn pin_reusing(v: &Object, pins: &mut PinTable, memo: &mut [u32; PIN_MEMO]) -> Option<u64> {
+    if let Some(bits) = pin_memo_hit(v, pins, memo) {
+        return Some(bits);
+    }
+    if pins.len() >= RUNTIME_PIN_CAP {
+        return None;
+    }
+    let p = Pin::Obj(v.clone());
+    pin_memo_note(&p, pins.len(), memo);
+    pins.push(p);
+    Some((pins.len() - 1) as u64)
 }
 
 impl CallCtx {
@@ -3811,14 +3948,12 @@ fn lane_tag(t: JitType) -> u32 {
 
 /// RFC 0071 WS1 — pack a call result for an `ObjPin` return lane: the
 /// `None` singleton is the nullable lane's `-1`; an instance pins into
-/// the caller's table (capped). Anything else can't ride the lane.
-fn obj_ret_bits(v: &Object, pins: &mut PinTable) -> Option<u64> {
+/// the caller's table (capped), reusing the pin that already holds it
+/// (a method returning `self`). Anything else can't ride the lane.
+fn obj_ret_bits(v: &Object, pins: &mut PinTable, memo: &mut [u32; PIN_MEMO]) -> Option<u64> {
     match v {
         Object::None => Some(u64::MAX),
-        Object::Instance(_) if pins.len() < RUNTIME_PIN_CAP => {
-            pins.push(Pin::Obj(v.clone()));
-            Some((pins.len() - 1) as u64)
-        }
+        Object::Instance(_) => pin_reusing(v, pins, memo),
         _ => None,
     }
 }
@@ -4170,6 +4305,49 @@ unsafe fn native_scalar_field_update(
     #[cfg(test)]
     crate::SCALAR_FIELD_UPDATE_NATIVE_CALLS.with(|hits| hits.set(hits.get() + 1));
     Some(value)
+}
+
+/// Arm `entry`'s in-line update (see [`InlineUpdate`]) after the helper
+/// ran it on `receiver`: the method guard and [`native_scalar_field_update`]
+/// have just held, so what compiled code still checks per call (the
+/// receiver's class version and split names, the shadow bound, the code
+/// identity, the observer and key gates) is all that can change. A split
+/// field and the plain increments only; anything else stays unarmed.
+fn arm_update(entry: &MethodEntry, nc: &NativeCallee, receiver: &Object, argc: u32) {
+    let Some(plan) = nc.scalar_update.as_deref() else {
+        return;
+    };
+    let Some(guard) = nc.attr_guards.get(plan.store_token) else {
+        return;
+    };
+    let Object::Instance(inst) = receiver else {
+        return;
+    };
+    let cls = inst.cls_raw();
+    let Some(keys) = cls.shared_keys.get() else {
+        return;
+    };
+    let (from_arg, inc) = match (plan.increment, argc) {
+        (Some(inc), 0) => (0, inc),
+        (None, 1) => (1, 0),
+        _ => return,
+    };
+    if guard.split_idx == u32::MAX
+        || guard.ver != entry.ver
+        || cls.attr_version.get() != entry.ver
+        || !matches!(guard.storage, AttrStorage::Indexed(i) if i == guard.split_idx)
+    {
+        return;
+    }
+    let shadow = keys.names_before(&entry.name, entry.name_hash);
+    let u = &entry.update;
+    u.shadow.set(u32::try_from(shadow).unwrap_or(0));
+    u.from_arg.set(from_arg);
+    u.inc.set(inc);
+    u.code_at.set(entry.func.code.as_ptr() as usize);
+    // SAFETY: `Rc` is one pointer, compared and never dereferenced.
+    u.code.set(unsafe { std::mem::transmute_copy::<Rc<CodeObject>, usize>(&entry.code) });
+    u.idx.set(guard.split_idx);
 }
 
 /// Bind the slots a keyword call skipped (tagged [`SlotTag::Default`]
@@ -4724,6 +4902,7 @@ unsafe fn try_native_call(
             // callee — keep it observable to callee-side stack walkers.
             frameless_code: Some(nc.code.clone()),
             dyn_callee: None,
+            pin_memo: [u32::MAX; PIN_MEMO],
         })
     };
     child.interp = ctx.interp;
@@ -4905,7 +5084,7 @@ unsafe fn try_native_call(
             // RFC 0071 WS1 — an object-lane return pins into the
             // *caller's* table (`None` rides as the nullable `-1`).
             if guards_ok && expect_tag == SlotTag::ObjPin as u32 {
-                return Some(match obj_ret_bits(&v, &mut ctx.pins) {
+                return Some(match obj_ret_bits(&v, &mut ctx.pins, &mut ctx.pin_memo) {
                     Some(bits) => {
                         jf.ret_bits = bits;
                         jf.ret_tag = expect_tag;
@@ -5004,7 +5183,7 @@ unsafe fn try_native_ctor(
         // `__init__` completed and returned `None` with guards intact;
         // the call site's value is the fresh instance.
         if expect_tag == SlotTag::ObjPin as u32 {
-            if let Some(bits) = obj_ret_bits(&inst, &mut ctx.pins) {
+            if let Some(bits) = obj_ret_bits(&inst, &mut ctx.pins, &mut ctx.pin_memo) {
                 jf.ret_bits = bits;
                 jf.ret_tag = expect_tag;
                 return Some(CallStatus::Ok as i64);
@@ -5343,7 +5522,7 @@ unsafe extern "C" fn wpjit_call_py(
                 // RFC 0071 WS1 — an object-lane result pins into this
                 // activation's table.
                 if expect_tag == SlotTag::ObjPin as u32 {
-                    if let Some(bits) = obj_ret_bits(&v, &mut ctx.pins) {
+                    if let Some(bits) = obj_ret_bits(&v, &mut ctx.pins, &mut ctx.pin_memo) {
                         jf.ret_bits = bits;
                         jf.ret_tag = expect_tag;
                         return CallStatus::Ok as i64;
@@ -5447,7 +5626,7 @@ fn deliver_call_result(jf: &mut JitFrame, ctx: &mut CallCtx, v: Object, expect_t
         // RFC 0071 WS1 — an object-lane result pins into this
         // activation's table.
         SlotTag::ObjPin => {
-            if let Some(bits) = obj_ret_bits(&v, &mut ctx.pins) {
+            if let Some(bits) = obj_ret_bits(&v, &mut ctx.pins, &mut ctx.pin_memo) {
                 jf.ret_bits = bits;
                 jf.ret_tag = expect_tag;
                 return CallStatus::Ok as i64;
@@ -5981,6 +6160,8 @@ unsafe extern "C" fn wpjit_call_method(
             if let Some(value) =
                 unsafe { native_scalar_field_update(jf, ctx, nc, &recv, argc as usize) }
             {
+                // Compiled code runs the next ones in line.
+                arm_update(entry, nc, &recv, argc);
                 if expect_tag == SlotTag::Int as u32 {
                     jf.ret_bits = value as u64;
                     jf.ret_tag = SlotTag::Int as u32;
@@ -6319,7 +6500,10 @@ unsafe extern "C" fn wpjit_list_get(frame: *mut JitFrame, pin: i64, idx: i64) ->
             // RFC 0073 WS3 — exact-`str` elements pin on the object
             // lane (indexing into a `split` result).
             (v @ (Object::Instance(_) | Object::Str(_) | Object::Tuple(_)), JitType::Obj) => {
-                Err(Pin::Obj(v.clone()))
+                match pin_memo_hit(v, &ctx.pins, &ctx.pin_memo) {
+                    Some(bits) => Ok(bits),
+                    None => Err(Pin::Obj(v.clone())),
+                }
             }
             // The nested lane: a list element pins on the float-list
             // lane (its reads re-validate each float).
@@ -6339,6 +6523,7 @@ unsafe extern "C" fn wpjit_list_get(frame: *mut JitFrame, pin: i64, idx: i64) ->
                 return 1;
             }
             jf.ret_bits = ctx.pins.len() as u64;
+            pin_memo_note(&p, ctx.pins.len(), &mut ctx.pin_memo);
             ctx.pins.push(p);
             0
         }
@@ -7127,8 +7312,12 @@ unsafe extern "C" fn wpjit_list_next(frame: *mut JitFrame, pin: i64, idx: i64) -
             (Object::None, JitType::Obj) => Ok(u64::MAX),
             // RFC 0073 WS3 — exact-`str` elements pin on the object
             // lane (a `split` result's `ForList` consumer).
+            // A loop over the same few objects reuses their pins.
             (v @ (Object::Instance(_) | Object::Str(_) | Object::Tuple(_)), JitType::Obj) => {
-                Err(Pin::Obj(v.clone()))
+                match pin_memo_hit(v, &ctx.pins, &ctx.pin_memo) {
+                    Some(bits) => Ok(bits),
+                    None => Err(Pin::Obj(v.clone())),
+                }
             }
             // The nested lane: a list element pins on the float-list
             // lane (see `wpjit_list_get`).
@@ -7138,19 +7327,20 @@ unsafe extern "C" fn wpjit_list_next(frame: *mut JitFrame, pin: i64, idx: i64) -
             _ => return 2,
         }
     };
-    match outcome {
-        Ok(bits) => {
+    let pinned = match outcome {
+        Ok(bits) => Some(bits),
+        Err(p) => (ctx.pins.len() < RUNTIME_PIN_CAP).then(|| {
+            pin_memo_note(&p, ctx.pins.len(), &mut ctx.pin_memo);
+            ctx.pins.push(p);
+            (ctx.pins.len() - 1) as u64
+        }),
+    };
+    match pinned {
+        Some(bits) => {
             jf.ret_bits = bits;
             0
         }
-        Err(p) => {
-            if ctx.pins.len() >= RUNTIME_PIN_CAP {
-                return 2;
-            }
-            jf.ret_bits = ctx.pins.len() as u64;
-            ctx.pins.push(p);
-            0
-        }
+        None => 2,
     }
 }
 
@@ -7259,7 +7449,7 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
                         SlotTag::Int => pack(&v, JitType::Int),
                         SlotTag::Float => pack(&v, JitType::Float),
                         SlotTag::Bool => pack(&v, JitType::Bool),
-                        SlotTag::ObjPin => obj_ret_bits(&v, &mut ctx.pins),
+                        SlotTag::ObjPin => obj_ret_bits(&v, &mut ctx.pins, &mut ctx.pin_memo),
                         _ => None,
                     }
                 };
@@ -9805,7 +9995,12 @@ unsafe extern "C" fn wpjit_iter_new(frame: *mut JitFrame, pin: i64) -> i64 {
 /// Pack one yielded element into a compiled loop-variable lane
 /// (RFC 0074 WS3 — the [`weavepy_jit::ITER_ELEM_STR`]-aware sibling
 /// of `wpjit_iter_next`'s packing). `None` = outside the lane.
-fn pack_iter_elem(v: &Object, tag: i64, pins: &mut PinTable) -> Option<u64> {
+fn pack_iter_elem(
+    v: &Object,
+    tag: i64,
+    pins: &mut PinTable,
+    memo: &mut [u32; PIN_MEMO],
+) -> Option<u64> {
     if tag == weavepy_jit::ITER_ELEM_STR {
         return match v {
             Object::Str(_) if pins.len() < RUNTIME_PIN_CAP => {
@@ -9831,7 +10026,7 @@ fn pack_iter_elem(v: &Object, tag: i64, pins: &mut PinTable) -> Option<u64> {
             | Object::Str(_)
             | Object::WStr(_)
             | Object::Bytes(_) => pin_any(v.clone(), pins),
-            _ => obj_ret_bits(v, pins),
+            _ => obj_ret_bits(v, pins, memo),
         },
         _ => None,
     }
@@ -10081,9 +10276,9 @@ unsafe extern "C" fn wpjit_iter_next_pair(
                 // store-pc deopt and unpack generically).
                 if let Object::Tuple(items) = &v {
                     if items.len() == 2 {
-                        let packed1 = pack_iter_elem(&items[0], tag1, &mut ctx.pins);
+                        let packed1 = pack_iter_elem(&items[0], tag1, &mut ctx.pins, &mut ctx.pin_memo);
                         let packed2 =
-                            packed1.and_then(|_| pack_iter_elem(&items[1], tag2, &mut ctx.pins));
+                            packed1.and_then(|_| pack_iter_elem(&items[1], tag2, &mut ctx.pins, &mut ctx.pin_memo));
                         if let (Some(b1), Some(b2)) = (packed1, packed2) {
                             jf.ret_bits = b1;
                             // SAFETY: the marshal buffer is at least
@@ -10409,6 +10604,7 @@ pub(crate) fn try_call_native_direct(
         // keep the activation observable to callee-side stack walkers.
         frameless_code: Some(code.clone()),
         dyn_callee: None,
+        pin_memo: [u32::MAX; PIN_MEMO],
     };
     let mut jf = JitFrame {
         locals: locals_buf.as_mut_ptr(),
@@ -11217,6 +11413,7 @@ fn enter_compiled(
         // spine already.
         frameless_code: None,
         dyn_callee: None,
+        pin_memo: [u32::MAX; PIN_MEMO],
     };
     let mut jf = JitFrame {
         locals: locals_buf.as_mut_ptr(),
@@ -12101,6 +12298,7 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
         // is on the spine already.
         frameless_code: None,
         dyn_callee: None,
+        pin_memo: [u32::MAX; PIN_MEMO],
     };
     let mut jf = JitFrame {
         locals: act.locals_buf.as_mut_ptr(),

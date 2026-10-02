@@ -105,6 +105,12 @@ pub fn dicts_active() -> bool {
     DICTS_ACTIVE.load(Ordering::Relaxed)
 }
 
+/// The flag [`dicts_active`] reads, for native code that reads it in line
+/// (a byte: nonzero while any dict watcher is active).
+pub(crate) fn dicts_active_flag() -> *const bool {
+    DICTS_ACTIVE.as_ptr()
+}
+
 pub fn watch_dict(watcher_id: u8, d: &Rc<RefCell<DictData>>) {
     let mut w = WATCHED_DICTS.lock();
     let ptr = Rc::as_ptr(d) as usize;
