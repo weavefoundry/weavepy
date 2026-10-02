@@ -173,6 +173,12 @@ enum Op {
         b: u8,
         kind: u8,
     },
+    /// `regs[dst] = regs[a][regs[b]]` (see [`subscr`]).
+    Subscr {
+        dst: u8,
+        a: u8,
+        b: u8,
+    },
     /// Exchange two registers.
     Swap {
         a: u8,
@@ -502,6 +508,12 @@ impl Builder<'_> {
                     b,
                     kind: arg as u8,
                 });
+            }
+            OpCode::BinarySubscr => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let dst = self.push_new()?;
+                self.ops.push(Op::Subscr { dst, a, b });
             }
             OpCode::CopyTop => {
                 let n = (arg as usize).max(1);
@@ -1044,6 +1056,7 @@ impl Interpreter {
                 Op::Truth { dst, src } => set!(dst, V::B(truth(get!(src))?)),
                 Op::Unary { dst, src, kind } => set!(dst, unary(get!(src), kind)?),
                 Op::Binary { dst, a, b, kind } => set!(dst, binary(get!(a), get!(b), kind)?),
+                Op::Subscr { dst, a, b } => set!(dst, subscr(&mut owned, get!(a), get!(b))?),
                 Op::Swap { a, b } => {
                     let (x, y) = (get!(a), get!(b));
                     set!(a, y);
@@ -1350,6 +1363,54 @@ pub(crate) fn binary(a: V, b: V, kind: u8) -> Option<V> {
             }
         }
     })
+}
+
+/// `a[b]` that can't run code or raise: a list's or tuple's item at an
+/// int index (borrowed: a leaf mutates no container), a dict's value for
+/// a `str` or `int` key (the core loop's probe, which compares no other
+/// key type), or an ASCII string's character (held by `owned`). Anything
+/// else, a miss included, declines.
+#[inline]
+fn subscr(owned: &mut Owned, a: V, b: V) -> Option<V> {
+    let V::R(c) = a else {
+        return None;
+    };
+    let index = |i: i64, n: usize| {
+        let n = n as i64;
+        let i = if i < 0 { i + n } else { i };
+        (0..n).contains(&i).then_some(i as usize)
+    };
+    // SAFETY: as `norm`; the borrows end before anything could change the
+    // containers (no Python runs during an evaluation).
+    match (unsafe { &*c }, b) {
+        (Object::List(l), V::I(i)) => {
+            let xs = unsafe { l.peek() }?;
+            Some(norm(&xs[index(i, xs.len())?]))
+        }
+        (Object::Tuple(t), V::I(i)) => Some(norm(&t[index(i, t.len())?])),
+        (Object::Str(s), V::I(i)) => {
+            if crate::object::str_char_len(s) != s.len() {
+                return None;
+            }
+            owned.own(Object::from_char(s.as_bytes()[index(i, s.len())?] as char))
+        }
+        (Object::Dict(d), V::I(_) | V::R(_)) => {
+            let int;
+            let key = match b {
+                V::I(i) => {
+                    int = Object::Int(i);
+                    &int
+                }
+                // SAFETY: as above.
+                V::R(k) if matches!(unsafe { &*k }, Object::Str(_)) => unsafe { &*k },
+                _ => return None,
+            };
+            let probe = crate::object::LeafProbe::new(key)?;
+            let v = unsafe { d.peek() }?.get(&probe)?;
+            Some(norm(v))
+        }
+        _ => None,
+    }
 }
 
 /// `BUILD_LIST 0` / `BUILD_MAP 0`: a new empty list or dict, tracked like

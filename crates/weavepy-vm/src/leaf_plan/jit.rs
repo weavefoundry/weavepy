@@ -16,8 +16,8 @@
 //! natively too once the callee's own plan is compiled).
 
 use super::{
-    binary, compare, is_same, new_container, norm, plan_store, truth, unary, LeafPlan, LeafRet, Op,
-    Owned, Pending, NEST, V,
+    binary, compare, is_same, new_container, norm, plan_store, subscr, truth, unary, LeafPlan,
+    LeafRet, Op, Owned, Pending, NEST, V,
 };
 use crate::object::{Object, PyFunction};
 use crate::sync::Rc;
@@ -506,6 +506,19 @@ unsafe extern "C" fn h_new(ctx: *mut Ctx<'static>, dict: u32) -> u32 {
     // SAFETY: called by native code with its context.
     let c = unsafe { cx(ctx) };
     match new_container(&mut c.owned, dict != 0) {
+        Some(v) => {
+            c.put(v);
+            0
+        }
+        None => 1,
+    }
+}
+
+/// `a[b]` (see [`subscr`]).
+unsafe extern "C" fn h_subscr(ctx: *mut Ctx<'static>, ta: u64, pa: u64, tb: u64, pb: u64) -> u32 {
+    // SAFETY: called by native code with its context.
+    let c = unsafe { cx(ctx) };
+    match subscr(&mut c.owned, value(ta, pa), value(tb, pb)) {
         Some(v) => {
             c.put(v);
             0
@@ -1536,6 +1549,13 @@ impl Lower<'_> {
             Op::New { dst, dict } => {
                 let d = self.u32c(u32::from(dict));
                 let st = self.call(h_new as *const () as usize, &[self.ctx, d]);
+                self.check(st);
+                self.set_out(fl, dst, 0);
+            }
+            Op::Subscr { dst, a, b } => {
+                let (ta, pa) = self.get(fl, a);
+                let (tb, pb) = self.get(fl, b);
+                let st = self.call(h_subscr as *const () as usize, &[self.ctx, ta, pa, tb, pb]);
                 self.check(st);
                 self.set_out(fl, dst, 0);
             }

@@ -62135,6 +62135,7 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
                 | OpCode::PopJumpIfNotNone
                 | OpCode::JumpForward
                 | OpCode::BinaryOp
+                | OpCode::BinarySubscr
                 | OpCode::CopyTop
                 | OpCode::Swap
                 | OpCode::PopTop
