@@ -601,6 +601,50 @@ fn deque_rotate(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
+/// `iter(d)` / `reversed(d)`: a fresh `_deque_iterator` (or reverse
+/// iterator) over `d` at index 0, snapshotting the mutation counter,
+/// exactly what the iterator classes' `__init__` builds, but with no
+/// Python code running. The classes come from the deque class's
+/// `_iter_types` pair (set by `_collections.py`), so a subclass and each
+/// copy of the module use their own.
+fn deque_make_iter(args: &[Object], reverse: bool) -> Result<Object, RuntimeError> {
+    let method = if reverse { "__reversed__" } else { "__iter__" };
+    let state = {
+        let st = receiver(args, method)?;
+        st.slots
+            .get_hinted(SLOT_STATE, &names().state)
+            .cloned()
+            .unwrap_or(Object::Int(0))
+    };
+    let [recv @ Object::Instance(inst)] = args else {
+        return Err(type_error(format!(
+            "deque.{method}() takes no arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    };
+    let it_cls = match inst.cls().lookup("_iter_types") {
+        Some(Object::Tuple(types)) => match types.get(usize::from(reverse)) {
+            Some(Object::Type(cls)) => cls.clone(),
+            _ => return Err(type_error("deque iterator types are not set")),
+        },
+        _ => return Err(type_error("deque iterator types are not set")),
+    };
+    let it = crate::types::PyInstance::new_deferred(it_cls);
+    // The iterator classes' slot order (see `deque_next_fast`).
+    it.slot_set("_deq", recv.clone());
+    it.slot_set("_index", Object::Int(0));
+    it.slot_set("_deq_state", state);
+    Ok(Object::Instance(it))
+}
+
+fn deque_iter(args: &[Object]) -> Result<Object, RuntimeError> {
+    deque_make_iter(args, false)
+}
+
+fn deque_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
+    deque_make_iter(args, true)
+}
+
 fn deque_iterator_index(args: &[Object]) -> Result<Object, RuntimeError> {
     receiver(args, "__iter__")?;
     let [_, index] = args else {
@@ -795,6 +839,8 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         reg("__bool__", "__bool__", deque_bool);
         reg("__getitem__", "__getitem__", deque_getitem);
         reg("rotate", "rotate", deque_rotate);
+        reg("__iter__", "__iter__", deque_iter);
+        reg("__reversed__", "__reversed__", deque_reversed);
         reg("iterator_index", "iterator_index", deque_iterator_index);
         reg("iterator_next", "__next__", deque_iterator_next);
         reg(
@@ -802,9 +848,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             "__next__",
             deque_reverse_iterator_next,
         );
-        // The end operations, length, truth, and iterator steps run no
-        // Python code. Indexing and rotation require an argument guard
-        // because index coercion can invoke Python's __index__ protocol.
+        // The end operations, length, truth, iterator construction, and
+        // iterator steps run no Python code. Indexing and rotation require
+        // an argument guard because index coercion can invoke Python's
+        // __index__ protocol.
         for name in [
             "append",
             "appendleft",
@@ -812,6 +859,8 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             "popleft",
             "__len__",
             "__bool__",
+            "__iter__",
+            "__reversed__",
             "iterator_next",
             "reverse_iterator_next",
         ] {

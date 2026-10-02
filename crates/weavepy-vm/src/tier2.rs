@@ -11110,13 +11110,29 @@ unsafe extern "C" fn wpjit_iter_new(frame: *mut JitFrame, pin: i64) -> i64 {
         Some(Pin::List(l, _)) => Object::List(l.clone()),
         None => return -1,
     };
+    // An instance whose class's `__iter__` is a registered native leaf
+    // (`deque.__iter__`) builds its iterator without Python and without
+    // effects: a failure deopts for the interpreter to raise it.
+    if let Object::Instance(_) = &recv {
+        if crate::gil::free_threading_enabled() {
+            return -1;
+        }
+        let Some(b) = interp.leaf_instance_dunder(&recv, "__iter__") else {
+            return -1;
+        };
+        return match (b.call)(std::slice::from_ref(&recv)) {
+            Ok(it) => {
+                let idx = ctx.pins.len() as i64;
+                ctx.pins.push(Pin::Obj(it));
+                idx
+            }
+            Err(_) => -1,
+        };
+    }
     // `make_iter` dispatches Python for exactly these receiver
     // shapes; a fresh compile would double `__iter__`'s side effects
     // on a post-hoc deopt, so they never enter the helper.
-    if matches!(
-        recv,
-        Object::Instance(_) | Object::Type(_) | Object::MappingProxyObj(_)
-    ) {
+    if matches!(recv, Object::Type(_) | Object::MappingProxyObj(_)) {
         return -1;
     }
     match interp.make_iter(&recv, &ctx.globals) {

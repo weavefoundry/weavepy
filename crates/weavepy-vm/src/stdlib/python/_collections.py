@@ -223,7 +223,7 @@ class deque:
     # `builtin_function_or_method`, like the C accelerator's.
     from _weave_collections import (
         append, appendleft, pop, popleft, rotate,
-        __len__, __bool__, __getitem__,
+        __len__, __bool__, __getitem__, __iter__, __reversed__,
     )
 
     def extend(self, iterable):
@@ -313,12 +313,6 @@ class deque:
     def reverse(self):
         self._state += 1
         self._flat().reverse()
-
-    def __iter__(self):
-        return _deque_iterator(self)
-
-    def __reversed__(self):
-        return _deque_reverse_iterator(self)
 
     def __contains__(self, x):
         # CPython `deque_contains`: mutation during a comparison raises.
@@ -941,3 +935,10 @@ class _deque_reverse_iterator:
         if deq is None:
             return type(self), (deque(),)
         return type(self), (deq, self._index)
+
+
+# The native `deque.__iter__` / `__reversed__` build these iterators
+# directly (no Python `__init__` runs), so a compiled loop can capture a
+# deque iterator without leaving native code. The classes ride on the
+# deque class itself, so each copy of this module pairs with its own.
+deque._iter_types = (_deque_iterator, _deque_reverse_iterator)
