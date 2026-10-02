@@ -958,6 +958,7 @@ impl JitState {
         weavepy_jit::register_const_str_helper(wpjit_const_str);
         weavepy_jit::register_tuple_read_helpers(wpjit_const_tuple, wpjit_tuple_len);
         weavepy_jit::register_unbox_int_helper(wpjit_unbox_int);
+        weavepy_jit::register_is_obj_helper(wpjit_is_obj);
         weavepy_jit::register_dict_iter_helper(wpjit_dict_iter_new);
         // RFC 0073 WS3 — the string write lanes.
         weavepy_jit::register_str_write_helpers(
@@ -7779,6 +7780,42 @@ unsafe extern "C" fn wpjit_str_eq(frame: *mut JitFrame, a: i64, b: i64) -> i64 {
         return 1;
     }
     i64::from(sa == sb)
+}
+
+/// The `wpjit_is_obj` helper ([`weavepy_jit::TOp::IsObj`]): whether two
+/// object-lane values (pin indices, `-1` for `None`) are the same object;
+/// `2` deopts on a pin miss.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe extern "C" fn wpjit_is_obj(frame: *mut JitFrame, a: i64, b: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &*jf.ctx.cast::<CallCtx>() };
+    let none = Object::None;
+    let at = |p: i64| -> Option<Result<&Object, *const ()>> {
+        if p == -1 {
+            return Some(Ok(&none));
+        }
+        match ctx.pins.get(usize::try_from(p).ok()?)? {
+            Pin::Obj(o) => Some(Ok(o)),
+            Pin::List(l, _) => Some(Err(Rc::as_ptr(l).cast())),
+        }
+    };
+    let (Some(x), Some(y)) = (at(a), at(b)) else {
+        return 2;
+    };
+    let same = match (x, y) {
+        (Ok(x), Ok(y)) => x.is_same(y),
+        (Err(x), Err(y)) => x == y,
+        (Ok(Object::List(l)), Err(y)) | (Err(y), Ok(Object::List(l))) => {
+            Rc::as_ptr(l).cast::<()>() == y
+        }
+        _ => false,
+    };
+    i64::from(same)
 }
 
 /// The `wpjit_str_len` helper (RFC 0071 WS6): `len` of a pinned `str`

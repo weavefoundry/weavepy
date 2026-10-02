@@ -590,6 +590,21 @@ pub type StrLenHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64) -> 
 pub type BytesGetHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, idx: i64) -> i64;
 
 static STR_EQ_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static IS_OBJ_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide object identity helper ([`crate::ir::TOp::IsObj`]):
+/// `1` when the two object-lane values (pin indices, or `-1` for `None`)
+/// name the same object, `0` when not, anything above `1` to deopt (a
+/// pin miss). Never runs Python code. Shares the [`StrEqHelper`] shape.
+/// Must precede the first compile of a frame containing `IsObj`.
+pub fn register_is_obj_helper(f: StrEqHelper) {
+    IS_OBJ_HELPER.store(f as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn is_obj_helper_addr() -> usize {
+    IS_OBJ_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
 static STR_LEN_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static BYTES_LEN_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static BYTES_GET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

@@ -516,6 +516,14 @@ impl JitEngine {
                 "frame coverage (no helper registered)",
             ));
         }
+        if runtime::is_obj_helper_addr() == 0
+            && tfunc
+                .blocks
+                .iter()
+                .any(|b| b.stmts.iter().any(|s| matches!(s.op, TOp::IsObj { .. })))
+        {
+            return Err(JitVerdict::UnsupportedOpcode("IS_OP (no helper registered)"));
+        }
         let needs_float_divmod = tfunc.blocks.iter().any(|b| {
             b.stmts
                 .iter()

@@ -4029,24 +4029,30 @@ fn step_abstract(
             }
             let b = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
-            let val = match (a.none_const, b.none_const) {
-                (false, true) => a,
-                (true, false) => b,
+            // Two object operands (`c is not determining`): both on the
+            // object lane, compared by identity.
+            let vals = match (a.none_const, b.none_const) {
+                (false, true) => vec![a],
+                (true, false) => vec![b],
+                (false, false) => vec![a, b],
                 _ => return Err(JitVerdict::UnsupportedOpcode("IS_OP shape")),
             };
-            if !val.is_plain() {
-                return Err(escape_verdict(code, &[&val], "CALL (callee escapes)"));
-            }
-            match val.ty {
-                JitType::Obj => {}
-                JitType::Unknown => {
-                    if let Some(slot) = val.src {
-                        set_local(local_types, slot, JitType::Obj, changed)?;
-                    }
-                    // No provenance: transient — a later iteration may
-                    // type it; emission bails if it never resolves.
+            for val in vals {
+                if !val.is_plain() {
+                    return Err(escape_verdict(code, &[&val], "CALL (callee escapes)"));
                 }
-                _ => return Err(JitVerdict::UnsupportedOpcode("IS_OP operand lane")),
+                match val.ty {
+                    JitType::Obj => {}
+                    JitType::Unknown => {
+                        if let Some(slot) = val.src {
+                            set_local(local_types, slot, JitType::Obj, changed)?;
+                        }
+                        // No provenance: transient — a later iteration
+                        // may type it; emission bails if it never
+                        // resolves.
+                    }
+                    _ => return Err(JitVerdict::UnsupportedOpcode("IS_OP operand lane")),
+                }
             }
             stack.push(SE::known(JitType::Bool));
         }
@@ -5645,6 +5651,11 @@ fn cmp_check(kind: CmpKind, a: JitType, b: JitType) -> Result<(), JitVerdict> {
     if !a.is_representable() || !b.is_representable() {
         return Ok(());
     }
+    // An object compared with an integral operand is guarded to be an
+    // exact machine-sized `int` (see `integer_operand_guard`).
+    if integer_operand_guard(a, b).is_some() {
+        return Ok(());
+    }
     if (a.is_integral() || a == JitType::Float) && (b.is_integral() || b == JitType::Float) {
         return Ok(());
     }
@@ -6702,8 +6713,24 @@ fn emit_instr(
         }
         OpCode::CompareOp => {
             let kind = cmp_kind(ins.arg)?;
-            let b = pop_val(stack)?;
-            let a = pop_val(stack)?;
+            let mut b = pop_val(stack)?;
+            let mut a = pop_val(stack)?;
+            // An object compared with an integral operand (a constant on
+            // a class, a field read generically) must be an exact
+            // machine-sized `int`; a miss restores both operands at this
+            // `COMPARE_OP` and the interpreter compares them.
+            if let Some(depth) = integer_operand_guard(a, b) {
+                stack.push(ESlot::val(a));
+                stack.push(ESlot::val(b));
+                push(TOp::UnboxInt { depth }, None, stack, stmts);
+                stack.pop();
+                stack.pop();
+                if depth == 0 {
+                    b = JitType::Int;
+                } else {
+                    a = JitType::Int;
+                }
+            }
             if a.is_integral() && b.is_integral() {
                 push(TOp::IntCmp(kind), Some(JitType::Bool), stack, stmts);
             } else if a == JitType::Float && b == JitType::Float {
@@ -6751,6 +6778,23 @@ fn emit_instr(
             let val = match (a.none_const, b.none_const) {
                 (false, true) => a,
                 (true, false) => b,
+                (false, false) => {
+                    // Two object operands: identity through the pins.
+                    for v in [&a, &b] {
+                        if !v.is_plain() || v.ty != JitType::Obj {
+                            return Err(JitVerdict::UnsupportedOpcode("IS_OP operand lane"));
+                        }
+                    }
+                    push(
+                        TOp::IsObj {
+                            negate: ins.arg == 1,
+                        },
+                        Some(JitType::Bool),
+                        stack,
+                        stmts,
+                    );
+                    return Ok(());
+                }
                 _ => return Err(JitVerdict::UnsupportedOpcode("IS_OP shape")),
             };
             if !val.is_plain() || val.ty != JitType::Obj {

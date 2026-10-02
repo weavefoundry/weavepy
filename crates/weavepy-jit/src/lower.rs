@@ -1248,6 +1248,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.emit_call_str_method(site, argc, ret, stmt.pc);
             }
             TOp::StrEq { negate } => self.emit_str_eq(negate, stmt.pc),
+            TOp::IsObj { negate } => self.emit_is_obj(negate, stmt.pc),
             TOp::StrLen => self.emit_pin_len(runtime::str_len_helper_addr(), stmt.pc),
             TOp::BytesLen => self.emit_pin_len(runtime::bytes_len_helper_addr(), stmt.pc),
             TOp::BytesGetItem => self.emit_bytes_get(stmt.pc),
@@ -2332,6 +2333,40 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         } else {
             status
         };
+        self.vstack.push((res, JitType::Bool));
+    }
+
+    /// `a is b` on two object lanes (see [`TOp::IsObj`]): equal machine
+    /// values (the same pin, or both `None`) are the same object; any
+    /// other pair asks the helper, whose status above `1` deopts.
+    fn emit_is_obj(&mut self, negate: bool, pc: u32) {
+        let snapshot = self.vstack.clone();
+        let (b_pin, _) = self.pop();
+        let (a_pin, _) = self.pop();
+        let same = self.b.ins().icmp(IntCC::Equal, a_pin, b_pin);
+        let slow = self.b.create_block();
+        let merge = self.b.create_block();
+        self.b.append_block_param(merge, types::I64);
+        let one = self.b.ins().iconst(types::I64, 1);
+        self.b.ins().brif(same, merge, &[one.into()], slow, &[]);
+        self.b.switch_to_block(slow);
+        let sig = self.list_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::is_obj_helper_addr() as i64);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, a_pin, b_pin]);
+        let status = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, status, 1);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        self.b.ins().jump(merge, &[status.into()]);
+        self.b.switch_to_block(merge);
+        let r = self.b.block_params(merge)[0];
+        let res = if negate { self.b.ins().bxor_imm(r, 1) } else { r };
         self.vstack.push((res, JitType::Bool));
     }
 

@@ -284,6 +284,12 @@ pub enum TOp {
     /// `-1` for `None`) and pushes the `bool` result. Purely native —
     /// no helper call, no deopt.
     IsNone { negate: bool },
+    /// `a is b` / `a is not b` on two object lanes: pops both (pin
+    /// indices, or `-1` for `None`) and pushes the `bool` identity
+    /// result. Equal machine values answer in line; otherwise the
+    /// registered helper compares the pinned objects (a pin miss
+    /// deopts).
+    IsObj { negate: bool },
     /// RFC 0070 WS1 — push the `None` singleton in the nullable object
     /// lane (machine value `-1`). Emitted where a `None` constant must
     /// occupy a *native* stack slot: a `StoreFast` into an `Obj` local,
@@ -1522,6 +1528,7 @@ impl TOp {
                 | TOp::AttrSet { .. }
                 | TOp::GuardNotNone
                 | TOp::StrEq { .. }
+                | TOp::IsObj { .. }
                 | TOp::StrLen
                 | TOp::BytesLen
                 | TOp::BytesGetItem
