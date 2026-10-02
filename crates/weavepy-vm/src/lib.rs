@@ -46937,7 +46937,38 @@ impl Interpreter {
         args: &[Object],
         kwargs: &[(String, Object)],
     ) -> Result<Object, RuntimeError> {
+        if kwargs.is_empty() {
+            if let Some(v) = self.call_pure_leaf(f, args) {
+                return Ok(v);
+            }
+        }
         self.call_python_owned(f, args.to_vec(), kwargs.to_vec())
+    }
+
+    /// A native caller's positional call of a pure leaf (a `key=`
+    /// function, a `map` callable, ...), evaluated in place as the core
+    /// loop evaluates one (see [`Self::pure_leaf_eval`]): `None` leaves the
+    /// call to the full machinery, nothing having happened.
+    #[inline]
+    fn call_pure_leaf(&self, f: &PyFunction, args: &[Object]) -> Option<Object> {
+        const MAX_ARGS: usize = 6;
+        // SAFETY: a function's code is only replaced under the GIL, and
+        // nothing here runs code that could replace it.
+        let code = unsafe { &*f.code.as_ptr() };
+        if args.len() > MAX_ARGS
+            || !code_is_pure_leaf(code)
+            || !pure_leaf_warm(code)
+            || crate::trace::any_observers_active()
+            || !self.inline_calls_ok()
+            || crate::recursion::current_depth() >= crate::recursion::recursion_limit()
+        {
+            return None;
+        }
+        let mut ptrs = [std::ptr::null::<Object>(); MAX_ARGS];
+        for (p, a) in ptrs.iter_mut().zip(args) {
+            *p = a;
+        }
+        self.pure_leaf_eval::<false, false>(code, f, &ptrs[..args.len()])
     }
 
     /// The full argument binder for [`Self::call_python_owned`]: CPython's
