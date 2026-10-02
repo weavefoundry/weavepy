@@ -456,6 +456,34 @@ impl SplitValues {
         self.push(keys, want, value);
     }
 
+    /// Make room for `cap` values before the first one arrives, adopting
+    /// the class's names (`keys`): a constructor that sets its fields in the
+    /// class's order then appends each in place, the first included (see
+    /// [`Self::append_over`] and compiled code's new-key stores). Nothing
+    /// when a block exists (values, or a recycled one) or `cap` is zero.
+    pub(crate) fn reserve_for(&mut self, keys: impl FnOnce() -> Rc<SharedKeys>, cap: usize) {
+        if self.block.is_some() || cap == 0 {
+            return;
+        }
+        let layout = Self::layout(cap);
+        // SAFETY: a nonzero-size layout (the header alone has a size).
+        #[allow(clippy::cast_ptr_alignment)]
+        let h = unsafe { std::alloc::alloc(layout) }.cast::<SplitHeader>();
+        let Some(h) = std::ptr::NonNull::new(h) else {
+            std::alloc::handle_alloc_error(layout);
+        };
+        // SAFETY: `h` is a fresh block of `cap` slots; the header owns one
+        // strong count of the names.
+        unsafe {
+            h.as_ptr().write(SplitHeader {
+                keys: Rc::into_raw(keys()),
+                len: 0,
+                cap: cap as u32,
+            });
+        }
+        self.block = Some(h);
+    }
+
     /// Whether [`Self::append_over`] of position `i` of `keys` succeeds
     /// once the positions from the current length up to `i` have been
     /// appended first (the next of a run of in-order appends).

@@ -92,6 +92,41 @@ class InlineNewFieldTests(unittest.TestCase):
         self.assertEqual(seen, [5])
         self.assertEqual(r.k, 0)
 
+    def test_instances_that_set_fewer_fields(self):
+        class S:
+            def __init__(self, i, full=True):
+                if full:
+                    self.a = i
+                    self.b = 2 * i
+
+        def make(n, full):
+            return [S(i, full) for i in range(n)]
+
+        full = make(self.N, True)
+        self.assertEqual(vars(full[3]), {"a": 3, "b": 6})
+        empty = make(10, False)
+        self.assertEqual(vars(empty[3]), {})
+        empty[3].b = 1
+        empty[3].a = 2
+        self.assertEqual(list(vars(empty[3]).items()), [("b", 1), ("a", 2)])
+        self.assertEqual(vars(make(1, True)[0]), {"a": 0, "b": 0})
+
+    def test_constructor_raising_midway(self):
+        class E:
+            def __init__(self, i):
+                self.a = i
+                if i < 0:
+                    raise ValueError(i)
+                self.b = i
+
+        def make(n):
+            return [E(i) for i in range(n)]
+
+        self.assertEqual(vars(make(self.N)[5]), {"a": 5, "b": 5})
+        with self.assertRaises(ValueError):
+            E(-1)
+        self.assertEqual(vars(make(3)[2]), {"a": 2, "b": 2})
+
 
 if __name__ == "__main__":
     unittest.main()

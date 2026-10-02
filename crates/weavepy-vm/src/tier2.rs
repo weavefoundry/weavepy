@@ -3958,9 +3958,10 @@ thread_local! {
     static SPARE_PINS: Cell<PinTable> = const { Cell::new(Vec::new()) };
 }
 
-/// The most pins [`SPARE_PINS`] keeps capacity for (the soft limit, plus
-/// the entry pins a pressure exit's activation also carried).
-const SPARE_PINS_CAP: usize = 2 * RUNTIME_PIN_SOFT_LIMIT;
+/// The most pins [`SPARE_PINS`] keeps capacity for: as many as an
+/// activation reaches before a pressure exit (see [`relax_pin_limit`]),
+/// with room for its entry pins (under a megabyte).
+const SPARE_PINS_CAP: usize = RUNTIME_PIN_CAP / 2 + 2 * RUNTIME_PIN_SOFT_LIMIT;
 
 /// An empty pin table, with the spare's capacity when there is one.
 fn take_pins() -> PinTable {
@@ -5539,6 +5540,18 @@ unsafe fn try_native_ctor(
     if ran_finalizers {
         // Threshold collection ran finalizers — arbitrary Python.
         ctx.dirty = true;
+    }
+    // Room for every field the class's instances set, so the compiled
+    // `__init__` appends even its first one in line.
+    if let (Object::Instance(i), Some(keys)) = (&inst, cls.shared_keys.get()) {
+        let n = keys.len();
+        if n > 0 && cls.native_kind.get() == 0 && i.dict.published().is_none() {
+            // SAFETY: the instance is fresh and unshared; nothing else
+            // borrows its values.
+            if let Some(split) = unsafe { i.dict.split_cell().peek_mut() } {
+                split.reserve_for(|| cls.shared_keys.share(), n);
+            }
+        }
     }
     // `__init__` is a procedure: its `None` rides the procedure lane.
     // A `try_native_call` rejection discards the fresh (empty, never
