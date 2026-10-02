@@ -14,7 +14,10 @@
 mod classes;
 mod encode;
 
+use std::hash::BuildHasher;
+
 use crate::shared_value::{SharedSlice, SharedStr};
+use indexmap::map::raw_entry_v1::{RawEntryApiV1, RawEntryMut};
 use num_bigint::BigInt;
 use weavepy_compiler::CodeObject;
 
@@ -293,13 +296,14 @@ impl UnpicklerGuard {
         Rc::as_ptr(class) == self.class.as_ptr() && class.attr_version.get() == self.version
     }
 
-    fn holds(&self, class: &Rc<TypeObject>, opcodes: &Opcodes) -> bool {
-        if !self.matches_class(class)
-            || !class
-                .lookup("__init__")
-                .is_some_and(|f| self.init.holds(&f))
-            || !class.lookup("load").is_some_and(|f| self.load.holds(&f))
-        {
+    /// Whether the functions that a stream of `opcodes` would run are still
+    /// the guarded ones, with their guarded code and defaults. Checked once
+    /// the stream proves supported, after [`Self::matches_class`]: an
+    /// unchanged class version (which every change to the class or its
+    /// bases advances) proves that `__init__`, `load`, and `find_class`
+    /// still resolve to the guarded functions.
+    fn holds(&self, opcodes: &Opcodes) -> bool {
+        if !self.init.holds_live() || !self.load.holds_live() {
             return false;
         }
         // STACK_GLOBAL is the only supported instruction that calls a
@@ -308,7 +312,7 @@ impl UnpicklerGuard {
             && !self
                 .find_class
                 .as_ref()
-                .is_some_and(|guard| class.lookup("find_class").is_some_and(|f| guard.holds(&f)))
+                .is_some_and(FunctionGuard::holds_live)
         {
             return false;
         }
@@ -392,15 +396,11 @@ fn make_loads(args: &[Object]) -> Result<Object, RuntimeError> {
             // request to use the existing unpickler.
             let context = || instances.as_ref()?.context();
             let decoded = match data {
-                Object::Bytes(data) => {
-                    decode(data, |opcodes| guard.holds(class, opcodes), &context)
-                }
+                Object::Bytes(data) => decode(data, |opcodes| guard.holds(opcodes), &context),
                 // Decoding runs no Python code, so the borrow is safe.
-                Object::ByteArray(data) => decode(
-                    &data.borrow(),
-                    |opcodes| guard.holds(class, opcodes),
-                    &context,
-                ),
+                Object::ByteArray(data) => {
+                    decode(&data.borrow(), |opcodes| guard.holds(opcodes), &context)
+                }
                 _ => None,
             };
             Ok(decoded.map_or(Object::None, |value| Object::new_tuple_array([value])))
@@ -581,6 +581,34 @@ struct DecodeContext {
     modules: Rc<RefCell<DictData>>,
 }
 
+/// Push `$value` (with node number `$node`, by default [`LEAF`]) onto the
+/// decoder stack, written straight into its slot. A value built in a
+/// temporary (with a byte store for its variant) and then copied with word
+/// loads stalls store forwarding, and the decoder's opcode arms otherwise
+/// share such a temporary.
+macro_rules! push_entry {
+    ($stack:expr, $value:expr) => {
+        push_entry!($stack, $value, LEAF)
+    };
+    ($stack:expr, $value:expr, $node:expr) => {
+        push_in_place!($stack, ($value, $node))
+    };
+}
+
+/// Push `$value` onto the vector `$items`, written straight into its slot
+/// (see [`push_entry`]).
+macro_rules! push_in_place {
+    ($items:expr, $value:expr) => {{
+        let items = &mut *$items;
+        if items.len() == items.capacity() {
+            items.try_reserve(1).ok()?;
+        }
+        items.spare_capacity_mut().first_mut()?.write($value);
+        // SAFETY: the slot past the end has just been initialized.
+        unsafe { items.set_len(items.len() + 1) };
+    }};
+}
+
 #[inline(always)]
 fn push<T>(items: &mut Vec<T>, value: T) -> Option<()> {
     // (The fallible reservation only when the vector is full.)
@@ -632,6 +660,14 @@ impl<'a> Reader<'a> {
         let value = self.data.get(self.pos..end)?;
         self.pos = end;
         Some(value)
+    }
+
+    /// Whether the current frame (or the data outside one) continues with
+    /// `bytes`.
+    #[inline]
+    fn next_is(&self, bytes: &[u8]) -> bool {
+        self.limit - self.pos >= bytes.len()
+            && self.data.get(self.pos..self.pos + bytes.len()) == Some(bytes)
     }
 
     #[inline(always)]
@@ -692,15 +728,56 @@ fn is_batch<V>(stack: &[V], begin: usize, marks: &[usize]) -> bool {
 
 /// A value on the stack or in the memo, with the number of the [`Node`]
 /// that describes it, [`LEAF`], or [`CLASS`].
-type Entry = (Object, u32);
+type Entry = (Object, NodeId);
+
+/// A node number. It is word-sized, like the rest of an [`Entry`], so an
+/// entry is copied with the same word stores that wrote it.
+type NodeId = u64;
+
+/// `value.clone()`, in line for the kinds that streams memoize, as a copy
+/// of the existing value's words: a value rebuilt in a temporary would be
+/// copied with word loads that stall on the byte store of its variant.
+#[inline(always)]
+fn clone_value(value: &Object) -> Object {
+    match value {
+        Object::Str(text) => std::mem::forget(text.clone()),
+        Object::Tuple(items) => std::mem::forget(items.clone()),
+        Object::List(items) => std::mem::forget(items.clone()),
+        Object::Dict(items) => std::mem::forget(items.clone()),
+        Object::Instance(instance) => std::mem::forget(instance.clone()),
+        Object::Type(class) => std::mem::forget(class.clone()),
+        Object::None | Object::Bool(_) | Object::Int(_) | Object::Float(_) => {}
+        _ => return value.clone(),
+    }
+    // SAFETY: each kind above is a plain value or a single counted
+    // reference, whose clone is a copy of the same words holding one more
+    // reference: the one just taken and forgotten, which the copy owns.
+    unsafe { std::ptr::read(value) }
+}
+
+/// The dictionary (or None) and the slot dictionary of a BUILD state pair.
+#[allow(clippy::type_complexity)]
+fn state_dicts<'s>(
+    first: &'s Object,
+    second: &'s Object,
+) -> Option<(Option<&'s Rc<RefCell<DictData>>>, &'s Rc<RefCell<DictData>>)> {
+    let Object::Dict(slots) = second else {
+        return None;
+    };
+    match first {
+        Object::None => Some((None, slots)),
+        Object::Dict(dict) => Some((Some(dict), slots)),
+        _ => None,
+    }
+}
 
 /// The node number of a value that isn't a container.
-const LEAF: u32 = 0;
+const LEAF: NodeId = 0;
 /// The node number of a class, which only NEWOBJ may consume.
-const CLASS: u32 = u32::MAX;
+const CLASS: NodeId = NodeId::MAX;
 /// The node number of a memo slot whose container's storage moved into an
 /// instance. Reading it returns to the full unpickler.
-const SPENT: u32 = u32::MAX - 1;
+const SPENT: NodeId = NodeId::MAX - 1;
 /// [`Node::memo`] for a container that no memo slot holds.
 const UNMEMOIZED: u32 = u32::MAX;
 /// [`Node::memo`] for a container that more than one memo slot holds.
@@ -718,7 +795,7 @@ struct Node {
     /// The memo slot that holds it, or one of the markers above.
     memo: u32,
     /// For a two-item tuple, the node numbers of its items.
-    pair: [u32; 2],
+    pair: [NodeId; 2],
 }
 
 /// A class that NEWOBJ and BUILD can handle without calling Python code.
@@ -762,7 +839,7 @@ impl Opcodes {
 /// until the whole stream has been accepted: any reason to return to the
 /// full unpickler drops them, and dropping them runs no Python code (an
 /// instance's class is proven to have no finalizer).
-struct Decoder<'c, const RECORD_OPCODES: bool> {
+struct Decoder<'c> {
     opcodes: Opcodes,
     nodes: Vec<Node>,
     memo: Vec<Entry>,
@@ -776,6 +853,9 @@ struct Decoder<'c, const RECORD_OPCODES: bool> {
     member_slots: Vec<(*const TypeObject, SharedStr)>,
     /// State keys and their interned strings (see [`Self::intern`]).
     interned: Vec<(SharedStr, SharedStr)>,
+    /// Emptied state dictionaries that nothing else can reach, with their
+    /// tables' capacity, for the next EMPTY_DICT.
+    spare_dicts: Vec<Rc<RefCell<DictData>>>,
     /// Every list and dictionary, and every instance tracked from birth, in
     /// creation order. Those the result can reach join the cycle collector
     /// once the stream is accepted.
@@ -824,10 +904,10 @@ thread_local! {
     static SPARE_SCRATCH: std::cell::Cell<Option<Scratch>> = const { std::cell::Cell::new(None) };
 }
 
-impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
+impl<'c> Decoder<'c> {
     fn new(context: &'c dyn Fn() -> Option<DecodeContext>, scratch: &mut Scratch) -> Self {
         Self {
-            opcodes: Opcodes([!RECORD_OPCODES; 256]),
+            opcodes: Opcodes([false; 256]),
             nodes: std::mem::take(&mut scratch.nodes),
             memo: std::mem::take(&mut scratch.memo),
             classes: Vec::new(),
@@ -835,6 +915,7 @@ impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
             resolved: None,
             member_slots: Vec::new(),
             interned: Vec::new(),
+            spare_dicts: Vec::new(),
             containers: std::mem::take(&mut scratch.containers),
         }
     }
@@ -848,16 +929,14 @@ impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
 
     #[inline(always)]
     fn opcode(&mut self, value: u8) {
-        if RECORD_OPCODES {
-            self.opcodes.insert(value);
-        }
+        self.opcodes.insert(value);
     }
 
-    fn node(&mut self, height: u32, pair: [u32; 2]) -> Option<u32> {
+    fn node(&mut self, height: u32, pair: [NodeId; 2]) -> Option<NodeId> {
         if height > MAX_DEPTH {
             return None;
         }
-        let number = u32::try_from(self.nodes.len())
+        let number = NodeId::try_from(self.nodes.len())
             .ok()?
             .checked_add(1)
             .filter(|&number| number < SPENT)?;
@@ -873,30 +952,50 @@ impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
         Some(number)
     }
 
-    /// A new, empty list or dictionary.
-    fn container(&mut self, value: Object) -> Option<Entry> {
+    /// Push a new, empty dictionary, reusing a moved state's when one waits.
+    fn empty_dict(&mut self, stack: &mut Vec<Entry>) -> Option<()> {
         let node = self.node(1, [LEAF; 2])?;
-        push(&mut self.containers, value.clone())?;
-        Some((value, node))
+        let dict = match self.spare_dicts.pop() {
+            // (A spare is already in `containers`.)
+            Some(dict) => dict,
+            None => {
+                let dict = Rc::new(RefCell::new(DictData::default()));
+                push_in_place!(&mut self.containers, Object::Dict(dict.clone()));
+                dict
+            }
+        };
+        push_entry!(stack, Object::Dict(dict), node);
+        Some(())
+    }
+
+    /// Push a new, empty list.
+    fn empty_list(&mut self, stack: &mut Vec<Entry>) -> Option<()> {
+        let node = self.node(1, [LEAF; 2])?;
+        let list = Rc::new(RefCell::new(Vec::new()));
+        push_in_place!(&mut self.containers, Object::List(list.clone()));
+        push_entry!(stack, Object::List(list), node);
+        Some(())
     }
 
     /// Mark the value of node `node` as taken by a container, and return its
     /// height. A class can't be taken.
     #[inline]
-    fn hold(&mut self, node: u32) -> Option<u32> {
+    fn hold(&mut self, node: NodeId) -> Option<u32> {
         if node == LEAF {
             return Some(0);
         }
         // (CLASS lies beyond every node.)
-        let node = self.nodes.get_mut(node as usize - 1)?;
+        let node = self.nodes.get_mut(usize::try_from(node - 1).ok()?)?;
         node.held = true;
         Some(node.height)
     }
 
     /// Let the container of node `node`, which nothing may hold yet, take
     /// items no taller than `height`.
-    fn grow(&mut self, node: u32, height: u32) -> Option<()> {
-        let node = self.nodes.get_mut((node as usize).checked_sub(1)?)?;
+    fn grow(&mut self, node: NodeId, height: u32) -> Option<()> {
+        let node = self
+            .nodes
+            .get_mut(usize::try_from(node.checked_sub(1)?).ok()?)?;
         if node.held {
             return None;
         }
@@ -906,8 +1005,8 @@ impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
 
     fn memoize(&mut self, entry: &Entry) -> Option<()> {
         let slot = u32::try_from(self.memo.len()).ok()?;
-        if let Some(node) = (entry.1 as usize)
-            .checked_sub(1)
+        if let Some(node) = (entry.1.checked_sub(1))
+            .and_then(|index| usize::try_from(index).ok())
             .and_then(|index| self.nodes.get_mut(index))
         {
             node.memo = if node.memo == UNMEMOIZED && slot < MEMOIZED_TWICE {
@@ -916,12 +1015,47 @@ impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
                 MEMOIZED_TWICE
             };
         }
-        push(&mut self.memo, entry.clone())
+        // The value usually was just pushed, its variant with a byte store:
+        // each kind is rebuilt from its fields (not copied by words) into
+        // the memo's slot.
+        let node = entry.1;
+        let memo = &mut self.memo;
+        match &entry.0 {
+            Object::Str(text) => push_entry!(memo, Object::Str(text.clone()), node),
+            Object::Tuple(items) => push_entry!(memo, Object::Tuple(items.clone()), node),
+            Object::List(items) => push_entry!(memo, Object::List(items.clone()), node),
+            Object::Dict(items) => push_entry!(memo, Object::Dict(items.clone()), node),
+            Object::Instance(instance) => {
+                push_entry!(memo, Object::Instance(instance.clone()), node);
+            }
+            Object::Type(class) => push_entry!(memo, Object::Type(class.clone()), node),
+            other => push_entry!(memo, other.clone(), node),
+        }
+        Some(())
     }
 
-    fn get(&self, slot: usize) -> Option<Entry> {
-        let entry = self.memo.get(slot)?;
-        (entry.1 != SPENT).then(|| entry.clone())
+    /// A MEMOIZE that follows the instruction that pushed the value, taken
+    /// without a dispatch: the pickler memoizes nearly every value it
+    /// writes.
+    #[inline(always)]
+    fn memoize_next(&mut self, reader: &mut Reader<'_>, stack: &[Entry]) -> Option<()> {
+        if reader.next_is(&[0x94]) {
+            reader.pos += 1;
+            self.opcode(0x94);
+            self.memoize(stack.last()?)?;
+        }
+        Some(())
+    }
+
+    /// GET: push the value of memo slot `slot`.
+    #[inline]
+    fn push_memo(&self, stack: &mut Vec<Entry>, slot: usize) -> Option<()> {
+        let (value, node) = self.memo.get(slot)?;
+        if *node == SPENT {
+            return None;
+        }
+        push_entry!(stack, clone_value(value), *node);
+        Some(())
     }
 
     /// The tallest of `items`, after marking them taken.
@@ -933,20 +1067,23 @@ impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
         Some(height)
     }
 
-    fn tuple(&mut self, stack: &mut Vec<Entry>, begin: usize) -> Option<Entry> {
+    /// Replace the items from `begin` on with a tuple of them.
+    fn tuple(&mut self, stack: &mut Vec<Entry>, begin: usize) -> Option<()> {
         let height = self.hold_all(&stack[begin..])?;
         let pair = match &stack[begin..] {
             [(_, first), (_, second)] => [*first, *second],
             _ => [LEAF; 2],
         };
-        let value = if begin == stack.len() {
-            Object::new_tuple(Vec::new())
+        let node = self.node(height + 1, pair)?;
+        if begin == stack.len() {
+            push_entry!(stack, Object::new_tuple(Vec::new()), node);
         } else {
-            Object::Tuple(crate::tuple_storage::TupleStorage::from_exact_iter(
+            let items = crate::tuple_storage::TupleStorage::from_exact_iter(
                 stack.drain(begin..).map(|(value, _)| value),
-            ))
-        };
-        Some((value, self.node(height + 1, pair)?))
+            );
+            push_entry!(stack, Object::Tuple(items), node);
+        }
+        Some(())
     }
 
     /// APPEND(S): the items from `begin` on join the list below them.
@@ -1002,12 +1139,29 @@ impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
         map.try_reserve((stack.len() - begin) / 2).ok()?;
         let mut items = stack.drain(begin..);
         while let Some((key, _)) = items.next() {
-            map.insert(DictKey(key), items.next()?.0);
+            let (value, _) = items.next()?;
+            let Object::Str(name) = key else {
+                map.insert(DictKey(key), value);
+                continue;
+            };
+            // `insert` for a string key, which equals only another string:
+            // the cached hash and a direct comparison, in line.
+            let hash = crate::fasthash::FxBuildHasher.hash_one(SharedStr::hash_cached(&name));
+            match map.raw_entry_mut_v1().from_hash(hash, |key| {
+                matches!(&key.0, Object::Str(other) if SharedStr::ptr_eq(other, &name) || *other == name)
+            }) {
+                RawEntryMut::Occupied(mut entry) => {
+                    entry.insert(value);
+                }
+                RawEntryMut::Vacant(entry) => {
+                    entry.insert_hashed_nocheck(hash, DictKey(Object::Str(name)), value);
+                }
+            }
         }
         Some(())
     }
 
-    fn global(&mut self, module: &Object, name: &Object) -> Option<Entry> {
+    fn global(&mut self, module: &Object, name: &Object) -> Option<Object> {
         let (Object::Str(module), Object::Str(name)) = (module, name) else {
             return None;
         };
@@ -1018,10 +1172,10 @@ impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
         let class = PlainClass::resolve(self.resolved.as_ref()?, module, name)?;
         let value = Object::Type(class.class.clone());
         push(&mut self.classes, class)?;
-        Some((value, CLASS))
+        Some(value)
     }
 
-    fn newobj(&mut self, class: Entry, args: Entry) -> Option<Entry> {
+    fn newobj(&mut self, stack: &mut Vec<Entry>, class: Entry, args: Entry) -> Option<()> {
         let ((Object::Type(class), CLASS), (Object::Tuple(args), _)) = (class, args) else {
             return None;
         };
@@ -1029,21 +1183,23 @@ impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
         if !args.is_empty() {
             return None;
         }
+        let node = self.node(1, [LEAF; 2])?;
         // `object.__new__(cls)`, including its cycle-collector registration:
         // deferred, as for a plain class's ordinary construction, until the
         // instance could hold a non-atomic value (the state paths below
         // track it then).
-        let value = if class.native_kind.get() == 0
+        let instance = if class.native_kind.get() == 0
             && !class.flags.is_builtin
             && !class.instances_need_finalize()
         {
-            Object::Instance(crate::types::PyInstance::new_deferred(class))
+            crate::types::PyInstance::new_deferred(class)
         } else {
-            let value = Object::Instance(Rc::new(crate::types::PyInstance::new(class)));
-            push(&mut self.containers, value.clone())?;
-            value
+            let instance = Rc::new(crate::types::PyInstance::new(class));
+            push_in_place!(&mut self.containers, Object::Instance(instance.clone()));
+            instance
         };
-        Some((value, self.node(1, [LEAF; 2])?))
+        push_entry!(stack, Object::Instance(instance), node);
+        Some(())
     }
 
     /// [`classes::is_member_slot`], remembered for this stream. (No Python
@@ -1068,8 +1224,10 @@ impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
     /// is reachable only through the `holders` references the caller
     /// accounts for and its one memo slot. Then its storage may move, and
     /// the memo slot (returned, when there is one) must be spent.
-    fn movable(&self, count: usize, node: u32, holders: usize) -> Option<Option<u32>> {
-        let node = self.nodes.get((node as usize).checked_sub(1)?)?;
+    fn movable(&self, count: usize, node: NodeId, holders: usize) -> Option<Option<u32>> {
+        let node = self
+            .nodes
+            .get(usize::try_from(node.checked_sub(1)?).ok()?)?;
         match node.memo {
             UNMEMOIZED => (count == holders).then_some(None),
             MEMOIZED_TWICE => None,
@@ -1108,24 +1266,26 @@ impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
             // publishing a table that bypasses the write barrier (the
             // record is retired with it).
             instance.ensure_gc_tracked();
-            let mut table: DictMap = std::mem::take(&mut **state.borrow_mut());
+            let mut state = state.borrow_mut();
+            let table: &mut DictMap = &mut state;
             // An interned key is equal to the key it replaces and has the
             // same hash, so the table stays valid.
-            for (key, _) in indexmap::map::MutableKeys::iter_mut2(&mut table) {
+            for (key, _) in indexmap::map::MutableKeys::iter_mut2(&mut *table) {
                 let Object::Str(name) = &key.0 else {
                     return None;
                 };
                 key.0 = Object::Str(self.intern(name));
             }
             let mut attributes = instance.dict_cell().borrow_mut();
+            let attributes: &mut DictMap = &mut attributes;
             if attributes.is_empty() {
-                **attributes = table;
+                // The state keeps the instance's empty table and its
+                // capacity, for reuse (see `spare_dicts`).
+                std::mem::swap(attributes, table);
                 return Some(());
             }
             attributes.try_reserve(table.len()).ok()?;
-            for (key, value) in table {
-                attributes.insert(key, value);
-            }
+            attributes.extend(table.drain(..));
             return Some(());
         }
         let state = state.borrow();
@@ -1142,32 +1302,80 @@ impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
     }
 
     fn build(&mut self, target: &Entry, state: Entry) -> Option<()> {
+        let (state, state_node) = state;
+        // The instance takes the state's items, so it must be free to
+        // change, and the state can't reach it.
+        let height = self.hold(state_node)?;
+        match &state {
+            Object::Dict(dict) => {
+                // Held by `state` and by `containers`.
+                let movable = self.movable(Rc::strong_count(dict), state_node, 2);
+                self.build_from(target, height, Some(dict), None, [movable, None], None)
+            }
+            Object::Tuple(pair) if pair.len() == 2 => {
+                let [first, second] = self
+                    .nodes
+                    .get(usize::try_from(state_node.checked_sub(1)?).ok()?)?
+                    .pair;
+                let (dict, slots) = state_dicts(&pair[0], &pair[1])?;
+                // The items move only when nothing else can reach the pair.
+                let count = crate::shared_value::ThinArc::strong_count(pair);
+                let Some(pair_slot) = self.movable(count, state_node, 1) else {
+                    return self.build_from(target, height, dict, Some(slots), [None, None], None);
+                };
+                // Each item is held by the pair and by `containers`.
+                let moves = [
+                    dict.and_then(|d| self.movable(Rc::strong_count(d), first, 2)),
+                    self.movable(Rc::strong_count(slots), second, 2),
+                ];
+                self.build_from(target, height, dict, Some(slots), moves, pair_slot)
+            }
+            _ => None,
+        }
+    }
+
+    /// TUPLE2, MEMOIZE, and BUILD, the way the pickler writes a state with
+    /// `__slots__`, without creating the pair. Its memo slot is spent from
+    /// the start, so reading it returns to the full unpickler.
+    fn build_pair(&mut self, stack: &mut Vec<Entry>, marks: &[usize]) -> Option<()> {
+        let second = pop(stack, marks)?;
+        let first = pop(stack, marks)?;
+        // The pair takes its items.
+        let height = 1 + self.hold(first.1)?.max(self.hold(second.1)?);
+        if height > MAX_DEPTH {
+            return None;
+        }
+        push(&mut self.memo, (Object::None, SPENT))?;
+        let (dict, slots) = state_dicts(&first.0, &second.0)?;
+        // Each item is held by `first` or `second` and by `containers`.
+        let moves = [
+            dict.and_then(|d| self.movable(Rc::strong_count(d), first.1, 2)),
+            self.movable(Rc::strong_count(slots), second.1, 2),
+        ];
+        self.build_from(top(stack, marks)?, height, dict, Some(slots), moves, None)
+    }
+
+    /// BUILD for the state dictionaries `dict` and `slots`, whose state is
+    /// `height` high. `moves` tells, for each, whether its storage may move
+    /// (and its memo slot, which is then spent, as is `pair_slot`).
+    fn build_from(
+        &mut self,
+        target: &Entry,
+        height: u32,
+        dict: Option<&Rc<RefCell<DictData>>>,
+        slots: Option<&Rc<RefCell<DictData>>>,
+        moves: [Option<Option<u32>>; 2],
+        pair_slot: Option<u32>,
+    ) -> Option<()> {
         let (Object::Instance(instance), target) = target else {
             return None;
         };
-        let (state, state_node) = state;
         let class = instance.cls();
         let has_dict = self
             .classes
             .iter()
             .find(|plain| Rc::ptr_eq(&plain.class, &class))?
             .has_dict;
-        // The default state: a dictionary for `__dict__`, or the pair
-        // `(dictionary or None, {slot: value})`.
-        let (dict, slots) = match &state {
-            Object::Dict(dict) => (Some(dict), None),
-            Object::Tuple(items) if items.len() == 2 => {
-                let Object::Dict(slots) = &items[1] else {
-                    return None;
-                };
-                match &items[0] {
-                    Object::None => (None, Some(slots)),
-                    Object::Dict(dict) => (Some(dict), Some(slots)),
-                    _ => return None,
-                }
-            }
-            _ => return None,
-        };
         if let Some(dict) = dict {
             let dict = dict.borrow();
             if !dict.keys().all(|key| matches!(key.0, Object::Str(_)))
@@ -1187,43 +1395,16 @@ impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
                 }
             }
         }
-        // The instance takes the state's items, so it must be free to
-        // change, and the state can't reach it.
-        let height = self.hold(state_node)?;
         self.grow(*target, height)?;
 
         // A state container that nothing else can reach gives its storage
         // to the instance. Its memo slot is spent, and so is the pair's:
         // reading either would see the emptied container.
-        let mut spent = [None; 3];
-        let (move_dict, move_slots) = match &state {
-            Object::Tuple(pair) => {
-                let items = self.nodes.get((state_node as usize).checked_sub(1)?)?.pair;
-                match self.movable(
-                    crate::shared_value::ThinArc::strong_count(pair),
-                    state_node,
-                    1,
-                ) {
-                    None => (false, false),
-                    Some(slot) => {
-                        // Each item is held by the pair and by `containers`.
-                        let dict =
-                            dict.and_then(|d| self.movable(Rc::strong_count(d), items[0], 2));
-                        let slots =
-                            slots.and_then(|s| self.movable(Rc::strong_count(s), items[1], 2));
-                        if dict.is_some() || slots.is_some() {
-                            spent = [slot, dict.flatten(), slots.flatten()];
-                        }
-                        (dict.is_some(), slots.is_some())
-                    }
-                }
-            }
-            _ => {
-                // Held by `state` and by `containers`.
-                let dict = dict.and_then(|d| self.movable(Rc::strong_count(d), state_node, 2));
-                spent[0] = dict.flatten();
-                (dict.is_some(), false)
-            }
+        let [move_dict, move_slots] = moves.map(|movable| movable.is_some());
+        let spent = if move_dict || move_slots {
+            [pair_slot, moves[0].flatten(), moves[1].flatten()]
+        } else {
+            [None; 3]
         };
         if let Some(dict) = dict {
             if !dict.borrow().is_empty() {
@@ -1238,7 +1419,17 @@ impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
                 instance.ensure_gc_tracked();
             }
             let mut storage = instance.slots.borrow_mut();
-            if move_slots {
+            if move_slots && storage.get_index(0).is_none() {
+                // Into empty storage, the distinct keys in order: the
+                // result of setting each in turn, built in one step. The
+                // emptied dictionary keeps its capacity for reuse.
+                let mut data = slots.borrow_mut();
+                let data: &mut DictMap = &mut data;
+                let mut entries = Vec::new();
+                entries.try_reserve_exact(data.len()).ok()?;
+                entries.extend(data.drain(..));
+                *storage = crate::types::SlotStorage::from_entries(entries);
+            } else if move_slots {
                 let data = std::mem::take(&mut *slots.borrow_mut());
                 for (key, value) in data {
                     let Object::Str(name) = &key.0 else {
@@ -1258,6 +1449,15 @@ impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
         for slot in spent.into_iter().flatten() {
             *self.memo.get_mut(slot as usize)? = (Object::None, SPENT);
         }
+        // A moved state dictionary is now empty and out of reach, so the
+        // next EMPTY_DICT can reuse it. (It remains in `containers`.)
+        for (moved, dict) in [(move_dict, dict), (move_slots, slots)] {
+            if let (true, Some(dict)) = (moved, dict) {
+                if self.spare_dicts.len() < 64 {
+                    self.spare_dicts.push(dict.clone());
+                }
+            }
+        }
         Some(())
     }
 
@@ -1276,7 +1476,10 @@ impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
         loop {
             let opcode = reader.byte()?;
             self.opcode(opcode);
-            let entry = match opcode {
+            // Every arm pushes its own result: a value that passes through a
+            // shared temporary (or an `Option`) is copied with unaligned
+            // loads that stall on the stores that just wrote it.
+            match opcode {
                 b'.' => {
                     return (marks.is_empty() && stack.len() == 1)
                         .then(|| stack.pop())
@@ -1284,36 +1487,26 @@ impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
                         // A class is only ever the operand of NEWOBJ.
                         .filter(|(_, node)| *node != CLASS);
                 }
-                0x95 => {
-                    reader.frame()?;
-                    continue;
+                0x95 => reader.frame()?,
+                b'(' => push(&mut *marks, stack.len())?,
+                0x94 => self.memoize(top(&*stack, &*marks)?)?,
+                b'h' => self.push_memo(stack, usize::from(reader.byte()?))?,
+                b'j' => self.push_memo(stack, usize::try_from(reader.u32()?).ok()?)?,
+                b'N' => push_entry!(stack, Object::None),
+                0x88 => push_entry!(stack, Object::Bool(true)),
+                0x89 => push_entry!(stack, Object::Bool(false)),
+                b'K' => {
+                    let value = i64::from(reader.byte()?);
+                    push_entry!(stack, Object::Int(value));
                 }
-                b'(' => {
-                    push(&mut *marks, stack.len())?;
-                    continue;
+                b'M' => {
+                    let value = u16::from_le_bytes(reader.read(2)?.try_into().ok()?);
+                    push_entry!(stack, Object::Int(i64::from(value)));
                 }
-                0x94 => {
-                    self.memoize(top(&*stack, &*marks)?)?;
-                    continue;
+                b'J' => {
+                    let value = i32::from_le_bytes(reader.read(4)?.try_into().ok()?);
+                    push_entry!(stack, Object::Int(i64::from(value)));
                 }
-                b'h' => self.get(usize::from(reader.byte()?))?,
-                b'j' => self.get(usize::try_from(reader.u32()?).ok()?)?,
-                b'N' => (Object::None, LEAF),
-                0x88 => (Object::Bool(true), LEAF),
-                0x89 => (Object::Bool(false), LEAF),
-                b'K' => (Object::Int(i64::from(reader.byte()?)), LEAF),
-                b'M' => (
-                    Object::Int(i64::from(u16::from_le_bytes(
-                        reader.read(2)?.try_into().ok()?,
-                    ))),
-                    LEAF,
-                ),
-                b'J' => (
-                    Object::Int(i64::from(i32::from_le_bytes(
-                        reader.read(4)?.try_into().ok()?,
-                    ))),
-                    LEAF,
-                ),
                 0x8a | 0x8b => {
                     let size = if opcode == 0x8a {
                         usize::from(reader.byte()?)
@@ -1322,102 +1515,123 @@ impl<'c, const RECORD_OPCODES: bool> Decoder<'c, RECORD_OPCODES> {
                         usize::try_from(size).ok()?
                     };
                     let bytes = reader.read(size)?;
-                    (
-                        Object::int_from_bigint(BigInt::from_signed_bytes_le(bytes)),
-                        LEAF,
-                    )
+                    let value = Object::int_from_bigint(BigInt::from_signed_bytes_le(bytes));
+                    push_entry!(stack, value);
                 }
-                b'G' => (
-                    Object::Float(f64::from_be_bytes(reader.read(8)?.try_into().ok()?)),
-                    LEAF,
-                ),
-                0x8c | b'X' | 0x8d | b'C' | b'B' | 0x8e => {
+                b'G' => {
+                    let value = f64::from_be_bytes(reader.read(8)?.try_into().ok()?);
+                    push_entry!(stack, Object::Float(value));
+                }
+                0x8c | b'X' | 0x8d => {
                     let size = match opcode {
-                        0x8c | b'C' => usize::from(reader.byte()?),
-                        b'X' | b'B' => usize::try_from(reader.u32()?).ok()?,
+                        0x8c => usize::from(reader.byte()?),
+                        b'X' => usize::try_from(reader.u32()?).ok()?,
                         _ => reader.size64()?,
                     };
                     let bytes = reader.read(size)?;
-                    let value = if matches!(opcode, 0x8c | b'X' | 0x8d) {
-                        // Surrogate-pass strings stay on the existing WStr path.
-                        let text = if bytes.is_ascii() {
-                            // SAFETY: ASCII text is valid UTF-8.
-                            unsafe { std::str::from_utf8_unchecked(bytes) }
-                        } else {
-                            std::str::from_utf8(bytes).ok()?
-                        };
-                        Object::Str(SharedStr::from(text))
+                    // Surrogate-pass strings stay on the existing WStr path.
+                    let text = if bytes.is_ascii() {
+                        // SAFETY: ASCII text is valid UTF-8.
+                        unsafe { std::str::from_utf8_unchecked(bytes) }
                     } else {
-                        Object::new_bytes(bytes)
+                        std::str::from_utf8(bytes).ok()?
                     };
-                    (value, LEAF)
+                    let text = SharedStr::from(text);
+                    push_entry!(stack, Object::Str(text));
+                    self.memoize_next(&mut reader, stack)?;
                 }
-                b']' => self.container(Object::new_list(Vec::new()))?,
-                b'}' => self.container(Object::new_dict())?,
-                b')' => (Object::new_tuple(Vec::new()), self.node(1, [LEAF; 2])?),
+                b'C' | b'B' | 0x8e => {
+                    let size = match opcode {
+                        b'C' => usize::from(reader.byte()?),
+                        b'B' => usize::try_from(reader.u32()?).ok()?,
+                        _ => reader.size64()?,
+                    };
+                    let value = Object::new_bytes(reader.read(size)?);
+                    push_entry!(stack, value);
+                    self.memoize_next(&mut reader, stack)?;
+                }
+                b']' => {
+                    self.empty_list(stack)?;
+                    self.memoize_next(&mut reader, stack)?;
+                }
+                b'}' => {
+                    self.empty_dict(stack)?;
+                    self.memoize_next(&mut reader, stack)?;
+                }
+                b')' => {
+                    let node = self.node(1, [LEAF; 2])?;
+                    push(stack, (Object::new_tuple(Vec::new()), node))?;
+                }
+                // The pickler writes a state with `__slots__` this way.
+                0x86 if reader.next_is(&[0x94, BUILD]) => {
+                    reader.pos += 2;
+                    self.opcode(0x94);
+                    self.opcode(BUILD);
+                    self.build_pair(stack, &*marks)?;
+                }
                 0x85..=0x87 => {
                     let count = usize::from(opcode - 0x84);
                     let begin = stack.len().checked_sub(count)?;
                     if marks.last().is_some_and(|mark| begin < *mark) {
                         return None;
                     }
-                    self.tuple(&mut *stack, begin)?
+                    self.tuple(stack, begin)?;
+                    self.memoize_next(&mut reader, stack)?;
                 }
                 b't' => {
                     let mark = marks.pop()?;
-                    self.tuple(&mut *stack, mark)?
+                    self.tuple(stack, mark)?;
+                    self.memoize_next(&mut reader, stack)?;
                 }
                 b'a' => {
                     let begin = stack.len().checked_sub(1)?;
-                    self.extend(&mut *stack, begin, &*marks)?;
-                    continue;
+                    self.extend(stack, begin, &*marks)?;
                 }
                 b'e' => {
                     let mark = marks.pop()?;
-                    self.extend(&mut *stack, mark, &*marks)?;
-                    continue;
+                    self.extend(stack, mark, &*marks)?;
                 }
                 b's' => {
                     let begin = stack.len().checked_sub(2)?;
-                    self.setitems(&mut *stack, begin, &*marks)?;
-                    continue;
+                    self.setitems(stack, begin, &*marks)?;
                 }
                 b'u' => {
                     let mark = marks.pop()?;
-                    self.setitems(&mut *stack, mark, &*marks)?;
-                    continue;
+                    self.setitems(stack, mark, &*marks)?;
                 }
                 STACK_GLOBAL => {
                     let (name, _) = pop(&mut *stack, &*marks)?;
                     let (module, _) = pop(&mut *stack, &*marks)?;
-                    self.global(&module, &name)?
+                    let class = self.global(&module, &name)?;
+                    push(stack, (class, CLASS))?;
+                    self.memoize_next(&mut reader, stack)?;
                 }
                 NEWOBJ => {
                     let args = pop(&mut *stack, &*marks)?;
                     let class = pop(&mut *stack, &*marks)?;
-                    self.newobj(class, args)?
+                    self.newobj(stack, class, args)?;
+                    self.memoize_next(&mut reader, stack)?;
                 }
                 BUILD => {
                     let state = pop(&mut *stack, &*marks)?;
                     self.build(top(&*stack, &*marks)?, state)?;
-                    continue;
                 }
                 // GLOBAL, REDUCE, NEWOBJ_EX, persistent IDs, external buffers,
                 // legacy protocols, and all other operations retain the full
                 // unpickler.
                 _ => return None,
-            };
-            push(&mut *stack, entry)?;
+            }
         }
     }
 
     /// Publish the accepted result. Every container that the result can
     /// reach is registered with the cycle collector: even an acyclic decoded
     /// container can acquire a cycle through later mutation. Releasing the
-    /// memo first leaves the result's references as the only ones beyond
-    /// `containers`' own.
+    /// memo and the spare dictionaries first leaves the result's references
+    /// as the only ones beyond `containers`' own.
     fn finish(&mut self, root: Object) -> Object {
         self.memo.clear();
+        self.spare_dicts.clear();
         for value in self.containers.drain(..) {
             let reachable = match &value {
                 Object::List(list) => Rc::strong_count(list) > 1,
@@ -1441,34 +1655,13 @@ fn decode(
     if data.len() < 3 || data[0] != 0x80 || !matches!(data[1], 4 | 5) {
         return None;
     }
-    // Checking the whole dispatch table has a fixed cost. For longer
-    // streams, avoid recording every opcode and pay that fixed cost once.
-    // Both specializations still validate the entire supported stream.
-    if data.len() <= 512 {
-        decode_with::<true>(data, validate, context)
-    } else {
-        // A replaced reader may ignore the input or reject it immediately.
-        // Check the full table before scanning a large stream so that such
-        // readers keep their existing fallback cost.
-        if !validate(&Opcodes([true; 256])) {
-            return None;
-        }
-        decode_with::<false>(data, |_| true, context)
-    }
-}
-
-fn decode_with<const RECORD_OPCODES: bool>(
-    data: &[u8],
-    validate: impl FnOnce(&Opcodes) -> bool,
-    context: &dyn Fn() -> Option<DecodeContext>,
-) -> Option<Object> {
     let mut scratch = Scratch::take();
-    let mut decoder = Decoder::<RECORD_OPCODES>::new(context, &mut scratch);
+    let mut decoder = Decoder::new(context, &mut scratch);
     let result = decoder
         .parse(data, &mut scratch.stack, &mut scratch.marks)
-        // A short stream's Python dispatch functions are checked only once
-        // the stream proves supported. Rejecting it then discards what was
-        // built.
+        // The code of the Python functions that the stream's instructions
+        // would run is checked once the stream proves supported. Rejecting
+        // it then discards what was built.
         .filter(|_| validate(&decoder.opcodes))
         .map(|(root, _)| decoder.finish(root));
     decoder.recycle(&mut scratch);
