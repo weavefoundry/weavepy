@@ -3908,29 +3908,10 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
         let Some(Object::Instance(inst)) = args.first() else {
             return Ok(Object::from_static(""));
         };
+        if let Some(m) = oserror_fields_message(inst) {
+            return Ok(Object::from_str(m));
+        }
         let get = |name: &'static str| exc_attr(inst, name);
-        let set = |o: &Option<Object>| matches!(o, Some(v) if !matches!(v, Object::None));
-        let errno = get("errno");
-        let strerror = get("strerror");
-        let filename = get("filename");
-        let filename2 = get("filename2");
-        let errno_s = errno.as_ref().map(Object::to_str).unwrap_or_default();
-        let strerror_s = strerror.as_ref().map(Object::to_str).unwrap_or_default();
-        if set(&filename) {
-            let f1 = filename.as_ref().map(Object::repr).unwrap_or_default();
-            if set(&filename2) {
-                let f2 = filename2.as_ref().map(Object::repr).unwrap_or_default();
-                return Ok(Object::from_str(format!(
-                    "[Errno {errno_s}] {strerror_s}: {f1} -> {f2}"
-                )));
-            }
-            return Ok(Object::from_str(format!(
-                "[Errno {errno_s}] {strerror_s}: {f1}"
-            )));
-        }
-        if set(&errno) && set(&strerror) {
-            return Ok(Object::from_str(format!("[Errno {errno_s}] {strerror_s}")));
-        }
         // BaseException.__str__: "" / str(arg) / repr(args).
         match get("args") {
             Some(Object::Tuple(items)) => Ok(match &items[..] {
@@ -5659,6 +5640,11 @@ pub fn exception_message(obj: &Object) -> Option<String> {
             if let Some(Object::Str(s)) = exc_attr(inst, "message") {
                 return Some(s.to_string());
             }
+            if inst.cls().is_subclass_of(&builtin_types().os_error) {
+                if let Some(m) = oserror_fields_message(inst) {
+                    return Some(m);
+                }
+            }
             if let Some(Object::Tuple(items)) = exc_attr(inst, "args") {
                 // `KeyError.__str__` renders a lone key by its repr.
                 if let [single] = &items[..] {
@@ -5674,6 +5660,25 @@ pub fn exception_message(obj: &Object) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// `OSError.__str__`'s `[Errno N] strerror[: filename[ -> filename2]]`
+/// rendering, when the named fields that shape needs are set (see
+/// `oserror_str`).
+fn oserror_fields_message(inst: &crate::types::PyInstance) -> Option<String> {
+    let get = |name: &'static str| exc_attr(inst, name).filter(|v| !matches!(v, Object::None));
+    let errno = get("errno");
+    let strerror = get("strerror");
+    let errno_s = errno.as_ref().map(Object::to_str).unwrap_or_default();
+    let strerror_s = strerror.as_ref().map(Object::to_str).unwrap_or_default();
+    if let Some(f1) = get("filename") {
+        let f1 = f1.repr();
+        return Some(match get("filename2") {
+            Some(f2) => format!("[Errno {errno_s}] {strerror_s}: {f1} -> {}", f2.repr()),
+            None => format!("[Errno {errno_s}] {strerror_s}: {f1}"),
+        });
+    }
+    (errno.is_some() && strerror.is_some()).then(|| format!("[Errno {errno_s}] {strerror_s}"))
 }
 
 /// `True` when `obj` is an instance whose class derives from `cls`.
