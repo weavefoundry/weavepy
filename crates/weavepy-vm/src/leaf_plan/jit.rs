@@ -827,10 +827,10 @@ impl Engine {
         let mut flags = settings::builder();
         flags.set("use_colocated_libcalls", "false").ok()?;
         flags.set("is_pic", "false").ok()?;
-        // No mid-end optimization (as for tier 2): the lowering emits the
-        // code it wants, and the pass cost more to run than it saved.
-        // `WEAVEPY_JIT_OPT=1` restores it.
-        let opt = if std::env::var_os("WEAVEPY_JIT_OPT").is_some() {
+        // No mid-end optimization: a plan's lowering emits the code it
+        // wants, and the pass cost more to run than it saved.
+        // `WEAVEPY_JIT_OPT=1` turns it on.
+        let opt = if std::env::var_os("WEAVEPY_JIT_OPT").is_some_and(|v| v == "1") {
             "speed"
         } else {
             "none"

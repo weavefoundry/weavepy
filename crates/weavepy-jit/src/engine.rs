@@ -269,14 +269,13 @@ impl JitEngine {
         // in-process.
         flag_builder.set("use_colocated_libcalls", "false").ok()?;
         flag_builder.set("is_pic", "false").ok()?;
-        // No mid-end optimization: the lowering already emits the code it
-        // wants, and the e-graph pass found nothing in it worth its share
-        // of compile time (measured: the fixtures ran no slower without it
-        // and compiled 3-8% faster). WEAVEPY_JIT_OPT=1 restores it.
-        let opt = if std::env::var_os("WEAVEPY_JIT_OPT").is_some() {
-            "speed"
-        } else {
+        // Cranelift's mid-end pays for itself in numeric loops: without it
+        // `jitloop` ran 2x and `spectral_norm` 1.2x slower, for a few
+        // percent of compile time saved. `WEAVEPY_JIT_OPT=0` turns it off.
+        let opt = if std::env::var_os("WEAVEPY_JIT_OPT").is_some_and(|v| v == "0") {
             "none"
+        } else {
+            "speed"
         };
         flag_builder.set("opt_level", opt).ok()?;
         if std::env::var_os("WEAVEPY_JIT_QUICK").is_some() {
