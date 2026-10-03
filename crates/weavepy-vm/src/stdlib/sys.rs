@@ -1420,7 +1420,7 @@ thread_local! {
     // (Fx-hashed: interning runs for every name of every code object a
     // module loads, and SipHash showed in import profiles.)
     static INTERN_POOL: RefCell<std::collections::HashSet<SharedStr, crate::fasthash::FxBuildHasher>> =
-        RefCell::new(std::collections::HashSet::with_hasher(Default::default()));
+        const { RefCell::new(std::collections::HashSet::with_hasher(crate::fasthash::FxBuildHasher)) };
 }
 
 /// Canonicalize `name` through the interpreter's intern pool, seeding it

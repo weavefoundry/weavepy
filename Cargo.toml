@@ -288,6 +288,8 @@ manual_map              = "allow"
 comparison_chain        = "allow"
 unnecessary_cast        = "allow"
 len_without_is_empty    = "allow"
+# New in Clippy 1.99; tests across the workspace assert emptiness this way.
+assert_is_empty         = "allow"
 # Interpreter compares IEEE-754 values exactly by design (Python `==`,
 # rounding, struct packing); an epsilon would be incorrect.
 float_cmp               = "allow"

@@ -522,7 +522,9 @@ impl JitEngine {
                 .iter()
                 .any(|b| b.stmts.iter().any(|s| matches!(s.op, TOp::IsObj { .. })))
         {
-            return Err(JitVerdict::UnsupportedOpcode("IS_OP (no helper registered)"));
+            return Err(JitVerdict::UnsupportedOpcode(
+                "IS_OP (no helper registered)",
+            ));
         }
         let needs_float_divmod = tfunc.blocks.iter().any(|b| {
             b.stmts
@@ -626,7 +628,11 @@ impl JitEngine {
         }
         if std::env::var_os("WEAVEPY_JIT_CLIF_STATS").is_some() {
             let f = &self.ctx.func;
-            let insts: usize = f.layout.blocks().map(|b| f.layout.block_insts(b).count()).sum();
+            let insts: usize = f
+                .layout
+                .blocks()
+                .map(|b| f.layout.block_insts(b).count())
+                .sum();
             eprintln!(
                 "jit clif {name}: {} blocks, {insts} insts, {} values",
                 f.layout.blocks().count(),
@@ -636,7 +642,7 @@ impl JitEngine {
 
         let stats = std::env::var_os("WEAVEPY_JIT_CLIF_STATS").is_some();
         if stats {
-            drop(cranelift_codegen::timing::take_current());
+            let _ = cranelift_codegen::timing::take_current();
         }
         let t0 = stats.then(std::time::Instant::now);
         self.module

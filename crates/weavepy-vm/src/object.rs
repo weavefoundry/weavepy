@@ -12984,6 +12984,10 @@ impl Object {
     }
 }
 
+// Every payload is one word or smaller, so a value is a tag and a word.
+const _: () = assert!(std::mem::size_of::<Object>() == 16);
+const _: () = assert!(std::mem::size_of::<Option<Object>>() == 16);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -13153,7 +13157,3 @@ mod tests {
         assert!(d.is_none());
     }
 }
-
-// Every payload is one word or smaller, so a value is a tag and a word.
-const _: () = assert!(std::mem::size_of::<Object>() == 16);
-const _: () = assert!(std::mem::size_of::<Option<Object>>() == 16);

@@ -1333,13 +1333,19 @@ impl Lower<'_> {
         let bad = self.b.ins().bor(not_scalar, not_ref);
         self.miss_if(bad, slow);
         let otag = self.b.ins().uload8(types::I32, f, pr, 0);
-        let not_inst = self.b.ins().icmp_imm(IntCC::NotEqual, otag, i64::from(l.tag_instance));
+        let not_inst = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, otag, i64::from(l.tag_instance));
         self.miss_if(not_inst, slow);
         let inst = self.b.ins().load(ptr, f, pr, 8);
         let cls = self.b.ins().load(ptr, f, inst, l.inst_class);
         let ver = self.b.ins().load(types::I64, f, cls, l.type_attr_version);
         let at = self.b.ins().iconst(ptr, slot);
-        let want = self.b.ins().load(types::I64, f, at, crate::FIELD_SLOT_VER as i32);
+        let want = self
+            .b
+            .ins()
+            .load(types::I64, f, at, crate::FIELD_SLOT_VER as i32);
         let idx = self.b.ins().uload32(f, at, crate::FIELD_SLOT_IDX as i32);
         let lazy = self.b.ins().load(ptr, f, inst, l.inst_dict_lazy);
         let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
@@ -1364,7 +1370,10 @@ impl Lower<'_> {
         let ckeys = self.b.ins().load(ptr, f, cls, l.type_shared_keys);
         let len = self.b.ins().uload32(f, block, l.split_len);
         let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
-        let absent = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
+        let absent = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
         let bad = self.b.ins().bor(foreign, absent);
         self.miss_if(bad, slow);
         let off = self.b.ins().ishl_imm(idx, 4);
@@ -2097,11 +2106,15 @@ impl Lower<'_> {
     /// Whether nothing after op `i` can decline the evaluation: every
     /// later op is a move, a constant, a return or a forward jump.
     fn infallible_after(plan: &LeafPlan, i: usize) -> bool {
-        plan.ops.iter().enumerate().skip(i + 1).all(|(k, op)| match *op {
-            Op::Move { .. } | Op::Const { .. } | Op::Return { .. } => true,
-            Op::Jump { target } => usize::from(target) > k,
-            _ => false,
-        })
+        plan.ops
+            .iter()
+            .enumerate()
+            .skip(i + 1)
+            .all(|(k, op)| match *op {
+                Op::Move { .. } | Op::Const { .. } | Op::Return { .. } => true,
+                Op::Jump { target } => usize::from(target) > k,
+                _ => false,
+            })
     }
 
     /// A `CALL` (op `i`): the callee its site last resolved in line behind

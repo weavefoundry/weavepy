@@ -284,7 +284,8 @@ impl JitHint {
     /// back edges (see [`Self::set_backedge_quiet`]).
     #[inline]
     pub fn is_backedge_quiet(&self) -> bool {
-        self.backedge_quiet.load(std::sync::atomic::Ordering::Relaxed)
+        self.backedge_quiet
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn set_backedge_quiet(&self) {

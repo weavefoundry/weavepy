@@ -515,7 +515,7 @@ fn object_is_tracked(target: &Object) -> bool {
             let id = id_of(target);
             gc_trace::with_state(|s| {
                 if !s.is_tracked(id) {
-                    s.track_now(&target);
+                    s.track_now(target);
                 }
                 s.is_tracked(id)
             })
@@ -587,7 +587,7 @@ fn get_stats(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn track_obj(args: &[Object]) -> Result<Object, RuntimeError> {
     if let Some(o) = args.first() {
-        gc_trace::track(&o);
+        gc_trace::track(o);
     }
     Ok(Object::None)
 }

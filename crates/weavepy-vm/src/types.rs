@@ -155,15 +155,18 @@ fn next_type_version() -> u64 {
 /// Never publish zero or reuse a token, including at counter exhaustion.
 fn allocate_type_version(counter: &std::sync::atomic::AtomicU64) -> Option<u64> {
     use std::sync::atomic::Ordering::Relaxed;
-    counter
-        .fetch_update(Relaxed, Relaxed, |value| {
-            if value == 0 {
-                None
-            } else {
-                value.checked_add(1)
-            }
-        })
-        .ok()
+    let mut value = counter.load(Relaxed);
+    loop {
+        let next = if value == 0 {
+            None
+        } else {
+            value.checked_add(1)
+        }?;
+        match counter.compare_exchange_weak(value, next, Relaxed, Relaxed) {
+            Ok(previous) => return Some(previous),
+            Err(current) => value = current,
+        }
+    }
 }
 
 #[cfg(test)]

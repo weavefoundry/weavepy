@@ -2974,7 +2974,9 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
     use crate::inst_dict::{InstDict, SplitValues};
     use crate::sync::GilCell;
     use crate::types::PyInstance;
-    if crate::gil::free_threading_enabled() || std::env::var_os("WEAVEPY_JIT_NO_INLINE_ATTRS").is_some() {
+    if crate::gil::free_threading_enabled()
+        || std::env::var_os("WEAVEPY_JIT_NO_INLINE_ATTRS").is_some()
+    {
         return None;
     }
     let word = |p: *const u8, off: usize| -> usize {
@@ -2993,12 +2995,15 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
     let data = Rc::as_ptr(inst) as usize;
     let arc_data = data.checked_sub(arc)?;
     let i32_of = |v: usize| i32::try_from(v).ok();
-    let inst_class = arc_data + std::mem::offset_of!(PyInstance, class) + GilCell::<Rc<TypeObject>>::DATA_OFFSET;
+    let inst_class =
+        arc_data + std::mem::offset_of!(PyInstance, class) + GilCell::<Rc<TypeObject>>::DATA_OFFSET;
     let dict = arc_data + std::mem::offset_of!(PyInstance, dict);
     let inst_dict_lazy = dict + InstDict::LAZY_OFFSET;
     let inst_split_borrow = dict + InstDict::SPLIT_OFFSET + GilCell::<SplitValues>::BORROW_OFFSET;
-    let inst_split_block =
-        dict + InstDict::SPLIT_OFFSET + GilCell::<SplitValues>::DATA_OFFSET + SplitValues::BLOCK_OFFSET;
+    let inst_split_block = dict
+        + InstDict::SPLIT_OFFSET
+        + GilCell::<SplitValues>::DATA_OFFSET
+        + SplitValues::BLOCK_OFFSET;
     let arc_p = arc as *const u8;
     // The class pointer is its `Arc` allocation too.
     let cls = inst.cls();
@@ -3031,7 +3036,10 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
     let cls_p = cls_arc as *const u8;
     // SAFETY: as `word`, a `u64` field.
     let ver = unsafe { cls_p.add(type_attr_version).cast::<u64>().read_unaligned() };
-    let keys = cls.shared_keys.get().map_or(0, |k| std::ptr::from_ref(k) as usize);
+    let keys = cls
+        .shared_keys
+        .get()
+        .map_or(0, |k| std::ptr::from_ref(k) as usize);
     let published = inst.dict.published().is_some();
     if ver != cls.attr_version.get()
         || word(cls_p, type_shared_keys) != keys
@@ -3916,7 +3924,10 @@ fn guards_hold(
     }
     (callees.is_empty() || callee_guards_hold(interp, callees, &guard_snapshot.ctor_vers))
         && math.iter().all(MathGuard::holds)
-        && !guard_snapshot.defaults.iter().any(|f| defaults_overridden(f))
+        && !guard_snapshot
+            .defaults
+            .iter()
+            .any(|f| defaults_overridden(f))
 }
 
 /// [`guards_hold`]'s globals, resolved name by name (and remembered as
@@ -3969,7 +3980,8 @@ fn callee_guards_hold(
             Object::Type(t) => {
                 let ver = t.attr_version.get();
                 let memo = ctor_vers.get(i);
-                if memo.is_some_and(|m| m.get() == ver) && ctor_still_inits_with(t, ver, code_snap) {
+                if memo.is_some_and(|m| m.get() == ver) && ctor_still_inits_with(t, ver, code_snap)
+                {
                     continue;
                 }
                 let ok = matches!(
@@ -4115,7 +4127,11 @@ fn put_pins(mut pins: PinTable) {
     pins.clear();
     SPARE_PINS.with(|spare| {
         let old = spare.take();
-        spare.set(if old.capacity() >= pins.capacity() { old } else { pins });
+        spare.set(if old.capacity() >= pins.capacity() {
+            old
+        } else {
+            pins
+        });
     });
 }
 
@@ -4727,7 +4743,8 @@ fn arm_update(entry: &MethodEntry, nc: &NativeCallee, receiver: &Object, argc: u
     u.inc.set(inc);
     u.code_at.set(func.code.as_ptr() as usize);
     // SAFETY: `Rc` is one pointer, compared and never dereferenced.
-    u.code.set(unsafe { std::mem::transmute_copy::<Rc<CodeObject>, usize>(code) });
+    u.code
+        .set(unsafe { std::mem::transmute_copy::<Rc<CodeObject>, usize>(code) });
     u.idx.set(guard.split_idx);
     #[cfg(test)]
     crate::SCALAR_FIELD_UPDATE_ARMED.with(|armed| armed.set(armed.get() + 1));
@@ -5222,8 +5239,10 @@ unsafe fn try_native_call(
     if status == JitStatus::Returned && !child.dirty {
         let expect = SlotTag::from_raw(expect_tag);
         let ret = if njf.ret_tag == expect_tag
-            && matches!(expect, SlotTag::Int | SlotTag::Float | SlotTag::Bool | SlotTag::None)
-        {
+            && matches!(
+                expect,
+                SlotTag::Int | SlotTag::Float | SlotTag::Bool | SlotTag::None
+            ) {
             Some(njf.ret_bits)
         } else if njf.ret_tag == SlotTag::ObjPin as u32 && njf.ret_bits == u64::MAX {
             // `None`.
@@ -5522,7 +5541,16 @@ unsafe fn finish_native_call(
             } else {
                 None
             };
-            match finish_deopted_callee(interp, nc, nctx, exit.locals, exit.spill, exit.tags, njf, pending) {
+            match finish_deopted_callee(
+                interp,
+                nc,
+                nctx,
+                exit.locals,
+                exit.spill,
+                exit.tags,
+                njf,
+                pending,
+            ) {
                 Ok(v) => Done::Obj(v),
                 Err(e) => Done::Raised(e),
             }
@@ -8509,7 +8537,9 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
                 Some(Pin::Obj(o @ (Object::Generator(_) | Object::Iter(_)))) => o.clone(),
                 // An instance iterator whose `__next__` is a registered native
                 // leaf (a `deque` iterator): stepped below without Python.
-                Some(Pin::Obj(o @ Object::Instance(_))) if !crate::gil::free_threading_enabled() => {
+                Some(Pin::Obj(o @ Object::Instance(_)))
+                    if !crate::gil::free_threading_enabled() =>
+                {
                     o.clone()
                 }
                 _ => return 2,
@@ -8538,7 +8568,9 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
                 match interp.leaf_next_step(&it, inst) {
                     None => return 2,
                     Some(Ok(v)) => Ok(Some(v)),
-                    Some(Err(RuntimeError::PyException(e))) if e.type_name() == "StopIteration" => Ok(None),
+                    Some(Err(RuntimeError::PyException(e))) if e.type_name() == "StopIteration" => {
+                        Ok(None)
+                    }
                     Some(Err(e)) => Err(e),
                 }
             } else {
@@ -11573,9 +11605,11 @@ unsafe extern "C" fn wpjit_iter_next_pair(
                 // store-pc deopt and unpack generically).
                 if let Object::Tuple(items) = &v {
                     if items.len() == 2 {
-                        let packed1 = pack_iter_elem(&items[0], tag1, &mut ctx.pins, &mut ctx.pin_memo);
-                        let packed2 =
-                            packed1.and_then(|_| pack_iter_elem(&items[1], tag2, &mut ctx.pins, &mut ctx.pin_memo));
+                        let packed1 =
+                            pack_iter_elem(&items[0], tag1, &mut ctx.pins, &mut ctx.pin_memo);
+                        let packed2 = packed1.and_then(|_| {
+                            pack_iter_elem(&items[1], tag2, &mut ctx.pins, &mut ctx.pin_memo)
+                        });
                         if let (Some(b1), Some(b2)) = (packed1, packed2) {
                             jf.ret_bits = b1;
                             // SAFETY: the marshal buffer is at least

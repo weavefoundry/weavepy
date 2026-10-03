@@ -7175,8 +7175,10 @@ fn simple_key_set(src: &Object) -> Option<crate::object::SetData> {
         if !items.iter().all(simple) {
             return None;
         }
-        let mut out =
-            crate::object::SetData::with_capacity_and_hasher(items.len(), Default::default());
+        let mut out = crate::object::SetData::with_capacity_and_hasher(
+            items.len(),
+            crate::fasthash::FxBuildHasher,
+        );
         for v in items {
             out.insert(DictKey(v.clone()));
         }

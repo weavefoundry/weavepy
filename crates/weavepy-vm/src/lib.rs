@@ -51,6 +51,8 @@ pub mod error;
 pub mod ext_loader;
 pub mod fasthash;
 pub mod foreign;
+#[cfg(feature = "jit")]
+mod frame_jit;
 pub mod frozen_code_cache;
 pub mod frozen_table;
 pub mod gc_trace;
@@ -61,8 +63,6 @@ pub mod hot_gates;
 pub mod import;
 pub mod import_time;
 pub mod inst_dict;
-#[cfg(feature = "jit")]
-mod frame_jit;
 mod lazy_arc;
 mod leaf_plan;
 pub mod linejump;
@@ -5142,9 +5142,8 @@ impl Interpreter {
                                 break Err(e);
                             }
                         }
-                    } else {
-                        break Err(err);
                     }
+                    break Err(err);
                 }
             }
         };
@@ -7827,7 +7826,8 @@ impl Interpreter {
         if !code.cellvars.is_empty() {
             // SAFETY: a bound slot's locals storage is its own.
             let cells = fresh_cells(f, &code, unsafe { &mut *act.frame.locals.as_ptr() });
-            return self.inline_bind_with(frame, shell, pc, act, code, callable, guard, cells, true);
+            return self
+                .inline_bind_with(frame, shell, pc, act, code, callable, guard, cells, true);
         }
         let cells: *const Rc<Vec<Rc<RefCell<Object>>>> =
             f.lean_cells_ref(&code).expect("checked by the shape");
@@ -7843,7 +7843,7 @@ impl Interpreter {
         frame: &mut Frame,
         shell: &mut QuietShell<'_>,
         pc: usize,
-        mut act: Box<InlineAct>,
+        act: Box<InlineAct>,
         code: Rc<CodeObject>,
         callable: Object,
         guard: crate::recursion::Guard,
@@ -10274,7 +10274,14 @@ impl Interpreter {
                         .is_some()
                     {
                         if let Some(hit) = self.core_native_method(
-                            code, other, pc + 1, next.arg, mslots, lbase, nlocals, consts,
+                            code,
+                            other,
+                            pc + 1,
+                            next.arg,
+                            mslots,
+                            lbase,
+                            nlocals,
+                            consts,
                         ) {
                             return Some(hit);
                         }
@@ -10291,11 +10298,28 @@ impl Interpreter {
                     };
                 if pure_site {
                     let (v, call_pc) = self.core_pure_method(
-                        code, other, pc + 1, next.arg, mslots, lbase, nlocals, consts, depth_cell,
+                        code,
+                        other,
+                        pc + 1,
+                        next.arg,
+                        mslots,
+                        lbase,
+                        nlocals,
+                        consts,
+                        depth_cell,
                     )?;
                     return Some((Ok(v), call_pc));
                 }
-                self.core_native_method(code, other, pc + 1, next.arg, mslots, lbase, nlocals, consts)
+                self.core_native_method(
+                    code,
+                    other,
+                    pc + 1,
+                    next.arg,
+                    mslots,
+                    lbase,
+                    nlocals,
+                    consts,
+                )
             }
             // A container's site-cached leaf method.
             Object::List(_) | Object::Dict(_) | Object::Set(_) | Object::Str(_) => {
@@ -10446,7 +10470,8 @@ impl Interpreter {
             #[cfg(feature = "jit")]
             if pc == 0 && !NATIVE {
                 if let Some(ext) = ext {
-                    ext.frame_jit.warm(code, ext, nlocals, frame_jit::Heat::Call);
+                    ext.frame_jit
+                        .warm(code, ext, nlocals, frame_jit::Heat::Call);
                 }
             }
             // The native code's view of the activation, built at its first
@@ -11402,7 +11427,12 @@ impl Interpreter {
                         #[cfg(feature = "jit")]
                         if !NATIVE {
                             if let Some(ext) = ext {
-                                ext.frame_jit.warm(code, ext, nlocals, frame_jit::Heat::BackEdge(last));
+                                ext.frame_jit.warm(
+                                    code,
+                                    ext,
+                                    nlocals,
+                                    frame_jit::Heat::BackEdge(last),
+                                );
                                 if ext.frame_jit.get(nlocals).is_some() {
                                     break Some(CoreExit::Switch);
                                 }
@@ -12943,8 +12973,7 @@ impl Interpreter {
         let Some(mut act) = self.inline_pool.pop() else {
             return false;
         };
-        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(sw.depth_cell)
-        else {
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(sw.depth_cell) else {
             self.inline_pool.push(act);
             return false;
         };
@@ -12954,7 +12983,11 @@ impl Interpreter {
         let nlocals = code.varnames.len();
         // SAFETY: a parked slot's locals storage is its own, and empty.
         let locals = unsafe { &mut *act.frame.locals.as_ptr() };
-        let first = if has_self { callee_slot + 1 } else { callee_slot + 2 };
+        let first = if has_self {
+            callee_slot + 1
+        } else {
+            callee_slot + 2
+        };
         let nargs = n - first;
         locals.reserve(nlocals.max(nargs));
         // SAFETY: the `nargs` operands above `first` move into the locals
@@ -13083,7 +13116,8 @@ impl Interpreter {
         let Some(recv) = frame.stack.last() else {
             return false;
         };
-        let Some(v) = self.pure_leaf_eval::<false, false>(code, getter, &[std::ptr::from_ref(recv)])
+        let Some(v) =
+            self.pure_leaf_eval::<false, false>(code, getter, &[std::ptr::from_ref(recv)])
         else {
             return false;
         };
@@ -14178,7 +14212,9 @@ impl Interpreter {
         // `PyFunction::code`); only compared, then cloned below.
         let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
         let (missing, slot_self) = slot.hit(Rc::as_ptr(f), Rc::as_ptr(code_rc))?;
-        if slot_self != has_self || !Self::lean_code_ok(code_rc) || Self::has_keyword_params(code_rc)
+        if slot_self != has_self
+            || !Self::lean_code_ok(code_rc)
+            || Self::has_keyword_params(code_rc)
         {
             return None;
         }
@@ -14254,9 +14290,9 @@ impl Interpreter {
                 unreachable!("checked above")
             };
             let cells = fresh_cells(f, &code, locals);
-            return Some(self.inline_bind_with(
-                frame, shell, pc, act, code, callable, guard, cells, true,
-            ));
+            return Some(
+                self.inline_bind_with(frame, shell, pc, act, code, callable, guard, cells, true),
+            );
         }
         // The cells handle is `f`'s (now `callable`'s) or the shared empty
         // vector: moving the callable leaves it where it was.
@@ -15760,29 +15796,28 @@ impl Interpreter {
                 }
             }
             return true;
-        } else {
-            let result = if clean {
-                done.clean = !had_shell;
-                // SAFETY: as above.
-                // SAFETY: as above.
-                unsafe { release_locals(&mut *frame.locals.as_ptr()) };
-                drop(done.guard.take());
-                Ok(v)
-            } else {
-                self.inline_finish(
-                    &mut done,
-                    QuietExit::Outcome {
-                        stepped: Ok(StepOutcome::Return(v)),
-                        cur_pc,
-                    },
-                )
-            };
-            done.clean &= !had_shell;
-            // SAFETY: the caller is the innermost remaining activation.
-            (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
-            // SAFETY: as above.
-            entry = unsafe { self.inline_deliver(&mut *cframe, done, result) };
         }
+        let result = if clean {
+            done.clean = !had_shell;
+            // SAFETY: as above.
+            // SAFETY: as above.
+            unsafe { release_locals(&mut *frame.locals.as_ptr()) };
+            drop(done.guard.take());
+            Ok(v)
+        } else {
+            self.inline_finish(
+                &mut done,
+                QuietExit::Outcome {
+                    stepped: Ok(StepOutcome::Return(v)),
+                    cur_pc,
+                },
+            )
+        };
+        done.clean &= !had_shell;
+        // SAFETY: the caller is the innermost remaining activation.
+        (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
+        // SAFETY: as above.
+        entry = unsafe { self.inline_deliver(&mut *cframe, done, result) };
         sw.cur = cframe;
         sw.last = if clast == &raw mut sw.scratch {
             sw.scratch = usize::MAX;
@@ -16464,8 +16499,7 @@ impl Interpreter {
             return false;
         };
         match slots.get_index_mut(key_idx as usize) {
-            Some((key, slot))
-                if matches!(&key.0, Object::Str(stored) if stored.as_ref() == name.as_str()) =>
+            Some((key, slot)) if matches!(&key.0, Object::Str(stored) if stored.as_ref() == name.as_str()) =>
             {
                 if !Self::core_droppable(slot) {
                     return false;
@@ -16508,9 +16542,7 @@ impl Interpreter {
             return false;
         };
         match slots.get_index(key_idx as usize) {
-            Some((key, old))
-                if matches!(&key.0, Object::Str(stored) if stored.as_ref() == name.as_str()) =>
-            {
+            Some((key, old)) if matches!(&key.0, Object::Str(stored) if stored.as_ref() == name.as_str()) => {
                 Self::core_droppable(old)
             }
             _ => slots.get(name).is_none(),
@@ -16952,9 +16984,10 @@ impl Interpreter {
                     let mut defaults: Option<Vec<Object>> = None;
                     let mut closure: Option<Vec<Object>> = None;
                     let mut k = 0;
-                    while let (Some(next), Some(value)) =
-                        (instrs.get(pc + 1 + k), n.checked_sub(2 + k).map(|i| &stack[i]))
-                    {
+                    while let (Some(next), Some(value)) = (
+                        instrs.get(pc + 1 + k),
+                        n.checked_sub(2 + k).map(|i| &stack[i]),
+                    ) {
                         let (Object::Tuple(items), OpCode::SetFunctionAttribute) = (value, next.op)
                         else {
                             break;
@@ -20042,7 +20075,11 @@ impl Interpreter {
         // `type.__dict__` is a data descriptor on the metatype that answers
         // ahead of everything else, unless the metaclass replaces
         // `__getattribute__` (a watched type re-arms on every lookup).
-        if code.names.get(name_idx as usize).is_some_and(|n| n == "__dict__") {
+        if code
+            .names
+            .get(name_idx as usize)
+            .is_some_and(|n| n == "__dict__")
+        {
             if crate::capi_watchers::types_active() {
                 return None;
             }
@@ -30942,7 +30979,7 @@ impl Interpreter {
         // match the `{}` literal and `b_dict` paths so a cycle through
         // the copy is collectable.
         if let Some(d) = &out {
-            gc_trace::track(&d);
+            gc_trace::track(d);
         }
         Ok(out)
     }
@@ -31218,10 +31255,12 @@ impl Interpreter {
         if self.seqtools.get().is_none() {
             let module = self.do_import("_seqtools", &Object::None, 0, globals).ok();
             let class = |name: &str| match &module {
-                Some(Object::Module(m)) => match m.dict.borrow().get(&DictKey(Object::from_str(name))) {
-                    Some(Object::Type(t)) => Some(t.clone()),
-                    _ => None,
-                },
+                Some(Object::Module(m)) => {
+                    match m.dict.borrow().get(&DictKey(Object::from_str(name))) {
+                        Some(Object::Type(t)) => Some(t.clone()),
+                        _ => None,
+                    }
+                }
                 _ => None,
             };
             let tools = class("_MapIter")
@@ -31290,9 +31329,9 @@ impl Interpreter {
         };
         let tools = self.seqtools.get()?.as_ref()?;
         let cls = inst.cls_raw();
-        let filter = if std::ptr::eq(cls, &*tools.map) {
+        let filter = if std::ptr::eq(cls, &raw const *tools.map) {
             false
-        } else if std::ptr::eq(cls, &*tools.filter) {
+        } else if std::ptr::eq(cls, &raw const *tools.filter) {
             true
         } else {
             return None;
@@ -31319,7 +31358,10 @@ impl Interpreter {
                 Err(e) => return Some(Err(e)),
             };
             if !filter {
-                return Some(self.call(&func, std::slice::from_ref(&item), &[], globals).map(Some));
+                return Some(
+                    self.call(&func, std::slice::from_ref(&item), &[], globals)
+                        .map(Some),
+                );
             }
             let keep = match &func {
                 Object::None => self.op_truth(&item),
@@ -40935,7 +40977,7 @@ impl Interpreter {
                     // is reclaimable and the drop-time "unclosed file"
                     // `ResourceWarning` still fires
                     // (test_io `test_garbage_collection`).
-                    gc_trace::track(&obj);
+                    gc_trace::track(obj);
                     Ok(())
                 }
             },
@@ -57611,8 +57653,7 @@ impl Drop for LeanFrame {
 /// (what [`fresh_cells`] appends).
 #[inline]
 fn closure_cells_ok(f: &PyFunction, code: &CodeObject) -> bool {
-    f.closure.len() == code.freevars.len()
-        && f.closure.iter().all(|c| matches!(c, Object::Cell(_)))
+    f.closure.len() == code.freevars.len() && f.closure.iter().all(|c| matches!(c, Object::Cell(_)))
 }
 
 /// The cells of a call of `f` running `code`, which has cell variables,
@@ -57632,7 +57673,9 @@ fn fresh_cells(
             .iter()
             .position(|n| n == name)
             .and_then(|i| locals.get_mut(i))
-            .map_or(Object::Unbound, |slot| std::mem::replace(slot, Object::Unbound));
+            .map_or(Object::Unbound, |slot| {
+                std::mem::replace(slot, Object::Unbound)
+            });
         cells.push(Rc::new(RefCell::new(initial)));
     }
     if crate::stdlib::tracemalloc_real::is_tracking() {
@@ -62969,7 +63012,10 @@ impl LeafSite {
                 let i = poly
                     .entries
                     .iter()
-                    .position(|e| e.as_ref().is_some_and(|e| e.ver == old.ver || e.ver == data.ver))
+                    .position(|e| {
+                        e.as_ref()
+                            .is_some_and(|e| e.ver == old.ver || e.ver == data.ver)
+                    })
                     .unwrap_or(poly.next);
                 if i == poly.next {
                     poly.next = (i + 1) % POLY_LEAF_SITES;
@@ -64302,10 +64348,8 @@ fn function_slots(
     let keys = fn_slot_keys();
     let module = globals.borrow().get(&DictKey(keys[1].clone())).cloned();
     let build = |module: Option<Object>| {
-        let mut map = crate::object::DictMap::with_capacity_and_hasher(
-            3,
-            crate::fasthash::FxBuildHasher,
-        );
+        let mut map =
+            crate::object::DictMap::with_capacity_and_hasher(3, crate::fasthash::FxBuildHasher);
         if let Some(m) = module {
             map.insert(DictKey(keys[0].clone()), m);
         }
@@ -66878,6 +66922,12 @@ fn compare_str(a: &str, b: &str, op: CompareKind) -> bool {
 
 pub use object::Object as Value;
 
+/// The `_seqtools` classes behind `map` and `filter`.
+struct SeqTools {
+    map: Rc<TypeObject>,
+    filter: Rc<TypeObject>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67905,7 +67955,9 @@ assert loop(2000) == 1999000
                     let native =
                         SCALAR_FIELD_UPDATE_NATIVE_CALLS.with(std::cell::Cell::get) - native;
                     let armed = SCALAR_FIELD_UPDATE_ARMED.with(std::cell::Cell::get) - armed;
-                    eprintln!("Application {name} completed updates: native {native}, armed {armed}");
+                    eprintln!(
+                        "Application {name} completed updates: native {native}, armed {armed}"
+                    );
                     if name == "richards" && !crate::tier2::jit_off_for_process() {
                         assert!(
                             native > 100 || (armed > 0 && native > 0),
@@ -74132,10 +74184,4 @@ print("native pickle coverage: ok")
         );
         assert_eq!(run(src), "small\nsmall\nlarge\n");
     }
-}
-
-/// The `_seqtools` classes behind `map` and `filter`.
-struct SeqTools {
-    map: Rc<TypeObject>,
-    filter: Rc<TypeObject>,
 }

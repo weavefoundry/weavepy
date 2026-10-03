@@ -1113,7 +1113,7 @@ impl<'c> Decoder<'c> {
             return None;
         }
         let mut height = 0;
-        for pair in stack[begin..].chunks_exact(2) {
+        for pair in stack[begin..].as_chunks::<2>().0 {
             // Tuple and float keys retain the full unpickler, including
             // arbitrary nesting and NaN key-identity behavior. So do
             // instances, whose hashing can call Python code.

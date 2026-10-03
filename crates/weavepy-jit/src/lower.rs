@@ -11,12 +11,12 @@
 //! locals + spilled stack back into the [`JitFrame`] and returns
 //! [`JitStatus::Deopt`] so the interpreter resumes at the exact pc.
 
+use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
     types, AbiParam, Block, BlockArg, FuncRef, Function, InstBuilder, MemFlags, SigRef, Signature,
     StackSlot, StackSlotData, StackSlotKind, Type, Value,
 };
-use cranelift_codegen::entity::EntityRef;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
 use crate::ir::{ArithKind, CmpKind, MathFunc, MethodRet, SliceOrigin, TFunc, TOp, TStmt, TTerm};
@@ -2366,7 +2366,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.b.ins().jump(merge, &[status.into()]);
         self.b.switch_to_block(merge);
         let r = self.b.block_params(merge)[0];
-        let res = if negate { self.b.ins().bxor_imm(r, 1) } else { r };
+        let res = if negate {
+            self.b.ins().bxor_imm(r, 1)
+        } else {
+            r
+        };
         self.vstack.push((res, JitType::Bool));
     }
 
@@ -2856,7 +2860,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .iadd_imm(mbuf, i64::from(token) * i64::from(l.method_size));
         let idx = self.b.ins().uload32(t, e, l.method_upd_idx);
         let from_arg = self.b.ins().uload32(t, e, l.method_upd_from_arg);
-        let unarmed = self.b.ins().icmp_imm(IntCC::Equal, idx, i64::from(u32::MAX));
+        let unarmed = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, idx, i64::from(u32::MAX));
         let form = self
             .b
             .ins()
@@ -2924,7 +2931,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let len = self.b.ins().uload32(t, block, l.split_len);
         let shadow = self.b.ins().uload32(t, e, l.method_upd_shadow);
         let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
-        let absent = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
+        let absent = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
         let shadowed = self.b.ins().icmp(IntCC::UnsignedGreaterThan, len, shadow);
         let bad = self.b.ins().bor(foreign, absent);
         let bad = self.b.ins().bor(bad, shadowed);
@@ -2934,7 +2944,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let at = self.b.ins().iadd_imm(at, i64::from(l.split_values));
         // An `int` field, plus the increment without overflow.
         let tag = self.b.ins().uload8(types::I32, t, at, 0);
-        let not_int = self.b.ins().icmp_imm(IntCC::NotEqual, tag, i64::from(l.tag_int));
+        let not_int = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, tag, i64::from(l.tag_int));
         self.miss_if(not_int, miss);
         let old = self.b.ins().load(types::I64, t, at, 8);
         let inc = match arg {
@@ -3125,7 +3138,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let done = self.b.create_block();
         let (items, len, list) = self.pinned_list(&l, pin, lanes, miss, false);
         let cap = self.b.ins().load(types::I64, t, list, l.list_cap);
-        let full = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, len, cap);
+        let full = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, len, cap);
         self.miss_if(full, miss);
         let off = self.b.ins().ishl_imm(len, 4);
         let at = self.b.ins().iadd(items, off);
@@ -3276,7 +3292,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .iadd_imm(gbuf, i64::from(site) * i64::from(l.guard_size));
         let idx = self.b.ins().uload32(t, g, l.guard_split_idx);
-        let none = self.b.ins().icmp_imm(IntCC::Equal, idx, i64::from(u32::MAX));
+        let none = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, idx, i64::from(u32::MAX));
         // The pin.
         let n = self.b.ins().load(types::I64, t, ctx, l.ctx_pins_len);
         let out = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, pin, n);
@@ -3287,8 +3306,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let p = self.b.ins().iadd(buf, off);
         let ptag = self.b.ins().uload8(types::I32, t, p, l.pin_tag);
         let otag = self.b.ins().uload8(types::I32, t, p, l.pin_obj);
-        let not_obj = self.b.ins().icmp_imm(IntCC::NotEqual, ptag, i64::from(l.pin_obj_tag));
-        let not_inst = self.b.ins().icmp_imm(IntCC::NotEqual, otag, i64::from(l.tag_instance));
+        let not_obj = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, ptag, i64::from(l.pin_obj_tag));
+        let not_inst = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, otag, i64::from(l.tag_instance));
         let bad = self.b.ins().bor(not_obj, not_inst);
         self.miss_if(bad, miss);
         let inst = self.b.ins().load(ptr, t, p, l.pin_obj + 8);
@@ -3319,7 +3344,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let ckeys = self.b.ins().load(ptr, t, cls, l.type_shared_keys);
         let len = self.b.ins().uload32(t, block, l.split_len);
         let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
-        let absent = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
+        let absent = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
         let bad = self.b.ins().bor(foreign, absent);
         self.miss_if(bad, miss);
         let off = self.b.ins().ishl_imm(idx, 4);
@@ -3335,7 +3363,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// the names before the guard's index and have room for one more, with
     /// no dict watcher active. Anything else branches to `miss` before
     /// anything is written.
-    fn split_append_addr(&mut self, l: &runtime::ObjLayout, pin: Value, site: u32, miss: Block) -> Value {
+    fn split_append_addr(
+        &mut self,
+        l: &runtime::ObjLayout,
+        pin: Value,
+        site: u32,
+        miss: Block,
+    ) -> Value {
         let t = MemFlags::trusted();
         let ptr = self.ptr_ty;
         let ctx = self.b.ins().load(ptr, t, self.frame_ptr, OFF_CTX);
@@ -3346,7 +3380,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .iadd_imm(gbuf, i64::from(site) * i64::from(l.guard_size));
         let idx = self.b.ins().uload32(t, g, l.guard_split_idx);
-        let none = self.b.ins().icmp_imm(IntCC::Equal, idx, i64::from(u32::MAX));
+        let none = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, idx, i64::from(u32::MAX));
         let n = self.b.ins().load(types::I64, t, ctx, l.ctx_pins_len);
         let out = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, pin, n);
         let bad = self.b.ins().bor(none, out);
@@ -3395,7 +3432,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let cap = self.b.ins().uload32(t, block, l.split_cap);
         let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
         let elsewhere = self.b.ins().icmp(IntCC::NotEqual, idx, len);
-        let full = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, len, cap);
+        let full = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, len, cap);
         let bad = self.b.ins().bor(foreign, elsewhere);
         let bad = self.b.ins().bor(bad, full);
         self.miss_if(bad, miss);
@@ -3431,7 +3471,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let p = self.b.ins().iadd(buf, off);
         let ptag = self.b.ins().uload8(types::I32, t, p, l.pin_tag);
         let lane = self.b.ins().uload8(types::I32, t, p, l.pin_list_elem);
-        let mut bad = self.b.ins().icmp_imm(IntCC::NotEqual, ptag, i64::from(l.pin_list_tag));
+        let mut bad = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, ptag, i64::from(l.pin_list_tag));
         let mut ok_lane = self.b.ins().iconst(types::I8, 0);
         for &want in lanes {
             let hit = self.b.ins().icmp_imm(IntCC::Equal, lane, want as i64);
@@ -4218,7 +4261,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// only computes, so when the enter helper declines or the leaf deopts
     /// (an overflow, a zero divisor), the ordinary call helper runs the
     /// call from the start.
-    fn emit_call_leaf(&mut self, ix: usize, from: &[LeafArg], call: SiteCall, ret: JitType, pc: u32) {
+    fn emit_call_leaf(
+        &mut self,
+        ix: usize,
+        from: &[LeafArg],
+        call: SiteCall,
+        ret: JitType,
+        pc: u32,
+    ) {
         let trusted = MemFlags::trusted();
         let (enter_addr, exit_addr, _) =
             runtime::self_call_helper_addrs().expect("checked by the engine");
@@ -4310,7 +4360,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // Declined or deopted: the ordinary call, from the start.
         self.b.switch_to_block(generic_b);
         self.vstack.extend(args.iter().copied());
-        self.emit_call_py(call.token, call.argc, call.kwc, call.perm, call.gaps, ret, pc);
+        self.emit_call_py(
+            call.token, call.argc, call.kwc, call.perm, call.gaps, ret, pc,
+        );
         let (v, _) = self.vstack.pop().expect("the call's result");
         self.b.ins().jump(join_b, &[v.into()]);
 

@@ -2664,13 +2664,13 @@ fn container_can_cycle(obj: &Object) -> bool {
 pub fn track_memoryview_exporter(mv: &Object, exporter: &Object) {
     debug_assert!(matches!(mv, Object::MemoryView(_)));
     if !is_atomic(exporter) {
-        track(&mv);
+        track(mv);
     }
 }
 
 pub fn track_if_cyclic(obj: &Object) -> bool {
     if container_can_cycle(obj) {
-        track(&obj);
+        track(obj);
         true
     } else {
         false
@@ -2837,7 +2837,7 @@ mod tests {
                 .map(|_| Object::Dict(Rc::new(RefCell::new(DictData::default()))))
                 .collect();
             for root in &roots {
-                state.track_now(&root);
+                state.track_now(root);
             }
             if frozen {
                 state.freeze_all();
@@ -2887,7 +2887,7 @@ mod tests {
             .collect();
         for root in &roots {
             // See `track_and_untrack` on `track_now`.
-            state.track_now(&root);
+            state.track_now(root);
         }
         for (collection, expected) in [(0, 1), (1, 2), (2, 2), (2, 2)] {
             assert_eq!(state.collect(collection), 0);

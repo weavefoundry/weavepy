@@ -610,6 +610,8 @@ struct RepeatCtx {
 }
 
 /// The matcher's capture marks: inline for up to 16 groups.
+// (The inline variant's size is the point: no allocation per match.)
+#[allow(clippy::large_enum_variant)]
 enum MarkBuf {
     Inline { len: usize, buf: [isize; 32] },
     Heap(Vec<isize>),
@@ -1423,7 +1425,7 @@ impl<'a, C: SreChar> Matcher<'a, C> {
         // eight frames stay far inside the 128 KiB red zone. (The first
         // check is at the eighth level, so a shallow match, the usual
         // case, never asks for the stack pointer.)
-        let r = if self.depth % 8 == 0 {
+        let r = if self.depth.is_multiple_of(8) {
             stacker::maybe_grow(128 * 1024, 4 * 1024 * 1024, || {
                 self.do_match_inner(pat, toplevel)
             })
@@ -2460,7 +2462,7 @@ impl Found<'_> {
     #[inline]
     pub(crate) fn mark(&self, i: usize) -> i64 {
         let (a, b) = self.span(i / 2);
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             a
         } else {
             b

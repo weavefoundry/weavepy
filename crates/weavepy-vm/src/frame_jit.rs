@@ -299,13 +299,17 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
             && crate::method_site_in_place(ext, pc + 1)
         {
             helped[pc + 1] = true;
-            if let Some(call) = (pc + 2..ins.len().min(pc + 12)).find(|&k| ins[k].op == OpCode::Call) {
+            if let Some(call) =
+                (pc + 2..ins.len().min(pc + 12)).find(|&k| ins[k].op == OpCode::Call)
+            {
                 helped[call] = true;
             }
         }
     }
     let at_loop = match at {
-        Heat::BackEdge(pc) => Some(pc).filter(|&pc| ins.get(pc).is_some_and(|i| i.op == OpCode::JumpBackward)),
+        Heat::BackEdge(pc) => {
+            Some(pc).filter(|&pc| ins.get(pc).is_some_and(|i| i.op == OpCode::JumpBackward))
+        }
         Heat::Call | Heat::Step => None,
     };
     ins.iter().enumerate().any(|(pc, i)| {
@@ -322,7 +326,10 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
             }
         }
         if stats::enabled() {
-            eprintln!("frame jit: {} loop at {top}: {native} native, {exits} exits", code.qualname);
+            eprintln!(
+                "frame jit: {} loop at {top}: {native} native, {exits} exits",
+                code.qualname
+            );
         }
         exits * EXIT_WEIGHT <= native
     })
@@ -456,7 +463,9 @@ fn tags() -> Option<Tags> {
         tag(&Object::new_list(Vec::new())),
         tag(&Object::new_dict()),
         tag(&Object::new_tuple_array([Object::None])),
-        tag(&Object::Type(crate::builtin_types::builtin_types().object_.clone())),
+        tag(&Object::Type(
+            crate::builtin_types::builtin_types().object_.clone(),
+        )),
     ];
     let t = Tags {
         none: tag(&Object::None),
@@ -473,7 +482,9 @@ fn tags() -> Option<Tags> {
     if samples.iter().any(|&t| t >= 64) {
         return None;
     }
-    let all = [t.none, t.unbound, t.boolean, t.int, t.float, t.cell, t.instance];
+    let all = [
+        t.none, t.unbound, t.boolean, t.int, t.float, t.cell, t.instance,
+    ];
     let distinct = all
         .iter()
         .enumerate()
@@ -893,7 +904,13 @@ unsafe extern "C" fn h_store_attr(
         let (code, pc) = (&*code, pc as usize);
         let local = &*st.locals.add(code.instructions[pc].arg as usize);
         let name = code.instructions[pc + 1].arg;
-        u32::from(!Interpreter::core_store_local_attr(code, local, pc + 1, name, &*slot))
+        u32::from(!Interpreter::core_store_local_attr(
+            code,
+            local,
+            pc + 1,
+            name,
+            &*slot,
+        ))
     }
 }
 
@@ -1010,16 +1027,7 @@ fn compile_with(
     let entries: Vec<bool>;
     let built = {
         let b = FunctionBuilder::new(&mut engine.ctx.func, &mut engine.fbctx);
-        let mut lower = Lower::new(
-            b,
-            ptr,
-            engine.tags,
-            code,
-            ext,
-            nlocals,
-            depths,
-            field_slots,
-        );
+        let mut lower = Lower::new(b, ptr, engine.tags, code, ext, nlocals, depths, field_slots);
         let done = lower.lower();
         entries = (0..ninstrs).map(|pc| lower.enters_at(pc)).collect();
         if done {
@@ -1266,11 +1274,7 @@ impl<'a> Lower<'a> {
     // ---- building blocks ----
 
     fn sig(&mut self, params: &[Type], ret: Option<Type>) -> SigRef {
-        if let Some((_, _, s)) = self
-            .sigs
-            .iter()
-            .find(|(p, r, _)| p == params && *r == ret)
-        {
+        if let Some((_, _, s)) = self.sigs.iter().find(|(p, r, _)| p == params && *r == ret) {
             return *s;
         }
         let mut sig = Signature::new(self.b.func.signature.call_conv);
@@ -1668,7 +1672,10 @@ impl<'a> Lower<'a> {
                 let t = o.tag.expect("unknown kinds carry a tag");
                 let byte = o.byte.expect("unknown kinds carry a byte");
                 let tb = self.tags;
-                let is_bool = self.b.ins().icmp_imm(IntCC::Equal, t, i64::from(tb.boolean));
+                let is_bool = self
+                    .b
+                    .ins()
+                    .icmp_imm(IntCC::Equal, t, i64::from(tb.boolean));
                 let is_int = self.b.ins().icmp_imm(IntCC::Equal, t, i64::from(tb.int));
                 let is_none = self.b.ins().icmp_imm(IntCC::Equal, t, i64::from(tb.none));
                 let mut ok = self.b.ins().bor(is_bool, is_int);
@@ -1768,8 +1775,8 @@ impl<'a> Lower<'a> {
             if ins.op == OpCode::LoadFast
                 && code.instructions.get(next).map(|i| i.op) == Some(OpCode::LoadMethodAttr)
             {
-                if let Some(call) = (pc + 2..n.min(pc + 12))
-                    .find(|&k| code.instructions[k].op == OpCode::Call)
+                if let Some(call) =
+                    (pc + 2..n.min(pc + 12)).find(|&k| code.instructions[k].op == OpCode::Call)
                 {
                     if call + 1 < n {
                         starts[call + 1] = true;
@@ -1878,9 +1885,7 @@ impl<'a> Lower<'a> {
                 self.push(Item::Int(v));
                 true
             }
-            OpCode::StoreFast if (ins.arg as usize) < self.nlocals => {
-                self.store_fast(pc, ins.arg)
-            }
+            OpCode::StoreFast if (ins.arg as usize) < self.nlocals => self.store_fast(pc, ins.arg),
             OpCode::PopTop => {
                 match self.pop() {
                     Item::Mem(s) => {
@@ -1944,7 +1949,10 @@ impl<'a> Lower<'a> {
                     Item::Mem(s) => {
                         let at = self.slot_addr(s);
                         let tag = self.tag_at(at);
-                        let none = self.b.ins().icmp_imm(IntCC::Equal, tag, i64::from(self.tags.none));
+                        let none =
+                            self.b
+                                .ins()
+                                .icmp_imm(IntCC::Equal, tag, i64::from(self.tags.none));
                         let scalar = self.is_scalar(tag);
                         let heap = self.b.create_block();
                         let done = self.b.create_block();
@@ -1962,14 +1970,18 @@ impl<'a> Lower<'a> {
                     Item::Local(i) => {
                         let at = self.local_addr(i);
                         let tag = self.tag_at(at);
-                        self.b.ins().icmp_imm(IntCC::Equal, tag, i64::from(self.tags.none))
+                        self.b
+                            .ins()
+                            .icmp_imm(IntCC::Equal, tag, i64::from(self.tags.none))
                     }
                     Item::Const(k) => {
                         let none = matches!(self.ext.objects[k as usize], Object::None);
                         self.b.ins().iconst(types::I8, i64::from(none))
                     }
                     Item::Dyn(tag, ..) => {
-                        self.b.ins().icmp_imm(IntCC::Equal, tag, i64::from(self.tags.none))
+                        self.b
+                            .ins()
+                            .icmp_imm(IntCC::Equal, tag, i64::from(self.tags.none))
                     }
                     Item::Int(_) | Item::Float(_) | Item::Bool(_) => {
                         self.b.ins().iconst(types::I8, 0)
@@ -2135,8 +2147,14 @@ impl<'a> Lower<'a> {
             return false;
         }
         self.flush();
-        let code = self.b.ins().iconst(self.ptr, std::ptr::from_ref(self.code) as i64);
-        let ext = self.b.ins().iconst(self.ptr, std::ptr::from_ref(self.ext) as i64);
+        let code = self
+            .b
+            .ins()
+            .iconst(self.ptr, std::ptr::from_ref(self.code) as i64);
+        let ext = self
+            .b
+            .ins()
+            .iconst(self.ptr, std::ptr::from_ref(self.ext) as i64);
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let nl = self.b.ins().iconst(types::I64, self.nlocals as i64);
         let len = self.b.ins().iconst(types::I64, self.depth as i64);
@@ -2194,10 +2212,17 @@ impl<'a> Lower<'a> {
         }
         self.flush();
         let slot = self.slot_addr(self.depth - 1);
-        let code = self.b.ins().iconst(self.ptr, std::ptr::from_ref(self.code) as i64);
+        let code = self
+            .b
+            .ins()
+            .iconst(self.ptr, std::ptr::from_ref(self.code) as i64);
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let r = self
-            .call(h_store_attr as *const () as usize, &[self.st, code, pcv, slot], true)
+            .call(
+                h_store_attr as *const () as usize,
+                &[self.st, code, pcv, slot],
+                true,
+            )
             .expect("returns");
         let out = self.exit_with(pc, &[], INTERP);
         self.branch_out(r, out);
@@ -2231,15 +2256,18 @@ impl<'a> Lower<'a> {
                 self.b.ins().iconst(types::I8, 0),
             )),
             Item::Bool(v) => Some((
-                self.b.ins().iconst(types::I64, i64::from(self.tags.boolean)),
+                self.b
+                    .ins()
+                    .iconst(types::I64, i64::from(self.tags.boolean)),
                 self.b.ins().iconst(types::I64, 0),
                 v,
             )),
             Item::Dyn(t, w, b) => Some((t, w, self.b.ins().ireduce(types::I8, b))),
-            Item::Const(k) if matches!(
-                self.ext.objects[k as usize],
-                Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
-            ) =>
+            Item::Const(k)
+                if matches!(
+                    self.ext.objects[k as usize],
+                    Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+                ) =>
             {
                 let o = self.operand(item).expect("a scalar constant");
                 let tag = match o.kind {
@@ -2376,8 +2404,9 @@ impl<'a> Lower<'a> {
             BinOpKind::Mod,
         ]
         .into_iter()
-        .any(|k| is(k));
-        let float_kind = is(BinOpKind::Add) || is(BinOpKind::Sub) || is(BinOpKind::Mult) || is(BinOpKind::Div);
+        .any(&is);
+        let float_kind =
+            is(BinOpKind::Add) || is(BinOpKind::Sub) || is(BinOpKind::Mult) || is(BinOpKind::Div);
         let ia = self.is_kind(a, Kind::Int, self.tags.int);
         let ib = self.is_kind(b, Kind::Int, self.tags.int);
         let fa = self.is_kind(a, Kind::Float, self.tags.float);
@@ -2418,7 +2447,12 @@ impl<'a> Lower<'a> {
             Ok(x) => s.b.ins().iconst(types::I8, i64::from(x)),
             Err(v) => v,
         };
-        let (iav, ibv, fav, fbv) = (to_v(self, ia), to_v(self, ib), to_v(self, fa), to_v(self, fb));
+        let (iav, ibv, fav, fbv) = (
+            to_v(self, ia),
+            to_v(self, ib),
+            to_v(self, fa),
+            to_v(self, fb),
+        );
         let done = self.b.create_block();
         self.b.append_block_param(done, types::I64);
         self.b.append_block_param(done, types::I64);
@@ -2568,11 +2602,14 @@ impl<'a> Lower<'a> {
             return false;
         }
         self.flush();
-        let ins = self
+        let ins = self.b.ins().iconst(
+            self.ptr,
+            std::ptr::from_ref(&self.code.instructions[pc]) as i64,
+        );
+        let code = self
             .b
             .ins()
-            .iconst(self.ptr, std::ptr::from_ref(&self.code.instructions[pc]) as i64);
-        let code = self.b.ins().iconst(self.ptr, std::ptr::from_ref(self.code) as i64);
+            .iconst(self.ptr, std::ptr::from_ref(self.code) as i64);
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let len = self.b.ins().iconst(types::I64, self.depth as i64);
         let n = self
@@ -2652,11 +2689,17 @@ impl<'a> Lower<'a> {
         } else if is(BinOpKind::BitXor) {
             self.b.ins().bxor(x, y)
         } else if is(BinOpKind::RShift) {
-            let out = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, y, 64);
+            let out = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, y, 64);
             self.branch_out(out, slow);
             self.b.ins().sshr(x, y)
         } else if is(BinOpKind::LShift) {
-            let out = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, y, 63);
+            let out = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, y, 63);
             self.branch_out(out, slow);
             let r = self.b.ins().ishl(x, y);
             let back = self.b.ins().sshr(r, y);
@@ -2757,8 +2800,12 @@ impl<'a> Lower<'a> {
                     Ok(x) => s.b.ins().iconst(types::I8, i64::from(x)),
                     Err(v) => v,
                 };
-                let (iav, ibv, fav, fbv) =
-                    (to_v(self, ia), to_v(self, ib), to_v(self, fa), to_v(self, fb));
+                let (iav, ibv, fav, fbv) = (
+                    to_v(self, ia),
+                    to_v(self, ib),
+                    to_v(self, fa),
+                    to_v(self, fb),
+                );
                 let done = self.b.create_block();
                 self.b.append_block_param(done, types::I8);
                 let both_int = self.b.ins().band(iav, ibv);
@@ -2801,9 +2848,7 @@ impl<'a> Lower<'a> {
                 let p = std::ptr::from_ref(obj).cast::<u8>();
                 // SAFETY: a constant's tag, payload byte and word (the
                 // constants live as long as the code).
-                let (t, b, w) = unsafe {
-                    (*p, *p.add(1), p.add(8).cast::<u64>().read_unaligned())
-                };
+                let (t, b, w) = unsafe { (*p, *p.add(1), p.add(8).cast::<u64>().read_unaligned()) };
                 let (t, w, b) = (i64::from(t), w as i64, i64::from(b));
                 (c(self, t), c(self, w), c(self, b))
             }
@@ -2850,7 +2895,10 @@ impl<'a> Lower<'a> {
         let words_mask = tags.by_pointer | (1i64 << tags.int) | (1i64 << tags.float);
         let by_word = self.b.ins().band_imm(bit, words_mask);
         let by_word = self.b.ins().icmp_imm(IntCC::NotEqual, by_word, 0);
-        let is_bool = self.b.ins().icmp_imm(IntCC::Equal, ta, i64::from(tags.boolean));
+        let is_bool = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, ta, i64::from(tags.boolean));
         let unit_mask = (1i64 << tags.none) | (1i64 << tags.unbound);
         let unit = self.b.ins().band_imm(bit, unit_mask);
         let unit = self.b.ins().icmp_imm(IntCC::NotEqual, unit, 0);
@@ -2883,7 +2931,11 @@ impl<'a> Lower<'a> {
         let it = self.slot_addr(it_slot);
         let out_slot = self.slot_addr(self.depth);
         let r = self
-            .call(h_for_iter as *const () as usize, &[self.st, it, out_slot], true)
+            .call(
+                h_for_iter as *const () as usize,
+                &[self.st, it, out_slot],
+                true,
+            )
             .expect("returns");
         let int_b = self.b.create_block();
         let other = self.b.create_block();
@@ -2971,7 +3023,10 @@ impl<'a> Lower<'a> {
         let ptr = self.ptr;
         let inst = self.b.ins().load(ptr, FLAGS, at, 8);
         let cls = self.b.ins().load(ptr, FLAGS, inst, l.inst_class);
-        let ver = self.b.ins().load(types::I64, FLAGS, cls, l.type_attr_version);
+        let ver = self
+            .b
+            .ins()
+            .load(types::I64, FLAGS, cls, l.type_attr_version);
         let cache = self
             .b
             .ins()
@@ -2998,7 +3053,10 @@ impl<'a> Lower<'a> {
         let ckeys = self.b.ins().load(ptr, FLAGS, cls, l.type_shared_keys);
         let len = self.b.ins().uload32(FLAGS, block, l.split_len);
         let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
-        let absent = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
+        let absent = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
         let bad = self.b.ins().bor(foreign, absent);
         self.branch_out(bad, miss);
         let off = self.b.ins().ishl_imm(idx, 4);

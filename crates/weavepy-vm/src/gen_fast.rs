@@ -380,7 +380,8 @@ impl Interpreter {
         let native = {
             let nlocals = locals.len();
             if ext.frame_jit.get(nlocals).is_none() {
-                ext.frame_jit.warm(code, ext, nlocals, crate::frame_jit::Heat::Step);
+                ext.frame_jit
+                    .warm(code, ext, nlocals, crate::frame_jit::Heat::Step);
             }
             ext.frame_jit.get(nlocals)
         };
@@ -747,12 +748,10 @@ impl Interpreter {
             }
             // (The stack slot keeps `g` alive: the inner step runs no code
             // that could reach this frame.)
-            Object::Generator(g) => {
-                match self.gen_fast_next(g, snap_gen, depth + 1, dead) {
-                    GenNext::Yielded(v) => ForNext::Value(v),
-                    GenNext::Declined | GenNext::Partial => ForNext::Bail,
-                }
-            }
+            Object::Generator(g) => match self.gen_fast_next(g, snap_gen, depth + 1, dead) {
+                GenNext::Yielded(v) => ForNext::Value(v),
+                GenNext::Declined | GenNext::Partial => ForNext::Bail,
+            },
             _ => ForNext::Bail,
         }
     }

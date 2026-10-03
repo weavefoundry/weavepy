@@ -1451,9 +1451,9 @@ fn subscr(owned: &mut Owned, a: V, b: V) -> Option<V> {
     match (unsafe { &*c }, b) {
         (Object::List(l), V::I(i)) => {
             let xs = unsafe { l.peek() }?;
-            Some(norm(&xs[index(i, xs.len())?]))
+            Some(norm(&raw const xs[index(i, xs.len())?]))
         }
-        (Object::Tuple(t), V::I(i)) => Some(norm(&t[index(i, t.len())?])),
+        (Object::Tuple(t), V::I(i)) => Some(norm(&raw const t[index(i, t.len())?])),
         (Object::Str(s), V::I(i)) => {
             if crate::object::str_char_len(s) != s.len() {
                 return None;
