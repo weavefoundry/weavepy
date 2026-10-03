@@ -579,8 +579,17 @@ fn scan<C: SreChar>(s: &[C], pred: impl Fn(u32) -> bool) -> usize {
 enum TailFirst {
     Any,
     Literal(u32),
-    /// A set (`IN`), by its code position.
+    /// A literal compared after ASCII (`LITERAL_IGNORE`) or Unicode
+    /// (`LITERAL_UNI_IGNORE`) lowercasing.
+    LiteralIgnore(u32),
+    LiteralUniIgnore(u32),
+    /// A set (`IN`), by its code position, and its lowercasing forms.
     Set(usize),
+    SetIgnore(usize),
+    SetUniIgnore(usize),
+    /// A `BRANCH` (by its code position) whose every alternative has a
+    /// requirement: any one of them.
+    Branch(usize),
 }
 
 /// Saved capture state (CPython's `LASTMARK_SAVE`, plus `MARK_PUSH` of
@@ -1157,35 +1166,112 @@ impl<'a, C: SreChar> Matcher<'a, C> {
 
     /// The first-character requirement of the tail at `tail` (see
     /// [`TailFirst`]).
-    #[inline]
-    fn tail_first(&self, mut tail: usize) -> TailFirst {
-        let code = self.code;
+    #[inline(always)]
+    fn tail_first(&self, tail: usize) -> TailFirst {
+        match Self::simple_first(self.code, tail) {
+            (TailFirst::Any, op) if self.code[op] == OP_BRANCH => self.branch_first(op),
+            (first, _) => first,
+        }
+    }
+
+    /// [`Self::tail_first`] without the `BRANCH` case, with the position
+    /// of the op it looked at (past any `MARK`s).
+    #[inline(always)]
+    fn simple_first(code: &[u32], mut tail: usize) -> (TailFirst, usize) {
         while code[tail] == OP_MARK {
             tail += 2;
         }
-        match code[tail] {
-            OP_LITERAL => TailFirst::Literal(code[tail + 1]),
-            OP_IN => TailFirst::Set(tail + 2),
+        let first = match code[tail] {
             // A single-character repeat of at least one item starts with
             // that item: <op> <skip> <min> <max> <item>.
             OP_REPEAT_ONE | OP_MIN_REPEAT_ONE | OP_POSSESSIVE_REPEAT_ONE if code[tail + 2] >= 1 => {
-                match code[tail + 4] {
-                    OP_LITERAL => TailFirst::Literal(code[tail + 5]),
-                    OP_IN => TailFirst::Set(tail + 6),
-                    _ => TailFirst::Any,
-                }
+                Self::item_first(code, tail + 4)
             }
+            _ => Self::item_first(code, tail),
+        };
+        (first, tail)
+    }
+
+    /// [`Self::tail_first`] of the `BRANCH` at `op`:
+    /// `<BRANCH> (<skip> <alternative>)* <0>`.
+    #[inline(never)]
+    fn branch_first(&self, op: usize) -> TailFirst {
+        let code = self.code;
+        let mut alt = op + 1;
+        while code[alt] != 0 {
+            // (A nested branch counts as no requirement.)
+            if matches!(Self::simple_first(code, alt + 1).0, TailFirst::Any) {
+                return TailFirst::Any;
+            }
+            alt += code[alt] as usize;
+        }
+        TailFirst::Branch(op)
+    }
+
+    /// Whether some alternative of the `BRANCH` at `op` can start at `pos`.
+    #[inline(never)]
+    fn branch_can_start(&self, op: usize, pos: usize) -> bool {
+        let code = self.code;
+        let mut alt = op + 1;
+        while code[alt] != 0 {
+            if self.simple_can_start(Self::simple_first(code, alt + 1).0, pos) {
+                return true;
+            }
+            alt += code[alt] as usize;
+        }
+        false
+    }
+
+    /// Whether the alternative whose body starts at `body` can start at
+    /// `pos` (kept out of line: the `BRANCH` arm is in the matcher's hot
+    /// loop).
+    #[inline(never)]
+    fn alternative_can_start(&self, body: usize, pos: usize) -> bool {
+        self.can_start(self.tail_first(body), pos)
+    }
+
+    /// The requirement of the single-character op at `op`.
+    #[inline(always)]
+    fn item_first(code: &[u32], op: usize) -> TailFirst {
+        match code[op] {
+            OP_LITERAL => TailFirst::Literal(code[op + 1]),
+            OP_LITERAL_IGNORE => TailFirst::LiteralIgnore(code[op + 1]),
+            OP_LITERAL_UNI_IGNORE => TailFirst::LiteralUniIgnore(code[op + 1]),
+            OP_IN => TailFirst::Set(op + 2),
+            OP_IN_IGNORE => TailFirst::SetIgnore(op + 2),
+            OP_IN_UNI_IGNORE => TailFirst::SetUniIgnore(op + 2),
             _ => TailFirst::Any,
         }
     }
 
     /// Whether the character at `pos` can start a tail requiring `first`.
-    #[inline]
+    #[inline(always)]
     fn can_start(&self, first: TailFirst, pos: usize) -> bool {
+        if let TailFirst::Branch(op) = first {
+            return self.branch_can_start(op, pos);
+        }
+        self.simple_can_start(first, pos)
+    }
+
+    /// [`Self::can_start`] for a requirement other than a `BRANCH`.
+    #[inline(always)]
+    fn simple_can_start(&self, first: TailFirst, pos: usize) -> bool {
+        if matches!(first, TailFirst::Any) {
+            return true;
+        }
+        if pos >= self.end {
+            return false;
+        }
+        let ch = cu(self.s[pos]);
         match first {
             TailFirst::Any => true,
-            TailFirst::Literal(c) => pos < self.end && cu(self.s[pos]) == c,
-            TailFirst::Set(set) => pos < self.end && self.charset(set, cu(self.s[pos])),
+            TailFirst::Literal(c) => ch == c,
+            TailFirst::LiteralIgnore(c) => lower_ascii(ch) == c,
+            TailFirst::LiteralUniIgnore(c) => lower_unicode(ch) == c,
+            TailFirst::Set(set) => self.charset(set, ch),
+            TailFirst::SetIgnore(set) => self.charset(set, lower_ascii(ch)),
+            TailFirst::SetUniIgnore(set) => self.charset(set, lower_unicode(ch)),
+            TailFirst::Branch(_) => true,
         }
     }
 
@@ -1334,8 +1420,10 @@ impl<'a, C: SreChar> Matcher<'a, C> {
         // Segmented stack growth: linear-depth backtracking (one native
         // frame per repetition) must not overflow the OS stack before
         // reaching MAX_DEPTH. Checking at every eighth level is enough:
-        // eight frames stay far inside the 128 KiB red zone.
-        let r = if self.depth % 8 == 1 {
+        // eight frames stay far inside the 128 KiB red zone. (The first
+        // check is at the eighth level, so a shallow match, the usual
+        // case, never asks for the stack pointer.)
+        let r = if self.depth % 8 == 0 {
             stacker::maybe_grow(128 * 1024, 4 * 1024 * 1024, || {
                 self.do_match_inner(pat, toplevel)
             })
@@ -1506,16 +1594,9 @@ impl<'a, C: SreChar> Matcher<'a, C> {
                 OP_BRANCH => {
                     let save = self.snapshot();
                     while code[pat] != 0 {
-                        // Fast skip when the branch can't possibly match.
-                        if code[pat + 1] == OP_LITERAL
-                            && (ptr >= end || cu(self.s[ptr]) != code[pat + 2])
-                        {
-                            pat += code[pat] as usize;
-                            continue;
-                        }
-                        if code[pat + 1] == OP_IN
-                            && (ptr >= end || !self.charset(pat + 3, cu(self.s[ptr])))
-                        {
+                        // Fast skip when the branch can't possibly match:
+                        // its first consuming op rejects the character.
+                        if !self.alternative_can_start(pat + 1, ptr) {
                             pat += code[pat] as usize;
                             continue;
                         }
