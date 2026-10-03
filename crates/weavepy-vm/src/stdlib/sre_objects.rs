@@ -32,7 +32,7 @@ use crate::shared_value::{SharedSlice, SharedStr};
 use crate::sync::{Rc, RefCell, Weak};
 use crate::types::{PyInstance, SlotStorage, TypeObject};
 
-use super::sre_mod::{self, CompiledCode};
+use super::sre_mod::{self, CompiledCode, Found};
 
 // Slot order of the natively built instances (the `__slots__` order the
 // classes declare).
@@ -102,6 +102,18 @@ type Ext = Rc<dyn std::any::Any + Send + Sync>;
 #[inline]
 fn class_ext(inst: &PyInstance) -> Option<Ext> {
     inst.class.borrow().native_ext.get().cloned()
+}
+
+/// Run `f` with the state on `inst`'s class, read in place. `f` must run
+/// no Python code (nothing can then reassign `__class__` and free the
+/// class while it runs).
+#[inline]
+fn with_state<R>(inst: &PyInstance, f: impl FnOnce(&State) -> R) -> Option<R> {
+    if crate::gil::free_threading_enabled() {
+        let ext = class_ext(inst)?;
+        return Some(f(ext.downcast_ref::<State>()?));
+    }
+    Some(f(state_of(inst.cls_raw())?))
 }
 
 fn with_interp<R>(
@@ -223,21 +235,19 @@ impl<'a> Subject<'a> {
         }
     }
 
-    /// One match attempt (see [`sre_mod::exec_marks`]).
-    fn exec(
+    /// One match attempt (see [`sre_mod::exec_found`]).
+    fn exec<R>(
         &self,
         cc: &CompiledCode,
         pos: usize,
         endpos: usize,
         mode: i64,
         must_advance: bool,
-        marks: &mut Vec<i64>,
-    ) -> Result<Option<isize>, RuntimeError> {
+        f: impl FnOnce(&Found<'_>) -> R,
+    ) -> Result<Option<R>, RuntimeError> {
         match &self.units {
-            Units::Narrow(b) => sre_mod::exec_marks(cc, b, pos, endpos, mode, must_advance, marks),
-            Units::Wide(w) => {
-                sre_mod::exec_marks(cc, &w[..], pos, endpos, mode, must_advance, marks)
-            }
+            Units::Narrow(b) => sre_mod::exec_found(cc, b, pos, endpos, mode, must_advance, f),
+            Units::Wide(w) => sre_mod::exec_found(cc, &w[..], pos, endpos, mode, must_advance, f),
         }
     }
 
@@ -268,8 +278,8 @@ impl<'a> Subject<'a> {
     }
 
     /// Group `g`'s text from `marks`, or `default` when it did not match.
-    fn group(&self, marks: &[i64], g: usize, default: &Object) -> Object {
-        let (a, b) = (marks[2 * g], marks[2 * g + 1]);
+    fn group(&self, found: &Found<'_>, g: usize, default: &Object) -> Object {
+        let (a, b) = found.span(g);
         if a < 0 || b < 0 {
             default.clone()
         } else {
@@ -393,23 +403,22 @@ fn merge_kwargs(args: &[Object], kw: &[(String, Object)], names: &[&str]) -> Opt
     Some(out)
 }
 
-thread_local! {
-    static SPARE: std::cell::RefCell<Vec<i64>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// A marks buffer from this thread's spare (taken, so a nested match,
-/// from a callable replacement, gets its own).
-fn take_marks() -> Vec<i64> {
-    SPARE.with(|s| std::mem::take(&mut *s.borrow_mut()))
-}
-
-fn give_marks(v: Vec<i64>) {
-    SPARE.with(|s| {
-        let mut s = s.borrow_mut();
-        if s.capacity() < v.capacity() {
-            *s = v;
-        }
-    });
+/// The flat spans tuple a match keeps (`_marks`), built in one
+/// fixed-size allocation for the common group counts.
+fn marks_tuple(found: &Found<'_>) -> Object {
+    use crate::tuple_storage::TupleStorage;
+    let n = 2 * (found.groups() + 1);
+    macro_rules! sized {
+        ($($k:literal),*) => {
+            match n {
+                $($k => TupleStorage::from_array::<$k>(std::array::from_fn(|i| {
+                    Object::Int(found.mark(i))
+                })),)*
+                _ => TupleStorage::from_exact_iter((0..n).map(|i| Object::Int(found.mark(i)))),
+            }
+        };
+    }
+    Object::Tuple(sized!(2, 4, 6, 8, 10, 12))
 }
 
 fn new_match(
@@ -418,8 +427,7 @@ fn new_match(
     string: &Object,
     pos: usize,
     endpos: usize,
-    marks: &[i64],
-    lastindex: isize,
+    found: &Found<'_>,
 ) -> Result<Object, RuntimeError> {
     let cls = st
         .match_cls
@@ -430,10 +438,8 @@ fn new_match(
         string.clone(),
         Object::Int(pos as i64),
         Object::Int(endpos as i64),
-        Object::Tuple(crate::tuple_storage::TupleStorage::from_exact_iter(
-            marks.iter().map(|&m| Object::Int(m)),
-        )),
-        Object::Int(lastindex as i64),
+        marks_tuple(found),
+        Object::Int(found.lastindex as i64),
     ];
     Ok(build(cls, &st.match_layout, values))
 }
@@ -467,8 +473,28 @@ fn exec_args(args: &[Object]) -> Option<ExecArgs<'_>> {
 }
 
 /// Run `f` with the pattern's state and code, when the receiver is a
-/// natively built pattern and the subject a fast one.
+/// natively built pattern and the subject a fast one. `f` runs no Python
+/// code, so the state is read through the class in place.
 fn with_pattern<R>(
+    recv: &Object,
+    string: &Object,
+    f: impl FnOnce(&State, &'static CompiledCode, i64) -> R,
+) -> Option<R> {
+    let Object::Instance(inst) = recv else {
+        return None;
+    };
+    with_state(inst, |st| {
+        let (cc, handle) = pattern_code(st, inst)?;
+        if !fast_subject(string, cc) {
+            return None;
+        }
+        Some(f(st, cc, handle))
+    })?
+}
+
+/// [`with_pattern`] for a body that may run Python code: the state is
+/// held by its own reference, not through the class.
+fn with_pattern_held<R>(
     recv: &Object,
     string: &Object,
     f: impl FnOnce(&State, &'static CompiledCode, i64) -> R,
@@ -490,14 +516,11 @@ fn pattern_exec(args: &[Object], mode: i64) -> Option<Result<Object, RuntimeErro
     with_pattern(a.recv, a.string, |st, cc, _| {
         let subject = Subject::new(a.string)?;
         let (p, e) = clamp(a.pos, a.endpos, subject.len());
-        let mut marks = take_marks();
-        let r = match subject.exec(cc, p, e, mode, false, &mut marks) {
-            Ok(None) => Ok(Object::None),
-            Ok(Some(li)) => new_match(st, a.recv, a.string, p, e, &marks, li),
-            Err(err) => Err(err),
-        };
-        give_marks(marks);
-        r
+        subject
+            .exec(cc, p, e, mode, false, |f| {
+                new_match(st, a.recv, a.string, p, e, f)
+            })?
+            .unwrap_or(Ok(Object::None))
     })
 }
 
@@ -519,23 +542,20 @@ fn pattern_findall(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         let subject = Subject::new(a.string)?;
         let (mut p, e) = clamp(a.pos, a.endpos, subject.len());
         let empty = empty_like(a.string);
-        let mut out = Vec::new();
-        let mut marks = Vec::new();
+        let mut out = Vec::with_capacity(8);
         let mut must_advance = false;
         while p <= e {
-            if subject
-                .exec(cc, p, e, 0, must_advance, &mut marks)?
-                .is_none()
-            {
+            let Some((s, en)) = subject.exec(cc, p, e, 0, must_advance, |f| {
+                out.push(match cc.groups {
+                    0 => subject.slice(f.start, f.end),
+                    1 => subject.group(f, 1, &empty),
+                    n => Object::new_tuple((1..=n).map(|g| subject.group(f, g, &empty)).collect()),
+                });
+                (f.start, f.end)
+            })?
+            else {
                 break;
-            }
-            let (s, en) = (marks[0] as usize, marks[1] as usize);
-            let item = match cc.groups {
-                0 => subject.slice(s, en),
-                1 => subject.group(&marks, 1, &empty),
-                n => Object::new_tuple((1..=n).map(|g| subject.group(&marks, g, &empty)).collect()),
             };
-            out.push(item);
             must_advance = s == en;
             p = en;
         }
@@ -569,6 +589,49 @@ fn pattern_scanner(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
                 Object::Bool(false),
             ],
         ))
+    })
+}
+
+/// Subjects up to this many code units have their matches found when
+/// `finditer` is called.
+const EAGER_FINDITER: usize = 512;
+
+/// `finditer`: over a short subject, an iterator over the matches found
+/// up front (a native tuple iterator, which the dispatch loop steps and
+/// ends without a call or a `StopIteration`); over a longer one, a lazy
+/// scanner. Only an immutable `str` or `bytes` subject is served, so
+/// finding the matches early cannot observe a different subject.
+fn pattern_finditer(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let a = exec_args(args)?;
+    let len = match a.string {
+        Object::Str(s) => SharedStr::char_count(s),
+        Object::Bytes(b) => b.len(),
+        _ => return None,
+    };
+    if len > EAGER_FINDITER {
+        return pattern_scanner(args);
+    }
+    with_pattern(a.recv, a.string, |st, cc, _| {
+        let subject = Subject::new(a.string)?;
+        let (mut p, e) = clamp(a.pos, a.endpos, subject.len());
+        let opos = p;
+        let mut out = Vec::with_capacity(8);
+        let mut must_advance = false;
+        while p <= e {
+            let Some((m, s, en)) = subject.exec(cc, p, e, 0, must_advance, |f| {
+                (new_match(st, a.recv, a.string, opos, e, f), f.start, f.end)
+            })?
+            else {
+                break;
+            };
+            out.push(m?);
+            must_advance = s == en;
+            p = en;
+        }
+        let items = crate::tuple_storage::TupleStorage::from_vec(out);
+        Ok(Object::Iter(Rc::new(RefCell::new(
+            crate::object::PyIterator::Tuple { items, index: 0 },
+        ))))
     })
 }
 
@@ -667,32 +730,42 @@ fn run_sub(
     let subject = Subject::new(string)?;
     let e = subject.len();
     let mut sink = Sink::new(&subject);
-    let mut marks = Vec::new();
     let (mut p, mut last, mut n) = (0usize, 0usize, 0i64);
     let mut must_advance = false;
     while p <= e && (count == 0 || n < count) {
-        let Some(li) = subject.exec(cc, p, e, 0, must_advance, &mut marks)? else {
-            break;
-        };
-        let (s, en) = (marks[0] as usize, marks[1] as usize);
-        sink.push_span(&subject, last, s);
-        match filter {
-            Filter::Literal(l) => sink.push_obj(l),
-            Filter::Template(t) => {
-                for piece in t.iter() {
-                    match piece {
-                        Piece::Lit(l) => sink.push_obj(l),
-                        Piece::Group(g) => {
-                            let (a, b) = (marks[2 * g], marks[2 * g + 1]);
-                            if a >= 0 && b >= 0 {
-                                sink.push_span(&subject, a as usize, b as usize);
+        // The literal and template replacements are written while the
+        // match is at hand; a callable gets a Match object, called after.
+        let Some((s, en, m)) = subject.exec(cc, p, e, 0, must_advance, |f| {
+            sink.push_span(&subject, last, f.start);
+            let m = match filter {
+                Filter::Literal(l) => {
+                    sink.push_obj(l);
+                    None
+                }
+                Filter::Template(t) => {
+                    for piece in t.iter() {
+                        match piece {
+                            Piece::Lit(l) => sink.push_obj(l),
+                            Piece::Group(g) => {
+                                let (a, b) = f.span(*g);
+                                if a >= 0 && b >= 0 {
+                                    sink.push_span(&subject, a as usize, b as usize);
+                                }
                             }
                         }
                     }
+                    None
                 }
-            }
-            Filter::Callable(f) => {
-                let m = new_match(st, recv, string, 0, e, &marks, li)?;
+                Filter::Callable(_) => Some(new_match(st, recv, string, 0, e, f)),
+            };
+            (f.start, f.end, m)
+        })?
+        else {
+            break;
+        };
+        match (filter, m) {
+            (Filter::Callable(f), Some(m)) => {
+                let m = m?;
                 // A builtin call runs with the interpreter and its thread
                 // handles already published, so the callable is called
                 // directly (as `functools` does).
@@ -704,6 +777,7 @@ fn run_sub(
                     sink.push_obj(&item);
                 }
             }
+            _ => {}
         }
         last = en;
         n += 1;
@@ -749,7 +823,7 @@ fn sub_full(args: &[Object], subn: bool) -> Option<Result<Object, RuntimeError>>
     if callable && !crate::builtins::object_is_callable(repl) {
         return None;
     }
-    with_pattern(recv, string, |st, cc, handle| {
+    with_pattern_held(recv, string, |st, cc, handle| {
         let filter = if callable {
             Filter::Callable(repl)
         } else if has_backslash(repl) {
@@ -797,22 +871,20 @@ fn pattern_split(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     with_pattern(recv, string, |_, cc, _| {
         let subject = Subject::new(string)?;
         let e = subject.len();
-        let mut out = Vec::new();
-        let mut marks = Vec::new();
+        let mut out = Vec::with_capacity(8);
         let (mut p, mut last, mut n) = (0usize, 0usize, 0i64);
         let mut must_advance = false;
         while p <= e && (maxsplit == 0 || n < maxsplit) {
-            if subject
-                .exec(cc, p, e, 0, must_advance, &mut marks)?
-                .is_none()
-            {
+            let Some((s, en)) = subject.exec(cc, p, e, 0, must_advance, |f| {
+                out.push(subject.slice(last, f.start));
+                for g in 1..=cc.groups {
+                    out.push(subject.group(f, g, &Object::None));
+                }
+                (f.start, f.end)
+            })?
+            else {
                 break;
-            }
-            let (s, en) = (marks[0] as usize, marks[1] as usize);
-            out.push(subject.slice(last, s));
-            for g in 1..=cc.groups {
-                out.push(subject.group(&marks, g, &Object::None));
-            }
+            };
             n += 1;
             must_advance = s == en;
             p = en;
@@ -834,17 +906,17 @@ fn with_match<R>(
     let Object::Instance(inst) = recv else {
         return None;
     };
-    let ext = class_ext(inst)?;
-    let st = ext.downcast_ref::<State>()?;
-    let slots = inst.slots.borrow();
-    let v = slots.values_for_layout(&st.match_layout)?;
-    let Object::Tuple(marks) = &v[M_MARKS] else {
-        return None;
-    };
-    if marks.len() < 2 || marks.len() % 2 != 0 {
-        return None;
-    }
-    f(st, v, marks)
+    with_state(inst, |st| {
+        let slots = inst.slots.borrow();
+        let v = slots.values_for_layout(&st.match_layout)?;
+        let Object::Tuple(marks) = &v[M_MARKS] else {
+            return None;
+        };
+        if marks.len() < 2 || marks.len() % 2 != 0 {
+            return None;
+        }
+        f(st, v, marks)
+    })?
 }
 
 enum GroupIdx {
@@ -1069,28 +1141,26 @@ fn scanner_step(args: &[Object], mode: i64, iter: bool) -> Result<Object, Runtim
     let subject = Subject::new(&string)?;
     let endpos = (endpos as usize).min(subject.len());
     let start = start as usize;
-    let mut marks = Vec::new();
-    let r = subject.exec(cc, start, endpos, mode, must_advance, &mut marks)?;
+    let pos = pos.max(0) as usize;
+    let r = subject.exec(cc, start, endpos, mode, must_advance, |f| {
+        (
+            new_match(st, &pattern, &string, pos, endpos, f),
+            f.start,
+            f.end,
+        )
+    })?;
     let mut slots = inst.slots.borrow_mut();
     let v = slots
         .values_for_layout_mut(&st.scanner_layout)
         .ok_or_else(bad)?;
-    let Some(li) = r else {
+    let Some((m, s, e)) = r else {
         v[S_START] = Object::Int(endpos as i64 + 1);
         return done();
     };
-    v[S_START] = Object::Int(marks[1]);
-    v[S_MUST] = Object::Bool(marks[0] == marks[1]);
+    v[S_START] = Object::Int(e as i64);
+    v[S_MUST] = Object::Bool(s == e);
     drop(slots);
-    new_match(
-        st,
-        &pattern,
-        &string,
-        pos.max(0) as usize,
-        endpos,
-        &marks,
-        li,
-    )
+    m
 }
 
 fn scanner_match(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1168,7 +1238,7 @@ const SPECS: &[Spec] = &[
         cls: 0,
         name: "finditer",
         key: "Pattern.finditer",
-        fast: pattern_scanner,
+        fast: pattern_finditer,
         full: None,
         params: EXEC_PARAMS,
     },
@@ -1445,20 +1515,13 @@ pub(crate) fn exec_match(args: &[Object]) -> Result<Object, RuntimeError> {
             .ok_or_else(|| type_error("exec_match(): expected an int"))
     };
     let (p, e) = clamp(int(pos)?, int(endpos)?, subject.len());
-    let mut marks = Vec::new();
     let must = must_advance.as_i64().unwrap_or(0) != 0;
-    match subject.exec(cc, p, e, int(mode)?, must, &mut marks)? {
-        None => Ok(Object::None),
-        Some(li) => new_match(
-            st,
-            pattern,
-            string,
-            int(mpos)?.max(0) as usize,
-            e,
-            &marks,
-            li,
-        ),
-    }
+    let mpos = int(mpos)?.max(0) as usize;
+    subject
+        .exec(cc, p, e, int(mode)?, must, |f| {
+            new_match(st, pattern, string, mpos, e, f)
+        })?
+        .unwrap_or(Ok(Object::None))
 }
 
 /// `_sre.clear_templates(Pattern)`: forget the parsed templates
