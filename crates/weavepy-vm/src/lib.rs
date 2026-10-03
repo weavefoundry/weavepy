@@ -10237,27 +10237,8 @@ impl Interpreter {
             .map_or(&[][..], |s| &s[..]);
         match other {
             Object::Instance(_) | Object::Module(_) => {
-                // `x.m(...)` of a pure leaf method with simple arguments: its
-                // result, evaluated on the borrowed operands.
-                if !simple_args_prefix(&code.instructions, pc + 2) {
-                    return None;
-                }
-                // A native method the site cached for this class version:
-                // straight to its fused call (the Python leaf probes below
-                // would miss).
-                if let (Object::Instance(i), Some(ms)) = (other, mslots.get(pc + 1)) {
-                    if ms
-                        .peek_inst_builtin(i.cls_raw().attr_version.get())
-                        .is_some()
-                    {
-                        if let Some(hit) = self.core_native_method(
-                            code, other, pc + 1, next.arg, mslots, lbase, nlocals, consts,
-                        ) {
-                            return Some(hit);
-                        }
-                    }
-                }
-                // A site that verified its callee for this class version.
+                // A site that verified its callee for this class version
+                // (its call checks the argument shape itself).
                 let mut missed = false;
                 if let (Object::Instance(i), Some(ext)) = (other, ext) {
                     if let Some(site) = leaf_site_hit(ext, pc + 1, i.cls_raw().attr_version.get()) {
@@ -10276,6 +10257,26 @@ impl Interpreter {
                             SiteCall::Done(v, call_pc) => return Some((Ok(v), call_pc)),
                             SiteCall::Declined => {}
                             SiteCall::Missed => missed = true,
+                        }
+                    }
+                }
+                // `x.m(...)` of a pure leaf method with simple arguments: its
+                // result, evaluated on the borrowed operands.
+                if !simple_args_prefix(&code.instructions, pc + 2) {
+                    return None;
+                }
+                // A native method the site cached for this class version:
+                // straight to its fused call (the Python leaf probes below
+                // would miss).
+                if let (Object::Instance(i), Some(ms)) = (other, mslots.get(pc + 1)) {
+                    if ms
+                        .peek_inst_builtin(i.cls_raw().attr_version.get())
+                        .is_some()
+                    {
+                        if let Some(hit) = self.core_native_method(
+                            code, other, pc + 1, next.arg, mslots, lbase, nlocals, consts,
+                        ) {
+                            return Some(hit);
                         }
                     }
                 }
@@ -14634,11 +14635,9 @@ impl Interpreter {
         for (k, o) in f.defaults[f.defaults.len() - missing..].iter().enumerate() {
             args[nargs + k] = o;
         }
-        if effect {
-            self.pure_leaf_eval::<false, true>(code_rc, f, &args[..total])
-        } else {
-            self.pure_leaf_eval::<false, false>(code_rc, f, &args[..total])
-        }
+        // SAFETY: this thread's own depth cell.
+        let depth = unsafe { (*depth_cell).get() };
+        self.pure_leaf_call(code_rc, f, &args[..total], effect, depth)
     }
 
     /// The core loop's fused `LOAD_FAST x; LOAD_ATTR m (method); <simple
@@ -14778,11 +14777,9 @@ impl Interpreter {
         if total != code_rc.arg_count as usize {
             return SiteCall::Declined;
         }
-        let r = if effect {
-            self.pure_leaf_eval::<false, true>(code_rc, f, &args[..total])
-        } else {
-            self.pure_leaf_eval::<false, false>(code_rc, f, &args[..total])
-        };
+        // SAFETY: as above.
+        let depth = unsafe { (*depth_cell).get() };
+        let r = self.pure_leaf_call(code_rc, f, &args[..total], effect, depth);
         let Some(v) = r else {
             if let Some(ext) = code_vm_ext(code) {
                 leaf_site_set(ext, code.instructions.len(), attr_pc, None);
@@ -14939,11 +14936,9 @@ impl Interpreter {
         for (k, o) in f.defaults[f.defaults.len() - missing..].iter().enumerate() {
             args[nargs + k] = o;
         }
-        if effect {
-            self.pure_leaf_eval::<false, true>(code_rc, f, &args[..total])
-        } else {
-            self.pure_leaf_eval::<false, false>(code_rc, f, &args[..total])
-        }
+        // SAFETY: this thread's own depth cell.
+        let depth = unsafe { (*depth_cell).get() };
+        self.pure_leaf_call(code_rc, f, &args[..total], effect, depth)
     }
 
     /// [`Self::core_pure_call`] for a `CALL_KW` at `pc`: `ops` is the
@@ -15267,6 +15262,40 @@ impl Interpreter {
         let r = self.leaf_eval::<GETTER, EFFECT>(code, f, args, 0);
         Self::leaf_call_exit(code, r.is_some());
         r
+    }
+
+    /// [`Self::pure_leaf_eval`] (with `effect`, of an effect leaf) at
+    /// recursion depth `depth`: a warm callee's compiled plan is entered
+    /// directly (see [`Self::leaf_site_native`]).
+    #[inline(always)]
+    fn pure_leaf_call(
+        &self,
+        code: &CodeObject,
+        f: &crate::object::PyFunction,
+        args: &[*const Object],
+        effect: bool,
+        depth: usize,
+    ) -> Option<Object> {
+        // (The tiny shapes `leaf_eval` answers itself skip the probe.)
+        #[cfg(feature = "jit")]
+        if code_vm_ext(code)
+            .is_some_and(|e| e.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) < 3)
+        {
+            let fast = if effect {
+                self.leaf_site_native::<true>(code, f, args, depth)
+            } else {
+                self.leaf_site_native::<false>(code, f, args, depth)
+            };
+            if let Some(r) = fast {
+                return r;
+            }
+        }
+        let _ = depth;
+        if effect {
+            self.pure_leaf_eval::<false, true>(code, f, args)
+        } else {
+            self.pure_leaf_eval::<false, false>(code, f, args)
+        }
     }
 
     /// [`Self::pure_leaf_eval`] for a constructor's leaf `__init__` on the
@@ -62573,8 +62602,23 @@ impl FieldSlot {
 /// `ver`, the method is `func`, whose code was `code`, a pure (or, with
 /// `effect`, an effect) leaf taking exactly the site's arguments. The
 /// class holds the function at that version; `func` is weak all the same,
-/// as [`MethodSlot`]'s are.
-struct LeafSite(std::cell::UnsafeCell<Option<LeafSiteData>>);
+/// as [`MethodSlot`]'s are. A site that sees several classes (a loop over
+/// a list of mixed constraint kinds) keeps the ones it saw before in its
+/// second cell, as [`MethodSlot`] keeps earlier resolutions.
+struct LeafSite(
+    std::cell::UnsafeCell<Option<LeafSiteData>>,
+    std::cell::UnsafeCell<Option<Box<PolyLeafSites>>>,
+);
+
+/// How many earlier callees a polymorphic [`LeafSite`] keeps.
+const POLY_LEAF_SITES: usize = 3;
+
+/// A [`LeafSite`]'s earlier callees, by class version, replaced
+/// round-robin.
+struct PolyLeafSites {
+    entries: [Option<LeafSiteData>; POLY_LEAF_SITES],
+    next: usize,
+}
 
 struct LeafSiteData {
     ver: u64,
@@ -62589,7 +62633,60 @@ unsafe impl Sync for LeafSite {}
 
 impl LeafSite {
     const fn empty() -> Self {
-        Self(std::cell::UnsafeCell::new(None))
+        Self(
+            std::cell::UnsafeCell::new(None),
+            std::cell::UnsafeCell::new(None),
+        )
+    }
+
+    /// An earlier callee verified under `ver` (see `leaf_site_hit`).
+    #[cold]
+    #[inline(never)]
+    fn poly_hit(
+        &self,
+        ver: u64,
+    ) -> Option<(*const crate::object::PyFunction, *const CodeObject, bool)> {
+        // SAFETY: GIL-serialized; the borrow ends before any refill.
+        let poly = unsafe { &*self.1.get() }.as_deref()?;
+        poly.entries
+            .iter()
+            .flatten()
+            .find(|d| d.ver == ver && d.func.strong_count() > 0)
+            .map(|d| (d.func.as_ptr(), d.code, d.effect))
+    }
+
+    /// Record `data` as the site's callee, keeping the one it replaces
+    /// (a live callee under another class version) among the earlier
+    /// ones; `None` forgets them all.
+    fn set(&self, data: Option<LeafSiteData>) {
+        // SAFETY: GIL-serialized; no reference into the site is live.
+        let (primary, poly) = unsafe { (&mut *self.0.get(), &mut *self.1.get()) };
+        let Some(data) = data else {
+            *primary = None;
+            *poly = None;
+            return;
+        };
+        if let Some(old) = primary.take() {
+            if old.ver != data.ver && old.func.strong_count() > 0 {
+                let poly = poly.get_or_insert_with(|| {
+                    Box::new(PolyLeafSites {
+                        entries: [const { None }; POLY_LEAF_SITES],
+                        next: 0,
+                    })
+                });
+                // The new callee's own entry, or the oldest, makes room.
+                let i = poly
+                    .entries
+                    .iter()
+                    .position(|e| e.as_ref().is_some_and(|e| e.ver == old.ver || e.ver == data.ver))
+                    .unwrap_or(poly.next);
+                if i == poly.next {
+                    poly.next = (i + 1) % POLY_LEAF_SITES;
+                }
+                poly.entries[i] = Some(old);
+            }
+        }
+        *primary = Some(data);
     }
 }
 
@@ -62601,10 +62698,15 @@ fn leaf_site_hit(
     pc: usize,
     ver: u64,
 ) -> Option<(*const crate::object::PyFunction, *const CodeObject, bool)> {
+    let site = ext.leaf_sites.get()?.get(pc)?;
     // SAFETY: GIL-serialized; the borrow ends before any refill.
-    let site = unsafe { &*ext.leaf_sites.get()?.get(pc)?.0.get() }.as_ref()?;
-    (site.ver == ver && site.func.strong_count() > 0)
-        .then(|| (site.func.as_ptr(), site.code, site.effect))
+    match unsafe { &*site.0.get() } {
+        Some(d) if d.ver == ver && d.func.strong_count() > 0 => {
+            Some((d.func.as_ptr(), d.code, d.effect))
+        }
+        Some(_) => site.poly_hit(ver),
+        None => None,
+    }
 }
 
 /// Whether the method call whose `LOAD_ATTR` is at `pc` last resolved to
@@ -62643,8 +62745,7 @@ fn leaf_site_set(ext: &CodeConstObjects, ninstrs: usize, pc: usize, data: Option
         .leaf_sites
         .get_or_init(|| (0..ninstrs).map(|_| LeafSite::empty()).collect());
     if let Some(site) = sites.get(pc) {
-        // SAFETY: GIL-serialized; no reference into the site is live.
-        unsafe { *site.0.get() = data };
+        site.set(data);
     }
 }
 

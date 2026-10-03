@@ -295,9 +295,46 @@ pub(super) fn run<const EFFECT: bool>(
             .as_ref()?
         }
     };
+    enter::<EFFECT>(
+        interp,
+        native,
+        (code, ext, plan, f),
+        args,
+        nest,
+        crate::recursion::current_depth(),
+    )
+}
+
+/// [`run`] for a plan whose native code is already compiled, with the
+/// caller's recursion `depth` in hand: `None` when there is no native
+/// code (yet), otherwise the evaluation's outcome.
+#[inline]
+pub(super) fn run_compiled<const EFFECT: bool>(
+    interp: &Interpreter,
+    code: &CodeObject,
+    ext: &CodeConstObjects,
+    plan: &LeafPlan,
+    f: &PyFunction,
+    args: &[*const Object],
+    depth: usize,
+) -> Option<Option<LeafRet>> {
+    let native = plan.native[usize::from(EFFECT)].get()?.as_ref()?;
+    enter::<EFFECT>(interp, native, (code, ext, plan, f), args, 0, depth)
+}
+
+/// One evaluation of `native` (see [`run`]), at recursion depth `depth`.
+#[inline(always)]
+fn enter<const EFFECT: bool>(
+    interp: &Interpreter,
+    native: &Native,
+    (code, ext, plan, f): (&CodeObject, &CodeConstObjects, &LeafPlan, &PyFunction),
+    args: &[*const Object],
+    nest: u8,
+    depth: usize,
+) -> Option<Option<LeafRet>> {
     // In-line callees run where the interpreter would nest frames: near
     // the recursion limit, it decides.
-    if crate::recursion::current_depth() + usize::from(nest) + usize::from(native.depth) + 1
+    if depth + usize::from(nest) + usize::from(native.depth) + 1
         >= crate::recursion::recursion_limit()
     {
         return None;

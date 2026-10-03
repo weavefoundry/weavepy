@@ -949,6 +949,42 @@ impl Interpreter {
             .into_object()
     }
 
+    /// A frameless call's evaluation of the general leaf `code` (see
+    /// `Interpreter::pure_leaf_call`) straight in its plan's native
+    /// code, at recursion depth `depth`, once the callee's warm-up is past
+    /// (the frameless call bookkeeping is then only the hit count):
+    /// `None` when the plan has no native code, or the callee one of the
+    /// tiny shapes `leaf_eval` answers itself; otherwise the result, or
+    /// `None` inside having done nothing observable.
+    #[cfg(feature = "jit")]
+    #[inline]
+    pub(crate) fn leaf_site_native<const EFFECT: bool>(
+        &self,
+        code: &CodeObject,
+        f: &crate::object::PyFunction,
+        args: &[*const Object],
+        depth: usize,
+    ) -> Option<Option<Object>> {
+        let ext = crate::code_vm_ext(code)?;
+        if ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) >= 3
+            || code.jit_hint.lean_entries() <= crate::tier2::LEAN_WARM_COMPILE_THRESHOLD_CAP
+        {
+            return None;
+        }
+        let plan = ext.leaf_plan.get()?.as_deref()?;
+        if args.len() != usize::from(plan.nargs) || args.len() != crate::leaf_arity(code) {
+            return None;
+        }
+        let r = jit::run_compiled::<EFFECT>(self, code, ext, plan, f, args, depth)?
+            .and_then(LeafRet::into_object);
+        if r.is_some() {
+            code.jit_hint.note_leaf_hit();
+        } else {
+            code.jit_hint.note_leaf_miss();
+        }
+        Some(r)
+    }
+
     /// [`Self::leaf_run`] with its result borrowed when the caller may
     /// (see [`LeafRet`]).
     #[inline(never)]

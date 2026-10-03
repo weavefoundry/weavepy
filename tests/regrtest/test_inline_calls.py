@@ -3,7 +3,8 @@
 A call of a function that its call site has seen before runs in a pooled
 activation (with its own cells when it has cell variables, and its
 `*args` tuple built by the site), and its return hands the result
-straight back; `with` loads its `__enter__` and `__exit__` from the site.
+straight back; `with` loads its `__enter__` and `__exit__` from the site,
+and a method call site remembers the leaf methods of several classes.
 Each loop here runs long enough for the sites to settle; then the callee,
 its arguments or its frame change, and every call must still behave as
 the interpreter's general call does.
@@ -262,6 +263,60 @@ class InlineCallTests(unittest.TestCase):
         self.assertEqual(va(1, 2), (1, 2))
         self.assertEqual(some(1, 5, 6), (1, 5, (6,)))
         self.assertIs(type(va()), tuple)
+
+    def test_polymorphic_leaf_sites(self):
+        class Base:
+            FORWARD = 1
+
+            def __init__(self, k):
+                self.k = k
+                self.direction = 1
+
+            def output(self):
+                return self.k if self.direction == Base.FORWARD else -self.k
+
+        class A(Base):
+            pass
+
+        class B(Base):
+            pass
+
+        class C:
+            def __init__(self, k):
+                self.k = k
+
+            def output(self):
+                return self.k * 10
+
+        class D(C):
+            pass
+
+        objs = [A(1), B(2), C(3), D(4)]
+
+        def total(n):
+            t = 0
+            for i in range(n):
+                for o in objs:
+                    t += o.output()
+            return t
+
+        self.assertEqual(total(WARM), WARM * (1 + 2 + 30 + 40))
+        # A class's method changes: only its instances see the new one.
+        B.output = lambda self: 100
+        self.assertEqual(total(10), 10 * (1 + 100 + 30 + 40))
+        # A function's code changes under the same class version.
+        def other(self):
+            return 7
+        C.output.__code__ = other.__code__
+        self.assertEqual(total(10), 10 * (1 + 100 + 7 + 7))
+        # An instance attribute shadows its class's method.
+        objs[0].output = lambda: 1000
+        self.assertEqual(total(10), 10 * (1000 + 100 + 7 + 7))
+        del objs[0].output
+        objs[1].direction = 0
+        self.assertEqual(total(10), 10 * (1 + 100 + 7 + 7))
+        del B.output
+        self.assertEqual(total(10), 10 * (1 - 2 + 7 + 7))
 
     def test_finalizers_run_on_return(self):
         seen = []
