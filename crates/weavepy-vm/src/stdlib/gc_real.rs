@@ -506,6 +506,8 @@ fn object_is_tracked(target: &Object) -> bool {
             inst.ensure_gc_tracked();
             gc_trace::with_state(|s| s.is_tracked_instance(id_of(target)))
         }
+        // A function may still be young.
+        Object::Function(_) => gc_trace::with_state(|s| s.is_tracked_instance(id_of(target))),
         // A list/dict/set born holding only scalars has its tracking
         // deferred; CPython tracks it from birth, so answer as CPython
         // does and hand it to the collector from here on.

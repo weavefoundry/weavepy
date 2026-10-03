@@ -389,6 +389,11 @@ pub struct GcState {
     /// collector the ones still alive ([`GcState::flush_young`]), so it
     /// sees exactly the population eager tracking would have shown it.
     young: RefCell<Vec<crate::sync::Weak<crate::types::PyInstance>>>,
+    /// Functions born since the last collection, held weakly as
+    /// [`Self::young`] holds instances (a `def` or `lambda` run in a loop
+    /// makes one per pass). A flush also hands the collector each live
+    /// one's globals dict, which [`track`] would have tracked at birth.
+    young_fns: RefCell<Vec<crate::sync::Weak<crate::object::PyFunction>>>,
     /// Frozen handles. `gc.freeze()` moves all tracked objects
     /// here; they are skipped by future collections until
     /// `gc.unfreeze()` runs.
@@ -437,6 +442,7 @@ impl GcState {
             deferred: RefCell::new(Vec::new()),
             deferred_limit: AtomicUsize::new(DEFERRED_FLOOR),
             young: RefCell::new(Vec::new()),
+            young_fns: RefCell::new(Vec::new()),
             frozen: RefCell::new(Vec::new()),
             garbage: RefCell::new(Vec::new()),
             callbacks: RefCell::new(Vec::new()),
@@ -474,6 +480,7 @@ impl GcState {
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).counts));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).deferred));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).young));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).young_fns));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).frozen));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).garbage));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).callbacks));
@@ -521,20 +528,34 @@ impl GcState {
             return;
         }
         if let Object::Instance(inst) = obj {
-            if self.nurse(inst) {
+            if self.nurse(&self.young, inst) {
                 return;
             }
         }
         self.track_now(obj);
     }
 
-    /// Register a newborn instance in the young set (see [`Self::young`]).
-    /// `false` leaves it to eager registration.
-    fn nurse(&self, inst: &crate::Rc<crate::types::PyInstance>) -> bool {
+    /// [`Self::track`] for a function: young (see [`Self::young_fns`]), or
+    /// registered at once together with its globals dict.
+    fn track_function(&self, obj: &Object, f: &crate::Rc<crate::object::PyFunction>) {
+        if self.nurse(&self.young_fns, f) {
+            return;
+        }
+        self.track(&Object::Dict(f.globals.clone()));
+        self.track_now(obj);
+    }
+
+    /// Register a newborn instance (or function) in its young set (see
+    /// [`Self::young`]). `false` leaves it to eager registration.
+    fn nurse<T: 'static>(
+        &self,
+        set: &RefCell<Vec<crate::sync::Weak<T>>>,
+        obj: &crate::Rc<T>,
+    ) -> bool {
         let over = {
             // SAFETY: nothing below runs code while the set is borrowed
             // (a dead predecessor's release only frees memory).
-            let Some(young) = (unsafe { self.young.peek_mut() }) else {
+            let Some(young) = (unsafe { set.peek_mut() }) else {
                 // A flush is walking the set, or cells are shared.
                 return false;
             };
@@ -547,14 +568,14 @@ impl GcState {
                     young.swap_remove(i);
                 }
             }
-            young.push(crate::Rc::downgrade(inst));
+            young.push(crate::Rc::downgrade(obj));
             young.len() >= YOUNG_CAP
         };
         // As in `track_now`: an id recycled from a finalized object starts
         // un-finalized (a finalizer that runs from here on is recorded).
         // SAFETY: a read that runs no code.
         if unsafe { self.finalized_ids.peek() }.is_none_or(|f| !f.is_empty()) {
-            let id = crate::Rc::as_ptr(inst) as usize as ObjectId;
+            let id = crate::Rc::as_ptr(obj) as usize as ObjectId;
             self.finalized_ids.borrow_mut().remove(&id);
         }
         self.note_gen0_alloc();
@@ -564,8 +585,20 @@ impl GcState {
         true
     }
 
-    /// Register the young instances still alive with the collector.
+    /// Register the young instances and functions still alive with the
+    /// collector.
     fn flush_young(&self) {
+        if let Ok(mut fns) = self.young_fns.try_borrow_mut() {
+            if !fns.is_empty() {
+                let fns = std::mem::take(&mut *fns);
+                for w in fns {
+                    if let Some(f) = w.upgrade() {
+                        self.track(&Object::Dict(f.globals.clone()));
+                        self.register(&Object::Function(f), false);
+                    }
+                }
+            }
+        }
         let young = match self.young.try_borrow_mut() {
             Ok(mut young) if !young.is_empty() => std::mem::take(&mut *young),
             _ => return,
@@ -577,22 +610,30 @@ impl GcState {
         }
     }
 
-    /// The young instances still alive (the dead ones are dropped).
+    /// The young instances and functions still alive (the dead ones are
+    /// dropped).
     fn young_live(&self) -> usize {
+        let fns = self.young_fns.try_borrow_mut().map_or(0, |mut fns| {
+            fns.retain(|w| w.strong_count() > 0);
+            fns.len()
+        });
         let Ok(mut young) = self.young.try_borrow_mut() else {
-            return 0;
+            return fns;
         };
         young.retain(|w| w.strong_count() > 0);
-        young.len()
+        young.len() + fns
     }
 
-    /// Whether the instance `id` is in the young set.
+    /// Whether the instance or function `id` is in a young set.
     fn is_young(&self, id: ObjectId) -> bool {
-        self.young.try_borrow().is_ok_and(|young| {
-            young
-                .iter()
-                .any(|w| w.as_ptr() as usize as ObjectId == id && w.strong_count() > 0)
-        })
+        fn holds<T: 'static>(set: &RefCell<Vec<crate::sync::Weak<T>>>, id: ObjectId) -> bool {
+            set.try_borrow().is_ok_and(|young| {
+                young
+                    .iter()
+                    .any(|w| w.as_ptr() as usize as ObjectId == id && w.strong_count() > 0)
+            })
+        }
+        holds(&self.young, id) || holds(&self.young_fns, id)
     }
 
     /// [`Self::track`] for a container its builder knows holds only
@@ -753,6 +794,19 @@ impl GcState {
     /// Stop tracking `obj`. Backs the explicit `gc._untrack(obj)` extension
     /// and the C-API `PyObject_GC_UnTrack`.
     pub fn untrack_id(&self, id: ObjectId) {
+        // (From the newest: an untrack usually follows its birth closely.)
+        if let Ok(mut fns) = self.young_fns.try_borrow_mut() {
+            if let Some(i) = fns
+                .iter()
+                .rposition(|w| w.as_ptr() as usize as ObjectId == id)
+            {
+                fns.swap_remove(i);
+                let mut counts = self.counts.borrow_mut();
+                counts[0] = counts[0].saturating_sub(1);
+                self.sync_gen0_gauge(counts[0], None);
+                return;
+            }
+        }
         if let Ok(mut young) = self.young.try_borrow_mut() {
             if let Some(i) = young
                 .iter()
@@ -896,7 +950,8 @@ impl GcState {
         self.index.borrow().contains_key(&id)
     }
 
-    /// [`Self::is_tracked`] for an instance, which may be young.
+    /// [`Self::is_tracked`] for an instance or function, which may be
+    /// young.
     pub fn is_tracked_instance(&self, id: ObjectId) -> bool {
         self.is_tracked(id) || self.is_young(id)
     }
@@ -2320,12 +2375,12 @@ pub fn track(obj: &Object) {
     // that never went through BuildMap) would otherwise never be a
     // candidate. CPython tracks every dict; we pair the tracking with
     // the objects that make the dict cycle-capable.
+    // (A young function's dict is tracked when the function is flushed.)
     if let Object::Module(m) = obj {
         let dict = Object::Dict(m.dict.clone());
         with_state(|s| s.track(&dict));
     } else if let Object::Function(f) = obj {
-        let dict = Object::Dict(f.globals.clone());
-        with_state(|s| s.track(&dict));
+        return with_state(|s| s.track_function(obj, f));
     }
     with_state(|s| s.track(obj));
 }

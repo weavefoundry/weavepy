@@ -16724,6 +16724,27 @@ impl Interpreter {
                     last = pc + k;
                     pc += 1 + k;
                 }
+                // A closure tuple's cell (`LOAD_FAST` of a cell variable in
+                // CPython 3.14's listing).
+                OpCode::LoadClosure | OpCode::LoadClosureBorrow => {
+                    let Some(cell) = cells.get(ins.arg as usize) else {
+                        break;
+                    };
+                    stack.push(Object::Cell(cell.clone()));
+                    last = pc;
+                    pc += 1;
+                }
+                // A prologue `MAKE_CELL`: the activation's cells are built
+                // with it (a later one, for an inlined comprehension, takes
+                // the full handler's fresh cell).
+                OpCode::MakeCell
+                    if instrs[..pc]
+                        .iter()
+                        .all(|i| matches!(i.op, OpCode::MakeCell | OpCode::CopyFreeVars)) =>
+                {
+                    last = pc;
+                    pc += 1;
+                }
                 OpCode::LoadConst => {
                     let Some(v) = consts.get(ins.arg as usize) else {
                         break;
@@ -57625,6 +57646,8 @@ static SLOW_LEAF_OPS: [bool; 256] = {
         OpCode::JumpForward,
         OpCode::ListAppend,
         OpCode::LoadAttr,
+        OpCode::LoadClosure,
+        OpCode::LoadClosureBorrow,
         OpCode::LoadConst,
         OpCode::LoadDeref,
         OpCode::LoadFast,
@@ -57633,6 +57656,8 @@ static SLOW_LEAF_OPS: [bool; 256] = {
         OpCode::LoadMethodAttr,
         OpCode::LoadSmallInt,
         OpCode::LoadSuperAttr,
+        OpCode::MakeCell,
+        OpCode::MakeFunction,
         OpCode::Nop,
         OpCode::NotTaken,
         OpCode::PopJumpIfFalse,
