@@ -8411,20 +8411,6 @@ unsafe extern "C" fn wpjit_get_iter(frame: *mut JitFrame, pin: i64) -> i64 {
     }
 }
 
-/// The `wpjit_iter_next` helper (RFC 0071 WS4): one step of a
-/// [`weavepy_jit::TTerm`]`::ForIter` loop over a pinned identity
-/// iterable. **Runs Python code** for a generator source (the resume
-/// executes the generator body — possibly natively, through
-/// `try_enter_resume`), so burned-in resolutions are revalidated after
-/// a dirty step; builtin iterators step without running Python and
-/// skip the revalidation. Statuses per [`weavepy_jit::IterNextHelper`]:
-/// `0` element in the lane, `1` exhausted, `2` deopt at the header
-/// (nothing consumed), `3` element consumed but outside the lane (raw
-/// object pinned, resume at the fused store), `4` raised.
-///
-/// # Safety
-///
-/// Same contract as [`wpjit_call_py`].
 /// One step of a list, tuple or range iterator, without the generic
 /// dispatch: the next item, or `None` once exhausted (the iterator then
 /// detached as [`PyIterator::next_value`] leaves it). `None` outside for
@@ -8441,6 +8427,20 @@ fn builtin_seq_step(cell: &Rc<GilRefCell<crate::object::PyIterator>>) -> Option<
     }
 }
 
+/// The `wpjit_iter_next` helper (RFC 0071 WS4): one step of a
+/// [`weavepy_jit::TTerm`]`::ForIter` loop over a pinned identity
+/// iterable. **Runs Python code** for a generator source (the resume
+/// executes the generator body — possibly natively, through
+/// `try_enter_resume`), so burned-in resolutions are revalidated after
+/// a dirty step; builtin iterators step without running Python and
+/// skip the revalidation. Statuses per [`weavepy_jit::IterNextHelper`]:
+/// `0` element in the lane, `1` exhausted, `2` deopt at the header
+/// (nothing consumed), `3` element consumed but outside the lane (raw
+/// object pinned, resume at the fused store), `4` raised.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
 unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i64) -> i64 {
     // SAFETY: see wpjit_call_py — same live-buffer contract.
     let jf = unsafe { &mut *frame };

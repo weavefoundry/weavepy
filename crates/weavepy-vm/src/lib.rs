@@ -7962,6 +7962,23 @@ impl Interpreter {
         }
     }
 
+    /// [`Self::inline_park`] for a clean slot whose operands and locals
+    /// the caller already released (the in-loop return's common case):
+    /// only the code handle and the slot's own fields remain.
+    #[inline(always)]
+    fn inline_park_clean(&mut self, mut act: Box<InlineAct>) {
+        debug_assert!(act.clean && act.frame.stack.is_empty());
+        // SAFETY: as `inline_park`: the code handle is owned while active.
+        unsafe { drop(std::ptr::read(&raw const act.frame.code)) };
+        act.parked = true;
+        act.clean = false;
+        act.guard = None;
+        act.caller_pending = None;
+        if self.inline_pool.len() < INLINE_POOL_CAP {
+            self.inline_pool.push(act);
+        }
+    }
+
     /// `FOR_ITER` over a suspended generator at `pc` of `frame`, as an
     /// inline activation: the generator's boxed frame runs in place (the
     /// `generator_send_lean` shape, without a nested native activation).
@@ -10338,22 +10355,10 @@ impl Interpreter {
                     ext.frame_jit.warm(code, ext, nlocals, frame_jit::Heat::Call);
                 }
             }
+            // The native code's view of the activation, built at its first
+            // entry (only the native copy of this loop enters it).
             #[cfg(feature = "jit")]
-            let mut nst = frame_jit::State {
-                locals: lbase,
-                stack: base,
-                len,
-                cap,
-                pc,
-                last,
-                countdown: std::ptr::addr_of_mut!(self.gil_countdown),
-                snap_gen,
-                maybe_dead: pending_work,
-                interp: std::ptr::from_ref(self),
-                out: 0,
-                depth_cell: sw.depth_cell,
-                err: None,
-            };
+            let mut nst: Option<frame_jit::State> = None;
             // The pc the native code last returned at (the arms run it).
             #[cfg(feature = "jit")]
             let mut handed = usize::MAX;
@@ -10361,12 +10366,27 @@ impl Interpreter {
                 #[cfg(feature = "jit")]
                 if NATIVE && pc != handed {
                     if let Some(native) = native.filter(|n| n.enters_at(pc)) {
+                        let nst = nst.get_or_insert_with(|| frame_jit::State {
+                            locals: lbase,
+                            stack: base,
+                            len,
+                            cap,
+                            pc,
+                            last,
+                            countdown: std::ptr::addr_of_mut!(self.gil_countdown),
+                            snap_gen,
+                            maybe_dead: pending_work,
+                            interp: std::ptr::from_ref(self),
+                            out: 0,
+                            depth_cell: sw.depth_cell,
+                            err: None,
+                        });
                         nst.len = len;
                         nst.pc = pc;
                         nst.last = last;
                         // SAFETY: the running activation's state, as this
                         // loop holds it (its locals count checked above).
-                        let status = unsafe { native.run(&mut nst) };
+                        let status = unsafe { native.run(nst) };
                         len = nst.len;
                         pc = nst.pc;
                         last = nst.last;
@@ -12709,6 +12729,9 @@ impl Interpreter {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         Self::unpack_bound_callee(unsafe { &mut *sw.cur }, pc);
+        if self.core_call_plain(sw, pc) {
+            return true;
+        }
         let mut tmp = None;
         // SAFETY: see `CoreSwitch`: the running activation is the
         // innermost; its handles are live and unborrowed here.
@@ -12743,6 +12766,133 @@ impl Interpreter {
         let Some(mut act) = act else {
             return false;
         };
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { (*sw.inl).push(act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
+    }
+
+    /// [`Self::core_call`]'s common case, with every check the site's
+    /// [`CallSlot`] settles done once: a plain function (no cells, no
+    /// closure, positional parameters only) that the site saw before,
+    /// called with exactly its arity, switched to in a pooled slot. The
+    /// general path's work, without its probes: `false` touches nothing.
+    #[inline(always)]
+    fn core_call_plain(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let Some(ins) = frame.code.instructions.get(pc) else {
+            return false;
+        };
+        let argc = ins.arg as usize;
+        let n = frame.stack.len();
+        let Some(callee_slot) = n.checked_sub(argc + 2) else {
+            return false;
+        };
+        let Object::Function(f) = &frame.stack[callee_slot] else {
+            return false;
+        };
+        let fp: *const crate::object::PyFunction = Rc::as_ptr(f);
+        let has_self = !matches!(frame.stack[callee_slot + 1], Object::Unbound);
+        // SAFETY: GIL-serialized raw read of the function's code cell (see
+        // `PyFunction::code`); only compared, then cloned below.
+        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        let Some(slot) = code_call_slot(&frame.code, pc) else {
+            return false;
+        };
+        if slot.hit(fp, Rc::as_ptr(code_rc)) != Some((0, has_self))
+            || !code_rc.cellvars.is_empty()
+            || !code_rc.freevars.is_empty()
+            || !f.closure.is_empty()
+            || Self::has_extended_params(code_rc)
+            || !Self::lean_code_ok(code_rc)
+            || crate::gil::free_threading_enabled()
+        {
+            return false;
+        }
+        let Some(mut act) = self.inline_pool.pop() else {
+            return false;
+        };
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(sw.depth_cell)
+        else {
+            self.inline_pool.push(act);
+            return false;
+        };
+        // Committed. The arguments move into the slot's (empty, sole-owned)
+        // locals; the callable and the empty self slot leave the stack.
+        let code = code_rc.clone();
+        let nlocals = code.varnames.len();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let first = if has_self { callee_slot + 1 } else { callee_slot + 2 };
+        let nargs = n - first;
+        locals.reserve(nlocals.max(nargs));
+        // SAFETY: the `nargs` operands above `first` move into the locals
+        // (reserved above) and the stack forgets them; the callable moves
+        // out of its slot, and an empty self slot owns nothing.
+        let callable = unsafe {
+            let (src, dst) = (frame.stack.as_ptr().add(first), locals.as_mut_ptr());
+            for k in 0..nargs {
+                dst.add(k).write(src.add(k).read());
+            }
+            locals.set_len(nargs);
+            let callable = frame.stack.as_ptr().add(callee_slot).read();
+            frame.stack.set_len(callee_slot);
+            callable
+        };
+        fill_unbound(locals, nlocals);
+        frame.pc = pc as u32 + 1;
+        // SAFETY: the slot is parked (see `inline_bind_cells`): its handles
+        // are stale copies, overwritten without a drop. `fp` stays alive
+        // while the slot holds `callable`.
+        unsafe {
+            let fr: &mut Frame = &mut act.frame;
+            std::ptr::write(&raw mut fr.code, code);
+            std::ptr::write(
+                &raw mut fr.cells,
+                borrowed_rc(crate::object::empty_cells_ref()),
+            );
+            std::ptr::write(&raw mut fr.globals, borrowed_rc(&(*fp).globals));
+            std::ptr::write(&raw mut fr.builtins, borrowed_rc(&(*fp).builtins));
+            std::ptr::write(&raw mut act.callable, callable);
+        }
+        act.frame.pc = 0;
+        act.parked = false;
+        act.call_pc = pc;
+        // The caller waits on the pending list (see `lean_pending_enter`).
+        // SAFETY: see `CoreSwitch`: the caller's handles are live, and
+        // nothing else borrows them here.
+        act.caller_pending = unsafe {
+            let depth = (*sw.inl).len();
+            if depth == 0 {
+                self.lean_pending_enter(frame, &mut *sw.root_shell, pc)
+            } else if depth == sw.entry_depth && !sw.entry_dead {
+                self.lean_pending_enter(frame, &mut *sw.entry_shell, pc)
+            } else {
+                let inl: &mut Vec<Box<InlineAct>> = &mut *sw.inl;
+                let caller: *mut InlineAct = &raw mut *inl[depth - 1];
+                self.lean_pending_enter(frame, &mut QuietShell::Lazy(&mut (*caller).act), pc)
+            }
+        };
+        act.exc_depth = self.exc_info_len();
+        act.guard = Some(guard);
+        // As `inline_bind_cells`: a hot body is compiled once, so native
+        // callers can take the direct lanes.
+        #[cfg(feature = "jit")]
+        {
+            let n = act.frame.code.jit_hint.bump_lean_entries();
+            if n <= crate::tier2::LEAN_WARM_COMPILE_THRESHOLD_CAP
+                && n == crate::tier2::lean_warm_at()
+                && !crate::tier2::jit_off_for_process()
+                && !act.frame.code.jit_hint.is_not_jitable()
+            {
+                crate::tier2::warm_compile(self, &mut act.frame);
+            }
+        }
         let callee: *mut Frame = &raw mut *act.frame;
         // SAFETY: as above.
         unsafe { (*sw.inl).push(act) };
@@ -15388,13 +15538,46 @@ impl Interpreter {
             // SAFETY: the callable is moved out exactly once; the parked
             // slot treats the field as stale (see `inline_deliver`).
             let callable = unsafe { std::ptr::read(&raw const done.callable) };
-            self.inline_park(done);
+            self.inline_park_clean(done);
             // SAFETY: as above.
-            unsafe {
-                (*cframe).stack.push(v);
-                self.release(callable);
+            unsafe { (*cframe).stack.push(v) };
+            match callable {
+                // A function something else still holds (its class, its
+                // module) can't die here: a plain decrement.
+                Object::Function(f) if Rc::strong_count(&f) > 1 => drop(f),
+                callable => self.release(callable),
             }
-            entry = QuietEntry::Returned { cur_pc: call_pc };
+            sw.cur = cframe;
+            sw.last = if clast == &raw mut sw.scratch {
+                sw.scratch = usize::MAX;
+                &raw mut sw.scratch
+            } else {
+                clast
+            };
+            // The caller's `Returned` entry protocol (`quiet_frame`), as
+            // below.
+            // SAFETY: as above.
+            unsafe { *sw.last = call_pc };
+            if self.gil_countdown <= 2 {
+                sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
+                return true;
+            }
+            self.gil_countdown -= 1;
+            if crate::hot_gates::loop_gen() != snap_gen {
+                sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
+                return true;
+            }
+            // SAFETY: see `quiet_run`.
+            if unsafe { (*sw.maybe_dead).get() } {
+                // SAFETY: as above.
+                unsafe {
+                    self.flush_lean(&mut *cframe, &mut *cshell.cast::<QuietShell<'_>>());
+                }
+                if self.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != snap_gen {
+                    sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
+                }
+            }
+            return true;
         } else {
             let result = if clean {
                 done.clean = !had_shell;
