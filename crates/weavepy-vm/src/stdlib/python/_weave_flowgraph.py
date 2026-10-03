@@ -410,22 +410,25 @@ def check_cfg(g):
 
 # ---- stack effects ---------------------------------------------------------
 
-_POPPED = _opcode_tables._POPPED
-_PUSHED = _opcode_tables._PUSHED
-_DEOPT = _opcode_tables._DEOPT
+# A table entry is the count, or a function of `oparg` (see `_opcode`).
+_DEOPT, _POPPED, _PUSHED = _opcode_tables._stack_tables()
 _MAX_REAL_OPCODE = _opcode_tables._MAX_REAL_OPCODE
 
 
 def num_popped(opcode, oparg):
     """``_PyOpcode_num_popped``; ``-1`` for an unknown opcode."""
     fn = _POPPED.get(opcode)
-    return -1 if fn is None else fn(oparg)
+    if fn is None:
+        return -1
+    return fn if fn.__class__ is int else fn(oparg)
 
 
 def num_pushed(opcode, oparg):
     """``_PyOpcode_num_pushed``; ``-1`` for an unknown opcode."""
     fn = _PUSHED.get(opcode)
-    return -1 if fn is None else fn(oparg)
+    if fn is None:
+        return -1
+    return fn if fn.__class__ is int else fn(oparg)
 
 
 def get_stack_effects(opcode, oparg, jump):
