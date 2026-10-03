@@ -102,6 +102,49 @@ class PlanStoreTests(unittest.TestCase):
         drive(n, 1)
         self.assertEqual(s.v, 3)
 
+    def test_slots_constructor(self):
+        import gc
+
+        class P:
+            __slots__ = ("x", "y")
+
+            def __init__(self, x, y):
+                self.x = x
+                self.y = y
+
+        class Q(P):
+            pass
+
+        def build(n):
+            if n < 0:
+                return locals()
+            t = 0
+            for i in range(n):
+                p = P(i, 2)
+                t += p.x + p.y
+            return t
+
+        self.assertEqual(build(WARM), sum(range(WARM)) + 2 * WARM)
+        p = P([], "s")
+        self.assertEqual((p.x, p.y), ([], "s"))
+        self.assertTrue(gc.is_tracked(p))
+        del p.x
+        with self.assertRaises(AttributeError):
+            p.x
+        p.__init__(1, 2)
+        self.assertEqual((p.x, p.y), (1, 2))
+        q = Q(3, 4)
+        self.assertEqual((q.x, q.y), (3, 4))
+        q.z = 5
+        self.assertEqual(vars(q), {"z": 5})
+        loop = P(0, 0)
+        loop.x = loop
+        del loop
+        gc.collect()
+        P.y = property(lambda self: "prop", lambda self, v: None)
+        r = P(1, 2)
+        self.assertEqual((r.x, r.y), (1, "prop"))
+
     def test_scalar_stores_in_place(self):
         class Src:
             def __init__(self, x):

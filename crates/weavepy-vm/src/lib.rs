@@ -7991,7 +7991,7 @@ impl Interpreter {
         act.caller_pending = None;
         act.init_inst = None;
         if self.inline_pool.len() < INLINE_POOL_CAP {
-            self.inline_pool.push(act);
+            push_fast(&mut self.inline_pool, act);
         }
     }
 
@@ -8013,7 +8013,7 @@ impl Interpreter {
         act.guard = None;
         act.caller_pending = None;
         if self.inline_pool.len() < INLINE_POOL_CAP {
-            self.inline_pool.push(act);
+            push_fast(&mut self.inline_pool, act);
         }
     }
 
@@ -9355,7 +9355,7 @@ impl Interpreter {
     /// the call didn't use (its locals must be empty again).
     fn inline_unslot(&mut self, act: Box<InlineAct>) {
         if self.inline_pool.len() < INLINE_POOL_CAP {
-            self.inline_pool.push(act);
+            push_fast(&mut self.inline_pool, act);
         }
     }
 
@@ -9647,7 +9647,7 @@ impl Interpreter {
     /// `lasti` from the advanced `pc`); one that has its shell keeps the
     /// mirror current itself, as the general path's pre-step store does.
     /// Returns the pending entry for [`Self::lean_pending_exit`].
-    #[inline]
+    #[inline(always)]
     fn lean_pending_enter(
         &mut self,
         frame: &mut Frame,
@@ -9782,7 +9782,7 @@ impl Interpreter {
     /// warms that compile after a few entries): a native entry is then
     /// worth its framing — a recursive body calls its native self
     /// directly from there.
-    #[inline]
+    #[inline(always)]
     fn lean_code_ok(code: &CodeObject) -> bool {
         if code.wire.as_ref().is_some_and(|w| w.exec_error.is_some()) {
             return false;
@@ -12894,7 +12894,7 @@ impl Interpreter {
         };
         let callee: *mut Frame = &raw mut *act.frame;
         // SAFETY: as above.
-        unsafe { (*sw.inl).push(act) };
+        unsafe { push_fast(&mut *sw.inl, act) };
         sw.cur = callee;
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
@@ -13021,7 +13021,7 @@ impl Interpreter {
         }
         let callee: *mut Frame = &raw mut *act.frame;
         // SAFETY: as above.
-        unsafe { (*sw.inl).push(act) };
+        unsafe { push_fast(&mut *sw.inl, act) };
         sw.cur = callee;
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
@@ -13117,7 +13117,7 @@ impl Interpreter {
         };
         let callee: *mut Frame = &raw mut *act.frame;
         // SAFETY: as above.
-        unsafe { (*sw.inl).push(act) };
+        unsafe { push_fast(&mut *sw.inl, act) };
         sw.cur = callee;
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
@@ -13144,7 +13144,7 @@ impl Interpreter {
         };
         let callee: *mut Frame = &raw mut *act.frame;
         // SAFETY: as above.
-        unsafe { (*sw.inl).push(act) };
+        unsafe { push_fast(&mut *sw.inl, act) };
         sw.cur = callee;
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
@@ -13173,7 +13173,7 @@ impl Interpreter {
         };
         let callee: *mut Frame = &raw mut *act.frame;
         // SAFETY: as above.
-        unsafe { (*sw.inl).push(act) };
+        unsafe { push_fast(&mut *sw.inl, act) };
         sw.cur = callee;
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
@@ -13217,7 +13217,7 @@ impl Interpreter {
         };
         let callee: *mut Frame = &raw mut *act.frame;
         // SAFETY: as above.
-        unsafe { (*sw.inl).push(act) };
+        unsafe { push_fast(&mut *sw.inl, act) };
         sw.cur = callee;
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
@@ -13613,7 +13613,7 @@ impl Interpreter {
         act.init_inst = Some(inst);
         let callee: *mut Frame = &raw mut *act.frame;
         // SAFETY: as above.
-        unsafe { (*sw.inl).push(act) };
+        unsafe { push_fast(&mut *sw.inl, act) };
         sw.cur = callee;
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
@@ -15553,7 +15553,7 @@ impl Interpreter {
         };
         let gen_frame = act.gen_frame;
         // SAFETY: as above.
-        unsafe { (*sw.inl).push(act) };
+        unsafe { push_fast(&mut *sw.inl, act) };
         sw.cur = gen_frame;
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
@@ -15614,7 +15614,7 @@ impl Interpreter {
         // SAFETY: the consumer is the innermost remaining activation.
         let (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
         // SAFETY: as above.
-        unsafe { (*cframe).stack.push(v) };
+        unsafe { push_fast(&mut (*cframe).stack, v) };
         sw.cur = cframe;
         sw.last = if clast == &raw mut sw.scratch {
             sw.scratch = usize::MAX;
@@ -15709,9 +15709,8 @@ impl Interpreter {
         if clean && done.init_inst.is_none() {
             done.clean = !had_shell;
             // SAFETY: as above.
-            for v in unsafe { (*frame.locals.as_ptr()).drain(..) } {
-                drop_hot(v);
-            }
+            // SAFETY: as above.
+            unsafe { release_locals(&mut *frame.locals.as_ptr()) };
             drop(done.guard.take());
             // SAFETY: the caller is the innermost remaining activation.
             (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
@@ -15723,7 +15722,7 @@ impl Interpreter {
             let callable = unsafe { std::ptr::read(&raw const done.callable) };
             self.inline_park_clean(done);
             // SAFETY: as above.
-            unsafe { (*cframe).stack.push(v) };
+            unsafe { push_fast(&mut (*cframe).stack, v) };
             match callable {
                 // A function something else still holds (its class, its
                 // module) can't die here: a plain decrement.
@@ -15765,9 +15764,8 @@ impl Interpreter {
             let result = if clean {
                 done.clean = !had_shell;
                 // SAFETY: as above.
-                for v in unsafe { (*frame.locals.as_ptr()).drain(..) } {
-                    drop_hot(v);
-                }
+                // SAFETY: as above.
+                unsafe { release_locals(&mut *frame.locals.as_ptr()) };
                 drop(done.guard.take());
                 Ok(v)
             } else {
@@ -16358,10 +16356,11 @@ impl Interpreter {
     }
 
     /// The core loop's `STORE_ATTR` into an instance: an indexed store
-    /// into the receiver's `__dict__` (the warm shape), or the single
-    /// probe a `StoreAttrNewKey` site's insert-or-overwrite needs — the
+    /// into the receiver's `__dict__` (the warm shape), the single probe
+    /// a `StoreAttrNewKey` site's insert-or-overwrite needs — the
     /// constructor shape, which would otherwise leave the loop for the
-    /// helper on every `self.x = …`. Nothing here runs Python code.
+    /// helper on every `self.x = …` — or a `__slots__` member's store.
+    /// Nothing here runs Python code.
     ///
     /// On `true` the value *moved* into the dict: the caller drops its
     /// stack slot without dropping the value.
@@ -16434,7 +16433,83 @@ impl Interpreter {
             IC::StoreAttrNewKey { ver } => {
                 Self::core_store_new_attr(code, inst, cls, attr_pc, name_idx, ver, value)
             }
+            IC::StoreAttrSlot { key_idx, ver } if cls.attr_version.get() == ver => {
+                Self::core_store_slot(code, inst, key_idx, name_idx, value)
+            }
             _ => false,
+        }
+    }
+
+    /// A validated `__slots__` member's store (the site's
+    /// `StoreAttrSlot`, whose class version the caller checked), as
+    /// `leaf_store_attr` makes it: over the member's droppable value, or
+    /// as its first value (the constructor shape). `true` moved `value`
+    /// in; `false` touched nothing.
+    #[inline(never)]
+    fn core_store_slot(
+        code: &CodeObject,
+        inst: &PyInstance,
+        key_idx: u32,
+        name_idx: u32,
+        value: &Object,
+    ) -> bool {
+        let Some(name) = code.names.get(name_idx as usize) else {
+            return false;
+        };
+        let Ok(mut slots) = inst.slots.try_borrow_mut() else {
+            return false;
+        };
+        match slots.get_index_mut(key_idx as usize) {
+            Some((key, slot))
+                if matches!(&key.0, Object::Str(stored) if stored.as_ref() == name.as_str()) =>
+            {
+                if !Self::core_droppable(slot) {
+                    return false;
+                }
+                // SAFETY: the value moves out of the caller's slot (it
+                // forgets it on `true`); the displaced one is droppable.
+                let v = unsafe { std::ptr::read(value) };
+                inst.note_slot_store(&v);
+                drop(std::mem::replace(slot, v));
+                true
+            }
+            _ => {
+                // Held elsewhere (another layout): the full store decides.
+                if slots.get(name).is_some() {
+                    return false;
+                }
+                // SAFETY: as above.
+                let v = unsafe { std::ptr::read(value) };
+                inst.note_slot_store(&v);
+                match code_name_obj(code, name_idx) {
+                    Some(Object::Str(shared)) => slots.insert_shared(shared, v),
+                    _ => slots.insert(name, v),
+                };
+                true
+            }
+        }
+    }
+
+    /// [`Self::core_store_slot`]'s verdict, without storing.
+    fn core_store_slot_ready(
+        code: &CodeObject,
+        inst: &PyInstance,
+        key_idx: u32,
+        name_idx: u32,
+    ) -> bool {
+        let Some(name) = code.names.get(name_idx as usize) else {
+            return false;
+        };
+        let Ok(slots) = inst.slots.try_borrow() else {
+            return false;
+        };
+        match slots.get_index(key_idx as usize) {
+            Some((key, old))
+                if matches!(&key.0, Object::Str(stored) if stored.as_ref() == name.as_str()) =>
+            {
+                Self::core_droppable(old)
+            }
+            _ => slots.get(name).is_none(),
         }
     }
 
@@ -16471,6 +16546,10 @@ impl Interpreter {
         let cls = inst.cls_raw();
         let ver = match code.caches.get(attr_pc as u32) {
             IC::StoreAttrInstance { ver, .. } | IC::StoreAttrNewKey { ver } => ver,
+            IC::StoreAttrSlot { key_idx, ver } => {
+                return cls.attr_version.get() == ver
+                    && Self::core_store_slot_ready(code, inst, key_idx, name_idx);
+            }
             _ => return false,
         };
         if cls.native_kind.get() != 0
@@ -57395,6 +57474,49 @@ fn fresh_cells(
         _ => None,
     }));
     Rc::new(cells)
+}
+
+/// `v.push(x)` with the room check in line (the call paths push one
+/// activation, slot or result per call, and the out-of-line `push` showed
+/// up in their profiles).
+#[inline(always)]
+fn push_fast<T>(v: &mut Vec<T>, x: T) {
+    let n = v.len();
+    if n < v.capacity() {
+        // SAFETY: `n < capacity`: the slot is allocated and unused.
+        unsafe {
+            v.as_mut_ptr().add(n).write(x);
+            v.set_len(n + 1);
+        }
+    } else {
+        push_grow(v, x);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn push_grow<T>(v: &mut Vec<T>, x: T) {
+    v.push(x);
+}
+
+/// Empty a finished activation's `locals`, releasing each value (an
+/// object that dies queues its finalizer, as any release does).
+///
+/// # Safety
+///
+/// Nothing else borrows `locals`.
+#[inline(always)]
+unsafe fn release_locals(locals: &mut Vec<Object>) {
+    let n = locals.len();
+    let base = locals.as_ptr();
+    // The vector forgets its values first: each is read out exactly once.
+    // SAFETY: the first `n` values are initialized.
+    unsafe {
+        locals.set_len(0);
+        for k in 0..n {
+            drop_hot(base.add(k).read());
+        }
+    }
 }
 
 /// An `Rc` sharing `r`'s allocation *without* a count of its own: it must
