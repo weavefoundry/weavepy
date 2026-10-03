@@ -2149,7 +2149,8 @@ impl<'a, C: SreChar> Matcher<'a, C> {
                         // A potential match.
                         let start = ptr - (prefix_len - 1);
                         self.start = start;
-                        self.ptr = ptr - (prefix_len - prefix_skip - 1);
+                        // (`prefix_skip` may be the whole prefix.)
+                        self.ptr = ptr + 1 + prefix_skip - prefix_len;
                         if flags & SRE_INFO_LITERAL != 0 {
                             return Ok(Some(start));
                         }
