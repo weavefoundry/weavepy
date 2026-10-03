@@ -260,6 +260,32 @@ jobs:
           target/release/weavepy-bench gate $FLAGS \
             --weavepy=target/release/weavepy \
             | tee bench-report.md
+      - name: Time call_overhead the way the gate runs it
+        # The gate has timed the PR binary's `call_overhead` at 1.2-1.5x
+        # the merge-base on every Windows PR run, while direct runs on the
+        # same runner time it at 0.6x. This separates the differences
+        # between the two (environment, caches, binary path).
+        if: failure() && matrix.os == 'windows-latest' && github.event_name == 'pull_request' && steps.bench_gate.outcome == 'failure'
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          F=crates/weavepy-bench/fixtures/call_overhead.py
+          export WEAVEPY_BENCH_WORK=150000
+          unset WEAVEPY_JIT
+          for label in gate-like jit=1 own-caches exe-path base; do
+            for i in 1 2 3; do
+              case $label in
+                gate-like) out=$(target/release/weavepy $F) ;;
+                jit=1) out=$(WEAVEPY_JIT=1 target/release/weavepy $F) ;;
+                own-caches) out=$(WEAVEPY_FROZEN_CACHE="$RUNNER_TEMP/fz" WEAVEPY_STDLIB_CACHE="$RUNNER_TEMP/sc" target/release/weavepy $F) ;;
+                exe-path) out=$(target/release/weavepy.exe $F) ;;
+                base) out=$("$BASE_WEAVEPY" $F) ;;
+              esac
+              echo "$label: $out"
+            done
+          done
+          echo "--- gate-like trace"
+          WEAVEPY_JIT_TRACE=1 target/release/weavepy $F 2>&1 | tail -30
       - name: Diagnose cold Windows JIT costs after a failed gate
         id: cold_jit_diagnostic
         if: failure() && matrix.os == 'windows-latest' && github.event_name == 'pull_request' && steps.bench_gate.outcome == 'failure'
