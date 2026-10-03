@@ -23149,7 +23149,7 @@ impl Interpreter {
                             }
                         }
                         0x04 => {
-                            f.slots
+                            f.slots()
                                 .borrow_mut()
                                 .insert(DictKey(Object::from_static("__annotations__")), value);
                         }
@@ -23174,7 +23174,7 @@ impl Interpreter {
                                     Object::from_str(format!("{owner_qualname}.__annotate__")),
                                 );
                             }
-                            f.slots
+                            f.slots()
                                 .borrow_mut()
                                 .insert(DictKey(Object::from_static("__annotate__")), value);
                         }
@@ -40576,11 +40576,11 @@ impl Interpreter {
                     // stored dict; either way the deferred `__annotate__`
                     // is dropped so the next read doesn't recompute.
                     "__annotations__" => {
-                        f.slots
+                        f.slots()
                             .borrow_mut()
                             .shift_remove(&DictKey(Object::from_static("__annotate__")));
                         if matches!(value, Object::None) {
-                            f.slots
+                            f.slots()
                                 .borrow_mut()
                                 .shift_remove(&DictKey(Object::from_static("__annotations__")));
                             return Ok(());
@@ -40599,7 +40599,7 @@ impl Interpreter {
                         if !crate::builtins::object_is_callable(&value) {
                             return Err(type_error("__annotate__ must be callable or None"));
                         }
-                        f.slots
+                        f.slots()
                             .borrow_mut()
                             .shift_remove(&DictKey(Object::from_static("__annotations__")));
                         f.set_slot(name, value);
@@ -41498,7 +41498,7 @@ impl Interpreter {
                     // `del f.__annotations__` clears both the dict and the
                     // deferred `__annotate__` (the setter with NULL).
                     "__annotations__" => {
-                        let mut slots = f.slots.borrow_mut();
+                        let mut slots = f.slots().borrow_mut();
                         slots.shift_remove(&DictKey(Object::from_static("__annotations__")));
                         slots.shift_remove(&DictKey(Object::from_static("__annotate__")));
                         return Ok(());
@@ -41518,7 +41518,7 @@ impl Interpreter {
                     // CPython allows deleting the nullable slots
                     // (`__doc__`, `__annotations__`, …): the value
                     // resets so the computed default resurfaces.
-                    f.slots
+                    f.slots()
                         .borrow_mut()
                         .shift_remove(&DictKey(Object::from_str(name)));
                     return Ok(());
@@ -44722,7 +44722,8 @@ impl Interpreter {
             kw_defaults,
             closure,
             attrs: RefCell::new(None),
-            slots: RefCell::new(DictData::default()),
+            slots_raw: RefCell::new(DictData::default()),
+            slot_seed: RefCell::new(None),
             closure_cells: std::sync::OnceLock::new(),
             defaults_override: crate::object::OverrideFlag::new(false),
         })))
@@ -48800,7 +48801,7 @@ impl Interpreter {
                     // The pinned slot objects are shared, as CPython's
                     // `gi_name` shares the function's `__name__`.
                     let (gen_name, gen_qualname) = {
-                        let slots = f.slots.borrow();
+                        let slots = f.slots().borrow();
                         let attr_str =
                             |attr: &'static str| match slots.get(&crate::object::StrKey(attr)) {
                                 Some(o @ Object::Str(_)) => Some(o.clone()),
@@ -62402,7 +62403,7 @@ struct CodeConstObjects {
     /// The getset slots of a function made from this code (see
     /// [`function_slots`]): the module name they were built for, and the
     /// entries, copied into each new function.
-    fn_slots: std::sync::OnceLock<(Option<Object>, crate::object::DictMap)>,
+    fn_slots: std::sync::OnceLock<(Option<Object>, Rc<crate::object::DictMap>)>,
     /// Whether this code is a *pure leaf* (see [`code_is_pure_leaf`]):
     /// `0` not yet decided, `1` no, `2` general leaf, `3` argument return,
     /// `4` constant return, `5` small-int return, `6` attribute return,
@@ -63638,8 +63639,9 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
         && !code.is_async_generator
         && !code.is_iterable_coroutine
         && !code.is_class_body
+        // (Free variables are read through the function's closure; cell
+        // variables would need cells of the evaluation's own.)
         && code.cellvars.is_empty()
-        && code.freevars.is_empty()
         && !code.has_varargs
         && code.kwonly_count == 0
         && leaf_arity(code) <= 8
@@ -63657,6 +63659,8 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
             OpCode::Resume
                 | OpCode::Nop
                 | OpCode::NotTaken
+                | OpCode::CopyFreeVars
+                | OpCode::LoadDeref
                 | OpCode::LoadFast
                 | OpCode::LoadFastBorrow
                 | OpCode::LoadFastCheck
@@ -64084,7 +64088,7 @@ fn new_function(
     // staticmethod wrappers) return the *same* object, which
     // `assertIs(wrapper.__name__, func.__name__)` in test_decorators
     // relies on.
-    let mut slots = function_slots(&code, globals);
+    let (mut slots, seed) = function_slots(&code, globals, annotations.is_none());
     if let Some(ann) = annotations {
         slots.insert(DictKey(fn_slot_keys()[3].clone()), ann);
     }
@@ -64100,7 +64104,8 @@ fn new_function(
         kw_defaults,
         closure,
         attrs: RefCell::new(None),
-        slots: RefCell::new(slots),
+        slots_raw: RefCell::new(slots),
+        slot_seed: RefCell::new(seed),
         closure_cells: std::sync::OnceLock::new(),
         defaults_override: crate::object::OverrideFlag::new(false),
     };
@@ -64117,9 +64122,15 @@ fn new_function(
 /// The getset slots a new function made from `code` in `globals` starts
 /// with: `__module__` (the globals' `__name__`, when set), `__name__` and
 /// `__qualname__`. Built once per code object (for the module name it
-/// first sees) and copied into each function after, so two functions made
-/// from one `def` share their name objects, as CPython's do.
-fn function_slots(code: &CodeObject, globals: &Rc<RefCell<DictData>>) -> DictData {
+/// first sees) and shared by each function after, so two functions made
+/// from one `def` share their name objects, as CPython's do: with
+/// `seeded`, as the function's seed (see `PyFunction::slot_seed`) beside
+/// empty slots, otherwise copied.
+fn function_slots(
+    code: &CodeObject,
+    globals: &Rc<RefCell<DictData>>,
+    seeded: bool,
+) -> (DictData, Option<Rc<crate::object::DictMap>>) {
     let keys = fn_slot_keys();
     let module = globals.borrow().get(&DictKey(keys[1].clone())).cloned();
     let build = |module: Option<Object>| {
@@ -64149,12 +64160,17 @@ fn function_slots(code: &CodeObject, globals: &Rc<RefCell<DictData>>) -> DictDat
         _ => false,
     };
     if let Some(ext) = code_vm_ext(code) {
-        let (built_for, map) = ext.fn_slots.get_or_init(|| (module.clone(), build(module.clone())));
+        let (built_for, map) = ext
+            .fn_slots
+            .get_or_init(|| (module.clone(), Rc::new(build(module.clone()))));
         if same(built_for, &module) {
-            return DictData::from(map.clone());
+            if seeded {
+                return (DictData::default(), Some(map.clone()));
+            }
+            return (DictData::from((**map).clone()), None);
         }
     }
-    DictData::from(build(module))
+    (DictData::from(build(module)), None)
 }
 
 fn fn_slot_keys() -> &'static [Object; 4] {

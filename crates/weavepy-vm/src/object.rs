@@ -4585,8 +4585,13 @@ pub struct PyFunction {
     /// data descriptors on the `function` type, so `f.__name__ = x`
     /// must never appear in `f.__dict__` (functools.update_wrapper
     /// copies `__dict__` and asserts the wrapper's annotations are
-    /// untouched by the wrapped function's slots).
-    pub slots: RefCell<DictData>,
+    /// untouched by the wrapped function's slots). Read through
+    /// [`Self::slots`], which first copies in [`Self::slot_seed`].
+    pub slots_raw: RefCell<DictData>,
+    /// The slots a new function starts with, shared by every function
+    /// one `def` makes (see `new_function`), until the first access to
+    /// [`Self::slots`] copies them in: most functions never read theirs.
+    pub slot_seed: RefCell<Option<Rc<DictMap>>>,
     /// The frame `cells` vector for a function whose code has free
     /// variables but no cell variables: exactly `closure`'s cells, built
     /// once (the closure is immutable) for the lean call paths.
@@ -4722,11 +4727,35 @@ impl PyFunction {
             .cloned()
     }
 
+    /// The function's getset slots (see [`Self::slots_raw`]), with the
+    /// seed it was made with copied in.
+    #[inline]
+    pub fn slots(&self) -> &RefCell<DictData> {
+        // SAFETY: a read of the seed's presence with nothing running.
+        if unsafe { (*self.slot_seed.as_ptr()).is_some() } {
+            self.plant_slot_seed();
+        }
+        &self.slots_raw
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn plant_slot_seed(&self) {
+        let Some(seed) = self.slot_seed.borrow_mut().take() else {
+            return;
+        };
+        let mut slots = self.slots_raw.borrow_mut();
+        // Every store goes through `slots()`, which plants the seed
+        // first: nothing is there yet to keep.
+        debug_assert!(slots.is_empty());
+        *slots = DictData::from((*seed).clone());
+    }
+
     /// Read a slot value if one has been stored (explicitly assigned or
     /// stamped at definition time). Computed fallbacks live at the
     /// attribute-access sites.
     pub fn slot(&self, name: &str) -> Option<Object> {
-        self.slots
+        self.slots()
             .borrow()
             .get(&crate::object::StrKey(name))
             .cloned()
@@ -4738,7 +4767,7 @@ impl PyFunction {
                 .0
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        self.slots
+        self.slots()
             .borrow_mut()
             .insert(DictKey(Object::from_str(name)), value);
     }

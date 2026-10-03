@@ -422,6 +422,18 @@ unsafe extern "C" fn h_global(
     0
 }
 
+unsafe extern "C" fn h_deref(ctx: *mut Ctx<'static>, fr: *const Frame, idx: u32) -> u32 {
+    // SAFETY: called by native code with its context and a live frame.
+    let (c, (_, _, f)) = unsafe { (cx(ctx), (*fr).parts()) };
+    match super::free_var(f, idx as u8) {
+        Some(v) => {
+            c.put(v);
+            0
+        }
+        None => 1,
+    }
+}
+
 unsafe extern "C" fn h_attr<const EFFECT: bool>(
     ctx: *mut Ctx<'static>,
     fr: *const Frame,
@@ -1695,6 +1707,15 @@ impl Lower<'_> {
                 self.b.ins().jump(done, &[t.into(), p.into()]);
                 self.b.switch_to_block(done);
                 let (t, p) = (self.b.block_params(done)[0], self.b.block_params(done)[1]);
+                self.set(fl, dst, t, p);
+            }
+            Op::Deref { dst, idx } => {
+                let idx = self.u32c(u32::from(idx));
+                let st = self.call(h_deref as *const () as usize, &[self.ctx, fl.fr, idx]);
+                self.check(st);
+                let flags = MemFlags::trusted();
+                let t = self.b.ins().load(types::I64, flags, self.ctx, 0);
+                let p = self.b.ins().load(types::I64, flags, self.ctx, 8);
                 self.set(fl, dst, t, p);
             }
             Op::Attr { dst, src, pc, name } => {

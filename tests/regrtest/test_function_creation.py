@@ -80,6 +80,75 @@ class FunctionCreationTests(unittest.TestCase):
         self.assertEqual(hs[7].__kwdefaults__, {"b": 7})
         self.assertEqual(hs[7].__annotations__, {"a": int, "return": int})
 
+    def test_name_slots_read_and_written_later(self):
+        import functools
+        import pickle
+
+        fs = [make_adder(i) for i in range(50)]
+
+        @functools.wraps(fs[0])
+        def wrapper(*args):
+            return fs[0](*args)
+
+        self.assertEqual(wrapper.__name__, "add")
+        self.assertEqual(wrapper.__qualname__, "make_adder.<locals>.add")
+        self.assertEqual(wrapper.__module__, __name__)
+        self.assertIs(wrapper.__wrapped__, fs[0])
+        fs[1].__module__ = "elsewhere"
+        self.assertEqual(fs[1].__module__, "elsewhere")
+        self.assertEqual(fs[2].__module__, __name__)
+        fs[3].__doc__ = "doc"
+        self.assertEqual((fs[3].__doc__, fs[4].__doc__), ("doc", None))
+        self.assertIs(pickle.loads(pickle.dumps(make_adder)), make_adder)
+        g = [make_lambda(k) for k in range(3)]
+        self.assertEqual({h.__name__ for h in g}, {"<lambda>"})
+        self.assertEqual(g[0].__qualname__, "make_lambda.<locals>.<lambda>")
+
+    def test_free_variable_reads(self):
+        def counter():
+            n = 0
+
+            def get():
+                return n
+
+            def bump():
+                nonlocal n
+                n += 1
+
+            return get, bump
+
+        get, bump = counter()
+        for _ in range(5000):
+            self.assertEqual(get(), 0)
+        bump()
+        self.assertEqual(get(), 1)
+
+        def late():
+            def read():
+                return value
+
+            out = [read]
+            try:
+                read()
+            except NameError as e:
+                out.append(type(e))
+            value = 7
+            out.append(read())
+            return out
+
+        for _ in range(3000):
+            r = late()
+        self.assertEqual(r[1:], [NameError, 7])
+
+        def scaled(k):
+            return lambda x: x * k + len(box)
+
+        box = [1, 2]
+        fs = [scaled(i) for i in range(4000)]
+        self.assertEqual(sum(f(1) for f in fs), sum(range(4000)) + 2 * 4000)
+        box.append(3)
+        self.assertEqual(fs[5](2), 13)
+
     def test_fresh_functions_share_call_shapes(self):
         def caller(n):
             t = 0

@@ -132,6 +132,12 @@ enum Op {
         dst: u8,
         pc: u16,
     },
+    /// `regs[dst]` = the closure cell `idx`'s value (a free variable: a
+    /// leaf has no cell variables of its own).
+    Deref {
+        dst: u8,
+        idx: u8,
+    },
     Attr {
         dst: u8,
         src: u8,
@@ -395,7 +401,14 @@ impl Builder<'_> {
     fn step(&mut self, pc: usize, ins: weavepy_compiler::Instruction) -> Option<bool> {
         let arg = ins.arg;
         match ins.op {
-            OpCode::Resume | OpCode::Nop | OpCode::NotTaken => {}
+            OpCode::Resume | OpCode::Nop | OpCode::NotTaken | OpCode::CopyFreeVars => {}
+            OpCode::LoadDeref => {
+                let dst = self.push_new()?;
+                self.ops.push(Op::Deref {
+                    dst,
+                    idx: u8::try_from(arg).ok()?,
+                });
+            }
             OpCode::LoadFast | OpCode::LoadFastBorrow | OpCode::LoadFastCheck => {
                 self.load_local(arg)?;
             }
@@ -899,6 +912,22 @@ pub(crate) enum LeafRet {
     Owned(Object),
 }
 
+/// The value of `f`'s closure cell `idx`, borrowed: nothing an evaluation
+/// runs can rebind a cell (a leaf has no `STORE_DEREF`), and the function
+/// holds its closure. `None` for an empty cell (the read raises).
+#[inline]
+pub(super) fn free_var(f: &crate::object::PyFunction, idx: u8) -> Option<V> {
+    let Object::Cell(cell) = f.closure.get(usize::from(idx))? else {
+        return None;
+    };
+    let p: *const Object = cell.as_ptr();
+    // SAFETY: see above.
+    if matches!(unsafe { &*p }, Object::Unbound) {
+        return None;
+    }
+    Some(norm(p))
+}
+
 impl LeafRet {
     /// The result as an owned object (a borrowed value is cloned).
     #[inline(always)]
@@ -1062,6 +1091,7 @@ impl Interpreter {
                 // SAFETY: `k` names a plan constant (the translation).
                 Op::Const { dst, k } => set!(dst, unsafe { *consts.get_unchecked(usize::from(k)) }),
                 Op::Global { dst, pc } => set!(dst, self.plan_global(code, stamps, f, pc)?),
+                Op::Deref { dst, idx } => set!(dst, free_var(f, idx)?),
                 Op::Attr { dst, src, pc, name } => {
                     let v = self.plan_attr::<GETTER, EFFECT>(
                         code,

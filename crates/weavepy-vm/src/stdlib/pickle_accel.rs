@@ -72,7 +72,7 @@ impl FunctionGuard {
         if !function.defaults_maybe_overridden() {
             return true;
         }
-        let slots = function.slots.borrow();
+        let slots = function.slots().borrow();
         !slots.contains_key(&StrKey("__defaults__"))
             && !slots.contains_key(&StrKey("__kwdefaults__"))
     }

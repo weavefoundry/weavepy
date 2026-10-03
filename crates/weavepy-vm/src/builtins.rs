@@ -5272,7 +5272,7 @@ fn attr_delete(obj: &Object, name: &str) -> Result<(), RuntimeError> {
         }
         Object::Function(f) => {
             if crate::object::is_function_slot(name) {
-                f.slots
+                f.slots()
                     .borrow_mut()
                     .shift_remove(&crate::object::DictKey(Object::from_str(name)));
             } else {
@@ -10455,7 +10455,8 @@ fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
         // Shared, not copied: `func.__dict__` mutations stay visible on
         // both, matching CPython where the function object is the same.
         attrs: RefCell::new(Some(f.attrs())),
-        slots: RefCell::new(f.slots.borrow().clone()),
+        slots_raw: RefCell::new(f.slots().borrow().clone()),
+        slot_seed: RefCell::new(None),
         closure_cells: std::sync::OnceLock::new(),
         // The copied slot store carries any override along.
         defaults_override: crate::object::OverrideFlag::new(f.defaults_maybe_overridden()),
