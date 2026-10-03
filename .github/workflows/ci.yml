@@ -269,6 +269,7 @@ jobs:
           python tools/bench_cold_jit.py \
             --base "$BASE_WEAVEPY" --new target/release/weavepy.exe \
             --samples 7 \
+            --fixtures sumvm:2000000,nested_loops:120,jitloop:1000,call_overhead:150000 \
             --out "target/performance/cold-jit-ci/${{ github.run_id }}-${{ github.run_attempt }}/report.json"
       - uses: actions/upload-artifact@v4
         if: always() && steps.cold_jit_diagnostic.outcome != 'skipped' && steps.cold_jit_diagnostic.outcome != ''
