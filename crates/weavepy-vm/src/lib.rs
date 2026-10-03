@@ -8245,10 +8245,12 @@ impl Interpreter {
             ) if !shell
                 .has_materialized
                 .load(std::sync::atomic::Ordering::Relaxed)
-                && shell.tb_refs.load(std::sync::atomic::Ordering::Relaxed) == 0
                 && self.exc_info_len() <= exc_depth =>
             {
                 self.pop_frame_shell();
+                // A lazy traceback entry still holding the shell had its
+                // frame object built by the pop.
+                Self::settle_exited_frame_object(&shell, frame, true);
                 self.recycle_frame_shell(shell);
                 Ok(FrameOutcome::Returned(v))
             }
@@ -9849,10 +9851,12 @@ impl Interpreter {
             ) if !shell
                 .has_materialized
                 .load(std::sync::atomic::Ordering::Relaxed)
-                && shell.tb_refs.load(std::sync::atomic::Ordering::Relaxed) == 0
                 && self.exc_info_len() <= exc_depth_on_entry =>
             {
                 self.pop_frame_shell();
+                // A lazy traceback entry still holding the shell had its
+                // frame object built by the pop.
+                Self::settle_exited_frame_object(&shell, frame, true);
                 self.recycle_frame_shell(shell);
                 FrameOutcome::Returned(v)
             }
@@ -15325,11 +15329,15 @@ impl Interpreter {
         let Some(top) = inl.last_mut() else {
             return false;
         };
-        // A generator resume, or an activation that needed its shell,
-        // finishes through `quiet_run`; so does a return into a caller
-        // whose protocol would yield straight away.
+        // A generator resume, or an activation whose shell the full
+        // epilogue would act on, finishes through `quiet_run`; so does a
+        // return into a caller whose protocol would yield straight away.
         if top.gen.is_some()
-            || top.act.shell.is_some()
+            || top
+                .act
+                .shell
+                .as_deref()
+                .is_some_and(|s| !self.shell_pops_quietly(s, top.exc_depth))
             || self.gil_countdown <= 2
             || crate::hot_gates::loop_gen() != snap_gen
         {
@@ -15346,6 +15354,16 @@ impl Interpreter {
         if depth == sw.entry_depth {
             sw.entry_dead = true;
         }
+        // An activation that caught an exception got its shell then (see
+        // `quiet_catch`): retire it as `inline_finish` does. Such a frame
+        // is not clean (the handler path set its exception fields).
+        let had_shell = match done.act.shell.take() {
+            Some(shell) => {
+                self.retire_quiet_shell(shell, frame, cur_pc);
+                true
+            }
+            None => false,
+        };
         // `inline_finish`'s shell-less return, its common case in line: no
         // leftover operands or cells, and locals only this activation
         // holds. They are released here; an object that dies with them
@@ -15356,7 +15374,7 @@ impl Interpreter {
         let mut tmp = None;
         let (cframe, clast, cshell, entry);
         if clean && done.init_inst.is_none() {
-            done.clean = true;
+            done.clean = !had_shell;
             // SAFETY: as above.
             for v in unsafe { (*frame.locals.as_ptr()).drain(..) } {
                 drop_hot(v);
@@ -15379,7 +15397,7 @@ impl Interpreter {
             entry = QuietEntry::Returned { cur_pc: call_pc };
         } else {
             let result = if clean {
-                done.clean = true;
+                done.clean = !had_shell;
                 // SAFETY: as above.
                 for v in unsafe { (*frame.locals.as_ptr()).drain(..) } {
                     drop_hot(v);
@@ -15395,6 +15413,7 @@ impl Interpreter {
                     },
                 )
             };
+            done.clean &= !had_shell;
             // SAFETY: the caller is the innermost remaining activation.
             (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
             // SAFETY: as above.
@@ -23866,13 +23885,19 @@ impl Interpreter {
     /// (`context_settled`); a fresh Rust-raised error has empty traceback
     /// and unset context/cause.
     fn chain_fresh_exception(&self, exc: &mut PyException) {
-        if !exc.context_settled
+        let fresh = !exc.context_settled
             && exc.context.is_none()
             && exc.cause.is_none()
             && exc.traceback.is_empty()
-            && !exc.suppress_tb_once
-            && !instance_has_nonnull_attr(&exc.instance, "__context__")
-        {
+            && !exc.suppress_tb_once;
+        // Nothing is being handled: there is no context to chain (the
+        // decision `attach_implicit_context` would settle the same way),
+        // so the instance's own `__context__` need not be probed.
+        if fresh && self.exc_info_len() == 0 {
+            exc.context_settled = true;
+            return;
+        }
+        if fresh && !instance_has_nonnull_attr(&exc.instance, "__context__") {
             self.attach_implicit_context(exc);
             if exc.context.is_some() {
                 Self::sync_exc_attrs(exc);
@@ -23943,24 +23968,73 @@ impl Interpreter {
             Ok(_) => RuntimeError::Internal("quiet unwind found a handler".to_owned()),
         };
         self.pop_frame_shell();
-        if shell
-            .has_materialized
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            // An exceptional exit leaves a frame object that outlives the
-            // activation (its traceback) at the last instruction, with
-            // its `f_locals` brought up to date.
-            let py = shell.materialized.borrow().clone();
-            if let Some(py) = py {
-                shell.refresh_materialized(&py);
-                py.invalidate_locals();
-            }
-        }
+        Self::settle_exited_frame_object(&shell, frame, false);
         if self.exc_info_len() > exc_depth {
             self.exc_info_stack.borrow_mut().truncate(exc_depth);
         }
         self.recycle_frame_shell(shell);
         err
+    }
+
+    /// Whether an inline activation returning with `shell` needs nothing
+    /// of the full epilogue: no frame object yet and no handled-exception
+    /// entries left above its entry depth (`inline_finish`'s second arm).
+    #[inline]
+    fn shell_pops_quietly(&self, shell: &crate::object::FrameShell, exc_depth: usize) -> bool {
+        !shell
+            .has_materialized
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self.exc_info_len() <= exc_depth
+    }
+
+    /// Retire the shell of a returning inline activation that
+    /// [`Self::shell_pops_quietly`] accepted, its return at `cur_pc`.
+    #[cold]
+    #[inline(never)]
+    fn retire_quiet_shell(
+        &mut self,
+        shell: Rc<crate::object::FrameShell>,
+        frame: &Frame,
+        cur_pc: usize,
+    ) {
+        if shell.tb_refs.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            // See `sync_lazy_tb_lasti`.
+            shell
+                .lasti
+                .store(cur_pc as u32, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.pop_frame_shell();
+        Self::settle_exited_frame_object(&shell, frame, true);
+        self.recycle_frame_shell(shell);
+    }
+
+    /// `run_activation`'s epilogue for the frame object of an activation
+    /// that just left the spine (`shell` popped), for the lean finishes:
+    /// leave it at the last executed instruction, and give a returned
+    /// frame's object that outlives the activation its own locals
+    /// (CPython's `take_ownership`), else bring its `f_locals` current.
+    fn settle_exited_frame_object(
+        shell: &crate::object::FrameShell,
+        frame: &Frame,
+        returned: bool,
+    ) {
+        if !shell
+            .has_materialized
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let Some(py) = shell.materialized.borrow().clone() else {
+            return;
+        };
+        shell.refresh_materialized(&py);
+        // The shell's cell and `py`; see `run_activation`.
+        let internal = 2 + usize::from(frame.py_frame.as_ref().is_some_and(|p| Rc::ptr_eq(p, &py)));
+        if returned && Rc::strong_count(&py) > internal {
+            py.take_ownership_of_locals();
+        } else {
+            py.invalidate_locals();
+        }
     }
 
     /// Look up a handler for `exc` at the current pc. If found,
@@ -24125,11 +24199,25 @@ impl Interpreter {
         // *head*; `tb_next` walks toward the raise site. Each
         // propagation prepends the current frame's `tb` to the
         // existing chain.
+        // One probe of the slot table: replace an existing chain's head in
+        // place, else add the slot.
         if let Object::Instance(inst) = &exc.instance {
-            if let Some(Object::Traceback(prev_tb)) = inst.slot_get("__traceback__") {
-                *new_tb.next.borrow_mut() = Some(prev_tb);
+            let new_tb = Object::Traceback(new_tb);
+            inst.note_slot_store(&new_tb);
+            let mut slots = inst.slots.borrow_mut();
+            match slots.get_mut("__traceback__") {
+                Some(slot) => {
+                    let prev = std::mem::replace(slot, new_tb);
+                    if let (Object::Traceback(prev_tb), Object::Traceback(head)) = (&prev, &*slot) {
+                        *head.next.borrow_mut() = Some(prev_tb.clone());
+                    }
+                    drop(slots);
+                    drop(prev);
+                }
+                None => {
+                    slots.insert("__traceback__", new_tb);
+                }
             }
-            inst.slot_set("__traceback__", Object::Traceback(new_tb));
         }
     }
 
@@ -47466,6 +47554,23 @@ impl Interpreter {
         // class against its attribute version (the MRO walk compared
         // nine names per entry on every construction).
         let families = exc_family_flags(&cls);
+        // The common case (`ValueError("x")`, a plain user subclass): no
+        // family shapes construction, so `args` is the only slot, built
+        // in place without the per-slot probes below.
+        if families & !EXC_CUSTOM_INIT == 0 {
+            let inst = PyInstance::new(cls);
+            let args_tuple = Object::new_tuple(args.to_vec());
+            inst.note_slot_store(&args_tuple);
+            let mut entries = Vec::with_capacity(4);
+            entries.push((crate::types::slot_key("args"), args_tuple));
+            *inst.slots.borrow_mut() = crate::types::SlotStorage::from_entries(entries);
+            let obj = Object::Instance(Rc::new(inst));
+            // See the GC note at the end.
+            if args.iter().any(|x| !crate::gc_trace::is_atomic(x)) {
+                crate::gc_trace::track(&obj);
+            }
+            return obj;
+        }
         let mro_has = |name: &str| families & exc_family_bit(name) != 0;
         let is_stop_iteration = mro_has("StopIteration");
         let inst = PyInstance::new(cls.clone());
@@ -47484,10 +47589,9 @@ impl Interpreter {
         } else {
             Object::new_tuple(args.to_vec())
         };
+        // (No `message` mirror: CPython has none, and `str()` and the Rust
+        // display derive the text from `args`.)
         inst.slot_set("args", args_tuple);
-        if let Some(first) = args.first() {
-            inst.slot_set("message", first.clone());
-        }
         // PEP 380: `StopIteration.value` is the first constructor arg
         // (or None). Generator `return` goes through
         // `stop_iteration_with`, but user code constructs
