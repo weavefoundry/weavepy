@@ -1255,8 +1255,8 @@ impl Lower<'_> {
         self.b.switch_to_block(fields);
         let keys = self.b.ins().load(ptr, f, block, l.split_keys);
         let ckeys = self.b.ins().load(ptr, f, cls, l.type_shared_keys);
+        // (`uload32` zero-extends to `i64` itself.)
         let len = self.b.ins().uload32(f, block, l.split_len);
-        let len = self.b.ins().uextend(types::I64, len);
         let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
         let shadows = self.b.ins().icmp(IntCC::UnsignedGreaterThan, len, limit);
         let bad = self.b.ins().bor(foreign, shadows);
