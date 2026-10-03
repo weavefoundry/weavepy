@@ -1253,6 +1253,98 @@ impl Lower<'_> {
         self.b.ins().jump(done, &[t.into(), p.into()]);
     }
 
+    /// The interpreter's indexed store (`core_store_attr` through the
+    /// site's [`crate::FieldSlot`] at `slot`) in line, for a scalar value
+    /// over a scalar field: the receiver register is a plain instance whose
+    /// class has the slot's version and whose values, split over its
+    /// class's names and borrowed by nobody, hold the slot's position. Its
+    /// old value owns nothing, and neither does the new one (no write
+    /// barrier, no release). Jumps to `done` stored, or to `slow` untouched.
+    fn inline_store(
+        &mut self,
+        l: &weavepy_jit::ObjLayout,
+        (tr, pr): (Value, Value),
+        (tv, pv): (Value, Value),
+        slot: i64,
+        done: Block,
+        slow: Block,
+    ) {
+        let f = MemFlags::trusted();
+        let ptr = self.ptr;
+        // The value: a scalar register.
+        let is_i = self.b.ins().icmp_imm(IntCC::Equal, tv, T_I as i64);
+        let is_f = self.b.ins().icmp_imm(IntCC::Equal, tv, T_F as i64);
+        let is_b = self.b.ins().icmp_imm(IntCC::Equal, tv, T_B as i64);
+        let is_n = self.b.ins().icmp_imm(IntCC::Equal, tv, T_N as i64);
+        let any = self.b.ins().bor(is_i, is_f);
+        let any = self.b.ins().bor(any, is_b);
+        let any = self.b.ins().bor(any, is_n);
+        let not_scalar = self.b.ins().icmp_imm(IntCC::Equal, any, 0);
+        let not_ref = self.b.ins().icmp_imm(IntCC::NotEqual, tr, T_R as i64);
+        let bad = self.b.ins().bor(not_scalar, not_ref);
+        self.miss_if(bad, slow);
+        let otag = self.b.ins().uload8(types::I32, f, pr, 0);
+        let not_inst = self.b.ins().icmp_imm(IntCC::NotEqual, otag, i64::from(l.tag_instance));
+        self.miss_if(not_inst, slow);
+        let inst = self.b.ins().load(ptr, f, pr, 8);
+        let cls = self.b.ins().load(ptr, f, inst, l.inst_class);
+        let ver = self.b.ins().load(types::I64, f, cls, l.type_attr_version);
+        let at = self.b.ins().iconst(ptr, slot);
+        let want = self.b.ins().load(types::I64, f, at, crate::FIELD_SLOT_VER as i32);
+        let idx = self.b.ins().uload32(f, at, crate::FIELD_SLOT_IDX as i32);
+        let lazy = self.b.ins().load(ptr, f, inst, l.inst_dict_lazy);
+        let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+        let shared = self.b.ins().uload8(types::I64, f, flag, 0);
+        let watched = self.b.ins().iconst(ptr, l.dict_watchers as i64);
+        let watched = self.b.ins().uload8(types::I64, f, watched, 0);
+        let borrow = self.b.ins().sload32(f, inst, l.inst_split_borrow);
+        let block = self.b.ins().load(ptr, f, inst, l.inst_split_block);
+        let unset = self.b.ins().icmp_imm(IntCC::Equal, want, 0);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, ver, want);
+        let busy = self.b.ins().icmp_imm(IntCC::NotEqual, borrow, 0);
+        let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
+        let other = self.b.ins().bor(lazy, shared);
+        let other = self.b.ins().bor(other, watched);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+        let bad = self.b.ins().bor(unset, stale);
+        let bad = self.b.ins().bor(bad, busy);
+        let bad = self.b.ins().bor(bad, empty);
+        let bad = self.b.ins().bor(bad, other);
+        self.miss_if(bad, slow);
+        let keys = self.b.ins().load(ptr, f, block, l.split_keys);
+        let ckeys = self.b.ins().load(ptr, f, cls, l.type_shared_keys);
+        let len = self.b.ins().uload32(f, block, l.split_len);
+        let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
+        let absent = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
+        let bad = self.b.ins().bor(foreign, absent);
+        self.miss_if(bad, slow);
+        let off = self.b.ins().ishl_imm(idx, 4);
+        let v = self.b.ins().iadd(block, off);
+        let v = self.b.ins().iadd_imm(v, i64::from(l.split_values));
+        // The old value: a scalar, which owns nothing.
+        let old = self.b.ins().uload8(types::I32, f, v, 0);
+        let mut owns = self.b.ins().iconst(types::I8, 1);
+        for tag in [l.tag_int, l.tag_float, l.tag_bool, l.tag_none] {
+            let hit = self.b.ins().icmp_imm(IntCC::Equal, old, i64::from(tag));
+            let clear = self.b.ins().bxor_imm(hit, 1);
+            owns = self.b.ins().band(owns, clear);
+        }
+        self.miss_if(owns, slow);
+        // The new value's tag byte and payload (a bool's byte at offset 1).
+        let t_int = self.b.ins().iconst(types::I32, i64::from(l.tag_int));
+        let t_float = self.b.ins().iconst(types::I32, i64::from(l.tag_float));
+        let t_bool = self.b.ins().iconst(types::I32, i64::from(l.tag_bool));
+        let t_none = self.b.ins().iconst(types::I32, i64::from(l.tag_none));
+        let tag = self.b.ins().select(is_i, t_int, t_none);
+        let tag = self.b.ins().select(is_f, t_float, tag);
+        let tag = self.b.ins().select(is_b, t_bool, tag);
+        self.b.ins().istore8(f, tag, v, 0);
+        let byte = self.b.ins().band_imm(pv, 1);
+        self.b.ins().istore8(f, byte, v, 1);
+        self.b.ins().store(f, pv, v, 8);
+        self.b.ins().jump(done, &[]);
+    }
+
     /// A class attribute the site's stamp remembers, in line: the receiver
     /// register `(t, p)` is a class at the stamp's version, which resolved
     /// the name to a scalar (see `class_attr_fill`). Jumps to `done` with
@@ -1916,13 +2008,29 @@ impl Lower<'_> {
                 }
                 let (tr, pr) = self.get(fl, recv);
                 let (tv, pv) = self.get(fl, val);
+                let last = Self::infallible_after(fl.plan, i);
+                // The plan's only store, with nothing after it that can
+                // decline: a scalar over a scalar field lands in line.
+                let done = self.b.create_block();
+                if last && !fl.may_store[i] {
+                    if let (Some(l), Some(slot)) = (
+                        crate::tier2::published_obj_layout(),
+                        crate::code_field_slot(fl.code, usize::from(pc)),
+                    ) {
+                        let slow = self.b.create_block();
+                        self.inline_store(l, (tr, pr), (tv, pv), slot as i64, done, slow);
+                        self.b.switch_to_block(slow);
+                    }
+                }
                 let pn = self.u32c(u32::from(pc) | u32::from(name) << 16);
-                let last = self.u32c(u32::from(Self::infallible_after(fl.plan, i)));
+                let last = self.u32c(u32::from(last));
                 let st = self.call(
                     h_store as *const () as usize,
                     &[self.ctx, tr, pr, tv, pv, pn, last],
                 );
                 self.check(st);
+                self.b.ins().jump(done, &[]);
+                self.b.switch_to_block(done);
             }
         }
         Some(true)

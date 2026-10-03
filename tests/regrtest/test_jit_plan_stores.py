@@ -102,6 +102,62 @@ class PlanStoreTests(unittest.TestCase):
         drive(n, 1)
         self.assertEqual(s.v, 3)
 
+    def test_scalar_stores_in_place(self):
+        class Src:
+            def __init__(self, x):
+                self.x = x
+
+        class Dst:
+            def __init__(self):
+                self.v = 0
+                self.w = 1
+
+        class Copy:
+            def __init__(self, a, b):
+                self.a = a
+                self.b = b
+
+            def put(self):
+                self.b.v = self.a.x
+
+        src, dst = Src(1), Dst()
+        c = Copy(src, dst)
+        drive(c, WARM)
+        self.assertEqual(dst.v, 1)
+        for value in (2.5, True, None, -7, 2**62):
+            src.x = value
+            drive(c, 1)
+            self.assertIs(type(dst.v), type(value))
+            self.assertEqual(dst.v, value)
+        # A heap value, over a scalar and then over itself.
+        src.x = [1]
+        drive(c, 2)
+        self.assertIs(dst.v, src.x)
+        src.x = 3
+        drive(c, 1)
+        self.assertEqual(dst.v, 3)
+        # Another instance of the class, without the field yet.
+        fresh = Dst.__new__(Dst)
+        c.b = fresh
+        drive(c, 1)
+        self.assertEqual(vars(fresh), {"v": 3})
+        # An instance whose dictionary was handed out.
+        other = Dst()
+        d = other.__dict__
+        c.b = other
+        src.x = 9
+        drive(c, 1)
+        self.assertEqual(d["v"], 9)
+        # The class changes under the cached version.
+        c.b = dst
+        Dst.extra = 1
+        src.x = 11
+        drive(c, 1)
+        self.assertEqual(dst.v, 11)
+        Dst.v = property(lambda self: -1, lambda self, value: None)
+        drive(c, 1)
+        self.assertEqual(dst.v, -1)
+
 
 if __name__ == "__main__":
     unittest.main()

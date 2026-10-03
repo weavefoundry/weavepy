@@ -62296,7 +62296,20 @@ impl StampSlot {
 /// is process-unique, so while both match, the value at that position of
 /// a split instance *is* the attribute: no inline-cache decode and no
 /// name comparison.
+#[repr(transparent)]
 struct FieldSlot(std::cell::UnsafeCell<(u64, u32)>);
+
+/// Where a [`FieldSlot`] keeps its class version (`u64`) and split
+/// position (`u32`), for native code that reads it in line.
+pub(crate) const FIELD_SLOT_VER: usize = std::mem::offset_of!((u64, u32), 0);
+pub(crate) const FIELD_SLOT_IDX: usize = std::mem::offset_of!((u64, u32), 1);
+
+/// The [`FieldSlot`] of the attribute site at `pc` of `code`, if the code
+/// has any (native code reads it in line).
+pub(crate) fn code_field_slot(code: &CodeObject, pc: usize) -> Option<*const u8> {
+    let slot = code_vm_ext(code)?.field_slots.get()?.get(pc)?;
+    Some(std::ptr::from_ref(slot).cast())
+}
 
 // SAFETY: as `StampSlot`.
 unsafe impl Send for FieldSlot {}
