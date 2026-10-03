@@ -7463,6 +7463,20 @@ impl Interpreter {
         }
     }
 
+    /// After the quiet loop caught an exception: whether the activation
+    /// yields as the outer loop's per-instruction prologue would (the GIL
+    /// countdown, a hot gate). Code that only calls and catches, such as
+    /// recursion retried in its `RecursionError` handler, would otherwise
+    /// never let another thread or a signal in.
+    #[inline]
+    fn quiet_caught_yields(&mut self, snap_gen: u64) -> bool {
+        if self.gil_countdown <= 2 {
+            return true;
+        }
+        self.gil_countdown -= 1;
+        crate::hot_gates::loop_gen() != snap_gen
+    }
+
     /// One activation's stretch of the quiet loop (see
     /// [`Self::quiet_run`]): runs `frame` from `entry` until it makes an
     /// inline call or exits.
@@ -7506,7 +7520,12 @@ impl Interpreter {
                     }
                 }
                 QuietEntry::Raised { err, cur_pc } => match self.quiet_catch(frame, shell, err) {
-                    Ok(()) => *last = cur_pc,
+                    Ok(()) => {
+                        *last = cur_pc;
+                        if self.quiet_caught_yields(snap_gen) {
+                            break 'run QuietExit::Yield;
+                        }
+                    }
                     Err(err) => {
                         // The raise path drops the staged operands wholesale
                         // (see the `CALL` arm of `step`).
@@ -7540,6 +7559,9 @@ impl Interpreter {
                         let err = match self.quiet_catch(frame, shell, err) {
                             Ok(()) => {
                                 *last = cur_pc;
+                                if self.quiet_caught_yields(snap_gen) {
+                                    break 'run QuietExit::Yield;
+                                }
                                 continue;
                             }
                             Err(err) => err,
@@ -7627,6 +7649,9 @@ impl Interpreter {
                             let err = match self.quiet_catch(frame, shell, err) {
                                 Ok(()) => {
                                     *last = cur_pc;
+                                    if self.quiet_caught_yields(snap_gen) {
+                                        break 'run QuietExit::Yield;
+                                    }
                                     continue;
                                 }
                                 Err(err) => err,
@@ -7698,6 +7723,9 @@ impl Interpreter {
                             let err = match self.quiet_catch(frame, shell, err) {
                                 Ok(()) => {
                                     *last = cur_pc;
+                                    if self.quiet_caught_yields(snap_gen) {
+                                        break 'run QuietExit::Yield;
+                                    }
                                     continue;
                                 }
                                 Err(err) => err,
