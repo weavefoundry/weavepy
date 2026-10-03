@@ -15756,7 +15756,13 @@ impl Interpreter {
             // SAFETY: the callable is moved out exactly once; the parked
             // slot treats the field as stale (see `inline_deliver`).
             let callable = unsafe { std::ptr::read(&raw const done.callable) };
-            self.inline_park_clean(done);
+            // A frame that caught an exception carries the handler path's
+            // state, which only the full park resets.
+            if had_shell {
+                self.inline_park(done);
+            } else {
+                self.inline_park_clean(done);
+            }
             // SAFETY: as above.
             unsafe { push_fast(&mut (*cframe).stack, v) };
             match callable {
