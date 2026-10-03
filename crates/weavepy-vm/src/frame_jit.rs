@@ -319,7 +319,13 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
         let top = (pc + 1).saturating_sub(i.arg as usize);
         let (mut native, mut exits) = (0usize, 0usize);
         for k in top..=pc {
-            if native_op(ins[k].op) || helped[k] {
+            // An attribute read stays in native code only when the core
+            // loop has seen it read a split-layout field or a natively
+            // served instance's field; a class attribute, a module's or a
+            // method leaves on every run.
+            let attr_exits = ins[k].op == OpCode::LoadAttr
+                && !(crate::field_site(ext, k) || crate::native_site(ext, k));
+            if (native_op(ins[k].op) && !attr_exits) || helped[k] {
                 native += 1;
             } else {
                 exits += 1;

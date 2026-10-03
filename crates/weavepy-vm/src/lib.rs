@@ -12744,7 +12744,7 @@ impl Interpreter {
                         // A natively served instance's public field (see
                         // `stdlib::datetime_native`).
                         if inst.cls_raw().native_kind.get() != 0 {
-                            match Self::core_native_field(ext, inst, ins.arg) {
+                            match Self::core_native_field(ext, inst, ins.arg, pc, ninstrs) {
                                 Some(v) if Self::core_droppable(unsafe { &*top }) => {
                                     // SAFETY: the receiver (droppable) is
                                     // replaced in place.
@@ -16193,17 +16193,23 @@ impl Interpreter {
     }
 
     /// A natively served instance's public field (`dt.hour`; see
-    /// [`crate::stdlib::datetime_native::leaf_field`]), or `None`.
+    /// [`crate::stdlib::datetime_native::leaf_field`]), or `None`. A read
+    /// marks the site at `pc` native (see [`native_site`]).
     #[inline(never)]
     fn core_native_field(
         ext: Option<&CodeConstObjects>,
         inst: &PyInstance,
         name_idx: u32,
+        pc: usize,
+        ninstrs: usize,
     ) -> Option<Object> {
-        let Object::Str(name) = ext?.name_objs.get(name_idx as usize)? else {
+        let ext = ext?;
+        let Object::Str(name) = ext.name_objs.get(name_idx as usize)? else {
             return None;
         };
-        crate::stdlib::datetime_native::leaf_field(inst, name)
+        let v = crate::stdlib::datetime_native::leaf_field(inst, name)?;
+        native_site_note(ext, ninstrs, pc);
+        Some(v)
     }
 
     /// A module attribute through the `LOAD_ATTR` site's cached index:
@@ -63154,6 +63160,15 @@ fn native_site_note(ext: &CodeConstObjects, ninstrs: usize, pc: usize) {
     if let Some(site) = sites.get(pc) {
         site.store(true, Ordering::Relaxed);
     }
+}
+
+/// Whether the `LOAD_ATTR` at `pc` has recorded a split-layout field (see
+/// [`FieldSlot`]).
+pub(crate) fn field_site(ext: &CodeConstObjects, pc: usize) -> bool {
+    ext.field_slots
+        .get()
+        .and_then(|s| s.get(pc))
+        .is_some_and(|s| s.get().0 != 0)
 }
 
 /// Whether the operator at `pc` has run on a natively served operand.
