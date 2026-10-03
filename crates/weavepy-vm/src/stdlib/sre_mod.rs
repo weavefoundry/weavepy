@@ -304,6 +304,7 @@ fn loc_word(ch: u32) -> bool {
     }
 }
 
+#[inline]
 fn uni_digit(ch: u32) -> bool {
     if ch < 128 {
         return ascii_digit(ch);
@@ -341,6 +342,7 @@ fn nd_digit(c: char) -> bool {
     )
 }
 
+#[inline]
 fn uni_space(ch: u32) -> bool {
     if ch < 128 {
         // `char::is_whitespace` over ASCII.
@@ -352,6 +354,7 @@ fn uni_space(ch: u32) -> bool {
     }
 }
 
+#[inline]
 fn uni_word(ch: u32) -> bool {
     if ch < 128 {
         return ascii_word(ch);
@@ -369,6 +372,7 @@ fn uni_linebreak(ch: u32) -> bool {
     )
 }
 
+#[inline]
 fn category(chcode: u32, ch: u32) -> bool {
     match chcode {
         CAT_DIGIT => ascii_digit(ch),
@@ -406,6 +410,24 @@ impl SreChar for u32 {}
 #[inline(always)]
 fn cu<C: SreChar>(c: C) -> u32 {
     c.into()
+}
+
+/// The length of `s`'s prefix whose units all satisfy `pred`.
+#[inline(always)]
+fn scan<C: SreChar>(s: &[C], pred: impl Fn(u32) -> bool) -> usize {
+    s.iter().position(|&c| !pred(cu(c))).unwrap_or(s.len())
+}
+
+/// What a tail's first consuming op requires of the character it starts
+/// at, after any `MARK`s (which consume nothing): a `REPEAT_ONE` or
+/// `MIN_REPEAT_ONE` skips the positions whose character cannot start the
+/// tail instead of trying the tail there.
+#[derive(Clone, Copy)]
+enum TailFirst {
+    Any,
+    Literal(u32),
+    /// A set (`IN`), by its code position.
+    Set(usize),
 }
 
 /// Saved capture state (CPython's `LASTMARK_SAVE`, plus `MARK_PUSH` of
@@ -919,6 +941,31 @@ impl<'a, C: SreChar> Matcher<'a, C> {
         up != lo && self.charset(set, up)
     }
 
+    /// The first-character requirement of the tail at `tail` (see
+    /// [`TailFirst`]).
+    #[inline]
+    fn tail_first(&self, mut tail: usize) -> TailFirst {
+        let code = self.code;
+        while code[tail] == OP_MARK {
+            tail += 2;
+        }
+        match code[tail] {
+            OP_LITERAL => TailFirst::Literal(code[tail + 1]),
+            OP_IN => TailFirst::Set(tail + 2),
+            _ => TailFirst::Any,
+        }
+    }
+
+    /// Whether the character at `pos` can start a tail requiring `first`.
+    #[inline]
+    fn can_start(&self, first: TailFirst, pos: usize) -> bool {
+        match first {
+            TailFirst::Any => true,
+            TailFirst::Literal(c) => pos < self.end && cu(self.s[pos]) == c,
+            TailFirst::Set(set) => pos < self.end && self.charset(set, cu(self.s[pos])),
+        }
+    }
+
     /// `SRE(count)` — count repeated single-character matches of the
     /// item at `pat`, starting at `self.ptr`, up to `maxcount`.
     fn count(&mut self, pat: usize, maxcount: u32) -> Result<usize, RuntimeError> {
@@ -932,11 +979,33 @@ impl<'a, C: SreChar> Matcher<'a, C> {
         let op = code[pat];
         let counted = match op {
             OP_IN => {
-                let mut p = ptr;
-                while p < end && self.charset(pat + 2, cu(s[p])) {
-                    p += 1;
+                let set = pat + 2;
+                match (code[set], code.get(set + 2).copied()) {
+                    // A lone category (`\w+`, `\d*`, `\s+`): one loop per
+                    // class, with no set walk per character.
+                    (OP_CATEGORY, Some(OP_FAILURE)) => {
+                        let s = &s[ptr..end];
+                        match code[set + 1] {
+                            CAT_UNI_WORD => scan(s, uni_word),
+                            CAT_WORD => scan(s, ascii_word),
+                            CAT_UNI_DIGIT => scan(s, uni_digit),
+                            CAT_DIGIT => scan(s, ascii_digit),
+                            CAT_UNI_SPACE => scan(s, uni_space),
+                            CAT_SPACE => scan(s, ascii_space),
+                            CAT_UNI_NOT_WORD => scan(s, |c| !uni_word(c)),
+                            CAT_UNI_NOT_DIGIT => scan(s, |c| !uni_digit(c)),
+                            CAT_UNI_NOT_SPACE => scan(s, |c| !uni_space(c)),
+                            cat => scan(s, |c| category(cat, c)),
+                        }
+                    }
+                    _ => {
+                        let mut p = ptr;
+                        while p < end && self.charset(set, cu(s[p])) {
+                            p += 1;
+                        }
+                        p - ptr
+                    }
                 }
-                p - ptr
             }
             OP_ANY => {
                 let mut p = ptr;
@@ -1266,13 +1335,10 @@ impl<'a, C: SreChar> Matcher<'a, C> {
                     let save = self.snapshot();
                     let orig = ptr;
                     let pmin_i = pmin as isize;
-                    if code[tail] == OP_LITERAL {
-                        let chr = code[tail + 1];
+                    let first = self.tail_first(tail);
+                    if !matches!(first, TailFirst::Any) {
                         loop {
-                            while cnt >= pmin_i && {
-                                let pos = orig + cnt as usize;
-                                pos >= end || cu(self.s[pos]) != chr
-                            } {
+                            while cnt >= pmin_i && !self.can_start(first, orig + cnt as usize) {
                                 cnt -= 1;
                             }
                             if cnt < pmin_i {
@@ -1331,15 +1397,18 @@ impl<'a, C: SreChar> Matcher<'a, C> {
                         return Ok(true);
                     }
                     let save = self.snapshot();
+                    let first = self.tail_first(tail);
                     loop {
                         if !(pmax == MAXREPEAT || (cnt as u32) <= pmax) {
                             break;
                         }
                         self.ptr = ptr;
-                        if self.do_match(tail, toplevel)? {
-                            return Ok(true);
+                        if self.can_start(first, ptr) {
+                            if self.do_match(tail, toplevel)? {
+                                return Ok(true);
+                            }
+                            self.restore(&save);
                         }
-                        self.restore(&save);
                         self.ptr = ptr;
                         let r = self.count(pat + 3, 1)?;
                         if r == 0 {

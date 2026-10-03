@@ -425,15 +425,16 @@ fn new_match(
         .match_cls
         .upgrade()
         .ok_or_else(|| type_error("re.Match is gone"))?;
-    let mut values = Vec::with_capacity(MATCH_SLOTS.len());
-    values.push(pattern.clone());
-    values.push(string.clone());
-    values.push(Object::Int(pos as i64));
-    values.push(Object::Int(endpos as i64));
-    values.push(Object::Tuple(
-        crate::tuple_storage::TupleStorage::from_exact_iter(marks.iter().map(|&m| Object::Int(m))),
-    ));
-    values.push(Object::Int(lastindex as i64));
+    let values = vec![
+        pattern.clone(),
+        string.clone(),
+        Object::Int(pos as i64),
+        Object::Int(endpos as i64),
+        Object::Tuple(crate::tuple_storage::TupleStorage::from_exact_iter(
+            marks.iter().map(|&m| Object::Int(m)),
+        )),
+        Object::Int(lastindex as i64),
+    ];
     Ok(build(cls, &st.match_layout, values))
 }
 
@@ -692,8 +693,13 @@ fn run_sub(
             }
             Filter::Callable(f) => {
                 let m = new_match(st, recv, string, 0, e, &marks, li)?;
-                let f = (*f).clone();
-                let item = with_interp(|i| i.call_object(f, &[m], &[]))?;
+                // A builtin call runs with the interpreter and its thread
+                // handles already published, so the callable is called
+                // directly (as `functools` does).
+                let item = with_interp(|i| {
+                    let globals = i.builtins_dict();
+                    i.call(f, &[m], &[], &globals)
+                })?;
                 if !matches!(item, Object::None) {
                     sink.push_obj(&item);
                 }
