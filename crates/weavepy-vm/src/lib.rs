@@ -7824,6 +7824,11 @@ impl Interpreter {
         let Object::Function(f) = &callable else {
             unreachable!("inline callees are plain functions")
         };
+        if !code.cellvars.is_empty() {
+            // SAFETY: a bound slot's locals storage is its own.
+            let cells = fresh_cells(f, &code, unsafe { &mut *act.frame.locals.as_ptr() });
+            return self.inline_bind_with(frame, shell, pc, act, code, callable, guard, cells, true);
+        }
         let cells: *const Rc<Vec<Rc<RefCell<Object>>>> =
             f.lean_cells_ref(&code).expect("checked by the shape");
         self.inline_bind_cells(frame, shell, pc, act, code, callable, guard, cells)
@@ -7844,25 +7849,47 @@ impl Interpreter {
         guard: crate::recursion::Guard,
         cells: *const Rc<Vec<Rc<RefCell<Object>>>>,
     ) -> Box<InlineAct> {
+        // SAFETY: the caller's contract — `callable` (moved into the
+        // slot below) or the process keeps it alive.
+        let cells = borrowed_rc(unsafe { &*cells });
+        self.inline_bind_with(frame, shell, pc, act, code, callable, guard, cells, false)
+    }
+
+    /// [`Self::inline_bind_cells`] with the frame's cells handle built:
+    /// borrowed (`owned` false: the callee's lean cells, see
+    /// [`borrowed_rc`]) or the activation's own fresh cells, which the
+    /// slot releases when it parks.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn inline_bind_with(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+        mut act: Box<InlineAct>,
+        code: Rc<CodeObject>,
+        callable: Object,
+        guard: crate::recursion::Guard,
+        cells: Rc<Vec<Rc<RefCell<Object>>>>,
+        owned: bool,
+    ) -> Box<InlineAct> {
         let Object::Function(f) = &callable else {
             unreachable!("inline callees are plain functions")
         };
-        // SAFETY: the caller's contract — `callable` (moved into the
-        // slot below) or the process keeps it alive.
-        let cells = unsafe { &*cells };
         // SAFETY: the slot is parked: its code, cells, globals and
         // builtins fields hold stale non-owning copies, overwritten here
         // without a drop. The new handles are `f`'s (borrowed: the slot
-        // holds `callable`, so `f` outlives the activation) and the code
-        // (owned).
+        // holds `callable`, so `f` outlives the activation), the cells
+        // as given, and the code (owned).
         unsafe {
             let fr: &mut Frame = &mut act.frame;
             std::ptr::write(&raw mut fr.code, code);
-            std::ptr::write(&raw mut fr.cells, borrowed_rc(cells));
+            std::ptr::write(&raw mut fr.cells, cells);
             std::ptr::write(&raw mut fr.globals, borrowed_rc(&f.globals));
             std::ptr::write(&raw mut fr.builtins, borrowed_rc(&f.builtins));
             std::ptr::write(&raw mut act.callable, callable);
         }
+        act.owns_cells = owned;
         act.frame.pc = 0;
         act.parked = false;
         act.call_pc = pc;
@@ -7949,8 +7976,14 @@ impl Interpreter {
         }
         // SAFETY: the code handle is owned while active; release it and
         // leave the stale copy (never read again until `inline_bind`
-        // overwrites it; `InlineAct::drop` restores an owned one).
+        // overwrites it; `InlineAct::drop` restores an owned one). Owned
+        // cells are released the same way.
         unsafe { drop(std::ptr::read(&raw const fr.code)) };
+        if act.owns_cells {
+            act.owns_cells = false;
+            // SAFETY: as for the code handle.
+            unsafe { drop(std::ptr::read(&raw const act.frame.cells)) };
+        }
         act.parked = true;
         act.clean = false;
         act.act.shell = None;
@@ -7970,6 +8003,11 @@ impl Interpreter {
         debug_assert!(act.clean && act.frame.stack.is_empty());
         // SAFETY: as `inline_park`: the code handle is owned while active.
         unsafe { drop(std::ptr::read(&raw const act.frame.code)) };
+        if act.owns_cells {
+            act.owns_cells = false;
+            // SAFETY: as `inline_park`.
+            unsafe { drop(std::ptr::read(&raw const act.frame.cells)) };
+        }
         act.parked = true;
         act.clean = false;
         act.guard = None;
@@ -8242,7 +8280,7 @@ impl Interpreter {
                 // operands or cells, the locals are released here.
                 done.clean = true;
                 if frame.stack.is_empty()
-                    && frame.code.cellvars.is_empty()
+                    && (frame.code.cellvars.is_empty() || done.owns_cells)
                     && Rc::strong_count(&frame.locals) == 1
                 {
                     // SAFETY: sole owner; nothing else reaches the vector.
@@ -8601,6 +8639,17 @@ impl Interpreter {
     /// code, and how many trailing parameters its compiled defaults fill.
     #[inline]
     fn lean_call_shape(f: &PyFunction, eff_argc: usize) -> Option<(Rc<CodeObject>, usize)> {
+        Self::lean_call_shape_cells(f, eff_argc, false)
+    }
+
+    /// [`Self::lean_call_shape`] for an inline activation, which with
+    /// `cells` may also own cell variables (see [`fresh_cells`]).
+    #[inline]
+    fn lean_call_shape_cells(
+        f: &PyFunction,
+        eff_argc: usize,
+        cells: bool,
+    ) -> Option<(Rc<CodeObject>, usize)> {
         let code = f.code();
         let total = code.arg_count as usize;
         if code.is_generator
@@ -8619,7 +8668,13 @@ impl Interpreter {
         {
             return None;
         }
-        f.lean_cells_ref(&code)?;
+        if cells && !code.cellvars.is_empty() {
+            if !closure_cells_ok(f, &code) {
+                return None;
+            }
+        } else {
+            f.lean_cells_ref(&code)?;
+        }
         let missing = if eff_argc < total {
             if f.defaults.len() < total - eff_argc {
                 return None;
@@ -8648,6 +8703,14 @@ impl Interpreter {
     #[inline(always)]
     fn has_extended_params(code: &CodeObject) -> bool {
         code.has_varargs || code.has_varkeywords || code.kwonly_count != 0
+    }
+
+    /// Whether `code` binds keyword-only parameters or `**kwargs` (the
+    /// extended parameters a positional call's cached shape can't bind;
+    /// `*args` it can).
+    #[inline(always)]
+    fn has_keyword_params(code: &CodeObject) -> bool {
+        code.has_varkeywords || code.kwonly_count != 0
     }
 
     /// How many trailing positional defaults a call of `f` (running
@@ -8826,13 +8889,13 @@ impl Interpreter {
             _ => None,
         };
         let (code, missing) = match &bound {
-            Some((f, _)) => Self::lean_call_shape(f, argc + 1)?,
+            Some((f, _)) => Self::lean_call_shape_cells(f, argc + 1, true)?,
             None => {
                 let Object::Function(f) = &frame.stack[callee_slot] else {
                     return None;
                 };
                 let has_self = !matches!(frame.stack[self_slot], Object::Unbound);
-                Self::lean_call_shape(f, argc + usize::from(has_self))?
+                Self::lean_call_shape_cells(f, argc + usize::from(has_self), true)?
             }
         };
         // Past the recursion limit the nested lean path raises.
@@ -10098,6 +10161,7 @@ impl Interpreter {
         }
         let done = match ins.op {
             OpCode::Call => self.leaf_core_call(frame, ins, pc),
+            OpCode::LoadSpecial => Self::leaf_load_special(frame, ins.arg, pc),
             _ => self.leaf_core_attr(frame, ins, pc),
         };
         match done {
@@ -10111,6 +10175,35 @@ impl Interpreter {
             CoreAttr::Decline | CoreAttr::Full => {}
         }
         done
+    }
+
+    /// `LOAD_SPECIAL` at `pc` of an instance whose class resolves the
+    /// method to a plain function: the function and the instance as its
+    /// self (what the full handler's bound method unpacks to at the call),
+    /// remembered in the site's method slot for the core loop. Declines
+    /// any other owner or class attribute, touching nothing.
+    fn leaf_load_special(frame: &mut Frame, special: u32, pc: usize) -> CoreAttr {
+        use weavepy_compiler::bytecode::{SPECIAL_ENTER, SPECIAL_EXIT};
+        let name = match special {
+            SPECIAL_ENTER => "__enter__",
+            SPECIAL_EXIT => "__exit__",
+            _ => return CoreAttr::Decline,
+        };
+        let Some(Object::Instance(inst)) = frame.stack.last() else {
+            return CoreAttr::Decline;
+        };
+        let cls = inst.cls_raw();
+        let ver = cls.attr_version.get();
+        let Some(Object::Function(f)) = cls.lookup(name) else {
+            return CoreAttr::Decline;
+        };
+        if let Some(ms) = code_method_slot(&frame.code, pc as u32) {
+            ms.set(ver, &f);
+        }
+        let owner = frame.stack.pop().expect("checked above");
+        frame.stack.push(Object::Function(f));
+        frame.stack.push(owner);
+        CoreAttr::Done
     }
 
     /// The core loop's `LOAD_FAST x` (at `pc`, of the heap local `other`)
@@ -12422,6 +12515,38 @@ impl Interpreter {
                         last = pc;
                         pc += 1;
                     }
+                    // `with`'s `__enter__` / `__exit__` of an instance: the
+                    // plain function its class resolved at this site, under
+                    // the instance (special lookup reads only the type, so
+                    // the class version alone keys it). The helper fills
+                    // the site.
+                    OpCode::LoadSpecial => {
+                        if len == 0 || len == cap {
+                            break Some(CoreExit::Helper);
+                        }
+                        // SAFETY: `len > 0`.
+                        let top = unsafe { base.add(len - 1) };
+                        let Object::Instance(inst) = (unsafe { &*top }) else {
+                            break Some(CoreExit::Helper);
+                        };
+                        let ver = inst.cls_raw().attr_version.get();
+                        let Some(f) = mslots!(cold_mslots, ext)
+                            .get(pc)
+                            .and_then(|ms| ms.get_held(ver))
+                        else {
+                            break Some(CoreExit::Helper);
+                        };
+                        // SAFETY: `len < cap`; the instance moves up into
+                        // the self slot.
+                        unsafe {
+                            let recv = top.read();
+                            top.write(Object::Function(f));
+                            base.add(len).write(recv);
+                        }
+                        len += 1;
+                        last = pc;
+                        pc += 1;
+                    }
                     // The method-form load's per-site function (the helper's
                     // `leaf_load_method` / class-receiver hits): an instance
                     // receiver moves up into the self slot under the function;
@@ -12749,7 +12874,7 @@ impl Interpreter {
                     if let (Some(act), Some((func, has_self, eff_argc))) = (&act, shape) {
                         let code = &act.frame.code;
                         if let Some(slot) = code_call_slot(&frame.code, pc)
-                            .filter(|_| !Self::has_extended_params(code))
+                            .filter(|_| !Self::has_keyword_params(code))
                         {
                             slot.set(CallShape {
                                 func,
@@ -13140,7 +13265,7 @@ impl Interpreter {
             _ => return None,
         };
         let eff_argc = items.len() + usize::from(receiver.is_some());
-        let (code, missing) = Self::lean_call_shape(f, eff_argc)?;
+        let (code, missing) = Self::lean_call_shape_cells(f, eff_argc, true)?;
         // Past the recursion limit the nested lean path raises.
         let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
             return None;
@@ -14052,9 +14177,7 @@ impl Interpreter {
         // `PyFunction::code`); only compared, then cloned below.
         let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
         let (missing, slot_self) = slot.hit(Rc::as_ptr(f), Rc::as_ptr(code_rc))?;
-        if slot_self != has_self
-            || !Self::lean_code_ok(code_rc)
-            || Self::has_extended_params(code_rc)
+        if slot_self != has_self || !Self::lean_code_ok(code_rc) || Self::has_keyword_params(code_rc)
         {
             return None;
         }
@@ -14065,7 +14188,15 @@ impl Interpreter {
         {
             return None;
         }
-        let cells: *const Rc<Vec<Rc<RefCell<Object>>>> = f.lean_cells_ref(code_rc)?;
+        let own_cells = !code_rc.cellvars.is_empty();
+        let cells: *const Rc<Vec<Rc<RefCell<Object>>>> = if own_cells {
+            if !closure_cells_ok(f, code_rc) {
+                return None;
+            }
+            std::ptr::null()
+        } else {
+            f.lean_cells_ref(code_rc)?
+        };
         let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(depth_cell) else {
             return None;
         };
@@ -14095,14 +14226,37 @@ impl Interpreter {
             }
             frame.stack.pop().expect("callee slot checked above")
         };
+        // A `*args` callee's surplus positionals become its tuple, which
+        // follows the positional parameters (there are no keyword ones).
+        let star = code.has_varargs.then(|| {
+            let npos = code.arg_count as usize;
+            if locals.len() > npos {
+                Object::Tuple(crate::tuple_storage::TupleStorage::from_exact_iter(
+                    locals.drain(npos..),
+                ))
+            } else {
+                // The interned empty tuple.
+                Object::new_tuple(Vec::new())
+            }
+        });
         if missing > 0 {
             let Object::Function(f) = &callable else {
                 unreachable!("checked above")
             };
             locals.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
         }
+        locals.extend(star);
         fill_unbound(locals, nlocals);
         frame.pc = pc as u32 + 1;
+        if own_cells {
+            let Object::Function(f) = &callable else {
+                unreachable!("checked above")
+            };
+            let cells = fresh_cells(f, &code, locals);
+            return Some(self.inline_bind_with(
+                frame, shell, pc, act, code, callable, guard, cells, true,
+            ));
+        }
         // The cells handle is `f`'s (now `callable`'s) or the shared empty
         // vector: moving the callable leaves it where it was.
         Some(self.inline_bind_cells(frame, shell, pc, act, code, callable, guard, cells))
@@ -15519,7 +15673,7 @@ impl Interpreter {
         // holds. They are released here; an object that dies with them
         // queues its finalizer, which runs below before the caller goes on.
         let clean = frame.stack.is_empty()
-            && frame.code.cellvars.is_empty()
+            && (frame.code.cellvars.is_empty() || done.owns_cells)
             && Rc::strong_count(&frame.locals) == 1;
         let mut tmp = None;
         let (cframe, clast, cshell, entry);
@@ -56656,6 +56810,9 @@ struct InlineAct {
     /// the activation runs its `__init__`, and the caller receives the
     /// instance instead of the (`None`) result.
     init_inst: Option<Object>,
+    /// The frame's `cells` handle is the activation's own (a callee with
+    /// cell variables, see [`fresh_cells`]), not borrowed from the callee.
+    owns_cells: bool,
 }
 
 impl InlineAct {
@@ -56704,6 +56861,7 @@ impl InlineAct {
             gen_frame: std::ptr::null_mut(),
             exhaust_arg: 0,
             init_inst: None,
+            owns_cells: false,
         });
         act.act.frame = std::ptr::from_mut::<Frame>(&mut act.frame);
         // SAFETY: parked slots hold a stale code copy (see the type docs):
@@ -56720,6 +56878,11 @@ unsafe impl Send for InlineAct {}
 
 impl Drop for InlineAct {
     fn drop(&mut self) {
+        if self.owns_cells {
+            // SAFETY: owned cells are released once (the frame's own drop
+            // forgets the handle).
+            unsafe { drop(std::ptr::read(&raw const self.frame.cells)) };
+        }
         if self.parked {
             // SAFETY: the stale copies are overwritten without a drop, so
             // the frame's and callable's own drops release valid values.
@@ -57103,7 +57266,9 @@ struct LeanKwShape {
 /// handles are *borrowed* from the callee function — which the caller
 /// keeps alive for the whole activation, and whose handles are
 /// immutable (a lean frame has no cell variables, so nothing rebinds
-/// `cells`) — so building one costs no reference-count traffic. The
+/// `cells`; an inline activation with them owns its `cells`, see
+/// `InlineAct::owns_cells`) — so building one costs no reference-count
+/// traffic. The
 /// borrowed handles are forgotten, never dropped; the rest is released
 /// on drop, or recycled by [`Interpreter::retire_lean_frame`]. Anything
 /// that keeps one of these handles beyond the activation (a shell or a
@@ -57163,6 +57328,44 @@ impl Drop for LeanFrame {
         std::mem::forget(builtins);
         std::mem::forget(cells);
     }
+}
+
+/// Whether `f`'s closure is exactly cells for `code`'s free variables
+/// (what [`fresh_cells`] appends).
+#[inline]
+fn closure_cells_ok(f: &PyFunction, code: &CodeObject) -> bool {
+    f.closure.len() == code.freevars.len()
+        && f.closure.iter().all(|c| matches!(c, Object::Cell(_)))
+}
+
+/// The cells of a call of `f` running `code`, which has cell variables,
+/// as `make_frame` builds them: a fresh cell per cell variable, holding
+/// the bound local of that name (moved out of `locals`) or nothing, then
+/// `f`'s closure cells (checked by [`closure_cells_ok`]).
+fn fresh_cells(
+    f: &PyFunction,
+    code: &CodeObject,
+    locals: &mut [Object],
+) -> Rc<Vec<Rc<RefCell<Object>>>> {
+    let mut cells: Vec<Rc<RefCell<Object>>> =
+        Vec::with_capacity(code.cellvars.len() + code.freevars.len());
+    for name in &code.cellvars {
+        let initial = code
+            .varnames
+            .iter()
+            .position(|n| n == name)
+            .and_then(|i| locals.get_mut(i))
+            .map_or(Object::Unbound, |slot| std::mem::replace(slot, Object::Unbound));
+        cells.push(Rc::new(RefCell::new(initial)));
+    }
+    if crate::stdlib::tracemalloc_real::is_tracking() {
+        crate::stdlib::tracemalloc_real::track_new_cells(&cells);
+    }
+    cells.extend(f.closure.iter().filter_map(|c| match c {
+        Object::Cell(c) => Some(c.clone()),
+        _ => None,
+    }));
+    Rc::new(cells)
 }
 
 /// An `Rc` sharing `r`'s allocation *without* a count of its own: it must
@@ -57715,6 +57918,7 @@ static CORE_LEAF_OPS: [bool; 256] = {
         OpCode::LoadAttr,
         OpCode::StoreAttr,
         OpCode::LoadMethodAttr,
+        OpCode::LoadSpecial,
         OpCode::CopyTop,
         OpCode::Swap,
         OpCode::GetIter,
@@ -57724,6 +57928,11 @@ static CORE_LEAF_OPS: [bool; 256] = {
         OpCode::PopJumpIfNone,
         OpCode::PopJumpIfNotNone,
         OpCode::CallEx,
+        OpCode::Call,
+        OpCode::ReturnValue,
+        OpCode::LoadDeref,
+        OpCode::BuildList,
+        OpCode::ContainsOp,
     ];
     let mut i = 0;
     while i < ops.len() {

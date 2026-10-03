@@ -1,10 +1,12 @@
-"""Plain Python calls the core loop switches to in place.
+"""Python calls the core loop switches to in place.
 
-A call of a plain function (positional parameters only, no cells) that
-its call site has seen before runs in a pooled activation, and its return
-hands the result straight back. Each loop here runs long enough for the
-sites to settle; then the callee, its arguments or its frame change, and
-every call must still behave as the interpreter's general call does.
+A call of a function that its call site has seen before runs in a pooled
+activation (with its own cells when it has cell variables, and its
+`*args` tuple built by the site), and its return hands the result
+straight back; `with` loads its `__enter__` and `__exit__` from the site.
+Each loop here runs long enough for the sites to settle; then the callee,
+its arguments or its frame change, and every call must still behave as
+the interpreter's general call does.
 """
 
 import sys
@@ -122,6 +124,144 @@ class InlineCallTests(unittest.TestCase):
         with self.assertRaises(RecursionError):
             down(0)
         self.assertEqual(loop_add(10), sum(range(10)) + 10)
+
+    def test_cell_variables(self):
+        def adder(n):
+            def add(x):
+                return x + n
+            return add
+
+        def counter(start):
+            count = start
+
+            def bump():
+                nonlocal count
+                count += 1
+                return count
+            bump()
+            return [bump, count]
+
+        def shadow(a, b):
+            def get():
+                return a, b
+            a = a * 2
+            return get
+
+        def peek(n):
+            def inner():
+                return n
+            return sorted(sys._getframe().f_locals)
+
+        def fails(n):
+            def inner():
+                return n
+            return [inner][n]
+
+        made = [adder(i) for i in range(WARM)]
+        self.assertEqual([f(1) for f in made[:3]], [1, 2, 3])
+        self.assertEqual(sum(f(0) for f in made), sum(range(WARM)))
+        for i in range(WARM):
+            bump, seen = counter(i)
+            self.assertEqual(seen, i + 1)
+            self.assertEqual(bump(), i + 2)
+            self.assertEqual(shadow(i, 1)(), (2 * i, 1))
+        self.assertEqual(peek(3), ["inner", "n"])
+        for i in range(WARM):
+            self.assertEqual(fails(0)(), 0)
+        with self.assertRaises(IndexError):
+            fails(1)
+
+    def test_cell_variable_finalizers(self):
+        seen = []
+
+        class Note:
+            def __del__(self):
+                seen.append(1)
+
+        def hold(i):
+            n = Note()
+
+            def keep():
+                return n
+            return i
+
+        def escape(i):
+            n = Note()
+
+            def keep():
+                return n
+            return keep
+
+        for i in range(WARM):
+            hold(i)
+        self.assertEqual(len(seen), WARM)
+        kept = [escape(i) for i in range(100)]
+        self.assertEqual(len(seen), WARM)
+        del kept
+        self.assertEqual(len(seen), WARM + 100)
+
+    def test_with_statements(self):
+        log = []
+
+        class CM:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                log.append(exc[0])
+                return False
+
+        def use(cm):
+            with cm as c:
+                return c
+
+        cm = CM()
+        for _ in range(WARM):
+            self.assertIs(use(cm), cm)
+        self.assertEqual(log, [None] * WARM)
+        log.clear()
+        # Special lookup reads the class, never the instance.
+        cm.__enter__ = lambda: "instance"
+        self.assertIs(use(cm), cm)
+        # A rebound class attribute takes effect at once.
+        CM.__enter__ = lambda self: "rebound"
+        self.assertEqual(use(cm), "rebound")
+        CM.__enter__ = staticmethod(lambda: "static")
+        self.assertEqual(use(cm), "static")
+
+        class Suppress(CM):
+            def __exit__(self, kind, value, tb):
+                log.append(kind)
+                return True
+
+        def boom(cm):
+            with cm:
+                raise KeyError(1)
+            return "suppressed"
+
+        for _ in range(WARM):
+            self.assertEqual(boom(Suppress()), "suppressed")
+        self.assertEqual(log[-1], KeyError)
+        with self.assertRaises(KeyError):
+            boom(CM())
+
+    def test_star_args(self):
+        def va(*args):
+            return args
+
+        def some(a, b=2, *rest):
+            return a, b, rest
+
+        def run(n):
+            t = 0
+            for i in range(n):
+                t += len(va(i, i, i)) + len(va()) + some(i)[1] + len(some(i, 1, 2, 3)[2])
+            return t
+
+        self.assertEqual(run(WARM), WARM * 7)
+        self.assertEqual(va(1, 2), (1, 2))
+        self.assertEqual(some(1, 5, 6), (1, 5, (6,)))
+        self.assertIs(type(va()), tuple)
 
     def test_finalizers_run_on_return(self):
         seen = []
