@@ -887,6 +887,12 @@ fn compile_allowed(counter: u32, threshold: u32) -> bool {
         || counter >= threshold.saturating_mul(16)
 }
 
+/// [`compile_allowed`] for the frame compiler (see `frame_jit`), which
+/// keeps tier 2's start-up and import budgets.
+pub(crate) fn frame_compile_allowed(counter: u32, threshold: u32) -> bool {
+    compile_allowed(counter, threshold)
+}
+
 /// True when no thread's JIT can be enabled (see [`JIT_PROCESS_GATE`]).
 #[inline]
 pub(crate) fn jit_off_for_process() -> bool {

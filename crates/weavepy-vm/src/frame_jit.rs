@@ -185,6 +185,9 @@ impl Native {
 pub(crate) struct Slot {
     native: std::sync::OnceLock<Option<Box<Native>>>,
     heat: AtomicU32,
+    /// How many times the code got hot while start-up or an import ran
+    /// (see `try_compile`).
+    deferred: AtomicU32,
 }
 
 impl Slot {
@@ -219,6 +222,16 @@ impl Slot {
     fn try_compile(&self, code: &CodeObject, ext: &CodeConstObjects, nlocals: usize, at: Heat) {
         if !enabled() {
             let _ = self.native.set(None);
+            return;
+        }
+        // Code that start-up or an import runs is mostly run once (a
+        // regular expression compiler's loops, a module's set-up), and a
+        // compile costs as much as thousands of interpreted iterations:
+        // there, code compiles only after sustained work, as tier 2's
+        // budget has it.
+        let d = self.deferred.load(Ordering::Relaxed).saturating_add(1);
+        if !crate::tier2::frame_compile_allowed(d.saturating_mul(hot()), hot()) {
+            self.deferred.store(d, Ordering::Relaxed);
             return;
         }
         // Loops the tier-2 compiler may still take keep their back edges'
