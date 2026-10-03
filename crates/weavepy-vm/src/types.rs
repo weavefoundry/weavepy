@@ -447,6 +447,10 @@ pub enum LeafAttrKind {
     ValueInstance(crate::sync::Weak<PyInstance>),
     /// A class stored on the class, likewise held weakly.
     ValueType(crate::sync::Weak<TypeObject>),
+    /// A dict stored on the class (`Enum._member_map_`), likewise.
+    ValueDict(crate::sync::Weak<crate::sync::RefCell<crate::object::DictData>>),
+    /// A list stored on the class (`Enum._member_names_`), likewise.
+    ValueList(crate::sync::Weak<crate::sync::RefCell<Vec<Object>>>),
     /// A `property` on the MRO (a data descriptor: it wins over the
     /// instance dict); its getter is read at access time.
     Property(crate::sync::Weak<crate::object::PyProperty>),

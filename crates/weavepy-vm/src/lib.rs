@@ -15892,8 +15892,12 @@ impl Interpreter {
                     // scalar one is remembered for the core loop's arm.
                     Some(Object::Type(cls)) => {
                         let v = Self::leaf_load_type_attr(code, cls, pc as u32, ins.arg);
+                        // (The stamp is keyed by the class's version alone,
+                        // which a metaclass's changes don't move.)
                         if let Some(v) = &v {
-                            class_attr_fill(code, cls, pc, v);
+                            if Self::plain_metaclass(cls) {
+                                class_attr_fill(code, cls, pc, v);
+                            }
                         }
                         v
                     }
@@ -19921,6 +19925,8 @@ impl Interpreter {
                 K::Value(v) => Some(LeafAttr::Value(Self::clone_operand(v))),
                 K::ValueInstance(w) => Some(LeafAttr::Value(Object::Instance(w.upgrade()?))),
                 K::ValueType(w) => Some(LeafAttr::Value(Object::Type(w.upgrade()?))),
+                K::ValueDict(w) => Some(LeafAttr::Value(Object::Dict(w.upgrade()?))),
+                K::ValueList(w) => Some(LeafAttr::Value(Object::List(w.upgrade()?))),
                 K::Property(w) => Some(LeafAttr::Property(w.upgrade()?)),
                 K::Other => None,
             };
@@ -19974,6 +19980,8 @@ impl Interpreter {
                     | Object::Str(_)),
                 ) => K::Value(v),
                 Some(Object::Type(t)) => K::ValueType(Rc::downgrade(&t)),
+                Some(Object::Dict(d)) => K::ValueDict(Rc::downgrade(&d)),
+                Some(Object::List(l)) => K::ValueList(Rc::downgrade(&l)),
                 // A plain instance stored on the class (`timezone.utc`):
                 // a value unless its class makes it a descriptor.
                 Some(Object::Instance(i)) => {
@@ -19994,6 +20002,8 @@ impl Interpreter {
             K::Value(v) => Some(LeafAttr::Value(Self::clone_operand(v))),
             K::ValueInstance(w) => w.upgrade().map(|i| LeafAttr::Value(Object::Instance(i))),
             K::ValueType(w) => w.upgrade().map(|t| LeafAttr::Value(Object::Type(t))),
+            K::ValueDict(w) => w.upgrade().map(|d| LeafAttr::Value(Object::Dict(d))),
+            K::ValueList(w) => w.upgrade().map(|l| LeafAttr::Value(Object::List(l))),
             K::Property(w) => w.upgrade().map(LeafAttr::Property),
             K::Other => None,
         };
@@ -20026,8 +20036,28 @@ impl Interpreter {
         // (A VM-native builtin class with a faithful C mirror keeps its
         // own dict authoritative; only an extension-defined type's C
         // attribute hooks are opaque here.)
-        if (cls.c_ext_ptr.get() != 0 && !cls.flags.is_builtin) || !Self::plain_metaclass(cls) {
+        if cls.c_ext_ptr.get() != 0 && !cls.flags.is_builtin {
             return None;
+        }
+        // `type.__dict__` is a data descriptor on the metatype that answers
+        // ahead of everything else, unless the metaclass replaces
+        // `__getattribute__` (a watched type re-arms on every lookup).
+        if code.names.get(name_idx as usize).is_some_and(|n| n == "__dict__") {
+            if crate::capi_watchers::types_active() {
+                return None;
+            }
+            // SAFETY: GIL-serialized raw read, as in `plain_metaclass`.
+            let meta = unsafe { (*cls.metaclass.as_ptr()).as_ref() };
+            if meta.is_some_and(|m| {
+                !Rc::ptr_eq(m, &builtin_types().type_)
+                    && (m.c_ext_ptr.get() != 0 || !Self::default_getattribute(m))
+            }) {
+                return None;
+            }
+            return Some(Object::MappingProxy(cls.dict.clone()));
+        }
+        if !Self::plain_metaclass(cls) {
+            return Self::leaf_load_meta_class_attr(code, cls, name_idx);
         }
         // A natively served class method (`datetime.fromisoformat`; see
         // `stdlib::datetime_native`), bound as `classmethod.__get__`
@@ -20060,6 +20090,41 @@ impl Interpreter {
             LeafAttr::Value(v) => Some(v),
             // A native method read through the class stays on the full
             // path (it reports as a method descriptor, not a function).
+            LeafAttr::InstanceOnly | LeafAttr::BuiltinMethod(_) | LeafAttr::Property(_) => None,
+        }
+    }
+
+    /// [`Self::leaf_load_type_attr`] for a class whose metaclass is a
+    /// Python subclass of `type` (`EnumType`, `ABCMeta`) that keeps the
+    /// default attribute access. CPython's `type_getattro` lets only a
+    /// metatype attribute intercept, so when the metaclass's MRO has no
+    /// entry for the name at all, the class's MRO answers as for a plain
+    /// metaclass. Nothing is cached per site: the class's attribute
+    /// version doesn't follow the metaclass.
+    #[inline(never)]
+    fn leaf_load_meta_class_attr(
+        code: &CodeObject,
+        cls: &Rc<TypeObject>,
+        name_idx: u32,
+    ) -> Option<Object> {
+        if crate::object::exotic_str_keys_possible() || cls.native_kind.get() != 0 {
+            return None;
+        }
+        // SAFETY: GIL-serialized raw read, as in `plain_metaclass`; the
+        // reference does not outlive the checks.
+        let meta = unsafe { (*cls.metaclass.as_ptr()).as_ref() }?;
+        if meta.c_ext_ptr.get() != 0 || !Self::default_getattribute(meta) {
+            return None;
+        }
+        let Some(Object::Str(name)) = code_name_obj(code, name_idx) else {
+            return None;
+        };
+        if meta.lookup(name).is_some() {
+            return None;
+        }
+        match Self::leaf_class_attr(code, cls, name_idx)? {
+            LeafAttr::Method(f) => Some(Object::Function(f)),
+            LeafAttr::Value(v) => Some(v),
             LeafAttr::InstanceOnly | LeafAttr::BuiltinMethod(_) | LeafAttr::Property(_) => None,
         }
     }
@@ -21155,7 +21220,11 @@ impl Interpreter {
                     // through its `__setitem__` (e.g. `enum._EnumDict`); the old
                     // value is the namespace's to manage, so no reap here.
                     let g = frame.globals.clone();
-                    self.class_ns_store(&ns_obj, &name, v, &g)?;
+                    let key = match code_name_obj(&frame.code, ins.arg) {
+                        Some(k @ Object::Str(s)) if **s == *name => k.clone(),
+                        _ => Object::from_str(name),
+                    };
+                    self.class_ns_store_key(&ns_obj, key, v, &g)?;
                 } else {
                     // Dict-subclass exec globals with an overridden
                     // `__setitem__` observe the binding (CPython's
@@ -21788,6 +21857,13 @@ impl Interpreter {
                 // `co_names[arg >> 2]` from the super object, pushing a
                 // null self slot after it when the method flag (bit 0)
                 // is set.
+                if let Some(attr) = self.load_super_attr_direct(frame, ins.arg)? {
+                    frame.push(attr);
+                    if ins.arg & 1 != 0 {
+                        frame.push(Object::Unbound);
+                    }
+                    return Ok(StepOutcome::Continue);
+                }
                 let self_obj = frame.pop()?;
                 let class_obj = frame.pop()?;
                 // The callable (global_super) is already in position
@@ -27202,6 +27278,118 @@ impl Interpreter {
         }
     }
 
+    /// The first stage of `super_getattro` for a bound proxy over
+    /// `receiver` (CPython's `su->obj`), walking `obj_type`'s MRO past
+    /// `thisclass`: the attribute through the descriptor protocol, or the
+    /// receiver's native payload's when a built-in base keeps it off its
+    /// type dict. `None` leaves the remaining special cases to the caller.
+    fn super_mro_attr(
+        &mut self,
+        obj_type: &Rc<TypeObject>,
+        receiver: &Object,
+        thisclass: &Rc<TypeObject>,
+        name: &str,
+    ) -> Result<Option<Object>, RuntimeError> {
+        // Walk `obj_type`'s MRO *after* `thisclass` (CPython's
+        // `super_getattro`: start one past `su->type` in
+        // `su->obj_type->tp_mro`). The proxy's own class (`super` or a
+        // user subclass) is irrelevant to the lookup target.
+        let found = {
+            let mro = obj_type.mro.borrow();
+            let start = mro
+                .iter()
+                .position(|t| Rc::ptr_eq(t, thisclass))
+                .map_or(mro.len(), |i| i + 1);
+            mro[start..].iter().find_map(|t| {
+                let v = t.dict.borrow().get(&crate::object::StrKey(name)).cloned()?;
+                // Introspection-only mirrors in builtin dicts (docs
+                // surface pass, RFC 0056 WS4) are invisible to super's
+                // walk too: `super().__repr__()` must fall through to
+                // the caller's non-virtual `object.__repr__` special case,
+                // not the virtual `slot_repr` (asyncio.Lock's repr
+                // chains through super and would re-enter itself).
+                if t.flags.is_builtin && crate::descr_registry::is_surface_only(&v) {
+                    return None;
+                }
+                Some(v)
+            })
+        };
+        if let Some(v) = found {
+            // CPython passes `su->obj_type` as `owner`, and a NULL
+            // instance when `su->obj == su->obj_type` (the class-bound
+            // form `super(C, cls)` inside `__new__`/classmethods), so
+            // plain functions come back unbound while classmethods
+            // still bind to the class.
+            let owner = Object::Type(obj_type.clone());
+            let instance_for_get = match receiver {
+                Object::Type(r) if Rc::ptr_eq(r, obj_type) => Object::None,
+                _ => receiver.clone(),
+            };
+            return self.descriptor_get(&v, &instance_for_get, &owner).map(Some);
+        }
+        // The MRO beyond the starting class reaches a built-in base
+        // (`dict`, `list`, …) whose methods aren't stored on the type
+        // dict and so don't surface above. Resolve `name` against the
+        // receiver's native payload so `super().__setitem__`,
+        // `super().append`, … dispatch to the wrapped built-in and
+        // operate on the shared payload. (Only names absent from the
+        // MRO reach here, so this never shadows a user override.)
+        if let Object::Instance(recv) = receiver {
+            if let Some(native) = recv.native.get() {
+                if let Ok(v) = self.load_attr(&native.clone(), name) {
+                    return Ok(Some(v));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// `LOAD_SUPER_ATTR`'s zero-argument form without the proxy: the
+    /// class and receiver on the stack are what `super()` would find, so
+    /// when the builtin `super` is the callable, nothing observes the call
+    /// (CPython's instrumented form reports it), and the receiver passes
+    /// the basic `supercheck`, the attribute is the MRO walk's. On a hit
+    /// the three operands leave the stack; `None` leaves them for the
+    /// general path, which also serves the walk's special cases.
+    fn load_super_attr_direct(
+        &mut self,
+        frame: &mut Frame,
+        arg: u32,
+    ) -> Result<Option<Object>, RuntimeError> {
+        if arg & 2 != 0 || crate::trace::any_observers_active() {
+            return Ok(None);
+        }
+        let n = frame.stack.len();
+        if n < 3 || !is_super_callable(&frame.stack[n - 3]) {
+            return Ok(None);
+        }
+        let Object::Type(cls) = &frame.stack[n - 2] else {
+            return Ok(None);
+        };
+        let receiver = &frame.stack[n - 1];
+        let obj_type = match receiver {
+            Object::Type(t) if Rc::ptr_eq(t, cls) || t.is_subclass_of(cls) => t.clone(),
+            _ => {
+                let oc = crate::builtins::class_of(receiver);
+                if !oc.is_subclass_of(cls) {
+                    return Ok(None);
+                }
+                oc
+            }
+        };
+        let (cls, receiver) = (cls.clone(), receiver.clone());
+        let code = frame.code.clone();
+        let Some(name) = code.names.get((arg >> 2) as usize) else {
+            return Ok(None);
+        };
+        let Some(attr) = self.super_mro_attr(&obj_type, &receiver, &cls, name)? else {
+            return Ok(None);
+        };
+        let len = frame.stack.len();
+        frame.stack.truncate(len - 3);
+        Ok(Some(attr))
+    }
+
     /// The default `object.__getattribute__` body: data descriptor → instance
     /// dict → class attr → built-in-subclass payload, ending in
     /// `AttributeError`. Does **not** consult `__getattr__` (the caller does)
@@ -27261,56 +27449,8 @@ impl Interpreter {
             None
         };
         if let Some((obj_type, receiver, thisclass)) = super_fields {
-            // Walk `obj_type`'s MRO *after* `thisclass` (CPython's
-            // `super_getattro`: start one past `su->type` in
-            // `su->obj_type->tp_mro`). The proxy's own class (`super` or a
-            // user subclass) is irrelevant to the lookup target.
-            let found = {
-                let mro = obj_type.mro.borrow();
-                let start = mro
-                    .iter()
-                    .position(|t| Rc::ptr_eq(t, &thisclass))
-                    .map_or(mro.len(), |i| i + 1);
-                mro[start..].iter().find_map(|t| {
-                    let v = t.dict.borrow().get(&crate::object::StrKey(name)).cloned()?;
-                    // Introspection-only mirrors in builtin dicts (docs
-                    // surface pass, RFC 0056 WS4) are invisible to super's
-                    // walk too — `super().__repr__()` must fall through to
-                    // the non-virtual `object.__repr__` special case below,
-                    // not the virtual `slot_repr` (asyncio.Lock's repr
-                    // chains through super and would re-enter itself).
-                    if t.flags.is_builtin && crate::descr_registry::is_surface_only(&v) {
-                        return None;
-                    }
-                    Some(v)
-                })
-            };
-            if let Some(v) = found {
-                // CPython passes `su->obj_type` as `owner`, and a NULL
-                // instance when `su->obj == su->obj_type` — the class-bound
-                // form `super(C, cls)` inside `__new__`/classmethods — so
-                // plain functions come back unbound while classmethods
-                // still bind to the class.
-                let owner = Object::Type(obj_type.clone());
-                let instance_for_get = match &receiver {
-                    Object::Type(r) if Rc::ptr_eq(r, &obj_type) => Object::None,
-                    _ => receiver.clone(),
-                };
-                return self.descriptor_get(&v, &instance_for_get, &owner);
-            }
-            // The MRO beyond the starting class reaches a built-in base
-            // (`dict`, `list`, …) whose methods aren't stored on the type
-            // dict and so don't surface above. Resolve `name` against the
-            // receiver's native payload so `super().__setitem__`,
-            // `super().append`, … dispatch to the wrapped built-in and
-            // operate on the shared payload. (Only names absent from the
-            // MRO reach here, so this never shadows a user override.)
-            if let Object::Instance(recv) = &receiver {
-                if let Some(native) = recv.native.get() {
-                    if let Ok(v) = self.load_attr(&native.clone(), name) {
-                        return Ok(v);
-                    }
-                }
+            if let Some(v) = self.super_mro_attr(&obj_type, &receiver, &thisclass, name)? {
+                return Ok(v);
             }
             // `object.__repr__` / `object.__str__` are identity slots that
             // WeavePy keeps as native behaviour rather than type-dict
@@ -44740,10 +44880,33 @@ impl Interpreter {
         value: Object,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<(), RuntimeError> {
-        let key = Object::from_str(name);
-        if let Some(method) = instance_method(ns_obj, "__setitem__") {
-            self.call(&method, &[key, value], &[], globals)?;
-            return Ok(());
+        self.class_ns_store_key(ns_obj, Object::from_str(name), value, globals)
+    }
+
+    /// [`Self::class_ns_store`] with the key already an object (the code
+    /// object's interned name, whose hash is cached, like the `co_names`
+    /// entry CPython's `STORE_NAME` passes).
+    fn class_ns_store_key(
+        &mut self,
+        ns_obj: &Object,
+        key: Object,
+        value: Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<(), RuntimeError> {
+        if let Object::Instance(inst) = ns_obj {
+            if let Some(m) = inst.cls().lookup("__setitem__") {
+                // A plain function takes the namespace as its first
+                // argument, with no bound method to build; anything else
+                // binds at call time (a descriptor's `__get__` runs then).
+                if matches!(m, Object::Function(_)) {
+                    self.call(&m, &[ns_obj.clone(), key, value], &[], globals)?;
+                } else {
+                    let method =
+                        Object::BoundMethod(Rc::new(BoundMethod::dispatch(ns_obj.clone(), m)));
+                    self.call(&method, &[key, value], &[], globals)?;
+                }
+                return Ok(());
+            }
         }
         self.store_subscr(ns_obj, &key, value, globals)
     }
@@ -44792,7 +44955,7 @@ impl Interpreter {
         name: &str,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Option<Object>, RuntimeError> {
-        let key = DictKey(Object::from_str(name));
+        let key = crate::object::StrKey(name);
         match ns_obj {
             Object::Dict(d) => Ok(d.borrow().get(&key).cloned()),
             Object::MappingProxy(d) => Ok(d.borrow().get(&key).cloned()),
@@ -46629,13 +46792,18 @@ impl Interpreter {
             }
             if let Object::Instance(inst) = &value {
                 if let Some(hook) = inst.cls().lookup("__set_name__") {
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(value.clone(), hook)));
-                    let res = self.call(
-                        &bound,
-                        &[Object::Type(ty.clone()), Object::from_str(&attr_name)],
-                        &[],
-                        &self.builtins.clone(),
-                    );
+                    let owner = Object::Type(ty.clone());
+                    let name = Object::from_str(&attr_name);
+                    let builtins = self.builtins.clone();
+                    // A plain function takes the descriptor as its first
+                    // argument, with no bound method to build.
+                    let res = if matches!(hook, Object::Function(_)) {
+                        self.call(&hook, &[value.clone(), owner, name], &[], &builtins)
+                    } else {
+                        let bound =
+                            Object::BoundMethod(Rc::new(BoundMethod::new(value.clone(), hook)));
+                        self.call(&bound, &[owner, name], &[], &builtins)
+                    };
                     // PEP 678 / CPython `type.__new__`: a failing
                     // `__set_name__` is re-raised with a note naming the
                     // descriptor, attribute, and owning class so the
