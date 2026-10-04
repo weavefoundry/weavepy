@@ -286,15 +286,10 @@ jobs:
           done
           A="$PWD/$F"
           echo "absolute-path: $(target/release/weavepy "$A")"
-          echo "absolute, fresh frozen cache: $(WEAVEPY_FROZEN_CACHE="$RUNNER_TEMP/fz2" target/release/weavepy "$A")"
-          echo "absolute, fresh stdlib cache: $(WEAVEPY_STDLIB_CACHE="$RUNNER_TEMP/sc2" target/release/weavepy "$A")"
-          echo "absolute, no frozen cache: $(WEAVEPY_FROZEN_CACHE=0 target/release/weavepy "$A")"
-          for P in "$F" "$A"; do
-            echo "--- trace for $P"
-            WEAVEPY_JIT_TRACE=1 WEAVEPY_FRAME_JIT_STATS=1 target/release/weavepy "$P" 2>&1 | grep -v " loop at " | tail -40
-            echo "--- burst stats for $P"
-            WEAVEPY_BURST_STATS=1 target/release/weavepy "$P" 2>&1 | head -40
+          for E in X=1 WEAVEPY_FRAME_JIT=0 WEAVEPY_JIT_QUICK=1 WEAVEPY_JIT_OPT=1 "WEAVEPY_PLAN_VERIFY=1 WEAVEPY_FRAME_JIT_VERIFY=1" WEAVEPY_JIT=0; do
+            for i in 1 2; do echo "absolute, $E: $(env $E target/release/weavepy "$A" 2>"$RUNNER_TEMP/err.txt") $(head -c 300 "$RUNNER_TEMP/err.txt")"; done
           done
+          for i in 1 2; do echo "relative, WEAVEPY_JIT=0: $(WEAVEPY_JIT=0 target/release/weavepy "$F")"; done
           echo "--- default cache"
           ls -la "$LOCALAPPDATA/weavepy" 2>&1 | head -20
       - name: Diagnose cold Windows JIT costs after a failed gate
