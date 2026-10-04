@@ -266,7 +266,7 @@ jobs:
         # same runner time it at 0.6x. This separates the differences
         # between the two (environment, caches, binary path).
         if: failure() && matrix.os == 'windows-latest' && github.event_name == 'pull_request' && steps.bench_gate.outcome == 'failure'
-        timeout-minutes: 5
+        timeout-minutes: 15
         shell: bash
         run: |
           F=crates/weavepy-bench/fixtures/call_overhead.py
@@ -284,8 +284,15 @@ jobs:
               echo "$label: $out"
             done
           done
+          echo "absolute-path: $(target/release/weavepy "$PWD/$F")"
+          echo "python-launched: $(python -c 'import subprocess,sys; print(subprocess.run([sys.argv[1], sys.argv[2]], capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout.strip())' target/release/weavepy.exe "$PWD/$F")"
           echo "--- gate-like trace"
           WEAVEPY_JIT_TRACE=1 target/release/weavepy $F 2>&1 | tail -30
+          for B in target/release/weavepy "$BASE_WEAVEPY"; do
+            echo "--- harness run, $B alone"
+            target/release/weavepy-bench run --weavepy="$B" --no-cpython --no-interp --samples=3 2>&1 \
+              | grep -E "\| (call_overhead|attr_access|sumvm) \|"
+          done
       - name: Diagnose cold Windows JIT costs after a failed gate
         id: cold_jit_diagnostic
         if: failure() && matrix.os == 'windows-latest' && github.event_name == 'pull_request' && steps.bench_gate.outcome == 'failure'
