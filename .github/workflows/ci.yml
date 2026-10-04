@@ -286,10 +286,10 @@ jobs:
           done
           A="$PWD/$F"
           echo "absolute-path: $(target/release/weavepy "$A")"
-          for E in X=1 WEAVEPY_FRAME_JIT=0 WEAVEPY_JIT_QUICK=1 WEAVEPY_JIT_OPT=1 "WEAVEPY_PLAN_VERIFY=1 WEAVEPY_FRAME_JIT_VERIFY=1" WEAVEPY_JIT=0; do
-            for i in 1 2; do echo "absolute, $E: $(env $E target/release/weavepy "$A" 2>"$RUNNER_TEMP/err.txt") $(head -c 300 "$RUNNER_TEMP/err.txt")"; done
+          for P in "$A" "$F"; do
+            echo "--- VM stats for $P"
+            WEAVEPY_VM_STATS=1 target/release/weavepy "$P" 2>&1 | grep -vE "^\| 0x|^\|--|^\| op" | head -70
           done
-          for i in 1 2; do echo "relative, WEAVEPY_JIT=0: $(WEAVEPY_JIT=0 target/release/weavepy "$F")"; done
           echo "--- default cache"
           ls -la "$LOCALAPPDATA/weavepy" 2>&1 | head -20
       - name: Diagnose cold Windows JIT costs after a failed gate
