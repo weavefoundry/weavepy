@@ -297,6 +297,9 @@ jobs:
               -o "$OUT/$name.json.gz" -- target/release/weavepy.exe "$path" \
               || echo "samply failed for $name"
           done
+          # The binaries and their PDBs, to symbolicate the profiles.
+          cp target/release/python314.dll target/release/python314.pdb \
+             target/release/weavepy.exe target/release/weavepy.pdb "$OUT/" || true
           ls -la "$OUT"
           echo "--- default cache"
           ls -la "$LOCALAPPDATA/weavepy" 2>&1 | head -20
