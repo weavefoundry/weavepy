@@ -15167,13 +15167,11 @@ impl Interpreter {
             args[k] = o;
         }
         // The `**kwargs` dictionary is built where it lives: no move of a
-        // filled table into its cell.
-        let varkw = code_rc.has_varkeywords.then(|| {
-            Object::Dict(Rc::new(RefCell::new(DictData::with_capacity_and_hasher(
-                kwc,
-                crate::fasthash::FxBuildHasher,
-            ))))
-        });
+        // filled table into its cell. It reuses the last call's when that
+        // one didn't escape (see `recycle_kw_dict`).
+        let varkw = code_rc
+            .has_varkeywords
+            .then(|| Object::Dict(spare_kw_dict(kwc)));
         for (j, o) in vals[eff_argc..].iter().enumerate() {
             let slot = ((perm >> (4 * j)) & 0xF) as usize;
             if slot == specialize::KW_TO_VARKW as usize {
@@ -15200,7 +15198,11 @@ impl Interpreter {
         if let Some(d) = &varkw {
             args[total] = d;
         }
-        self.pure_leaf_eval::<false, false>(code_rc, f, &args[..arity])
+        let result = self.pure_leaf_eval::<false, false>(code_rc, f, &args[..arity]);
+        if let Some(Object::Dict(d)) = varkw {
+            recycle_kw_dict(d);
+        }
+        result
     }
 
     /// A keyword call's parameters, bound as `kw_names_fill_locals` leaves
@@ -57785,6 +57787,47 @@ fn borrowed_rc<T>(r: &Rc<T>) -> Rc<T> {
 enum QuietShell<'a> {
     Ready(&'a crate::object::FrameShell),
     Lazy(&'a mut LeanAct),
+}
+
+thread_local! {
+    /// The `**kwargs` dictionary of the last keyword leaf call, emptied,
+    /// when nothing kept it (see [`recycle_kw_dict`]).
+    static SPARE_KW_DICT: std::cell::Cell<Option<Rc<RefCell<DictData>>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// An empty `**kwargs` dictionary with room for `n` keys: the spare one,
+/// if any, else a fresh one.
+fn spare_kw_dict(n: usize) -> Rc<RefCell<DictData>> {
+    SPARE_KW_DICT
+        .try_with(std::cell::Cell::take)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| {
+            Rc::new(RefCell::new(DictData::with_capacity_and_hasher(
+                n,
+                crate::fasthash::FxBuildHasher,
+            )))
+        })
+}
+
+/// Keep a keyword leaf call's `**kwargs` dictionary for the next call
+/// when nothing else holds it. A call per iteration otherwise allocates
+/// and frees the same blocks, and when they are alone on their allocator
+/// page the page is released and fetched again every time (on Windows
+/// that doubled `call_overhead`). Clearing restamps the dictionary, so
+/// the next call sees a new one.
+fn recycle_kw_dict(mut d: Rc<RefCell<DictData>>) {
+    const MAX_KEPT_KEYS: usize = 16;
+    let Some(cell) = Rc::get_mut(&mut d) else {
+        return;
+    };
+    let data = cell.get_mut();
+    if data.capacity() > MAX_KEPT_KEYS {
+        return;
+    }
+    data.clear();
+    let _ = SPARE_KW_DICT.try_with(|spare| spare.set(Some(d)));
 }
 
 #[cfg(test)]
