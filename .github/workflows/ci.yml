@@ -266,7 +266,7 @@ jobs:
         # same runner time it at 0.6x. This separates the differences
         # between the two (environment, caches, binary path).
         if: failure() && matrix.os == 'windows-latest' && github.event_name == 'pull_request' && steps.bench_gate.outcome == 'failure'
-        timeout-minutes: 15
+        timeout-minutes: 30
         shell: bash
         run: |
           F=crates/weavepy-bench/fixtures/call_overhead.py
@@ -286,10 +286,18 @@ jobs:
           done
           A="$PWD/$F"
           echo "absolute-path: $(target/release/weavepy "$A")"
-          for P in "$A" "$F"; do
-            echo "--- VM stats for $P"
-            WEAVEPY_VM_STATS=1 target/release/weavepy "$P" 2>&1 | grep -vE "^\| 0x|^\|--|^\| op" | head -70
+          # A sampling profile of each run, taken from outside the process
+          # (in-process statistics shift the layout and hide the slowdown).
+          cargo install samply --locked --quiet || echo "samply install failed"
+          OUT="target/performance/cold-jit-ci/${{ github.run_id }}-${{ github.run_attempt }}/profiles"
+          mkdir -p "$OUT"
+          for spec in "slow:$A" "fast:$F"; do
+            name=${spec%%:*}; path=${spec#*:}
+            samply record --save-only --unstable-presymbolicate --rate 4000 \
+              -o "$OUT/$name.json.gz" -- target/release/weavepy.exe "$path" \
+              || echo "samply failed for $name"
           done
+          ls -la "$OUT"
           echo "--- default cache"
           ls -la "$LOCALAPPDATA/weavepy" 2>&1 | head -20
       - name: Diagnose cold Windows JIT costs after a failed gate
