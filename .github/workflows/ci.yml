@@ -284,15 +284,19 @@ jobs:
               echo "$label: $out"
             done
           done
-          echo "absolute-path: $(target/release/weavepy "$PWD/$F")"
-          echo "python-launched: $(python -c 'import subprocess,sys; print(subprocess.run([sys.argv[1], sys.argv[2]], capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout.strip())' target/release/weavepy.exe "$PWD/$F")"
-          echo "--- gate-like trace"
-          WEAVEPY_JIT_TRACE=1 target/release/weavepy $F 2>&1 | tail -30
-          for B in target/release/weavepy "$BASE_WEAVEPY"; do
-            echo "--- harness run, $B alone"
-            target/release/weavepy-bench run --weavepy="$B" --no-cpython --no-interp --samples=3 2>&1 \
-              | grep -E "\| (call_overhead|attr_access|sumvm) \|"
+          A="$PWD/$F"
+          echo "absolute-path: $(target/release/weavepy "$A")"
+          echo "absolute, fresh frozen cache: $(WEAVEPY_FROZEN_CACHE="$RUNNER_TEMP/fz2" target/release/weavepy "$A")"
+          echo "absolute, fresh stdlib cache: $(WEAVEPY_STDLIB_CACHE="$RUNNER_TEMP/sc2" target/release/weavepy "$A")"
+          echo "absolute, no frozen cache: $(WEAVEPY_FROZEN_CACHE=0 target/release/weavepy "$A")"
+          for P in "$F" "$A"; do
+            echo "--- trace for $P"
+            WEAVEPY_JIT_TRACE=1 WEAVEPY_FRAME_JIT_STATS=1 target/release/weavepy "$P" 2>&1 | grep -v " loop at " | tail -40
+            echo "--- burst stats for $P"
+            WEAVEPY_BURST_STATS=1 target/release/weavepy "$P" 2>&1 | head -40
           done
+          echo "--- default cache"
+          ls -la "$LOCALAPPDATA/weavepy" 2>&1 | head -20
       - name: Diagnose cold Windows JIT costs after a failed gate
         id: cold_jit_diagnostic
         if: failure() && matrix.os == 'windows-latest' && github.event_name == 'pull_request' && steps.bench_gate.outcome == 'failure'
