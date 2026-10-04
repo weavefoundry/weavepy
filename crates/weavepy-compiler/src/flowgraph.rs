@@ -3092,7 +3092,7 @@ impl Cfg {
         }
         co.instructions = instructions;
         co.linetable = linetable;
-        co.coltable = coltable;
+        co.coltable = coltable.into();
         co.exception_table = table;
         co.constants = self.consts;
         no_interrupt.sort_unstable();

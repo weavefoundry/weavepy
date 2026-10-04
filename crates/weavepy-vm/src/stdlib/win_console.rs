@@ -767,6 +767,6 @@ fn wcio_new(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     };
     let inst = Object::Instance(Rc::new(PyInstance::new(cls)));
-    crate::gc_trace::track(inst.clone());
+    crate::gc_trace::track(&inst);
     Ok(inst)
 }

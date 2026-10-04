@@ -103,6 +103,7 @@ pub mod signal_mod;
 pub mod socket_mod;
 pub mod sqlite3_native;
 pub mod sre_mod;
+pub(crate) mod sre_objects;
 pub mod statistics_accel;
 pub mod struct_mod;
 pub mod subprocess_mod;

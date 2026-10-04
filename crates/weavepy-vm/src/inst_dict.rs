@@ -107,6 +107,14 @@ impl SharedKeys {
         })
     }
 
+    /// How many leading names are not `name` (Python hash `hash`): its
+    /// position, or all of them when none is. An instance holding no more
+    /// values than this has no attribute `name`.
+    pub(crate) fn names_before(&self, name: &str, hash: i64) -> usize {
+        let n = self.len();
+        self.position_hashed(n, name, hash).unwrap_or(n)
+    }
+
     /// Publish the `str` name `name` as the next name; `None` when the
     /// table is full. The caller holds the GIL outside free-threaded mode.
     fn push(&self, name: &SharedStr) -> Option<usize> {
@@ -225,6 +233,15 @@ impl Drop for SplitValues {
 }
 
 impl SplitValues {
+    /// Where native code finds a split block's parts: the block pointer
+    /// (null when empty) within the values, and the shared names' pointer,
+    /// the `u32` length and the first value within a block.
+    pub(crate) const BLOCK_OFFSET: usize = std::mem::offset_of!(Self, block);
+    pub(crate) const KEYS_OFFSET: usize = std::mem::offset_of!(SplitHeader, keys);
+    pub(crate) const LEN_OFFSET: usize = std::mem::offset_of!(SplitHeader, len);
+    pub(crate) const CAP_OFFSET: usize = std::mem::offset_of!(SplitHeader, cap);
+    pub(crate) const VALUES_OFFSET: usize = std::mem::size_of::<SplitHeader>();
+
     #[inline]
     fn layout(cap: usize) -> std::alloc::Layout {
         std::alloc::Layout::new::<SplitHeader>()
@@ -437,6 +454,34 @@ impl SplitValues {
             }
         }
         self.push(keys, want, value);
+    }
+
+    /// Make room for `cap` values before the first one arrives, adopting
+    /// the class's names (`keys`): a constructor that sets its fields in the
+    /// class's order then appends each in place, the first included (see
+    /// [`Self::append_over`] and compiled code's new-key stores). Nothing
+    /// when a block exists (values, or a recycled one) or `cap` is zero.
+    pub(crate) fn reserve_for(&mut self, keys: impl FnOnce() -> Rc<SharedKeys>, cap: usize) {
+        if self.block.is_some() || cap == 0 {
+            return;
+        }
+        let layout = Self::layout(cap);
+        // SAFETY: a nonzero-size layout (the header alone has a size).
+        #[allow(clippy::cast_ptr_alignment)]
+        let h = unsafe { std::alloc::alloc(layout) }.cast::<SplitHeader>();
+        let Some(h) = std::ptr::NonNull::new(h) else {
+            std::alloc::handle_alloc_error(layout);
+        };
+        // SAFETY: `h` is a fresh block of `cap` slots; the header owns one
+        // strong count of the names.
+        unsafe {
+            h.as_ptr().write(SplitHeader {
+                keys: Rc::into_raw(keys()),
+                len: 0,
+                cap: cap as u32,
+            });
+        }
+        self.block = Some(h);
     }
 
     /// Whether [`Self::append_over`] of position `i` of `keys` succeeds
@@ -675,6 +720,12 @@ impl std::fmt::Debug for InstDict {
 }
 
 impl InstDict {
+    /// Where native code finds the published dictionary's pointer (null
+    /// while the values are split) and the split values' cell.
+    pub(crate) const LAZY_OFFSET: usize =
+        std::mem::offset_of!(Self, lazy) + LazyArc::<RefCell<DictData>>::POINTER_OFFSET;
+    pub(crate) const SPLIT_OFFSET: usize = std::mem::offset_of!(Self, split);
+
     pub fn new() -> Self {
         Self {
             lazy: LazyArc::new(),
@@ -1128,10 +1179,17 @@ impl crate::types::PyInstance {
     /// layout, no materializing).
     pub fn attr_position_str(&self, name: &str) -> Option<u32> {
         let i = match self.dict.published() {
-            Some(d) => d
-                .try_borrow()
-                .ok()?
-                .get_index_of(&crate::object::StrKey(name))?,
+            Some(d) => {
+                // Never runs Python: a stored key only a user `__eq__`
+                // could equate leaves the position unknown.
+                let probe =
+                    crate::object::LeafNameProbe::new(name, crate::object::py_str_hash(name));
+                let i = d.try_borrow().ok()?.get_index_of(&probe);
+                if probe.saw_exotic() {
+                    return None;
+                }
+                i?
+            }
             None => self
                 .dict
                 .split_cell()

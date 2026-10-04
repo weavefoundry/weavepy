@@ -231,7 +231,13 @@ jobs:
         # rust-cache still primes dependency compilation, and the
         # merge-base is usually a recent main commit CI has built
         # before, so this step is mostly cache hits.
+        #
+        # The reference binary is only timed, so a lint that a newer
+        # toolchain added (one the merge-base predates) mustn't fail
+        # the build: lints are capped at warnings here.
         shell: bash
+        env:
+          RUSTFLAGS: "--cap-lints=warn"
         run: |
           BASE_SHA=$(git merge-base "${{ github.event.pull_request.base.sha }}" HEAD)
           echo "merge-base: $BASE_SHA"
@@ -254,6 +260,43 @@ jobs:
           target/release/weavepy-bench gate $FLAGS \
             --weavepy=target/release/weavepy \
             | tee bench-report.md
+      - name: Time call_overhead the way the gate runs it
+        # The gate has timed the PR binary's `call_overhead` at 1.2-1.5x
+        # the merge-base on every Windows PR run, while direct runs on the
+        # same runner time it at 0.6x. This separates the differences
+        # between the two (environment, caches, binary path).
+        if: failure() && matrix.os == 'windows-latest' && github.event_name == 'pull_request' && steps.bench_gate.outcome == 'failure'
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          F=crates/weavepy-bench/fixtures/call_overhead.py
+          export WEAVEPY_BENCH_WORK=150000
+          unset WEAVEPY_JIT
+          for label in gate-like jit=1 own-caches exe-path base; do
+            for i in 1 2 3; do
+              case $label in
+                gate-like) out=$(target/release/weavepy $F) ;;
+                jit=1) out=$(WEAVEPY_JIT=1 target/release/weavepy $F) ;;
+                own-caches) out=$(WEAVEPY_FROZEN_CACHE="$RUNNER_TEMP/fz" WEAVEPY_STDLIB_CACHE="$RUNNER_TEMP/sc" target/release/weavepy $F) ;;
+                exe-path) out=$(target/release/weavepy.exe $F) ;;
+                base) out=$("$BASE_WEAVEPY" $F) ;;
+              esac
+              echo "$label: $out"
+            done
+          done
+          A="$PWD/$F"
+          echo "absolute-path: $(target/release/weavepy "$A")"
+          echo "absolute, fresh frozen cache: $(WEAVEPY_FROZEN_CACHE="$RUNNER_TEMP/fz2" target/release/weavepy "$A")"
+          echo "absolute, fresh stdlib cache: $(WEAVEPY_STDLIB_CACHE="$RUNNER_TEMP/sc2" target/release/weavepy "$A")"
+          echo "absolute, no frozen cache: $(WEAVEPY_FROZEN_CACHE=0 target/release/weavepy "$A")"
+          for P in "$F" "$A"; do
+            echo "--- trace for $P"
+            WEAVEPY_JIT_TRACE=1 WEAVEPY_FRAME_JIT_STATS=1 target/release/weavepy "$P" 2>&1 | grep -v " loop at " | tail -40
+            echo "--- burst stats for $P"
+            WEAVEPY_BURST_STATS=1 target/release/weavepy "$P" 2>&1 | head -40
+          done
+          echo "--- default cache"
+          ls -la "$LOCALAPPDATA/weavepy" 2>&1 | head -20
       - name: Diagnose cold Windows JIT costs after a failed gate
         id: cold_jit_diagnostic
         if: failure() && matrix.os == 'windows-latest' && github.event_name == 'pull_request' && steps.bench_gate.outcome == 'failure'
@@ -263,6 +306,7 @@ jobs:
           python tools/bench_cold_jit.py \
             --base "$BASE_WEAVEPY" --new target/release/weavepy.exe \
             --samples 7 \
+            --fixtures sumvm:2000000,nested_loops:120,jitloop:1000,call_overhead:150000 \
             --out "target/performance/cold-jit-ci/${{ github.run_id }}-${{ github.run_attempt }}/report.json"
       - uses: actions/upload-artifact@v4
         if: always() && steps.cold_jit_diagnostic.outcome != 'skipped' && steps.cold_jit_diagnostic.outcome != ''

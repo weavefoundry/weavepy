@@ -12,6 +12,9 @@
 
 use weavepy_compiler::{BinOpKind, CodeObject, CompareKind, OpCode, UnaryKind};
 
+#[cfg(feature = "jit")]
+mod jit;
+
 use crate::object::Object;
 use crate::sync::Rc;
 use crate::{CodeConstObjects, Interpreter};
@@ -107,6 +110,9 @@ pub(crate) fn compare(a: V, b: V, kind: CompareKind) -> Option<bool> {
 /// Registers a plan may address: the locals, then the operand stack.
 const REGS: usize = 32;
 
+/// Nested leaf calls evaluated within one evaluation at most this deep.
+const NEST: u8 = 3;
+
 /// One plan operation. Registers are `u8` indices below [`REGS`]; `pc`
 /// is the source instruction (its inline caches and site slots), and
 /// `name` its `co_names` index.
@@ -125,6 +131,12 @@ enum Op {
     Global {
         dst: u8,
         pc: u16,
+    },
+    /// `regs[dst]` = the closure cell `idx`'s value (a free variable: a
+    /// leaf has no cell variables of its own).
+    Deref {
+        dst: u8,
+        idx: u8,
     },
     Attr {
         dst: u8,
@@ -166,6 +178,12 @@ enum Op {
         a: u8,
         b: u8,
         kind: u8,
+    },
+    /// `regs[dst] = regs[a][regs[b]]` (see [`subscr`]).
+    Subscr {
+        dst: u8,
+        a: u8,
+        b: u8,
     },
     /// Exchange two registers.
     Swap {
@@ -229,6 +247,13 @@ pub(crate) struct LeafPlan {
     /// reassigned), each to a different name: the buffered stores share
     /// one receiver and each is the latest to its attribute.
     unique_stores: bool,
+    /// Evaluations so far, toward compiling the plan (see [`jit`]).
+    #[cfg(feature = "jit")]
+    runs: std::sync::atomic::AtomicU32,
+    /// The native code for a pure and an effect evaluation, once compiled
+    /// (`None` inside: the plan stays interpreted).
+    #[cfg(feature = "jit")]
+    native: [std::sync::OnceLock<Option<jit::Native>>; 2],
 }
 
 // SAFETY: the constants' pointers name the code extension's immutable
@@ -376,7 +401,14 @@ impl Builder<'_> {
     fn step(&mut self, pc: usize, ins: weavepy_compiler::Instruction) -> Option<bool> {
         let arg = ins.arg;
         match ins.op {
-            OpCode::Resume | OpCode::Nop | OpCode::NotTaken => {}
+            OpCode::Resume | OpCode::Nop | OpCode::NotTaken | OpCode::CopyFreeVars => {}
+            OpCode::LoadDeref => {
+                let dst = self.push_new()?;
+                self.ops.push(Op::Deref {
+                    dst,
+                    idx: u8::try_from(arg).ok()?,
+                });
+            }
             OpCode::LoadFast | OpCode::LoadFastBorrow | OpCode::LoadFastCheck => {
                 self.load_local(arg)?;
             }
@@ -489,6 +521,12 @@ impl Builder<'_> {
                     b,
                     kind: arg as u8,
                 });
+            }
+            OpCode::BinarySubscr => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let dst = self.push_new()?;
+                self.ops.push(Op::Subscr { dst, a, b });
             }
             OpCode::CopyTop => {
                 let n = (arg as usize).max(1);
@@ -679,6 +717,10 @@ impl Builder<'_> {
             nargs: u8::try_from(crate::leaf_arity(self.code)).ok()?,
             nregs: u8::try_from(self.top.get().clamp(self.nl, REGS)).ok()?,
             unique_stores: self.stored.is_some() && self.code.arg_count > 0,
+            #[cfg(feature = "jit")]
+            runs: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "jit")]
+            native: [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
         })
     }
 }
@@ -741,6 +783,14 @@ impl Owned {
 }
 
 impl Owned {
+    #[inline(always)]
+    fn new() -> Self {
+        Owned {
+            buf: [const { std::mem::MaybeUninit::uninit() }; OWNED],
+            n: 0,
+        }
+    }
+
     /// Whether `p` names one of the held values.
     #[inline(always)]
     fn holds(&self, p: *const Object) -> bool {
@@ -792,6 +842,15 @@ struct Pending {
 }
 
 impl Pending {
+    #[inline(always)]
+    fn new() -> Self {
+        Pending {
+            buf: [const { std::mem::MaybeUninit::uninit() }; PENDING],
+            n: 0,
+            moved: 0,
+        }
+    }
+
     fn get(&self, k: usize) -> &Store {
         debug_assert!(k < self.n);
         // SAFETY: the first `n` entries are initialized.
@@ -853,6 +912,22 @@ pub(crate) enum LeafRet {
     Owned(Object),
 }
 
+/// The value of `f`'s closure cell `idx`, borrowed: nothing an evaluation
+/// runs can rebind a cell (a leaf has no `STORE_DEREF`), and the function
+/// holds its closure. `None` for an empty cell (the read raises).
+#[inline]
+pub(super) fn free_var(f: &crate::object::PyFunction, idx: u8) -> Option<V> {
+    let Object::Cell(cell) = f.closure.get(usize::from(idx))? else {
+        return None;
+    };
+    let p: *const Object = cell.as_ptr();
+    // SAFETY: see above.
+    if matches!(unsafe { &*p }, Object::Unbound) {
+        return None;
+    }
+    Some(norm(p))
+}
+
 impl LeafRet {
     /// The result as an owned object (a borrowed value is cloned).
     #[inline(always)]
@@ -867,7 +942,7 @@ impl LeafRet {
 /// An owned object for a leaf value (the return value, a buffered
 /// store's value); `None` for the markers that are never values.
 #[inline(always)]
-fn to_object(v: V) -> Option<Object> {
+pub(super) fn to_object(v: V) -> Option<Object> {
     Some(match v {
         // SAFETY: as `norm` (an owned value is cloned before its holder
         // drops).
@@ -903,6 +978,42 @@ impl Interpreter {
             .into_object()
     }
 
+    /// A frameless call's evaluation of the general leaf `code` (see
+    /// `Interpreter::pure_leaf_call`) straight in its plan's native
+    /// code, at recursion depth `depth`, once the callee's warm-up is past
+    /// (the frameless call bookkeeping is then only the hit count):
+    /// `None` when the plan has no native code, or the callee one of the
+    /// tiny shapes `leaf_eval` answers itself; otherwise the result, or
+    /// `None` inside having done nothing observable.
+    #[cfg(feature = "jit")]
+    #[inline]
+    pub(crate) fn leaf_site_native<const EFFECT: bool>(
+        &self,
+        code: &CodeObject,
+        f: &crate::object::PyFunction,
+        args: &[*const Object],
+        depth: usize,
+    ) -> Option<Option<Object>> {
+        let ext = crate::code_vm_ext(code)?;
+        if ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) >= 3
+            || code.jit_hint.lean_entries() <= crate::tier2::LEAN_WARM_COMPILE_THRESHOLD_CAP
+        {
+            return None;
+        }
+        let plan = ext.leaf_plan.get()?.as_deref()?;
+        if args.len() != usize::from(plan.nargs) || args.len() != crate::leaf_arity(code) {
+            return None;
+        }
+        let r = jit::run_compiled::<EFFECT>(self, code, ext, plan, f, args, depth)?
+            .and_then(LeafRet::into_object);
+        if r.is_some() {
+            code.jit_hint.note_leaf_hit();
+        } else {
+            code.jit_hint.note_leaf_miss();
+        }
+        Some(r)
+    }
+
     /// [`Self::leaf_run`] with its result borrowed when the caller may
     /// (see [`LeafRet`]).
     #[inline(never)]
@@ -915,9 +1026,6 @@ impl Interpreter {
         args: &[*const Object],
         nest: u8,
     ) -> Option<LeafRet> {
-        use weavepy_compiler::InlineCache as IC;
-        /// Nested leaf calls evaluated in place at most this deep.
-        const NEST: u8 = 3;
         /// A pure-leaf callee runs as a frame of this evaluation: its
         /// registers are the next `REGS` window, and its caller's state
         /// waits here until its return.
@@ -935,6 +1043,14 @@ impl Interpreter {
         let nargs = usize::from(plan.nargs);
         if args.len() != nargs {
             return None;
+        }
+        // A warm plan runs as native code (a getter's or constructor's
+        // evaluation stays here).
+        #[cfg(feature = "jit")]
+        if !GETTER && !FRESH {
+            if let Some(r) = jit::run::<EFFECT>(self, code, ext, plan, f, args, nest) {
+                return r;
+            }
         }
         let (mut code, mut ext, mut plan, mut f) = (code, ext, plan, f);
         let mut regs = [const { std::mem::MaybeUninit::<V>::uninit() }; REGS];
@@ -960,15 +1076,8 @@ impl Interpreter {
         }
         let mut consts: &[V] = &plan.consts;
         let mut stamps: &[crate::StampSlot] = ext.stamp_slots.get().map_or(&[], |s| &s[..]);
-        let mut owned = Owned {
-            buf: [const { std::mem::MaybeUninit::uninit() }; OWNED],
-            n: 0,
-        };
-        let mut pend = Pending {
-            buf: [const { std::mem::MaybeUninit::uninit() }; PENDING],
-            n: 0,
-            moved: 0,
-        };
+        let mut owned = Owned::new();
+        let mut pend = Pending::new();
         let mut ops: &[Op] = &plan.ops;
         let mut ip = 0usize;
         loop {
@@ -981,134 +1090,25 @@ impl Interpreter {
                 Op::Move { dst, src } => set!(dst, get!(src)),
                 // SAFETY: `k` names a plan constant (the translation).
                 Op::Const { dst, k } => set!(dst, unsafe { *consts.get_unchecked(usize::from(k)) }),
-                Op::Global { dst, pc } => {
-                    // The callee's own namespaces, stamp-validated as the
-                    // core loop's `LOAD_GLOBAL` arm.
-                    let pc = usize::from(pc);
-                    let slot = stamps.get(pc)?;
-                    let (gdict, bdict) = (f.globals.as_ptr(), f.builtins.as_ptr());
-                    let gid = crate::specialize::rc_id(&f.globals);
-                    // SAFETY (raw dict reads): nothing runs code here.
-                    let g_stamp = unsafe { (*gdict).mutation_stamp() };
-                    let hit = match code.caches.get(pc as u32) {
-                        IC::LoadGlobalModule {
-                            globals_id,
-                            key_idx,
-                        } if globals_id == gid && slot.get() == [gid, g_stamp, 0] => unsafe {
-                            (*gdict).get_index(key_idx as usize)
-                        },
-                        IC::LoadGlobalBuiltin {
-                            builtins_id,
-                            key_idx,
-                        } if builtins_id == crate::specialize::rc_id(&f.builtins)
-                            && !self.globals_missing_any.get()
-                            && slot.get()
-                                == [gid, g_stamp, unsafe { (*bdict).mutation_stamp() }] =>
-                        unsafe { (*bdict).get_index(key_idx as usize) },
-                        _ => return None,
-                    };
-                    set!(dst, norm(hit?.1));
-                }
+                Op::Global { dst, pc } => set!(dst, self.plan_global(code, stamps, f, pc)?),
+                Op::Deref { dst, idx } => set!(dst, free_var(f, idx)?),
                 Op::Attr { dst, src, pc, name } => {
-                    let V::R(p) = get!(src) else {
-                        return None;
-                    };
-                    let (pc, name) = (u32::from(pc), u32::from(name));
-                    // SAFETY: as `norm`.
-                    let recv = unsafe { &*p };
-                    if EFFECT && pend.n > 0 {
-                        // A buffered store to this attribute, the latest.
-                        let hit = (0..pend.n)
-                            .rev()
-                            .map(|k| pend.get(k))
-                            // SAFETY: stable receivers (see `Store`).
-                            .find(|(r, _, n, _)| *n == name && unsafe { (**r).is_same(recv) });
-                        if let Some((_, _, _, v)) = hit {
-                            set!(dst, norm(v));
-                            continue;
-                        }
-                    }
-                    let v = match recv {
-                        Object::Instance(inst) => {
-                            if GETTER && inst.cls_raw().native_kind.get() != 0 {
-                                return None;
-                            }
-                            // SAFETY: the receiver remains rooted by an
-                            // argument or owned scratch; no Python runs.
-                            let hit = unsafe {
-                                Self::leaf_cached_instance_field(ext, code, inst, pc, name)
-                            }
-                            .map(std::ptr::from_ref);
-                            match hit {
-                                Some(v) => norm(v),
-                                // A stale or absent site cache resolves
-                                // through the site's own entries.
-                                None => owned.own(Self::leaf_attr_resolve_site(
-                                    code, inst, recv, pc, name,
-                                )?)?,
-                            }
-                        }
-                        Object::Type(cls) => {
-                            if GETTER && !Self::plain_metaclass(cls) {
-                                return None;
-                            }
-                            match stamps
-                                .get(pc as usize)
-                                .and_then(|s| crate::class_attr_hit(s, cls))
-                            {
-                                Some(v) => owned.own(v)?,
-                                None => {
-                                    owned.own(Self::leaf_load_type_attr(code, cls, pc, name)?)?
-                                }
-                            }
-                        }
-                        Object::Module(module) => {
-                            if GETTER
-                                && (crate::object::module_class(module).is_some()
-                                    || code.names.get(name as usize)?.starts_with("__"))
-                            {
-                                return None;
-                            }
-                            owned.own(Self::leaf_load_attr_recv(code, recv, pc, name)?)?
-                        }
-                        _ => return None,
-                    };
+                    let v = self.plan_attr::<GETTER, EFFECT>(
+                        code,
+                        ext,
+                        stamps,
+                        &mut owned,
+                        &pend,
+                        get!(src),
+                        pc,
+                        name,
+                    )?;
                     set!(dst, v);
                 }
                 Op::Method { dst, src, pc, name } => {
-                    // A method off the site's slot: the function under
-                    // the receiver, or a class's function with an empty
-                    // self slot (as the core loop's arm).
-                    let V::R(p) = get!(src) else {
-                        return None;
-                    };
-                    let ms = crate::code_method_slot(code, u32::from(pc))?;
-                    // SAFETY: as `norm`.
-                    match unsafe { &*p } {
-                        Object::Instance(inst) => {
-                            let cls = inst.cls_raw();
-                            if !Self::default_getattribute(cls) {
-                                return None;
-                            }
-                            let fp = ms.peek_fn(cls.attr_version.get())?;
-                            // The instance's attributes must not shadow
-                            // the method.
-                            if crate::inst_may_shadow(inst, code, u32::from(name)) {
-                                return None;
-                            }
-                            set!(dst, V::Fn(fp));
-                            set!(dst + 1, V::R(p));
-                        }
-                        Object::Type(cls) => {
-                            set!(dst, V::Fn(ms.peek_unbound(cls.attr_version.get())?));
-                            set!(dst + 1, V::Null);
-                        }
-                        recv => {
-                            let b = self.leaf_builtin_method_ptr(ms, recv, code, name)?;
-                            set!(dst, V::Bi(b));
-                            set!(dst + 1, V::R(p));
-                        }
-                    }
+                    let (func, recv) = self.plan_method(code, get!(src), pc, name)?;
+                    set!(dst, func);
+                    set!(dst + 1, recv);
                 }
                 Op::Compare { dst, a, b, kind } => {
                     // SAFETY: the translation checked `kind` names a
@@ -1117,77 +1117,12 @@ impl Interpreter {
                     set!(dst, V::B(compare(get!(a), get!(b), kind)?));
                 }
                 Op::Is { dst, a, b, invert } => {
-                    let same = match (get!(a), get!(b)) {
-                        (V::N, V::N) => true,
-                        (V::B(x), V::B(y)) => x == y,
-                        (V::I(x), V::I(y)) => Object::Int(x).is_same(&Object::Int(y)),
-                        (V::F(x), V::F(y)) => Object::Float(x).is_same(&Object::Float(y)),
-                        // SAFETY: as `norm`.
-                        (V::R(p), V::R(q)) => unsafe { (*p).is_same(&*q) },
-                        _ => false,
-                    };
-                    set!(dst, V::B(same != invert));
+                    set!(dst, V::B(is_same(get!(a), get!(b)) != invert))
                 }
                 Op::Truth { dst, src } => set!(dst, V::B(truth(get!(src))?)),
-                Op::Unary { dst, src, kind } => {
-                    let v = get!(src);
-                    let r = match kind {
-                        k if k == UnaryKind::Not as u8 => V::B(!truth(v)?),
-                        k if k == UnaryKind::Neg as u8 => match v {
-                            V::I(i) => V::I(i.checked_neg()?),
-                            V::F(x) => V::F(-x),
-                            _ => return None,
-                        },
-                        k if k == UnaryKind::Pos as u8 => match v {
-                            V::I(_) | V::F(_) => v,
-                            _ => return None,
-                        },
-                        k if k == UnaryKind::Invert as u8 => match v {
-                            V::I(i) => V::I(!i),
-                            _ => return None,
-                        },
-                        _ => return None,
-                    };
-                    set!(dst, r);
-                }
-                Op::Binary { dst, a, b, kind } => {
-                    let r = match (get!(a), get!(b)) {
-                        (V::I(a), V::I(b)) => V::I(match kind {
-                            k if k == BinOpKind::Add as u8 => a.checked_add(b)?,
-                            k if k == BinOpKind::Sub as u8 => a.checked_sub(b)?,
-                            k if k == BinOpKind::Mult as u8 => a.checked_mul(b)?,
-                            k if k == BinOpKind::BitAnd as u8 => a & b,
-                            k if k == BinOpKind::BitOr as u8 => a | b,
-                            k if k == BinOpKind::BitXor as u8 => a ^ b,
-                            k if k == BinOpKind::RShift as u8 && (0..64).contains(&b) => a >> b,
-                            k if k == BinOpKind::LShift as u8
-                                && (0..63).contains(&b)
-                                && ((a << b) >> b) == a =>
-                            {
-                                a << b
-                            }
-                            k if k == BinOpKind::FloorDiv as u8 && b > 0 && a >= 0 => a / b,
-                            k if k == BinOpKind::Mod as u8 && b > 0 && a >= 0 => a % b,
-                            _ => return None,
-                        }),
-                        (x, y) => {
-                            let (x, y) = match (x, y) {
-                                (V::F(x), V::F(y)) => (x, y),
-                                (V::I(x), V::F(y)) => (x as f64, y),
-                                (V::F(x), V::I(y)) => (x, y as f64),
-                                _ => return None,
-                            };
-                            // SAFETY: as the core loop's `BINARY_OP` arm
-                            // (the compiler emits only valid kinds).
-                            let kind: BinOpKind = unsafe { std::mem::transmute(kind) };
-                            match Self::leaf_float_op(x, y, kind)? {
-                                Object::Float(x) => V::F(x),
-                                _ => return None,
-                            }
-                        }
-                    };
-                    set!(dst, r);
-                }
+                Op::Unary { dst, src, kind } => set!(dst, unary(get!(src), kind)?),
+                Op::Binary { dst, a, b, kind } => set!(dst, binary(get!(a), get!(b), kind)?),
+                Op::Subscr { dst, a, b } => set!(dst, subscr(&mut owned, get!(a), get!(b))?),
                 Op::Swap { a, b } => {
                     let (x, y) = (get!(a), get!(b));
                     set!(a, y);
@@ -1204,28 +1139,7 @@ impl Interpreter {
                     }
                 }
                 Op::Jump { target } => ip = usize::from(target),
-                Op::New { dst, dict } => {
-                    // Tracked like the core loop's; an allocation that
-                    // would trigger a collection is left to it.
-                    if crate::stdlib::tracemalloc_real::is_tracking()
-                        || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
-                        || crate::gc_trace::auto_collect_due()
-                    {
-                        return None;
-                    }
-                    let obj = if dict {
-                        Object::Dict(Rc::new(crate::sync::RefCell::new(
-                            crate::object::DictData::with_capacity_and_hasher(
-                                0,
-                                crate::fasthash::FxBuildHasher,
-                            ),
-                        )))
-                    } else {
-                        Object::new_list(Vec::new())
-                    };
-                    crate::gc_trace::track(obj.clone());
-                    set!(dst, owned.own(obj)?);
-                }
+                Op::New { dst, dict } => set!(dst, new_container(&mut owned, dict)?),
                 Op::Decline => return None,
                 Op::Call { at, argc, pc } => {
                     // A pure-leaf callee, evaluated in place: only while
@@ -1401,73 +1315,7 @@ impl Interpreter {
                         set!(c.at, v);
                         continue;
                     }
-                    // A value this evaluation's scratch doesn't hold outlives
-                    // it (a pure body stores nothing), so a nested caller
-                    // borrows it rather than taking a reference to release.
-                    if !EFFECT && !matches!(v, V::R(p) if owned.holds(p)) {
-                        return Some(LeafRet::Borrowed(v));
-                    }
-                    let r = to_object(v)?;
-                    if EFFECT && pend.n > 0 {
-                        // The latest store to each attribute is the one
-                        // that lands; every one of them must go through
-                        // before any does (a decline touched nothing, and
-                        // the ordinary call runs the body instead). A
-                        // lone store is its own check: it declines whole.
-                        let unique = plan.unique_stores;
-                        if pend.n > 1 {
-                            // With one receiver, appends of new attributes
-                            // land in order: `cursor` is its split length
-                            // once the earlier ones have.
-                            let mut cursor = None;
-                            // A store the shortcut can't vouch for may
-                            // move the layout: the rest check in full.
-                            let mut split_ok = unique;
-                            for k in 0..pend.n {
-                                if !unique && !pend.latest(k) {
-                                    continue;
-                                }
-                                let (rp, spc, name, _) = pend.get(k);
-                                // SAFETY: stable receivers (see `Store`).
-                                let Object::Instance(inst) = (unsafe { &**rp }) else {
-                                    return None;
-                                };
-                                let (spc, name) = (*spc as usize, *name);
-                                let ready = if split_ok {
-                                    Self::core_store_attr_ready_split(ext, inst, spc, &mut cursor)
-                                } else {
-                                    None
-                                };
-                                split_ok &= ready.is_some();
-                                if !ready.unwrap_or_else(|| {
-                                    Self::core_store_attr_ready(code, inst, spc, name)
-                                }) {
-                                    return None;
-                                }
-                            }
-                        }
-                        let n = pend.n;
-                        for k in 0..n {
-                            if !unique && !pend.latest(k) {
-                                continue;
-                            }
-                            let (rp, spc, name, value) = pend.get(k);
-                            // SAFETY: stable receivers (see `Store`).
-                            let Object::Instance(inst) = (unsafe { &**rp }) else {
-                                return None;
-                            };
-                            // On `true` the value moved into the dict.
-                            if Self::core_store_attr(code, inst, *spc as usize, *name, value) {
-                                pend.moved |= 1 << k;
-                            } else if n == 1 {
-                                // The lone store declined, untouched.
-                                return None;
-                            } else {
-                                debug_assert!(false, "a ready store declined");
-                            }
-                        }
-                    }
-                    return Some(LeafRet::Owned(r));
+                    return self.plan_finish::<EFFECT>(code, ext, plan, &owned, &mut pend, v);
                 }
                 Op::StoreAttr {
                     recv,
@@ -1501,24 +1349,433 @@ impl Interpreter {
                         }
                         continue;
                     }
-                    if !matches!(recv, Object::Instance(_)) || pend.n == PENDING {
-                        return None;
-                    }
-                    let value = to_object(get!(val))?;
-                    // An argument receiver is used in place; any other
-                    // (a field's value) is held by the owned scratch.
-                    let rp = if args.iter().any(|&a| std::ptr::eq(a, rp)) {
-                        rp
-                    } else {
-                        let V::R(held) = owned.own(crate::clone_hot(recv))? else {
-                            return None;
-                        };
-                        held
-                    };
-                    pend.buf[pend.n].write((rp, u32::from(pc), u32::from(name), value));
-                    pend.n += 1;
+                    plan_store(args, &mut owned, &mut pend, rp, get!(val), pc, name)?;
                 }
             }
         }
+    }
+}
+
+/// `a is b` on two leaf values.
+#[inline(always)]
+pub(crate) fn is_same(a: V, b: V) -> bool {
+    match (a, b) {
+        (V::N, V::N) => true,
+        (V::B(x), V::B(y)) => x == y,
+        (V::I(x), V::I(y)) => Object::Int(x).is_same(&Object::Int(y)),
+        (V::F(x), V::F(y)) => Object::Float(x).is_same(&Object::Float(y)),
+        // SAFETY: as `norm`.
+        (V::R(p), V::R(q)) => unsafe { (*p).is_same(&*q) },
+        _ => false,
+    }
+}
+
+/// A unary operator on a scalar; `None` for any other operand.
+#[inline(always)]
+pub(crate) fn unary(v: V, kind: u8) -> Option<V> {
+    Some(match kind {
+        k if k == UnaryKind::Not as u8 => V::B(!truth(v)?),
+        k if k == UnaryKind::Neg as u8 => match v {
+            V::I(i) => V::I(i.checked_neg()?),
+            V::F(x) => V::F(-x),
+            _ => return None,
+        },
+        k if k == UnaryKind::Pos as u8 => match v {
+            V::I(_) | V::F(_) => v,
+            _ => return None,
+        },
+        k if k == UnaryKind::Invert as u8 => match v {
+            V::I(i) => V::I(!i),
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// A binary operator on two scalars; `None` for any other operands or a
+/// result the interpreter must produce (an overflow, a negative operand
+/// of a floor division).
+#[inline(always)]
+pub(crate) fn binary(a: V, b: V, kind: u8) -> Option<V> {
+    Some(match (a, b) {
+        (V::I(a), V::I(b)) => V::I(match kind {
+            k if k == BinOpKind::Add as u8 => a.checked_add(b)?,
+            k if k == BinOpKind::Sub as u8 => a.checked_sub(b)?,
+            k if k == BinOpKind::Mult as u8 => a.checked_mul(b)?,
+            k if k == BinOpKind::BitAnd as u8 => a & b,
+            k if k == BinOpKind::BitOr as u8 => a | b,
+            k if k == BinOpKind::BitXor as u8 => a ^ b,
+            k if k == BinOpKind::RShift as u8 && (0..64).contains(&b) => a >> b,
+            k if k == BinOpKind::LShift as u8 && (0..63).contains(&b) && ((a << b) >> b) == a => {
+                a << b
+            }
+            k if k == BinOpKind::FloorDiv as u8 && b > 0 && a >= 0 => a / b,
+            k if k == BinOpKind::Mod as u8 && b > 0 && a >= 0 => a % b,
+            _ => return None,
+        }),
+        (x, y) => {
+            let (x, y) = match (x, y) {
+                (V::F(x), V::F(y)) => (x, y),
+                (V::I(x), V::F(y)) => (x as f64, y),
+                (V::F(x), V::I(y)) => (x, y as f64),
+                _ => return None,
+            };
+            // SAFETY: as the core loop's `BINARY_OP` arm (the compiler
+            // emits only valid kinds).
+            let kind: BinOpKind = unsafe { std::mem::transmute(kind) };
+            match Interpreter::leaf_float_op(x, y, kind)? {
+                Object::Float(x) => V::F(x),
+                _ => return None,
+            }
+        }
+    })
+}
+
+/// `a[b]` that can't run code or raise: a list's or tuple's item at an
+/// int index (borrowed: a leaf mutates no container), a dict's value for
+/// a `str` or `int` key (the core loop's probe, which compares no other
+/// key type), or an ASCII string's character (held by `owned`). Anything
+/// else, a miss included, declines.
+#[inline]
+fn subscr(owned: &mut Owned, a: V, b: V) -> Option<V> {
+    let V::R(c) = a else {
+        return None;
+    };
+    let index = |i: i64, n: usize| {
+        let n = n as i64;
+        let i = if i < 0 { i + n } else { i };
+        (0..n).contains(&i).then_some(i as usize)
+    };
+    // SAFETY: as `norm`; the borrows end before anything could change the
+    // containers (no Python runs during an evaluation).
+    match (unsafe { &*c }, b) {
+        (Object::List(l), V::I(i)) => {
+            let xs = unsafe { l.peek() }?;
+            Some(norm(&raw const xs[index(i, xs.len())?]))
+        }
+        (Object::Tuple(t), V::I(i)) => Some(norm(&raw const t[index(i, t.len())?])),
+        (Object::Str(s), V::I(i)) => {
+            if crate::object::str_char_len(s) != s.len() {
+                return None;
+            }
+            owned.own(Object::from_char(s.as_bytes()[index(i, s.len())?] as char))
+        }
+        (Object::Dict(d), V::I(_) | V::R(_)) => {
+            let int;
+            let key = match b {
+                V::I(i) => {
+                    int = Object::Int(i);
+                    &int
+                }
+                // SAFETY: as above.
+                V::R(k) if matches!(unsafe { &*k }, Object::Str(_)) => unsafe { &*k },
+                _ => return None,
+            };
+            let probe = crate::object::LeafProbe::new(key)?;
+            let v = unsafe { d.peek() }?.get(&probe)?;
+            Some(norm(v))
+        }
+        _ => None,
+    }
+}
+
+/// `BUILD_LIST 0` / `BUILD_MAP 0`: a new empty list or dict, tracked like
+/// the core loop's and held by the owned scratch. An allocation that would
+/// trigger a collection is left to the core loop.
+#[inline(always)]
+fn new_container(owned: &mut Owned, dict: bool) -> Option<V> {
+    if crate::stdlib::tracemalloc_real::is_tracking()
+        || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+        || crate::gc_trace::auto_collect_due()
+    {
+        return None;
+    }
+    let obj = if dict {
+        Object::Dict(Rc::new(crate::sync::RefCell::new(
+            crate::object::DictData::with_capacity_and_hasher(0, crate::fasthash::FxBuildHasher),
+        )))
+    } else {
+        Object::new_list(Vec::new())
+    };
+    crate::gc_trace::track(&obj);
+    owned.own(obj)
+}
+
+/// An effect leaf's `recv.name = val` (at store `pc`), buffered until the
+/// return commits it. An argument receiver is used in place; any other (a
+/// field's value) is held by the owned scratch.
+#[inline(always)]
+fn plan_store(
+    args: &[*const Object],
+    owned: &mut Owned,
+    pend: &mut Pending,
+    rp: *const Object,
+    val: V,
+    pc: u16,
+    name: u16,
+) -> Option<()> {
+    // SAFETY: as `norm`.
+    let recv = unsafe { &*rp };
+    if !matches!(recv, Object::Instance(_)) || pend.n == PENDING {
+        return None;
+    }
+    let value = to_object(val)?;
+    let rp = if args.iter().any(|&a| std::ptr::eq(a, rp)) {
+        rp
+    } else {
+        let V::R(held) = owned.own(crate::clone_hot(recv))? else {
+            return None;
+        };
+        held
+    };
+    pend.buf[pend.n].write((rp, u32::from(pc), u32::from(name), value));
+    pend.n += 1;
+    Some(())
+}
+
+impl Interpreter {
+    /// `LOAD_GLOBAL` at `pc` of `code` in `f`'s namespaces, stamp-validated
+    /// as the core loop's arm.
+    #[inline(always)]
+    fn plan_global(
+        &self,
+        code: &CodeObject,
+        stamps: &[crate::StampSlot],
+        f: &crate::object::PyFunction,
+        pc: u16,
+    ) -> Option<V> {
+        self.plan_global_at(code, stamps.get(usize::from(pc))?, f, pc)
+    }
+
+    /// [`Self::plan_global`] with the site's stamp slot in hand.
+    #[inline(always)]
+    fn plan_global_at(
+        &self,
+        code: &CodeObject,
+        slot: &crate::StampSlot,
+        f: &crate::object::PyFunction,
+        pc: u16,
+    ) -> Option<V> {
+        use weavepy_compiler::InlineCache as IC;
+        let pc = usize::from(pc);
+        let (gdict, bdict) = (f.globals.as_ptr(), f.builtins.as_ptr());
+        let gid = crate::specialize::rc_id(&f.globals);
+        // SAFETY (raw dict reads): nothing runs code here.
+        let g_stamp = unsafe { (*gdict).mutation_stamp() };
+        let hit = match code.caches.get(pc as u32) {
+            IC::LoadGlobalModule {
+                globals_id,
+                key_idx,
+            } if globals_id == gid && slot.get() == [gid, g_stamp, 0] => unsafe {
+                (*gdict).get_index(key_idx as usize)
+            },
+            IC::LoadGlobalBuiltin {
+                builtins_id,
+                key_idx,
+            } if builtins_id == crate::specialize::rc_id(&f.builtins)
+                && !self.globals_missing_any.get()
+                && slot.get() == [gid, g_stamp, unsafe { (*bdict).mutation_stamp() }] =>
+            unsafe { (*bdict).get_index(key_idx as usize) },
+            _ => return None,
+        };
+        Some(norm(hit?.1))
+    }
+
+    /// `src.name` (the `LOAD_ATTR` at `pc`): the latest buffered store to
+    /// it, a cached instance field, or what the site resolves; a value the
+    /// read hands back owned is held by the owned scratch.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn plan_attr<const GETTER: bool, const EFFECT: bool>(
+        &self,
+        code: &CodeObject,
+        ext: &CodeConstObjects,
+        stamps: &[crate::StampSlot],
+        owned: &mut Owned,
+        pend: &Pending,
+        src: V,
+        pc: u16,
+        name: u16,
+    ) -> Option<V> {
+        let V::R(p) = src else {
+            return None;
+        };
+        let (pc, name) = (u32::from(pc), u32::from(name));
+        // SAFETY: as `norm`.
+        let recv = unsafe { &*p };
+        if EFFECT && pend.n > 0 {
+            // A buffered store to this attribute, the latest.
+            let hit = (0..pend.n)
+                .rev()
+                .map(|k| pend.get(k))
+                // SAFETY: stable receivers (see `Store`).
+                .find(|(r, _, n, _)| *n == name && unsafe { (**r).is_same(recv) });
+            if let Some((_, _, _, v)) = hit {
+                return Some(norm(v));
+            }
+        }
+        match recv {
+            Object::Instance(inst) => {
+                if GETTER && inst.cls_raw().native_kind.get() != 0 {
+                    return None;
+                }
+                // SAFETY: the receiver remains rooted by an argument or
+                // owned scratch; no Python runs.
+                match unsafe { Self::leaf_cached_instance_field(ext, code, inst, pc, name) } {
+                    Some(v) => Some(norm(v)),
+                    // A stale or absent site cache resolves through the
+                    // site's own entries.
+                    None => owned.own(Self::leaf_attr_resolve_site(code, inst, recv, pc, name)?),
+                }
+            }
+            Object::Type(cls) => {
+                if GETTER && !Self::plain_metaclass(cls) {
+                    return None;
+                }
+                match stamps
+                    .get(pc as usize)
+                    .and_then(|s| crate::class_attr_hit(s, cls))
+                {
+                    Some(v) => owned.own(v),
+                    None => {
+                        let v = Self::leaf_load_type_attr(code, cls, pc, name)?;
+                        // A scalar is a plain class value (see
+                        // `leaf_load_type_attr`): remembered for the next
+                        // read, which native code makes in line.
+                        crate::class_attr_fill(code, cls, pc as usize, &v);
+                        owned.own(v)
+                    }
+                }
+            }
+            Object::Module(module) => {
+                if GETTER
+                    && (crate::object::module_class(module).is_some()
+                        || code.names.get(name as usize)?.starts_with("__"))
+                {
+                    return None;
+                }
+                owned.own(Self::leaf_load_attr_recv(code, recv, pc, name)?)
+            }
+            _ => None,
+        }
+    }
+
+    /// The method-form load of `src.name` off the site's slot: the function
+    /// and the receiver, or a class's function and the empty self slot (as
+    /// the core loop's arm).
+    #[inline(always)]
+    fn plan_method(&self, code: &CodeObject, src: V, pc: u16, name: u16) -> Option<(V, V)> {
+        let ms = crate::code_method_slot(code, u32::from(pc))?;
+        self.plan_method_at(code, ms, src, name)
+    }
+
+    /// [`Self::plan_method`] with the site's method slot in hand.
+    #[inline(always)]
+    fn plan_method_at(
+        &self,
+        code: &CodeObject,
+        ms: &crate::MethodSlot,
+        src: V,
+        name: u16,
+    ) -> Option<(V, V)> {
+        let V::R(p) = src else {
+            return None;
+        };
+        // SAFETY: as `norm`.
+        match unsafe { &*p } {
+            Object::Instance(inst) => {
+                let cls = inst.cls_raw();
+                if !Self::default_getattribute(cls) {
+                    return None;
+                }
+                let fp = ms.peek_fn(cls.attr_version.get())?;
+                // The instance's attributes must not shadow the method.
+                if crate::inst_may_shadow(inst, code, u32::from(name)) {
+                    return None;
+                }
+                Some((V::Fn(fp), V::R(p)))
+            }
+            Object::Type(cls) => Some((V::Fn(ms.peek_unbound(cls.attr_version.get())?), V::Null)),
+            recv => {
+                let b = self.leaf_builtin_method_ptr(ms, recv, code, name)?;
+                Some((V::Bi(b), V::R(p)))
+            }
+        }
+    }
+
+    /// The evaluation's return of `v`: borrowed when the evaluation's
+    /// scratch doesn't hold it (a pure body stores nothing, so it outlives
+    /// the evaluation), otherwise owned, with an effect leaf's buffered
+    /// stores committed first. The latest store to each attribute is the
+    /// one that lands; every one must go through before any does (a decline
+    /// touched nothing, and the ordinary call runs the body instead). A
+    /// lone store is its own check: it declines whole.
+    #[inline(always)]
+    fn plan_finish<const EFFECT: bool>(
+        &self,
+        code: &CodeObject,
+        ext: &CodeConstObjects,
+        plan: &LeafPlan,
+        owned: &Owned,
+        pend: &mut Pending,
+        v: V,
+    ) -> Option<LeafRet> {
+        if !EFFECT && !matches!(v, V::R(p) if owned.holds(p)) {
+            return Some(LeafRet::Borrowed(v));
+        }
+        let r = to_object(v)?;
+        if EFFECT && pend.n > 0 {
+            let unique = plan.unique_stores;
+            if pend.n > 1 {
+                // With one receiver, appends of new attributes land in
+                // order: `cursor` is its split length once the earlier ones
+                // have. A store the shortcut can't vouch for may move the
+                // layout: the rest check in full.
+                let mut cursor = None;
+                let mut split_ok = unique;
+                for k in 0..pend.n {
+                    if !unique && !pend.latest(k) {
+                        continue;
+                    }
+                    let (rp, spc, name, _) = pend.get(k);
+                    // SAFETY: stable receivers (see `Store`).
+                    let Object::Instance(inst) = (unsafe { &**rp }) else {
+                        return None;
+                    };
+                    let (spc, name) = (*spc as usize, *name);
+                    let ready = if split_ok {
+                        Self::core_store_attr_ready_split(ext, inst, spc, &mut cursor)
+                    } else {
+                        None
+                    };
+                    split_ok &= ready.is_some();
+                    if !ready.unwrap_or_else(|| Self::core_store_attr_ready(code, inst, spc, name))
+                    {
+                        return None;
+                    }
+                }
+            }
+            let n = pend.n;
+            for k in 0..n {
+                if !unique && !pend.latest(k) {
+                    continue;
+                }
+                let (rp, spc, name, value) = pend.get(k);
+                // SAFETY: stable receivers (see `Store`).
+                let Object::Instance(inst) = (unsafe { &**rp }) else {
+                    return None;
+                };
+                // On `true` the value moved into the dict.
+                if Self::core_store_attr(code, inst, *spc as usize, *name, value) {
+                    pend.moved |= 1 << k;
+                } else if n == 1 {
+                    // The lone store declined, untouched.
+                    return None;
+                } else {
+                    debug_assert!(false, "a ready store declined");
+                }
+            }
+        }
+        Some(LeafRet::Owned(r))
     }
 }

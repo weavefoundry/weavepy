@@ -89,6 +89,8 @@ def main():
     parser.add_argument("--fixture-root", type=Path, default=Path("crates/weavepy-bench/fixtures"))
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--fixtures", default="sumvm:2000000,nested_loops:120,jitloop:1000",
+                        help="comma-separated NAME:WORK pairs to diagnose")
     args = parser.parse_args()
     if args.samples < 1:
         parser.error("samples must be positive")
@@ -107,7 +109,9 @@ def main():
               "environment": {name: os.environ.get(name) for name in
                               ("PYTHONHASHSEED", "PYTHONDONTWRITEBYTECODE", "PYTHON_JIT", "PYTHON_GIL", "WEAVEPY_STDLIB_CACHE")}}
     args.out.write_text(json.dumps(report, indent=2) + "\n")
-    for name, work in [("sumvm", 2000000), ("nested_loops", 120), ("jitloop", 1000)]:
+    fixtures = [(name, int(work)) for name, work in
+                (item.split(":") for item in args.fixtures.split(",") if item)]
+    for name, work in fixtures:
         path = (args.fixture_root / (name + ".py")).resolve(strict=True)
         row = {"work": work, "fixture": str(path), "sha256": digest(path), "modes": {}}
         for warm in (False, True):

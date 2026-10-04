@@ -155,15 +155,18 @@ fn next_type_version() -> u64 {
 /// Never publish zero or reuse a token, including at counter exhaustion.
 fn allocate_type_version(counter: &std::sync::atomic::AtomicU64) -> Option<u64> {
     use std::sync::atomic::Ordering::Relaxed;
-    counter
-        .fetch_update(Relaxed, Relaxed, |value| {
-            if value == 0 {
-                None
-            } else {
-                value.checked_add(1)
-            }
-        })
-        .ok()
+    let mut value = counter.load(Relaxed);
+    loop {
+        let next = if value == 0 {
+            None
+        } else {
+            value.checked_add(1)
+        }?;
+        match counter.compare_exchange_weak(value, next, Relaxed, Relaxed) {
+            Ok(previous) => return Some(previous),
+            Err(current) => value = current,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -447,6 +450,10 @@ pub enum LeafAttrKind {
     ValueInstance(crate::sync::Weak<PyInstance>),
     /// A class stored on the class, likewise held weakly.
     ValueType(crate::sync::Weak<TypeObject>),
+    /// A dict stored on the class (`Enum._member_map_`), likewise.
+    ValueDict(crate::sync::Weak<crate::sync::RefCell<crate::object::DictData>>),
+    /// A list stored on the class (`Enum._member_names_`), likewise.
+    ValueList(crate::sync::Weak<crate::sync::RefCell<Vec<Object>>>),
     /// A `property` on the MRO (a data descriptor: it wins over the
     /// instance dict); its getter is read at access time.
     Property(crate::sync::Weak<crate::object::PyProperty>),
@@ -739,6 +746,13 @@ pub struct TypeObject {
     /// Every exception construction asked the MRO for nine names. Last
     /// field: the hot ones above keep their offsets.
     pub exc_families: Cell<u64>,
+}
+
+/// A dying TypeObject clears the weak references watching it.
+impl Drop for TypeObject {
+    fn drop(&mut self) {
+        crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
+    }
 }
 
 /// Per-class resolution of the `type.__call__` protocol, cached on the
@@ -1100,7 +1114,7 @@ impl TypeObject {
         // free it — and weakrefs to it (or to methods in its dict)
         // would never clear. Built-ins are immortal; skip them.
         if !ty.flags.is_builtin {
-            crate::gc_trace::track(Object::Type(ty.clone()));
+            crate::gc_trace::track(&Object::Type(ty.clone()));
         }
         Ok(ty)
     }
@@ -1537,12 +1551,20 @@ impl TypeObject {
     /// conservative `true` on any borrow conflict: a spurious resurrection
     /// is harmless because `Vm::invoke_finalizer` simply no-ops when the
     /// instance turns out to have no `__del__`.
+    #[inline]
     pub fn instances_need_finalize(&self) -> bool {
         match self.has_del.get() {
-            1 => return false,
-            2 => return true,
-            _ => {}
+            1 => false,
+            2 => true,
+            _ => self.instances_need_finalize_slow(),
         }
+    }
+
+    /// [`Self::instances_need_finalize`] with no cached verdict: the MRO
+    /// walk, which caches one.
+    #[cold]
+    #[inline(never)]
+    fn instances_need_finalize_slow(&self) -> bool {
         let Ok(mro) = self.mro.try_borrow() else {
             return true;
         };
@@ -1989,7 +2011,15 @@ enum SlotData {
         layout: SharedSlice<DictKey>,
         values: Box<[Object]>,
     },
+    /// A natively built `datetime` value's fields, packed into words (see
+    /// [`crate::stdlib::datetime_native::PackedSlots`]). Readers that
+    /// need `&Object`s get a lazily built copy; any write first converts
+    /// to [`Self::Fixed`].
+    Packed(crate::stdlib::datetime_native::PackedSlots),
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<SlotStorage>() == 32);
 
 /// Is `key` the slot name `name`? (Interned names usually share the
 /// probe's storage, settled without reading either length.)
@@ -2030,7 +2060,7 @@ fn slot_name_eq(stored: &str, name: &str) -> bool {
 /// The key for a newly populated slot `name`. The slots every raise
 /// populates (`args`, `__traceback__`, the chaining links) share one
 /// interned key each instead of allocating a string per exception.
-fn slot_key(name: &str) -> DictKey {
+pub(crate) fn slot_key(name: &str) -> DictKey {
     const COMMON: [&str; 6] = [
         "args",
         "__traceback__",
@@ -2094,6 +2124,7 @@ impl SlotStorage {
             SlotData::Fixed { layout, values } if SharedSlice::ptr_eq(layout, expected) => {
                 Some(values)
             }
+            SlotData::Packed(p) if SharedSlice::ptr_eq(p.layout(), expected) => Some(p.values()),
             _ => None,
         }
     }
@@ -2102,6 +2133,7 @@ impl SlotStorage {
         &mut self,
         expected: &SharedSlice<DictKey>,
     ) -> Option<&mut [Object]> {
+        self.unpack();
         match &mut self.data {
             SlotData::Fixed { layout, values } if SharedSlice::ptr_eq(layout, expected) => {
                 Some(values)
@@ -2110,9 +2142,58 @@ impl SlotStorage {
         }
     }
 
+    /// Storage holding a natively packed value (see [`SlotData::Packed`]).
+    pub(crate) fn from_packed(packed: crate::stdlib::datetime_native::PackedSlots) -> Self {
+        Self {
+            data: SlotData::Packed(packed),
+        }
+    }
+
+    /// The packed value, while the storage still holds one.
+    #[inline]
+    pub(crate) fn as_packed(&self) -> Option<&crate::stdlib::datetime_native::PackedSlots> {
+        match &self.data {
+            SlotData::Packed(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// [`Self::as_packed`], mutably.
+    #[inline]
+    pub(crate) fn as_packed_mut(
+        &mut self,
+    ) -> Option<&mut crate::stdlib::datetime_native::PackedSlots> {
+        match &mut self.data {
+            SlotData::Packed(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Turn a [`SlotData::Packed`] storage into [`SlotData::Fixed`]
+    /// (before a slot is written).
+    #[inline]
+    fn unpack(&mut self) {
+        if let SlotData::Packed(_) = &self.data {
+            self.unpack_slow();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn unpack_slow(&mut self) {
+        if let SlotData::Packed(p) = std::mem::take(self).data {
+            let layout = p.layout().clone();
+            self.data = SlotData::Fixed {
+                layout,
+                values: p.into_values(),
+            };
+        }
+    }
+
     /// Turn a [`SlotData::Fixed`] storage into the per-key form (before
     /// a key is added or removed).
     fn unfix(&mut self) {
+        self.unpack();
         if let SlotData::Fixed { layout, values } = &mut self.data {
             let values = std::mem::take(values);
             let entries: Vec<(DictKey, Object)> =
@@ -2138,6 +2219,24 @@ impl SlotStorage {
     /// Storage holding `values` under `layout` (see the 64-bit variant).
     pub fn from_layout(layout: SharedSlice<DictKey>, values: Vec<Object>) -> Self {
         Self::from_entries(layout.iter().cloned().zip(values).collect())
+    }
+
+    /// Storage holding a packed value's slots (stored per key here).
+    pub(crate) fn from_packed(packed: crate::stdlib::datetime_native::PackedSlots) -> Self {
+        let layout = packed.layout().clone();
+        Self::from_layout(layout, packed.into_values().into_vec())
+    }
+
+    #[inline]
+    pub(crate) fn as_packed(&self) -> Option<&crate::stdlib::datetime_native::PackedSlots> {
+        None
+    }
+
+    #[inline]
+    pub(crate) fn as_packed_mut(
+        &mut self,
+    ) -> Option<&mut crate::stdlib::datetime_native::PackedSlots> {
+        None
     }
 }
 
@@ -2186,6 +2285,13 @@ impl SlotStorage {
                     |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
                 )
                 .map(|index| index as u32),
+            SlotData::Packed(p) => p
+                .layout()
+                .iter()
+                .position(
+                    |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
+                )
+                .map(|index| index as u32),
         }
     }
 
@@ -2198,12 +2304,14 @@ impl SlotStorage {
             SlotData::Small(entries) => entries.get(index).map(|(key, value)| (key, value)),
             SlotData::Many(table) => table.get_index(index),
             SlotData::Fixed { layout, values } => layout.get(index).zip(values.get(index)),
+            SlotData::Packed(p) => p.layout().get(index).zip(p.values().get(index)),
             _ => None,
         }
     }
 
     #[inline]
     pub fn get_index_mut(&mut self, index: usize) -> Option<(&DictKey, &mut Object)> {
+        self.unpack();
         match &mut self.data {
             SlotData::Single { key, value } if index == 0 => key.as_ref().map(|key| (key, value)),
             SlotData::Small(entries) => entries.get_mut(index).map(|(key, value)| (&*key, value)),
@@ -2229,6 +2337,13 @@ impl SlotStorage {
                     |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
                 )
                 .and_then(|i| values.get(i)),
+            SlotData::Packed(p) => p
+                .layout()
+                .iter()
+                .position(
+                    |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
+                )
+                .and_then(|i| p.values().get(i)),
             _ => None,
         }
     }
@@ -2301,8 +2416,78 @@ impl SlotStorage {
                 }
                 Some(std::array::from_fn(|i| &values[i]))
             }
+            SlotData::Packed(p) => {
+                let (keys, values) = (p.layout().get(..N)?, p.values().get(..N)?);
+                if !keys
+                    .iter()
+                    .zip(names)
+                    .all(|(key, name)| key_named(key, name))
+                {
+                    return None;
+                }
+                Some(std::array::from_fn(|i| &values[i]))
+            }
             _ => None,
         }
+    }
+
+    /// Whether the first `N` keys of a small store are the given
+    /// interned names themselves (pointer identity, as attribute stores
+    /// intern them).
+    #[inline(always)]
+    fn leads_with_interned<const N: usize>(
+        &self,
+        names: &[&crate::shared_value::SharedStr; N],
+    ) -> bool {
+        let SlotData::Small(entries) = &self.data else {
+            return false;
+        };
+        if entries.len() < N {
+            return false;
+        }
+        let mut same = true;
+        for (i, name) in names.iter().enumerate() {
+            same &= matches!(&entries[i].0 .0, Object::Str(s)
+                if crate::shared_value::SharedStr::ptr_eq(s, name));
+        }
+        same
+    }
+
+    /// [`Self::leading`] for its common shape, inlined: a small store
+    /// whose first `N` keys are the given interned names themselves. Any
+    /// other shape takes the full comparison.
+    #[inline(always)]
+    pub fn leading_interned<const N: usize>(
+        &self,
+        names: [&crate::shared_value::SharedStr; N],
+    ) -> Option<[&Object; N]> {
+        if !self.leads_with_interned(&names) {
+            return self.leading(names);
+        }
+        let SlotData::Small(entries) = &self.data else {
+            return None;
+        };
+        let base = entries.as_ptr();
+        // SAFETY: the store holds at least `N` entries (checked above).
+        Some(std::array::from_fn(|i| unsafe { &(*base.add(i)).1 }))
+    }
+
+    /// [`Self::leading_interned`], mutably.
+    #[inline(always)]
+    pub fn leading_interned_mut<const N: usize>(
+        &mut self,
+        names: [&crate::shared_value::SharedStr; N],
+    ) -> Option<[&mut Object; N]> {
+        if !self.leads_with_interned(&names) {
+            return self.leading_mut(names);
+        }
+        let SlotData::Small(entries) = &mut self.data else {
+            return None;
+        };
+        let base = entries.as_mut_ptr();
+        // SAFETY: the store holds at least `N` entries (checked above),
+        // and each index yields a distinct entry.
+        Some(std::array::from_fn(|i| unsafe { &mut (*base.add(i)).1 }))
     }
 
     /// [`Self::leading`], mutably.
@@ -2311,6 +2496,7 @@ impl SlotStorage {
         &mut self,
         names: [&crate::shared_value::SharedStr; N],
     ) -> Option<[&mut Object; N]> {
+        self.unpack();
         let values: &mut [Object] = match &mut self.data {
             SlotData::Small(entries) => {
                 let entries = entries.get_mut(..N)?;
@@ -2343,6 +2529,7 @@ impl SlotStorage {
 
     /// Mutable access to a populated slot's value, by name.
     pub fn get_mut(&mut self, name: &str) -> Option<&mut Object> {
+        self.unpack();
         match &mut self.data {
             SlotData::Single {
                 key: Some(DictKey(Object::Str(stored))),
@@ -2382,6 +2569,7 @@ impl SlotStorage {
         value: Object,
         make_key: impl FnOnce() -> DictKey,
     ) -> Option<Object> {
+        self.unpack();
         if let SlotData::Fixed { .. } = &self.data {
             if let Some(slot) = self.get_mut(name) {
                 return Some(std::mem::replace(slot, value));
@@ -2468,7 +2656,8 @@ impl SlotStorage {
             }
             SlotData::Small(entries) => (None, Some(entries), None, None),
             SlotData::Many(table) => (None, None, Some(table), None),
-            SlotData::Fixed { layout, values } => (None, None, None, Some((layout, values))),
+            SlotData::Fixed { layout, values } => (None, None, None, Some((layout, &values[..]))),
+            SlotData::Packed(p) => (None, None, None, Some((p.layout(), p.values()))),
         };
         single
             .into_iter()
@@ -2605,13 +2794,7 @@ pub struct PyInstance {
     /// `_PyGC_FINALIZED` bit. Set by `Vm::invoke_finalizer` the moment the
     /// finalizer is dispatched; read by [`PyInstance`]'s `Drop` to decide
     /// whether the dying instance still needs its `__del__` resurrected onto
-    /// the pending-finalizer queue. Without this, an acyclic finalizable
-    /// instance whose last `Arc` is dropped on a code path that *didn't*
-    /// route through the prompt-reap cascade (e.g. a cross-thread handoff
-    /// where a transient clone briefly inflated the refcount so the reap
-    /// bailed) is freed silently, skipping `__del__` (RFC 0040:
-    /// `test_multiprocessing_*` `test_release_task_refs` leaked one
-    /// `CountedObject` per race).
+    /// the pending-finalizer queue.
     pub finalize_ran: Cell<bool>,
     /// Cycle-collector tracking is still deferred: the collector has
     /// never seen this instance, and it holds only atomic values (see
@@ -2755,6 +2938,13 @@ impl PyInstance {
     /// The caller established that `obj` is its only reference, the
     /// instance is still deferred and owns no C body.
     pub fn try_recycle(mut inst: Rc<Self>) {
+        // SAFETY: the caller holds the only reference.
+        if unsafe { &*inst.class.as_ptr() }.native_kind.get() != 0 {
+            if let Err(inst) = crate::stdlib::datetime_native::recycle(inst) {
+                drop(Rc::into_arc(inst));
+            }
+            return;
+        }
         let Some(m) = Rc::get_mut(&mut inst) else {
             return;
         };
@@ -2939,19 +3129,8 @@ impl PyInstance {
 }
 
 impl Drop for PyInstance {
-    /// Last-resort finalizer safety net, mirroring
-    /// [`crate::object::PyGenerator`]'s `Drop`. WeavePy normally runs an
-    /// instance's `__del__` through the prompt-reap cascade the instant its
-    /// last program reference is dropped (matching CPython's refcount
-    /// timing). But that cascade is driven from specific eval-loop sites and
-    /// is gated on a refcount-dead test; when the final `Arc` is released
-    /// somewhere else — most often a cross-thread object handoff where a
-    /// transient clone on another thread briefly inflated the strong count so
-    /// the reap conservatively bailed — the instance would otherwise be freed
-    /// by a plain `Arc` drop with its `__del__` silently skipped (the cycle
-    /// collector never revisits acyclic objects). Catch that here: resurrect
-    /// a shallow copy that shares the dying instance's `__dict__`/slots/native
-    /// value onto the VM's pending-finalizer queue so `__del__` still runs.
+    /// An instance dies when its last reference goes, as in CPython, and
+    /// the weak references watching it clear.
     fn drop(&mut self) {
         // A deferred-tracking record names this instance; the dict may
         // outlive it (`d = obj.__dict__`), so retire the record first.
@@ -2968,12 +3147,6 @@ impl Drop for PyInstance {
                 }
             }
         }
-        if crate::hot_gates::env_flags::reap_trace() {
-            let name = self.cls().name.clone();
-            if name.contains("Block") || name.contains("DataFrame") {
-                eprintln!("[INST-DROP] {name} body={:#x}", self.c_body.get());
-            }
-        }
         // RFC 0045 (wave 3): release the faithful C inline body this
         // instance owns, if it ever crossed into a C extension that reads
         // its fields at fixed `tp_basicsize` offsets. Runs before the
@@ -2988,44 +3161,9 @@ impl Drop for PyInstance {
                 free(body);
             }
         }
-        // Already finalized (cascade/GC/this net's resurrected copy): the
-        // common case for finalizable instances and the *only* path for the
-        // overwhelmingly common finalizer-free instance — a single `Cell`
-        // read keeps the hot drop path cheap.
-        if self.finalize_ran.get() {
-            return;
-        }
-        // No `__del__` anywhere in the MRO ⇒ nothing to do. Cached on the
-        // type, so this is one more `Cell` read after the first instance.
-        if !self.cls().instances_need_finalize() {
-            return;
-        }
-        // CPython runs `tp_finalize` once: claim it so the resurrected copy
-        // (and any re-drop after the finalizer completes) can't loop.
-        self.finalize_ran.set(true);
-        // Can't run Python from `Drop`; resurrect onto the pending queue. The
-        // copy shares `dict`/`slots`/`native` (cloning the `Arc`s/contents),
-        // so `__del__` observes the same attributes; `try_*` tolerates TLS
-        // teardown and re-entrant borrows by dropping the request.
-        let resurrected = Object::Instance(Rc::new(PyInstance {
-            class: RefCell::new(self.cls()),
-            dict: self.dict.clone(),
-            native: match self.native.get() {
-                Some(v) => crate::sync::OnceBox::from(v.clone()),
-                None => crate::sync::OnceBox::new(),
-            },
-            inline_values: Cell::new(self.inline_values.get()),
-            slots: RefCell::new(self.slots.borrow().clone()),
-            hash_cache: crate::sync::CachedHash::new(self.hash_cache.get()),
-            // This copy still owes its queued invocation. Dispatch claims
-            // its flag atomically; a failed enqueue suppresses its Drop.
-            finalize_ran: Cell::new(false),
-            // The resurrected copy is a distinct object that owns no C
-            // body (the dying `self` already freed its own above).
-            deferred: crate::sync::Cell::new(false),
-            c_body: CBody::default(),
-        }));
-        crate::vm_singletons::try_push_pending_finalizer(resurrected);
+        // A finalizer, if the class has one, already ran: `rc::Rc`'s `Drop`
+        // queued this instance for it at its last release.
+        crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
     }
 }
 

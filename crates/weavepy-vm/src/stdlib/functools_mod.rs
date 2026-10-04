@@ -311,7 +311,7 @@ fn lru_cache_wrapper_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // wrapper counted as an external root that made that namespace
     // immortal.
     let wrapper = Object::Instance(inst);
-    crate::gc_trace::track(wrapper.clone());
+    crate::gc_trace::track(&wrapper);
     Ok(wrapper)
 }
 
@@ -632,11 +632,8 @@ fn scalar_lru_operation(
         data.insert(DictKey(key.clone()), value.clone());
         order.push(limit).ok_or_else(invalid_lru_order)?;
     }
-    // Publish a consistent cache before releasing an evicted result. The
-    // prompt-reap queue preserves its finalizer's real calling frame.
-    if let Some((_, value)) = removed {
-        crate::vm_singletons::queue_container_removed(&value);
-    }
+    // Publish a consistent cache before releasing an evicted result.
+    drop(removed);
     Ok(ScalarLru::Complete(None))
 }
 
@@ -811,11 +808,7 @@ fn lru_cache_clear(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Obje
                 None
             }
         };
-        if let Some(retired) = retired {
-            for (_, value) in retired {
-                crate::vm_singletons::queue_container_removed(&value);
-            }
-        }
+        drop(retired);
     }
     lru_set(&inst, "_lru_hits", Object::Int(0));
     lru_set(&inst, "_lru_misses", Object::Int(0));

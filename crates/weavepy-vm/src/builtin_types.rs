@@ -428,7 +428,7 @@ impl BuiltinTypes {
                             );
                             pi.dict = dict.into();
                             let inst = Object::Instance(Rc::new(pi));
-                            crate::gc_trace::track(inst.clone());
+                            crate::gc_trace::track(&inst);
                             return Ok(inst);
                         }
                     }
@@ -491,7 +491,7 @@ impl BuiltinTypes {
                             let mut pi = crate::types::PyInstance::with_native(cls.clone(), ns);
                             pi.dict = dict.into();
                             let inst = Object::Instance(Rc::new(pi));
-                            crate::gc_trace::track(inst.clone());
+                            crate::gc_trace::track(&inst);
                             return Ok(inst);
                         }
                     }
@@ -500,7 +500,7 @@ impl BuiltinTypes {
                     // through a closure cell is a cycle the collector must
                     // see (test_interpreters' captured_thread_exception
                     // left its Thread in `threading._dangling`).
-                    crate::gc_trace::track(ns.clone());
+                    crate::gc_trace::track(&ns);
                     Ok(ns)
                 };
             let mut ns_dict = simple_namespace_.dict.borrow_mut();
@@ -1536,12 +1536,8 @@ fn exc_slot_readonly(name: &str, class_name: &str, default: Object) -> Object {
 /// applied by an old pickle, or `self.args = …` in a shadowing
 /// `__init__` that ran before the class descriptor was reachable).
 pub(crate) fn exc_attr(inst: &crate::types::PyInstance, name: &str) -> Option<Object> {
-    inst.slot_get(name).or_else(|| {
-        inst.dict_cell()
-            .borrow()
-            .get(&crate::object::StrKey(name))
-            .cloned()
-    })
+    // Read without publishing a `__dict__` the instance never needed.
+    inst.slot_get(name).or_else(|| inst.attr_get_str(name))
 }
 
 /// Construct an exception instance of `class_name` with `message` as
@@ -1557,15 +1553,17 @@ pub fn make_exception(class_name: &str, message: impl Into<String>) -> Object {
 /// Build a built-in exception instance whose single `args[0]` element is the
 /// *object* `arg`, not a stringified message — `KeyError(key)` where
 /// `e.args[0] is key`. CPython's `KeyError.__str__` renders `repr(args[0])`,
-/// which our `exc_str` already reproduces; we set `message` to that repr so
-/// the Rust Display/traceback path matches too.
+/// which our `exc_str` already reproduces, and so does
+/// [`exception_message`] for the Rust Display/traceback path.
 pub fn make_exception_with_object(class_name: &str, arg: Object) -> Object {
-    let exc = make_exception(class_name, "");
-    if let Object::Instance(inst) = &exc {
-        inst.slot_set("args", Object::new_tuple_array([arg.clone()]));
-        inst.slot_set("message", Object::from_str(arg.repr()));
-    }
-    exc
+    let bt = builtin_types();
+    let class = match class_name {
+        "KeyError" => bt.key_error.clone(),
+        _ => bt
+            .by_name(class_name)
+            .unwrap_or_else(|| bt.exception.clone()),
+    };
+    exception_from_parts(class, Some(arg))
 }
 
 /// Build a faithful `UnicodeEncodeError` instance carrying the 5-tuple
@@ -1834,7 +1832,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::new_tuple(new_args.to_vec()),
         );
         let obj = Object::Instance(inst);
-        crate::gc_trace::track(obj.clone());
+        crate::gc_trace::track(&obj);
         return Ok(obj);
     }
     // `tuple.__new__(tuple, it)` / `int.__new__(int, x)` … on the *built-in
@@ -1846,7 +1844,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // name/doc seeding lives in `module.__init__` only).
     if cls.is_subclass_of(&builtin_types().module_) {
         let inst = Object::Instance(Rc::new(PyInstance::new(cls)));
-        crate::gc_trace::track(inst.clone());
+        crate::gc_trace::track(&inst);
         return Ok(inst);
     }
     // A `type` subclass reaching the generic allocator is a wrong-arity
@@ -1929,7 +1927,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
                     let interp = unsafe { &mut *ptr };
                     let s = interp.type_call_default(&bt.str_, &args[1..], &[])?;
                     let inst = Object::Instance(Rc::new(PyInstance::with_native(cls.clone(), s)));
-                    crate::gc_trace::track(inst.clone());
+                    crate::gc_trace::track(&inst);
                     return Ok(inst);
                 }
             }
@@ -1955,7 +1953,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
                     let interp = unsafe { &mut *ptr };
                     let v = interp.type_call_default(&bt.int_, &args[1..], &[])?;
                     let inst = Object::Instance(Rc::new(PyInstance::with_native(cls.clone(), v)));
-                    crate::gc_trace::track(inst.clone());
+                    crate::gc_trace::track(&inst);
                     return Ok(inst);
                 }
             }
@@ -1970,7 +1968,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // `__init__` / `__setstate__` / the `_reconstruct` append-and-update loop.
     if let Some(native) = native_seed_for_new(&cls, args.get(1)) {
         let inst = Object::Instance(Rc::new(PyInstance::with_native(cls, native)));
-        crate::gc_trace::track(inst.clone());
+        crate::gc_trace::track(&inst);
         return Ok(inst);
     }
     // RFC 0024: explicit `object.__new__(cls)` / `super().__new__(cls)`
@@ -1982,7 +1980,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // A natively served class's instances are never tracked (see
     // `stdlib::datetime_native`).
     if !native {
-        crate::gc_trace::track(inst.clone());
+        crate::gc_trace::track(&inst);
     }
     Ok(inst)
 }
@@ -3910,29 +3908,10 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
         let Some(Object::Instance(inst)) = args.first() else {
             return Ok(Object::from_static(""));
         };
+        if let Some(m) = oserror_fields_message(inst) {
+            return Ok(Object::from_str(m));
+        }
         let get = |name: &'static str| exc_attr(inst, name);
-        let set = |o: &Option<Object>| matches!(o, Some(v) if !matches!(v, Object::None));
-        let errno = get("errno");
-        let strerror = get("strerror");
-        let filename = get("filename");
-        let filename2 = get("filename2");
-        let errno_s = errno.as_ref().map(Object::to_str).unwrap_or_default();
-        let strerror_s = strerror.as_ref().map(Object::to_str).unwrap_or_default();
-        if set(&filename) {
-            let f1 = filename.as_ref().map(Object::repr).unwrap_or_default();
-            if set(&filename2) {
-                let f2 = filename2.as_ref().map(Object::repr).unwrap_or_default();
-                return Ok(Object::from_str(format!(
-                    "[Errno {errno_s}] {strerror_s}: {f1} -> {f2}"
-                )));
-            }
-            return Ok(Object::from_str(format!(
-                "[Errno {errno_s}] {strerror_s}: {f1}"
-            )));
-        }
-        if set(&errno) && set(&strerror) {
-            return Ok(Object::from_str(format!("[Errno {errno_s}] {strerror_s}")));
-        }
         // BaseException.__str__: "" / str(arg) / repr(args).
         match get("args") {
             Some(Object::Tuple(items)) => Ok(match &items[..] {
@@ -4858,47 +4837,53 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
 }
 
 pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<String>) -> Object {
-    use crate::types::PyInstance;
-    let (mut is_syntax, mut is_stop_iteration, mut is_import) = (false, false, false);
-    for t in class.mro.borrow().iter() {
-        match t.name.as_str() {
-            "SyntaxError" => is_syntax = true,
-            "StopIteration" => is_stop_iteration = true,
-            "ImportError" => is_import = true,
-            _ => {}
-        }
-    }
-    let inst = PyInstance::new(class);
-    let msg = Object::from_str(message);
+    let message: String = message.into();
     // A messageless raise (`StopIteration()`, `GeneratorExit()`, …)
     // has *empty* args in CPython, not `("",)`.
-    let args = if msg.to_str().is_empty() {
-        Object::new_tuple(Vec::new())
+    let msg = if message.is_empty() {
+        None
     } else {
-        Object::new_tuple_array([msg.clone()])
+        Some(Object::from_str(message))
     };
+    exception_from_parts(class, msg)
+}
+
+/// A built-in exception of `class` whose `args` is `(arg,)`, or `()`
+/// for `None`: the shared tail of the Rust-side constructors.
+///
+/// The pseudo-slots land in one vector sized for the traceback and
+/// chaining links a raise adds next, and the class's families come
+/// from its memoised flags rather than an MRO walk. CPython keeps no
+/// `message` attribute: `str()` and [`exception_message`] derive the
+/// text from `args` on demand, so nothing is formatted here.
+pub(crate) fn exception_from_parts(class: Rc<TypeObject>, arg: Option<Object>) -> Object {
+    use crate::types::{slot_key, PyInstance, SlotStorage};
+    let families = crate::exc_family_flags(&class);
+    let inst = PyInstance::new(class);
+    let args = match &arg {
+        None => Object::new_tuple(Vec::new()),
+        Some(a) => Object::new_tuple_array([a.clone()]),
+    };
+    inst.note_slot_store(&args);
+    let mut entries: Vec<(crate::object::DictKey, Object)> = Vec::with_capacity(4);
     // PEP 380: `StopIteration.value` is always present (CPython sets it
     // in `StopIteration.__init__`, defaulting to None). A Rust-raised
-    // bare `StopIteration` must answer `.value` too — asyncio's
+    // bare `StopIteration` must answer `.value` too: asyncio's
     // `Task.__step` reads `exc.value` on every coroutine return, and a
     // missing attribute leaves the task wedged (gh: shutdown_asyncgens).
-    if is_stop_iteration {
-        let value = if msg.to_str().is_empty() {
-            Object::None
-        } else {
-            msg.clone()
-        };
-        inst.slot_set("value", value);
+    if families & crate::EXC_FAM_STOP_ITERATION != 0 {
+        let value = arg.clone().unwrap_or(Object::None);
+        inst.note_slot_store(&value);
+        entries.push((slot_key("value"), value));
     }
-    inst.slot_set("args", args);
-    inst.slot_set("message", msg.clone());
+    entries.push((slot_key("args"), args));
     // The BaseException pseudo-slots (`__context__`/`__cause__`/
     // `__suppress_context__`/`__traceback__`) and OSError's named fields
     // (`errno`/`strerror`/…) are *not* seeded per-instance: their class
     // slot descriptors answer the CPython getset defaults while unset,
     // and a subclass's own class attribute (`class Err(OSError): errno =
     // EINVAL`, raised bare via `raise Err`) stays visible.
-    if is_import {
+    if families & (crate::EXC_FAM_IMPORT_ERROR | crate::EXC_FAM_SYNTAX_ERROR) != 0 {
         // ImportError/ModuleNotFoundError expose `msg` (the message
         // string). CPython always defines the slot; a Rust-raised
         // ImportError must answer `.msg` so consumers (e.g. numpy's
@@ -4906,15 +4891,15 @@ pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<Strin
         // AttributeError. `name`/`path`/`name_from` are intentionally
         // *not* pre-set here so the import machinery's
         // `set_exception_attr` (which skips already-present slots) can
-        // still populate the real module name.
-        inst.slot_set("msg", msg.clone());
+        // still populate the real module name. SyntaxError gets `msg`
+        // from `args[0]` too; the location payload reads `None` off the
+        // class descriptors until `error::syntax_error_located` fills
+        // real values.
+        let msg = arg.unwrap_or_else(|| Object::from_static(""));
+        inst.note_slot_store(&msg);
+        entries.push((slot_key("msg"), msg));
     }
-    if is_syntax {
-        // SyntaxError gets `msg` from `args[0]`; the location payload
-        // reads `None` off the class descriptors until
-        // `error::syntax_error_located` fills real values.
-        inst.slot_set("msg", msg);
-    }
+    *inst.slots.borrow_mut() = SlotStorage::from_entries(entries);
     Object::Instance(Rc::new(inst))
 }
 
@@ -5237,7 +5222,7 @@ pub(crate) fn exception_group_new(
     // An exception group always anchors other exception instances, so
     // it can participate in reference cycles — GC-track it like
     // `build_exception_instance` does for enriched exceptions.
-    crate::gc_trace::track(inst.clone());
+    crate::gc_trace::track(&inst);
     Ok(inst)
 }
 
@@ -5655,7 +5640,18 @@ pub fn exception_message(obj: &Object) -> Option<String> {
             if let Some(Object::Str(s)) = exc_attr(inst, "message") {
                 return Some(s.to_string());
             }
+            if inst.cls().is_subclass_of(&builtin_types().os_error) {
+                if let Some(m) = oserror_fields_message(inst) {
+                    return Some(m);
+                }
+            }
             if let Some(Object::Tuple(items)) = exc_attr(inst, "args") {
+                // `KeyError.__str__` renders a lone key by its repr.
+                if let [single] = &items[..] {
+                    if inst.cls().is_subclass_of(&builtin_types().key_error) {
+                        return Some(single.repr());
+                    }
+                }
                 if let Some(first) = items.first() {
                     return Some(first.to_str());
                 }
@@ -5664,6 +5660,25 @@ pub fn exception_message(obj: &Object) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// `OSError.__str__`'s `[Errno N] strerror[: filename[ -> filename2]]`
+/// rendering, when the named fields that shape needs are set (see
+/// `oserror_str`).
+fn oserror_fields_message(inst: &crate::types::PyInstance) -> Option<String> {
+    let get = |name: &'static str| exc_attr(inst, name).filter(|v| !matches!(v, Object::None));
+    let errno = get("errno");
+    let strerror = get("strerror");
+    let errno_s = errno.as_ref().map(Object::to_str).unwrap_or_default();
+    let strerror_s = strerror.as_ref().map(Object::to_str).unwrap_or_default();
+    if let Some(f1) = get("filename") {
+        let f1 = f1.repr();
+        return Some(match get("filename2") {
+            Some(f2) => format!("[Errno {errno_s}] {strerror_s}: {f1} -> {}", f2.repr()),
+            None => format!("[Errno {errno_s}] {strerror_s}: {f1}"),
+        });
+    }
+    (errno.is_some() && strerror.is_some()).then(|| format!("[Errno {errno_s}] {strerror_s}"))
 }
 
 /// `True` when `obj` is an instance whose class derives from `cls`.
@@ -5817,7 +5832,7 @@ fn int_new_kw(
         return Some(Ok(v));
     }
     let inst = Object::Instance(Rc::new(PyInstance::with_native(cls.clone(), v)));
-    crate::gc_trace::track(inst.clone());
+    crate::gc_trace::track(&inst);
     Some(Ok(inst))
 }
 

@@ -329,30 +329,10 @@ pub unsafe fn release_c_ownership(p: *mut PyObject) {
         .lock()
         .ok()
         .and_then(|mut g| g.as_mut().and_then(|m| m.remove(&(p as usize))));
-    if let Some(inst) = &pinned {
+    if pinned.is_some() {
         // C just dropped what may be this instance's last program-visible
-        // reference (CPython would run `tp_dealloc` right here). If the VM
-        // side still pins it through GC-handle / weakref-registry clones, a
-        // plain `Rc` drop below cannot reap it — a *tracked* extension
-        // temporary that dies inside a C call (a Cython generator abandoned
-        // by `BlockManager.iget`, still holding `self` in its closure) would
-        // otherwise stay pinned by its own handle until the next full
-        // collection, keeping everything it references alive with it
-        // (pandas' `_is_view_after_cow_rules` then reads a stale live
-        // `Block` weakref). Park it for the eval loop's between-bytecodes
-        // reap; anything still genuinely alive fails the drain's
-        // refcount-dead test untouched.
-        //
-        // Only a *GC-tracked* instance needs the park: an untracked one has
-        // no handle pinning it, so the plain `Rc` drop below reclaims it
-        // immediately (running `tp_dealloc` through the free hook) — and a
-        // queued clone would instead keep it alive until the next eval-loop
-        // safe point, which never comes for a drop performed outside
-        // bytecode execution (an embedding host dropping its last handle).
-        let obj = weavepy_vm::object::Object::Instance(inst.clone());
-        if weavepy_vm::gc_trace::is_tracked(weavepy_vm::weakref_registry::id_of(&obj)) {
-            weavepy_vm::vm_singletons::queue_cext_dropped(&obj);
-        }
+        // reference; the plain `Rc` drop below reclaims it then (running
+        // `tp_dealloc` through the free hook), as CPython's would.
     } else if unsafe { crate::mirror::is_orphaned_instance_body(p) }
         && !body_free_in_flight(p as usize)
     {
@@ -618,8 +598,8 @@ unsafe fn dealloc_and_free_body(p: *mut PyObject) {
                     (*ty).tp_basicsize = orig_basicsize.wrapping_add(8);
                     // A `tp_dealloc` is extension code: its decref chains can
                     // re-enter the VM, and any bytecode that runs beneath it
-                    // must see a live C frame (RFC 0047 — the prompt reaper's
-                    // borrowed-pointer window).
+                    // must see a live C frame (RFC 0047 — the borrowed-pointer
+                    // window that defers parked C drops).
                     let _cext_guard = weavepy_vm::vm_singletons::enter_cext_call();
                     // Consent protocol: the dealloc must reach a `tp_free`
                     // (absorbed by `PyObject_Free`/`PyObject_GC_Del`, which

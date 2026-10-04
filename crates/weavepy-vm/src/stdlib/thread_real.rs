@@ -1434,16 +1434,19 @@ fn spawn_python_worker(
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 worker_interp.run_thread_local_death_cleanup(synth_id as i64);
             }));
-            // Run any `__del__`/weakref-callback finalizers this worker
-            // deferred onto its *thread-local* pending queue (the prompt-reap
-            // cascade and the `PyInstance` `Drop` safety net both enqueue
-            // there). A blocked pool handler thread — `_handle_results`
+            // Release the target and its arguments, then run the
+            // `__del__`s and weakref callbacks this worker queued on its
+            // *thread-local* pending queue — the target function's death
+            // included (test_thread.test__count waits on its weakref
+            // callback). A blocked pool handler thread — `_handle_results`
             // parked in `outqueue.get()` — never reaches an eval-loop tick
             // to drain its own queue, so without this flush an object whose
-            // last reference died on that thread (e.g. a `test_release_task_refs`
-            // result copy) would be freed silently at thread teardown with its
-            // `__del__` skipped, leaking it. Drain while the GIL and the
-            // worker interpreter are both still live; isolate panics.
+            // last reference died on that thread would be freed with its
+            // `__del__` skipped. Drain while the GIL and the worker
+            // interpreter are both still live; isolate panics.
+            drop(worker_func);
+            drop(positional);
+            drop(kwargs_pairs);
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 worker_interp.run_pending_finalizers();
             }));
@@ -1455,17 +1458,13 @@ fn spawn_python_worker(
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                 super::greenlet_native::on_thread_teardown,
             ));
-            // Release this worker's Python references *while the GIL is
-            // still held*. The interpreter snapshot pins a large shared
-            // object graph; dropping it after the GIL is gone lets its
-            // `Arc` decrements (and the prompt-reap bookkeeping they
-            // trigger) race a peer thread's in-flight mark phase — which
+            // Release this worker's interpreter *while the GIL is still
+            // held*. Its snapshot pins a large shared object graph, and
+            // dropping it after the GIL is gone lets its `Arc` decrements
+            // race a peer thread's in-flight mark phase — which
             // intermittently classified the peer's *live* suspended
             // generators as garbage and closed them mid-`for` loop
             // (test_threading.test_foreign_thread's `wait_threads_exit`).
-            drop(worker_func);
-            drop(positional);
-            drop(kwargs_pairs);
             drop(worker_interp);
             crate::vm_singletons::clear_thread_python_tls();
             // Drop the guard before marking finished so the parent's
@@ -1730,13 +1729,6 @@ fn make_thread_handle_object(state: Arc<ThreadHandleState>, ident: Object) -> Ob
             return Err(runtime_error("thread not started"));
         }
         if join_state.done.load(Ordering::Acquire) {
-            // Already-finished fast path: still sweep — the worker's teardown
-            // (`del self._target, self._args, self._kwargs` in `Thread.run`)
-            // dropped containers that stay pinned by their cycle-GC handles
-            // until a sweep, and callers expect join() to have restored
-            // CPython's refcount timing regardless of who won the race
-            // (test_threading.test_no_refcycle_through_target).
-            crate::gc_trace::reap_dead_acyclic();
             return Ok(Object::None);
         }
         // Joining a thread from itself would deadlock; CPython's handle
@@ -1786,18 +1778,6 @@ fn make_thread_handle_object(state: Arc<ThreadHandleState>, ident: Object) -> Ob
                 }
             },
         }
-        // RFC 0039 (WS4): the just-joined worker ran its target's
-        // teardown — e.g. `threading.Thread.run`'s
-        // `del self._target, self._args, self._kwargs` — on its own
-        // thread, dropping the last *program* reference to any argument
-        // cycle. Objects this (joining) thread allocated are still pinned
-        // by its cycle-GC handle until a collection, so a `del` right
-        // after the join would still see the dead container as a live
-        // referrer. Refcounting would have freed it instantly in CPython;
-        // sweep this thread's dead acyclic garbage now so the caller's
-        // subsequent `del` finalizes the cycle without an explicit
-        // `gc.collect()` (test_threading.test_no_refcycle_through_target).
-        crate::gc_trace::reap_dead_acyclic();
         Ok(Object::None)
     };
 

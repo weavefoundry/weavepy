@@ -1104,9 +1104,9 @@ fn make_ref_object_with_class(
     class_override: Option<Rc<TypeObject>>,
 ) -> Object {
     let target_id = id_of(&target);
-    // The registry's strong clone keeps the referent alive until the
-    // collector's prompt reap clears it, so a deferred instance is
-    // tracked from here on.
+    // A weakly referenced instance may die in a cycle, and only a
+    // collection can find that, so a deferred instance is tracked from
+    // here on.
     if let Object::Instance(inst) = &target {
         inst.ensure_gc_tracked();
     }
@@ -1123,27 +1123,6 @@ fn make_ref_object_with_class(
     slot.fixed_wrapper = fixed_wrapper;
     let slot = Arc::new(slot);
     register(slot.clone());
-
-    // RFC 0040 (GC arc): a weakref *with a callback* (`weakref.ref(obj, cb)`,
-    // `weakref.finalize`, `multiprocessing.util.Finalize`) must fire that
-    // callback the instant the referent's last strong reference drops, not at
-    // the next cyclic collection. Enroll the (tracked) referent in the cycle
-    // GC's prompt-finalization index so a refcount-death between bytecodes
-    // fires it — matching CPython's `tp_dealloc` weakref clear.
-    //
-    // Callback-*less* refs must clear promptly too (leak tests observe
-    // `wr()` going `None` right after the owning scope exits — test_ssl's
-    // SSLContext checks), but NOT via this index: enrolling every weakref
-    // target would leave `has_any_finalizable()` permanently true from the
-    // interpreter-boot weakrefs (`abc`/`typing` registries), turning the
-    // eval loop's drop safe point into a full index scan on every
-    // reference-dropping opcode (a 3-4x interpreter-wide slowdown, RFC 0054
-    // WS5 re-measure). They are served by the opcode-level prompt-reap
-    // cascade (`reap_dead_subgraph` clears weakrefs) plus the suspect
-    // re-probe for deaths inside Rust transients.
-    if callback.is_some() {
-        crate::gc_trace::note_weakref_finalizable(target_id);
-    }
 
     // The getter owns the slot. Registry entries and the wrapper's
     // back-pointer are weak; callback ownership stays in traced storage.
@@ -1236,7 +1215,7 @@ fn make_ref_object_with_class(
     // is its own callback) and bound methods are tracked as well.
     let callback_can_cycle = !matches!(&callback, None | Some(Object::Builtin(_)));
     if callback_can_cycle {
-        crate::gc_trace::track(wrapper.clone());
+        crate::gc_trace::track(&wrapper);
     }
     wrapper
 }
@@ -1536,7 +1515,7 @@ mod tests {
             TypeObject::new_user("WeakrefTarget", vec![], DictData::default()).unwrap(),
         );
         let r = c_new_ref(target.clone(), None).unwrap();
-        crate::gc_trace::sweep_weakref_only_targets();
+        crate::weakref_registry::sweep_dead_targets();
         let live = ref_type_call(std::slice::from_ref(&r)).unwrap();
         assert!(live.is_same(&target));
         let id = id_of(&target);

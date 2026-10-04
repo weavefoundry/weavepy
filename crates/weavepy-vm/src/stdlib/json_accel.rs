@@ -1020,7 +1020,7 @@ fn parse_object<C: JsonChar>(
                     // CPython replaces duplicate values as it parses. Run
                     // a displaced value's finalizer before the next field,
                     // with no table borrow held across user code.
-                    interp.prompt_reap_dropped(previous);
+                    interp.release(previous);
                 }
             }
             DecodedObject::Pairs(pairs) => pairs.push((key_obj, value)),

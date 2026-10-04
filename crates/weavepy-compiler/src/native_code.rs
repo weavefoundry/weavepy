@@ -16,7 +16,7 @@ use crate::bytecode::{CacheTable, Instruction, OpCode};
 use crate::{CodeObject, ColSpan, Constant, ExcHandler};
 
 /// The layout revision; bump it whenever the encoding changes.
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 
 /// Encode `code` (and its nested code objects). `None` for a code object
 /// the format doesn't carry: one with raw CPython wire overrides, or with
@@ -26,6 +26,21 @@ pub fn encode(code: &CodeObject) -> Option<Vec<u8>> {
     w.byte(VERSION);
     w.code(code)?;
     Some(w.0)
+}
+
+/// Decode a column-span block [`encode`] wrote (see `ColTable`).
+pub(crate) fn decode_coltable(bytes: &[u8]) -> Option<Vec<ColSpan>> {
+    let mut r = Reader { bytes, pos: 0 };
+    let end_lines = r.deltas()?;
+    let mut spans = Vec::with_capacity(end_lines.len());
+    for end_lineno in end_lines {
+        spans.push(ColSpan {
+            end_lineno,
+            col: r.i32()?,
+            end_col: r.i32()?,
+        });
+    }
+    (r.pos == bytes.len()).then_some(spans)
 }
 
 /// Decode what [`encode`] wrote, stamping `filename` on every code
@@ -116,11 +131,15 @@ impl Writer {
         // Line numbers as deltas from the previous entry: mostly zero, so
         // one byte each whatever the line.
         self.deltas(c.linetable.iter().copied());
-        self.deltas(c.coltable.iter().map(|s| s.end_lineno));
-        for s in &c.coltable {
-            self.int(i64::from(s.col));
-            self.int(i64::from(s.end_col));
+        // The column spans as one length-prefixed block, which a reader
+        // keeps encoded until something reads a column (see `ColTable`).
+        let mut cols = Writer(Vec::new());
+        cols.deltas(c.coltable.iter().map(|s| s.end_lineno));
+        for s in c.coltable.iter() {
+            cols.int(i64::from(s.col));
+            cols.int(i64::from(s.end_col));
         }
+        self.bytes(&cols.0);
         self.uint(u64::from(c.arg_count));
         self.uint(u64::from(c.posonly_count));
         self.uint(u64::from(c.kwonly_count));
@@ -360,15 +379,7 @@ impl Reader<'_> {
             });
         }
         let linetable = self.deltas()?;
-        let end_lines = self.deltas()?;
-        let mut coltable = Vec::with_capacity(end_lines.len());
-        for end_lineno in end_lines {
-            coltable.push(ColSpan {
-                end_lineno,
-                col: self.i32()?,
-                end_col: self.i32()?,
-            });
-        }
+        let coltable = crate::ColTable::encoded(Arc::from(self.raw()?));
         let arg_count = self.u32()?;
         let posonly_count = self.u32()?;
         let kwonly_count = self.u32()?;
@@ -472,7 +483,7 @@ mod tests {
             constants: vec![Constant::Int(-5)],
             varnames: vec!["x".to_owned()],
             linetable: vec![1, 2, 2],
-            coltable: vec![ColSpan::default(); 3],
+            coltable: vec![ColSpan::default(); 3].into(),
             arg_count: 1,
             is_generator: true,
             is_nested: true,

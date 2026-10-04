@@ -6,6 +6,7 @@
 //! (multi-code-point) SpecialCasing expansions.
 
 use crate::stdlib::ucd;
+use std::mem::MaybeUninit;
 
 const CAPITAL_SIGMA: u32 = 0x3A3;
 const FINAL_SIGMA: u32 = 0x3C2;
@@ -61,7 +62,7 @@ fn lower_at(cps: &[char], i: usize) -> ucd::CaseMap {
 
 pub fn lower(s: &str) -> String {
     if s.is_ascii() {
-        return s.to_ascii_lowercase();
+        return ascii_case_map(s, AsciiCase::Lower);
     }
     let cps: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
@@ -73,7 +74,7 @@ pub fn lower(s: &str) -> String {
 
 pub fn upper(s: &str) -> String {
     if s.is_ascii() {
-        return s.to_ascii_uppercase();
+        return ascii_case_map(s, AsciiCase::Upper);
     }
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -85,7 +86,7 @@ pub fn upper(s: &str) -> String {
 /// `str.casefold()` — context-free full fold (no Final_Sigma).
 pub fn casefold(s: &str) -> String {
     if s.is_ascii() {
-        return s.to_ascii_lowercase();
+        return ascii_case_map(s, AsciiCase::Lower);
     }
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -96,16 +97,7 @@ pub fn casefold(s: &str) -> String {
 
 pub fn title(s: &str) -> String {
     if s.is_ascii() {
-        let mut previous_is_cased = false;
-        return ascii_case_map(s, |b| {
-            let mapped = if previous_is_cased {
-                b.to_ascii_lowercase()
-            } else {
-                b.to_ascii_uppercase()
-            };
-            previous_is_cased = b.is_ascii_alphabetic();
-            mapped
-        });
+        return ascii_case_map(s, AsciiCase::Title);
     }
     let cps: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
@@ -125,11 +117,7 @@ pub fn title(s: &str) -> String {
 /// lowered with the sigma rule.
 pub fn capitalize(s: &str) -> String {
     if s.is_ascii() {
-        let mut out = s.to_ascii_lowercase();
-        if let Some(first) = out.get_mut(..1) {
-            first.make_ascii_uppercase();
-        }
-        return out;
+        return ascii_case_map(s, AsciiCase::Capitalize);
     }
     let cps: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
@@ -144,13 +132,7 @@ pub fn capitalize(s: &str) -> String {
 
 pub fn swapcase(s: &str) -> String {
     if s.is_ascii() {
-        return ascii_case_map(s, |b| {
-            if b.is_ascii_lowercase() {
-                b.to_ascii_uppercase()
-            } else {
-                b.to_ascii_lowercase()
-            }
-        });
+        return ascii_case_map(s, AsciiCase::Swap);
     }
     let cps: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
@@ -168,10 +150,87 @@ pub fn swapcase(s: &str) -> String {
     out
 }
 
-/// ASCII case mappings preserve both length and UTF-8 validity. Keep this
-/// safe even if a future caller passes a non-ASCII byte through the mapper.
-fn ascii_case_map(s: &str, map: impl FnMut(u8) -> u8) -> String {
-    String::from_utf8(s.bytes().map(map).collect()).expect("ASCII case mapping")
+/// The case operations' ASCII forms, which [`ascii_case_into`] applies
+/// to a whole buffer at once. (`casefold` of ASCII is `Lower`.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AsciiCase {
+    Upper,
+    Lower,
+    Title,
+    Capitalize,
+    Swap,
+}
+
+/// Write the `case` mapping of ASCII `src` into `dst` (of equal length),
+/// initializing all of it.
+///
+/// Each output byte depends only on its input byte and, for `Title`, the
+/// one before it (a letter follows a cased letter exactly when the byte
+/// before it is alphabetic), so every loop below is branch-free and
+/// vectorizes, where the per-character case-table lookups of the general
+/// path don't. Each mapping flips the case bit (`0x20`) of selected
+/// letters only, so ASCII stays ASCII; a non-ASCII byte is never a letter
+/// here and passes through unchanged.
+pub fn ascii_case_into(case: AsciiCase, src: &[u8], dst: &mut [MaybeUninit<u8>]) {
+    #[inline(always)]
+    fn is_lower(b: u8) -> bool {
+        b.wrapping_sub(b'a') < 26
+    }
+    #[inline(always)]
+    fn is_upper(b: u8) -> bool {
+        b.wrapping_sub(b'A') < 26
+    }
+    #[inline(always)]
+    fn is_alpha(b: u8) -> bool {
+        (b | 0x20).wrapping_sub(b'a') < 26
+    }
+    #[inline(always)]
+    fn flip(b: u8, when: bool) -> MaybeUninit<u8> {
+        MaybeUninit::new(b ^ (u8::from(when) << 5))
+    }
+    assert_eq!(src.len(), dst.len());
+    let (Some(&first), Some(head)) = (src.first(), dst.first_mut()) else {
+        return;
+    };
+    match case {
+        AsciiCase::Upper => {
+            for (d, &c) in dst.iter_mut().zip(src) {
+                *d = flip(c, is_lower(c));
+            }
+        }
+        AsciiCase::Lower => {
+            for (d, &c) in dst.iter_mut().zip(src) {
+                *d = flip(c, is_upper(c));
+            }
+        }
+        AsciiCase::Swap => {
+            for (d, &c) in dst.iter_mut().zip(src) {
+                *d = flip(c, is_alpha(c));
+            }
+        }
+        AsciiCase::Capitalize => {
+            *head = flip(first, is_lower(first));
+            for (d, &c) in dst[1..].iter_mut().zip(&src[1..]) {
+                *d = flip(c, is_upper(c));
+            }
+        }
+        AsciiCase::Title => {
+            *head = flip(first, is_lower(first));
+            for ((d, &c), &prev) in dst[1..].iter_mut().zip(&src[1..]).zip(src) {
+                let cased = is_alpha(prev);
+                *d = flip(c, (cased && is_upper(c)) || (!cased && is_lower(c)));
+            }
+        }
+    }
+}
+
+/// [`ascii_case_into`] into a new `String`.
+fn ascii_case_map(s: &str, case: AsciiCase) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    ascii_case_into(case, s.as_bytes(), &mut out.spare_capacity_mut()[..s.len()]);
+    // SAFETY: `ascii_case_into` initialized all `s.len()` bytes.
+    unsafe { out.set_len(s.len()) };
+    String::from_utf8(out).expect("ASCII case mapping")
 }
 
 /// `Py_UNICODE_ISSPACE` — differs from Rust's `char::is_whitespace` (e.g.

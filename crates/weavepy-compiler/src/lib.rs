@@ -280,6 +280,14 @@ impl JitHint {
         true
     }
 
+    /// Whether the tier-2 state has no further interest in this code's
+    /// back edges (see [`Self::set_backedge_quiet`]).
+    #[inline]
+    pub fn is_backedge_quiet(&self) -> bool {
+        self.backedge_quiet
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn set_backedge_quiet(&self) {
         self.backedge_quiet
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -504,8 +512,9 @@ pub struct CodeObject {
     /// PEP-657 fine-grained column spans, one per instruction (same length
     /// as `instructions` once emission finishes). Drives the column fields
     /// of `co_positions()`. Empty when never populated (e.g. code objects
-    /// reconstructed from marshal, which doesn't carry columns).
-    pub coltable: Vec<ColSpan>,
+    /// reconstructed from marshal, which doesn't carry columns). Decoded
+    /// from the code cache on first use (see [`ColTable`]).
+    pub coltable: ColTable,
     /// Number of positional + keyword arguments (excluding `*args`/`**kwargs`).
     pub arg_count: u32,
     /// Number of positional-only arguments.
@@ -625,6 +634,74 @@ pub struct WireOverrides {
 
 /// A per-instruction source-column span (PEP-657). `col`/`end_col` are
 /// 0-based UTF-8 byte offsets within their respective source lines, and
+/// A code object's column spans (see [`CodeObject::coltable`]): a
+/// vector, or the code cache's encoding of one, decoded on first use.
+/// Most code never reports a column (only tracebacks and
+/// `co_positions()` read them), so a module loaded from the cache skips
+/// the work until something does.
+#[derive(Clone, Default)]
+pub struct ColTable {
+    spans: std::sync::OnceLock<Vec<ColSpan>>,
+    encoded: Option<std::sync::Arc<[u8]>>,
+}
+
+impl ColTable {
+    /// The spans `encoded` holds in the code cache's form (see
+    /// `native_code`), decoded when first read.
+    pub(crate) fn encoded(encoded: std::sync::Arc<[u8]>) -> Self {
+        ColTable {
+            spans: std::sync::OnceLock::new(),
+            encoded: Some(encoded),
+        }
+    }
+
+    fn spans(&self) -> &Vec<ColSpan> {
+        self.spans.get_or_init(|| {
+            self.encoded
+                .as_deref()
+                .and_then(native_code::decode_coltable)
+                .unwrap_or_default()
+        })
+    }
+}
+
+impl From<Vec<ColSpan>> for ColTable {
+    fn from(spans: Vec<ColSpan>) -> Self {
+        ColTable {
+            spans: std::sync::OnceLock::from(spans),
+            encoded: None,
+        }
+    }
+}
+
+impl std::ops::Deref for ColTable {
+    type Target = Vec<ColSpan>;
+
+    fn deref(&self) -> &Vec<ColSpan> {
+        self.spans()
+    }
+}
+
+impl std::ops::DerefMut for ColTable {
+    fn deref_mut(&mut self) -> &mut Vec<ColSpan> {
+        self.spans();
+        self.encoded = None;
+        self.spans.get_mut().expect("decoded above")
+    }
+}
+
+impl PartialEq for ColTable {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl std::fmt::Debug for ColTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
 /// are `-1` when the column was not tracked. `end_lineno` is `0` when
 /// unknown (callers fall back to the instruction's start line).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2623,7 +2700,8 @@ impl Compiler {
             }
         };
         self.co.linetable.push(line);
-        self.co.coltable.push(self.resolve_colspan());
+        let span = self.resolve_colspan();
+        self.co.coltable.push(span);
         offset
     }
 

@@ -304,7 +304,7 @@ pub fn build_with_state(
         // pinned its whole importlib graph (and everything reachable from
         // it) for the life of the process.
         let tracked = |o: Object| {
-            crate::gc_trace::track(o.clone());
+            crate::gc_trace::track(&o);
             o
         };
         d.insert(
@@ -1417,8 +1417,10 @@ fn sys_setrecursionlimit(args: &[Object]) -> Result<Object, RuntimeError> {
 // (pickle's `load_build` inserts `sys.intern(k)` keys —
 // test_pickle test_attribute_name_interning).
 thread_local! {
-    static INTERN_POOL: RefCell<std::collections::HashSet<SharedStr>> =
-        RefCell::new(std::collections::HashSet::new());
+    // (Fx-hashed: interning runs for every name of every code object a
+    // module loads, and SipHash showed in import profiles.)
+    static INTERN_POOL: RefCell<std::collections::HashSet<SharedStr, crate::fasthash::FxBuildHasher>> =
+        const { RefCell::new(std::collections::HashSet::with_hasher(crate::fasthash::FxBuildHasher)) };
 }
 
 /// Canonicalize `name` through the interpreter's intern pool, seeding it
@@ -1939,7 +1941,7 @@ pub(crate) fn sizeof_estimate(o: &Object) -> i64 {
         // wide struct, plus len+1 units of the kind width
         // (test_str.test_raiseMemError pins all four kinds).
         Object::Str(s) => {
-            let len = crate::builtins::str_char_len(s) as i64;
+            let len = crate::object::str_char_len(s) as i64;
             match s.chars().map(u32::from).max().unwrap_or(0) {
                 0..=0x7f => 40 + len + 1,
                 0x80..=0xff => 56 + (len + 1),
@@ -2738,22 +2740,16 @@ fn stdlib_module_names_value() -> Object {
 }
 
 /// `sys.getrefcount(obj)` — best-effort, derived from the real
-/// `Rc::strong_count` of the payload. Infrastructure references
-/// (the cycle-GC registry's handle, weakref slots' strong clones)
-/// are discounted so the number tracks *program-visible* bindings;
-/// `+1` accounts for the argument reference, like CPython. The
+/// `Rc::strong_count` of the payload. The collector and the weakref
+/// registry hold no strong references; clones held only by the C-API
+/// layer's caches are discounted so the number tracks *program-visible*
+/// bindings. `+1` accounts for the argument reference, like CPython. The
 /// exact number is implementation-specific even in CPython.
 fn sys_getrefcount(args: &[Object]) -> Result<Object, RuntimeError> {
     let Some(obj) = args.first() else {
         return Err(type_error("getrefcount() takes exactly 1 argument"));
     };
     let strong = crate::gc_trace::strong_count_for(obj);
-    let id = crate::weakref_registry::id_of(obj);
-    let registry = usize::from(crate::gc_trace::is_tracked(id));
-    let weak_clones = crate::weakref_registry::strong_clone_count(id);
-    // A dropped-but-registry-pinned memoryview (dead under CPython
-    // refcounting) must not count through its exporter edge.
-    let zombie_refs = crate::gc_trace::zombie_memoryview_refs_to(id);
     // Clones held only by the C-API layer's pin caches (a parked
     // argument-pinned identity box, a dead-except-pin scalar/tuple pin —
     // RFC 0076 WS1) are infrastructure too: on CPython the corresponding
@@ -2768,9 +2764,6 @@ fn sys_getrefcount(args: &[Object]) -> Result<Object, RuntimeError> {
     // unless CPython wouldn't have taken one at all (a borrowed load).
     let borrowed = borrowed_argument_discount(obj);
     let visible = strong
-        .saturating_sub(registry)
-        .saturating_sub(weak_clones)
-        .saturating_sub(zombie_refs)
         .saturating_sub(pinned)
         .saturating_sub(borrowed)
         .saturating_add(extra_c);

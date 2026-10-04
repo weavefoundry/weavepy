@@ -133,6 +133,26 @@ pub struct DirectLeaf {
     max_stack: u32,
     params: Vec<JitType>,
     ret: JitType,
+    /// Per parameter, the bits of the default a call that leaves it out
+    /// binds (in the parameter's lane), when the caller burns it in.
+    defaults: Vec<Option<u64>>,
+}
+
+impl DirectLeaf {
+    /// The lanes of the leaf's parameters.
+    #[must_use]
+    pub fn params(&self) -> &[JitType] {
+        &self.params
+    }
+
+    /// Let calls that leave parameters out bind `defaults` (per
+    /// parameter, the default's bits in its lane): the embedder guards
+    /// that they stay the function's defaults.
+    #[must_use]
+    pub fn with_defaults(mut self, defaults: Vec<Option<u64>>) -> Self {
+        self.defaults = defaults;
+        self
+    }
 }
 
 impl CompiledFrame {
@@ -168,6 +188,7 @@ impl CompiledFrame {
             func_id: self.func_id,
             n_locals: self.n_locals,
             max_stack: self.max_stack,
+            defaults: vec![None; params.len()],
             params,
             ret,
         })
@@ -248,8 +269,19 @@ impl JitEngine {
         // in-process.
         flag_builder.set("use_colocated_libcalls", "false").ok()?;
         flag_builder.set("is_pic", "false").ok()?;
-        // Favour fast compiles over the last few percent of codegen.
-        flag_builder.set("opt_level", "speed").ok()?;
+        // Cranelift's mid-end pays for itself in numeric loops: without it
+        // `jitloop` ran 2x and `spectral_norm` 1.2x slower, for a few
+        // percent of compile time saved. `WEAVEPY_JIT_OPT=0` turns it off.
+        let opt = if std::env::var_os("WEAVEPY_JIT_OPT").is_some_and(|v| v == "0") {
+            "none"
+        } else {
+            "speed"
+        };
+        flag_builder.set("opt_level", opt).ok()?;
+        if std::env::var_os("WEAVEPY_JIT_QUICK").is_some() {
+            flag_builder.set("opt_level", "none").ok()?;
+            flag_builder.set("regalloc_algorithm", "single_pass").ok()?;
+        }
         // The IR verifier re-checks every function it compiles: a debug
         // aid whose cost lands on every warm-up in release builds.
         if !cfg!(debug_assertions) {
@@ -483,6 +515,16 @@ impl JitEngine {
                 "frame coverage (no helper registered)",
             ));
         }
+        if runtime::is_obj_helper_addr() == 0
+            && tfunc
+                .blocks
+                .iter()
+                .any(|b| b.stmts.iter().any(|s| matches!(s.op, TOp::IsObj { .. })))
+        {
+            return Err(JitVerdict::UnsupportedOpcode(
+                "IS_OP (no helper registered)",
+            ));
+        }
         let needs_float_divmod = tfunc.blocks.iter().any(|b| {
             b.stmts
                 .iter()
@@ -526,20 +568,29 @@ impl JitEngine {
         let mut leaves: Vec<(u32, FuncRef, DirectLeaf)> = Vec::new();
         if runtime::self_call_helper_addrs().is_some() {
             for stmt in tfunc.blocks.iter().flat_map(|b| &b.stmts) {
-                let TOp::CallPy {
-                    token,
-                    argc,
-                    ret,
-                    is_self: false,
-                } = stmt.op
-                else {
-                    continue;
+                // A site that leaves parameters out binds the defaults the
+                // leaf carries (checked per site by the lowering).
+                let (token, argc, ret) = match stmt.op {
+                    TOp::CallPy {
+                        token,
+                        argc,
+                        ret,
+                        is_self: false,
+                    } => (token, argc, ret),
+                    TOp::CallPyKw {
+                        token,
+                        argc,
+                        kwc,
+                        ret,
+                        ..
+                    } => (token, argc + kwc, ret),
+                    _ => continue,
                 };
                 if leaves.iter().any(|(t, ..)| *t == token) {
                     continue;
                 }
                 if let Some(leaf) = direct(token) {
-                    if leaf.params.len() == argc as usize && leaf.ret == ret {
+                    if leaf.params.len() >= argc as usize && leaf.ret == ret {
                         let fref = self
                             .module
                             .declare_func_in_func(leaf.func_id, &mut self.ctx.func);
@@ -549,7 +600,7 @@ impl JitEngine {
             }
         }
 
-        build_function(
+        let sound = build_function(
             &mut self.ctx.func,
             &mut self.fbctx,
             tfunc,
@@ -563,17 +614,52 @@ impl JitEngine {
                     n_locals: leaf.n_locals,
                     max_stack: leaf.max_stack,
                     params: leaf.params,
+                    defaults: leaf.defaults,
                 })
                 .collect(),
         );
+        if !sound {
+            self.module.clear_context(&mut self.ctx);
+            return Err(JitVerdict::NotConverged);
+        }
+        if std::env::var_os("WEAVEPY_JIT_CLIF_DUMP").is_some() {
+            eprintln!("jit clif {name}:\n{}", self.ctx.func.display());
+        }
+        if std::env::var_os("WEAVEPY_JIT_CLIF_STATS").is_some() {
+            let f = &self.ctx.func;
+            let insts: usize = f
+                .layout
+                .blocks()
+                .map(|b| f.layout.block_insts(b).count())
+                .sum();
+            eprintln!(
+                "jit clif {name}: {} blocks, {insts} insts, {} values",
+                f.layout.blocks().count(),
+                f.dfg.num_values()
+            );
+        }
 
+        let stats = std::env::var_os("WEAVEPY_JIT_CLIF_STATS").is_some();
+        if stats {
+            let _ = cranelift_codegen::timing::take_current();
+        }
+        let t0 = stats.then(std::time::Instant::now);
         self.module
             .define_function(id, &mut self.ctx)
             .map_err(|_| JitVerdict::NotConverged)?;
+        let t1 = stats.then(std::time::Instant::now);
         self.module.clear_context(&mut self.ctx);
         self.module
             .finalize_definitions()
             .map_err(|_| JitVerdict::NotConverged)?;
+        if let (Some(t0), Some(t1)) = (t0, t1) {
+            eprintln!(
+                "jit define {name}: {:?}, finalize {:?}\n{}",
+                t1 - t0,
+                t1.elapsed(),
+                cranelift_codegen::timing::take_current()
+            );
+        }
 
         let code_ptr = self.module.get_finalized_function(id);
         // SAFETY: `code_ptr` is a finalized function with exactly the
@@ -696,7 +782,10 @@ fn op_mix(tfunc: &TFunc) -> OpMix {
                 TOp::CallDyn { .. } => mix.dyn_calls += 1,
                 TOp::DynAttrGet { .. } | TOp::DynAttrSet { .. } => mix.dyn_attrs += 1,
                 TOp::ContainsDyn { .. } => mix.dyn_other += 1,
-                TOp::CallPy { .. } | TOp::CallPyKw { .. } | TOp::CallMethod { .. } => {
+                TOp::CallPy { .. }
+                | TOp::CallPyKw { .. }
+                | TOp::CallMethod { .. }
+                | TOp::ObjGetItem { .. } => {
                     mix.guarded_calls += 1;
                 }
                 _ => {}

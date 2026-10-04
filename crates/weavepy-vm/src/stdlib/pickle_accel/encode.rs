@@ -40,25 +40,36 @@ struct Framer {
 }
 
 impl Framer {
-    #[inline]
+    #[inline(always)]
     fn write(&mut self, data: &[u8]) -> Option<()> {
         if self.frame_start.is_none() {
-            let start = self.output.len();
-            extend(&mut self.output, &[0x95, 0, 0, 0, 0, 0, 0, 0, 0])?;
-            self.frame_start = Some(start);
+            self.open()?;
         }
         extend(&mut self.output, data)
     }
 
+    #[cold]
+    fn open(&mut self) -> Option<()> {
+        let start = self.output.len();
+        extend(&mut self.output, &[0x95, 0, 0, 0, 0, 0, 0, 0, 0])?;
+        self.frame_start = Some(start);
+        Some(())
+    }
+
+    #[inline]
     fn commit(&mut self, force: bool) {
         let Some(start) = self.frame_start else {
             return;
         };
+        if force || self.output.len() - (start + 9) >= FRAME_TARGET {
+            self.end_frame(start);
+        }
+    }
+
+    #[cold]
+    fn end_frame(&mut self, start: usize) {
         let body = start + 9;
         let len = self.output.len() - body;
-        if !force && len < FRAME_TARGET {
-            return;
-        }
         if len >= 4 {
             self.output[start + 1..body].copy_from_slice(&(len as u64).to_le_bytes());
         } else {
@@ -113,9 +124,13 @@ struct ClassPlan {
 
 struct Encoder<'a> {
     writer: Framer,
+    // Memo positions by object identity.
+    memo: MemoTable,
     // Pins prevent another thread's container mutation from releasing an
     // already memoized value and reusing its address during this operation.
-    memo: FxHashMap<i64, (u32, Object)>,
+    // While one thread owns every object, nothing else can mutate the graph,
+    // so the values stay alive and unpinned.
+    pins: Option<Vec<Object>>,
     // Memo positions taken by the default state's temporary tuple and
     // dictionary, to which no later object can refer.
     anonymous: u32,
@@ -126,21 +141,203 @@ struct Encoder<'a> {
     resolved: Option<InstanceContext>,
     classes: FxHashMap<usize, Rc<ClassPlan>>,
     slot_name_caches: Vec<(Rc<TypeObject>, Vec<Object>)>,
+    // An empty vector for the next instance's slot state.
+    spare_slots: Vec<(Object, Object)>,
+}
+
+/// The memo: memo positions by object identity (an address, never 0), in an
+/// open-addressing table with linear probing. Each entry records the
+/// generation of the call that wrote it, so the next call clears the table
+/// by starting a new generation.
+#[derive(Default)]
+struct MemoTable {
+    entries: Vec<MemoEntry>,
+    len: usize,
+    generation: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct MemoEntry {
+    id: i64,
+    index: u32,
+    generation: u32,
+}
+
+impl MemoTable {
+    const MIN_CAPACITY: usize = 64;
+
+    /// The first slot to probe for `id`, in a table of `capacity` slots (a
+    /// power of two): a multiplicative hash spreads aligned addresses.
+    #[inline]
+    fn home(id: i64, capacity: usize) -> usize {
+        let hash = (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (hash >> (64 - capacity.trailing_zeros())) as usize
+    }
+
+    #[inline]
+    fn get(&self, id: i64) -> Option<u32> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let mask = self.entries.len() - 1;
+        let mut slot = Self::home(id, self.entries.len());
+        loop {
+            let entry = &self.entries[slot];
+            if entry.generation != self.generation {
+                return None;
+            }
+            if entry.id == id {
+                return Some(entry.index);
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    /// `id`'s memo position, or else the slot at which to insert it. Makes
+    /// room for one more entry first; `None` only when that fails.
+    #[inline]
+    fn find(&mut self, id: i64) -> Option<Result<u32, usize>> {
+        if (self.len + 1) * 2 > self.entries.len() {
+            self.grow()?;
+        }
+        let mask = self.entries.len() - 1;
+        let mut slot = Self::home(id, self.entries.len());
+        loop {
+            let entry = &self.entries[slot];
+            if entry.generation != self.generation {
+                return Some(Err(slot));
+            }
+            if entry.id == id {
+                return Some(Ok(entry.index));
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    /// Insert at a slot that [`Self::find`] returned.
+    #[inline]
+    fn insert(&mut self, slot: usize, id: i64, index: u32) {
+        self.entries[slot] = MemoEntry {
+            id,
+            index,
+            generation: self.generation,
+        };
+        self.len += 1;
+    }
+
+    #[cold]
+    fn grow(&mut self) -> Option<()> {
+        if self.generation == 0 {
+            // A fresh table: generation 0 marks every slot empty.
+            self.generation = 1;
+        }
+        let capacity = (self.entries.len() * 2).max(Self::MIN_CAPACITY);
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(capacity).ok()?;
+        entries.resize(capacity, MemoEntry::default());
+        let old = std::mem::replace(&mut self.entries, entries);
+        let mask = capacity - 1;
+        for entry in old.into_iter().filter(|e| e.generation == self.generation) {
+            let mut slot = Self::home(entry.id, capacity);
+            while self.entries[slot].generation == self.generation {
+                slot = (slot + 1) & mask;
+            }
+            self.entries[slot] = entry;
+        }
+        Some(())
+    }
+
+    /// Empty the table, keeping its storage.
+    fn clear(&mut self) {
+        self.len = 0;
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            // The generations wrapped: every stale entry must go.
+            self.entries.fill(MemoEntry::default());
+            self.generation = 1;
+        }
+    }
+}
+
+/// `id(value)` for the kinds of value the encoder memoizes.
+#[inline]
+fn identity(value: &Object) -> i64 {
+    match value {
+        Object::Str(text) => text.as_ptr() as usize as i64,
+        Object::Bytes(bytes) => bytes.as_ptr() as usize as i64,
+        Object::Tuple(items) => {
+            crate::shared_value::ThinArc::as_ptr(items).cast::<()>() as usize as i64
+        }
+        Object::List(items) => Rc::as_ptr(items) as usize as i64,
+        Object::Dict(items) => Rc::as_ptr(items) as usize as i64,
+        Object::Instance(instance) => Rc::as_ptr(instance) as usize as i64,
+        Object::Type(class) => Rc::as_ptr(class) as usize as i64,
+        _ => object_identity(value),
+    }
 }
 
 impl Encoder<'_> {
     fn next_index(&self) -> Option<u32> {
-        u32::try_from(self.memo.len())
+        u32::try_from(self.memo.len)
             .ok()?
             .checked_add(self.anonymous)
     }
 
-    fn memoize(&mut self, value: &Object) -> Option<()> {
+    #[inline]
+    fn pin(&mut self, value: &Object) -> Option<()> {
+        if let Some(pins) = &mut self.pins {
+            pins.try_reserve(1).ok()?;
+            pins.push(value.clone());
+        }
+        Some(())
+    }
+
+    /// MEMOIZE for `value`, just written, whose identity is `id`.
+    fn memoize(&mut self, value: &Object, id: i64) -> Option<()> {
         let index = self.next_index()?;
-        self.memo.try_reserve(1).ok()?;
-        self.memo
-            .insert(object_identity(value), (index, value.clone()));
+        if let Err(slot) = self.memo.find(id)? {
+            self.memo.insert(slot, id, index);
+        }
+        self.pin(value)?;
         self.writer.write(&[0x94])
+    }
+
+    /// GET for a memoized `value` (reporting `true`), or else `write` it
+    /// and memoize it, with one table probe for both.
+    #[inline]
+    fn save_memoized(
+        &mut self,
+        value: &Object,
+        id: i64,
+        write: impl FnOnce(&mut Framer) -> Option<()>,
+    ) -> Option<bool> {
+        let next = self.next_index()?;
+        match self.memo.find(id)? {
+            Ok(index) => {
+                self.get(index)?;
+                Some(true)
+            }
+            Err(slot) => {
+                write(&mut self.writer)?;
+                self.memo.insert(slot, id, next);
+                self.pin(value)?;
+                self.writer.write(&[0x94])?;
+                Some(false)
+            }
+        }
+    }
+
+    /// The checks and the frame commit with which every `save` starts.
+    #[inline]
+    fn enter(&mut self, depth: usize) -> Option<()> {
+        // Leave ample room for the Python pickler's constructor/descriptor
+        // calls and save/handler/batch expansion at every graph level. A
+        // low recursion budget retains its existing fallback behavior.
+        if depth > MAX_DEPTH || depth.saturating_mul(8).saturating_add(32) >= self.python_headroom {
+            return None;
+        }
+        self.writer.commit(false);
+        Some(())
     }
 
     fn memoize_anonymous(&mut self) -> Option<()> {
@@ -191,34 +388,22 @@ impl Encoder<'_> {
         }
     }
 
-    fn save(&mut self, value: &Object, depth: usize) -> Option<()> {
-        // Leave ample room for the Python pickler's constructor/descriptor
-        // calls and save/handler/batch expansion at every graph level. A
-        // low recursion budget retains its existing fallback behavior.
-        if depth > MAX_DEPTH || depth.saturating_mul(8).saturating_add(32) >= self.python_headroom {
+    /// Whether `id`, a container's identity, is memoized (written as GET)
+    /// or must be written. A container that is still being written means
+    /// a cycle: recursive tuples require a POP/GET repair, so every cyclic
+    /// graph retains the existing pickler.
+    fn memoized_container(&mut self, id: i64) -> Option<bool> {
+        if self.active.contains(&id) {
             return None;
         }
-        self.writer.commit(false);
-        let memoized = matches!(
-            value,
-            Object::Str(_)
-                | Object::Bytes(_)
-                | Object::List(_)
-                | Object::Dict(_)
-                | Object::Tuple(_)
-                | Object::Instance(_)
-        );
-        let id = if memoized { object_identity(value) } else { 0 };
-        if memoized {
-            // Recursive tuples require a POP/GET repair. Retain the existing
-            // pickler for every cyclic graph in this first implementation.
-            if !matches!(value, Object::Str(_) | Object::Bytes(_)) && self.active.contains(&id) {
-                return None;
-            }
-            if let Some(&(index, _)) = self.memo.get(&id) {
-                return self.get(index);
-            }
+        match self.memo.get(id) {
+            Some(index) => self.get(index).map(|()| true),
+            None => Some(false),
         }
+    }
+
+    fn save(&mut self, value: &Object, depth: usize) -> Option<()> {
+        self.enter(depth)?;
         match value {
             Object::None => self.writer.write(b"N"),
             Object::Bool(value) => self.writer.write(&[if *value { 0x88 } else { 0x89 }]),
@@ -231,16 +416,21 @@ impl Encoder<'_> {
                 self.writer.write(b"G")?;
                 self.writer.write(&value.to_bits().to_be_bytes())
             }
-            Object::Str(text) => {
-                self.writer.data(text.as_bytes(), true)?;
-                self.memoize(value)
-            }
-            Object::Bytes(bytes) => {
-                self.writer.data(bytes, false)?;
-                self.memoize(value)
-            }
+            Object::Str(text) => self
+                .save_memoized(value, identity(value), |writer| {
+                    writer.data(text.as_bytes(), true)
+                })
+                .map(drop),
+            Object::Bytes(bytes) => self
+                .save_memoized(value, identity(value), |writer| writer.data(bytes, false))
+                .map(drop),
+            // The empty tuple is never memoized.
             Object::Tuple(items) if items.is_empty() => self.writer.write(b")"),
             Object::Tuple(items) => {
+                let id = identity(value);
+                if self.memoized_container(id)? {
+                    return Some(());
+                }
                 self.active.try_reserve(1).ok()?;
                 self.active.push(id);
                 if items.len() > 3 {
@@ -255,75 +445,156 @@ impl Encoder<'_> {
                     3 => 0x87,
                     _ => b't',
                 }])?;
-                self.memoize(value)?;
+                self.memoize(value, id)?;
                 self.active.pop();
                 Some(())
             }
             Object::List(items) => {
-                // A bounded snapshot releases the container lock before
-                // recursion without duplicating the entire list's storage.
+                // (See `memoized_container`.)
+                let id = identity(value);
+                if self.active.contains(&id) {
+                    return None;
+                }
+                if self.save_memoized(value, id, |writer| writer.write(b"]"))? {
+                    return Some(());
+                }
                 // Keep the original length as a bound; observed resizing
                 // returns to the Python pickler before any callbacks run.
                 let length = items.borrow().len();
-                let mut batch = Vec::new();
-                batch.try_reserve_exact(length.min(1000)).ok()?;
                 self.active.try_reserve(1).ok()?;
                 self.active.push(id);
-                self.writer.write(b"]")?;
-                self.memoize(value)?;
                 for start in (0..length).step_by(1000) {
-                    batch.clear();
-                    {
-                        let items = items.borrow();
-                        if items.len() != length {
-                            return None;
-                        }
-                        let end = start.saturating_add(1000).min(length);
-                        batch.extend(items[start..end].iter().cloned());
-                    }
-                    if batch.len() != 1 {
+                    let end = start.saturating_add(1000).min(length);
+                    if end - start != 1 {
                         self.writer.write(b"(")?;
                     }
-                    for item in &batch {
-                        self.save(item, depth + 1)?;
+                    let mut index = start;
+                    while index < end {
+                        // Leaves are written under one borrow. The lock is
+                        // released before recursing into a container, which
+                        // a clone keeps alive meanwhile.
+                        let next = {
+                            let items = items.borrow();
+                            if items.len() != length {
+                                return None;
+                            }
+                            loop {
+                                let Some(item) = items[..end].get(index) else {
+                                    break None;
+                                };
+                                index += 1;
+                                if !self.save_leaf(item, depth + 1)? {
+                                    break Some(item.clone());
+                                }
+                            }
+                        };
+                        let Some(item) = next else {
+                            break;
+                        };
+                        self.save(&item, depth + 1)?;
                     }
                     self.writer
-                        .write(if batch.len() == 1 { b"a" } else { b"e" })?;
+                        .write(if end - start == 1 { b"a" } else { b"e" })?;
                 }
                 self.active.pop();
                 Some(())
             }
             Object::Dict(items) => {
-                let items = {
-                    let items = items.borrow();
-                    let mut snapshot = Vec::new();
-                    snapshot.try_reserve_exact(items.len()).ok()?;
-                    snapshot.extend(
-                        items
-                            .iter()
-                            .map(|(key, value)| (key.0.clone(), value.clone())),
-                    );
-                    snapshot
-                };
+                let id = identity(value);
+                if self.active.contains(&id) {
+                    return None;
+                }
+                if self.save_memoized(value, id, |writer| writer.write(b"}"))? {
+                    return Some(());
+                }
                 self.active.try_reserve(1).ok()?;
                 self.active.push(id);
-                self.writer.write(b"}")?;
-                self.memoize(value)?;
-                self.save_items(&items, depth + 1)?;
+                self.save_dict_items(items, depth + 1)?;
                 self.active.pop();
                 Some(())
             }
             Object::Instance(instance) => {
+                let id = identity(value);
+                if self.memoized_container(id)? {
+                    return Some(());
+                }
                 // The instance is memoized before its state, but a graph
                 // that returns to it is cyclic and keeps the full pickler.
                 self.active.try_reserve(1).ok()?;
                 self.active.push(id);
-                self.save_instance(value, instance, depth)?;
+                self.save_instance(value, id, instance, depth)?;
                 self.active.pop();
                 Some(())
             }
             _ => None,
         }
+    }
+
+    /// `save` for a value that needs no recursion. `Some(false)` reports a
+    /// value that isn't such a leaf, leaving it unsaved.
+    #[inline]
+    fn save_leaf(&mut self, value: &Object, depth: usize) -> Option<bool> {
+        match value {
+            Object::None
+            | Object::Bool(_)
+            | Object::Int(_)
+            | Object::Long(_)
+            | Object::Float(_)
+            | Object::Str(_)
+            | Object::Bytes(_) => {
+                self.save(value, depth)?;
+                Some(true)
+            }
+            _ => Some(false),
+        }
+    }
+
+    /// `_batch_setitems` over a live dictionary, batched as lists are in
+    /// [`Self::save`]. Any mutable access to the dictionary meanwhile,
+    /// which draws a new stamp, returns to the Python pickler.
+    fn save_dict_items(&mut self, dict: &RefCell<DictData>, depth: usize) -> Option<()> {
+        let (length, stamp) = {
+            let dict = dict.borrow();
+            (dict.len(), dict.mutation_stamp())
+        };
+        for start in (0..length).step_by(1000) {
+            let end = start.saturating_add(1000).min(length);
+            if end - start != 1 {
+                self.writer.write(b"(")?;
+            }
+            let mut index = start;
+            while index < end {
+                let next = {
+                    let dict = dict.borrow();
+                    if dict.mutation_stamp() != stamp || dict.len() != length {
+                        return None;
+                    }
+                    loop {
+                        if index == end {
+                            break None;
+                        }
+                        let (key, value) = dict.get_index(index)?;
+                        index += 1;
+                        if !self.save_leaf(&key.0, depth)? {
+                            break Some((Some(key.0.clone()), value.clone()));
+                        }
+                        if !self.save_leaf(value, depth)? {
+                            break Some((None, value.clone()));
+                        }
+                    }
+                };
+                let Some((key, value)) = next else {
+                    break;
+                };
+                if let Some(key) = key {
+                    self.save(&key, depth)?;
+                }
+                self.save(&value, depth)?;
+            }
+            self.writer
+                .write(if end - start == 1 { b"s" } else { b"u" })?;
+        }
+        Some(())
     }
 
     fn save_items(&mut self, items: &[(Object, Object)], depth: usize) -> Option<()> {
@@ -346,6 +617,7 @@ impl Encoder<'_> {
     fn save_instance(
         &mut self,
         value: &Object,
+        id: i64,
         instance: &Rc<PyInstance>,
         depth: usize,
     ) -> Option<()> {
@@ -375,29 +647,43 @@ impl Encoder<'_> {
         if dict.is_some() && !plan.has_dict {
             return None;
         }
-        let mut slots: Vec<(Object, Object)> = Vec::new();
+        // (Nested instances take a new vector.)
+        let mut slots = std::mem::take(&mut self.spare_slots);
         if !plan.slot_names.is_empty() {
             let storage = instance.slots.borrow();
             slots.try_reserve_exact(plan.slot_names.len()).ok()?;
-            for name in &plan.slot_names {
+            for (index, name) in plan.slot_names.iter().enumerate() {
                 let Object::Str(text) = name else {
                     return None;
                 };
                 let repeated = slots
                     .iter()
                     .any(|(seen, _)| matches!(seen, Object::Str(seen) if seen == text));
-                if let (false, Some(value)) = (repeated, storage.get(text)) {
+                if repeated {
+                    continue;
+                }
+                // Storage usually holds the slots in declaration order.
+                let value = match storage.get_index(index) {
+                    Some((DictKey(Object::Str(stored)), value)) if stored == text => Some(value),
+                    _ => storage.get(text),
+                };
+                if let Some(value) = value {
                     slots.push((name.clone(), value.clone()));
                 }
             }
         }
 
         self.save_class(&class, &plan, depth + 1)?;
-        self.save(&Object::new_tuple(Vec::new()), depth + 1)?;
+        // `save(())`
+        self.enter(depth + 1)?;
+        self.writer.write(b")")?;
         self.writer.write(&[0x81])?;
-        self.memoize(value)?;
+        self.memoize(value, id)?;
         match (dict, slots.is_empty()) {
-            (None, true) => return Some(()),
+            (None, true) => {
+                self.spare_slots = slots;
+                return Some(());
+            }
             (Some(dict), true) => self.save(&Object::Dict(dict), depth + 1)?,
             (dict, false) => {
                 // The state is the temporary `(dict or None, {slot: value})`.
@@ -411,6 +697,8 @@ impl Encoder<'_> {
                 self.memoize_anonymous()?;
             }
         }
+        slots.clear();
+        self.spare_slots = slots;
         self.writer.write(b"b")
     }
 
@@ -418,13 +706,14 @@ impl Encoder<'_> {
     fn save_class(&mut self, class: &Rc<TypeObject>, plan: &ClassPlan, depth: usize) -> Option<()> {
         self.writer.commit(false);
         let value = Object::Type(class.clone());
-        if let Some(&(index, _)) = self.memo.get(&object_identity(&value)) {
+        let id = identity(&value);
+        if let Some(index) = self.memo.get(id) {
             return self.get(index);
         }
         self.save(&plan.module, depth + 1)?;
         self.save(&plan.qualname, depth + 1)?;
         self.writer.write(&[0x93])?;
-        self.memoize(&value)
+        self.memoize(&value, id)
     }
 
     fn class_plan(&mut self, class: &Rc<TypeObject>) -> Option<Rc<ClassPlan>> {
@@ -520,7 +809,7 @@ impl Encoder<'_> {
                 continue;
             }
             let names = Object::new_list(names);
-            crate::gc_trace::track(names.clone());
+            crate::gc_trace::track(&names);
             dict.insert(DictKey(Object::from_static("__slotnames__")), names);
             drop(dict);
             class.bump_attr_version();
@@ -555,17 +844,20 @@ fn encode_with_context(
     if !matches!(protocol, 4 | 5) {
         return None;
     }
-    // The previous call's memo table (emptied, its capacity kept) and
-    // output size: a `dumps` loop then neither regrows the table nor
-    // copies the output as it doubles.
+    // The previous call's memo table (emptied, its capacity kept) and the
+    // last two output sizes: a `dumps` loop, even one that alternates
+    // between two values, then neither regrows the table nor copies the
+    // output as it doubles.
     let memo = SPARE_MEMO.with(std::cell::Cell::take).unwrap_or_default();
-    let hint = OUTPUT_HINT.with(std::cell::Cell::get);
+    let (last, before) = OUTPUT_HINT.with(std::cell::Cell::get);
+    let hint = last.max(before);
     let mut encoder = Encoder {
         writer: Framer {
             output: Vec::new(),
             frame_start: None,
         },
         memo,
+        pins: (!crate::sync::bias_held()).then(Vec::new),
         anonymous: 0,
         active: Vec::new(),
         python_headroom,
@@ -573,6 +865,7 @@ fn encode_with_context(
         resolved: None,
         classes: FxHashMap::default(),
         slot_name_caches: Vec::new(),
+        spare_slots: Vec::new(),
     };
     let done = (|| {
         encoder
@@ -588,12 +881,12 @@ fn encode_with_context(
         Some(())
     })();
     let mut memo = std::mem::take(&mut encoder.memo);
-    if memo.capacity() <= MAX_SPARE_MEMO {
+    if memo.entries.len() <= MAX_SPARE_MEMO {
         memo.clear();
         SPARE_MEMO.with(|spare| spare.set(Some(memo)));
     }
     done?;
-    OUTPUT_HINT.with(|h| h.set(encoder.writer.output.len()));
+    OUTPUT_HINT.with(|h| h.set((encoder.writer.output.len(), last)));
     Some(encoder.writer.output)
 }
 
@@ -602,9 +895,9 @@ const MAX_SPARE_MEMO: usize = 1 << 14;
 const MAX_OUTPUT_HINT: usize = 1 << 20;
 
 thread_local! {
-    static SPARE_MEMO: std::cell::Cell<Option<FxHashMap<i64, (u32, Object)>>> =
+    static SPARE_MEMO: std::cell::Cell<Option<MemoTable>> =
         const { std::cell::Cell::new(None) };
-    static OUTPUT_HINT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static OUTPUT_HINT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 #[cfg(test)]

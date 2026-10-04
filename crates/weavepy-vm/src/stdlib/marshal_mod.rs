@@ -1750,7 +1750,7 @@ impl<'a> MarshalReader<'a> {
             // PEP-657 columns recovered from long-form location entries
             // (RFC 0056 WS4): traceback caret underlines survive the
             // `.pyc` round-trip.
-            coltable: decoded.coltable,
+            coltable: decoded.coltable.into(),
             arg_count,
             posonly_count,
             kwonly_count,

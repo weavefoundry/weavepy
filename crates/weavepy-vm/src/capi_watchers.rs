@@ -105,6 +105,12 @@ pub fn dicts_active() -> bool {
     DICTS_ACTIVE.load(Ordering::Relaxed)
 }
 
+/// The flag [`dicts_active`] reads, for native code that reads it in line
+/// (a byte: nonzero while any dict watcher is active).
+pub(crate) fn dicts_active_flag() -> *const bool {
+    DICTS_ACTIVE.as_ptr()
+}
+
 pub fn watch_dict(watcher_id: u8, d: &Rc<RefCell<DictData>>) {
     let mut w = WATCHED_DICTS.lock();
     let ptr = Rc::as_ptr(d) as usize;
@@ -221,11 +227,7 @@ pub fn dict_update_begin(target: &Rc<RefCell<DictData>>, target_was_empty: bool)
 pub fn note_dropped(vm_dropped: &Object) {
     if let Object::Dict(d) = vm_dropped {
         if dicts_active() {
-            let id = crate::weakref_registry::id_of(vm_dropped);
-            let registry_clones = crate::weakref_registry::strong_clone_count(id);
-            // The GC registry's `track` handle is a strong clone too.
-            let gc_clone = usize::from(crate::gc_trace::is_tracked(id));
-            if Rc::strong_count(d) <= 1 + registry_clones + gc_clone && dict_mask(d) != 0 {
+            if Rc::strong_count(d) <= 1 && dict_mask(d) != 0 {
                 dict_event("DEALLOCATED", d, None, None);
                 let ptr = Rc::as_ptr(d) as usize;
                 let mut w = WATCHED_DICTS.lock();
@@ -238,12 +240,7 @@ pub fn note_dropped(vm_dropped: &Object) {
     }
     if let Object::Function(f) = vm_dropped {
         if funcs_active() {
-            let id = crate::weakref_registry::id_of(vm_dropped);
-            let registry_clones = crate::weakref_registry::strong_clone_count(id);
-            // The GC registry holds one strong clone from MAKE_FUNCTION's
-            // `track`; a dying function is down to our handle + that one.
-            let gc_clone = usize::from(crate::gc_trace::is_tracked(id));
-            if Rc::strong_count(f) <= 1 + registry_clones + gc_clone {
+            if Rc::strong_count(f) <= 1 {
                 func_event("DESTROY", vm_dropped, &Object::None);
             }
         }

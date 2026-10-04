@@ -93,9 +93,11 @@ pub struct WeakRefSlot {
     /// Identity of the referent. Used to look up the registry
     /// list when the referent dies.
     pub target_id: ObjectId,
-    /// `Some(strong_clone_of_target)` while the referent is
-    /// alive. Set to `None` by `notify_clear`.
-    pub target: RefCell<Option<Object>>,
+    /// The referent, held weakly, while the slot is live. Set to `None`
+    /// by `notify_clear`. A weak reference never keeps its referent
+    /// alive: the referent dies by reference count, and its `Drop` (or the
+    /// collector's sweep, for kinds without one) clears the slot.
+    pub target: RefCell<Option<WeakTarget>>,
     /// Whether a callback was supplied at creation. The callback
     /// *object* itself lives in the user-visible wrapper's traced slots
     /// or dictionary (under `__callback__`), never here: the wrapper is
@@ -166,11 +168,45 @@ pub mod kind {
     pub const CALLABLE_PROXY: u8 = 2;
 }
 
+/// A slot's referent. Every Python-visible referent has a heap allocation
+/// and is held weakly; a value without one (only the registry's own unit
+/// tests make such slots) is simply held.
+#[allow(missing_debug_implementations)]
+pub enum WeakTarget {
+    Weak(crate::weak_object::WeakObject),
+    Strong(Object),
+}
+
+impl WeakTarget {
+    pub fn new(target: &Object) -> Self {
+        match crate::weak_object::WeakObject::new(target) {
+            Some(w) => Self::Weak(w),
+            None => Self::Strong(target.clone()),
+        }
+    }
+
+    /// The referent, while it is alive.
+    pub fn upgrade(&self) -> Option<Object> {
+        match self {
+            Self::Weak(w) => w.upgrade(),
+            Self::Strong(o) => Some(o.clone()),
+        }
+    }
+
+    /// Whether the referent has died.
+    pub fn is_dead(&self) -> bool {
+        match self {
+            Self::Weak(w) => w.is_dead(),
+            Self::Strong(_) => false,
+        }
+    }
+}
+
 impl WeakRefSlot {
     pub fn new(target_id: ObjectId, target: Object, has_callback: bool, kind: u8) -> Self {
         Self {
             target_id,
-            target: RefCell::new(Some(target)),
+            target: RefCell::new(Some(WeakTarget::new(&target))),
             has_callback,
             fixed_wrapper: false,
             identity_hash: target_id as i64,
@@ -188,7 +224,17 @@ impl WeakRefSlot {
         if self.is_dead() {
             return None;
         }
-        self.target.borrow().clone()
+        self.target.borrow().as_ref()?.upgrade()
+    }
+
+    /// Whether the referent died without this slot being cleared yet (a
+    /// kind with no death hook; see `sweep_dead_targets`).
+    pub fn target_died(&self) -> bool {
+        !self.is_dead()
+            && self
+                .target
+                .try_borrow()
+                .is_ok_and(|t| t.as_ref().is_some_and(WeakTarget::is_dead))
     }
 
     /// Clear the slot. Returns the callback (if any) so the caller can
@@ -354,17 +400,33 @@ impl WeakRefRegistry {
     /// list of `(weakref_object, callback_object)` pairs the
     /// caller should invoke. Removes the entry for `id`.
     pub fn notify_clear(&self, id: ObjectId) -> Vec<(Arc<WeakRefSlot>, Option<Object>)> {
+        let entries = Self::take_entries(&mut self.inner.borrow_mut(), id);
+        Self::clear_entries(entries)
+    }
+
+    /// [`Self::notify_clear`] from a `Drop`, which may run while the
+    /// registry is borrowed: `None` then, leaving the slots for the
+    /// collector's sweep.
+    fn try_notify_clear(&self, id: ObjectId) -> Option<Vec<(Arc<WeakRefSlot>, Option<Object>)>> {
         let entries = {
-            let mut g = self.inner.borrow_mut();
-            // Hot path: this runs for every object the prompt reaper
-            // frees, and almost none of them was ever weakly referenced.
-            // Skip the map removal on the miss-filter's say-so, exactly
-            // as `count` does.
-            if g.slots.is_empty() || !g.filter.may_contain(id) {
-                return Vec::new();
-            }
-            g.slots.remove(&id).unwrap_or_default()
+            let Ok(mut g) = self.inner.try_borrow_mut() else {
+                return None;
+            };
+            Self::take_entries(&mut g, id)
         };
+        Some(Self::clear_entries(entries))
+    }
+
+    fn take_entries(g: &mut RegistryInner, id: ObjectId) -> Vec<Weak<WeakRefSlot>> {
+        // Almost no object was ever weakly referenced: skip the map
+        // removal on the miss-filter's say-so, exactly as `count` does.
+        if g.slots.is_empty() || !g.filter.may_contain(id) {
+            return Vec::new();
+        }
+        g.slots.remove(&id).unwrap_or_default()
+    }
+
+    fn clear_entries(entries: Vec<Weak<WeakRefSlot>>) -> Vec<(Arc<WeakRefSlot>, Option<Object>)> {
         let mut out = Vec::with_capacity(entries.len());
         // CPython fires a referent's weakref callbacks newest-first (its
         // weakref list inserts at the head), so a chain of
@@ -394,28 +456,23 @@ impl WeakRefRegistry {
             .unwrap_or(0)
     }
 
-    /// How many *strong clones* of the referent the registry is
-    /// currently holding for `id`. Every live, un-cleared slot keeps
-    /// one `Object` clone of its target alive (see
-    /// [`WeakRefSlot::target`]). The cycle collector subtracts this
-    /// from an object's outer refcount so a weakref does **not** keep
-    /// its referent reachable — otherwise `weakref.ref(obj)()` would
-    /// stay live forever and `WeakKeyDictionary`/`WeakValueDictionary`
-    /// would never self-clean after `del obj; gc.collect()`.
-    pub fn strong_clone_count(&self, id: ObjectId) -> usize {
-        let g = self.inner.borrow();
-        if g.slots.is_empty() || !g.filter.may_contain(id) {
-            return 0;
-        }
+    /// The ids whose referent died without clearing its slots: the kinds
+    /// with no death hook (`set`, `bytearray`, `SimpleNamespace`, code
+    /// objects), or a death that found the registry busy. Their slots are cleared by
+    /// [`sweep_dead_targets`].
+    fn dead_target_ids(&self) -> Vec<ObjectId> {
+        let Ok(g) = self.inner.try_borrow() else {
+            return Vec::new();
+        };
         g.slots
-            .get(&id)
-            .map(|v| {
+            .iter()
+            .filter(|(_, v)| {
                 v.iter()
                     .filter_map(Weak::upgrade)
-                    .filter(|s| !s.is_dead() && s.target.borrow().is_some())
-                    .count()
+                    .any(|slot| slot.target_died())
             })
-            .unwrap_or(0)
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Snapshot the live weakrefs targeting `id` as
@@ -486,7 +543,7 @@ impl WeakRefRegistry {
             .filter_map(|(id, v)| {
                 v.iter()
                     .filter_map(Weak::upgrade)
-                    .find_map(|s| s.target.borrow().clone())
+                    .find_map(|s| s.target.borrow().as_ref()?.upgrade())
                     .map(|t| (*id, t))
             })
             .collect()
@@ -509,8 +566,8 @@ static REGISTRY: std::sync::LazyLock<WeakRefRegistry> =
     std::sync::LazyLock::new(WeakRefRegistry::new);
 
 /// RFC 0065 (WS4): insert-only miss-filter over every id a weakref was
-/// ever registered for. The prompt-reap drop paths ask "is anything
-/// watching this object?" for *every* dropped container; the
+/// ever registered for. Every death hook asks "is anything watching
+/// this object?"; the
 /// overwhelming "no" answer is two relaxed loads here instead of the
 /// registry cell's borrow protocol. Stale bits (dead referents) are
 /// false positives that take the precise path — never a correctness
@@ -575,14 +632,34 @@ pub fn count_for(id: ObjectId) -> usize {
     with_registry(|r| r.count(id))
 }
 
-/// Convenience: count of registry-held strong clones of `id` in the
-/// current thread. Used by the cycle collector's refcount accounting.
-pub fn strong_clone_count(id: ObjectId) -> usize {
-    // RFC 0065 (WS4): see `count_for`.
-    if !WEAKREF_FILTER.may_contain(id) {
-        return 0;
+/// The death hook every weakly referenceable object's `Drop` calls with
+/// its own id: clear the slots watching it and queue their callbacks for
+/// the next safe point, as CPython's `tp_dealloc` does. One relaxed load
+/// when no weakref was ever registered for `id`.
+#[inline]
+pub fn on_death(id: ObjectId) {
+    if WEAKREF_FILTER.may_contain(id) {
+        on_death_slow(id);
     }
-    with_registry(|r| r.strong_clone_count(id))
+}
+
+#[cold]
+fn on_death_slow(id: ObjectId) {
+    // A death during a registry borrow leaves the slots for
+    // `sweep_dead_targets`.
+    if let Some(cleared) = REGISTRY.try_notify_clear(id) {
+        queue_callbacks(cleared);
+    }
+}
+
+/// Clear the slots of referents that died without their death hook
+/// clearing them, and queue the callbacks. Run by every collection.
+pub fn sweep_dead_targets() -> usize {
+    let ids = REGISTRY.dead_target_ids();
+    for &id in &ids {
+        queue_callbacks(notify_clear(id));
+    }
+    ids.len()
 }
 
 /// Convenience: collect every live weakref for `id` in the
@@ -705,11 +782,9 @@ mod tests {
         reg.register(last.clone());
         drop(dead);
         assert_eq!(reg.count(64), 2);
-        assert_eq!(reg.strong_clone_count(64), 2);
         first.clear();
-        // A still-owned, cleared slot is a live wrapper, not a target owner.
+        // A still-owned, cleared slot is a live wrapper.
         assert_eq!(reg.count(64), 2);
-        assert_eq!(reg.strong_clone_count(64), 1);
         reg.shrink();
         let watchers = reg.collect_strong(64);
         assert_eq!(watchers.len(), 2);
@@ -721,7 +796,6 @@ mod tests {
         assert!(Arc::ptr_eq(&cleared[1].0, &first));
         assert!(last.upgrade().is_none());
         assert_eq!(reg.count(64), 0);
-        assert_eq!(reg.strong_clone_count(64), 0);
         assert!(reg.notify_clear(64).is_empty());
     }
 
@@ -765,9 +839,7 @@ mod tests {
         let replacement = Arc::new(WeakRefSlot::new(16, Object::Int(7), false, kind::REF));
         reg.register(replacement.clone());
         assert_eq!(reg.count(16), 1);
-        assert_eq!(reg.strong_clone_count(16), 1);
         assert_eq!(reg.count(17), 0);
-        assert_eq!(reg.strong_clone_count(17), 0);
         assert!(reg.collect_strong(17).is_empty());
         assert!(reg.notify_clear(17).is_empty());
     }

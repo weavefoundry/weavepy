@@ -119,6 +119,55 @@ pub(crate) unsafe fn try_release_shared<T: ?Sized>(value: *const T) -> bool {
     true
 }
 
+/// Free the `Arc` allocation holding `value` when this is its last owner
+/// and no weak reference exists, with plain loads instead of `Arc`'s two
+/// locked decrements (strong, then the implicit weak). Only for payloads
+/// with no destructor, so nothing runs while the counts still read one.
+/// Returns `false`, having changed nothing, when another owner or a weak
+/// reference exists (or the bias is off); the caller must then drop an
+/// `Arc` normally.
+///
+/// While the bias holds, this thread is the only one that can touch the
+/// counts, and with no weak reference nobody else can reach the payload.
+///
+/// # Safety
+///
+/// `value` must point at the payload of a live `Arc` allocation, and the
+/// caller must own one of its strong references, which this consumes on
+/// success.
+#[inline(always)]
+pub(crate) unsafe fn try_free_last<T: ?Sized>(value: *const T) -> bool {
+    debug_assert!(!std::mem::needs_drop::<T>());
+    if !refcounts_biased() {
+        return false;
+    }
+    // SAFETY: live allocation, per the caller; the weak count is the
+    // word after the strong count (`ArcInner` is `repr(C)`).
+    let (strong, weak) = unsafe {
+        let strong = strong_word(value);
+        (&*strong, &*strong.add(1))
+    };
+    if strong.load(Ordering::Relaxed) != 1 || weak.load(Ordering::Relaxed) != 1 {
+        return false;
+    }
+    // `Arc` sizes its allocation as the two counters followed by the
+    // payload's layout, padded (`arcinner_layout_for_value_layout`).
+    // SAFETY: as above; the payload is live until the deallocation.
+    let payload = std::alloc::Layout::for_value(unsafe { &*value });
+    let (inner, _) = std::alloc::Layout::new::<[usize; 2]>()
+        .extend(payload)
+        .expect("Arc layout");
+    // SAFETY: the sole owner frees the allocation it owns, with the layout
+    // `Arc` allocated it with; the payload needs no drop.
+    unsafe {
+        std::alloc::dealloc(
+            ptr::from_ref(strong).cast::<u8>().cast_mut(),
+            inner.pad_to_align(),
+        );
+    }
+    true
+}
+
 /// Convert an [`Rc`] to one of an unsized type, such as a trait object:
 /// `rc_unsize!(rc => dyn Trait)`. Stable Rust only coerces its own smart
 /// pointers, so the conversion passes through `Arc`.
@@ -132,13 +181,13 @@ macro_rules! rc_unsize {
 /// A reference-counted shared pointer with biased counting. See the module
 /// documentation.
 #[repr(transparent)]
-pub struct Rc<T: ?Sized>(ManuallyDrop<Arc<T>>);
+pub struct Rc<T: ?Sized + 'static>(ManuallyDrop<Arc<T>>);
 
 /// A weak reference to an [`Rc`] allocation.
 #[repr(transparent)]
 pub struct Weak<T: ?Sized>(std::sync::Weak<T>);
 
-impl<T> Rc<T> {
+impl<T: 'static> Rc<T> {
     #[inline]
     pub fn new(value: T) -> Self {
         Self(ManuallyDrop::new(Arc::new(value)))
@@ -167,7 +216,7 @@ impl<T> Rc<T> {
     }
 }
 
-impl<T: ?Sized> Rc<T> {
+impl<T: ?Sized + 'static> Rc<T> {
     #[inline]
     pub fn from_arc(arc: Arc<T>) -> Self {
         Self(ManuallyDrop::new(arc))
@@ -248,14 +297,14 @@ impl<T: ?Sized> Rc<T> {
     }
 }
 
-impl<T: Clone> Rc<T> {
+impl<T: Clone + 'static> Rc<T> {
     #[inline]
     pub fn make_mut(this: &mut Self) -> &mut T {
         Arc::make_mut(&mut this.0)
     }
 }
 
-impl<T: ?Sized> Clone for Rc<T> {
+impl<T: ?Sized + 'static> Clone for Rc<T> {
     #[inline(always)]
     fn clone(&self) -> Self {
         // SAFETY: `self` keeps the allocation alive, and the new owner
@@ -267,20 +316,119 @@ impl<T: ?Sized> Clone for Rc<T> {
     }
 }
 
-impl<T: ?Sized> Drop for Rc<T> {
+impl<T: ?Sized + 'static> Drop for Rc<T> {
     #[inline(always)]
     fn drop(&mut self) {
         // SAFETY: this owner holds one strong reference, released exactly
-        // once: either here, or by Arc's own drop.
+        // once: either here, or by Arc's own drop, or by handing it on.
         unsafe {
-            if !try_release_shared(Arc::as_ptr(&self.0)) {
-                ManuallyDrop::drop(&mut self.0);
+            if try_release_shared(Arc::as_ptr(&self.0)) {
+                return;
             }
+            // The last reference to an object that owes a finalizer moves
+            // to the finalizer queue instead: the object stays alive, at
+            // its address, until its `__del__` (or generator close) has
+            // run, as CPython's `tp_finalize` before `tp_dealloc`.
+            if finalizable_kind::<T>() && Arc::strong_count(&self.0) == 1 {
+                let arc = ManuallyDrop::take(&mut self.0);
+                crate::vm_singletons::finalize_on_last_release(arc);
+                return;
+            }
+            if nesting_kind::<T>() {
+                release_nested(ManuallyDrop::take(&mut self.0));
+                return;
+            }
+            ManuallyDrop::drop(&mut self.0);
         }
     }
 }
 
-impl<T: ?Sized> Deref for Rc<T> {
+/// Whether `T` is a container payload, whose release can release more
+/// containers in turn. Constant per instantiation.
+#[inline(always)]
+fn nesting_kind<T: ?Sized + 'static>() -> bool {
+    use crate::object::{
+        BoundMethod, DictData, FrozenSetObj, PyFrame, PyFunction, PyGenerator, PyIterator,
+        PyTraceback, SetData,
+    };
+    use crate::sync::RefCell;
+    use std::any::TypeId;
+    let t = TypeId::of::<T>();
+    t == TypeId::of::<crate::types::PyInstance>()
+        || t == TypeId::of::<RefCell<Vec<crate::object::Object>>>()
+        || t == TypeId::of::<RefCell<DictData>>()
+        || t == TypeId::of::<RefCell<SetData>>()
+        || t == TypeId::of::<FrozenSetObj>()
+        || t == TypeId::of::<RefCell<crate::object::Object>>()
+        || t == TypeId::of::<RefCell<PyIterator>>()
+        || t == TypeId::of::<PyFunction>()
+        || t == TypeId::of::<BoundMethod>()
+        || t == TypeId::of::<PyGenerator>()
+        || t == TypeId::of::<PyFrame>()
+        || t == TypeId::of::<PyTraceback>()
+}
+
+/// How deep releases may nest before the trashcan takes over.
+const TRASHCAN_DEPTH: u32 = 50;
+
+/// CPython's trashcan: releasing a deeply nested structure (a 500,000-deep
+/// element tree, a long linked list of instances) recurses through every
+/// level's drop glue, which would overflow the native stack. Past
+/// [`TRASHCAN_DEPTH`] nested releases a container's last reference is
+/// parked instead, and the outermost release frees the parked ones one at
+/// a time.
+struct Trashcan {
+    depth: std::cell::Cell<u32>,
+    parked: std::cell::RefCell<Vec<Box<dyn std::any::Any>>>,
+}
+
+thread_local! {
+    static TRASHCAN: Trashcan = const {
+        Trashcan {
+            depth: std::cell::Cell::new(0),
+            parked: std::cell::RefCell::new(Vec::new()),
+        }
+    };
+}
+
+/// Release the last reference to a container (see [`Trashcan`]).
+pub(crate) fn release_nested<R: 'static>(last: R) {
+    let mut last = Some(last);
+    let _ = TRASHCAN.try_with(|t| {
+        let depth = t.depth.get();
+        if depth >= TRASHCAN_DEPTH {
+            if let Ok(mut parked) = t.parked.try_borrow_mut() {
+                parked.push(Box::new(last.take()));
+            }
+            return;
+        }
+        t.depth.set(depth + 1);
+        drop(last.take());
+        if depth == 0 {
+            loop {
+                let next = t.parked.try_borrow_mut().ok().and_then(|mut p| p.pop());
+                match next {
+                    Some(next) => drop(next),
+                    None => break,
+                }
+            }
+        }
+        t.depth.set(depth);
+    });
+    // Thread teardown, with the trashcan gone: release in place.
+    drop(last);
+}
+
+/// Whether `T` is a payload whose last release may owe a finalizer (see
+/// `vm_singletons::finalize_on_last_release`). Constant per instantiation.
+#[inline(always)]
+fn finalizable_kind<T: ?Sized + 'static>() -> bool {
+    use std::any::TypeId;
+    let t = TypeId::of::<T>();
+    t == TypeId::of::<crate::types::PyInstance>() || t == TypeId::of::<crate::object::PyGenerator>()
+}
+
+impl<T: ?Sized + 'static> Deref for Rc<T> {
     type Target = T;
     #[inline(always)]
     fn deref(&self) -> &T {
@@ -288,81 +436,81 @@ impl<T: ?Sized> Deref for Rc<T> {
     }
 }
 
-impl<T: ?Sized> AsRef<T> for Rc<T> {
+impl<T: ?Sized + 'static> AsRef<T> for Rc<T> {
     fn as_ref(&self) -> &T {
         self
     }
 }
 
-impl<T: ?Sized> Borrow<T> for Rc<T> {
+impl<T: ?Sized + 'static> Borrow<T> for Rc<T> {
     fn borrow(&self) -> &T {
         self
     }
 }
 
-impl<T: ?Sized + fmt::Debug> fmt::Debug for Rc<T> {
+impl<T: ?Sized + fmt::Debug + 'static> fmt::Debug for Rc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl<T: ?Sized + fmt::Display> fmt::Display for Rc<T> {
+impl<T: ?Sized + fmt::Display + 'static> fmt::Display for Rc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&**self, f)
     }
 }
 
-impl<T: ?Sized> fmt::Pointer for Rc<T> {
+impl<T: ?Sized + 'static> fmt::Pointer for Rc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Pointer::fmt(&Self::as_ptr(self), f)
     }
 }
 
-impl<T: ?Sized + PartialEq> PartialEq for Rc<T> {
+impl<T: ?Sized + PartialEq + 'static> PartialEq for Rc<T> {
     fn eq(&self, other: &Self) -> bool {
         **self == **other
     }
 }
 
-impl<T: ?Sized + Eq> Eq for Rc<T> {}
+impl<T: ?Sized + Eq + 'static> Eq for Rc<T> {}
 
-impl<T: ?Sized + PartialOrd> PartialOrd for Rc<T> {
+impl<T: ?Sized + PartialOrd + 'static> PartialOrd for Rc<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         (**self).partial_cmp(&**other)
     }
 }
 
-impl<T: ?Sized + Ord> Ord for Rc<T> {
+impl<T: ?Sized + Ord + 'static> Ord for Rc<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         (**self).cmp(&**other)
     }
 }
 
-impl<T: ?Sized + Hash> Hash for Rc<T> {
+impl<T: ?Sized + Hash + 'static> Hash for Rc<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         (**self).hash(state)
     }
 }
 
-impl<T: Default> Default for Rc<T> {
+impl<T: Default + 'static> Default for Rc<T> {
     fn default() -> Self {
         Self::new(T::default())
     }
 }
 
-impl<T> From<T> for Rc<T> {
+impl<T: 'static> From<T> for Rc<T> {
     fn from(value: T) -> Self {
         Self::new(value)
     }
 }
 
-impl<T: ?Sized> From<Box<T>> for Rc<T> {
+impl<T: ?Sized + 'static> From<Box<T>> for Rc<T> {
     fn from(value: Box<T>) -> Self {
         Self::from_arc(Arc::from(value))
     }
 }
 
-impl<T> From<Vec<T>> for Rc<[T]> {
+impl<T: 'static> From<Vec<T>> for Rc<[T]> {
     fn from(value: Vec<T>) -> Self {
         Self::from_arc(Arc::from(value))
     }
@@ -380,19 +528,19 @@ impl From<String> for Rc<str> {
     }
 }
 
-impl<T: ?Sized> From<Arc<T>> for Rc<T> {
+impl<T: ?Sized + 'static> From<Arc<T>> for Rc<T> {
     fn from(value: Arc<T>) -> Self {
         Self::from_arc(value)
     }
 }
 
-impl<T> Weak<T> {
+impl<T: 'static> Weak<T> {
     pub const fn new() -> Self {
         Self(std::sync::Weak::new())
     }
 }
 
-impl<T: ?Sized> Weak<T> {
+impl<T: ?Sized + 'static> Weak<T> {
     #[inline]
     pub fn upgrade(&self) -> Option<Rc<T>> {
         self.0.upgrade().map(Rc::from_arc)
@@ -421,7 +569,7 @@ impl<T: ?Sized> Clone for Weak<T> {
     }
 }
 
-impl<T> Default for Weak<T> {
+impl<T: 'static> Default for Weak<T> {
     fn default() -> Self {
         Self::new()
     }

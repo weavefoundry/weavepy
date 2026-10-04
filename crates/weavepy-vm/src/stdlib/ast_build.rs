@@ -82,11 +82,7 @@ impl Builder<'_> {
     ) -> Result<Object, RuntimeError> {
         let builder = self.recursive.resolve(function)?;
         let result = self.walk(vm, spec, &builder, &function.globals);
-        if result.is_ok() {
-            vm.reap_call_receiver(builder);
-        } else {
-            crate::gc_trace::mark_maybe_dead();
-        }
+        vm.release(builder);
         result
     }
 
@@ -178,11 +174,10 @@ impl Builder<'_> {
                 let node = vm.call(&new, std::slice::from_ref(&cls), &[], globals);
                 let node = match node {
                     Ok(node) => {
-                        vm.reap_call_receiver(new);
+                        vm.release(new);
                         node
                     }
                     Err(error) => {
-                        crate::gc_trace::mark_maybe_dead();
                         return Err(error);
                     }
                 };
@@ -219,24 +214,20 @@ impl Builder<'_> {
                         // setter's unused result. An ignored child can die here.
                         let result = match result {
                             Ok(result) => {
-                                vm.reap_call_receiver(setter);
+                                vm.release(setter);
                                 vm.reap_call_args(&mut args);
                                 result
                             }
                             Err(error) => {
-                                crate::gc_trace::mark_maybe_dead();
                                 return Err(error);
                             }
                         };
-                        crate::gc_trace::note_dropped(&result);
-                        if Interpreter::local_needs_prompt_reap(&result) {
-                            vm.prompt_reap_dropped(result);
-                        }
+                        vm.release(result);
                     }
                     Ok(())
                 })();
                 if let Err(error) = outcome {
-                    vm.prompt_reap_dropped(node);
+                    vm.release(node);
                     return Err(error);
                 }
                 Ok(node)
@@ -258,7 +249,7 @@ impl Builder<'_> {
                     Ok(())
                 })();
                 if let Err(error) = outcome {
-                    vm.prompt_reap_dropped(result);
+                    vm.release(result);
                     return Err(error);
                 }
                 Ok(result)
