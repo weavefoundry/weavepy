@@ -8440,7 +8440,7 @@ unsafe extern "C" fn wpjit_get_iter(frame: *mut JitFrame, pin: i64) -> i64 {
     #[allow(clippy::cast_ptr_alignment)]
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     match ctx.pins.get(pin as usize) {
-        Some(Pin::Obj(Object::Generator(_) | Object::Iter(_))) => 0,
+        Some(Pin::Obj(Object::Generator(_) | Object::Iter(_) | Object::LazyIter(_))) => 0,
         _ => 1,
     }
 }
@@ -8520,6 +8520,9 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
     // iterator cloned.
     let fast = match ctx.pins.get(pin as usize) {
         Some(Pin::Obj(Object::Iter(cell))) => builtin_seq_step(cell),
+        // A native adapter step that runs no code (`zip` of native
+        // iterators, `itertools.repeat`, ...).
+        Some(Pin::Obj(Object::LazyIter(l))) => interp.lazy_core_next(l),
         _ => None,
     };
     let (step, runs_python) = match fast {
@@ -8534,7 +8537,9 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
                 return 2;
             }
             let it = match ctx.pins.get(pin as usize) {
-                Some(Pin::Obj(o @ (Object::Generator(_) | Object::Iter(_)))) => o.clone(),
+                Some(Pin::Obj(
+                    o @ (Object::Generator(_) | Object::Iter(_) | Object::LazyIter(_)),
+                )) => o.clone(),
                 // An instance iterator whose `__next__` is a registered native
                 // leaf (a `deque` iterator): stepped below without Python.
                 Some(Pin::Obj(o @ Object::Instance(_)))
@@ -8547,7 +8552,7 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
             // A builtin-iterator step is pure native code; everything else
             // (generator resume) runs arbitrary Python on behalf of this
             // activation.
-            let runs_python = matches!(it, Object::Generator(_));
+            let runs_python = matches!(it, Object::Generator(_) | Object::LazyIter(_));
             if runs_python {
                 ctx.dirty = true;
                 // A generator resume from native code rebuilds a whole interpreter
@@ -10552,6 +10557,23 @@ unsafe fn call_dyn_impl(
         let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
         args.push(unpack_pins(bits, tag, &ctx.pins));
     }
+    // A builtin iterator type or an exact `itertools` class whose native
+    // adapter builds without running code (`zip(xs, ys)`,
+    // `enumerate(xs)`, `itertools.repeat(x, n)`).
+    if kwc == 0 {
+        if let Object::Type(t) = &callee {
+            let built = if t.flags.is_builtin {
+                crate::seqiter::builtin_ctor_pure(t, &args)
+            } else if t.lazy_ctor.get() != 0 {
+                crate::stdlib::itertools_mod::native_new_pure(t, &args)
+            } else {
+                None
+            };
+            if let Some(v) = built {
+                return dyn_leaf_result(jf, ctx, v, int_result);
+            }
+        }
+    }
     // The keyword tail pairs with the interned names tuple (the plan
     // scan admitted only a non-empty all-`str` tuple constant).
     let mut kwargs: Vec<(String, Object)> = Vec::new();
@@ -11518,6 +11540,26 @@ unsafe extern "C" fn wpjit_iter_next_pair(
                 3
             }
         };
+    }
+    // An `enumerate` or two-source `zip` over native iterators whose step
+    // runs no code: the pair straight into the lanes, as above.
+    let pair = match ctx.pins.get(pin as usize) {
+        Some(Pin::Obj(Object::LazyIter(l))) => crate::seqiter::lazy_pure_pair(l),
+        Some(Pin::Obj(it @ Object::Iter(_))) => crate::seqiter::enumerate_pure_pair(it),
+        _ => None,
+    };
+    if let Some((k, v)) = pair {
+        let b1 = pack_iter_elem(&k, tag1, &mut ctx.pins, &mut ctx.pin_memo);
+        let b2 = b1.and_then(|_| pack_iter_elem(&v, tag2, &mut ctx.pins, &mut ctx.pin_memo));
+        if let (Some(b1), Some(b2)) = (b1, b2) {
+            jf.ret_bits = b1;
+            // SAFETY: the marshal buffer is at least one slot wide.
+            unsafe { *jf.call_args = b2 };
+            return 0;
+        }
+        ctx.pins.push(Pin::Obj(Object::new_tuple_array([k, v])));
+        jf.ret_bits = (ctx.pins.len() - 1) as u64;
+        return 3;
     }
     // The loop's poll point — see `wpjit_iter_next`.
     crate::gil::yield_checkpoint();

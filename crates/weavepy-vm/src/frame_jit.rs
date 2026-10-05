@@ -557,8 +557,23 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
     // SAFETY: the code passes its live state and an initialized slot with
     // a free one above it.
     let (st, top) = unsafe { (&mut *st, &*it) };
-    let Object::Iter(rc) = top else {
-        return 3;
+    let rc = match top {
+        Object::Iter(rc) => rc,
+        // A native adapter whose step runs no code (`zip` of native
+        // iterators, `itertools.repeat`, ...); its exhaustion is the
+        // interpreter's.
+        Object::LazyIter(l) => {
+            // SAFETY: the code passes its live state, whose interpreter
+            // is dormant while the helper runs.
+            let interp = unsafe { &*st.interp };
+            let Some(Some(v)) = interp.lazy_core_next(l) else {
+                return 3;
+            };
+            // SAFETY: the slot above the iterator is free.
+            unsafe { out.write(v) };
+            return 1;
+        }
+        _ => return 3,
     };
     let unique = Rc::strong_count(rc) == 1;
     // SAFETY: nothing below runs code while the iterator is borrowed.
@@ -617,6 +632,42 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
             };
             *index += 1;
             v
+        }
+        // `reversed(xs)`: the item below the cursor.
+        PyIterator::Reversed { items, index, .. } => {
+            if *index < 0 {
+                return 3;
+            }
+            // SAFETY: as above.
+            let Some(xs) = (unsafe { items.peek() }) else {
+                return 3;
+            };
+            let Some(v) = xs.get(*index as usize) else {
+                return 3;
+            };
+            let v = crate::clone_hot(v);
+            *index -= 1;
+            v
+        }
+        // `enumerate` over a native iterator whose step runs no code.
+        PyIterator::Enumerate {
+            inner,
+            count,
+            count_big: None,
+        } if *count < i64::MAX => {
+            // SAFETY: as above; `inner` is a cell of its own.
+            let Some(inner) = (unsafe { inner.peek_mut() }) else {
+                return 3;
+            };
+            if !inner.pure_ready() {
+                return 3;
+            }
+            let Some(x) = inner.next_value() else {
+                return 3;
+            };
+            let i = *count;
+            *count += 1;
+            Object::new_tuple_array([Object::Int(i), x])
         }
         _ => return 3,
     };

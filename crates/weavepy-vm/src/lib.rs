@@ -74,6 +74,7 @@ pub mod pycache;
 pub mod rare_events;
 pub mod rc;
 pub mod recursion;
+mod seqiter;
 pub mod shared_value;
 pub mod specialize;
 pub mod stdlib;
@@ -933,9 +934,6 @@ pub struct Interpreter {
     /// (process-unique) attribute version of the class that resolved it
     /// (see [`Interpreter::core_leaf_next`]).
     core_next: ThreadCell<Option<(u64, Option<Rc<crate::object::BuiltinFn>>, u8)>>,
-    /// `_seqtools`' lazy `map` and `filter` classes, once imported (see
-    /// [`Interpreter::seqtools_step`]).
-    seqtools: std::cell::OnceCell<Option<SeqTools>>,
     /// How the last class seen in a boolean context answers it (see
     /// [`Interpreter::leaf_instance_truth`]), by attribute version.
     core_truth: ThreadCell<Option<(u64, NativeTruth)>>,
@@ -1168,7 +1166,6 @@ impl Default for Interpreter {
             leaf_fns: std::cell::OnceCell::new(),
             leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
             core_next: ThreadCell::new(None),
-            seqtools: std::cell::OnceCell::new(),
             core_truth: ThreadCell::new(None),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
         };
@@ -1296,7 +1293,6 @@ impl Interpreter {
             leaf_fns: std::cell::OnceCell::new(),
             leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
             core_next: ThreadCell::new(None),
-            seqtools: std::cell::OnceCell::new(),
             core_truth: ThreadCell::new(None),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
         }
@@ -6202,12 +6198,12 @@ impl Interpreter {
         kind: crate::trace::HookKind,
     ) -> Result<Object, RuntimeError> {
         // Frames running WeavePy's Python stand-ins for CPython C code
-        // (`map`/`filter`/`zip` in `_seqtools`, the `_weave_*` internals)
+        // (the `_seqtools` iterators, the `_weave_*` internals)
         // must be invisible to `sys.settrace`, exactly as their C
         // originals are: CPython fires no call/line/return/exception
         // events inside a C function. pdb's skip-module test steps over
         // `string.capwords` and must land on the caller's `--Return--`,
-        // not inside `_seqtools.map.__new__` (test_pdb_skip_modules).
+        // not inside a `_seqtools` helper (test_pdb_skip_modules).
         if matches!(kind, crate::trace::HookKind::Trace)
             && code_hidden_from_trace(&py_frame.code.filename)
         {
@@ -6738,7 +6734,7 @@ impl Interpreter {
         // to `sys.monitoring` as to `sys.settrace` (see
         // `invoke_observe_hook`): C code fires no PY_START/LINE/... events,
         // and pdb's `sys.monitoring` backend must not step into
-        // `_seqtools.map.__new__` (test_pdb_skip_modules).
+        // a `_seqtools` helper (test_pdb_skip_modules).
         if code_hidden_from_trace(&code.filename) {
             return Ok(());
         }
@@ -11605,6 +11601,42 @@ impl Interpreter {
                                     }
                                 }
                             }
+                            // A native adapter whose step runs no code (a `zip`
+                            // of native iterators); a pair for the
+                            // `UNPACK_SEQUENCE 2` that follows goes straight to
+                            // the stack, which skips it.
+                            Object::LazyIter(l) => {
+                                let fuse = len + 2 <= cap
+                                    && pc + 1 < ninstrs
+                                    // SAFETY: `pc + 1 < ninstrs`.
+                                    && unsafe { (*instrs.add(pc + 1)).op }
+                                        == OpCode::UnpackSequence
+                                    // SAFETY: as above.
+                                    && unsafe { (*instrs.add(pc + 1)).arg } == 2;
+                                if fuse {
+                                    let Some((a, b)) = crate::seqiter::lazy_pure_pair(l) else {
+                                        break None;
+                                    };
+                                    // `UNPACK_SEQUENCE` leaves the first item on
+                                    // top. SAFETY: `len + 2 <= cap`.
+                                    unsafe { base.add(len).write(b) };
+                                    unsafe { base.add(len + 1).write(a) };
+                                    len += 2;
+                                    pc += 1;
+                                    last = pc;
+                                    pc += 1;
+                                    continue;
+                                }
+                                let Some(Some(v)) = self.lazy_core_next(l) else {
+                                    break None;
+                                };
+                                // SAFETY: `len < cap`.
+                                unsafe { base.add(len).write(v) };
+                                len += 1;
+                                last = pc;
+                                pc += 1;
+                                continue;
+                            }
                             // A generator resumes inline, switched to in place
                             // (the quiet loop's lean path when it declines).
                             Object::Generator(g) => {
@@ -11719,6 +11751,23 @@ impl Interpreter {
                                 *index += ch.len_utf8();
                                 Object::from_char(ch)
                             }
+                            // `reversed(xs)`: the item below the cursor
+                            // (exhaustion, which detaches, is the full arm's).
+                            crate::object::PyIterator::Reversed { items, index, .. } => {
+                                if *index < 0 {
+                                    break None;
+                                }
+                                // SAFETY: as above.
+                                let Some(xs) = (unsafe { items.peek() }) else {
+                                    break None;
+                                };
+                                let Some(v) = xs.get(*index as usize) else {
+                                    break None;
+                                };
+                                let v = Self::clone_operand(v);
+                                *index -= 1;
+                                v
+                            }
                             // A dict or dict view's next key, value, or item; an
                             // item unpacked by the `UNPACK_SEQUENCE 2` that
                             // follows goes straight to the stack, as below.
@@ -11769,21 +11818,20 @@ impl Interpreter {
                             }
                             // `for i, x in enumerate(xs)`: the pair goes straight
                             // to the `UNPACK_SEQUENCE 2` that follows, which is
-                            // skipped, so no tuple is ever built.
+                            // skipped, so no tuple is ever built; any other
+                            // loop gets the `(i, x)` tuple.
                             crate::object::PyIterator::Enumerate {
                                 inner,
                                 count,
                                 count_big: None,
                             } => {
-                                if len + 2 > cap
-                                    || pc + 1 >= ninstrs
+                                let fuse = len + 2 <= cap
+                                    && pc + 1 < ninstrs
                                     // SAFETY: `pc + 1 < ninstrs`.
-                                    || unsafe { (*instrs.add(pc + 1)).op } != OpCode::UnpackSequence
+                                    && unsafe { (*instrs.add(pc + 1)).op }
+                                        == OpCode::UnpackSequence
                                     // SAFETY: as above.
-                                    || unsafe { (*instrs.add(pc + 1)).arg } != 2
-                                {
-                                    break None;
-                                }
+                                    && unsafe { (*instrs.add(pc + 1)).arg } == 2;
                                 let Some(next_count) = count.checked_add(1) else {
                                     break None;
                                 };
@@ -11857,12 +11905,16 @@ impl Interpreter {
                                 };
                                 let i = *count;
                                 *count = next_count;
-                                // `UNPACK_SEQUENCE` leaves the first item on top.
-                                // SAFETY: `len + 2 <= cap`.
-                                unsafe { base.add(len).write(x) };
-                                len += 1;
-                                pc += 1;
-                                Object::Int(i)
+                                if !fuse {
+                                    Object::new_tuple_array([Object::Int(i), x])
+                                } else {
+                                    // `UNPACK_SEQUENCE` leaves the first item on
+                                    // top. SAFETY: `len + 2 <= cap`.
+                                    unsafe { base.add(len).write(x) };
+                                    len += 1;
+                                    pc += 1;
+                                    Object::Int(i)
+                                }
                             }
                             _ => break None,
                         };
@@ -13042,6 +13094,15 @@ impl Interpreter {
                         // SAFETY: `len > 0`.
                         let top = unsafe { base.add(len - 1) };
                         let v = unsafe { &*top };
+                        // An iterator is its own iterator.
+                        if matches!(
+                            v,
+                            Object::Iter(_) | Object::LazyIter(_) | Object::Generator(_)
+                        ) {
+                            last = pc;
+                            pc += 1;
+                            continue;
+                        }
                         if !matches!(
                             v,
                             Object::List(_)
@@ -16308,7 +16369,13 @@ impl Interpreter {
         match ins.op {
             OpCode::GetIter => {
                 // A list, tuple or range: its native iterator (as the full
-                // leaf arm).
+                // leaf arm); an iterator is its own.
+                if matches!(
+                    stack.last(),
+                    Some(Object::Iter(_) | Object::LazyIter(_) | Object::Generator(_))
+                ) {
+                    return CoreAttr::Done;
+                }
                 let it = match stack.last() {
                     Some(v @ (Object::List(_) | Object::Tuple(_) | Object::Range(_))) => {
                         match v.make_iter() {
@@ -16557,7 +16624,23 @@ impl Interpreter {
             return None;
         };
         if cls.native_kind.get() == 0 {
-            return None;
+            // The builtin adapter types and the exact `itertools` classes:
+            // their native adapters, when building one runs no code.
+            if kw || (!cls.flags.is_builtin && cls.lazy_ctor.get() == 0) {
+                return None;
+            }
+            let args = ops.get(2..2 + argc)?;
+            if !ops
+                .iter()
+                .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
+            {
+                return None;
+            }
+            return if cls.flags.is_builtin {
+                crate::seqiter::builtin_ctor_pure(cls, args)
+            } else {
+                crate::stdlib::itertools_mod::native_new_pure(cls, args)
+            };
         }
         let args = ops.get(2..2 + argc)?;
         let (names, values): (&[Object], &[Object]) = if kw {
@@ -17848,6 +17931,44 @@ impl Interpreter {
                         }
                     }
                 }
+                OpCode::ForIter if matches!(stack.last(), Some(Object::LazyIter(_))) => {
+                    // A native adapter whose step needs no interpreter (a
+                    // `zip` of native iterators, ...); exhaustion is retired
+                    // here, since a second step might consume more.
+                    let Some(Object::LazyIter(l)) = stack.last() else {
+                        break;
+                    };
+                    let Some(next) = self.lazy_core_next(l) else {
+                        break;
+                    };
+                    match next {
+                        Some(v) => {
+                            stack.push(v);
+                            last = pc;
+                            pc += 1;
+                        }
+                        None => {
+                            let it = stack.pop().expect("checked");
+                            last = pc;
+                            pc += 1 + ins.arg as usize;
+                            // `skip_end_for`
+                            if instrs.get(pc).map(|i| i.op) == Some(OpCode::EndFor) {
+                                pc += 1;
+                                if matches!(
+                                    instrs.get(pc).map(|i| i.op),
+                                    Some(OpCode::PopIter | OpCode::PopTop)
+                                ) {
+                                    pc += 1;
+                                }
+                            }
+                            // The iterator leaves the stack (a full handler
+                            // takes the coarse mark for it).
+                            drop(it);
+                            stop = LeafStop::Marked;
+                            break;
+                        }
+                    }
+                }
                 OpCode::ForIter => {
                     let mut range_done = false;
                     let next = {
@@ -17934,6 +18055,39 @@ impl Interpreter {
                                 ch.map(|ch| {
                                     *index += ch.len_utf8();
                                     Object::from_char(ch)
+                                })
+                            }
+                            crate::object::PyIterator::Reversed { items, index, .. } => {
+                                let v = match items.try_borrow() {
+                                    Ok(xs) if *index >= 0 => xs.get(*index as usize).cloned(),
+                                    _ => None,
+                                };
+                                if v.is_some() {
+                                    *index -= 1;
+                                }
+                                v
+                            }
+                            crate::object::PyIterator::Enumerate {
+                                inner,
+                                count,
+                                count_big: None,
+                            } if *count < i64::MAX => {
+                                // `enumerate` over a native iterator whose
+                                // step runs no code; exhaustion, which may
+                                // release the source, is left to the full
+                                // handler.
+                                // SAFETY: the step runs no code; `inner` is a
+                                // cell of its own.
+                                let Some(inner) = (unsafe { inner.peek_mut() }) else {
+                                    break;
+                                };
+                                if !inner.pure_ready() {
+                                    break;
+                                }
+                                inner.next_value().map(|v| {
+                                    let i = *count;
+                                    *count += 1;
+                                    Object::new_tuple_array([Object::Int(i), v])
                                 })
                             }
                             _ => None,
@@ -18664,6 +18818,12 @@ impl Interpreter {
                                 Err(_) => break,
                             }
                         }
+                        // An iterator is its own iterator.
+                        Some(Object::Iter(_) | Object::LazyIter(_) | Object::Generator(_)) => {
+                            last = pc;
+                            pc += 1;
+                            continue;
+                        }
                         _ => break,
                     };
                     let it = Object::Iter(Rc::new(RefCell::new(it)));
@@ -19044,14 +19204,83 @@ impl Interpreter {
         else {
             return;
         };
-        let Some(f) = Self::instance_call_function(inst) else {
+        if let Some(f) = Self::instance_call_function(inst) {
+            // SAFETY: the instance moves to the (dropless) self slot.
+            unsafe {
+                let obj = callee.read();
+                callee.write(Object::Function(f));
+                callee.add(1).write(obj);
+            }
+            return;
+        }
+        let Some(b) = Self::instance_call_native(inst) else {
             return;
         };
+        // A `functools.partial` with no keywords and at most one stored
+        // argument is its function called with that argument first (in the
+        // self slot). The instance leaves by a plain decrement: something
+        // else still holds it.
+        if b.name == crate::stdlib::functools_mod::PARTIAL_CALL_NAME {
+            if Rc::strong_count(inst) > 1 {
+                if let Some((func, first)) = crate::stdlib::functools_mod::partial_inline(inst) {
+                    // SAFETY: the slots are rewritten in place; the old
+                    // callee is released by a decrement (see above).
+                    unsafe {
+                        drop(callee.read());
+                        callee.write(func);
+                        callee.add(1).write(first);
+                    }
+                    return;
+                }
+            }
+        }
+        // Otherwise the native `__call__` itself, with the instance as its
+        // first argument (the self slot).
         // SAFETY: the instance moves to the (dropless) self slot.
         unsafe {
             let obj = callee.read();
-            callee.write(Object::Function(f));
+            callee.write(Object::Builtin(b));
             callee.add(1).write(obj);
+        }
+    }
+
+    /// `type(inst).__call__` when it is one of the native calls that take
+    /// the instance as their first argument (`functools.partial`'s,
+    /// `operator.itemgetter`'s, ...), cached on the class under its
+    /// attribute version.
+    #[inline(never)]
+    fn instance_call_native(inst: &PyInstance) -> Option<Rc<crate::object::BuiltinFn>> {
+        use crate::types::LeafAttrKind as K;
+        /// The cache key for a native `__call__` (an address no interned
+        /// name has).
+        static CALL_NATIVE_KEY: u8 = 0;
+        let cls = inst.cls_raw();
+        let key = std::ptr::addr_of!(CALL_NATIVE_KEY) as usize;
+        let ver = cls.attr_version.get();
+        match cls.leaf_attrs.get(key, ver) {
+            Some(K::BuiltinMethod(b)) => Some(b.clone()),
+            Some(_) => None,
+            None => {
+                let kind = match cls.lookup("__call__") {
+                    Some(Object::Builtin(b))
+                        if matches!(
+                            b.name,
+                            ".itemgetter.__call__"
+                                | ".attrgetter.__call__"
+                                | ".methodcaller.__call__"
+                        ) || b.name == crate::stdlib::functools_mod::PARTIAL_CALL_NAME =>
+                    {
+                        K::BuiltinMethod(b)
+                    }
+                    _ => K::Other,
+                };
+                let found = match &kind {
+                    K::BuiltinMethod(b) => Some(b.clone()),
+                    _ => None,
+                };
+                cls.leaf_attrs.set(key, ver, kind);
+                found
+            }
         }
     }
 
@@ -19307,6 +19536,12 @@ impl Interpreter {
                     ("len", LeafKind::Len),
                     ("isinstance", LeafKind::Isinstance),
                     ("getattr", LeafKind::GetAttr),
+                    ("iter", LeafKind::Fast(crate::seqiter::iter_fast)),
+                    ("min", LeafKind::Fast(crate::seqiter::min_fast)),
+                    ("max", LeafKind::Fast(crate::seqiter::max_fast)),
+                    ("sum", LeafKind::Fast(crate::seqiter::sum_fast)),
+                    ("any", LeafKind::Fast(crate::seqiter::any_fast)),
+                    ("all", LeafKind::Fast(crate::seqiter::all_fast)),
                 ] {
                     if let Some(Object::Builtin(f)) = b.get(&crate::object::StrKey(name)) {
                         calls.insert(Rc::as_ptr(f) as usize, kind);
@@ -19514,6 +19749,15 @@ impl Interpreter {
             let obj = Object::new_list(items);
             gc_trace::track(&obj);
             return Some(obj);
+        }
+        if ty.flags.is_builtin {
+            // `map(f, xs)`, `zip(xs, ys)`, `enumerate(xs)`, ... over sources
+            // that need no `iter()` call.
+            return crate::seqiter::builtin_ctor_pure(ty, args);
+        }
+        if ty.lazy_ctor.get() != 0 {
+            // An exact `itertools` class, likewise.
+            return crate::stdlib::itertools_mod::native_new_pure(ty, args);
         }
         None
     }
@@ -23006,11 +23250,7 @@ impl Interpreter {
                         }
                         Err(e) => return Err(e),
                     },
-                    Object::Instance(_) => 'next: {
-                        // `map` and `filter` step natively when they can.
-                        if let Some(r) = self.seqtools_step(&it_obj, &frame.globals) {
-                            break 'next r?;
-                        }
+                    Object::Instance(_) => {
                         // Call __next__; treat StopIteration as exhaustion.
                         let next = match instance_native_dunder(&it_obj, "__next__", None) {
                             Some(r) => Some(r),
@@ -26157,6 +26397,7 @@ impl Interpreter {
             }
             Object::Instance(inst) => self.load_attr_instance(inst, obj, name),
             Object::Type(ty) => self.load_attr_type_dispatch(&ty.clone(), obj, name),
+            Object::LazyIter(l) => self.load_attr_lazy_iter(l, obj, name),
             Object::Property(p) => match name {
                 // A tagged numeric getset/member (`float.real`,
                 // `complex.real`) reports CPython descriptor metadata.
@@ -27671,6 +27912,50 @@ impl Interpreter {
                     name
                 )))
             }
+        }
+    }
+
+    /// Attribute access on a native adapter (`map`, `zip`, an exact
+    /// `itertools` object, …): its type's attributes, with functions
+    /// bound to it.
+    fn load_attr_lazy_iter(
+        &mut self,
+        l: &Rc<crate::object::PyLazyIter>,
+        obj: &Object,
+        name: &str,
+    ) -> Result<Object, RuntimeError> {
+        if let Some(m) = crate::seqiter::lazy_special_method(l, name) {
+            return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                obj.clone(),
+                m,
+            ))));
+        }
+        // An exact `itertools` object is its own core: the class's Python
+        // methods reach the state through `self._core`.
+        if name == "_core" && l.cls.is_some() {
+            return Ok(obj.clone());
+        }
+        let cls = crate::builtins::class_of(obj);
+        match cls.lookup(name) {
+            Some(Object::Property(p)) => {
+                let fget = p.fget.borrow().clone();
+                if matches!(fget, Object::None) {
+                    return Err(attribute_error(format!(
+                        "property '{name}' of '{}' object has no getter",
+                        cls.name
+                    )));
+                }
+                let globals = self.builtins.clone();
+                self.call(&fget, std::slice::from_ref(obj), &[], &globals)
+            }
+            Some(Object::ClassMethod(inner)) => Ok(Object::BoundMethod(Rc::new(
+                BoundMethod::py_method(Object::Type(cls.clone()), inner.func()),
+            ))),
+            Some(attr) => Ok(self.maybe_bind(obj, attr)),
+            None => Err(attribute_error(format!(
+                "'{}' object has no attribute '{name}'",
+                cls.name
+            ))),
         }
     }
 
@@ -31688,6 +31973,25 @@ impl Interpreter {
                 }
                 Ok(out)
             }
+            Object::LazyIter(l) => {
+                let mut out = Vec::new();
+                if !self.seq_drain(l, &mut out, globals)? {
+                    loop {
+                        if let Some(r) = crate::seqiter::lazy_pure_next(l) {
+                            match r {
+                                Some(x) => out.push(x),
+                                None => break,
+                            }
+                            continue;
+                        }
+                        match self.lazy_iter_next(l, globals)? {
+                            Some(x) => out.push(x),
+                            None => break,
+                        }
+                    }
+                }
+                Ok(out)
+            }
             other => {
                 // Fall through to the existing builtin so we don't
                 // re-implement range/dict/str iteration here.
@@ -31723,10 +32027,10 @@ impl Interpreter {
         Ok(out)
     }
 
-    /// Instantiate one of `_seqtools`'s lazy iterator classes
-    /// (`_FilterIter` / `_MapIter` / `_ZipIter`). Returns `Ok(None)` only
-    /// if the frozen helper module is somehow unavailable, letting the
-    /// caller fall back; in practice it is always frozen in.
+    /// Instantiate one of `_seqtools`'s lazy iterator classes (the
+    /// user-sequence `_ReversedIter`). Returns `Ok(None)` only if the
+    /// frozen helper module is somehow unavailable, letting the caller
+    /// fall back; in practice it is always frozen in.
     fn make_seqtools_iter(
         &mut self,
         class_name: &'static str,
@@ -31734,13 +32038,6 @@ impl Interpreter {
         kwargs: &[(String, Object)],
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Option<Object>, RuntimeError> {
-        // The common shape is built here (what its `__new__` would build):
-        // a callable over native containers or iterators, no keywords.
-        if kwargs.is_empty() {
-            if let Some(it) = self.seqtools_new(class_name, args, globals) {
-                return Ok(Some(it));
-            }
-        }
         let module = match self.do_import("_seqtools", &Object::None, 0, globals) {
             Ok(m) => m,
             Err(_) => return Ok(None),
@@ -31756,190 +32053,6 @@ impl Interpreter {
         match cls {
             Some(cls) => Ok(Some(self.call(&cls, args, kwargs, globals)?)),
             None => Ok(None),
-        }
-    }
-
-    /// The `_seqtools` classes, importing them on first use.
-    fn seqtools(&mut self, globals: &Rc<RefCell<DictData>>) -> Option<&SeqTools> {
-        if self.seqtools.get().is_none() {
-            let module = self.do_import("_seqtools", &Object::None, 0, globals).ok();
-            let class = |name: &str| match &module {
-                Some(Object::Module(m)) => {
-                    match m.dict.borrow().get(&DictKey(Object::from_str(name))) {
-                        Some(Object::Type(t)) => Some(t.clone()),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            };
-            let tools = class("_MapIter")
-                .zip(class("_FilterIter"))
-                .map(|(map, filter)| SeqTools { map, filter });
-            let _ = self.seqtools.set(tools);
-        }
-        self.seqtools.get()?.as_ref()
-    }
-
-    /// A `map(func, *iterables)` or `filter(func, iterable)` instance
-    /// built without running its class's `__new__`, when every iterable is
-    /// a list, tuple, string or range (iterated natively) or already an
-    /// iterator; `None` leaves the call to the class.
-    fn seqtools_new(
-        &mut self,
-        class_name: &str,
-        args: &[Object],
-        globals: &Rc<RefCell<DictData>>,
-    ) -> Option<Object> {
-        let filter = match class_name {
-            "_MapIter" => false,
-            "_FilterIter" => true,
-            _ => return None,
-        };
-        let (func, sources) = args.split_first()?;
-        if sources.is_empty() || (filter && sources.len() != 1) {
-            return None;
-        }
-        let mut iters = Vec::with_capacity(sources.len());
-        for s in sources {
-            iters.push(match s {
-                Object::Iter(_) | Object::Generator(_) => s.clone(),
-                Object::List(_) | Object::Tuple(_) | Object::Str(_) | Object::Range(..) => {
-                    Object::Iter(Rc::new(RefCell::new(s.make_iter().ok()?)))
-                }
-                _ => return None,
-            });
-        }
-        let tools = self.seqtools(globals)?;
-        let cls = if filter { &tools.filter } else { &tools.map };
-        let inst = crate::types::PyInstance::new(cls.clone());
-        inst.slot_set("_func", func.clone());
-        if filter {
-            inst.slot_set("_it", iters.pop()?);
-        } else {
-            inst.slot_set("_iters", Object::new_tuple(iters));
-            inst.slot_set("_strict", Object::Bool(false));
-        }
-        let obj = Object::Instance(Rc::new(inst));
-        gc_trace::track(&obj);
-        Some(obj)
-    }
-
-    /// The next value of an exact `map` or `filter` over one native
-    /// iterator, stepped here rather than through its `__next__`:
-    /// `Some(Ok(None))` at exhaustion, `None` when the class's own
-    /// `__next__` must run.
-    fn seqtools_step(
-        &mut self,
-        it: &Object,
-        globals: &Rc<RefCell<DictData>>,
-    ) -> Option<Result<Option<Object>, RuntimeError>> {
-        let Object::Instance(inst) = it else {
-            return None;
-        };
-        let tools = self.seqtools.get()?.as_ref()?;
-        let cls = inst.cls_raw();
-        let filter = if std::ptr::eq(cls, &raw const *tools.map) {
-            false
-        } else if std::ptr::eq(cls, &raw const *tools.filter) {
-            true
-        } else {
-            return None;
-        };
-        if crate::trace::any_observers_active() {
-            return None;
-        }
-        let func = inst.slot_get("_func")?;
-        let source = if filter {
-            inst.slot_get("_it")?
-        } else {
-            match inst.slot_get("_iters")? {
-                Object::Tuple(t) if t.len() == 1 => t[0].clone(),
-                _ => return None,
-            }
-        };
-        let Object::Iter(cursor) = &source else {
-            return None;
-        };
-        loop {
-            let item = match cursor.borrow_mut().next_value_checked() {
-                Ok(Some(v)) => v,
-                Ok(None) => return Some(Ok(None)),
-                Err(e) => return Some(Err(e)),
-            };
-            if !filter {
-                return Some(
-                    self.call(&func, std::slice::from_ref(&item), &[], globals)
-                        .map(Some),
-                );
-            }
-            let keep = match &func {
-                Object::None => self.op_truth(&item),
-                Object::Type(t) if Rc::ptr_eq(t, &builtin_types().bool_) => self.op_truth(&item),
-                f => match self.call(f, std::slice::from_ref(&item), &[], globals) {
-                    Ok(r) => self.op_truth(&r),
-                    Err(e) => Err(e),
-                },
-            };
-            match keep {
-                Ok(true) => return Some(Ok(Some(item))),
-                Ok(false) => {}
-                Err(e) => return Some(Err(e)),
-            }
-        }
-    }
-
-    /// `map(func, *iterables)` — VM-aware (the plain builtin can't call
-    /// back into the interpreter).
-    ///
-    /// When any input is a VM-driven iterable (generator, instance with
-    /// `__next__`, …) the result is a *lazy* `_seqtools._MapIter`
-    /// (CPython's `map` object): `func` runs on demand, so mapping over
-    /// an unbounded source works. For plain native containers we keep
-    /// the eager fast path — observably equivalent for finite pure
-    /// inputs, and crucially the returned native iterator stays
-    /// consumable by native builtins (e.g. `dict.fromkeys(map(...))`).
-    fn do_map_call(
-        &mut self,
-        args: &[Object],
-        kwargs: &[(String, Object)],
-        globals: &Rc<RefCell<DictData>>,
-    ) -> Result<Object, RuntimeError> {
-        // 3.14 `map(..., strict=True)` (gh-119793); any other keyword is
-        // rejected the way CPython's `|$p:map` format does.
-        for (k, _) in kwargs {
-            if k != "strict" {
-                return Err(type_error(format!(
-                    "map() got an unexpected keyword argument '{k}'"
-                )));
-            }
-        }
-        if args.len() < 2 {
-            return Err(type_error("map() must have at least two arguments."));
-        }
-        // Always lazy, like CPython's `map` type: laziness is observable
-        // in type identity (`map` reduces by its own constructor —
-        // test_pickle's test_compat_pickle checks the emitted global is
-        // `itertools.imap` under protocol < 3), in error timing (`func`
-        // failures surface at `next()`, not construction), and in side
-        // effect interleaving.
-        match self.make_seqtools_iter("_MapIter", args, kwargs, globals)? {
-            Some(it) => Ok(it),
-            None => Err(runtime_error("internal: _seqtools._MapIter unavailable")),
-        }
-    }
-
-    /// `filter(func_or_None, iterable)` — VM-aware. `None` keeps truthy
-    /// items; otherwise an item is kept when `func(item)` is truthy.
-    /// Always lazy (`_seqtools._FilterIter`), like CPython's `filter`
-    /// type (see [`Self::do_map_call`]).
-    fn do_filter_call(
-        &mut self,
-        args: &[Object],
-        globals: &Rc<RefCell<DictData>>,
-    ) -> Result<Object, RuntimeError> {
-        match self.make_seqtools_iter("_FilterIter", args, &[], globals)? {
-            Some(it) => Ok(it),
-            None => Err(runtime_error("internal: _seqtools._FilterIter unavailable")),
         }
     }
 
@@ -32144,104 +32257,6 @@ impl Interpreter {
             }
         }
         Ok(Object::Bool(!want_any))
-    }
-
-    /// Lazy, VM-driven `zip(*iterables, strict=False)`. The static `b_zip`
-    /// materialises every argument up-front via `Object::make_iter`, which
-    /// (a) can't drive a Python generator/instance iterator and (b) would
-    /// deadlock on an unbounded one such as `itertools.count()`. This pulls
-    /// one element per iterable per round and stops at the shortest —
-    /// CPython's lazy contract — so `zip(words, count())` terminates.
-    /// Returns an eager list, mirroring WeavePy's existing `zip` result type.
-    fn do_zip_call(
-        &mut self,
-        args: &[Object],
-        kwargs: &[(String, Object)],
-        globals: &Rc<RefCell<DictData>>,
-    ) -> Result<Object, RuntimeError> {
-        let mut strict = false;
-        for (k, v) in kwargs {
-            if k == "strict" {
-                strict = v.is_truthy();
-            } else {
-                return Err(type_error(format!(
-                    "zip() got an unexpected keyword argument '{k}'"
-                )));
-            }
-        }
-        // Lazy (CPython's `zip` object) when any input is VM-driven: no
-        // iterable is pre-materialised, so `zip(count(), count())`
-        // constructs instantly and pulls one tuple per `next()`.
-        // `_ZipIter` also carries the strict-mode mismatch diagnostics.
-        // Strict mode is *always* lazy: CPython reports the length
-        // mismatch from `next()`, not from the constructor, and leaves
-        // the inputs' partial consumption observable (test_builtin
-        // test_zip_strict_iterators). A *stateful* native iterator input
-        // (`zip(iter(range(4)))`) is lazy for the same reason: the eager
-        // path would drain it at construction, and 3.14's
-        // `Executor.map(..., buffersize=n)` islices `zip(*iterables)` and
-        // then reads the leftovers from the original iterator
-        // (test_concurrent_futures test_map_buffersize_when_buffer_is_full).
-        if strict
-            || args
-                .iter()
-                .any(|a| object_needs_vm_iter(a) || matches!(a, Object::Iter(_)))
-        {
-            let ctor_kwargs = [("strict".to_owned(), Object::Bool(strict))];
-            return match self.make_seqtools_iter("_ZipIter", args, &ctor_kwargs, globals)? {
-                Some(it) => Ok(it),
-                None => Err(runtime_error("internal: _seqtools._ZipIter unavailable")),
-            };
-        }
-        // Eager fast path for native finite containers; the result is a
-        // native iterator that plain builtins can consume directly.
-        if args.is_empty() {
-            // `next(zip())` raises StopIteration — an iterator, not a list.
-            let it = Object::new_list(Vec::new()).make_iter()?;
-            return Ok(Object::Iter(Rc::new(RefCell::new(it))));
-        }
-        let iters: Vec<Object> = args
-            .iter()
-            .map(|a| self.make_iter(a, globals))
-            .collect::<Result<_, _>>()?;
-        let n = iters.len();
-        let mut out: Vec<Object> = Vec::new();
-        loop {
-            let mut tup: Vec<Object> = Vec::with_capacity(n);
-            for (i, it) in iters.iter().enumerate() {
-                match self.iter_next(it, globals)? {
-                    Some(v) => tup.push(v),
-                    None => {
-                        if strict && i > 0 {
-                            let than = if i > 1 {
-                                format!("arguments 1-{i}")
-                            } else {
-                                "argument 1".to_owned()
-                            };
-                            return Err(value_error(format!(
-                                "zip() argument {} is shorter than {than}",
-                                i + 1
-                            )));
-                        }
-                        if strict {
-                            // First iterable ran out: any later one that still
-                            // yields is "longer than argument 1".
-                            for (j, it2) in iters.iter().enumerate().skip(1) {
-                                if self.iter_next(it2, globals)?.is_some() {
-                                    return Err(value_error(format!(
-                                        "zip() argument {} is longer than argument 1",
-                                        j + 1
-                                    )));
-                                }
-                            }
-                        }
-                        let it = Object::new_list(out).make_iter()?;
-                        return Ok(Object::Iter(Rc::new(RefCell::new(it))));
-                    }
-                }
-            }
-            out.push(Object::new_tuple(tup));
-        }
     }
 
     /// `isinstance(obj, classinfo)` — honours `__instancecheck__` on
@@ -34041,6 +34056,16 @@ impl Interpreter {
                 return self.repr_of(&native, globals);
             }
         }
+        // An exact `itertools` object renders through its class's
+        // `__repr__` (`count(5)`), when it defines one.
+        if let Object::LazyIter(l) = v {
+            if let Some(cls) = &l.cls {
+                if let Some(f @ Object::Function(_)) = cls.lookup("__repr__") {
+                    let r = self.call(&f, std::slice::from_ref(v), &[], globals)?;
+                    return Self::require_str_result(r, "__repr__");
+                }
+            }
+        }
         // `repr(SomeClass)` consults the metaclass (`EnumType.__repr__`
         // renders `<enum 'Color'>` instead of `<class 'Color'>`).
         if let Object::Type(_) = v {
@@ -34825,9 +34850,6 @@ impl Interpreter {
                 Err(e) => Err(e),
             },
             Object::Instance(inst) => {
-                if let Some(r) = self.seqtools_step(iter, globals) {
-                    return r;
-                }
                 // A registered native leaf `__next__` (the class cache the
                 // core loop's `FOR_ITER` uses): called directly.
                 if !crate::gil::free_threading_enabled() && !crate::trace::any_observers_active() {
@@ -34944,173 +34966,24 @@ impl Interpreter {
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Option<Object>, RuntimeError> {
         use crate::object::LazyIterKind;
-        // Pure state machines first: their stepping never re-enters the
-        // interpreter, so the whole transition runs under one borrow.
-        {
-            let mut st = l.state.borrow_mut();
-            match &mut *st {
-                LazyIterKind::Repeat { obj, times } => {
-                    return match times {
-                        None => Ok(Some(obj.clone())),
-                        Some(t) if *t <= 0 => Ok(None),
-                        Some(t) => {
-                            *t -= 1;
-                            Ok(Some(obj.clone()))
-                        }
-                    }
-                }
-                LazyIterKind::Product {
-                    pools,
-                    indices,
-                    started,
-                    stopped,
-                } => {
-                    if *stopped {
-                        return Ok(None);
-                    }
-                    if !*started {
-                        if pools.iter().any(|p| p.is_empty()) {
-                            *stopped = true;
-                            return Ok(None);
-                        }
-                        *started = true;
-                        indices.clear();
-                        indices.resize(pools.len(), 0);
-                        let t: Vec<Object> = pools.iter().map(|p| p[0].clone()).collect();
-                        return Ok(Some(Object::new_tuple(t)));
-                    }
-                    let n = pools.len();
-                    let mut i = n as i64 - 1;
-                    while i >= 0 {
-                        let k = i as usize;
-                        indices[k] += 1;
-                        if indices[k] < pools[k].len() {
-                            break;
-                        }
-                        indices[k] = 0;
-                        i -= 1;
-                    }
-                    if i < 0 {
-                        *stopped = true;
-                        return Ok(None);
-                    }
-                    let t: Vec<Object> = pools
-                        .iter()
-                        .zip(indices.iter())
-                        .map(|(p, &ix)| p[ix].clone())
-                        .collect();
-                    return Ok(Some(Object::new_tuple(t)));
-                }
-                LazyIterKind::Permutations {
-                    pool,
-                    r,
-                    indices,
-                    cycles,
-                    started,
-                    stopped,
-                } => {
-                    if *stopped {
-                        return Ok(None);
-                    }
-                    let n = pool.len();
-                    let r = *r;
-                    if !*started {
-                        *started = true;
-                        let t: Vec<Object> =
-                            indices[..r].iter().map(|&ix| pool[ix].clone()).collect();
-                        return Ok(Some(Object::new_tuple(t)));
-                    }
-                    if n == 0 {
-                        *stopped = true;
-                        return Ok(None);
-                    }
-                    let mut i = r as i64 - 1;
-                    while i >= 0 {
-                        let k = i as usize;
-                        cycles[k] -= 1;
-                        if cycles[k] == 0 {
-                            indices[k..].rotate_left(1);
-                            cycles[k] = n - k;
-                        } else {
-                            let j = n - cycles[k];
-                            indices.swap(k, j);
-                            let t: Vec<Object> =
-                                indices[..r].iter().map(|&ix| pool[ix].clone()).collect();
-                            return Ok(Some(Object::new_tuple(t)));
-                        }
-                        i -= 1;
-                    }
-                    *stopped = true;
-                    return Ok(None);
-                }
-                LazyIterKind::Combinations {
-                    pool,
-                    r,
-                    indices,
-                    started,
-                    stopped,
-                } => {
-                    if *stopped {
-                        return Ok(None);
-                    }
-                    let n = pool.len();
-                    let r = *r;
-                    if !*started {
-                        *started = true;
-                        let t: Vec<Object> = indices.iter().map(|&ix| pool[ix].clone()).collect();
-                        return Ok(Some(Object::new_tuple(t)));
-                    }
-                    let mut i = r as i64 - 1;
-                    while i >= 0 && indices[i as usize] == i as usize + n - r {
-                        i -= 1;
-                    }
-                    if i < 0 {
-                        *stopped = true;
-                        return Ok(None);
-                    }
-                    let k = i as usize;
-                    indices[k] += 1;
-                    for j in k + 1..r {
-                        indices[j] = indices[j - 1] + 1;
-                    }
-                    let t: Vec<Object> = indices.iter().map(|&ix| pool[ix].clone()).collect();
-                    return Ok(Some(Object::new_tuple(t)));
-                }
-                LazyIterKind::Cwr {
-                    pool,
-                    r,
-                    indices,
-                    started,
-                    stopped,
-                } => {
-                    if *stopped {
-                        return Ok(None);
-                    }
-                    let n = pool.len();
-                    let r = *r;
-                    if !*started {
-                        *started = true;
-                        let t: Vec<Object> = indices.iter().map(|&ix| pool[ix].clone()).collect();
-                        return Ok(Some(Object::new_tuple(t)));
-                    }
-                    let mut i = r as i64 - 1;
-                    while i >= 0 && indices[i as usize] == n - 1 {
-                        i -= 1;
-                    }
-                    if i < 0 {
-                        *stopped = true;
-                        return Ok(None);
-                    }
-                    let k = i as usize;
-                    let v = indices[k] + 1;
-                    for slot in indices[k..].iter_mut() {
-                        *slot = v;
-                    }
-                    let t: Vec<Object> = indices.iter().map(|&ix| pool[ix].clone()).collect();
-                    return Ok(Some(Object::new_tuple(t)));
-                }
-                _ => {}
+        // Steps that run no code first (pure state machines, and native
+        // sources with an item ready), under one borrow.
+        if let Some(r) = crate::seqiter::lazy_pure_next(l) {
+            return Ok(r);
+        }
+        // The builtin `map`/`filter`/`zip`/`enumerate` adapters.
+        if l.is_builtin_kind() {
+            if let Some(r) = self.seq_lazy_next(l, globals) {
+                return r;
             }
+        }
+        // The pure state machines under a guarded borrow (the unguarded
+        // view above is unavailable while cells are shared across threads).
+        if let Some(r) = crate::seqiter::machine_step(&mut l.state.borrow_mut()) {
+            return Ok(r);
+        }
+        if let Some(r) = self.groupby_lazy_next(l, globals) {
+            return r;
         }
         // Reentrant kinds: copy the state out so no borrow is held while
         // we re-enter the interpreter (the source may observe this
@@ -35293,7 +35166,13 @@ impl Interpreter {
             | LazyIterKind::Product { .. }
             | LazyIterKind::Permutations { .. }
             | LazyIterKind::Combinations { .. }
-            | LazyIterKind::Cwr { .. } => unreachable!("handled above"),
+            | LazyIterKind::Cwr { .. }
+            | LazyIterKind::Map { .. }
+            | LazyIterKind::Filter { .. }
+            | LazyIterKind::Zip { .. }
+            | LazyIterKind::Enumerate { .. }
+            | LazyIterKind::GroupBy { .. }
+            | LazyIterKind::Grouper { .. } => unreachable!("handled above"),
         };
         match snap {
             Snap::Count { current, step } => {
@@ -35424,7 +35303,7 @@ impl Interpreter {
                     let Some(item) = self.iter_next(&source, globals)? else {
                         return Ok(None);
                     };
-                    let verdict = self.call(&func, std::slice::from_ref(&item), &[], globals)?;
+                    let verdict = self.seq_call1(&func, item.clone(), globals)?;
                     if !self.obj_truthy(&verdict, globals)? {
                         if let LazyIterKind::DropWhile { started: s, .. } =
                             &mut *l.state.borrow_mut()
@@ -35446,7 +35325,7 @@ impl Interpreter {
                 let Some(item) = self.iter_next(&source, globals)? else {
                     return Ok(None);
                 };
-                let verdict = self.call(&func, std::slice::from_ref(&item), &[], globals)?;
+                let verdict = self.seq_call1(&func, item.clone(), globals)?;
                 if self.obj_truthy(&verdict, globals)? {
                     Ok(Some(item))
                 } else {
@@ -35463,7 +35342,7 @@ impl Interpreter {
                 let truthy = match &func {
                     Object::None => self.obj_truthy(&item, globals)?,
                     f => {
-                        let verdict = self.call(f, std::slice::from_ref(&item), &[], globals)?;
+                        let verdict = self.seq_call1(f, item.clone(), globals)?;
                         self.obj_truthy(&verdict, globals)?
                     }
                 };
@@ -35479,6 +35358,11 @@ impl Interpreter {
                     Object::Tuple(items) => items.to_vec(),
                     other => self.collect_iterable(other, globals)?,
                 };
+                if let Object::Function(f) = &func {
+                    if let Some(r) = self.call_pure_leaf(f, &call_args) {
+                        return Ok(Some(r));
+                    }
+                }
                 Ok(Some(self.call(&func, &call_args, &[], globals)?))
             }
             Snap::Pairwise { source, old } => {
@@ -41181,6 +41065,25 @@ impl Interpreter {
     fn store_attr(&mut self, obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError> {
         match obj {
             Object::Instance(inst) => self.store_attr_instance(inst, obj, name, value),
+            // An exact `itertools` object's `__setstate__` replaces its
+            // core (`self._core = ...`): the new core's state moves in.
+            Object::LazyIter(l) if name == "_core" && l.cls.is_some() => {
+                let Object::LazyIter(new) = &value else {
+                    return Err(type_error("_core must be a native itertools core"));
+                };
+                if !Rc::ptr_eq(l, new) {
+                    let state = std::mem::replace(
+                        &mut *new.state.borrow_mut(),
+                        crate::object::LazyIterKind::Repeat {
+                            obj: Object::None,
+                            times: Some(0),
+                        },
+                    );
+                    let old = std::mem::replace(&mut *l.state.borrow_mut(), state);
+                    drop(old);
+                }
+                Ok(())
+            }
             // `cell.cell_contents` is writable since 3.7 (bpo-30486):
             // `mock.patch` rebinds closure variables through it.
             Object::Cell(c) if name == "cell_contents" => {
@@ -43916,12 +43819,6 @@ impl Interpreter {
                         }
                         return invoke(args);
                     }
-                    if b.name == "map" && (args.len() >= 2 || !kwargs.is_empty()) {
-                        return self.do_map_call(args, kwargs, outer_globals);
-                    }
-                    if b.name == "filter" && args.len() == 2 {
-                        return self.do_filter_call(args, outer_globals);
-                    }
                     // Only the genuine free-function builtins: a struct
                     // sequence's field getter is a `binds_instance` BuiltinFn
                     // that may be *named* "min" (sys.float_info.min), and
@@ -44424,29 +44321,11 @@ impl Interpreter {
                     let needs_vm_iter = object_needs_vm_iter;
                     // `enumerate` is lazy in CPython — it must not consume
                     // its source up front (`enumerate(itertools.count())`
-                    // would hang). Route VM-driven sources to the lazy
-                    // `_seqtools._EnumerateIter` instead.
+                    // would hang). VM-driven sources get the native lazy
+                    // adapter.
                     if b.name == "enumerate" && args.first().is_some_and(needs_vm_iter) {
-                        // `enumerate(iterable, start=N)`: fold the keyword
-                        // into the positional form the helper expects.
-                        let mut ctor_args = args.to_vec();
-                        for (k, v) in kwargs {
-                            if k == "start" && ctor_args.len() == 1 {
-                                ctor_args.push(v.clone());
-                            } else {
-                                return Err(type_error(format!(
-                                    "enumerate() got an unexpected keyword argument '{k}'"
-                                )));
-                            }
-                        }
-                        if let Some(it) = self.make_seqtools_iter(
-                            "_EnumerateIter",
-                            &ctor_args,
-                            &[],
-                            outer_globals,
-                        )? {
-                            return Ok(it);
-                        }
+                        let (iterable, start) = crate::seqiter::enumerate_args(args, kwargs)?;
+                        return self.enumerate_lazy(&iterable, start.as_ref(), outer_globals);
                     }
                     if matches!(b.name, "sum" | "all" | "any" | "prod")
                         && args.first().is_some_and(needs_vm_iter)
@@ -44477,9 +44356,6 @@ impl Interpreter {
                     // can't take keywords, and the VM path is what returns a
                     // true iterator (CPython's `zip` object) rather than a
                     // pre-built list.
-                    if b.name == "zip" {
-                        return self.do_zip_call(args, kwargs, outer_globals);
-                    }
                     if b.name == "sorted" && !args.is_empty() {
                         return self.do_sorted_call(args, kwargs, outer_globals);
                     }
@@ -45833,35 +45709,6 @@ impl Interpreter {
                     {
                         resolved_bases.push(origin);
                         bases_replaced = true;
-                        continue;
-                    }
-                }
-            }
-            // CPython's `map`/`filter`/`zip`/`enumerate` are real types and
-            // subclassable. WeavePy dispatches *calls* to them through fast
-            // builtin functions, but a class statement naming one as a base
-            // needs the actual type — the `_seqtools` lazy-iterator class
-            // that those dispatch paths construct.
-            if let Object::Builtin(bf) = b {
-                let seqtools_cls = match bf.name {
-                    "map" => Some("_MapIter"),
-                    "filter" => Some("_FilterIter"),
-                    "zip" => Some("_ZipIter"),
-                    "enumerate" => Some("_EnumerateIter"),
-                    _ => None,
-                };
-                if let Some(cls_name) = seqtools_cls {
-                    let module = self.do_import("_seqtools", &Object::None, 0, &body_fn.globals)?;
-                    let cls = match &module {
-                        Object::Module(m) => m
-                            .dict
-                            .borrow()
-                            .get(&DictKey(Object::from_static(cls_name)))
-                            .cloned(),
-                        _ => None,
-                    };
-                    if let Some(cls) = cls {
-                        resolved_bases.push(cls);
                         continue;
                     }
                 }
@@ -48014,6 +47861,14 @@ impl Interpreter {
                 return r;
             }
         }
+        // An exact `itertools` class: its native adapter.
+        if cls.lazy_ctor.get() != 0 {
+            if let Some(r) =
+                crate::stdlib::itertools_mod::native_new_interp(self, &cls, args, kwargs)
+            {
+                return r;
+            }
+        }
         if kwargs.is_empty() && !cls.flags.is_builtin {
             if let Some(r) = self.instantiate_plain_lean(&cls, args) {
                 return r;
@@ -48041,6 +47896,10 @@ impl Interpreter {
         // Built-in conversion types route to the underlying builtin
         // function so `int("3")`, `range(5)`, `list(xs)` keep working.
         if cls.flags.is_builtin {
+            if let Some(ty) = crate::seqiter::SeqType::of_exact(&cls) {
+                let globals = self.builtins.clone();
+                return self.seq_new(ty, args, kwargs, &globals);
+            }
             // Exception classes first: a raise constructs one, and none of
             // the conversion or descriptor constructors below is one.
             if cls.flags.is_exception {
@@ -48268,30 +48127,12 @@ impl Interpreter {
             }
             // `enumerate` is lazy in CPython — a VM-driven source (a
             // generator, or a user `__iter__`) can't be materialised up
-            // front (`enumerate(itertools.count())` would hang). Route
-            // those to the frozen `_seqtools._EnumerateIter`, exactly as
-            // the builtin-function call path does.
+            // front (`enumerate(itertools.count())` would hang): it gets
+            // the native lazy adapter.
             if cls.name == "enumerate" && args.first().is_some_and(object_needs_vm_iter) {
-                let mut ctor_args = args.to_vec();
-                for (k, v) in kwargs {
-                    if k == "start" && ctor_args.len() == 1 {
-                        ctor_args.push(v.clone());
-                    } else if k == "iterable" {
-                        return Err(type_error(
-                            "argument for enumerate() given by name ('iterable') and position (1)",
-                        ));
-                    } else {
-                        return Err(type_error(format!(
-                            "enumerate() got an unexpected keyword argument '{k}'"
-                        )));
-                    }
-                }
-                let global_dummy = Rc::new(RefCell::new(DictData::default()));
-                if let Some(it) =
-                    self.make_seqtools_iter("_EnumerateIter", &ctor_args, &[], &global_dummy)?
-                {
-                    return Ok(it);
-                }
+                let (iterable, start) = crate::seqiter::enumerate_args(args, kwargs)?;
+                let globals = self.builtins.clone();
+                return self.enumerate_lazy(&iterable, start.as_ref(), &globals);
             }
             // `reversed(x)` on a user instance must honour `__reversed__`
             // / `__getitem__`+`__len__` through the interpreter.
@@ -48351,7 +48192,11 @@ impl Interpreter {
                     let items = self.collect_iterable(&args[0], &global_dummy)?;
                     let mut d = DictData::default();
                     for (i, pair) in items.into_iter().enumerate() {
-                        let kv = self.collect_iterable(&pair, &global_dummy)?;
+                        // A 2-tuple (`dict(zip(ks, vs))`) is its own pair.
+                        let kv = match &pair {
+                            Object::Tuple(t) if t.len() == 2 => t.to_vec(),
+                            _ => self.collect_iterable(&pair, &global_dummy)?,
+                        };
                         if kv.len() != 2 {
                             return Err(type_error(format!(
                                 "dictionary update sequence element #{i} has length {}; 2 is required",
@@ -49921,6 +49766,29 @@ impl Interpreter {
                     }
                     return Err(e);
                 }
+            }
+        }
+        // `list(it)` / `tuple(it)` of an iterator (a native adapter, a
+        // generator): drained straight into the container, without the
+        // generic constructor dispatch. Classes fire no profile events.
+        if let (Object::Type(t), [arg @ (Object::LazyIter(_) | Object::Generator(_))]) =
+            (&callable, args.as_slice())
+        {
+            let bt = builtin_types();
+            let name = if Rc::ptr_eq(t, &bt.list_) {
+                Some("list")
+            } else if Rc::ptr_eq(t, &bt.tuple_) {
+                Some("tuple")
+            } else {
+                None
+            };
+            if let Some(name) = name {
+                let r = self.do_list_or_tuple_call(name, arg, &frame.globals)?;
+                frame.push(r);
+                self.release(callable);
+                self.reap_call_args(&mut args);
+                self.recycle_scratch(args);
+                return Ok(());
             }
         }
         // RFC 0047 — a *method call on a Python function* transfers
@@ -51576,6 +51444,22 @@ impl Interpreter {
         // iterator as its native payload; reduce that and swap in the
         // instance's own class (CPython's `enum_reduce` uses
         // `Py_TYPE(self)`) — same contract as the `__reduce_ex__` path.
+        // A lazy `enumerate` (over an interpreter-driven source) reduces to
+        // its source and next index.
+        let lazy = match recv {
+            Object::LazyIter(l) => Some(l.clone()),
+            Object::Instance(inst) => match inst.native.get() {
+                Some(Object::LazyIter(l)) => Some(l.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(l) = lazy {
+            let cls = Object::Type(crate::builtins::class_of(recv));
+            if let Some(r) = crate::seqiter::enumerate_reduce(&l, cls) {
+                return Ok(r);
+            }
+        }
         if let Object::Instance(inst) = recv {
             if let Some(native @ Object::Iter(it)) = inst.native.get() {
                 let swap = matches!(
@@ -55880,8 +55764,8 @@ fn unicode_decode_error_span(e: &RuntimeError) -> Option<(usize, usize)> {
 /// Whether frames of this file are hidden from `sys.settrace`.
 ///
 /// These frozen modules are Python stand-ins for machinery CPython
-/// implements in C: `_seqtools` carries `map`/`filter`/`zip`/`enumerate`
-/// and friends, and the `_weave_*` modules are interpreter internals with
+/// implements in C: `_seqtools` carries the sequence and callable
+/// iterators, and the `_weave_*` modules are interpreter internals with
 /// no CPython counterpart at all. CPython fires no trace events while C
 /// code runs, so a debugger must never see call/line/return/exception
 /// events from these frames (pdb's step over `string.capwords` — which
@@ -63091,6 +62975,7 @@ fn object_needs_vm_iter(o: &Object) -> bool {
             | Object::Coroutine(_)
             | Object::AsyncGenerator(_)
             | Object::Instance(_)
+            | Object::LazyIter(_)
     )
 }
 
@@ -63199,7 +63084,6 @@ pub(crate) fn builtin_needs_interp(name: &str) -> bool {
                 | "dir"
                 | "divmod"
                 | "extend"
-                | "filter"
                 | "float"
                 | "format"
                 | "getattr"
@@ -63213,7 +63097,6 @@ pub(crate) fn builtin_needs_interp(name: &str) -> bool {
                 | "len"
                 | "list"
                 | "locals"
-                | "map"
                 | "max"
                 | "memoryview"
                 | "min"
@@ -63235,7 +63118,6 @@ pub(crate) fn builtin_needs_interp(name: &str) -> bool {
                 // `__init__` builtins fall through unchanged.
                 | "__init__"
                 | "vars"
-                | "zip"
                 | "open"
                 | "fspath"
                 | "fsdecode"
@@ -66213,16 +66095,6 @@ fn is_union_eligible(obj: &Object) -> bool {
         || is_pep604_union(obj).is_some()
         || is_generic_alias(obj)
         || is_typevar_like(obj)
-        || is_builtin_callable_type(obj)
-}
-
-/// `map`/`filter`/`zip` are real (subclassable) types in CPython but
-/// WeavePy dispatches *calls* to them through fast builtin functions
-/// (the `_seqtools` classes back subclassing — see the bases-resolution
-/// seam). For PEP 604 they must behave like the types they stand for:
-/// `list | map | set` is a valid union (test_types test_or_types_operator).
-fn is_builtin_callable_type(obj: &Object) -> bool {
-    matches!(obj, Object::Builtin(b) if matches!(b.name, "map" | "filter" | "zip"))
 }
 
 /// True if `obj` is a PEP 695 / `typing.TypeVar`-shaped placeholder (a
@@ -66246,7 +66118,6 @@ fn is_union_initiator(obj: &Object) -> bool {
         || is_pep604_union(obj).is_some()
         || is_generic_alias(obj)
         || is_typevar_like(obj)
-        || is_builtin_callable_type(obj)
 }
 
 /// Detect whether `obj` is a PEP 604 union. Returns the flattened
@@ -67818,12 +67689,6 @@ fn compare_str(a: &str, b: &str, op: CompareKind) -> bool {
 // ---------- public re-exports ----------
 
 pub use object::Object as Value;
-
-/// The `_seqtools` classes behind `map` and `filter`.
-struct SeqTools {
-    map: Rc<TypeObject>,
-    filter: Rc<TypeObject>,
-}
 
 #[cfg(test)]
 mod tests {

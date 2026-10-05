@@ -73,6 +73,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             "_register_classmethod_descriptor",
             register_classmethod_descriptor
         );
+        reg!("_register_types", register_types);
+        reg!("groupby_core", groupby_core);
+        reg!("grouper_core", grouper_core);
+        reg!("groupby_setstate", groupby_setstate);
     }
     Rc::new(PyModule {
         name: "_itertools".to_owned(),
@@ -180,16 +184,14 @@ fn islice(args: &[Object]) -> Result<Object, RuntimeError> {
     };
 
     let source = interp.iter_object(iterable.clone())?;
-    Ok(Object::LazyIter(Rc::new(PyLazyIter {
-        state: RefCell::new(LazyIterKind::Islice {
-            source,
-            next_idx: start,
-            pos: 0,
-            stop,
-            step,
-            done: false,
-        }),
-    })))
+    Ok(make_lazy(LazyIterKind::Islice {
+        source,
+        next_idx: start,
+        pos: 0,
+        stop,
+        step,
+        done: false,
+    }))
 }
 
 /// Non-negative machine int from a builtin-call argument.
@@ -213,16 +215,14 @@ fn islice_core(args: &[Object]) -> Result<Object, RuntimeError> {
         other => Some(nonneg_int(other, "stop")?),
     };
     let step = nonneg_int(step, "step")?.max(1);
-    Ok(Object::LazyIter(Rc::new(PyLazyIter {
-        state: RefCell::new(LazyIterKind::Islice {
-            source: source.clone(),
-            next_idx: start,
-            pos: 0,
-            stop,
-            step,
-            done: false,
-        }),
-    })))
+    Ok(make_lazy(LazyIterKind::Islice {
+        source: source.clone(),
+        next_idx: start,
+        pos: 0,
+        stop,
+        step,
+        done: false,
+    }))
 }
 
 /// `islice_set_cnt(core, cnt)` — `islice.__setstate__` restores the
@@ -254,12 +254,10 @@ fn repeat_core(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::Int(i) => Some((*i).max(0)),
         _ => return Err(type_error("repeat_core: times must be an int or None")),
     };
-    Ok(Object::LazyIter(Rc::new(PyLazyIter {
-        state: RefCell::new(LazyIterKind::Repeat {
-            obj: obj.clone(),
-            times,
-        }),
-    })))
+    Ok(make_lazy(LazyIterKind::Repeat {
+        obj: obj.clone(),
+        times,
+    }))
 }
 
 /// Live native [`TeeShared`]s keyed by the address of the Python
@@ -308,19 +306,15 @@ fn tee_core(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     };
     drop(guard);
-    Ok(Object::LazyIter(Rc::new(PyLazyIter {
-        state: RefCell::new(LazyIterKind::TeeBranch {
-            shared,
-            data: data.clone(),
-            index,
-        }),
-    })))
+    Ok(make_lazy(LazyIterKind::TeeBranch {
+        shared,
+        data: data.clone(),
+        index,
+    }))
 }
 
 fn make_lazy(kind: LazyIterKind) -> Object {
-    Object::LazyIter(Rc::new(PyLazyIter {
-        state: RefCell::new(kind),
-    }))
+    Object::LazyIter(Rc::new(PyLazyIter::new(kind)))
 }
 
 fn opt_obj(o: &Object) -> Option<Object> {
@@ -422,11 +416,536 @@ fn chain_from_iterable(args: &[Object]) -> Result<Object, RuntimeError> {
     let globals = interp.builtins_dict();
     let it = interp.make_iter(iterable, &globals)?;
     let core = chain_core(&[it, Object::None])?;
+    if cls.lazy_ctor.get() == K_CHAIN {
+        return Ok(with_class(core, cls));
+    }
     let inst = Rc::new(crate::types::PyInstance::new(cls.clone()));
     inst.dict_cell()
         .borrow_mut()
         .insert(DictKey(Object::from_static("_core")), core);
     Ok(Object::Instance(inst))
+}
+
+// ---------------------------------------------------------------------------
+// Native construction. The frozen `itertools.py` registers its exact
+// classes (`_register_types`); calling one builds the adapter here, with
+// no Python `__new__` frame, and the adapter itself is the instance: it
+// reports the class as its type, and the class's Python methods reach
+// its state through `self._core` (which an exact adapter answers with
+// itself). Any shape the native path doesn't take exactly (keywords it
+// doesn't know, arguments that would raise, a subclass) decides so before
+// any side effect and runs the class's own `__new__`.
+// ---------------------------------------------------------------------------
+
+pub(crate) const K_CHAIN: u8 = 1;
+const K_COUNT: u8 = 2;
+const K_REPEAT: u8 = 3;
+const K_CYCLE: u8 = 4;
+const K_ACCUMULATE: u8 = 5;
+const K_COMPRESS: u8 = 6;
+const K_DROPWHILE: u8 = 7;
+const K_TAKEWHILE: u8 = 8;
+const K_FILTERFALSE: u8 = 9;
+const K_STARMAP: u8 = 10;
+const K_ISLICE: u8 = 11;
+const K_PAIRWISE: u8 = 12;
+const K_ZIP_LONGEST: u8 = 13;
+const K_PRODUCT: u8 = 14;
+const K_PERMUTATIONS: u8 = 15;
+const K_COMBINATIONS: u8 = 16;
+const K_CWR: u8 = 17;
+const K_BATCHED: u8 = 18;
+const K_GROUPBY: u8 = 19;
+
+const KINDS: [(&str, u8); 19] = [
+    ("groupby", K_GROUPBY),
+    ("chain", K_CHAIN),
+    ("count", K_COUNT),
+    ("repeat", K_REPEAT),
+    ("cycle", K_CYCLE),
+    ("accumulate", K_ACCUMULATE),
+    ("compress", K_COMPRESS),
+    ("dropwhile", K_DROPWHILE),
+    ("takewhile", K_TAKEWHILE),
+    ("filterfalse", K_FILTERFALSE),
+    ("starmap", K_STARMAP),
+    ("islice", K_ISLICE),
+    ("pairwise", K_PAIRWISE),
+    ("zip_longest", K_ZIP_LONGEST),
+    ("product", K_PRODUCT),
+    ("permutations", K_PERMUTATIONS),
+    ("combinations", K_COMBINATIONS),
+    ("combinations_with_replacement", K_CWR),
+    ("batched", K_BATCHED),
+];
+
+/// `_register_types(namespace)`: mark the module's exact classes.
+fn register_types(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Dict(ns)] = args else {
+        return Err(type_error("_register_types expected a namespace dict"));
+    };
+    let ns = ns.borrow();
+    for (name, kind) in KINDS {
+        if let Some(Object::Type(cls)) = ns.get(&DictKey(Object::from_static(name))) {
+            cls.lazy_ctor.set(kind);
+        }
+    }
+    if let (Some(Object::Type(gb)), Some(Object::Type(gr))) = (
+        ns.get(&DictKey(Object::from_static("groupby"))),
+        ns.get(&DictKey(Object::from_static("_grouper"))),
+    ) {
+        GROUPER_CLASSES.with(|g| {
+            let mut g = g.borrow_mut();
+            g.retain(|(a, _)| a.strong_count() > 0);
+            g.push((Rc::downgrade(gb), Rc::downgrade(gr)));
+        });
+    }
+    Ok(Object::None)
+}
+
+type WeakType = crate::sync::Weak<crate::types::TypeObject>;
+
+thread_local! {
+    /// Each registered `groupby` class with the `_grouper` class its
+    /// groups report.
+    static GROUPER_CLASSES: std::cell::RefCell<Vec<(WeakType, WeakType)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The `_grouper` class registered with `groupby` class `cls`.
+fn grouper_class_for(cls: &crate::types::TypeObject) -> Option<Rc<crate::types::TypeObject>> {
+    GROUPER_CLASSES.with(|g| {
+        g.borrow()
+            .iter()
+            .find(|(gb, _)| std::ptr::eq(gb.as_ptr(), cls))
+            .and_then(|(_, gr)| gr.upgrade())
+    })
+}
+
+/// `groupby_core(iterator, key_or_None, grouper_class)`.
+fn groupby_core(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [source, keyfunc, grouper_cls] = args else {
+        return Err(type_error("groupby_core expected 3 arguments"));
+    };
+    Ok(make_lazy(LazyIterKind::GroupBy {
+        source: source.clone(),
+        keyfunc: keyfunc.clone(),
+        tgtkey: None,
+        currkey: None,
+        currvalue: None,
+        currgrouper: None,
+        grouper_cls: match grouper_cls {
+            Object::Type(t) => Some(t.clone()),
+            _ => None,
+        },
+    }))
+}
+
+/// `grouper_core(groupby_core, tgtkey)`: a group of `groupby_core`,
+/// installed as its current one (CPython's `_grouper_create`).
+fn grouper_core(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::LazyIter(parent), tgtkey] = args else {
+        return Err(type_error("incorrect usage of internal _grouper"));
+    };
+    if !matches!(&*parent.state.borrow(), LazyIterKind::GroupBy { .. }) {
+        return Err(type_error("incorrect usage of internal _grouper"));
+    }
+    let grouper = Rc::new(PyLazyIter::new(LazyIterKind::Grouper {
+        parent: parent.clone(),
+        tgtkey: tgtkey.clone(),
+    }));
+    if let LazyIterKind::GroupBy { currgrouper, .. } = &mut *parent.state.borrow_mut() {
+        *currgrouper = Some(Rc::downgrade(&grouper));
+    }
+    Ok(Object::LazyIter(grouper))
+}
+
+/// `groupby_setstate(core, currkey, currvalue, tgtkey)`.
+fn groupby_setstate(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::LazyIter(l), key, value, tgt] = args else {
+        return Err(type_error("groupby_setstate expected 4 arguments"));
+    };
+    let old = match &mut *l.state.borrow_mut() {
+        LazyIterKind::GroupBy {
+            currkey,
+            currvalue,
+            tgtkey,
+            ..
+        } => (
+            currkey.replace(key.clone()),
+            currvalue.replace(value.clone()),
+            tgtkey.replace(tgt.clone()),
+        ),
+        _ => return Err(type_error("groupby_setstate: not a groupby core")),
+    };
+    drop(old);
+    Ok(Object::None)
+}
+
+/// `core`, a freshly built adapter, as an instance of `cls` (a
+/// `groupby` also learns the class its groups report).
+fn with_class(core: Object, cls: &Rc<crate::types::TypeObject>) -> Object {
+    match core {
+        Object::LazyIter(mut l) => {
+            if let Some(slot) = Rc::get_mut(&mut l) {
+                slot.cls = Some(cls.clone());
+                if let LazyIterKind::GroupBy { grouper_cls, .. } = slot.state.get_mut() {
+                    *grouper_cls = grouper_class_for(cls);
+                }
+            }
+            Object::LazyIter(l)
+        }
+        other => other,
+    }
+}
+
+/// An `int` argument as CPython's index conversion would take it for
+/// the shapes the native path serves (`bool` included).
+fn small_int(o: &Object) -> Option<i64> {
+    match o {
+        Object::Int(i) => Some(*i),
+        Object::Bool(b) => Some(i64::from(*b)),
+        _ => None,
+    }
+}
+
+/// `islice` index: `None`, or an int in `0..=sys.maxsize`.
+fn islice_arg(o: &Object) -> Option<Object> {
+    match o {
+        Object::None => Some(Object::None),
+        _ => small_int(o).filter(|i| *i >= 0).map(Object::Int),
+    }
+}
+
+/// Unwrap a `Some(Ok(v))`, returning `None` (decline) or the error.
+macro_rules! take {
+    ($e:expr) => {
+        match $e {
+            None => return None,
+            Some(Err(e)) => return Some(Err(e)),
+            Some(Ok(v)) => v,
+        }
+    };
+}
+
+/// Build the adapter for `kind` from a call's arguments: `None` to run
+/// the class's own `__new__`, nothing having been done. `iter_of` is
+/// `iter(x)` and `pool_of` is `tuple(x)`; either may decline (the core
+/// loop's variants, which run no code), and only after every argument
+/// that could make the call decline has been checked.
+pub(crate) fn native_new(
+    kind: u8,
+    args: &[Object],
+    kwargs: &[(String, Object)],
+    iter_of: &mut dyn FnMut(&Object) -> Option<Result<Object, RuntimeError>>,
+    pool_of: &mut dyn FnMut(&Object) -> Option<Result<Object, RuntimeError>>,
+) -> Option<Result<Object, RuntimeError>> {
+    let n = args.len();
+    // The keywords a kind understands; any other declines.
+    let mut fillvalue = Object::None;
+    let mut repeat = 1i64;
+    let mut initial = Object::None;
+    let mut key = Object::None;
+    match kind {
+        K_GROUPBY => {
+            for (k, v) in kwargs {
+                if k != "key" {
+                    return None;
+                }
+                key = v.clone();
+            }
+        }
+        K_ACCUMULATE => {
+            for (k, v) in kwargs {
+                if k != "initial" {
+                    return None;
+                }
+                initial = v.clone();
+            }
+        }
+        K_ZIP_LONGEST => {
+            for (k, v) in kwargs {
+                if k != "fillvalue" {
+                    return None;
+                }
+                fillvalue = v.clone();
+            }
+        }
+        K_PRODUCT => {
+            for (k, v) in kwargs {
+                if k != "repeat" {
+                    return None;
+                }
+                repeat = small_int(v).filter(|r| *r >= 0)?;
+            }
+        }
+        _ if !kwargs.is_empty() => return None,
+        _ => {}
+    }
+    let core = match kind {
+        K_CHAIN => {
+            let source = Object::Iter(Rc::new(RefCell::new(
+                Object::new_tuple(args.to_vec()).make_iter().ok()?,
+            )));
+            chain_core(&[source, Object::None])
+        }
+        K_COUNT => {
+            let num = |o: &Object| {
+                matches!(
+                    o,
+                    Object::Int(_) | Object::Bool(_) | Object::Long(_) | Object::Float(_)
+                )
+            };
+            if n > 2 || !args.iter().all(num) {
+                return None;
+            }
+            let start = args.first().cloned().unwrap_or(Object::Int(0));
+            let step = args.get(1).cloned().unwrap_or(Object::Int(1));
+            count_core(&[start, step])
+        }
+        K_REPEAT => {
+            let times = match args {
+                [_] => Object::None,
+                [_, Object::None] => Object::None,
+                [_, t] => Object::Int(small_int(t)?.max(0)),
+                _ => return None,
+            };
+            repeat_core(&[args[0].clone(), times])
+        }
+        K_CYCLE => {
+            let [it] = args else {
+                return None;
+            };
+            let source = take!(iter_of(it));
+            Ok(make_lazy(LazyIterKind::Cycle {
+                source: Some(source),
+                saved: Rc::new(RefCell::new(Vec::new())),
+                index: 0,
+                firstpass: false,
+            }))
+        }
+        K_ACCUMULATE => {
+            if !(1..=2).contains(&n) {
+                return None;
+            }
+            let func = args.get(1).cloned().unwrap_or(Object::None);
+            let source = take!(iter_of(&args[0]));
+            accumulate_core(&[source, func, Object::Bool(false), Object::None, initial])
+        }
+        K_COMPRESS => {
+            let [data, selectors] = args else {
+                return None;
+            };
+            let data = take!(iter_of(data));
+            let selectors = take!(iter_of(selectors));
+            compress_core(&[data, selectors])
+        }
+        K_DROPWHILE | K_TAKEWHILE | K_FILTERFALSE | K_STARMAP => {
+            let [func, it] = args else {
+                return None;
+            };
+            let source = take!(iter_of(it));
+            match kind {
+                K_DROPWHILE => dropwhile_core(&[func.clone(), source, Object::Bool(false)]),
+                K_TAKEWHILE => takewhile_core(&[func.clone(), source, Object::Bool(false)]),
+                K_FILTERFALSE => filterfalse_core(&[func.clone(), source]),
+                _ => starmap_core(&[func.clone(), source]),
+            }
+        }
+        K_ISLICE => {
+            let (start, stop, step) = match args {
+                [_, stop] => (Object::Int(0), islice_arg(stop)?, Object::Int(1)),
+                [_, start, stop, rest @ ..] if rest.len() <= 1 => {
+                    let start = match islice_arg(start)? {
+                        Object::None => Object::Int(0),
+                        s => s,
+                    };
+                    let step = match rest {
+                        [] | [Object::None] => Object::Int(1),
+                        [s] => Object::Int(small_int(s).filter(|s| *s >= 1)?),
+                        _ => return None,
+                    };
+                    (start, islice_arg(stop)?, step)
+                }
+                _ => return None,
+            };
+            let source = take!(iter_of(&args[0]));
+            islice_core(&[source, start, stop, step])
+        }
+        K_PAIRWISE => {
+            let [it] = args else {
+                return None;
+            };
+            let source = take!(iter_of(it));
+            pairwise_core(&[source])
+        }
+        K_ZIP_LONGEST => {
+            let mut iters = Vec::with_capacity(n);
+            for a in args {
+                iters.push(take!(iter_of(a)));
+            }
+            zip_longest_core(&[fillvalue, Object::new_tuple(iters)])
+        }
+        K_PRODUCT => {
+            let mut pools = Vec::with_capacity(n);
+            for a in args {
+                pools.push(take!(pool_of(a)));
+            }
+            let repeat = usize::try_from(repeat).ok()?;
+            let mut all = Vec::with_capacity(pools.len().saturating_mul(repeat));
+            for _ in 0..repeat {
+                all.extend(pools.iter().cloned());
+            }
+            product_core(&[
+                Object::new_tuple(all),
+                Object::None,
+                Object::Bool(false),
+                Object::Bool(false),
+            ])
+        }
+        K_PERMUTATIONS => {
+            let r = match args {
+                [_] | [_, Object::None] => None,
+                [_, r] => Some(small_int(r).filter(|r| *r >= 0)?),
+                _ => return None,
+            };
+            let pool = take!(pool_of(&args[0]));
+            let len = match &pool {
+                Object::Tuple(t) => t.len() as i64,
+                _ => return None,
+            };
+            let r = r.unwrap_or(len);
+            permutations_core(&[
+                pool,
+                Object::Int(r),
+                Object::None,
+                Object::None,
+                Object::Bool(false),
+                Object::Bool(r > len),
+            ])
+        }
+        K_COMBINATIONS | K_CWR => {
+            let [it, r] = args else {
+                return None;
+            };
+            let r = small_int(r).filter(|r| *r >= 0)?;
+            let pool = take!(pool_of(it));
+            let len = match &pool {
+                Object::Tuple(t) => t.len() as i64,
+                _ => return None,
+            };
+            let stopped = if kind == K_CWR {
+                len == 0 && r > 0
+            } else {
+                r > len
+            };
+            let build = if kind == K_CWR {
+                cwr_core
+            } else {
+                combinations_core
+            };
+            build(&[
+                pool,
+                Object::Int(r),
+                Object::None,
+                Object::Bool(false),
+                Object::Bool(stopped),
+            ])
+        }
+        K_GROUPBY => {
+            let key = match args {
+                [_] => key,
+                [_, k] if kwargs.is_empty() => k.clone(),
+                _ => return None,
+            };
+            let source = take!(iter_of(&args[0]));
+            groupby_core(&[source, key, Object::None])
+        }
+        K_BATCHED => {
+            let [it, size] = args else {
+                return None;
+            };
+            let size = small_int(size).filter(|s| *s >= 1)?;
+            let source = take!(iter_of(it));
+            batched_core(&[source, Object::Int(size), Object::Bool(false)])
+        }
+        _ => return None,
+    };
+    Some(core)
+}
+
+/// `iter(x)` for the core loop: an iterator is its own, a native
+/// container builds one; anything that might run code declines.
+fn pure_iter(o: &Object) -> Option<Result<Object, RuntimeError>> {
+    match o {
+        Object::Iter(_) | Object::Generator(_) | Object::LazyIter(_) => Some(Ok(o.clone())),
+        Object::List(_)
+        | Object::Tuple(_)
+        | Object::Str(_)
+        | Object::Range(_)
+        | Object::Dict(_)
+        | Object::Set(_)
+        | Object::FrozenSet(_)
+        | Object::Bytes(_) => Some(Ok(Object::Iter(Rc::new(RefCell::new(o.make_iter().ok()?))))),
+        _ => None,
+    }
+}
+
+/// `tuple(x)` for the core loop, over a tuple or a list.
+fn pure_pool(o: &Object) -> Option<Result<Object, RuntimeError>> {
+    match o {
+        Object::Tuple(_) => Some(Ok(o.clone())),
+        Object::List(l) => Some(Ok(Object::new_tuple(l.try_borrow().ok()?.clone()))),
+        _ => None,
+    }
+}
+
+/// `cls(*args)` for a registered exact class, built without running any
+/// code (the core loop's `CALL`): `None` for every other shape.
+pub(crate) fn native_new_pure(
+    cls: &Rc<crate::types::TypeObject>,
+    args: &[Object],
+) -> Option<Object> {
+    let core = native_new(
+        cls.lazy_ctor.get(),
+        args,
+        &[],
+        &mut pure_iter,
+        &mut pure_pool,
+    )?
+    .ok()?;
+    Some(with_class(core, cls))
+}
+
+/// `cls(*args, **kwargs)` for a registered exact class: `None` to run
+/// the class's own `__new__`.
+pub(crate) fn native_new_interp(
+    interp: &mut crate::Interpreter,
+    cls: &Rc<crate::types::TypeObject>,
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Option<Result<Object, RuntimeError>> {
+    let globals = interp.builtins_dict();
+    let cell = RefCell::new(interp);
+    let mut iter_of = |o: &Object| Some(cell.borrow_mut().make_iter(o, &globals));
+    let mut pool_of = |o: &Object| {
+        Some(
+            cell.borrow_mut()
+                .collect_iterable(o, &globals)
+                .map(|v| match o {
+                    Object::Tuple(_) => o.clone(),
+                    _ => Object::new_tuple(v),
+                }),
+        )
+    };
+    let core = native_new(
+        cls.lazy_ctor.get(),
+        args,
+        kwargs,
+        &mut iter_of,
+        &mut pool_of,
+    )?;
+    Some(core.map(|c| with_class(c, cls)))
 }
 
 /// `compress_core(data, selectors)`.
@@ -791,6 +1310,45 @@ fn lazy_state(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Int(*n as i64),
             Object::Bool(*strict),
         ],
+        LazyIterKind::GroupBy {
+            source,
+            keyfunc,
+            tgtkey,
+            currkey,
+            currvalue,
+            ..
+        } => {
+            // A cleared (NULL) field is an empty tuple, a set one a 1-tuple.
+            let field = |o: &Option<Object>| match o {
+                Some(v) => Object::new_tuple_array([v.clone()]),
+                None => Object::new_tuple_array([]),
+            };
+            vec![
+                source.clone(),
+                keyfunc.clone(),
+                field(tgtkey),
+                field(currkey),
+                field(currvalue),
+            ]
+        }
+        LazyIterKind::Grouper { parent, tgtkey } => {
+            let current = matches!(
+                &*parent.state.borrow(),
+                LazyIterKind::GroupBy { currgrouper: Some(w), .. }
+                    if std::ptr::eq(w.as_ptr(), Rc::as_ptr(l))
+            );
+            vec![
+                Object::LazyIter(parent.clone()),
+                tgtkey.clone(),
+                Object::Bool(current),
+            ]
+        }
+        LazyIterKind::Map { .. }
+        | LazyIterKind::Filter { .. }
+        | LazyIterKind::Zip { .. }
+        | LazyIterKind::Enumerate { .. } => {
+            return Err(type_error("lazy_state: not a native itertools core"))
+        }
     };
     Ok(Object::new_tuple(items))
 }

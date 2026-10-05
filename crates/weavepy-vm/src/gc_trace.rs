@@ -2111,6 +2111,7 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
                 }
             }
         }
+        Object::LazyIter(l) => l.gc_referents(visit),
         Object::Builtin(_)
         | Object::Generator(_)
         | Object::Coroutine(_)

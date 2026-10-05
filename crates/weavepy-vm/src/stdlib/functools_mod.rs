@@ -32,10 +32,19 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("_partial_call")),
             Object::Builtin(Rc::new(BuiltinFn {
-                name: "__call__",
+                name: PARTIAL_CALL_NAME,
                 binds_instance: false,
                 call: Box::new(|args| partial_call(args, &[])),
                 call_kw: Some(Box::new(partial_call)),
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("_partial_new_for")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "_partial_new_for",
+                binds_instance: false,
+                call: Box::new(partial_new_for),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -73,9 +82,169 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     })
 }
 
+/// What a `partial` class's native `__new__` knows about it (see
+/// [`partial_new_for`]): the class, the `Placeholder` singleton, and the
+/// pure-Python `__new__` that serves every shape [`partial_new`] doesn't.
+struct PartialReg {
+    cls: crate::sync::Weak<crate::types::TypeObject>,
+    placeholder: Object,
+    py_new: Object,
+}
+
+/// `_partial_new_for(partial, Placeholder, _partial_new)`: the native
+/// `__new__` for this `functools` module's `partial` class (a fresh
+/// import of `functools` makes its own).
+fn partial_new_for(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls), placeholder, py_new] = args else {
+        return Err(type_error(
+            "_partial_new_for expected (partial, Placeholder, __new__)",
+        ));
+    };
+    let reg = Rc::new(PartialReg {
+        cls: Rc::downgrade(cls),
+        placeholder: placeholder.clone(),
+        py_new: py_new.clone(),
+    });
+    let reg_kw = reg.clone();
+    Ok(Object::Builtin(Rc::new(BuiltinFn {
+        name: "__new__",
+        binds_instance: false,
+        call: Box::new(move |args| partial_new(&reg, args, &[])),
+        call_kw: Some(Box::new(move |args, kwargs| {
+            partial_new(&reg_kw, args, kwargs)
+        })),
+    })))
+}
+
+/// The native `partial.__call__`'s name (the dispatch loop recognizes
+/// it; the visible name is `__call__`).
+pub(crate) const PARTIAL_CALL_NAME: &str = ".partial.__call__";
+
+/// The call a `partial` instance stands for, as the dispatch loop can make
+/// it directly: its function, and the one stored positional argument to
+/// pass first (`Unbound` for none). `None` when the partial has keywords,
+/// placeholders, or more than one stored argument.
+pub(crate) fn partial_inline(inst: &crate::types::PyInstance) -> Option<(Object, Object)> {
+    with_partial_fields(inst, |[func, args, kw, phcount]| {
+        if !matches!(phcount, Object::Int(0)) {
+            return None;
+        }
+        let Object::Dict(kw) = kw else {
+            return None;
+        };
+        // SAFETY: a read that runs no code.
+        if !unsafe { kw.peek() }?.is_empty() {
+            return None;
+        }
+        let Object::Tuple(args) = args else {
+            return None;
+        };
+        let first = match &args[..] {
+            [] => Object::Unbound,
+            [a] => a.clone(),
+            _ => return None,
+        };
+        Some((func.clone(), first))
+    })
+    .flatten()
+}
+
+thread_local! {
+    /// The interned names of a partial's first four slots.
+    static PARTIAL_KEYS: [crate::shared_value::SharedStr; 4] = PARTIAL_SLOTS[..4]
+        .iter()
+        .map(|name| match crate::stdlib::sys::intern_name(name) {
+            Object::Str(s) => s,
+            _ => unreachable!("interned names are strs"),
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("four names"));
+}
+
+/// `f` over a partial instance's `_func`, `_args`, `_keywords`, and
+/// `_phcount` slots, read in place when they lead its slot store (as
+/// both constructors lay them out): `None` otherwise.
+fn with_partial_fields<R>(
+    inst: &crate::types::PyInstance,
+    f: impl FnOnce([&Object; 4]) -> R,
+) -> Option<R> {
+    PARTIAL_KEYS.with(|keys| {
+        // SAFETY: a read; `f` runs no code that could borrow the slots.
+        let slots = unsafe { inst.slots.peek() }?;
+        let fields = slots.leading_interned([&keys[0], &keys[1], &keys[2], &keys[3]])?;
+        Some(f(fields))
+    })
+}
+
+/// The slots of a `partial` instance, in the order [`partial_new`]
+/// stores them.
+const PARTIAL_SLOTS: [&str; 5] = ["_func", "_args", "_keywords", "_phcount", "_merger"];
+
+/// `partial.__new__(cls, func, /, *args, **keywords)` for the common
+/// shape: a callable that isn't itself a partial, and no `Placeholder`.
+/// Everything else (merging a partial's arguments, placeholders, and
+/// every error) runs the pure-Python `__new__`.
+fn partial_new(
+    reg: &PartialReg,
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let interp = crate::builtins::reentrant_interp()?;
+    let (placeholder, py_new) = (&reg.placeholder, &reg.py_new);
+    let Some(cls) = reg.cls.upgrade() else {
+        let globals = interp.builtins_dict();
+        return interp.call(py_new, args, kwargs, &globals);
+    };
+    if let [Object::Type(sub)] = args {
+        return Err(type_error(format!(
+            "type '{}' takes at least one argument",
+            sub.name
+        )));
+    }
+    let simple = match args {
+        [Object::Type(sub), func, rest @ ..] => {
+            sub.is_subclass_of(&cls)
+                && crate::builtins::object_is_callable(func)
+                && !matches!(func, Object::Instance(i) if i.cls().is_subclass_of(&cls))
+                && !rest.iter().any(|a| a.is_same(placeholder))
+                && !kwargs.iter().any(|(_, v)| v.is_same(placeholder))
+        }
+        _ => false,
+    };
+    if !simple {
+        let globals = interp.builtins_dict();
+        return interp.call(py_new, args, kwargs, &globals);
+    }
+    let Object::Type(sub) = &args[0] else {
+        unreachable!("checked above");
+    };
+    let mut kw = DictData::default();
+    for (k, v) in kwargs {
+        kw.insert(DictKey(Object::from_str(k.clone())), v.clone());
+    }
+    let keywords = Object::Dict(Rc::new(RefCell::new(kw)));
+    crate::gc_trace::track(&keywords);
+    let values = [
+        args[1].clone(),
+        Object::new_tuple(args[2..].to_vec()),
+        keywords,
+        Object::Int(0),
+        Object::None,
+    ];
+    let inst = crate::types::PyInstance::new(sub.clone());
+    for (name, v) in PARTIAL_SLOTS.iter().zip(values) {
+        inst.slot_set(name, v);
+    }
+    let obj = Object::Instance(Rc::new(inst));
+    crate::gc_trace::track(&obj);
+    Ok(obj)
+}
+
 /// `partial.__call__(self, /, *args, **keywords)` without a Python
 /// frame: merge stored args/keywords with the call's and tail-call
-/// `self.func` through the interpreter.
+/// `self.func` through the interpreter. Like CPython's `partial_call`, it
+/// reads the instance's own fields, never the (overridable) attributes.
 fn partial_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
         return Err(type_error(
@@ -87,27 +256,57 @@ fn partial_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     let slf = args.first().ok_or_else(|| {
         type_error("descriptor '__call__' of 'functools.partial' object needs an argument")
     })?;
+    let fields = match slf {
+        Object::Instance(inst) => with_partial_fields(inst, |[f, a, k, p]| {
+            (f.clone(), a.clone(), k.clone(), p.clone())
+        })
+        .or_else(|| {
+            let slots = inst.slots.borrow();
+            let mut out: [Option<Object>; 4] = Default::default();
+            for (slot, name) in out.iter_mut().zip(PARTIAL_SLOTS) {
+                *slot = slots.get(name).cloned();
+            }
+            match out {
+                [Some(f), Some(a), Some(k), Some(p)] => Some((f, a, k, p)),
+                _ => None,
+            }
+        }),
+        _ => None,
+    };
+    let (func, stored_args, stored_kw, phcount) = match fields {
+        Some(f) => f,
+        None => (
+            interp.load_attr_public(slf, "func")?,
+            interp.load_attr_public(slf, "args")?,
+            interp.load_attr_public(slf, "keywords")?,
+            interp.load_attr_public(slf, "_phcount")?,
+        ),
+    };
     // 3.14 `functools.Placeholder`: a partial with placeholders merges
     // call-site positionals into the stored tuple. That path stays in
     // the frozen `functools.py` (`_partial_call_py`); the native fast
     // path covers the common placeholder-free case.
-    if let Ok(phcount) = interp.load_attr_public(slf, "_phcount") {
-        if !matches!(phcount, Object::Int(0)) {
-            let py_call = interp.load_attr_public(slf, "_partial_call_py")?;
-            let globals = interp.builtins_dict();
-            return interp.call(&py_call, &args[1..], kwargs, &globals);
-        }
+    if !matches!(phcount, Object::Int(0)) {
+        let py_call = interp.load_attr_public(slf, "_partial_call_py")?;
+        let globals = interp.builtins_dict();
+        return interp.call(&py_call, &args[1..], kwargs, &globals);
     }
-    let func = interp.load_attr_public(slf, "func")?;
-    let stored_args = interp.load_attr_public(slf, "args")?;
-    let stored_kw = interp.load_attr_public(slf, "keywords")?;
 
-    let mut call_args: Vec<Object> = match &stored_args {
-        Object::Tuple(xs) => xs.to_vec(),
-        _ => return Err(type_error("partial 'args' must be a tuple")),
+    let Object::Tuple(stored) = &stored_args else {
+        return Err(type_error("partial 'args' must be a tuple"));
     };
+    let mut call_args: Vec<Object> = Vec::with_capacity(stored.len() + args.len() - 1);
+    call_args.extend(stored.iter().cloned());
     call_args.extend_from_slice(&args[1..]);
 
+    let globals = interp.builtins_dict();
+    let stored_empty = match &stored_kw {
+        Object::Dict(d) => d.borrow().is_empty(),
+        _ => false,
+    };
+    if stored_empty {
+        return interp.call(&func, &call_args, kwargs, &globals);
+    }
     let mut call_kwargs: Vec<(String, Object)> = Vec::new();
     if let Object::Dict(d) = &stored_kw {
         for (k, v) in d.borrow().iter() {
@@ -128,8 +327,6 @@ fn partial_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
             call_kwargs.push((k.clone(), v.clone()));
         }
     }
-
-    let globals = interp.builtins_dict();
     interp.call(&func, &call_args, &call_kwargs, &globals)
 }
 
@@ -880,11 +1077,18 @@ fn reduce(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runtim
     };
     // SAFETY: published by the enclosing VM frame on this thread.
     let interp = unsafe { &mut *ptr };
-    let function = args[0].clone();
-    let it = interp.iter_object(args[1].clone())?;
+    let function = &args[0];
+    let globals = interp.builtins_dict();
+    let it = match interp.make_iter(&args[1], &globals) {
+        Ok(it) => it,
+        Err(e) if crate::is_type_error(&e) => {
+            return Err(type_error("reduce() arg 2 must support iteration"))
+        }
+        Err(e) => return Err(e),
+    };
     let mut acc = match args.get(2) {
         Some(initial) => initial.clone(),
-        None => match interp.iter_next_object(it.clone())? {
+        None => match interp.iter_next(&it, &globals)? {
             Some(first) => first,
             None => {
                 return Err(type_error(
@@ -893,9 +1097,8 @@ fn reduce(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runtim
             }
         },
     };
-    let globals = interp.builtins_dict();
-    while let Some(x) = interp.iter_next_object(it.clone())? {
-        acc = interp.call(&function, &[acc, x], &[], &globals)?;
+    while let Some(x) = interp.iter_next(&it, &globals)? {
+        acc = interp.call(function, &[acc, x], &[], &globals)?;
     }
     Ok(acc)
 }

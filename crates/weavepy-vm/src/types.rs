@@ -673,6 +673,10 @@ pub struct TypeObject {
     /// are never cycle-collector tracked (like CPython's C types without
     /// `Py_TPFLAGS_HAVE_GC`), and the leaf guards key on the value.
     pub native_kind: Cell<u8>,
+    /// Non-zero for an exact `itertools` class whose calls build the
+    /// native adapter directly (see `stdlib::itertools_mod::native_new`):
+    /// the adapter's kind. A subclass has its own (zero) value.
+    pub lazy_ctor: Cell<u8>,
     /// Native-implementation state for such a class (see
     /// `stdlib::datetime_native`), set once.
     pub native_ext: std::sync::OnceLock<Rc<dyn std::any::Any + Send + Sync>>,
@@ -1081,6 +1085,7 @@ impl TypeObject {
             inst_dict_hint: std::sync::atomic::AtomicU32::new(0),
             shared_keys: crate::sync::LazyArc::new(),
             native_kind: Cell::new(0),
+            lazy_ctor: Cell::new(0),
             native_ext: std::sync::OnceLock::new(),
             abc_state: std::sync::OnceLock::new(),
             slot_names: RefCell::new(Vec::new()),
