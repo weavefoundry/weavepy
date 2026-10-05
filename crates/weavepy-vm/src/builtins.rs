@@ -2760,7 +2760,11 @@ fn slot_sizeof(args: &[Object]) -> Result<Object, RuntimeError> {
 fn slot_getstate(args: &[Object]) -> Result<Object, RuntimeError> {
     let o = one(args, "__getstate__")?;
     if let Object::Instance(inst) = o {
-        let slots = inst.slots_snapshot();
+        let mut slots = inst.slots_snapshot();
+        // Native storage under a name that isn't an identifier (an
+        // `OrderedDict`'s order, `stdlib::collections_odict`) is no
+        // attribute: CPython's C struct fields aren't pickled state.
+        slots.retain(|(name, _)| !name.starts_with('<'));
         let dict_is_empty = inst.dict.get().is_none_or(|dict| dict.borrow().is_empty());
         let dict_state = if dict_is_empty {
             Object::None
@@ -8424,6 +8428,7 @@ pub(crate) fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
                 watch: Some(crate::object::DictWatch::new(d)),
                 owner,
                 reverse: true,
+                odict: None,
             })))
         };
     match iterable {
@@ -13490,6 +13495,71 @@ fn dict_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
     found.ok_or_else(|| key_error_object(key.clone()))
 }
 
+/// The dict a `dict.__getitem__`/`__setitem__` leaf half serves: an exact
+/// dict, or the native payload of a dict-subclass instance.
+#[inline]
+fn leaf_dict_of(recv: &Object) -> Option<&Rc<RefCell<DictData>>> {
+    match recv {
+        Object::Dict(d) => Some(d),
+        Object::Instance(inst) => match inst.native.get()? {
+            Object::Dict(d) => Some(d),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `dict.__getitem__`'s leaf half (see `leaf_builtins::Fast`): a present
+/// `str`/`int` key, found by exact native equality. A miss (which a
+/// subclass may serve through `__missing__`) takes the full path.
+pub(crate) fn dict_getitem_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv, key] = args else {
+        return None;
+    };
+    let probe = crate::object::LeafProbe::new(key)?;
+    let d = leaf_dict_of(recv)?.try_borrow().ok()?;
+    d.get(&probe).map(|v| Ok(v.clone()))
+}
+
+/// `dict.__setitem__`'s leaf half: a `str`/`int` key replacing an
+/// exact-key entry, or inserting one no stored key could equal. Anything
+/// that could run Python (an exotic stored key, a dict watcher) takes the
+/// full path.
+pub(crate) fn dict_setitem_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv, key, value] = args else {
+        return None;
+    };
+    if crate::capi_watchers::dicts_active() {
+        return None;
+    }
+    let probe = crate::object::LeafProbe::new(key)?;
+    let cell = leaf_dict_of(recv)?;
+    let mut d = cell.try_borrow_mut().ok()?;
+    let (old, changed, added) = match d.get_mut(&probe) {
+        Some(slot) => {
+            let old = std::mem::replace(slot, value.clone());
+            let changed = !old.is_same(value);
+            (Some(old), changed, false)
+        }
+        None => {
+            if !probe.miss_is_exact() {
+                return None;
+            }
+            d.insert(DictKey(key.clone()), value.clone());
+            (None, true, true)
+        }
+    };
+    drop(d);
+    if added {
+        crate::object::dict_watch_bump(cell);
+    }
+    if changed {
+        crate::object::dict_mutation_event(cell);
+    }
+    drop(old);
+    Some(Ok(Object::None))
+}
+
 fn dict_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
     let key = args
@@ -13646,7 +13716,7 @@ fn dict_update(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
-fn dict_clear(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn dict_clear(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
     dict_view_no_args(args, "clear")?;
     let evicted: Vec<(DictKey, Object)> = d.borrow_mut().drain(..).collect();
@@ -13723,7 +13793,7 @@ fn tuple_index(args: &[Object]) -> Result<Object, RuntimeError> {
 
 // ---------- dict extras ----------
 
-fn dict_setdefault(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn dict_setdefault(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
     let key = match args.get(1) {
         Some(k) => DictKey(k.clone()),

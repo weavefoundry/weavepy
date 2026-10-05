@@ -810,6 +810,670 @@ fn deque_rotate_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     }
 }
 
+// ---------------------------------------------------------------------
+// `_tuplegetter`: the named tuple field descriptor.
+
+/// [`crate::types::TypeObject::collections_kind`] of the `_tuplegetter` class:
+/// the attribute paths read a named tuple field through one of its
+/// instances as a native tuple index (see [`tuplegetter_read`]).
+pub(crate) const DESCR_TUPLEGETTER: u8 = 1;
+
+/// The descriptor's field index lives in a slot whose name isn't an
+/// identifier: no Python code can reach (or rebind) it, so the index is
+/// fixed for the descriptor's life, as in CPython's C struct, and the
+/// attribute caches may remember it.
+const TG_INDEX: &str = "<index>";
+
+/// The field index of `desc` when it is an instance of a `_tuplegetter`
+/// class.
+#[inline]
+pub(crate) fn tuplegetter_index(desc: &crate::types::PyInstance) -> Option<usize> {
+    if desc.cls_raw().collections_kind.get() != DESCR_TUPLEGETTER {
+        return None;
+    }
+    let slots = desc.slots.try_borrow().ok()?;
+    match slots.get_hinted(0, TG_INDEX)? {
+        Object::Int(i) => usize::try_from(*i).ok(),
+        _ => None,
+    }
+}
+
+/// The field `desc` (a `_tuplegetter`) reads from the tuple-subclass
+/// instance `recv`, when it is in range (anything else is the Python
+/// `__get__`'s to raise).
+#[inline]
+pub(crate) fn tuplegetter_read(
+    desc: &crate::types::PyInstance,
+    recv: &crate::types::PyInstance,
+) -> Option<Object> {
+    let index = tuplegetter_index(desc)?;
+    match recv.native.get()? {
+        Object::Tuple(t) => t.get(index).cloned(),
+        _ => None,
+    }
+}
+
+/// `install_tuplegetter(cls)`: mark the `_tuplegetter` class (exactly; a
+/// subclass is never marked) for the native attribute paths.
+fn install_tuplegetter(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls)] = args else {
+        return Err(type_error("install_tuplegetter() expects a class"));
+    };
+    cls.collections_kind.set(DESCR_TUPLEGETTER);
+    Ok(Object::None)
+}
+
+/// `tuplegetter_init(desc, index)`: record the field index, once.
+fn tuplegetter_init(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Instance(desc), index] = args else {
+        return Err(type_error(
+            "tuplegetter_init() expects a descriptor and an index",
+        ));
+    };
+    let index = crate::builtins::coerce_index_i64(index)?;
+    if desc.slot_get(TG_INDEX).is_some() {
+        return Err(type_error("_tuplegetter index is already set"));
+    }
+    desc.slot_set(TG_INDEX, Object::Int(index));
+    Ok(Object::None)
+}
+
+fn tg_index(desc: &Object) -> Result<i64, RuntimeError> {
+    match desc {
+        Object::Instance(d) => match d.slot_get(TG_INDEX) {
+            Some(Object::Int(i)) => Ok(i),
+            _ => Err(type_error("uninitialized _tuplegetter")),
+        },
+        _ => Err(type_error("_tuplegetter expected")),
+    }
+}
+
+/// `tuplegetter_index(desc)`: the field index (for `__reduce__`).
+fn tuplegetter_index_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [desc] = args else {
+        return Err(type_error("tuplegetter_index() expects a descriptor"));
+    };
+    tg_index(desc).map(Object::Int)
+}
+
+/// `_tuplegetter.__get__(self, obj, type=None)`, as CPython's
+/// `tuplegetter_descr_get`: the descriptor itself through the class, the
+/// field through a tuple, and an error otherwise.
+fn tuplegetter_get(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (desc, obj) = match args {
+        [desc, obj] | [desc, obj, _] => (desc, obj),
+        _ => return Err(type_error("__get__ expected 1 or 2 arguments")),
+    };
+    let index = tg_index(desc)?;
+    let tuple = match obj {
+        Object::Tuple(t) => Some(t),
+        Object::Instance(i) => match i.native.get() {
+            Some(Object::Tuple(t)) => Some(t),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(tuple) = tuple else {
+        if matches!(obj, Object::None) {
+            return Ok(desc.clone());
+        }
+        return Err(type_error(format!(
+            "descriptor for index '{index}' for tuple subclasses doesn't apply to '{}' object",
+            crate::builtins::class_of(obj).name
+        )));
+    };
+    usize::try_from(index)
+        .ok()
+        .and_then(|i| tuple.get(i).cloned())
+        .ok_or_else(|| index_error("tuple index out of range"))
+}
+
+// ---------------------------------------------------------------------
+// `namedtuple` construction.
+
+/// A registered generated `__new__`: the function (weakly), the code
+/// object it was built with (held, so its address names it for the
+/// registry's life), and the field count.
+type NtNew = (
+    crate::sync::Weak<crate::object::PyFunction>,
+    Rc<weavepy_compiler::CodeObject>,
+    usize,
+);
+
+/// The generated `__new__` functions of named tuple classes (see
+/// [`namedtuple_new_shape`]).
+static NT_NEWS: parking_lot::Mutex<Vec<NtNew>> = parking_lot::Mutex::new(Vec::new());
+
+/// `namedtuple_register(new, nfields)`: `namedtuple()` vouches that `new`
+/// is its generated `lambda _cls, f1, …, fn: _tuple_new(_cls, (f1, …, fn))`
+/// (with `_tuple_new` bound to `tuple.__new__` in a namespace nothing else
+/// holds).
+fn namedtuple_register(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Function(f), Object::Int(n)] = args else {
+        return Err(type_error(
+            "namedtuple_register() expects a function and a count",
+        ));
+    };
+    let n = usize::try_from(*n).map_err(|_| type_error("negative field count"))?;
+    let code = f.code();
+    let mut reg = NT_NEWS.lock();
+    reg.retain(|(w, _, _)| w.strong_count() > 0);
+    reg.push((Rc::downgrade(f), code, n));
+    Ok(Object::None)
+}
+
+/// When `f` is a registered named tuple `__new__`: the address of the code
+/// object it was registered with and its field count. A class whose
+/// `__new__` is `f` builds `cls(*fields)` as the tuple directly while `f`
+/// still runs that code (see `Interpreter::instantiate_named_tuple`).
+pub(crate) fn namedtuple_new_shape(f: &Rc<crate::object::PyFunction>) -> Option<(usize, usize)> {
+    let reg = NT_NEWS.lock();
+    reg.iter()
+        .find(|(w, _, _)| std::ptr::eq(w.as_ptr(), Rc::as_ptr(f)) && w.strong_count() > 0)
+        .map(|(_, code, n)| (Rc::as_ptr(code) as usize, *n))
+}
+
+/// The generated `_make` functions of named tuple classes, with the code
+/// each was registered with (see [`namedtuple_replace`]).
+static NT_MAKES: parking_lot::Mutex<Vec<NtNew>> = parking_lot::Mutex::new(Vec::new());
+
+/// `namedtuple_register_make(make, nfields)`: `namedtuple()` vouches that
+/// `make` is its generated `_make` (`tuple.__new__(cls, iterable)` plus
+/// the length check).
+fn namedtuple_register_make(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Function(f), Object::Int(n)] = args else {
+        return Err(type_error(
+            "namedtuple_register_make() expects a function and a count",
+        ));
+    };
+    let n = usize::try_from(*n).map_err(|_| type_error("negative field count"))?;
+    let code = f.code();
+    let mut reg = NT_MAKES.lock();
+    reg.retain(|(w, _, _)| w.strong_count() > 0);
+    reg.push((Rc::downgrade(f), code, n));
+    Ok(Object::None)
+}
+
+/// A named tuple instance of `cls` holding `items`: what
+/// `tuple.__new__(cls, items)` builds for a tuple subclass.
+///
+/// A tuple of atomic values can't close a cycle, so (unless the class has
+/// a finalizer) the instance's cycle-collector tracking is deferred until
+/// it could hold something else (a `__dict__` or slot store), as for a
+/// plain instance; CPython likewise untracks such tuples. The flag says
+/// whether it was tracked now.
+pub(crate) fn new_named_tuple(
+    cls: &Rc<crate::types::TypeObject>,
+    items: Vec<Object>,
+) -> (Object, bool) {
+    let atomic = items.iter().all(Object::is_gc_atomic) && !cls.instances_need_finalize();
+    let inst = crate::types::PyInstance::with_native(cls.clone(), Object::new_tuple(items));
+    if atomic {
+        inst.deferred.set(true);
+        return (Object::Instance(Rc::new(inst)), false);
+    }
+    let inst = Object::Instance(Rc::new(inst));
+    crate::gc_trace::track(&inst);
+    (inst, true)
+}
+
+fn named_tuple_of(cls: &Rc<crate::types::TypeObject>, items: Vec<Object>) -> Object {
+    new_named_tuple(cls, items).0
+}
+
+/// `namedtuple_make(cls, iterable, nfields)`: the body of a generated
+/// `_make` for an exact `tuple` or `list` argument; `None` (nothing done)
+/// for any other iterable, which the Python body handles.
+fn namedtuple_make(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls), iterable, Object::Int(n)] = args else {
+        return Err(type_error(
+            "namedtuple_make() expects a class, an iterable and a count",
+        ));
+    };
+    if !cls.is_subclass_of(&crate::builtin_types::builtin_types().tuple_) {
+        return Ok(Object::None);
+    }
+    let items: Vec<Object> = match iterable {
+        Object::Tuple(t) => t.iter().cloned().collect(),
+        Object::List(l) => l.borrow().clone(),
+        _ => return Ok(Object::None),
+    };
+    if items.len() as i64 != *n {
+        return Err(type_error(format!(
+            "Expected {n} arguments, got {}",
+            items.len()
+        )));
+    }
+    Ok(named_tuple_of(cls, items))
+}
+
+/// `namedtuple_replace(self, kwds, field_names)`: the body of a generated
+/// `_replace` (`self._make(map(kwds.pop, field_names, self))`) when
+/// `type(self)._make` is still a generated `_make`, each named field
+/// popped from `kwds`; `None` (nothing done, `kwds` untouched) otherwise.
+/// The caller reports what is left in `kwds`.
+fn namedtuple_replace(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Instance(inst), Object::Dict(kwds), Object::Tuple(fields)] = args else {
+        return Ok(Object::None);
+    };
+    let Some(Object::Tuple(values)) = inst.native.get() else {
+        return Ok(Object::None);
+    };
+    if values.len() != fields.len() {
+        return Ok(Object::None);
+    }
+    let cls = inst.cls();
+    let Some(Object::ClassMethod(make)) = cls.lookup("_make") else {
+        return Ok(Object::None);
+    };
+    let Object::Function(f) = make.func() else {
+        return Ok(Object::None);
+    };
+    let registered = NT_MAKES.lock().iter().any(|(w, code, n)| {
+        std::ptr::eq(w.as_ptr(), Rc::as_ptr(&f))
+            && w.strong_count() > 0
+            && *n == values.len()
+            && Rc::ptr_eq(&f.code(), code)
+    });
+    if !registered {
+        return Ok(Object::None);
+    }
+    let mut items = Vec::with_capacity(values.len());
+    for (name, value) in fields.iter().zip(values.iter()) {
+        items.push(match crate::builtins::dict_remove(kwds, name)? {
+            Some((_, v)) => v,
+            None => value.clone(),
+        });
+    }
+    Ok(named_tuple_of(&cls, items))
+}
+
+// ---------------------------------------------------------------------
+// `ChainMap`.
+
+/// `self.maps` of a `ChainMap` (an instance attribute, unless the class
+/// makes `maps` something else).
+fn chainmap_maps(interp: &mut crate::Interpreter, recv: &Object) -> Result<Object, RuntimeError> {
+    if let Object::Instance(inst) = recv {
+        if inst.cls_raw().lookup("maps").is_none() {
+            if let Some(maps) = inst.attr_get_str("maps") {
+                return Ok(maps);
+            }
+        }
+    }
+    interp.load_attr_public(recv, "maps")
+}
+
+/// The `index`th mapping of `maps` (a list, read live as the Python loop
+/// iterates it), or `None` past its end.
+fn nth_map(maps: &Object, index: usize) -> Option<Object> {
+    match maps {
+        Object::List(l) => l.borrow().get(index).cloned(),
+        Object::Tuple(t) => t.get(index).cloned(),
+        _ => None,
+    }
+}
+
+/// `ChainMap.__getitem__(self, key)`: the first mapping's value for `key`
+/// (`mapping[key]`, a `KeyError` passing to the next mapping), else
+/// `self.__missing__(key)` — the Python method's loop, with an exact
+/// dict's miss settled without raising.
+fn chainmap_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [recv, key] = args else {
+        return Err(type_error(format!(
+            "__getitem__() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    };
+    let interp = crate::builtins::reentrant_interp()?;
+    let maps = chainmap_maps(interp, recv)?;
+    if !matches!(maps, Object::List(_) | Object::Tuple(_)) {
+        // Another iterable of mappings: the generic loop.
+        let globals = interp.builtins_dict();
+        let it = interp.make_iter(&maps, &globals)?;
+        while let Some(mapping) = interp.iter_next(&it, &globals)? {
+            if let Some(v) = chainmap_probe(interp, &mapping, key)? {
+                return Ok(v);
+            }
+        }
+    } else {
+        let mut i = 0;
+        while let Some(mapping) = nth_map(&maps, i) {
+            if let Some(v) = chainmap_probe(interp, &mapping, key)? {
+                return Ok(v);
+            }
+            i += 1;
+        }
+    }
+    let missing = interp.load_attr_public(recv, "__missing__")?;
+    interp.call_object(missing, std::slice::from_ref(key), &[])
+}
+
+/// [`chainmap_getitem`]'s leaf half (see `leaf_builtins::Fast`): a plain
+/// key found by exact native equality in a list of exact dicts held in
+/// the instance's own `maps` attribute. A key no map holds (the
+/// `__missing__` call), or anything that could run Python, declines.
+fn chainmap_getitem_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(inst), key] = args else {
+        return None;
+    };
+    if crate::object::exotic_str_keys_possible() || inst.cls_raw().lookup("maps").is_some() {
+        return None;
+    }
+    let Object::List(maps) = inst.attr_get_str("maps")? else {
+        return None;
+    };
+    let probe = crate::object::LeafProbe::new(key)?;
+    let maps = maps.try_borrow().ok()?;
+    for mapping in maps.iter() {
+        let Object::Dict(d) = mapping else {
+            return None;
+        };
+        let d = d.try_borrow().ok()?;
+        match d.get(&probe) {
+            Some(v) => return Some(Ok(v.clone())),
+            None if probe.miss_is_exact() => {}
+            None => return None,
+        }
+    }
+    None
+}
+
+/// `mapping[key]`, with a `KeyError` (or subclass) reported as `None`.
+fn chainmap_probe(
+    interp: &mut crate::Interpreter,
+    mapping: &Object,
+    key: &Object,
+) -> Result<Option<Object>, RuntimeError> {
+    if let Object::Dict(d) = mapping {
+        crate::builtins::ensure_dict_key(key)?;
+        return crate::builtins::dict_lookup(d, key);
+    }
+    match interp.subscr_get_public(mapping, key) {
+        Ok(v) => Ok(Some(v)),
+        Err(RuntimeError::PyException(e)) => {
+            let key_error = Object::Type(crate::builtin_types::builtin_types().key_error.clone());
+            if interp.exception_matches(&e.instance, &key_error)? {
+                Ok(None)
+            } else {
+                Err(RuntimeError::PyException(e))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `ChainMap.__contains__(self, key)`: whether any mapping holds `key`.
+fn chainmap_contains(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [recv, key] = args else {
+        return Err(type_error(format!(
+            "__contains__() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    };
+    let interp = crate::builtins::reentrant_interp()?;
+    let maps = chainmap_maps(interp, recv)?;
+    let globals = interp.builtins_dict();
+    if !matches!(maps, Object::List(_) | Object::Tuple(_)) {
+        let it = interp.make_iter(&maps, &globals)?;
+        while let Some(mapping) = interp.iter_next(&it, &globals)? {
+            if interp.contains_full(&mapping, key, &globals)? {
+                return Ok(Object::Bool(true));
+            }
+        }
+        return Ok(Object::Bool(false));
+    }
+    let mut i = 0;
+    while let Some(mapping) = nth_map(&maps, i) {
+        if interp.contains_full(&mapping, key, &globals)? {
+            return Ok(Object::Bool(true));
+        }
+        i += 1;
+    }
+    Ok(Object::Bool(false))
+}
+
+// ---------------------------------------------------------------------
+// `defaultdict`.
+
+/// The `default_factory` member's docstring (CPython's `defdict_members`).
+const DD_FACTORY_DOC: &str = "Factory for default value called by __missing__().";
+
+/// `install_defaultdict(cls)`: turn the class's `default_factory` slot
+/// into CPython's member descriptor: unset (never assigned, or deleted)
+/// reads as `None`. The `__slots__` declaration that made the slot is an
+/// implementation detail the C type doesn't have, so it leaves the class
+/// dict (the layout it set up, no instance `__dict__` and no weak
+/// references, stays, as in CPython).
+fn install_defaultdict(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls)] = args else {
+        return Err(type_error("install_defaultdict() expects a class"));
+    };
+    let desc = Object::SlotDescriptor(Rc::new(crate::object::SlotDescriptor {
+        name: "default_factory".to_owned(),
+        class_name: cls.name.clone(),
+        default: Some(Object::None),
+        readonly: false,
+        doc: Some(DD_FACTORY_DOC),
+        objclass: RefCell::new(Some(Rc::downgrade(cls))),
+    }));
+    {
+        let mut d = cls.dict.borrow_mut();
+        d.insert(DictKey(Object::from_static("default_factory")), desc);
+        d.shift_remove(&DictKey(Object::from_static("__slots__")));
+    }
+    cls.bump_attr_version();
+    Ok(Object::None)
+}
+
+/// `defaultdict.__init__(self, default_factory=None, /, *args, **kwds)`,
+/// as CPython's `defdict_init`: the factory (callable or `None`) is set
+/// first, then the rest initializes the dict.
+fn dd_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let Some(Object::Instance(inst)) = args.first() else {
+        return Err(type_error(
+            "descriptor '__init__' of 'collections.defaultdict' object needs an argument",
+        ));
+    };
+    let factory = args.get(1).cloned().unwrap_or(Object::None);
+    if !matches!(factory, Object::None) && !crate::builtins::object_is_callable(&factory) {
+        return Err(type_error("first argument must be callable or None"));
+    }
+    inst.slot_set("default_factory", factory);
+    if args.len() > 2 || !kwargs.is_empty() {
+        let init = crate::builtin_types::builtin_types()
+            .dict_
+            .dict
+            .borrow()
+            .get(&crate::object::StrKey("__init__"))
+            .cloned()
+            .ok_or_else(|| type_error("dict.__init__ is missing"))?;
+        let mut rest = Vec::with_capacity(args.len() - 1);
+        rest.push(args[0].clone());
+        rest.extend_from_slice(&args[2..]);
+        crate::builtins::reentrant_interp()?.call_object(init, &rest, kwargs)?;
+    }
+    Ok(Object::None)
+}
+
+/// A new value from one of the common factories, built natively: the
+/// value `int()`, `list()`, `dict()`, `set()`, `float()`, `str()` or
+/// `tuple()` returns.
+fn builtin_factory_value(factory: &Object) -> Option<Object> {
+    let Object::Type(t) = factory else {
+        return None;
+    };
+    let bt = crate::builtin_types::builtin_types();
+    Some(if Rc::ptr_eq(t, &bt.int_) {
+        Object::Int(0)
+    } else if Rc::ptr_eq(t, &bt.list_) {
+        Object::new_list(Vec::new())
+    } else if Rc::ptr_eq(t, &bt.dict_) {
+        Object::new_dict()
+    } else if Rc::ptr_eq(t, &bt.set_) {
+        Object::new_set()
+    } else if Rc::ptr_eq(t, &bt.float_) {
+        Object::Float(0.0)
+    } else if Rc::ptr_eq(t, &bt.str_) {
+        Object::from_static("")
+    } else if Rc::ptr_eq(t, &bt.tuple_) {
+        Object::new_tuple(Vec::new())
+    } else {
+        return None;
+    })
+}
+
+/// `defaultdict.__missing__(self, key)`, as CPython's `defdict_missing`:
+/// `KeyError(key)` without a factory; otherwise the factory's value,
+/// stored with `dict.setdefault` (the first value stored wins when the
+/// factory itself fills the key — gh-91618).
+fn dd_missing(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [recv, key] = args else {
+        return Err(type_error(format!(
+            "__missing__() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    };
+    let Object::Instance(inst) = recv else {
+        return Err(type_error(format!(
+            "descriptor '__missing__' for 'collections.defaultdict' objects doesn't apply to a '{}' object",
+            crate::builtins::class_of(recv).name
+        )));
+    };
+    let factory = inst.slot_get("default_factory").unwrap_or(Object::None);
+    if matches!(factory, Object::None) {
+        return Err(crate::error::key_error_object(key.clone()));
+    }
+    let value = match builtin_factory_value(&factory) {
+        Some(v) => v,
+        None => crate::builtins::reentrant_interp()?.call_object(factory, &[], &[])?,
+    };
+    if matches!(value, Object::List(_) | Object::Dict(_) | Object::Set(_)) {
+        crate::gc_trace::track(&value);
+    }
+    crate::builtins::dict_setdefault(&[recv.clone(), key.clone(), value])
+}
+
+// ---------------------------------------------------------------------
+// `_count_elements`.
+
+/// The dict a `Counter`-style tally may update directly: an exact dict,
+/// or a dict subclass whose class keeps `dict.get` and `dict.__setitem__`
+/// (CPython's `_count_elements` fast-path test).
+fn tally_dict(mapping: &Object) -> Option<Rc<RefCell<DictData>>> {
+    match mapping {
+        Object::Dict(d) => Some(d.clone()),
+        Object::Instance(inst) => {
+            let Some(Object::Dict(d)) = inst.native.get() else {
+                return None;
+            };
+            let cls = inst.cls_raw();
+            let bt = crate::builtin_types::builtin_types();
+            let same = |name: &str| {
+                let base = bt
+                    .dict_
+                    .dict
+                    .borrow()
+                    .get(&crate::object::StrKey(name))
+                    .cloned();
+                match (cls.lookup(name), base) {
+                    (Some(Object::Builtin(a)), Some(Object::Builtin(b))) => Rc::ptr_eq(&a, &b),
+                    _ => false,
+                }
+            };
+            (same("get") && same("__setitem__")).then(|| d.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Count one element into `d` (`d[key] = d.get(key, 0) + 1`).
+fn tally_one(
+    interp: &mut crate::Interpreter,
+    d: &Rc<RefCell<DictData>>,
+    key: &Object,
+) -> Result<(), RuntimeError> {
+    // A plain key and an `int` count: in place.
+    if let Some(probe) = crate::object::LeafProbe::new(key) {
+        if !crate::capi_watchers::dicts_active() {
+            if let Ok(mut m) = d.try_borrow_mut() {
+                match m.get_mut(&probe) {
+                    Some(Object::Int(n)) if *n < i64::MAX => {
+                        *n += 1;
+                        drop(m);
+                        crate::object::dict_mutation_event(d);
+                        return Ok(());
+                    }
+                    Some(_) => {}
+                    None if probe.miss_is_exact() => {
+                        m.insert(DictKey(key.clone()), Object::Int(1));
+                        drop(m);
+                        crate::object::dict_watch_bump(d);
+                        crate::object::dict_mutation_event(d);
+                        return Ok(());
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    crate::builtins::ensure_hashable(key)?;
+    let new = match crate::builtins::dict_lookup(d, key)? {
+        None => Object::Int(1),
+        Some(old) => {
+            interp.binary_op_public(&old, &Object::Int(1), weavepy_compiler::BinOpKind::Add)?
+        }
+    };
+    crate::builtins::dict_insert(d, key.clone(), new)?;
+    Ok(())
+}
+
+/// `count_elements(mapping, iterable)`: the tally `_count_elements` runs
+/// when `mapping` is a dict it may update directly (see [`tally_dict`]):
+/// `True` when done, `False` (nothing consumed) for the Python loop over
+/// `mapping.get` and `mapping[key] = …`.
+fn count_elements(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [mapping, iterable] = args else {
+        return Err(type_error(
+            "count_elements() expects a mapping and an iterable",
+        ));
+    };
+    let Some(d) = tally_dict(mapping) else {
+        return Ok(Object::Bool(false));
+    };
+    let interp = crate::builtins::reentrant_interp()?;
+    match iterable {
+        Object::Str(s) => {
+            for c in s.chars() {
+                tally_one(interp, &d, &Object::from_char(c))?;
+            }
+        }
+        Object::List(items) => {
+            // Snapshot-free: the list may change under a key's `__eq__`.
+            let mut i = 0;
+            loop {
+                let item = items.borrow().get(i).cloned();
+                let Some(item) = item else { break };
+                tally_one(interp, &d, &item)?;
+                i += 1;
+            }
+        }
+        Object::Tuple(items) => {
+            for item in items.iter() {
+                tally_one(interp, &d, item)?;
+            }
+        }
+        _ => {
+            let globals = interp.builtins_dict();
+            let it = interp.make_iter(iterable, &globals)?;
+            while let Some(item) = interp.iter_next(&it, &globals)? {
+                tally_one(interp, &d, &item)?;
+            }
+        }
+    }
+    Ok(Object::Bool(true))
+}
+
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::default()));
     {
@@ -842,12 +1506,97 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         reg("__iter__", "__iter__", deque_iter);
         reg("__reversed__", "__reversed__", deque_reversed);
         reg("iterator_index", "iterator_index", deque_iterator_index);
+        reg(
+            "install_tuplegetter",
+            "install_tuplegetter",
+            install_tuplegetter,
+        );
+        reg("tuplegetter_init", "tuplegetter_init", tuplegetter_init);
+        reg(
+            "tuplegetter_index",
+            "tuplegetter_index",
+            tuplegetter_index_builtin,
+        );
+        reg("tuplegetter_get", "__get__", tuplegetter_get);
+        reg(
+            "install_defaultdict",
+            "install_defaultdict",
+            install_defaultdict,
+        );
+        reg("dd_missing", "__missing__", dd_missing);
+        reg("count_elements", "count_elements", count_elements);
+        reg(
+            "namedtuple_register",
+            "namedtuple_register",
+            namedtuple_register,
+        );
+        reg(
+            "namedtuple_register_make",
+            "namedtuple_register_make",
+            namedtuple_register_make,
+        );
+        reg("namedtuple_make", "namedtuple_make", namedtuple_make);
+        reg("chainmap_getitem", "__getitem__", chainmap_getitem);
+        reg("chainmap_contains", "__contains__", chainmap_contains);
+        reg(
+            "namedtuple_replace",
+            "namedtuple_replace",
+            namedtuple_replace,
+        );
         reg("iterator_next", "__next__", deque_iterator_next);
         reg(
             "reverse_iterator_next",
             "__next__",
             deque_reverse_iterator_next,
         );
+        d.insert(
+            DictKey(Object::from_static("dd_init")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__init__",
+                binds_instance: true,
+                call: Box::new(|a: &[Object]| dd_init(a, &[])),
+                call_kw: Some(Box::new(dd_init)),
+            })),
+        );
+        // The `OrderedDict` methods (see `collections_odict`).
+        for (export, name, body, kw) in super::collections_odict::exports() {
+            d.insert(
+                DictKey(Object::from_static(export)),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name,
+                    binds_instance: true,
+                    call: Box::new(body),
+                    call_kw: kw.map(|kw| {
+                        Box::new(kw)
+                            as Box<
+                                dyn Fn(
+                                        &[Object],
+                                        &[(String, Object)],
+                                    )
+                                        -> Result<Object, RuntimeError>
+                                    + Send
+                                    + Sync,
+                            >
+                    }),
+                })),
+            );
+        }
+        for name in super::collections_odict::LEAVES {
+            if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
+                crate::leaf_builtins::register(b);
+            }
+        }
+        for (name, fast) in super::collections_odict::leaf_halves() {
+            if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
+                crate::leaf_builtins::register_fast(b, fast);
+                if let Some((_, names)) = super::collections_odict::leaf_kw_names()
+                    .into_iter()
+                    .find(|(n, _)| *n == name)
+                {
+                    crate::leaf_builtins::register_fast_kw(b, names, fast);
+                }
+            }
+        }
         // The end operations, length, truth, iterator construction, and
         // iterator steps run no Python code. Indexing and rotation require
         // an argument guard because index coercion can invoke Python's
@@ -863,6 +1612,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             "__reversed__",
             "iterator_next",
             "reverse_iterator_next",
+            "tuplegetter_get",
         ] {
             if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
                 crate::leaf_builtins::register(b);
@@ -874,6 +1624,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 deque_getitem_leaf as crate::leaf_builtins::Fast,
             ),
             ("rotate", deque_rotate_leaf as crate::leaf_builtins::Fast),
+            ("chainmap_getitem", chainmap_getitem_leaf),
         ] {
             if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
                 crate::leaf_builtins::register_fast(b, fast);
