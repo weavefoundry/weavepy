@@ -5,15 +5,25 @@ and `_count_elements` in C here; the verbatim `collections/__init__.py`
 imports each inside `try/except ImportError` and falls back to its
 pure-Python definitions when absent.
 
-WeavePy supplies the two containers that have *no* pure-Python fallback
-in the real module — `deque` and `defaultdict` — plus `_count_elements`,
-an `OrderedDict` with the C implementation's observable semantics
-(state-guarded iterators that pickle, gh-119004 mutation checks in
-`__eq__`), and `_tuplegetter`. The collections fallback for the latter —
-`property(_itemgetter(index))` — is observably different: a 3.13
-property picks up `__name__` via `__set_name__`, so `pydoc` prints a
-title line for namedtuple fields that CPython's C descriptor never has
-(test_pydoc test_namedtuple_field_descriptor).
+The classes here are Python classes whose hot methods are native builtins
+from `_weave_collections` (`stdlib/collections_native.rs` and
+`stdlib/collections_odict.rs`), with the C types' observable semantics:
+
+- `_tuplegetter`, the named tuple field descriptor, keeps its index in
+  native storage; the interpreter reads a field through it as a tuple item.
+  (The collections fallback, `property(_itemgetter(index))`, differs
+  observably: a property picks up `__name__` via `__set_name__`, so `pydoc`
+  prints a title line CPython's C descriptor never has, test_pydoc
+  test_namedtuple_field_descriptor.)
+- `defaultdict` has a `default_factory` member and native `__init__` and
+  `__missing__`.
+- `OrderedDict` keeps its order in a native keys-only dict beside its dict
+  payload, as the C type keeps a node list beside its dict.
+- `deque` keeps its items in a list with native end operations.
+- `_count_elements` tallies natively into a dict or a `Counter`.
+
+`collections.py` also adopts the native named tuple construction helpers
+and `ChainMap` lookups defined here.
 """
 
 __all__ = ["deque", "defaultdict", "OrderedDict", "_count_elements"]
@@ -69,10 +79,10 @@ from _weave_collections import (
     od_popitem as _od_popitem,
     od_reversed as _od_reversed,
     od_setdefault as _od_setdefault,
-    od_setitem as _od_setitem,
-    od_update_fast as _od_update_fast,
     od_items as _od_items,
     od_keys as _od_keys,
+    od_setitem as _od_setitem,
+    od_update_fast as _od_update_fast,
     od_values as _od_values,
     odv_items_iter as _odv_items_iter,
     odv_items_reversed as _odv_items_reversed,

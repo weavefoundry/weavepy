@@ -32266,6 +32266,12 @@ impl Interpreter {
             // we'd compute by default, so skip it to avoid recursion.
             if !Rc::ptr_eq(&meta, &builtin_types().type_) {
                 if let Some(hook) = meta.lookup("__instancecheck__") {
+                    // `abc.ABCMeta.__instancecheck__` only forwards to the
+                    // native `_abc_instancecheck`: called directly.
+                    if let Some(check) = crate::stdlib::abc_mod::forwarded_check(&hook, false) {
+                        let res = check(&[Object::Type(cls.clone()), obj.clone()])?;
+                        return Ok(Object::Bool(res.is_truthy()));
+                    }
                     // `dispatch` (not `new`) so a descriptor-wrapped hook
                     // honours its `__get__`: pandas builds `ABCSeries` etc.
                     // from a metaclass whose `__instancecheck__` is a
@@ -32423,6 +32429,12 @@ impl Interpreter {
             let meta = info_cls.metaclass_or_type();
             if !Rc::ptr_eq(&meta, &builtin_types().type_) {
                 if let Some(hook) = meta.lookup("__subclasscheck__") {
+                    // `abc.ABCMeta.__subclasscheck__` only forwards to the
+                    // native `_abc_subclasscheck`: called directly.
+                    if let Some(check) = crate::stdlib::abc_mod::forwarded_check(&hook, true) {
+                        let res = check(&[Object::Type(info_cls.clone()), cls.clone()])?;
+                        return Ok(Object::Bool(res.is_truthy()));
+                    }
                     // `dispatch` so a `@classmethod` (pandas' ABC shims) or
                     // other descriptor-wrapped hook honours its `__get__`;
                     // plain functions still take the receiver-prepend path.
