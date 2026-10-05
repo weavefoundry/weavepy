@@ -2070,6 +2070,10 @@ impl State {
             for bit in 0..N_SIGNALS {
                 if sig & (1 << bit) != 0 {
                     let i = self.signal_index(flags, bit)?;
+                    // A flag already raised stays as it is (`True`).
+                    if matches!(flags.get_index(i), Some((_, Object::Bool(true)))) {
+                        continue;
+                    }
                     if let Some((_, v)) = flags.map_mut_value_store().get_index_mut(i) {
                         *v = Object::Bool(true);
                     }
@@ -2180,10 +2184,10 @@ fn ctx_arg(a: &[Object], i: usize) -> Option<&Object> {
 
 /// An optional rounding argument: `Some(None)` when omitted or `None`,
 /// `Some(Some(mode))` for a valid mode, `None` for anything else.
-fn rounding_arg(a: &[Object], i: usize) -> Option<Option<Round>> {
+fn rounding_arg(st: &State, a: &[Object], i: usize) -> Option<Option<Round>> {
     match arg(a, i) {
         None | Some(Object::None) => Some(None),
-        Some(o) => Some(Some(round_of(o)?)),
+        Some(o) => Some(Some(st.round(o)?)),
     }
 }
 
@@ -2628,7 +2632,7 @@ fn d_round(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
 fn d_quantize(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let (st, x) = recv(a, 4)?;
     let e = st.operand(a.get(1)?)?;
-    let mode = rounding_arg(a, 2)?;
+    let mode = rounding_arg(st, a, 2)?;
     let ctx = st.resolve(ctx_arg(a, 3))?;
     let mut sig = 0;
     let r = quantize(&x, e.exp, mode.unwrap_or(ctx.p.round), &ctx.p, &mut sig)?;
@@ -2638,7 +2642,7 @@ fn d_quantize(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
 /// `to_integral_value(rounding=None, context=None)`.
 fn d_to_integral_value(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let (st, x) = recv(a, 3)?;
-    let mode = rounding_arg(a, 1)?;
+    let mode = rounding_arg(st, a, 1)?;
     let ctx = st.resolve(ctx_arg(a, 2))?;
     if x.exp >= 0 {
         return ok(st.make(&x)?);
@@ -2649,7 +2653,7 @@ fn d_to_integral_value(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
 /// `to_integral_exact(rounding=None, context=None)`.
 fn d_to_integral_exact(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let (st, x) = recv(a, 3)?;
-    let mode = rounding_arg(a, 1)?;
+    let mode = rounding_arg(st, a, 1)?;
     let ctx = st.resolve(ctx_arg(a, 2))?;
     if x.exp >= 0 {
         return ok(st.make(&x)?);
