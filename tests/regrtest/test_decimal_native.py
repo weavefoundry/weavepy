@@ -103,6 +103,9 @@ OPS = {
     "create": lambda c, a, b: c.create_decimal(str(a)),
     "addint": lambda c, a, b: (a + 7, 7 + a, a - 3, 3 - a, a * -2,
                                   a == 1, 2 < a),
+    "pow": lambda c, a, b: (a ** 2, a ** 3, (-a) ** 5, a ** 1, 3 ** b.copy_abs()
+                            .to_integral_value().min(7), a ** b.copy_abs()
+                            .to_integral_value().min(9)),
 }
 
 
@@ -134,6 +137,19 @@ for i in range(400):
     else:
         ctx_args = (prec, mode)
     check(names[i % len(names)], ctx_args, rand_dec(rng), rand_dec(rng))
+
+# Integral powers: exact results at their ideal exponents, results one
+# digit too long, powers of ten, one, zero, and the range limits.
+powers = lambda c, a, b: tuple(a ** n for n in (1, 2, 3, 4, 7, 10, 25))
+for mode in MODES:
+    for v in ["1.5", "-1.5", "2", "0.5", "1.10", "100", "1E+2", "1.000",
+              "-1", "0", "-0.00", "9.99", "12345", "3E-5", "7E+50"]:
+        check("pow", (5, mode), v, "3")
+        check("pow", (9, mode, -20, 20, 0), v, "2")
+        for args in [(5, mode), (28, mode), (3, mode, -6, 6, 1)]:
+            want = run(False, args, powers, v)
+            got = run(True, args, powers, v)
+            assert got == want, (v, args, got, want)
 
 # Ties in every rounding mode, for both signs.
 for mode in MODES:

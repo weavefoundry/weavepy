@@ -2251,6 +2251,141 @@ fn d_rtruediv(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
     binary(a, true, div)
 }
 
+/// The value of an integral power exponent: an `int`, or an integral
+/// finite `Decimal`, between 1 and a bound past which the Python code
+/// runs.
+fn int_exponent(y: &Fin) -> Option<u32> {
+    if y.sign == 1 || y.is_zero() {
+        return None;
+    }
+    let v = if y.exp >= 0 {
+        y.coef
+            .mul_pow10(u64::try_from(y.exp).ok().filter(|e| *e < 8)?)?
+    } else {
+        let (q, r) = y.coef.divrem_pow10(y.exp.unsigned_abs());
+        if !r.is_zero() {
+            return None;
+        }
+        q
+    };
+    match v {
+        Coef::S(n @ 1..=100_000) => Some(n as u32),
+        _ => None,
+    }
+}
+
+/// `Decimal.__pow__(other)` without a modulus, for a finite base and a
+/// positive integral exponent (`y` is its value, `ideal` the base's
+/// exponent): the exact power when it fits in `prec + 1` digits, at the
+/// exponent `_power_exact` picks, else the exact value, which `_fix`
+/// rounds correctly as the Python code's `_dpower` result does. `None`
+/// for zero bases, a base equal to one, and results that leave the
+/// normal range.
+fn power(x: &Fin, n: u32, c: &CtxP, sig: &mut u16) -> Option<Fin> {
+    if x.is_zero() {
+        return None;
+    }
+    let result_sign = if n & 1 == 1 { x.sign } else { 0 };
+    // `self == 1` has its own exponent rule.
+    if cmp(
+        &x.abs(),
+        &Fin {
+            sign: 0,
+            coef: Coef::S(1),
+            exp: 0,
+        },
+    )? == Ordering::Equal
+    {
+        return None;
+    }
+    // Strip the coefficient's trailing zeros.
+    let (mut xc, mut xe) = (x.coef.clone(), x.exp as i128);
+    loop {
+        let (q, r) = xc.divrem_pow10(1);
+        if !r.is_zero() {
+            break;
+        }
+        xc = q;
+        xe += 1;
+    }
+    let m = i128::from(n);
+    let p = c.prec + 1;
+    let ideal = x.exp as i128 * m;
+    let exp = xe * m;
+    let ans = if xc.is_one() {
+        let zeros = (exp - ideal).min(p - 1);
+        Fin::new(
+            result_sign,
+            Coef::S(1).mul_pow10(u64::try_from(zeros).ok()?)?,
+            exp - zeros,
+        )?
+    } else {
+        // `xc ** n` stays below `MAX_DIGITS` digits, or the Python code runs.
+        if (xc.ndigits() as u128).saturating_mul(u128::from(n)) > u128::from(MAX_DIGITS) + 1 {
+            return None;
+        }
+        let mut pw = Coef::S(1);
+        let mut base = xc;
+        let mut e = n;
+        while e > 0 {
+            if e & 1 == 1 {
+                pw = pw.mul(&base)?;
+            }
+            e >>= 1;
+            if e > 0 {
+                base = base.mul(&base)?;
+            }
+        }
+        let len = pw.ndigits() as i128;
+        if len <= p {
+            let zeros = (exp - ideal).min(p - len);
+            Fin::new(
+                result_sign,
+                pw.mul_pow10(u64::try_from(zeros).ok()?)?,
+                exp - zeros,
+            )?
+        } else {
+            Fin::new(result_sign, pw, exp)?
+        }
+    };
+    let mut s = 0;
+    let r = fix(ans, c, &mut s)?;
+    // Subnormal, underflowing and clamped results follow the Python code's
+    // own overflow and underflow estimates.
+    if s & (S_SUBNORMAL | S_UNDERFLOW | S_CLAMPED) != 0 {
+        return None;
+    }
+    *sig |= s;
+    Some(r)
+}
+
+/// `__pow__(other, modulo=None, context=None)` / `__rpow__`.
+fn pow_impl(a: &[Object], reflected: bool) -> Option<Result<Object, RuntimeError>> {
+    if arg(a, 2).is_some_and(|m| !matches!(m, Object::None)) {
+        return None;
+    }
+    let (st, x) = recv(a, 4)?;
+    let y = st.operand(a.get(1)?)?;
+    let ctx = st.resolve(ctx_arg(a, 3))?;
+    let (base, exp) = if reflected { (y, x) } else { (x, y) };
+    let n = int_exponent(&exp)?;
+    let mut sig = 0;
+    let r = power(&base, n, &ctx.p, &mut sig)?;
+    ok(st.finish(&ctx, sig, &r)?)
+}
+
+fn d_pow(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    pow_impl(a, false)
+}
+
+fn d_rpow(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    pow_impl(a, true)
+}
+
+fn pow_op(x: &Fin, y: &Fin, c: &CtxP, sig: &mut u16) -> Option<Fin> {
+    power(x, int_exponent(y)?, c, sig)
+}
+
 fn floordiv(x: &Fin, y: &Fin, c: &CtxP, _: &mut u16) -> Option<Fin> {
     Some(divide(x, y, c)?.0)
 }
@@ -3475,6 +3610,7 @@ pub(crate) fn leaf_binop(
         B::Div => div,
         B::FloorDiv => floordiv,
         B::Mod => rem,
+        B::Pow => pow_op,
         _ => return None,
     };
     let x = st.fin(a)?;
@@ -3676,6 +3812,20 @@ const SPECS: &[Spec] = &[
         ["other", "context"],
         d_rmod,
         "($self, /, other, context=None)"
+    ),
+    spec!(
+        D,
+        "__pow__",
+        ["other", "modulo", "context"],
+        d_pow,
+        "($self, /, other, modulo=None, context=None)"
+    ),
+    spec!(
+        D,
+        "__rpow__",
+        ["other", "modulo", "context"],
+        d_rpow,
+        "($self, /, other, modulo=None, context=None)"
     ),
     spec!(
         D,
