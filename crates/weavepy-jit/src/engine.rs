@@ -427,6 +427,18 @@ impl JitEngine {
                     runtime::dyn_compare_helper_addr(),
                     "generic comparison (no helper registered)",
                 )),
+                TOp::DynGetItem => Some((
+                    runtime::dyn_getitem_helper_addr(),
+                    "generic subscript (no helper registered)",
+                )),
+                TOp::DynSetItem => Some((
+                    runtime::dyn_setitem_helper_addr(),
+                    "generic item store (no helper registered)",
+                )),
+                TOp::DynUnary { .. } => Some((
+                    runtime::dyn_unary_helper_addr(),
+                    "generic unary op (no helper registered)",
+                )),
                 TOp::CallDyn {
                     int_result: true, ..
                 } => Some((
@@ -712,6 +724,9 @@ impl JitEngine {
                     | TOp::ContainsDyn { .. }
                     | TOp::DynBinary { .. }
                     | TOp::DynCompare { .. }
+                    | TOp::DynGetItem
+                    | TOp::DynSetItem
+                    | TOp::DynUnary { .. }
             )
         });
         let interp_entry = (has_loop || !round_trips) && tfunc.pc0_entry;
@@ -789,6 +804,15 @@ fn calls_dynamically(tfunc: &TFunc) -> bool {
 /// interpreter's generic object protocol (dynamic calls and attribute
 /// accesses) against all statements (see [`CompiledFrame::op_mix`]).
 fn op_mix(tfunc: &TFunc) -> OpMix {
+    if std::env::var_os("WEAVEPY_JIT_DUMP").is_some() {
+        for (bi, b) in tfunc.blocks.iter().enumerate() {
+            eprintln!("jit block {bi} entry {:?}", b.entry_stack);
+            for st in &b.stmts {
+                eprintln!("    {:4} {:?}", st.pc, st.op);
+            }
+            eprintln!("    term {:?}", b.term);
+        }
+    }
     if std::env::var_os("WEAVEPY_JIT_OPS").is_some() {
         let mut hist: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
         for b in &tfunc.blocks {
@@ -807,7 +831,12 @@ fn op_mix(tfunc: &TFunc) -> OpMix {
             match st.op {
                 TOp::CallDyn { .. } => mix.dyn_calls += 1,
                 TOp::DynAttrGet { .. } | TOp::DynAttrSet { .. } => mix.dyn_attrs += 1,
-                TOp::ContainsDyn { .. } | TOp::DynBinary { .. } | TOp::DynCompare { .. } => {
+                TOp::ContainsDyn { .. }
+                | TOp::DynBinary { .. }
+                | TOp::DynCompare { .. }
+                | TOp::DynGetItem
+                | TOp::DynSetItem
+                | TOp::DynUnary { .. } => {
                     mix.dyn_other += 1;
                 }
                 TOp::CallPy { .. }

@@ -1490,6 +1490,40 @@ pub(crate) fn dyn_compare_helper_addr() -> usize {
     DYN_COMPARE_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
+static DYN_GETITEM_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DYN_SETITEM_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DYN_UNARY_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the generic subscript and unary helpers
+/// ([`crate::ir::TOp::DynGetItem`], [`crate::ir::TOp::DynSetItem`],
+/// [`crate::ir::TOp::DynUnary`]), with the generic binary operation's
+/// shape and statuses: operands staged in the marshal buffer (a store
+/// stages value, container, index), `(frame, oparg, 0) -> status`.
+pub fn register_dyn_item_helpers(
+    getitem: DynAttrHelper,
+    setitem: DynAttrHelper,
+    unary: DynAttrHelper,
+) {
+    DYN_GETITEM_HELPER.store(getitem as usize, std::sync::atomic::Ordering::Release);
+    DYN_SETITEM_HELPER.store(setitem as usize, std::sync::atomic::Ordering::Release);
+    DYN_UNARY_HELPER.store(unary as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn dyn_getitem_helper_addr() -> usize {
+    DYN_GETITEM_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn dyn_setitem_helper_addr() -> usize {
+    DYN_SETITEM_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn dyn_unary_helper_addr() -> usize {
+    DYN_UNARY_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
 static BUILD_SET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// RFC 0076 WS8 — register the process-wide set-construction helper

@@ -442,6 +442,11 @@ struct Plan {
     /// arithmetic or a comparison, never tests against `None`, and no
     /// earlier attempt found stored on another lane.
     num_slots: HashSet<u32>,
+    /// Counted ranges whose bounds are expressions (see
+    /// [`range_prefix`]): the erased `range` load's pc → its `CALL`'s
+    /// pc. A side exit between them rebuilds the callee (a span like a
+    /// `len` callee's).
+    range_spans: HashMap<usize, usize>,
     /// Synthetic slots appended after the code object's real locals.
     n_synth: u32,
 }
@@ -1415,6 +1420,7 @@ fn analyze_once(
         max_call_args: 0,
         loop_depths: HashMap::new(),
         comp_saved: HashMap::new(),
+        range_depths: HashMap::new(),
     };
     let mut emit_entries: Vec<Option<Vec<ESlot>>> = vec![None; raw.len()];
     for &r in &roots {
@@ -1448,7 +1454,15 @@ fn analyze_once(
             &mut out,
             probes,
             &ctor,
-        )?;
+        )
+        .inspect_err(|_| {
+            // A failure in the block's terminator names the terminator.
+            FAIL_PC.with(|c| {
+                if c.get().is_none() {
+                    c.set(Some(raw[bi].end - 1));
+                }
+            });
+        })?;
         blocks_opt[compact[&bi]] = Some(tb);
     }
     let mut blocks: Vec<TBlock> = Vec::with_capacity(reachable.len());
@@ -2031,6 +2045,11 @@ fn plan_rewrite(
                 plan.nop.insert(exit + 1);
             }
             plan.calls.insert(i - 2, (pops, cur_slot, stop_slot));
+            // Bounds that can leave native code (an overflow, a guard)
+            // rebuild the erased `range` and its null marker there.
+            if !simple_bounds(code, push_null + 1, i - 2) {
+                plan.range_spans.insert(callee, i - 2);
+            }
             plan.headers.insert(i, (cur_slot, stop_slot, var_slot));
             plan.fused_store.insert(i + 1, var_slot);
             plan.loops.push(RangeLoopMeta {
@@ -2562,17 +2581,30 @@ fn range_prefix(
     if !(1..=3).contains(&k) || i < 4 + k {
         return None;
     }
-    let args_start = i - 2 - k;
-    for arg_ins in &ins[args_start..(i - 2)] {
-        match arg_ins.op {
-            OpCode::LoadFast | OpCode::LoadSmallInt => {}
-            OpCode::LoadConst
-                if matches!(
-                    code.constants.get(arg_ins.arg as usize),
-                    Some(Constant::Int(_))
-                ) => {}
-            _ => return None,
+    // The bounds are any expressions over locals, cells, constants,
+    // globals, attributes, arithmetic, and calls (`range(1, n - 1)`,
+    // `range(len(xs))`): walk back from the `CALL` to where they start,
+    // `k` complete values earlier.
+    let call = i - 2;
+    let mut acc = 0i32;
+    let mut args_start = None;
+    for q in (0..call).rev() {
+        acc += bound_expr_effect(code, &ins[q])?;
+        if acc == k as i32 {
+            args_start = Some(q);
+            break;
         }
+    }
+    let args_start = args_start?;
+    let mut depth = 0i32;
+    for q in args_start..call {
+        depth += bound_expr_effect(code, &ins[q])?;
+        if depth < 0 {
+            return None;
+        }
+    }
+    if args_start < 2 {
+        return None;
     }
     // An explicit step is only allowed as the constant 1; it is erased
     // so the call effectively becomes `range(start, stop)`.
@@ -2612,6 +2644,39 @@ fn range_prefix(
         return None;
     }
     Some((callee, push_null, step_nop, pops))
+}
+
+/// The stack effect (pushes less pops) of an instruction a counted
+/// range's bound expressions may contain (see [`range_prefix`]), `None`
+/// for anything else.
+fn bound_expr_effect(code: &CodeObject, ins: &weavepy_compiler::Instruction) -> Option<i32> {
+    match ins.op {
+        OpCode::LoadFast
+        | OpCode::LoadSmallInt
+        | OpCode::LoadDeref
+        | OpCode::LoadGlobal
+        | OpCode::PushNull => Some(1),
+        OpCode::LoadConst
+            if matches!(code.constants.get(ins.arg as usize), Some(Constant::Int(_))) =>
+        {
+            Some(1)
+        }
+        OpCode::BinaryOp => Some(-1),
+        OpCode::UnaryOp | OpCode::LoadAttr => Some(0),
+        OpCode::Call => Some(-(ins.arg as i32) - 1),
+        _ => None,
+    }
+}
+
+/// Whether a counted range's bounds, from `start` up to the `CALL` at
+/// `call`, are bare loads (nothing between the erased `range` load and
+/// the `CALL` can leave native code).
+fn simple_bounds(code: &CodeObject, start: usize, call: usize) -> bool {
+    code.instructions[start..call].iter().all(|x| {
+        matches!(x.op, OpCode::LoadFast | OpCode::LoadSmallInt)
+            || (x.op == OpCode::LoadConst
+                && matches!(code.constants.get(x.arg as usize), Some(Constant::Int(_))))
+    })
 }
 
 /// Resolve a forward branch/jump target instruction index.
@@ -3746,6 +3811,7 @@ fn infer_block(
             .iter()
             .any(|v| !v.is_plain() || !v.ty.is_representable())
         {
+            FAIL_PC.with(|c| c.set(Some(b.start)));
             return Err(JitVerdict::TypeUnknown);
         }
         return Ok(Vec::new());
@@ -4337,7 +4403,17 @@ fn step_abstract(
                                 // before storing it in an unboxed local.
                                 let source = match local_types.get(s as usize) {
                                     Some(Some(source)) => *source,
-                                    _ => (probes.param)(s).ok_or(JitVerdict::TypeUnknown)?,
+                                    _ => {
+                                        // Any other live iterable (a list of
+                                        // lists, say) rides the object lane.
+                                        let lane = (probes.param)(s)
+                                            .or_else(|| (probes.obj)(s).then_some(JitType::Obj))
+                                            .ok_or(JitVerdict::TypeUnknown)?;
+                                        if lane == JitType::Obj {
+                                            set_local(local_types, s, lane, changed)?;
+                                        }
+                                        lane
+                                    }
                                 };
                                 let elem = if source == JitType::Bytes {
                                     set_local(local_types, s, JitType::Bytes, changed)?;
@@ -4643,8 +4719,8 @@ fn step_abstract(
         // shared mutable state — another closure can rebind between
         // accesses.
         OpCode::LoadDeref => {
-            let lane = (probes.cell)(ins.arg)
-                .ok_or(JitVerdict::UnsupportedOpcode("LOAD_DEREF (cell lane)"))?;
+            let lane =
+                (probes.cell)(ins.arg).ok_or(JitVerdict::ProbeMiss("LOAD_DEREF (cell lane)"))?;
             stack.push(SE::known(lane));
         }
         OpCode::StoreDeref => {
@@ -4653,6 +4729,7 @@ fn step_abstract(
                 return Err(escape_verdict(code, &[&v], "CALL (callee escapes)"));
             }
             let lane = (probes.cell)(ins.arg)
+                .filter(|lane| !lane.is_list())
                 .ok_or(JitVerdict::UnsupportedOpcode("STORE_DEREF (cell lane)"))?;
             if v.ty == lane {
                 // Typed and matching — nothing to learn.
@@ -5325,14 +5402,38 @@ fn step_abstract(
             // index lane). The value lane may still be `Unknown` this
             // iteration (an empty dict) — tolerated like any transient.
             if let Some((pk, pv)) = resolve_dict_container(&cont, local_types, changed, probes)? {
+                // Any other key (a tuple, say) takes the interpreter's
+                // own subscript (`TOp::DynGetItem`).
+                if idx.ty.is_representable() && !matches!(idx.ty, JitType::Int | JitType::Str) {
+                    stack.push(SE::known(JitType::Obj));
+                    return Ok(());
+                }
                 check_dict_key(&idx, pk, local_types, changed)?;
                 if pv.is_representable() && !dict_val_ok(pv) {
-                    return Err(JitVerdict::UnsupportedOpcode("dict value lane"));
+                    stack.push(SE::known(JitType::Obj));
+                    return Ok(());
                 }
                 stack.push(SE::known(pv));
                 return Ok(());
             }
-            check_subscr_index(&idx, local_types, changed)?;
+            // An index on another lane than `int` (an object guarded as an
+            // `int` for a sequence, or anything else for the generic
+            // subscript).
+            if idx.ty.is_representable() && idx.ty != JitType::Int {
+                if idx.ty != JitType::Obj || !subscr_speculates_int(cont.ty) {
+                    if !cont.ty.is_representable() {
+                        if let Some(slot) = cont.src {
+                            settle_container(slot, local_types, changed, probes)?;
+                        }
+                        stack.push(SE::known(JitType::Unknown));
+                        return Ok(());
+                    }
+                    stack.push(SE::known(JitType::Obj));
+                    return Ok(());
+                }
+            } else {
+                check_subscr_index(&idx, local_types, changed)?;
+            }
             // RFC 0071 WS6 — `bytes[i]` reads a byte as an `Int`.
             if cont.ty == JitType::Bytes {
                 stack.push(SE::known(JitType::Int));
@@ -5359,7 +5460,18 @@ fn step_abstract(
                 stack.push(SE::known(JitType::Str));
                 return Ok(());
             }
+            // A container on any other lane takes the interpreter's own
+            // subscript (`TOp::DynGetItem`).
+            if cont.ty.is_representable() && cont.ty.elem_lane().is_none() {
+                stack.push(SE::known(JitType::Obj));
+                return Ok(());
+            }
             let elem = resolve_list_container(&cont, local_types, changed, probes)?;
+            if elem.is_none() {
+                if let Some(slot) = cont.src {
+                    settle_container(slot, local_types, changed, probes)?;
+                }
+            }
             stack.push(match elem {
                 // RFC 0073 WS1 (element residue) — an object-lane
                 // element read from a list *local* carries the list's
@@ -5651,22 +5763,38 @@ fn step_abstract(
             // the value operand — an empty dict admits stores with no
             // lane evidence at all.
             if let Some((pk, _)) = resolve_dict_container(&cont, local_types, changed, probes)? {
-                check_dict_key(&idx, pk, local_types, changed)?;
-                if val.ty.is_representable() && !dict_val_ok(val.ty) {
-                    return Err(JitVerdict::UnsupportedOpcode("dict value lane"));
+                // Other keys or values take the interpreter's own store
+                // (`TOp::DynSetItem`).
+                if idx.ty.is_representable() && !matches!(idx.ty, JitType::Int | JitType::Str) {
+                    return Ok(());
                 }
+                check_dict_key(&idx, pk, local_types, changed)?;
                 return Ok(());
             }
-            check_subscr_index(&idx, local_types, changed)?;
+            if idx.ty.is_representable() && idx.ty != JitType::Int {
+                if idx.ty != JitType::Obj || !cont.ty.is_list() {
+                    if !cont.ty.is_representable() {
+                        if let Some(slot) = cont.src {
+                            settle_container(slot, local_types, changed, probes)?;
+                        }
+                    }
+                    return Ok(());
+                }
+            } else {
+                check_subscr_index(&idx, local_types, changed)?;
+            }
+            if cont.ty.is_representable() && !cont.ty.is_list() {
+                return Ok(());
+            }
             let elem = resolve_list_container(&cont, local_types, changed, probes)?;
             if let Some(el) = elem {
-                if val.ty.is_representable() {
-                    if val.ty != el {
-                        return Err(JitVerdict::UnsupportedOpcode("STORE_SUBSCR (value lane)"));
+                if !val.ty.is_representable() {
+                    if let Some(slot) = val.src {
+                        set_local(local_types, slot, el, changed)?;
                     }
-                } else if let Some(slot) = val.src {
-                    set_local(local_types, slot, el, changed)?;
                 }
+            } else if let Some(slot) = cont.src {
+                settle_container(slot, local_types, changed, probes)?;
             }
         }
         // `del d[k]` on an exact dict (the key lane as a store's).
@@ -5785,6 +5913,30 @@ fn resolve_list_container(
         return Ok(Some(elem));
     }
     Ok(None)
+}
+
+/// Whether a subscript on a `cont` container guards an object index as
+/// an `int` (a sequence the typed lanes index natively).
+fn subscr_speculates_int(cont: JitType) -> bool {
+    cont.is_list() || matches!(cont, JitType::Str | JitType::Bytes)
+}
+
+/// Type an untyped container local no list or dict probe matched: any
+/// other live value rides the object lane (its subscripts run through
+/// the interpreter's own); an unbound one stays transient.
+fn settle_container(
+    slot: u32,
+    local_types: &mut [Option<JitType>],
+    changed: &mut bool,
+    probes: &mut Probes<'_>,
+) -> Result<(), JitVerdict> {
+    if local_types.get(slot as usize).copied().flatten().is_some() {
+        return Ok(());
+    }
+    if (probes.list)(slot).is_none() && (probes.dict)(slot).is_none() && (probes.obj)(slot) {
+        set_local(local_types, slot, JitType::Obj, changed)?;
+    }
+    Ok(())
 }
 
 /// RFC 0073 WS2 — resolve a subscript/membership container operand to
@@ -6454,10 +6606,11 @@ fn unary_result_type(kind: UnaryKind, a: JitType) -> Result<JitType, JitVerdict>
         UnaryKind::Neg | UnaryKind::Invert => {
             if a.is_integral() {
                 Ok(JitType::Int)
-            } else if matches!(kind, UnaryKind::Neg) {
+            } else if matches!(kind, UnaryKind::Neg) && a == JitType::Float {
                 Ok(JitType::Float)
             } else {
-                Err(JitVerdict::UnsupportedOpcode("~float"))
+                // The interpreter's own unary operation (`TOp::DynUnary`).
+                Ok(JitType::Obj)
             }
         }
         UnaryKind::Pos => {
@@ -6466,7 +6619,7 @@ fn unary_result_type(kind: UnaryKind, a: JitType) -> Result<JitType, JitVerdict>
             } else if a == JitType::Int {
                 Ok(JitType::Int)
             } else {
-                Err(JitVerdict::UnsupportedOpcode("+bool"))
+                Ok(JitType::Obj)
             }
         }
     }
@@ -6673,6 +6826,9 @@ struct EmitOut {
     /// records one slot lower). Keyed so block re-emission stays
     /// idempotent.
     loop_depths: HashMap<u32, u32>,
+    /// Interpreter depths of erased `range` loads ahead of expression
+    /// bounds (see `Plan::range_spans`), by pc.
+    range_depths: HashMap<usize, u32>,
     /// RFC 0073 WS1 — inlined-comprehension saved-target spans, keyed
     /// by the comprehension's `FOR_ITER` pc.
     comp_saved: HashMap<u32, CompSavedMeta>,
@@ -6710,6 +6866,7 @@ fn emit_block(
     for s in &entry {
         if s.has_native() {
             if !s.ty.is_representable() {
+                FAIL_PC.with(|c| c.set(Some(b.start)));
                 return Err(JitVerdict::TypeUnknown);
             }
             entry_stack.push(s.ty);
@@ -7107,6 +7264,7 @@ fn emit_instr(
         math_spans,
         null_spans,
         max_call_args,
+        range_depths,
         ..
     } = out;
     // Note: `max_stack` counts markers too — a harmless overestimate of
@@ -7119,6 +7277,11 @@ fn emit_instr(
             }
             *max_stack = (*max_stack).max(stack.len() as u32);
         };
+    // An erased `range` load ahead of expression bounds: the depth its
+    // span rebuilds the callee at.
+    if plan.range_spans.contains_key(&i) {
+        range_depths.insert(i, plan.hidden_at(i) + stack.len() as u32);
+    }
     // RFC 0058 WS4 — rewritten range-loop pcs (RFC 0071 WS4 adds the
     // list-loop fused store, performed by the `ForList` terminator).
     if plan.nop.contains(&i)
@@ -7128,6 +7291,18 @@ fn emit_instr(
         return Ok(());
     }
     if let Some(&(pops, cur_slot, stop_slot)) = plan.calls.get(&i) {
+        if let Some((&callee, _)) = plan.range_spans.iter().find(|&(_, &c)| c == i) {
+            let interp_depth = range_depths
+                .get(&callee)
+                .copied()
+                .ok_or(JitVerdict::UnsupportedOpcode("range (bounds span)"))?;
+            len_spans.push(CalleeSpanMeta {
+                token: code.instructions[callee].arg,
+                live_from: callee as u32,
+                live_to: i as u32 + 1,
+                interp_depth,
+            });
+        }
         // Stack is [.., start?, stop]; store the bounds into the
         // synthetic slots (one arg seeds `cur` with 0).
         stack.pop().ok_or(JitVerdict::StackUnderflow)?;
@@ -7418,8 +7593,8 @@ fn emit_instr(
         // (and stability-checked) by the fixpoint; re-probe here so
         // the burned lane matches the converged typing.
         OpCode::LoadDeref => {
-            let lane = (probes.cell)(ins.arg)
-                .ok_or(JitVerdict::UnsupportedOpcode("LOAD_DEREF (cell lane)"))?;
+            let lane =
+                (probes.cell)(ins.arg).ok_or(JitVerdict::ProbeMiss("LOAD_DEREF (cell lane)"))?;
             push(
                 TOp::CellGet { idx: ins.arg, lane },
                 Some(lane),
@@ -7429,6 +7604,7 @@ fn emit_instr(
         }
         OpCode::StoreDeref => {
             let lane = (probes.cell)(ins.arg)
+                .filter(|lane| !lane.is_list())
                 .ok_or(JitVerdict::UnsupportedOpcode("STORE_DEREF (cell lane)"))?;
             let v = pop_val(stack)?;
             if v != lane {
@@ -7727,6 +7903,17 @@ fn emit_instr(
                 }
                 (UnaryKind::Not, JitType::Float) => {
                     push(TOp::FloatNot, Some(JitType::Bool), stack, stmts);
+                }
+                (UnaryKind::Neg | UnaryKind::Pos | UnaryKind::Invert, t)
+                    if t.is_representable() =>
+                {
+                    push(
+                        TOp::DynUnary { arg: ins.arg },
+                        Some(JitType::Obj),
+                        stack,
+                        stmts,
+                    );
+                    *max_call_args = (*max_call_args).max(1);
                 }
                 _ => return Err(JitVerdict::UnsupportedOpcode("UNARY_OP lane")),
             }
@@ -9170,22 +9357,45 @@ fn emit_instr(
             // lane comes from the operand, the value lane from a fresh
             // probe on the container local (inference resolved it on
             // the same live frame, so a miss here is environmental).
+            // The interpreter's own subscript for whatever no typed lane
+            // covers (`TOp::DynGetItem`).
+            macro_rules! dyn_get {
+                () => {{
+                    if !dyn_op_ok(cont, idx_slot.ty) {
+                        return Err(JitVerdict::TypeUnknown);
+                    }
+                    *max_call_args = (*max_call_args).max(2);
+                    push(TOp::DynGetItem, Some(JitType::Obj), stack, stmts);
+                    return Ok(());
+                }};
+            }
             if cont == JitType::Dict {
                 if !matches!(idx, JitType::Int | JitType::Str) {
-                    return Err(JitVerdict::UnsupportedOpcode("dict key lane"));
+                    dyn_get!();
                 }
                 let (_, pv) = cont_slot
                     .src
                     .and_then(|s| (probes.dict)(s))
                     .ok_or(JitVerdict::ProbeMiss("dict value lane"))?;
                 if !dict_val_ok(pv) {
-                    return Err(JitVerdict::UnsupportedOpcode("dict value lane"));
+                    dyn_get!();
                 }
                 push(TOp::DictGet { key: idx, val: pv }, Some(pv), stack, stmts);
                 return Ok(());
             }
+            let mut idx = idx;
+            if idx == JitType::Obj && subscr_speculates_int(cont) {
+                // A sequence index is guarded as an exact `int`; a miss
+                // resumes at the subscript with both operands.
+                stack.push(cont_slot);
+                stack.push(idx_slot);
+                push(TOp::UnboxInt { depth: 0 }, None, stack, stmts);
+                stack.pop();
+                stack.pop();
+                idx = JitType::Int;
+            }
             if idx != JitType::Int {
-                return Err(JitVerdict::UnsupportedOpcode("subscript index lane"));
+                dyn_get!();
             }
             // RFC 0071 WS6 — `bytes[i]` through the registered helper.
             if cont == JitType::Bytes {
@@ -9237,37 +9447,49 @@ fn emit_instr(
                 push(TOp::StrGetItem, Some(JitType::Str), stack, stmts);
                 return Ok(());
             }
-            let elem = cont
-                .elem_lane()
-                .ok_or(JitVerdict::UnsupportedOpcode("subscript container lane"))?;
+            let Some(elem) = cont.elem_lane() else {
+                dyn_get!();
+            };
             push(TOp::ListGet { elem }, Some(elem), stack, stmts);
         }
         OpCode::StoreSubscr => {
-            let idx = pop_val(stack)?;
-            let cont = pop_val(stack)?;
+            let n = stack.len();
+            if n < 3 {
+                return Err(JitVerdict::StackUnderflow);
+            }
+            let (val, cont, mut idx) = (stack[n - 3].ty, stack[n - 2].ty, stack[n - 1].ty);
+            for s in &stack[n - 3..] {
+                if !s.is_plain() {
+                    return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                }
+            }
+            if idx == JitType::Obj && cont.is_list() {
+                // A list index is guarded as an exact `int` (see
+                // `BINARY_SUBSCR`).
+                push(TOp::UnboxInt { depth: 0 }, None, stack, stmts);
+                idx = JitType::Int;
+            }
+            stack.truncate(n - 3);
             // RFC 0073 WS2 — `d[k] = v` on a pinned exact dict: both
             // lanes come from the operands (an empty dict admits with
             // no probe evidence at all).
-            if cont == JitType::Dict {
-                if !matches!(idx, JitType::Int | JitType::Str) {
-                    return Err(JitVerdict::UnsupportedOpcode("dict key lane"));
+            let typed = if cont == JitType::Dict {
+                matches!(idx, JitType::Int | JitType::Str) && dict_val_ok(val)
+            } else {
+                idx == JitType::Int && cont.elem_lane() == Some(val)
+            };
+            if !typed {
+                // The interpreter's own item store (`TOp::DynSetItem`).
+                if !dyn_op_ok(val, cont) || !idx.is_representable() {
+                    return Err(JitVerdict::TypeUnknown);
                 }
-                let val = pop_val(stack)?;
-                if !dict_val_ok(val) {
-                    return Err(JitVerdict::UnsupportedOpcode("dict value lane"));
-                }
-                push(TOp::DictSet { key: idx, val }, None, stack, stmts);
+                *max_call_args = (*max_call_args).max(3);
+                push(TOp::DynSetItem, None, stack, stmts);
                 return Ok(());
             }
-            if idx != JitType::Int {
-                return Err(JitVerdict::UnsupportedOpcode("subscript index lane"));
-            }
-            let elem = cont
-                .elem_lane()
-                .ok_or(JitVerdict::UnsupportedOpcode("subscript container lane"))?;
-            let val = pop_val(stack)?;
-            if val != elem {
-                return Err(JitVerdict::UnsupportedOpcode("STORE_SUBSCR (value lane)"));
+            if cont == JitType::Dict {
+                push(TOp::DictSet { key: idx, val }, None, stack, stmts);
+                return Ok(());
             }
             push(TOp::ListSet, None, stack, stmts);
         }

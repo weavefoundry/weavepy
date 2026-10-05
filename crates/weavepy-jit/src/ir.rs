@@ -660,6 +660,21 @@ pub enum TOp {
     /// comparison. With the oparg's to-`bool` flag the result is the
     /// comparison's truth (the `Bool` lane), otherwise an object pin.
     DynCompare { arg: u32 },
+    /// `container[index]` no typed lane covers (a tuple, a dict with a
+    /// tuple key, a user `__getitem__`): pops both operands (staged
+    /// through the marshal buffer) and runs the interpreter's own
+    /// subscript, pushing the result as an object pin. Exits as
+    /// [`TOp::DynBinary`] does.
+    DynGetItem,
+    /// The `STORE_SUBSCR` counterpart: pops the index, the container,
+    /// and the value (staged in that interpreter order: value,
+    /// container, index) and runs the interpreter's own item store.
+    DynSetItem,
+    /// `-x`, `+x`, or `~x` on an object (its `__neg__`/`__pos__`/
+    /// `__invert__`): pops the operand and runs the interpreter's unary
+    /// operation for the `UNARY_OP` oparg `arg`, pushing the result as
+    /// an object pin. Exits as [`TOp::DynBinary`] does.
+    DynUnary { arg: u32 },
     /// RFC 0076 WS8 — `BUILD_SET k`: elements stage with per-element
     /// tags (like [`TOp::BuildTuple`]) and the registered
     /// `wpjit_build_set` helper builds the fresh set, pinned on the
@@ -1621,6 +1636,9 @@ impl TOp {
                 | TOp::ContainsDyn { .. }
                 | TOp::DynBinary { .. }
                 | TOp::DynCompare { .. }
+                | TOp::DynGetItem
+                | TOp::DynSetItem
+                | TOp::DynUnary { .. }
                 | TOp::BuildSet { .. }
                 | TOp::StrMod
                 | TOp::StrSlice { .. }

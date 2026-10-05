@@ -282,9 +282,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             JitType::Int => SlotTag::Int as i64,
             JitType::Float => SlotTag::Float as i64,
             JitType::Bool => SlotTag::Bool as i64,
-            JitType::ListInt | JitType::ListFloat | JitType::ListObj | JitType::ListListFloat => {
-                SlotTag::ListPin as i64
-            }
+            JitType::ListInt
+            | JitType::ListFloat
+            | JitType::ListObj
+            | JitType::ListListFloat
+            | JitType::ListListInt => SlotTag::ListPin as i64,
             // RFC 0071 WS6 — `Str`/`Bytes` pins spill like object pins
             // (the rebuild resolves the pin to the real payload).
             // RFC 0073 WS2 — `Dict` pins ride the same tag.
@@ -336,6 +338,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             | TOp::ContainsDyn { .. }
                             | TOp::DynBinary { .. }
                             | TOp::DynCompare { .. }
+                            | TOp::DynGetItem
+                            | TOp::DynSetItem
+                            | TOp::DynUnary { .. }
                     )
                 })
         });
@@ -1317,6 +1322,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::DynBinary { arg } => {
                 self.emit_dyn_op(runtime::dyn_binop_helper_addr(), arg, JitType::Obj, stmt.pc);
             }
+            TOp::DynGetItem => {
+                self.emit_dyn_op(runtime::dyn_getitem_helper_addr(), 0, JitType::Obj, stmt.pc);
+            }
+            TOp::DynSetItem => self.emit_dyn_setitem(stmt.pc),
+            TOp::DynUnary { arg } => self.emit_dyn_unary(arg, stmt.pc),
             TOp::DynCompare { arg } => {
                 let lane = if arg & weavepy_compiler::COMPARE_OP_TO_BOOL_FLAG != 0 {
                     JitType::Bool
@@ -1609,6 +1619,95 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .load(types::I64, trusted, self.frame_ptr, OFF_RET_BITS);
         self.vstack.push((res, JitType::Bool));
+    }
+
+    /// [`TOp::DynSetItem`]: stage value, container, and index (the
+    /// interpreter's stack order) and run the interpreter's item store.
+    /// Exits as [`Self::emit_dyn_op`] does; nothing is pushed.
+    fn emit_dyn_setitem(&mut self, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot_full = self.vstack.clone();
+        let (idx, ity) = self.pop();
+        let (cont, cty) = self.pop();
+        let (val, vty) = self.pop();
+        for (k, (v, ty)) in [(val, vty), (cont, cty), (idx, ity)]
+            .into_iter()
+            .enumerate()
+        {
+            self.b
+                .ins()
+                .store(trusted, v, self.call_args_base, (k as i32) * 8);
+            let tagv = self.b.ins().iconst(types::I32, Self::tag(ty));
+            self.b
+                .ins()
+                .store(trusted, tagv, self.call_tags_base, (k as i32) * 4);
+        }
+        self.emit_dyn_call(runtime::dyn_setitem_helper_addr(), 0, pc, &snapshot_full);
+    }
+
+    /// [`TOp::DynUnary`]: stage the operand and run the interpreter's
+    /// unary operation, pushing its result pin.
+    fn emit_dyn_unary(&mut self, arg: u32, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot_full = self.vstack.clone();
+        let (v, ty) = self.pop();
+        self.b.ins().store(trusted, v, self.call_args_base, 0);
+        let tagv = self.b.ins().iconst(types::I32, Self::tag(ty));
+        self.b.ins().store(trusted, tagv, self.call_tags_base, 0);
+        self.emit_dyn_call(runtime::dyn_unary_helper_addr(), arg, pc, &snapshot_full);
+        let res = self
+            .b
+            .ins()
+            .load(types::I64, trusted, self.frame_ptr, OFF_RET_BITS);
+        self.vstack.push((res, JitType::Obj));
+    }
+
+    /// The call and exits shared by the generic operation helpers: with
+    /// the operands already staged and popped, call `helper_addr` with
+    /// `arg` and leave on a raise (`1`, at `pc`), a parked result (`2`,
+    /// after `pc`), or a decline (`3`, at `pc` with `snapshot_full`);
+    /// continue in a fresh block on success.
+    fn emit_dyn_call(
+        &mut self,
+        helper_addr: usize,
+        arg: u32,
+        pc: u32,
+        snapshot_full: &[(Value, JitType)],
+    ) {
+        let snapshot = self.vstack.clone();
+        self.writeback_locals();
+        let sig = self.list_helper_sig();
+        let helper = self.b.ins().iconst(self.ptr_ty, helper_addr as i64);
+        let argv = self.b.ins().iconst(types::I64, i64::from(arg));
+        let zero = self.b.ins().iconst(types::I64, 0);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, argv, zero]);
+        let status = self.b.inst_results(call)[0];
+        let ok_b = self.b.create_block();
+        let bad_b = self.b.create_block();
+        let is_ok = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
+        self.b.ins().brif(is_ok, ok_b, &[], bad_b, &[]);
+        self.b.switch_to_block(bad_b);
+        let raised_b = self.b.create_block();
+        let not_raised_b = self.b.create_block();
+        let is_raised = self.b.ins().icmp_imm(IntCC::Equal, status, 1);
+        self.b
+            .ins()
+            .brif(is_raised, raised_b, &[], not_raised_b, &[]);
+        self.b.switch_to_block(raised_b);
+        self.emit_exit(pc, &snapshot, JitStatus::Raised);
+        self.b.switch_to_block(not_raised_b);
+        let boxed_b = self.b.create_block();
+        let reject_b = self.b.create_block();
+        let is_boxed = self.b.ins().icmp_imm(IntCC::Equal, status, 2);
+        self.b.ins().brif(is_boxed, boxed_b, &[], reject_b, &[]);
+        self.b.switch_to_block(boxed_b);
+        self.emit_exit(pc + 1, &snapshot, JitStatus::Deopt);
+        self.b.switch_to_block(reject_b);
+        self.emit_exit(pc, snapshot_full, JitStatus::Deopt);
+        self.b.switch_to_block(ok_b);
     }
 
     /// [`TOp::DynBinary`] / [`TOp::DynCompare`]: stage both operands in

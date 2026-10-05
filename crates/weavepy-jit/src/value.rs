@@ -42,6 +42,10 @@ pub enum JitType {
     /// list and pins it on the [`JitType::ListFloat`] lane, whose own
     /// accesses re-validate every float (the scalar list discipline).
     ListListFloat,
+    /// A pinned `list` of `int` lists (a grid, a board): element reads
+    /// pin on the [`JitType::ListInt`] lane, like
+    /// [`JitType::ListListFloat`]'s.
+    ListListInt,
     /// RFC 0065 WS5 — a *pinned* instance receiver. Like the list pins,
     /// the machine value is an `i64` index into the embedder's
     /// per-entry pinned-object table; attribute access goes through the
@@ -101,7 +105,11 @@ impl JitType {
     pub fn is_list(self) -> bool {
         matches!(
             self,
-            JitType::ListInt | JitType::ListFloat | JitType::ListObj | JitType::ListListFloat
+            JitType::ListInt
+                | JitType::ListFloat
+                | JitType::ListObj
+                | JitType::ListListFloat
+                | JitType::ListListInt
         )
     }
 
@@ -120,6 +128,7 @@ impl JitType {
                 | JitType::ListFloat
                 | JitType::ListObj
                 | JitType::ListListFloat
+                | JitType::ListListInt
                 | JitType::Obj
                 | JitType::Str
                 | JitType::Bytes
@@ -136,6 +145,7 @@ impl JitType {
             JitType::ListFloat => Some(JitType::Float),
             JitType::ListObj => Some(JitType::Obj),
             JitType::ListListFloat => Some(JitType::ListFloat),
+            JitType::ListListInt => Some(JitType::ListInt),
             _ => None,
         }
     }
@@ -150,6 +160,7 @@ impl JitType {
             JitType::Float => Some(JitType::ListFloat),
             JitType::Obj => Some(JitType::ListObj),
             JitType::ListFloat => Some(JitType::ListListFloat),
+            JitType::ListInt => Some(JitType::ListListInt),
             _ => None,
         }
     }
@@ -159,9 +170,10 @@ impl JitType {
     /// (`wpjit_cell_get`/`_set`). The unboxed scalar lanes read/write
     /// their machine values; the nullable [`JitType::Obj`] lane
     /// re-reads (and freshly pins) the payload per access — no
-    /// burn-in, because closures exist to be mutated. The remaining
-    /// pinned lanes stay out: their specialized helpers assume a
-    /// payload identity that shared mutable cell storage can't offer.
+    /// burn-in, because closures exist to be mutated. The list lanes
+    /// re-read and re-validate the cell's list per access too (reads
+    /// only: a store of a list into a cell stays interpreted). The
+    /// remaining pinned lanes stay out.
     #[inline]
     #[must_use]
     pub fn cell_lane_code(self) -> Option<i64> {
@@ -170,6 +182,11 @@ impl JitType {
             JitType::Float => Some(1),
             JitType::Bool => Some(2),
             JitType::Obj => Some(3),
+            JitType::ListInt => Some(4),
+            JitType::ListFloat => Some(5),
+            JitType::ListObj => Some(6),
+            JitType::ListListFloat => Some(7),
+            JitType::ListListInt => Some(8),
             _ => None,
         }
     }
@@ -183,6 +200,11 @@ impl JitType {
             1 => Some(JitType::Float),
             2 => Some(JitType::Bool),
             3 => Some(JitType::Obj),
+            4 => Some(JitType::ListInt),
+            5 => Some(JitType::ListFloat),
+            6 => Some(JitType::ListObj),
+            7 => Some(JitType::ListListFloat),
+            8 => Some(JitType::ListListInt),
             _ => None,
         }
     }

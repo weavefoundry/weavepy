@@ -1012,6 +1012,11 @@ impl JitState {
         weavepy_jit::register_truth_helper(wpjit_truth);
         weavepy_jit::register_contains_dyn_helper(wpjit_contains_dyn);
         weavepy_jit::register_dyn_op_helpers(wpjit_dyn_binop, wpjit_dyn_compare);
+        weavepy_jit::register_dyn_item_helpers(
+            wpjit_dyn_getitem,
+            wpjit_dyn_setitem,
+            wpjit_dyn_unary,
+        );
         weavepy_jit::register_build_set_helper(wpjit_build_set);
         weavepy_jit::register_iter_new_helper(wpjit_iter_new);
         weavepy_jit::register_iter_next_pair_helper(wpjit_iter_next_pair);
@@ -2516,6 +2521,7 @@ fn unpack_ty(bits: u64, ty: JitType, pins: &PinTable) -> Object {
         | JitType::ListFloat
         | JitType::ListObj
         | JitType::ListListFloat
+        | JitType::ListListInt
         | JitType::Obj
         | JitType::Str
         | JitType::Bytes
@@ -2578,6 +2584,9 @@ fn entry_local_ok(obj: &Object, ty: JitType) -> bool {
         (Some(Object::List(inner)), JitType::ListFloat) => {
             matches!(inner.borrow().first(), None | Some(Object::Float(_)))
         }
+        (Some(Object::List(inner)), JitType::ListInt) => {
+            matches!(inner.borrow().first(), None | Some(Object::Int(_)))
+        }
         (first, elem) => matches!(
             (first, elem),
             (None, _)
@@ -2620,13 +2629,17 @@ fn list_elem_lane(items: &[Object]) -> Option<JitType> {
             // element lane; the access helpers re-validate per element.
             // Tuples too (a list of pairs a `for a, b in` loop unpacks).
             Object::Instance(_) | Object::None | Object::Tuple(_) => JitType::Obj,
-            // A non-empty all-`float` list element: the nested lane.
+            // A non-empty all-`float` or all-`int` list element: the
+            // nested lanes.
             Object::List(inner) => {
                 let inner = inner.borrow();
-                if inner.is_empty() || !inner.iter().all(|x| matches!(x, Object::Float(_))) {
+                if !inner.is_empty() && inner.iter().all(|x| matches!(x, Object::Float(_))) {
+                    JitType::ListFloat
+                } else if !inner.is_empty() && inner.iter().all(|x| matches!(x, Object::Int(_))) {
+                    JitType::ListInt
+                } else {
                     return None;
                 }
-                JitType::ListFloat
             }
             _ => return None,
         };
@@ -2756,6 +2769,13 @@ fn probe_cell_lane(frame: &super::Frame, idx: u32) -> Option<JitType> {
     let payload = cell.borrow();
     scalar_lane(&payload).or_else(|| match &*payload {
         Object::Unbound => None,
+        // A homogeneous list rides its list lane (re-read and
+        // re-validated per access, like the object lane).
+        Object::List(l) => Some(
+            list_elem_lane(&l.borrow())
+                .and_then(JitType::list_of)
+                .unwrap_or(JitType::Obj),
+        ),
         _ => Some(JitType::Obj),
     })
 }
@@ -3892,6 +3912,10 @@ struct CallCtx {
     /// the activation leaves native code after the call that did it,
     /// keeping whatever the inspection wrote (see [`sync_native_locals`]).
     introspected: Cell<bool>,
+    /// Per closure cell, the pin of the list a list-lane read of it pinned
+    /// last (`u32::MAX` for none): reread while the cell holds the same
+    /// list, it costs no new pin.
+    cell_list_pins: Vec<u32>,
     /// A frameless activation's inspected locals: the storage of the
     /// activation shell the inspection found (a framed activation's are
     /// its frame's own).
@@ -4037,14 +4061,33 @@ fn pin_memo_hit(v: &Object, pins: &PinTable, memo: &[u32; PIN_MEMO]) -> Option<u
     }
 }
 
+/// The pin that already holds this very list (a row of a nested list
+/// read again), when the memo remembers one.
+#[inline]
+fn list_pin_memo_hit(
+    l: &Rc<crate::sync::RefCell<Vec<Object>>>,
+    pins: &PinTable,
+    memo: &[u32; PIN_MEMO],
+) -> Option<u64> {
+    let id = Rc::as_ptr(l) as usize;
+    let hint = memo[pin_memo_slot(id)] as usize;
+    match pins.get(hint) {
+        Some(Pin::List(p, _)) if Rc::ptr_eq(p, l) => Some(hint as u64),
+        _ => None,
+    }
+}
+
 /// Remember that pin `ix` will hold `p`'s object.
 #[inline]
 fn pin_memo_note(p: &Pin, ix: usize, memo: &mut [u32; PIN_MEMO]) {
-    if let Pin::Obj(v) = p {
-        let id = pin_identity(v);
-        if id != 0 {
-            memo[pin_memo_slot(id)] = ix as u32;
+    match p {
+        Pin::Obj(v) => {
+            let id = pin_identity(v);
+            if id != 0 {
+                memo[pin_memo_slot(id)] = ix as u32;
+            }
         }
+        Pin::List(l, _) => memo[pin_memo_slot(Rc::as_ptr(l) as usize)] = ix as u32,
     }
 }
 
@@ -4512,9 +4555,11 @@ fn lane_tag(t: JitType) -> u32 {
         JitType::Bool => SlotTag::Bool as u32,
         // RFC 0071 WS1 — the nullable object lane crosses as a pin.
         JitType::Obj => SlotTag::ObjPin as u32,
-        JitType::ListInt | JitType::ListFloat | JitType::ListObj | JitType::ListListFloat => {
-            SlotTag::ListPin as u32
-        }
+        JitType::ListInt
+        | JitType::ListFloat
+        | JitType::ListObj
+        | JitType::ListListFloat
+        | JitType::ListListInt => SlotTag::ListPin as u32,
         _ => u32::MAX,
     }
 }
@@ -5647,6 +5692,7 @@ fn fresh_child(ctx: &CallCtx, nc: &NativeCallee, callee_key: *const CodeObject) 
         pin_memo: [u32::MAX; PIN_MEMO],
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
+        cell_list_pins: Vec::new(),
     })
 }
 
@@ -7757,10 +7803,17 @@ unsafe extern "C" fn wpjit_list_get(frame: *mut JitFrame, pin: i64, idx: i64) ->
                     None => Err(Pin::Obj(v.clone())),
                 }
             }
-            // The nested lane: a list element pins on the float-list
-            // lane (its reads re-validate each float).
-            (Object::List(inner), JitType::ListFloat) => {
-                Err(Pin::List(inner.clone(), JitType::Float))
+            // The nested lanes: a list element pins on the float-list or
+            // int-list lane (its reads re-validate each element), reusing
+            // the pin of a row read before.
+            (Object::List(inner), lane @ (JitType::ListFloat | JitType::ListInt)) => {
+                match list_pin_memo_hit(inner, &ctx.pins, &ctx.pin_memo) {
+                    Some(bits) => Ok(bits),
+                    None => Err(Pin::List(
+                        inner.clone(),
+                        lane.elem_lane().unwrap_or(JitType::Int),
+                    )),
+                }
             }
             _ => return 1,
         }
@@ -7883,6 +7936,30 @@ unsafe extern "C" fn wpjit_cell_get(frame: *mut JitFrame, idx: i64, lane: i64) -
         (Object::None, Some(JitType::Obj)) => Ok(u64::MAX),
         (Object::Unbound, _) => return 1,
         (v, Some(JitType::Obj)) => Err(v.clone()),
+        // A list lane pins the cell's current list when it still has the
+        // site's element lane (the list helpers re-check each element),
+        // reusing the pin of the list the site read last.
+        (v @ Object::List(l), Some(lane)) if lane.is_list() && entry_local_ok(v, lane) => {
+            let elem = lane.elem_lane().unwrap_or(JitType::Unknown);
+            let slot = idx as usize;
+            if let Some(&pin) = ctx.cell_list_pins.get(slot) {
+                if matches!(ctx.pins.get(pin as usize), Some(Pin::List(p, _)) if Rc::ptr_eq(p, l)) {
+                    jf.ret_bits = u64::from(pin);
+                    return 0;
+                }
+            }
+            if ctx.pins.len() >= RUNTIME_PIN_CAP {
+                return 1;
+            }
+            let pin = ctx.pins.len();
+            ctx.pins.push(Pin::List(l.clone(), elem));
+            if ctx.cell_list_pins.len() <= slot {
+                ctx.cell_list_pins.resize(slot + 1, u32::MAX);
+            }
+            ctx.cell_list_pins[slot] = pin as u32;
+            jf.ret_bits = pin as u64;
+            return 0;
+        }
         _ => return 1,
     };
     match outcome {
@@ -8468,6 +8545,9 @@ unsafe extern "C" fn wpjit_tuple_len(frame: *mut JitFrame, pin: i64) -> i64 {
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     match ctx.pins.get(pin as usize) {
         Some(Pin::Obj(Object::Tuple(items))) => items.len() as i64,
+        // The other exact builtin containers measure without code.
+        Some(Pin::List(l, _) | Pin::Obj(Object::List(l))) => l.borrow().len() as i64,
+        Some(Pin::Obj(Object::Dict(d))) => d.borrow().len() as i64,
         // An instance whose class's `__len__` is a registered native leaf
         // (`deque.__len__`): its body runs no Python and has no effects,
         // so anything but a plain length deopts for the interpreter to
@@ -8656,10 +8736,15 @@ unsafe extern "C" fn wpjit_list_next(frame: *mut JitFrame, pin: i64, idx: i64) -
                     None => Err(Pin::Obj(v.clone())),
                 }
             }
-            // The nested lane: a list element pins on the float-list
-            // lane (see `wpjit_list_get`).
-            (Object::List(inner), JitType::ListFloat) => {
-                Err(Pin::List(inner.clone(), JitType::Float))
+            // The nested lanes (see `wpjit_list_get`).
+            (Object::List(inner), lane @ (JitType::ListFloat | JitType::ListInt)) => {
+                match list_pin_memo_hit(inner, &ctx.pins, &ctx.pin_memo) {
+                    Some(bits) => Ok(bits),
+                    None => Err(Pin::List(
+                        inner.clone(),
+                        lane.elem_lane().unwrap_or(JitType::Int),
+                    )),
+                }
             }
             _ => return 2,
         }
@@ -11523,6 +11608,107 @@ unsafe extern "C" fn wpjit_dyn_binop(frame: *mut JitFrame, arg: i64, _unused: i6
     }
 }
 
+/// The `wpjit_dyn_getitem` helper (`weavepy_jit::TOp::DynGetItem`): the
+/// interpreter's own subscript (a user `__getitem__`, `__missing__`, a
+/// class's `__class_getitem__`) on the two staged operands, its result
+/// handed back as an object pin. Statuses as [`wpjit_dyn_binop`].
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`]; both operands are staged.
+unsafe extern "C" fn wpjit_dyn_getitem(frame: *mut JitFrame, _arg: i64, _unused: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
+    let interp = unsafe { &mut *ctx.interp };
+    // SAFETY: native code staged both operands.
+    let (container, index) = unsafe { dyn_operands(jf, ctx) };
+    ctx.dirty = true;
+    match interp.subscr_get_public(&container, &index) {
+        Err(err) => {
+            ctx.raised = Some(err);
+            1
+        }
+        Ok(v) => deliver_dyn_result(jf, ctx, interp, v),
+    }
+}
+
+/// The `wpjit_dyn_setitem` helper (`weavepy_jit::TOp::DynSetItem`): the
+/// interpreter's own item store on the staged value, container, and
+/// index. Status `0` stored; `1` raised; `2` stored but a guard broke
+/// (deopt after the store, with no result to place).
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`]; three operands are staged.
+unsafe extern "C" fn wpjit_dyn_setitem(frame: *mut JitFrame, _arg: i64, _unused: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
+    let interp = unsafe { &mut *ctx.interp };
+    // SAFETY: native code staged three operands.
+    let [value, container, index] = std::array::from_fn(|k| unsafe {
+        unpack_pins(*jf.call_args.add(k), *jf.call_tags.add(k), &ctx.pins)
+    });
+    ctx.dirty = true;
+    match interp.subscr_set_public(&container, &index, value) {
+        Err(err) => {
+            ctx.raised = Some(err);
+            1
+        }
+        Ok(()) => {
+            let still_valid = guards_hold(
+                interp,
+                &ctx.globals,
+                &ctx.builtins,
+                &ctx.guard_snapshot,
+                &ctx.callees,
+                &ctx.math,
+            );
+            if still_valid {
+                0
+            } else {
+                ctx.parked = None;
+                2
+            }
+        }
+    }
+}
+
+/// The `wpjit_dyn_unary` helper (`weavepy_jit::TOp::DynUnary`): the
+/// interpreter's unary operation for the `UNARY_OP` oparg `arg` (an
+/// operand's `__neg__`, say) on the staged operand. Statuses as
+/// [`wpjit_dyn_binop`].
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`]; one operand is staged.
+unsafe extern "C" fn wpjit_dyn_unary(frame: *mut JitFrame, arg: i64, _unused: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
+    let interp = unsafe { &mut *ctx.interp };
+    // SAFETY: native code staged the operand.
+    let v = unsafe { unpack_pins(*jf.call_args, *jf.call_tags, &ctx.pins) };
+    // SAFETY: `UnaryKind` is `repr(u8)` and the compiler only emits
+    // valid kinds (the interpreter decodes `UNARY_OP` the same way).
+    let kind: weavepy_compiler::UnaryKind = unsafe { std::mem::transmute(arg as u8) };
+    ctx.dirty = true;
+    match interp.op_unary(&v, kind) {
+        Err(err) => {
+            ctx.raised = Some(err);
+            1
+        }
+        Ok(r) => deliver_dyn_result(jf, ctx, interp, r),
+    }
+}
+
 /// The `wpjit_dyn_compare` helper (`weavepy_jit::TOp::DynCompare`): the
 /// interpreter's rich comparison for `arg` on the two staged operands. With
 /// the oparg's to-`bool` flag the result is its truth (`0`/`1` in
@@ -12354,6 +12540,7 @@ pub(crate) fn try_call_native_direct(
         pin_memo: [u32::MAX; PIN_MEMO],
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
+        cell_list_pins: Vec::new(),
     };
     let mut jf = JitFrame {
         locals: locals_buf.as_mut_ptr(),
@@ -13206,6 +13393,7 @@ fn enter_compiled(
         pin_memo: [u32::MAX; PIN_MEMO],
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
+        cell_list_pins: Vec::new(),
     };
     let mut jf = JitFrame {
         locals: locals_buf.as_mut_ptr(),
@@ -14093,6 +14281,7 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
         pin_memo: [u32::MAX; PIN_MEMO],
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
+        cell_list_pins: Vec::new(),
     };
     let mut jf = JitFrame {
         locals: act.locals_buf.as_mut_ptr(),
