@@ -409,6 +409,7 @@ impl Interpreter {
             depth_cell: std::ptr::null(),
             err: None,
             frame: frame_ptr,
+            sw: std::ptr::null_mut(),
         };
         #[cfg(feature = "jit")]
         let mut handed = usize::MAX;

@@ -34,7 +34,7 @@
 //! object layout tier 2 measures (see `tier2::obj_layout`).
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use cranelift_codegen::ir::{
     condcodes::{FloatCC, IntCC},
@@ -58,6 +58,10 @@ pub(crate) const INTERP: u32 = 0;
 pub(crate) const MARKED: u32 = 1;
 /// A call raised `State::err`, with `pc` past it.
 pub(crate) const RAISED: u32 = 2;
+/// A call or return switched the running activation (see
+/// `Interpreter::core_call`), the frame synced first: the core loop
+/// reloads.
+pub(crate) const RELOAD: u32 = 4;
 
 /// Activations and back edges before a code object is compiled
 /// (`WEAVEPY_FRAME_JIT_HOT` overrides it, a tuning aid).
@@ -82,6 +86,10 @@ fn size_factor(code: &CodeObject) -> u32 {
 
 /// The code length [`hot`] alone covers.
 const SIZE_UNIT: usize = 16;
+
+/// How many entries at a pc may get nowhere before the core loop stops
+/// entering there.
+const MAX_FAILS: u8 = 32;
 
 /// The longest code compiled.
 const MAX_INSTRUCTIONS: usize = 4096;
@@ -112,6 +120,9 @@ pub(crate) struct State {
     /// The running frame, for its namespaces and cells (its stack and
     /// locals are the fields above).
     pub(crate) frame: *mut crate::Frame,
+    /// The core loop's activation switch, for calls and returns (null in
+    /// a generator's fast step).
+    pub(crate) sw: *mut crate::CoreSwitch,
 }
 
 const S_LOCALS: i32 = 0;
@@ -147,8 +158,12 @@ pub(crate) struct Native {
     /// The locals vector's length the code was compiled for.
     nlocals: usize,
     /// The pcs worth entering at: block starts whose first instruction
-    /// the native code runs.
-    entries: Box<[bool]>,
+    /// the native code runs, until entries there keep getting nowhere
+    /// (see `fails`).
+    entries: Box<[AtomicBool]>,
+    /// How many entries at each pc handed its first instruction straight
+    /// back (an iterator or operand its helpers never take).
+    fails: Box<[AtomicU8]>,
     /// The code's name, opcodes, stack depths and the stack capacity it
     /// needs (for `WEAVEPY_FRAME_JIT_STATS`).
     name: String,
@@ -176,7 +191,21 @@ impl Native {
     /// Whether entering at `pc` gets anywhere.
     #[inline(always)]
     pub(crate) fn enters_at(&self, pc: usize) -> bool {
-        self.entries.get(pc).copied().unwrap_or(false)
+        self.entries
+            .get(pc)
+            .is_some_and(|e| e.load(Ordering::Relaxed))
+    }
+
+    /// An entry at `pc` got nowhere: after a few, the core loop stops
+    /// entering there.
+    #[cold]
+    #[inline(never)]
+    fn note_fail(&self, pc: usize) {
+        if let (Some(f), Some(e)) = (self.fails.get(pc), self.entries.get(pc)) {
+            if f.fetch_add(1, Ordering::Relaxed) >= MAX_FAILS {
+                e.store(false, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Run from `st.pc` until an instruction the core loop must run.
@@ -187,9 +216,12 @@ impl Native {
     /// from, as the core loop holds it, with `nlocals` locals.
     #[inline(always)]
     pub(crate) unsafe fn run(&self, st: &mut State) -> u32 {
-        let (from, len, cap) = (st.pc, st.len, st.cap);
+        let (from, len, cap, last) = (st.pc, st.len, st.cap, st.last);
         // SAFETY: the caller's contract.
         let status = unsafe { (self.func)(st) };
+        if status == INTERP && st.pc == from && st.last == last {
+            self.note_fail(from);
+        }
         if stats::enabled() {
             // Why an entry got nowhere: a stack too small for the code, a
             // depth the block doesn't start at, or the instruction itself.
@@ -586,6 +618,8 @@ mod stats {
         let op = match (status, ops.get(at)) {
             (0, Some(op)) => format!("{op:?}{bail}"),
             (0, None) => "<end>".to_owned(),
+            (super::RELOAD, _) => "<switched>".to_owned(),
+            (super::RAISED, _) => "<raised>".to_owned(),
             _ => "<marked>".to_owned(),
         };
         let mut counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1782,7 +1816,27 @@ unsafe extern "C" fn h_call(
             }
         }
         if python != 0 {
-            return CALL_DECLINED;
+            // A Python callee's activation, switched to as the arm does
+            // (the frame synced first; a declined switch leaves the call
+            // to the quiet loop).
+            if st.sw.is_null() {
+                return CALL_DECLINED;
+            }
+            let sw = &mut *st.sw;
+            let frame = &mut *st.frame;
+            frame.stack.set_len(len);
+            frame.pc = pc as u32;
+            *sw.last = st.last;
+            let interp = &mut *st.interp.cast_mut();
+            let switched = if python == 1 {
+                interp.core_call(sw, pc)
+            } else {
+                interp.core_new(sw, pc, st.snap_gen)
+            };
+            if !switched && sw.pending.is_none() {
+                sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+            }
+            return RELOAD;
         }
         // A builtin the site has settled as a leaf (one it hasn't runs
         // through the core loop's builtin lane).
@@ -1862,6 +1916,32 @@ unsafe extern "C" fn h_call(
                 RAISED
             }
         }
+    }
+}
+
+/// `RETURN_VALUE` (the `pc`th instruction) of an inline activation with
+/// the value atop a `len`-deep stack: the frame synced and the caller
+/// switched back to as the core loop's arm does (`1`), or `0` for the
+/// root activation's, which the core loop's quiet loop returns from.
+unsafe extern "C" fn h_return(st: *mut State, pc: u64, len: u64) -> u32 {
+    // SAFETY: the code passes its live state, whose switch is the core
+    // loop's (non-null: generator bodies don't return through here), and
+    // its stack depth.
+    unsafe {
+        let st = &mut *st;
+        let sw = &mut *st.sw;
+        if (*sw.inl).is_empty() {
+            return 0;
+        }
+        let frame = &mut *st.frame;
+        frame.stack.set_len(len as usize);
+        frame.pc = pc as u32;
+        *sw.last = st.last;
+        let interp = &mut *st.interp.cast_mut();
+        if !interp.core_return(sw, st.snap_gen) {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+        }
+        1
     }
 }
 
@@ -1950,6 +2030,9 @@ impl Engine {
         // run than it saves. Its register allocator pays for itself (the
         // single-pass one spills around every helper call).
         flags.set("opt_level", "none").ok()?;
+        if let Ok(a) = std::env::var("WEAVEPY_FRAME_JIT_REGALLOC") {
+            flags.set("regalloc_algorithm", &a).ok()?;
+        }
         if !cfg!(debug_assertions) && !verify() {
             flags.set("enable_verifier", "false").ok()?;
         }
@@ -2070,7 +2153,8 @@ fn compile_with(
     Some(Native {
         func,
         nlocals,
-        entries: entries.into_boxed_slice(),
+        fails: entries.iter().map(|_| AtomicU8::new(0)).collect(),
+        entries: entries.into_iter().map(AtomicBool::new).collect(),
         name: code.qualname.clone(),
         ops: code.instructions.iter().map(|i| i.op).collect(),
         depths: depths.into(),
@@ -2144,9 +2228,6 @@ struct Lower<'a> {
     st: Value,
     locals: Value,
     stack: Value,
-    snap: Value,
-    countdown: Value,
-    dead: Value,
     /// The instruction that last ran, when known here; `None` at a block's
     /// start, whose `st.last` the entry or the jump in wrote.
     last_pc: Option<usize>,
@@ -2295,9 +2376,6 @@ impl<'a> Lower<'a> {
         let load = |b: &mut FunctionBuilder<'_>, ty, off| b.ins().load(ty, FLAGS, st, off);
         let locals = load(&mut b, ptr, S_LOCALS);
         let stack = load(&mut b, ptr, S_STACK);
-        let snap = load(&mut b, types::I64, S_SNAP);
-        let countdown = load(&mut b, ptr, S_COUNTDOWN);
-        let dead = load(&mut b, ptr, S_DEAD);
         Lower {
             b,
             ptr,
@@ -2311,9 +2389,6 @@ impl<'a> Lower<'a> {
             st,
             locals,
             stack,
-            snap,
-            countdown,
-            dead,
             last_pc: None,
             maybe_unbound: {
                 let params = code.arg_count as usize
@@ -2388,6 +2463,14 @@ impl<'a> Lower<'a> {
             let v = self.b.ins().iconst(types::I64, pc as i64);
             self.b.ins().store(FLAGS, v, self.st, S_LAST);
         }
+    }
+
+    /// The running thread's queued-finalizer flag (read where checked: a
+    /// value live through the whole function costs the register allocator
+    /// more than the load).
+    fn dead_flag(&mut self) -> Value {
+        let dead = self.b.ins().load(self.ptr, FLAGS, self.st, S_DEAD);
+        self.b.ins().uload8(types::I32, FLAGS, dead, 0)
     }
 
     fn slot_addr(&mut self, slot: usize) -> Value {
@@ -2600,7 +2683,7 @@ impl<'a> Lower<'a> {
     /// Stop for a queued finalizer (with `pc` next), from the current
     /// state.
     fn check_released(&mut self, next: usize) {
-        let f = self.b.ins().uload8(types::I32, FLAGS, self.dead, 0);
+        let f = self.dead_flag();
         let out = self.exit_with(next, &[], MARKED);
         self.branch_out(f, out);
     }
@@ -3152,19 +3235,21 @@ impl<'a> Lower<'a> {
                 self.flush();
                 // The back edge is the eval breaker (the core loop's arm,
                 // which the exits below hand the instruction to).
-                let c = self.b.ins().load(types::I32, FLAGS, self.countdown, 0);
+                let countdown = self.b.ins().load(self.ptr, FLAGS, self.st, S_COUNTDOWN);
+                let c = self.b.ins().load(types::I32, FLAGS, countdown, 0);
                 let low = self.b.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, c, 1);
                 let gen_addr = self
                     .b
                     .ins()
                     .iconst(self.ptr, crate::hot_gates::loop_gen_ptr() as i64);
                 let g = self.b.ins().load(types::I64, FLAGS, gen_addr, 0);
-                let moved = self.b.ins().icmp(IntCC::NotEqual, g, self.snap);
+                let snap = self.b.ins().load(types::I64, FLAGS, self.st, S_SNAP);
+                let moved = self.b.ins().icmp(IntCC::NotEqual, g, snap);
                 let trip = self.b.ins().bor(low, moved);
                 let out = self.exit_with(pc, &[], INTERP);
                 self.branch_out(trip, out);
                 let c1 = self.b.ins().iadd_imm(c, -1);
-                self.b.ins().store(FLAGS, c1, self.countdown, 0);
+                self.b.ins().store(FLAGS, c1, countdown, 0);
                 self.set_last(pc);
                 self.goto(next.saturating_sub(ins.arg as usize));
                 return false;
@@ -3220,8 +3305,25 @@ impl<'a> Lower<'a> {
                 true
             }
             OpCode::UnaryOp if ins.arg <= 3 => return self.unary(pc, ins.arg),
-            // (A generator body's raise can't leave from here.)
+            // (A generator body's raise can't leave from here, nor its
+            // return switch.)
             OpCode::Call if !self.is_gen() => return self.call_op(pc, ins.arg as usize),
+            OpCode::ReturnValue if !self.is_gen() && self.depth > 0 => {
+                self.flush();
+                self.store_last();
+                let pcv = self.b.ins().iconst(types::I64, pc as i64);
+                let len = self.b.ins().iconst(types::I64, self.depth as i64);
+                let r = self
+                    .call(h_return as *const () as usize, &[self.st, pcv, len], true)
+                    .expect("returns");
+                let out = self.exit_with(pc, &[], INTERP);
+                let switched = self.b.create_block();
+                self.b.ins().brif(r, switched, &[], out, &[]);
+                self.b.switch_to_block(switched);
+                let s = self.b.ins().iconst(types::I32, i64::from(RELOAD));
+                self.b.ins().return_(&[s]);
+                return false;
+            }
             _ => {
                 self.exit(INTERP, pc);
                 return false;
@@ -3340,7 +3442,7 @@ impl<'a> Lower<'a> {
     /// Stop for a queued finalizer with the state as a helper left it (pc
     /// and depth already stored).
     fn check_released_dynamic(&mut self) {
-        let f = self.b.ins().uload8(types::I32, FLAGS, self.dead, 0);
+        let f = self.dead_flag();
         let out = self.b.create_block();
         let ok = self.b.create_block();
         self.b.ins().brif(f, out, &[], ok, &[]);
@@ -3675,12 +3777,11 @@ impl<'a> Lower<'a> {
             .expect("returns");
         let out = self.exit_with(pc, &[Item::Mem(slot), Item::Mem(slot + 1)], INTERP);
         self.branch_out(r, out);
+        // (The operands were a local's, a constant's or scalars: their
+        // copies' releases free nothing.)
         let saved = self.last_pc.replace(pc);
         let after = self.exit_with(pc + 1, &[Item::Mem(slot)], INTERP);
-        let marked = self.exit_with(pc + 1, &[Item::Mem(slot)], MARKED);
         self.last_pc = saved;
-        let f = self.b.ins().uload8(types::I32, FLAGS, self.dead, 0);
-        self.branch_out(f, marked);
         let tag = self.tag_at(at);
         let scalar = self.is_scalar(tag);
         let ok = self.b.create_block();
@@ -4055,21 +4156,7 @@ impl<'a> Lower<'a> {
         let declined = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, r, 1);
         let out = self.exit_with(pc, &[Item::Mem(slot), Item::Mem(slot + 1)], INTERP);
         self.branch_out(declined, out);
-        let saved = self.last_pc.replace(pc);
-        let marked = self.exit_with(pc + 1, &[Item::Mem(slot)], MARKED);
-        self.last_pc = saved;
-        let f = self.b.ins().uload8(types::I32, FLAGS, self.dead, 0);
-        let marked_b = self.b.create_block();
-        let fine = self.b.create_block();
-        self.b.ins().brif(f, marked_b, &[], fine, &[]);
-        // (The result goes onto the stack for the core loop.)
-        self.b.switch_to_block(marked_b);
-        let dst = self.slot_addr(slot);
-        self.write_tag(dst, self.tags.boolean);
-        let r8 = self.b.ins().ireduce(types::I8, r);
-        self.b.ins().store(FLAGS, r8, dst, 1);
-        self.b.ins().jump(marked, &[]);
-        self.b.switch_to_block(fine);
+        // (The helper releases only numbers and strings: no finalizer.)
         let t = self.b.ins().icmp_imm(IntCC::NotEqual, r, 0);
         self.b.ins().jump(done, &[t.into()]);
     }
@@ -4594,7 +4681,7 @@ impl<'a> Lower<'a> {
         let saved = self.last_pc.replace(pc);
         let marked = self.exit_with(pc + 1, &[Item::Mem(slot)], MARKED);
         self.last_pc = saved;
-        let f = self.b.ins().uload8(types::I32, FLAGS, self.dead, 0);
+        let f = self.dead_flag();
         let marked_b = self.b.create_block();
         let fine = self.b.create_block();
         self.b.ins().brif(f, marked_b, &[], fine, &[]);
@@ -4642,13 +4729,16 @@ impl<'a> Lower<'a> {
         let ran = self.b.create_block();
         let other = self.b.create_block();
         self.b.ins().brif(r, other, &[], ran, &[]);
+        // Raised or switched: the core loop takes it from the state.
         self.b.switch_to_block(other);
-        let raised = self.b.ins().icmp_imm(IntCC::Equal, r, i64::from(RAISED));
-        let raise_b = self.b.create_block();
-        self.b.ins().brif(raised, raise_b, &[], out, &[]);
-        self.b.switch_to_block(raise_b);
-        let s = self.b.ins().iconst(types::I32, i64::from(RAISED));
-        self.b.ins().return_(&[s]);
+        let declined = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, r, i64::from(CALL_DECLINED));
+        let leave = self.b.create_block();
+        self.b.ins().brif(declined, out, &[], leave, &[]);
+        self.b.switch_to_block(leave);
+        self.b.ins().return_(&[r]);
         self.b.switch_to_block(ran);
         self.depth -= argc + 1;
         self.set_last(pc);

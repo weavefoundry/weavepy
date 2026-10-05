@@ -10843,6 +10843,7 @@ impl Interpreter {
                             depth_cell: sw.depth_cell,
                             err: None,
                             frame: sw.cur,
+                            sw: std::ptr::from_mut(sw),
                         });
                         nst.len = len;
                         nst.pc = pc;
@@ -10850,6 +10851,11 @@ impl Interpreter {
                         // SAFETY: the running activation's state, as this
                         // loop holds it (its locals count checked above).
                         let status = unsafe { native.run(nst) };
+                        // A call or return the native code switched the
+                        // activation for (synced before the switch).
+                        if status == frame_jit::RELOAD {
+                            break Some(CoreExit::Reload);
+                        }
                         len = nst.len;
                         pc = nst.pc;
                         last = nst.last;
