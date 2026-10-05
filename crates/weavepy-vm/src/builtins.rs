@@ -8331,7 +8331,7 @@ fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
                 watch: Some(crate::object::DictWatch::new(d)),
                 owner,
                 reverse: true,
-                odict: false,
+                odict: None,
             })))
         };
     match iterable {

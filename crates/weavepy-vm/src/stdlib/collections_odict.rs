@@ -17,8 +17,8 @@
 //! `odict`): a structural change of the order (an insertion, a deletion,
 //! `move_to_end`) between steps raises `OrderedDict mutated during
 //! iteration`, as CPython's `od_state` check does, while replacing a value
-//! does not. The values and items iterators wrap such a key iterator in a
-//! small Python class whose `__next__` reads each value from the payload.
+//! does not. The values and items iterators walk the order the same way
+//! and read each value from the payload.
 
 use crate::error::{key_error, key_error_object, runtime_error, type_error, RuntimeError};
 use crate::object::{DictData, DictKey, DictViewKind, Object, PyIterator};
@@ -165,22 +165,29 @@ fn index_of(d: &Rc<RefCell<DictData>>, key: &Object) -> Result<Option<usize>, Ru
     crate::object::dict_index_of(d, key)
 }
 
-/// A fresh key iterator over the order of `od`, reversed or not, holding
-/// `od` alive.
-pub(crate) fn order_iter(od: &Object, order: Rc<RefCell<DictData>>, reverse: bool) -> Object {
+/// A fresh iterator over the order of `od` (`main` is its dict payload):
+/// its keys, or its values or items read from the payload, reversed or
+/// not, holding `od` alive.
+pub(crate) fn order_iter(
+    od: &Object,
+    main: Rc<RefCell<DictData>>,
+    order: Rc<RefCell<DictData>>,
+    kind: DictViewKind,
+    reverse: bool,
+) -> Object {
     let len = order.borrow().len();
     // The order's state is captured now, as CPython's iterator snapshots
     // `od_state` at creation.
     let watch = Some(crate::object::DictWatch::new(&order));
     let it = Object::Iter(Rc::new(RefCell::new(PyIterator::DictKeys {
-        kind: DictViewKind::Keys,
+        kind,
         index: if reverse { len } else { 0 },
         dict: Some(order),
         len,
         watch,
         reverse,
         owner: Some(od.clone()),
-        odict: true,
+        odict: Some(main),
     })));
     crate::gc_trace::track(&it);
     it
@@ -287,120 +294,32 @@ fn od_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
 
 /// `OrderedDict.__iter__(self)`.
 fn od_iter(args: &[Object]) -> Result<Object, RuntimeError> {
-    let (inst, _) = receiver(args, "__iter__")?;
+    let (inst, main) = receiver(args, "__iter__")?;
     if args.len() != 1 {
         return Err(type_error("__iter__() takes no arguments"));
     }
-    Ok(order_iter(&args[0], order_of(&inst), false))
+    Ok(order_iter(
+        &args[0],
+        main,
+        order_of(&inst),
+        DictViewKind::Keys,
+        false,
+    ))
 }
 
 /// `OrderedDict.__reversed__(self)`.
 fn od_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
-    let (inst, _) = receiver(args, "__reversed__")?;
+    let (inst, main) = receiver(args, "__reversed__")?;
     if args.len() != 1 {
         return Err(type_error("__reversed__() takes no arguments"));
     }
-    Ok(order_iter(&args[0], order_of(&inst), true))
-}
-
-// The values/items iterator class's slots, in the order
-// [`od_view_iter`] fills them.
-const IT_KEYS: &str = "_it";
-const IT_OD: &str = "_od";
-const IT_KIND: &str = "_kind";
-
-/// `view_iter(od, kind, reverse, cls)`: the iterator behind the views.
-/// Keys (`kind` 0) iterate the order directly; values (1) and items (2)
-/// are an instance of `cls` (the values/items iterator class) around a key
-/// iterator, reading each value from the payload.
-fn od_view_iter(args: &[Object]) -> Result<Object, RuntimeError> {
-    let (inst, _) = receiver(args, "__iter__")?;
-    let [od, Object::Int(kind), reverse, cls] = args else {
-        return Err(type_error(
-            "view_iter() expects an OrderedDict, a kind, a direction and a class",
-        ));
-    };
-    let keys = order_iter(od, order_of(&inst), truth(reverse)?);
-    if *kind == 0 {
-        return Ok(keys);
-    }
-    let Object::Type(cls) = cls else {
-        return Err(type_error("view_iter() expects an iterator class"));
-    };
-    let it = PyInstance::new_deferred(cls.clone());
-    it.slot_set(IT_KEYS, keys);
-    it.slot_set(IT_OD, od.clone());
-    it.slot_set(IT_KIND, Object::Int(*kind));
-    Ok(Object::Instance(it))
-}
-
-/// The key iterator, payload and kind of a values/items iterator.
-fn view_iter_parts(
-    args: &[Object],
-) -> Result<(Rc<RefCell<PyIterator>>, Rc<RefCell<DictData>>, i64), RuntimeError> {
-    let [Object::Instance(it)] = args else {
-        return Err(type_error("OrderedDict iterator expected"));
-    };
-    let slots = it.slots.borrow();
-    let keys = match slots.get_hinted(0, IT_KEYS) {
-        Some(Object::Iter(k)) => k.clone(),
-        _ => return Err(type_error("OrderedDict iterator expected")),
-    };
-    let main = match slots.get_hinted(1, IT_OD) {
-        Some(Object::Instance(od)) => match od.native.get() {
-            Some(Object::Dict(d)) => d.clone(),
-            _ => return Err(type_error("OrderedDict iterator expected")),
-        },
-        _ => return Err(type_error("OrderedDict iterator expected")),
-    };
-    let kind = match slots.get_hinted(2, IT_KIND) {
-        Some(Object::Int(k)) => *k,
-        _ => 1,
-    };
-    Ok((keys, main, kind))
-}
-
-/// `__next__` of a values/items iterator.
-fn od_view_next(args: &[Object]) -> Result<Object, RuntimeError> {
-    let (keys, main, kind) = view_iter_parts(args)?;
-    let next = keys.borrow_mut().next_value_checked();
-    let Some(key) = next? else {
-        return Err(crate::error::stop_iteration());
-    };
-    let Some(value) = crate::builtins::dict_lookup(&main, &key)? else {
-        return Err(key_error_object(key));
-    };
-    Ok(if kind == 1 {
-        value
-    } else {
-        Object::new_tuple_array([key, value])
-    })
-}
-
-/// `iter_remaining(it)`: what a values/items iterator would still yield,
-/// without advancing it (its `__reduce__`).
-fn od_view_remaining(args: &[Object]) -> Result<Object, RuntimeError> {
-    let (keys, main, kind) = view_iter_parts(args)?;
-    let pending = keys.borrow().remaining_items();
-    let mut out = Vec::with_capacity(pending.len());
-    for key in pending {
-        let Some(value) = crate::builtins::dict_lookup(&main, &key)? else {
-            return Err(key_error_object(key));
-        };
-        out.push(if kind == 1 {
-            value
-        } else {
-            Object::new_tuple_array([key, value])
-        });
-    }
-    Ok(Object::new_list(out))
-}
-
-/// `__length_hint__` of a values/items iterator.
-fn od_view_length_hint(args: &[Object]) -> Result<Object, RuntimeError> {
-    let (keys, _, _) = view_iter_parts(args)?;
-    let n = keys.borrow().remaining().unwrap_or(0);
-    Ok(Object::Int(n as i64))
+    Ok(order_iter(
+        &args[0],
+        main,
+        order_of(&inst),
+        DictViewKind::Keys,
+        true,
+    ))
 }
 
 /// `OrderedDict.move_to_end(self, key, last=True)`.
@@ -744,13 +663,102 @@ fn od_pop_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     leaf_unlink(&main, &order, index, &probe).map(Ok)
 }
 
-/// `install_odict(cls)`: mark the `OrderedDict` class (exactly).
+/// The view classes `keys()`, `values()` and `items()` hand out (CPython's
+/// `odict_keys`, `odict_values` and `odict_items`), kept on the
+/// `OrderedDict` class by [`install_odict`].
+struct ViewTypes([crate::sync::Weak<TypeObject>; 3]);
+
+/// `install_odict(cls, keys, values, items)`: mark the `OrderedDict` class
+/// (exactly) and record its view classes.
 fn install_odict(args: &[Object]) -> Result<Object, RuntimeError> {
-    let [Object::Type(cls)] = args else {
-        return Err(type_error("install_odict() expects a class"));
+    let [Object::Type(cls), Object::Type(k), Object::Type(v), Object::Type(i)] = args else {
+        return Err(type_error(
+            "install_odict() expects the class and its view classes",
+        ));
     };
     cls.collections_kind.set(KIND_ODICT);
+    let views = Rc::new(ViewTypes([
+        Rc::downgrade(k),
+        Rc::downgrade(v),
+        Rc::downgrade(i),
+    ]));
+    let _ = cls
+        .native_ext
+        .set(crate::rc_unsize!(views => dyn std::any::Any + Send + Sync));
     Ok(Object::None)
+}
+
+/// A new view of `od` of the given kind (0 keys, 1 values, 2 items): an
+/// instance of the view class with its `_mapping` slot set, as
+/// `MappingView.__init__` leaves it.
+fn make_view(args: &[Object], kind: usize, method: &str) -> Result<Object, RuntimeError> {
+    let (inst, _) = receiver(args, method)?;
+    if args.len() != 1 {
+        return Err(type_error(format!(
+            "{method}() takes no arguments ({} given)",
+            args.len() - 1
+        )));
+    }
+    let cls = inst
+        .cls_raw()
+        .mro
+        .borrow()
+        .iter()
+        .find(|t| t.collections_kind.get() == KIND_ODICT)
+        .and_then(|t| t.native_ext.get()?.downcast_ref::<ViewTypes>()?.0[kind].upgrade())
+        .ok_or_else(|| type_error("OrderedDict views are not installed"))?;
+    let view = PyInstance::new_deferred(cls);
+    view.slot_set("_mapping", args[0].clone());
+    Ok(Object::Instance(view))
+}
+
+fn od_keys(args: &[Object]) -> Result<Object, RuntimeError> {
+    make_view(args, 0, "keys")
+}
+
+fn od_values(args: &[Object]) -> Result<Object, RuntimeError> {
+    make_view(args, 1, "values")
+}
+
+fn od_items(args: &[Object]) -> Result<Object, RuntimeError> {
+    make_view(args, 2, "items")
+}
+
+/// A view's `__iter__`/`__reversed__`: the order iterator of the view's
+/// `OrderedDict` (its `_mapping`).
+fn view_iter(args: &[Object], kind: DictViewKind, reverse: bool) -> Result<Object, RuntimeError> {
+    let [Object::Instance(view)] = args else {
+        return Err(type_error("__iter__() takes no arguments"));
+    };
+    let Some(od) = view.slot_get("_mapping") else {
+        return Err(crate::error::attribute_error("_mapping"));
+    };
+    let (inst, main) = receiver(std::slice::from_ref(&od), "__iter__")?;
+    Ok(order_iter(&od, main, order_of(&inst), kind, reverse))
+}
+
+fn keys_iter(args: &[Object]) -> Result<Object, RuntimeError> {
+    view_iter(args, DictViewKind::Keys, false)
+}
+
+fn keys_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
+    view_iter(args, DictViewKind::Keys, true)
+}
+
+fn values_iter(args: &[Object]) -> Result<Object, RuntimeError> {
+    view_iter(args, DictViewKind::Values, false)
+}
+
+fn values_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
+    view_iter(args, DictViewKind::Values, true)
+}
+
+fn items_iter(args: &[Object]) -> Result<Object, RuntimeError> {
+    view_iter(args, DictViewKind::Items, false)
+}
+
+fn items_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
+    view_iter(args, DictViewKind::Items, true)
 }
 
 /// The module's `OrderedDict` callables: `(export, name, body, keyword
@@ -766,20 +774,15 @@ pub(crate) fn exports() -> Vec<(&'static str, &'static str, Body, Option<Kw>)> {
         ("od_delitem", "__delitem__", od_delitem, None),
         ("od_iter", "__iter__", od_iter, None),
         ("od_reversed", "__reversed__", od_reversed, None),
-        ("od_view_iter", "view_iter", od_view_iter, None),
-        ("od_view_next", "__next__", od_view_next, None),
-        (
-            "od_view_remaining",
-            "iter_remaining",
-            od_view_remaining,
-            None,
-        ),
-        (
-            "od_view_length_hint",
-            "__length_hint__",
-            od_view_length_hint,
-            None,
-        ),
+        ("od_keys", "keys", od_keys, None),
+        ("od_values", "values", od_values, None),
+        ("od_items", "items", od_items, None),
+        ("odv_keys_iter", "__iter__", keys_iter, None),
+        ("odv_keys_reversed", "__reversed__", keys_reversed, None),
+        ("odv_values_iter", "__iter__", values_iter, None),
+        ("odv_values_reversed", "__reversed__", values_reversed, None),
+        ("odv_items_iter", "__iter__", items_iter, None),
+        ("odv_items_reversed", "__reversed__", items_reversed, None),
         (
             "od_move_to_end",
             "move_to_end",
@@ -805,6 +808,22 @@ pub(crate) fn exports() -> Vec<(&'static str, &'static str, Body, Option<Kw>)> {
         ("install_odict", "install_odict", install_odict, None),
     ]
 }
+
+/// The exports whose whole body runs no Python code (receiver checks,
+/// iterator and view construction).
+pub(crate) const LEAVES: [&str; 11] = [
+    "od_iter",
+    "od_reversed",
+    "od_keys",
+    "od_values",
+    "od_items",
+    "odv_keys_iter",
+    "odv_keys_reversed",
+    "odv_values_iter",
+    "odv_values_reversed",
+    "odv_items_iter",
+    "odv_items_reversed",
+];
 
 /// The exports with leaf halves.
 pub(crate) fn leaf_halves() -> [(&'static str, crate::leaf_builtins::Fast); 4] {

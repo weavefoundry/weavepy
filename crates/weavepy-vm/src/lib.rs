@@ -14195,7 +14195,7 @@ impl Interpreter {
             watch,
             reverse: false,
             owner,
-            ..
+            odict,
         } = it
         else {
             return DictStep::Decline;
@@ -14220,6 +14220,25 @@ impl Interpreter {
             *dict = None;
             *watch = None;
             return DictStep::Exhausted;
+        };
+        // An `OrderedDict`'s values come from its payload: a plain key's,
+        // found by exact native equality (anything else is the checked
+        // step's, which may raise).
+        let v = match (odict.as_ref(), &*kind) {
+            (Some(payload), DictViewKind::Values | DictViewKind::Items) => {
+                let Some(probe) = crate::object::LeafProbe::new(&k.0) else {
+                    return DictStep::Decline;
+                };
+                // SAFETY: as above.
+                let Some(payload) = (unsafe { payload.peek() }) else {
+                    return DictStep::Decline;
+                };
+                let Some(v) = payload.get(&probe) else {
+                    return DictStep::Decline;
+                };
+                v
+            }
+            _ => v,
         };
         let item = match kind {
             DictViewKind::Keys => (clone_hot(&k.0), None),

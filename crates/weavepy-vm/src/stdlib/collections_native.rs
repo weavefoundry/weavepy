@@ -1308,6 +1308,11 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 })),
             );
         }
+        for name in super::collections_odict::LEAVES {
+            if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
+                crate::leaf_builtins::register(b);
+            }
+        }
         for (name, fast) in super::collections_odict::leaf_halves() {
             if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
                 crate::leaf_builtins::register_fast(b, fast);

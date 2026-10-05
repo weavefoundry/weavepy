@@ -8322,11 +8322,14 @@ pub enum PyIterator {
         /// `di_pos >= dk_nentries` bail-out
         /// (test_dict.test_reversed_dict_after_clear_and_restore).
         reverse: bool,
-        /// An `OrderedDict`'s key iterator over its order dict (see
-        /// `stdlib::collections_odict`): the watch is taken at creation,
-        /// and a structural change raises CPython's `OrderedDict mutated
-        /// during iteration` in either direction.
-        odict: bool,
+        /// An `OrderedDict` iterator (see `stdlib::collections_odict`):
+        /// `dict` is the od's order (keys only) and this its dict payload,
+        /// from which the values and items kinds read each key's value (a
+        /// key the payload lost raises `KeyError`, as in CPython). The
+        /// watch is taken at creation, and a structural change of the
+        /// order raises `OrderedDict mutated during iteration` in either
+        /// direction.
+        odict: Option<Rc<RefCell<DictData>>>,
     },
     Bytes {
         data: SharedSlice<u8>,
@@ -8520,9 +8523,37 @@ impl PyIterator {
                 dict,
                 owner,
                 reverse,
+                odict,
                 ..
             } => {
                 let d = dict.as_ref()?;
+                // An `OrderedDict`'s values or items: each value comes from
+                // the payload by key (unchecked, a lost key ends the walk;
+                // the checked step raises instead — `od_step`).
+                if let (Some(payload), DictViewKind::Values | DictViewKind::Items) = (odict, *kind)
+                {
+                    let i = if *reverse {
+                        index.checked_sub(1)
+                    } else {
+                        Some(*index)
+                    };
+                    let key = i.and_then(|i| d.borrow().get_index(i).map(|(k, _)| k.0.clone()));
+                    let Some(key) = key else {
+                        *dict = None;
+                        *owner = None;
+                        return None;
+                    };
+                    let value = crate::builtins::dict_lookup(payload, &key).ok().flatten()?;
+                    if *reverse {
+                        *index -= 1;
+                    } else {
+                        *index += 1;
+                    }
+                    return Some(match kind {
+                        DictViewKind::Values => value,
+                        _ => Object::new_tuple_array([key, value]),
+                    });
+                }
                 let entry = if *reverse {
                     if *index == 0 {
                         None
@@ -8786,7 +8817,7 @@ impl PyIterator {
             index,
             reverse,
             owner,
-            odict: true,
+            odict: Some(_),
             ..
         } = self
         {
@@ -8858,6 +8889,7 @@ impl PyIterator {
             PyIterator::DictKeys {
                 kind: DictViewKind::Items,
                 reverse: false,
+                odict: None,
                 ..
             }
         ) {
@@ -8891,6 +8923,54 @@ impl PyIterator {
         Some(Ok(entry))
     }
 
+    /// The checked step of an `OrderedDict` values or items iterator (see
+    /// `PyIterator::DictKeys::odict`): the next key's value read from the
+    /// payload, or the `KeyError` CPython's `odictiter_iternext` raises
+    /// for a key the payload lost. `None` for any other iterator.
+    fn od_step(&mut self) -> Option<Result<Option<Object>, RuntimeError>> {
+        let PyIterator::DictKeys {
+            kind: kind @ (DictViewKind::Values | DictViewKind::Items),
+            index,
+            dict,
+            owner,
+            reverse,
+            odict: Some(payload),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let Some(d) = dict.as_ref() else {
+            return Some(Ok(None));
+        };
+        let i = if *reverse {
+            index.checked_sub(1)
+        } else {
+            Some(*index)
+        };
+        let key = i.and_then(|i| d.borrow().get_index(i).map(|(k, _)| k.0.clone()));
+        let Some(key) = key else {
+            *dict = None;
+            *owner = None;
+            return Some(Ok(None));
+        };
+        if *reverse {
+            *index -= 1;
+        } else {
+            *index += 1;
+        }
+        let kind = *kind;
+        let payload = payload.clone();
+        Some(match crate::builtins::dict_lookup(&payload, &key) {
+            Ok(Some(value)) => Ok(Some(match kind {
+                DictViewKind::Values => value,
+                _ => Object::new_tuple_array([key, value]),
+            })),
+            Ok(None) => Err(crate::error::key_error_object(key)),
+            Err(e) => Err(e),
+        })
+    }
+
     /// Like [`next_value`], but enforces CPython's "container changed
     /// size during iteration" invariant before yielding. Used on the
     /// *user-visible* `__next__` boundaries (`FOR_ITER`, the `next()`
@@ -8912,6 +8992,9 @@ impl PyIterator {
         }
         if self.dict_iter_guard()? {
             return Ok(None);
+        }
+        if let Some(step) = self.od_step() {
+            return step;
         }
         if let PyIterator::File { file } = self {
             // Surface read errors (OSError, decode errors) at the
@@ -9055,8 +9138,34 @@ impl PyIterator {
                 index,
                 dict,
                 reverse,
+                odict,
                 ..
             } => match dict {
+                // An `OrderedDict`'s values or items, read from its payload.
+                Some(d) if odict.is_some() && !matches!(kind, DictViewKind::Keys) => {
+                    let payload = odict.as_ref().expect("checked");
+                    let keys: Vec<Object> = {
+                        let d = d.borrow();
+                        let range: Box<dyn Iterator<Item = usize>> = if *reverse {
+                            Box::new((0..(*index).min(d.len())).rev())
+                        } else {
+                            Box::new((*index).min(d.len())..d.len())
+                        };
+                        range
+                            .filter_map(|i| d.get_index(i))
+                            .map(|(k, _)| k.0.clone())
+                            .collect()
+                    };
+                    keys.into_iter()
+                        .filter_map(|k| {
+                            let v = crate::builtins::dict_lookup(payload, &k).ok().flatten()?;
+                            Some(match kind {
+                                DictViewKind::Values => v,
+                                _ => Object::new_tuple_array([k, v]),
+                            })
+                        })
+                        .collect()
+                }
                 Some(d) => {
                     let d = d.borrow();
                     let range: Box<dyn Iterator<Item = usize>> = if *reverse {
@@ -10103,7 +10212,7 @@ impl Object {
                     watch: None,
                     reverse: false,
                     owner: None,
-                    odict: false,
+                    odict: None,
                 })
             }
             Object::Set(s) => {
@@ -10169,7 +10278,7 @@ impl Object {
                     watch: None,
                     reverse: false,
                     owner: v.owner.clone(),
-                    odict: false,
+                    odict: None,
                 })
             }
             Object::MappingProxy(d) => {
@@ -10182,7 +10291,7 @@ impl Object {
                     watch: None,
                     reverse: false,
                     owner: None,
-                    odict: false,
+                    odict: None,
                 })
             }
             // Static fallback; the VM's iteration dispatch delegates to

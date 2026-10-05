@@ -22,6 +22,14 @@ __all__ = ["deque", "defaultdict", "OrderedDict", "_count_elements"]
 # subscription (`deque[int]`) yields a `types.GenericAlias`. `types` only
 # imports `sys`, so this is import-cycle safe from this low-level module.
 from types import GenericAlias as _GenericAlias
+# The OrderedDict views subclass the ABC views (as CPython's subclass
+# `dict_keys`, …); `os` has already imported `_collections_abc` by the
+# time anything imports this module.
+from _collections_abc import (
+    ItemsView as _ItemsView,
+    KeysView as _KeysView,
+    ValuesView as _ValuesView,
+)
 from _weave_collections import iterator_index as _deque_iterator_index
 from _weave_collections import (
     install_tuplegetter as _install_tuplegetter,
@@ -52,10 +60,15 @@ from _weave_collections import (
     od_setdefault as _od_setdefault,
     od_setitem as _od_setitem,
     od_update_fast as _od_update_fast,
-    od_view_iter as _od_view_iter,
-    od_view_length_hint as _od_view_length_hint,
-    od_view_next as _od_view_next,
-    od_view_remaining as _od_iter_remaining,
+    od_items as _od_items,
+    od_keys as _od_keys,
+    od_values as _od_values,
+    odv_items_iter as _odv_items_iter,
+    odv_items_reversed as _odv_items_reversed,
+    odv_keys_iter as _odv_keys_iter,
+    odv_keys_reversed as _odv_keys_reversed,
+    odv_values_iter as _odv_values_iter,
+    odv_values_reversed as _odv_values_reversed,
 )
 
 
@@ -532,36 +545,6 @@ class _deque_iterator:
         return type(self), (deq, self._index)
 
 
-class _OrderedDictIter:
-    """Iterator over an OrderedDict's values or items (CPython's
-    `odict_iterator`): a native key iterator over the order, whose
-    `__next__` reads each value from the dict. Mutating the order between
-    steps raises RuntimeError, exactly like the C iterator's `od_state`
-    check; a key the dict lost behind the order's back raises KeyError."""
-
-    __slots__ = ("_it", "_od", "_kind")
-
-    # The C type's identity (`<odict_iterator object at …>`).
-    __module__ = "builtins"
-    __qualname__ = "odict_iterator"
-
-    def __iter__(self):
-        return self
-
-    __next__ = _od_view_next
-    __length_hint__ = _od_view_length_hint
-
-    def __reduce__(self):
-        # CPython's odict iterators pickle as a plain `iter` over the
-        # *remaining* elements, leaving the live iterator undisturbed
-        # (test_ordered_dict test_iterators_pickled).
-        return iter, (_od_iter_remaining(self),)
-
-
-_OrderedDictIter.__name__ = "odict_iterator"
-
-_odict_views = None
-
 # Per-view `repr` recursion guard (CPython's `Py_ReprEnter` in
 # `dictview_repr`): `od[k] = od.values()` renders the inner view as `...`.
 _odict_view_repr_running = set()
@@ -578,47 +561,27 @@ def _odict_view_repr(view):
         _odict_view_repr_running.discard(key)
 
 
-def _get_odict_views():
-    """Lazily build the KeysView/ValuesView/ItemsView subclasses the
-    view methods hand out (CPython's odict_keys/odict_values/
-    odict_items). Deferred so `_collections` never imports
-    `_collections_abc` at module-exec time."""
-    global _odict_views
-    if _odict_views is None:
-        from _collections_abc import ItemsView, KeysView, ValuesView
+# The views `OrderedDict.keys()`/`values()`/`items()` hand out (CPython's
+# odict_keys/odict_values/odict_items): iterating one walks the order.
+class odict_keys(_KeysView):
+    __module__ = "builtins"
+    __repr__ = _odict_view_repr
+    __iter__ = _odv_keys_iter
+    __reversed__ = _odv_keys_reversed
 
-        class odict_keys(KeysView):
-            __module__ = "builtins"
-            __repr__ = _odict_view_repr
 
-            def __iter__(self):
-                return _od_view_iter(self._mapping, 0, False, None)
+class odict_values(_ValuesView):
+    __module__ = "builtins"
+    __repr__ = _odict_view_repr
+    __iter__ = _odv_values_iter
+    __reversed__ = _odv_values_reversed
 
-            def __reversed__(self):
-                return _od_view_iter(self._mapping, 0, True, None)
 
-        class odict_values(ValuesView):
-            __module__ = "builtins"
-            __repr__ = _odict_view_repr
-
-            def __iter__(self):
-                return _od_view_iter(self._mapping, 1, False, _OrderedDictIter)
-
-            def __reversed__(self):
-                return _od_view_iter(self._mapping, 1, True, _OrderedDictIter)
-
-        class odict_items(ItemsView):
-            __module__ = "builtins"
-            __repr__ = _odict_view_repr
-
-            def __iter__(self):
-                return _od_view_iter(self._mapping, 2, False, _OrderedDictIter)
-
-            def __reversed__(self):
-                return _od_view_iter(self._mapping, 2, True, _OrderedDictIter)
-
-        _odict_views = (odict_keys, odict_values, odict_items)
-    return _odict_views
+class odict_items(_ItemsView):
+    __module__ = "builtins"
+    __repr__ = _odict_view_repr
+    __iter__ = _odv_items_iter
+    __reversed__ = _odv_items_reversed
 
 
 _odict_repr_running = set()
@@ -694,17 +657,9 @@ class OrderedDict(dict):
     def update(self, other=(), /, **kwds):
         self.__update(other, kwds)
 
-    def keys(self):
-        "D.keys() -> a set-like object providing a view on D's keys"
-        return _get_odict_views()[0](self)
-
-    def values(self):
-        "D.values() -> an object providing a view on D's values"
-        return _get_odict_views()[1](self)
-
-    def items(self):
-        "D.items() -> a set-like object providing a view on D's items"
-        return _get_odict_views()[2](self)
+    keys = _od_keys
+    values = _od_values
+    items = _od_items
 
     def setdefault(self, key, default=None):
         '''Insert key with a value of default if key is not in the dictionary.
@@ -829,7 +784,7 @@ class OrderedDict(dict):
 
 
 _od_missing = object()
-_install_odict(OrderedDict)
+_install_odict(OrderedDict, odict_keys, odict_values, odict_items)
 
 
 class _deque_reverse_iterator:
