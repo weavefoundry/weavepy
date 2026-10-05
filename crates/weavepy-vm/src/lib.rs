@@ -19264,6 +19264,52 @@ impl Interpreter {
                     last = pc;
                     pc += 1;
                 }
+                // `xs[a:b] = ys` on an exact list with int (or omitted)
+                // bounds and an exact list or tuple value: the splice the
+                // full handler's slice assignment makes.
+                OpCode::StoreSlice => {
+                    let n = stack.len();
+                    if n < 4 {
+                        break;
+                    }
+                    let bound = |o: &Object| match o {
+                        Object::None => Some(None),
+                        Object::Int(i) => Some(Some(*i)),
+                        _ => None,
+                    };
+                    let (Some(start), Some(stop)) = (bound(&stack[n - 2]), bound(&stack[n - 1]))
+                    else {
+                        break;
+                    };
+                    let Object::List(dst) = &stack[n - 3] else {
+                        break;
+                    };
+                    let items: Vec<Object> = match &stack[n - 4] {
+                        Object::Tuple(t) => t.to_vec(),
+                        Object::List(l) => match l.try_borrow() {
+                            Ok(l) => l.clone(),
+                            Err(_) => break,
+                        },
+                        _ => break,
+                    };
+                    let Ok(mut d) = dst.try_borrow_mut() else {
+                        break;
+                    };
+                    let len = d.len() as i64;
+                    let clamp = |i: Option<i64>, dflt: i64| {
+                        let i = i.unwrap_or(dflt);
+                        let i = if i < 0 { i + len } else { i };
+                        i.clamp(0, len) as usize
+                    };
+                    let a = clamp(start, 0);
+                    let b = clamp(stop, len).max(a);
+                    let removed: Vec<Object> = d.splice(a..b, items).collect();
+                    drop(d);
+                    drop(removed);
+                    stack.truncate(n - 4);
+                    last = pc;
+                    pc += 1;
+                }
                 // `del obj.attr` of a plain instance's own attribute: its
                 // class has no `__delattr__` and no attribute of that name
                 // (so no descriptor), and the deletion runs no Python (a
@@ -60890,6 +60936,7 @@ static SLOW_LEAF_OPS: [bool; 256] = {
         OpCode::LoadConst,
         OpCode::LoadDeref,
         OpCode::LoadFast,
+        OpCode::StoreSlice,
         OpCode::DeleteAttr,
         OpCode::DeleteFast,
         OpCode::ListExtend,

@@ -452,6 +452,43 @@ class ContextManagerShapesTest(unittest.TestCase):
             self.assertEqual(list(forward(gen, (1,), {"b": 2})), [3])
             self.assertEqual(list(gen(*[4])), [4])
 
+class SliceStoreAndGcTest(unittest.TestCase):
+    def test_slice_assignment(self):
+        import random
+
+        rng = random.Random(3)
+        for _ in range(500):
+            xs = list(range(rng.randint(0, 6)))
+            ref = list(xs)
+            a = rng.choice([None, -9, -2, -1, 0, 1, 2, 5, 9])
+            b = rng.choice([None, -9, -2, -1, 0, 1, 2, 5, 9])
+            v = rng.choice([[], [7], (8, 9), [10, 11, 12]])
+            xs[a:b] = v
+            ref[slice(a, b)] = list(v)
+            self.assertEqual(xs, ref)
+        ys = [1, 2, 3]
+        ys[1:] = ys
+        self.assertEqual(ys, [1, 1, 2, 3])
+        with self.assertRaises(TypeError):
+            xs = [1, 2]
+            xs[0:1] = 5
+
+    def test_dead_registered_instances(self):
+        import gc
+        import weakref
+
+        class Node:
+            pass
+
+        keep = []
+        for _ in range(3):
+            batch = [Node() for _ in range(2000)]
+            gc.collect()
+            keep.append(weakref.ref(batch[0]))
+            del batch
+        self.assertEqual([r() for r in keep], [None, None, None])
+        gc.collect()
+
 class FormatTest(unittest.TestCase):
     def test_huge_field_index(self):
         for _ in range(3):

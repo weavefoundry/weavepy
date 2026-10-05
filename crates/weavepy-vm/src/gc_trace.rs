@@ -831,6 +831,58 @@ impl GcState {
         true
     }
 
+    /// Drop the registry entry of a registered object that just died, if
+    /// the registry is free to change: its weak handle otherwise keeps the
+    /// object's allocation alive until a collection of its generation
+    /// prunes it (CPython unlinks a dying object from its GC list at
+    /// once). A busy registry (a collection is releasing garbage) is left
+    /// as it is; that collection prunes the entry.
+    fn forget_dead(&self, id: ObjectId) {
+        let (Ok(mut index), Ok(mut counts), Ok(mut gens)) = (
+            self.index.try_borrow_mut(),
+            self.counts.try_borrow_mut(),
+            self.generations.try_borrow_mut(),
+        ) else {
+            return;
+        };
+        let Some(handle) = index.get(&id) else {
+            return;
+        };
+        if !handle.object.is_dead() || handle.color.load(Ordering::Acquire) == color::Frozen {
+            return;
+        }
+        let handle = index.remove(&id).expect("probed above");
+        let g = usize::from(
+            handle
+                .generation
+                .load(Ordering::Acquire)
+                .min(MAX_GENERATION),
+        );
+        let slot = handle.slot.load(Ordering::Acquire);
+        let removed = if gens[g]
+            .handles
+            .get(slot)
+            .is_some_and(|h| HandleRc::ptr_eq(h, &handle))
+        {
+            swap_remove_handle(&mut gens[g].handles, slot);
+            true
+        } else {
+            remove_handle_by_ptr(&mut gens[g].handles, &handle)
+        };
+        if !removed {
+            // Somewhere unexpected: leave it to the collector.
+            index.insert(id, handle);
+            return;
+        }
+        // (As `untrack_id_in` accounts it.)
+        counts[0] = counts[0].saturating_sub(1);
+        self.sync_gen0_gauge(counts[0], None);
+        drop((index, counts, gens));
+        serial_add(&self.tracked_count, usize::MAX);
+        serial_add(&self.tracked_version, 1);
+        drop(handle);
+    }
+
     /// Stop tracking `obj`. Backs the explicit `gc._untrack(obj)` extension
     /// and the C-API `PyObject_GC_UnTrack`.
     pub fn untrack_id(&self, id: ObjectId) {
@@ -2575,6 +2627,14 @@ pub fn collection_in_progress() -> bool {
 pub fn untrack(obj: &Object) {
     let id = crate::weakref_registry::id_of(obj);
     with_state(|s| s.untrack_id(id));
+}
+
+/// See [`GcState::forget_dead`]; a cheap filter probe first.
+#[inline]
+pub fn forget_dead(id: ObjectId) {
+    if maybe_tracked(id) {
+        with_state(|s| s.forget_dead(id));
+    }
 }
 
 /// [`untrack`] by identity.
