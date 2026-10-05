@@ -78,6 +78,23 @@ for _ in range(5):
     else:
         raise AssertionError("index() of a missing item")
 
+# Python code a method body runs sees the calling frame on the stack.
+class Peek:
+    seen = None
+
+    def __eq__(self, other):
+        Peek.seen = sys._getframe(1).f_code.co_name
+        return False
+
+
+def peeking_caller():
+    return [Peek()].count(1)
+
+
+for _ in range(300):
+    peeking_caller()
+assert Peek.seen == "peeking_caller", Peek.seen
+
 # Sentinel-dispatched methods still work in the method-call shape.
 it = iter([1, 2, 3])
 next(it)

@@ -4108,6 +4108,10 @@ impl Interpreter {
         if let Some(v) = sent {
             frame.push(v);
         }
+        // A lean activation further up the native stack may be waiting
+        // for its shell (native code it called, a builtin method body, runs
+        // this one): the spine below this frame must be whole first.
+        self.flush_pending_callers();
         // Push a cheap frame *shell* for the duration of this run
         // (RFC 0058). The Python-visible `PyFrame` is materialised
         // only when something introspects it — tracing, `sys._getframe`,
@@ -13005,6 +13009,33 @@ impl Interpreter {
         }
     }
 
+    /// Put `sw`'s running activation, `frame` (synced, suspended at the
+    /// call at `pc`), on the pending list (see [`Self::lean_pending_enter`])
+    /// while code it calls runs: anything that needs the whole spine then
+    /// materializes its shell too.
+    #[inline]
+    fn core_pending_enter(
+        &mut self,
+        sw: &mut CoreSwitch,
+        frame: &mut Frame,
+        pc: usize,
+    ) -> Option<usize> {
+        // SAFETY: see `CoreSwitch`: the running activation's handles are
+        // live, and nothing else borrows them here.
+        unsafe {
+            let depth = (*sw.inl).len();
+            if depth == 0 {
+                self.lean_pending_enter(frame, &mut *sw.root_shell, pc)
+            } else if depth == sw.entry_depth && !sw.entry_dead {
+                self.lean_pending_enter(frame, &mut *sw.entry_shell, pc)
+            } else {
+                let inl: &mut Vec<Box<InlineAct>> = &mut *sw.inl;
+                let caller: *mut InlineAct = &raw mut *inl[depth - 1];
+                self.lean_pending_enter(frame, &mut QuietShell::Lazy(&mut (*caller).act), pc)
+            }
+        }
+    }
+
     /// The core loop's `CALL` of a Python callee at `pc` of `sw`'s
     /// (synced) running activation: the quiet loop's inline call
     /// ([`Self::try_inline_call`]), with the callee's activation pushed
@@ -13132,10 +13163,13 @@ impl Interpreter {
         // SAFETY: the first `argc + 1` entries were written above.
         let ops =
             unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<Object>(), argc + 1) };
+        // The body may run Python code that looks up the stack.
+        let pending = self.core_pending_enter(sw, frame, pc);
         let result = match b.call_kw.as_ref() {
             Some(call_kw) => call_kw(ops, &[]),
             None => (b.call)(ops),
         };
+        self.lean_pending_exit(pending);
         // The operands drop as the full handler's do, after the call.
         // SAFETY: each initialized entry drops exactly once; `buf` itself
         // has no drop glue.
@@ -13268,20 +13302,7 @@ impl Interpreter {
         act.parked = false;
         act.call_pc = pc;
         // The caller waits on the pending list (see `lean_pending_enter`).
-        // SAFETY: see `CoreSwitch`: the caller's handles are live, and
-        // nothing else borrows them here.
-        act.caller_pending = unsafe {
-            let depth = (*sw.inl).len();
-            if depth == 0 {
-                self.lean_pending_enter(frame, &mut *sw.root_shell, pc)
-            } else if depth == sw.entry_depth && !sw.entry_dead {
-                self.lean_pending_enter(frame, &mut *sw.entry_shell, pc)
-            } else {
-                let inl: &mut Vec<Box<InlineAct>> = &mut *sw.inl;
-                let caller: *mut InlineAct = &raw mut *inl[depth - 1];
-                self.lean_pending_enter(frame, &mut QuietShell::Lazy(&mut (*caller).act), pc)
-            }
-        };
+        act.caller_pending = self.core_pending_enter(sw, frame, pc);
         act.exc_depth = self.exc_info_len();
         act.guard = Some(guard);
         // As `inline_bind_cells`: a hot body is compiled once, so native

@@ -344,10 +344,14 @@ strip    = "none"
 # not its exact values, so confirm results on a release build. Cargo puts
 # its output in `target/quick/`.
 [profile.quick]
-inherits      = "release"
-lto           = "thin"
-codegen-units = 16
-incremental   = true
+inherits        = "release"
+lto             = "thin"
+codegen-units   = 16
+incremental     = true
+# Keep the line tables (in a packed .dSYM on macOS) so profiles map
+# samples to source lines (`tools/pybench/lines.py`).
+strip           = "none"
+split-debuginfo = "packed"
 
 # A profile for shipping a maximally-optimized interpreter binary.
 [profile.dist]
