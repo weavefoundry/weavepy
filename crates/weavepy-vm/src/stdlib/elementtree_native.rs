@@ -9,18 +9,22 @@
 //! the Python classes and gives their hot paths native bodies, as
 //! `stdlib::datetime_native` does for `datetime`:
 //!
-//! - `Element.__init__`, `makeelement`, `append`, `extend`, `insert`,
-//!   `__len__`, `__getitem__`, `get` and `set`, and `SubElement`;
-//! - `Element.iter` and `itertext`, as a native iterator that walks the
-//!   children lists the way the Python generators do (live lists, read
-//!   lazily, so mutation during iteration behaves the same);
+//! - `Element.__init__` (and `Element(...)` itself, see [`construct`]),
+//!   `makeelement`, `append`, `extend`, `insert`, `__len__`,
+//!   `__getitem__`, `get` and `set`, and `SubElement`;
+//! - `Element.iter`, `itertext` and `iter(elem)`, as a native iterator
+//!   that walks the children lists the way the Python generators and the
+//!   sequence protocol do (live lists, read lazily, so mutation during
+//!   iteration behaves the same);
 //! - `Element.find`, `findall` and `findtext`, which evaluate the
 //!   selector list `ElementPath` compiled and cached for the path (the
 //!   steps it produces for tags, `*`, `.`, `//` and attribute predicates);
 //! - `_namespaces` and `_serialize_xml`, which build the output in one
 //!   buffer and hand it to `write` in large pieces;
 //! - `TreeBuilder.start`, `end` and `data`, and `XMLParser._start` and
-//!   `_end`, so a parse builds the tree without interpreted calls.
+//!   `_end`, which `pyexpat` calls directly, and, while a parser's
+//!   handlers are those natives, a [`Session`] that builds the tree from
+//!   the expat events with no handler calls at all.
 //!
 //! A native serves only the exact classes, while their dictionaries still
 //! hold what [`install`] left there, and elements whose instance
@@ -30,7 +34,12 @@
 //! raises) calls the Python code the native replaced, so behavior is
 //! unchanged. The instances keep their ordinary `__dict__` layout, so
 //! pickling, `copy` and Python code reading `elem.tag` see what they
-//! always did.
+//! always did. The natives that never run Python code also register leaf
+//! fast halves, so the dispatch loop calls them in place.
+//!
+//! An import of `ElementTree` that blocks `_elementtree` (what CPython's
+//! tests call `pyET`) asks for the pure-Python implementation, and the
+//! module skips [`install`] for it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
