@@ -750,9 +750,65 @@ impl Deref for SharedStr {
         unsafe { std::str::from_utf8_unchecked(&self.0) }
     }
 }
+impl SharedStr {
+    /// The shared empty string, or the shared one-character string for a
+    /// Latin-1 character (CPython caches the same 257): `None` for
+    /// anything longer. Indexing and iterating a string then allocate
+    /// nothing for these characters.
+    #[inline]
+    pub fn small(value: &str) -> Option<Self> {
+        let code = match value.as_bytes() {
+            [] => return Some(small_table()[256].clone()),
+            [b] => usize::from(*b),
+            // U+0080..U+00FF encode as two bytes led by 0xC2 or 0xC3.
+            [lead @ (0xC2 | 0xC3), cont] => usize::from((lead & 0x1F) << 6 | (cont & 0x3F)),
+            _ => return None,
+        };
+        Some(small_table()[code].clone())
+    }
+}
+
+/// [`SharedStr::small`]'s strings: the 256 Latin-1 characters by code
+/// point, then the empty string.
+fn small_table() -> &'static [SharedStr; 257] {
+    static TABLE: std::sync::OnceLock<[SharedStr; 257]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        std::array::from_fn(|i| {
+            let mut buf = [0; 4];
+            let text: &str = if i == 256 {
+                ""
+            } else {
+                char::from(i as u8).encode_utf8(&mut buf)
+            };
+            SharedStr::fresh(text)
+        })
+    })
+}
+
+impl SharedStr {
+    /// A newly allocated string holding `value` (see [`SharedStr::small`]
+    /// for the shared ones).
+    #[inline]
+    fn fresh(value: &str) -> Self {
+        let len = value.len();
+        // SAFETY: exactly `len` bytes of UTF-8 are copied; the count is
+        // left for first use.
+        Self(unsafe {
+            StrStorage::alloc(len, if len == 0 { 0 } else { CHARS_UNKNOWN }, |dst| {
+                copy_text(value.as_ptr(), dst, len);
+            })
+        })
+    }
+}
+
 impl From<&str> for SharedStr {
     #[inline]
     fn from(value: &str) -> Self {
+        if value.len() <= 2 {
+            if let Some(small) = Self::small(value) {
+                return small;
+            }
+        }
         let len = value.len();
         // SAFETY: exactly `len` bytes of UTF-8 are copied; the count is
         // left for first use.

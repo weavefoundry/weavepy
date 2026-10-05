@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--inclusive", action="store_true")
     ap.add_argument("--thread", default="weavepy-main")
     ap.add_argument("--chain", action="store_true", help="show the enclosing inlined frames too")
+    ap.add_argument("--depth", type=int, default=7, help="inlined frames shown with --chain")
     ap.add_argument("--parent-of", help="count samples whose leaf function's name contains this "
                     "at their caller's address (the call sites of a hot callee)")
     args = ap.parse_args()
@@ -161,7 +162,7 @@ def main():
             continue
         def loc(line):
             return line.rsplit("(", 1)[-1].rstrip(")") if "(" in line else line
-        lines[a] = loc(chain[0]) + ("  <- " + " <- ".join(loc(c) for c in chain[1:7]) if args.chain else "")
+        lines[a] = loc(chain[0]) + ("  <- " + " <- ".join(loc(c) for c in chain[1:args.depth]) if args.chain else "")
     by_line = collections.Counter()
     for a, n in top:
         by_line[lines.get(a, hex(a))] += n

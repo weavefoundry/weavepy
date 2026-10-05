@@ -12734,16 +12734,7 @@ impl Object {
     /// allocates nothing for them.
     #[inline]
     pub fn from_char(ch: char) -> Self {
-        static LATIN1: std::sync::OnceLock<Box<[SharedStr]>> = std::sync::OnceLock::new();
-        let code = ch as u32;
-        if code < 256 {
-            let table = LATIN1.get_or_init(|| {
-                (0u8..=255)
-                    .map(|b| SharedStr::from(&*char::from(b).encode_utf8(&mut [0; 4])))
-                    .collect()
-            });
-            return Object::Str(table[code as usize].clone());
-        }
+        // (Latin-1 characters come out of `SharedStr::small`'s table.)
         Object::Str(SharedStr::from(&*ch.encode_utf8(&mut [0; 4])))
     }
 
