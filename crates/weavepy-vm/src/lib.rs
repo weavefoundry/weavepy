@@ -5778,6 +5778,12 @@ impl Interpreter {
     /// (RFC 0060). Falls back to the legacy snapshot dict only if the
     /// frozen proxy module cannot be imported (interpreter bootstrap).
     pub fn frame_locals_view(&mut self, fr: Rc<PyFrame>) -> Result<Object, RuntimeError> {
+        // A frame running in native code keeps its locals there: bring
+        // the frame's own storage up to date first.
+        #[cfg(feature = "jit")]
+        if let Some(mirror) = fr.locals_mirror.borrow().clone() {
+            crate::tier2::sync_native_locals(&mirror);
+        }
         if fr.is_unoptimized_scope() && !fr.has_live_hidden_locals() {
             return Ok(fr.locals());
         }
@@ -69675,6 +69681,13 @@ assert loop(2000) == 1999000
                         // method entry; compiled code runs the rest in line.
                         assert!(
                             native > 100 || (armed > 0 && native > 0),
+                            "compiled {kind} native update coverage: {native} (armed {armed})"
+                        );
+                    } else if kind == "class-default" {
+                        // A stable class-level `int` default certifies like
+                        // no default at all, once the caller's loop compiles.
+                        assert!(
+                            native == 0 || (armed > 0 && native > 0),
                             "compiled {kind} native update coverage: {native} (armed {armed})"
                         );
                     } else if matches!(kind, "default" | "slots" | "alias") {

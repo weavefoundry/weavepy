@@ -29,7 +29,7 @@ use crate::ir::{
     ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, CompSavedMeta, CtorFieldSrc,
     GlobalGuard, IterLoopMeta, ListLoopMeta, MathFunc, MathGuardMeta, MethodRet, MethodSiteMeta,
     MethodSpanMeta, OsrEntry, RangeLoopMeta, ResolvedGlobal, SliceOrigin, StrMethod, TBlock, TFunc,
-    TOp, TStmt, TTerm,
+    TOp, TStmt, TTerm, UNBOX_FLOAT_ARITH, UNBOX_FLOAT_CMP, UNBOX_FLOAT_EXACT,
 };
 use crate::value::JitType;
 
@@ -49,10 +49,12 @@ pub struct MethodResolution {
     pub arg_count: u32,
     pub min_args: u32,
     pub ret: MethodRet,
-    /// The callee is a native accelerator's leaf method (`deque.pop`):
-    /// its object-lane result is a container element, so arithmetic on
-    /// it speculates the integer lane (see [`SE::num_hint`]).
+    /// The callee is a native accelerator's leaf method (`deque.pop`).
     pub native: bool,
+    /// The native callee's object-lane result is a container element, so
+    /// arithmetic on it speculates the integer lane (see
+    /// [`SE::num_hint`]).
+    pub elem: bool,
 }
 
 /// Maximum receiver path retained by analysis. The final attribute read adds
@@ -242,6 +244,37 @@ pub struct Probes<'a> {
     /// *unbound* slot keeps the retriable probe-miss verdict, so a
     /// later training point can still specialize.
     pub obj: &'a mut dyn FnMut(u32) -> bool,
+    /// The observed lane of local `slot` in the requesting activation,
+    /// graded like [`Self::param`] (scalars, `str`, `bytes`, and the
+    /// object lane; lists and dicts stay `None` for their use-site
+    /// probes) but for any slot and on every attempt. A region compile
+    /// (see `Carve`) seeds the locals an OSR-only loop reads before it
+    /// writes them from here, since the code that assigned them never
+    /// runs natively.
+    pub local: &'a mut dyn FnMut(u32) -> Option<JitType>,
+    /// The lane of the live loop iterator at interpreter-stack index
+    /// `depth` in the requesting activation: `Int` for a unit-step
+    /// `range` iterator, a list lane for a plain list iterator, `Obj`
+    /// for any other iterator, `None` when the slot holds no iterator.
+    /// Consulted only for an OSR-only loop that contains
+    /// [`Self::entry_pc`] (so the stack is that loop's own).
+    pub stack_iter: &'a mut dyn FnMut(u32) -> Option<JitType>,
+    /// The element lanes of local `slot`'s live value in the requesting
+    /// activation when it's a list or tuple of 2-tuples (a sparse row
+    /// of `(index, weight)` pairs): each component is `Int` or `Float`
+    /// when every sampled pair agrees, `Obj` otherwise. Trains a
+    /// `for a, b in <local>:` loop's variable lanes; the step helper
+    /// re-validates every element, so it's only a prediction.
+    pub pairs: &'a mut dyn FnMut(u32) -> Option<(JitType, JitType)>,
+    /// The pc the requesting activation stands at (a loop header for an
+    /// OSR request, `0` for a fresh call), `None` without an activation.
+    pub entry_pc: Option<u32>,
+    /// Whether an *environmental* failure (a value the requesting
+    /// activation doesn't have yet) may carve its loop out of the region
+    /// rather than fail the analysis. The embedder sets it on its final,
+    /// seeded attempt, so an unseeded first attempt still fails with the
+    /// verdict that asks for seeding.
+    pub carve_env: bool,
     /// RFC 0071 WS3 — the analysis-local attribute-path interner (the
     /// analyzer owns the entries; it lives here so both passes and the
     /// probe adapters share it without threading another parameter).
@@ -394,7 +427,7 @@ struct Plan {
     /// JIT's buffer, not the interpreter frame those builtins inspect.
     frame_readers: HashSet<usize>,
     /// Cold exits: statement-start pcs where native code hands the rest of
-    /// the activation to the interpreter (see `cold_point`).
+    /// the activation to the interpreter (see `carve_step`).
     cold: HashSet<usize>,
     /// Typed `[]` accumulators: a `BUILD_LIST 0` pc → the local it is
     /// stored into. When that local is assigned nothing but empty-list
@@ -405,6 +438,22 @@ struct Plan {
     /// the erased `LOAD_GLOBAL list` pc — the deopt point). The callee
     /// loads, their `PUSH_NULL`s, the inner `CALL` and a unit step erase.
     list_range: HashMap<usize, (u8, usize)>,
+    /// The iterators of `for` loops whose code stays interpreted around
+    /// a native root (see [`Region`]): seq synthetic slot → the
+    /// iterator's interpreter-stack depth. Native code never steps one;
+    /// it rides the object lane from the root's entry to its exits.
+    passthrough: HashMap<u32, u32>,
+    /// Numeric speculation: the locals an opaque value stored into may
+    /// take the scalar lane the live activation holds in them, guarded at
+    /// each such store (see `num_spec_lane`). Locals the code reads into
+    /// arithmetic or a comparison, never tests against `None`, and no
+    /// earlier attempt found stored on another lane.
+    num_slots: HashSet<u32>,
+    /// Counted ranges whose bounds are expressions (see
+    /// [`range_prefix`]): the erased `range` load's pc → its `CALL`'s
+    /// pc. A side exit between them rebuilds the callee (a span like a
+    /// `len` callee's).
+    range_spans: HashMap<usize, usize>,
     /// Synthetic slots appended after the code object's real locals.
     n_synth: u32,
 }
@@ -418,6 +467,9 @@ enum PairSrc {
     /// `enumerate(<local>)` over a certified canonical `enumerate` —
     /// `Int` index, element lane from a list or exact-bytes source.
     Enumerate(u32),
+    /// `<local>` itself, a list or tuple of pairs — lanes from the
+    /// pair probe.
+    Local(u32),
 }
 
 /// RFC 0073 WS1 — one recognized inlined comprehension (PEP 709
@@ -563,6 +615,11 @@ pub fn analyze_with_probes(
         obj_global: &mut |_| None,
         cell: &mut |_| None,
         obj: &mut |_| false,
+        local: &mut |_| None,
+        stack_iter: &mut |_| None,
+        pairs: &mut |_| None,
+        entry_pc: None,
+        carve_env: false,
         paths: &mut arena,
     };
     analyze_impl(code, resolve, &mut probes)
@@ -591,6 +648,11 @@ pub fn analyze_for_ret(
         obj_global: &mut obj,
         cell: &mut |_| None,
         obj: &mut |_| false,
+        local: &mut |_| None,
+        stack_iter: &mut |_| None,
+        pairs: &mut |_| None,
+        entry_pc: None,
+        carve_env: false,
         paths: &mut arena,
     };
     analyze_impl(code, resolve, &mut probes)
@@ -608,79 +670,198 @@ pub fn analyze_frame(
 
 thread_local! {
     /// The instruction the last failed inference/emission step stopped
-    /// at (see `cold_point`).
+    /// at (see `carve_step`).
     static FAIL_PC: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
-/// Every jump-landing pc of `code`.
-fn jump_targets(code: &CodeObject) -> HashSet<usize> {
-    let mut targets = HashSet::new();
-    for (i, item) in code.instructions.iter().enumerate() {
-        match item.op {
-            OpCode::PopJumpIfFalse
-            | OpCode::PopJumpIfTrue
-            | OpCode::PopJumpIfNone
-            | OpCode::PopJumpIfNotNone
-            | OpCode::JumpForward
-            | OpCode::ForIter => {
-                targets.insert(forward_target(i, item.arg));
-            }
-            OpCode::JumpBackward => {
-                if let Some(t) = backward_target(i, item.arg) {
-                    targets.insert(t);
-                }
-            }
-            _ => {}
-        }
-    }
-    targets
+/// One loop of a code object's (structured) loop nest.
+#[derive(Debug, Clone, Copy)]
+struct LoopInfo {
+    /// The header pc, the target of every back edge of the loop.
+    head: usize,
+    /// The last pc of the loop's extent, inclusive: its last back edge,
+    /// or for a `for` loop the `END_FOR`/`POP_ITER` epilogue after it.
+    end: usize,
+    /// The innermost enclosing loop (an index into the forest).
+    parent: Option<usize>,
+    /// A `while` loop, or a `for` loop whose iterator is all it keeps on
+    /// the interpreter stack (a statement, not a comprehension): native
+    /// code can enter it mid-frame with an empty operand stack.
+    plain: bool,
 }
 
-/// Where an unsupported instruction at `p` can become a *cold exit*: the
-/// start of its statement (its source line, back to the nearest jump
-/// target), when that lies outside every loop and after at least one —
-/// native code then runs the loop and hands the rest of the activation
-/// to the interpreter, at most once per activation. `None` inside a
-/// loop body (a side exit there would deopt every iteration) or ahead of
-/// any loop (native entry would buy nothing).
-fn cold_point(code: &CodeObject, p: usize) -> Option<usize> {
+/// The loops of `code`, outermost first (ascending header pc). Only back
+/// edges normal control flow reaches count: an exception handler's jump
+/// back to a loop header (a `with` block's exit path) is not part of the
+/// loop's code. Empty when the loops don't nest (nothing is carved then).
+fn loop_forest(code: &CodeObject) -> Vec<LoopInfo> {
     let ins = &code.instructions;
-    let loops: Vec<(usize, usize)> = ins
-        .iter()
-        .enumerate()
-        .filter(|(_, x)| x.op == OpCode::JumpBackward)
-        .filter_map(|(j, x)| backward_target(j, x.arg).map(|t| (t, j)))
-        .collect();
-    // A point inside a loop moves to the start of its outermost loop: a
-    // `for` statement's iterable setup (the instructions on its line
-    // before the `FOR_ITER` head), or a `while` loop's head.
-    let (p, for_setup) = match loops
-        .iter()
-        .filter(|&&(t, j)| t <= p && p <= j)
-        .map(|&(t, _)| t)
-        .min()
-    {
-        Some(t) if ins[t].op == OpCode::ForIter => (t.checked_sub(1)?, true),
-        Some(t) => (t, false),
-        None => (p, false),
-    };
-    // Worth it only after native work: a loop completed before the exit.
-    // A loop-free body would enter native code just to leave it (short
-    // methods with an unsupported statement near the top, every call).
-    if !loops.iter().any(|&(_, j)| j < p) {
-        return None;
+    let n = ins.len();
+    let mut reached = vec![false; n];
+    let mut work = vec![0usize];
+    while let Some(pc) = work.pop() {
+        if pc >= n || reached[pc] {
+            continue;
+        }
+        reached[pc] = true;
+        work.extend(control_succs(code, pc));
     }
+    let mut last_edge: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    for (j, x) in ins.iter().enumerate() {
+        if x.op == OpCode::JumpBackward && reached[j] {
+            if let Some(t) = backward_target(j, x.arg) {
+                let e = last_edge.entry(t).or_insert(j);
+                *e = (*e).max(j);
+            }
+        }
+    }
+    let mut loops: Vec<LoopInfo> = Vec::with_capacity(last_edge.len());
+    for (&head, &edge) in &last_edge {
+        let is_for = ins[head].op == OpCode::ForIter;
+        let mut end = edge;
+        if is_for {
+            let exit = forward_target(head, ins[head].arg);
+            if exit < n {
+                end = end.max(exit);
+                if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopIter | OpCode::PopTop) {
+                    end = end.max(exit + 1);
+                }
+            }
+        }
+        let plain = !is_for || (head >= 1 && ins[head - 1].op == OpCode::GetIter);
+        loops.push(LoopInfo {
+            head,
+            end,
+            parent: None,
+            plain,
+        });
+    }
+    for k in 0..loops.len() {
+        let (h, e) = (loops[k].head, loops[k].end);
+        // Extents either nest or are disjoint.
+        if loops.iter().any(|o| o.head < h && h <= o.end && o.end < e) {
+            return Vec::new();
+        }
+        loops[k].parent = (0..loops.len())
+            .filter(|&o| o != k && loops[o].head < h && e <= loops[o].end)
+            .max_by_key(|&o| loops[o].head);
+    }
+    loops
+}
+
+/// The innermost loop of `loops` whose extent contains `pc`.
+fn innermost_loop(loops: &[LoopInfo], pc: usize) -> Option<usize> {
+    (0..loops.len())
+        .filter(|&k| loops[k].head <= pc && pc <= loops[k].end)
+        .max_by_key(|&k| loops[k].head)
+}
+
+/// The start of the statement holding the top-level (loop-free) `p`:
+/// the first instruction of its source line (a statement's internal
+/// jumps, a comprehension's loop say, stay inside the cut). For a loop
+/// header, the start of the `for` statement's iterable setup.
+fn stmt_start(code: &CodeObject, p: usize, for_setup: bool) -> Option<usize> {
+    let ins = &code.instructions;
+    let p = if for_setup { p.checked_sub(1)? } else { p };
     let line = code.linetable.get(p).copied()?;
-    let targets = jump_targets(code);
     let mut q = p;
-    while q > 0
-        && code.linetable.get(q - 1) == Some(&line)
-        && (for_setup || !targets.contains(&q))
-        && !targets.contains(&(q - 1).max(1))
-    {
+    while q > 0 && code.linetable.get(q - 1) == Some(&line) && ins[q - 1].op != OpCode::Resume {
         q -= 1;
     }
-    (q > 0 && !loops.iter().any(|&(t, j)| t < q && q <= j)).then_some(q)
+    (q > 0).then_some(q)
+}
+
+/// The region carving state (see [`analyze_impl`]): loops whose code
+/// stays with the interpreter, and why.
+#[derive(Default, Clone)]
+struct Carve {
+    /// Header pcs of the excluded loops. An excluded loop's own code
+    /// runs interpreted; each loop nested in it that is not excluded
+    /// itself compiles as an OSR-only region (see `region_roots`).
+    excluded: HashSet<usize>,
+    /// The excluded headers whose exclusion is *environmental*: their
+    /// code failed only for want of live values (an unbound local or
+    /// receiver, an unseeded iterator), so a later request from inside
+    /// the loop may compile it.
+    env: HashSet<usize>,
+}
+
+/// The native region one analysis attempt compiles, derived from the
+/// carving state: which loops run natively, and which of those are
+/// *roots* entered only through OSR because the code around them stays
+/// interpreted.
+struct Region {
+    /// Per loop of the forest: its code stays with the interpreter. A
+    /// carved loop, or one nested in a stayed loop that can't be entered
+    /// on its own (a comprehension, or under a comprehension).
+    stays: Vec<bool>,
+    /// Per pc: the innermost loop whose extent contains it.
+    innermost: Vec<Option<usize>>,
+    /// Native loops whose parent stays: entered only at their headers.
+    roots: Vec<usize>,
+}
+
+impl Region {
+    fn new(code: &CodeObject, loops: &[LoopInfo], carve: &Carve) -> Region {
+        // Parents precede children (ascending headers, nested extents).
+        let mut stays = vec![false; loops.len()];
+        let mut plain_chain = vec![false; loops.len()];
+        for k in 0..loops.len() {
+            let lp = loops[k];
+            plain_chain[k] = lp.plain && lp.parent.is_none_or(|p| plain_chain[p]);
+            // A loop over a short constant tuple would enter and leave
+            // native code every few iterations: not worth a region.
+            stays[k] = carve.excluded.contains(&lp.head)
+                || lp.parent.is_some_and(|p| {
+                    stays[p] && (!plain_chain[k] || short_const_loop(code, lp.head))
+                });
+        }
+        let roots = (0..loops.len())
+            .filter(|&k| !stays[k] && loops[k].parent.is_some_and(|p| stays[p]))
+            .collect();
+        let innermost = (0..code.instructions.len())
+            .map(|pc| innermost_loop(loops, pc))
+            .collect();
+        Region {
+            stays,
+            innermost,
+            roots,
+        }
+    }
+
+    /// Whether the code at `pc` can run natively (top-level cuts are
+    /// separate: the cold points).
+    fn native(&self, pc: usize) -> bool {
+        self.innermost
+            .get(pc)
+            .copied()
+            .flatten()
+            .is_none_or(|k| !self.stays[k])
+    }
+
+    /// The forest index of the loop headed at `head`.
+    fn loop_at(loops: &[LoopInfo], head: usize) -> Option<usize> {
+        loops.iter().position(|l| l.head == head)
+    }
+
+    /// Interpreter-stack depth of a staying `for` loop's iterator: its
+    /// enclosing loops each hold one below it (they're all plain when a
+    /// native root sits inside, the only case the depth matters).
+    fn depth(loops: &[LoopInfo], k: usize) -> u32 {
+        let mut d = 0;
+        let mut cur = loops[k].parent;
+        while let Some(p) = cur {
+            d += 1;
+            cur = loops[p].parent;
+        }
+        d
+    }
+}
+
+/// Whether a failure verdict depends on the activation the compile ran
+/// for rather than on the code alone.
+fn environmental(v: &JitVerdict) -> bool {
+    matches!(v, JitVerdict::TypeUnknown | JitVerdict::ProbeMiss(_))
 }
 
 fn analyze_impl(
@@ -699,12 +880,45 @@ fn analyze_impl(
     // Typed `[]` accumulators are a prediction: any failure under them
     // re-analyzes with the literal on the object lane, as before.
     let mut lane_lists = has_empty_list_store(code);
-    // Cold exits (see `cold_point`), grown one unsupported statement at
-    // a time.
+    // Region carving: an unsupported construct no longer rejects the
+    // whole frame. A failure at top level (outside every loop) becomes
+    // a cold exit at the start of its statement; a failure inside a loop
+    // excludes that loop and every loop around it, and the loops nested
+    // in an excluded loop compile on their own as OSR-only regions (see
+    // `Carve`). Each step re-analyzes, so the steps are budgeted.
     let mut cold: HashSet<usize> = HashSet::new();
+    let mut carve = Carve::default();
+    let forest = loop_forest(code);
+    let mut steps = 0usize;
+    // The verdict that started the carving, reported when carving leaves
+    // nothing native.
+    let mut first_err: Option<JitVerdict> = None;
+    // Numeric speculation (see `Plan::num_slots`), backed off one local at
+    // a time when another store gives the local a different lane.
+    let mut num_slots = numeric_slots(code);
+    let mut backoffs = 0usize;
     loop {
         FAIL_PC.with(|c| c.set(None));
-        match analyze_once(code, resolve, probes, &demote, lane_lists, &cold) {
+        match analyze_once(
+            code, resolve, probes, &demote, lane_lists, &cold, &carve, &forest, &num_slots,
+        ) {
+            // A region that only lacked live values, compiled for a request
+            // it can't even enter (a comprehension's header, say): wait for
+            // a request from inside the loop that lacked them.
+            Ok(tf)
+                if !carve.env.is_empty()
+                    && probes.entry_pc.is_some_and(|pc| {
+                        pc != 0 && !tf.osr_entries.iter().any(|e| e.pc == pc)
+                    }) =>
+            {
+                return Err(JitVerdict::ProbeMiss("region (entry)"));
+            }
+            Err(JitVerdict::NonUniformLocal(slot)) if backoffs < 8 && num_slots.remove(&slot) => {
+                if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+                    eprintln!("jit numeric backoff {:?} local {}", code.name, slot);
+                }
+                backoffs += 1;
+            }
             Err(JitVerdict::CalleeEscapes(name_idx)) => {
                 if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
                     eprintln!(
@@ -718,35 +932,202 @@ fn analyze_impl(
                     return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
                 }
             }
-            Err(
-                e @ (JitVerdict::UnsupportedOpcode(_)
-                | JitVerdict::UnsupportedConst
-                | JitVerdict::MixedArithTypes
-                | JitVerdict::NonUniformLocal(_)),
-            ) if cold.len() < 4
-                && FAIL_PC
-                    .with(std::cell::Cell::get)
-                    .and_then(|p| cold_point(code, p))
-                    .is_some_and(|q| !cold.contains(&q)) =>
+            Err(e)
+                if steps < MAX_CARVE_STEPS
+                    && carve_step(code, &forest, &mut carve, &mut cold, &e, probes.carve_env) =>
             {
-                let q = FAIL_PC
-                    .with(std::cell::Cell::get)
-                    .and_then(|p| cold_point(code, p))
-                    .expect("checked by the guard");
-                if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
-                    eprintln!("jit cold exit {:?} pc {}: {:?}", code.name, q, e);
+                steps += 1;
+                first_err.get_or_insert(e);
+            }
+            // Carving left no native loop: report the verdict that started
+            // it, or, when live values were missing, a retriable miss (a
+            // request from inside a loop may find them).
+            Err(JitVerdict::Trivial) if first_err.is_some() => {
+                if !carve.env.is_empty() {
+                    return Err(JitVerdict::ProbeMiss("region (live values)"));
                 }
-                cold.insert(q);
+                return Err(first_err.expect("checked by the guard"));
+            }
+            Err(e) if !carve.env.is_empty() && !matches!(e, JitVerdict::CalleeEscapes(_)) => {
+                if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+                    eprintln!("jit region miss {:?}: {:?}", code.name, e);
+                }
+                return Err(JitVerdict::ProbeMiss("region (live values)"));
             }
             Err(e) if lane_lists => {
                 if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
                     eprintln!("jit lane-list retry {:?}: {:?}", code.name, e);
                 }
                 lane_lists = false;
+                cold.clear();
+                carve = Carve::default();
+                steps = 0;
+                first_err = None;
             }
-            other => return other,
+            other => {
+                if let Err(e) = &other {
+                    if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+                        if let Some(p) = FAIL_PC.with(std::cell::Cell::get) {
+                            eprintln!(
+                                "jit fail {:?} pc {} ({:?}, line {:?}): {:?}",
+                                code.name,
+                                p,
+                                code.instructions.get(p).map(|i| i.op),
+                                code.linetable.get(p),
+                                e
+                            );
+                        }
+                    }
+                }
+                return other;
+            }
         }
     }
+}
+
+/// The most carving steps one analysis takes (each is a re-analysis).
+const MAX_CARVE_STEPS: usize = 10;
+
+/// One carving step for the failure `e` at the recorded failing pc:
+/// exclude the innermost loop around it (and every loop around that),
+/// or cut the top-level statement holding it. Returns whether anything
+/// changed (otherwise the failure stands). `env_ok` admits carving on
+/// an environmental verdict (the embedder's seeded, final attempt).
+fn carve_step(
+    code: &CodeObject,
+    forest: &[LoopInfo],
+    carve: &mut Carve,
+    cold: &mut HashSet<usize>,
+    e: &JitVerdict,
+    env_ok: bool,
+) -> bool {
+    let env = environmental(e);
+    let carvable = env
+        || matches!(
+            e,
+            JitVerdict::UnsupportedOpcode(_)
+                | JitVerdict::UnsupportedConst
+                | JitVerdict::MixedArithTypes
+                | JitVerdict::NonUniformLocal(_)
+        );
+    // A loop-free body has no region worth carving out.
+    if !carvable || (env && !env_ok) || forest.is_empty() {
+        return false;
+    }
+    let Some(p) = FAIL_PC.with(std::cell::Cell::get) else {
+        return false;
+    };
+    let trace = std::env::var_os("WEAVEPY_JIT_TRACE").is_some();
+    match innermost_loop(forest, p) {
+        Some(k) if !carve.excluded.contains(&forest[k].head) => {
+            let mut top = k;
+            let mut cur = Some(k);
+            while let Some(c) = cur {
+                carve.excluded.insert(forest[c].head);
+                if env {
+                    carve.env.insert(forest[c].head);
+                }
+                top = c;
+                cur = forest[c].parent;
+            }
+            // The pc-0 flow stops before an excluded top-level loop sets
+            // up its iterator.
+            let lp = forest[top];
+            let cut = if code.instructions[lp.head].op == OpCode::ForIter {
+                stmt_start(code, lp.head, true)
+            } else {
+                Some(lp.head)
+            };
+            if let Some(q) = cut {
+                cold.insert(q);
+            }
+            if trace {
+                eprintln!(
+                    "jit carve {:?} loop at pc {} (fail pc {}): {:?}",
+                    code.name, forest[k].head, p, e
+                );
+            }
+            true
+        }
+        Some(_) => false,
+        None => match stmt_start(code, p, false) {
+            Some(q) if !cold.contains(&q) && innermost_loop(forest, q).is_none() => {
+                if trace {
+                    eprintln!("jit cold exit {:?} pc {}: {:?}", code.name, q, e);
+                }
+                cold.insert(q);
+                true
+            }
+            _ => false,
+        },
+    }
+}
+
+/// The speculated scalar lane of a `STORE_FAST slot` of a `ty` value
+/// (see [`Plan::num_slots`]): an opaque value stored into a numeric local
+/// that holds a `float` or `int` in the requesting activation, when no
+/// store has given the local another lane.
+fn num_spec_lane(
+    code: &CodeObject,
+    plan: &Plan,
+    slot: u32,
+    ty: JitType,
+    local_types: &[Option<JitType>],
+    probes: &mut Probes<'_>,
+) -> Option<JitType> {
+    if ty != JitType::Obj || slot >= code.varnames.len() as u32 || !plan.num_slots.contains(&slot) {
+        return None;
+    }
+    let lane = (probes.local)(slot).filter(|t| matches!(t, JitType::Float | JitType::Int))?;
+    local_types
+        .get(slot as usize)
+        .copied()
+        .flatten()
+        .is_none_or(|cur| cur == lane)
+        .then_some(lane)
+}
+
+/// The locals [`Plan::num_slots`] admits, before backing off: read
+/// straight into a `BINARY_OP` or `COMPARE_OP` (as either operand), and
+/// never tested against `None` (a local that can hold `None` would miss
+/// a scalar guard).
+fn numeric_slots(code: &CodeObject) -> HashSet<u32> {
+    let ins = &code.instructions;
+    let simple = |k: usize| {
+        matches!(
+            ins[k].op,
+            OpCode::LoadFast | OpCode::LoadConst | OpCode::LoadSmallInt
+        )
+    };
+    let mut num: HashSet<u32> = HashSet::new();
+    let mut none_tested: HashSet<u32> = HashSet::new();
+    for i in 0..ins.len() {
+        match ins[i].op {
+            OpCode::BinaryOp | OpCode::CompareOp => {
+                for k in [i.checked_sub(1), i.checked_sub(2)].into_iter().flatten() {
+                    if ins[k].op == OpCode::LoadFast {
+                        num.insert(ins[k].arg);
+                    }
+                    if !simple(k) {
+                        break;
+                    }
+                }
+            }
+            OpCode::PopJumpIfNone | OpCode::PopJumpIfNotNone | OpCode::IsOp => {
+                for k in [i.checked_sub(1), i.checked_sub(2)].into_iter().flatten() {
+                    if ins[k].op == OpCode::LoadFast {
+                        none_tested.insert(ins[k].arg);
+                    }
+                    if !simple(k) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    num.retain(|s| !none_tested.contains(s));
+    num
 }
 
 /// Whether `code` stores an empty-list literal straight into a local
@@ -766,6 +1147,9 @@ fn analyze_once(
     demote: &HashSet<u32>,
     lane_lists: bool,
     cold: &HashSet<usize>,
+    carve: &Carve,
+    loops: &[LoopInfo],
+    num_slots: &HashSet<u32>,
 ) -> Result<TFunc, JitVerdict> {
     // RFC 0070 WS2 — sync generator bodies are admitted (yields become
     // `Yielded` side exits; entry is OSR-only). Coroutines and async
@@ -781,14 +1165,82 @@ fn analyze_once(
         return Err(JitVerdict::Trivial);
     }
 
-    let mut plan = plan_rewrite(code, resolve, probes.obj_global, demote, lane_lists)?;
+    let region = Region::new(code, loops, carve);
+    let mut plan = plan_rewrite(
+        code,
+        resolve,
+        probes.obj_global,
+        demote,
+        lane_lists,
+        loops,
+        &region,
+    )?;
+    plan.num_slots = num_slots.clone();
+    // Region exits: where native code would step into code that stays
+    // interpreted, it hands the activation over instead (a cold exit at
+    // that pc). Blocks split wherever nativeness changes.
+    let mut leaders: BTreeSet<usize> = BTreeSet::new();
+    let mut exits: BTreeSet<usize> = BTreeSet::new();
+    for pc in 0..n {
+        if pc > 0 && region.native(pc) != region.native(pc - 1) {
+            leaders.insert(pc);
+        }
+        if region.native(pc) {
+            for q in control_succs(code, pc) {
+                if q < n && !region.native(q) {
+                    exits.insert(q);
+                }
+            }
+        }
+    }
     plan.cold = cold.clone();
+    let region_exits: Vec<u32> = exits
+        .iter()
+        .filter(|q| !cold.contains(q))
+        .map(|&q| q as u32)
+        .collect();
+    plan.cold.extend(exits.iter().copied());
 
-    let raw = build_blocks(code, &plan.cold)?;
-    let reachable = reachable_blocks(&raw);
+    let raw = build_blocks(code, &plan.cold, &leaders)?;
+    let block0 = block_index_at(&raw, 0);
+    let reach0 = reachable_blocks(&raw, &[block0]);
+    // OSR-only roots: native loops whose surroundings stay interpreted,
+    // and top-level loops a cut leaves unreachable from the entry.
+    let reach0_set: HashSet<usize> = reach0.iter().copied().collect();
+    let osr_roots: Vec<usize> = (0..loops.len())
+        .filter(|&k| {
+            !region.stays[k]
+                && (region.roots.contains(&k)
+                    || (loops[k].parent.is_none()
+                        && loops[k].plain
+                        && !reach0_set.contains(&block_index_at(&raw, loops[k].head))))
+        })
+        .collect();
+    let mut roots: Vec<usize> = vec![block0];
+    roots.extend(
+        osr_roots
+            .iter()
+            .map(|&k| block_index_at(&raw, loops[k].head)),
+    );
+    let reachable = reachable_blocks(&raw, &roots);
     if reachable.is_empty() {
         return Err(JitVerdict::Trivial);
     }
+    // Carving that leaves no loop native leaves nothing worth compiling.
+    if !carve.excluded.is_empty() {
+        let reach: HashSet<usize> = reachable.iter().copied().collect();
+        let native_loop = (0..loops.len())
+            .any(|k| !region.stays[k] && reach.contains(&block_index_at(&raw, loops[k].head)));
+        if !native_loop {
+            return Err(JitVerdict::Trivial);
+        }
+    }
+    // Whether a fresh activation gains anything natively: with roots,
+    // only when its own flow reaches a loop before any cut.
+    let pc0_entry = osr_roots.is_empty()
+        || loops
+            .iter()
+            .any(|l| reach0_set.contains(&block_index_at(&raw, l.head)));
 
     let n_locals = code.varnames.len() as u32 + plan.n_synth;
     let livein = compute_livein(code, &raw, &reachable, code.varnames.len() as u32);
@@ -830,13 +1282,76 @@ fn analyze_once(
             }
         }
     }
+    // A passed-through iterator rides the object lane (see
+    // `Plan::passthrough`).
+    for &seq in plan.passthrough.keys() {
+        local_types[seq as usize] = Some(JitType::Obj);
+    }
+    // An OSR-only root's iterator was set up by code that stays
+    // interpreted: type its synthetic slots from the shape (a counted
+    // range) or from the live iterator the requesting activation holds
+    // for it. An unseeded list loop fails at its header (environmental),
+    // and carving leaves it for a request from inside it.
+    for &k in &osr_roots {
+        let head = loops[k].head;
+        if let Some(&(cur, stop, _)) = plan.headers.get(&head) {
+            local_types[cur as usize] = Some(JitType::Int);
+            local_types[stop as usize] = Some(JitType::Int);
+        } else if let Some(&(seq, idx, _)) = plan.iter_headers.get(&head) {
+            if plan.pair_headers.contains_key(&head) {
+                local_types[seq as usize] = Some(JitType::Obj);
+                continue;
+            }
+            let inside = probes
+                .entry_pc
+                .is_some_and(|pc| head <= pc as usize && pc as usize <= loops[k].end);
+            if !inside {
+                continue;
+            }
+            match (probes.stack_iter)(Region::depth(loops, k)) {
+                Some(lane) if lane.is_list() => {
+                    local_types[seq as usize] = Some(lane);
+                    local_types[idx as usize] = Some(JitType::Int);
+                }
+                Some(JitType::Obj | JitType::Int) => {
+                    local_types[seq as usize] = Some(JitType::Obj);
+                }
+                _ => {}
+            }
+        }
+    }
+    // The locals an OSR-only root may read before writing them were
+    // assigned by interpreted code: seed them from the live activation.
+    if !osr_roots.is_empty() {
+        let root_blocks: HashSet<usize> = roots[1..].iter().copied().collect();
+        for slot in root_livein(code, &raw, &reachable, &root_blocks) {
+            if local_types[slot as usize].is_some() {
+                continue;
+            }
+            if let Some(t) = (probes.local)(slot) {
+                if matches!(
+                    t,
+                    JitType::Int
+                        | JitType::Float
+                        | JitType::Bool
+                        | JitType::Obj
+                        | JitType::Str
+                        | JitType::Bytes
+                ) {
+                    local_types[slot as usize] = Some(t);
+                }
+            }
+        }
+    }
     let mut ret = RetInfo::default();
     // RFC 0073 WS1 — constructor provenance: populated by the fixpoint,
     // read (converged) by the emission pass.
     let mut ctor = CtorState::default();
     let mut entry_stacks: Vec<Option<Vec<SE>>> = vec![None; raw.len()];
-    let entry_raw = block_index_at(&raw, 0);
-    entry_stacks[entry_raw] = Some(Vec::new());
+    let entry_raw = block0;
+    for &r in &roots {
+        entry_stacks[r] = Some(Vec::new());
+    }
     let mut iters = 0;
     loop {
         let mut changed = false;
@@ -917,9 +1432,12 @@ fn analyze_once(
         max_call_args: 0,
         loop_depths: HashMap::new(),
         comp_saved: HashMap::new(),
+        range_depths: HashMap::new(),
     };
     let mut emit_entries: Vec<Option<Vec<ESlot>>> = vec![None; raw.len()];
-    emit_entries[entry_raw] = Some(Vec::new());
+    for &r in &roots {
+        emit_entries[r] = Some(Vec::new());
+    }
     let mut blocks_opt: Vec<Option<TBlock>> = vec![None; reachable.len()];
     let mut queue: VecDeque<usize> = reachable.iter().copied().collect();
     let mut stalled = 0usize;
@@ -948,20 +1466,37 @@ fn analyze_once(
             &mut out,
             probes,
             &ctor,
-        )?;
+        )
+        .inspect_err(|_| {
+            // A failure in the block's terminator names the terminator.
+            FAIL_PC.with(|c| {
+                if c.get().is_none() {
+                    c.set(Some(raw[bi].end - 1));
+                }
+            });
+        })?;
         blocks_opt[compact[&bi]] = Some(tb);
     }
     let mut blocks: Vec<TBlock> = Vec::with_capacity(reachable.len());
     for tb in blocks_opt {
         blocks.push(tb.ok_or(JitVerdict::NonEmptyBoundaryStack)?);
     }
-    let method_sites: Vec<MethodSiteMeta> = {
-        let mut sites = Vec::with_capacity(out.method_sites.len());
-        for s in out.method_sites {
-            sites.push(s.ok_or(JitVerdict::UnsupportedOpcode("method site (token gap)"))?);
-        }
-        sites
-    };
+    // A token with no site was probed for code an earlier carving step
+    // left to the interpreter: no statement names it, so a placeholder
+    // keeps the table parallel to the embedder's.
+    let method_sites: Vec<MethodSiteMeta> = out
+        .method_sites
+        .into_iter()
+        .map(|s| {
+            s.unwrap_or_else(|| MethodSiteMeta {
+                slot: u32::MAX,
+                name: String::new(),
+                arg_count: 0,
+                min_args: 0,
+                ret: MethodRet::None,
+            })
+        })
+        .collect();
 
     // OSR entry points (RFC 0059 WS3b): every backward-jump target
     // with an *empty* boundary stack is enterable mid-frame once the
@@ -1112,11 +1647,15 @@ fn analyze_once(
         .list_loops
         .iter()
         .filter(|l| local_types.get(l.seq_slot as usize).copied().flatten() == Some(JitType::Obj))
-        .map(|l| IterLoopMeta {
-            iter_slot: l.seq_slot,
-            live_from: l.live_from,
-            live_to: l.live_to,
-            interp_depth: depth_of(l.live_from),
+        .map(|l| {
+            let pass = plan.passthrough.get(&l.seq_slot).copied();
+            IterLoopMeta {
+                iter_slot: l.seq_slot,
+                live_from: l.live_from,
+                live_to: l.live_to,
+                interp_depth: pass.unwrap_or_else(|| depth_of(l.live_from)),
+                passthrough: pass.is_some(),
+            }
         })
         .collect();
     let mut comp_saved: Vec<CompSavedMeta> = out.comp_saved.values().copied().collect();
@@ -1165,6 +1704,18 @@ fn analyze_once(
             v.sort_unstable();
             v
         },
+        region_exits,
+        region_roots: osr_roots.iter().map(|&k| loops[k].head as u32).collect(),
+        stayed_heads: (0..loops.len())
+            .filter(|&k| region.stays[k])
+            .map(|k| loops[k].head as u32)
+            .collect(),
+        env_heads: {
+            let mut v: Vec<u32> = carve.env.iter().map(|&pc| pc as u32).collect();
+            v.sort_unstable();
+            v
+        },
+        pc0_entry,
         comp_target_slots: {
             let mut v: Vec<u32> = plan.comp_headers.values().map(|c| c.saved_slot).collect();
             v.sort_unstable();
@@ -1320,6 +1871,8 @@ fn plan_rewrite(
     obj_global: &mut dyn FnMut(&str) -> Option<(u32, JitType)>,
     demote: &HashSet<u32>,
     lane_lists: bool,
+    loops: &[LoopInfo],
+    region: &Region,
 ) -> Result<Plan, JitVerdict> {
     let ins = &code.instructions;
     let n = ins.len();
@@ -1363,7 +1916,33 @@ fn plan_rewrite(
         if !matches!(ins[i].op, OpCode::ForIter) {
             continue;
         }
-        let bail = || JitVerdict::UnsupportedOpcode("FOR_ITER (non-range shape)");
+        // A loop whose code stays interpreted keeps its iterator on the
+        // interpreter stack, where a native root nested in it finds it:
+        // the root's entry pins it whole and its exits put it back (see
+        // `Plan::passthrough`).
+        if let Some(k) = Region::loop_at(loops, i).filter(|&k| region.stays[k]) {
+            let exit = forward_target(i, ins[i].arg);
+            let live_to = if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopIter) {
+                exit + 2
+            } else {
+                exit + 1
+            };
+            let seq_slot = n_real + plan.n_synth;
+            plan.n_synth += 2;
+            plan.list_loops.push(ListLoopMeta {
+                seq_slot,
+                idx_slot: seq_slot + 1,
+                live_from: i as u32,
+                live_to: live_to.min(loops[k].end + 1) as u32,
+                interp_depth: 0,
+            });
+            plan.passthrough.insert(seq_slot, Region::depth(loops, k));
+            continue;
+        }
+        let bail = || {
+            FAIL_PC.with(|c| c.set(Some(i)));
+            JitVerdict::UnsupportedOpcode("FOR_ITER (non-range shape)")
+        };
         let exit = forward_target(i, ins[i].arg);
         if exit >= n || !matches!(ins[exit].op, OpCode::EndFor) {
             return Err(bail());
@@ -1435,6 +2014,8 @@ fn plan_rewrite(
             {
                 plan.pair_src
                     .insert(i - 1, PairSrc::Enumerate(ins[i - 3].arg));
+            } else if i >= 2 && matches!(ins[i - 2].op, OpCode::LoadFast) {
+                plan.pair_src.insert(i - 1, PairSrc::Local(ins[i - 2].arg));
             }
             plan.list_loops.push(ListLoopMeta {
                 seq_slot,
@@ -1478,6 +2059,11 @@ fn plan_rewrite(
                 plan.nop.insert(exit + 1);
             }
             plan.calls.insert(i - 2, (pops, cur_slot, stop_slot));
+            // Bounds that can leave native code (an overflow, a guard)
+            // rebuild the erased `range` and its null marker there.
+            if !simple_bounds(code, push_null + 1, i - 2) {
+                plan.range_spans.insert(callee, i - 2);
+            }
             plan.headers.insert(i, (cur_slot, stop_slot, var_slot));
             plan.fused_store.insert(i + 1, var_slot);
             plan.loops.push(RangeLoopMeta {
@@ -1634,10 +2220,18 @@ fn plan_rewrite(
     // `del`ed. By induction the slot is unbound outside comprehension
     // bodies, so each save parks `Unbound` and each restore re-clears.
     if !plan.comp_headers.is_empty() {
-        let comp_target_bail =
-            || JitVerdict::UnsupportedOpcode("FOR_ITER (comprehension target escapes)");
         let comps: Vec<(usize, CompHeaderPlan)> =
             plan.comp_headers.iter().map(|(&h, c)| (h, *c)).collect();
+        // The failure names the comprehension, so carving excludes it.
+        let comp_target_bail = |slot: u32| {
+            let head = comps
+                .iter()
+                .filter(|(_, c)| c.saved_slot == slot)
+                .map(|(h, _)| *h)
+                .min();
+            FAIL_PC.with(|c| c.set(head));
+            JitVerdict::UnsupportedOpcode("FOR_ITER (comprehension target escapes)")
+        };
         let is_comp_slot = |slot: u32| comps.iter().any(|(_, c)| c.saved_slot == slot);
         // Parameter slots are stored by the caller at entry, so a
         // parameter target can never be proven unbound. (`*args`/
@@ -1649,7 +2243,7 @@ fn plan_rewrite(
             + u32::from(code.has_varkeywords);
         for (_, c) in &comps {
             if c.saved_slot < n_params {
-                return Err(comp_target_bail());
+                return Err(comp_target_bail(c.saved_slot));
             }
         }
         // The compiler protects each inlined comprehension with a
@@ -1690,7 +2284,7 @@ fn plan_rewrite(
                             c.saved_slot == item.arg && (pc == h + 1 || pc == c.saved_to as usize)
                         });
                     if !ok {
-                        return Err(comp_target_bail());
+                        return Err(comp_target_bail(item.arg));
                     }
                 }
                 OpCode::LoadFast if is_comp_slot(item.arg) => {
@@ -1698,7 +2292,7 @@ fn plan_rewrite(
                         .iter()
                         .any(|(h, c)| c.saved_slot == item.arg && *h < pc && pc < c.exit);
                     if !ok {
-                        return Err(comp_target_bail());
+                        return Err(comp_target_bail(item.arg));
                     }
                 }
                 OpCode::LoadFastAndClear if is_comp_slot(item.arg) => {
@@ -1706,11 +2300,11 @@ fn plan_rewrite(
                         .iter()
                         .any(|(_, c)| c.saved_slot == item.arg && pc == c.saved_from as usize);
                     if !ok {
-                        return Err(comp_target_bail());
+                        return Err(comp_target_bail(item.arg));
                     }
                 }
                 OpCode::DeleteFast if is_comp_slot(item.arg) => {
-                    return Err(comp_target_bail());
+                    return Err(comp_target_bail(item.arg));
                 }
                 _ => {}
             }
@@ -1906,6 +2500,7 @@ fn plan_rewrite(
             _ if demote.contains(&item.arg) => {
                 let name = &code.names[item.arg as usize];
                 let Some((token, lane)) = obj_global(name) else {
+                    FAIL_PC.with(|c| c.set(Some(i)));
                     return Err(JitVerdict::UnsupportedOpcode("LOAD_GLOBAL"));
                 };
                 plan.obj_globals.insert(item.arg, (token, lane));
@@ -1920,6 +2515,7 @@ fn plan_rewrite(
             | ResolvedGlobal::ConstFloat(_)
             | ResolvedGlobal::ConstBool(_)
             | ResolvedGlobal::LenBuiltin
+            | ResolvedGlobal::MathGlobal(_)
             | ResolvedGlobal::PyFunc { .. }
             | ResolvedGlobal::MathModule => {
                 let name = &code.names[item.arg as usize];
@@ -1933,6 +2529,7 @@ fn plan_rewrite(
             _ => {
                 let name = &code.names[item.arg as usize];
                 let Some((token, lane)) = obj_global(name) else {
+                    FAIL_PC.with(|c| c.set(Some(i)));
                     return Err(JitVerdict::UnsupportedOpcode("LOAD_GLOBAL"));
                 };
                 plan.obj_globals.insert(item.arg, (token, lane));
@@ -1998,17 +2595,30 @@ fn range_prefix(
     if !(1..=3).contains(&k) || i < 4 + k {
         return None;
     }
-    let args_start = i - 2 - k;
-    for arg_ins in &ins[args_start..(i - 2)] {
-        match arg_ins.op {
-            OpCode::LoadFast | OpCode::LoadSmallInt => {}
-            OpCode::LoadConst
-                if matches!(
-                    code.constants.get(arg_ins.arg as usize),
-                    Some(Constant::Int(_))
-                ) => {}
-            _ => return None,
+    // The bounds are any expressions over locals, cells, constants,
+    // globals, attributes, arithmetic, and calls (`range(1, n - 1)`,
+    // `range(len(xs))`): walk back from the `CALL` to where they start,
+    // `k` complete values earlier.
+    let call = i - 2;
+    let mut acc = 0i32;
+    let mut args_start = None;
+    for q in (0..call).rev() {
+        acc += bound_expr_effect(code, ins[q])?;
+        if acc == k as i32 {
+            args_start = Some(q);
+            break;
         }
+    }
+    let args_start = args_start?;
+    let mut depth = 0i32;
+    for &arg in &ins[args_start..call] {
+        depth += bound_expr_effect(code, arg)?;
+        if depth < 0 {
+            return None;
+        }
+    }
+    if args_start < 2 {
+        return None;
     }
     // An explicit step is only allowed as the constant 1; it is erased
     // so the call effectively becomes `range(start, stop)`.
@@ -2048,6 +2658,39 @@ fn range_prefix(
         return None;
     }
     Some((callee, push_null, step_nop, pops))
+}
+
+/// The stack effect (pushes less pops) of an instruction a counted
+/// range's bound expressions may contain (see [`range_prefix`]), `None`
+/// for anything else.
+fn bound_expr_effect(code: &CodeObject, ins: weavepy_compiler::Instruction) -> Option<i32> {
+    match ins.op {
+        OpCode::LoadFast
+        | OpCode::LoadSmallInt
+        | OpCode::LoadDeref
+        | OpCode::LoadGlobal
+        | OpCode::PushNull => Some(1),
+        OpCode::LoadConst
+            if matches!(code.constants.get(ins.arg as usize), Some(Constant::Int(_))) =>
+        {
+            Some(1)
+        }
+        OpCode::BinaryOp => Some(-1),
+        OpCode::UnaryOp | OpCode::LoadAttr => Some(0),
+        OpCode::Call => Some(-(ins.arg as i32) - 1),
+        _ => None,
+    }
+}
+
+/// Whether a counted range's bounds, from `start` up to the `CALL` at
+/// `call`, are bare loads (nothing between the erased `range` load and
+/// the `CALL` can leave native code).
+fn simple_bounds(code: &CodeObject, start: usize, call: usize) -> bool {
+    code.instructions[start..call].iter().all(|x| {
+        matches!(x.op, OpCode::LoadFast | OpCode::LoadSmallInt)
+            || (x.op == OpCode::LoadConst
+                && matches!(code.constants.get(x.arg as usize), Some(Constant::Int(_))))
+    })
 }
 
 /// Resolve a forward branch/jump target instruction index.
@@ -2181,9 +2824,13 @@ fn common_error_constant(ins: weavepy_compiler::Instruction) -> bool {
 }
 
 /// Build the basic blocks, resolving relative jumps to absolute indices.
-fn build_blocks(code: &CodeObject, cold: &HashSet<usize>) -> Result<Vec<RawBlock>, JitVerdict> {
+fn build_blocks(
+    code: &CodeObject,
+    cold: &HashSet<usize>,
+    extra: &BTreeSet<usize>,
+) -> Result<Vec<RawBlock>, JitVerdict> {
     let n = code.instructions.len();
-    let mut leaders: BTreeSet<usize> = BTreeSet::new();
+    let mut leaders: BTreeSet<usize> = extra.iter().copied().filter(|&pc| pc < n).collect();
     leaders.insert(0);
     // A cold exit starts its own block, which ends native control.
     for &pc in cold {
@@ -2500,14 +3147,17 @@ fn has_native_cycle(blocks: &[TBlock]) -> bool {
     false
 }
 
-/// Blocks reachable from the entry (block 0), in deterministic order.
-fn reachable_blocks(raw: &[RawBlock]) -> Vec<usize> {
+/// Blocks reachable from `roots` (the entry block, plus any OSR-only
+/// region roots), in deterministic order.
+fn reachable_blocks(raw: &[RawBlock], roots: &[usize]) -> Vec<usize> {
     let mut seen = vec![false; raw.len()];
     let mut order = Vec::new();
     let mut q = VecDeque::new();
-    if !raw.is_empty() {
-        q.push_back(0usize);
-        seen[0] = true;
+    for &r in roots {
+        if r < raw.len() && !seen[r] {
+            q.push_back(r);
+            seen[r] = true;
+        }
     }
     while let Some(b) = q.pop_front() {
         order.push(b);
@@ -2599,6 +3249,94 @@ fn compute_livein(
     livein
 }
 
+/// The local slots some path from an OSR-only root (`roots`, whose
+/// entries assign nothing) may read before writing: what the interpreted
+/// code around a region leaves for the region to read.
+fn root_livein(
+    code: &CodeObject,
+    raw: &[RawBlock],
+    reachable: &[usize],
+    roots: &HashSet<usize>,
+) -> Vec<u32> {
+    let reachset: HashSet<usize> = reachable.iter().copied().collect();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); raw.len()];
+    for &b in reachable {
+        for &s in &raw[b].succs {
+            if reachset.contains(&s) {
+                preds[s].push(b);
+            }
+        }
+    }
+    let n_real = code.varnames.len() as u32;
+    let full: HashSet<u32> = (0..n_real).collect();
+    let params: HashSet<u32> = (0..code.arg_count.min(n_real)).collect();
+    let entry = block_index_at(raw, 0);
+    let mut assigned_in: Vec<HashSet<u32>> = vec![full; raw.len()];
+    loop {
+        let mut changed = false;
+        for &b in reachable {
+            let new_in = if roots.contains(&b) {
+                HashSet::new()
+            } else if b == entry {
+                params.clone()
+            } else {
+                let mut acc: Option<HashSet<u32>> = None;
+                for &p in &preds[b] {
+                    let out = assigned_out(code, &raw[p], &assigned_in[p]);
+                    acc = Some(match acc {
+                        None => out,
+                        Some(a) => a.intersection(&out).copied().collect(),
+                    });
+                }
+                acc.unwrap_or_default()
+            };
+            if new_in != assigned_in[b] {
+                assigned_in[b] = new_in;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut live: BTreeSet<u32> = BTreeSet::new();
+    for &b in reachable {
+        let mut cur = assigned_in[b].clone();
+        for i in raw[b].start..raw[b].end {
+            let ins = code.instructions[i];
+            match ins.op {
+                OpCode::LoadFast | OpCode::DeleteFast if !cur.contains(&ins.arg) => {
+                    live.insert(ins.arg);
+                }
+                OpCode::StoreFast => {
+                    cur.insert(ins.arg);
+                }
+                _ => {}
+            }
+        }
+    }
+    live.into_iter().filter(|&s| s < n_real).collect()
+}
+
+/// The pcs control can reach from the instruction at `pc` (a block
+/// boundary's successors; an instruction that ends native control has
+/// none).
+fn control_succs(code: &CodeObject, pc: usize) -> Vec<usize> {
+    let ins = code.instructions[pc];
+    match ins.op {
+        OpCode::ReturnValue | OpCode::RaiseVarargs | OpCode::Reraise => Vec::new(),
+        OpCode::LoadCommonConstant if common_error_constant(ins) => Vec::new(),
+        OpCode::JumpForward => vec![forward_target(pc, ins.arg)],
+        OpCode::JumpBackward => backward_target(pc, ins.arg).into_iter().collect(),
+        OpCode::PopJumpIfFalse
+        | OpCode::PopJumpIfTrue
+        | OpCode::PopJumpIfNone
+        | OpCode::PopJumpIfNotNone
+        | OpCode::ForIter => vec![pc + 1, forward_target(pc, ins.arg)],
+        _ => vec![pc + 1],
+    }
+}
+
 /// `assigned_in ∪ {slots stored in this block}`.
 fn assigned_out(code: &CodeObject, b: &RawBlock, assigned_in: &HashSet<u32>) -> HashSet<u32> {
     let mut out = assigned_in.clone();
@@ -2620,6 +3358,9 @@ enum MarkKind {
     Py,
     Len,
     Math(MathFunc),
+    /// A `math` intrinsic bound to a global (see
+    /// [`ResolvedGlobal::MathGlobal`]); spans like `Len`.
+    MathGlobal(MathFunc),
 }
 
 /// A `LOAD_GLOBAL`-resolved Python callee riding the *abstract* stack
@@ -2787,6 +3528,8 @@ struct MethodMark {
     load_pc: u32,
     /// See [`MethodResolution::native`].
     native: bool,
+    /// See [`MethodResolution::elem`].
+    elem: bool,
 }
 
 /// RFC 0073 WS3 — a burned-in native `str` method riding on its
@@ -3082,6 +3825,7 @@ fn infer_block(
             .iter()
             .any(|v| !v.is_plain() || !v.ty.is_representable())
         {
+            FAIL_PC.with(|c| c.set(Some(b.start)));
             return Err(JitVerdict::TypeUnknown);
         }
         return Ok(Vec::new());
@@ -3673,7 +4417,17 @@ fn step_abstract(
                                 // before storing it in an unboxed local.
                                 let source = match local_types.get(s as usize) {
                                     Some(Some(source)) => *source,
-                                    _ => (probes.param)(s).ok_or(JitVerdict::TypeUnknown)?,
+                                    _ => {
+                                        // Any other live iterable (a list of
+                                        // lists, say) rides the object lane.
+                                        let lane = (probes.param)(s)
+                                            .or_else(|| (probes.obj)(s).then_some(JitType::Obj))
+                                            .ok_or(JitVerdict::TypeUnknown)?;
+                                        if lane == JitType::Obj {
+                                            set_local(local_types, s, lane, changed)?;
+                                        }
+                                        lane
+                                    }
                                 };
                                 let elem = if source == JitType::Bytes {
                                     set_local(local_types, s, JitType::Bytes, changed)?;
@@ -3682,6 +4436,11 @@ fn step_abstract(
                                     JitType::Obj
                                 };
                                 ctor.pair_lanes.insert(seq_slot, (JitType::Int, elem));
+                            }
+                        }
+                        PairSrc::Local(s) => {
+                            if let Some(lanes) = (probes.pairs)(s) {
+                                ctor.pair_lanes.insert(seq_slot, lanes);
                             }
                         }
                     }
@@ -3819,11 +4578,28 @@ fn step_abstract(
                 }
                 // RFC 0065 WS5: `len` rides the abstract stack the same
                 // way; its CALL lowers to `ListLen`, never a real call.
+                Some(ResolvedGlobal::MathGlobal(func)) => {
+                    stack.push(SE {
+                        callee: Some(CalleeMark {
+                            kind: MarkKind::MathGlobal(*func),
+                            token: ins.arg,
+                            arg_count: 1,
+                            min_args: 1,
+                            is_self: false,
+                            ret: Some(JitType::Float),
+                            ctor: false,
+                            load_pc: i as u32,
+                            interp_depth: 0,
+                        }),
+                        ..SE::known(JitType::Unknown)
+                    });
+                    return Ok(());
+                }
                 Some(ResolvedGlobal::LenBuiltin) => {
                     stack.push(SE {
                         callee: Some(CalleeMark {
                             kind: MarkKind::Len,
-                            token: 0,
+                            token: ins.arg,
                             arg_count: 1,
                             min_args: 1,
                             is_self: false,
@@ -3934,6 +4710,14 @@ fn step_abstract(
             // RFC 0073 WS1 — track constructor provenance for the
             // attribute-probe fallback.
             ctor.note_store(ins.arg, &v);
+            // Numeric speculation (see `Plan::num_slots`): an opaque value
+            // stored into a local the live activation holds a `float` or
+            // `int` in gives the local that scalar lane, guarded at the
+            // store.
+            if let Some(t) = num_spec_lane(code, plan, ins.arg, v.ty, local_types, probes) {
+                set_local(local_types, ins.arg, t, changed)?;
+                return Ok(());
+            }
             if v.ty.is_representable() {
                 set_local(local_types, ins.arg, v.ty, changed)?;
             } else if let Some(src) = v.src {
@@ -3954,8 +4738,8 @@ fn step_abstract(
         // shared mutable state — another closure can rebind between
         // accesses.
         OpCode::LoadDeref => {
-            let lane = (probes.cell)(ins.arg)
-                .ok_or(JitVerdict::UnsupportedOpcode("LOAD_DEREF (cell lane)"))?;
+            let lane =
+                (probes.cell)(ins.arg).ok_or(JitVerdict::ProbeMiss("LOAD_DEREF (cell lane)"))?;
             stack.push(SE::known(lane));
         }
         OpCode::StoreDeref => {
@@ -3964,6 +4748,7 @@ fn step_abstract(
                 return Err(escape_verdict(code, &[&v], "CALL (callee escapes)"));
             }
             let lane = (probes.cell)(ins.arg)
+                .filter(|lane| !lane.is_list())
                 .ok_or(JitVerdict::UnsupportedOpcode("STORE_DEREF (cell lane)"))?;
             if v.ty == lane {
                 // Typed and matching — nothing to learn.
@@ -4004,7 +4789,13 @@ fn step_abstract(
             let res = if hinted && a.ty == JitType::Obj && b.ty == JitType::Obj {
                 bin_result_type(kind, JitType::Int, JitType::Int)?
             } else {
-                bin_result_type(kind, a.ty, b.ty)?
+                match bin_result_type(kind, a.ty, b.ty) {
+                    Ok(t) => t,
+                    // No typed lane: the interpreter's own dispatch runs it
+                    // (`TOp::DynBinary`), producing an object.
+                    Err(_) if dyn_op_ok(a.ty, b.ty) => JitType::Obj,
+                    Err(e) => return Err(e),
+                }
             };
             stack.push(SE::known(res));
         }
@@ -4016,8 +4807,14 @@ fn step_abstract(
                 return Err(escape_verdict(code, &[&a, &b], "CALL (callee escapes)"));
             }
             let (a, b) = resolve_pair(a, b, local_types, changed);
-            cmp_check(kind, a.ty, b.ty)?;
-            stack.push(SE::known(JitType::Bool));
+            match cmp_check(kind, a.ty, b.ty) {
+                Ok(()) => stack.push(SE::known(JitType::Bool)),
+                // The interpreter's rich comparison (`TOp::DynCompare`).
+                Err(_) if dyn_op_ok(a.ty, b.ty) => {
+                    stack.push(SE::known(dyn_compare_lane(ins.arg)));
+                }
+                Err(e) => return Err(e),
+            }
         }
         // RFC 0070 WS1 — `x is None` / `x is not None` on a nullable
         // object lane. Exactly one operand must be the `None` constant
@@ -4217,6 +5014,7 @@ fn step_abstract(
                                 ret: res.ret,
                                 load_pc: i as u32,
                                 native: res.native,
+                                elem: res.elem,
                             }),
                             ..recv
                         });
@@ -4371,7 +5169,7 @@ fn step_abstract(
                         ..SE::known(JitType::Unknown)
                     }),
                     MethodRet::Scalar(ty) => stack.push(SE {
-                        num_hint: m.native && ty == JitType::Obj,
+                        num_hint: m.elem && ty == JitType::Obj,
                         ..SE::known(ty)
                     }),
                 }
@@ -4401,13 +5199,15 @@ fn step_abstract(
             // RFC 0069 WS2 — a burned-in math intrinsic: one operand,
             // `float` (an integral operand promotes with the guarded
             // exact-range conversion, like mixed arithmetic).
-            if let MarkKind::Math(_) = mark.kind {
+            if let MarkKind::Math(_) | MarkKind::MathGlobal(_) = mark.kind {
                 if argc != 1 {
                     return Err(JitVerdict::UnsupportedOpcode("math (arity)"));
                 }
                 let a = &args[0];
                 if a.ty.is_representable() {
-                    if !(a.ty == JitType::Float || a.ty.is_integral()) {
+                    // An object operand is guarded as a float (or a
+                    // promoted int) at emission.
+                    if !(a.ty == JitType::Float || a.ty == JitType::Obj || a.ty.is_integral()) {
                         return Err(JitVerdict::UnsupportedOpcode("math (operand lane)"));
                     }
                 }
@@ -4621,14 +5421,47 @@ fn step_abstract(
             // index lane). The value lane may still be `Unknown` this
             // iteration (an empty dict) — tolerated like any transient.
             if let Some((pk, pv)) = resolve_dict_container(&cont, local_types, changed, probes)? {
+                // Any other key (a tuple, say) takes the interpreter's
+                // own subscript (`TOp::DynGetItem`).
+                if idx.ty.is_representable() && !matches!(idx.ty, JitType::Int | JitType::Str) {
+                    stack.push(SE::known(JitType::Obj));
+                    return Ok(());
+                }
                 check_dict_key(&idx, pk, local_types, changed)?;
                 if pv.is_representable() && !dict_val_ok(pv) {
-                    return Err(JitVerdict::UnsupportedOpcode("dict value lane"));
+                    stack.push(SE::known(JitType::Obj));
+                    return Ok(());
                 }
                 stack.push(SE::known(pv));
                 return Ok(());
             }
-            check_subscr_index(&idx, local_types, changed)?;
+            // An index on another lane than `int` (an object guarded as an
+            // `int` for a sequence, or anything else for the generic
+            // subscript).
+            if idx.ty.is_representable() && idx.ty != JitType::Int {
+                // An untyped container local may probe as a list, whose
+                // object index is then guarded as an `int`.
+                let list_elem = if idx.ty == JitType::Obj && !cont.ty.is_representable() {
+                    resolve_list_container(&cont, local_types, changed, probes).unwrap_or(None)
+                } else {
+                    None
+                };
+                if list_elem.is_none()
+                    && (idx.ty != JitType::Obj || !subscr_speculates_int(cont.ty))
+                {
+                    if !cont.ty.is_representable() {
+                        if let Some(slot) = cont.src {
+                            settle_container(slot, true, local_types, changed, probes)?;
+                        }
+                        stack.push(SE::known(JitType::Unknown));
+                        return Ok(());
+                    }
+                    stack.push(SE::known(JitType::Obj));
+                    return Ok(());
+                }
+            } else {
+                check_subscr_index(&idx, local_types, changed)?;
+            }
             // RFC 0071 WS6 — `bytes[i]` reads a byte as an `Int`.
             if cont.ty == JitType::Bytes {
                 stack.push(SE::known(JitType::Int));
@@ -4655,7 +5488,18 @@ fn step_abstract(
                 stack.push(SE::known(JitType::Str));
                 return Ok(());
             }
+            // A container on any other lane takes the interpreter's own
+            // subscript (`TOp::DynGetItem`).
+            if cont.ty.is_representable() && cont.ty.elem_lane().is_none() {
+                stack.push(SE::known(JitType::Obj));
+                return Ok(());
+            }
             let elem = resolve_list_container(&cont, local_types, changed, probes)?;
+            if elem.is_none() {
+                if let Some(slot) = cont.src {
+                    settle_container(slot, true, local_types, changed, probes)?;
+                }
+            }
             stack.push(match elem {
                 // RFC 0073 WS1 (element residue) — an object-lane
                 // element read from a list *local* carries the list's
@@ -4947,22 +5791,43 @@ fn step_abstract(
             // the value operand — an empty dict admits stores with no
             // lane evidence at all.
             if let Some((pk, _)) = resolve_dict_container(&cont, local_types, changed, probes)? {
-                check_dict_key(&idx, pk, local_types, changed)?;
-                if val.ty.is_representable() && !dict_val_ok(val.ty) {
-                    return Err(JitVerdict::UnsupportedOpcode("dict value lane"));
+                // Other keys or values take the interpreter's own store
+                // (`TOp::DynSetItem`).
+                if idx.ty.is_representable() && !matches!(idx.ty, JitType::Int | JitType::Str) {
+                    return Ok(());
                 }
+                check_dict_key(&idx, pk, local_types, changed)?;
                 return Ok(());
             }
-            check_subscr_index(&idx, local_types, changed)?;
+            if idx.ty.is_representable() && idx.ty != JitType::Int {
+                let list_elem = if idx.ty == JitType::Obj && !cont.ty.is_representable() {
+                    resolve_list_container(&cont, local_types, changed, probes).unwrap_or(None)
+                } else {
+                    None
+                };
+                if list_elem.is_none() && (idx.ty != JitType::Obj || !cont.ty.is_list()) {
+                    if !cont.ty.is_representable() {
+                        if let Some(slot) = cont.src {
+                            settle_container(slot, false, local_types, changed, probes)?;
+                        }
+                    }
+                    return Ok(());
+                }
+            } else {
+                check_subscr_index(&idx, local_types, changed)?;
+            }
+            if cont.ty.is_representable() && !cont.ty.is_list() {
+                return Ok(());
+            }
             let elem = resolve_list_container(&cont, local_types, changed, probes)?;
             if let Some(el) = elem {
-                if val.ty.is_representable() {
-                    if val.ty != el {
-                        return Err(JitVerdict::UnsupportedOpcode("STORE_SUBSCR (value lane)"));
+                if !val.ty.is_representable() {
+                    if let Some(slot) = val.src {
+                        set_local(local_types, slot, el, changed)?;
                     }
-                } else if let Some(slot) = val.src {
-                    set_local(local_types, slot, el, changed)?;
                 }
+            } else if let Some(slot) = cont.src {
+                settle_container(slot, false, local_types, changed, probes)?;
             }
         }
         // `del d[k]` on an exact dict (the key lane as a store's).
@@ -5081,6 +5946,38 @@ fn resolve_list_container(
         return Ok(Some(elem));
     }
     Ok(None)
+}
+
+/// Whether a subscript on a `cont` container guards an object index as
+/// an `int` (a sequence the typed lanes index natively).
+fn subscr_speculates_int(cont: JitType) -> bool {
+    cont.is_list() || matches!(cont, JitType::Str | JitType::Bytes)
+}
+
+/// Type an untyped container local no list or dict probe matched: any
+/// other live value rides the object lane (its subscripts run through
+/// the interpreter's own), except that an exact `str` or `bytes` being
+/// `read` keeps its indexed lane; an unbound one stays transient.
+fn settle_container(
+    slot: u32,
+    read: bool,
+    local_types: &mut [Option<JitType>],
+    changed: &mut bool,
+    probes: &mut Probes<'_>,
+) -> Result<(), JitVerdict> {
+    if local_types.get(slot as usize).copied().flatten().is_some() {
+        return Ok(());
+    }
+    if (probes.list)(slot).is_none() && (probes.dict)(slot).is_none() && (probes.obj)(slot) {
+        // A read from an exact `str` or `bytes` keeps its own indexed
+        // lane.
+        let lane = match (probes.local)(slot) {
+            Some(t @ (JitType::Str | JitType::Bytes)) if read => t,
+            _ => JitType::Obj,
+        };
+        set_local(local_types, slot, lane, changed)?;
+    }
+    Ok(())
 }
 
 /// RFC 0073 WS2 — resolve a subscript/membership container operand to
@@ -5494,6 +6391,11 @@ fn bin_result_type(kind: ArithKind, a: JitType, b: JitType) -> Result<JitType, J
             if depth == 0 { JitType::Int } else { b },
         );
     }
+    if float_operand_guard(a, b).is_some() {
+        // The opaque operand is guarded as a float (or a promoted int)
+        // at emission, so the operation runs on the float lanes.
+        return bin_result_type(kind, JitType::Float, JitType::Float);
+    }
     let a_int = a.is_integral();
     let b_int = b.is_integral();
     if a_int && b_int {
@@ -5630,6 +6532,26 @@ fn fuse_int_result(stmts: &mut [TStmt], pc: u32, native: bool) -> bool {
     }
 }
 
+/// [`fuse_int_result`]'s float counterpart: a method call immediately
+/// before a float guard at `pc` hands over an exact `float` unboxed
+/// (stricter than the guard's promotion, never looser), and anything
+/// else leaves through the call's completed-result exit.
+fn fuse_float_result(stmts: &mut [TStmt], pc: u32) -> bool {
+    let Some(previous) = stmts.last_mut() else {
+        return false;
+    };
+    if previous.pc.checked_add(1) != Some(pc) {
+        return false;
+    }
+    match &mut previous.op {
+        TOp::CallMethod { ret, .. } if *ret == MethodRet::Scalar(JitType::Obj) => {
+            *ret = MethodRet::Scalar(JitType::Float);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// An integral peer provides a useful speculative lane for an opaque
 /// operand. Two opaque operands have no such evidence and stay generic
 /// unless one is a native container element (see [`SE::num_hint`]).
@@ -5644,6 +6566,55 @@ fn integer_operand_guard(a: JitType, b: JitType) -> Option<u8> {
     }
 }
 
+/// A `float` peer gives an opaque operand a float lane to speculate on:
+/// emission guards it with [`TOp::UnboxFloat`], which also promotes an
+/// exact `int` the way Python's mixed arithmetic does. The depth is
+/// measured from TOS.
+fn float_operand_guard(a: JitType, b: JitType) -> Option<u8> {
+    if a == JitType::Float && b == JitType::Obj {
+        Some(0)
+    } else if a == JitType::Obj && b == JitType::Float {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Whether the `for` loop headed at `head` iterates a constant tuple of
+/// fewer than [`MIN_REGION_TRIPS`] items.
+fn short_const_loop(code: &CodeObject, head: usize) -> bool {
+    let ins = &code.instructions;
+    head >= 2
+        && ins[head - 1].op == OpCode::GetIter
+        && ins[head - 2].op == OpCode::LoadConst
+        && matches!(
+            code.constants.get(ins[head - 2].arg as usize),
+            Some(Constant::Tuple(items)) if items.len() < MIN_REGION_TRIPS
+        )
+}
+
+/// The fewest iterations an OSR-only region loop is worth entering for
+/// (the embedder checks the live iterator against it, see
+/// [`TFunc::region_roots`]).
+pub const MIN_REGION_TRIPS: usize = 8;
+
+/// Whether operands on lanes `a` and `b` can take the generic operation
+/// lanes ([`TOp::DynBinary`], [`TOp::DynCompare`]): both marshal into the
+/// helper's buffer.
+fn dyn_op_ok(a: JitType, b: JitType) -> bool {
+    a.is_representable() && b.is_representable()
+}
+
+/// The result lane of a generic comparison: `bool` when the oparg asks
+/// for the truth of the result, the object itself otherwise.
+fn dyn_compare_lane(arg: u32) -> JitType {
+    if arg & COMPARE_OP_TO_BOOL_FLAG != 0 {
+        JitType::Bool
+    } else {
+        JitType::Obj
+    }
+}
+
 /// Validate comparison operand lanes. Same-lane always works; mixed
 /// integral/float works via a *guarded* promotion (the interpreter
 /// compares exactly, so the JIT deopts when the int exceeds ±2^53).
@@ -5653,7 +6624,7 @@ fn cmp_check(kind: CmpKind, a: JitType, b: JitType) -> Result<(), JitVerdict> {
     }
     // An object compared with an integral operand is guarded to be an
     // exact machine-sized `int` (see `integer_operand_guard`).
-    if integer_operand_guard(a, b).is_some() {
+    if integer_operand_guard(a, b).is_some() || float_operand_guard(a, b).is_some() {
         return Ok(());
     }
     if (a.is_integral() || a == JitType::Float) && (b.is_integral() || b == JitType::Float) {
@@ -5676,10 +6647,11 @@ fn unary_result_type(kind: UnaryKind, a: JitType) -> Result<JitType, JitVerdict>
         UnaryKind::Neg | UnaryKind::Invert => {
             if a.is_integral() {
                 Ok(JitType::Int)
-            } else if matches!(kind, UnaryKind::Neg) {
+            } else if matches!(kind, UnaryKind::Neg) && a == JitType::Float {
                 Ok(JitType::Float)
             } else {
-                Err(JitVerdict::UnsupportedOpcode("~float"))
+                // The interpreter's own unary operation (`TOp::DynUnary`).
+                Ok(JitType::Obj)
             }
         }
         UnaryKind::Pos => {
@@ -5688,7 +6660,7 @@ fn unary_result_type(kind: UnaryKind, a: JitType) -> Result<JitType, JitVerdict>
             } else if a == JitType::Int {
                 Ok(JitType::Int)
             } else {
-                Err(JitVerdict::UnsupportedOpcode("+bool"))
+                Ok(JitType::Obj)
             }
         }
     }
@@ -5895,6 +6867,9 @@ struct EmitOut {
     /// records one slot lower). Keyed so block re-emission stays
     /// idempotent.
     loop_depths: HashMap<u32, u32>,
+    /// Interpreter depths of erased `range` loads ahead of expression
+    /// bounds (see `Plan::range_spans`), by pc.
+    range_depths: HashMap<usize, u32>,
     /// RFC 0073 WS1 — inlined-comprehension saved-target spans, keyed
     /// by the comprehension's `FOR_ITER` pc.
     comp_saved: HashMap<u32, CompSavedMeta>,
@@ -5932,6 +6907,7 @@ fn emit_block(
     for s in &entry {
         if s.has_native() {
             if !s.ty.is_representable() {
+                FAIL_PC.with(|c| c.set(Some(b.start)));
                 return Err(JitVerdict::TypeUnknown);
             }
             entry_stack.push(s.ty);
@@ -6329,6 +7305,7 @@ fn emit_instr(
         math_spans,
         null_spans,
         max_call_args,
+        range_depths,
         ..
     } = out;
     // Note: `max_stack` counts markers too — a harmless overestimate of
@@ -6341,6 +7318,11 @@ fn emit_instr(
             }
             *max_stack = (*max_stack).max(stack.len() as u32);
         };
+    // An erased `range` load ahead of expression bounds: the depth its
+    // span rebuilds the callee at.
+    if plan.range_spans.contains_key(&i) {
+        range_depths.insert(i, plan.hidden_at(i) + stack.len() as u32);
+    }
     // RFC 0058 WS4 — rewritten range-loop pcs (RFC 0071 WS4 adds the
     // list-loop fused store, performed by the `ForList` terminator).
     if plan.nop.contains(&i)
@@ -6350,6 +7332,18 @@ fn emit_instr(
         return Ok(());
     }
     if let Some(&(pops, cur_slot, stop_slot)) = plan.calls.get(&i) {
+        if let Some((&callee, _)) = plan.range_spans.iter().find(|&(_, &c)| c == i) {
+            let interp_depth = range_depths
+                .get(&callee)
+                .copied()
+                .ok_or(JitVerdict::UnsupportedOpcode("range (bounds span)"))?;
+            len_spans.push(CalleeSpanMeta {
+                token: code.instructions[callee].arg,
+                live_from: callee as u32,
+                live_to: i as u32 + 1,
+                interp_depth,
+            });
+        }
         // Stack is [.., start?, stop]; store the bounds into the
         // synthetic slots (one arg seeds `cur` with 0).
         stack.pop().ok_or(JitVerdict::StackUnderflow)?;
@@ -6480,12 +7474,30 @@ fn emit_instr(
                 }
                 // RFC 0065 WS5: `len` rides the interpreter stack the
                 // same way; the `CALL` lowers to `ListLen`.
+                Some(ResolvedGlobal::MathGlobal(func)) => {
+                    let n_iters = plan.hidden_at(i);
+                    stack.push(ESlot {
+                        callee: Some(CalleeMark {
+                            kind: MarkKind::MathGlobal(*func),
+                            token: ins.arg,
+                            arg_count: 1,
+                            min_args: 1,
+                            is_self: false,
+                            ret: Some(JitType::Float),
+                            ctor: false,
+                            load_pc: pc,
+                            interp_depth: n_iters + stack.len() as u32,
+                        }),
+                        ..ESlot::val(JitType::Unknown)
+                    });
+                    return Ok(());
+                }
                 Some(ResolvedGlobal::LenBuiltin) => {
                     let n_iters = plan.hidden_at(i);
                     stack.push(ESlot {
                         callee: Some(CalleeMark {
                             kind: MarkKind::Len,
-                            token: 0,
+                            token: ins.arg,
                             arg_count: 1,
                             min_args: 1,
                             is_self: false,
@@ -6568,7 +7580,16 @@ fn emit_instr(
                 .get(ins.arg as usize)
                 .copied()
                 .flatten()
-                .ok_or(JitVerdict::TypeUnknown)?;
+                .ok_or(JitVerdict::TypeUnknown)
+                .inspect_err(|_| {
+                    if std::env::var_os("WEAVEPY_JIT_TRACE_PC").is_some() {
+                        eprintln!(
+                            "jit untyped local {:?} {:?}",
+                            code.name,
+                            code.varnames.get(ins.arg as usize)
+                        );
+                    }
+                })?;
             // Push manually so the slot provenance rides along (RFC
             // 0065 WS5 attribute sites re-probe by slot).
             stmts.push(TStmt {
@@ -6597,6 +7618,24 @@ fn emit_instr(
                 push(TOp::StoreLocal(ins.arg), None, stack, stmts);
                 return Ok(());
             }
+            // A speculated scalar local (see `num_spec_lane`) unboxes the
+            // opaque value at the store; a miss resumes at `STORE_FAST`.
+            if top.ty == JitType::Obj && top.is_plain() {
+                match local_types.get(ins.arg as usize).copied().flatten() {
+                    Some(JitType::Float) if !fuse_float_result(stmts, pc) => push(
+                        TOp::UnboxFloat {
+                            depth: 0,
+                            promote: UNBOX_FLOAT_EXACT,
+                        },
+                        None,
+                        stack,
+                        stmts,
+                    ),
+                    Some(JitType::Float) => {}
+                    Some(JitType::Int) => push(TOp::UnboxInt { depth: 0 }, None, stack, stmts),
+                    _ => {}
+                }
+            }
             pop_val(stack)?;
             push(TOp::StoreLocal(ins.arg), None, stack, stmts);
         }
@@ -6604,8 +7643,8 @@ fn emit_instr(
         // (and stability-checked) by the fixpoint; re-probe here so
         // the burned lane matches the converged typing.
         OpCode::LoadDeref => {
-            let lane = (probes.cell)(ins.arg)
-                .ok_or(JitVerdict::UnsupportedOpcode("LOAD_DEREF (cell lane)"))?;
+            let lane =
+                (probes.cell)(ins.arg).ok_or(JitVerdict::ProbeMiss("LOAD_DEREF (cell lane)"))?;
             push(
                 TOp::CellGet { idx: ins.arg, lane },
                 Some(lane),
@@ -6615,6 +7654,7 @@ fn emit_instr(
         }
         OpCode::StoreDeref => {
             let lane = (probes.cell)(ins.arg)
+                .filter(|lane| !lane.is_list())
                 .ok_or(JitVerdict::UnsupportedOpcode("STORE_DEREF (cell lane)"))?;
             let v = pop_val(stack)?;
             if v != lane {
@@ -6665,6 +7705,31 @@ fn emit_instr(
                     a = JitType::Int;
                 }
             }
+            // An object with a float peer is guarded as a float (an exact
+            // `int` promotes, as Python's mixed arithmetic does); a miss
+            // restores the boxed value at this BINARY_OP.
+            if let Some(depth) = float_operand_guard(a, b) {
+                if depth != 0 || !fuse_float_result(stmts, pc) {
+                    stack.push(ESlot::val(a));
+                    stack.push(ESlot::val(b));
+                    push(
+                        TOp::UnboxFloat {
+                            depth,
+                            promote: UNBOX_FLOAT_ARITH,
+                        },
+                        None,
+                        stack,
+                        stmts,
+                    );
+                    stack.pop();
+                    stack.pop();
+                }
+                if depth == 0 {
+                    b = JitType::Float;
+                } else {
+                    a = JitType::Float;
+                }
+            }
             // RFC 0071 WS4 — `list * int` repeats the pinned list on
             // the same lane through `wpjit_list_repeat`.
             if matches!(kind, ArithKind::Mul) && a.is_list() {
@@ -6707,8 +7772,19 @@ fn emit_instr(
                 if matches!(kind, ArithKind::Add) && a == JitType::Str && str_accumulator(code, i) {
                     return Err(JitVerdict::UnsupportedOpcode("str accumulator"));
                 }
-                let (op, ty) = lower_bin(kind, a, b)?;
-                push(op, Some(ty), stack, stmts);
+                match lower_bin(kind, a, b) {
+                    Ok((op, ty)) => push(op, Some(ty), stack, stmts),
+                    Err(_) if dyn_op_ok(a, b) => {
+                        *max_call_args = (*max_call_args).max(2);
+                        push(
+                            TOp::DynBinary { arg: ins.arg },
+                            Some(JitType::Obj),
+                            stack,
+                            stmts,
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
         OpCode::CompareOp => {
@@ -6729,6 +7805,30 @@ fn emit_instr(
                     b = JitType::Int;
                 } else {
                     a = JitType::Int;
+                }
+            }
+            // An object compared with a float is guarded as a float, or an
+            // `int` the conversion keeps exact.
+            if let Some(depth) = float_operand_guard(a, b) {
+                if depth != 0 || !fuse_float_result(stmts, pc) {
+                    stack.push(ESlot::val(a));
+                    stack.push(ESlot::val(b));
+                    push(
+                        TOp::UnboxFloat {
+                            depth,
+                            promote: UNBOX_FLOAT_CMP,
+                        },
+                        None,
+                        stack,
+                        stmts,
+                    );
+                    stack.pop();
+                    stack.pop();
+                }
+                if depth == 0 {
+                    b = JitType::Float;
+                } else {
+                    a = JitType::Float;
                 }
             }
             if a.is_integral() && b.is_integral() {
@@ -6755,12 +7855,34 @@ fn emit_instr(
             } else if a == JitType::Str && b == JitType::Str {
                 // RFC 0071 WS6 — `str` equality through the registered
                 // helper; ordering compares stay non-JITable.
-                let negate = match kind {
-                    CmpKind::Eq => false,
-                    CmpKind::Ne => true,
-                    _ => return Err(JitVerdict::UnsupportedOpcode("COMPARE_OP (str order)")),
-                };
-                push(TOp::StrEq { negate }, Some(JitType::Bool), stack, stmts);
+                match kind {
+                    CmpKind::Eq | CmpKind::Ne => push(
+                        TOp::StrEq {
+                            negate: kind == CmpKind::Ne,
+                        },
+                        Some(JitType::Bool),
+                        stack,
+                        stmts,
+                    ),
+                    // Ordering runs through the interpreter's comparison.
+                    _ => {
+                        *max_call_args = (*max_call_args).max(2);
+                        push(
+                            TOp::DynCompare { arg: ins.arg },
+                            Some(dyn_compare_lane(ins.arg)),
+                            stack,
+                            stmts,
+                        );
+                    }
+                }
+            } else if dyn_op_ok(a, b) {
+                *max_call_args = (*max_call_args).max(2);
+                push(
+                    TOp::DynCompare { arg: ins.arg },
+                    Some(dyn_compare_lane(ins.arg)),
+                    stack,
+                    stmts,
+                );
             } else {
                 return Err(JitVerdict::MixedArithTypes);
             }
@@ -6831,6 +7953,17 @@ fn emit_instr(
                 }
                 (UnaryKind::Not, JitType::Float) => {
                     push(TOp::FloatNot, Some(JitType::Bool), stack, stmts);
+                }
+                (UnaryKind::Neg | UnaryKind::Pos | UnaryKind::Invert, t)
+                    if t.is_representable() =>
+                {
+                    push(
+                        TOp::DynUnary { arg: ins.arg },
+                        Some(JitType::Obj),
+                        stack,
+                        stmts,
+                    );
+                    *max_call_args = (*max_call_args).max(1);
                 }
                 _ => return Err(JitVerdict::UnsupportedOpcode("UNARY_OP lane")),
             }
@@ -7122,6 +8255,7 @@ fn emit_instr(
                         ret: res.ret,
                         load_pc: pc,
                         native: res.native,
+                        elem: res.elem,
                     });
                     stack.push(ESlot {
                         null: Some((pc, plan.hidden_at(i) + stack.len() as u32)),
@@ -7449,7 +8583,7 @@ fn emit_instr(
                             return Err(JitVerdict::TypeUnknown);
                         }
                         stack.push(ESlot {
-                            num_hint: m.native && ty == JitType::Obj,
+                            num_hint: m.elem && ty == JitType::Obj,
                             ..ESlot::val(ty)
                         });
                     }
@@ -7571,7 +8705,7 @@ fn emit_instr(
             // operand (an integral operand converts exactly — i64 →
             // f64 is correctly rounded for the whole lane, matching
             // the interpreter's conversion).
-            if let MarkKind::Math(func) = mark.kind {
+            if let MarkKind::Math(func) | MarkKind::MathGlobal(func) = mark.kind {
                 if argc != 1 {
                     return Err(JitVerdict::UnsupportedOpcode("math (arity)"));
                 }
@@ -7579,15 +8713,36 @@ fn emit_instr(
                     stack.push(ESlot::val(arg_tys[0]));
                     push(TOp::IntToFloatTos { guarded: false }, None, stack, stmts);
                     stack.pop();
+                } else if arg_tys[0] == JitType::Obj {
+                    // Guarded as a float, or an exact int converted (the
+                    // function's own conversion); a miss resumes at CALL.
+                    stack.push(ESlot::val(JitType::Obj));
+                    if !fuse_float_result(stmts, pc) {
+                        push(
+                            TOp::UnboxFloat {
+                                depth: 0,
+                                promote: UNBOX_FLOAT_ARITH,
+                            },
+                            None,
+                            stack,
+                            stmts,
+                        );
+                    }
+                    stack.pop();
                 } else if arg_tys[0] != JitType::Float {
                     return Err(JitVerdict::UnsupportedOpcode("math (operand lane)"));
                 }
-                math_spans.push(CalleeSpanMeta {
+                let span = CalleeSpanMeta {
                     token: mark.token,
                     live_from: mark.load_pc,
                     live_to: pc + 1,
                     interp_depth: mark.interp_depth,
-                });
+                };
+                if let MarkKind::MathGlobal(_) = mark.kind {
+                    len_spans.push(span);
+                } else {
+                    math_spans.push(span);
+                }
                 push(TOp::MathIntrinsic(func), Some(JitType::Float), stack, stmts);
                 return Ok(());
             }
@@ -7618,7 +8773,7 @@ fn emit_instr(
                     return Err(JitVerdict::UnsupportedOpcode("len (argument lane)"));
                 };
                 len_spans.push(CalleeSpanMeta {
-                    token: 0,
+                    token: mark.token,
                     live_from: mark.load_pc,
                     live_to: pc + 1,
                     interp_depth: mark.interp_depth,
@@ -8252,22 +9407,45 @@ fn emit_instr(
             // lane comes from the operand, the value lane from a fresh
             // probe on the container local (inference resolved it on
             // the same live frame, so a miss here is environmental).
+            // The interpreter's own subscript for whatever no typed lane
+            // covers (`TOp::DynGetItem`).
+            macro_rules! dyn_get {
+                () => {{
+                    if !dyn_op_ok(cont, idx_slot.ty) {
+                        return Err(JitVerdict::TypeUnknown);
+                    }
+                    *max_call_args = (*max_call_args).max(2);
+                    push(TOp::DynGetItem, Some(JitType::Obj), stack, stmts);
+                    return Ok(());
+                }};
+            }
             if cont == JitType::Dict {
                 if !matches!(idx, JitType::Int | JitType::Str) {
-                    return Err(JitVerdict::UnsupportedOpcode("dict key lane"));
+                    dyn_get!();
                 }
                 let (_, pv) = cont_slot
                     .src
                     .and_then(|s| (probes.dict)(s))
                     .ok_or(JitVerdict::ProbeMiss("dict value lane"))?;
                 if !dict_val_ok(pv) {
-                    return Err(JitVerdict::UnsupportedOpcode("dict value lane"));
+                    dyn_get!();
                 }
                 push(TOp::DictGet { key: idx, val: pv }, Some(pv), stack, stmts);
                 return Ok(());
             }
+            let mut idx = idx;
+            if idx == JitType::Obj && subscr_speculates_int(cont) {
+                // A sequence index is guarded as an exact `int`; a miss
+                // resumes at the subscript with both operands.
+                stack.push(cont_slot);
+                stack.push(idx_slot);
+                push(TOp::UnboxInt { depth: 0 }, None, stack, stmts);
+                stack.pop();
+                stack.pop();
+                idx = JitType::Int;
+            }
             if idx != JitType::Int {
-                return Err(JitVerdict::UnsupportedOpcode("subscript index lane"));
+                dyn_get!();
             }
             // RFC 0071 WS6 — `bytes[i]` through the registered helper.
             if cont == JitType::Bytes {
@@ -8319,37 +9497,49 @@ fn emit_instr(
                 push(TOp::StrGetItem, Some(JitType::Str), stack, stmts);
                 return Ok(());
             }
-            let elem = cont
-                .elem_lane()
-                .ok_or(JitVerdict::UnsupportedOpcode("subscript container lane"))?;
+            let Some(elem) = cont.elem_lane() else {
+                dyn_get!();
+            };
             push(TOp::ListGet { elem }, Some(elem), stack, stmts);
         }
         OpCode::StoreSubscr => {
-            let idx = pop_val(stack)?;
-            let cont = pop_val(stack)?;
+            let n = stack.len();
+            if n < 3 {
+                return Err(JitVerdict::StackUnderflow);
+            }
+            let (val, cont, mut idx) = (stack[n - 3].ty, stack[n - 2].ty, stack[n - 1].ty);
+            for s in &stack[n - 3..] {
+                if !s.is_plain() {
+                    return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                }
+            }
+            if idx == JitType::Obj && cont.is_list() {
+                // A list index is guarded as an exact `int` (see
+                // `BINARY_SUBSCR`).
+                push(TOp::UnboxInt { depth: 0 }, None, stack, stmts);
+                idx = JitType::Int;
+            }
+            stack.truncate(n - 3);
             // RFC 0073 WS2 — `d[k] = v` on a pinned exact dict: both
             // lanes come from the operands (an empty dict admits with
             // no probe evidence at all).
-            if cont == JitType::Dict {
-                if !matches!(idx, JitType::Int | JitType::Str) {
-                    return Err(JitVerdict::UnsupportedOpcode("dict key lane"));
+            let typed = if cont == JitType::Dict {
+                matches!(idx, JitType::Int | JitType::Str) && dict_val_ok(val)
+            } else {
+                idx == JitType::Int && cont.elem_lane() == Some(val)
+            };
+            if !typed {
+                // The interpreter's own item store (`TOp::DynSetItem`).
+                if !dyn_op_ok(val, cont) || !idx.is_representable() {
+                    return Err(JitVerdict::TypeUnknown);
                 }
-                let val = pop_val(stack)?;
-                if !dict_val_ok(val) {
-                    return Err(JitVerdict::UnsupportedOpcode("dict value lane"));
-                }
-                push(TOp::DictSet { key: idx, val }, None, stack, stmts);
+                *max_call_args = (*max_call_args).max(3);
+                push(TOp::DynSetItem, None, stack, stmts);
                 return Ok(());
             }
-            if idx != JitType::Int {
-                return Err(JitVerdict::UnsupportedOpcode("subscript index lane"));
-            }
-            let elem = cont
-                .elem_lane()
-                .ok_or(JitVerdict::UnsupportedOpcode("subscript container lane"))?;
-            let val = pop_val(stack)?;
-            if val != elem {
-                return Err(JitVerdict::UnsupportedOpcode("STORE_SUBSCR (value lane)"));
+            if cont == JitType::Dict {
+                push(TOp::DictSet { key: idx, val }, None, stack, stmts);
+                return Ok(());
             }
             push(TOp::ListSet, None, stack, stmts);
         }

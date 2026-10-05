@@ -257,6 +257,12 @@ pub(crate) const OP_GETITEM: u8 = 7;
 pub(crate) const OP_NEXT: u8 = 8;
 pub(crate) const OP_RNEXT: u8 = 9;
 
+/// Whether direct operation `op` returns a deque element (arithmetic on
+/// the result then speculates the integer lane).
+pub(crate) fn op_returns_element(op: u8) -> bool {
+    matches!(op, OP_POP | OP_POPLEFT | OP_GETITEM | OP_NEXT | OP_RNEXT)
+}
+
 /// One deque operation's common case on `recv` (and its one argument),
 /// over the unguarded views [`fast_parts`] takes: the whole operation,
 /// or `None` with nothing touched when it needs the full body (a guarded

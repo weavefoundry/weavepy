@@ -292,6 +292,11 @@ struct GuardSnapshot {
     /// construction plan is a function of it, so an unchanged class only
     /// needs its `__init__` code and metaclass rechecked.
     ctor_vers: Vec<Cell<u64>>,
+    /// Live activations of this compile whose frame Python code has
+    /// inspected (see [`sync_native_locals`]): while any is, the guards
+    /// fail, so each such activation leaves native code right after the
+    /// call that inspected it (and no new one enters).
+    introspected: Cell<u32>,
 }
 
 impl GuardSnapshot {
@@ -301,6 +306,7 @@ impl GuardSnapshot {
             last_ok: std::cell::Cell::new((0, 0, 0, 0, 0)),
             defaults,
             ctor_vers: (0..callees).map(|_| Cell::new(u64::MAX)).collect(),
+            introspected: Cell::new(0),
         }
     }
 }
@@ -964,6 +970,7 @@ impl JitState {
         weavepy_jit::register_const_str_helper(wpjit_const_str);
         weavepy_jit::register_tuple_read_helpers(wpjit_const_tuple, wpjit_tuple_len);
         weavepy_jit::register_unbox_int_helper(wpjit_unbox_int);
+        weavepy_jit::register_unbox_float_helper(wpjit_unbox_float);
         weavepy_jit::register_is_obj_helper(wpjit_is_obj);
         weavepy_jit::register_dict_iter_helper(wpjit_dict_iter_new);
         // RFC 0073 WS3 — the string write lanes.
@@ -1004,6 +1011,12 @@ impl JitState {
         // and set literals.
         weavepy_jit::register_truth_helper(wpjit_truth);
         weavepy_jit::register_contains_dyn_helper(wpjit_contains_dyn);
+        weavepy_jit::register_dyn_op_helpers(wpjit_dyn_binop, wpjit_dyn_compare);
+        weavepy_jit::register_dyn_item_helpers(
+            wpjit_dyn_getitem,
+            wpjit_dyn_setitem,
+            wpjit_dyn_unary,
+        );
         weavepy_jit::register_build_set_helper(wpjit_build_set);
         weavepy_jit::register_iter_new_helper(wpjit_iter_new);
         weavepy_jit::register_iter_next_pair_helper(wpjit_iter_next_pair);
@@ -1055,10 +1068,14 @@ impl JitState {
             // A cold exit handed the activation to the interpreter, which
             // now asks to enter a loop the frame can't: compile again from
             // here (see `CacheEntry::recompile_at_osr`).
-            let recompile = entry.recompile_at_osr
-                && entry_pc != 0
+            // A loop carved out for its code alone stays interpreted; one
+            // carved out for want of live values recompiles from inside.
+            let recompile = entry_pc != 0
                 && matches!(&entry.tier, Tier::Compiled(a)
-                    if !a.cf.osr_entries.iter().any(|e| e.pc == entry_pc));
+                    if !a.cf.osr_entries.iter().any(|e| e.pc == entry_pc)
+                        && ((entry.recompile_at_osr && !a.cf.stayed_heads.contains(&entry_pc))
+                            || (a.cf.env_heads.contains(&entry_pc)
+                                && entry.cold_recompiles < COLD_RECOMPILE_BUDGET)));
             if recompile {
                 entry.recompile_at_osr = false;
                 entry.cold_recompiles = entry.cold_recompiles.saturating_add(1);
@@ -1139,6 +1156,8 @@ impl JitState {
             ctor_field,
             cell,
             obj_live,
+            stack_iter,
+            pairs,
         } = probes;
         // RFC 0071 WS1 — an already-compiled callee's *actual* return
         // lane, from the code cache. The static re-analysis in
@@ -1269,6 +1288,8 @@ impl JitState {
                             min_args: e.min_args,
                             ret: e.ret,
                             native: matches!(e.callee, MethodCallee::Native { .. }),
+                            elem: matches!(e.callee, MethodCallee::Native { op, .. }
+                                if crate::stdlib::collections_native::op_returns_element(op)),
                         });
                     }
                     let e = method(slot, path, name)?;
@@ -1280,6 +1301,8 @@ impl JitState {
                         min_args: e.min_args,
                         ret: e.ret,
                         native: matches!(e.callee, MethodCallee::Native { .. }),
+                        elem: matches!(e.callee, MethodCallee::Native { op, .. }
+                                if crate::stdlib::collections_native::op_returns_element(op)),
                     };
                     methods.push(e);
                     Some(res)
@@ -1288,7 +1311,17 @@ impl JitState {
             // guard snapshot below re-resolves each burned pair.
             let mut probe_math = |name: &str, attr_name: &str| math_attr(name, attr_name).is_some();
             // RFC 0069 WS3 — parameter-lane seeding, active on retry only.
-            let mut probe_param = |slot: u32| if seed_params { param(slot) } else { None };
+            // The same live-local grading types an OSR-only region's
+            // inputs on every attempt (`Probes::local`).
+            let param_cell = std::cell::RefCell::new(&mut **param);
+            let mut probe_param = |slot: u32| {
+                if seed_params {
+                    (param_cell.borrow_mut())(slot)
+                } else {
+                    None
+                }
+            };
+            let mut probe_local = |slot: u32| (param_cell.borrow_mut())(slot);
             // RFC 0073 WS5 — keyword-name → parameter-slot resolution
             // against the callee table `classify` built. Unknown
             // names, positional-only parameters, and constructor
@@ -1346,6 +1379,11 @@ impl JitState {
                 obj_global: &mut probe_obj_global,
                 cell: &mut **cell,
                 obj: &mut **obj_live,
+                local: &mut probe_local,
+                stack_iter: &mut **stack_iter,
+                pairs: &mut **pairs,
+                entry_pc: Some(entry_pc),
+                carve_env: seed_params,
                 paths: &mut path_arena,
             };
             let t0 = std::env::var_os("WEAVEPY_JIT_TRACE")
@@ -1398,7 +1436,10 @@ impl JitState {
         };
         let (res, callees, methods, obj_names) = {
             let first = run(false);
-            if matches!(first.0, Err(weavepy_jit::JitVerdict::TypeUnknown)) {
+            if matches!(
+                first.0,
+                Err(weavepy_jit::JitVerdict::TypeUnknown | weavepy_jit::JitVerdict::ProbeMiss(_))
+            ) {
                 run(true)
             } else {
                 first
@@ -1710,7 +1751,7 @@ impl JitState {
             // code; a stale plan (or one not yet rebuilt) simply takes
             // the interpreter path, and `guards_hold` — which re-probes
             // the full construction shape — remains the semantic guard.
-            Object::Type(t) => {
+            Object::Type(t) if t.metaclass_is_type() => {
                 let init = {
                     let cached = t.instance_plan.borrow();
                     let (ver, plan) = cached.as_ref()?.clone();
@@ -1891,6 +1932,12 @@ struct VmProbes<'a> {
     /// the requesting activation (no grading), for the analyzer's
     /// generic-attribute probe-miss fallback.
     obj_live: &'a mut dyn FnMut(u32) -> bool,
+    /// The lane of the live loop iterator at an interpreter-stack index
+    /// of the requesting activation (see [`probe_stack_iter_lane`]).
+    stack_iter: &'a mut dyn FnMut(u32) -> Option<JitType>,
+    /// The pair lanes of a local list or tuple of 2-tuples (see
+    /// [`probe_pair_lanes`]).
+    pairs: &'a mut dyn FnMut(u32) -> Option<(JitType, JitType)>,
 }
 
 /// RFC 0071 WS2 — one constructible class's burned-in call shape: the
@@ -2316,6 +2363,11 @@ fn method_ret_info(
         cell: &mut |_| None,
         // Depth bound: no live locals to observe in the nested view.
         obj: &mut |_| false,
+        local: &mut |_| None,
+        stack_iter: &mut |_| None,
+        pairs: &mut |_| None,
+        entry_pc: None,
+        carve_env: false,
         paths: &mut path_arena,
     };
     match weavepy_jit::analyze_frame(fcode, &mut classify, &mut probes) {
@@ -2475,6 +2527,7 @@ fn unpack_ty(bits: u64, ty: JitType, pins: &PinTable) -> Object {
         | JitType::ListFloat
         | JitType::ListObj
         | JitType::ListListFloat
+        | JitType::ListListInt
         | JitType::Obj
         | JitType::Str
         | JitType::Bytes
@@ -2537,6 +2590,9 @@ fn entry_local_ok(obj: &Object, ty: JitType) -> bool {
         (Some(Object::List(inner)), JitType::ListFloat) => {
             matches!(inner.borrow().first(), None | Some(Object::Float(_)))
         }
+        (Some(Object::List(inner)), JitType::ListInt) => {
+            matches!(inner.borrow().first(), None | Some(Object::Int(_)))
+        }
         (first, elem) => matches!(
             (first, elem),
             (None, _)
@@ -2555,6 +2611,43 @@ fn entry_local_ok(obj: &Object, ty: JitType) -> bool {
 /// `int` or `float` list; `Some(Unknown)` for an *empty* list
 /// (definitely a list, but with no lane evidence — RFC 0065 WS5 lets
 /// `append`'s value lane pin it); `None` otherwise.
+fn probe_pair_lanes(frame: &super::Frame, slot: u32) -> Option<(JitType, JitType)> {
+    /// Enough pairs to see a mixed component without scanning a long
+    /// container on every compile.
+    const SAMPLE: usize = 16;
+    let locals = frame.locals.borrow();
+    let grade = |items: &[Object]| -> Option<(JitType, JitType)> {
+        let lane = |v: &Object| match v {
+            Object::Int(_) => JitType::Int,
+            Object::Float(_) => JitType::Float,
+            _ => JitType::Obj,
+        };
+        let mut out: Option<(JitType, JitType)> = None;
+        for it in items.iter().take(SAMPLE) {
+            let Object::Tuple(t) = it else {
+                return None;
+            };
+            let [a, b] = &t[..] else {
+                return None;
+            };
+            let (a, b) = (lane(a), lane(b));
+            out = Some(match out {
+                None => (a, b),
+                Some((x, y)) => (
+                    if x == a { x } else { JitType::Obj },
+                    if y == b { y } else { JitType::Obj },
+                ),
+            });
+        }
+        out
+    };
+    match locals.get(slot as usize) {
+        Some(Object::List(l)) => grade(&l.borrow()),
+        Some(Object::Tuple(t)) => grade(t),
+        _ => None,
+    }
+}
+
 fn probe_list_lane(frame: &super::Frame, slot: u32) -> Option<JitType> {
     let locals = frame.locals.borrow();
     let Some(Object::List(l)) = locals.get(slot as usize) else {
@@ -2579,13 +2672,17 @@ fn list_elem_lane(items: &[Object]) -> Option<JitType> {
             // element lane; the access helpers re-validate per element.
             // Tuples too (a list of pairs a `for a, b in` loop unpacks).
             Object::Instance(_) | Object::None | Object::Tuple(_) => JitType::Obj,
-            // A non-empty all-`float` list element: the nested lane.
+            // A non-empty all-`float` or all-`int` list element: the
+            // nested lanes.
             Object::List(inner) => {
                 let inner = inner.borrow();
-                if inner.is_empty() || !inner.iter().all(|x| matches!(x, Object::Float(_))) {
+                if !inner.is_empty() && inner.iter().all(|x| matches!(x, Object::Float(_))) {
+                    JitType::ListFloat
+                } else if !inner.is_empty() && inner.iter().all(|x| matches!(x, Object::Int(_))) {
+                    JitType::ListInt
+                } else {
                     return None;
                 }
-                JitType::ListFloat
             }
             _ => return None,
         };
@@ -2596,6 +2693,26 @@ fn list_elem_lane(items: &[Object]) -> Option<JitType> {
         }
     }
     lane
+}
+
+/// The lane of the live loop iterator at index `depth` of the requesting
+/// activation's operand stack: `Int` for a unit-step `range` iterator,
+/// the list lane of a plain list iterator's items, `Obj` for any other
+/// iterator, `None` for anything else.
+fn probe_stack_iter_lane(frame: &super::Frame, depth: u32) -> Option<JitType> {
+    match frame.stack.get(depth as usize)? {
+        Object::Iter(it) => Some(match &*it.borrow() {
+            PyIterator::Range { step: 1, .. } => JitType::Int,
+            PyIterator::List {
+                items, owner: None, ..
+            } => list_elem_lane(&items.borrow())
+                .and_then(JitType::list_of)
+                .unwrap_or(JitType::Obj),
+            _ => JitType::Obj,
+        }),
+        Object::Generator(_) => Some(JitType::Obj),
+        _ => None,
+    }
 }
 
 /// RFC 0076 WS8 — the live-value probe: whether local `slot` holds
@@ -2695,6 +2812,13 @@ fn probe_cell_lane(frame: &super::Frame, idx: u32) -> Option<JitType> {
     let payload = cell.borrow();
     scalar_lane(&payload).or_else(|| match &*payload {
         Object::Unbound => None,
+        // A homogeneous list rides its list lane (re-read and
+        // re-validated per access, like the object lane).
+        Object::List(l) => Some(
+            list_elem_lane(&l.borrow())
+                .and_then(JitType::list_of)
+                .unwrap_or(JitType::Obj),
+        ),
         _ => Some(JitType::Obj),
     })
 }
@@ -3550,6 +3674,8 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
             |cls: &str, attr: &str| probe_ctor_field(interp_ref, frame_ref, cls, attr);
         let mut probe_cell = |idx: u32| probe_cell_lane(frame_ref, idx);
         let mut probe_obj = |slot: u32| probe_obj_live(frame_ref, slot);
+        let mut probe_iter = |depth: u32| probe_stack_iter_lane(frame_ref, depth);
+        let mut probe_pairs = |slot: u32| probe_pair_lanes(frame_ref, slot);
         let _ = st.get_compiled(
             &frame.code,
             0,
@@ -3567,6 +3693,8 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
                 ctor_field: &mut probe_ctor_fld,
                 cell: &mut probe_cell,
                 obj_live: &mut probe_obj,
+                stack_iter: &mut probe_iter,
+                pairs: &mut probe_pairs,
             },
         );
     });
@@ -3638,7 +3766,28 @@ fn grade_obj_global(obj: &Object) -> JitType {
     }
 }
 
+/// The guard snapshot's value for the erased builtin global named
+/// `code.names[name_idx]` (a `len` or `math` intrinsic span's callee).
+fn erased_global(entry: &CompiledEntry, code: &CodeObject, name_idx: u32) -> Object {
+    let Some(name) = code.names.get(name_idx as usize) else {
+        return Object::None;
+    };
+    entry
+        .guard_snapshot
+        .iter()
+        .find(|(n, _)| n == name)
+        .map_or(Object::None, |(_, o)| o.clone())
+}
+
 fn classify_global(obj: Option<&Object>) -> ResolvedGlobal {
+    // A `math` intrinsic bound to a global (`from math import sqrt`).
+    if let Some(builtin @ Object::Builtin(b)) = obj {
+        if let Some(func) = weavepy_jit::MathFunc::from_attr(b.name) {
+            if math_builtin_ok(builtin, b.name) {
+                return ResolvedGlobal::MathGlobal(func);
+            }
+        }
+    }
     match obj {
         Some(Object::Builtin(b)) if b.name == "range" => ResolvedGlobal::RangeBuiltin,
         Some(Object::Type(t)) if Rc::ptr_eq(t, &crate::builtin_types::builtin_types().range_) => {
@@ -3803,6 +3952,123 @@ struct CallCtx {
     /// objects reuses their pins instead of growing the table. Advisory;
     /// every hit is checked against the pin it names.
     pin_memo: [u32; PIN_MEMO],
+    /// Python code inspected this activation's frame (its `f_locals`):
+    /// the frame's locals were synced from the native buffers then, and
+    /// the activation leaves native code after the call that did it,
+    /// keeping whatever the inspection wrote (see [`sync_native_locals`]).
+    introspected: Cell<bool>,
+    /// Per closure cell, the pin of the list a list-lane read of it pinned
+    /// last (`u32::MAX` for none): reread while the cell holds the same
+    /// list, it costs no new pin.
+    cell_list_pins: Vec<u32>,
+    /// A frameless activation's inspected locals: the storage of the
+    /// activation shell the inspection found (a framed activation's are
+    /// its frame's own).
+    inspected_locals: std::cell::RefCell<Option<Rc<GilRefCell<Vec<Object>>>>>,
+}
+
+/// A framed native activation running on this thread, registered so
+/// frame introspection can find its live locals (see
+/// [`sync_native_locals`]).
+struct NativeFrameRec {
+    /// The interpreter frame's (or activation shell's) locals storage,
+    /// the identity a frame object's locals mirror shares.
+    locals: *const GilRefCell<Vec<Object>>,
+    ctx: *const CallCtx,
+    jf: *const JitFrame,
+}
+
+thread_local! {
+    /// The framed native activations on this thread's stack, innermost
+    /// last.
+    static NATIVE_FRAMES: std::cell::RefCell<Vec<NativeFrameRec>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Register the native activation `jf` (whose context is `jf.ctx`) as
+/// running the frame whose locals storage is `locals`, for the duration
+/// of `run`.
+fn with_native_frame<T>(
+    locals: &Rc<GilRefCell<Vec<Object>>>,
+    jf: *const JitFrame,
+    run: impl FnOnce() -> T,
+) -> T {
+    // SAFETY: `jf` is the live activation's frame; its context pointer
+    // was set from the activation's `CallCtx`.
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { (*jf).ctx.cast::<CallCtx>() };
+    NATIVE_FRAMES.with(|recs| {
+        recs.borrow_mut().push(NativeFrameRec {
+            locals: Rc::as_ptr(locals),
+            ctx,
+            jf,
+        });
+    });
+    let out = run();
+    NATIVE_FRAMES.with(|recs| {
+        recs.borrow_mut().pop();
+    });
+    out
+}
+
+/// The end of an activation's native run: an inspected activation stops
+/// failing its compile's guards (see [`GuardSnapshot::introspected`]).
+fn end_introspection(ctx: &CallCtx) {
+    if ctx.introspected.get() {
+        let n = ctx.guard_snapshot.introspected.get();
+        ctx.guard_snapshot.introspected.set(n.saturating_sub(1));
+    }
+}
+
+/// Make the frame whose locals storage is `locals` current for Python
+/// code inspecting it (a `FrameLocalsProxy`, PEP 667): when native code
+/// is running that frame, its locals live in the native buffers (written
+/// back before every call out of native code), so copy them into the
+/// frame. The activation is then marked: it leaves native code right
+/// after the call it is suspended in, and its exit keeps the frame's
+/// locals, including anything the inspection wrote.
+pub(crate) fn sync_native_locals(locals: &Rc<GilRefCell<Vec<Object>>>) {
+    let p = Rc::as_ptr(locals);
+    NATIVE_FRAMES.with(|recs| {
+        let recs = recs.borrow();
+        let Some(rec) = recs.iter().rev().find(|r| r.locals == p) else {
+            return;
+        };
+        // SAFETY: a registered activation is live, suspended in a helper
+        // call below this one; its context and frame outlive the record.
+        let ctx = unsafe { &*rec.ctx };
+        let jf = unsafe { &*rec.jf };
+        // SAFETY: the compiled frame outlives its activations.
+        let Some(cf) = (unsafe { ctx.cf.as_ref() }) else {
+            return;
+        };
+        let Ok(mut out) = locals.try_borrow_mut() else {
+            return;
+        };
+        // A frameless activation's shell starts out empty.
+        if let Some(code) = &ctx.frameless_code {
+            if out.len() < code.varnames.len() {
+                out.resize(code.varnames.len(), Object::Unbound);
+            }
+            *ctx.inspected_locals.borrow_mut() = Some(locals.clone());
+        }
+        let n = out
+            .len()
+            .min(cf.local_types.len())
+            .min(jf.n_locals as usize);
+        for (slot, dst) in out.iter_mut().enumerate().take(n) {
+            if let Some(ty) = cf.local_types[slot] {
+                // SAFETY: the buffer is `n_locals` wide.
+                let bits = unsafe { *jf.locals.add(slot) };
+                *dst = unpack_ty(bits, ty, &ctx.pins);
+            }
+        }
+        if !ctx.introspected.get() {
+            ctx.introspected.set(true);
+            let n = ctx.guard_snapshot.introspected.get();
+            ctx.guard_snapshot.introspected.set(n + 1);
+        }
+    });
 }
 
 /// The size of [`CallCtx::pin_memo`].
@@ -3841,14 +4107,33 @@ fn pin_memo_hit(v: &Object, pins: &PinTable, memo: &[u32; PIN_MEMO]) -> Option<u
     }
 }
 
+/// The pin that already holds this very list (a row of a nested list
+/// read again), when the memo remembers one.
+#[inline]
+fn list_pin_memo_hit(
+    l: &Rc<crate::sync::RefCell<Vec<Object>>>,
+    pins: &PinTable,
+    memo: &[u32; PIN_MEMO],
+) -> Option<u64> {
+    let id = Rc::as_ptr(l) as usize;
+    let hint = memo[pin_memo_slot(id)] as usize;
+    match pins.get(hint) {
+        Some(Pin::List(p, _)) if Rc::ptr_eq(p, l) => Some(hint as u64),
+        _ => None,
+    }
+}
+
 /// Remember that pin `ix` will hold `p`'s object.
 #[inline]
 fn pin_memo_note(p: &Pin, ix: usize, memo: &mut [u32; PIN_MEMO]) {
-    if let Pin::Obj(v) = p {
-        let id = pin_identity(v);
-        if id != 0 {
-            memo[pin_memo_slot(id)] = ix as u32;
+    match p {
+        Pin::Obj(v) => {
+            let id = pin_identity(v);
+            if id != 0 {
+                memo[pin_memo_slot(id)] = ix as u32;
+            }
         }
+        Pin::List(l, _) => memo[pin_memo_slot(Rc::as_ptr(l) as usize)] = ix as u32,
     }
 }
 
@@ -3905,6 +4190,9 @@ fn guards_hold(
     callees: &CalleeTable,
     math: &MathTable,
 ) -> bool {
+    if guard_snapshot.introspected.get() != 0 {
+        return false;
+    }
     // SAFETY (stamp reads): GIL-serialized raw reads of the dicts'
     // mutation stamps — no dict borrow is held while native code is
     // entered or resumed (the reentrant dict paths exist so user code
@@ -4313,9 +4601,11 @@ fn lane_tag(t: JitType) -> u32 {
         JitType::Bool => SlotTag::Bool as u32,
         // RFC 0071 WS1 — the nullable object lane crosses as a pin.
         JitType::Obj => SlotTag::ObjPin as u32,
-        JitType::ListInt | JitType::ListFloat | JitType::ListObj | JitType::ListListFloat => {
-            SlotTag::ListPin as u32
-        }
+        JitType::ListInt
+        | JitType::ListFloat
+        | JitType::ListObj
+        | JitType::ListListFloat
+        | JitType::ListListInt => SlotTag::ListPin as u32,
         _ => u32::MAX,
     }
 }
@@ -5231,6 +5521,7 @@ unsafe fn try_native_call(
             nc.cf.enter(&raw mut njf)
         })
     };
+    end_introspection(&child);
 
     // The common returns, from a callee that ran no Python (nothing needs
     // revalidating): a scalar in the expected lane, or `None` or an
@@ -5445,6 +5736,9 @@ fn fresh_child(ctx: &CallCtx, nc: &NativeCallee, callee_key: *const CodeObject) 
         frameless_code: Some(nc.code.clone()),
         dyn_callee: None,
         pin_memo: [u32::MAX; PIN_MEMO],
+        introspected: Cell::new(false),
+        inspected_locals: std::cell::RefCell::new(None),
+        cell_list_pins: Vec::new(),
     })
 }
 
@@ -5824,14 +6118,22 @@ fn finish_deopted(
 ) -> Result<Object, RuntimeError> {
     let n_real = code.varnames.len();
     let mut locals_v: Vec<Object> = Vec::with_capacity(n_real);
-    for slot in 0..n_real {
-        match entry.cf.local_types.get(slot).copied().flatten() {
-            Some(ty) => locals_v.push(unpack_ty(
-                locals_buf.get(slot).copied().unwrap_or(0),
-                ty,
-                &nctx.pins,
-            )),
-            None => locals_v.push(Object::Unbound),
+    // An inspected activation's shell holds its locals, plus whatever the
+    // inspection wrote (see `sync_native_locals`).
+    let inspected = nctx.inspected_locals.borrow_mut().take();
+    if let Some(shell) = inspected.filter(|_| nctx.introspected.get()) {
+        locals_v.extend(shell.borrow().iter().take(n_real).cloned());
+        locals_v.resize(n_real, Object::Unbound);
+    } else {
+        for slot in 0..n_real {
+            match entry.cf.local_types.get(slot).copied().flatten() {
+                Some(ty) => locals_v.push(unpack_ty(
+                    locals_buf.get(slot).copied().unwrap_or(0),
+                    ty,
+                    &nctx.pins,
+                )),
+                None => locals_v.push(Object::Unbound),
+            }
         }
     }
     let mut frame = super::Frame {
@@ -5916,9 +6218,10 @@ fn call_with_activation_shell<T>(
     let Some(code) = &ctx.frameless_code else {
         return f(interp);
     };
+    let shell_locals = Rc::new(GilRefCell::new(Vec::new()));
     let shell = Rc::new(crate::object::FrameShell {
         code: crate::object::FrameSlot::new(code.clone()),
-        locals: crate::object::FrameSlot::new(Rc::new(GilRefCell::new(Vec::new()))),
+        locals: crate::object::FrameSlot::new(shell_locals.clone()),
         cells: crate::object::FrameSlot::new(ctx.cells.clone()),
         globals: crate::object::FrameSlot::new(ctx.globals.clone()),
         builtins: crate::object::FrameSlot::new(ctx.builtins.clone()),
@@ -5933,7 +6236,8 @@ fn call_with_activation_shell<T>(
         tb_refs: std::sync::atomic::AtomicU32::new(0),
     });
     interp.frame_stack.borrow_mut().push(shell);
-    let out = f(interp);
+    // Inspection of the shell's frame finds this activation's locals.
+    let out = with_native_frame(&shell_locals, jf, || f(interp));
     // The general pop: a traceback entry or a callee frame's `f_back` may
     // hold the shell lazily, and gets its frame object on the way out.
     interp.pop_frame_shell();
@@ -6848,6 +7152,12 @@ fn deliver_native_result(jf: &mut JitFrame, ctx: &mut CallCtx, v: Object, expect
             jf.ret_tag = expect_tag;
             return CallStatus::Ok as i64;
         }
+        (SlotTag::Float, &Object::Float(value)) => {
+            std::mem::forget(v);
+            jf.ret_bits = value.to_bits();
+            jf.ret_tag = expect_tag;
+            return CallStatus::Ok as i64;
+        }
         (SlotTag::ObjPin, Object::None) => {
             std::mem::forget(v);
             jf.ret_bits = u64::MAX;
@@ -7109,7 +7419,13 @@ unsafe extern "C" fn wpjit_call_native_method(
                 } else {
                     None
                 };
-                if argc == 0 || arg.is_some() {
+                if *op == crate::stdlib::random_core::OP_RANDOM {
+                    if argc == 0 {
+                        if let Some(v) = crate::stdlib::random_core::random_fast(recv) {
+                            return deliver_native_result(jf, ctx, v, expect_tag);
+                        }
+                    }
+                } else if argc == 0 || arg.is_some() {
                     let arg = arg.as_deref();
                     if let Some(v) = crate::stdlib::collections_native::fast_op(*op, recv, arg) {
                         return deliver_native_result(jf, ctx, v, expect_tag);
@@ -7533,10 +7849,17 @@ unsafe extern "C" fn wpjit_list_get(frame: *mut JitFrame, pin: i64, idx: i64) ->
                     None => Err(Pin::Obj(v.clone())),
                 }
             }
-            // The nested lane: a list element pins on the float-list
-            // lane (its reads re-validate each float).
-            (Object::List(inner), JitType::ListFloat) => {
-                Err(Pin::List(inner.clone(), JitType::Float))
+            // The nested lanes: a list element pins on the float-list or
+            // int-list lane (its reads re-validate each element), reusing
+            // the pin of a row read before.
+            (Object::List(inner), lane @ (JitType::ListFloat | JitType::ListInt)) => {
+                match list_pin_memo_hit(inner, &ctx.pins, &ctx.pin_memo) {
+                    Some(bits) => Ok(bits),
+                    None => Err(Pin::List(
+                        inner.clone(),
+                        lane.elem_lane().unwrap_or(JitType::Int),
+                    )),
+                }
             }
             _ => return 1,
         }
@@ -7659,6 +7982,30 @@ unsafe extern "C" fn wpjit_cell_get(frame: *mut JitFrame, idx: i64, lane: i64) -
         (Object::None, Some(JitType::Obj)) => Ok(u64::MAX),
         (Object::Unbound, _) => return 1,
         (v, Some(JitType::Obj)) => Err(v.clone()),
+        // A list lane pins the cell's current list when it still has the
+        // site's element lane (the list helpers re-check each element),
+        // reusing the pin of the list the site read last.
+        (v @ Object::List(l), Some(lane)) if lane.is_list() && entry_local_ok(v, lane) => {
+            let elem = lane.elem_lane().unwrap_or(JitType::Unknown);
+            let slot = idx as usize;
+            if let Some(&pin) = ctx.cell_list_pins.get(slot) {
+                if matches!(ctx.pins.get(pin as usize), Some(Pin::List(p, _)) if Rc::ptr_eq(p, l)) {
+                    jf.ret_bits = u64::from(pin);
+                    return 0;
+                }
+            }
+            if ctx.pins.len() >= RUNTIME_PIN_CAP {
+                return 1;
+            }
+            let pin = ctx.pins.len();
+            ctx.pins.push(Pin::List(l.clone(), elem));
+            if ctx.cell_list_pins.len() <= slot {
+                ctx.cell_list_pins.resize(slot + 1, u32::MAX);
+            }
+            ctx.cell_list_pins[slot] = pin as u32;
+            jf.ret_bits = pin as u64;
+            return 0;
+        }
         _ => return 1,
     };
     match outcome {
@@ -8244,6 +8591,9 @@ unsafe extern "C" fn wpjit_tuple_len(frame: *mut JitFrame, pin: i64) -> i64 {
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     match ctx.pins.get(pin as usize) {
         Some(Pin::Obj(Object::Tuple(items))) => items.len() as i64,
+        // The other exact builtin containers measure without code.
+        Some(Pin::List(l, _) | Pin::Obj(Object::List(l))) => l.borrow().len() as i64,
+        Some(Pin::Obj(Object::Dict(d))) => d.borrow().len() as i64,
         // An instance whose class's `__len__` is a registered native leaf
         // (`deque.__len__`): its body runs no Python and has no effects,
         // so anything but a plain length deopts for the interpreter to
@@ -8295,6 +8645,40 @@ unsafe extern "C" fn wpjit_unbox_int(frame: *mut JitFrame, pin: i64) -> i64 {
         return 1;
     };
     jf.ret_bits = *value as u64;
+    0
+}
+
+/// Guard a pinned `float` before native float arithmetic, comparison, or
+/// a store into a float-lane local (`weavepy_jit::TOp::UnboxFloat`). The
+/// argument packs the pin with the promotion mode in its high bits: an
+/// exact `float` always passes; an exact `int` passes converted under
+/// the arithmetic mode, and within ±2^53 under the comparison mode.
+/// Anything else (including subclasses, `bool`, and big integers) deopts
+/// without invoking a hook.
+///
+/// # Safety
+///
+/// Same live-activation contract as [`wpjit_call_py`].
+unsafe extern "C" fn wpjit_unbox_float(frame: *mut JitFrame, packed: i64) -> i64 {
+    if packed < 0 {
+        return 1;
+    }
+    // SAFETY: see wpjit_call_py for the live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    let pin = (packed & 0xFFFF_FFFF) as usize;
+    let mode = (packed >> 32) as u8;
+    let v = match ctx.pins.get(pin) {
+        Some(Pin::Obj(Object::Float(f))) => *f,
+        Some(Pin::Obj(Object::Int(i))) => match mode {
+            weavepy_jit::UNBOX_FLOAT_ARITH => *i as f64,
+            weavepy_jit::UNBOX_FLOAT_CMP if i.unsigned_abs() <= 1 << 53 => *i as f64,
+            _ => return 1,
+        },
+        _ => return 1,
+    };
+    jf.ret_bits = v.to_bits();
     0
 }
 
@@ -8398,10 +8782,15 @@ unsafe extern "C" fn wpjit_list_next(frame: *mut JitFrame, pin: i64, idx: i64) -
                     None => Err(Pin::Obj(v.clone())),
                 }
             }
-            // The nested lane: a list element pins on the float-list
-            // lane (see `wpjit_list_get`).
-            (Object::List(inner), JitType::ListFloat) => {
-                Err(Pin::List(inner.clone(), JitType::Float))
+            // The nested lanes (see `wpjit_list_get`).
+            (Object::List(inner), lane @ (JitType::ListFloat | JitType::ListInt)) => {
+                match list_pin_memo_hit(inner, &ctx.pins, &ctx.pin_memo) {
+                    Some(bits) => Ok(bits),
+                    None => Err(Pin::List(
+                        inner.clone(),
+                        lane.elem_lane().unwrap_or(JitType::Int),
+                    )),
+                }
             }
             _ => return 2,
         }
@@ -10187,6 +10576,11 @@ unsafe fn try_dyn_native(
     }
     let (nc, recv) = match callee {
         Object::Type(t) => {
+            // A metaclass's `__call__` decides what calling the class
+            // does: only `type`'s own is the constructor pipeline.
+            if !t.metaclass_is_type() {
+                return None;
+            }
             // Mirror `resolve_native_callee`'s constructor arm: the
             // memoised instance plan must be current and carry a
             // plain-function `__init__`.
@@ -10892,7 +11286,15 @@ unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i6
     let code = unsafe { &*ctx.code_ptr };
     let (value, kind) = match receiver {
         Object::Instance(inst) if inst.cls_raw().native_kind.get() == 0 => (
-            super::Interpreter::leaf_load_attr_recv(code, receiver, jf.deopt_pc, name_idx),
+            // The site's split-layout shortcut first (the interpreter's
+            // own fastest read), then its inline cache.
+            super::code_vm_ext(code)
+                // SAFETY: the view is cloned before anything else runs.
+                .and_then(|ext| unsafe { super::field_slot_hit(ext, jf.deopt_pc as usize, inst) })
+                .map(super::clone_hot)
+                .or_else(|| {
+                    super::Interpreter::leaf_load_attr_recv(code, receiver, jf.deopt_pc, name_idx)
+                }),
             0,
         ),
         Object::Type(cls) if super::Interpreter::plain_metaclass(cls) => (
@@ -11021,6 +11423,25 @@ unsafe extern "C" fn wpjit_dyn_attr_set(frame: *mut JitFrame, pin: i64, name: i6
     // SAFETY: native code staged the value in slot 0.
     let (bits, tag) = unsafe { (*jf.call_args, *jf.call_tags) };
     let value = unpack_pins(bits, tag, &ctx.pins);
+    // A plain instance whose site cache proves an ordinary field store
+    // (the interpreter's core-loop store): no Python runs, so neither the
+    // dirtiness discipline nor a guard recheck applies.
+    if let Object::Instance(inst) = &recv {
+        if !crate::gil::free_threading_enabled()
+            && !matches!(value, Object::BoundMethod(_))
+            && super::Interpreter::core_store_attr(
+                code,
+                inst,
+                jf.deopt_pc as usize,
+                name_idx,
+                &value,
+            )
+        {
+            // The store moved the value's bits into the instance.
+            std::mem::forget(value);
+            return 0;
+        }
+    }
     ctx.dirty = true;
     match interp.store_attr_shared_name(&recv, &attr, value) {
         Err(err) => {
@@ -11194,6 +11615,262 @@ unsafe extern "C" fn wpjit_contains_dyn(frame: *mut JitFrame, pin: i64, negate: 
     }
 }
 
+/// The two operands a generic operation staged in marshal slots 0 and 1.
+///
+/// # Safety
+///
+/// Native code staged both entries and their tags.
+unsafe fn dyn_operands(jf: &JitFrame, ctx: &CallCtx) -> (Object, Object) {
+    // SAFETY: per the function contract.
+    let (a_bits, a_tag, b_bits, b_tag) = unsafe {
+        (
+            *jf.call_args,
+            *jf.call_tags,
+            *jf.call_args.add(1),
+            *jf.call_tags.add(1),
+        )
+    };
+    (
+        unpack_pins(a_bits, a_tag, &ctx.pins),
+        unpack_pins(b_bits, b_tag, &ctx.pins),
+    )
+}
+
+/// Deliver a generic operation's completed result `v` as an object pin
+/// (status `0`), or park it and deopt after the operation (`2`) when it
+/// invalidated a guard or the pin table is full.
+fn deliver_dyn_result(
+    jf: &mut JitFrame,
+    ctx: &mut CallCtx,
+    interp: &mut super::Interpreter,
+    v: Object,
+) -> i64 {
+    let still_valid = guards_hold(
+        interp,
+        &ctx.globals,
+        &ctx.builtins,
+        &ctx.guard_snapshot,
+        &ctx.callees,
+        &ctx.math,
+    );
+    if still_valid {
+        if ctx.temporary_pin_limit_reached() {
+            // Leave to reclaim the temporaries (see `relax_pin_limit`).
+            ctx.pin_pressure_exit = true;
+        } else if let Some(bits) = pin_any(v.clone(), &mut ctx.pins) {
+            jf.ret_bits = bits;
+            return 0;
+        }
+    }
+    ctx.parked = Some(v);
+    2
+}
+
+/// The `wpjit_dyn_binop` helper (`weavepy_jit::TOp::DynBinary`): run the
+/// interpreter's own `BINARY_OP` dispatch for `arg` (the operator and the
+/// in-place flag) on the two staged operands — the full `__op__` /
+/// `__rop__` protocol, which may run Python code — and hand back the
+/// result as an object pin. Status `1` raised (the error parked on the
+/// context); `2` completed but parked (deopt after the operation).
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`]; both operands are staged.
+unsafe extern "C" fn wpjit_dyn_binop(frame: *mut JitFrame, arg: i64, _unused: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
+    let interp = unsafe { &mut *ctx.interp };
+    // SAFETY: native code staged both operands.
+    let (a, b) = unsafe { dyn_operands(jf, ctx) };
+    let arg = arg as u32;
+    // SAFETY: `BinOpKind` is `repr(u8)` and the compiler only emits valid
+    // kinds (the interpreter's `binary_op_step` decodes it the same way).
+    let kind: weavepy_compiler::BinOpKind = unsafe { std::mem::transmute(arg as u8) };
+    let globals = ctx.globals.clone();
+    ctx.dirty = true;
+    let r = if arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG != 0 {
+        interp.dispatch_inplace_op(&a, &b, kind, &globals)
+    } else {
+        interp.dispatch_binary_op(&a, &b, kind, &globals)
+    };
+    match r {
+        Err(err) => {
+            ctx.raised = Some(err);
+            1
+        }
+        Ok(v) => {
+            interp.record_alloc(&v);
+            deliver_dyn_result(jf, ctx, interp, v)
+        }
+    }
+}
+
+/// The `wpjit_dyn_getitem` helper (`weavepy_jit::TOp::DynGetItem`): the
+/// interpreter's own subscript (a user `__getitem__`, `__missing__`, a
+/// class's `__class_getitem__`) on the two staged operands, its result
+/// handed back as an object pin. Statuses as [`wpjit_dyn_binop`].
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`]; both operands are staged.
+unsafe extern "C" fn wpjit_dyn_getitem(frame: *mut JitFrame, _arg: i64, _unused: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
+    let interp = unsafe { &mut *ctx.interp };
+    // SAFETY: native code staged both operands.
+    let (container, index) = unsafe { dyn_operands(jf, ctx) };
+    ctx.dirty = true;
+    match interp.subscr_get_public(&container, &index) {
+        Err(err) => {
+            ctx.raised = Some(err);
+            1
+        }
+        Ok(v) => deliver_dyn_result(jf, ctx, interp, v),
+    }
+}
+
+/// The `wpjit_dyn_setitem` helper (`weavepy_jit::TOp::DynSetItem`): the
+/// interpreter's own item store on the staged value, container, and
+/// index. Status `0` stored; `1` raised; `2` stored but a guard broke
+/// (deopt after the store, with no result to place).
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`]; three operands are staged.
+unsafe extern "C" fn wpjit_dyn_setitem(frame: *mut JitFrame, _arg: i64, _unused: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
+    let interp = unsafe { &mut *ctx.interp };
+    // SAFETY: native code staged three operands.
+    let [value, container, index] = std::array::from_fn(|k| unsafe {
+        unpack_pins(*jf.call_args.add(k), *jf.call_tags.add(k), &ctx.pins)
+    });
+    ctx.dirty = true;
+    match interp.subscr_set_public(&container, &index, value) {
+        Err(err) => {
+            ctx.raised = Some(err);
+            1
+        }
+        Ok(()) => {
+            let still_valid = guards_hold(
+                interp,
+                &ctx.globals,
+                &ctx.builtins,
+                &ctx.guard_snapshot,
+                &ctx.callees,
+                &ctx.math,
+            );
+            if still_valid {
+                0
+            } else {
+                ctx.parked = None;
+                2
+            }
+        }
+    }
+}
+
+/// The `wpjit_dyn_unary` helper (`weavepy_jit::TOp::DynUnary`): the
+/// interpreter's unary operation for the `UNARY_OP` oparg `arg` (an
+/// operand's `__neg__`, say) on the staged operand. Statuses as
+/// [`wpjit_dyn_binop`].
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`]; one operand is staged.
+unsafe extern "C" fn wpjit_dyn_unary(frame: *mut JitFrame, arg: i64, _unused: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
+    let interp = unsafe { &mut *ctx.interp };
+    // SAFETY: native code staged the operand.
+    let v = unsafe { unpack_pins(*jf.call_args, *jf.call_tags, &ctx.pins) };
+    // SAFETY: `UnaryKind` is `repr(u8)` and the compiler only emits
+    // valid kinds (the interpreter decodes `UNARY_OP` the same way).
+    let kind: weavepy_compiler::UnaryKind = unsafe { std::mem::transmute(arg as u8) };
+    ctx.dirty = true;
+    match interp.op_unary(&v, kind) {
+        Err(err) => {
+            ctx.raised = Some(err);
+            1
+        }
+        Ok(r) => deliver_dyn_result(jf, ctx, interp, r),
+    }
+}
+
+/// The `wpjit_dyn_compare` helper (`weavepy_jit::TOp::DynCompare`): the
+/// interpreter's rich comparison for `arg` on the two staged operands. With
+/// the oparg's to-`bool` flag the result is its truth (`0`/`1` in
+/// `ret_bits`), as `COMPARE_OP` computes it; otherwise an object pin.
+/// Statuses as [`wpjit_dyn_binop`].
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`]; both operands are staged.
+unsafe extern "C" fn wpjit_dyn_compare(frame: *mut JitFrame, arg: i64, _unused: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
+    let interp = unsafe { &mut *ctx.interp };
+    // SAFETY: native code staged both operands.
+    let (a, b) = unsafe { dyn_operands(jf, ctx) };
+    let arg = arg as u32;
+    let to_bool = arg & weavepy_compiler::COMPARE_OP_TO_BOOL_FLAG != 0;
+    // SAFETY: `CompareKind` is `repr(u8)`; decoded as `compare_op_step`
+    // decodes it.
+    let kind: weavepy_compiler::CompareKind =
+        unsafe { std::mem::transmute((arg & !weavepy_compiler::COMPARE_OP_TO_BOOL_FLAG) as u8) };
+    let globals = ctx.globals.clone();
+    ctx.dirty = true;
+    let r = interp.rich_compare_obj(&a, &b, kind, &globals);
+    let r = match r {
+        Ok(v) if to_bool => match v {
+            Object::Bool(t) => Ok(t),
+            Object::Instance(_) | Object::MappingProxyObj(_) => interp.obj_truthy(&v, &globals),
+            other => Ok(other.is_truthy()),
+        }
+        .map(Object::Bool),
+        other => other,
+    };
+    match r {
+        Err(err) => {
+            ctx.raised = Some(err);
+            1
+        }
+        Ok(Object::Bool(t)) if to_bool => {
+            let still_valid = guards_hold(
+                interp,
+                &ctx.globals,
+                &ctx.builtins,
+                &ctx.guard_snapshot,
+                &ctx.callees,
+                &ctx.math,
+            );
+            if still_valid {
+                jf.ret_bits = u64::from(t);
+                0
+            } else {
+                ctx.parked = Some(Object::Bool(t));
+                2
+            }
+        }
+        Ok(v) => deliver_dyn_result(jf, ctx, interp, v),
+    }
+}
+
 /// The `wpjit_build_set` helper (RFC 0076 WS8): build a fresh set from
 /// `n` per-element-tagged entries staged in the marshal buffer, pin
 /// it, and answer the pin index — negative deopts (cap pressure, or
@@ -11340,7 +12017,12 @@ fn pack_iter_elem(
             | Object::Bool(_)
             | Object::Str(_)
             | Object::WStr(_)
-            | Object::Bytes(_) => pin_any(v.clone(), pins),
+            | Object::Bytes(_)
+            // Containers too (a list of rows, a list of pairs): the pin
+            // shares them with the iterable they came from.
+            | Object::Tuple(_)
+            | Object::List(_)
+            | Object::Dict(_) => pin_any(v.clone(), pins),
             _ => obj_ret_bits(v, pins, memo),
         },
         _ => None,
@@ -11565,6 +12247,65 @@ unsafe extern "C" fn wpjit_iter_next_pair(
     crate::gil::yield_checkpoint();
     if crate::hot_gates::load() != 0 || crate::trace::any_observers_active() {
         return 2;
+    }
+    // A list or tuple iterator (a row of `(index, weight)` pairs) steps
+    // in place: no Python runs, and the element unpacks like the
+    // generic step's below.
+    let seq_step = match ctx.pins.get(pin as usize) {
+        Some(Pin::Obj(Object::Iter(cell))) => {
+            cell.try_borrow_mut()
+                .ok()
+                .and_then(|mut it| match &mut *it {
+                    // The common step inline (`next_value` is a large
+                    // function); exhaustion detaches through it.
+                    crate::object::PyIterator::List { items, index, .. } => {
+                        let next = items.borrow().get(*index).cloned();
+                        Some(match next {
+                            Some(v) => {
+                                *index += 1;
+                                Some(v)
+                            }
+                            None => it.next_value(),
+                        })
+                    }
+                    crate::object::PyIterator::Tuple { items, index } => {
+                        let next = items.get(*index).cloned();
+                        if next.is_some() {
+                            *index += 1;
+                        }
+                        Some(next)
+                    }
+                    _ => None,
+                })
+        }
+        _ => None,
+    };
+    if let Some(step) = seq_step {
+        let Some(v) = step else {
+            return 1;
+        };
+        if let Object::Tuple(items) = &v {
+            if let [a, b] = &items[..] {
+                let packed1 = pack_iter_elem(a, tag1, &mut ctx.pins, &mut ctx.pin_memo);
+                let packed2 =
+                    packed1.and_then(|_| pack_iter_elem(b, tag2, &mut ctx.pins, &mut ctx.pin_memo));
+                if let (Some(b1), Some(b2)) = (packed1, packed2) {
+                    jf.ret_bits = b1;
+                    // SAFETY: the marshal buffer is at least one slot
+                    // wide (`max_call_args.max(1)`).
+                    unsafe { *jf.call_args = b2 };
+                    return 0;
+                }
+            }
+        }
+        // Not in the lanes: the erased `UNPACK_SEQUENCE` consumes it.
+        jf.ret_bits = if matches!(v, Object::None) {
+            u64::MAX
+        } else {
+            ctx.pins.push(Pin::Obj(v));
+            (ctx.pins.len() - 1) as u64
+        };
+        return 3;
     }
     if tag1 == SlotTag::Int as i64 && tag2 == SlotTag::Int as i64 {
         let pair = match ctx.pins.get(pin as usize) {
@@ -11981,6 +12722,9 @@ pub(crate) fn try_call_native_direct(
         frameless_code: Some(code.clone()),
         dyn_callee: None,
         pin_memo: [u32::MAX; PIN_MEMO],
+        introspected: Cell::new(false),
+        inspected_locals: std::cell::RefCell::new(None),
+        cell_list_pins: Vec::new(),
     };
     let mut jf = JitFrame {
         locals: locals_buf.as_mut_ptr(),
@@ -12009,6 +12753,7 @@ pub(crate) fn try_call_native_direct(
             cf.enter(&raw mut jf)
         })
     };
+    end_introspection(&ctx);
 
     native_stat(|s| s.direct_calls.set(s.direct_calls.get() + 1));
     // A direct callee that keeps calling back into the interpreter is
@@ -12115,6 +12860,8 @@ pub(crate) fn try_enter(interp: &mut super::Interpreter, frame: &mut super::Fram
             |cls: &str, attr: &str| probe_ctor_field(interp_ref, frame_ref, cls, attr);
         let mut probe_cell = |idx: u32| probe_cell_lane(frame_ref, idx);
         let mut probe_obj = |slot: u32| probe_obj_live(frame_ref, slot);
+        let mut probe_iter = |depth: u32| probe_stack_iter_lane(frame_ref, depth);
+        let mut probe_pairs = |slot: u32| probe_pair_lanes(frame_ref, slot);
         st.get_compiled(
             &frame.code,
             frame.pc as u32,
@@ -12132,6 +12879,8 @@ pub(crate) fn try_enter(interp: &mut super::Interpreter, frame: &mut super::Fram
                 ctor_field: &mut probe_ctor_fld,
                 cell: &mut probe_cell,
                 obj_live: &mut probe_obj,
+                stack_iter: &mut probe_iter,
+                pairs: &mut probe_pairs,
             },
         )
     });
@@ -12298,6 +13047,8 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
             |cls: &str, attr: &str| probe_ctor_field(interp_ref, frame_ref, cls, attr);
         let mut probe_cell = |idx: u32| probe_cell_lane(frame_ref, idx);
         let mut probe_obj = |slot: u32| probe_obj_live(frame_ref, slot);
+        let mut probe_iter = |depth: u32| probe_stack_iter_lane(frame_ref, depth);
+        let mut probe_pairs = |slot: u32| probe_pair_lanes(frame_ref, slot);
         st.get_compiled(
             &frame.code,
             frame.pc as u32,
@@ -12315,6 +13066,8 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
                 ctor_field: &mut probe_ctor_fld,
                 cell: &mut probe_cell,
                 obj_live: &mut probe_obj,
+                stack_iter: &mut probe_iter,
+                pairs: &mut probe_pairs,
             },
         )
     });
@@ -12327,7 +13080,17 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
     };
     let cf = &entry.cf;
     let pc = frame.pc;
+    // A region loop entered once per iteration of the interpreted code
+    // around it is worth entering only for enough remaining iterations.
+    if cf.region_roots.contains(&(pc as u32)) && short_live_loop(&frame.stack) {
+        return JitEntry::Skip;
+    }
     let Some(osr) = cf.osr_entries.iter().find(|e| e.pc == pc) else {
+        // A loop whose code stays interpreted is expected to find no
+        // entry: its nested regions enter at their own headers.
+        if cf.stayed_heads.contains(&(pc as u32)) {
+            return JitEntry::Skip;
+        }
         return fail(&frame.code);
     };
     if !guards_hold(
@@ -12403,6 +13166,26 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
     enter_compiled(interp, frame, &entry, pc, &synth, None)
 }
 
+/// Whether the innermost live loop iterator (the top of an OSR request's
+/// stack) has fewer than `weavepy_jit::MIN_REGION_TRIPS` items left.
+fn short_live_loop(stack: &[Object]) -> bool {
+    let Some(Object::Iter(it)) = stack.last() else {
+        return false;
+    };
+    let left = match &*it.borrow() {
+        PyIterator::Range {
+            current,
+            stop,
+            step: 1,
+        } => stop.saturating_sub(*current),
+        PyIterator::List { items, index, .. } => {
+            (items.borrow().len() as i64).saturating_sub(*index as i64)
+        }
+        _ => return false,
+    };
+    left < weavepy_jit::MIN_REGION_TRIPS as i64
+}
+
 /// Decompose the live rewritten-loop iterators sitting on the
 /// interpreter stack (`stack[..n]`, outermost first by ascending
 /// `live_from`) into the synthetic-slot seeds the compiled loops run
@@ -12450,7 +13233,8 @@ fn decompose_live_loops(
         // iterator slot. Exactly the shapes `wpjit_get_iter` admits.
         if let LiveLoop::Iter(lp) = lp {
             let o = &stack[idx];
-            if !matches!(o, Object::Generator(_) | Object::Iter(_)) {
+            // A passed-through iterator is never stepped natively.
+            if !lp.passthrough && !matches!(o, Object::Generator(_) | Object::Iter(_)) {
                 return None;
             }
             synth.push((lp.iter_slot, SynthSeed::PinObj(o.clone())));
@@ -12550,6 +13334,8 @@ pub(crate) fn try_enter_resume(
             |cls: &str, attr: &str| probe_ctor_field(interp_ref, frame_ref, cls, attr);
         let mut probe_cell = |idx: u32| probe_cell_lane(frame_ref, idx);
         let mut probe_obj = |slot: u32| probe_obj_live(frame_ref, slot);
+        let mut probe_iter = |depth: u32| probe_stack_iter_lane(frame_ref, depth);
+        let mut probe_pairs = |slot: u32| probe_pair_lanes(frame_ref, slot);
         st.get_compiled(
             &frame.code,
             frame.pc as u32,
@@ -12567,6 +13353,8 @@ pub(crate) fn try_enter_resume(
                 ctor_field: &mut probe_ctor_fld,
                 cell: &mut probe_cell,
                 obj_live: &mut probe_obj,
+                stack_iter: &mut probe_iter,
+                pairs: &mut probe_pairs,
             },
         )
     });
@@ -12793,6 +13581,9 @@ fn enter_compiled(
         frameless_code: None,
         dyn_callee: None,
         pin_memo: [u32::MAX; PIN_MEMO],
+        introspected: Cell::new(false),
+        inspected_locals: std::cell::RefCell::new(None),
+        cell_list_pins: Vec::new(),
     };
     let mut jf = JitFrame {
         locals: locals_buf.as_mut_ptr(),
@@ -12816,7 +13607,10 @@ fn enter_compiled(
     // to address; the engine that backs `cf` lives in this thread's
     // `JIT` thread-local for the process lifetime; `ctx` outlives the
     // call and is only touched by the `wpjit_call_py` helper.
-    let status = unsafe { cf.enter(&raw mut jf) };
+    let jf_ptr: *mut JitFrame = &raw mut jf;
+    // SAFETY: as above.
+    let status = with_native_frame(&frame.locals, jf_ptr, || unsafe { cf.enter(jf_ptr) });
+    end_introspection(&ctx);
 
     // A cold exit is an expected hand-off, never a deopt charge.
     let cold_exit = matches!(status, JitStatus::Deopt) && cf.cold_exits.contains(&jf.deopt_pc);
@@ -12989,7 +13783,9 @@ fn native_exit_writeback(
     status: JitStatus,
 ) -> JitEntry {
     let cf = &entry.cf;
-    {
+    // An inspected activation's frame already holds its locals, plus
+    // whatever the inspection wrote (see `sync_native_locals`).
+    if !ctx.introspected.get() {
         let mut locals = frame.locals.borrow_mut();
         for (slot, &bits) in locals_buf.iter().enumerate() {
             if let Some(ty) = cf.local_types[slot] {
@@ -13120,20 +13916,14 @@ fn rebuild_stack(
         inserts.push((s.interp_depth, entry.callees[s.token as usize].0.clone()));
         inserts.push((s.interp_depth + 1, Object::Unbound));
     }
-    if !cf.len_spans.is_empty() {
-        let len_obj = entry
-            .guard_snapshot
-            .iter()
-            .find(|(name, _)| name == "len")
-            .map(|(_, o)| o.clone());
-        for s in cf
-            .len_spans
-            .iter()
-            .filter(|s| s.live_from < jf.deopt_pc && jf.deopt_pc < s.live_to)
-        {
-            inserts.push((s.interp_depth, len_obj.clone().unwrap_or(Object::None)));
-            inserts.push((s.interp_depth + 1, Object::Unbound));
-        }
+    for s in cf
+        .len_spans
+        .iter()
+        .filter(|s| s.live_from < jf.deopt_pc && jf.deopt_pc < s.live_to)
+    {
+        let callee = erased_global(entry, &frame.code, s.token);
+        inserts.push((s.interp_depth, callee));
+        inserts.push((s.interp_depth + 1, Object::Unbound));
     }
     // RFC 0069 WS2 — open math-intrinsic spans: the interpreter holds
     // the bound intrinsic function (from the per-guard snapshot) and
@@ -13440,23 +14230,14 @@ fn park_plan(frame: &super::Frame, entry: &CompiledEntry, jf: &JitFrame) -> Opti
         ));
         inserts.push((s.interp_depth + 1, PlanSlot::Obj(Object::Unbound)));
     }
-    if !cf.len_spans.is_empty() {
-        let len_obj = entry
-            .guard_snapshot
-            .iter()
-            .find(|(name, _)| name == "len")
-            .map(|(_, o)| o.clone());
-        for s in cf
-            .len_spans
-            .iter()
-            .filter(|s| s.live_from < pc && pc < s.live_to)
-        {
-            inserts.push((
-                s.interp_depth,
-                PlanSlot::Obj(len_obj.clone().unwrap_or(Object::None)),
-            ));
-            inserts.push((s.interp_depth + 1, PlanSlot::Obj(Object::Unbound)));
-        }
+    for s in cf
+        .len_spans
+        .iter()
+        .filter(|s| s.live_from < pc && pc < s.live_to)
+    {
+        let callee = erased_global(entry, code, s.token);
+        inserts.push((s.interp_depth, PlanSlot::Obj(callee)));
+        inserts.push((s.interp_depth + 1, PlanSlot::Obj(Object::Unbound)));
     }
     for s in cf
         .math_spans
@@ -13688,6 +14469,9 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
         frameless_code: None,
         dyn_callee: None,
         pin_memo: [u32::MAX; PIN_MEMO],
+        introspected: Cell::new(false),
+        inspected_locals: std::cell::RefCell::new(None),
+        cell_list_pins: Vec::new(),
     };
     let mut jf = JitFrame {
         locals: act.locals_buf.as_mut_ptr(),
@@ -13713,7 +14497,10 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
     // (`compile_id` matched above) and live in the box across the
     // call; the engine backing `cf` lives in this thread's `JIT`
     // thread-local for the process lifetime; `ctx` outlives the call.
-    let status = unsafe { cf.enter(&raw mut jf) };
+    let jf_ptr: *mut JitFrame = &raw mut jf;
+    // SAFETY: as above.
+    let status = with_native_frame(&frame.locals, jf_ptr, || unsafe { cf.enter(jf_ptr) });
+    end_introspection(&ctx);
     let cold_exit = matches!(status, JitStatus::Deopt) && cf.cold_exits.contains(&jf.deopt_pc);
     note_native_exit(frame, &jf, status, ctx.pin_pressure_exit, cold_exit);
     if matches!(status, JitStatus::Yielded) {

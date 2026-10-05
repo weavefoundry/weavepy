@@ -940,6 +940,22 @@ pub(crate) fn unbox_int_helper_addr() -> usize {
     UNBOX_INT_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
+static UNBOX_FLOAT_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the `float` pin guard ([`crate::ir::TOp::UnboxFloat`]). Its
+/// argument packs the pin (low 32 bits) with the promotion mode (high
+/// bits; a negative argument is the `None` pin). On success it writes
+/// the `f64` bits to frame.ret_bits and returns zero; a nonzero status
+/// deopts without invoking Python code.
+pub fn register_unbox_float_helper(f: StrLenHelper) {
+    UNBOX_FLOAT_HELPER.store(f as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn unbox_float_helper_addr() -> usize {
+    UNBOX_FLOAT_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
 static DICT_ITER_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Register the process-wide dict-iterator capture helper (RFC 0073
@@ -1447,6 +1463,65 @@ pub fn register_contains_dyn_helper(f: DynAttrHelper) {
 #[must_use]
 pub(crate) fn contains_dyn_helper_addr() -> usize {
     CONTAINS_DYN_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static DYN_BINOP_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DYN_COMPARE_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the generic binary-operation and comparison helpers
+/// ([`crate::ir::TOp::DynBinary`], [`crate::ir::TOp::DynCompare`]).
+/// Shape: `(frame, oparg, 0) -> status`, the two operands staged in the
+/// marshal buffer (slots 0 and 1, with tags). Status `0` writes the
+/// result to `frame.ret_bits` (an object pin, or `0`/`1` for a to-`bool`
+/// comparison); `1` raised; `2` completed but parked (deopt after the
+/// pc); `3` declined before running anything (deopt at the pc).
+pub fn register_dyn_op_helpers(binop: DynAttrHelper, compare: DynAttrHelper) {
+    DYN_BINOP_HELPER.store(binop as usize, std::sync::atomic::Ordering::Release);
+    DYN_COMPARE_HELPER.store(compare as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn dyn_binop_helper_addr() -> usize {
+    DYN_BINOP_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn dyn_compare_helper_addr() -> usize {
+    DYN_COMPARE_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static DYN_GETITEM_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DYN_SETITEM_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DYN_UNARY_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the generic subscript and unary helpers
+/// ([`crate::ir::TOp::DynGetItem`], [`crate::ir::TOp::DynSetItem`],
+/// [`crate::ir::TOp::DynUnary`]), with the generic binary operation's
+/// shape and statuses: operands staged in the marshal buffer (a store
+/// stages value, container, index), `(frame, oparg, 0) -> status`.
+pub fn register_dyn_item_helpers(
+    getitem: DynAttrHelper,
+    setitem: DynAttrHelper,
+    unary: DynAttrHelper,
+) {
+    DYN_GETITEM_HELPER.store(getitem as usize, std::sync::atomic::Ordering::Release);
+    DYN_SETITEM_HELPER.store(setitem as usize, std::sync::atomic::Ordering::Release);
+    DYN_UNARY_HELPER.store(unary as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn dyn_getitem_helper_addr() -> usize {
+    DYN_GETITEM_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn dyn_setitem_helper_addr() -> usize {
+    DYN_SETITEM_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn dyn_unary_helper_addr() -> usize {
+    DYN_UNARY_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
 static BUILD_SET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

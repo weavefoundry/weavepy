@@ -66,6 +66,14 @@ pub struct CompiledFrame {
     pub comp_target_slots: Vec<u32>,
     /// Cold-exit pcs (see [`crate::ir::TFunc::cold_exits`]).
     pub cold_exits: Vec<u32>,
+    /// See [`crate::ir::TFunc::region_exits`].
+    pub region_exits: Vec<u32>,
+    /// See [`crate::ir::TFunc::region_roots`].
+    pub region_roots: Vec<u32>,
+    /// See [`crate::ir::TFunc::stayed_heads`].
+    pub stayed_heads: Vec<u32>,
+    /// See [`crate::ir::TFunc::env_heads`].
+    pub env_heads: Vec<u32>,
     /// Whether the interpreter should enter this body directly: a
     /// loop-free body that round-trips into the interpreter (generic
     /// calls, dynamic attributes or membership) gains nothing native
@@ -407,6 +415,30 @@ impl JitEngine {
                     runtime::unbox_int_helper_addr(),
                     "integer guard (no helper registered)",
                 )),
+                TOp::UnboxFloat { .. } => Some((
+                    runtime::unbox_float_helper_addr(),
+                    "float guard (no helper registered)",
+                )),
+                TOp::DynBinary { .. } => Some((
+                    runtime::dyn_binop_helper_addr(),
+                    "generic binary op (no helper registered)",
+                )),
+                TOp::DynCompare { .. } => Some((
+                    runtime::dyn_compare_helper_addr(),
+                    "generic comparison (no helper registered)",
+                )),
+                TOp::DynGetItem => Some((
+                    runtime::dyn_getitem_helper_addr(),
+                    "generic subscript (no helper registered)",
+                )),
+                TOp::DynSetItem => Some((
+                    runtime::dyn_setitem_helper_addr(),
+                    "generic item store (no helper registered)",
+                )),
+                TOp::DynUnary { .. } => Some((
+                    runtime::dyn_unary_helper_addr(),
+                    "generic unary op (no helper registered)",
+                )),
                 TOp::CallDyn {
                     int_result: true, ..
                 } => Some((
@@ -690,9 +722,14 @@ impl JitEngine {
                     | TOp::DynAttrGet { .. }
                     | TOp::DynAttrSet { .. }
                     | TOp::ContainsDyn { .. }
+                    | TOp::DynBinary { .. }
+                    | TOp::DynCompare { .. }
+                    | TOp::DynGetItem
+                    | TOp::DynSetItem
+                    | TOp::DynUnary { .. }
             )
         });
-        let interp_entry = has_loop || !round_trips;
+        let interp_entry = (has_loop || !round_trips) && tfunc.pc0_entry;
         Ok(CompiledFrame {
             func,
             livein: tfunc.livein_locals.clone(),
@@ -706,6 +743,10 @@ impl JitEngine {
             comp_saved: tfunc.comp_saved.clone(),
             comp_target_slots: tfunc.comp_target_slots.clone(),
             cold_exits: tfunc.cold_exits.clone(),
+            region_exits: tfunc.region_exits.clone(),
+            region_roots: tfunc.region_roots.clone(),
+            stayed_heads: tfunc.stayed_heads.clone(),
+            env_heads: tfunc.env_heads.clone(),
             interp_entry,
             callee_spans: tfunc.callee_spans.clone(),
             len_spans: tfunc.len_spans.clone(),
@@ -763,6 +804,15 @@ fn calls_dynamically(tfunc: &TFunc) -> bool {
 /// interpreter's generic object protocol (dynamic calls and attribute
 /// accesses) against all statements (see [`CompiledFrame::op_mix`]).
 fn op_mix(tfunc: &TFunc) -> OpMix {
+    if std::env::var_os("WEAVEPY_JIT_DUMP").is_some() {
+        for (bi, b) in tfunc.blocks.iter().enumerate() {
+            eprintln!("jit block {bi} entry {:?}", b.entry_stack);
+            for st in &b.stmts {
+                eprintln!("    {:4} {:?}", st.pc, st.op);
+            }
+            eprintln!("    term {:?}", b.term);
+        }
+    }
     if std::env::var_os("WEAVEPY_JIT_OPS").is_some() {
         let mut hist: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
         for b in &tfunc.blocks {
@@ -781,7 +831,14 @@ fn op_mix(tfunc: &TFunc) -> OpMix {
             match st.op {
                 TOp::CallDyn { .. } => mix.dyn_calls += 1,
                 TOp::DynAttrGet { .. } | TOp::DynAttrSet { .. } => mix.dyn_attrs += 1,
-                TOp::ContainsDyn { .. } => mix.dyn_other += 1,
+                TOp::ContainsDyn { .. }
+                | TOp::DynBinary { .. }
+                | TOp::DynCompare { .. }
+                | TOp::DynGetItem
+                | TOp::DynSetItem
+                | TOp::DynUnary { .. } => {
+                    mix.dyn_other += 1;
+                }
                 TOp::CallPy { .. }
                 | TOp::CallPyKw { .. }
                 | TOp::CallMethod { .. }

@@ -111,6 +111,11 @@ fn analyze_code_cfg(code: &CodeObject, cfg: &Cfg) -> Result<TFunc, JitVerdict> {
         obj_global: &mut obj_global,
         cell: &mut |_| None,
         obj: &mut |_| false,
+        local: &mut |_| None,
+        stack_iter: &mut |_| None,
+        pairs: &mut |_| None,
+        entry_pc: None,
+        carve_env: false,
         paths: &mut paths,
     };
     analyze_frame(code, &mut resolve, &mut probes)
@@ -449,16 +454,21 @@ fn guarded_integer_division_retains_float_result() {
 
 #[test]
 fn two_opaque_arithmetic_operands_do_not_guess_a_scalar_lane() {
-    assert!(matches!(
-        analyze_cfg(
-            "def k(a, b):\n    return a + b\n",
-            &Cfg {
-                obj_params: vec![0, 1],
-                ..Cfg::default()
-            },
-        ),
-        Err(JitVerdict::MixedArithTypes)
-    ));
+    // With no evidence for either operand, the interpreter's own dispatch
+    // runs the operation; nothing is guarded as a scalar.
+    let tf = analyze_cfg(
+        "def k(a, b):\n    return a + b\n",
+        &Cfg {
+            obj_params: vec![0, 1],
+            ..Cfg::default()
+        },
+    )
+    .expect("a generic binary operation should analyze");
+    assert!(has_op(&tf, |op| matches!(op, TOp::DynBinary { .. })));
+    assert!(!has_op(&tf, |op| matches!(
+        op,
+        TOp::UnboxInt { .. } | TOp::UnboxFloat { .. }
+    )));
 }
 
 #[test]
@@ -738,6 +748,11 @@ fn shadowed_enumerate_gets_no_trained_lanes() {
         obj_global: &mut obj_global,
         cell: &mut |_| None,
         obj: &mut |_| false,
+        local: &mut |_| None,
+        stack_iter: &mut |_| None,
+        pairs: &mut |_| None,
+        entry_pc: None,
+        carve_env: false,
         paths: &mut paths,
     };
     let tf = analyze_frame(&code, &mut resolve, &mut probes)
