@@ -124,6 +124,8 @@ const S_COUNTDOWN: i32 = 48;
 const S_SNAP: i32 = 56;
 const S_DEAD: i32 = 64;
 const S_OUT: i32 = 80;
+const S_INTERP: i32 = std::mem::offset_of!(State, interp) as i32;
+const S_FRAME: i32 = std::mem::offset_of!(State, frame) as i32;
 const _: () = {
     assert!(std::mem::offset_of!(State, locals) == S_LOCALS as usize);
     assert!(std::mem::offset_of!(State, stack) == S_STACK as usize);
@@ -153,6 +155,9 @@ pub(crate) struct Native {
     ops: Box<[OpCode]>,
     depths: Box<[i64]>,
     need: usize,
+    /// The `LOAD_GLOBAL` sites' caches, which the code addresses.
+    #[allow(clippy::vec_box)]
+    _globals: Vec<Box<GlobalCache>>,
 }
 
 // SAFETY: the code only touches the state it is handed; it is only
@@ -605,6 +610,9 @@ struct Tags {
     float: u8,
     cell: u8,
     instance: u8,
+    /// `Option::<Object>::None`'s first byte, when the option keeps
+    /// `Object`'s size (its tag byte's niche).
+    opt_none: Option<u8>,
     /// The heap variants whose identity is their payload pointer (and so
     /// `is` compares payload words): instances, strings, lists, dicts,
     /// tuples, classes.
@@ -657,6 +665,12 @@ fn tags() -> Option<Tags> {
         float: tag(&Object::Float(1.0)),
         cell: tag(&cell),
         instance: tag(&inst),
+        opt_none: {
+            let none: Option<Object> = None;
+            // SAFETY: reading the first byte of a 16-byte value.
+            (std::mem::size_of::<Option<Object>>() == 16)
+                .then(|| unsafe { *std::ptr::from_ref(&none).cast::<u8>() })
+        },
         by_pointer: samples
             .iter()
             .fold(0, |m, &t| if t < 64 { m | (1i64 << t) } else { m }),
@@ -1106,6 +1120,44 @@ unsafe extern "C" fn h_compare_bool(at: *mut Object, arg: u32) -> u32 {
     }
 }
 
+/// `TO_BOOL` of the value at `at`, for the shapes the leaf arm runs
+/// (scalars, strings, lists, tuples, dicts, an instance with a native or
+/// no `__bool__` / `__len__`): `0` or `1` the truth (the operand
+/// released), anything else declined untouched.
+unsafe extern "C" fn h_truth(st: *mut State, at: *mut Object) -> u32 {
+    // SAFETY: the code passes its live state and an initialized stack
+    // slot; the truth tests run no Python code.
+    unsafe {
+        let v = &*at;
+        let b = match v {
+            Object::Bool(b) => *b,
+            Object::Int(i) => *i != 0,
+            Object::None => false,
+            Object::Str(s) => !s.is_empty(),
+            Object::Float(f) => *f != 0.0,
+            Object::List(l) => match l.try_borrow() {
+                Ok(l) => !l.is_empty(),
+                Err(_) => return 2,
+            },
+            Object::Tuple(t) => !t.is_empty(),
+            Object::Dict(d) => match d.try_borrow() {
+                Ok(d) => !d.is_empty(),
+                Err(_) => return 2,
+            },
+            Object::Instance(_) => match (*(*st).interp).leaf_instance_truth(v) {
+                Some(b) => b,
+                None => return 2,
+            },
+            _ => return 2,
+        };
+        if !droppable(v) {
+            return 2;
+        }
+        crate::drop_hot(at.read());
+        u32::from(b)
+    }
+}
+
 /// `LOAD_FAST x` (the `pc`th instruction of `code`) and the call
 /// `x.m(<simple arguments>)` after it, as the core loop's fused arm runs it
 /// (see `Interpreter::core_local_method`), on a stack `len` deep: `0` the
@@ -1204,13 +1256,14 @@ unsafe extern "C" fn h_load_global(
     pc: u64,
     nlocals: u64,
     len: u64,
+    cache: *mut GlobalCache,
 ) -> u32 {
     use weavepy_compiler::InlineCache as IC;
     // SAFETY: the code passes its live state (whose frame is the running
-    // one), its own code and extension, one of its `LOAD_GLOBAL`s, and
-    // its stack depth (with room for a push). The dict reads are the core
-    // loop's arm's: no dict borrow is held while bytecode runs, and
-    // nothing here runs code.
+    // one), its own code and extension, one of its `LOAD_GLOBAL`s, its
+    // stack depth (with room for a push), and the site's cache. The dict
+    // reads are the core loop's arm's: no dict borrow is held while
+    // bytecode runs, and nothing here runs code.
     unsafe {
         let st = &mut *st;
         let frame = &*st.frame;
@@ -1225,21 +1278,22 @@ unsafe extern "C" fn h_load_global(
         let (gdict, bdict) = (frame.globals.as_ptr(), frame.builtins.as_ptr());
         let gid = crate::specialize::rc_id(&frame.globals);
         let g_stamp = (*gdict).mutation_stamp();
-        let hit = match code.caches.get(pc as u32) {
+        let b_stamp = (*bdict).mutation_stamp();
+        let (hit, builtin) = match code.caches.get(pc as u32) {
             IC::LoadGlobalModule {
                 globals_id,
                 key_idx,
             } if globals_id == gid && slot.get() == [gid, g_stamp, 0] => {
-                (*gdict).get_index(key_idx as usize)
+                ((*gdict).get_index(key_idx as usize), false)
             }
             IC::LoadGlobalBuiltin {
                 builtins_id,
                 key_idx,
             } if builtins_id == crate::specialize::rc_id(&frame.builtins)
                 && !interp.globals_missing_any.get()
-                && slot.get() == [gid, g_stamp, (*bdict).mutation_stamp()] =>
+                && slot.get() == [gid, g_stamp, b_stamp] =>
             {
-                (*bdict).get_index(key_idx as usize)
+                ((*bdict).get_index(key_idx as usize), true)
             }
             _ => return DECLINED,
         };
@@ -1344,12 +1398,64 @@ unsafe extern "C" fn h_load_global(
                     return fused(st, c, pc + 1);
                 }
             }
-            _ => {}
+            // A value no fused shape takes: the native code reads it in
+            // line while the dicts' stamps hold (a stamp changes with every
+            // mutation, so the value stays where it is).
+            _ => {
+                let c = &mut *cache;
+                let field = |off: usize| st.frame.cast::<u8>().add(off).cast::<u64>().read();
+                c.value = 0;
+                c.globals = field(F_GLOBALS);
+                c.gstamp = g_stamp;
+                c.gdata = gdict as u64;
+                (c.builtins, c.bstamp, c.bdata) = if builtin {
+                    (field(F_BUILTINS), b_stamp, bdict as u64)
+                } else {
+                    (0, 0, 0)
+                };
+                c.value = std::ptr::from_ref(v) as u64;
+            }
         }
         dst.write(crate::clone_hot(v));
         PUSHED
     }
 }
+
+/// A `LOAD_GLOBAL` site's in-line cache: the frame's namespaces (their
+/// `Rc` handles' bits) and the dicts' stamps the value at `value` was
+/// found under (`builtins` 0 for a module global; `globals` 0 empty).
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct GlobalCache {
+    globals: u64,
+    gstamp: u64,
+    gdata: u64,
+    builtins: u64,
+    bstamp: u64,
+    bdata: u64,
+    value: u64,
+}
+
+const GC_GLOBALS: i32 = std::mem::offset_of!(GlobalCache, globals) as i32;
+const GC_GSTAMP: i32 = std::mem::offset_of!(GlobalCache, gstamp) as i32;
+const GC_GDATA: i32 = std::mem::offset_of!(GlobalCache, gdata) as i32;
+const GC_BUILTINS: i32 = std::mem::offset_of!(GlobalCache, builtins) as i32;
+const GC_BSTAMP: i32 = std::mem::offset_of!(GlobalCache, bstamp) as i32;
+const GC_BDATA: i32 = std::mem::offset_of!(GlobalCache, bdata) as i32;
+const GC_VALUE: i32 = std::mem::offset_of!(GlobalCache, value) as i32;
+
+/// Where the frame's namespaces, the interpreter's missing-globals flag
+/// and a dict's stamp sit.
+const F_GLOBALS: usize = std::mem::offset_of!(crate::Frame, globals);
+const F_BUILTINS: usize = std::mem::offset_of!(crate::Frame, builtins);
+const F_BUILTINS_OBJ: usize = std::mem::offset_of!(crate::Frame, builtins_obj);
+const I_MISSING: usize = std::mem::offset_of!(Interpreter, globals_missing_any);
+const DICT_STAMP: i32 = crate::object::DictData::STAMP_OFFSET as i32;
+const _: () = {
+    // (The cache holds a namespace handle's bits, the flag is a byte.)
+    assert!(std::mem::size_of::<Rc<crate::sync::RefCell<crate::object::DictData>>>() == 8);
+    assert!(std::mem::size_of::<std::cell::Cell<bool>>() == 1);
+};
 
 /// `LOAD_ATTR` with the method flag (the `pc`th instruction of `code`)
 /// on the receiver atop a `len`-deep stack, as the core loop's arm runs
@@ -1925,11 +2031,13 @@ fn compile_with(
         .field_slots
         .get_or_init(|| (0..ninstrs).map(|_| FieldSlot::empty()).collect());
     let entries: Vec<bool>;
+    let globals: Vec<Box<GlobalCache>>;
     let built = {
         let b = FunctionBuilder::new(&mut engine.ctx.func, &mut engine.fbctx);
         let mut lower = Lower::new(b, ptr, engine.tags, code, ext, nlocals, depths, field_slots);
         let done = lower.lower();
         entries = (0..ninstrs).map(|pc| lower.enters_at(pc)).collect();
+        globals = std::mem::take(&mut lower.global_caches);
         if done {
             lower.b.seal_all_blocks();
             lower.b.finalize();
@@ -1967,6 +2075,7 @@ fn compile_with(
         ops: code.instructions.iter().map(|i| i.op).collect(),
         depths: depths.into(),
         need: stack_need(depths),
+        _globals: globals,
     })
 }
 
@@ -2048,6 +2157,8 @@ struct Lower<'a> {
     bound: Vec<bool>,
     /// Each block start's block (instruction index → block).
     blocks: Vec<Option<Block>>,
+    /// The re-entry copies of the blocks' rests (see `lower`).
+    resume: Vec<Option<Block>>,
     /// Dispatches on the state's pc and depth (the entry, and helpers that
     /// move the pc by a run-time amount).
     dispatch: Block,
@@ -2062,6 +2173,9 @@ struct Lower<'a> {
     /// Side exits waiting for their blocks to be filled (after the body:
     /// the builder fills one block at a time).
     side_exits: Vec<SideExit>,
+    /// The `LOAD_GLOBAL` sites' caches, which the code addresses.
+    #[allow(clippy::vec_box)]
+    global_caches: Vec<Box<GlobalCache>>,
 }
 
 /// An exit block of [`Lower::exit_with`], filled after the body from the
@@ -2121,6 +2235,34 @@ fn native_op(op: OpCode) -> bool {
             | OpCode::GetIter
             | OpCode::UnaryOp
     )
+}
+
+/// Whether the native code may hand the instruction at `pc` back to the
+/// core loop for a shape its helpers don't settle (the next instruction is
+/// worth re-entering at).
+fn may_decline(code: &CodeObject, pc: usize) -> bool {
+    native_at(code, pc)
+        && matches!(
+            code.instructions[pc].op,
+            OpCode::LoadGlobal
+                | OpCode::LoadAttr
+                | OpCode::LoadMethodAttr
+                | OpCode::StoreAttr
+                | OpCode::BuildTuple
+                | OpCode::BuildList
+                | OpCode::LoadDeref
+                | OpCode::GetIter
+                | OpCode::BinarySubscr
+                | OpCode::BinarySlice
+                | OpCode::StoreSubscr
+                | OpCode::ListAppend
+                | OpCode::UnpackSequence
+                | OpCode::ContainsOp
+                | OpCode::BinaryOp
+                | OpCode::CompareOp
+                | OpCode::ToBool
+                | OpCode::UnaryOp
+        )
 }
 
 /// Whether the native code runs the instruction at `pc` itself (as
@@ -2190,12 +2332,14 @@ impl<'a> Lower<'a> {
             },
             bound: vec![false; nlocals],
             blocks: Vec::new(),
+            resume: Vec::new(),
             dispatch: Block::from_u32(0),
             cold: false,
             vs: Vec::new(),
             depth: 0,
             sigs: Vec::new(),
             side_exits: Vec::new(),
+            global_caches: Vec::new(),
         }
     }
 
@@ -2639,7 +2783,7 @@ impl<'a> Lower<'a> {
     /// instruction the native code runs (not one it hands straight back).
     fn enters_at(&self, pc: usize) -> bool {
         let instrs = &self.code.instructions;
-        if !self.blocks.get(pc).is_some_and(Option::is_some) || pc >= instrs.len() {
+        if pc >= instrs.len() || (self.blocks[pc].is_none() && self.resume[pc].is_none()) {
             return false;
         }
         native_at(self.code, pc)
@@ -2730,6 +2874,22 @@ impl<'a> Lower<'a> {
             .iter()
             .map(|&s| s.then(|| self.b.create_block()))
             .collect();
+        // Re-entry points after an instruction the helpers may hand back:
+        // the core loop runs that one instruction and enters again at a
+        // copy of the rest of its block (within a code size budget).
+        let mut budget = n;
+        self.resume = vec![None; n];
+        for pc in 0..n.saturating_sub(1) {
+            if starts[pc + 1] || self.depths[pc + 1] < 0 || !may_decline(code, pc) {
+                continue;
+            }
+            let rest = (pc + 1..n).take_while(|&k| !starts[k]).count();
+            if rest < 2 || rest > budget {
+                continue;
+            }
+            budget -= rest;
+            self.resume[pc + 1] = Some(self.b.create_block());
+        }
         // The entry: to the block at the state's pc, when the stack has the
         // block's depth.
         self.dispatch = self.b.create_block();
@@ -2751,7 +2911,7 @@ impl<'a> Lower<'a> {
         let mut tramps = Vec::new();
         let mut calls = Vec::with_capacity(n);
         for pc in 0..n {
-            let target = match self.blocks[pc] {
+            let target = match self.blocks[pc].or(self.resume[pc]) {
                 Some(blk) => {
                     let t = self.b.create_block();
                     tramps.push((t, blk, self.depths[pc]));
@@ -2773,34 +2933,45 @@ impl<'a> Lower<'a> {
             self.b.ins().brif(wrong, out, &[], blk, &[]);
         }
         // The blocks: each from its start until it ends or the next block
-        // starts.
+        // starts; then the re-entry copies.
         for start in 0..n {
-            let Some(blk) = self.blocks[start] else {
-                continue;
-            };
-            self.b.switch_to_block(blk);
-            self.vs.clear();
-            self.depth = self.depths[start] as usize;
-            self.last_pc = None;
-            self.bound.iter_mut().for_each(|b| *b = false);
-            let mut pc = start;
-            loop {
-                if !self.instruction(pc) {
-                    break;
-                }
-                pc += 1;
-                if pc >= n {
-                    self.exit(INTERP, pc);
-                    break;
-                }
-                if self.blocks[pc].is_some() {
-                    self.goto(pc);
-                    break;
-                }
+            if let Some(blk) = self.blocks[start] {
+                self.lower_block(start, blk);
+            }
+        }
+        for start in 0..n {
+            if let Some(blk) = self.resume[start] {
+                self.lower_block(start, blk);
             }
         }
         self.side_exits();
         true
+    }
+
+    /// Lower `blk`, from the instruction at `start` until the block ends or
+    /// the next one starts.
+    fn lower_block(&mut self, start: usize, blk: Block) {
+        let n = self.code.instructions.len();
+        self.b.switch_to_block(blk);
+        self.vs.clear();
+        self.depth = self.depths[start] as usize;
+        self.last_pc = None;
+        self.bound.iter_mut().for_each(|b| *b = false);
+        let mut pc = start;
+        loop {
+            if !self.instruction(pc) {
+                break;
+            }
+            pc += 1;
+            if pc >= n {
+                self.exit(INTERP, pc);
+                break;
+            }
+            if self.blocks[pc].is_some() {
+                self.goto(pc);
+                break;
+            }
+        }
     }
 
     /// Lower the instruction at `pc` into the current block: `true` when
@@ -2853,22 +3024,7 @@ impl<'a> Lower<'a> {
             }
             OpCode::BinaryOp => return self.binary(pc, ins.arg),
             OpCode::CompareOp => return self.compare(pc, ins.arg),
-            OpCode::ToBool => {
-                let item = self.pop();
-                let Some(o) = self.operand(item) else {
-                    self.push(item);
-                    self.exit(INTERP, pc);
-                    return false;
-                };
-                if o.kind == Kind::Bool {
-                    self.push(item);
-                } else {
-                    let other = self.exit_with(pc, &[item], INTERP);
-                    let t = self.truth(o, true, other);
-                    self.push(Item::Bool(t));
-                }
-                true
-            }
+            OpCode::ToBool => return self.to_bool(pc),
             OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => {
                 let item = self.pop();
                 let Some(o) = self.operand(item) else {
@@ -4233,9 +4389,10 @@ impl<'a> Lower<'a> {
         s
     }
 
-    /// `LOAD_GLOBAL` through [`h_load_global`]: the value on the stack; a
-    /// fused shape continues at whatever follows it (through the
-    /// dispatch).
+    /// `LOAD_GLOBAL`: the site's cached value in line while the frame's
+    /// namespaces and their stamps match it, anything else through
+    /// [`h_load_global`] (which fills the cache); a fused shape continues
+    /// at whatever follows it (through the dispatch).
     fn load_global(&mut self, pc: usize) -> bool {
         let next = self.code.instructions.get(pc + 1).map(|i| i.op);
         let may_fuse = matches!(
@@ -4247,23 +4404,88 @@ impl<'a> Lower<'a> {
         if may_fuse {
             self.flush();
         }
+        let s = self.depth;
+        let dst = self.slot_addr(s);
+        let cache: Box<GlobalCache> = Box::default();
+        let cache_at = std::ptr::from_ref::<GlobalCache>(&cache) as i64;
+        self.global_caches.push(cache);
+        let helper = self.b.create_block();
+        let done = self.b.create_block();
+        if let Some(none_tag) = self.tags.opt_none {
+            let ptr = self.ptr;
+            let c = self.b.ins().iconst(ptr, cache_at);
+            let frame = self.b.ins().load(ptr, FLAGS, self.st, S_FRAME);
+            let g = self
+                .b
+                .ins()
+                .load(types::I64, FLAGS, frame, F_GLOBALS as i32);
+            let cg = self.b.ins().load(types::I64, FLAGS, c, GC_GLOBALS);
+            let gd = self.b.ins().load(ptr, FLAGS, c, GC_GDATA);
+            let other = self.b.ins().icmp(IntCC::NotEqual, g, cg);
+            self.branch_out(other, helper);
+            let gs = self.b.ins().load(types::I64, FLAGS, gd, DICT_STAMP);
+            let cgs = self.b.ins().load(types::I64, FLAGS, c, GC_GSTAMP);
+            let bo = self
+                .b
+                .ins()
+                .uload8(types::I64, FLAGS, frame, F_BUILTINS_OBJ as i32);
+            let moved = self.b.ins().icmp(IntCC::NotEqual, gs, cgs);
+            let custom = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::NotEqual, bo, i64::from(none_tag));
+            let bad = self.b.ins().bor(moved, custom);
+            self.branch_out(bad, helper);
+            let cb = self.b.ins().load(types::I64, FLAGS, c, GC_BUILTINS);
+            let builtin = self.b.create_block();
+            let read = self.b.create_block();
+            self.b.ins().brif(cb, builtin, &[], read, &[]);
+            // A builtin: the builtins too, and no globals `__missing__`.
+            self.b.switch_to_block(builtin);
+            let b = self
+                .b
+                .ins()
+                .load(types::I64, FLAGS, frame, F_BUILTINS as i32);
+            let bd = self.b.ins().load(ptr, FLAGS, c, GC_BDATA);
+            let other = self.b.ins().icmp(IntCC::NotEqual, b, cb);
+            self.branch_out(other, helper);
+            let bs = self.b.ins().load(types::I64, FLAGS, bd, DICT_STAMP);
+            let cbs = self.b.ins().load(types::I64, FLAGS, c, GC_BSTAMP);
+            let interp = self.b.ins().load(ptr, FLAGS, self.st, S_INTERP);
+            let missing = self
+                .b
+                .ins()
+                .uload8(types::I64, FLAGS, interp, I_MISSING as i32);
+            let moved = self.b.ins().icmp(IntCC::NotEqual, bs, cbs);
+            let missing = self.b.ins().icmp_imm(IntCC::NotEqual, missing, 0);
+            let bad = self.b.ins().bor(moved, missing);
+            self.branch_out(bad, helper);
+            self.b.ins().jump(read, &[]);
+            self.b.switch_to_block(read);
+            let v = self.b.ins().load(ptr, FLAGS, c, GC_VALUE);
+            self.copy_value(dst, v);
+            self.b.ins().jump(done, &[]);
+        } else {
+            self.b.ins().jump(helper, &[]);
+        }
+        self.b.switch_to_block(helper);
         let code = self.code_ptr();
         let ext = self.ext_ptr();
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let nl = self.b.ins().iconst(types::I64, self.nlocals as i64);
         let len = self.b.ins().iconst(types::I64, self.depth as i64);
+        let c = self.b.ins().iconst(self.ptr, cache_at);
         let r = self
             .call(
                 h_load_global as *const () as usize,
-                &[self.st, code, ext, pcv, nl, len],
+                &[self.st, code, ext, pcv, nl, len, c],
                 true,
             )
             .expect("returns");
         let out = self.exit_with(pc, &[], INTERP);
         if may_fuse {
-            let pushed = self.b.create_block();
             let other = self.b.create_block();
-            self.b.ins().brif(r, other, &[], pushed, &[]);
+            self.b.ins().brif(r, other, &[], done, &[]);
             self.b.switch_to_block(other);
             let fused = self.b.ins().icmp_imm(IntCC::Equal, r, i64::from(FUSED));
             let fb = self.b.create_block();
@@ -4273,11 +4495,10 @@ impl<'a> Lower<'a> {
             self.b.switch_to_block(fb);
             self.check_released_dynamic();
             self.b.ins().jump(self.dispatch, &[]);
-            self.b.switch_to_block(pushed);
         } else {
-            self.branch_out(r, out);
+            self.b.ins().brif(r, out, &[], done, &[]);
         }
-        let s = self.depth;
+        self.b.switch_to_block(done);
         self.push(Item::Mem(s));
         self.set_last(pc);
         true
@@ -4332,6 +4553,65 @@ impl<'a> Lower<'a> {
         self.depth -= 2;
         self.set_last(pc);
         self.check_released(pc + 1);
+        true
+    }
+
+    /// `TO_BOOL`: a scalar's truth in line, any other value's through
+    /// [`h_truth`].
+    fn to_bool(&mut self, pc: usize) -> bool {
+        let item = self.pop();
+        let o = self.operand(item);
+        if o.is_some_and(|o| o.kind == Kind::Bool) {
+            self.push(item);
+            self.set_last(pc);
+            return true;
+        }
+        let other = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I8);
+        match o {
+            Some(o) => {
+                let t = self.truth(o, true, other);
+                self.b.ins().jump(done, &[t.into()]);
+            }
+            None => {
+                self.b.ins().jump(other, &[]);
+            }
+        }
+        // Any other value through the helper (the operand onto the stack).
+        self.b.switch_to_block(other);
+        let slot = self.depth;
+        let cold = std::mem::replace(&mut self.cold, true);
+        self.materialize(item, slot);
+        self.cold = cold;
+        let at = self.slot_addr(slot);
+        let r = self
+            .call(h_truth as *const () as usize, &[self.st, at], true)
+            .expect("returns");
+        let declined = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, r, 1);
+        let out = self.exit_with(pc, &[Item::Mem(slot)], INTERP);
+        self.branch_out(declined, out);
+        let saved = self.last_pc.replace(pc);
+        let marked = self.exit_with(pc + 1, &[Item::Mem(slot)], MARKED);
+        self.last_pc = saved;
+        let f = self.b.ins().uload8(types::I32, FLAGS, self.dead, 0);
+        let marked_b = self.b.create_block();
+        let fine = self.b.create_block();
+        self.b.ins().brif(f, marked_b, &[], fine, &[]);
+        // (The result goes onto the stack for the core loop.)
+        self.b.switch_to_block(marked_b);
+        let dst = self.slot_addr(slot);
+        self.write_tag(dst, self.tags.boolean);
+        let r8 = self.b.ins().ireduce(types::I8, r);
+        self.b.ins().store(FLAGS, r8, dst, 1);
+        self.b.ins().jump(marked, &[]);
+        self.b.switch_to_block(fine);
+        let t = self.b.ins().icmp_imm(IntCC::NotEqual, r, 0);
+        self.b.ins().jump(done, &[t.into()]);
+        self.b.switch_to_block(done);
+        let t = self.b.block_params(done)[0];
+        self.push(Item::Bool(t));
+        self.set_last(pc);
         true
     }
 
