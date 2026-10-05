@@ -23,6 +23,14 @@ fn main() {
     std::process::exit(weavepy_cli::cli_main());
 }
 
+/// Configure the allocator before anything allocates (see
+/// `weavepy_cli::configure_allocator`).
+#[cfg(not(windows))]
+#[used]
+#[cfg_attr(target_vendor = "apple", link_section = "__DATA,__mod_init_func")]
+#[cfg_attr(not(target_vendor = "apple"), link_section = ".init_array")]
+static CONFIGURE_ALLOCATOR: extern "C" fn() = weavepy_cli::configure_allocator;
+
 #[cfg(windows)]
 fn main() {
     std::process::exit(shim::run());

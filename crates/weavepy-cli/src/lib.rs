@@ -53,6 +53,12 @@ mod alloc_profile;
 #[global_allocator]
 static GLOBAL_ALLOC: alloc_profile::Profiled = alloc_profile::Profiled;
 
+/// The allocator set-up an executable runs before its first allocation
+/// (see `alloc::configure`): the bin targets list it among their
+/// initializers. (The profiling allocator forwards to mimalloc, so it
+/// applies there too.)
+pub use alloc::configure as configure_allocator;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Opt-in in-process PC sampler (`WEAVEPY_PCPROF=<file>`): a `SIGPROF`
