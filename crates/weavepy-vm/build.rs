@@ -172,10 +172,14 @@ fn main() {
     // artifact without reading (and paging in) the module's source text.
     let mut hashes = String::new();
     for source in frozen_sources::frozen_sources() {
+        let h = frozen_sources::source_hash(source.source);
         writeln!(
             hashes,
-            "    0x{:016x},",
-            frozen_sources::source_hash(source.source)
+            "    0x{:04x}_{:04x}_{:04x}_{:04x},",
+            h >> 48,
+            (h >> 32) & 0xffff,
+            (h >> 16) & 0xffff,
+            h & 0xffff,
         )
         .unwrap();
     }
