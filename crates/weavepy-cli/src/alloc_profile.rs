@@ -4,8 +4,9 @@
 //! records its call stack. A sampled block is charged [`SAMPLE`] bytes to
 //! its stack while it lives, so at exit the table estimates the *live* heap
 //! by allocation site. With `WEAVEPY_ALLOC_PROFILE=<file>` set, the live
-//! samples are written to `<file>`: one line per sample, the charged bytes
-//! then the slide-adjusted return addresses (resolve them with `atos`).
+//! samples are written to `<file>`: one line per sample, the charged bytes,
+//! the block's own size (`s<bytes>`), then the slide-adjusted return
+//! addresses (resolve them with `atos`).
 //! `WEAVEPY_ALLOC_SAMPLE=<bytes>` changes the sampling interval, and the
 //! file's first line (starting `#`) gives the exact live and peak heap
 //! totals, which tell transient allocations apart from retained ones.
@@ -37,6 +38,8 @@ const SLOTS: usize = 1 << 18;
 
 struct Sample {
     ptr: usize,
+    /// The sampled block's own size.
+    size: usize,
     stack: [usize; DEPTH],
 }
 
@@ -47,6 +50,7 @@ static TABLE: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
     static IN_HOOK: Cell<bool> = const { Cell::new(false) };
     static UNTIL_SAMPLE: Cell<usize> = const { Cell::new(SAMPLE) };
+    static RNG: Cell<u64> = const { Cell::new(0x9E37_79B9_7F4A_7C15) };
 }
 
 extern "C" {
@@ -123,6 +127,7 @@ fn snapshot(live: usize) {
         if s.ptr != 0 && s.ptr != usize::MAX {
             unsafe {
                 (*snap.add(n)).ptr = s.ptr;
+                (*snap.add(n)).size = s.size;
                 (*snap.add(n)).stack = s.stack;
             }
             n += 1;
@@ -133,7 +138,7 @@ fn snapshot(live: usize) {
     unlock();
 }
 
-fn record(ptr: usize) {
+fn record(ptr: usize, size: usize) {
     let mut stack = [0usize; DEPTH];
     // SAFETY: `backtrace` fills at most `DEPTH` entries of the buffer.
     let n = unsafe { libc::backtrace(stack.as_mut_ptr().cast(), DEPTH as libc::c_int) };
@@ -148,6 +153,7 @@ fn record(ptr: usize) {
         // a tombstone can take it (a long run would fill the table otherwise).
         if s.ptr == 0 || s.ptr == ptr || s.ptr == usize::MAX {
             s.ptr = ptr;
+            s.size = size;
             s.stack = stack;
             break;
         }
@@ -241,7 +247,19 @@ fn sample(ptr: usize, size: usize) {
         let due = UNTIL_SAMPLE.with(|left| {
             let l = left.get();
             if size >= l {
-                left.set(INTERVAL.load(Ordering::Relaxed));
+                // A uniformly random gap with the interval as its mean: a
+                // fixed gap aliases with a loop that allocates the same
+                // bytes per iteration, charging one site for all of them.
+                let r = RNG.with(|rng| {
+                    let mut x = rng.get();
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    rng.set(x);
+                    x
+                });
+                let interval = INTERVAL.load(Ordering::Relaxed);
+                left.set(1 + (r as usize) % (2 * interval));
                 true
             } else {
                 left.set(l - size);
@@ -250,7 +268,7 @@ fn sample(ptr: usize, size: usize) {
         });
         if due {
             hook.set(true);
-            record(ptr);
+            record(ptr, size);
             hook.set(false);
         }
     });
@@ -297,7 +315,7 @@ fn render(header: String, t: *mut Sample, n: usize) -> String {
         if s.ptr == 0 || s.ptr == usize::MAX {
             continue;
         }
-        out.push_str(&interval.to_string());
+        out.push_str(&format!("{interval} s{}", s.size));
         for &a in s.stack.iter().take_while(|a| **a != 0) {
             out.push_str(&format!(" {:x}", a.wrapping_sub(slide)));
         }
