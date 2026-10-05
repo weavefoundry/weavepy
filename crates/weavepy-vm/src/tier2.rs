@@ -890,8 +890,14 @@ pub(crate) fn note_startup_finished() {
 fn compile_allowed(counter: u32, threshold: u32) -> bool {
     let phase = compilation_phase();
     (phase == CompilationPhase::Normal && STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed))
-        || counter >= threshold.saturating_mul(16)
+        || counter >= threshold.saturating_mul(IMPORT_THRESHOLD_FACTOR)
 }
+
+/// How many times the normal threshold's work code run during start-up
+/// or an import needs before it compiles: import-time code (a regex
+/// compiler, a table builder) mostly runs once per process, and an
+/// attempt costs milliseconds.
+const IMPORT_THRESHOLD_FACTOR: u32 = 64;
 
 /// [`compile_allowed`] for the frame compiler (see `frame_jit`), which
 /// keeps tier 2's start-up and import budgets.
