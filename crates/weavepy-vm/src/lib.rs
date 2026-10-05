@@ -24210,6 +24210,21 @@ impl Interpreter {
                     .cloned()
                     .ok_or_else(|| RuntimeError::Internal("SEND empty stack".to_owned()))?;
                 let result = match &iter {
+                    // A delegate's return needs no `StopIteration` unless an
+                    // observer must see it caught (`fire_caught_stop_iteration`).
+                    Object::Generator(g) | Object::Coroutine(g)
+                        if !crate::trace::any_observers_active() =>
+                    {
+                        match self.generator_resume(g, value) {
+                            Ok(GenResume::Yielded(v)) => Ok(v),
+                            Ok(GenResume::Returned(v)) => {
+                                frame.push(v);
+                                frame.pc += ins.arg;
+                                return Ok(StepOutcome::Continue);
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
                     Object::Generator(g) | Object::Coroutine(g) => self.generator_send(g, value),
                     Object::AsyncGenerator(g) => {
                         // Async-generator semantics under SEND:
@@ -32462,9 +32477,25 @@ impl Interpreter {
         if attr_certainly_missing(&args[0], &name) {
             return Ok(Object::Bool(false));
         }
+        let immutable_type = match &args[0] {
+            Object::Type(t) if t.flags.is_builtin && !crate::stdlib::os::is_struct_seq_type(t) => {
+                Some(t)
+            }
+            _ => None,
+        };
+        if let Some(t) = immutable_type {
+            if builtin_type_misses::contains(t, &name) {
+                return Ok(Object::Bool(false));
+            }
+        }
         match self.load_attr(&args[0], &name) {
             Ok(_) => Ok(Object::Bool(true)),
-            Err(e) if self.is_attribute_error(&e) => Ok(Object::Bool(false)),
+            Err(e) if self.is_attribute_error(&e) => {
+                if let Some(t) = immutable_type {
+                    builtin_type_misses::insert(t, &name);
+                }
+                Ok(Object::Bool(false))
+            }
             Err(e) => Err(e),
         }
     }
@@ -58662,6 +58693,57 @@ thread_local! {
     static SLOT_WRAPPER_CACHE: std::cell::RefCell<
         crate::fasthash::FxHashMap<usize, crate::fasthash::FxHashMap<Box<str>, Option<Object>>>,
     > = std::cell::RefCell::new(crate::fasthash::FxHashMap::default());
+}
+
+/// Attribute names a built-in type was found to lack. Built-in types are
+/// immutable, so a miss is permanent, and `hasattr` can answer a repeat
+/// without raising (asyncio's `isfuture` asks
+/// `hasattr(type(coro), '_asyncio_future_blocking')` for every coroutine
+/// it's handed). Their attributes resolve dynamically, so a first miss
+/// must still go through the full lookup. Entries are keyed by address
+/// and hold the type weakly, which keeps the address from being reused.
+mod builtin_type_misses {
+    use std::cell::RefCell;
+
+    use crate::fasthash::{FxHashMap, FxHashSet};
+    use crate::sync::{Rc, Weak};
+    use crate::types::TypeObject;
+
+    /// Past this many names the record starts over (a bound, not a cache
+    /// policy: real programs probe a handful of names).
+    const CAP: usize = 512;
+
+    type Misses = FxHashMap<usize, (Weak<TypeObject>, FxHashSet<Box<str>>)>;
+
+    thread_local! {
+        static MISSES: RefCell<(usize, Misses)> = RefCell::new((0, FxHashMap::default()));
+    }
+
+    pub(super) fn contains(ty: &Rc<TypeObject>, name: &str) -> bool {
+        MISSES.with(|m| {
+            m.borrow()
+                .1
+                .get(&(Rc::as_ptr(ty) as usize))
+                .is_some_and(|(w, names)| w.strong_count() > 0 && names.contains(name))
+        })
+    }
+
+    pub(super) fn insert(ty: &Rc<TypeObject>, name: &str) {
+        MISSES.with(|m| {
+            let mut m = m.borrow_mut();
+            let (count, map) = &mut *m;
+            if *count >= CAP {
+                *count = 0;
+                map.clear();
+            }
+            let entry = map
+                .entry(Rc::as_ptr(ty) as usize)
+                .or_insert_with(|| (Rc::downgrade(ty), FxHashSet::default()));
+            if entry.1.insert(name.into()) {
+                *count += 1;
+            }
+        });
+    }
 }
 
 /// Whether `obj.name` certainly raises `AttributeError` without running
