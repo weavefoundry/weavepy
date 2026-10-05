@@ -835,12 +835,43 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
             // SAFETY: the running thread's interpreter, dormant while the
             // helper runs; the stack slot keeps `g` alive.
             let interp = unsafe { &mut *st.interp.cast_mut() };
-            if let crate::gen_fast::GenNext::Yielded(v) =
-                interp.gen_fast_next(g, st.snap_gen, 0, st.maybe_dead)
-            {
-                // SAFETY: the slot above the iterator is free.
-                unsafe { out.write(v) };
-                return 1;
+            match interp.gen_fast_next(g, st.snap_gen, 0, st.maybe_dead) {
+                crate::gen_fast::GenNext::Yielded(v) => {
+                    // SAFETY: the slot above the iterator is free.
+                    unsafe { out.write(v) };
+                    return 1;
+                }
+                crate::gen_fast::GenNext::Exhausted => {
+                    // SAFETY: the finished generator leaves the stack.
+                    drop(unsafe { it.read() });
+                    // SAFETY: the running thread's own flag.
+                    if !unsafe { (*st.maybe_dead).get() } {
+                        return 2;
+                    }
+                    // Its frame released something that queued a finalizer,
+                    // which runs before the next instruction: the core loop
+                    // takes over past the loop, synced as for a switch.
+                    // SAFETY: as below.
+                    unsafe {
+                        let sw = &mut *st.sw;
+                        let frame = &mut *st.frame;
+                        let code = &frame.code;
+                        let mut to = pc as usize + 1 + code.instructions[pc as usize].arg as usize;
+                        let op = |pc: usize| code.instructions.get(pc).map(|i| i.op);
+                        if op(to) == Some(OpCode::EndFor) {
+                            to += 1;
+                            if matches!(op(to), Some(OpCode::PopIter | OpCode::PopTop)) {
+                                to += 1;
+                            }
+                        }
+                        frame.stack.set_len(it.offset_from(st.stack) as usize);
+                        frame.pc = to as u32;
+                        *sw.last = pc as usize;
+                        sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Marked));
+                    }
+                    return FOR_SWITCHED;
+                }
+                crate::gen_fast::GenNext::Declined | crate::gen_fast::GenNext::Partial => {}
             }
             // SAFETY: the running activation's frame and switch; the
             // stack is synced (the iterator on top) before the switch.
@@ -2033,7 +2064,7 @@ unsafe extern "C" fn h_call(
             let sw = &mut *st.sw;
             let interp = &mut *st.interp.cast_mut();
             let switched = if python == 1 {
-                interp.core_call(sw, pc)
+                interp.core_call(sw, pc) || interp.core_gen_call(sw, pc)
             } else {
                 interp.core_new(sw, pc, st.snap_gen)
             };

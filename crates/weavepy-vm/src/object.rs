@@ -4885,8 +4885,7 @@ impl PyFunction {
     /// generator snapshots them at call time); a function whose slots
     /// were never touched still has its code's interned names.
     pub fn name_objects(&self) -> (Option<Object>, Option<Object>) {
-        // SAFETY: a read of the seed's presence with nothing running.
-        if unsafe { (*self.slot_seed.as_ptr()).is_some() } {
+        if self.names_seeded() {
             let code = self.code();
             return (
                 Some(crate::stdlib::sys::intern_name(&code.name)),
@@ -4899,6 +4898,13 @@ impl PyFunction {
             _ => None,
         };
         (attr_str("__name__"), attr_str("__qualname__"))
+    }
+
+    /// Whether the function's slots are still its definition-time seed
+    /// (so `__name__` and `__qualname__` are its code's).
+    pub fn names_seeded(&self) -> bool {
+        // SAFETY: a read of the seed's presence with nothing running.
+        unsafe { (*self.slot_seed.as_ptr()).is_some() }
     }
 
     /// Read a slot value if one has been stored (explicitly assigned or

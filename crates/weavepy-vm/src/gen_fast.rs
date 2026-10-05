@@ -34,6 +34,8 @@ use crate::{FoldSink, Frame, Interpreter};
 pub(crate) enum GenStep {
     /// The body yielded this value; the frame is suspended past the yield.
     Yielded(Object),
+    /// The body returned this value (a step that may finish the body).
+    Returned(Object),
     /// The next instruction needs the general loop.
     Bail,
 }
@@ -41,6 +43,8 @@ pub(crate) enum GenStep {
 /// How a fast `next()` of a generator ended.
 pub(crate) enum GenNext {
     Yielded(Object),
+    /// The generator returned, and is finished.
+    Exhausted,
     /// Nothing happened: the generator is as it was.
     Declined,
     /// The generator consumed its sent value and advanced, then stopped
@@ -337,6 +341,7 @@ impl Interpreter {
     /// With `fold` (a draining consumer's sink, top level only), a yield
     /// the sink takes resumes the body at once with `None` sent. `dead` is
     /// the thread's queued-finalizer flag (`gc_trace::maybe_dead_flag`).
+    /// With `finish`, the step also runs a `return`, which ends it.
     pub(crate) fn gen_fast_step(
         &mut self,
         frame: &mut Frame,
@@ -344,6 +349,7 @@ impl Interpreter {
         depth: u8,
         fold: Option<FoldSink>,
         dead: *const std::cell::Cell<bool>,
+        finish: bool,
     ) -> GenStep {
         // The frame, for the native code's namespace reads.
         #[cfg(feature = "jit")]
@@ -418,6 +424,7 @@ impl Interpreter {
         // indices and pcs the eligibility scan proved in range (`in_bounds`:
         // every jump lands on an instruction and the last can't fall
         // through, so `pc < ninstrs` whenever an instruction is read).
+        let mut returned = None;
         let yielded = loop {
             #[cfg(feature = "jit")]
             if pc != handed {
@@ -681,6 +688,12 @@ impl Interpreter {
                     frame.agen_yielded_value = ins.arg == 0;
                     break Some(unsafe { top.read() });
                 }
+                OpCode::ReturnValue if finish && len > 0 => {
+                    len -= 1;
+                    pc += 1;
+                    returned = Some(unsafe { base.add(len).read() });
+                    break None;
+                }
                 _ => break None,
             }
         };
@@ -688,9 +701,10 @@ impl Interpreter {
         // pops moved values out).
         unsafe { frame.stack.set_len(len) };
         frame.pc = pc as u32;
-        match yielded {
-            Some(v) => GenStep::Yielded(v),
-            None => GenStep::Bail,
+        match (yielded, returned) {
+            (Some(v), _) => GenStep::Yielded(v),
+            (None, Some(v)) => GenStep::Returned(v),
+            (None, None) => GenStep::Bail,
         }
     }
 
@@ -760,6 +774,7 @@ impl Interpreter {
             // that could reach this frame.)
             Object::Generator(g) => match self.gen_fast_next(g, snap_gen, depth + 1, dead) {
                 GenNext::Yielded(v) => ForNext::Value(v),
+                GenNext::Exhausted => ForNext::Exhausted,
                 GenNext::Declined | GenNext::Partial => ForNext::Bail,
             },
             _ => ForNext::Bail,
@@ -779,8 +794,16 @@ impl Interpreter {
         if !Self::gen_fast_frame_ok(frame) {
             return None;
         }
-        match self.gen_fast_step(frame, snap_gen, 0, fold, crate::gc_trace::maybe_dead_flag()) {
+        match self.gen_fast_step(
+            frame,
+            snap_gen,
+            0,
+            fold,
+            crate::gc_trace::maybe_dead_flag(),
+            false,
+        ) {
             GenStep::Yielded(v) => Some(v),
+            GenStep::Returned(_) => unreachable!("not a finishing step"),
             GenStep::Bail => None,
         }
     }
@@ -832,8 +855,21 @@ impl Interpreter {
             frame.stack.push(Object::None);
         }
         debug_assert!(!frame.stack.is_empty());
-        let out = match self.gen_fast_step(frame, snap_gen, depth, None, dead) {
+        let out = match self.gen_fast_step(frame, snap_gen, depth, None, dead, true) {
             GenStep::Yielded(v) => GenNext::Yielded(v),
+            // The general epilogue of a return (`inline_gen_finish`): the
+            // generator finishes and its frame is released (anything that
+            // dies with it queues its finalizer; the value a `FOR_ITER`
+            // discards too).
+            GenStep::Returned(v) => {
+                *g.state.borrow_mut() = GeneratorState::Finished;
+                drop(v);
+                let frame: &mut Frame = &mut boxed;
+                self.recycle_frame_allocs(frame);
+                Self::release_finished_gen(g);
+                drop(boxed);
+                return GenNext::Exhausted;
+            }
             GenStep::Bail if frame.pc == start => {
                 // Nothing ran: the resume is undone.
                 if partial {

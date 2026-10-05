@@ -7615,11 +7615,15 @@ impl Interpreter {
                         });
                     }
                 }
-                // Likewise a yield from a lean generator resume: the full
-                // handler's only other effect is the async-generator tag.
-                if op_before == Some(OpCode::YieldValue)
-                    && matches!(&*shell, QuietShell::Lazy(act) if act.shell.is_none())
-                {
+                // Likewise a yield: the full handler's only other effect is
+                // the async-generator tag. A frame with a shell keeps it
+                // current, as the slow step below would.
+                if op_before == Some(OpCode::YieldValue) {
+                    if !matches!(&*shell, QuietShell::Lazy(act) if act.shell.is_none()) {
+                        self.flush_lean(frame, shell)
+                            .lasti
+                            .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if let Some(v) = frame.stack.pop() {
                         frame.agen_yielded_value = frame.code.instructions[cur_pc].arg == 0;
                         frame.pc = cur_pc as u32 + 1;
@@ -10507,7 +10511,9 @@ impl Interpreter {
             }
             _ => {}
         }
-        if ins.op == OpCode::GetYieldFromIter {
+        // `iter(obj)` (or `yield from obj`) of an instance whose `__iter__`
+        // is a generator function: the generator, made in place.
+        if matches!(ins.op, OpCode::GetYieldFromIter | OpCode::GetIter) {
             let Some(v) = frame.stack.last() else {
                 return CoreAttr::Decline;
             };
@@ -12026,15 +12032,44 @@ impl Interpreter {
                                 // place, without switching (see `gen_fast`).
                                 // (The stack slot keeps `g` alive: the step
                                 // runs no code that could reach this frame.)
-                                if let gen_fast::GenNext::Yielded(v) =
-                                    self.gen_fast_next(g, snap_gen, 0, pending_work)
-                                {
-                                    // SAFETY: `len < cap` (checked above).
-                                    unsafe { base.add(len).write(v) };
-                                    len += 1;
-                                    last = pc;
-                                    pc += 1;
-                                    continue;
+                                match self.gen_fast_next(g, snap_gen, 0, pending_work) {
+                                    gen_fast::GenNext::Yielded(v) => {
+                                        // SAFETY: `len < cap` (checked above).
+                                        unsafe { base.add(len).write(v) };
+                                        len += 1;
+                                        last = pc;
+                                        pc += 1;
+                                        continue;
+                                    }
+                                    // The finished generator leaves the
+                                    // stack, and the loop exits past its
+                                    // `END_FOR`/`POP_ITER` pair (anything
+                                    // its frame released may have queued a
+                                    // finalizer, run before the next
+                                    // instruction).
+                                    gen_fast::GenNext::Exhausted => {
+                                        len -= 1;
+                                        // SAFETY: the slot is initialized.
+                                        unsafe { drop_hot(base.add(len).read()) };
+                                        last = pc;
+                                        pc += 1 + ins.arg as usize;
+                                        let op_at = |pc: usize| {
+                                            // SAFETY: `pc < ninstrs` is checked first.
+                                            (pc < ninstrs).then(|| unsafe { (*instrs.add(pc)).op })
+                                        };
+                                        if op_at(pc) == Some(OpCode::EndFor) {
+                                            pc += 1;
+                                            if matches!(
+                                                op_at(pc),
+                                                Some(OpCode::PopIter | OpCode::PopTop)
+                                            ) {
+                                                pc += 1;
+                                            }
+                                        }
+                                        after_release!();
+                                        continue;
+                                    }
+                                    gen_fast::GenNext::Declined | gen_fast::GenNext::Partial => {}
                                 }
                                 // SAFETY: `len <= cap`, every slot initialized.
                                 unsafe { frame.stack.set_len(len) };
@@ -12454,6 +12489,14 @@ impl Interpreter {
                         *last_pc = last;
                         if !self.core_gen_yield(sw, snap_gen) {
                             sw.pending = Some(CoreExit::Stop(LeafStop::Step));
+                        } else {
+                            // A `yield from` chain passes the value straight
+                            // up: each consumer's next instruction is its own
+                            // yield.
+                            while sw.pending.is_none()
+                                && self.core_yield_chains(sw)
+                                && self.core_gen_yield(sw, snap_gen)
+                            {}
                         }
                         break Some(CoreExit::Reload);
                     }
@@ -16904,9 +16947,36 @@ impl Interpreter {
     /// and made the running one here. `false` touches nothing.
     #[inline(never)]
     fn core_gen_resume(&mut self, sw: &mut CoreSwitch, pc: usize, mode: InlineResume) -> bool {
-        if !self.inline_calls_ok() {
+        if !self.inline_calls_ok() || !self.core_gen_resume_one(sw, pc, mode) {
             return false;
         }
+        // A `yield from` chain: a generator suspended in one resumes at
+        // `RESUME; JUMP_BACKWARD_NO_INTERRUPT` back to its `SEND`, which
+        // neither checks the eval breaker, so its own sub-generator
+        // resumes straight away, as running the three would.
+        loop {
+            // SAFETY: see `CoreSwitch` (the generator just made running).
+            let gf = unsafe { &mut *sw.cur };
+            let Some(send_pc) = yield_from_resend(&gf.code.instructions, gf.pc as usize) else {
+                break;
+            };
+            let n = gf.stack.len();
+            if n < 2 || !matches!(gf.stack[n - 2], Object::Generator(_) | Object::Coroutine(_)) {
+                break;
+            }
+            // (Left at the `SEND` if it declines: the core loop runs it.)
+            gf.pc = send_pc as u32;
+            if !self.core_gen_resume_one(sw, send_pc, InlineResume::Send) {
+                break;
+            }
+        }
+        true
+    }
+
+    /// One step of [`Self::core_gen_resume`]: the generator at `pc` of the
+    /// running activation resumed and made the running one.
+    #[inline(always)]
+    fn core_gen_resume_one(&mut self, sw: &mut CoreSwitch, pc: usize, mode: InlineResume) -> bool {
         let mut tmp = None;
         // SAFETY: see `CoreSwitch` (as in `core_call`).
         let act = unsafe {
@@ -16930,6 +17000,20 @@ impl Interpreter {
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
         true
+    }
+
+    /// Whether `sw`'s running activation is an inline generator resume
+    /// about to yield (a `yield from` passing a value through).
+    #[inline(always)]
+    fn core_yield_chains(&self, sw: &CoreSwitch) -> bool {
+        // SAFETY: see `CoreSwitch`.
+        let (inl, frame) = unsafe { (&*sw.inl, &*sw.cur) };
+        inl.last().is_some_and(|top| top.gen.is_some())
+            && frame
+                .code
+                .instructions
+                .get(frame.pc as usize)
+                .is_some_and(|i| i.op == OpCode::YieldValue)
     }
 
     /// The core loop's `YIELD_VALUE` of `sw`'s running activation, an
@@ -17031,6 +17115,105 @@ impl Interpreter {
         true
     }
 
+    /// [`Self::core_return`] of an inline generator resume: the quiet
+    /// loop's return exit, `inline_gen_finish` (the generator finishes)
+    /// and `inline_gen_deliver` for a `FOR_ITER` or `SEND` consumer, then
+    /// its `Returned` protocol, with the consumer made the running
+    /// activation. `false` touches nothing.
+    #[inline(never)]
+    fn core_gen_return(&mut self, sw: &mut CoreSwitch, snap_gen: u64) -> bool {
+        // SAFETY: see `CoreSwitch`.
+        let inl = unsafe { &mut *sw.inl };
+        let depth = inl.len();
+        let Some(top) = inl.last_mut() else {
+            return false;
+        };
+        // A shell (the general epilogue's), or `next(gen)`'s exhaustion
+        // (a `StopIteration`), finishes through `quiet_run`.
+        if top.act.shell.is_some()
+            || top.exhaust_arg == GEN_NEXT_CALL
+            || self.gil_countdown <= 2
+            || crate::hot_gates::loop_gen() != snap_gen
+        {
+            return false;
+        }
+        // SAFETY: the running activation is `top`'s generator frame.
+        let frame = unsafe { &mut *sw.cur };
+        let Some(v) = frame.stack.pop() else {
+            return false;
+        };
+        frame.pc += 1;
+        let mut done = inl.pop().expect("checked above");
+        if depth == sw.entry_depth {
+            sw.entry_dead = true;
+        }
+        drop(done.guard.take());
+        let gen = done.gen.take().expect("a generator activation");
+        let mut boxed = done.gen_box.take().expect("a generator activation");
+        done.gen_frame = std::ptr::null_mut();
+        *gen.state.borrow_mut() = GeneratorState::Finished;
+        self.recycle_frame_allocs(&mut boxed);
+        Self::release_finished_gen(&gen);
+        drop(boxed);
+        drop(gen);
+        let call_pc = done.call_pc;
+        let arg = done.exhaust_arg;
+        self.lean_pending_exit(done.caller_pending);
+        done.act.frame = std::ptr::from_mut::<Frame>(&mut done.frame);
+        done.caller_pending = None;
+        if self.inline_pool.len() < INLINE_POOL_CAP {
+            self.inline_pool.push(done);
+        }
+        let mut tmp = None;
+        // SAFETY: the consumer is the innermost remaining activation.
+        let (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
+        // SAFETY: as above.
+        let consumer = unsafe { &mut *cframe };
+        if arg & GEN_SEND != 0 {
+            // `SEND`: the return value is the `yield from`/`await` result;
+            // the sub-generator stays for `END_SEND`.
+            consumer.stack.push(v);
+            consumer.pc += arg & !GEN_SEND;
+        } else {
+            // `FOR_ITER`: the exhausted generator leaves the stack.
+            drop(v);
+            let it = consumer.stack.pop();
+            consumer.pc += arg;
+            consumer.skip_end_for();
+            drop(it);
+        }
+        sw.cur = cframe;
+        sw.last = if clast == &raw mut sw.scratch {
+            sw.scratch = usize::MAX;
+            &raw mut sw.scratch
+        } else {
+            clast
+        };
+        // The consumer's `QuietEntry::Returned` protocol (`quiet_frame`).
+        // SAFETY: as above.
+        unsafe { *sw.last = call_pc };
+        if self.gil_countdown <= 2 {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
+            return true;
+        }
+        self.gil_countdown -= 1;
+        if crate::hot_gates::loop_gen() != snap_gen {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
+            return true;
+        }
+        // SAFETY: see `quiet_run`.
+        if unsafe { (*sw.maybe_dead).get() } {
+            // SAFETY: as above.
+            unsafe {
+                self.flush_lean(&mut *cframe, &mut *cshell.cast::<QuietShell<'_>>());
+            }
+            if self.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != snap_gen {
+                sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
+            }
+        }
+        true
+    }
+
     /// The core loop's `RETURN_VALUE` of `sw`'s running activation, the
     /// innermost inline one (synced, `pc` at the return): `quiet_run`'s
     /// finish and delivery of an inline activation that never needed its
@@ -17046,15 +17229,17 @@ impl Interpreter {
         let Some(top) = inl.last_mut() else {
             return false;
         };
-        // A generator resume, or an activation whose shell the full
-        // epilogue would act on, finishes through `quiet_run`; so does a
-        // return into a caller whose protocol would yield straight away.
-        if top.gen.is_some()
-            || top
-                .act
-                .shell
-                .as_deref()
-                .is_some_and(|s| !self.shell_pops_quietly(s, top.exc_depth))
+        if top.gen.is_some() {
+            return self.core_gen_return(sw, snap_gen);
+        }
+        // An activation whose shell the full epilogue would act on
+        // finishes through `quiet_run`; so does a return into a caller
+        // whose protocol would yield straight away.
+        if top
+            .act
+            .shell
+            .as_deref()
+            .is_some_and(|s| !self.shell_pops_quietly(s, top.exc_depth))
             || self.gil_countdown <= 2
             || crate::hot_gates::loop_gen() != snap_gen
         {
@@ -51443,7 +51628,18 @@ impl Interpreter {
         // CPython snapshots the *function's* current `__name__` and
         // `__qualname__` (which user code may have reassigned) into
         // `gi_name`/`gi_qualname` at call time, sharing the objects.
-        let (name, qualname) = f.name_objects();
+        let (name, qualname) = match code_vm_ext(code) {
+            Some(ext) if f.names_seeded() => {
+                let (name, qualname) = ext.gen_names.get_or_init(|| {
+                    (
+                        crate::stdlib::sys::intern_name(&code.name),
+                        crate::stdlib::sys::intern_name(&code.qualname),
+                    )
+                });
+                (Some(name.clone()), Some(qualname.clone()))
+            }
+            _ => f.name_objects(),
+        };
         let gen_code = Object::Code(frame.code.clone());
         let gen = Rc::new(PyGenerator::with_names(
             name.unwrap_or_else(|| Object::from_str(f.name.clone())),
@@ -51497,14 +51693,22 @@ impl Interpreter {
         &self,
         f: &PyFunction,
         code: &Rc<CodeObject>,
-        mut positional: Vec<Object>,
+        positional: Vec<Object>,
     ) -> Option<Object> {
+        let start = self.generator_start(f, code, positional.len())?;
+        Some(self.start_generator_at(f, code, positional, start))
+    }
+
+    /// Whether [`Self::start_generator_fast`] makes the generator for a
+    /// call of `f` (its code `code`) with `given` positional arguments:
+    /// the `RETURN_GENERATOR` it starts past, if so.
+    fn generator_start(&self, f: &PyFunction, code: &CodeObject, given: usize) -> Option<usize> {
         let nargs = code.arg_count as usize;
         if !(code.is_generator || code.is_coroutine || code.is_async_generator)
             || code.kwonly_count != 0
             || code.has_varargs
             || code.has_varkeywords
-            || positional.len() > nargs
+            || given > nargs
             || (code.is_coroutine && crate::stdlib::sys::coroutine_origin_tracking_depth() > 0)
             || crate::trace::eval_frame_record_active()
             || crate::trace::any_observers_active()
@@ -51512,19 +51716,29 @@ impl Interpreter {
         {
             return None;
         }
-        let missing = nargs - positional.len();
-        if missing > 0 {
-            if missing > f.defaults.len() || f.defaults_maybe_overridden() {
-                return None;
-            }
-            positional.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
+        let missing = nargs - given;
+        if missing > 0 && (missing > f.defaults.len() || f.defaults_maybe_overridden()) {
+            return None;
         }
         let start = code
             .instructions
             .iter()
             .position(|i| !matches!(i.op, OpCode::MakeCell | OpCode::CopyFreeVars))?;
-        if code.instructions[start].op != OpCode::ReturnGenerator {
-            return None;
+        (code.instructions[start].op == OpCode::ReturnGenerator).then_some(start)
+    }
+
+    /// [`Self::start_generator_fast`] once [`Self::generator_start`] has
+    /// found `start`.
+    fn start_generator_at(
+        &self,
+        f: &PyFunction,
+        code: &Rc<CodeObject>,
+        mut positional: Vec<Object>,
+        start: usize,
+    ) -> Object {
+        let missing = code.arg_count as usize - positional.len();
+        if missing > 0 {
+            positional.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
         }
         let mut frame = self.make_frame(
             code.clone(),
@@ -51534,7 +51748,7 @@ impl Interpreter {
             Some(f.builtins.clone()),
         );
         frame.pc = start as u32 + 1;
-        Some(Self::wrap_started_generator(f, code, frame))
+        Self::wrap_started_generator(f, code, frame)
     }
 
     /// The core loop's `CALL` at `pc` of a generator function (a plain
@@ -51542,7 +51756,7 @@ impl Interpreter {
     /// activation: the generator, made in place (see
     /// [`Self::start_generator_fast`]). `false` touches nothing.
     #[inline(never)]
-    fn core_gen_call(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+    pub(crate) fn core_gen_call(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         let frame = unsafe { &mut *sw.cur };
@@ -51565,20 +51779,35 @@ impl Interpreter {
             _ => return false,
         };
         let code = f.code();
-        if !(code.is_generator || code.is_coroutine || code.is_async_generator) {
-            return false;
-        }
-        let mut positional = Vec::with_capacity(code.varnames.len().max(argc + 1));
-        positional.extend(receiver.cloned());
-        positional.extend(frame.stack[callee_at + 2..].iter().cloned());
-        let Some(gen) = self.start_generator_fast(f, &code, positional) else {
+        let Some(start) = self.generator_start(f, &code, argc + usize::from(receiver.is_some()))
+        else {
             return false;
         };
-        // The operands leave the stack; one that dies queues its finalizer,
-        // which runs before the next instruction.
-        for o in frame.stack.drain(callee_at..).collect::<Vec<_>>() {
-            self.release(o);
-        }
+        // Committed: the arguments move into the generator's frame, and
+        // the callee and its self slot leave the stack (one that dies
+        // queues its finalizer, which runs before the next instruction).
+        let mut positional = self.pooled_scratch();
+        let mut ops = frame.stack.drain(callee_at..);
+        let callee = ops.next().expect("checked above");
+        let slot = ops.next().expect("checked above");
+        let callee_receiver = match &callee {
+            Object::BoundMethod(bm) => Some(bm.receiver.clone()),
+            _ => None,
+        };
+        positional.extend(callee_receiver);
+        positional.extend((!matches!(slot, Object::Unbound)).then_some(slot));
+        positional.extend(ops);
+        let gen = match &callee {
+            Object::Function(f) => self.start_generator_at(f, &code, positional, start),
+            Object::BoundMethod(bm) => {
+                let Object::Function(f) = &bm.function else {
+                    unreachable!("checked above");
+                };
+                self.start_generator_at(f, &code, positional, start)
+            }
+            _ => unreachable!("checked above"),
+        };
+        self.release(callee);
         frame.stack.push(gen);
         frame.pc = pc as u32 + 1;
         // SAFETY: the running activation's last-pc slot.
@@ -60350,6 +60579,21 @@ fn fresh_cells(
     Rc::new(cells)
 }
 
+/// The `SEND` a generator suspended in a `yield from` at `pc` goes back
+/// to: `pc` is the `RESUME` after its `YIELD_VALUE`, followed by the
+/// no-interrupt jump back to the `SEND`.
+#[inline(always)]
+fn yield_from_resend(instrs: &[weavepy_compiler::Instruction], pc: usize) -> Option<usize> {
+    let [resume, jump] = instrs.get(pc..pc + 2)? else {
+        return None;
+    };
+    if resume.op != OpCode::Resume || jump.op != OpCode::JumpBackward {
+        return None;
+    }
+    let target = (pc + 2).checked_sub(jump.arg as usize)?;
+    (instrs.get(target)?.op == OpCode::Send).then_some(target)
+}
+
 /// `v.push(x)` with the room check in line (the call paths push one
 /// activation, slot or result per call, and the out-of-line `push` showed
 /// up in their profiles).
@@ -65635,6 +65879,10 @@ struct CodeConstObjects {
     /// Whether every return is `return None` (see
     /// [`code_returns_only_none`]): `0` not yet decided, `1` no, `2` yes.
     returns_none: std::sync::atomic::AtomicU8,
+    /// The code's name and qualified name as interned strings: a fresh
+    /// generator's `gi_name` and `gi_qualname` while its function's names
+    /// are untouched.
+    gen_names: std::sync::OnceLock<(Object, Object)>,
     /// The code's native form for the core loop (see [`frame_jit`]).
     #[cfg(feature = "jit")]
     frame_jit: frame_jit::Slot,
@@ -67322,6 +67570,7 @@ fn code_vm_ext_build(
             leaf_sites: std::sync::OnceLock::new(),
             leaf_plan: std::sync::OnceLock::new(),
             returns_none: std::sync::atomic::AtomicU8::new(0),
+            gen_names: std::sync::OnceLock::new(),
             #[cfg(feature = "jit")]
             frame_jit: frame_jit::Slot::default(),
         })
