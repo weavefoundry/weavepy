@@ -3247,8 +3247,9 @@ pub struct LeafProbe<'a> {
 }
 
 impl<'a> LeafProbe<'a> {
-    /// `None` unless `key` is a `str`, a machine `int`, or a plain
-    /// instance hashed by identity (its `__hash__` is `object`'s).
+    /// `None` unless `key` is a `str`, a machine `int`, a plain instance
+    /// hashed by identity (its `__hash__` is `object`'s), or a class whose
+    /// metaclass keeps `type`'s `__hash__` and `__eq__`.
     #[inline]
     pub fn new(key: &'a Object) -> Option<Self> {
         let hash = match key {
@@ -3260,6 +3261,7 @@ impl<'a> LeafProbe<'a> {
             {
                 identity_hash(key)
             }
+            Object::Type(t) if type_hash_is_identity(t) => identity_hash(key),
             _ => return None,
         };
         Some(Self {
@@ -3280,6 +3282,17 @@ impl<'a> LeafProbe<'a> {
     }
 }
 
+/// Whether class `t` hashes and compares by identity: its metaclass
+/// keeps `type`'s `__hash__` and `__eq__` (no Python runs for either).
+#[inline]
+pub(crate) fn type_hash_is_identity(t: &crate::types::TypeObject) -> bool {
+    t.c_ext_ptr.get() == 0
+        && t.metaclass.borrow().as_ref().is_none_or(|m| {
+            !m.dunder(crate::types::Dunder::Hash).user_defined()
+                && !m.dunder(crate::types::Dunder::Eq).user_defined()
+        })
+}
+
 impl Hash for LeafProbe<'_> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -3296,6 +3309,7 @@ impl indexmap::Equivalent<DictKey> for LeafProbe<'_> {
             // Identity settles an instance probe (CPython compares keys
             // with `is` first); any other pairing may need `__eq__`.
             (Object::Instance(a), Object::Instance(b)) if Rc::ptr_eq(a, b) => true,
+            (Object::Type(a), Object::Type(b)) if Rc::ptr_eq(a, b) => true,
             _ => {
                 self.foreign.set(true);
                 false

@@ -1228,13 +1228,20 @@ pub(crate) fn itertools_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
 }
 
 /// A builtin adapter type's call (`map`, `filter`, `zip`, `enumerate`,
-/// `reversed`) built without running any code (the core loop's `CALL`):
-/// `None` for every shape that might.
+/// `reversed`), or `type(x)`, built without running any code (the core
+/// loop's `CALL`): `None` for every shape that might.
 pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option<Object> {
     if let Some(ty) = SeqType::of_exact(cls) {
         return Interpreter::seq_new_pure(ty, args);
     }
     let bt = builtin_types();
+    // `type(x)`: the object's class (`b_type`'s one-argument form).
+    if Rc::ptr_eq(cls, &bt.type_) {
+        return match args {
+            [x] => Some(Object::Type(crate::builtins::class_of(x))),
+            _ => None,
+        };
+    }
     let native = |o: &Object| {
         matches!(
             o,

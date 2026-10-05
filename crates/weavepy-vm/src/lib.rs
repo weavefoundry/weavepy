@@ -19072,21 +19072,19 @@ impl Interpreter {
                 _ => None,
             },
             Object::Dict(_) | Object::Set(_) | Object::FrozenSet(_)
-                if matches!(
-                    item,
-                    Object::Str(_) | Object::Int(_) | Object::Bool(_) | Object::None
-                ) =>
+                if Self::leaf_hash_native(item) =>
             {
-                // A `str` or `int` key settles natively (see `LeafProbe`).
-                if let (Object::Dict(d), Some(probe)) =
-                    (container, crate::object::LeafProbe::new(item))
-                {
-                    let m = d.try_borrow().ok()?;
-                    if m.get(&probe).is_some() {
-                        return Some(true);
-                    }
-                    if probe.miss_is_exact() {
-                        return Some(false);
+                // A `str`, `int`, or identity-hashed key settles natively
+                // (see `LeafProbe`).
+                if let Some(probe) = crate::object::LeafProbe::new(item) {
+                    let found = match container {
+                        Object::Dict(d) => d.try_borrow().ok()?.get_index_of(&probe).is_some(),
+                        Object::Set(st) => st.try_borrow().ok()?.get_index_of(&probe).is_some(),
+                        Object::FrozenSet(fs) => fs.get_index_of(&probe).is_some(),
+                        _ => return None,
+                    };
+                    if found || probe.miss_is_exact() {
+                        return Some(found);
                     }
                 }
                 let key = DictKey(item.clone());
@@ -19104,6 +19102,28 @@ impl Interpreter {
                 found.ok().flatten()
             }
             _ => None,
+        }
+    }
+
+    /// Whether hashing `item` runs no Python code: a native scalar, a
+    /// class whose metaclass keeps `type`'s `__hash__` and `__eq__`, or an
+    /// instance hashed by identity. (Equality with a stored key that
+    /// needs Python is the probe's to defer.)
+    #[inline]
+    fn leaf_hash_native(item: &Object) -> bool {
+        match item {
+            Object::Str(_)
+            | Object::Int(_)
+            | Object::Bool(_)
+            | Object::None
+            | Object::Float(_)
+            | Object::Bytes(_) => true,
+            Object::Type(t) => crate::object::type_hash_is_identity(t),
+            Object::Instance(inst) => {
+                inst.native.get().is_none()
+                    && inst.class_dunder(crate::types::Dunder::Hash).object_owner()
+            }
+            _ => false,
         }
     }
 
@@ -20160,7 +20180,7 @@ impl Interpreter {
             K::DictGet => {
                 if !((args.len() == 2 || args.len() == 3)
                     && matches!(args[0], O::Dict(_))
-                    && leaf_key(&args[1]))
+                    && Self::leaf_hash_native(&args[1]))
                 {
                     return None;
                 }
@@ -20203,7 +20223,10 @@ impl Interpreter {
             // dropping an element, or calling Python.
             K::SetPop => args.len() == 1 && matches!(args[0], O::Set(_)),
             K::SetRemove => {
-                if !(args.len() == 2 && matches!(args[0], O::Set(_)) && leaf_key(&args[1])) {
+                if !(args.len() == 2
+                    && matches!(args[0], O::Set(_))
+                    && Self::leaf_hash_native(&args[1]))
+                {
                     return None;
                 }
                 let O::Set(st) = &args[0] else { return None };
@@ -20221,7 +20244,10 @@ impl Interpreter {
                 !deferred && matches!(safe, Ok(Some(true)))
             }
             K::SetAdd | K::SetDiscard => {
-                if !(args.len() == 2 && matches!(args[0], O::Set(_)) && leaf_key(&args[1])) {
+                if !(args.len() == 2
+                    && matches!(args[0], O::Set(_))
+                    && Self::leaf_hash_native(&args[1]))
+                {
                     return None;
                 }
                 // A stored key may need a Python comparison; the set body
