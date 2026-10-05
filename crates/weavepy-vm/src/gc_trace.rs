@@ -2175,7 +2175,7 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
                 }
             }
             // (An unplanted seed holds only the shared name strings.)
-            if let Ok(slots) = f.slots_raw.try_borrow() {
+            if let Some(Ok(slots)) = f.slots_raw.get().map(RefCell::try_borrow) {
                 for (k, v) in slots.iter() {
                     visit(&k.0);
                     visit(v);
@@ -2387,7 +2387,7 @@ pub fn clear_object_fields(obj: &Object) -> bool {
                     attrs.clear();
                 }
             }
-            if let Ok(mut slots) = f.slots_raw.try_borrow_mut() {
+            if let Some(Ok(mut slots)) = f.slots_raw.get().map(RefCell::try_borrow_mut) {
                 slots.clear();
             }
             if let Ok(mut seed) = f.slot_seed.try_borrow_mut() {

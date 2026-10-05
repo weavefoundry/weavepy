@@ -47502,7 +47502,7 @@ impl Interpreter {
             kw_defaults,
             closure,
             attrs: RefCell::new(None),
-            slots_raw: RefCell::new(DictData::default()),
+            slots_raw: crate::sync::OnceBox::new(),
             slot_seed: RefCell::new(None),
             closure_cells: std::sync::OnceLock::new(),
             defaults_override: crate::object::OverrideFlag::new(false),
@@ -65926,6 +65926,41 @@ struct CodeConstObjects {
     /// The code's native form for the core loop (see [`frame_jit`]).
     #[cfg(feature = "jit")]
     frame_jit: frame_jit::Slot,
+    /// Site executions that found the per-instruction tables above
+    /// unallocated, until the code is warm enough to allocate them (see
+    /// [`site_tables_warm`]).
+    cold_sites: std::sync::atomic::AtomicU32,
+}
+
+/// Whether `ext`'s code (of `ninstrs` instructions) may allocate its
+/// per-instruction side tables, after one more site execution found one
+/// unallocated.
+///
+/// Each table holds an entry per instruction, tens of bytes each, while
+/// most code runs only a few times (a function an import calls once or
+/// twice): allocating the tables at a site's first run cost a small
+/// program's start-up about 1.5 MB. So the tables wait until the code's
+/// sites have run about as many times as it has instructions (two or
+/// three passes over a typical body, or a few iterations of a loop), and
+/// until then a site runs without its cache, as its first run does
+/// anyway. The slower cold runs cost start-up under 1% in instructions.
+#[cold]
+#[inline(never)]
+fn site_tables_warm(ext: &CodeConstObjects, ninstrs: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    // (A racing thread losing a count is harmless.)
+    let n = ext.cold_sites.load(Relaxed).saturating_add(1);
+    ext.cold_sites.store(n, Relaxed);
+    n as usize >= ninstrs
+}
+
+/// Let `code`'s side tables be allocated from now on (see
+/// [`site_tables_warm`]): the code is hot.
+pub(crate) fn mark_site_tables_warm(code: &CodeObject) {
+    if let Some(ext) = code_vm_ext_existing(code) {
+        ext.cold_sites
+            .store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// A `CALL` site's inline-call shape (see `Interpreter::core_call`): the
@@ -66069,13 +66104,15 @@ fn builtin_recv_tag(recv: &Object) -> Option<u64> {
 #[inline]
 fn code_call_slot(code: &CodeObject, pc: usize) -> Option<&CallSlot> {
     let ext = code_vm_ext(code)?;
-    ext.call_slots
-        .get_or_init(|| {
-            (0..code.instructions.len())
-                .map(|_| CallSlot::empty())
-                .collect()
-        })
-        .get(pc)
+    let n = code.instructions.len();
+    match ext.call_slots.get() {
+        Some(slots) => slots,
+        None if site_tables_warm(ext, n) => ext
+            .call_slots
+            .get_or_init(|| (0..n).map(|_| CallSlot::empty()).collect()),
+        None => return None,
+    }
+    .get(pc)
 }
 
 /// A `LOAD_ATTR` site's polymorphic instance-attribute cache: up to
@@ -66135,13 +66172,15 @@ impl AttrPoly {
 #[inline]
 fn code_attr_poly(code: &CodeObject, cache_pc: u32) -> Option<&AttrPoly> {
     let ext = code_vm_ext(code)?;
-    ext.attr_poly
-        .get_or_init(|| {
-            (0..code.instructions.len())
-                .map(|_| AttrPoly::empty())
-                .collect()
-        })
-        .get(cache_pc as usize)
+    let n = code.instructions.len();
+    match ext.attr_poly.get() {
+        Some(slots) => slots,
+        None if site_tables_warm(ext, n) => ext
+            .attr_poly
+            .get_or_init(|| (0..n).map(|_| AttrPoly::empty()).collect()),
+        None => return None,
+    }
+    .get(cache_pc as usize)
 }
 
 /// The state a `LOAD_GLOBAL` site last proved its cached slot against:
@@ -66365,7 +66404,7 @@ pub(crate) fn method_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
 /// Record (or, with `data` `None`, forget) the site at `pc`'s callee.
 #[inline(never)]
 fn leaf_site_set(ext: &CodeConstObjects, ninstrs: usize, pc: usize, data: Option<LeafSiteData>) {
-    if data.is_none() && ext.leaf_sites.get().is_none() {
+    if ext.leaf_sites.get().is_none() && (data.is_none() || !site_tables_warm(ext, ninstrs)) {
         return;
     }
     let sites = ext
@@ -66417,6 +66456,9 @@ unsafe fn field_slot_hit<'a>(
 fn field_slot_note(ext: &CodeConstObjects, ninstrs: usize, pc: usize, inst: &PyInstance, idx: u32) {
     // SAFETY: a read with nothing running (the caller's own guarded read).
     if unsafe { inst.split_field(idx as usize) }.is_none() {
+        return;
+    }
+    if ext.field_slots.get().is_none() && !site_tables_warm(ext, ninstrs) {
         return;
     }
     let slots = ext
@@ -66540,13 +66582,15 @@ fn drop_hot(v: Object) {
 #[inline]
 fn code_stamp_slot(code: &CodeObject, cache_pc: u32) -> Option<&StampSlot> {
     let ext = code_vm_ext(code)?;
-    ext.stamp_slots
-        .get_or_init(|| {
-            (0..code.instructions.len())
-                .map(|_| StampSlot::empty())
-                .collect()
-        })
-        .get(cache_pc as usize)
+    let n = code.instructions.len();
+    match ext.stamp_slots.get() {
+        Some(slots) => slots,
+        None if site_tables_warm(ext, n) => ext
+            .stamp_slots
+            .get_or_init(|| (0..n).map(|_| StampSlot::empty()).collect()),
+        None => return None,
+    }
+    .get(cache_pc as usize)
 }
 
 /// Tags of a `LOAD_ATTR` site's class-attribute stamp (`[attr_version,
@@ -67098,13 +67142,15 @@ impl MethodSlot {
 #[inline]
 fn code_method_slot(code: &CodeObject, cache_pc: u32) -> Option<&MethodSlot> {
     let ext = code_vm_ext(code)?;
-    ext.method_slots
-        .get_or_init(|| {
-            (0..code.instructions.len())
-                .map(|_| MethodSlot::empty())
-                .collect()
-        })
-        .get(cache_pc as usize)
+    let n = code.instructions.len();
+    match ext.method_slots.get() {
+        Some(slots) => slots,
+        None if site_tables_warm(ext, n) => ext
+            .method_slots
+            .get_or_init(|| (0..n).map(|_| MethodSlot::empty()).collect()),
+        None => return None,
+    }
+    .get(cache_pc as usize)
 }
 
 /// The plain function class `cls` (at attribute version `ver`) resolves
@@ -67609,6 +67655,7 @@ fn code_vm_ext_build(
             gen_names: std::sync::OnceLock::new(),
             #[cfg(feature = "jit")]
             frame_jit: frame_jit::Slot::default(),
+            cold_sites: std::sync::atomic::AtomicU32::new(0),
         })
     })
 }
@@ -67702,7 +67749,7 @@ fn new_function(
         kw_defaults,
         closure,
         attrs: RefCell::new(None),
-        slots_raw: RefCell::new(DictData::default()),
+        slots_raw: crate::sync::OnceBox::new(),
         slot_seed: RefCell::new(Some(crate::object::LazySlots(module))),
         closure_cells: std::sync::OnceLock::new(),
         defaults_override: crate::object::OverrideFlag::new(false),

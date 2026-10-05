@@ -168,6 +168,21 @@ fn main() {
         writeln!(index, "    ({}, {}, {row}),", blob.len(), name.len()).unwrap();
         blob.push_str(name);
     }
+    // Each row's source hash, so the frozen code cache can validate an
+    // artifact without reading (and paging in) the module's source text.
+    let mut hashes = String::new();
+    for source in frozen_sources::frozen_sources() {
+        let h = frozen_sources::source_hash(source.source);
+        writeln!(
+            hashes,
+            "    0x{:04x}_{:04x}_{:04x}_{:04x},",
+            h >> 48,
+            (h >> 32) & 0xffff,
+            (h >> 16) & 0xffff,
+            h & 0xffff,
+        )
+        .unwrap();
+    }
     std::fs::write(
         out_dir.join("frozen_index.rs"),
         format!(
@@ -175,8 +190,11 @@ fn main() {
              pub(crate) static FROZEN_NAMES: &str = {blob:?};\n\
              /// `(offset, length)` of each name in [`FROZEN_NAMES`], in order,\n\
              /// with its row in `frozen_sources()`.\n\
-             pub(crate) static FROZEN_INDEX: [(u32, u16, u16); {}] = [\n{index}];\n",
-            names.len()
+             pub(crate) static FROZEN_INDEX: [(u32, u16, u16); {}] = [\n{index}];\n\
+             /// `source_hash` of each row's source, by row.\n\
+             pub(crate) static FROZEN_HASHES: [u64; {}] = [\n{hashes}];\n",
+            names.len(),
+            frozen_sources::frozen_sources().len()
         ),
     )
     .expect("write frozen_index.rs");

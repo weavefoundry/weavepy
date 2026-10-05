@@ -16,13 +16,24 @@ CPython's: a mismatch is reported as a failure.
 ``/usr/bin/time -l``) for a process doing 1 and 1 + REPS calls, and reports
 the per-call difference, which cancels startup and import work and is
 stable on a loaded machine.
+
+Each interpreter gets a frozen code cache of its own under
+``target/pybench-frozen/``, filled by one untimed warm-up run per
+benchmark. WeavePy's per-user cache is shared by every build, and with
+``PYTHONDONTWRITEBYTECODE`` set (as agent shells do) a build whose embedded
+stdlib differs from the one that last wrote a module compiles that module
+from source on every run, which inflates its time and memory. The warm-up
+also leaves no benchmark ``.pyc`` behind: one written by another build
+could carry different code under the same cache tag.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -30,6 +41,33 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 BENCH_DIR = os.path.join(HERE, "benchmarks")
 HARNESS = os.path.join(HERE, "harness.py")
+FROZEN_ROOT = os.path.join(os.path.dirname(os.path.dirname(HERE)), "target", "pybench-frozen")
+
+
+def interp_env(interp, write=False):
+    """The environment for a run of `interp`: its own frozen code cache
+    (see the module docs), written only when `write` is set."""
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    path = os.path.realpath(shutil.which(interp) or interp)
+    key = hashlib.sha1(path.encode()).hexdigest()[:16]
+    env["WEAVEPY_FROZEN_CACHE"] = os.path.join(FROZEN_ROOT, key)
+    if write:
+        env.pop("PYTHONDONTWRITEBYTECODE", None)
+    else:
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+def warm(interp, name, timeout):
+    """Fill `interp`'s frozen code cache with what benchmark `name`
+    imports, then drop the benchmark pycs the run wrote."""
+    try:
+        subprocess.run([interp, HARNESS, name, "1", "0"], capture_output=True,
+                       timeout=timeout, env=interp_env(interp, write=True))
+    except subprocess.TimeoutExpired:
+        pass
+    shutil.rmtree(os.path.join(BENCH_DIR, "__pycache__"), ignore_errors=True)
 
 
 def discover():
@@ -47,11 +85,9 @@ def work_for(name):
 
 
 def run_once(interp, name, work, reps, timeout):
-    env = dict(os.environ)
-    env.pop("PYTHONPATH", None)
     proc = subprocess.run(
         [interp, HARNESS, name, str(work), str(reps)],
-        capture_output=True, text=True, timeout=timeout, env=env,
+        capture_output=True, text=True, timeout=timeout, env=interp_env(interp),
     )
     if proc.returncode != 0:
         return {"error": (proc.stderr or proc.stdout).strip().splitlines()[-1:] or ["exit %d" % proc.returncode]}
@@ -63,7 +99,7 @@ def instructions(interp, name, work, reps, timeout):
     def count(r):
         proc = subprocess.run(
             ["/usr/bin/time", "-l", interp, HARNESS, name, str(work), str(r)],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, timeout=timeout, env=interp_env(interp),
         )
         m = re.search(r"(\d+)\s+instructions retired", proc.stderr)
         if proc.returncode != 0 or not m:
@@ -108,6 +144,8 @@ def main():
     rows = []
     for name in names:
         work = work_for(name)
+        for _, interp in interps:
+            warm(interp, name, args.timeout)
         if args.instructions:
             row = {"name": name}
             for label, interp in interps:

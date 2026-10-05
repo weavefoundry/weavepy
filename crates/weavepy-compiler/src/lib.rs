@@ -512,8 +512,9 @@ pub struct CodeObject {
     /// `RuntimeError::PyException` propagates through this code object.
     pub exception_table: Vec<ExcHandler>,
     /// Source line number (1-based) per emitted instruction. Same length
-    /// as `instructions`. Used for traceback rendering.
-    pub linetable: Vec<u32>,
+    /// as `instructions`. Used for traceback rendering. Decoded from the
+    /// code cache on first use (see [`LineTable`]).
+    pub linetable: LineTable,
     /// PEP-657 fine-grained column spans, one per instruction (same length
     /// as `instructions` once emission finishes). Drives the column fields
     /// of `co_positions()`. Empty when never populated (e.g. code objects
@@ -702,6 +703,75 @@ impl PartialEq for ColTable {
 }
 
 impl std::fmt::Debug for ColTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+/// A code object's line numbers (see [`CodeObject::linetable`]): a vector,
+/// or the code cache's encoding of one (a byte per instruction, mostly),
+/// decoded on first use. Most code never reports a line (tracebacks,
+/// tracing, `f_lineno` and the JIT's statement boundaries read them), so
+/// a module loaded from the cache keeps the compact form until something
+/// does, instead of four bytes per instruction.
+#[derive(Clone, Default)]
+pub struct LineTable {
+    lines: std::sync::OnceLock<Vec<u32>>,
+    encoded: Option<std::sync::Arc<[u8]>>,
+}
+
+impl LineTable {
+    /// The lines `encoded` holds in the code cache's form (see
+    /// `native_code`), decoded when first read.
+    pub(crate) fn encoded(encoded: std::sync::Arc<[u8]>) -> Self {
+        LineTable {
+            lines: std::sync::OnceLock::new(),
+            encoded: Some(encoded),
+        }
+    }
+
+    fn lines(&self) -> &Vec<u32> {
+        self.lines.get_or_init(|| {
+            self.encoded
+                .as_deref()
+                .and_then(native_code::decode_linetable)
+                .unwrap_or_default()
+        })
+    }
+}
+
+impl From<Vec<u32>> for LineTable {
+    fn from(lines: Vec<u32>) -> Self {
+        LineTable {
+            lines: std::sync::OnceLock::from(lines),
+            encoded: None,
+        }
+    }
+}
+
+impl std::ops::Deref for LineTable {
+    type Target = Vec<u32>;
+
+    fn deref(&self) -> &Vec<u32> {
+        self.lines()
+    }
+}
+
+impl std::ops::DerefMut for LineTable {
+    fn deref_mut(&mut self) -> &mut Vec<u32> {
+        self.lines();
+        self.encoded = None;
+        self.lines.get_mut().expect("decoded above")
+    }
+}
+
+impl PartialEq for LineTable {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl std::fmt::Debug for LineTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         (**self).fmt(f)
     }

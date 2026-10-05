@@ -10,7 +10,7 @@
 //! so going through them would put every allocation on that path.
 
 use std::alloc::{GlobalAlloc, Layout};
-use std::ffi::c_void;
+use std::ffi::{c_int, c_long, c_void};
 
 use libmimalloc_sys::{
     mi_free, mi_malloc, mi_malloc_aligned, mi_realloc, mi_realloc_aligned, mi_zalloc,
@@ -76,6 +76,39 @@ unsafe impl GlobalAlloc for Mimalloc {
             } else {
                 mi_realloc_aligned(ptr.cast::<c_void>(), new_size, layout.align()).cast()
             }
+        }
+    }
+}
+
+extern "C" {
+    fn mi_option_set(option: c_int, value: c_long);
+}
+
+/// mimalloc 3's `mi_option_arena_reserve` (its position in `mi_option_t`).
+const MI_OPTION_ARENA_RESERVE: c_int = 23;
+
+/// The size of each arena mimalloc reserves, in KiB, unless the
+/// environment sets `MIMALLOC_ARENA_RESERVE`.
+///
+/// mimalloc's default reserves one 1 GiB arena, and in an arena that
+/// large the pages it hands out after a burst of frees are often fresh
+/// ones rather than the ones just freed, which stay resident: a program
+/// that repeatedly builds and drops a large structure peaked about 9 MB
+/// higher (the generator tree benchmark, 46 MB against 37 MB). Arenas of
+/// 64 MiB keep reuse tight. (Later arenas still grow geometrically, so a
+/// large heap doesn't need many.)
+const ARENA_RESERVE_KIB: c_long = 64 * 1024;
+
+/// Configure the allocator before its first allocation (mimalloc reads an
+/// option when it first needs it; the first arena is reserved by the first
+/// allocation). Runs from the executable's initializer list, before
+/// `main`, so it must not allocate.
+pub extern "C" fn configure() {
+    // SAFETY: `getenv` with a NUL-terminated name; no other thread runs
+    // yet. `mi_option_set` only stores the value.
+    unsafe {
+        if libc::getenv(c"MIMALLOC_ARENA_RESERVE".as_ptr()).is_null() {
+            mi_option_set(MI_OPTION_ARENA_RESERVE, ARENA_RESERVE_KIB);
         }
     }
 }

@@ -5,14 +5,33 @@
 //! its stack while it lives, so at exit the table estimates the *live* heap
 //! by allocation site. With `WEAVEPY_ALLOC_PROFILE=<file>` set, the live
 //! samples are written to `<file>`: one line per sample, the charged bytes
-//! then the slide-adjusted return addresses (resolve them with `atos`).
+//! (the interval, or the block size when that is larger),
+//! the block's own size (`s<bytes>`), then the slide-adjusted return
+//! addresses (resolve them with `atos`).
+//! `WEAVEPY_ALLOC_SAMPLE=<bytes>` changes the sampling interval, and the
+//! file's first line (starting `#`) gives the exact live and peak heap
+//! totals, which tell transient allocations apart from retained ones.
+//! `<file>.peak` holds the samples live when the heap last grew past a
+//! new high-water mark (within about 6% of the peak), in the same form.
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// Bytes between samples.
+/// Default bytes between samples.
 const SAMPLE: usize = 16 * 1024;
+
+/// Bytes between samples (`WEAVEPY_ALLOC_SAMPLE`, else [`SAMPLE`]).
+static INTERVAL: AtomicUsize = AtomicUsize::new(SAMPLE);
+/// Exact bytes currently allocated, and the most ever allocated at once.
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+/// The live total past which the next peak snapshot is taken.
+static SNAP_AT: AtomicUsize = AtomicUsize::new(1 << 20);
+/// The peak snapshot: a mapping of `SLOTS` samples, and how many it holds.
+static SNAP: AtomicUsize = AtomicUsize::new(0);
+static SNAP_LEN: AtomicUsize = AtomicUsize::new(0);
+static SNAP_LIVE: AtomicUsize = AtomicUsize::new(0);
 /// Return addresses kept per sample.
 const DEPTH: usize = 24;
 /// Sampled blocks tracked at once (open addressing, power of two).
@@ -20,6 +39,8 @@ const SLOTS: usize = 1 << 18;
 
 struct Sample {
     ptr: usize,
+    /// The sampled block's own size.
+    size: usize,
     stack: [usize; DEPTH],
 }
 
@@ -30,6 +51,7 @@ static TABLE: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
     static IN_HOOK: Cell<bool> = const { Cell::new(false) };
     static UNTIL_SAMPLE: Cell<usize> = const { Cell::new(SAMPLE) };
+    static RNG: Cell<u64> = const { Cell::new(0x9E37_79B9_7F4A_7C15) };
 }
 
 extern "C" {
@@ -62,8 +84,26 @@ pub(crate) fn start() {
     if std::env::var_os("WEAVEPY_ALLOC_PROFILE").is_none() {
         return;
     }
+    if let Some(n) = std::env::var("WEAVEPY_ALLOC_SAMPLE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        INTERVAL.store(n, Ordering::Relaxed);
+    }
+    let (Some(p), Some(snap)) = (map_samples(), map_samples()) else {
+        return;
+    };
+    SNAP.store(snap, Ordering::Release);
+    TABLE.store(p, Ordering::Release);
+    ENABLED.store(true, Ordering::Release);
+}
+
+/// A fresh zeroed mapping of `SLOTS` samples, owned for the rest of the
+/// process.
+fn map_samples() -> Option<usize> {
     let bytes = SLOTS * std::mem::size_of::<Sample>();
-    // SAFETY: a fresh zeroed mapping owned for the rest of the process.
+    // SAFETY: an anonymous private mapping; nothing else aliases it.
     let p = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -74,14 +114,32 @@ pub(crate) fn start() {
             0,
         )
     };
-    if p == libc::MAP_FAILED {
-        return;
-    }
-    TABLE.store(p as usize, Ordering::Release);
-    ENABLED.store(true, Ordering::Release);
+    (p != libc::MAP_FAILED).then_some(p as usize)
 }
 
-fn record(ptr: usize) {
+/// Copy the live samples into the peak snapshot.
+fn snapshot(live: usize) {
+    let (t, snap) = (table(), SNAP.load(Ordering::Acquire) as *mut Sample);
+    lock();
+    let mut n = 0;
+    for i in 0..SLOTS {
+        // SAFETY: `i < SLOTS` and `n <= i`, inside both mappings.
+        let s = unsafe { &*t.add(i) };
+        if s.ptr != 0 && s.ptr != usize::MAX {
+            unsafe {
+                (*snap.add(n)).ptr = s.ptr;
+                (*snap.add(n)).size = s.size;
+                (*snap.add(n)).stack = s.stack;
+            }
+            n += 1;
+        }
+    }
+    SNAP_LEN.store(n, Ordering::Relaxed);
+    SNAP_LIVE.store(live, Ordering::Relaxed);
+    unlock();
+}
+
+fn record(ptr: usize, size: usize) {
     let mut stack = [0usize; DEPTH];
     // SAFETY: `backtrace` fills at most `DEPTH` entries of the buffer.
     let n = unsafe { libc::backtrace(stack.as_mut_ptr().cast(), DEPTH as libc::c_int) };
@@ -92,8 +150,11 @@ fn record(ptr: usize) {
     for _ in 0..SLOTS {
         // SAFETY: `i < SLOTS`, inside the mapping.
         let s = unsafe { &mut *t.add(i) };
-        if s.ptr == 0 || s.ptr == ptr {
+        // A fresh block's address was forgotten when it was last freed, so
+        // a tombstone can take it (a long run would fill the table otherwise).
+        if s.ptr == 0 || s.ptr == ptr || s.ptr == usize::MAX {
             s.ptr = ptr;
+            s.size = size;
             s.stack = stack;
             break;
         }
@@ -132,6 +193,7 @@ unsafe impl GlobalAlloc for Profiled {
         // SAFETY: forwarded unchanged.
         let p = unsafe { crate::alloc::Mimalloc.alloc(layout) };
         if ENABLED.load(Ordering::Relaxed) && !p.is_null() {
+            grow(layout.size());
             sample(p as usize, layout.size());
         }
         p
@@ -139,6 +201,7 @@ unsafe impl GlobalAlloc for Profiled {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if ENABLED.load(Ordering::Relaxed) {
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
             forget(ptr as usize);
         }
         // SAFETY: forwarded unchanged.
@@ -147,14 +210,33 @@ unsafe impl GlobalAlloc for Profiled {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if ENABLED.load(Ordering::Relaxed) {
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
             forget(ptr as usize);
         }
         // SAFETY: forwarded unchanged.
         let p = unsafe { crate::alloc::Mimalloc.realloc(ptr, layout, new_size) };
         if ENABLED.load(Ordering::Relaxed) && !p.is_null() {
+            grow(new_size);
             sample(p as usize, new_size);
         }
         p
+    }
+}
+
+/// Count `size` more live bytes (blocks allocated before [`start`] are
+/// never counted, so their frees may briefly wrap the counter below zero).
+fn grow(size: usize) {
+    let live = LIVE.fetch_add(size, Ordering::Relaxed).wrapping_add(size);
+    if live < usize::MAX / 2 && live > PEAK.load(Ordering::Relaxed) {
+        PEAK.fetch_max(live, Ordering::Relaxed);
+        let at = SNAP_AT.load(Ordering::Relaxed);
+        if live > at
+            && SNAP_AT
+                .compare_exchange(at, live + live / 16, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            snapshot(live);
+        }
     }
 }
 
@@ -166,7 +248,19 @@ fn sample(ptr: usize, size: usize) {
         let due = UNTIL_SAMPLE.with(|left| {
             let l = left.get();
             if size >= l {
-                left.set(SAMPLE);
+                // A uniformly random gap with the interval as its mean: a
+                // fixed gap aliases with a loop that allocates the same
+                // bytes per iteration, charging one site for all of them.
+                let r = RNG.with(|rng| {
+                    let mut x = rng.get();
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    rng.set(x);
+                    x
+                });
+                let interval = INTERVAL.load(Ordering::Relaxed);
+                left.set(1 + (r as usize) % (2 * interval));
                 true
             } else {
                 left.set(l - size);
@@ -175,7 +269,7 @@ fn sample(ptr: usize, size: usize) {
         });
         if due {
             hook.set(true);
-            record(ptr);
+            record(ptr, size);
             hook.set(false);
         }
     });
@@ -189,23 +283,46 @@ pub(crate) fn finish() {
     if !ENABLED.swap(false, Ordering::AcqRel) {
         return;
     }
-    let t = table();
+    let header = format!(
+        "# live {} peak {}\n",
+        LIVE.load(Ordering::Relaxed) as isize,
+        PEAK.load(Ordering::Relaxed)
+    );
+    lock();
+    let out = render(header, table(), SLOTS);
+    unlock();
+    let _ = std::fs::write(&path, out);
+    let header = format!("# snapshot live {}\n", SNAP_LIVE.load(Ordering::Relaxed));
+    let snap = render(
+        header,
+        SNAP.load(Ordering::Acquire) as *mut Sample,
+        SNAP_LEN.load(Ordering::Relaxed),
+    );
+    let mut peak_path = path;
+    peak_path.push(".peak");
+    let _ = std::fs::write(peak_path, snap);
+}
+
+/// The occupied samples among the first `n` of `t`, one line each after
+/// `header`.
+fn render(header: String, t: *mut Sample, n: usize) -> String {
     // SAFETY: the main executable is image 0.
     let slide = unsafe { _dyld_get_image_vmaddr_slide(0) } as usize;
-    let mut out = String::new();
-    lock();
-    for i in 0..SLOTS {
-        // SAFETY: `i < SLOTS`.
+    let interval = INTERVAL.load(Ordering::Relaxed);
+    let mut out = header;
+    for i in 0..n {
+        // SAFETY: `i < n <= SLOTS`.
         let s = unsafe { &*t.add(i) };
         if s.ptr == 0 || s.ptr == usize::MAX {
             continue;
         }
-        out.push_str(&SAMPLE.to_string());
+        // A block larger than the mean gap is (nearly) always sampled:
+        // charge its own size.
+        out.push_str(&format!("{} s{}", interval.max(s.size), s.size));
         for &a in s.stack.iter().take_while(|a| **a != 0) {
             out.push_str(&format!(" {:x}", a.wrapping_sub(slide)));
         }
         out.push('\n');
     }
-    unlock();
-    let _ = std::fs::write(path, out);
+    out
 }

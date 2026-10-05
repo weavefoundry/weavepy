@@ -408,6 +408,10 @@ struct DirectEntry {
 /// outgrew a tuple): the native frame plus the guard snapshots and
 /// resolution tables its entries validate against.
 struct Artifacts {
+    /// The compiled code object. A compiled entry pins its code (the
+    /// native callers that hold these artifacts read it); an entry that
+    /// never compiled holds only a weak handle (see [`CacheEntry::code`]).
+    code: Rc<CodeObject>,
     cf: StdRc<CompiledFrame>,
     /// A plan for a callback-free bound update, owned by this compilation.
     /// Other code adds no allocation and keeps ordinary native dispatch.
@@ -507,11 +511,65 @@ struct CacheEntry {
     /// stamp; `Some((g, None))` memoizes *ineligibility* so a hot
     /// never-eligible callee costs one lookup, not a shape re-check.
     direct: Option<(u64, Option<StdRc<DirectEntry>>)>,
-    /// Keeps the code object alive so its address can't be reused while
-    /// this entry (and any compiled pointer keyed by it) is live. Also
-    /// read by [`evict_dead_entries`]: strong_count == 1 means the JIT
-    /// is the sole owner and the entry is evictable.
-    code: Rc<CodeObject>,
+    /// Keeps the code object's allocation reserved, so its address can't
+    /// be reused while this entry is keyed by it, without keeping the code
+    /// itself alive: every code object that runs gets an entry, and most
+    /// never compile (a module body runs once), so a strong handle kept
+    /// each one's instructions, constants, and side tables for the rest
+    /// of the process. A compiled entry's [`Artifacts::code`] pins it. A
+    /// dead code's entry is dropped by the next sweep (see
+    /// [`cache_entry`] and [`gc_sweep`]).
+    code: crate::sync::Weak<CodeObject>,
+}
+
+impl CacheEntry {
+    fn new(code: &Rc<CodeObject>) -> CacheEntry {
+        CacheEntry {
+            counter: 0,
+            tier: Tier::Cold,
+            defer_osr: false,
+            osr_failures: 0,
+            deopts: 0,
+            native_entries: 0,
+            generic_dyn_calls: 0,
+            probe_misses: Vec::new(),
+            recompile_at_osr: false,
+            cold_recompiles: 0,
+            native: None,
+            method_native: None,
+            direct: None,
+            code: Rc::downgrade(code),
+        }
+    }
+
+    /// Whether nothing but this thread's tier cache keeps the entry's code
+    /// alive: it is dead, or only the entry's own compiled artifacts hold it.
+    fn code_unowned(&self) -> bool {
+        match &self.tier {
+            Tier::Compiled(a) => Rc::strong_count(&a.code) == 1,
+            _ => self.code.strong_count() == 0,
+        }
+    }
+}
+
+/// The fewest tier-cache entries that trigger a sweep of dead ones.
+const CACHE_SWEEP_MIN: usize = 1024;
+
+/// The tier-cache entry for `code` in `cache`, made on its first use. A
+/// cache that has grown to `sweep_at` entries first drops those of code
+/// objects that have died (see [`JitState::sweep_at`]).
+fn cache_entry<'a>(
+    cache: &'a mut CodeMap<CacheEntry>,
+    sweep_at: &mut usize,
+    code: &Rc<CodeObject>,
+) -> &'a mut CacheEntry {
+    if cache.len() >= *sweep_at {
+        cache.retain(|_, e| e.code.strong_count() != 0);
+        *sweep_at = (cache.len() * 2).max(CACHE_SWEEP_MIN);
+    }
+    cache
+        .entry(Rc::as_ptr(code).cast::<CodeObject>())
+        .or_insert_with(|| CacheEntry::new(code))
 }
 
 /// Give up on OSR for a code object after this many failed validations.
@@ -669,6 +727,10 @@ struct JitState {
     range_budget: bool,
     engine: Option<JitEngine>,
     cache: CodeMap<CacheEntry>,
+    /// The cache size at which [`cache_entry`] next sweeps out the
+    /// entries of dead code objects (twice the live count the last sweep
+    /// left, so sweeping stays amortized constant time per entry).
+    sweep_at: usize,
     stats: JitStats,
     /// RFC 0067 WS1 — bumped on every successful compile; stale
     /// native-callee tables (stamped with an older generation) are
@@ -1033,6 +1095,7 @@ impl JitState {
             range_budget: explicit_threshold.is_none(),
             engine: None,
             cache: CodeMap::default(),
+            sweep_at: CACHE_SWEEP_MIN,
             stats: JitStats::default(),
             compile_gen: 0,
         }
@@ -1050,22 +1113,7 @@ impl JitState {
     ) -> Option<CompiledEntry> {
         let key = Rc::as_ptr(code).cast::<CodeObject>();
         {
-            let entry = self.cache.entry(key).or_insert_with(|| CacheEntry {
-                counter: 0,
-                tier: Tier::Cold,
-                defer_osr: false,
-                osr_failures: 0,
-                deopts: 0,
-                native_entries: 0,
-                generic_dyn_calls: 0,
-                probe_misses: Vec::new(),
-                recompile_at_osr: false,
-                cold_recompiles: 0,
-                native: None,
-                method_native: None,
-                direct: None,
-                code: code.clone(),
-            });
+            let entry = cache_entry(&mut self.cache, &mut self.sweep_at, code);
             if entry_pc == 0 {
                 // Backedge heat survives: repeated calls can amortize the
                 // compile even when an individual activation is short.
@@ -1123,6 +1171,10 @@ impl JitState {
                     {
                         return None;
                     }
+                    // Hot code keeps its inline-cache tables from here on,
+                    // whatever the verdict (the compiled form's interpreter
+                    // round trips and every later deopt use them).
+                    super::mark_site_tables_warm(code);
                     // RFC 0073 WS1 — a probe-miss rejection is
                     // *environmental* (a receiver local was unbound in
                     // the activation that triggered the compile), so
@@ -1545,6 +1597,7 @@ impl JitState {
                         })
                         .collect();
                     let artifacts = StdRc::new(Artifacts {
+                        code: code.clone(),
                         cf: StdRc::new(cf),
                         scalar_update,
                         snap: StdRc::new(GuardSnapshot::new(snap, burned_defaults, callees.len())),
@@ -1722,7 +1775,7 @@ impl JitState {
             let Tier::Compiled(a) = &ce.tier else {
                 return None;
             };
-            (a.clone(), ce.code.clone())
+            (a.clone(), a.code.clone())
         };
         let method_shape = if native_callable(&art.cf, &code) {
             Some(false)
@@ -1819,23 +1872,7 @@ impl JitState {
         if !self.enabled {
             return false;
         }
-        let key = Rc::as_ptr(code).cast::<CodeObject>();
-        let entry = self.cache.entry(key).or_insert_with(|| CacheEntry {
-            counter: 0,
-            tier: Tier::Cold,
-            defer_osr: false,
-            osr_failures: 0,
-            deopts: 0,
-            native_entries: 0,
-            generic_dyn_calls: 0,
-            probe_misses: Vec::new(),
-            recompile_at_osr: false,
-            cold_recompiles: 0,
-            native: None,
-            method_native: None,
-            direct: None,
-            code: code.clone(),
-        });
+        let entry = cache_entry(&mut self.cache, &mut self.sweep_at, code);
         match entry.tier {
             Tier::Cold => {
                 if entry.defer_osr {
@@ -2471,8 +2508,12 @@ const RUNTIME_PIN_CAP: usize = 1 << 16;
 
 /// Request reconstruction at the next loop poll after this many new pins.
 /// The hard cap still bounds allocations between polls. This counts handles,
-/// not bytes, and a polling stride can overshoot the soft limit.
-const RUNTIME_PIN_SOFT_LIMIT: usize = 1 << 12;
+/// not bytes, and a polling stride can overshoot the soft limit. A pin can
+/// hold a whole structure (each `copy.deepcopy` result of a loop), so the
+/// limit is kept low: at 4096 the deepcopy benchmark kept about 17 MB of
+/// dead copies alive, and a pressure exit every few hundred pins costs
+/// nothing measurable.
+const RUNTIME_PIN_SOFT_LIMIT: usize = 1 << 9;
 
 /// Retire every pin after the activation's result or complete interpreter
 /// state has been reconstructed. A pin that held an object's last
@@ -3530,12 +3571,12 @@ fn attr_fingerprint_obj(
     Some((lane, ver, storage))
 }
 
-/// Drop tier-cache entries whose code object the JIT is the sole real
-/// owner of, then discard return-lane entries whose weak code is dead. The cache
-/// pins code objects so pointer keys stay valid, which would otherwise
-/// make every executed code object immortal (observable through
-/// `weakref` on `__code__`). Called from `gc.collect()`. Eviction is
-/// always safe: a live code object re-enters the cache through the
+/// Drop tier-cache entries whose code object is dead or kept alive only
+/// by the entry's own compiled artifacts, then discard return-lane
+/// entries whose weak code is dead. A compiled entry pins its code, which
+/// would otherwise make every compiled code object immortal (observable
+/// through `weakref` on `__code__`). Called from `gc.collect()`. Eviction
+/// is always safe: a live code object re-enters the cache through the
 /// normal hot path. Runs to a fixpoint because an evicted entry can
 /// release the last strong reference to another cached code object
 /// (e.g. a nested function's code held via `co_consts`).
@@ -3547,7 +3588,7 @@ pub(crate) fn gc_sweep() {
             let dead: Vec<*const CodeObject> = st
                 .cache
                 .iter()
-                .filter(|(_, e)| Rc::strong_count(&e.code) == 1)
+                .filter(|(_, e)| e.code_unowned())
                 .map(|(k, _)| *k)
                 .collect();
             for k in dead {
@@ -3610,7 +3651,6 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
         if !st.enabled {
             return;
         }
-        let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
         let threshold = st.threshold;
         // Embedders that never report start-up finished still compile,
         // after sustained work. Both budgets here must match
@@ -3623,22 +3663,8 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
         } else {
             threshold.saturating_mul(IMPORT_THRESHOLD_FACTOR)
         };
-        let entry = st.cache.entry(key).or_insert_with(|| CacheEntry {
-            counter: 0,
-            tier: Tier::Cold,
-            defer_osr: false,
-            osr_failures: 0,
-            deopts: 0,
-            native_entries: 0,
-            generic_dyn_calls: 0,
-            probe_misses: Vec::new(),
-            recompile_at_osr: false,
-            cold_recompiles: 0,
-            native: None,
-            method_native: None,
-            direct: None,
-            code: frame.code.clone(),
-        });
+        let st = &mut *st;
+        let entry = cache_entry(&mut st.cache, &mut st.sweep_at, &frame.code);
         if matches!(entry.tier, Tier::Cold) {
             if phase != CompilationPhase::Normal {
                 // A loop-free body gains nothing from native code until
@@ -10737,7 +10763,7 @@ unsafe fn try_borrowed_dyn_scalar(
         let Tier::Compiled(art) = &entry.tier else {
             return Some(BorrowedScalarCall::RetryPython);
         };
-        let (cf, code) = (&art.cf, &entry.code);
+        let (cf, code) = (&art.cf, &art.code);
         if !native_callable(cf, code) {
             return Some(BorrowedScalarCall::RetryPython);
         }

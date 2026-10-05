@@ -28,13 +28,32 @@ mod frozen_index {
 /// the generated sorted name index (see build.rs) so a lookup never
 /// reads the name literals laid out beside each module's source text.
 pub(crate) fn frozen_lookup(name: &str) -> Option<frozen_sources::FrozenSource> {
+    frozen_sources().get(frozen_row(name)?).copied()
+}
+
+/// The row of [`frozen_sources`] registered under `name` (see
+/// [`frozen_lookup`]).
+fn frozen_row(name: &str) -> Option<usize> {
     use frozen_index::{FROZEN_INDEX, FROZEN_NAMES};
     let at = FROZEN_INDEX
         .binary_search_by(|&(off, len, _)| {
             FROZEN_NAMES[off as usize..off as usize + len as usize].cmp(name)
         })
         .ok()?;
-    frozen_sources().get(FROZEN_INDEX[at].2 as usize).copied()
+    Some(FROZEN_INDEX[at].2 as usize)
+}
+
+/// [`frozen_sources::source_hash`] of `source`, the source of the frozen
+/// module `name`: build.rs's precomputed value when it is that module's
+/// table row (compared by address, so the text isn't read), else
+/// computed.
+pub(crate) fn frozen_source_hash(name: &str, source: &str) -> u64 {
+    if let Some(row) = frozen_row(name) {
+        if std::ptr::eq(frozen_sources()[row].source, source) {
+            return frozen_index::FROZEN_HASHES[row];
+        }
+    }
+    frozen_sources::source_hash(source)
 }
 
 pub(crate) mod ast_build;

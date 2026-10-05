@@ -3091,7 +3091,7 @@ impl Cfg {
             });
         }
         co.instructions = instructions;
-        co.linetable = linetable;
+        co.linetable = linetable.into();
         co.coltable = coltable.into();
         co.exception_table = table;
         co.constants = self.consts;

@@ -4624,7 +4624,7 @@ fn code_replace(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
                 let target = want_u32(v, "co_firstlineno")?;
                 if let Some(&first) = nc.linetable.first() {
                     let delta = i64::from(target) - i64::from(first);
-                    for l in &mut nc.linetable {
+                    for l in nc.linetable.iter_mut() {
                         *l = (i64::from(*l) + delta).max(0) as u32;
                     }
                 }
@@ -4724,7 +4724,7 @@ pub fn foreign_code_object(
         is_nested: flags & 0x0010 != 0,
         ..Default::default()
     };
-    nc.linetable = vec![firstlineno.max(1)];
+    nc.linetable = vec![firstlineno.max(1)].into();
     let w = nc.wire.get_or_insert_with(Default::default);
     w.co_code = Some(Vec::new());
     w.exec_error = Some("cannot execute foreign bytecode".to_owned());
@@ -4747,7 +4747,7 @@ fn install_wire_code(nc: &mut weavepy_compiler::CodeObject, bytes: Vec<u8>) {
             // Keep per-instruction side tables in sync with the new
             // instruction count; line info defaults to the first line.
             let first = nc.linetable.iter().copied().find(|l| *l > 0).unwrap_or(1);
-            nc.linetable = vec![first; instructions.len()];
+            nc.linetable = vec![first; instructions.len()].into();
             nc.coltable = Vec::new().into();
             nc.caches = weavepy_compiler::CacheTable::with_len(instructions.len());
             nc.instructions = instructions;
@@ -4935,7 +4935,7 @@ pub(crate) fn code_type_call(
         Some(decoded) => {
             nc.caches = weavepy_compiler::CacheTable::with_len(decoded.instructions.len());
             nc.instructions = decoded.instructions;
-            nc.linetable = decoded.linetable;
+            nc.linetable = decoded.linetable.into();
             nc.coltable = decoded.coltable.into();
             nc.exception_table = decoded.exception_table;
             nc.no_interrupt_jumps = decoded.no_interrupt_jumps;
@@ -4945,7 +4945,7 @@ pub(crate) fn code_type_call(
                 Some(op) => format!("unknown opcode {op}"),
                 None => "cannot execute foreign bytecode".to_owned(),
             };
-            nc.linetable = vec![firstlineno.max(1)];
+            nc.linetable = vec![firstlineno.max(1)].into();
             nc.wire.get_or_insert_with(Default::default).exec_error = Some(msg);
         }
     }
@@ -10545,7 +10545,7 @@ fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
         // Shared, not copied: `func.__dict__` mutations stay visible on
         // both, matching CPython where the function object is the same.
         attrs: RefCell::new(Some(f.attrs())),
-        slots_raw: RefCell::new(f.slots().borrow().clone()),
+        slots_raw: RefCell::new(f.slots().borrow().clone()).into(),
         slot_seed: RefCell::new(None),
         closure_cells: std::sync::OnceLock::new(),
         // The copied slot store carries any override along.
