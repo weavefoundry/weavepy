@@ -29,7 +29,7 @@ use crate::ir::{
     ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, CompSavedMeta, CtorFieldSrc,
     GlobalGuard, IterLoopMeta, ListLoopMeta, MathFunc, MathGuardMeta, MethodRet, MethodSiteMeta,
     MethodSpanMeta, OsrEntry, RangeLoopMeta, ResolvedGlobal, SliceOrigin, StrMethod, TBlock, TFunc,
-    TOp, TStmt, TTerm,
+    TOp, TStmt, TTerm, UNBOX_FLOAT_ARITH, UNBOX_FLOAT_CMP, UNBOX_FLOAT_EXACT,
 };
 use crate::value::JitType;
 
@@ -49,10 +49,12 @@ pub struct MethodResolution {
     pub arg_count: u32,
     pub min_args: u32,
     pub ret: MethodRet,
-    /// The callee is a native accelerator's leaf method (`deque.pop`):
-    /// its object-lane result is a container element, so arithmetic on
-    /// it speculates the integer lane (see [`SE::num_hint`]).
+    /// The callee is a native accelerator's leaf method (`deque.pop`).
     pub native: bool,
+    /// The native callee's object-lane result is a container element, so
+    /// arithmetic on it speculates the integer lane (see
+    /// [`SE::num_hint`]).
+    pub elem: bool,
 }
 
 /// Maximum receiver path retained by analysis. The final attribute read adds
@@ -242,6 +244,30 @@ pub struct Probes<'a> {
     /// *unbound* slot keeps the retriable probe-miss verdict, so a
     /// later training point can still specialize.
     pub obj: &'a mut dyn FnMut(u32) -> bool,
+    /// The observed lane of local `slot` in the requesting activation,
+    /// graded like [`Self::param`] (scalars, `str`, `bytes`, and the
+    /// object lane; lists and dicts stay `None` for their use-site
+    /// probes) but for any slot and on every attempt. A region compile
+    /// (see `Carve`) seeds the locals an OSR-only loop reads before it
+    /// writes them from here, since the code that assigned them never
+    /// runs natively.
+    pub local: &'a mut dyn FnMut(u32) -> Option<JitType>,
+    /// The lane of the live loop iterator at interpreter-stack index
+    /// `depth` in the requesting activation: `Int` for a unit-step
+    /// `range` iterator, a list lane for a plain list iterator, `Obj`
+    /// for any other iterator, `None` when the slot holds no iterator.
+    /// Consulted only for an OSR-only loop that contains
+    /// [`Self::entry_pc`] (so the stack is that loop's own).
+    pub stack_iter: &'a mut dyn FnMut(u32) -> Option<JitType>,
+    /// The pc the requesting activation stands at (a loop header for an
+    /// OSR request, `0` for a fresh call), `None` without an activation.
+    pub entry_pc: Option<u32>,
+    /// Whether an *environmental* failure (a value the requesting
+    /// activation doesn't have yet) may carve its loop out of the region
+    /// rather than fail the analysis. The embedder sets it on its final,
+    /// seeded attempt, so an unseeded first attempt still fails with the
+    /// verdict that asks for seeding.
+    pub carve_env: bool,
     /// RFC 0071 WS3 — the analysis-local attribute-path interner (the
     /// analyzer owns the entries; it lives here so both passes and the
     /// probe adapters share it without threading another parameter).
@@ -394,7 +420,7 @@ struct Plan {
     /// JIT's buffer, not the interpreter frame those builtins inspect.
     frame_readers: HashSet<usize>,
     /// Cold exits: statement-start pcs where native code hands the rest of
-    /// the activation to the interpreter (see `cold_point`).
+    /// the activation to the interpreter (see `carve_step`).
     cold: HashSet<usize>,
     /// Typed `[]` accumulators: a `BUILD_LIST 0` pc → the local it is
     /// stored into. When that local is assigned nothing but empty-list
@@ -405,6 +431,16 @@ struct Plan {
     /// the erased `LOAD_GLOBAL list` pc — the deopt point). The callee
     /// loads, their `PUSH_NULL`s, the inner `CALL` and a unit step erase.
     list_range: HashMap<usize, (u8, usize)>,
+    /// The iterators of `for` loops whose code stays interpreted around
+    /// a native root (see [`Region`]): seq synthetic slot → the
+    /// iterator's interpreter-stack depth. Native code never steps one;
+    /// it rides the object lane from the root's entry to its exits.
+    passthrough: HashMap<u32, u32>,
+    /// Numeric speculation, enabled on a retry after mixed-lane
+    /// arithmetic failed: an opaque value stored into a local whose live
+    /// value is a `float` or `int` gives the local that lane, guarded at
+    /// each such store (see `num_spec_lane`).
+    num_spec: bool,
     /// Synthetic slots appended after the code object's real locals.
     n_synth: u32,
 }
@@ -563,6 +599,10 @@ pub fn analyze_with_probes(
         obj_global: &mut |_| None,
         cell: &mut |_| None,
         obj: &mut |_| false,
+        local: &mut |_| None,
+        stack_iter: &mut |_| None,
+        entry_pc: None,
+        carve_env: false,
         paths: &mut arena,
     };
     analyze_impl(code, resolve, &mut probes)
@@ -591,6 +631,10 @@ pub fn analyze_for_ret(
         obj_global: &mut obj,
         cell: &mut |_| None,
         obj: &mut |_| false,
+        local: &mut |_| None,
+        stack_iter: &mut |_| None,
+        entry_pc: None,
+        carve_env: false,
         paths: &mut arena,
     };
     analyze_impl(code, resolve, &mut probes)
@@ -608,79 +652,194 @@ pub fn analyze_frame(
 
 thread_local! {
     /// The instruction the last failed inference/emission step stopped
-    /// at (see `cold_point`).
+    /// at (see `carve_step`).
     static FAIL_PC: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
-/// Every jump-landing pc of `code`.
-fn jump_targets(code: &CodeObject) -> HashSet<usize> {
-    let mut targets = HashSet::new();
-    for (i, item) in code.instructions.iter().enumerate() {
-        match item.op {
-            OpCode::PopJumpIfFalse
-            | OpCode::PopJumpIfTrue
-            | OpCode::PopJumpIfNone
-            | OpCode::PopJumpIfNotNone
-            | OpCode::JumpForward
-            | OpCode::ForIter => {
-                targets.insert(forward_target(i, item.arg));
-            }
-            OpCode::JumpBackward => {
-                if let Some(t) = backward_target(i, item.arg) {
-                    targets.insert(t);
-                }
-            }
-            _ => {}
-        }
-    }
-    targets
+/// One loop of a code object's (structured) loop nest.
+#[derive(Debug, Clone, Copy)]
+struct LoopInfo {
+    /// The header pc, the target of every back edge of the loop.
+    head: usize,
+    /// The last pc of the loop's extent, inclusive: its last back edge,
+    /// or for a `for` loop the `END_FOR`/`POP_ITER` epilogue after it.
+    end: usize,
+    /// The innermost enclosing loop (an index into the forest).
+    parent: Option<usize>,
+    /// A `while` loop, or a `for` loop whose iterator is all it keeps on
+    /// the interpreter stack (a statement, not a comprehension): native
+    /// code can enter it mid-frame with an empty operand stack.
+    plain: bool,
 }
 
-/// Where an unsupported instruction at `p` can become a *cold exit*: the
-/// start of its statement (its source line, back to the nearest jump
-/// target), when that lies outside every loop and after at least one —
-/// native code then runs the loop and hands the rest of the activation
-/// to the interpreter, at most once per activation. `None` inside a
-/// loop body (a side exit there would deopt every iteration) or ahead of
-/// any loop (native entry would buy nothing).
-fn cold_point(code: &CodeObject, p: usize) -> Option<usize> {
+/// The loops of `code`, outermost first (ascending header pc). Only back
+/// edges normal control flow reaches count: an exception handler's jump
+/// back to a loop header (a `with` block's exit path) is not part of the
+/// loop's code. Empty when the loops don't nest (nothing is carved then).
+fn loop_forest(code: &CodeObject) -> Vec<LoopInfo> {
     let ins = &code.instructions;
-    let loops: Vec<(usize, usize)> = ins
-        .iter()
-        .enumerate()
-        .filter(|(_, x)| x.op == OpCode::JumpBackward)
-        .filter_map(|(j, x)| backward_target(j, x.arg).map(|t| (t, j)))
-        .collect();
-    // A point inside a loop moves to the start of its outermost loop: a
-    // `for` statement's iterable setup (the instructions on its line
-    // before the `FOR_ITER` head), or a `while` loop's head.
-    let (p, for_setup) = match loops
-        .iter()
-        .filter(|&&(t, j)| t <= p && p <= j)
-        .map(|&(t, _)| t)
-        .min()
-    {
-        Some(t) if ins[t].op == OpCode::ForIter => (t.checked_sub(1)?, true),
-        Some(t) => (t, false),
-        None => (p, false),
-    };
-    // Worth it only after native work: a loop completed before the exit.
-    // A loop-free body would enter native code just to leave it (short
-    // methods with an unsupported statement near the top, every call).
-    if !loops.iter().any(|&(_, j)| j < p) {
-        return None;
+    let n = ins.len();
+    let mut reached = vec![false; n];
+    let mut work = vec![0usize];
+    while let Some(pc) = work.pop() {
+        if pc >= n || reached[pc] {
+            continue;
+        }
+        reached[pc] = true;
+        work.extend(control_succs(code, pc));
     }
+    let mut last_edge: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    for (j, x) in ins.iter().enumerate() {
+        if x.op == OpCode::JumpBackward && reached[j] {
+            if let Some(t) = backward_target(j, x.arg) {
+                let e = last_edge.entry(t).or_insert(j);
+                *e = (*e).max(j);
+            }
+        }
+    }
+    let mut loops: Vec<LoopInfo> = Vec::with_capacity(last_edge.len());
+    for (&head, &edge) in &last_edge {
+        let is_for = ins[head].op == OpCode::ForIter;
+        let mut end = edge;
+        if is_for {
+            let exit = forward_target(head, ins[head].arg);
+            if exit < n {
+                end = end.max(exit);
+                if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopIter | OpCode::PopTop) {
+                    end = end.max(exit + 1);
+                }
+            }
+        }
+        let plain = !is_for || (head >= 1 && ins[head - 1].op == OpCode::GetIter);
+        loops.push(LoopInfo {
+            head,
+            end,
+            parent: None,
+            plain,
+        });
+    }
+    for k in 0..loops.len() {
+        let (h, e) = (loops[k].head, loops[k].end);
+        // Extents either nest or are disjoint.
+        if loops.iter().any(|o| o.head < h && h <= o.end && o.end < e) {
+            return Vec::new();
+        }
+        loops[k].parent = (0..loops.len())
+            .filter(|&o| o != k && loops[o].head < h && e <= loops[o].end)
+            .max_by_key(|&o| loops[o].head);
+    }
+    loops
+}
+
+/// The innermost loop of `loops` whose extent contains `pc`.
+fn innermost_loop(loops: &[LoopInfo], pc: usize) -> Option<usize> {
+    (0..loops.len())
+        .filter(|&k| loops[k].head <= pc && pc <= loops[k].end)
+        .max_by_key(|&k| loops[k].head)
+}
+
+/// The start of the statement holding the top-level (loop-free) `p`:
+/// the first instruction of its source line (a statement's internal
+/// jumps, a comprehension's loop say, stay inside the cut). For a loop
+/// header, the start of the `for` statement's iterable setup.
+fn stmt_start(code: &CodeObject, p: usize, for_setup: bool) -> Option<usize> {
+    let ins = &code.instructions;
+    let p = if for_setup { p.checked_sub(1)? } else { p };
     let line = code.linetable.get(p).copied()?;
-    let targets = jump_targets(code);
     let mut q = p;
-    while q > 0
-        && code.linetable.get(q - 1) == Some(&line)
-        && (for_setup || !targets.contains(&q))
-        && !targets.contains(&(q - 1).max(1))
-    {
+    while q > 0 && code.linetable.get(q - 1) == Some(&line) && ins[q - 1].op != OpCode::Resume {
         q -= 1;
     }
-    (q > 0 && !loops.iter().any(|&(t, j)| t < q && q <= j)).then_some(q)
+    (q > 0).then_some(q)
+}
+
+/// The region carving state (see [`analyze_impl`]): loops whose code
+/// stays with the interpreter, and why.
+#[derive(Default, Clone)]
+struct Carve {
+    /// Header pcs of the excluded loops. An excluded loop's own code
+    /// runs interpreted; each loop nested in it that is not excluded
+    /// itself compiles as an OSR-only region (see `region_roots`).
+    excluded: HashSet<usize>,
+    /// The excluded headers whose exclusion is *environmental*: their
+    /// code failed only for want of live values (an unbound local or
+    /// receiver, an unseeded iterator), so a later request from inside
+    /// the loop may compile it.
+    env: HashSet<usize>,
+}
+
+/// The native region one analysis attempt compiles, derived from the
+/// carving state: which loops run natively, and which of those are
+/// *roots* entered only through OSR because the code around them stays
+/// interpreted.
+struct Region {
+    /// Per loop of the forest: its code stays with the interpreter. A
+    /// carved loop, or one nested in a stayed loop that can't be entered
+    /// on its own (a comprehension, or under a comprehension).
+    stays: Vec<bool>,
+    /// Per pc: the innermost loop whose extent contains it.
+    innermost: Vec<Option<usize>>,
+    /// Native loops whose parent stays: entered only at their headers.
+    roots: Vec<usize>,
+}
+
+impl Region {
+    fn new(code: &CodeObject, loops: &[LoopInfo], carve: &Carve) -> Region {
+        // Parents precede children (ascending headers, nested extents).
+        let mut stays = vec![false; loops.len()];
+        let mut plain_chain = vec![false; loops.len()];
+        for k in 0..loops.len() {
+            let lp = loops[k];
+            plain_chain[k] = lp.plain && lp.parent.is_none_or(|p| plain_chain[p]);
+            stays[k] = carve.excluded.contains(&lp.head)
+                || lp.parent.is_some_and(|p| stays[p] && !plain_chain[k]);
+        }
+        let roots = (0..loops.len())
+            .filter(|&k| !stays[k] && loops[k].parent.is_some_and(|p| stays[p]))
+            .collect();
+        let innermost = (0..code.instructions.len())
+            .map(|pc| innermost_loop(loops, pc))
+            .collect();
+        Region {
+            stays,
+            innermost,
+            roots,
+        }
+    }
+
+    /// Whether the code at `pc` can run natively (top-level cuts are
+    /// separate: the cold points).
+    fn native(&self, pc: usize) -> bool {
+        self.innermost
+            .get(pc)
+            .copied()
+            .flatten()
+            .is_none_or(|k| !self.stays[k])
+    }
+
+    /// The forest index of the loop headed at `head`.
+    fn loop_at(loops: &[LoopInfo], head: usize) -> Option<usize> {
+        loops.iter().position(|l| l.head == head)
+    }
+
+    /// Interpreter-stack depth of a staying `for` loop's iterator: its
+    /// enclosing loops each hold one below it (they're all plain when a
+    /// native root sits inside, the only case the depth matters).
+    fn depth(loops: &[LoopInfo], k: usize) -> u32 {
+        let mut d = 0;
+        let mut cur = loops[k].parent;
+        while let Some(p) = cur {
+            d += 1;
+            cur = loops[p].parent;
+        }
+        d
+    }
+}
+
+/// Whether a failure verdict depends on the activation the compile ran
+/// for rather than on the code alone.
+fn environmental(v: &JitVerdict) -> bool {
+    matches!(v, JitVerdict::TypeUnknown | JitVerdict::ProbeMiss(_))
 }
 
 fn analyze_impl(
@@ -699,12 +858,33 @@ fn analyze_impl(
     // Typed `[]` accumulators are a prediction: any failure under them
     // re-analyzes with the literal on the object lane, as before.
     let mut lane_lists = has_empty_list_store(code);
-    // Cold exits (see `cold_point`), grown one unsupported statement at
-    // a time.
+    // Region carving: an unsupported construct no longer rejects the
+    // whole frame. A failure at top level (outside every loop) becomes
+    // a cold exit at the start of its statement; a failure inside a loop
+    // excludes that loop and every loop around it, and the loops nested
+    // in an excluded loop compile on their own as OSR-only regions (see
+    // `Carve`). Each step re-analyzes, so the steps are budgeted.
     let mut cold: HashSet<usize> = HashSet::new();
+    let mut carve = Carve::default();
+    let forest = loop_forest(code);
+    let mut steps = 0usize;
+    // The verdict that started the carving, reported when carving leaves
+    // nothing native.
+    let mut first_err: Option<JitVerdict> = None;
+    // Numeric speculation (see `Plan::num_spec`), switched on by the
+    // first mixed-lane failure.
+    let mut num_spec = false;
     loop {
         FAIL_PC.with(|c| c.set(None));
-        match analyze_once(code, resolve, probes, &demote, lane_lists, &cold) {
+        match analyze_once(
+            code, resolve, probes, &demote, lane_lists, &cold, &carve, &forest, num_spec,
+        ) {
+            Err(JitVerdict::MixedArithTypes) if !num_spec => {
+                if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+                    eprintln!("jit numeric speculation {:?}", code.name);
+                }
+                num_spec = true;
+            }
             Err(JitVerdict::CalleeEscapes(name_idx)) => {
                 if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
                     eprintln!(
@@ -718,35 +898,159 @@ fn analyze_impl(
                     return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
                 }
             }
-            Err(
-                e @ (JitVerdict::UnsupportedOpcode(_)
-                | JitVerdict::UnsupportedConst
-                | JitVerdict::MixedArithTypes
-                | JitVerdict::NonUniformLocal(_)),
-            ) if cold.len() < 4
-                && FAIL_PC
-                    .with(std::cell::Cell::get)
-                    .and_then(|p| cold_point(code, p))
-                    .is_some_and(|q| !cold.contains(&q)) =>
+            Err(e)
+                if steps < MAX_CARVE_STEPS
+                    && carve_step(code, &forest, &mut carve, &mut cold, &e, probes.carve_env) =>
             {
-                let q = FAIL_PC
-                    .with(std::cell::Cell::get)
-                    .and_then(|p| cold_point(code, p))
-                    .expect("checked by the guard");
-                if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
-                    eprintln!("jit cold exit {:?} pc {}: {:?}", code.name, q, e);
+                steps += 1;
+                first_err.get_or_insert(e);
+            }
+            // Carving left no native loop: report the verdict that started
+            // it, or, when live values were missing, a retriable miss (a
+            // request from inside a loop may find them).
+            Err(JitVerdict::Trivial) if first_err.is_some() => {
+                if !carve.env.is_empty() {
+                    return Err(JitVerdict::ProbeMiss("region (live values)"));
                 }
-                cold.insert(q);
+                return Err(first_err.expect("checked by the guard"));
+            }
+            Err(e) if !carve.env.is_empty() && !matches!(e, JitVerdict::CalleeEscapes(_)) => {
+                if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+                    eprintln!("jit region miss {:?}: {:?}", code.name, e);
+                }
+                return Err(JitVerdict::ProbeMiss("region (live values)"));
             }
             Err(e) if lane_lists => {
                 if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
                     eprintln!("jit lane-list retry {:?}: {:?}", code.name, e);
                 }
                 lane_lists = false;
+                cold.clear();
+                carve = Carve::default();
+                steps = 0;
+                first_err = None;
             }
-            other => return other,
+            other => {
+                if let Err(e) = &other {
+                    if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+                        if let Some(p) = FAIL_PC.with(std::cell::Cell::get) {
+                            eprintln!(
+                                "jit fail {:?} pc {} ({:?}, line {:?}): {:?}",
+                                code.name,
+                                p,
+                                code.instructions.get(p).map(|i| i.op),
+                                code.linetable.get(p),
+                                e
+                            );
+                        }
+                    }
+                }
+                return other;
+            }
         }
     }
+}
+
+/// The most carving steps one analysis takes (each is a re-analysis).
+const MAX_CARVE_STEPS: usize = 10;
+
+/// One carving step for the failure `e` at the recorded failing pc:
+/// exclude the innermost loop around it (and every loop around that),
+/// or cut the top-level statement holding it. Returns whether anything
+/// changed (otherwise the failure stands). `env_ok` admits carving on
+/// an environmental verdict (the embedder's seeded, final attempt).
+fn carve_step(
+    code: &CodeObject,
+    forest: &[LoopInfo],
+    carve: &mut Carve,
+    cold: &mut HashSet<usize>,
+    e: &JitVerdict,
+    env_ok: bool,
+) -> bool {
+    let env = environmental(e);
+    let carvable = env
+        || matches!(
+            e,
+            JitVerdict::UnsupportedOpcode(_)
+                | JitVerdict::UnsupportedConst
+                | JitVerdict::MixedArithTypes
+                | JitVerdict::NonUniformLocal(_)
+        );
+    // A loop-free body has no region worth carving out.
+    if !carvable || (env && !env_ok) || forest.is_empty() {
+        return false;
+    }
+    let Some(p) = FAIL_PC.with(std::cell::Cell::get) else {
+        return false;
+    };
+    let trace = std::env::var_os("WEAVEPY_JIT_TRACE").is_some();
+    match innermost_loop(forest, p) {
+        Some(k) if !carve.excluded.contains(&forest[k].head) => {
+            let mut top = k;
+            let mut cur = Some(k);
+            while let Some(c) = cur {
+                carve.excluded.insert(forest[c].head);
+                if env {
+                    carve.env.insert(forest[c].head);
+                }
+                top = c;
+                cur = forest[c].parent;
+            }
+            // The pc-0 flow stops before an excluded top-level loop sets
+            // up its iterator.
+            let lp = forest[top];
+            let cut = if code.instructions[lp.head].op == OpCode::ForIter {
+                stmt_start(code, lp.head, true)
+            } else {
+                Some(lp.head)
+            };
+            if let Some(q) = cut {
+                cold.insert(q);
+            }
+            if trace {
+                eprintln!(
+                    "jit carve {:?} loop at pc {} (fail pc {}): {:?}",
+                    code.name, forest[k].head, p, e
+                );
+            }
+            true
+        }
+        Some(_) => false,
+        None => match stmt_start(code, p, false) {
+            Some(q) if !cold.contains(&q) && innermost_loop(forest, q).is_none() => {
+                if trace {
+                    eprintln!("jit cold exit {:?} pc {}: {:?}", code.name, q, e);
+                }
+                cold.insert(q);
+                true
+            }
+            _ => false,
+        },
+    }
+}
+
+/// The speculated scalar lane of a `STORE_FAST slot` of a `ty` value
+/// under [`Plan::num_spec`]: an opaque value stored into a real local
+/// that holds a `float` or `int` in the requesting activation, when no
+/// store has given the local another lane.
+fn num_spec_lane(
+    code: &CodeObject,
+    plan: &Plan,
+    slot: u32,
+    ty: JitType,
+    local_types: &[Option<JitType>],
+    probes: &mut Probes<'_>,
+) -> Option<JitType> {
+    if !plan.num_spec || ty != JitType::Obj || slot >= code.varnames.len() as u32 {
+        return None;
+    }
+    let lane = (probes.local)(slot).filter(|t| matches!(t, JitType::Float | JitType::Int))?;
+    local_types
+        .get(slot as usize)
+        .copied()
+        .flatten()
+        .is_none_or(|cur| cur == lane)
+        .then_some(lane)
 }
 
 /// Whether `code` stores an empty-list literal straight into a local
@@ -766,6 +1070,9 @@ fn analyze_once(
     demote: &HashSet<u32>,
     lane_lists: bool,
     cold: &HashSet<usize>,
+    carve: &Carve,
+    loops: &[LoopInfo],
+    num_spec: bool,
 ) -> Result<TFunc, JitVerdict> {
     // RFC 0070 WS2 — sync generator bodies are admitted (yields become
     // `Yielded` side exits; entry is OSR-only). Coroutines and async
@@ -781,14 +1088,82 @@ fn analyze_once(
         return Err(JitVerdict::Trivial);
     }
 
-    let mut plan = plan_rewrite(code, resolve, probes.obj_global, demote, lane_lists)?;
+    let region = Region::new(code, loops, carve);
+    let mut plan = plan_rewrite(
+        code,
+        resolve,
+        probes.obj_global,
+        demote,
+        lane_lists,
+        loops,
+        &region,
+    )?;
+    plan.num_spec = num_spec;
+    // Region exits: where native code would step into code that stays
+    // interpreted, it hands the activation over instead (a cold exit at
+    // that pc). Blocks split wherever nativeness changes.
+    let mut leaders: BTreeSet<usize> = BTreeSet::new();
+    let mut exits: BTreeSet<usize> = BTreeSet::new();
+    for pc in 0..n {
+        if pc > 0 && region.native(pc) != region.native(pc - 1) {
+            leaders.insert(pc);
+        }
+        if region.native(pc) {
+            for q in control_succs(code, pc) {
+                if q < n && !region.native(q) {
+                    exits.insert(q);
+                }
+            }
+        }
+    }
     plan.cold = cold.clone();
+    let region_exits: Vec<u32> = exits
+        .iter()
+        .filter(|q| !cold.contains(q))
+        .map(|&q| q as u32)
+        .collect();
+    plan.cold.extend(exits.iter().copied());
 
-    let raw = build_blocks(code, &plan.cold)?;
-    let reachable = reachable_blocks(&raw);
+    let raw = build_blocks(code, &plan.cold, &leaders)?;
+    let block0 = block_index_at(&raw, 0);
+    let reach0 = reachable_blocks(&raw, &[block0]);
+    // OSR-only roots: native loops whose surroundings stay interpreted,
+    // and top-level loops a cut leaves unreachable from the entry.
+    let reach0_set: HashSet<usize> = reach0.iter().copied().collect();
+    let osr_roots: Vec<usize> = (0..loops.len())
+        .filter(|&k| {
+            !region.stays[k]
+                && (region.roots.contains(&k)
+                    || (loops[k].parent.is_none()
+                        && loops[k].plain
+                        && !reach0_set.contains(&block_index_at(&raw, loops[k].head))))
+        })
+        .collect();
+    let mut roots: Vec<usize> = vec![block0];
+    roots.extend(
+        osr_roots
+            .iter()
+            .map(|&k| block_index_at(&raw, loops[k].head)),
+    );
+    let reachable = reachable_blocks(&raw, &roots);
     if reachable.is_empty() {
         return Err(JitVerdict::Trivial);
     }
+    // Carving that leaves no loop native leaves nothing worth compiling.
+    if !carve.excluded.is_empty() {
+        let reach: HashSet<usize> = reachable.iter().copied().collect();
+        let native_loop = (0..loops.len())
+            .any(|k| !region.stays[k] && reach.contains(&block_index_at(&raw, loops[k].head)));
+        if !native_loop {
+            return Err(JitVerdict::Trivial);
+        }
+    }
+    // Whether a fresh activation gains anything natively: with roots,
+    // only when its own flow reaches a loop before any cut.
+    let pc0_entry = osr_roots.is_empty()
+        || loops
+            .iter()
+            .any(|l| reach0_set.contains(&block_index_at(&raw, l.head)));
 
     let n_locals = code.varnames.len() as u32 + plan.n_synth;
     let livein = compute_livein(code, &raw, &reachable, code.varnames.len() as u32);
@@ -830,13 +1205,76 @@ fn analyze_once(
             }
         }
     }
+    // A passed-through iterator rides the object lane (see
+    // `Plan::passthrough`).
+    for &seq in plan.passthrough.keys() {
+        local_types[seq as usize] = Some(JitType::Obj);
+    }
+    // An OSR-only root's iterator was set up by code that stays
+    // interpreted: type its synthetic slots from the shape (a counted
+    // range) or from the live iterator the requesting activation holds
+    // for it. An unseeded list loop fails at its header (environmental),
+    // and carving leaves it for a request from inside it.
+    for &k in &osr_roots {
+        let head = loops[k].head;
+        if let Some(&(cur, stop, _)) = plan.headers.get(&head) {
+            local_types[cur as usize] = Some(JitType::Int);
+            local_types[stop as usize] = Some(JitType::Int);
+        } else if let Some(&(seq, idx, _)) = plan.iter_headers.get(&head) {
+            if plan.pair_headers.contains_key(&head) {
+                local_types[seq as usize] = Some(JitType::Obj);
+                continue;
+            }
+            let inside = probes
+                .entry_pc
+                .is_some_and(|pc| head <= pc as usize && pc as usize <= loops[k].end);
+            if !inside {
+                continue;
+            }
+            match (probes.stack_iter)(Region::depth(loops, k)) {
+                Some(lane) if lane.is_list() => {
+                    local_types[seq as usize] = Some(lane);
+                    local_types[idx as usize] = Some(JitType::Int);
+                }
+                Some(JitType::Obj | JitType::Int) => {
+                    local_types[seq as usize] = Some(JitType::Obj);
+                }
+                _ => {}
+            }
+        }
+    }
+    // The locals an OSR-only root may read before writing them were
+    // assigned by interpreted code: seed them from the live activation.
+    if !osr_roots.is_empty() {
+        let root_blocks: HashSet<usize> = roots[1..].iter().copied().collect();
+        for slot in root_livein(code, &raw, &reachable, &root_blocks) {
+            if local_types[slot as usize].is_some() {
+                continue;
+            }
+            if let Some(t) = (probes.local)(slot) {
+                if matches!(
+                    t,
+                    JitType::Int
+                        | JitType::Float
+                        | JitType::Bool
+                        | JitType::Obj
+                        | JitType::Str
+                        | JitType::Bytes
+                ) {
+                    local_types[slot as usize] = Some(t);
+                }
+            }
+        }
+    }
     let mut ret = RetInfo::default();
     // RFC 0073 WS1 — constructor provenance: populated by the fixpoint,
     // read (converged) by the emission pass.
     let mut ctor = CtorState::default();
     let mut entry_stacks: Vec<Option<Vec<SE>>> = vec![None; raw.len()];
-    let entry_raw = block_index_at(&raw, 0);
-    entry_stacks[entry_raw] = Some(Vec::new());
+    let entry_raw = block0;
+    for &r in &roots {
+        entry_stacks[r] = Some(Vec::new());
+    }
     let mut iters = 0;
     loop {
         let mut changed = false;
@@ -919,7 +1357,9 @@ fn analyze_once(
         comp_saved: HashMap::new(),
     };
     let mut emit_entries: Vec<Option<Vec<ESlot>>> = vec![None; raw.len()];
-    emit_entries[entry_raw] = Some(Vec::new());
+    for &r in &roots {
+        emit_entries[r] = Some(Vec::new());
+    }
     let mut blocks_opt: Vec<Option<TBlock>> = vec![None; reachable.len()];
     let mut queue: VecDeque<usize> = reachable.iter().copied().collect();
     let mut stalled = 0usize;
@@ -1112,11 +1552,15 @@ fn analyze_once(
         .list_loops
         .iter()
         .filter(|l| local_types.get(l.seq_slot as usize).copied().flatten() == Some(JitType::Obj))
-        .map(|l| IterLoopMeta {
-            iter_slot: l.seq_slot,
-            live_from: l.live_from,
-            live_to: l.live_to,
-            interp_depth: depth_of(l.live_from),
+        .map(|l| {
+            let pass = plan.passthrough.get(&l.seq_slot).copied();
+            IterLoopMeta {
+                iter_slot: l.seq_slot,
+                live_from: l.live_from,
+                live_to: l.live_to,
+                interp_depth: pass.unwrap_or_else(|| depth_of(l.live_from)),
+                passthrough: pass.is_some(),
+            }
         })
         .collect();
     let mut comp_saved: Vec<CompSavedMeta> = out.comp_saved.values().copied().collect();
@@ -1165,6 +1609,17 @@ fn analyze_once(
             v.sort_unstable();
             v
         },
+        region_exits,
+        stayed_heads: (0..loops.len())
+            .filter(|&k| region.stays[k])
+            .map(|k| loops[k].head as u32)
+            .collect(),
+        env_heads: {
+            let mut v: Vec<u32> = carve.env.iter().map(|&pc| pc as u32).collect();
+            v.sort_unstable();
+            v
+        },
+        pc0_entry,
         comp_target_slots: {
             let mut v: Vec<u32> = plan.comp_headers.values().map(|c| c.saved_slot).collect();
             v.sort_unstable();
@@ -1320,6 +1775,8 @@ fn plan_rewrite(
     obj_global: &mut dyn FnMut(&str) -> Option<(u32, JitType)>,
     demote: &HashSet<u32>,
     lane_lists: bool,
+    loops: &[LoopInfo],
+    region: &Region,
 ) -> Result<Plan, JitVerdict> {
     let ins = &code.instructions;
     let n = ins.len();
@@ -1363,7 +1820,33 @@ fn plan_rewrite(
         if !matches!(ins[i].op, OpCode::ForIter) {
             continue;
         }
-        let bail = || JitVerdict::UnsupportedOpcode("FOR_ITER (non-range shape)");
+        // A loop whose code stays interpreted keeps its iterator on the
+        // interpreter stack, where a native root nested in it finds it:
+        // the root's entry pins it whole and its exits put it back (see
+        // `Plan::passthrough`).
+        if let Some(k) = Region::loop_at(loops, i).filter(|&k| region.stays[k]) {
+            let exit = forward_target(i, ins[i].arg);
+            let live_to = if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopIter) {
+                exit + 2
+            } else {
+                exit + 1
+            };
+            let seq_slot = n_real + plan.n_synth;
+            plan.n_synth += 2;
+            plan.list_loops.push(ListLoopMeta {
+                seq_slot,
+                idx_slot: seq_slot + 1,
+                live_from: i as u32,
+                live_to: live_to.min(loops[k].end + 1) as u32,
+                interp_depth: 0,
+            });
+            plan.passthrough.insert(seq_slot, Region::depth(loops, k));
+            continue;
+        }
+        let bail = || {
+            FAIL_PC.with(|c| c.set(Some(i)));
+            JitVerdict::UnsupportedOpcode("FOR_ITER (non-range shape)")
+        };
         let exit = forward_target(i, ins[i].arg);
         if exit >= n || !matches!(ins[exit].op, OpCode::EndFor) {
             return Err(bail());
@@ -1634,10 +2117,18 @@ fn plan_rewrite(
     // `del`ed. By induction the slot is unbound outside comprehension
     // bodies, so each save parks `Unbound` and each restore re-clears.
     if !plan.comp_headers.is_empty() {
-        let comp_target_bail =
-            || JitVerdict::UnsupportedOpcode("FOR_ITER (comprehension target escapes)");
         let comps: Vec<(usize, CompHeaderPlan)> =
             plan.comp_headers.iter().map(|(&h, c)| (h, *c)).collect();
+        // The failure names the comprehension, so carving excludes it.
+        let comp_target_bail = |slot: u32| {
+            let head = comps
+                .iter()
+                .filter(|(_, c)| c.saved_slot == slot)
+                .map(|(h, _)| *h)
+                .min();
+            FAIL_PC.with(|c| c.set(head));
+            JitVerdict::UnsupportedOpcode("FOR_ITER (comprehension target escapes)")
+        };
         let is_comp_slot = |slot: u32| comps.iter().any(|(_, c)| c.saved_slot == slot);
         // Parameter slots are stored by the caller at entry, so a
         // parameter target can never be proven unbound. (`*args`/
@@ -1649,7 +2140,7 @@ fn plan_rewrite(
             + u32::from(code.has_varkeywords);
         for (_, c) in &comps {
             if c.saved_slot < n_params {
-                return Err(comp_target_bail());
+                return Err(comp_target_bail(c.saved_slot));
             }
         }
         // The compiler protects each inlined comprehension with a
@@ -1690,7 +2181,7 @@ fn plan_rewrite(
                             c.saved_slot == item.arg && (pc == h + 1 || pc == c.saved_to as usize)
                         });
                     if !ok {
-                        return Err(comp_target_bail());
+                        return Err(comp_target_bail(item.arg));
                     }
                 }
                 OpCode::LoadFast if is_comp_slot(item.arg) => {
@@ -1698,7 +2189,7 @@ fn plan_rewrite(
                         .iter()
                         .any(|(h, c)| c.saved_slot == item.arg && *h < pc && pc < c.exit);
                     if !ok {
-                        return Err(comp_target_bail());
+                        return Err(comp_target_bail(item.arg));
                     }
                 }
                 OpCode::LoadFastAndClear if is_comp_slot(item.arg) => {
@@ -1706,11 +2197,11 @@ fn plan_rewrite(
                         .iter()
                         .any(|(_, c)| c.saved_slot == item.arg && pc == c.saved_from as usize);
                     if !ok {
-                        return Err(comp_target_bail());
+                        return Err(comp_target_bail(item.arg));
                     }
                 }
                 OpCode::DeleteFast if is_comp_slot(item.arg) => {
-                    return Err(comp_target_bail());
+                    return Err(comp_target_bail(item.arg));
                 }
                 _ => {}
             }
@@ -1906,6 +2397,7 @@ fn plan_rewrite(
             _ if demote.contains(&item.arg) => {
                 let name = &code.names[item.arg as usize];
                 let Some((token, lane)) = obj_global(name) else {
+                    FAIL_PC.with(|c| c.set(Some(i)));
                     return Err(JitVerdict::UnsupportedOpcode("LOAD_GLOBAL"));
                 };
                 plan.obj_globals.insert(item.arg, (token, lane));
@@ -1933,6 +2425,7 @@ fn plan_rewrite(
             _ => {
                 let name = &code.names[item.arg as usize];
                 let Some((token, lane)) = obj_global(name) else {
+                    FAIL_PC.with(|c| c.set(Some(i)));
                     return Err(JitVerdict::UnsupportedOpcode("LOAD_GLOBAL"));
                 };
                 plan.obj_globals.insert(item.arg, (token, lane));
@@ -2181,9 +2674,13 @@ fn common_error_constant(ins: weavepy_compiler::Instruction) -> bool {
 }
 
 /// Build the basic blocks, resolving relative jumps to absolute indices.
-fn build_blocks(code: &CodeObject, cold: &HashSet<usize>) -> Result<Vec<RawBlock>, JitVerdict> {
+fn build_blocks(
+    code: &CodeObject,
+    cold: &HashSet<usize>,
+    extra: &BTreeSet<usize>,
+) -> Result<Vec<RawBlock>, JitVerdict> {
     let n = code.instructions.len();
-    let mut leaders: BTreeSet<usize> = BTreeSet::new();
+    let mut leaders: BTreeSet<usize> = extra.iter().copied().filter(|&pc| pc < n).collect();
     leaders.insert(0);
     // A cold exit starts its own block, which ends native control.
     for &pc in cold {
@@ -2500,14 +2997,17 @@ fn has_native_cycle(blocks: &[TBlock]) -> bool {
     false
 }
 
-/// Blocks reachable from the entry (block 0), in deterministic order.
-fn reachable_blocks(raw: &[RawBlock]) -> Vec<usize> {
+/// Blocks reachable from `roots` (the entry block, plus any OSR-only
+/// region roots), in deterministic order.
+fn reachable_blocks(raw: &[RawBlock], roots: &[usize]) -> Vec<usize> {
     let mut seen = vec![false; raw.len()];
     let mut order = Vec::new();
     let mut q = VecDeque::new();
-    if !raw.is_empty() {
-        q.push_back(0usize);
-        seen[0] = true;
+    for &r in roots {
+        if r < raw.len() && !seen[r] {
+            q.push_back(r);
+            seen[r] = true;
+        }
     }
     while let Some(b) = q.pop_front() {
         order.push(b);
@@ -2597,6 +3097,94 @@ fn compute_livein(
         }
     }
     livein
+}
+
+/// The local slots some path from an OSR-only root (`roots`, whose
+/// entries assign nothing) may read before writing: what the interpreted
+/// code around a region leaves for the region to read.
+fn root_livein(
+    code: &CodeObject,
+    raw: &[RawBlock],
+    reachable: &[usize],
+    roots: &HashSet<usize>,
+) -> Vec<u32> {
+    let reachset: HashSet<usize> = reachable.iter().copied().collect();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); raw.len()];
+    for &b in reachable {
+        for &s in &raw[b].succs {
+            if reachset.contains(&s) {
+                preds[s].push(b);
+            }
+        }
+    }
+    let n_real = code.varnames.len() as u32;
+    let full: HashSet<u32> = (0..n_real).collect();
+    let params: HashSet<u32> = (0..code.arg_count.min(n_real)).collect();
+    let entry = block_index_at(raw, 0);
+    let mut assigned_in: Vec<HashSet<u32>> = vec![full; raw.len()];
+    loop {
+        let mut changed = false;
+        for &b in reachable {
+            let new_in = if roots.contains(&b) {
+                HashSet::new()
+            } else if b == entry {
+                params.clone()
+            } else {
+                let mut acc: Option<HashSet<u32>> = None;
+                for &p in &preds[b] {
+                    let out = assigned_out(code, &raw[p], &assigned_in[p]);
+                    acc = Some(match acc {
+                        None => out,
+                        Some(a) => a.intersection(&out).copied().collect(),
+                    });
+                }
+                acc.unwrap_or_default()
+            };
+            if new_in != assigned_in[b] {
+                assigned_in[b] = new_in;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut live: BTreeSet<u32> = BTreeSet::new();
+    for &b in reachable {
+        let mut cur = assigned_in[b].clone();
+        for i in raw[b].start..raw[b].end {
+            let ins = code.instructions[i];
+            match ins.op {
+                OpCode::LoadFast | OpCode::DeleteFast if !cur.contains(&ins.arg) => {
+                    live.insert(ins.arg);
+                }
+                OpCode::StoreFast => {
+                    cur.insert(ins.arg);
+                }
+                _ => {}
+            }
+        }
+    }
+    live.into_iter().filter(|&s| s < n_real).collect()
+}
+
+/// The pcs control can reach from the instruction at `pc` (a block
+/// boundary's successors; an instruction that ends native control has
+/// none).
+fn control_succs(code: &CodeObject, pc: usize) -> Vec<usize> {
+    let ins = code.instructions[pc];
+    match ins.op {
+        OpCode::ReturnValue | OpCode::RaiseVarargs | OpCode::Reraise => Vec::new(),
+        OpCode::LoadCommonConstant if common_error_constant(ins) => Vec::new(),
+        OpCode::JumpForward => vec![forward_target(pc, ins.arg)],
+        OpCode::JumpBackward => backward_target(pc, ins.arg).into_iter().collect(),
+        OpCode::PopJumpIfFalse
+        | OpCode::PopJumpIfTrue
+        | OpCode::PopJumpIfNone
+        | OpCode::PopJumpIfNotNone
+        | OpCode::ForIter => vec![pc + 1, forward_target(pc, ins.arg)],
+        _ => vec![pc + 1],
+    }
 }
 
 /// `assigned_in ∪ {slots stored in this block}`.
@@ -2787,6 +3375,8 @@ struct MethodMark {
     load_pc: u32,
     /// See [`MethodResolution::native`].
     native: bool,
+    /// See [`MethodResolution::elem`].
+    elem: bool,
 }
 
 /// RFC 0073 WS3 — a burned-in native `str` method riding on its
@@ -3934,6 +4524,14 @@ fn step_abstract(
             // RFC 0073 WS1 — track constructor provenance for the
             // attribute-probe fallback.
             ctor.note_store(ins.arg, &v);
+            // Numeric speculation (see `Plan::num_spec`): an opaque value
+            // stored into a local the live activation holds a `float` or
+            // `int` in gives the local that scalar lane, guarded at the
+            // store.
+            if let Some(t) = num_spec_lane(code, plan, ins.arg, v.ty, local_types, probes) {
+                set_local(local_types, ins.arg, t, changed)?;
+                return Ok(());
+            }
             if v.ty.is_representable() {
                 set_local(local_types, ins.arg, v.ty, changed)?;
             } else if let Some(src) = v.src {
@@ -4217,6 +4815,7 @@ fn step_abstract(
                                 ret: res.ret,
                                 load_pc: i as u32,
                                 native: res.native,
+                                elem: res.elem,
                             }),
                             ..recv
                         });
@@ -4371,7 +4970,7 @@ fn step_abstract(
                         ..SE::known(JitType::Unknown)
                     }),
                     MethodRet::Scalar(ty) => stack.push(SE {
-                        num_hint: m.native && ty == JitType::Obj,
+                        num_hint: m.elem && ty == JitType::Obj,
                         ..SE::known(ty)
                     }),
                 }
@@ -5494,6 +6093,11 @@ fn bin_result_type(kind: ArithKind, a: JitType, b: JitType) -> Result<JitType, J
             if depth == 0 { JitType::Int } else { b },
         );
     }
+    if float_operand_guard(a, b).is_some() {
+        // The opaque operand is guarded as a float (or a promoted int)
+        // at emission, so the operation runs on the float lanes.
+        return bin_result_type(kind, JitType::Float, JitType::Float);
+    }
     let a_int = a.is_integral();
     let b_int = b.is_integral();
     if a_int && b_int {
@@ -5630,6 +6234,26 @@ fn fuse_int_result(stmts: &mut [TStmt], pc: u32, native: bool) -> bool {
     }
 }
 
+/// [`fuse_int_result`]'s float counterpart: a method call immediately
+/// before a float guard at `pc` hands over an exact `float` unboxed
+/// (stricter than the guard's promotion, never looser), and anything
+/// else leaves through the call's completed-result exit.
+fn fuse_float_result(stmts: &mut [TStmt], pc: u32) -> bool {
+    let Some(previous) = stmts.last_mut() else {
+        return false;
+    };
+    if previous.pc.checked_add(1) != Some(pc) {
+        return false;
+    }
+    match &mut previous.op {
+        TOp::CallMethod { ret, .. } if *ret == MethodRet::Scalar(JitType::Obj) => {
+            *ret = MethodRet::Scalar(JitType::Float);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// An integral peer provides a useful speculative lane for an opaque
 /// operand. Two opaque operands have no such evidence and stay generic
 /// unless one is a native container element (see [`SE::num_hint`]).
@@ -5638,6 +6262,20 @@ fn integer_operand_guard(a: JitType, b: JitType) -> Option<u8> {
     if a.is_integral() && b == JitType::Obj {
         Some(0)
     } else if a == JitType::Obj && b.is_integral() {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// A `float` peer gives an opaque operand a float lane to speculate on:
+/// emission guards it with [`TOp::UnboxFloat`], which also promotes an
+/// exact `int` the way Python's mixed arithmetic does. The depth is
+/// measured from TOS.
+fn float_operand_guard(a: JitType, b: JitType) -> Option<u8> {
+    if a == JitType::Float && b == JitType::Obj {
+        Some(0)
+    } else if a == JitType::Obj && b == JitType::Float {
         Some(1)
     } else {
         None
@@ -5653,7 +6291,7 @@ fn cmp_check(kind: CmpKind, a: JitType, b: JitType) -> Result<(), JitVerdict> {
     }
     // An object compared with an integral operand is guarded to be an
     // exact machine-sized `int` (see `integer_operand_guard`).
-    if integer_operand_guard(a, b).is_some() {
+    if integer_operand_guard(a, b).is_some() || float_operand_guard(a, b).is_some() {
         return Ok(());
     }
     if (a.is_integral() || a == JitType::Float) && (b.is_integral() || b == JitType::Float) {
@@ -6597,6 +7235,24 @@ fn emit_instr(
                 push(TOp::StoreLocal(ins.arg), None, stack, stmts);
                 return Ok(());
             }
+            // A speculated scalar local (see `num_spec_lane`) unboxes the
+            // opaque value at the store; a miss resumes at `STORE_FAST`.
+            if top.ty == JitType::Obj && top.is_plain() {
+                match local_types.get(ins.arg as usize).copied().flatten() {
+                    Some(JitType::Float) if !fuse_float_result(stmts, pc) => push(
+                        TOp::UnboxFloat {
+                            depth: 0,
+                            promote: UNBOX_FLOAT_EXACT,
+                        },
+                        None,
+                        stack,
+                        stmts,
+                    ),
+                    Some(JitType::Float) => {}
+                    Some(JitType::Int) => push(TOp::UnboxInt { depth: 0 }, None, stack, stmts),
+                    _ => {}
+                }
+            }
             pop_val(stack)?;
             push(TOp::StoreLocal(ins.arg), None, stack, stmts);
         }
@@ -6665,6 +7321,31 @@ fn emit_instr(
                     a = JitType::Int;
                 }
             }
+            // An object with a float peer is guarded as a float (an exact
+            // `int` promotes, as Python's mixed arithmetic does); a miss
+            // restores the boxed value at this BINARY_OP.
+            if let Some(depth) = float_operand_guard(a, b) {
+                if depth != 0 || !fuse_float_result(stmts, pc) {
+                    stack.push(ESlot::val(a));
+                    stack.push(ESlot::val(b));
+                    push(
+                        TOp::UnboxFloat {
+                            depth,
+                            promote: UNBOX_FLOAT_ARITH,
+                        },
+                        None,
+                        stack,
+                        stmts,
+                    );
+                    stack.pop();
+                    stack.pop();
+                }
+                if depth == 0 {
+                    b = JitType::Float;
+                } else {
+                    a = JitType::Float;
+                }
+            }
             // RFC 0071 WS4 — `list * int` repeats the pinned list on
             // the same lane through `wpjit_list_repeat`.
             if matches!(kind, ArithKind::Mul) && a.is_list() {
@@ -6729,6 +7410,30 @@ fn emit_instr(
                     b = JitType::Int;
                 } else {
                     a = JitType::Int;
+                }
+            }
+            // An object compared with a float is guarded as a float, or an
+            // `int` the conversion keeps exact.
+            if let Some(depth) = float_operand_guard(a, b) {
+                if depth != 0 || !fuse_float_result(stmts, pc) {
+                    stack.push(ESlot::val(a));
+                    stack.push(ESlot::val(b));
+                    push(
+                        TOp::UnboxFloat {
+                            depth,
+                            promote: UNBOX_FLOAT_CMP,
+                        },
+                        None,
+                        stack,
+                        stmts,
+                    );
+                    stack.pop();
+                    stack.pop();
+                }
+                if depth == 0 {
+                    b = JitType::Float;
+                } else {
+                    a = JitType::Float;
                 }
             }
             if a.is_integral() && b.is_integral() {
@@ -7122,6 +7827,7 @@ fn emit_instr(
                         ret: res.ret,
                         load_pc: pc,
                         native: res.native,
+                        elem: res.elem,
                     });
                     stack.push(ESlot {
                         null: Some((pc, plan.hidden_at(i) + stack.len() as u32)),
@@ -7449,7 +8155,7 @@ fn emit_instr(
                             return Err(JitVerdict::TypeUnknown);
                         }
                         stack.push(ESlot {
-                            num_hint: m.native && ty == JitType::Obj,
+                            num_hint: m.elem && ty == JitType::Obj,
                             ..ESlot::val(ty)
                         });
                     }

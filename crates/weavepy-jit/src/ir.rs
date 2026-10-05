@@ -15,6 +15,13 @@
 
 use crate::value::JitType;
 
+/// [`TOp::UnboxFloat`]: an exact `float` only.
+pub const UNBOX_FLOAT_EXACT: u8 = 0;
+/// [`TOp::UnboxFloat`]: an exact `float`, or an exact `int` converted.
+pub const UNBOX_FLOAT_ARITH: u8 = 1;
+/// [`TOp::UnboxFloat`]: an exact `float`, or an exact `int` within ±2^53.
+pub const UNBOX_FLOAT_CMP: u8 = 2;
+
 /// Index of a [`TBlock`] within a [`TFunc`].
 pub type BlockId = usize;
 
@@ -446,6 +453,15 @@ pub enum TOp {
     /// depth 0 or 1 from TOS. A miss resumes at the consuming opcode
     /// with the original object, without replaying its producer.
     UnboxInt { depth: u8 },
+    /// Guard an object operand as a `float`, at depth 0 or 1 from TOS,
+    /// and replace it with its unboxed value. `promote` widens what
+    /// passes: [`UNBOX_FLOAT_EXACT`] admits only an exact `float` (a
+    /// value stored into a float-lane local keeps its exact type);
+    /// [`UNBOX_FLOAT_ARITH`] also converts an exact `int`, as Python's
+    /// mixed arithmetic does; [`UNBOX_FLOAT_CMP`] converts only an `int`
+    /// within ±2^53, where the conversion keeps a comparison exact. A
+    /// miss resumes at the consuming opcode with the original object.
+    UnboxFloat { depth: u8, promote: u8 },
     /// RFC 0073 WS2 — `BUILD_MAP n` (`n` *pairs*): pops `2n`
     /// interleaved key/value entries (staged through the marshal
     /// buffer with per-slot tags), builds a fresh GC-tracked dict
@@ -1355,6 +1371,10 @@ pub struct IterLoopMeta {
     /// RFC 0073 WS1 — interpreter-stack depth of the rebuilt
     /// iterator (see [`RangeLoopMeta::interp_depth`]).
     pub interp_depth: u32,
+    /// The loop's own code stays interpreted and native code never
+    /// steps it: the iterator (any object) only rides from an OSR-only
+    /// root's entry, where it is pinned whole, to the root's exits.
+    pub passthrough: bool,
 }
 
 /// RFC 0073 WS1 — deopt-reconstruction metadata for one inlined
@@ -1418,10 +1438,24 @@ pub struct TFunc {
     /// only inside their comprehension bodies (and written there before
     /// any read), so an OSR entry admits them unbound on any lane.
     pub comp_target_slots: Vec<u32>,
-    /// Cold-exit pcs (see the analyzer's `cold_point`): an expected
-    /// hand-off to the interpreter, at most once per activation — never
-    /// charged as a deopt.
+    /// Cold-exit pcs (see the analyzer's `carve_step`): an expected
+    /// hand-off to the interpreter — never charged as a deopt. Includes
+    /// [`Self::region_exits`].
     pub cold_exits: Vec<u32>,
+    /// The cold exits where a native region ends because the code after
+    /// it stays interpreted (a root loop finishing inside an interpreted
+    /// loop, say): routine hand-offs, taken once per region entry.
+    pub region_exits: Vec<u32>,
+    /// Headers of the loops whose code stays interpreted. An OSR request
+    /// at one is expected to find no entry.
+    pub stayed_heads: Vec<u32>,
+    /// The [`Self::stayed_heads`] whose code stayed only for want of live
+    /// values in the activation the compile ran for: an OSR request at
+    /// one may recompile with that loop's own values.
+    pub env_heads: Vec<u32>,
+    /// Whether a fresh (pc 0) activation reaches native loop work before
+    /// any cut; `false` when only OSR entries make the compile worth it.
+    pub pc0_entry: bool,
     /// Erased Python callees (RFC 0059 WS3), ascending `live_from`, for
     /// deopt stack reconstruction during argument computation.
     pub callee_spans: Vec<CalleeSpanMeta>,
@@ -1542,6 +1576,7 @@ impl TOp {
                 | TOp::PushConstTuple { .. }
                 | TOp::TupleLen
                 | TOp::UnboxInt { .. }
+                | TOp::UnboxFloat { .. }
                 | TOp::StrConcat
                 | TOp::StrGetItem
                 | TOp::BuildString { .. }

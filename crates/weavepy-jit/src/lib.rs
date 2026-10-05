@@ -39,7 +39,7 @@ pub use ir::{
     ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, CompSavedMeta, CtorFieldSrc,
     GlobalGuard, IterLoopMeta, ListLoopMeta, MathFunc, MathGuardMeta, MethodRet, MethodSiteMeta,
     MethodSpanMeta, OsrEntry, RangeLoopMeta, ResolvedGlobal, SliceOrigin, StrMethod, TBlock, TFunc,
-    TOp, TStmt, TTerm,
+    TOp, TStmt, TTerm, UNBOX_FLOAT_ARITH, UNBOX_FLOAT_CMP, UNBOX_FLOAT_EXACT,
 };
 pub use runtime::{
     global_obj_list_elem, register_attr_get_chain_helper, register_attr_helpers,
@@ -55,16 +55,17 @@ pub use runtime::{
     register_obj_getitem_helper, register_poll_helper, register_self_call_helpers,
     register_str_format_helpers, register_str_helpers, register_str_method_helper,
     register_str_write_helpers, register_truth_helper, register_tuple_read_helpers,
-    register_unbox_int_helper, set_obj_layout, AttrGetChainHelper, AttrGetHelper, AttrSetHelper,
-    BuildListHelper, BuildTupleHelper, BytesGetHelper, CachedAttrChainHelper, CallDynHelper,
-    CallMethodHelper, CallPyHelper, CallStatus, CellGetHelper, CellSetHelper, DictAccessHelper,
-    DynAttrHelper, GetIterHelper, GuardMethodHelper, IterNextHelper, IterNextPairHelper, JitFrame,
-    JitStatus, ListAppendHelper, ListFromRangeHelper, ListGetHelper, ListLenHelper, ListNextHelper,
-    ListRepeatHelper, ListSetHelper, ListSliceHelper, MathBinaryHelper, MathUnaryHelper, ObjLayout,
-    PollHelper, SelfEnterHelper, SelfExitHelper, SelfSlowHelper, SlotTag, StrEqHelper,
-    StrLenHelper, StrModHelper, CALL_GAPS, DICT_KEY_INT, DICT_KEY_STR, DICT_VAL_FLOAT,
-    DICT_VAL_INT, DICT_VAL_OBJ, ITER_ELEM_STR, JIT_POLL_STRIDE, MAX_ATTR_CHAIN_LEN,
-    MAX_CACHED_ATTR_CHAIN_LEN, METHOD_GUARD_AT_CALL, METHOD_NATIVE,
+    register_unbox_float_helper, register_unbox_int_helper, set_obj_layout, AttrGetChainHelper,
+    AttrGetHelper, AttrSetHelper, BuildListHelper, BuildTupleHelper, BytesGetHelper,
+    CachedAttrChainHelper, CallDynHelper, CallMethodHelper, CallPyHelper, CallStatus,
+    CellGetHelper, CellSetHelper, DictAccessHelper, DynAttrHelper, GetIterHelper,
+    GuardMethodHelper, IterNextHelper, IterNextPairHelper, JitFrame, JitStatus, ListAppendHelper,
+    ListFromRangeHelper, ListGetHelper, ListLenHelper, ListNextHelper, ListRepeatHelper,
+    ListSetHelper, ListSliceHelper, MathBinaryHelper, MathUnaryHelper, ObjLayout, PollHelper,
+    SelfEnterHelper, SelfExitHelper, SelfSlowHelper, SlotTag, StrEqHelper, StrLenHelper,
+    StrModHelper, CALL_GAPS, DICT_KEY_INT, DICT_KEY_STR, DICT_VAL_FLOAT, DICT_VAL_INT,
+    DICT_VAL_OBJ, ITER_ELEM_STR, JIT_POLL_STRIDE, MAX_ATTR_CHAIN_LEN, MAX_CACHED_ATTR_CHAIN_LEN,
+    METHOD_GUARD_AT_CALL, METHOD_NATIVE,
 };
 pub use value::JitType;
 

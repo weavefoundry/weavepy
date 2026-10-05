@@ -66,6 +66,12 @@ pub struct CompiledFrame {
     pub comp_target_slots: Vec<u32>,
     /// Cold-exit pcs (see [`crate::ir::TFunc::cold_exits`]).
     pub cold_exits: Vec<u32>,
+    /// See [`crate::ir::TFunc::region_exits`].
+    pub region_exits: Vec<u32>,
+    /// See [`crate::ir::TFunc::stayed_heads`].
+    pub stayed_heads: Vec<u32>,
+    /// See [`crate::ir::TFunc::env_heads`].
+    pub env_heads: Vec<u32>,
     /// Whether the interpreter should enter this body directly: a
     /// loop-free body that round-trips into the interpreter (generic
     /// calls, dynamic attributes or membership) gains nothing native
@@ -407,6 +413,10 @@ impl JitEngine {
                     runtime::unbox_int_helper_addr(),
                     "integer guard (no helper registered)",
                 )),
+                TOp::UnboxFloat { .. } => Some((
+                    runtime::unbox_float_helper_addr(),
+                    "float guard (no helper registered)",
+                )),
                 TOp::CallDyn {
                     int_result: true, ..
                 } => Some((
@@ -692,7 +702,7 @@ impl JitEngine {
                     | TOp::ContainsDyn { .. }
             )
         });
-        let interp_entry = has_loop || !round_trips;
+        let interp_entry = (has_loop || !round_trips) && tfunc.pc0_entry;
         Ok(CompiledFrame {
             func,
             livein: tfunc.livein_locals.clone(),
@@ -706,6 +716,9 @@ impl JitEngine {
             comp_saved: tfunc.comp_saved.clone(),
             comp_target_slots: tfunc.comp_target_slots.clone(),
             cold_exits: tfunc.cold_exits.clone(),
+            region_exits: tfunc.region_exits.clone(),
+            stayed_heads: tfunc.stayed_heads.clone(),
+            env_heads: tfunc.env_heads.clone(),
             interp_entry,
             callee_spans: tfunc.callee_spans.clone(),
             len_spans: tfunc.len_spans.clone(),

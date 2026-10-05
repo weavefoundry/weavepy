@@ -111,6 +111,10 @@ fn analyze_code_cfg(code: &CodeObject, cfg: &Cfg) -> Result<TFunc, JitVerdict> {
         obj_global: &mut obj_global,
         cell: &mut |_| None,
         obj: &mut |_| false,
+        local: &mut |_| None,
+        stack_iter: &mut |_| None,
+        entry_pc: None,
+        carve_env: false,
         paths: &mut paths,
     };
     analyze_frame(code, &mut resolve, &mut probes)
@@ -738,6 +742,10 @@ fn shadowed_enumerate_gets_no_trained_lanes() {
         obj_global: &mut obj_global,
         cell: &mut |_| None,
         obj: &mut |_| false,
+        local: &mut |_| None,
+        stack_iter: &mut |_| None,
+        entry_pc: None,
+        carve_env: false,
         paths: &mut paths,
     };
     let tf = analyze_frame(&code, &mut resolve, &mut probes)

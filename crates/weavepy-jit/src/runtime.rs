@@ -940,6 +940,22 @@ pub(crate) fn unbox_int_helper_addr() -> usize {
     UNBOX_INT_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
+static UNBOX_FLOAT_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the `float` pin guard ([`crate::ir::TOp::UnboxFloat`]). Its
+/// argument packs the pin (low 32 bits) with the promotion mode (high
+/// bits; a negative argument is the `None` pin). On success it writes
+/// the `f64` bits to frame.ret_bits and returns zero; a nonzero status
+/// deopts without invoking Python code.
+pub fn register_unbox_float_helper(f: StrLenHelper) {
+    UNBOX_FLOAT_HELPER.store(f as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn unbox_float_helper_addr() -> usize {
+    UNBOX_FLOAT_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
 static DICT_ITER_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Register the process-wide dict-iterator capture helper (RFC 0073

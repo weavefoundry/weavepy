@@ -1259,6 +1259,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::DictLen => self.emit_pin_len(runtime::dict_len_helper_addr(), stmt.pc),
             TOp::TupleLen => self.emit_pin_len(runtime::tuple_len_helper_addr(), stmt.pc),
             TOp::UnboxInt { depth } => self.emit_unbox_int(depth, stmt.pc),
+            TOp::UnboxFloat { depth, promote } => self.emit_unbox_float(depth, promote, stmt.pc),
             TOp::IterCapture {
                 iter_slot,
                 materialize,
@@ -2148,6 +2149,42 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             OFF_RET_BITS,
         );
         self.vstack[index] = (value, JitType::Int);
+    }
+
+    /// [`TOp::UnboxFloat`]: guard an object operand as a `float` (see
+    /// the op for `promote`) and replace it with its unboxed value. A
+    /// miss deopts with the operand stack as it was.
+    fn emit_unbox_float(&mut self, depth: u8, promote: u8, pc: u32) {
+        let snapshot = self.vstack.clone();
+        let index = self.vstack.len() - 1 - usize::from(depth);
+        let (pin, lane) = self.vstack[index];
+        debug_assert_eq!(lane, JitType::Obj);
+        let sig = self.pin_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::unbox_float_helper_addr() as i64);
+        // The `None` pin (-1) stays negative; any other pin carries the
+        // mode in its high bits.
+        let mode = self.b.ins().iconst(types::I64, i64::from(promote) << 32);
+        let packed = self.b.ins().bor(pin, mode);
+        let none = self.b.ins().icmp_imm(IntCC::SignedLessThan, pin, 0);
+        let arg = self.b.ins().select(none, pin, packed);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, arg]);
+        let status = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        let value = self.b.ins().load(
+            types::F64,
+            MemFlags::trusted(),
+            self.frame_ptr,
+            OFF_RET_BITS,
+        );
+        self.vstack[index] = (value, JitType::Float);
     }
 
     /// A code constant through its memoizing pin helper. Negative status
