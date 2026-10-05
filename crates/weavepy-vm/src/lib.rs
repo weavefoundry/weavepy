@@ -17120,6 +17120,16 @@ impl Interpreter {
         if let Some(done) = Self::leaf_function_attr(code, stack, ins) {
             return done;
         }
+        // `y.append` (a builtin container's method read as a value) and
+        // `obj.__dict__`: sites the full handler never specializes.
+        if ins.op == OpCode::LoadAttr {
+            if let Some(v) = self.leaf_plain_attr_value(code, stack.last(), ins.arg) {
+                if let Some(top) = stack.last_mut() {
+                    drop(std::mem::replace(top, v));
+                }
+                return CoreAttr::Done;
+            }
+        }
         // `gen.send(...)` and the other generator and coroutine methods:
         // the bound method, with an empty self slot (sites the full
         // handler never specializes either).
@@ -17334,6 +17344,51 @@ impl Interpreter {
                 CoreAttr::Done
             }
             _ => CoreAttr::Decline,
+        }
+    }
+
+    /// `LOAD_ATTR` (without the method flag) of `co_names[name_idx]` on
+    /// `recv`, for two shapes the full handler serves without
+    /// specializing: an exact builtin container's method, bound as
+    /// `load_attr` binds it, and a plain instance's `__dict__` when its
+    /// class keeps the standard `__dict__` member. `None` otherwise.
+    fn leaf_plain_attr_value(
+        &self,
+        code: &CodeObject,
+        recv: Option<&Object>,
+        name_idx: u32,
+    ) -> Option<Object> {
+        let recv = recv?;
+        let name = code.names.get(name_idx as usize)?.as_str();
+        match recv {
+            Object::List(_)
+            | Object::Dict(_)
+            | Object::Set(_)
+            | Object::FrozenSet(_)
+            | Object::Str(_)
+            | Object::Bytes(_)
+            | Object::Tuple(_)
+                if !name.starts_with("__") =>
+            {
+                let m = self.lookup_method(recv, name)?;
+                Some(self.maybe_bind(recv, m))
+            }
+            Object::Instance(inst) if name == "__dict__" => {
+                let cls = inst.cls_raw();
+                if inst.native.get().is_some()
+                    || !cls.has_managed_dict()
+                    || !Self::default_getattribute(cls)
+                    || cls.lookup("__getattr__").is_some()
+                {
+                    return None;
+                }
+                let member = cls.lookup("__dict__")?;
+                if crate::builtins::class_of(&member).name != "member_descriptor" {
+                    return None;
+                }
+                Some(Object::Dict(inst.dict_shared()))
+            }
+            _ => None,
         }
     }
 
@@ -53084,6 +53139,11 @@ impl Interpreter {
                 crate::builtins::class_of(recv).name
             )));
         }
+        if proto >= 2 {
+            if let Some(reduced) = self.reduce_newobj_plain(recv) {
+                return Ok(reduced);
+            }
+        }
         let helper_name = if proto >= 2 {
             "_reduce_newobj"
         } else {
@@ -53093,6 +53153,62 @@ impl Interpreter {
             .module_attr("copyreg", helper_name)
             .ok_or_else(|| runtime_error(format!("copyreg.{helper_name} unavailable")))?;
         self.call(&helper, &[recv.clone(), Object::Int(proto)], &[], globals)
+    }
+
+    /// `copyreg._reduce_newobj(obj, protocol)` for the common instance,
+    /// natively: a plain instance (no native payload) of a class with no
+    /// `__slots__` anywhere on its MRO, no `__getnewargs_ex__` or
+    /// `__getnewargs__`, and `object`'s own `__getstate__` reduces to
+    /// `(copyreg.__newobj__, (cls,), state, None, None)` with `state` its
+    /// `__dict__` when non-empty, else `None`. `None` for every other
+    /// shape (the Python helper decides).
+    fn reduce_newobj_plain(&mut self, recv: &Object) -> Option<Object> {
+        let Object::Instance(inst) = recv else {
+            return None;
+        };
+        if inst.native.get().is_some() || crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let cls = inst.cls();
+        let slots_key = crate::object::StrKey("__slots__");
+        if cls
+            .mro
+            .borrow()
+            .iter()
+            .any(|c| c.dict.borrow().get(&slots_key).is_some())
+        {
+            return None;
+        }
+        if cls.lookup("__getnewargs_ex__").is_some() || cls.lookup("__getnewargs__").is_some() {
+            return None;
+        }
+        let default_getstate = builtin_types()
+            .object_
+            .dict
+            .borrow()
+            .get(&crate::object::StrKey("__getstate__"))
+            .cloned()?;
+        // (The class lookup skips `object`'s own entry: none found is the
+        // default too.)
+        match (cls.lookup("__getstate__"), &default_getstate) {
+            (None, _) => {}
+            (Some(Object::Builtin(a)), Object::Builtin(b)) if Rc::ptr_eq(&a, b) => {}
+            _ => return None,
+        }
+        let newobj = self.module_attr("copyreg", "__newobj__")?;
+        let dict = inst.dict_shared();
+        let state = if dict.try_borrow().ok()?.is_empty() {
+            Object::None
+        } else {
+            Object::Dict(dict)
+        };
+        Some(Object::new_tuple(vec![
+            newobj,
+            Object::new_tuple(vec![Object::Type(cls)]),
+            state,
+            Object::None,
+            Object::None,
+        ]))
     }
 
     /// `<builtin-iterator>.__reduce__()` → `(iter, (remaining_items,))`.
