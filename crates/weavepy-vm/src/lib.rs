@@ -22721,24 +22721,43 @@ impl Interpreter {
             }
             return Some(Object::MappingProxy(cls.dict.clone()));
         }
-        if !Self::plain_metaclass(cls) {
-            return Self::leaf_load_meta_class_attr(code, cls, name_idx);
-        }
-        // `cls.__doc__` of a Python class (`type_get_doc`): its own dict's
-        // entry, or `None` without one; a descriptor there is the full
-        // path's to run.
+        // `cls.__doc__` of a Python class: under `type`, `type_get_doc`
+        // reads the class's own dict (`None` without an entry); under a
+        // Python metaclass, that metaclass's own `__doc__` entry (a plain
+        // value, not a data descriptor) leaves the read to the class's
+        // MRO, which the class's own entry answers. A descriptor anywhere
+        // is the full path's to run.
         if !cls.flags.is_builtin
             && code
                 .names
                 .get(name_idx as usize)
                 .is_some_and(|n| n == "__doc__")
         {
+            let plain = |v: Option<&Object>| matches!(v, Some(Object::Str(_) | Object::None));
+            let key = crate::object::StrKey("__doc__");
+            if !Self::plain_metaclass(cls) {
+                // SAFETY: GIL-serialized raw read, as in `plain_metaclass`.
+                let meta = unsafe { (*cls.metaclass.as_ptr()).as_ref() }?;
+                if meta.flags.is_builtin
+                    || meta.c_ext_ptr.get() != 0
+                    || !Self::default_getattribute(meta)
+                    || !plain(meta.dict.try_borrow().ok()?.get(&key))
+                {
+                    return None;
+                }
+                let d = cls.dict.try_borrow().ok()?;
+                let v = d.get(&key);
+                return plain(v).then(|| v.cloned()).flatten();
+            }
             let d = cls.dict.try_borrow().ok()?;
-            return match d.get(&crate::object::StrKey("__doc__")) {
+            return match d.get(&key) {
                 None => Some(Object::None),
-                Some(v @ (Object::Str(_) | Object::None)) => Some(v.clone()),
+                v if plain(v) => v.cloned(),
                 Some(_) => None,
             };
+        }
+        if !Self::plain_metaclass(cls) {
+            return Self::leaf_load_meta_class_attr(code, cls, name_idx);
         }
         // A natively served class method (`datetime.fromisoformat`; see
         // `stdlib::datetime_native`), bound as `classmethod.__get__`
@@ -23070,10 +23089,16 @@ impl Interpreter {
                             || !cls.setattr_is_default()
                             || cls.forbids_dict
                             || crate::object::exotic_str_keys_possible()
-                            || name.starts_with("__")
-                            || name == "args"
+                            || (name.starts_with("__") && name != "__doc__")
+                            // An exception's `args` is a `BaseException`
+                            // descriptor.
+                            || (name == "args"
+                                && cls.is_subclass_of(&builtin_types().base_exception))
                             || inst.c_body.get() != 0
-                            || !matches!(cls.lookup(name), None | Some(Object::Function(_)))
+                            || !matches!(
+                                cls.lookup(name),
+                                None | Some(Object::Function(_) | Object::Str(_) | Object::None)
+                            )
                             || crate::capi_watchers::dicts_active()
                         {
                             return None;
