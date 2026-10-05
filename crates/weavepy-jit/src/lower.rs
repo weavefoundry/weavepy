@@ -1852,6 +1852,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let snapshot = self.vstack.clone();
 
         self.writeback_locals();
+        // The native store reuses this exact instruction's inline cache.
+        self.store_call_site_pc(pc);
 
         let sig = self.list_helper_sig();
         let helper = self

@@ -68578,6 +68578,13 @@ assert loop(2000) == 1999000
                             native > 100 || (armed > 0 && native > 0),
                             "compiled {kind} native update coverage: {native} (armed {armed})"
                         );
+                    } else if kind == "class-default" {
+                        // A stable class-level `int` default certifies like
+                        // no default at all, once the caller's loop compiles.
+                        assert!(
+                            native == 0 || (armed > 0 && native > 0),
+                            "compiled {kind} native update coverage: {native} (armed {armed})"
+                        );
                     } else if matches!(kind, "default" | "slots" | "alias") {
                         assert!(
                             native > 100,

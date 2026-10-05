@@ -1157,6 +1157,7 @@ impl JitState {
             cell,
             obj_live,
             stack_iter,
+            pairs,
         } = probes;
         // RFC 0071 WS1 — an already-compiled callee's *actual* return
         // lane, from the code cache. The static re-analysis in
@@ -1380,6 +1381,7 @@ impl JitState {
                 obj: &mut **obj_live,
                 local: &mut probe_local,
                 stack_iter: &mut **stack_iter,
+                pairs: &mut **pairs,
                 entry_pc: Some(entry_pc),
                 carve_env: seed_params,
                 paths: &mut path_arena,
@@ -1749,7 +1751,7 @@ impl JitState {
             // code; a stale plan (or one not yet rebuilt) simply takes
             // the interpreter path, and `guards_hold` — which re-probes
             // the full construction shape — remains the semantic guard.
-            Object::Type(t) => {
+            Object::Type(t) if t.metaclass_is_type() => {
                 let init = {
                     let cached = t.instance_plan.borrow();
                     let (ver, plan) = cached.as_ref()?.clone();
@@ -1933,6 +1935,9 @@ struct VmProbes<'a> {
     /// The lane of the live loop iterator at an interpreter-stack index
     /// of the requesting activation (see [`probe_stack_iter_lane`]).
     stack_iter: &'a mut dyn FnMut(u32) -> Option<JitType>,
+    /// The pair lanes of a local list or tuple of 2-tuples (see
+    /// [`probe_pair_lanes`]).
+    pairs: &'a mut dyn FnMut(u32) -> Option<(JitType, JitType)>,
 }
 
 /// RFC 0071 WS2 — one constructible class's burned-in call shape: the
@@ -2360,6 +2365,7 @@ fn method_ret_info(
         obj: &mut |_| false,
         local: &mut |_| None,
         stack_iter: &mut |_| None,
+        pairs: &mut |_| None,
         entry_pc: None,
         carve_env: false,
         paths: &mut path_arena,
@@ -2605,6 +2611,43 @@ fn entry_local_ok(obj: &Object, ty: JitType) -> bool {
 /// `int` or `float` list; `Some(Unknown)` for an *empty* list
 /// (definitely a list, but with no lane evidence — RFC 0065 WS5 lets
 /// `append`'s value lane pin it); `None` otherwise.
+fn probe_pair_lanes(frame: &super::Frame, slot: u32) -> Option<(JitType, JitType)> {
+    /// Enough pairs to see a mixed component without scanning a long
+    /// container on every compile.
+    const SAMPLE: usize = 16;
+    let locals = frame.locals.borrow();
+    let grade = |items: &[Object]| -> Option<(JitType, JitType)> {
+        let lane = |v: &Object| match v {
+            Object::Int(_) => JitType::Int,
+            Object::Float(_) => JitType::Float,
+            _ => JitType::Obj,
+        };
+        let mut out: Option<(JitType, JitType)> = None;
+        for it in items.iter().take(SAMPLE) {
+            let Object::Tuple(t) = it else {
+                return None;
+            };
+            let [a, b] = &t[..] else {
+                return None;
+            };
+            let (a, b) = (lane(a), lane(b));
+            out = Some(match out {
+                None => (a, b),
+                Some((x, y)) => (
+                    if x == a { x } else { JitType::Obj },
+                    if y == b { y } else { JitType::Obj },
+                ),
+            });
+        }
+        out
+    };
+    match locals.get(slot as usize) {
+        Some(Object::List(l)) => grade(&l.borrow()),
+        Some(Object::Tuple(t)) => grade(t),
+        _ => None,
+    }
+}
+
 fn probe_list_lane(frame: &super::Frame, slot: u32) -> Option<JitType> {
     let locals = frame.locals.borrow();
     let Some(Object::List(l)) = locals.get(slot as usize) else {
@@ -3632,6 +3675,7 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
         let mut probe_cell = |idx: u32| probe_cell_lane(frame_ref, idx);
         let mut probe_obj = |slot: u32| probe_obj_live(frame_ref, slot);
         let mut probe_iter = |depth: u32| probe_stack_iter_lane(frame_ref, depth);
+        let mut probe_pairs = |slot: u32| probe_pair_lanes(frame_ref, slot);
         let _ = st.get_compiled(
             &frame.code,
             0,
@@ -3650,6 +3694,7 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
                 cell: &mut probe_cell,
                 obj_live: &mut probe_obj,
                 stack_iter: &mut probe_iter,
+                pairs: &mut probe_pairs,
             },
         );
     });
@@ -3950,6 +3995,7 @@ fn with_native_frame<T>(
 ) -> T {
     // SAFETY: `jf` is the live activation's frame; its context pointer
     // was set from the activation's `CallCtx`.
+    #[allow(clippy::cast_ptr_alignment)]
     let ctx = unsafe { (*jf).ctx.cast::<CallCtx>() };
     NATIVE_FRAMES.with(|recs| {
         recs.borrow_mut().push(NativeFrameRec {
@@ -10525,6 +10571,11 @@ unsafe fn try_dyn_native(
     }
     let (nc, recv) = match callee {
         Object::Type(t) => {
+            // A metaclass's `__call__` decides what calling the class
+            // does: only `type`'s own is the constructor pipeline.
+            if !t.metaclass_is_type() {
+                return None;
+            }
             // Mirror `resolve_native_callee`'s constructor arm: the
             // memoised instance plan must be current and carry a
             // plain-function `__init__`.
@@ -11213,7 +11264,15 @@ unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i6
     let code = unsafe { &*ctx.code_ptr };
     let (value, kind) = match receiver {
         Object::Instance(inst) if inst.cls_raw().native_kind.get() == 0 => (
-            super::Interpreter::leaf_load_attr_recv(code, receiver, jf.deopt_pc, name_idx),
+            // The site's split-layout shortcut first (the interpreter's
+            // own fastest read), then its inline cache.
+            super::code_vm_ext(code)
+                // SAFETY: the view is cloned before anything else runs.
+                .and_then(|ext| unsafe { super::field_slot_hit(ext, jf.deopt_pc as usize, inst) })
+                .map(super::clone_hot)
+                .or_else(|| {
+                    super::Interpreter::leaf_load_attr_recv(code, receiver, jf.deopt_pc, name_idx)
+                }),
             0,
         ),
         Object::Type(cls) if super::Interpreter::plain_metaclass(cls) => (
@@ -11342,6 +11401,25 @@ unsafe extern "C" fn wpjit_dyn_attr_set(frame: *mut JitFrame, pin: i64, name: i6
     // SAFETY: native code staged the value in slot 0.
     let (bits, tag) = unsafe { (*jf.call_args, *jf.call_tags) };
     let value = unpack_pins(bits, tag, &ctx.pins);
+    // A plain instance whose site cache proves an ordinary field store
+    // (the interpreter's core-loop store): no Python runs, so neither the
+    // dirtiness discipline nor a guard recheck applies.
+    if let Object::Instance(inst) = &recv {
+        if !crate::gil::free_threading_enabled()
+            && !matches!(value, Object::BoundMethod(_))
+            && super::Interpreter::core_store_attr(
+                code,
+                inst,
+                jf.deopt_pc as usize,
+                name_idx,
+                &value,
+            )
+        {
+            // The store moved the value's bits into the instance.
+            std::mem::forget(value);
+            return 0;
+        }
+    }
     ctx.dirty = true;
     match interp.store_attr_shared_name(&recv, &attr, value) {
         Err(err) => {
@@ -11917,7 +11995,12 @@ fn pack_iter_elem(
             | Object::Bool(_)
             | Object::Str(_)
             | Object::WStr(_)
-            | Object::Bytes(_) => pin_any(v.clone(), pins),
+            | Object::Bytes(_)
+            // Containers too (a list of rows, a list of pairs): the pin
+            // shares them with the iterable they came from.
+            | Object::Tuple(_)
+            | Object::List(_)
+            | Object::Dict(_) => pin_any(v.clone(), pins),
             _ => obj_ret_bits(v, pins, memo),
         },
         _ => None,
@@ -12122,6 +12205,65 @@ unsafe extern "C" fn wpjit_iter_next_pair(
     crate::gil::yield_checkpoint();
     if crate::hot_gates::load() != 0 || crate::trace::any_observers_active() {
         return 2;
+    }
+    // A list or tuple iterator (a row of `(index, weight)` pairs) steps
+    // in place: no Python runs, and the element unpacks like the
+    // generic step's below.
+    let seq_step = match ctx.pins.get(pin as usize) {
+        Some(Pin::Obj(Object::Iter(cell))) => {
+            cell.try_borrow_mut()
+                .ok()
+                .and_then(|mut it| match &mut *it {
+                    // The common step inline (`next_value` is a large
+                    // function); exhaustion detaches through it.
+                    crate::object::PyIterator::List { items, index, .. } => {
+                        let next = items.borrow().get(*index).cloned();
+                        Some(match next {
+                            Some(v) => {
+                                *index += 1;
+                                Some(v)
+                            }
+                            None => it.next_value(),
+                        })
+                    }
+                    crate::object::PyIterator::Tuple { items, index } => {
+                        let next = items.get(*index).cloned();
+                        if next.is_some() {
+                            *index += 1;
+                        }
+                        Some(next)
+                    }
+                    _ => None,
+                })
+        }
+        _ => None,
+    };
+    if let Some(step) = seq_step {
+        let Some(v) = step else {
+            return 1;
+        };
+        if let Object::Tuple(items) = &v {
+            if let [a, b] = &items[..] {
+                let packed1 = pack_iter_elem(a, tag1, &mut ctx.pins, &mut ctx.pin_memo);
+                let packed2 =
+                    packed1.and_then(|_| pack_iter_elem(b, tag2, &mut ctx.pins, &mut ctx.pin_memo));
+                if let (Some(b1), Some(b2)) = (packed1, packed2) {
+                    jf.ret_bits = b1;
+                    // SAFETY: the marshal buffer is at least one slot
+                    // wide (`max_call_args.max(1)`).
+                    unsafe { *jf.call_args = b2 };
+                    return 0;
+                }
+            }
+        }
+        // Not in the lanes: the erased `UNPACK_SEQUENCE` consumes it.
+        jf.ret_bits = if matches!(v, Object::None) {
+            u64::MAX
+        } else {
+            ctx.pins.push(Pin::Obj(v));
+            (ctx.pins.len() - 1) as u64
+        };
+        return 3;
     }
     if tag1 == SlotTag::Int as i64 && tag2 == SlotTag::Int as i64 {
         let pair = match ctx.pins.get(pin as usize) {
@@ -12677,6 +12819,7 @@ pub(crate) fn try_enter(interp: &mut super::Interpreter, frame: &mut super::Fram
         let mut probe_cell = |idx: u32| probe_cell_lane(frame_ref, idx);
         let mut probe_obj = |slot: u32| probe_obj_live(frame_ref, slot);
         let mut probe_iter = |depth: u32| probe_stack_iter_lane(frame_ref, depth);
+        let mut probe_pairs = |slot: u32| probe_pair_lanes(frame_ref, slot);
         st.get_compiled(
             &frame.code,
             frame.pc as u32,
@@ -12695,6 +12838,7 @@ pub(crate) fn try_enter(interp: &mut super::Interpreter, frame: &mut super::Fram
                 cell: &mut probe_cell,
                 obj_live: &mut probe_obj,
                 stack_iter: &mut probe_iter,
+                pairs: &mut probe_pairs,
             },
         )
     });
@@ -12862,6 +13006,7 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
         let mut probe_cell = |idx: u32| probe_cell_lane(frame_ref, idx);
         let mut probe_obj = |slot: u32| probe_obj_live(frame_ref, slot);
         let mut probe_iter = |depth: u32| probe_stack_iter_lane(frame_ref, depth);
+        let mut probe_pairs = |slot: u32| probe_pair_lanes(frame_ref, slot);
         st.get_compiled(
             &frame.code,
             frame.pc as u32,
@@ -12880,6 +13025,7 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
                 cell: &mut probe_cell,
                 obj_live: &mut probe_obj,
                 stack_iter: &mut probe_iter,
+                pairs: &mut probe_pairs,
             },
         )
     });
@@ -13147,6 +13293,7 @@ pub(crate) fn try_enter_resume(
         let mut probe_cell = |idx: u32| probe_cell_lane(frame_ref, idx);
         let mut probe_obj = |slot: u32| probe_obj_live(frame_ref, slot);
         let mut probe_iter = |depth: u32| probe_stack_iter_lane(frame_ref, depth);
+        let mut probe_pairs = |slot: u32| probe_pair_lanes(frame_ref, slot);
         st.get_compiled(
             &frame.code,
             frame.pc as u32,
@@ -13165,6 +13312,7 @@ pub(crate) fn try_enter_resume(
                 cell: &mut probe_cell,
                 obj_live: &mut probe_obj,
                 stack_iter: &mut probe_iter,
+                pairs: &mut probe_pairs,
             },
         )
     });

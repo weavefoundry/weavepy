@@ -168,4 +168,150 @@ def overflowing_bound(n, big):
 assert overflowing_bound(2000, 100) == 6000
 assert overflowing_bound(3, 2 ** 63 + 1) == 9
 
+
+# Rows of (index, weight) pairs: the pair lanes are trained from the live
+# row, and every surprise (an int weight, a non-pair element, a pair that
+# isn't a 2-tuple, a row that grows mid-loop) must behave as interpreted.
+def sparse(rows, x, cycles):
+    y = [0.0] * len(rows)
+    for _ in range(cycles):
+        for r, row in enumerate(rows):
+            s = 0.0
+            for col, v in row:
+                s += x[col] * v
+            y[r] = s
+    return y
+
+
+def sparse_ref(rows, x):
+    return [sum(x[c] * v for c, v in row) for row in rows]
+
+
+x = [float(i % 7) + 0.5 for i in range(40)]
+rows = [[((r * 3 + k) % 40, (r + k) * 0.25) for k in range(5)] for r in range(60)]
+assert sparse(rows, x, 20) == sparse_ref(rows, x)
+rows[45][2] = (rows[45][2][0], 3)  # an int weight in a float lane
+assert sparse(rows, x, 20) == sparse_ref(rows, x)
+rows[50][1] = [7, 1.5]  # a list pair unpacks too
+assert sparse(rows, x, 20) == sparse_ref(rows, x)
+rows[55] = tuple(rows[55])  # a tuple row
+assert sparse(rows, x, 20) == sparse_ref(rows, x)
+rows[58][3] = (1, 2.0, 3.0)
+try:
+    sparse(rows, x, 20)
+except ValueError as exc:
+    assert str(exc) == "too many values to unpack (expected 2, got 3)", exc
+else:
+    raise AssertionError("expected ValueError")
+
+
+def growing(pairs):
+    total = 0.0
+    for a, b in pairs:
+        if a == 100 and len(pairs) < 3000:
+            pairs.append((a, b + 1.0))  # the iterator sees appended pairs
+        total += a * b
+    return total, len(pairs)
+
+
+def growing_ref(pairs):
+    total, i = 0.0, 0
+    while i < len(pairs):
+        a, b = pairs[i]
+        if a == 100 and len(pairs) < 3000:
+            pairs.append((a, b + 1.0))
+        total += a * b
+        i += 1
+    return total, len(pairs)
+
+
+assert growing([(i % 101, 0.5) for i in range(2000)]) == \
+    growing_ref([(i % 101, 0.5) for i in range(2000)])
+
+
+# A metaclass `__call__` runs for every construction in a hot loop.
+class Counting(type):
+    calls = 0
+
+    def __call__(cls, *args):
+        Counting.calls += 1
+        return super().__call__(*args)
+
+
+class Made(metaclass=Counting):
+    def __init__(self, v):
+        self.v = v
+
+
+def construct(n):
+    total = 0.0
+    for i in range(n):
+        total += Made(i * 0.5).v
+    return total
+
+
+assert construct(3000) == sum(i * 0.5 for i in range(3000))
+assert Counting.calls == 3000, Counting.calls
+
+# Attribute stores and loads on a global instance: the site caches serve
+# the plain field, and a class change mid-loop (a property, `__slots__`
+# style storage, a `__setattr__`) must take effect on the next iteration.
+class Box:
+    def __init__(self):
+        self.x = 0
+        self.y = 0
+
+
+box = Box()
+log = []
+
+
+def install():
+    def setter(self, v):
+        log.append(v)
+        self.__dict__["_x"] = v
+    Box.x = property(lambda self: self.__dict__.get("_x", -1), setter)
+
+
+def store_loop(n, at):
+    total = 0
+    for i in range(n):
+        if i == at:
+            install()
+        box.x = i
+        total += box.x
+    return total
+
+
+assert store_loop(3000, -1) == sum(range(3000)) and box.x == 2999
+assert store_loop(3000, 2000) == sum(range(3000)), store_loop
+assert log == list(range(2000, 3000)), log[:3]
+del Box.x
+
+
+class Watched:
+    def __init__(self):
+        self.v = 0
+
+    def __setattr__(self, name, value):
+        if value == 2500:
+            raise AttributeError("no 2500")
+        object.__setattr__(self, name, value)
+
+
+watched = Watched()
+
+
+def guarded_stores(n):
+    for i in range(n):
+        watched.v = i
+
+
+try:
+    guarded_stores(3000)
+except AttributeError as exc:
+    assert str(exc) == "no 2500" and watched.v == 2499
+else:
+    raise AssertionError("expected AttributeError")
+
 print("JIT generic items: ok")

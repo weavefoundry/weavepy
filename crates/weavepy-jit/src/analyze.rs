@@ -259,6 +259,13 @@ pub struct Probes<'a> {
     /// Consulted only for an OSR-only loop that contains
     /// [`Self::entry_pc`] (so the stack is that loop's own).
     pub stack_iter: &'a mut dyn FnMut(u32) -> Option<JitType>,
+    /// The element lanes of local `slot`'s live value in the requesting
+    /// activation when it's a list or tuple of 2-tuples (a sparse row
+    /// of `(index, weight)` pairs): each component is `Int` or `Float`
+    /// when every sampled pair agrees, `Obj` otherwise. Trains a
+    /// `for a, b in <local>:` loop's variable lanes; the step helper
+    /// re-validates every element, so it's only a prediction.
+    pub pairs: &'a mut dyn FnMut(u32) -> Option<(JitType, JitType)>,
     /// The pc the requesting activation stands at (a loop header for an
     /// OSR request, `0` for a fresh call), `None` without an activation.
     pub entry_pc: Option<u32>,
@@ -460,6 +467,9 @@ enum PairSrc {
     /// `enumerate(<local>)` over a certified canonical `enumerate` —
     /// `Int` index, element lane from a list or exact-bytes source.
     Enumerate(u32),
+    /// `<local>` itself, a list or tuple of pairs — lanes from the
+    /// pair probe.
+    Local(u32),
 }
 
 /// RFC 0073 WS1 — one recognized inlined comprehension (PEP 709
@@ -607,6 +617,7 @@ pub fn analyze_with_probes(
         obj: &mut |_| false,
         local: &mut |_| None,
         stack_iter: &mut |_| None,
+        pairs: &mut |_| None,
         entry_pc: None,
         carve_env: false,
         paths: &mut arena,
@@ -639,6 +650,7 @@ pub fn analyze_for_ret(
         obj: &mut |_| false,
         local: &mut |_| None,
         stack_iter: &mut |_| None,
+        pairs: &mut |_| None,
         entry_pc: None,
         carve_env: false,
         paths: &mut arena,
@@ -2002,6 +2014,8 @@ fn plan_rewrite(
             {
                 plan.pair_src
                     .insert(i - 1, PairSrc::Enumerate(ins[i - 3].arg));
+            } else if i >= 2 && matches!(ins[i - 2].op, OpCode::LoadFast) {
+                plan.pair_src.insert(i - 1, PairSrc::Local(ins[i - 2].arg));
             }
             plan.list_loops.push(ListLoopMeta {
                 seq_slot,
@@ -2589,7 +2603,7 @@ fn range_prefix(
     let mut acc = 0i32;
     let mut args_start = None;
     for q in (0..call).rev() {
-        acc += bound_expr_effect(code, &ins[q])?;
+        acc += bound_expr_effect(code, ins[q])?;
         if acc == k as i32 {
             args_start = Some(q);
             break;
@@ -2597,8 +2611,8 @@ fn range_prefix(
     }
     let args_start = args_start?;
     let mut depth = 0i32;
-    for q in args_start..call {
-        depth += bound_expr_effect(code, &ins[q])?;
+    for &arg in &ins[args_start..call] {
+        depth += bound_expr_effect(code, arg)?;
         if depth < 0 {
             return None;
         }
@@ -2649,7 +2663,7 @@ fn range_prefix(
 /// The stack effect (pushes less pops) of an instruction a counted
 /// range's bound expressions may contain (see [`range_prefix`]), `None`
 /// for anything else.
-fn bound_expr_effect(code: &CodeObject, ins: &weavepy_compiler::Instruction) -> Option<i32> {
+fn bound_expr_effect(code: &CodeObject, ins: weavepy_compiler::Instruction) -> Option<i32> {
     match ins.op {
         OpCode::LoadFast
         | OpCode::LoadSmallInt
@@ -4424,6 +4438,11 @@ fn step_abstract(
                                 ctor.pair_lanes.insert(seq_slot, (JitType::Int, elem));
                             }
                         }
+                        PairSrc::Local(s) => {
+                            if let Some(lanes) = (probes.pairs)(s) {
+                                ctor.pair_lanes.insert(seq_slot, lanes);
+                            }
+                        }
                     }
                 }
                 set_local(local_types, seq_slot, JitType::Obj, changed)?;
@@ -5420,10 +5439,19 @@ fn step_abstract(
             // `int` for a sequence, or anything else for the generic
             // subscript).
             if idx.ty.is_representable() && idx.ty != JitType::Int {
-                if idx.ty != JitType::Obj || !subscr_speculates_int(cont.ty) {
+                // An untyped container local may probe as a list, whose
+                // object index is then guarded as an `int`.
+                let list_elem = if idx.ty == JitType::Obj && !cont.ty.is_representable() {
+                    resolve_list_container(&cont, local_types, changed, probes).unwrap_or(None)
+                } else {
+                    None
+                };
+                if list_elem.is_none()
+                    && (idx.ty != JitType::Obj || !subscr_speculates_int(cont.ty))
+                {
                     if !cont.ty.is_representable() {
                         if let Some(slot) = cont.src {
-                            settle_container(slot, local_types, changed, probes)?;
+                            settle_container(slot, true, local_types, changed, probes)?;
                         }
                         stack.push(SE::known(JitType::Unknown));
                         return Ok(());
@@ -5469,7 +5497,7 @@ fn step_abstract(
             let elem = resolve_list_container(&cont, local_types, changed, probes)?;
             if elem.is_none() {
                 if let Some(slot) = cont.src {
-                    settle_container(slot, local_types, changed, probes)?;
+                    settle_container(slot, true, local_types, changed, probes)?;
                 }
             }
             stack.push(match elem {
@@ -5772,10 +5800,15 @@ fn step_abstract(
                 return Ok(());
             }
             if idx.ty.is_representable() && idx.ty != JitType::Int {
-                if idx.ty != JitType::Obj || !cont.ty.is_list() {
+                let list_elem = if idx.ty == JitType::Obj && !cont.ty.is_representable() {
+                    resolve_list_container(&cont, local_types, changed, probes).unwrap_or(None)
+                } else {
+                    None
+                };
+                if list_elem.is_none() && (idx.ty != JitType::Obj || !cont.ty.is_list()) {
                     if !cont.ty.is_representable() {
                         if let Some(slot) = cont.src {
-                            settle_container(slot, local_types, changed, probes)?;
+                            settle_container(slot, false, local_types, changed, probes)?;
                         }
                     }
                     return Ok(());
@@ -5794,7 +5827,7 @@ fn step_abstract(
                     }
                 }
             } else if let Some(slot) = cont.src {
-                settle_container(slot, local_types, changed, probes)?;
+                settle_container(slot, false, local_types, changed, probes)?;
             }
         }
         // `del d[k]` on an exact dict (the key lane as a store's).
@@ -5923,9 +5956,11 @@ fn subscr_speculates_int(cont: JitType) -> bool {
 
 /// Type an untyped container local no list or dict probe matched: any
 /// other live value rides the object lane (its subscripts run through
-/// the interpreter's own); an unbound one stays transient.
+/// the interpreter's own), except that an exact `str` or `bytes` being
+/// `read` keeps its indexed lane; an unbound one stays transient.
 fn settle_container(
     slot: u32,
+    read: bool,
     local_types: &mut [Option<JitType>],
     changed: &mut bool,
     probes: &mut Probes<'_>,
@@ -5934,7 +5969,13 @@ fn settle_container(
         return Ok(());
     }
     if (probes.list)(slot).is_none() && (probes.dict)(slot).is_none() && (probes.obj)(slot) {
-        set_local(local_types, slot, JitType::Obj, changed)?;
+        // A read from an exact `str` or `bytes` keeps its own indexed
+        // lane.
+        let lane = match (probes.local)(slot) {
+            Some(t @ (JitType::Str | JitType::Bytes)) if read => t,
+            _ => JitType::Obj,
+        };
+        set_local(local_types, slot, lane, changed)?;
     }
     Ok(())
 }
@@ -7539,7 +7580,16 @@ fn emit_instr(
                 .get(ins.arg as usize)
                 .copied()
                 .flatten()
-                .ok_or(JitVerdict::TypeUnknown)?;
+                .ok_or(JitVerdict::TypeUnknown)
+                .inspect_err(|_| {
+                    if std::env::var_os("WEAVEPY_JIT_TRACE_PC").is_some() {
+                        eprintln!(
+                            "jit untyped local {:?} {:?}",
+                            code.name,
+                            code.varnames.get(ins.arg as usize)
+                        );
+                    }
+                })?;
             // Push manually so the slot provenance rides along (RFC
             // 0065 WS5 attribute sites re-probe by slot).
             stmts.push(TStmt {
