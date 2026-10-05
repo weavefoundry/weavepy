@@ -53,6 +53,7 @@ pub mod datetime_accel;
 pub mod datetime_mod;
 pub(crate) mod datetime_native;
 pub(crate) mod decimal_native;
+pub(crate) mod elementtree_native;
 pub mod errno_mod;
 pub mod faulthandler_mod;
 #[cfg(unix)]
@@ -301,6 +302,7 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_weave_contextvars", contextvars_native::build);
     cache.register_builtin("_weave_datetime", datetime_accel::build);
     cache.register_builtin("_weave_decimal", decimal_native::build);
+    cache.register_builtin("_weave_elementtree", elementtree_native::build);
     cache.register_builtin("_weave_pickle", pickle_accel::build);
     cache.register_builtin("gc", gc_real::build);
     cache.register_builtin("_multiprocessing", multiprocessing_mod::build);

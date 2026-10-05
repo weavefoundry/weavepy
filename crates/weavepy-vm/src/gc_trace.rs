@@ -381,6 +381,10 @@ pub struct GcState {
     deferred: RefCell<Vec<DeferredContainer>>,
     /// Length at which [`GcState::sweep_deferred`] compacts `deferred`.
     deferred_limit: AtomicUsize,
+    /// Dead entries of the older generations pruned since the last
+    /// collection: deallocations the young-generation count owes (see
+    /// [`GcState::maybe_auto_collect`]).
+    old_deaths: AtomicUsize,
     /// Instances born since the last collection, held weakly: most die
     /// young, and registering one with the collector (an index entry and
     /// a handle) costs far more than its life. Their births count toward
@@ -446,6 +450,7 @@ impl GcState {
             gen0_gauge: AtomicU64::new(DEFAULT_THRESHOLDS[0] as u64),
             deferred: RefCell::new(Vec::new()),
             deferred_limit: AtomicUsize::new(DEFERRED_FLOOR),
+            old_deaths: AtomicUsize::new(0),
             young: RefCell::new(Vec::new()),
             young_fns: RefCell::new(Vec::new()),
             young_gens: RefCell::new(Vec::new()),
@@ -952,9 +957,10 @@ impl GcState {
         (removed, i)
     }
 
-    /// Drop the dead young entries, plus a bounded slice of the older
-    /// generations'. Returns the young generation's live population.
-    fn prune(&self) -> usize {
+    /// Drop the dead young entries, plus a slice of `old_budget` entries
+    /// of the older generations' (whose dead are added to `old_deaths`).
+    /// Returns the young generation's live population.
+    fn prune(&self, old_budget: usize) -> usize {
         let (removed, live) = {
             let mut index = self.index.borrow_mut();
             let mut gens = self.generations.borrow_mut();
@@ -970,8 +976,9 @@ impl GcState {
                 (2, cursor - n1)
             };
             let (r, stop) =
-                Self::prune_dead_in(&mut index, &mut gens[g].handles, start, OLD_PRUNE_BUDGET);
+                Self::prune_dead_in(&mut index, &mut gens[g].handles, start, old_budget);
             removed += r;
+            self.old_deaths.fetch_add(r, Ordering::Relaxed);
             let next = if stop >= gens[g].handles.len() {
                 if g == 1 {
                     gens[1].handles.len()
@@ -1140,10 +1147,12 @@ impl GcState {
     ///
     /// CPython's counter is allocations *minus deallocations* of tracked
     /// objects. Deaths aren't counted as they happen here, so the counter
-    /// is corrected when it trips: the dead young entries are pruned and
-    /// the count restarts from the survivors, unless they alone make up
-    /// half the threshold (which also bounds the pruning work at two
-    /// entries per allocation).
+    /// is corrected when it trips: the dead young entries are pruned, a
+    /// slice of the older generations is pruned and its dead credited, and
+    /// the count restarts from the survivors less those deaths, unless
+    /// that alone makes up half the threshold. (A loop that builds a
+    /// structure and drops the previous one thus seldom collects, as in
+    /// CPython; the pruning costs a few steps per allocation.)
     pub fn maybe_auto_collect(&self) -> bool {
         if !self.is_enabled() || self.collecting.load(Ordering::Acquire) {
             return false;
@@ -1166,7 +1175,16 @@ impl GcState {
         if !due {
             return false;
         }
-        let live = self.prune() + self.young_live();
+        // The older objects found dead (a slice of the older generations
+        // sized to the threshold, so a program that frees what it
+        // allocates is seen to) offset the young survivors. Deaths beyond
+        // the survivors are dropped, as CPython's count never goes below
+        // zero.
+        let young = self.prune(OLD_PRUNE_BUDGET.max(threshold0.saturating_mul(2)));
+        let survivors = young + self.young_live();
+        let deaths = self.old_deaths.load(Ordering::Relaxed).min(survivors);
+        self.old_deaths.store(deaths, Ordering::Relaxed);
+        let live = survivors - deaths;
         if live < threshold0 / 2 {
             let mut counts = self.counts.borrow_mut();
             counts[0] = live;
@@ -1286,6 +1304,7 @@ impl GcState {
     ///   pass (leftover garbage waits for the next trigger), keeping the
     ///   per-allocation cost flat.
     fn collect_impl(&self, upto: usize, exact: bool) -> usize {
+        self.old_deaths.store(0, Ordering::Relaxed);
         // Promote any deferred container that can now anchor a cycle, so
         // the mark phase sees the whole candidate population. Before the
         // re-entrancy claim: promotion calls `track_now`.

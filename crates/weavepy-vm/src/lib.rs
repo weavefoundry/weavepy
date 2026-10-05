@@ -932,8 +932,10 @@ pub struct Interpreter {
     leaf_opaque: ThreadCell<(u64, leaf_builtins::LeafMap)>,
     /// The core loop's last native iterator `__next__`, keyed by the
     /// (process-unique) attribute version of the class that resolved it
-    /// (see [`Interpreter::core_leaf_next`]).
-    core_next: ThreadCell<Option<(u64, Option<Rc<crate::object::BuiltinFn>>, u8)>>,
+    /// (see [`Interpreter::core_leaf_next`]): a whole-body leaf with its
+    /// direct operation, or a leaf fast half (with the builtin, which the
+    /// cache keeps alive).
+    core_next: ThreadCell<Option<CoreNext>>,
     /// How the last class seen in a boolean context answers it (see
     /// [`Interpreter::leaf_instance_truth`]), by attribute version.
     core_truth: ThreadCell<Option<(u64, NativeTruth)>>,
@@ -20205,18 +20207,21 @@ impl Interpreter {
         let ver = cls.attr_version.get();
         let b = match cls.leaf_attrs.get(key, ver) {
             Some(K::BuiltinMethod(b)) => Rc::as_ptr(b),
+            Some(K::Value(_)) => return self.leaf_instance_len_fast(cls, ver, v),
             Some(_) => return None,
             None => {
                 let kind = match cls.lookup("__len__") {
-                    Some(Object::Builtin(b))
-                        if b.binds_instance
-                            && self.leaf_call_kind(&b) == Some(LeafKind::Opaque) =>
-                    {
-                        K::BuiltinMethod(b)
+                    Some(Object::Builtin(b)) if b.binds_instance => {
+                        match self.leaf_call_kind(&b) {
+                            Some(LeafKind::Opaque) => K::BuiltinMethod(b),
+                            // A fast half (see `leaf_instance_len_fast`).
+                            Some(LeafKind::Fast(_)) => K::Value(Object::None),
+                            _ => K::Other,
+                        }
                     }
                     _ => K::Other,
                 };
-                let found = matches!(kind, K::BuiltinMethod(_));
+                let found = matches!(kind, K::BuiltinMethod(_) | K::Value(_));
                 cls.leaf_attrs.set(key, ver, kind);
                 return if found {
                     self.leaf_instance_len(v)
@@ -20233,6 +20238,47 @@ impl Interpreter {
             None => (b.call)(std::slice::from_ref(v)),
         };
         match r.ok()? {
+            Object::Int(n) if n >= 0 => Some(Object::Int(n)),
+            _ => None,
+        }
+    }
+
+    /// [`Self::leaf_instance_len`] for a class whose `__len__` is a builtin
+    /// registered with a leaf fast half (see `leaf_builtins::register_fast`;
+    /// the length cache marks it with a `Value`): the half's answer, or
+    /// `None` when it declines.
+    #[inline(never)]
+    fn leaf_instance_len_fast(
+        &self,
+        cls: &crate::types::TypeObject,
+        ver: u64,
+        v: &Object,
+    ) -> Option<Object> {
+        use crate::types::LeafAttrKind as K;
+        /// The cache key for the fast half's builtin.
+        static LEN_FAST_KEY: u8 = 0;
+        let key = std::ptr::addr_of!(LEN_FAST_KEY) as usize;
+        let fast = match cls.leaf_attrs.get(key, ver) {
+            Some(K::BuiltinMethod(b)) => match self.leaf_call_kind(b)? {
+                LeafKind::Fast(f) => f,
+                _ => return None,
+            },
+            Some(_) => return None,
+            None => {
+                let kind = match cls.lookup("__len__") {
+                    Some(Object::Builtin(b)) if b.binds_instance => K::BuiltinMethod(b),
+                    _ => K::Other,
+                };
+                let found = matches!(kind, K::BuiltinMethod(_));
+                cls.leaf_attrs.set(key, ver, kind);
+                return if found {
+                    self.leaf_instance_len_fast(cls, ver, v)
+                } else {
+                    None
+                };
+            }
+        };
+        match fast(std::slice::from_ref(v))?.ok()? {
             Object::Int(n) if n >= 0 => Some(Object::Int(n)),
             _ => None,
         }
@@ -20950,12 +20996,34 @@ impl Interpreter {
         inst: &PyInstance,
     ) -> Option<(*const crate::object::BuiltinFn, u8)> {
         let ver = inst.cls_raw().attr_version.get();
-        if let Some((v, b, op)) = &*self.core_next.borrow() {
+        if let Some((v, b, op, _)) = &*self.core_next.borrow() {
             if *v == ver {
                 return b.as_ref().map(|b| (Rc::as_ptr(b), *op));
             }
         }
         self.core_leaf_next_resolve(inst, ver)
+    }
+
+    /// The class's `__next__` when it is a builtin registered with a leaf
+    /// fast half (see `leaf_builtins::register_fast`): the half, which
+    /// declines (`None`) any step that needs the full body.
+    #[inline]
+    fn core_leaf_next_fast(&self, inst: &PyInstance) -> Option<leaf_builtins::Fast> {
+        let ver = inst.cls_raw().attr_version.get();
+        let hit = match &*self.core_next.borrow() {
+            Some((v, _, _, fast)) if *v == ver => Some(fast.as_ref().map(|(_, f)| *f)),
+            _ => None,
+        };
+        match hit {
+            Some(f) => f,
+            None => {
+                self.core_leaf_next_resolve(inst, ver);
+                match &*self.core_next.borrow() {
+                    Some((_, _, _, fast)) => fast.as_ref().map(|(_, f)| *f),
+                    None => None,
+                }
+            }
+        }
     }
 
     /// A native iterator step through [`Self::core_leaf_next_op`]: the
@@ -20967,7 +21035,10 @@ impl Interpreter {
         it: &Object,
         inst: &PyInstance,
     ) -> Option<Result<Object, RuntimeError>> {
-        let (b, op) = self.core_leaf_next_op(inst)?;
+        let Some((b, op)) = self.core_leaf_next_op(inst) else {
+            // A fast half declines what needs the full body.
+            return self.core_leaf_next_fast(inst)?(std::slice::from_ref(it));
+        };
         if op != 0 {
             if let Some(v) = crate::stdlib::collections_native::fast_op(op, it, None) {
                 return Some(Ok(v));
@@ -20987,21 +21058,20 @@ impl Interpreter {
     ) -> Option<(*const crate::object::BuiltinFn, u8)> {
         // A miss is remembered too: a Python-level `__next__` class asks
         // again on every step of a generic iteration.
-        let found = match inst.cls().lookup("__next__") {
-            Some(Object::Builtin(b))
-                if b.binds_instance
-                    && matches!(self.leaf_call_kind(&b), Some(LeafKind::Opaque)) =>
-            {
-                Some(b)
-            }
-            _ => None,
+        let (found, fast) = match inst.cls().lookup("__next__") {
+            Some(Object::Builtin(b)) if b.binds_instance => match self.leaf_call_kind(&b) {
+                Some(LeafKind::Opaque) => (Some(b), None),
+                Some(LeafKind::Fast(f)) => (None, Some((b, f))),
+                _ => (None, None),
+            },
+            _ => (None, None),
         };
         let op = found
             .as_ref()
             .and_then(leaf_builtins::jit_method_op)
             .unwrap_or(0);
         let out = found.as_ref().map(|b| (Rc::as_ptr(b), op));
-        *self.core_next.borrow_mut() = Some((ver, found, op));
+        *self.core_next.borrow_mut() = Some((ver, found, op, fast));
         out
     }
 
@@ -35740,6 +35810,11 @@ impl Interpreter {
                     }
                     return Ok(result);
                 }
+                // An `xml.etree` element (no `__iter__`; a native
+                // `__getitem__`) walks its children natively.
+                if let Some(it) = crate::stdlib::elementtree_native::sequence_iter(v) {
+                    return Ok(it);
+                }
                 // Legacy sequence protocol: an object that defines
                 // `__getitem__` but no `__iter__` is still iterable —
                 // CPython calls `obj[0]`, `obj[1]`, … until `IndexError`.
@@ -45013,10 +45088,12 @@ impl Interpreter {
                     if b.name == "next" && (args.len() == 1 || args.len() == 2) {
                         return self.do_next_call(args, outer_globals);
                     }
-                    if b.name == "iter" && args.len() == 1 {
+                    // (`!binds_instance`: a method named `iter`, such as
+                    // `Element.iter`'s native body, is not the builtin.)
+                    if b.name == "iter" && !b.binds_instance && args.len() == 1 {
                         return self.do_iter_call(&args[0], outer_globals);
                     }
-                    if b.name == "iter" && args.len() == 2 {
+                    if b.name == "iter" && !b.binds_instance && args.len() == 2 {
                         // ``iter(callable, sentinel)`` — return a small
                         // VM-aware iterator that re-invokes ``callable``
                         // each step. Modelled as a Python-side
@@ -49218,6 +49295,11 @@ impl Interpreter {
             if let Some(r) =
                 crate::stdlib::itertools_mod::native_new_interp(self, &cls, args, kwargs)
             {
+                return r;
+            }
+        }
+        if cls.native_ext.get().is_some() {
+            if let Some(r) = crate::stdlib::elementtree_native::construct(&cls, args, kwargs) {
                 return r;
             }
         }
@@ -59867,6 +59949,16 @@ fn note_predicate_stage(code: &CodeObject, stage: usize) {
         });
     }
 }
+
+/// The core loop's cached `__next__` resolution (see
+/// `Interpreter::core_next`): the class version, the whole-body leaf
+/// builtin and its direct operation, and a leaf fast half.
+type CoreNext = (
+    u64,
+    Option<Rc<crate::object::BuiltinFn>>,
+    u8,
+    Option<(Rc<crate::object::BuiltinFn>, leaf_builtins::Fast)>,
+);
 
 /// Builtins that native modules vouch for as *leaf*: for every argument,
 /// the body runs no Python code, walks no frames, and calls
