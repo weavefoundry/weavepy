@@ -209,15 +209,15 @@ pub struct JitHint {
     /// validation, marshaling) cannot amortize; callers that enter code
     /// from the interpreter prefer to interpret such bodies.
     loops: std::sync::atomic::AtomicU8,
-    /// Lean (interpreted, loop-free) activations so far; the VM warms
-    /// the tier-2 compile from it so native callers can still reach a
-    /// compiled form.
+    /// Lean (interpreted) activations so far; the VM warms the tier-2
+    /// compile from it so native callers can still reach a compiled form.
     lean_entries: std::sync::atomic::AtomicU32,
     /// Whether every loop in the code yields (0 unknown, 1 no, 2 yes):
     /// a generator whose native resume could run at most one iteration
     /// of any loop before yielding again.
     yields_in_loops: std::sync::atomic::AtomicU8,
-    /// A native entry at pc 0 exists (the VM's tier-2 compiled it).
+    /// The VM's tier-2 compiled a native entry at pc 0 that the
+    /// interpreter's calls should take (not just its native callers).
     compiled: std::sync::atomic::AtomicBool,
     /// Back edges left before the next consultation of the tier-2 state
     /// (see [`JitHint::backedge_tick`]).
@@ -371,6 +371,13 @@ impl JitHint {
     pub fn defer_lean_compile(&self) {
         self.lean_entries
             .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Move the warm-up checkpoint, which the count reaches at `at`, to
+    /// the next lean activation.
+    pub fn warm_next_lean(&self, at: u32) {
+        self.lean_entries
+            .store(at.saturating_sub(1), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Count one lean activation; returns the new count.

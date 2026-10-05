@@ -472,6 +472,15 @@ struct CacheEntry {
     recompile_at_osr: bool,
     /// Recompiles taken for [`Self::recompile_at_osr`].
     cold_recompiles: u8,
+    /// Back edges run while cold (counted a consultation's stride at a
+    /// time) and the activations they ran in: the activations counted
+    /// here, plus the lean ones the code's `jit_hint` counts (credited
+    /// here before its count restarts, and debited when it moves ahead,
+    /// so `calls` wraps). Their ratio decides
+    /// whether the interpreter's calls should enter the compiled code
+    /// (see [`LOOP_CALL_ITERATIONS`]).
+    backedges: u32,
+    calls: u32,
     /// Native side exits taken by this code's compiled frame. Healthy
     /// compiled code exits by *returning* (deopt is exceptional — a
     /// type-lane surprise or invalidated guard), so a frame that keeps
@@ -529,6 +538,8 @@ impl CacheEntry {
             tier: Tier::Cold,
             defer_osr: false,
             osr_failures: 0,
+            backedges: 0,
+            calls: 0,
             deopts: 0,
             native_entries: 0,
             generic_dyn_calls: 0,
@@ -574,6 +585,16 @@ fn cache_entry<'a>(
 
 /// Give up on OSR for a code object after this many failed validations.
 const OSR_FAILURE_BUDGET: u32 = 64;
+
+/// The fewest loop iterations a call, as a compile measures them (back
+/// edges per activation while the code was cold), for the interpreter's
+/// calls to enter the compiled code at pc 0 instead of running it lean.
+/// The few iterations of `raytrace`'s `first_hit` gain more natively than
+/// the general call costs (the benchmark retires 3% fewer instructions),
+/// while tomllib's `skip_chars`, about one iteration a call, would cost
+/// `tomllib_loads` 23% more. A lean call that runs long still enters
+/// native code from its back edge.
+const LOOP_CALL_ITERATIONS: u32 = 2;
 
 /// Retire a compiled code object after this many native side exits.
 /// Sized like [`OSR_FAILURE_BUDGET`]: far above anything a legitimate
@@ -876,7 +897,12 @@ pub(crate) fn note_frameless_calls(code: &CodeObject, n: u32) -> bool {
             Some(entry) if matches!(entry.tier, Tier::Cold) => {
                 entry.counter = entry.counter.saturating_add(n);
                 let next = entry.counter.saturating_add(1);
-                next >= threshold && compile_allowed(next, threshold)
+                let due = next >= threshold && compile_allowed(next, threshold);
+                if !due {
+                    // The caller restarts the lean count.
+                    entry.calls = entry.calls.wrapping_add(n);
+                }
+                due
             }
             Some(_) => false,
         }
@@ -1112,6 +1138,9 @@ impl JitState {
         probes: &mut VmProbes<'_>,
     ) -> Option<CompiledEntry> {
         let key = Rc::as_ptr(code).cast::<CodeObject>();
+        // Whether the code's calls run enough iterations of its loops for
+        // a native entry to pay for the general call.
+        let long_calls;
         {
             let entry = cache_entry(&mut self.cache, &mut self.sweep_at, code);
             if entry_pc == 0 {
@@ -1163,6 +1192,9 @@ impl JitState {
                 Tier::NotJitable => return None,
                 Tier::Cold => {
                     entry.counter += 1;
+                    if entry_pc == 0 {
+                        entry.calls = entry.calls.wrapping_add(1);
+                    }
                     if entry.counter == self.threshold / 2 && self.engine.is_none() {
                         spawn_codegen_prewarm();
                     }
@@ -1189,6 +1221,11 @@ impl JitState {
                     }
                 }
             }
+            let calls = entry
+                .calls
+                .wrapping_add(code.jit_hint.lean_entries())
+                .max(1);
+            long_calls = entry.backedges / calls >= LOOP_CALL_ITERATIONS;
         }
         // Threshold reached: compile (engine + cache borrowed disjointly).
         if self.engine.is_none() {
@@ -1574,11 +1611,22 @@ impl JitState {
                     // lanes. Any other loop-free body is cheaper to
                     // interpret than to frame (and an OO body's calls
                     // would bounce back through the interpreter).
-                    if entry_pc == 0
+                    //
+                    // So are the calls of a loop that runs a few
+                    // iterations a call or more (see
+                    // [`LOOP_CALL_ITERATIONS`]): a native entry at pc 0
+                    // pays for the general call. A loop that runs fewer (a
+                    // scanner's `while s[i] in chars`) stays interpreted,
+                    // entering its native form from the back edge when a
+                    // call runs long.
+                    let recursive = entry_pc == 0
                         && callees
                             .iter()
-                            .any(|(_, c)| std::ptr::eq(Rc::as_ptr(c), std::ptr::from_ref(&**code)))
-                    {
+                            .any(|(_, c)| std::ptr::eq(Rc::as_ptr(c), std::ptr::from_ref(&**code)));
+                    let hot_loop = long_calls
+                        && cf.interp_entry
+                        && !(code.is_generator || code.is_coroutine || code.is_async_generator);
+                    if recursive || hot_loop {
                         code.jit_hint.mark_compiled();
                     }
                     let scalar_update =
@@ -1875,13 +1923,13 @@ impl JitState {
         let entry = cache_entry(&mut self.cache, &mut self.sweep_at, code);
         match entry.tier {
             Tier::Cold => {
+                // One consultation stands for a stride of back edges.
+                let stride = u32::from(weavepy_compiler::JitHint::BACKEDGE_STRIDE);
+                entry.backedges = entry.backedges.saturating_add(stride);
                 if entry.defer_osr {
                     return false;
                 }
-                // One consultation stands for a stride of back edges.
-                entry.counter = entry
-                    .counter
-                    .saturating_add(u32::from(weavepy_compiler::JitHint::BACKEDGE_STRIDE));
+                entry.counter = entry.counter.saturating_add(stride);
                 entry.counter >= self.threshold
             }
             Tier::Compiled(..) => {
@@ -3679,7 +3727,9 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
                 let interval = lean_warm_at();
                 entry.counter = entry.counter.saturating_add(interval);
                 if entry.counter < interval.saturating_mul(IMPORT_THRESHOLD_FACTOR) {
-                    frame.code.jit_hint.defer_lean_compile();
+                    let hint = &frame.code.jit_hint;
+                    entry.calls = entry.calls.wrapping_add(hint.lean_entries());
+                    hint.defer_lean_compile();
                     return;
                 }
             }
@@ -13056,6 +13106,17 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
             if let Some(entry) = st.cache.get_mut(&key) {
                 if matches!(entry.tier, Tier::Cold) && short_scalar_range(frame) {
                     entry.defer_osr = true;
+                    // The next call compiles (see `get_compiled`), lean
+                    // ones included: they otherwise compile only at the
+                    // warm-up checkpoint, many calls on. The lean count
+                    // moves there, so the calls it held are credited.
+                    let hint = &frame.code.jit_hint;
+                    let at = lean_warm_at();
+                    entry.calls = entry
+                        .calls
+                        .wrapping_add(hint.lean_entries())
+                        .wrapping_sub(at - 1);
+                    hint.warm_next_lean(at);
                     return None;
                 }
             }

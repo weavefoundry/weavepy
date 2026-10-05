@@ -10115,13 +10115,15 @@ impl Interpreter {
 
     /// Whether `code` may run as a lean activation: nothing about it needs
     /// the general prologue (an undecodable `co_code` raises there), and
-    /// the tier-2 JIT has no compiled form of it (the general prologue is
-    /// where compiled code is entered): a native entry is then worth its
-    /// framing — a recursive body calls its native self directly from
-    /// there. Until then the body is the interpreter's, loops included: a
-    /// short call's loop (a scanner's `while s[i] in chars`) costs far less
-    /// than the general call, and a hot one heats its compile from its
-    /// back edge.
+    /// the tier-2 JIT hasn't claimed its calls (the general prologue is
+    /// where compiled code is entered). It claims them once a native entry
+    /// is worth its framing: a recursive body calls its native self
+    /// directly from there, and a loop running a few iterations a call
+    /// gains more natively than the framing costs (see
+    /// `tier2::LOOP_CALL_ITERATIONS`). Until then the body is the
+    /// interpreter's, loops included: a short call's loop (a scanner's
+    /// `while s[i] in chars`) costs far less than the general call, and a
+    /// hot one heats its compile from its back edge.
     #[inline(always)]
     fn lean_code_ok(code: &CodeObject) -> bool {
         if code.wire.as_ref().is_some_and(|w| w.exec_error.is_some()) {
