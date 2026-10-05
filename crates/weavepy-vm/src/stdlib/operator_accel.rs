@@ -157,13 +157,17 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 Box::new(methodcaller_call) as CallBox,
             ),
         ] {
-            let obj = Object::Builtin(Rc::new(BuiltinFn {
+            let b = Rc::new(BuiltinFn {
                 name,
                 binds_instance: false,
                 call: f,
                 call_kw: None,
-            }));
-            d.insert(DictKey(Object::from_static(export)), obj);
+            });
+            if name == ".itemgetter.__call__" {
+                // Native containers subscripted by plain keys, in place.
+                crate::leaf_builtins::register_fast(&b, itemgetter_fast);
+            }
+            d.insert(DictKey(Object::from_static(export)), Object::Builtin(b));
         }
 
         // Post-splice registration hook: `operator_mod.py` assigns the
@@ -239,6 +243,22 @@ where
     // SAFETY: published by the enclosing VM frame on this thread.
     let interp = unsafe { &mut *ptr };
     f(interp)
+}
+
+/// A getter object's stored field: its own slot (as CPython's C types
+/// read their struct members), or the attribute when the instance has no
+/// such slot.
+fn field(
+    interp: &mut crate::Interpreter,
+    slf: &Object,
+    name: &str,
+) -> Result<Object, RuntimeError> {
+    if let Object::Instance(inst) = slf {
+        if let Some(v) = inst.slot_get(name) {
+            return Ok(v);
+        }
+    }
+    interp.load_attr_public(slf, name)
 }
 
 fn two_args<'a>(args: &'a [Object], name: &str) -> Result<(&'a Object, &'a Object), RuntimeError> {
@@ -343,7 +363,7 @@ fn op_is_not(args: &[Object]) -> Result<Object, RuntimeError> {
 fn attrgetter_call(args: &[Object]) -> Result<Object, RuntimeError> {
     let (slf, obj) = two_args(args, "attrgetter.__call__")?;
     with_interp(|interp| {
-        let attrs = interp.load_attr_public(slf, "_attrs")?;
+        let attrs = field(interp, slf, "_attrs")?;
         let Object::Tuple(attrs) = &attrs else {
             return Err(type_error("attrgetter '_attrs' must be a tuple"));
         };
@@ -371,7 +391,7 @@ fn attrgetter_call(args: &[Object]) -> Result<Object, RuntimeError> {
 fn itemgetter_call(args: &[Object]) -> Result<Object, RuntimeError> {
     let (slf, obj) = two_args(args, "itemgetter.__call__")?;
     with_interp(|interp| {
-        let items = interp.load_attr_public(slf, "_items")?;
+        let items = field(interp, slf, "_items")?;
         let Object::Tuple(items) = &items else {
             return Err(type_error("itemgetter '_items' must be a tuple"));
         };
@@ -387,18 +407,64 @@ fn itemgetter_call(args: &[Object]) -> Result<Object, RuntimeError> {
     })
 }
 
+/// [`itemgetter_call`]'s pure fast half (the dispatch loop's leaf call):
+/// a list or tuple indexed by an int in range, or a dict holding a `str`
+/// or `int` key. Anything else, including every miss, declines to the full
+/// path, which raises.
+fn itemgetter_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(inst), obj] = args else {
+        return None;
+    };
+    // SAFETY: a read that runs no code.
+    let Object::Tuple(items) = unsafe { inst.slots.peek() }?
+        .get_hinted(0, "_items")?
+        .clone()
+    else {
+        return None;
+    };
+    let get = |item: &Object| -> Option<Object> {
+        let index = |len: usize| -> Option<usize> {
+            let Object::Int(i) = item else {
+                return None;
+            };
+            let len = len as i64;
+            let k = if *i < 0 { i + len } else { *i };
+            (0..len).contains(&k).then_some(k as usize)
+        };
+        match obj {
+            Object::List(l) => {
+                let v = l.try_borrow().ok()?;
+                v.get(index(v.len())?).cloned()
+            }
+            Object::Tuple(t) => t.get(index(t.len())?).cloned(),
+            Object::Dict(d) => {
+                let probe = crate::object::LeafProbe::new(item)?;
+                if matches!(item, Object::Instance(_)) {
+                    return None;
+                }
+                d.try_borrow().ok()?.get(&probe).cloned()
+            }
+            _ => None,
+        }
+    };
+    Some(Ok(match &items[..] {
+        [item] => get(item)?,
+        many => Object::new_tuple(many.iter().map(get).collect::<Option<Vec<_>>>()?),
+    }))
+}
+
 /// `methodcaller.__call__(self, obj, /)` without a Python frame. Looks up
 /// the stored method name on `obj` and tail-calls it with the stored
 /// args/kwargs through the interpreter.
 fn methodcaller_call(args: &[Object]) -> Result<Object, RuntimeError> {
     let (slf, obj) = two_args(args, "methodcaller.__call__")?;
     with_interp(|interp| {
-        let name = interp.load_attr_public(slf, "_name")?;
+        let name = field(interp, slf, "_name")?;
         let Object::Str(name) = &name else {
             return Err(type_error("method name must be a string"));
         };
-        let stored_args = interp.load_attr_public(slf, "_args")?;
-        let stored_kwargs = interp.load_attr_public(slf, "_kwargs")?;
+        let stored_args = field(interp, slf, "_args")?;
+        let stored_kwargs = field(interp, slf, "_kwargs")?;
         let call_args: Vec<Object> = match &stored_args {
             Object::Tuple(xs) => xs.to_vec(),
             _ => return Err(type_error("methodcaller '_args' must be a tuple")),

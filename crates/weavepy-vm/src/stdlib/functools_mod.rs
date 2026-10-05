@@ -32,7 +32,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("_partial_call")),
             Object::Builtin(Rc::new(BuiltinFn {
-                name: "__call__",
+                name: PARTIAL_CALL_NAME,
                 binds_instance: false,
                 call: Box::new(|args| partial_call(args, &[])),
                 call_kw: Some(Box::new(partial_call)),
@@ -116,6 +116,67 @@ fn partial_new_for(args: &[Object]) -> Result<Object, RuntimeError> {
     })))
 }
 
+/// The native `partial.__call__`'s name (the dispatch loop recognizes
+/// it; the visible name is `__call__`).
+pub(crate) const PARTIAL_CALL_NAME: &str = ".partial.__call__";
+
+/// The call a `partial` instance stands for, as the dispatch loop can make
+/// it directly: its function, and the one stored positional argument to
+/// pass first (`Unbound` for none). `None` when the partial has keywords,
+/// placeholders, or more than one stored argument.
+pub(crate) fn partial_inline(inst: &crate::types::PyInstance) -> Option<(Object, Object)> {
+    with_partial_fields(inst, |[func, args, kw, phcount]| {
+        if !matches!(phcount, Object::Int(0)) {
+            return None;
+        }
+        let Object::Dict(kw) = kw else {
+            return None;
+        };
+        // SAFETY: a read that runs no code.
+        if !unsafe { kw.peek() }?.is_empty() {
+            return None;
+        }
+        let Object::Tuple(args) = args else {
+            return None;
+        };
+        let first = match &args[..] {
+            [] => Object::Unbound,
+            [a] => a.clone(),
+            _ => return None,
+        };
+        Some((func.clone(), first))
+    })
+    .flatten()
+}
+
+thread_local! {
+    /// The interned names of a partial's first four slots.
+    static PARTIAL_KEYS: [crate::shared_value::SharedStr; 4] = PARTIAL_SLOTS[..4]
+        .iter()
+        .map(|name| match crate::stdlib::sys::intern_name(name) {
+            Object::Str(s) => s,
+            _ => unreachable!("interned names are strs"),
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("four names"));
+}
+
+/// `f` over a partial instance's `_func`, `_args`, `_keywords`, and
+/// `_phcount` slots, read in place when they lead its slot store (as
+/// both constructors lay them out): `None` otherwise.
+fn with_partial_fields<R>(
+    inst: &crate::types::PyInstance,
+    f: impl FnOnce([&Object; 4]) -> R,
+) -> Option<R> {
+    PARTIAL_KEYS.with(|keys| {
+        // SAFETY: a read; `f` runs no code that could borrow the slots.
+        let slots = unsafe { inst.slots.peek() }?;
+        let fields = slots.leading_interned([&keys[0], &keys[1], &keys[2], &keys[3]])?;
+        Some(f(fields))
+    })
+}
+
 /// The slots of a `partial` instance, in the order [`partial_new`]
 /// stores them.
 const PARTIAL_SLOTS: [&str; 5] = ["_func", "_args", "_keywords", "_phcount", "_merger"];
@@ -196,7 +257,10 @@ fn partial_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
         type_error("descriptor '__call__' of 'functools.partial' object needs an argument")
     })?;
     let fields = match slf {
-        Object::Instance(inst) => {
+        Object::Instance(inst) => with_partial_fields(inst, |[f, a, k, p]| {
+            (f.clone(), a.clone(), k.clone(), p.clone())
+        })
+        .or_else(|| {
             let slots = inst.slots.borrow();
             let mut out: [Option<Object>; 4] = Default::default();
             for (slot, name) in out.iter_mut().zip(PARTIAL_SLOTS) {
@@ -206,7 +270,7 @@ fn partial_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
                 [Some(f), Some(a), Some(k), Some(p)] => Some((f, a, k, p)),
                 _ => None,
             }
-        }
+        }),
         _ => None,
     };
     let (func, stored_args, stored_kw, phcount) = match fields {

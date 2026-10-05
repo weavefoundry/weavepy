@@ -829,23 +829,34 @@ pub(crate) fn lazy_special_method(l: &PyLazyIter, name: &str) -> Option<Object> 
 /// excludes iterators that step another (`enumerate`, shared handles),
 /// for adapters that step several sources which could alias.
 fn src_ready(it: &Object, leaf: bool) -> bool {
-    let Object::Iter(c) = it else {
-        return false;
-    };
-    // SAFETY: a read that runs no code.
-    unsafe { c.peek() }.is_some_and(|c| {
-        c.pure_ready()
-            && !(leaf && matches!(c, PyIterator::Enumerate { .. } | PyIterator::Shared(_)))
-    })
+    match it {
+        // SAFETY: a read that runs no code.
+        Object::Iter(c) => unsafe { c.peek() }.is_some_and(|c| {
+            c.pure_ready()
+                && !(leaf && matches!(c, PyIterator::Enumerate { .. } | PyIterator::Shared(_)))
+        }),
+        // An unbounded counter or repeater (`zip(count(), xs)`).
+        // SAFETY: as above.
+        Object::LazyIter(l) => unsafe { l.state.peek() }.is_some_and(|st| match st {
+            LazyIterKind::Count {
+                current: Object::Int(a),
+                step: Object::Int(b),
+            } => a.checked_add(*b).is_some(),
+            LazyIterKind::Repeat { times, .. } => times.is_none_or(|t| t > 0),
+            _ => false,
+        }),
+        _ => false,
+    }
 }
 
 /// The next item of a source [`src_ready`] admitted.
 fn src_step(it: &Object) -> Option<Object> {
-    let Object::Iter(c) = it else {
-        return None;
-    };
-    // SAFETY: the step runs no code (the source was found ready).
-    unsafe { c.peek_mut() }?.next_value()
+    match it {
+        // SAFETY: the step runs no code (the source was found ready).
+        Object::Iter(c) => unsafe { c.peek_mut() }?.next_value(),
+        Object::LazyIter(l) => itertools_pure_next(l)?,
+        _ => None,
+    }
 }
 
 /// Whether every source of a several-source adapter can step purely and
@@ -855,7 +866,8 @@ fn srcs_ready(iters: &[Object]) -> bool {
         && iters.iter().enumerate().all(|(i, a)| {
             iters[..i].iter().all(|b| match (a, b) {
                 (Object::Iter(a), Object::Iter(b)) => !Rc::ptr_eq(a, b),
-                _ => false,
+                (Object::LazyIter(a), Object::LazyIter(b)) => !Rc::ptr_eq(a, b),
+                _ => true,
             })
         })
 }

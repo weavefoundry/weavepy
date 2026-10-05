@@ -18803,14 +18803,83 @@ impl Interpreter {
         else {
             return;
         };
-        let Some(f) = Self::instance_call_function(inst) else {
+        if let Some(f) = Self::instance_call_function(inst) {
+            // SAFETY: the instance moves to the (dropless) self slot.
+            unsafe {
+                let obj = callee.read();
+                callee.write(Object::Function(f));
+                callee.add(1).write(obj);
+            }
+            return;
+        }
+        let Some(b) = Self::instance_call_native(inst) else {
             return;
         };
+        // A `functools.partial` with no keywords and at most one stored
+        // argument is its function called with that argument first (in the
+        // self slot). The instance leaves by a plain decrement: something
+        // else still holds it.
+        if b.name == crate::stdlib::functools_mod::PARTIAL_CALL_NAME {
+            if Rc::strong_count(inst) > 1 {
+                if let Some((func, first)) = crate::stdlib::functools_mod::partial_inline(inst) {
+                    // SAFETY: the slots are rewritten in place; the old
+                    // callee is released by a decrement (see above).
+                    unsafe {
+                        drop(callee.read());
+                        callee.write(func);
+                        callee.add(1).write(first);
+                    }
+                    return;
+                }
+            }
+        }
+        // Otherwise the native `__call__` itself, with the instance as its
+        // first argument (the self slot).
         // SAFETY: the instance moves to the (dropless) self slot.
         unsafe {
             let obj = callee.read();
-            callee.write(Object::Function(f));
+            callee.write(Object::Builtin(b));
             callee.add(1).write(obj);
+        }
+    }
+
+    /// `type(inst).__call__` when it is one of the native calls that take
+    /// the instance as their first argument (`functools.partial`'s,
+    /// `operator.itemgetter`'s, ...), cached on the class under its
+    /// attribute version.
+    #[inline(never)]
+    fn instance_call_native(inst: &PyInstance) -> Option<Rc<crate::object::BuiltinFn>> {
+        use crate::types::LeafAttrKind as K;
+        /// The cache key for a native `__call__` (an address no interned
+        /// name has).
+        static CALL_NATIVE_KEY: u8 = 0;
+        let cls = inst.cls_raw();
+        let key = std::ptr::addr_of!(CALL_NATIVE_KEY) as usize;
+        let ver = cls.attr_version.get();
+        match cls.leaf_attrs.get(key, ver) {
+            Some(K::BuiltinMethod(b)) => Some(b.clone()),
+            Some(_) => None,
+            None => {
+                let kind = match cls.lookup("__call__") {
+                    Some(Object::Builtin(b))
+                        if matches!(
+                            b.name,
+                            ".itemgetter.__call__"
+                                | ".attrgetter.__call__"
+                                | ".methodcaller.__call__"
+                        ) || b.name == crate::stdlib::functools_mod::PARTIAL_CALL_NAME =>
+                    {
+                        K::BuiltinMethod(b)
+                    }
+                    _ => K::Other,
+                };
+                let found = match &kind {
+                    K::BuiltinMethod(b) => Some(b.clone()),
+                    _ => None,
+                };
+                cls.leaf_attrs.set(key, ver, kind);
+                found
+            }
         }
     }
 
