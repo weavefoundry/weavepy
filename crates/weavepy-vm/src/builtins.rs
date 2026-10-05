@@ -454,7 +454,73 @@ fn is_exception_like(name: &str) -> bool {
 /// method. The returned [`Object`] is always a [`Object::Builtin`];
 /// the VM wraps it as a [`crate::object::BoundMethod`] so the
 /// receiver flows through as the first argument on call.
+///
+/// For the receiver kinds whose methods depend only on the kind and the
+/// name, the answer is built once and shared, as CPython's type dict holds
+/// one method descriptor per name: each lookup would otherwise allocate a
+/// fresh builtin (and its boxed bodies) and free it after the call.
 pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
+    let Some(tag) = method_memo_tag(obj) else {
+        return lookup_method_uncached(obj, name);
+    };
+    let memo = METHOD_MEMO.get_or_init(|| RefCell::new(Vec::new()));
+    if let Some(hit) = memo
+        .borrow()
+        .get(usize::from(tag))
+        .and_then(|names| names.get(name))
+    {
+        return hit.clone();
+    }
+    // (Built without the memo borrowed: nothing here reaches it, but a
+    // builder is free to.)
+    let found = lookup_method_uncached(obj, name);
+    let mut memo = memo.borrow_mut();
+    if memo.len() <= usize::from(tag) {
+        memo.resize_with(usize::from(tag) + 1, Default::default);
+    }
+    let names = &mut memo[usize::from(tag)];
+    // Arbitrary names (`getattr(s, text)`) mustn't grow it without bound.
+    if names.len() < METHOD_MEMO_CAP {
+        names.insert(name.into(), found.clone());
+    }
+    found
+}
+
+/// Per receiver kind (see [`method_memo_tag`]), each name's method or miss.
+static METHOD_MEMO: std::sync::OnceLock<
+    RefCell<Vec<crate::fasthash::FxHashMap<Box<str>, Option<Object>>>>,
+> = std::sync::OnceLock::new();
+
+/// Names the method memo keeps per receiver kind.
+const METHOD_MEMO_CAP: usize = 1024;
+
+/// The memo key of a receiver kind whose methods are a function of the
+/// kind and the name alone (its variant index), or `None`.
+pub(crate) fn method_memo_tag(obj: &Object) -> Option<u8> {
+    let tag = match obj {
+        Object::Str(_) => 0,
+        Object::List(_) => 1,
+        Object::Range(_) => 2,
+        Object::Dict(_) => 3,
+        Object::Tuple(_) => 4,
+        Object::Set(_) => 5,
+        Object::FrozenSet(_) => 6,
+        Object::Bytes(_) => 7,
+        Object::ByteArray(_) => 8,
+        Object::Int(_) => 9,
+        Object::Long(_) => 10,
+        Object::Bool(_) => 11,
+        Object::Float(_) => 12,
+        Object::Complex(_) => 13,
+        Object::Slice(_) => 14,
+        Object::Iter(_) => 15,
+        _ => return None,
+    };
+    Some(tag)
+}
+
+/// [`lookup_method`] without the memo: a fresh method object.
+fn lookup_method_uncached(obj: &Object, name: &str) -> Option<Object> {
     let f: Option<BuiltinFn> = match obj {
         Object::Str(_) => match name {
             "upper" => Some(method("upper", str_upper)),
@@ -5517,6 +5583,15 @@ fn parse_int_string(
 
 fn int_bit_length(args: &[Object]) -> Result<Object, RuntimeError> {
     let v = one(args, "bit_length")?;
+    match v {
+        Object::Int(i) => {
+            return Ok(Object::Int(i64::from(
+                64 - i.unsigned_abs().leading_zeros(),
+            )))
+        }
+        Object::Bool(b) => return Ok(Object::Int(i64::from(*b))),
+        _ => {}
+    }
     let n = v.as_bigint().ok_or_else(|| {
         type_error(format!(
             "bit_length: '{}' object is not an integer",
@@ -5529,6 +5604,11 @@ fn int_bit_length(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn int_bit_count(args: &[Object]) -> Result<Object, RuntimeError> {
     let v = one(args, "bit_count")?;
+    match v {
+        Object::Int(i) => return Ok(Object::Int(i64::from(i.unsigned_abs().count_ones()))),
+        Object::Bool(b) => return Ok(Object::Int(i64::from(*b))),
+        _ => {}
+    }
     let n = v.as_bigint().ok_or_else(|| {
         type_error(format!(
             "bit_count: '{}' object is not an integer",
@@ -12369,6 +12449,22 @@ fn str_encode(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
         .ok_or_else(|| type_error("encode() missing receiver"))?;
     if !recv.is_str() {
         return Err(type_error("expected str method receiver"));
+    }
+    // UTF-8 with no error handler, the common call: a `str` holds valid
+    // UTF-8 (lone surrogates live in `WStr`), so its bytes are the answer,
+    // as CPython's C fast path for the codec gives them.
+    if let Object::Str(text) = recv {
+        let utf8 = kwargs.is_empty()
+            && match args {
+                [_] => true,
+                [_, Object::Str(enc)] => {
+                    matches!(&**enc, "utf-8" | "utf8" | "UTF-8" | "UTF8" | "utf_8")
+                }
+                _ => false,
+            };
+        if utf8 {
+            return Ok(Object::new_bytes(text.as_bytes().to_vec()));
+        }
     }
     // The names accept any str-shaped object, not just `Object::Str`:
     // CPython's clinic checks `PyUnicode_Check`, which is subtype-inclusive.

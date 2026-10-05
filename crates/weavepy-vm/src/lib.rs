@@ -7698,7 +7698,19 @@ impl Interpreter {
                         shell,
                         cur_pc,
                         crate::recursion::depth_cell(),
-                        false,
+                        GenResume::ForIter,
+                    ) {
+                        return FrameEv::Call(act);
+                    }
+                }
+                // Likewise `yield from gen` and `await coro`.
+                if op_before == Some(OpCode::Send) && self.inline_calls_ok() {
+                    if let Some(act) = self.try_inline_gen(
+                        frame,
+                        shell,
+                        cur_pc,
+                        crate::recursion::depth_cell(),
+                        GenResume::Send,
                     ) {
                         return FrameEv::Call(act);
                     }
@@ -8048,25 +8060,46 @@ impl Interpreter {
     /// `FOR_ITER` over a suspended generator at `pc` of `frame`, as an
     /// inline activation: the generator's boxed frame runs in place (the
     /// `generator_send_lean` shape, without a nested native activation).
-    /// With `next_call`, the instruction is instead the `CALL` of builtin
-    /// `next` on the generator: the call's operands leave the stack, the
-    /// yielded value is its result, and exhaustion raises `StopIteration`.
-    /// `None` leaves everything untouched.
+    /// With [`GenResume::NextCall`], the instruction is instead the `CALL`
+    /// of builtin `next` on the generator: the call's operands leave the
+    /// stack, the yielded value is its result, and exhaustion raises
+    /// `StopIteration`. With [`GenResume::Send`], it's a `SEND` to the
+    /// generator or coroutine below the stack's top: the sent value goes
+    /// in, the yielded value replaces it, and exhaustion leaves the return
+    /// value and takes the jump. `None` leaves everything untouched.
     fn try_inline_gen(
         &mut self,
         frame: &mut Frame,
         shell: &mut QuietShell<'_>,
         pc: usize,
         depth_cell: *const std::cell::Cell<usize>,
-        next_call: bool,
+        mode: GenResume,
     ) -> Option<Box<InlineAct>> {
-        let arg = if next_call {
-            GEN_NEXT_CALL
-        } else {
-            frame.code.instructions.get(pc)?.arg
+        let arg = match mode {
+            GenResume::NextCall => GEN_NEXT_CALL,
+            GenResume::ForIter => frame.code.instructions.get(pc)?.arg,
+            GenResume::Send => {
+                let jump = frame.code.instructions.get(pc)?.arg;
+                if jump & GEN_SEND != 0 {
+                    return None;
+                }
+                jump | GEN_SEND
+            }
         };
-        let Some(Object::Generator(g)) = frame.stack.last() else {
-            return None;
+        let send = mode == GenResume::Send;
+        let n = frame.stack.len();
+        let (g, sent_none) = if send {
+            match (frame.stack.get(n.checked_sub(2)?), frame.stack.last()) {
+                (Some(Object::Generator(g) | Object::Coroutine(g)), Some(v)) => {
+                    (g, matches!(v, Object::None))
+                }
+                _ => return None,
+            }
+        } else {
+            let Some(Object::Generator(g)) = frame.stack.last() else {
+                return None;
+            };
+            (g, true)
         };
         // Validate and take the frame under one exclusive view. No Python
         // runs while it is held; it ends before the activation resumes.
@@ -8095,6 +8128,10 @@ impl Interpreter {
                     c.has_materialized
                         .load(std::sync::atomic::Ordering::Relaxed)
                 })
+                // A value sent into a fresh generator raises, and one whose
+                // fast step already consumed its resume value can't take
+                // another: the full `SEND` handles both.
+                || (!sent_none && (first_resume || gf.sent_consumed))
             {
                 return None;
             }
@@ -8118,12 +8155,17 @@ impl Interpreter {
         crate::tier2::materialize_parked(gf);
         gf.gen_first_resume = first_resume;
         // (A fast step that stopped partway already consumed it.)
+        let sent = if send {
+            frame.stack.pop().unwrap_or(Object::None)
+        } else {
+            Object::None
+        };
         if !std::mem::take(&mut gf.sent_consumed) {
-            gf.push(Object::None);
+            gf.push(sent);
         }
         let gen_frame: *mut Frame = gf;
         frame.pc = pc as u32 + 1;
-        if next_call {
+        if mode == GenResume::NextCall {
             // `next`, its empty self slot and the generator (held above).
             let n = frame.stack.len();
             drop(frame.stack.drain(n - 3..));
@@ -8267,6 +8309,13 @@ impl Interpreter {
                 err: crate::error::stop_iteration_with(v),
                 cur_pc: call_pc,
             },
+            // `SEND`: the return value is the `yield from`/`await` result;
+            // the sub-generator stays for `END_SEND`.
+            Ok(GenStep::Exhausted(v)) if arg & GEN_SEND != 0 => {
+                frame.stack.push(v);
+                frame.pc += arg & !GEN_SEND;
+                QuietEntry::Returned { cur_pc: call_pc }
+            }
             Ok(GenStep::Exhausted(_)) => {
                 let it = frame.stack.pop();
                 frame.pc += arg;
@@ -11467,6 +11516,28 @@ impl Interpreter {
                             }
                         }
                     }
+                    // `yield from gen` and `await coro`: the sub-generator
+                    // resumes inline, switched to in place (the quiet loop's
+                    // `SEND` when it declines).
+                    OpCode::Send => {
+                        // SAFETY: `len >= 2` is checked first.
+                        if len < 2
+                            || !matches!(
+                                unsafe { &*base.add(len - 2) },
+                                Object::Generator(_) | Object::Coroutine(_)
+                            )
+                        {
+                            break Some(CoreExit::Stop(LeafStop::Step));
+                        }
+                        // SAFETY: `len <= cap`, every slot initialized.
+                        unsafe { frame.stack.set_len(len) };
+                        frame.pc = pc as u32;
+                        *last_pc = last;
+                        if !self.core_gen_resume(sw, pc, GenResume::Send) {
+                            sw.pending = Some(CoreExit::Stop(LeafStop::Step));
+                        }
+                        break Some(CoreExit::Reload);
+                    }
                     OpCode::ForIter => {
                         // A range iterator's next value; anything else (another
                         // iterator kind, exhaustion) takes the full arms.
@@ -11526,7 +11597,7 @@ impl Interpreter {
                                 unsafe { frame.stack.set_len(len) };
                                 frame.pc = pc as u32;
                                 *last_pc = last;
-                                if !self.core_gen_resume(sw, pc, false) {
+                                if !self.core_gen_resume(sw, pc, GenResume::ForIter) {
                                     sw.pending = Some(CoreExit::Stop(LeafStop::Step));
                                 }
                                 break Some(CoreExit::Reload);
@@ -12061,7 +12132,7 @@ impl Interpreter {
                             unsafe { frame.stack.set_len(len) };
                             frame.pc = pc as u32;
                             *last_pc = last;
-                            if !self.core_gen_resume(sw, pc, true) {
+                            if !self.core_gen_resume(sw, pc, GenResume::NextCall) {
                                 sw.pending = Some(CoreExit::Stop(LeafStop::Step));
                             }
                             break Some(CoreExit::Reload);
@@ -12150,6 +12221,48 @@ impl Interpreter {
                         }
                         // The site's method slot (its leaf kind), read once.
                         let site_slot = mslots!(cold_mslots, ext).get(pc);
+                        // A builtin type's method that isn't a registered leaf
+                        // (`i.bit_length()`, `s.encode()`, `t.count(x)`): its
+                        // body runs right here (see `core_bound_builtin_call`),
+                        // once the site has settled that it qualifies.
+                        if let Some(slot) = site_slot {
+                            // SAFETY: `len >= argc + 2`: the callee and its
+                            // self slot.
+                            let (callee, self_slot) =
+                                unsafe { (&*base.add(len - argc - 2), &*base.add(len - argc - 1)) };
+                            let body = match (callee, self_slot) {
+                                (Object::Builtin(b), recv) if !matches!(recv, Object::Unbound) => {
+                                    Some((b, recv))
+                                }
+                                (Object::BoundMethod(bm), Object::Unbound)
+                                    if !bm.redispatch_descriptor =>
+                                {
+                                    match &bm.function {
+                                        Object::Builtin(b) => Some((b, &bm.receiver)),
+                                        _ => None,
+                                    }
+                                }
+                                _ => None,
+                            };
+                            if let Some((b, recv)) = body {
+                                let settled = slot.is_native_body(b)
+                                    || (slot.get_leaf(b).is_none()
+                                        && self.native_body_ok(b, recv)
+                                        && {
+                                            slot.set_native_body(b);
+                                            true
+                                        });
+                                if settled {
+                                    // SAFETY: `len <= cap`, every slot initialized.
+                                    unsafe { frame.stack.set_len(len) };
+                                    frame.pc = pc as u32;
+                                    *last_pc = last;
+                                    if self.core_bound_builtin_call(sw, pc) {
+                                        break Some(CoreExit::Reload);
+                                    }
+                                }
+                            }
+                        }
                         // SAFETY: `len >= argc + 2`.
                         match unsafe { &*base.add(len - argc - 2) } {
                             // `lst.append(x)` / `lst.pop()` on an exact list (the
@@ -12683,20 +12796,13 @@ impl Interpreter {
                                     None => break Some(CoreExit::Helper),
                                 }
                             }
-                            // A native container's site-cached method (the
-                            // helper's builtin-receiver case, which fills the
-                            // slot under the receiver's tag).
-                            recv @ (Object::List(_)
-                            | Object::Dict(_)
-                            | Object::Set(_)
-                            | Object::Str(_)) => {
-                                let tag = match recv {
-                                    Object::List(_) => 1,
-                                    Object::Dict(_) => 2,
-                                    Object::Set(_) => 3,
-                                    _ => 4,
-                                };
-                                let Some(b) = ms.get_builtin(tag) else {
+                            // A builtin receiver's site-cached method (the
+                            // helper's builtin-receiver case or the full
+                            // handler fills the slot under the receiver's tag).
+                            recv => {
+                                let Some(b) =
+                                    builtin_recv_tag(recv).and_then(|tag| ms.get_builtin(tag))
+                                else {
                                     break Some(CoreExit::Helper);
                                 };
                                 // SAFETY: `len < cap`; the receiver moves up.
@@ -12710,7 +12816,6 @@ impl Interpreter {
                                 pc += 1;
                                 continue;
                             }
-                            _ => break Some(CoreExit::Helper),
                         };
                         // SAFETY: `len < cap`; the class (count above one) is
                         // released in place of an empty self slot.
@@ -12956,6 +13061,118 @@ impl Interpreter {
         sw.cur = callee;
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
+        true
+    }
+
+    /// Whether `b`, called on `recv`, is a builtin type's method that the
+    /// core loop may call directly: bound to its exact builtin receiver,
+    /// not a registered leaf (those have their own lanes), and needing none
+    /// of the interpreter-aware dispatch the full handler applies by name.
+    fn native_body_ok(&self, b: &Rc<crate::object::BuiltinFn>, recv: &Object) -> bool {
+        b.binds_instance
+            && builtins::method_memo_tag(recv).is_some()
+            && native_call_ic_safe(b.name)
+            && self.leaf_call_kind(b).is_none()
+    }
+
+    /// The core loop's `CALL` at `pc` of a builtin type's method on its
+    /// exact builtin receiver (`i.bit_length()`, `s.encode()`,
+    /// `t.count(x)`), in `sw`'s synced running activation, as `(method,
+    /// receiver)` or as a bound method with an empty self slot: the
+    /// method's body runs directly, as the full handler's dispatch ends up
+    /// running it, without that handler's chain of special cases. The body
+    /// may run Python code (an element's `__eq__`), so the operands leave
+    /// the stack first, and the core loop reloads after. The caller has
+    /// settled the method (see [`Self::native_body_ok`]). `false` touches
+    /// nothing.
+    #[inline(never)]
+    fn core_bound_builtin_call(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+        const MAX_ARGS: usize = 8;
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let Some(ins) = frame.code.instructions.get(pc) else {
+            return false;
+        };
+        let argc = ins.arg as usize;
+        let n = frame.stack.len();
+        let Some(callee_at) = n.checked_sub(argc + 2) else {
+            return false;
+        };
+        let (b, receiver) = match (&frame.stack[callee_at], &frame.stack[callee_at + 1]) {
+            (Object::Builtin(b), recv) if !matches!(recv, Object::Unbound) => (b, recv),
+            (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
+                match &bm.function {
+                    Object::Builtin(b) => (b, &bm.receiver),
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        };
+        if argc >= MAX_ARGS || !b.binds_instance || builtins::method_memo_tag(receiver).is_none() {
+            return false;
+        }
+        let (b, receiver) = (b.clone(), receiver.clone());
+        // Committed. The receiver and the arguments move into `buf`; the
+        // self slot and the callable leave the stack.
+        let mut buf = [const { std::mem::MaybeUninit::<Object>::uninit() }; MAX_ARGS + 1];
+        buf[0].write(receiver);
+        // SAFETY: the `argc` operands above the self slot move into `buf`
+        // (`argc < MAX_ARGS`) and the stack forgets them.
+        unsafe {
+            let src = frame.stack.as_ptr().add(callee_at + 2);
+            for k in 0..argc {
+                buf[k + 1].write(src.add(k).read());
+            }
+            frame.stack.set_len(callee_at + 2);
+        }
+        let self_slot = frame.stack.pop();
+        let callable = frame.stack.pop();
+        frame.pc = pc as u32 + 1;
+        // SAFETY: the first `argc + 1` entries were written above.
+        let ops =
+            unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<Object>(), argc + 1) };
+        let result = match b.call_kw.as_ref() {
+            Some(call_kw) => call_kw(ops, &[]),
+            None => (b.call)(ops),
+        };
+        // The operands drop as the full handler's do, after the call.
+        // SAFETY: each initialized entry drops exactly once; `buf` itself
+        // has no drop glue.
+        unsafe { std::ptr::drop_in_place(ops) };
+        for o in [callable, self_slot].into_iter().flatten() {
+            // A scalar or a shared method (the memo holds it) leaves by a
+            // plain drop; anything else as the full handler releases it.
+            if matches!(
+                o,
+                Object::Int(_)
+                    | Object::Float(_)
+                    | Object::Bool(_)
+                    | Object::None
+                    | Object::Builtin(_)
+            ) {
+                drop(o);
+            } else {
+                self.release(o);
+            }
+        }
+        drop(b);
+        match result {
+            Ok(v) => {
+                // SAFETY: as above (the body ran nested activations of its
+                // own, never this one).
+                unsafe { (*sw.cur).stack.push(v) };
+                // SAFETY: the running activation's last-pc slot.
+                unsafe { *sw.last = pc };
+            }
+            Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
+        }
+        // A finalizer queued by a dying operand runs before the next
+        // instruction, as after the full handler's call.
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
         true
     }
 
@@ -15597,7 +15814,7 @@ impl Interpreter {
     /// ([`Self::try_inline_gen`]), with the generator's activation pushed
     /// and made the running one here. `false` touches nothing.
     #[inline(never)]
-    fn core_gen_resume(&mut self, sw: &mut CoreSwitch, pc: usize, next_call: bool) -> bool {
+    fn core_gen_resume(&mut self, sw: &mut CoreSwitch, pc: usize, mode: GenResume) -> bool {
         if !self.inline_calls_ok() {
             return false;
         }
@@ -15611,7 +15828,7 @@ impl Interpreter {
                 &mut *shell.cast::<QuietShell<'_>>(),
                 pc,
                 sw.depth_cell,
-                next_call,
+                mode,
             )
         };
         let Some(act) = act else {
@@ -21896,6 +22113,39 @@ impl Interpreter {
                             }
                             _ => None,
                         };
+                        // A builtin type's method on its exact receiver is the
+                        // method memo's (one per kind and name): the site
+                        // remembers it for the core loop, which pushes
+                        // `(method, receiver)` from then on, and so does this
+                        // load.
+                        let unbound = unbound.or_else(|| {
+                            let Object::BoundMethod(bm) = &v else {
+                                return None;
+                            };
+                            let Object::Builtin(b) = &bm.function else {
+                                return None;
+                            };
+                            let tag = builtin_recv_tag(&bm.receiver)?;
+                            // (A sentinel-named method is dispatched by name
+                            // in its bound form.)
+                            if !b.binds_instance
+                                || bm.redispatch_descriptor
+                                || mon_call
+                                || !native_call_ic_safe(b.name)
+                            {
+                                return None;
+                            }
+                            let name = frame.code.names.get(ins.arg as usize)?;
+                            match builtins::lookup_method(&bm.receiver, name) {
+                                Some(Object::Builtin(memo)) if Rc::ptr_eq(&memo, b) => {
+                                    if let Some(slot) = code_method_slot(&frame.code, cache_pc) {
+                                        slot.set_builtin(tag, b);
+                                    }
+                                    Some((bm.function.clone(), bm.receiver.clone()))
+                                }
+                                _ => None,
+                            }
+                        });
                         match unbound {
                             Some((function, self_obj)) => {
                                 frame.push(function);
@@ -57293,6 +57543,24 @@ enum FrameEv {
 /// (no `FOR_ITER` jump is that long).
 const GEN_NEXT_CALL: u32 = u32::MAX;
 
+/// Set in [`InlineAct::exhaust_arg`] (with the `SEND`'s jump below it) for
+/// a sub-generator resumed by `yield from` or `await`: exhaustion leaves
+/// its return value on the delegator's stack and takes the jump.
+const GEN_SEND: u32 = 1 << 31;
+
+/// Which instruction resumes a generator inline (see
+/// [`Interpreter::try_inline_gen`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GenResume {
+    /// `FOR_ITER` over the generator at the top of the stack.
+    ForIter,
+    /// A `CALL` of builtin `next` on the generator at the top of the stack.
+    NextCall,
+    /// `SEND` of the value at the top of the stack to the generator or
+    /// coroutine below it (`yield from`, `await`).
+    Send,
+}
+
 enum GenStep {
     /// The generator yielded this value.
     Yielded(Object),
@@ -58965,12 +59233,21 @@ fn make_gen_method(name: &str, receiver: &Object) -> Object {
         "aclose" => ".agen_close",
         _ => ".gen_unknown",
     };
-    let builtin = Object::Builtin(Rc::new(BuiltinFn {
-        name: internal_name,
-        binds_instance: false,
-        call: Box::new(unreachable_call),
-        call_kw: None,
-    }));
+    // One method object per name, shared as a type's method descriptor is.
+    static METHODS: std::sync::OnceLock<RefCell<crate::fasthash::FxHashMap<&'static str, Object>>> =
+        std::sync::OnceLock::new();
+    let methods = METHODS.get_or_init(Default::default);
+    let cached = methods.borrow().get(internal_name).cloned();
+    let builtin = cached.unwrap_or_else(|| {
+        let builtin = Object::Builtin(Rc::new(BuiltinFn {
+            name: internal_name,
+            binds_instance: false,
+            call: Box::new(unreachable_call),
+            call_kw: None,
+        }));
+        methods.borrow_mut().insert(internal_name, builtin.clone());
+        builtin
+    });
     Object::BoundMethod(Rc::new(BoundMethod::new(receiver.clone(), builtin)))
 }
 
@@ -62862,6 +63139,20 @@ impl CallSlot {
     }
 }
 
+/// The [`MethodSlot`] builtin tag of a builtin receiver whose methods the
+/// method memo serves (see [`builtins::lookup_method`]): the container
+/// tags the leaf tables use, and one per other kind above them.
+#[inline]
+fn builtin_recv_tag(recv: &Object) -> Option<u64> {
+    Some(match recv {
+        Object::List(_) => 1,
+        Object::Dict(_) => 2,
+        Object::Set(_) => 3,
+        Object::Str(_) => 4,
+        other => 16 + u64::from(builtins::method_memo_tag(other)?),
+    })
+}
+
 /// The inline-call shape slot of the `CALL` at `pc`.
 #[inline]
 fn code_call_slot(code: &CodeObject, pc: usize) -> Option<&CallSlot> {
@@ -63431,6 +63722,10 @@ enum MethodSlotFn {
     /// A rejected native bound-call body, weakly held so a call site
     /// doesn't extend its lifetime. The key is the registry generation.
     NonLeaf(crate::sync::Weak<crate::object::BoundMethod>),
+    /// A `CALL` site's builtin type method that isn't a registered leaf:
+    /// its body is called directly (see
+    /// `Interpreter::core_bound_builtin_call`).
+    NativeBody(Rc<crate::object::BuiltinFn>),
     /// A `LOAD_ATTR` site's `property` getter for instances of the class
     /// at the key's version, and the code it was checked against (see
     /// `Interpreter::try_inline_property`).
@@ -63724,6 +64019,20 @@ impl MethodSlot {
     fn set_leaf(&self, f: &Rc<crate::object::BuiltinFn>, kind: LeafKind) {
         // SAFETY: as `set`.
         unsafe { *self.0.get() = (0, MethodSlotFn::Leaf(f.clone(), kind)) };
+    }
+
+    /// Whether this `CALL` site settled that `f` is a non-leaf builtin
+    /// type method whose body the core loop calls directly.
+    #[inline]
+    fn is_native_body(&self, f: &Rc<crate::object::BuiltinFn>) -> bool {
+        // SAFETY: as `get`.
+        matches!(unsafe { &*self.0.get() }, (_, MethodSlotFn::NativeBody(cached)) if Rc::ptr_eq(cached, f))
+    }
+
+    #[inline]
+    fn set_native_body(&self, f: &Rc<crate::object::BuiltinFn>) {
+        // SAFETY: as `set`.
+        unsafe { *self.0.get() = (0, MethodSlotFn::NativeBody(f.clone())) };
     }
 
     fn is_non_leaf(&self, method: &Rc<crate::object::BoundMethod>) -> bool {
