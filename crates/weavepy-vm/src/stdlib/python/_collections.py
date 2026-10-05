@@ -38,8 +38,19 @@ from _weave_collections import (
     tuplegetter_init as _tuplegetter_init,
 )
 # `namedtuple()` registers each generated `__new__` here, so the
-# interpreter builds `NT(a, b, c)` as the tuple directly.
-from _weave_collections import namedtuple_register as _namedtuple_register
+# interpreter builds `NT(a, b, c)` as the tuple directly, and each generated
+# `_make`, whose common cases (and `_replace`'s) run natively.
+from _weave_collections import (
+    namedtuple_make as _namedtuple_make,
+    namedtuple_register as _namedtuple_register,
+    namedtuple_register_make as _namedtuple_register_make,
+    namedtuple_replace as _namedtuple_replace,
+)
+# `ChainMap`'s lookups (collections.py adopts them).
+from _weave_collections import (
+    chainmap_contains as _chainmap_contains,
+    chainmap_getitem as _chainmap_getitem,
+)
 from _weave_collections import (
     count_elements as _count_elements_native,
     dd_init as _dd_init,

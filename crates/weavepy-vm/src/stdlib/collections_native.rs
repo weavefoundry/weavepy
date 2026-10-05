@@ -973,6 +973,220 @@ pub(crate) fn namedtuple_new_shape(f: &Rc<crate::object::PyFunction>) -> Option<
         .map(|(_, code, n)| (Rc::as_ptr(code) as usize, *n))
 }
 
+/// The generated `_make` functions of named tuple classes, with the code
+/// each was registered with (see [`namedtuple_replace`]).
+static NT_MAKES: parking_lot::Mutex<Vec<NtNew>> = parking_lot::Mutex::new(Vec::new());
+
+/// `namedtuple_register_make(make, nfields)`: `namedtuple()` vouches that
+/// `make` is its generated `_make` (`tuple.__new__(cls, iterable)` plus
+/// the length check).
+fn namedtuple_register_make(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Function(f), Object::Int(n)] = args else {
+        return Err(type_error(
+            "namedtuple_register_make() expects a function and a count",
+        ));
+    };
+    let n = usize::try_from(*n).map_err(|_| type_error("negative field count"))?;
+    let code = f.code();
+    let mut reg = NT_MAKES.lock();
+    reg.retain(|(w, _, _)| w.strong_count() > 0);
+    reg.push((Rc::downgrade(f), code, n));
+    Ok(Object::None)
+}
+
+/// A named tuple instance of `cls` holding `items`: what
+/// `tuple.__new__(cls, items)` builds for a tuple subclass.
+fn named_tuple_of(cls: &Rc<crate::types::TypeObject>, items: Vec<Object>) -> Object {
+    let inst = Object::Instance(Rc::new(crate::types::PyInstance::with_native(
+        cls.clone(),
+        Object::new_tuple(items),
+    )));
+    crate::gc_trace::track(&inst);
+    inst
+}
+
+/// `namedtuple_make(cls, iterable, nfields)`: the body of a generated
+/// `_make` for an exact `tuple` or `list` argument; `None` (nothing done)
+/// for any other iterable, which the Python body handles.
+fn namedtuple_make(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls), iterable, Object::Int(n)] = args else {
+        return Err(type_error(
+            "namedtuple_make() expects a class, an iterable and a count",
+        ));
+    };
+    if !cls.is_subclass_of(&crate::builtin_types::builtin_types().tuple_) {
+        return Ok(Object::None);
+    }
+    let items: Vec<Object> = match iterable {
+        Object::Tuple(t) => t.iter().cloned().collect(),
+        Object::List(l) => l.borrow().clone(),
+        _ => return Ok(Object::None),
+    };
+    if items.len() as i64 != *n {
+        return Err(type_error(format!(
+            "Expected {n} arguments, got {}",
+            items.len()
+        )));
+    }
+    Ok(named_tuple_of(cls, items))
+}
+
+/// `namedtuple_replace(self, kwds, field_names)`: the body of a generated
+/// `_replace` (`self._make(map(kwds.pop, field_names, self))`) when
+/// `type(self)._make` is still a generated `_make`, each named field
+/// popped from `kwds`; `None` (nothing done, `kwds` untouched) otherwise.
+/// The caller reports what is left in `kwds`.
+fn namedtuple_replace(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Instance(inst), Object::Dict(kwds), Object::Tuple(fields)] = args else {
+        return Ok(Object::None);
+    };
+    let Some(Object::Tuple(values)) = inst.native.get() else {
+        return Ok(Object::None);
+    };
+    if values.len() != fields.len() {
+        return Ok(Object::None);
+    }
+    let cls = inst.cls();
+    let Some(Object::ClassMethod(make)) = cls.lookup("_make") else {
+        return Ok(Object::None);
+    };
+    let Object::Function(f) = make.func() else {
+        return Ok(Object::None);
+    };
+    let registered = NT_MAKES.lock().iter().any(|(w, code, n)| {
+        std::ptr::eq(w.as_ptr(), Rc::as_ptr(&f))
+            && w.strong_count() > 0
+            && *n == values.len()
+            && Rc::ptr_eq(&f.code(), code)
+    });
+    if !registered {
+        return Ok(Object::None);
+    }
+    let mut items = Vec::with_capacity(values.len());
+    for (name, value) in fields.iter().zip(values.iter()) {
+        items.push(match crate::builtins::dict_remove(kwds, name)? {
+            Some((_, v)) => v,
+            None => value.clone(),
+        });
+    }
+    Ok(named_tuple_of(&cls, items))
+}
+
+// ---------------------------------------------------------------------
+// `ChainMap`.
+
+/// `self.maps` of a `ChainMap` (an instance attribute, unless the class
+/// makes `maps` something else).
+fn chainmap_maps(interp: &mut crate::Interpreter, recv: &Object) -> Result<Object, RuntimeError> {
+    if let Object::Instance(inst) = recv {
+        if inst.cls_raw().lookup("maps").is_none() {
+            if let Some(maps) = inst.attr_get_str("maps") {
+                return Ok(maps);
+            }
+        }
+    }
+    interp.load_attr_public(recv, "maps")
+}
+
+/// The `index`th mapping of `maps` (a list, read live as the Python loop
+/// iterates it), or `None` past its end.
+fn nth_map(maps: &Object, index: usize) -> Option<Object> {
+    match maps {
+        Object::List(l) => l.borrow().get(index).cloned(),
+        Object::Tuple(t) => t.get(index).cloned(),
+        _ => None,
+    }
+}
+
+/// `ChainMap.__getitem__(self, key)`: the first mapping's value for `key`
+/// (`mapping[key]`, a `KeyError` passing to the next mapping), else
+/// `self.__missing__(key)` — the Python method's loop, with an exact
+/// dict's miss settled without raising.
+fn chainmap_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [recv, key] = args else {
+        return Err(type_error(format!(
+            "__getitem__() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    };
+    let interp = crate::builtins::reentrant_interp()?;
+    let maps = chainmap_maps(interp, recv)?;
+    if !matches!(maps, Object::List(_) | Object::Tuple(_)) {
+        // Another iterable of mappings: the generic loop.
+        let globals = interp.builtins_dict();
+        let it = interp.make_iter(&maps, &globals)?;
+        while let Some(mapping) = interp.iter_next(&it, &globals)? {
+            if let Some(v) = chainmap_probe(interp, &mapping, key)? {
+                return Ok(v);
+            }
+        }
+    } else {
+        let mut i = 0;
+        while let Some(mapping) = nth_map(&maps, i) {
+            if let Some(v) = chainmap_probe(interp, &mapping, key)? {
+                return Ok(v);
+            }
+            i += 1;
+        }
+    }
+    let missing = interp.load_attr_public(recv, "__missing__")?;
+    interp.call_object(missing, std::slice::from_ref(key), &[])
+}
+
+/// `mapping[key]`, with a `KeyError` (or subclass) reported as `None`.
+fn chainmap_probe(
+    interp: &mut crate::Interpreter,
+    mapping: &Object,
+    key: &Object,
+) -> Result<Option<Object>, RuntimeError> {
+    if let Object::Dict(d) = mapping {
+        crate::builtins::ensure_dict_key(key)?;
+        return crate::builtins::dict_lookup(d, key);
+    }
+    match interp.subscr_get_public(mapping, key) {
+        Ok(v) => Ok(Some(v)),
+        Err(RuntimeError::PyException(e)) => {
+            let key_error = Object::Type(crate::builtin_types::builtin_types().key_error.clone());
+            if interp.exception_matches(&e.instance, &key_error)? {
+                Ok(None)
+            } else {
+                Err(RuntimeError::PyException(e))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `ChainMap.__contains__(self, key)`: whether any mapping holds `key`.
+fn chainmap_contains(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [recv, key] = args else {
+        return Err(type_error(format!(
+            "__contains__() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    };
+    let interp = crate::builtins::reentrant_interp()?;
+    let maps = chainmap_maps(interp, recv)?;
+    let globals = interp.builtins_dict();
+    if !matches!(maps, Object::List(_) | Object::Tuple(_)) {
+        let it = interp.make_iter(&maps, &globals)?;
+        while let Some(mapping) = interp.iter_next(&it, &globals)? {
+            if interp.contains_full(&mapping, key, &globals)? {
+                return Ok(Object::Bool(true));
+            }
+        }
+        return Ok(Object::Bool(false));
+    }
+    let mut i = 0;
+    while let Some(mapping) = nth_map(&maps, i) {
+        if interp.contains_full(&mapping, key, &globals)? {
+            return Ok(Object::Bool(true));
+        }
+        i += 1;
+    }
+    Ok(Object::Bool(false))
+}
+
 // ---------------------------------------------------------------------
 // `defaultdict`.
 
@@ -1269,6 +1483,19 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             "namedtuple_register",
             "namedtuple_register",
             namedtuple_register,
+        );
+        reg(
+            "namedtuple_register_make",
+            "namedtuple_register_make",
+            namedtuple_register_make,
+        );
+        reg("namedtuple_make", "namedtuple_make", namedtuple_make);
+        reg("chainmap_getitem", "__getitem__", chainmap_getitem);
+        reg("chainmap_contains", "__contains__", chainmap_contains);
+        reg(
+            "namedtuple_replace",
+            "namedtuple_replace",
+            namedtuple_replace,
         );
         reg("iterator_next", "__next__", deque_iterator_next);
         reg(

@@ -25419,7 +25419,11 @@ impl Interpreter {
         }
     }
 
-    fn exception_matches(&self, exc: &Object, ty: &Object) -> Result<bool, RuntimeError> {
+    pub(crate) fn exception_matches(
+        &self,
+        exc: &Object,
+        ty: &Object,
+    ) -> Result<bool, RuntimeError> {
         // The commonest handler names the raised exception's own class,
         // which (being raised) derives from BaseException.
         if let (Object::Instance(inst), Object::Type(t)) = (exc, ty) {
