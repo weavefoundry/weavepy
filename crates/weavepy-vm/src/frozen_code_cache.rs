@@ -25,10 +25,14 @@
 //!   if the source ever varied at runtime (it doesn't) we'd hash
 //!   the source instead.
 //! - Inline caches inside the [`CodeObject`] are *not* shared
-//!   across interpreters. Each clone of the cached code starts
+//!   across interpreters. Each copy of the cached code starts
 //!   with a fresh, empty cache table because the type fingerprints
 //!   one interpreter recorded would be invalid in another (the
 //!   `Rc::as_ptr` addresses change).
+//! - The cache keeps each module in the compact `native_code` form
+//!   the disk layer uses, not as a [`CodeObject`]: a resident copy of
+//!   every compiled module would double the memory its code takes in
+//!   the (usual) single-interpreter process, which never reads it.
 //!
 //! ## Threading
 //!
@@ -44,29 +48,35 @@ use std::sync::OnceLock;
 use weavepy_compiler::CodeObject;
 
 thread_local! {
-    static CACHE: RefCell<HashMap<&'static str, CodeObject>> = RefCell::new(HashMap::new());
+    /// Each module's code in `native_code` form, with the filename it
+    /// was compiled under.
+    static CACHE: RefCell<HashMap<&'static str, (Box<str>, Box<[u8]>)>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Look up a previously-compiled frozen module by its static
-/// name. Returns a fresh clone of the cached [`CodeObject`] —
+/// name. Returns a fresh copy of the cached [`CodeObject`] —
 /// callers want their own copy because the inline-cache
 /// side-table needs to start fresh per-interpreter.
 pub fn get(name: &str) -> Option<CodeObject> {
     CACHE.with(|c| {
         let map = c.borrow();
-        map.get(name).map(|code| {
-            let clone = code.clone();
-            // Reset every cache slot to `Empty` — see module docs.
-            clone.caches.clear();
-            clone
-        })
+        let (filename, bytes) = map.get(name)?;
+        weavepy_compiler::native_code::decode(bytes, filename)
     })
 }
 
 /// Install a freshly-compiled frozen module into the cache.
 /// Keyed on the module's `&'static` name (which the frozen
 /// loader carries through; we don't allocate a new `String`).
+/// A code object the native form doesn't carry just isn't cached.
 pub fn insert(name: &str, code: &CodeObject) {
+    if CACHE.with(|c| c.borrow().contains_key(name)) {
+        return;
+    }
+    let Some(bytes) = weavepy_compiler::native_code::encode(code) else {
+        return;
+    };
     // Look up the static name from the registered frozen sources
     // — the borrow-checker doesn't let us hash on a `&str`-into-
     // `&'static str` upgrade directly. We use `Box::leak` of the
@@ -75,10 +85,10 @@ pub fn insert(name: &str, code: &CodeObject) {
     // savings.
     let static_name: &'static str = Box::leak(name.to_owned().into_boxed_str());
     CACHE.with(|c| {
-        let mut map = c.borrow_mut();
-        if !map.contains_key(static_name) {
-            map.insert(static_name, code.clone());
-        }
+        c.borrow_mut().insert(
+            static_name,
+            (code.filename.as_str().into(), bytes.into_boxed_slice()),
+        );
     });
 }
 
@@ -106,25 +116,6 @@ pub fn insert(name: &str, code: &CodeObject) {
 /// CPython magic: these files are WeavePy-internal).
 const FROZEN_MAGIC: &[u8; 4] = b"WPYN";
 const FROZEN_HEADER_LEN: usize = 20;
-
-/// FNV-1a 64-bit over 8-byte words (the tail zero-padded): tiny,
-/// dependency-free, and plenty for cache validation (collisions only
-/// matter combined with an equal length).
-fn fnv1a(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let (words, rest) = s.as_bytes().as_chunks::<8>();
-    let mut mix = |w: u64| {
-        h ^= w;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    };
-    for w in words {
-        mix(u64::from_le_bytes(*w));
-    }
-    let mut tail = [0u8; 8];
-    tail[..rest.len()].copy_from_slice(rest);
-    mix(u64::from_le_bytes(tail));
-    h
-}
 
 /// The per-user frozen-cache directory, resolved once. `None` disables
 /// the disk layer (no resolvable cache dir, or `WEAVEPY_FROZEN_CACHE=0`).
@@ -177,7 +168,9 @@ pub fn get_disk(name: &str, source: &str, filename: &str) -> Option<CodeObject> 
     }
     let len = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
     let hash = u64::from_le_bytes(bytes[12..20].try_into().ok()?);
-    if len as usize != source.len() || hash != fnv1a(source) {
+    // An embedded module's hash comes from the build: computing it here
+    // would page in the whole source text the cached code stands for.
+    if len as usize != source.len() || hash != crate::stdlib::frozen_source_hash(name, source) {
         return None;
     }
     // Not mirrored into the in-memory cache: a later interpreter reads the
@@ -205,7 +198,7 @@ pub fn write_disk(name: &str, source: &str, code: &CodeObject) {
     bytes.extend_from_slice(FROZEN_MAGIC);
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&(source.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&fnv1a(source).to_le_bytes());
+    bytes.extend_from_slice(&crate::stdlib::frozen_source_hash(name, source).to_le_bytes());
     bytes.extend_from_slice(&payload);
     // Atomic-ish: temp + rename so concurrent starts never observe a
     // half-written artifact.
