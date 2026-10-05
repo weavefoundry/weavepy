@@ -68,6 +68,8 @@ pub struct CompiledFrame {
     pub cold_exits: Vec<u32>,
     /// See [`crate::ir::TFunc::region_exits`].
     pub region_exits: Vec<u32>,
+    /// See [`crate::ir::TFunc::region_roots`].
+    pub region_roots: Vec<u32>,
     /// See [`crate::ir::TFunc::stayed_heads`].
     pub stayed_heads: Vec<u32>,
     /// See [`crate::ir::TFunc::env_heads`].
@@ -417,6 +419,14 @@ impl JitEngine {
                     runtime::unbox_float_helper_addr(),
                     "float guard (no helper registered)",
                 )),
+                TOp::DynBinary { .. } => Some((
+                    runtime::dyn_binop_helper_addr(),
+                    "generic binary op (no helper registered)",
+                )),
+                TOp::DynCompare { .. } => Some((
+                    runtime::dyn_compare_helper_addr(),
+                    "generic comparison (no helper registered)",
+                )),
                 TOp::CallDyn {
                     int_result: true, ..
                 } => Some((
@@ -700,6 +710,8 @@ impl JitEngine {
                     | TOp::DynAttrGet { .. }
                     | TOp::DynAttrSet { .. }
                     | TOp::ContainsDyn { .. }
+                    | TOp::DynBinary { .. }
+                    | TOp::DynCompare { .. }
             )
         });
         let interp_entry = (has_loop || !round_trips) && tfunc.pc0_entry;
@@ -717,6 +729,7 @@ impl JitEngine {
             comp_target_slots: tfunc.comp_target_slots.clone(),
             cold_exits: tfunc.cold_exits.clone(),
             region_exits: tfunc.region_exits.clone(),
+            region_roots: tfunc.region_roots.clone(),
             stayed_heads: tfunc.stayed_heads.clone(),
             env_heads: tfunc.env_heads.clone(),
             interp_entry,
@@ -794,7 +807,9 @@ fn op_mix(tfunc: &TFunc) -> OpMix {
             match st.op {
                 TOp::CallDyn { .. } => mix.dyn_calls += 1,
                 TOp::DynAttrGet { .. } | TOp::DynAttrSet { .. } => mix.dyn_attrs += 1,
-                TOp::ContainsDyn { .. } => mix.dyn_other += 1,
+                TOp::ContainsDyn { .. } | TOp::DynBinary { .. } | TOp::DynCompare { .. } => {
+                    mix.dyn_other += 1;
+                }
                 TOp::CallPy { .. }
                 | TOp::CallPyKw { .. }
                 | TOp::CallMethod { .. }

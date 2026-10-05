@@ -646,6 +646,20 @@ pub enum TOp {
     /// discipline applies), pushing the `Bool` (already negated for
     /// the `not in` form). Statuses as [`TOp::Truth`].
     ContainsDyn { negate: bool },
+    /// A binary operation no typed lane covers (`Obj - Obj` dispatching
+    /// to `__sub__`, `str * int`, `int ** int`): pops two operands of
+    /// any marshalable lanes (staged through the marshal buffer with
+    /// their tags) and runs the interpreter's own `BINARY_OP` dispatch
+    /// for `arg` (the raw oparg: the operator and the in-place flag)
+    /// through the registered `wpjit_dyn_binop` helper, pushing the
+    /// result as a fresh object-lane pin. A raise takes the `Raised` exit
+    /// at this pc; a completed operation that invalidated a guard parks
+    /// its result and deopts after it.
+    DynBinary { arg: u32 },
+    /// The `COMPARE_OP` counterpart, through the interpreter's rich
+    /// comparison. With the oparg's to-`bool` flag the result is the
+    /// comparison's truth (the `Bool` lane), otherwise an object pin.
+    DynCompare { arg: u32 },
     /// RFC 0076 WS8 — `BUILD_SET k`: elements stage with per-element
     /// tags (like [`TOp::BuildTuple`]) and the registered
     /// `wpjit_build_set` helper builds the fresh set, pinned on the
@@ -851,6 +865,11 @@ pub enum ResolvedGlobal {
     /// pinned-list length callee (lowered to [`TOp::ListLen`], never a
     /// real call).
     LenBuiltin,
+    /// A global bound to one of the `math` module's intrinsic functions
+    /// (`from math import sqrt`): its `CALL` lowers to
+    /// [`TOp::MathIntrinsic`] like the `math.sqrt` attribute form, the
+    /// global's identity guard standing in for the module guard.
+    MathGlobal(MathFunc),
     /// The canonical builtin `list`: `list(range(...))` over simple
     /// integer bounds lowers to [`TOp::ListFromRange`] (a fresh pinned
     /// `int` list, never a real call). Any other use burns as an
@@ -1446,6 +1465,11 @@ pub struct TFunc {
     /// it stays interpreted (a root loop finishing inside an interpreted
     /// loop, say): routine hand-offs, taken once per region entry.
     pub region_exits: Vec<u32>,
+    /// Headers of the OSR-only region loops: entered once per iteration of
+    /// the interpreted code around them, so the embedder skips an entry
+    /// whose live iterator has fewer than
+    /// [`crate::analyze::MIN_REGION_TRIPS`] items left.
+    pub region_roots: Vec<u32>,
     /// Headers of the loops whose code stays interpreted. An OSR request
     /// at one is expected to find no entry.
     pub stayed_heads: Vec<u32>,
@@ -1459,11 +1483,12 @@ pub struct TFunc {
     /// Erased Python callees (RFC 0059 WS3), ascending `live_from`, for
     /// deopt stack reconstruction during argument computation.
     pub callee_spans: Vec<CalleeSpanMeta>,
-    /// RFC 0065 WS5 — erased `len` builtins riding the interpreter
-    /// stack between their `LOAD_GLOBAL` and `CALL`. Same
-    /// reconstruction contract as [`Self::callee_spans`], except the
-    /// re-inserted object is the guard snapshot's `len` (the `token`
-    /// field is unused) and `live_to` is the pc *after* the `CALL`.
+    /// RFC 0065 WS5 — erased builtin globals (`len`, a `math` intrinsic
+    /// bound to a global) riding the interpreter stack between their
+    /// `LOAD_GLOBAL` and `CALL`. Same reconstruction contract as
+    /// [`Self::callee_spans`], except the re-inserted object is the
+    /// guard snapshot's value for the global named `code.names[token]`
+    /// and `live_to` is the pc *after* the `CALL`.
     pub len_spans: Vec<CalleeSpanMeta>,
     /// RFC 0065 WS5 / RFC 0069 WS1 — erased bound-method receivers
     /// (`list.append` and burned-in method sites), for rewriting the
@@ -1594,6 +1619,8 @@ impl TOp {
                 | TOp::DynAttrSet { .. }
                 | TOp::Truth
                 | TOp::ContainsDyn { .. }
+                | TOp::DynBinary { .. }
+                | TOp::DynCompare { .. }
                 | TOp::BuildSet { .. }
                 | TOp::StrMod
                 | TOp::StrSlice { .. }

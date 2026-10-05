@@ -453,16 +453,21 @@ fn guarded_integer_division_retains_float_result() {
 
 #[test]
 fn two_opaque_arithmetic_operands_do_not_guess_a_scalar_lane() {
-    assert!(matches!(
-        analyze_cfg(
-            "def k(a, b):\n    return a + b\n",
-            &Cfg {
-                obj_params: vec![0, 1],
-                ..Cfg::default()
-            },
-        ),
-        Err(JitVerdict::MixedArithTypes)
-    ));
+    // With no evidence for either operand, the interpreter's own dispatch
+    // runs the operation; nothing is guarded as a scalar.
+    let tf = analyze_cfg(
+        "def k(a, b):\n    return a + b\n",
+        &Cfg {
+            obj_params: vec![0, 1],
+            ..Cfg::default()
+        },
+    )
+    .expect("a generic binary operation should analyze");
+    assert!(has_op(&tf, |op| matches!(op, TOp::DynBinary { .. })));
+    assert!(!has_op(&tf, |op| matches!(
+        op,
+        TOp::UnboxInt { .. } | TOp::UnboxFloat { .. }
+    )));
 }
 
 #[test]

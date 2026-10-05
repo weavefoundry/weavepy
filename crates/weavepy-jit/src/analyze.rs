@@ -436,11 +436,12 @@ struct Plan {
     /// iterator's interpreter-stack depth. Native code never steps one;
     /// it rides the object lane from the root's entry to its exits.
     passthrough: HashMap<u32, u32>,
-    /// Numeric speculation, enabled on a retry after mixed-lane
-    /// arithmetic failed: an opaque value stored into a local whose live
-    /// value is a `float` or `int` gives the local that lane, guarded at
-    /// each such store (see `num_spec_lane`).
-    num_spec: bool,
+    /// Numeric speculation: the locals an opaque value stored into may
+    /// take the scalar lane the live activation holds in them, guarded at
+    /// each such store (see `num_spec_lane`). Locals the code reads into
+    /// arithmetic or a comparison, never tests against `None`, and no
+    /// earlier attempt found stored on another lane.
+    num_slots: HashSet<u32>,
     /// Synthetic slots appended after the code object's real locals.
     n_synth: u32,
 }
@@ -791,8 +792,12 @@ impl Region {
         for k in 0..loops.len() {
             let lp = loops[k];
             plain_chain[k] = lp.plain && lp.parent.is_none_or(|p| plain_chain[p]);
+            // A loop over a short constant tuple would enter and leave
+            // native code every few iterations: not worth a region.
             stays[k] = carve.excluded.contains(&lp.head)
-                || lp.parent.is_some_and(|p| stays[p] && !plain_chain[k]);
+                || lp.parent.is_some_and(|p| {
+                    stays[p] && (!plain_chain[k] || short_const_loop(code, lp.head))
+                });
         }
         let roots = (0..loops.len())
             .filter(|&k| !stays[k] && loops[k].parent.is_some_and(|p| stays[p]))
@@ -871,19 +876,31 @@ fn analyze_impl(
     // The verdict that started the carving, reported when carving leaves
     // nothing native.
     let mut first_err: Option<JitVerdict> = None;
-    // Numeric speculation (see `Plan::num_spec`), switched on by the
-    // first mixed-lane failure.
-    let mut num_spec = false;
+    // Numeric speculation (see `Plan::num_slots`), backed off one local at
+    // a time when another store gives the local a different lane.
+    let mut num_slots = numeric_slots(code);
+    let mut backoffs = 0usize;
     loop {
         FAIL_PC.with(|c| c.set(None));
         match analyze_once(
-            code, resolve, probes, &demote, lane_lists, &cold, &carve, &forest, num_spec,
+            code, resolve, probes, &demote, lane_lists, &cold, &carve, &forest, &num_slots,
         ) {
-            Err(JitVerdict::MixedArithTypes) if !num_spec => {
+            // A region that only lacked live values, compiled for a request
+            // it can't even enter (a comprehension's header, say): wait for
+            // a request from inside the loop that lacked them.
+            Ok(tf)
+                if !carve.env.is_empty()
+                    && probes.entry_pc.is_some_and(|pc| {
+                        pc != 0 && !tf.osr_entries.iter().any(|e| e.pc == pc)
+                    }) =>
+            {
+                return Err(JitVerdict::ProbeMiss("region (entry)"));
+            }
+            Err(JitVerdict::NonUniformLocal(slot)) if backoffs < 8 && num_slots.remove(&slot) => {
                 if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
-                    eprintln!("jit numeric speculation {:?}", code.name);
+                    eprintln!("jit numeric backoff {:?} local {}", code.name, slot);
                 }
-                num_spec = true;
+                backoffs += 1;
             }
             Err(JitVerdict::CalleeEscapes(name_idx)) => {
                 if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
@@ -1030,7 +1047,7 @@ fn carve_step(
 }
 
 /// The speculated scalar lane of a `STORE_FAST slot` of a `ty` value
-/// under [`Plan::num_spec`]: an opaque value stored into a real local
+/// (see [`Plan::num_slots`]): an opaque value stored into a numeric local
 /// that holds a `float` or `int` in the requesting activation, when no
 /// store has given the local another lane.
 fn num_spec_lane(
@@ -1041,7 +1058,7 @@ fn num_spec_lane(
     local_types: &[Option<JitType>],
     probes: &mut Probes<'_>,
 ) -> Option<JitType> {
-    if !plan.num_spec || ty != JitType::Obj || slot >= code.varnames.len() as u32 {
+    if ty != JitType::Obj || slot >= code.varnames.len() as u32 || !plan.num_slots.contains(&slot) {
         return None;
     }
     let lane = (probes.local)(slot).filter(|t| matches!(t, JitType::Float | JitType::Int))?;
@@ -1051,6 +1068,49 @@ fn num_spec_lane(
         .flatten()
         .is_none_or(|cur| cur == lane)
         .then_some(lane)
+}
+
+/// The locals [`Plan::num_slots`] admits, before backing off: read
+/// straight into a `BINARY_OP` or `COMPARE_OP` (as either operand), and
+/// never tested against `None` (a local that can hold `None` would miss
+/// a scalar guard).
+fn numeric_slots(code: &CodeObject) -> HashSet<u32> {
+    let ins = &code.instructions;
+    let simple = |k: usize| {
+        matches!(
+            ins[k].op,
+            OpCode::LoadFast | OpCode::LoadConst | OpCode::LoadSmallInt
+        )
+    };
+    let mut num: HashSet<u32> = HashSet::new();
+    let mut none_tested: HashSet<u32> = HashSet::new();
+    for i in 0..ins.len() {
+        match ins[i].op {
+            OpCode::BinaryOp | OpCode::CompareOp => {
+                for k in [i.checked_sub(1), i.checked_sub(2)].into_iter().flatten() {
+                    if ins[k].op == OpCode::LoadFast {
+                        num.insert(ins[k].arg);
+                    }
+                    if !simple(k) {
+                        break;
+                    }
+                }
+            }
+            OpCode::PopJumpIfNone | OpCode::PopJumpIfNotNone | OpCode::IsOp => {
+                for k in [i.checked_sub(1), i.checked_sub(2)].into_iter().flatten() {
+                    if ins[k].op == OpCode::LoadFast {
+                        none_tested.insert(ins[k].arg);
+                    }
+                    if !simple(k) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    num.retain(|s| !none_tested.contains(s));
+    num
 }
 
 /// Whether `code` stores an empty-list literal straight into a local
@@ -1072,7 +1132,7 @@ fn analyze_once(
     cold: &HashSet<usize>,
     carve: &Carve,
     loops: &[LoopInfo],
-    num_spec: bool,
+    num_slots: &HashSet<u32>,
 ) -> Result<TFunc, JitVerdict> {
     // RFC 0070 WS2 — sync generator bodies are admitted (yields become
     // `Yielded` side exits; entry is OSR-only). Coroutines and async
@@ -1098,7 +1158,7 @@ fn analyze_once(
         loops,
         &region,
     )?;
-    plan.num_spec = num_spec;
+    plan.num_slots = num_slots.clone();
     // Region exits: where native code would step into code that stays
     // interpreted, it hands the activation over instead (a cold exit at
     // that pc). Blocks split wherever nativeness changes.
@@ -1395,13 +1455,22 @@ fn analyze_once(
     for tb in blocks_opt {
         blocks.push(tb.ok_or(JitVerdict::NonEmptyBoundaryStack)?);
     }
-    let method_sites: Vec<MethodSiteMeta> = {
-        let mut sites = Vec::with_capacity(out.method_sites.len());
-        for s in out.method_sites {
-            sites.push(s.ok_or(JitVerdict::UnsupportedOpcode("method site (token gap)"))?);
-        }
-        sites
-    };
+    // A token with no site was probed for code an earlier carving step
+    // left to the interpreter: no statement names it, so a placeholder
+    // keeps the table parallel to the embedder's.
+    let method_sites: Vec<MethodSiteMeta> = out
+        .method_sites
+        .into_iter()
+        .map(|s| {
+            s.unwrap_or_else(|| MethodSiteMeta {
+                slot: u32::MAX,
+                name: String::new(),
+                arg_count: 0,
+                min_args: 0,
+                ret: MethodRet::None,
+            })
+        })
+        .collect();
 
     // OSR entry points (RFC 0059 WS3b): every backward-jump target
     // with an *empty* boundary stack is enterable mid-frame once the
@@ -1610,6 +1679,7 @@ fn analyze_once(
             v
         },
         region_exits,
+        region_roots: osr_roots.iter().map(|&k| loops[k].head as u32).collect(),
         stayed_heads: (0..loops.len())
             .filter(|&k| region.stays[k])
             .map(|k| loops[k].head as u32)
@@ -2412,6 +2482,7 @@ fn plan_rewrite(
             | ResolvedGlobal::ConstFloat(_)
             | ResolvedGlobal::ConstBool(_)
             | ResolvedGlobal::LenBuiltin
+            | ResolvedGlobal::MathGlobal(_)
             | ResolvedGlobal::PyFunc { .. }
             | ResolvedGlobal::MathModule => {
                 let name = &code.names[item.arg as usize];
@@ -3208,6 +3279,9 @@ enum MarkKind {
     Py,
     Len,
     Math(MathFunc),
+    /// A `math` intrinsic bound to a global (see
+    /// [`ResolvedGlobal::MathGlobal`]); spans like `Len`.
+    MathGlobal(MathFunc),
 }
 
 /// A `LOAD_GLOBAL`-resolved Python callee riding the *abstract* stack
@@ -4409,11 +4483,28 @@ fn step_abstract(
                 }
                 // RFC 0065 WS5: `len` rides the abstract stack the same
                 // way; its CALL lowers to `ListLen`, never a real call.
+                Some(ResolvedGlobal::MathGlobal(func)) => {
+                    stack.push(SE {
+                        callee: Some(CalleeMark {
+                            kind: MarkKind::MathGlobal(*func),
+                            token: ins.arg,
+                            arg_count: 1,
+                            min_args: 1,
+                            is_self: false,
+                            ret: Some(JitType::Float),
+                            ctor: false,
+                            load_pc: i as u32,
+                            interp_depth: 0,
+                        }),
+                        ..SE::known(JitType::Unknown)
+                    });
+                    return Ok(());
+                }
                 Some(ResolvedGlobal::LenBuiltin) => {
                     stack.push(SE {
                         callee: Some(CalleeMark {
                             kind: MarkKind::Len,
-                            token: 0,
+                            token: ins.arg,
                             arg_count: 1,
                             min_args: 1,
                             is_self: false,
@@ -4524,7 +4615,7 @@ fn step_abstract(
             // RFC 0073 WS1 — track constructor provenance for the
             // attribute-probe fallback.
             ctor.note_store(ins.arg, &v);
-            // Numeric speculation (see `Plan::num_spec`): an opaque value
+            // Numeric speculation (see `Plan::num_slots`): an opaque value
             // stored into a local the live activation holds a `float` or
             // `int` in gives the local that scalar lane, guarded at the
             // store.
@@ -4602,7 +4693,13 @@ fn step_abstract(
             let res = if hinted && a.ty == JitType::Obj && b.ty == JitType::Obj {
                 bin_result_type(kind, JitType::Int, JitType::Int)?
             } else {
-                bin_result_type(kind, a.ty, b.ty)?
+                match bin_result_type(kind, a.ty, b.ty) {
+                    Ok(t) => t,
+                    // No typed lane: the interpreter's own dispatch runs it
+                    // (`TOp::DynBinary`), producing an object.
+                    Err(_) if dyn_op_ok(a.ty, b.ty) => JitType::Obj,
+                    Err(e) => return Err(e),
+                }
             };
             stack.push(SE::known(res));
         }
@@ -4614,8 +4711,14 @@ fn step_abstract(
                 return Err(escape_verdict(code, &[&a, &b], "CALL (callee escapes)"));
             }
             let (a, b) = resolve_pair(a, b, local_types, changed);
-            cmp_check(kind, a.ty, b.ty)?;
-            stack.push(SE::known(JitType::Bool));
+            match cmp_check(kind, a.ty, b.ty) {
+                Ok(()) => stack.push(SE::known(JitType::Bool)),
+                // The interpreter's rich comparison (`TOp::DynCompare`).
+                Err(_) if dyn_op_ok(a.ty, b.ty) => {
+                    stack.push(SE::known(dyn_compare_lane(ins.arg)));
+                }
+                Err(e) => return Err(e),
+            }
         }
         // RFC 0070 WS1 — `x is None` / `x is not None` on a nullable
         // object lane. Exactly one operand must be the `None` constant
@@ -5000,13 +5103,15 @@ fn step_abstract(
             // RFC 0069 WS2 — a burned-in math intrinsic: one operand,
             // `float` (an integral operand promotes with the guarded
             // exact-range conversion, like mixed arithmetic).
-            if let MarkKind::Math(_) = mark.kind {
+            if let MarkKind::Math(_) | MarkKind::MathGlobal(_) = mark.kind {
                 if argc != 1 {
                     return Err(JitVerdict::UnsupportedOpcode("math (arity)"));
                 }
                 let a = &args[0];
                 if a.ty.is_representable() {
-                    if !(a.ty == JitType::Float || a.ty.is_integral()) {
+                    // An object operand is guarded as a float (or a
+                    // promoted int) at emission.
+                    if !(a.ty == JitType::Float || a.ty == JitType::Obj || a.ty.is_integral()) {
                         return Err(JitVerdict::UnsupportedOpcode("math (operand lane)"));
                     }
                 }
@@ -6282,6 +6387,41 @@ fn float_operand_guard(a: JitType, b: JitType) -> Option<u8> {
     }
 }
 
+/// Whether the `for` loop headed at `head` iterates a constant tuple of
+/// fewer than [`MIN_REGION_TRIPS`] items.
+fn short_const_loop(code: &CodeObject, head: usize) -> bool {
+    let ins = &code.instructions;
+    head >= 2
+        && ins[head - 1].op == OpCode::GetIter
+        && ins[head - 2].op == OpCode::LoadConst
+        && matches!(
+            code.constants.get(ins[head - 2].arg as usize),
+            Some(Constant::Tuple(items)) if items.len() < MIN_REGION_TRIPS
+        )
+}
+
+/// The fewest iterations an OSR-only region loop is worth entering for
+/// (the embedder checks the live iterator against it, see
+/// [`TFunc::region_roots`]).
+pub const MIN_REGION_TRIPS: usize = 8;
+
+/// Whether operands on lanes `a` and `b` can take the generic operation
+/// lanes ([`TOp::DynBinary`], [`TOp::DynCompare`]): both marshal into the
+/// helper's buffer.
+fn dyn_op_ok(a: JitType, b: JitType) -> bool {
+    a.is_representable() && b.is_representable()
+}
+
+/// The result lane of a generic comparison: `bool` when the oparg asks
+/// for the truth of the result, the object itself otherwise.
+fn dyn_compare_lane(arg: u32) -> JitType {
+    if arg & COMPARE_OP_TO_BOOL_FLAG != 0 {
+        JitType::Bool
+    } else {
+        JitType::Obj
+    }
+}
+
 /// Validate comparison operand lanes. Same-lane always works; mixed
 /// integral/float works via a *guarded* promotion (the interpreter
 /// compares exactly, so the JIT deopts when the int exceeds ±2^53).
@@ -7118,12 +7258,30 @@ fn emit_instr(
                 }
                 // RFC 0065 WS5: `len` rides the interpreter stack the
                 // same way; the `CALL` lowers to `ListLen`.
+                Some(ResolvedGlobal::MathGlobal(func)) => {
+                    let n_iters = plan.hidden_at(i);
+                    stack.push(ESlot {
+                        callee: Some(CalleeMark {
+                            kind: MarkKind::MathGlobal(*func),
+                            token: ins.arg,
+                            arg_count: 1,
+                            min_args: 1,
+                            is_self: false,
+                            ret: Some(JitType::Float),
+                            ctor: false,
+                            load_pc: pc,
+                            interp_depth: n_iters + stack.len() as u32,
+                        }),
+                        ..ESlot::val(JitType::Unknown)
+                    });
+                    return Ok(());
+                }
                 Some(ResolvedGlobal::LenBuiltin) => {
                     let n_iters = plan.hidden_at(i);
                     stack.push(ESlot {
                         callee: Some(CalleeMark {
                             kind: MarkKind::Len,
-                            token: 0,
+                            token: ins.arg,
                             arg_count: 1,
                             min_args: 1,
                             is_self: false,
@@ -7388,8 +7546,19 @@ fn emit_instr(
                 if matches!(kind, ArithKind::Add) && a == JitType::Str && str_accumulator(code, i) {
                     return Err(JitVerdict::UnsupportedOpcode("str accumulator"));
                 }
-                let (op, ty) = lower_bin(kind, a, b)?;
-                push(op, Some(ty), stack, stmts);
+                match lower_bin(kind, a, b) {
+                    Ok((op, ty)) => push(op, Some(ty), stack, stmts),
+                    Err(_) if dyn_op_ok(a, b) => {
+                        *max_call_args = (*max_call_args).max(2);
+                        push(
+                            TOp::DynBinary { arg: ins.arg },
+                            Some(JitType::Obj),
+                            stack,
+                            stmts,
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
         OpCode::CompareOp => {
@@ -7460,12 +7629,34 @@ fn emit_instr(
             } else if a == JitType::Str && b == JitType::Str {
                 // RFC 0071 WS6 — `str` equality through the registered
                 // helper; ordering compares stay non-JITable.
-                let negate = match kind {
-                    CmpKind::Eq => false,
-                    CmpKind::Ne => true,
-                    _ => return Err(JitVerdict::UnsupportedOpcode("COMPARE_OP (str order)")),
-                };
-                push(TOp::StrEq { negate }, Some(JitType::Bool), stack, stmts);
+                match kind {
+                    CmpKind::Eq | CmpKind::Ne => push(
+                        TOp::StrEq {
+                            negate: kind == CmpKind::Ne,
+                        },
+                        Some(JitType::Bool),
+                        stack,
+                        stmts,
+                    ),
+                    // Ordering runs through the interpreter's comparison.
+                    _ => {
+                        *max_call_args = (*max_call_args).max(2);
+                        push(
+                            TOp::DynCompare { arg: ins.arg },
+                            Some(dyn_compare_lane(ins.arg)),
+                            stack,
+                            stmts,
+                        );
+                    }
+                }
+            } else if dyn_op_ok(a, b) {
+                *max_call_args = (*max_call_args).max(2);
+                push(
+                    TOp::DynCompare { arg: ins.arg },
+                    Some(dyn_compare_lane(ins.arg)),
+                    stack,
+                    stmts,
+                );
             } else {
                 return Err(JitVerdict::MixedArithTypes);
             }
@@ -8277,7 +8468,7 @@ fn emit_instr(
             // operand (an integral operand converts exactly — i64 →
             // f64 is correctly rounded for the whole lane, matching
             // the interpreter's conversion).
-            if let MarkKind::Math(func) = mark.kind {
+            if let MarkKind::Math(func) | MarkKind::MathGlobal(func) = mark.kind {
                 if argc != 1 {
                     return Err(JitVerdict::UnsupportedOpcode("math (arity)"));
                 }
@@ -8285,15 +8476,36 @@ fn emit_instr(
                     stack.push(ESlot::val(arg_tys[0]));
                     push(TOp::IntToFloatTos { guarded: false }, None, stack, stmts);
                     stack.pop();
+                } else if arg_tys[0] == JitType::Obj {
+                    // Guarded as a float, or an exact int converted (the
+                    // function's own conversion); a miss resumes at CALL.
+                    stack.push(ESlot::val(JitType::Obj));
+                    if !fuse_float_result(stmts, pc) {
+                        push(
+                            TOp::UnboxFloat {
+                                depth: 0,
+                                promote: UNBOX_FLOAT_ARITH,
+                            },
+                            None,
+                            stack,
+                            stmts,
+                        );
+                    }
+                    stack.pop();
                 } else if arg_tys[0] != JitType::Float {
                     return Err(JitVerdict::UnsupportedOpcode("math (operand lane)"));
                 }
-                math_spans.push(CalleeSpanMeta {
+                let span = CalleeSpanMeta {
                     token: mark.token,
                     live_from: mark.load_pc,
                     live_to: pc + 1,
                     interp_depth: mark.interp_depth,
-                });
+                };
+                if let MarkKind::MathGlobal(_) = mark.kind {
+                    len_spans.push(span);
+                } else {
+                    math_spans.push(span);
+                }
                 push(TOp::MathIntrinsic(func), Some(JitType::Float), stack, stmts);
                 return Ok(());
             }
@@ -8324,7 +8536,7 @@ fn emit_instr(
                     return Err(JitVerdict::UnsupportedOpcode("len (argument lane)"));
                 };
                 len_spans.push(CalleeSpanMeta {
-                    token: 0,
+                    token: mark.token,
                     live_from: mark.load_pc,
                     live_to: pc + 1,
                     interp_depth: mark.interp_depth,

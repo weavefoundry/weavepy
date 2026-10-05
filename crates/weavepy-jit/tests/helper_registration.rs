@@ -18,6 +18,7 @@ fn function(ops: &[TOp]) -> TFunc {
         comp_target_slots: vec![],
         cold_exits: vec![],
         region_exits: vec![],
+        region_roots: vec![],
         stayed_heads: vec![],
         env_heads: vec![],
         pc0_entry: true,

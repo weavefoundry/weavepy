@@ -5782,6 +5782,12 @@ impl Interpreter {
     /// (RFC 0060). Falls back to the legacy snapshot dict only if the
     /// frozen proxy module cannot be imported (interpreter bootstrap).
     pub fn frame_locals_view(&mut self, fr: Rc<PyFrame>) -> Result<Object, RuntimeError> {
+        // A frame running in native code keeps its locals there: bring
+        // the frame's own storage up to date first.
+        #[cfg(feature = "jit")]
+        if let Some(mirror) = fr.locals_mirror.borrow().clone() {
+            crate::tier2::sync_native_locals(&mirror);
+        }
         if fr.is_unoptimized_scope() && !fr.has_live_hidden_locals() {
             return Ok(fr.locals());
         }

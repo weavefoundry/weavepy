@@ -334,6 +334,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             | TOp::CallDyn { .. }
                             | TOp::DynAttrSet { .. }
                             | TOp::ContainsDyn { .. }
+                            | TOp::DynBinary { .. }
+                            | TOp::DynCompare { .. }
                     )
                 })
         });
@@ -1312,6 +1314,17 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::DynAttrSet { name } => self.emit_dyn_attr_set(name, stmt.pc),
             TOp::Truth => self.emit_truth(stmt.pc),
             TOp::ContainsDyn { negate } => self.emit_contains_dyn(negate, stmt.pc),
+            TOp::DynBinary { arg } => {
+                self.emit_dyn_op(runtime::dyn_binop_helper_addr(), arg, JitType::Obj, stmt.pc);
+            }
+            TOp::DynCompare { arg } => {
+                let lane = if arg & weavepy_compiler::COMPARE_OP_TO_BOOL_FLAG != 0 {
+                    JitType::Bool
+                } else {
+                    JitType::Obj
+                };
+                self.emit_dyn_op(runtime::dyn_compare_helper_addr(), arg, lane, stmt.pc);
+            }
             TOp::BuildSet { n } => self.emit_build_set(n, stmt.pc),
             TOp::StrMod => self.emit_str_mod(stmt.pc),
             TOp::StrSlice {
@@ -1596,6 +1609,69 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .load(types::I64, trusted, self.frame_ptr, OFF_RET_BITS);
         self.vstack.push((res, JitType::Bool));
+    }
+
+    /// [`TOp::DynBinary`] / [`TOp::DynCompare`]: stage both operands in
+    /// the marshal buffer, run the interpreter's operation through the
+    /// helper at `helper_addr`, and push its result on `lane`. Exits as
+    /// [`Self::emit_contains_dyn`] does.
+    fn emit_dyn_op(&mut self, helper_addr: usize, arg: u32, lane: JitType, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot_full = self.vstack.clone();
+        let (b, bty) = self.pop();
+        let (a, aty) = self.pop();
+        for (k, (val, ty)) in [(a, aty), (b, bty)].into_iter().enumerate() {
+            let off = (k as i32) * 8;
+            self.b.ins().store(trusted, val, self.call_args_base, off);
+            let tagv = self.b.ins().iconst(types::I32, Self::tag(ty));
+            self.b
+                .ins()
+                .store(trusted, tagv, self.call_tags_base, (k as i32) * 4);
+        }
+        let snapshot = self.vstack.clone();
+
+        self.writeback_locals();
+
+        let sig = self.list_helper_sig();
+        let helper = self.b.ins().iconst(self.ptr_ty, helper_addr as i64);
+        let argv = self.b.ins().iconst(types::I64, i64::from(arg));
+        let zero = self.b.ins().iconst(types::I64, 0);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, argv, zero]);
+        let status = self.b.inst_results(call)[0];
+
+        let ok_b = self.b.create_block();
+        let bad_b = self.b.create_block();
+        let is_ok = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
+        self.b.ins().brif(is_ok, ok_b, &[], bad_b, &[]);
+
+        self.b.switch_to_block(bad_b);
+        let raised_b = self.b.create_block();
+        let not_raised_b = self.b.create_block();
+        let is_raised = self.b.ins().icmp_imm(IntCC::Equal, status, 1);
+        self.b
+            .ins()
+            .brif(is_raised, raised_b, &[], not_raised_b, &[]);
+        self.b.switch_to_block(raised_b);
+        self.emit_exit(pc, &snapshot, JitStatus::Raised);
+        self.b.switch_to_block(not_raised_b);
+        let boxed_b = self.b.create_block();
+        let reject_b = self.b.create_block();
+        let is_boxed = self.b.ins().icmp_imm(IntCC::Equal, status, 2);
+        self.b.ins().brif(is_boxed, boxed_b, &[], reject_b, &[]);
+        self.b.switch_to_block(boxed_b);
+        self.emit_exit(pc + 1, &snapshot, JitStatus::Deopt);
+        self.b.switch_to_block(reject_b);
+        self.emit_exit(pc, &snapshot_full, JitStatus::Deopt);
+
+        self.b.switch_to_block(ok_b);
+        let res = self
+            .b
+            .ins()
+            .load(types::I64, trusted, self.frame_ptr, OFF_RET_BITS);
+        self.vstack.push((res, lane));
     }
 
     /// RFC 0074 WS2/WS4: offer an object-lane attribute read to the

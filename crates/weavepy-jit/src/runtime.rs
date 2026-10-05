@@ -1465,6 +1465,31 @@ pub(crate) fn contains_dyn_helper_addr() -> usize {
     CONTAINS_DYN_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
+static DYN_BINOP_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DYN_COMPARE_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the generic binary-operation and comparison helpers
+/// ([`crate::ir::TOp::DynBinary`], [`crate::ir::TOp::DynCompare`]).
+/// Shape: `(frame, oparg, 0) -> status`, the two operands staged in the
+/// marshal buffer (slots 0 and 1, with tags). Status `0` writes the
+/// result to `frame.ret_bits` (an object pin, or `0`/`1` for a to-`bool`
+/// comparison); `1` raised; `2` completed but parked (deopt after the
+/// pc); `3` declined before running anything (deopt at the pc).
+pub fn register_dyn_op_helpers(binop: DynAttrHelper, compare: DynAttrHelper) {
+    DYN_BINOP_HELPER.store(binop as usize, std::sync::atomic::Ordering::Release);
+    DYN_COMPARE_HELPER.store(compare as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn dyn_binop_helper_addr() -> usize {
+    DYN_BINOP_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn dyn_compare_helper_addr() -> usize {
+    DYN_COMPARE_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
 static BUILD_SET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// RFC 0076 WS8 — register the process-wide set-construction helper
