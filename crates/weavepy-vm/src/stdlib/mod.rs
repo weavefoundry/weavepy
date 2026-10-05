@@ -150,8 +150,8 @@ pub mod warnings_mod;
 
 pub mod asyncio_events;
 pub mod collections_native;
-pub mod contextvars_native;
 pub mod collections_odict;
+pub mod contextvars_native;
 pub mod gc_real;
 pub mod multiprocessing_mod;
 pub mod queue_native;

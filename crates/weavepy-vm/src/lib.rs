@@ -9623,6 +9623,143 @@ impl Interpreter {
         Some(self.inline_bind(frame, shell, pc, act, code, Object::Function(getter), guard))
     }
 
+    /// `LOAD_ATTR` at `pc` of `frame` (no method flag) on an instance whose
+    /// class attribute is a descriptor written in Python (an instance of a
+    /// class with a plain `__get__(self, instance, owner)` function), as an
+    /// inline activation of that `__get__`: the receiver leaves the stack,
+    /// and the return pushes the result. Only a data descriptor (one whose
+    /// class also has `__set__` or `__delete__`) qualifies, as it wins over
+    /// the instance's own attributes.
+    fn try_inline_descr_get(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+    ) -> Option<Box<InlineAct>> {
+        let ins = frame.code.instructions.get(pc)?;
+        if ins.op != OpCode::LoadAttr {
+            return None;
+        }
+        let Some(Object::Instance(inst)) = frame.stack.last() else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        // (An `AttributeError` from `__get__` falls back to `__getattr__`
+        // on the full path.)
+        if !Self::default_getattribute(cls)
+            || crate::object::exotic_str_keys_possible()
+            || cls.lookup("__getattr__").is_some()
+        {
+            return None;
+        }
+        let name = frame.code.names.get(ins.arg as usize)?;
+        if name.starts_with("__") {
+            return None;
+        }
+        let Some(Object::Instance(descr)) = cls.lookup(name) else {
+            return None;
+        };
+        let dcls = descr.cls_raw();
+        let Some(Object::Function(get)) = dcls.lookup("__get__") else {
+            return None;
+        };
+        // (A non-data descriptor would yield to the instance's own
+        // attribute; those stay on the full path.)
+        if dcls.lookup("__set__").is_none() && dcls.lookup("__delete__").is_none() {
+            return None;
+        }
+        let code = get.code();
+        if code.arg_count != 3
+            || code.kwonly_count != 0
+            || code.has_varargs
+            || code.has_varkeywords
+            || code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || !Self::lean_code_ok(&code)
+        {
+            return None;
+        }
+        get.lean_cells_ref(&code)?;
+        let owner = Object::Type(inst.cls());
+        let descr = Object::Instance(descr.clone());
+        // Past the recursion limit the nested lean path raises.
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
+            return None;
+        };
+        // Committed.
+        let receiver = frame.stack.pop()?;
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        locals.push(descr);
+        locals.push(receiver);
+        locals.push(owner);
+        fill_unbound(locals, code.varnames.len());
+        frame.pc = pc as u32 + 1;
+        Some(self.inline_bind(frame, shell, pc, act, code, Object::Function(get), guard))
+    }
+
+    /// `BINARY_SUBSCR` at `pc` of `frame` on an instance whose class's
+    /// `__getitem__` is a plain Python function of `(self, key)`, as an
+    /// inline activation (CPython's `BINARY_SUBSCR_GETITEM`): the operands
+    /// leave the stack as its arguments, and its return pushes the result.
+    fn try_inline_getitem(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+    ) -> Option<Box<InlineAct>> {
+        let n = frame.stack.len();
+        let Some(Object::Instance(inst)) = frame.stack.get(n.checked_sub(2)?) else {
+            return None;
+        };
+        // The site remembers the function by the class's attribute version.
+        let cls = inst.cls_raw();
+        let ver = cls.attr_version.get();
+        let slot = code_method_slot(&frame.code, pc as u32);
+        let f = match slot.and_then(|s| s.get_held(ver)) {
+            Some(f) => f,
+            None => {
+                let Some(Object::Function(f)) = cls.lookup("__getitem__") else {
+                    return None;
+                };
+                if let Some(s) = slot {
+                    s.set(ver, &f);
+                }
+                f
+            }
+        };
+        let code = f.code();
+        if code.arg_count != 2
+            || code.kwonly_count != 0
+            || code.has_varargs
+            || code.has_varkeywords
+            || code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || !Self::lean_code_ok(&code)
+        {
+            return None;
+        }
+        f.lean_cells_ref(&code)?;
+        // Past the recursion limit the nested lean path raises.
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
+            return None;
+        };
+        // Committed.
+        let key = frame.stack.pop()?;
+        let container = frame.stack.pop()?;
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        locals.push(container);
+        locals.push(key);
+        fill_unbound(locals, code.varnames.len());
+        frame.pc = pc as u32 + 1;
+        Some(self.inline_bind(frame, shell, pc, act, code, Object::Function(f), guard))
+    }
+
     /// `FOR_ITER` over a generator, from the quiet loop: the generator
     /// resumes as a lean activation (see `generator_send_lean`); its
     /// value is pushed, or on exhaustion the loop exits exactly as the
@@ -10244,18 +10381,31 @@ impl Interpreter {
                         CoreAttr::Raised(e) => return LeafStop::Raised(e),
                         CoreAttr::Full => return LeafStop::Step,
                         CoreAttr::Decline => {
-                            let load_attr = frame
-                                .code
-                                .instructions
-                                .get(frame.pc as usize)
-                                .is_some_and(|i| i.op == OpCode::LoadAttr);
-                            if load_attr && self.core_property(sw) {
-                                continue;
+                            match frame.code.instructions.get(frame.pc as usize).map(|i| i.op) {
+                                Some(OpCode::LoadAttr)
+                                    if self.core_property(sw) || self.core_getitem(sw, true) =>
+                                {
+                                    continue
+                                }
+                                Some(OpCode::Call) if self.core_leaf_call_lane(sw) => continue,
+                                _ => {}
                             }
                         }
                     }
                 }
-                CoreExit::Slow => {}
+                CoreExit::Slow => {
+                    // SAFETY: as above.
+                    let frame = unsafe { &*sw.cur };
+                    if frame
+                        .code
+                        .instructions
+                        .get(frame.pc as usize)
+                        .is_some_and(|i| i.op == OpCode::BinarySubscr)
+                        && self.core_getitem(sw, false)
+                    {
+                        continue;
+                    }
+                }
                 CoreExit::Reload => unreachable!("handled inside the core loop"),
             }
             // SAFETY: as above.
@@ -13757,6 +13907,71 @@ impl Interpreter {
         true
     }
 
+    /// [`Self::core_property`] for a `BINARY_SUBSCR` the instance's Python
+    /// `__getitem__` serves ([`Self::try_inline_getitem`]), or with
+    /// `descr` a `LOAD_ATTR` a Python descriptor's `__get__` serves
+    /// ([`Self::try_inline_descr_get`]). `false` touches nothing.
+    #[inline(never)]
+    fn core_getitem(&mut self, sw: &mut CoreSwitch, descr: bool) -> bool {
+        if !self.inline_calls_ok() {
+            return false;
+        }
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch` (as in `core_call`).
+        let act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            let pc = (*frame).pc as usize;
+            let shell = &mut *shell.cast::<QuietShell<'_>>();
+            if descr {
+                self.try_inline_descr_get(&mut *frame, shell, pc)
+            } else {
+                self.try_inline_getitem(&mut *frame, shell, pc)
+            }
+        };
+        let Some(mut act) = act else {
+            return false;
+        };
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
+    }
+
+    /// The core loop's `CALL` at `pc` of a registered leaf builtin whose
+    /// leaf half declined the operands (`len(obj)` of an instance with a
+    /// Python `__len__`, say): the call runs through [`Self::call`] in
+    /// the builtin lane rather than as a full step. `false` touches
+    /// nothing.
+    #[inline(never)]
+    fn core_leaf_call_lane(&mut self, sw: &mut CoreSwitch) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &*sw.cur };
+        let pc = frame.pc as usize;
+        let Some(ins) = frame.code.instructions.get(pc) else {
+            return false;
+        };
+        let Some(callee_at) = frame.stack.len().checked_sub(ins.arg as usize + 2) else {
+            return false;
+        };
+        let ok = match (&frame.stack[callee_at], &frame.stack[callee_at + 1]) {
+            (Object::Builtin(b), Object::Unbound) => {
+                !b.binds_instance && self.leaf_call_kind(b).is_some()
+            }
+            (Object::Builtin(b), recv) => {
+                b.binds_instance
+                    && builtins::method_memo_tag(recv).is_some()
+                    && self.leaf_call_kind(b).is_some()
+            }
+            _ => false,
+        };
+        ok && self.core_builtin_lane(sw, pc, true)
+    }
+
     /// [`Self::core_call`] for the `CALL_KW` at `pc`: the quiet loop's
     /// inline keyword call ([`Self::try_inline_call_kw`]), pushed and made
     /// the running activation. `false` touches nothing.
@@ -16639,10 +16854,31 @@ impl Interpreter {
                 // a native container's site-cached builtin method likewise
                 // (the full leaf arm fills that cache on a miss).
                 let f = match stack.last() {
-                    Some(Object::Instance(_)) => {
+                    Some(Object::Instance(inst)) => {
                         match Self::leaf_load_method(code, stack, pc as u32, ins.arg) {
                             Some(f) => f,
-                            None => return CoreAttr::Decline,
+                            // `obj.cm(...)`: a class method's function with
+                            // the instance's class in the self slot.
+                            None => {
+                                let (v, self_obj) =
+                                    match Self::leaf_resolve_instance_attr(code, inst, ins.arg) {
+                                        Some(LeafAttr::ClassMethod(f)) => {
+                                            (Object::Function(f), Object::Type(inst.cls()))
+                                        }
+                                        // An instance-dict value (a stored
+                                        // callable) or a plain class value,
+                                        // with an empty self slot.
+                                        Some(LeafAttr::Value(v)) => (v, Object::Unbound),
+                                        _ => return CoreAttr::Decline,
+                                    };
+                                let Some(top) = stack.last_mut() else {
+                                    return CoreAttr::Decline;
+                                };
+                                let inst = std::mem::replace(top, v);
+                                stack.push(self_obj);
+                                drop(inst);
+                                return CoreAttr::Done;
+                            }
                         }
                     }
                     // `Cls.f(...)`: a plain function (or a static method's)
@@ -16658,8 +16894,38 @@ impl Interpreter {
                                 drop(cls);
                                 return CoreAttr::Done;
                             }
+                            // `Cls.cm(...)`: a class method's function with
+                            // the class in the self slot (the call the bound
+                            // method makes).
+                            Some(Object::BoundMethod(bm))
+                                if matches!(
+                                    (&bm.function, &bm.receiver),
+                                    (Object::Function(_), Object::Type(_))
+                                ) =>
+                            {
+                                let Some(top) = stack.last_mut() else {
+                                    return CoreAttr::Decline;
+                                };
+                                let cls = std::mem::replace(top, bm.function.clone());
+                                stack.push(cls);
+                                return CoreAttr::Done;
+                            }
                             _ => return CoreAttr::Decline,
                         }
+                    }
+                    // `module.f(...)`: the module attribute with an empty
+                    // self slot, as the slow arm.
+                    Some(Object::Module(_)) => {
+                        let Some(v) = Self::leaf_load_attr(code, stack, pc as u32, ins.arg) else {
+                            return CoreAttr::Decline;
+                        };
+                        let Some(top) = stack.last_mut() else {
+                            return CoreAttr::Decline;
+                        };
+                        let module = std::mem::replace(top, v);
+                        stack.push(Object::Unbound);
+                        drop(module);
+                        return CoreAttr::Done;
                     }
                     Some(recv) => {
                         let tag = match recv {
@@ -20934,9 +21200,13 @@ impl Interpreter {
                     _ => None,
                 }
             }
-            (LeafAttr::InstanceOnly | LeafAttr::BuiltinMethod(_) | LeafAttr::Property(_), _) => {
-                None
-            }
+            (
+                LeafAttr::InstanceOnly
+                | LeafAttr::BuiltinMethod(_)
+                | LeafAttr::Property(_)
+                | LeafAttr::ClassMethod(_),
+                _,
+            ) => None,
         }
     }
 
@@ -21033,6 +21303,7 @@ impl Interpreter {
                 K::InstanceOnly => Some(LeafAttr::InstanceOnly),
                 K::Method(w) => Some(LeafAttr::Method(w.upgrade()?)),
                 K::StaticFn(w) => Some(LeafAttr::Value(Object::Function(w.upgrade()?))),
+                K::ClassFn(w) => Some(LeafAttr::ClassMethod(w.upgrade()?)),
                 K::BuiltinMethod(b) => Some(LeafAttr::BuiltinMethod(b.clone())),
                 K::Value(v) => Some(LeafAttr::Value(Self::clone_operand(v))),
                 K::ValueInstance(w) => Some(LeafAttr::Value(Object::Instance(w.upgrade()?))),
@@ -21071,6 +21342,10 @@ impl Interpreter {
                 // class and an instance, never bound.
                 Some(Object::StaticMethod(w)) => match w.func() {
                     Object::Function(f) => K::StaticFn(Rc::downgrade(&f)),
+                    _ => K::Other,
+                },
+                Some(Object::ClassMethod(w)) => match w.func() {
+                    Object::Function(f) => K::ClassFn(Rc::downgrade(&f)),
                     _ => K::Other,
                 },
                 // A native method on the class (a non-data descriptor that
@@ -21115,6 +21390,7 @@ impl Interpreter {
             K::InstanceOnly => Some(LeafAttr::InstanceOnly),
             K::Method(w) => w.upgrade().map(LeafAttr::Method),
             K::StaticFn(w) => w.upgrade().map(|f| LeafAttr::Value(Object::Function(f))),
+            K::ClassFn(w) => w.upgrade().map(LeafAttr::ClassMethod),
             K::BuiltinMethod(b) => Some(LeafAttr::BuiltinMethod(b.clone())),
             K::Value(v) => Some(LeafAttr::Value(Self::clone_operand(v))),
             K::ValueInstance(w) => w.upgrade().map(|i| LeafAttr::Value(Object::Instance(i))),
@@ -21210,6 +21486,11 @@ impl Interpreter {
                 Some(Object::Function(f))
             }
             LeafAttr::Value(v) => Some(v),
+            // A class method, bound to the class.
+            LeafAttr::ClassMethod(f) => Some(Object::BoundMethod(Rc::new(BoundMethod::py_method(
+                Object::Type(cls.clone()),
+                Object::Function(f),
+            )))),
             // A native method read through the class stays on the full
             // path (it reports as a method descriptor, not a function).
             LeafAttr::InstanceOnly
@@ -21250,6 +21531,10 @@ impl Interpreter {
         match Self::leaf_class_attr(code, cls, name_idx)? {
             LeafAttr::Method(f) => Some(Object::Function(f)),
             LeafAttr::Value(v) => Some(v),
+            LeafAttr::ClassMethod(f) => Some(Object::BoundMethod(Rc::new(BoundMethod::py_method(
+                Object::Type(cls.clone()),
+                Object::Function(f),
+            )))),
             LeafAttr::InstanceOnly
             | LeafAttr::BuiltinMethod(_)
             | LeafAttr::Property(_)
@@ -21370,7 +21655,8 @@ impl Interpreter {
                 LeafAttr::Value(_)
                 | LeafAttr::InstanceOnly
                 | LeafAttr::Property(_)
-                | LeafAttr::TupleField(_) => None,
+                | LeafAttr::TupleField(_)
+                | LeafAttr::ClassMethod(_) => None,
             };
         };
         let cls = inst.cls_raw();
@@ -57974,6 +58260,9 @@ enum LeafAttr {
     Value(Object),
     /// A plain function off the class MRO, to bind to the receiver.
     Method(Rc<crate::object::PyFunction>),
+    /// A class method's plain function off the class MRO, to bind to the
+    /// class (only a read through the class serves it).
+    ClassMethod(Rc<crate::object::PyFunction>),
     /// Not on the class MRO at all (only `leaf_class_attr` reports it).
     InstanceOnly,
     /// A native method on the class MRO, to bind to the receiver.

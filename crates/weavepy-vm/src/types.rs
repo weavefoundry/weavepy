@@ -448,6 +448,9 @@ pub enum LeafAttrKind {
     /// A static method's function: read through a class or an instance,
     /// it is the function itself, never bound.
     StaticFn(crate::sync::Weak<crate::object::PyFunction>),
+    /// A class method's function: read through the class, it binds the
+    /// class.
+    ClassFn(crate::sync::Weak<crate::object::PyFunction>),
     /// A native method on the MRO that binds the instance as its first
     /// argument (a non-data descriptor: the instance dict still wins).
     BuiltinMethod(crate::sync::Rc<crate::object::BuiltinFn>),

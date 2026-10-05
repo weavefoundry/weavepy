@@ -2,15 +2,22 @@
 slowest relative to CPython.
 
     python3 tools/pybench/microops.py --weavepy BIN [--cpython python3.14]
-        [--filter SUBSTR] [--target-ms 40]
+        [--filter SUBSTR] [--target-ms 40] [--instructions]
 
 Each case is a (setup, statement) pair. The statement runs in a loop
 inside a generated function, so locals are fast locals as in real code.
 The per-iteration time of an empty loop is subtracted.
+
+``--instructions`` instead counts instructions retired (macOS
+``/usr/bin/time -l``) for processes running each loop ten thousand
+and a hundred thousand times, and reports the difference per
+iteration (an empty loop's subtracted), which is stable on a loaded
+machine.
 """
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 
@@ -287,6 +294,43 @@ print(json.dumps(out))
 '''
 
 
+ONE = r'''
+import sys
+SETUP
+stmt = sys.argv[1]
+body = "\n".join("        " + line for line in stmt.splitlines())
+ns = dict(globals())
+exec("def bench(n):\n    for i in range(n):\n" + body + "\n", ns)
+ns["bench"](int(sys.argv[2]))
+'''
+
+
+def count_instructions(interp, stmt, n):
+    src = ONE.replace("SETUP", SETUP_COMMON)
+    proc = subprocess.run(["/usr/bin/time", "-l", interp, "-c", src, stmt, str(n)],
+                          capture_output=True, text=True, timeout=600)
+    m = re.search(r"(\d+)\s+instructions retired", proc.stderr)
+    if proc.returncode != 0 or not m:
+        return None
+    return int(m.group(1))
+
+
+def run_instructions(interp, cases, lo=10000, hi=110000):
+    def per_iter(stmt):
+        a = count_instructions(interp, stmt, lo)
+        b = count_instructions(interp, stmt, hi)
+        if a is None or b is None:
+            return None
+        return (b - a) / (hi - lo)
+
+    empty = per_iter("pass")
+    out = {}
+    for name, stmt in cases:
+        v = per_iter(stmt)
+        out[name] = "error" if v is None else max(v - empty, 1.0)
+    return out
+
+
 def run(interp, cases, target):
     src = RUNNER.replace("SETUP", SETUP_COMMON)
     proc = subprocess.run([interp, "-c", src, json.dumps(cases), str(target)],
@@ -304,12 +348,18 @@ def main():
     ap.add_argument("--target-ms", type=float, default=40)
     ap.add_argument("--sort", choices=["ratio", "name"], default="ratio")
     ap.add_argument("--json")
+    ap.add_argument("--instructions", action="store_true")
     args = ap.parse_args()
     cases = CASES
     if args.filter:
         cases = [c for c in cases if any(f in c[0] for f in args.filter)]
-    cp = run(args.cpython, cases, args.target_ms)
-    wp = run(args.weavepy, cases, args.target_ms)
+    if args.instructions:
+        cp = run_instructions(args.cpython, cases)
+        wp = run_instructions(args.weavepy, cases)
+    else:
+        cp = run(args.cpython, cases, args.target_ms)
+        wp = run(args.weavepy, cases, args.target_ms)
+    unit = "in" if args.instructions else "ns"
     rows = []
     for name, _ in cases:
         c, w = cp[name], wp[name]
@@ -325,7 +375,7 @@ def main():
         if ratio == float("inf"):
             print("%-24s cpython %s | weavepy %s" % (name, c, w))
         else:
-            print("%-24s cpython %9.1f ns  weavepy %9.1f ns  ratio %6.2f" % (name, c, w, ratio))
+            print("%-24s cpython %9.1f %s  weavepy %9.1f %s  ratio %6.2f" % (name, c, unit, w, unit, ratio))
     print("geomean ratio over %d ops: %.3f" % (len(finite), math.exp(sum(map(math.log, finite)) / len(finite))))
     if args.json:
         with open(args.json, "w") as fh:
