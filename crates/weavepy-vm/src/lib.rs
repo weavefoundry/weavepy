@@ -9806,11 +9806,11 @@ impl Interpreter {
         {
             return None;
         }
-        let inst = Object::Instance(Rc::new(PyInstance::with_native(
-            cls.clone(),
-            Object::new_tuple(args.to_vec()),
-        )));
-        gc_trace::track(&inst);
+        let (inst, tracked) =
+            crate::stdlib::collections_native::new_named_tuple(cls, args.to_vec());
+        if tracked && gc_trace::maybe_auto_collect() {
+            self.run_pending_finalizers();
+        }
         Some(inst)
     }
 
@@ -13710,15 +13710,12 @@ impl Interpreter {
             // only the pointer is compared.
             if argc == nfields && unsafe { Rc::as_ptr(&*f.code.as_ptr()) } as usize == code {
                 let fields: Vec<Object> = frame.stack.drain(self_slot + 1..).collect();
-                let inst = Object::Instance(Rc::new(PyInstance::with_native(
-                    ty,
-                    Object::new_tuple(fields),
-                )));
-                gc_trace::track(&inst);
+                let (inst, tracked) =
+                    crate::stdlib::collections_native::new_named_tuple(&ty, fields);
                 frame.stack.truncate(callee_slot);
                 frame.stack.push(inst);
                 frame.pc = pc as u32 + 1;
-                if gc_trace::maybe_auto_collect() {
+                if tracked && gc_trace::maybe_auto_collect() {
                     self.run_pending_finalizers();
                 }
                 return true;

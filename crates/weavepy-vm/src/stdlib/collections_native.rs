@@ -996,13 +996,29 @@ fn namedtuple_register_make(args: &[Object]) -> Result<Object, RuntimeError> {
 
 /// A named tuple instance of `cls` holding `items`: what
 /// `tuple.__new__(cls, items)` builds for a tuple subclass.
-fn named_tuple_of(cls: &Rc<crate::types::TypeObject>, items: Vec<Object>) -> Object {
-    let inst = Object::Instance(Rc::new(crate::types::PyInstance::with_native(
-        cls.clone(),
-        Object::new_tuple(items),
-    )));
+///
+/// A tuple of atomic values can't close a cycle, so (unless the class has
+/// a finalizer) the instance's cycle-collector tracking is deferred until
+/// it could hold something else (a `__dict__` or slot store), as for a
+/// plain instance; CPython likewise untracks such tuples. The flag says
+/// whether it was tracked now.
+pub(crate) fn new_named_tuple(
+    cls: &Rc<crate::types::TypeObject>,
+    items: Vec<Object>,
+) -> (Object, bool) {
+    let atomic = items.iter().all(Object::is_gc_atomic) && !cls.instances_need_finalize();
+    let inst = crate::types::PyInstance::with_native(cls.clone(), Object::new_tuple(items));
+    if atomic {
+        inst.deferred.set(true);
+        return (Object::Instance(Rc::new(inst)), false);
+    }
+    let inst = Object::Instance(Rc::new(inst));
     crate::gc_trace::track(&inst);
-    inst
+    (inst, true)
+}
+
+fn named_tuple_of(cls: &Rc<crate::types::TypeObject>, items: Vec<Object>) -> Object {
+    new_named_tuple(cls, items).0
 }
 
 /// `namedtuple_make(cls, iterable, nfields)`: the body of a generated
