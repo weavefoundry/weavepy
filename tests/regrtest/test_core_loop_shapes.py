@@ -362,6 +362,96 @@ class DisplayAndComprehensionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             a, b, *c, d, e = [1, 2, 3]
 
+class ContextManagerShapesTest(unittest.TestCase):
+    def test_contextmanager_and_suppress(self):
+        import contextlib
+
+        @contextlib.contextmanager
+        def cm(v, *, extra=0):
+            yield v + extra
+
+        total = 0
+        for i in range(50):
+            with cm(i, extra=1) as v:
+                total += v
+            with contextlib.suppress(KeyError):
+                raise KeyError(i)
+        self.assertEqual(total, sum(range(1, 51)))
+
+    def test_delete_attributes(self):
+        class C:
+            pass
+
+        class D:
+            def __delattr__(self, name):
+                self.log.append(name)
+
+        class Q:
+            @property
+            def x(self):
+                return 1
+
+            @x.deleter
+            def x(self):
+                Q.deleted += 1
+
+        Q.deleted = 0
+        for _ in range(5):
+            c = C()
+            c.a, c.b = 1, 2
+            del c.a
+            self.assertEqual(vars(c), {"b": 2})
+            with self.assertRaises(AttributeError):
+                del c.a
+            d = D()
+            d.__dict__["log"] = []
+            del d.x
+            self.assertEqual(d.log, ["x"])
+            del Q().x
+        self.assertEqual(Q.deleted, 5)
+
+    def test_abc_instantiation(self):
+        import abc
+
+        class Base(abc.ABC):
+            @abc.abstractmethod
+            def f(self):
+                pass
+
+        class Impl(Base):
+            def __init__(self, v):
+                self.v = v
+
+            def f(self):
+                return self.v
+
+        for i in range(5):
+            self.assertEqual(Impl(i).f(), i)
+            with self.assertRaises(TypeError):
+                Base()
+
+        class Meta(type):
+            def __call__(cls, *args):
+                return ("meta", args)
+
+        class M(metaclass=Meta):
+            pass
+
+        for _ in range(3):
+            self.assertEqual(M(1), ("meta", (1,)))
+
+    def test_generator_forwarding_calls(self):
+        def gen(a, b=0):
+            yield a + b
+
+        def forward(f, args, kwds):
+            return f(*args, **kwds)
+
+        for _ in range(5):
+            self.assertEqual(list(forward(gen, (1,), {})), [1])
+            self.assertEqual(list(forward(gen, (1,), {"b": 2})), [3])
+            self.assertEqual(list(gen(*[4])), [4])
+
 class FormatTest(unittest.TestCase):
     def test_huge_field_index(self):
         for _ in range(3):

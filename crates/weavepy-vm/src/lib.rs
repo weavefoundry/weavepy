@@ -12522,10 +12522,11 @@ impl Interpreter {
                         unsafe { frame.stack.set_len(len) };
                         frame.pc = pc as u32;
                         *last_pc = last;
-                        if !self.core_call_forward(sw, pc) && sw.pending.is_none() {
-                            sw.pending = Some(CoreExit::Stop(LeafStop::Step));
+                        if self.core_call_forward(sw, pc) || sw.pending.is_some() {
+                            break Some(CoreExit::Reload);
                         }
-                        break Some(CoreExit::Reload);
+                        // Declined untouched: the leaf arm builds the dict.
+                        break None;
                     }
                     // `f(*args)` of a Python callee switches in place (see
                     // `core_call_ex`); anything else takes the full handler.
@@ -14332,7 +14333,8 @@ impl Interpreter {
             self.try_inline_call_ex(&mut *frame, &mut *shell.cast::<QuietShell<'_>>(), pc)
         };
         let Some(mut act) = act else {
-            return false;
+            // A generator function's call makes its generator in place.
+            return self.core_gen_call_ex(sw, pc);
         };
         let callee: *mut Frame = &raw mut *act.frame;
         // SAFETY: as above.
@@ -14340,6 +14342,60 @@ impl Interpreter {
         sw.cur = callee;
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
+        true
+    }
+
+    /// [`Self::core_gen_call`] for the `CALL_FUNCTION_EX` at `pc`:
+    /// `f(*args)` (or `f(*args, **{})`) of a generator function, over an
+    /// exact tuple or list. `false` touches nothing.
+    fn core_gen_call_ex(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let n = frame.stack.len();
+        let Some(callee_slot) = n.checked_sub(4) else {
+            return false;
+        };
+        let [callee, null, spread, mapping] = &frame.stack[callee_slot..] else {
+            return false;
+        };
+        let Object::Function(f) = callee else {
+            return false;
+        };
+        let empty_kw = match mapping {
+            Object::Unbound => true,
+            Object::Dict(d) => d.try_borrow().is_ok_and(|d| d.is_empty()),
+            _ => false,
+        };
+        if !matches!(null, Object::Unbound) || !empty_kw {
+            return false;
+        }
+        let code = f.code();
+        if !(code.is_generator || code.is_coroutine || code.is_async_generator) {
+            return false;
+        }
+        let positional: Vec<Object> = match spread {
+            Object::Tuple(t) => t.to_vec(),
+            Object::List(l) => match l.try_borrow() {
+                Ok(l) => l.clone(),
+                Err(_) => return false,
+            },
+            _ => return false,
+        };
+        let Some(gen) = self.start_generator_fast(f, &code, positional) else {
+            return false;
+        };
+        for o in frame.stack.drain(callee_slot..).collect::<Vec<_>>() {
+            self.release(o);
+        }
+        frame.stack.push(gen);
+        frame.pc = pc as u32 + 1;
+        // SAFETY: the running activation's last-pc slot.
+        unsafe { *sw.last = pc };
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        if unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
         true
     }
 
@@ -14660,7 +14716,7 @@ impl Interpreter {
         };
         if !matches!(frame.stack[self_slot], Object::Unbound)
             || ty.flags.is_builtin
-            || !Self::plain_metaclass(ty)
+            || !Self::metaclass_calls_like_type(ty)
             || matches!(frame.code.caches.get(pc as u32), IC::Empty)
         {
             return false;
@@ -19187,6 +19243,47 @@ impl Interpreter {
                     last = pc;
                     pc += 1;
                 }
+                // `del obj.attr` of a plain instance's own attribute: its
+                // class has no `__delattr__` and no attribute of that name
+                // (so no descriptor), and the deletion runs no Python (a
+                // missing attribute raises on the full path).
+                OpCode::DeleteAttr => {
+                    let Some(Object::Instance(inst)) = stack.last() else {
+                        break;
+                    };
+                    let Some(name) = code.names.get(ins.arg as usize) else {
+                        break;
+                    };
+                    let cls = inst.cls_raw();
+                    // (`object`'s own `__delattr__` is the default.)
+                    let custom_delattr = match cls.lookup("__delattr__") {
+                        None => false,
+                        Some(Object::Builtin(b)) => !builtin_types()
+                            .object_
+                            .dict
+                            .borrow()
+                            .get(&crate::object::StrKey("__delattr__"))
+                            .is_some_and(|o| matches!(o, Object::Builtin(d) if Rc::ptr_eq(d, &b))),
+                        Some(_) => true,
+                    };
+                    if inst.native.get().is_some()
+                        || name.starts_with("__")
+                        || crate::capi_watchers::dicts_active()
+                        || custom_delattr
+                        || cls.lookup(name).is_some()
+                    {
+                        break;
+                    }
+                    let inst = inst.clone();
+                    let obj = Object::Instance(inst.clone());
+                    if self.generic_delattr_instance(&inst, &obj, name).is_err() {
+                        break;
+                    }
+                    drop(obj);
+                    drop(stack.pop());
+                    last = pc;
+                    pc += 1;
+                }
                 // `del x` of a bound plain local (an `except ... as e:`
                 // clause's cleanup): an unbound one raises, and a slot shared
                 // with a cell is the full handler's. (A frame object nothing
@@ -22342,6 +22439,28 @@ impl Interpreter {
 
     /// Whether `cls`'s metaclass is `type` itself.
     #[inline]
+    /// Whether calling `cls` is `type.__call__`: its metaclass is `type`,
+    /// or a Python subclass of it that doesn't replace `__call__`
+    /// (`ABCMeta` doesn't; `EnumType` does).
+    fn metaclass_calls_like_type(cls: &TypeObject) -> bool {
+        if Self::plain_metaclass(cls) {
+            return true;
+        }
+        // SAFETY: as in `plain_metaclass`.
+        let Some(meta) = (unsafe { (*cls.metaclass.as_ptr()).as_ref() }) else {
+            return true;
+        };
+        if meta.c_ext_ptr.get() != 0 || crate::object::exotic_str_keys_possible() {
+            return false;
+        }
+        let type_call = builtin_types().type_.lookup("__call__");
+        match (meta.lookup("__call__"), type_call) {
+            (None, None) => true,
+            (Some(Object::Builtin(a)), Some(Object::Builtin(b))) => Rc::ptr_eq(&a, &b),
+            _ => false,
+        }
+    }
+
     fn plain_metaclass(cls: &TypeObject) -> bool {
         // SAFETY: GIL-serialized raw read (the burst is off in
         // free-threaded mode); the reference does not outlive the compare.
@@ -60712,6 +60831,7 @@ static SLOW_LEAF_OPS: [bool; 256] = {
         OpCode::LoadConst,
         OpCode::LoadDeref,
         OpCode::LoadFast,
+        OpCode::DeleteAttr,
         OpCode::DeleteFast,
         OpCode::ListExtend,
         OpCode::ListToTuple,
