@@ -9955,7 +9955,7 @@ impl Interpreter {
 
     /// Push the shells of every pending lean *caller* (see
     /// [`Self::flush_lean_cold`], which also pushes the running one's).
-    fn flush_pending_callers(&mut self) {
+    pub(crate) fn flush_pending_callers(&mut self) {
         if self.lean_pending.is_empty() {
             return;
         }
@@ -12225,43 +12225,45 @@ impl Interpreter {
                         }
                         // The site's method slot (its leaf kind), read once.
                         let site_slot = mslots!(cold_mslots, ext).get(pc);
-                        // A builtin type's method that isn't a registered leaf
-                        // (`i.bit_length()`, `s.encode()`, `t.count(x)`): its
-                        // body runs right here (see `core_bound_builtin_call`),
-                        // once the site has settled that it qualifies.
+                        // A builtin that isn't a registered leaf: a builtin
+                        // type's method (`i.bit_length()`, `s.encode()`,
+                        // `t.count(x)`) or a common builtin function
+                        // (`min(a, b)`, `getattr(o, n)`), its body run right
+                        // here (see `core_builtin_lane`) once the site has
+                        // settled that it qualifies.
                         if let Some(slot) = site_slot {
                             // SAFETY: `len >= argc + 2`: the callee and its
                             // self slot.
                             let (callee, self_slot) =
                                 unsafe { (&*base.add(len - argc - 2), &*base.add(len - argc - 1)) };
                             let body = match (callee, self_slot) {
-                                (Object::Builtin(b), recv) if !matches!(recv, Object::Unbound) => {
-                                    Some((b, recv))
-                                }
+                                (Object::Builtin(b), Object::Unbound) => Some((b, None)),
+                                (Object::Builtin(b), recv) => Some((b, Some(recv))),
                                 (Object::BoundMethod(bm), Object::Unbound)
                                     if !bm.redispatch_descriptor =>
                                 {
                                     match &bm.function {
-                                        Object::Builtin(b) => Some((b, &bm.receiver)),
+                                        Object::Builtin(b) => Some((b, Some(&bm.receiver))),
                                         _ => None,
                                     }
                                 }
                                 _ => None,
                             };
                             if let Some((b, recv)) = body {
-                                let settled = slot.is_native_body(b)
-                                    || (slot.get_leaf(b).is_none()
-                                        && self.native_body_ok(b, recv)
-                                        && {
-                                            slot.set_native_body(b);
-                                            true
-                                        });
-                                if settled {
+                                let settled = slot.native_body(b).or_else(|| {
+                                    if slot.get_leaf(b).is_some() {
+                                        return None;
+                                    }
+                                    let via_call = self.builtin_lane(b, recv)?;
+                                    slot.set_native_body(b, via_call);
+                                    Some(via_call)
+                                });
+                                if let Some(via_call) = settled {
                                     // SAFETY: `len <= cap`, every slot initialized.
                                     unsafe { frame.stack.set_len(len) };
                                     frame.pc = pc as u32;
                                     *last_pc = last;
-                                    if self.core_bound_builtin_call(sw, pc) {
+                                    if self.core_builtin_lane(sw, pc, via_call) {
                                         break Some(CoreExit::Reload);
                                     }
                                 }
@@ -13095,29 +13097,66 @@ impl Interpreter {
         true
     }
 
-    /// Whether `b`, called on `recv`, is a builtin type's method that the
-    /// core loop may call directly: bound to its exact builtin receiver,
-    /// not a registered leaf (those have their own lanes), and needing none
-    /// of the interpreter-aware dispatch the full handler applies by name.
-    fn native_body_ok(&self, b: &Rc<crate::object::BuiltinFn>, recv: &Object) -> bool {
-        b.binds_instance
-            && builtins::method_memo_tag(recv).is_some()
-            && native_call_ic_safe(b.name)
-            && self.leaf_call_kind(b).is_none()
+    /// Whether the core loop may run the non-leaf builtin `b`, called on
+    /// `recv` (a method's receiver) or as a plain function, in place (see
+    /// [`Self::core_builtin_lane`]): `Some(via_call)`, `via_call` when the
+    /// body must be reached through [`Self::call`]'s interpreter-aware
+    /// dispatch. A method must be bound to its exact builtin receiver; a
+    /// function must be one of the common builtins that never look at the
+    /// calling frame (`locals()`, `sys._getframe()` and the like keep the
+    /// full handler, which makes the frame stack whole first).
+    fn builtin_lane(
+        &self,
+        b: &Rc<crate::object::BuiltinFn>,
+        recv: Option<&Object>,
+    ) -> Option<bool> {
+        if self.leaf_call_kind(b).is_some() {
+            return None;
+        }
+        match recv {
+            Some(recv) => {
+                if !b.binds_instance || builtins::method_memo_tag(recv).is_none() {
+                    return None;
+                }
+                if native_call_ic_safe(b.name) {
+                    return Some(false);
+                }
+                matches!(
+                    b.name,
+                    "update"
+                        | "extend"
+                        | "sort"
+                        | "join"
+                        | "union"
+                        | "intersection"
+                        | "difference"
+                        | "symmetric_difference"
+                        | "intersection_update"
+                        | "difference_update"
+                        | "symmetric_difference_update"
+                        | "issubset"
+                        | "issuperset"
+                        | "isdisjoint"
+                        | "fromkeys"
+                )
+                .then_some(true)
+            }
+            None => (!b.binds_instance && builtin_fn_lane_ok(b.name)).then_some(true),
+        }
     }
 
-    /// The core loop's `CALL` at `pc` of a builtin type's method on its
-    /// exact builtin receiver (`i.bit_length()`, `s.encode()`,
-    /// `t.count(x)`), in `sw`'s synced running activation, as `(method,
-    /// receiver)` or as a bound method with an empty self slot: the
-    /// method's body runs directly, as the full handler's dispatch ends up
-    /// running it, without that handler's chain of special cases. The body
-    /// may run Python code (an element's `__eq__`), so the operands leave
-    /// the stack first, and the core loop reloads after. The caller has
-    /// settled the method (see [`Self::native_body_ok`]). `false` touches
-    /// nothing.
+    /// The core loop's `CALL` at `pc` of a non-leaf builtin the site settled
+    /// on (see [`Self::builtin_lane`]), in `sw`'s synced running activation:
+    /// a builtin type's method on its exact receiver, as `(method, receiver)`
+    /// or as a bound method with an empty self slot, or a builtin function.
+    /// The body runs directly, or with `via_call` through [`Self::call`], as
+    /// the full handler's dispatch ends up running it, without that
+    /// handler's chain of special cases. The body may run Python code (an
+    /// element's `__eq__`, a key function), so the operands leave the stack
+    /// first, the activation waits on the pending list meanwhile, and the
+    /// core loop reloads after. `false` touches nothing.
     #[inline(never)]
-    fn core_bound_builtin_call(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+    fn core_builtin_lane(&mut self, sw: &mut CoreSwitch, pc: usize, via_call: bool) -> bool {
         const MAX_ARGS: usize = 8;
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
@@ -13131,43 +13170,58 @@ impl Interpreter {
             return false;
         };
         let (b, receiver) = match (&frame.stack[callee_at], &frame.stack[callee_at + 1]) {
-            (Object::Builtin(b), recv) if !matches!(recv, Object::Unbound) => (b, recv),
+            (Object::Builtin(b), Object::Unbound) => (b, None),
+            (Object::Builtin(b), recv) => (b, Some(recv)),
             (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
                 match &bm.function {
-                    Object::Builtin(b) => (b, &bm.receiver),
+                    Object::Builtin(b) => (b, Some(&bm.receiver)),
                     _ => return false,
                 }
             }
             _ => return false,
         };
-        if argc >= MAX_ARGS || !b.binds_instance || builtins::method_memo_tag(receiver).is_none() {
+        let ok = argc < MAX_ARGS
+            && match receiver {
+                Some(recv) => b.binds_instance && builtins::method_memo_tag(recv).is_some(),
+                None => !b.binds_instance,
+            };
+        if !ok {
             return false;
         }
-        let (b, receiver) = (b.clone(), receiver.clone());
+        let (b, receiver) = (b.clone(), receiver.cloned());
         // Committed. The receiver and the arguments move into `buf`; the
         // self slot and the callable leave the stack.
         let mut buf = [const { std::mem::MaybeUninit::<Object>::uninit() }; MAX_ARGS + 1];
-        buf[0].write(receiver);
+        let first = usize::from(receiver.is_some());
+        if let Some(receiver) = receiver {
+            buf[0].write(receiver);
+        }
         // SAFETY: the `argc` operands above the self slot move into `buf`
         // (`argc < MAX_ARGS`) and the stack forgets them.
         unsafe {
             let src = frame.stack.as_ptr().add(callee_at + 2);
             for k in 0..argc {
-                buf[k + 1].write(src.add(k).read());
+                buf[first + k].write(src.add(k).read());
             }
             frame.stack.set_len(callee_at + 2);
         }
         let self_slot = frame.stack.pop();
         let callable = frame.stack.pop();
         frame.pc = pc as u32 + 1;
-        // SAFETY: the first `argc + 1` entries were written above.
-        let ops =
-            unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<Object>(), argc + 1) };
+        // SAFETY: the first `first + argc` entries were written above.
+        let ops = unsafe {
+            std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<Object>(), first + argc)
+        };
         // The body may run Python code that looks up the stack.
         let pending = self.core_pending_enter(sw, frame, pc);
-        let result = match b.call_kw.as_ref() {
-            Some(call_kw) => call_kw(ops, &[]),
-            None => (b.call)(ops),
+        let result = if via_call {
+            let globals = frame.globals.clone();
+            self.call(&Object::Builtin(b.clone()), ops, &[], &globals)
+        } else {
+            match b.call_kw.as_ref() {
+                Some(call_kw) => call_kw(ops, &[]),
+                None => (b.call)(ops),
+            }
         };
         self.lean_pending_exit(pending);
         // The operands drop as the full handler's do, after the call.
@@ -13175,14 +13229,15 @@ impl Interpreter {
         // has no drop glue.
         unsafe { std::ptr::drop_in_place(ops) };
         for o in [callable, self_slot].into_iter().flatten() {
-            // A scalar or a shared method (the memo holds it) leaves by a
-            // plain drop; anything else as the full handler releases it.
+            // A scalar or a shared builtin leaves by a plain drop; anything
+            // else as the full handler releases it.
             if matches!(
                 o,
                 Object::Int(_)
                     | Object::Float(_)
                     | Object::Bool(_)
                     | Object::None
+                    | Object::Unbound
                     | Object::Builtin(_)
             ) {
                 drop(o);
@@ -32834,12 +32889,69 @@ impl Interpreter {
         Ok(Object::None)
     }
 
+    /// [`Self::dict_merge_from`]'s plain case: merge `src` into `dst`
+    /// (distinct dicts) when no key on either side can run Python code to
+    /// hash or compare (see [`crate::object::dict_key_is_reentrant`]), with
+    /// the same effects as one insert per key. `false` touches nothing.
+    fn dict_merge_plain(&self, dst: &Rc<RefCell<DictData>>, src: &Rc<RefCell<DictData>>) -> bool {
+        // A destination this large is merged key by key: checking its keys
+        // could cost more than the merge saves.
+        const DST_CHECK_CAP: usize = 32;
+        let (Ok(s), Ok(mut d)) = (src.try_borrow(), dst.try_borrow_mut()) else {
+            return false;
+        };
+        if s.keys().any(|k| crate::object::dict_key_is_reentrant(&k.0)) {
+            return false;
+        }
+        let was = d.len();
+        if was > DST_CHECK_CAP || d.keys().any(|k| crate::object::dict_key_is_reentrant(&k.0)) {
+            return false;
+        }
+        let mut changed = false;
+        if was == 0 {
+            // The source's table, hashes and all (through `DerefMut`, which
+            // stamps the dict and tracks a deferred owner).
+            **d = crate::object::DictMap::clone(&s);
+        } else {
+            d.reserve(s.len());
+            for (k, v) in s.iter() {
+                if let Some(old) = d.insert(k.clone(), v.clone()) {
+                    changed |= !old.is_same(v);
+                }
+            }
+        }
+        let added = d.len() != was;
+        drop(d);
+        drop(s);
+        // What the per-key inserts report: a new key moves live iterators'
+        // trip-wire, and any change is a mutation.
+        if added {
+            crate::object::dict_watch_bump(dst);
+        }
+        if added || changed {
+            crate::object::dict_mutation_event(dst);
+        }
+        true
+    }
+
     pub(crate) fn dict_merge_from(
         &mut self,
         dst: &Object,
         other: &Object,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<(), RuntimeError> {
+        // A plain dict into a plain dict whose keys' hashing and equality
+        // run no Python code: one pass under the borrows, the destination
+        // sized once (cloned outright when empty), instead of a guarded
+        // `store_subscr` per key.
+        if let (Object::Dict(dd), Object::Dict(src)) = (dst, other) {
+            if !Rc::ptr_eq(dd, src)
+                && !crate::capi_watchers::dicts_active()
+                && self.dict_merge_plain(dd, src)
+            {
+                return Ok(());
+            }
+        }
         // Fast paths: snapshot first — source and destination may alias
         // (`d.update(d)`), and GilCell forbids overlapping borrows.
         let native_entries = match other {
@@ -59683,6 +59795,74 @@ fn freeze_set_result(o: Object) -> Object {
     }
 }
 
+/// Whether no element of either `set`/`frozenset` operand can run Python
+/// code to hash or compare (see [`crate::object::dict_key_is_reentrant`]),
+/// so set algebra may run under their borrows without a snapshot.
+fn set_algebra_plain_ok(a: &Object, b: &Object) -> bool {
+    fn plain(o: &Object) -> bool {
+        let check = |s: &crate::object::SetData| {
+            !s.iter().any(|k| crate::object::dict_key_is_reentrant(&k.0))
+        };
+        match o {
+            Object::Set(s) => s.try_borrow().is_ok_and(|s| check(&s)),
+            Object::FrozenSet(s) => check(s),
+            _ => false,
+        }
+    }
+    plain(a) && plain(b)
+}
+
+/// `a op b` for `set`/`frozenset` operands that [`set_algebra_plain_ok`]
+/// accepted, with CPython's iteration order and element choice: a union
+/// copies the left and adds the right; an intersection walks the smaller
+/// operand (the right one on a tie) and keeps its elements; a difference
+/// walks the left. The result kind follows the left operand.
+fn set_algebra_plain(a: &Object, b: &Object, op: BinOpKind) -> Object {
+    use crate::object::SetData;
+    fn with<R>(o: &Object, f: impl FnOnce(&SetData) -> R) -> R {
+        match o {
+            Object::Set(s) => f(&s.borrow()),
+            Object::FrozenSet(s) => f(s),
+            _ => unreachable!("checked by set_algebra_plain_ok"),
+        }
+    }
+    let out = with(a, |x| {
+        with(b, |y| match op {
+            BinOpKind::BitOr => {
+                let mut out = x.clone();
+                out.reserve(y.len());
+                for k in y {
+                    out.insert(k.clone());
+                }
+                out
+            }
+            BinOpKind::BitAnd => {
+                let (small, big) = if y.len() > x.len() { (x, y) } else { (y, x) };
+                let mut out = SetData::with_capacity_and_hasher(
+                    small.len().min(big.len()),
+                    crate::fasthash::FxBuildHasher,
+                );
+                for k in small {
+                    if big.contains(k) {
+                        out.insert(k.clone());
+                    }
+                }
+                out
+            }
+            BinOpKind::Sub => x.iter().filter(|k| !y.contains(*k)).cloned().collect(),
+            _ => {
+                let mut out: SetData = x.iter().filter(|k| !y.contains(*k)).cloned().collect();
+                out.extend(y.iter().filter(|k| !x.contains(*k)).cloned());
+                out
+            }
+        })
+    });
+    match a {
+        Object::FrozenSet(_) => Object::FrozenSet(Rc::new(crate::object::FrozenSetObj::new(out))),
+        _ => Object::Set(Rc::new(RefCell::new(out))),
+    }
+}
+
 fn union_sets(a: &crate::object::SetData, b: &crate::object::SetData) -> Object {
     let mut out = a.clone();
     for k in b.iter() {
@@ -62797,6 +62977,40 @@ pub(crate) fn native_call_ic_safe(name: &str) -> bool {
         && !builtin_needs_interp(name)
 }
 
+/// Builtin functions the core loop may call in place (see
+/// `Interpreter::builtin_lane`): common ones that never look at the
+/// calling frame, so the frame stack needn't be whole while they run.
+/// (Python code they call makes it whole as it needs to.)
+fn builtin_fn_lane_ok(name: &str) -> bool {
+    matches!(
+        name,
+        // builtins
+        "abs" | "aiter" | "all" | "anext" | "any" | "ascii" | "bin" | "callable" | "chr"
+            | "delattr" | "divmod" | "format" | "getattr" | "hasattr" | "hash" | "hex" | "id"
+            | "isinstance" | "issubclass" | "iter" | "len" | "max" | "min" | "next" | "oct"
+            | "ord" | "pow" | "print" | "repr" | "round" | "setattr" | "sorted" | "sum"
+            // math
+            | "acos" | "acosh" | "asin" | "asinh" | "atan" | "atan2" | "atanh" | "cbrt"
+            | "ceil" | "comb" | "copysign" | "cos" | "cosh" | "degrees" | "dist" | "erf"
+            | "erfc" | "exp" | "exp2" | "expm1" | "fabs" | "factorial" | "floor" | "fma"
+            | "fmod" | "frexp" | "fsum" | "gamma" | "gcd" | "hypot" | "isclose" | "isfinite"
+            | "isinf" | "isnan" | "isqrt" | "lcm" | "ldexp" | "lgamma" | "log" | "log10"
+            | "log1p" | "log2" | "modf" | "nextafter" | "perm" | "prod" | "radians"
+            | "remainder" | "sin" | "sinh" | "sqrt" | "sumprod" | "tan" | "tanh" | "trunc"
+            | "ulp"
+            // operator
+            | "add" | "and_" | "concat" | "contains" | "countOf" | "eq" | "floordiv" | "ge"
+            | "getitem" | "gt" | "index" | "indexOf" | "inv" | "invert" | "is_" | "is_not"
+            | "le" | "lshift" | "lt" | "mod" | "mul" | "ne" | "neg" | "not_" | "or_" | "pos"
+            | "rshift" | "setitem" | "sub" | "truediv" | "truth" | "xor"
+            // time, heapq, bisect
+            | "time" | "time_ns" | "perf_counter" | "perf_counter_ns" | "monotonic"
+            | "monotonic_ns" | "heappush" | "heappop" | "heapify" | "heapreplace"
+            | "heappushpop" | "bisect" | "bisect_left" | "bisect_right" | "insort"
+            | "insort_left" | "insort_right"
+    )
+}
+
 fn is_super_callable(obj: &Object) -> bool {
     // `super` is now the real type; the legacy builtin-function form is
     // kept as a fallback for globals dicts that never received the
@@ -63743,10 +63957,10 @@ enum MethodSlotFn {
     /// A rejected native bound-call body, weakly held so a call site
     /// doesn't extend its lifetime. The key is the registry generation.
     NonLeaf(crate::sync::Weak<crate::object::BoundMethod>),
-    /// A `CALL` site's builtin type method that isn't a registered leaf:
-    /// its body is called directly (see
-    /// `Interpreter::core_bound_builtin_call`).
-    NativeBody(Rc<crate::object::BuiltinFn>),
+    /// A `CALL` site's builtin that isn't a registered leaf: its body is
+    /// called directly, or with `via_call` through `Interpreter::call`
+    /// (see `Interpreter::core_builtin_lane`).
+    NativeBody(Rc<crate::object::BuiltinFn>, bool),
     /// A `LOAD_ATTR` site's `property` getter for instances of the class
     /// at the key's version, and the code it was checked against (see
     /// `Interpreter::try_inline_property`).
@@ -64042,18 +64256,23 @@ impl MethodSlot {
         unsafe { *self.0.get() = (0, MethodSlotFn::Leaf(f.clone(), kind)) };
     }
 
-    /// Whether this `CALL` site settled that `f` is a non-leaf builtin
-    /// type method whose body the core loop calls directly.
+    /// How this `CALL` site settled to call the non-leaf builtin `f`
+    /// (see [`MethodSlotFn::NativeBody`]): `Some(via_call)`.
     #[inline]
-    fn is_native_body(&self, f: &Rc<crate::object::BuiltinFn>) -> bool {
+    fn native_body(&self, f: &Rc<crate::object::BuiltinFn>) -> Option<bool> {
         // SAFETY: as `get`.
-        matches!(unsafe { &*self.0.get() }, (_, MethodSlotFn::NativeBody(cached)) if Rc::ptr_eq(cached, f))
+        match unsafe { &*self.0.get() } {
+            (_, MethodSlotFn::NativeBody(cached, via_call)) if Rc::ptr_eq(cached, f) => {
+                Some(*via_call)
+            }
+            _ => None,
+        }
     }
 
     #[inline]
-    fn set_native_body(&self, f: &Rc<crate::object::BuiltinFn>) {
+    fn set_native_body(&self, f: &Rc<crate::object::BuiltinFn>, via_call: bool) {
         // SAFETY: as `set`.
-        unsafe { *self.0.get() = (0, MethodSlotFn::NativeBody(f.clone())) };
+        unsafe { *self.0.get() = (0, MethodSlotFn::NativeBody(f.clone(), via_call)) };
     }
 
     fn is_non_leaf(&self, method: &Rc<crate::object::BoundMethod>) -> bool {
@@ -65425,6 +65644,14 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             }
             Ok(Object::new_bytearray(out))
         }
+        // Neither operand holds an element whose hashing or equality runs
+        // Python code: the operation runs under the borrows, with no
+        // snapshot (see `set_algebra_plain`).
+        (
+            O::Set(_) | O::FrozenSet(_),
+            O::Set(_) | O::FrozenSet(_),
+            B::BitOr | B::BitAnd | B::Sub | B::BitXor,
+        ) if set_algebra_plain_ok(&a, &b) => Ok(set_algebra_plain(&a, &b, op)),
         // Set operators accept any mix of `set`/`frozenset` operands; the
         // result kind follows the *left* operand (CPython's `set_and` &
         // co. use `PyAnySet_Check` on the other operand and build a result

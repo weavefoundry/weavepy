@@ -18013,6 +18013,16 @@ fn staticmethod_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obj
 /// Fetch the interpreter published by the enclosing VM frame — the
 /// subscript slot methods below delegate to the VM's own subscript
 /// machinery so their behavior is byte-for-byte `recv[key]`.
+/// Push the shells of lean activations still waiting on the pending list,
+/// so a native reader of this thread's frame stack sees every frame: the
+/// core loop runs some builtins in place, without making the stack whole
+/// first as the full handler does.
+pub(crate) fn sync_frame_spine() {
+    if let Ok(interp) = reentrant_interp() {
+        interp.flush_pending_callers();
+    }
+}
+
 pub(crate) fn reentrant_interp() -> Result<&'static mut crate::Interpreter, RuntimeError> {
     let ptr = crate::vm_singletons::current_interpreter_ptr()
         .ok_or_else(|| crate::error::runtime_error("no running interpreter"))?;

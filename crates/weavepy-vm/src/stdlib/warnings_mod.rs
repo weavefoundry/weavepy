@@ -948,6 +948,7 @@ fn setup_context(
     stacklevel: i64,
     skip_file_prefixes: &[String],
 ) -> Result<(String, i64, Object, Object), RuntimeError> {
+    crate::builtins::sync_frame_spine();
     // Per-thread frame stack, with the interpreter's own as a fallback
     // (shutdown finalizers run `__del__` without re-activating handles —
     // same fallback `sys._getframe` keeps).

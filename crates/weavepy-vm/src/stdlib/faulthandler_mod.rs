@@ -793,6 +793,7 @@ fn fh_is_enabled(_args: &[Object]) -> Result<Object, RuntimeError> {
 // ---------------------------------------------------------------------
 
 fn fh_dump_traceback(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    crate::builtins::sync_frame_spine();
     let interp = current_interp("faulthandler.dump_traceback()")?;
     let file = args.first().or_else(|| kwarg(kwargs, "file")).cloned();
     let all_threads = args

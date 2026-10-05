@@ -362,6 +362,7 @@ pub fn build_with_state(
                     name: "_current_frames",
                     binds_instance: false,
                     call: Box::new(move |_args| {
+                        crate::builtins::sync_frame_spine();
                         let mut d = DictData::default();
                         for (ident, stack, _exc) in
                             crate::stdlib::faulthandler_mod::thread_snapshots()
@@ -1563,6 +1564,7 @@ fn sys_getframe(
     args: &[Object],
     frame_stack: &crate::object::FrameStack,
 ) -> Result<Object, RuntimeError> {
+    crate::builtins::sync_frame_spine();
     if args.len() > 1 {
         return Err(type_error(format!(
             "_getframe expected at most 1 argument, got {}",
@@ -1602,6 +1604,7 @@ fn sys_getframemodulename(
     args: &[Object],
     frame_stack: &crate::object::FrameStack,
 ) -> Result<Object, RuntimeError> {
+    crate::builtins::sync_frame_spine();
     let depth = match args.first() {
         Some(o) => match o {
             Object::Int(d) => *d,
@@ -2781,6 +2784,7 @@ fn sys_getrefcount(args: &[Object]) -> Result<Object, RuntimeError> {
 /// argument clone corresponds to a reference CPython never counted.
 fn borrowed_argument_discount(obj: &Object) -> usize {
     use weavepy_compiler::bytecode::{wire, OpCode};
+    crate::builtins::sync_frame_spine();
     let Some(handles) = crate::vm_singletons::current_thread_handles() else {
         return 0;
     };
