@@ -144,7 +144,14 @@ struct ExpatState {
     /// Never read — its only job is the keepalive.
     #[allow(dead_code)]
     parent: Object,
+    /// The `xml.etree` tree-building session the element and text events
+    /// feed while the handlers are its natives (see [`take_session`]).
+    session: Option<Box<Session>>,
+    /// No session for the rest of this parse call.
+    session_blocked: bool,
 }
+
+use crate::stdlib::elementtree_native::Session;
 
 impl ExpatState {
     fn parser(&self) -> XML_Parser {
@@ -154,10 +161,13 @@ impl ExpatState {
 
 type StateRef = Rc<RefCell<ExpatState>>;
 
-fn parser_reg() -> &'static parking_lot::Mutex<std::collections::HashMap<i64, StateRef>> {
-    static REG: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<i64, StateRef>>> =
-        std::sync::OnceLock::new();
-    REG.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+/// The live parsers' states by handle (looked up on every expat callback:
+/// the integer handles hash with the cheap hasher).
+type Registry = parking_lot::Mutex<crate::fasthash::FxHashMap<i64, StateRef>>;
+
+fn parser_reg() -> &'static Registry {
+    static REG: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
+    REG.get_or_init(|| parking_lot::Mutex::new(Default::default()))
 }
 
 fn next_id() -> i64 {
@@ -171,7 +181,27 @@ fn state_of(id: i64) -> Option<StateRef> {
 
 /// Registry lookup from an expat userdata pointer (the state id).
 fn state_from_ud(ud: *mut c_void) -> Option<StateRef> {
-    state_of(ud as i64)
+    // The last parser this thread looked up, held weakly: a parse makes
+    // every callback ask for the same one.
+    thread_local! {
+        static LAST: std::cell::RefCell<(i64, crate::sync::Weak<RefCell<ExpatState>>)> =
+            std::cell::RefCell::new((0, crate::sync::Weak::new()));
+    }
+    let id = ud as i64;
+    let hit = LAST.with(|last| {
+        let last = last.borrow();
+        if last.0 == id {
+            last.1.upgrade()
+        } else {
+            None
+        }
+    });
+    if hit.is_some() {
+        return hit;
+    }
+    let st = state_of(id)?;
+    LAST.with(|last| *last.borrow_mut() = (id, Rc::downgrade(&st)));
+    Some(st)
 }
 
 fn self_inst(args: &[Object]) -> Result<Rc<PyInstance>, RuntimeError> {
@@ -260,10 +290,57 @@ fn key_fallback(s: String) -> Object {
 // Handler dispatch + character-data buffering
 // ---------------------------------------------------------------------------
 
+/// The parser's `xml.etree` session (see
+/// `elementtree_native::Session`), begun when the handlers allow one,
+/// taken out of the state while it runs.
+fn take_session(st: &StateRef) -> Option<Box<Session>> {
+    let mut s = st.borrow_mut();
+    if let Some(sess) = s.session.take() {
+        return Some(sess);
+    }
+    if s.session_blocked || s.pending_exc.is_some() {
+        return None;
+    }
+    let begun = if s.ordered_attributes && !s.specified_attributes {
+        Session::begin(
+            &s.handlers[H_START_ELEMENT],
+            &s.handlers[H_END_ELEMENT],
+            &s.handlers[H_CHARACTER_DATA],
+            &s.intern,
+        )
+    } else {
+        None
+    };
+    if begun.is_none() {
+        s.session_blocked = true;
+    }
+    begun
+}
+
+/// End the session, if one runs (before any handler, that is any Python
+/// code, runs, and when a parse call returns).
+fn end_session(st: &StateRef) {
+    let sess = st.borrow_mut().session.take();
+    if let Some(sess) = sess {
+        sess.finish();
+    }
+}
+
+/// Hand character data to the session, or else to the handler.
+fn deliver_text(st: &StateRef, text: Object) {
+    if let Some(mut sess) = take_session(st) {
+        sess.data(text);
+        st.borrow_mut().session = Some(sess);
+        return;
+    }
+    dispatch(st, H_CHARACTER_DATA, vec![text]);
+}
+
 /// Call the Python handler in `slot`. Returns `None` if the handler is unset,
 /// an exception is already pending, or the handler raised (in which case the
 /// exception is parked and the parse aborted — CPython's `flag_error`).
 fn dispatch(st: &StateRef, slot: usize, args: Vec<Object>) -> Option<Object> {
+    end_session(st);
     let handler = {
         let s = st.borrow();
         if s.pending_exc.is_some() {
@@ -324,8 +401,7 @@ fn flush_chardata(st: &StateRef) -> bool {
     if matches!(handler, Object::None) {
         return true;
     }
-    let text = utf8_obj(&bytes);
-    dispatch(st, H_CHARACTER_DATA, vec![text]);
+    deliver_text(st, utf8_obj(&bytes));
     st.borrow().pending_exc.is_none()
 }
 
@@ -366,6 +442,23 @@ unsafe extern "C" fn tr_start_element(
         }
         n
     };
+    if let Some(mut sess) = take_session(&st) {
+        let mut pairs = (0..max / 2).map(|j| {
+            (
+                std::ffi::CStr::from_ptr(*atts.add(2 * j)).to_bytes(),
+                conv_opt(*atts.add(2 * j + 1)),
+            )
+        });
+        let served = sess
+            .start(std::ffi::CStr::from_ptr(name).to_bytes(), &mut pairs)
+            .is_some();
+        if served {
+            st.borrow_mut().session = Some(sess);
+            return;
+        }
+        sess.finish();
+        st.borrow_mut().session_blocked = true;
+    }
     let name_obj = intern_cstr(&st, name);
     let container = if ordered {
         let mut items = Vec::with_capacity(max);
@@ -399,6 +492,17 @@ unsafe extern "C" fn tr_end_element(ud: *mut c_void, name: *const c_char) {
     if !flush_chardata(&st) {
         return;
     }
+    if let Some(mut sess) = take_session(&st) {
+        if sess
+            .end(std::ffi::CStr::from_ptr(name).to_bytes())
+            .is_some()
+        {
+            st.borrow_mut().session = Some(sess);
+            return;
+        }
+        sess.finish();
+        st.borrow_mut().session_blocked = true;
+    }
     let name_obj = intern_cstr(&st, name);
     dispatch(&st, H_END_ELEMENT, vec![name_obj]);
 }
@@ -417,8 +521,7 @@ unsafe extern "C" fn tr_character_data(ud: *mut c_void, s: *const c_char, len: c
         (buffering, fits, oversize)
     };
     if !buffering {
-        let text = utf8_obj(data);
-        dispatch(&st, H_CHARACTER_DATA, vec![text]);
+        deliver_text(&st, utf8_obj(data));
         return;
     }
     if !fits {
@@ -432,8 +535,7 @@ unsafe extern "C" fn tr_character_data(ud: *mut c_void, s: *const c_char, len: c
         }
     }
     if oversize {
-        let text = utf8_obj(data);
-        dispatch(&st, H_CHARACTER_DATA, vec![text]);
+        deliver_text(&st, utf8_obj(data));
     } else {
         st.borrow_mut().buffer.extend_from_slice(data);
     }
@@ -786,6 +888,10 @@ unsafe extern "C" fn tr_unknown_encoding(
     info: *mut ex::XML_Encoding,
 ) -> c_int {
     let st = state_from_ud(data);
+    // The codec lookup runs Python code.
+    if let Some(st) = &st {
+        end_session(st);
+    }
     let Ok(ip) = interp() else {
         return ex::XML_STATUS_ERROR;
     };
@@ -1506,6 +1612,8 @@ fn register_parser(
         pending_exc: None,
         reparse_deferral: expat_at_least(2, 6),
         parent,
+        session: None,
+        session_blocked: false,
     }));
     parser_reg().lock().insert(id, state);
     let inst = PyInstance::new(parser_type());
@@ -1704,7 +1812,11 @@ fn external_entity_parser_create(args: &[Object]) -> Result<Object, RuntimeError
 /// Feed one chunk to expat and translate the outcome: pending Python
 /// exception > ExpatError > success (returns expat's status code, 1).
 fn feed(st: &StateRef, data: &[u8], isfinal: bool) -> Result<i64, RuntimeError> {
-    let parser = st.borrow().parser();
+    let parser = {
+        let mut s = st.borrow_mut();
+        s.session_blocked = false;
+        s.parser()
+    };
     // SAFETY: live parser; `data` outlives the call.
     let rc = unsafe {
         ex::XML_Parse(
@@ -1798,14 +1910,17 @@ fn parse_method(args: &[Object]) -> Result<Object, RuntimeError> {
     let st = state_of_args(args)?;
     let data = parse_data_arg(&st, args.get(1))?;
     let isfinal = args.get(2).map(Object::is_truthy).unwrap_or(false);
-    let rc = feed(&st, &data, isfinal)?;
-    if !flush_chardata(&st) {
-        let e = st.borrow_mut().pending_exc.take();
-        if let Some(e) = e {
-            return Err(e);
+    let r = feed(&st, &data, isfinal).and_then(|rc| {
+        if !flush_chardata(&st) {
+            let e = st.borrow_mut().pending_exc.take();
+            if let Some(e) = e {
+                return Err(e);
+            }
         }
-    }
-    Ok(Object::Int(rc))
+        Ok(rc)
+    });
+    end_session(&st);
+    Ok(Object::Int(r?))
 }
 
 fn parse_file_method(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1829,13 +1944,18 @@ fn parse_file_method(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         };
         let isfinal = bytes.is_empty();
-        let status = feed(&st, &bytes, isfinal)?;
+        let status = feed(&st, &bytes, isfinal);
+        // `read` is Python code: the session ends first.
+        end_session(&st);
+        let status = status?;
         if isfinal {
             rc = status;
             break;
         }
     }
-    if !flush_chardata(&st) {
+    let flushed = flush_chardata(&st);
+    end_session(&st);
+    if !flushed {
         let e = st.borrow_mut().pending_exc.take();
         if let Some(e) = e {
             return Err(e);

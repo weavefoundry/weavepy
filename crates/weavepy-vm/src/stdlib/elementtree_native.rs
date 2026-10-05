@@ -2660,6 +2660,303 @@ pub(crate) fn expat_dispatch(
 }
 
 // ---------------------------------------------------------------------
+// Parse sessions.
+
+/// A parse whose expat events build the tree natively, as the C
+/// accelerator's `XMLParser` does with a `TreeBuilder` target: `pyexpat`
+/// begins one when the parser's handlers are the natives
+/// `XMLParser.__init__` installs (`self._start`, `self._end`,
+/// `target.data`) over an exact `XMLParser` and `TreeBuilder`, and feeds it
+/// the events directly, without building handler arguments or calling
+/// through the interpreter.
+///
+/// The `TreeBuilder`'s `_data` and `_elem` lists are updated in place; its
+/// `_last`, `_tail` and `_root` live here until [`Session::finish`], which
+/// `pyexpat` calls before any other handler (that is, any Python code)
+/// runs and when the parse call returns. Names are resolved through the
+/// parser's intern dictionary and `_names` memo, as the Python code
+/// resolves them, then cached by their bytes. An event a session can't
+/// serve exactly (say, text arriving for an element that already has
+/// some) is declined before anything changes: `pyexpat` then ends the
+/// session and dispatches the event as usual.
+pub(crate) struct Session {
+    ext: Ext,
+    tb: Rc<PyInstance>,
+    at: [usize; 5],
+    memo: Dict,
+    intern: Option<Dict>,
+    names: crate::fasthash::FxHashMap<Box<[u8]>, Object>,
+    data: List,
+    elems: List,
+    /// The children lists and tags of the elements in `_elem`, innermost
+    /// last.
+    stack: Vec<(List, Object)>,
+    last: Object,
+    tail: Object,
+    root: Object,
+    cls: Rc<TypeObject>,
+}
+
+type Ext = Rc<dyn std::any::Any + Send + Sync>;
+
+/// The receiver of `handler` when it is the native handler `k` (see
+/// `State::handlers`), with its class's state.
+fn native_handler(handler: &Object, k: usize) -> Option<(Rc<PyInstance>, Ext)> {
+    let Object::BoundMethod(bm) = handler else {
+        return None;
+    };
+    let (Object::Builtin(b), Object::Instance(recv)) = (&bm.function, &bm.receiver) else {
+        return None;
+    };
+    let ext = class_of(recv).native_ext.get()?.clone();
+    let st = ext.downcast_ref::<State>()?;
+    (st.handlers.get()?[k] == Rc::as_ptr(b) as usize).then(|| (recv.clone(), ext.clone()))
+}
+
+impl Session {
+    /// A session for a parser whose handlers are `start`, `end` and
+    /// `data` and whose intern dictionary is `intern`, when they are the
+    /// natives over an exact `XMLParser` and `TreeBuilder` in the state
+    /// their constructors leave.
+    pub(crate) fn begin(
+        start: &Object,
+        end: &Object,
+        data: &Object,
+        intern: &Object,
+    ) -> Option<Box<Session>> {
+        if crate::gil::free_threading_enabled() {
+            return None;
+        }
+        let (parser, ext) = native_handler(start, 0)?;
+        let (end_parser, _) = native_handler(end, 1)?;
+        if !Rc::ptr_eq(&parser, &end_parser) {
+            return None;
+        }
+        let st = ext.downcast_ref::<State>()?;
+        let (memo, target) = parser_fields(st, &Object::Instance(parser))?;
+        let (tb, f) = builder(st, &target)?;
+        match data {
+            Object::None => {}
+            _ => {
+                let (data_tb, _) = native_handler(data, 2)?;
+                if !Rc::ptr_eq(&data_tb, &tb) {
+                    return None;
+                }
+            }
+        }
+        match &f.factory {
+            Object::Type(t) if Rc::as_ptr(t) as usize == st.class_ptrs[ELEMENT] => {}
+            _ => return None,
+        }
+        let cls = st.element_class()?;
+        if !st.verified(ELEMENT, &cls) || flag(&f.tail).is_none() {
+            return None;
+        }
+        let intern = match intern {
+            Object::Dict(d) => Some(d.clone()),
+            Object::None => None,
+            _ => return None,
+        };
+        let elems = read(&f.elems, Clone::clone)?;
+        let mut stack = Vec::with_capacity(elems.len() + 8);
+        for e in &elems {
+            let v = element_view(st, e)?;
+            stack.push((v.children?, v.tag));
+        }
+        Some(Box::new(Session {
+            ext,
+            tb,
+            at: f.at,
+            memo,
+            intern,
+            names: Default::default(),
+            data: f.data,
+            elems: f.elems,
+            stack,
+            last: f.last,
+            tail: f.tail,
+            root: f.root,
+            cls,
+        }))
+    }
+
+    #[inline]
+    fn st(&self) -> &State {
+        self.ext
+            .downcast_ref::<State>()
+            .expect("a session holds its module's state")
+    }
+
+    /// The `_fixname` result for expat's name `raw` (interned through the
+    /// parser's intern dictionary first, as `pyexpat` does); `None` when
+    /// a dictionary holds a key only Python code can compare.
+    fn name(&mut self, raw: &[u8]) -> Option<Object> {
+        if let Some(v) = self.names.get(raw) {
+            return Some(v.clone());
+        }
+        let text = String::from_utf8_lossy(raw);
+        let interned = match &self.intern {
+            Some(d) => {
+                let key = SharedStr::from(&*text);
+                match dict_str_get(d, &key)? {
+                    Some(Object::Str(s)) => s,
+                    Some(_) => return None,
+                    None => {
+                        let o = Object::Str(key.clone());
+                        write(d, |m| m.insert(DictKey(o.clone()), o))?;
+                        key
+                    }
+                }
+            }
+            None => SharedStr::from(&*text),
+        };
+        let fixed = fixname(&self.memo, &interned)?;
+        self.names.insert(raw.into(), fixed.clone());
+        Some(fixed)
+    }
+
+    /// Whether [`Self::flush`] can run natively.
+    fn can_flush(&self) -> bool {
+        let st = self.st();
+        let Some(pending) = read(&self.data, |d| {
+            d.iter()
+                .all(|p| matches!(p, Object::Str(_)))
+                .then_some(!d.is_empty())
+        })
+        .flatten() else {
+            return false;
+        };
+        if !pending || matches!(self.last, Object::None) {
+            return true;
+        }
+        let Some(last) = st.exact(ELEMENT, &self.last) else {
+            return false;
+        };
+        let field = if flag(&self.tail) == Some(true) {
+            &st.names.tail
+        } else {
+            &st.names.text
+        };
+        matches!(get_field(last, field), None | Some(Object::None))
+    }
+
+    /// `TreeBuilder._flush`, once [`Self::can_flush`] said it can.
+    fn flush(&mut self) {
+        let Some(text) = read(&self.data, |d| match d.len() {
+            0 => None,
+            1 => Some(d[0].clone()),
+            _ => {
+                let mut s = String::new();
+                for piece in d {
+                    if let Object::Str(p) = piece {
+                        s.push_str(p);
+                    }
+                }
+                Some(Object::from_str(s))
+            }
+        })
+        .flatten() else {
+            return;
+        };
+        let st = self.st();
+        if let Some(last) = st.exact(ELEMENT, &self.last) {
+            let field = if flag(&self.tail) == Some(true) {
+                &st.names.tail
+            } else {
+                &st.names.text
+            };
+            set_field(last, field, text);
+        }
+        if Rc::strong_count(&self.data) == 2 {
+            let items = write(&self.data, std::mem::take);
+            drop(items);
+        } else {
+            let Object::List(l) = new_list(Vec::new()) else {
+                unreachable!("a new list");
+            };
+            store_at(
+                &self.tb,
+                self.at[TB_DATA],
+                &st.names.data,
+                Object::List(l.clone()),
+            );
+            self.data = l;
+        }
+    }
+
+    /// A start tag: `XMLParser._start` and `TreeBuilder.start`. `None`
+    /// declines (nothing changed).
+    pub(crate) fn start(
+        &mut self,
+        name: &[u8],
+        atts: &mut dyn Iterator<Item = (&[u8], Object)>,
+    ) -> Option<()> {
+        let tag = self.name(name)?;
+        let mut attrib = DictData::default();
+        for (k, v) in atts {
+            attrib.insert(DictKey(self.name(k)?), v);
+        }
+        if !self.can_flush() {
+            return None;
+        }
+        self.flush();
+        let st = self.st();
+        let n = &st.names;
+        let inst = PyInstance::new_deferred(self.cls.clone());
+        let Object::List(children) = new_list(Vec::new()) else {
+            unreachable!("a new list");
+        };
+        set_field(&inst, &n.tag, tag.clone());
+        set_field(&inst, &n.attrib, new_dict(attrib));
+        set_field(&inst, &n.children, Object::List(children.clone()));
+        let elem = Object::Instance(inst);
+        match self.stack.last() {
+            Some((parent, _)) => append(parent, elem.clone()),
+            None => {
+                if matches!(self.root, Object::None) {
+                    self.root = elem.clone();
+                }
+            }
+        }
+        append(&self.elems, elem.clone());
+        self.stack.push((children, tag));
+        self.last = elem;
+        self.tail = Object::Int(0);
+        Some(())
+    }
+
+    /// An end tag: `XMLParser._end` and `TreeBuilder.end`. `None`
+    /// declines (nothing changed but name resolution).
+    pub(crate) fn end(&mut self, name: &[u8]) -> Option<()> {
+        let tag = self.name(name)?;
+        let (_, top) = self.stack.last()?;
+        if native_eq(top, &tag) != Some(true) || !self.can_flush() {
+            return None;
+        }
+        self.flush();
+        let elem = write(&self.elems, Vec::pop)??;
+        self.stack.pop();
+        self.last = elem;
+        self.tail = Object::Int(1);
+        Some(())
+    }
+
+    /// Character data: `TreeBuilder.data`.
+    pub(crate) fn data(&mut self, text: Object) {
+        append(&self.data, text);
+    }
+
+    /// Store the builder fields the session kept.
+    pub(crate) fn finish(self) {
+        let st = self.st();
+        let n = &st.names;
+        store_at(&self.tb, self.at[TB_LAST], &n.last, self.last.clone());
+        store_at(&self.tb, self.at[TB_TAIL], &n.tail_flag, self.tail.clone());
+        store_at(&self.tb, self.at[TB_ROOT], &n.root, self.root.clone());
+    }
+}
+
+// ---------------------------------------------------------------------
 // Installation.
 
 type Native = fn(&State, &[Object], Kw) -> Option<Result<Object, RuntimeError>>;
