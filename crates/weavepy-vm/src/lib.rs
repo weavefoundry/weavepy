@@ -41281,6 +41281,9 @@ impl Interpreter {
                             )?;
                         }
                         let new_code = Object::Code(c.clone());
+                        // The slots keep the names of the code the function
+                        // was made from.
+                        f.slots();
                         *f.code.borrow_mut() = c;
                         crate::rare_events::bump(crate::rare_events::FUNC_MODIFICATION);
                         if crate::capi_watchers::funcs_active() {
@@ -63412,10 +63415,6 @@ struct CodeConstObjects {
     /// Inline-call shapes per `CALL` site (see [`CallSlot`]); allocated
     /// on the first inline call in this code object.
     call_slots: std::sync::OnceLock<Box<[CallSlot]>>,
-    /// The getset slots of a function made from this code (see
-    /// [`function_slots`]): the module name they were built for, and the
-    /// entries, copied into each new function.
-    fn_slots: std::sync::OnceLock<(Option<Object>, Rc<crate::object::DictMap>)>,
     /// Whether this code is a *pure leaf* (see [`code_is_pure_leaf`]):
     /// `0` not yet decided, `1` no, `2` general leaf, `3` argument return,
     /// `4` constant return, `5` small-int return, `6` attribute return,
@@ -65061,7 +65060,6 @@ fn code_vm_ext_build(
             stamp_slots: std::sync::OnceLock::new(),
             attr_poly: std::sync::OnceLock::new(),
             call_slots: std::sync::OnceLock::new(),
-            fn_slots: std::sync::OnceLock::new(),
             pure_leaf: std::sync::atomic::AtomicU8::new(0),
             fast_pairs: std::sync::OnceLock::new(),
             gen_fast: std::sync::atomic::AtomicU8::new(0),
@@ -65149,10 +65147,10 @@ fn new_function(
     // staticmethod wrappers) return the *same* object, which
     // `assertIs(wrapper.__name__, func.__name__)` in test_decorators
     // relies on.
-    let (mut slots, seed) = function_slots(&code, globals, annotations.is_none());
-    if let Some(ann) = annotations {
-        slots.insert(DictKey(fn_slot_keys()[3].clone()), ann);
-    }
+    let module = globals
+        .borrow()
+        .get(&DictKey(fn_slot_keys()[1].clone()))
+        .cloned();
     let f = PyFunction {
         name: code.name.clone(),
         code: RefCell::new(code),
@@ -65165,11 +65163,16 @@ fn new_function(
         kw_defaults,
         closure,
         attrs: RefCell::new(None),
-        slots_raw: RefCell::new(slots),
-        slot_seed: RefCell::new(seed),
+        slots_raw: RefCell::new(DictData::default()),
+        slot_seed: RefCell::new(Some(crate::object::LazySlots(module))),
         closure_cells: std::sync::OnceLock::new(),
         defaults_override: crate::object::OverrideFlag::new(false),
     };
+    if let Some(ann) = annotations {
+        f.slots()
+            .borrow_mut()
+            .insert(DictKey(fn_slot_keys()[3].clone()), ann);
+    }
     // A function participates in cycles through its globals (`exec(src,
     // d)` builds `d -> f -> d`), its `__dict__`, and any closure cell that
     // closes over the function. Tracked so `gc.collect()` can reclaim
@@ -65180,59 +65183,7 @@ fn new_function(
     obj
 }
 
-/// The getset slots a new function made from `code` in `globals` starts
-/// with: `__module__` (the globals' `__name__`, when set), `__name__` and
-/// `__qualname__`. Built once per code object (for the module name it
-/// first sees) and shared by each function after, so two functions made
-/// from one `def` share their name objects, as CPython's do: with
-/// `seeded`, as the function's seed (see `PyFunction::slot_seed`) beside
-/// empty slots, otherwise copied.
-fn function_slots(
-    code: &CodeObject,
-    globals: &Rc<RefCell<DictData>>,
-    seeded: bool,
-) -> (DictData, Option<Rc<crate::object::DictMap>>) {
-    let keys = fn_slot_keys();
-    let module = globals.borrow().get(&DictKey(keys[1].clone())).cloned();
-    let build = |module: Option<Object>| {
-        let mut map =
-            crate::object::DictMap::with_capacity_and_hasher(3, crate::fasthash::FxBuildHasher);
-        if let Some(m) = module {
-            map.insert(DictKey(keys[0].clone()), m);
-        }
-        map.insert(
-            DictKey(keys[1].clone()),
-            Object::from_str(code.name.clone()),
-        );
-        // `__qualname__` is the code object's PEP 3155 dotted name
-        // (computed at compile time from lexical nesting), not the bare
-        // `__name__`.
-        map.insert(
-            DictKey(keys[2].clone()),
-            Object::from_str(code.qualname.clone()),
-        );
-        map
-    };
-    let same = |a: &Option<Object>, b: &Option<Object>| match (a, b) {
-        (Some(a), Some(b)) => a.is_same(b),
-        (None, None) => true,
-        _ => false,
-    };
-    if let Some(ext) = code_vm_ext(code) {
-        let (built_for, map) = ext
-            .fn_slots
-            .get_or_init(|| (module.clone(), Rc::new(build(module.clone()))));
-        if same(built_for, &module) {
-            if seeded {
-                return (DictData::default(), Some(map.clone()));
-            }
-            return (DictData::from((**map).clone()), None);
-        }
-    }
-    (DictData::from(build(module)), None)
-}
-
-fn fn_slot_keys() -> &'static [Object; 4] {
+pub(crate) fn fn_slot_keys() -> &'static [Object; 4] {
     static KEYS: std::sync::OnceLock<[Object; 4]> = std::sync::OnceLock::new();
     KEYS.get_or_init(|| {
         [

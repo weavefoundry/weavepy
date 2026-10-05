@@ -4588,10 +4588,12 @@ pub struct PyFunction {
     /// untouched by the wrapped function's slots). Read through
     /// [`Self::slots`], which first copies in [`Self::slot_seed`].
     pub slots_raw: RefCell<DictData>,
-    /// The slots a new function starts with, shared by every function
-    /// one `def` makes (see `new_function`), until the first access to
-    /// [`Self::slots`] copies them in: most functions never read theirs.
-    pub slot_seed: RefCell<Option<Rc<DictMap>>>,
+    /// The slots a new function starts with, built on first access to
+    /// [`Self::slots`] (most functions never read theirs): `__module__`
+    /// from the defining globals' `__name__`, kept here, and `__name__`
+    /// and `__qualname__` from the code's interned names, which every
+    /// function one `def` makes shares, as CPython's do.
+    pub slot_seed: RefCell<Option<LazySlots>>,
     /// The frame `cells` vector for a function whose code has free
     /// variables but no cell variables: exactly `closure`'s cells, built
     /// once (the closure is immutable) for the lean call paths.
@@ -4602,6 +4604,11 @@ pub struct PyFunction {
     /// had them overridden.
     pub defaults_override: OverrideFlag,
 }
+
+/// A function's getset slots before their first read (see
+/// [`PyFunction::slot_seed`]): the defining globals' `__name__`, if set.
+#[derive(Debug, Clone)]
+pub struct LazySlots(pub Option<Object>);
 
 /// A dying PyFunction clears the weak references watching it.
 impl Drop for PyFunction {
@@ -4741,14 +4748,28 @@ impl PyFunction {
     #[cold]
     #[inline(never)]
     fn plant_slot_seed(&self) {
-        let Some(seed) = self.slot_seed.borrow_mut().take() else {
+        let Some(LazySlots(module)) = self.slot_seed.borrow_mut().take() else {
             return;
         };
+        let code = self.code();
+        let [module_key, name_key, qualname_key, _] = crate::fn_slot_keys();
+        let mut map = DictMap::with_capacity_and_hasher(3, crate::fasthash::FxBuildHasher);
+        if let Some(m) = module {
+            map.insert(DictKey(module_key.clone()), m);
+        }
+        map.insert(
+            DictKey(name_key.clone()),
+            crate::stdlib::sys::intern_name(&code.name),
+        );
+        map.insert(
+            DictKey(qualname_key.clone()),
+            crate::stdlib::sys::intern_name(&code.qualname),
+        );
         let mut slots = self.slots_raw.borrow_mut();
         // Every store goes through `slots()`, which plants the seed
         // first: nothing is there yet to keep.
         debug_assert!(slots.is_empty());
-        *slots = DictData::from((*seed).clone());
+        *slots = DictData::from(map);
     }
 
     /// Read a slot value if one has been stored (explicitly assigned or
