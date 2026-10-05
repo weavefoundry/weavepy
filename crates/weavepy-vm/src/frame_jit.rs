@@ -822,12 +822,65 @@ unsafe extern "C" fn h_store(st: *mut State, slot: *mut Object, i: u64) -> u32 {
 /// goes to `out`, the slot above): `0` an `int` in `st.out`, `1` another
 /// value written to `out`, `2` the exhausted iterator retired (it left the
 /// stack), anything else declined.
-unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Object) -> u32 {
-    // SAFETY: the code passes its live state and an initialized slot with
-    // a free one above it.
+unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Object, pc: u64) -> u32 {
+    // SAFETY: the code passes its live state, an initialized slot with a
+    // free one above it, and its `FOR_ITER`'s pc.
     let (st, top) = unsafe { (&mut *st, &*it) };
     let rc = match top {
         Object::Iter(rc) => rc,
+        // A generator: a simple body's step in place (see `gen_fast`),
+        // any other resumes as an inline activation, switched to as the
+        // core loop's arm does (not from a generator's own fast step).
+        Object::Generator(g) if !st.sw.is_null() => {
+            // SAFETY: the running thread's interpreter, dormant while the
+            // helper runs; the stack slot keeps `g` alive.
+            let interp = unsafe { &mut *st.interp.cast_mut() };
+            if let crate::gen_fast::GenNext::Yielded(v) =
+                interp.gen_fast_next(g, st.snap_gen, 0, st.maybe_dead)
+            {
+                // SAFETY: the slot above the iterator is free.
+                unsafe { out.write(v) };
+                return 1;
+            }
+            // SAFETY: the running activation's frame and switch; the
+            // stack is synced (the iterator on top) before the switch.
+            unsafe {
+                let sw = &mut *st.sw;
+                let frame = &mut *st.frame;
+                let len = it.offset_from(st.stack) as usize + 1;
+                frame.stack.set_len(len);
+                frame.pc = pc as u32;
+                *sw.last = st.last;
+                if !interp.core_gen_resume(sw, pc as usize, crate::InlineResume::ForIter) {
+                    sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+                }
+            }
+            return FOR_SWITCHED;
+        }
+        // A native iterator class's `__next__` (a registered leaf builtin)
+        // in place; exhaustion is the core loop's, a raise leaves past the
+        // instruction.
+        obj @ Object::Instance(inst) if !st.sw.is_null() => {
+            // SAFETY: as above.
+            let interp = unsafe { &*st.interp };
+            return match interp.leaf_next_step(obj, inst) {
+                Some(Ok(v)) => {
+                    // SAFETY: the slot above the iterator is free.
+                    unsafe { out.write(v) };
+                    1
+                }
+                Some(Err(RuntimeError::PyException(exc))) if exc.type_name() == "StopIteration" => {
+                    3
+                }
+                Some(Err(e)) => {
+                    st.len = unsafe { it.offset_from(st.stack) } as usize + 1;
+                    st.pc = pc as usize + 1;
+                    st.err = Some(e);
+                    FOR_RAISED
+                }
+                None => 3,
+            };
+        }
         // A native adapter whose step runs no code (`zip` of native
         // iterators, `itertools.repeat`, ...); its exhaustion is the
         // interpreter's.
@@ -948,6 +1001,11 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
     unsafe { out.write(v) };
     1
 }
+
+/// [`h_for_iter`] switched to a generator's activation (`RELOAD`).
+const FOR_SWITCHED: u32 = 4;
+/// [`h_for_iter`]'s iterator raised (`RAISED`, the state past it).
+const FOR_RAISED: u32 = 5;
 
 /// A container instruction (`BINARY_SUBSCR`, `BINARY_SLICE`, `STORE_SUBSCR`,
 /// `LIST_APPEND`, `UNPACK_SEQUENCE`; the one at `ins`, the `pc`th of
@@ -1234,6 +1292,23 @@ unsafe extern "C" fn h_truth(st: *mut State, at: *mut Object) -> u32 {
         }
         crate::drop_hot(at.read());
         u32::from(b)
+    }
+}
+
+/// `IS_OP` with oparg `arg` over the values at `at` and above it, as the
+/// core loop's arm runs it: `0` or `1` the answer (both released),
+/// anything else declined untouched.
+unsafe extern "C" fn h_is(at: *mut Object, arg: u32) -> u32 {
+    // SAFETY: the code passes two initialized stack slots.
+    unsafe {
+        let (a, b) = (&*at, &*at.add(1));
+        if !droppable(a) || !droppable(b) {
+            return 2;
+        }
+        let same = a.is_same(b);
+        crate::drop_hot(at.add(1).read());
+        crate::drop_hot(at.read());
+        u32::from(same != (arg == 1))
     }
 }
 
@@ -1882,15 +1957,32 @@ unsafe extern "C" fn h_call(
         }
         let base = st.stack;
         let start = len - argc - 2;
-        // `next(gen)` resumes the generator inline: the core loop's.
+        // The frame synced for a switch, as the core loop's arm syncs it.
+        let sync = |st: &mut State| {
+            let frame = &mut *st.frame;
+            frame.stack.set_len(len);
+            frame.pc = pc as u32;
+            *(*st.sw).last = st.last;
+        };
+        // `next(gen)`: the generator resumes inline, as for `FOR_ITER`,
+        // with the yield as the call's result.
         if argc == 1
             && matches!(
-                (&*base.add(start), &*base.add(start + 2)),
-                (Object::Builtin(b), Object::Generator(_))
+                (&*base.add(start), &*base.add(start + 1), &*base.add(start + 2)),
+                (Object::Builtin(b), Object::Unbound, Object::Generator(_))
                     if Rc::as_ptr(b) as usize == interp.leaf_fns().next_ptr
             )
         {
-            return CALL_DECLINED;
+            if st.sw.is_null() {
+                return CALL_DECLINED;
+            }
+            sync(st);
+            let sw = &mut *st.sw;
+            let interp = &mut *st.interp.cast_mut();
+            if !interp.core_gen_resume(sw, pc, crate::InlineResume::NextCall) {
+                sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+            }
+            return RELOAD;
         }
         Interpreter::core_instance_callee(base.add(start));
         let done = |st: &mut State, r: Object| {
@@ -1934,11 +2026,8 @@ unsafe extern "C" fn h_call(
             if st.sw.is_null() {
                 return CALL_DECLINED;
             }
+            sync(st);
             let sw = &mut *st.sw;
-            let frame = &mut *st.frame;
-            frame.stack.set_len(len);
-            frame.pc = pc as u32;
-            *sw.last = st.last;
             let interp = &mut *st.interp.cast_mut();
             let switched = if python == 1 {
                 interp.core_call(sw, pc)
@@ -1955,6 +2044,38 @@ unsafe extern "C" fn h_call(
         let Some(slot) = ext.method_slots.get().and_then(|s| s.get(pc)) else {
             return CALL_DECLINED;
         };
+        // A builtin the site settled on running in the core loop's lane (a
+        // builtin type's method, a common builtin function), whose body may
+        // run Python code: through the lane, which reloads after.
+        let body = match (&ops[0], &ops[1]) {
+            (Object::Builtin(b), Object::Unbound) => Some((b, None)),
+            (Object::Builtin(b), recv) => Some((b, Some(recv))),
+            (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
+                match &bm.function {
+                    Object::Builtin(b) => Some((b, Some(&bm.receiver))),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let (Some((b, recv)), false) = (body, st.sw.is_null()) {
+            let settled = slot.native_body(b).or_else(|| {
+                if slot.get_leaf(b).is_some() {
+                    return None;
+                }
+                let via_call = interp.builtin_lane(b, recv)?;
+                slot.set_native_body(b, via_call);
+                Some(via_call)
+            });
+            if let Some(via_call) = settled {
+                sync(st);
+                let sw = &mut *st.sw;
+                let interp = &mut *st.interp.cast_mut();
+                if interp.core_builtin_lane(sw, pc, via_call) {
+                    return RELOAD;
+                }
+            }
+        }
         let Object::Builtin(b) = &ops[0] else {
             return CALL_DECLINED;
         };
@@ -2003,7 +2124,8 @@ unsafe extern "C" fn h_call(
             start + 1
         };
         let args = std::slice::from_raw_parts(base.add(first), len - first);
-        if !args.iter().all(droppable) {
+        // (A generator's fast step can't raise from here.)
+        if !args.iter().all(droppable) || st.sw.is_null() {
             return CALL_DECLINED;
         }
         let r = match kind {
@@ -2443,6 +2565,7 @@ fn native_op(op: OpCode) -> bool {
             | OpCode::LoadDeref
             | OpCode::GetIter
             | OpCode::UnaryOp
+            | OpCode::LoadFastAndClear
     )
 }
 
@@ -2453,6 +2576,7 @@ fn native_at(code: &CodeObject, pc: usize) -> bool {
     match ins.op {
         OpCode::BuildTuple => (1..=3).contains(&ins.arg),
         OpCode::UnaryOp => ins.arg <= 3,
+        OpCode::LoadFastAndClear => code.cellvars.is_empty(),
         op => native_op(op),
     }
 }
@@ -2497,7 +2621,7 @@ impl<'a> Lower<'a> {
                     + usize::from(code.has_varkeywords);
                 let mut m: Vec<bool> = (0..nlocals).map(|i| i >= params).collect();
                 for ins in &code.instructions {
-                    if ins.op == OpCode::DeleteFast {
+                    if matches!(ins.op, OpCode::DeleteFast | OpCode::LoadFastAndClear) {
                         if let Some(x) = m.get_mut(ins.arg as usize) {
                             *x = true;
                         }
@@ -3382,6 +3506,23 @@ impl<'a> Lower<'a> {
                 return self.build(pc, ins.arg as usize, false)
             }
             OpCode::BuildList => return self.build(pc, ins.arg as usize, true),
+            // PEP 709: the local's value (`Unbound` included) moves onto
+            // the stack and the local empties (a cell-sharing local is the
+            // core loop's).
+            OpCode::LoadFastAndClear
+                if (ins.arg as usize) < self.nlocals && self.code.cellvars.is_empty() =>
+            {
+                let i = ins.arg;
+                self.flush_local(i);
+                let s = self.depth;
+                let dst = self.slot_addr(s);
+                let src = self.local_addr(i);
+                self.copy16(dst, src);
+                self.write_tag(src, self.tags.unbound);
+                self.bound[i as usize] = false;
+                self.push(Item::Mem(s));
+                true
+            }
             OpCode::LoadDeref => {
                 let s = self.depth;
                 let dst = self.slot_addr(s);
@@ -3411,9 +3552,9 @@ impl<'a> Lower<'a> {
                 true
             }
             OpCode::UnaryOp if ins.arg <= 3 => return self.unary(pc, ins.arg),
-            // (A generator body's raise can't leave from here, nor its
-            // return switch.)
-            OpCode::Call if !self.is_gen() => return self.call_op(pc, ins.arg as usize),
+            // (A generator's fast step never switches or raises from a call
+            // helper; a generator body's return isn't a switch.)
+            OpCode::Call => return self.call_op(pc, ins.arg as usize),
             OpCode::ReturnValue if !self.is_gen() && self.depth > 0 => {
                 self.flush();
                 self.store_last();
@@ -4419,10 +4560,38 @@ impl<'a> Lower<'a> {
         let ai = self.pop();
         let (Some((ta, wa, ba)), Some((tb, wb, bb))) = (self.identity(ai), self.identity(bi))
         else {
-            self.push(ai);
-            self.push(bi);
-            self.exit(INTERP, pc);
-            return false;
+            // A stack value (whose release the test owes): through the
+            // helper, the operands onto the stack.
+            let slot = self.depth;
+            self.materialize(ai, slot);
+            self.materialize(bi, slot + 1);
+            let at = self.slot_addr(slot);
+            let k = self.b.ins().iconst(types::I32, i64::from(arg));
+            let r = self
+                .call(h_is as *const () as usize, &[at, k], true)
+                .expect("returns");
+            let declined = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, r, 1);
+            let out = self.exit_with(pc, &[Item::Mem(slot), Item::Mem(slot + 1)], INTERP);
+            self.branch_out(declined, out);
+            // (The result onto the stack for a finalizer's stop.)
+            let saved = self.last_pc.replace(pc);
+            let marked = self.exit_with(pc + 1, &[Item::Mem(slot)], MARKED);
+            self.last_pc = saved;
+            let f = self.dead_flag();
+            let marked_b = self.b.create_block();
+            let fine = self.b.create_block();
+            self.b.ins().brif(f, marked_b, &[], fine, &[]);
+            self.b.switch_to_block(marked_b);
+            let dst = self.slot_addr(slot);
+            self.write_tag(dst, self.tags.boolean);
+            let r8 = self.b.ins().ireduce(types::I8, r);
+            self.b.ins().store(FLAGS, r8, dst, 1);
+            self.b.ins().jump(marked, &[]);
+            self.b.switch_to_block(fine);
+            let t = self.b.ins().icmp_imm(IntCC::NotEqual, r, 0);
+            self.push(Item::Bool(t));
+            self.set_last(pc);
+            return true;
         };
         let slow = self.exit_with(pc, &[ai, bi], INTERP);
         let tags = self.tags;
@@ -4465,13 +4634,17 @@ impl<'a> Lower<'a> {
     fn for_iter(&mut self, pc: usize, arg: u32) -> bool {
         let before = self.last_pc;
         self.flush();
+        // (A switch to a generator, or a raise, leaves `st.last` as the
+        // instruction before.)
+        self.store_last();
         let it_slot = self.depth - 1;
         let it = self.slot_addr(it_slot);
         let out_slot = self.slot_addr(self.depth);
+        let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let r = self
             .call(
                 h_for_iter as *const () as usize,
-                &[self.st, it, out_slot],
+                &[self.st, it, out_slot, pcv],
                 true,
             )
             .expect("returns");
@@ -4516,7 +4689,27 @@ impl<'a> Lower<'a> {
         self.set_last(pc);
         self.goto(to);
         self.depth = depth;
+        // Switched to a generator, or raised: the core loop takes it from
+        // the state; anything else is the core loop's.
         self.b.switch_to_block(decl);
+        let switched = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, r, i64::from(FOR_SWITCHED));
+        let raised = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, r, i64::from(FOR_RAISED));
+        let leave = self.b.create_block();
+        let declined = self.b.create_block();
+        let either = self.b.ins().bor(switched, raised);
+        self.b.ins().brif(either, leave, &[], declined, &[]);
+        self.b.switch_to_block(leave);
+        let reload = self.b.ins().iconst(types::I32, i64::from(RELOAD));
+        let raise = self.b.ins().iconst(types::I32, i64::from(RAISED));
+        let s = self.b.ins().select(switched, reload, raise);
+        self.b.ins().return_(&[s]);
+        self.b.switch_to_block(declined);
         self.last_pc = before;
         self.exit(INTERP, pc);
         false
