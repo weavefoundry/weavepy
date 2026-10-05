@@ -119,4 +119,30 @@ assert [(k, list(g)) for k, g in it.groupby("aabbc")] == [
     ("c", ["c"]),
 ]
 
+# groupby: groups go stale once the groupby advances, and keys run once
+# per element.
+g = it.groupby("aabbcc")
+k1, g1 = next(g)
+k2, g2 = next(g)
+assert (k1, list(g1), k2, list(g2)) == ("a", [], "b", ["b", "b"])
+assert type(g) is it.groupby and iter(g) is g
+assert type(g2).__name__ == "_grouper"
+calls = []
+keys = [k for k, _ in it.groupby(range(6), lambda x: calls.append(x) or x // 2)]
+assert keys == [0, 1, 2] and calls == list(range(6))
+assert [(k, list(v)) for k, v in it.groupby(range(4), key=lambda x: x % 2 == 0)] == [
+    (True, [0]),
+    (False, [1]),
+    (True, [2]),
+    (False, [3]),
+]
+raises(ZeroDivisionError, list, it.groupby([1, 0], lambda x: 1 // x))
+
+
+class GB(it.groupby):
+    pass
+
+
+assert [(k, list(v)) for k, v in GB("aab")] == [("a", ["a", "a"]), ("b", ["b"])]
+
 print("itertools native ok")

@@ -74,6 +74,9 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             register_classmethod_descriptor
         );
         reg!("_register_types", register_types);
+        reg!("groupby_core", groupby_core);
+        reg!("grouper_core", grouper_core);
+        reg!("groupby_setstate", groupby_setstate);
     }
     Rc::new(PyModule {
         name: "_itertools".to_owned(),
@@ -452,8 +455,10 @@ const K_PERMUTATIONS: u8 = 15;
 const K_COMBINATIONS: u8 = 16;
 const K_CWR: u8 = 17;
 const K_BATCHED: u8 = 18;
+const K_GROUPBY: u8 = 19;
 
-const KINDS: [(&str, u8); 18] = [
+const KINDS: [(&str, u8); 19] = [
+    ("groupby", K_GROUPBY),
     ("chain", K_CHAIN),
     ("count", K_COUNT),
     ("repeat", K_REPEAT),
@@ -485,15 +490,108 @@ fn register_types(args: &[Object]) -> Result<Object, RuntimeError> {
             cls.lazy_ctor.set(kind);
         }
     }
+    if let (Some(Object::Type(gb)), Some(Object::Type(gr))) = (
+        ns.get(&DictKey(Object::from_static("groupby"))),
+        ns.get(&DictKey(Object::from_static("_grouper"))),
+    ) {
+        GROUPER_CLASSES.with(|g| {
+            let mut g = g.borrow_mut();
+            g.retain(|(a, _)| a.strong_count() > 0);
+            g.push((Rc::downgrade(gb), Rc::downgrade(gr)));
+        });
+    }
     Ok(Object::None)
 }
 
-/// `core`, a freshly built adapter, as an instance of `cls`.
+type WeakType = crate::sync::Weak<crate::types::TypeObject>;
+
+thread_local! {
+    /// Each registered `groupby` class with the `_grouper` class its
+    /// groups report.
+    static GROUPER_CLASSES: std::cell::RefCell<Vec<(WeakType, WeakType)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The `_grouper` class registered with `groupby` class `cls`.
+fn grouper_class_for(cls: &crate::types::TypeObject) -> Option<Rc<crate::types::TypeObject>> {
+    GROUPER_CLASSES.with(|g| {
+        g.borrow()
+            .iter()
+            .find(|(gb, _)| std::ptr::eq(gb.as_ptr(), cls))
+            .and_then(|(_, gr)| gr.upgrade())
+    })
+}
+
+/// `groupby_core(iterator, key_or_None, grouper_class)`.
+fn groupby_core(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [source, keyfunc, grouper_cls] = args else {
+        return Err(type_error("groupby_core expected 3 arguments"));
+    };
+    Ok(make_lazy(LazyIterKind::GroupBy {
+        source: source.clone(),
+        keyfunc: keyfunc.clone(),
+        tgtkey: None,
+        currkey: None,
+        currvalue: None,
+        currgrouper: None,
+        grouper_cls: match grouper_cls {
+            Object::Type(t) => Some(t.clone()),
+            _ => None,
+        },
+    }))
+}
+
+/// `grouper_core(groupby_core, tgtkey)`: a group of `groupby_core`,
+/// installed as its current one (CPython's `_grouper_create`).
+fn grouper_core(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::LazyIter(parent), tgtkey] = args else {
+        return Err(type_error("incorrect usage of internal _grouper"));
+    };
+    if !matches!(&*parent.state.borrow(), LazyIterKind::GroupBy { .. }) {
+        return Err(type_error("incorrect usage of internal _grouper"));
+    }
+    let grouper = Rc::new(PyLazyIter::new(LazyIterKind::Grouper {
+        parent: parent.clone(),
+        tgtkey: tgtkey.clone(),
+    }));
+    if let LazyIterKind::GroupBy { currgrouper, .. } = &mut *parent.state.borrow_mut() {
+        *currgrouper = Some(Rc::downgrade(&grouper));
+    }
+    Ok(Object::LazyIter(grouper))
+}
+
+/// `groupby_setstate(core, currkey, currvalue, tgtkey)`.
+fn groupby_setstate(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::LazyIter(l), key, value, tgt] = args else {
+        return Err(type_error("groupby_setstate expected 4 arguments"));
+    };
+    let old = match &mut *l.state.borrow_mut() {
+        LazyIterKind::GroupBy {
+            currkey,
+            currvalue,
+            tgtkey,
+            ..
+        } => (
+            currkey.replace(key.clone()),
+            currvalue.replace(value.clone()),
+            tgtkey.replace(tgt.clone()),
+        ),
+        _ => return Err(type_error("groupby_setstate: not a groupby core")),
+    };
+    drop(old);
+    Ok(Object::None)
+}
+
+/// `core`, a freshly built adapter, as an instance of `cls` (a
+/// `groupby` also learns the class its groups report).
 fn with_class(core: Object, cls: &Rc<crate::types::TypeObject>) -> Object {
     match core {
         Object::LazyIter(mut l) => {
             if let Some(slot) = Rc::get_mut(&mut l) {
                 slot.cls = Some(cls.clone());
+                if let LazyIterKind::GroupBy { grouper_cls, .. } = slot.state.get_mut() {
+                    *grouper_cls = grouper_class_for(cls);
+                }
             }
             Object::LazyIter(l)
         }
@@ -547,7 +645,16 @@ pub(crate) fn native_new(
     let mut fillvalue = Object::None;
     let mut repeat = 1i64;
     let mut initial = Object::None;
+    let mut key = Object::None;
     match kind {
+        K_GROUPBY => {
+            for (k, v) in kwargs {
+                if k != "key" {
+                    return None;
+                }
+                key = v.clone();
+            }
+        }
         K_ACCUMULATE => {
             for (k, v) in kwargs {
                 if k != "initial" {
@@ -744,6 +851,15 @@ pub(crate) fn native_new(
                 Object::Bool(false),
                 Object::Bool(stopped),
             ])
+        }
+        K_GROUPBY => {
+            let key = match args {
+                [_] => key,
+                [_, k] if kwargs.is_empty() => k.clone(),
+                _ => return None,
+            };
+            let source = take!(iter_of(&args[0]));
+            groupby_core(&[source, key, Object::None])
         }
         K_BATCHED => {
             let [it, size] = args else {
@@ -1194,6 +1310,39 @@ fn lazy_state(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Int(*n as i64),
             Object::Bool(*strict),
         ],
+        LazyIterKind::GroupBy {
+            source,
+            keyfunc,
+            tgtkey,
+            currkey,
+            currvalue,
+            ..
+        } => {
+            // A cleared (NULL) field is an empty tuple, a set one a 1-tuple.
+            let field = |o: &Option<Object>| match o {
+                Some(v) => Object::new_tuple_array([v.clone()]),
+                None => Object::new_tuple_array([]),
+            };
+            vec![
+                source.clone(),
+                keyfunc.clone(),
+                field(tgtkey),
+                field(currkey),
+                field(currvalue),
+            ]
+        }
+        LazyIterKind::Grouper { parent, tgtkey } => {
+            let current = matches!(
+                &*parent.state.borrow(),
+                LazyIterKind::GroupBy { currgrouper: Some(w), .. }
+                    if std::ptr::eq(w.as_ptr(), Rc::as_ptr(l))
+            );
+            vec![
+                Object::LazyIter(parent.clone()),
+                tgtkey.clone(),
+                Object::Bool(current),
+            ]
+        }
         LazyIterKind::Map { .. }
         | LazyIterKind::Filter { .. }
         | LazyIterKind::Zip { .. }

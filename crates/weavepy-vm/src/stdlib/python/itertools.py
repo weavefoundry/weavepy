@@ -1376,6 +1376,74 @@ class _grouper:
         return (iter, ((),))
 
 
+if _HAVE_NATIVE and hasattr(_n, "groupby_core"):
+    # Native cores: the exact classes build them directly (an exact
+    # `groupby`'s groups are native `_grouper`s), and these classes serve
+    # subclasses, explicit `_grouper(...)` construction, and pickling.
+    class groupby:
+        """groupby(iterable, key=None) -> make an iterator that returns
+        consecutive keys and groups from the iterable.
+        """
+
+        def __new__(cls, iterable=_NULL, key=None, *rest):
+            if rest:
+                raise TypeError(
+                    f"groupby() takes at most 2 arguments ({2 + len(rest)} given)"
+                )
+            if iterable is _NULL:
+                raise TypeError("groupby() missing required argument 'iterable' (pos 1)")
+            self = object.__new__(cls)
+            self._core = _n.groupby_core(iter(iterable), key, _grouper)
+            return self
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._core)
+
+        def __reduce__(self):
+            _pickle_deprecated()
+            it, keyfunc, tgtkey, currkey, currvalue = _core_state(self._core)
+            if tgtkey and currkey and currvalue:
+                return (
+                    type(self),
+                    (it, keyfunc),
+                    (currkey[0], currvalue[0], tgtkey[0]),
+                )
+            return (type(self), (it, keyfunc))
+
+        def __setstate__(self, state):
+            _pickle_deprecated()
+            if not (isinstance(state, tuple) and len(state) == 3):
+                raise TypeError("state is not a 3-tuple")
+            currkey, currvalue, tgtkey = state
+            _n.groupby_setstate(self._core, currkey, currvalue, tgtkey)
+
+    class _grouper:
+
+        def __new__(cls, parent, tgtkey):
+            if not isinstance(parent, groupby):
+                raise TypeError("incorrect usage of internal _grouper")
+            self = object.__new__(cls)
+            self._core = _n.grouper_core(parent._core, tgtkey)
+            return self
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._core)
+
+        def __reduce__(self):
+            _pickle_deprecated()
+            parent, tgtkey, current = _core_state(self._core)
+            if current:
+                return (type(self), (parent, tgtkey))
+            return (iter, ((),))
+
+
+
 # ---------------------------------------------------------------------------
 # islice
 # ---------------------------------------------------------------------------

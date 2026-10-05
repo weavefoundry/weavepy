@@ -34436,6 +34436,9 @@ impl Interpreter {
         if let Some(r) = crate::seqiter::machine_step(&mut l.state.borrow_mut()) {
             return Ok(r);
         }
+        if let Some(r) = self.groupby_lazy_next(l, globals) {
+            return r;
+        }
         // Reentrant kinds: copy the state out so no borrow is held while
         // we re-enter the interpreter (the source may observe this
         // object), then write the advanced cursor back before returning.
@@ -34621,7 +34624,9 @@ impl Interpreter {
             | LazyIterKind::Map { .. }
             | LazyIterKind::Filter { .. }
             | LazyIterKind::Zip { .. }
-            | LazyIterKind::Enumerate { .. } => unreachable!("handled above"),
+            | LazyIterKind::Enumerate { .. }
+            | LazyIterKind::GroupBy { .. }
+            | LazyIterKind::Grouper { .. } => unreachable!("handled above"),
         };
         match snap {
             Snap::Count { current, step } => {

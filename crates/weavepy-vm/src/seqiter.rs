@@ -1476,3 +1476,186 @@ impl Interpreter {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// `itertools.groupby` and its groupers (CPython's `groupby_next`,
+// `groupby_step`, and `_grouper_next`). No borrow of an adapter's state
+// survives a call into the key function or a key comparison: both may
+// re-enter the groupby (gh-143543, gh-146613).
+// ---------------------------------------------------------------------------
+
+/// Whether `obj` is `l` (`currgrouper is self`).
+fn is_current_grouper(parent: &PyLazyIter, g: &PyLazyIter) -> bool {
+    match &*parent.state.borrow() {
+        LazyIterKind::GroupBy {
+            currgrouper: Some(w),
+            ..
+        } => std::ptr::eq(w.as_ptr(), g),
+        _ => false,
+    }
+}
+
+impl Interpreter {
+    /// Step a `groupby` or one of its groupers: `None` when `l` is
+    /// another kind.
+    pub(crate) fn groupby_lazy_next(
+        &mut self,
+        l: &Rc<PyLazyIter>,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Option<Result<Option<Object>, RuntimeError>> {
+        let parent = match &*l.state.borrow() {
+            LazyIterKind::GroupBy { .. } => None,
+            LazyIterKind::Grouper { parent, tgtkey } => Some((parent.clone(), tgtkey.clone())),
+            _ => return None,
+        };
+        Some(match parent {
+            None => self.groupby_next(l, globals),
+            Some((parent, tgtkey)) => self.grouper_next(l, &parent, &tgtkey, globals),
+        })
+    }
+
+    /// `groupby_step`: pull the next value and its key, storing both only
+    /// once both are in hand. `Ok(false)` at the source's end.
+    fn groupby_step(
+        &mut self,
+        l: &PyLazyIter,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<bool, RuntimeError> {
+        let (source, keyfunc) = match &*l.state.borrow() {
+            LazyIterKind::GroupBy {
+                source, keyfunc, ..
+            } => (source.clone(), keyfunc.clone()),
+            _ => return Ok(false),
+        };
+        let Some(value) = self.iter_next(&source, globals)? else {
+            return Ok(false);
+        };
+        let key = match keyfunc {
+            Object::None => value.clone(),
+            f => self.seq_call1(&f, value.clone(), globals)?,
+        };
+        if let LazyIterKind::GroupBy {
+            currkey, currvalue, ..
+        } = &mut *l.state.borrow_mut()
+        {
+            let old = (currkey.replace(key), currvalue.replace(value));
+            drop(old);
+        }
+        Ok(true)
+    }
+
+    /// `tgtkey is currkey or tgtkey == currkey`.
+    fn group_keys_equal(&mut self, a: &Object, b: &Object) -> Result<bool, RuntimeError> {
+        if a.is_same(b) {
+            return Ok(true);
+        }
+        self.op_compare(a, b, weavepy_compiler::CompareKind::Eq)
+    }
+
+    fn groupby_next(
+        &mut self,
+        l: &Rc<PyLazyIter>,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<Object>, RuntimeError> {
+        if let LazyIterKind::GroupBy { currgrouper, .. } = &mut *l.state.borrow_mut() {
+            *currgrouper = None;
+        }
+        // Skip to the next group.
+        loop {
+            let keys = match &*l.state.borrow() {
+                LazyIterKind::GroupBy {
+                    currkey, tgtkey, ..
+                } => (currkey.clone(), tgtkey.clone()),
+                _ => return Ok(None),
+            };
+            match keys {
+                (None, _) => {}
+                (Some(_), None) => break,
+                (Some(curr), Some(tgt)) => {
+                    if !self.group_keys_equal(&tgt, &curr)? {
+                        break;
+                    }
+                }
+            }
+            if !self.groupby_step(l, globals)? {
+                return Ok(None);
+            }
+        }
+        let mut st = l.state.borrow_mut();
+        let LazyIterKind::GroupBy {
+            currkey: Some(key),
+            tgtkey,
+            currgrouper,
+            grouper_cls,
+            ..
+        } = &mut *st
+        else {
+            return Ok(None);
+        };
+        let key = key.clone();
+        let old = tgtkey.replace(key.clone());
+        let grouper = Rc::new(PyLazyIter {
+            state: RefCell::new(LazyIterKind::Grouper {
+                parent: l.clone(),
+                tgtkey: key.clone(),
+            }),
+            cls: grouper_cls.clone(),
+        });
+        *currgrouper = Some(Rc::downgrade(&grouper));
+        drop(st);
+        drop(old);
+        Ok(Some(Object::new_tuple_array([
+            key,
+            Object::LazyIter(grouper),
+        ])))
+    }
+
+    fn grouper_next(
+        &mut self,
+        g: &Rc<PyLazyIter>,
+        parent: &Rc<PyLazyIter>,
+        tgtkey: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<Object>, RuntimeError> {
+        if !is_current_grouper(parent, g) {
+            return Ok(None);
+        }
+        let need_step = matches!(
+            &*parent.state.borrow(),
+            LazyIterKind::GroupBy {
+                currvalue: None,
+                ..
+            }
+        );
+        if need_step && !self.groupby_step(parent, globals)? {
+            return Ok(None);
+        }
+        let curr = match &*parent.state.borrow() {
+            LazyIterKind::GroupBy {
+                currkey: Some(k), ..
+            } => k.clone(),
+            _ => return Ok(None),
+        };
+        if !self.group_keys_equal(tgtkey, &curr)? {
+            return Ok(None);
+        }
+        // The comparison may have re-entered and advanced the groupby.
+        if !is_current_grouper(parent, g) {
+            return Ok(None);
+        }
+        let mut st = parent.state.borrow_mut();
+        let LazyIterKind::GroupBy {
+            currkey, currvalue, ..
+        } = &mut *st
+        else {
+            return Ok(None);
+        };
+        let Some(value) = currvalue.take() else {
+            return Ok(None);
+        };
+        let old = currkey.take();
+        drop(st);
+        drop(old);
+        Ok(Some(value))
+    }
+}

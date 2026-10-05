@@ -8177,6 +8177,24 @@ impl PyLazyIter {
                 visit(source);
                 opt(count_big, visit);
             }
+            LazyIterKind::GroupBy {
+                source,
+                keyfunc,
+                tgtkey,
+                currkey,
+                currvalue,
+                ..
+            } => {
+                visit(source);
+                visit(keyfunc);
+                opt(tgtkey, visit);
+                opt(currkey, visit);
+                opt(currvalue, visit);
+            }
+            LazyIterKind::Grouper { parent, tgtkey } => {
+                visit(&Object::LazyIter(parent.clone()));
+                visit(tgtkey);
+            }
         }
     }
 
@@ -8211,6 +8229,8 @@ impl PyLazyIter {
             LazyIterKind::Combinations { .. } => "combinations",
             LazyIterKind::Cwr { .. } => "combinations_with_replacement",
             LazyIterKind::Batched { .. } => "batched",
+            LazyIterKind::GroupBy { .. } => "groupby",
+            LazyIterKind::Grouper { .. } => "_grouper",
         }
     }
 }
@@ -8378,6 +8398,24 @@ pub enum LazyIterKind {
         source: Object,
         count: i64,
         count_big: Option<Object>,
+    },
+    /// `itertools.groupby(source, key)`. `None` fields are CPython's
+    /// cleared (NULL) ones; `currgrouper` identifies the live group
+    /// (held weakly: a grouper holds its parent). `grouper_cls` is the
+    /// class new groupers report.
+    GroupBy {
+        source: Object,
+        keyfunc: Object,
+        tgtkey: Option<Object>,
+        currkey: Option<Object>,
+        currvalue: Option<Object>,
+        currgrouper: Option<crate::sync::Weak<PyLazyIter>>,
+        grouper_cls: Option<Rc<crate::types::TypeObject>>,
+    },
+    /// One group of a `groupby` (`itertools._grouper`).
+    Grouper {
+        parent: Rc<PyLazyIter>,
+        tgtkey: Object,
     },
 }
 
