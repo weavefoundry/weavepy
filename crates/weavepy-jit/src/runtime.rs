@@ -132,6 +132,18 @@ pub enum SlotTag {
 /// are tagged [`SlotTag::Default`].
 pub const CALL_GAPS: u32 = 1 << 31;
 
+/// Set in a [`crate::TOp::CallMethod`] token when a native method site's
+/// guard runs at the call instead of at its load: nothing between the
+/// two can run code (see `TOp::GuardMethod`), so the call helper checks
+/// the receiver itself and resolves a miss generically.
+pub const METHOD_GUARD_AT_CALL: u32 = 1 << 31;
+
+/// Set in a [`crate::TOp::CallMethod`] token when the site resolved a
+/// native leaf method: its helper never runs Python on this activation's
+/// behalf (any call that would leaves through a side exit, which writes
+/// the locals back itself), so the call skips the locals write-back.
+pub const METHOD_NATIVE: u32 = 1 << 30;
+
 impl SlotTag {
     /// Decode a raw tag written by native code.
     #[inline]
@@ -148,6 +160,116 @@ impl SlotTag {
             _ => SlotTag::Int,
         }
     }
+}
+
+/// Where the embedder keeps what a pinned instance's field read or write
+/// touches, so compiled code can do the common one in line: byte offsets
+/// (from the pointer named in each field's doc), the object tags, and the
+/// address of the flag that says borrow-free reads are off. The embedder
+/// measures and checks them; compiled code falls back to its helpers on
+/// anything else.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ObjLayout {
+    /// [`JitFrame::ctx`] → the pin table's buffer pointer and length.
+    pub ctx_pins_ptr: i32,
+    pub ctx_pins_len: i32,
+    /// A pin: its size, its discriminant byte and the object pin's value,
+    /// and where that object sits in it.
+    pub pin_size: i32,
+    pub pin_tag: i32,
+    pub pin_obj_tag: u8,
+    pub pin_obj: i32,
+    /// [`JitFrame::ctx`] → the attribute guards' shared pointer; that
+    /// pointer → the guard array.
+    pub ctx_guards: i32,
+    pub guards_buf: i32,
+    /// A guard: its size, its class version (`u64`), and the split-values
+    /// index its name sits at (`u32`, `u32::MAX` for none).
+    pub guard_size: i32,
+    pub guard_ver: i32,
+    pub guard_split_idx: i32,
+    /// Object tags (the first byte of a value); a word payload is at 8, a
+    /// `bool`'s at 1.
+    pub tag_instance: u8,
+    pub tag_int: u8,
+    pub tag_float: u8,
+    pub tag_bool: u8,
+    pub tag_none: u8,
+    /// A class value's tag (its payload pointer is the class pointer).
+    pub tag_type: u8,
+    /// An instance value's payload pointer → the instance's class pointer,
+    /// its published dict pointer (null while split), its split values'
+    /// borrow counter (`i32`) and block pointer (null while empty).
+    pub inst_class: i32,
+    pub inst_dict_lazy: i32,
+    pub inst_split_borrow: i32,
+    pub inst_split_block: i32,
+    /// A class pointer → its attribute version (`u64`) and its shared
+    /// names' pointer.
+    pub type_attr_version: i32,
+    pub type_shared_keys: i32,
+    /// A split block → its names' pointer, its length and capacity
+    /// (`u32`s) and its first value.
+    pub split_keys: i32,
+    pub split_len: i32,
+    pub split_cap: i32,
+    pub split_values: i32,
+    /// An instance value's payload pointer → its native body's pointer
+    /// (a word; zero for an ordinary instance).
+    pub inst_c_body: i32,
+    /// The byte that is nonzero once cells are shared between threads.
+    pub cells_unguarded: usize,
+    /// A list pin: its discriminant byte's value, where the list pointer
+    /// and the element lane (a [`crate::JitType`] byte) sit in it.
+    pub pin_list_tag: u8,
+    pub pin_list: i32,
+    pub pin_list_elem: i32,
+    /// A list pointer → its cell's borrow counter (`i32`), and its items'
+    /// buffer pointer, length and capacity.
+    pub list_borrow: i32,
+    pub list_ptr: i32,
+    pub list_len: i32,
+    pub list_cap: i32,
+    /// [`JitFrame::ctx`] → the method entries' shared pointer; that
+    /// pointer → the entry array and its length.
+    pub ctx_methods: i32,
+    pub methods_buf: i32,
+    pub methods_len: i32,
+    /// A method entry: its size, its class version (`u64`), and its
+    /// in-line field update: the field's split index (`u32`, `u32::MAX`
+    /// while unarmed), the most split values a receiver may hold without
+    /// shadowing the method (`u32`), whether the increment is the call's
+    /// argument (`u32`: `1`, else `0`), the literal increment (`i64`),
+    /// where the function keeps its code pointer and the code pointer that
+    /// must be there (words).
+    pub method_size: i32,
+    pub method_ver: i32,
+    pub method_upd_idx: i32,
+    pub method_upd_shadow: i32,
+    pub method_upd_from_arg: i32,
+    pub method_upd_inc: i32,
+    pub method_upd_code_at: i32,
+    pub method_upd_code: i32,
+    /// Words (or a byte, for `dict_watchers`) that are nonzero while a
+    /// call can't be skipped: an observer may be active, a dict watcher
+    /// is, or a class may hold an exotic key.
+    pub observers: usize,
+    pub dict_watchers: usize,
+    pub exotic_keys: usize,
+}
+
+static OBJ_LAYOUT: std::sync::OnceLock<ObjLayout> = std::sync::OnceLock::new();
+
+/// Publish the embedder's object layout (once; later calls are ignored).
+/// Frames compiled from then on read pinned instances' fields in line.
+pub fn set_obj_layout(layout: ObjLayout) {
+    let _ = OBJ_LAYOUT.set(layout);
+}
+
+/// The published object layout.
+#[must_use]
+pub(crate) fn obj_layout() -> Option<&'static ObjLayout> {
+    OBJ_LAYOUT.get()
 }
 
 /// The exchange buffer the VM passes to a compiled frame.
@@ -468,6 +590,21 @@ pub type StrLenHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64) -> 
 pub type BytesGetHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, idx: i64) -> i64;
 
 static STR_EQ_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static IS_OBJ_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide object identity helper ([`crate::ir::TOp::IsObj`]):
+/// `1` when the two object-lane values (pin indices, or `-1` for `None`)
+/// name the same object, `0` when not, anything above `1` to deopt (a
+/// pin miss). Never runs Python code. Shares the [`StrEqHelper`] shape.
+/// Must precede the first compile of a frame containing `IsObj`.
+pub fn register_is_obj_helper(f: StrEqHelper) {
+    IS_OBJ_HELPER.store(f as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn is_obj_helper_addr() -> usize {
+    IS_OBJ_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
 static STR_LEN_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static BYTES_LEN_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static BYTES_GET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1039,6 +1176,57 @@ pub(crate) fn call_method_helper_addr() -> usize {
     CALL_METHOD_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// The native method-site load guard (see [`crate::TOp::GuardMethod`]):
+/// `0` when the receiver pin still matches the site's burned
+/// resolution, anything else to deopt at the load.
+pub type GuardMethodHelper =
+    unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, token: i64) -> i64;
+
+static GUARD_METHOD_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide native method-site load guard. Must precede
+/// the first compile of a frame containing `GuardMethod` ops.
+pub fn register_guard_method_helper(helper: GuardMethodHelper) {
+    GUARD_METHOD_HELPER.store(helper as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn guard_method_helper_addr() -> usize {
+    GUARD_METHOD_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static CALL_NATIVE_METHOD_HELPER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide native method-call helper: the
+/// [`CallMethodHelper`] for a [`crate::TOp::CallMethod`] whose token
+/// carries [`METHOD_NATIVE`]. Must precede the first compile of a frame
+/// containing such a call.
+pub fn register_call_native_method_helper(helper: CallMethodHelper) {
+    CALL_NATIVE_METHOD_HELPER.store(helper as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn call_native_method_helper_addr() -> usize {
+    CALL_NATIVE_METHOD_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static OBJ_GETITEM_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide native-subscript helper (see
+/// [`crate::TOp::ObjGetItem`]). Shares [`CallMethodHelper`]'s shape: the
+/// `token` names the burned `__getitem__` resolution and the index rides
+/// the marshal buffer as the one argument. Must precede the first
+/// compile of a frame containing `ObjGetItem` ops.
+pub fn register_obj_getitem_helper(helper: CallMethodHelper) {
+    OBJ_GETITEM_HELPER.store(helper as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn obj_getitem_helper_addr() -> usize {
+    OBJ_GETITEM_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
 static STR_METHOD_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Register the process-wide native `str`-method helper (RFC 0073
@@ -1298,6 +1486,36 @@ pub fn register_global_obj_helper(f: StrLenHelper) {
 #[must_use]
 pub(crate) fn global_obj_helper_addr() -> usize {
     GLOBAL_OBJ_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The obj-global helper's argument for `token` on `lane`: a pinned-list
+/// lane's element lane rides the high word (`1` int, `2` float, `3`
+/// object, `4` float list), so the helper pins the list as a list.
+#[must_use]
+pub(crate) fn global_obj_list_code(token: u32, lane: crate::JitType) -> i64 {
+    use crate::JitType;
+    let elem = match lane.elem_lane() {
+        Some(JitType::Int) => 1,
+        Some(JitType::Float) => 2,
+        Some(JitType::Obj) => 3,
+        Some(JitType::ListFloat) => 4,
+        _ => 0,
+    };
+    i64::from(token) | (elem << 32)
+}
+
+/// Inverse of [`global_obj_list_code`]: the element lane a list-lane
+/// global pins with, `None` for an object pin.
+#[must_use]
+pub fn global_obj_list_elem(code: i64) -> Option<crate::JitType> {
+    use crate::JitType;
+    match code >> 32 {
+        1 => Some(JitType::Int),
+        2 => Some(JitType::Float),
+        3 => Some(JitType::Obj),
+        4 => Some(JitType::ListFloat),
+        _ => None,
+    }
 }
 
 static ITER_NEW_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

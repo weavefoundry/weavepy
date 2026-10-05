@@ -145,11 +145,10 @@ pub fn ensure_active<R>(body: impl FnOnce() -> R) -> R {
     // RFC 0047 (wave 5): mark a C-extension call live on this thread for
     // the duration of `body`. Every bridged C invocation (dunder shims,
     // `PyCFunction`s, descriptors, tp_call, foreign hooks) funnels through
-    // here, so the VM's prompt reaper can tell "plain bytecode, no
-    // extension frame below" (`depth == 0` — reclaiming a dead escaped
-    // subgraph is as safe as CPython's own `tp_dealloc`) from "inside a C
-    // call that may hold borrowed body pointers" (`depth > 0` — defer
-    // memory reclamation to the tracing collector).
+    // here, so the VM can tell "plain bytecode, no extension frame below"
+    // (`depth == 0` — releasing objects C dropped is as safe as CPython's
+    // own `tp_dealloc`) from "inside a C call that may hold borrowed body
+    // pointers" (`depth > 0` — keep them parked).
     let _cext_guard = weavepy_vm::vm_singletons::enter_cext_call();
     if current_interpreter_mut().is_some() {
         if ea_trace_enabled() {

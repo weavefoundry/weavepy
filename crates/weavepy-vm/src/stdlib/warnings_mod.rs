@@ -614,16 +614,8 @@ fn call_show_warning(
     )?;
     let shown = ip.call_object_with_globals(&show_fn, &[msg.clone()], &[], &globals);
     // CPython decrefs the transient `WarningMessage` the moment
-    // `_showwarnmsg` returns; when the hook did not retain it (the stock
-    // stderr writer), the message — and, through `source=`, the very
-    // object whose finalizer emitted the warning — dies right here. A
-    // plain Rust drop would leave the tracked message pinned by its own
-    // GC handle until the next cyclic collection, keeping e.g. an
-    // unclosed `SpooledTemporaryFile`'s buffered fd alive across tests
-    // (test_tempfile.test_warnings_on_cleanup). The refcount guard
-    // inside leaves a *recorded* message (a `catch_warnings(record=True)`
-    // log holds it) untouched.
-    ip.maybe_prompt_reap_replaced(msg);
+    // `_showwarnmsg` returns: unless the hook kept it, it dies here.
+    drop(msg);
     shown?;
     Ok(())
 }

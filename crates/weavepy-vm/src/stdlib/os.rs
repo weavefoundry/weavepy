@@ -7497,7 +7497,7 @@ fn struct_seq_replace(
     let obj = Object::Instance(Rc::new(new_inst));
     // CPython allocates the copy through the GC heap, so it is tracked from
     // birth (test_structseq.test_replace_gc_tracked builds a cycle out of it).
-    crate::gc_trace::track(obj.clone());
+    crate::gc_trace::track(&obj);
     Ok(obj)
 }
 

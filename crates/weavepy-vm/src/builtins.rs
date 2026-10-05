@@ -2662,7 +2662,7 @@ fn slot_sizeof(args: &[Object]) -> Result<Object, RuntimeError> {
         // is 56 bytes + (len+1) units of the kind width (1 for latin-1,
         // 2 for BMP, 4 beyond).
         Object::Str(s) => {
-            let len = str_char_len(s) as i64;
+            let len = crate::object::str_char_len(s) as i64;
             let max_cp = s.chars().map(u32::from).max().unwrap_or(0);
             match max_cp {
                 0..=0x7f => 40 + len + 1,
@@ -4681,7 +4681,7 @@ fn install_wire_code(nc: &mut weavepy_compiler::CodeObject, bytes: Vec<u8>) {
             // instruction count; line info defaults to the first line.
             let first = nc.linetable.iter().copied().find(|l| *l > 0).unwrap_or(1);
             nc.linetable = vec![first; instructions.len()];
-            nc.coltable = Vec::new();
+            nc.coltable = Vec::new().into();
             nc.caches = weavepy_compiler::CacheTable::with_len(instructions.len());
             nc.instructions = instructions;
             nc.exception_table = Vec::new();
@@ -4869,7 +4869,7 @@ pub(crate) fn code_type_call(
             nc.caches = weavepy_compiler::CacheTable::with_len(decoded.instructions.len());
             nc.instructions = decoded.instructions;
             nc.linetable = decoded.linetable;
-            nc.coltable = decoded.coltable;
+            nc.coltable = decoded.coltable.into();
             nc.exception_table = decoded.exception_table;
             nc.no_interrupt_jumps = decoded.no_interrupt_jumps;
         }
@@ -5272,7 +5272,7 @@ fn attr_delete(obj: &Object, name: &str) -> Result<(), RuntimeError> {
         }
         Object::Function(f) => {
             if crate::object::is_function_slot(name) {
-                f.slots
+                f.slots()
                     .borrow_mut()
                     .shift_remove(&crate::object::DictKey(Object::from_str(name)));
             } else {
@@ -7013,7 +7013,7 @@ fn b_list(args: &[Object]) -> Result<Object, RuntimeError> {
     let obj = Object::new_list(out);
     // CPython tracks every list; keep `list(...)` consistent with the
     // `[]` literal path so `gc.is_tracked` and cycle collection agree.
-    crate::gc_trace::track(obj.clone());
+    crate::gc_trace::track(&obj);
     // tracemalloc parity with the `[]` literal path
     // (`test_tracemalloc.test_reset_peak` builds `list(range(100000))`
     // and expects the peak to reflect it).
@@ -7047,7 +7047,7 @@ fn b_tuple(args: &[Object]) -> Result<Object, RuntimeError> {
 fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
         let obj = Object::new_dict();
-        crate::gc_trace::track(obj.clone());
+        crate::gc_trace::track(&obj);
         return Ok(obj);
     }
     if args.len() > 1 {
@@ -7063,7 +7063,7 @@ fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
         // Clone the stored table so copying never rehashes user keys.
         let d = src.borrow().clone();
         let obj = Object::Dict(Rc::new(RefCell::new(d)));
-        crate::gc_trace::track(obj.clone());
+        crate::gc_trace::track(&obj);
         return Ok(obj);
     }
     // Mapping path for user-defined classes (`__keys__` style) is
@@ -7117,7 +7117,7 @@ fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
         i += 1;
     }
     let obj = Object::Dict(Rc::new(RefCell::new(d)));
-    crate::gc_trace::track(obj.clone());
+    crate::gc_trace::track(&obj);
     Ok(obj)
 }
 
@@ -7139,6 +7139,8 @@ fn b_set(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let out = if args.is_empty() {
         crate::object::SetData::default()
+    } else if let Some(out) = simple_key_set(&args[0]) {
+        out
     } else {
         // `set([[]])` raises `TypeError: unhashable type: 'list'` — check
         // each element as it is admitted, like CPython's `set_init`. A
@@ -7154,8 +7156,39 @@ fn b_set(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let obj = Object::Set(Rc::new(RefCell::new(out)));
     // CPython tracks every set (`gc.is_tracked(set())` is True).
-    crate::gc_trace::track(obj.clone());
+    crate::gc_trace::track(&obj);
     Ok(obj)
+}
+
+/// The set of a list's or tuple's items when every item is an `int`,
+/// `str`, `float`, `bool` or `None` (whose hashing and comparison run no
+/// Python and can't fail): sized once and filled without the per-insert
+/// error scope. `None` leaves the general path to it.
+fn simple_key_set(src: &Object) -> Option<crate::object::SetData> {
+    fn build(items: &[Object]) -> Option<crate::object::SetData> {
+        let simple = |v: &Object| {
+            matches!(
+                v,
+                Object::Int(_) | Object::Str(_) | Object::Float(_) | Object::Bool(_) | Object::None
+            )
+        };
+        if !items.iter().all(simple) {
+            return None;
+        }
+        let mut out = crate::object::SetData::with_capacity_and_hasher(
+            items.len(),
+            crate::fasthash::FxBuildHasher,
+        );
+        for v in items {
+            out.insert(DictKey(v.clone()));
+        }
+        Some(out)
+    }
+    match src {
+        Object::List(l) => build(&l.try_borrow().ok()?),
+        Object::Tuple(t) => build(t),
+        _ => None,
+    }
 }
 
 fn b_frozenset(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8243,7 +8276,7 @@ fn b_sorted(args: &[Object]) -> Result<Object, RuntimeError> {
         crate::compare_op(a, b, weavepy_compiler::CompareKind::Lt)
     })?;
     let obj = Object::new_list(buf);
-    crate::gc_trace::track(obj.clone());
+    crate::gc_trace::track(&obj);
     Ok(obj)
 }
 
@@ -10424,7 +10457,8 @@ fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
         // Shared, not copied: `func.__dict__` mutations stay visible on
         // both, matching CPython where the function object is the same.
         attrs: RefCell::new(Some(f.attrs())),
-        slots: RefCell::new(f.slots.borrow().clone()),
+        slots_raw: RefCell::new(f.slots().borrow().clone()),
+        slot_seed: RefCell::new(None),
         closure_cells: std::sync::OnceLock::new(),
         // The copied slot store carries any override along.
         defaults_override: crate::object::OverrideFlag::new(f.defaults_maybe_overridden()),
@@ -10777,14 +10811,41 @@ fn str_arity(name: &str, args: &[Object], min: usize, max: usize) -> Result<(), 
     Ok(())
 }
 
+/// An ASCII `str` receiver's case mapping, written straight into the
+/// result, which is ASCII too and born knowing its count; `None` for any
+/// other receiver.
+fn ascii_case_result(args: &[Object], case: crate::unicode_case::AsciiCase) -> Option<Object> {
+    let Some(Object::Str(s)) = args.first() else {
+        return None;
+    };
+    if !SharedStr::is_ascii(s) {
+        return None;
+    }
+    // SAFETY: an ASCII case mapping of ASCII text is ASCII of the same
+    // length, all of it written (see `ascii_case_into`).
+    Some(Object::Str(unsafe {
+        SharedStr::build_unchecked(s.len(), Some(s.len()), |out| {
+            out.push_with(s.len(), |buf| {
+                crate::unicode_case::ascii_case_into(case, s.as_bytes(), buf);
+            });
+        })
+    }))
+}
+
 fn str_upper(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("upper", args, 0, 0)?;
+    if let Some(out) = ascii_case_result(args, crate::unicode_case::AsciiCase::Upper) {
+        return Ok(out);
+    }
     let up = crate::unicode_case::upper(&str_self(args)?);
     Ok(str_result(args, up))
 }
 
 fn str_lower(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("lower", args, 0, 0)?;
+    if let Some(out) = ascii_case_result(args, crate::unicode_case::AsciiCase::Lower) {
+        return Ok(out);
+    }
     let lo = crate::unicode_case::lower(&str_self(args)?);
     Ok(str_result(args, lo))
 }
@@ -10794,6 +10855,9 @@ fn str_lower(args: &[Object]) -> Result<Object, RuntimeError> {
 /// and folding is context-free (no Greek final-sigma special-casing).
 fn str_casefold(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("casefold", args, 0, 0)?;
+    if let Some(out) = ascii_case_result(args, crate::unicode_case::AsciiCase::Lower) {
+        return Ok(out);
+    }
     let out = crate::unicode_case::casefold(&str_self(args)?);
     Ok(str_result(args, out))
 }
@@ -10850,33 +10914,38 @@ fn ascii_space_table() -> &'static [bool; 128] {
     TABLE.get_or_init(|| std::array::from_fn(|i| crate::unicode_case::is_space(i as u8 as char)))
 }
 
-fn str_split_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
+fn str_split_whitespace(s: &str, ascii: bool, maxsplit: i64) -> Vec<Object> {
     use crate::unicode_case::is_space;
-    // Presized: `collect()` over a filtered split carries no size hint,
-    // so the vector grew several times for a sentence-length string.
-    let mut out = Vec::with_capacity((s.len() / 8).min(64) + 1);
+    // Presized: `collect()` over a filtered split carries no size hint.
+    // English prose averages under five letters a word, so a quarter of
+    // the length covers a sentence without growing (each growth copies).
+    let mut out = Vec::with_capacity((s.len() / 4).min(256) + 1);
     let limit = if maxsplit < 0 { i64::MAX } else { maxsplit };
     let mut splits = 0i64;
-    if str_is_ascii_cached(s) {
+    if ascii {
+        // Fields of ASCII text are ASCII: each is born knowing its count.
         let table = ascii_space_table();
+        // Every ASCII space is at most `' '`, so most bytes are settled
+        // by one comparison.
+        let is_space = |c: u8| c <= b' ' && table[usize::from(c)];
         let b = s.as_bytes();
         let mut i = 0;
         loop {
-            while i < b.len() && table[b[i] as usize] {
+            while i < b.len() && is_space(b[i]) {
                 i += 1;
             }
             if i == b.len() {
                 break;
             }
             if splits >= limit {
-                out.push(Object::Str(SharedStr::from(&s[i..])));
+                out.push(Object::Str(SharedStr::from_ascii(&s[i..])));
                 break;
             }
             let start = i;
-            while i < b.len() && !table[b[i] as usize] {
+            while i < b.len() && !is_space(b[i]) {
                 i += 1;
             }
-            out.push(Object::Str(SharedStr::from(&s[start..i])));
+            out.push(Object::Str(SharedStr::from_ascii(&s[start..i])));
             splits += 1;
         }
         return out;
@@ -10903,8 +10972,14 @@ fn str_split_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
 /// initial elements are all strings. Register them before returning
 /// through either the interpreter or a native string helper.
 fn new_str_split_list(items: Vec<Object>) -> Object {
+    // Plain `str` fields can't close a cycle yet, however many there are.
+    let inert = items.iter().all(|o| matches!(o, Object::Str(_)));
     let result = Object::new_list(items);
-    crate::gc_trace::track(result.clone());
+    if inert {
+        crate::gc_trace::with_state(|s| s.track_inert(&result));
+    } else {
+        crate::gc_trace::track(&result);
+    }
     result
 }
 
@@ -10928,26 +11003,55 @@ fn str_split(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
             out
         }
     };
-    let out: Vec<Object> = match sep {
-        None | Some(Object::None) => str_split_whitespace(&s, maxsplit),
+    let (_, ascii) = recv_char_len(args, &s);
+    let mut out: Vec<Object> = match sep {
+        None | Some(Object::None) => str_split_whitespace(&s, ascii, maxsplit),
         Some(sep_obj) => {
             let sep = str_arg_bridged(sep_obj)
                 .ok_or_else(|| type_error("must be str or None, not other"))?;
             if sep.is_empty() {
                 return Err(value_error("empty separator"));
             }
-            if maxsplit < 0 {
-                s.split(&*sep)
-                    .map(|s| Object::Str(SharedStr::from(s)))
-                    .collect()
-            } else {
-                s.splitn((maxsplit as usize).saturating_add(1), &*sep)
-                    .map(|s| Object::Str(SharedStr::from(s)))
-                    .collect()
-            }
+            str_split_sep(&s, ascii, &sep, maxsplit)
         }
     };
+    // CPython returns an exact `str` that needed no splitting as the
+    // list's one item itself, not a copy.
+    if let ([Object::Str(only)], Some(recv @ Object::Str(_))) = (&out[..], args.first()) {
+        if only.len() == s.len() {
+            out[0] = recv.clone();
+        }
+    }
     Ok(new_str_split_list(wrap(out)))
+}
+
+/// `s.split(sep, maxsplit)` for a non-empty separator. A one-byte
+/// separator scans with `memchr` rather than `str::split`'s searcher,
+/// whose setup costs more than splitting a short line; fields of ASCII
+/// text are born knowing their counts.
+fn str_split_sep(s: &str, ascii: bool, sep: &str, maxsplit: i64) -> Vec<Object> {
+    let piece = |text: &str| {
+        Object::Str(if ascii {
+            SharedStr::from_ascii(text)
+        } else {
+            SharedStr::from(text)
+        })
+    };
+    let limit = usize::try_from(maxsplit).unwrap_or(usize::MAX);
+    if let [byte] = *sep.as_bytes() {
+        let mut out = Vec::new();
+        let mut start = 0;
+        for at in memchr::memchr_iter(byte, s.as_bytes()) {
+            if out.len() == limit {
+                break;
+            }
+            out.push(piece(&s[start..at]));
+            start = at + 1;
+        }
+        out.push(piece(&s[start..]));
+        return out;
+    }
+    s.splitn(limit.saturating_add(1), sep).map(piece).collect()
 }
 
 fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -10960,10 +11064,10 @@ fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
     // Exact built-in sequences of exact strings need no iteration hooks,
     // reference clones, or intermediate copies. Hold a list's read guard
     // across both passes so concurrent mutation cannot change its size.
-    if matches!(args.first(), Some(Object::Str(_))) {
+    if let Some(Object::Str(sep)) = args.first() {
         let joined = match &args[1] {
-            Object::List(items) => join_exact_strings(&items.borrow(), &sep),
-            Object::Tuple(items) => join_exact_strings(items, &sep),
+            Object::List(items) => join_exact_strings(&items.borrow(), sep),
+            Object::Tuple(items) => join_exact_strings(items, sep),
             _ => None,
         };
         if let Some(joined) = joined {
@@ -11017,27 +11121,50 @@ fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 /// Return `None` for shapes that need the general Unicode/iterator path.
-fn join_exact_strings(items: &[Object], sep: &str) -> Option<Object> {
-    let mut size = sep.len().checked_mul(items.len().saturating_sub(1))?;
+/// The result is written straight into its final allocation, and knows its
+/// code-point count when every part (and the separator) already does.
+fn join_exact_strings(items: &[Object], sep: &SharedStr) -> Option<Object> {
+    let gaps = items.len().saturating_sub(1);
+    let mut size = sep.len().checked_mul(gaps)?;
+    // The separator is usually a constant: counting it once memoises it.
+    let mut chars = SharedStr::char_count(sep).checked_mul(gaps);
     for item in items {
         let Object::Str(s) = item else {
             return None;
         };
         size = size.checked_add(s.len())?;
+        chars = chars.and_then(|n| Some(n + SharedStr::known_char_count(s)?));
     }
     if items.len() == 1 {
         return Some(items[0].clone());
     }
-    let mut joined = String::with_capacity(size);
-    for (i, item) in items.iter().enumerate() {
-        if i != 0 {
-            joined.push_str(sep);
+    let fill = |out: &mut crate::shared_value::TextWriter<'_>| {
+        let mut items = items.iter().filter_map(|item| match item {
+            Object::Str(s) => Some(s.as_bytes()),
+            _ => None,
+        });
+        if let Some(first) = items.next() {
+            out.push(first);
         }
-        if let Object::Str(s) = item {
-            joined.push_str(s);
+        // The usual one-byte separator (`" "`, `","`) is stored directly.
+        if let [byte] = *sep.as_bytes() {
+            for item in items {
+                out.push_byte(byte);
+                out.push(item);
+            }
+        } else {
+            for item in items {
+                out.push(sep.as_bytes());
+                out.push(item);
+            }
         }
-    }
-    Some(Object::from_str(joined))
+    };
+    // SAFETY: a concatenation of `str`s is UTF-8, `size` bytes long (the
+    // caller holds the list's guard, so its items cannot change), and
+    // `chars` sums their counts.
+    Some(Object::Str(unsafe {
+        SharedStr::build_unchecked(size, chars, fill)
+    }))
 }
 
 fn str_startswith(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -11182,6 +11309,94 @@ fn str_match_prefix_suffix(
     }
 }
 
+/// `recv.replace(from, to, limit)` for an exact `str` receiver and a
+/// non-empty `from`: one scan records the matches, so the result is
+/// written straight into an allocation of its exact size, and a receiver
+/// with no match is returned itself (CPython's `unicode_result_unchanged`).
+/// `None` when the result's size overflows, for the general path to
+/// report.
+fn str_replace_exact(recv: &SharedStr, from: &str, to: &str, limit: usize) -> Option<Object> {
+    /// Match offsets, on the stack for the usual handful.
+    struct Hits {
+        inline: [usize; 32],
+        len: usize,
+        spill: Vec<usize>,
+    }
+    impl Hits {
+        fn push(&mut self, at: usize) {
+            if self.len < self.inline.len() {
+                self.inline[self.len] = at;
+            } else {
+                if self.spill.is_empty() {
+                    self.spill.extend_from_slice(&self.inline);
+                }
+                self.spill.push(at);
+            }
+            self.len += 1;
+        }
+        fn as_slice(&self) -> &[usize] {
+            if self.len <= self.inline.len() {
+                &self.inline[..self.len]
+            } else {
+                &self.spill
+            }
+        }
+    }
+    let (h, n) = (recv.as_bytes(), from.as_bytes());
+    let mut hits = Hits {
+        inline: [0; 32],
+        len: 0,
+        spill: Vec::new(),
+    };
+    if n.len() <= 16 && n[0].is_ascii() {
+        // A short needle that starts with an ASCII byte (never inside a
+        // multibyte character, so every hit is a boundary) is found by a
+        // `memchr` scan for that byte; comparing at most 16 bytes per
+        // candidate keeps it linear.
+        if let Some(last_start) = h.len().checked_sub(n.len()) {
+            let mut i = 0;
+            while i <= last_start && hits.len < limit {
+                let Some(off) = memchr::memchr(n[0], &h[i..=last_start]) else {
+                    break;
+                };
+                let at = i + off;
+                if short_bytes_eq(&h[at + 1..at + n.len()], &n[1..]) {
+                    hits.push(at);
+                    i = at + n.len();
+                } else {
+                    i = at + 1;
+                }
+            }
+        }
+    } else {
+        for (at, _) in recv.match_indices(from).take(limit) {
+            hits.push(at);
+        }
+    }
+    let hits = hits.as_slice();
+    if hits.is_empty() {
+        return Some(Object::Str(recv.clone()));
+    }
+    let size = (h.len() - hits.len() * n.len()).checked_add(hits.len().checked_mul(to.len())?)?;
+    // ASCII text with ASCII replacements stays ASCII.
+    let chars = (SharedStr::is_ascii(recv) && to.is_ascii()).then_some(size);
+    let fill = |out: &mut crate::shared_value::TextWriter<'_>| {
+        let mut copied = 0;
+        for &at in hits {
+            out.push(&h[copied..at]);
+            out.push(to.as_bytes());
+            copied = at + n.len();
+        }
+        out.push(&h[copied..]);
+    };
+    // SAFETY: the result splices whole `str`s at character boundaries
+    // (every match is one), `size` bytes in all; `chars` is given only
+    // when every byte is ASCII.
+    Some(Object::Str(unsafe {
+        SharedStr::build_unchecked(size, chars, fill)
+    }))
+}
+
 fn str_replace_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
     let positional = args.len().saturating_sub(1);
@@ -11255,10 +11470,16 @@ fn str_replace_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
             out.push_str(to);
         }
         out
+    } else if let (Some(Object::Str(recv)), false) = (
+        args.first(),
+        args.iter().any(|o| matches!(o, Object::WStr(_))),
+    ) {
+        let limit = usize::try_from(count).unwrap_or(usize::MAX);
+        if let Some(out) = str_replace_exact(recv, from, to, limit) {
+            return Ok(out);
+        }
+        s.replacen(from, to, limit)
     } else if count < 0 {
-        // Not `substr_find`'s loop: `replace` scans the whole haystack,
-        // where the two-way searcher's one-off preprocessing amortizes
-        // and beats a memchr candidate scan (measured: 3385 -> 3631).
         s.replace(from, to)
     } else {
         s.replacen(from, to, count as usize)
@@ -11454,15 +11675,10 @@ fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(p) => p,
         None => return Err(type_error("find() expected str")),
     };
-    // One ASCII probe for the whole call: each of the char/byte
-    // conversions below consults the same thread-local cache, and the
-    // TLS access costs more than the work it guards.
-    let ascii = str_is_ascii_cached(s);
-    let total_chars = if ascii {
-        s.len() as i64
-    } else {
-        str_char_len(s) as i64
-    };
+    // One ASCII probe for the whole call, O(1) from the receiver's
+    // memoised count.
+    let (total_chars, ascii) = recv_char_len(args, s);
+    let total_chars = total_chars as i64;
     let Some((start, end)) = str_search_window(args, total_chars) else {
         return Ok(Object::Int(-1));
     };
@@ -11488,6 +11704,17 @@ fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// The method receiver's length in code points, and whether it is pure
+/// ASCII (one byte per code point): O(1) from a `str`'s memoised count, a
+/// scan of the bridged text for a `WStr`.
+fn recv_char_len(args: &[Object], s: &str) -> (usize, bool) {
+    let n = match args.first() {
+        Some(Object::Str(recv)) => SharedStr::char_count(recv),
+        _ => s.chars().count(),
+    };
+    (n, n == s.len())
+}
+
 /// Whether `s` is pure ASCII, memoized by buffer identity. CPython's PEP 393
 /// layout makes char↔byte offset mapping O(1); our UTF-8 `SharedStr` needs a
 /// scan. Callers like `str.find(sub, start)`-in-a-loop (email's
@@ -11511,15 +11738,6 @@ pub(crate) fn str_is_ascii_cached(s: &str) -> bool {
     })
 }
 
-/// Total `len()` in code points, O(1) for (cached-)ASCII strings.
-pub(crate) fn str_char_len(s: &str) -> usize {
-    if str_is_ascii_cached(s) {
-        s.len()
-    } else {
-        s.chars().count()
-    }
-}
-
 fn char_offset_to_byte(s: &str, n: usize) -> usize {
     if n == 0 {
         return 0;
@@ -11539,18 +11757,27 @@ fn byte_offset_to_char(s: &str, byte: usize) -> usize {
 
 fn str_title(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("title", args, 0, 0)?;
+    if let Some(out) = ascii_case_result(args, crate::unicode_case::AsciiCase::Title) {
+        return Ok(out);
+    }
     let out = crate::unicode_case::title(&str_self(args)?);
     Ok(str_result(args, out))
 }
 
 fn str_capitalize(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("capitalize", args, 0, 0)?;
+    if let Some(out) = ascii_case_result(args, crate::unicode_case::AsciiCase::Capitalize) {
+        return Ok(out);
+    }
     let out = crate::unicode_case::capitalize(&str_self(args)?);
     Ok(str_result(args, out))
 }
 
 fn str_swapcase(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("swapcase", args, 0, 0)?;
+    if let Some(out) = ascii_case_result(args, crate::unicode_case::AsciiCase::Swap) {
+        return Ok(out);
+    }
     let out = crate::unicode_case::swapcase(&str_self(args)?);
     Ok(str_result(args, out))
 }
@@ -11733,17 +11960,27 @@ fn str_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(p) => p,
         None => return Err(type_error("rfind() expected str")),
     };
-    let total_chars = str_char_len(s) as i64;
-    let Some((start, end)) = str_search_window(args, total_chars) else {
+    let (total_chars, ascii) = recv_char_len(args, s);
+    let Some((start, end)) = str_search_window(args, total_chars as i64) else {
         return Ok(Object::Int(-1));
     };
-    let start_byte = char_offset_to_byte(s, start as usize);
-    let end_byte = char_offset_to_byte(s, end as usize);
+    let (start_byte, end_byte) = if ascii {
+        ((start as usize).min(s.len()), (end as usize).min(s.len()))
+    } else {
+        (
+            char_offset_to_byte(s, start as usize),
+            char_offset_to_byte(s, end as usize),
+        )
+    };
     let hay = &s[start_byte..end_byte];
     match substr_rfind(hay, &sub) {
         Some(byte_idx) => {
             let abs_byte = byte_idx + start_byte;
-            Ok(Object::Int(byte_offset_to_char(s, abs_byte) as i64))
+            Ok(Object::Int(if ascii {
+                abs_byte as i64
+            } else {
+                byte_offset_to_char(s, abs_byte) as i64
+            }))
         }
         None => Ok(Object::Int(-1)),
     }
@@ -11779,12 +12016,8 @@ fn str_count(args: &[Object]) -> Result<Object, RuntimeError> {
         None => return Err(type_error("count() expected str")),
     };
     // One ASCII probe for the whole call, as `str.find` does.
-    let ascii = str_is_ascii_cached(s);
-    let total_chars = if ascii {
-        s.len() as i64
-    } else {
-        str_char_len(s) as i64
-    };
+    let (total_chars, ascii) = recv_char_len(args, s);
+    let total_chars = total_chars as i64;
     let Some((start, end)) = str_search_window(args, total_chars) else {
         return Ok(Object::Int(0));
     };
@@ -12470,7 +12703,7 @@ fn list_setitem(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         let replaced = crate::apply_slice_assignment(&mut l.borrow_mut(), s, replacement)?;
         for old in replaced {
-            queue_removed(old);
+            drop(old);
         }
         return Ok(Object::None);
     }
@@ -12479,7 +12712,7 @@ fn list_setitem(args: &[Object]) -> Result<Object, RuntimeError> {
         let n = list_index_arg(l.len(), key, "__setitem__")?;
         std::mem::replace(&mut l[n], val.clone())
     };
-    queue_removed(old);
+    drop(old);
     Ok(Object::None)
 }
 
@@ -12493,7 +12726,7 @@ fn list_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
         let mut indices = crate::slice_indices(l.len(), s)?;
         indices.sort_unstable();
         for i in indices.into_iter().rev() {
-            queue_removed(l.remove(i));
+            drop(l.remove(i));
         }
         return Ok(Object::None);
     }
@@ -12502,7 +12735,7 @@ fn list_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
         let n = list_index_arg(l.len(), key, "__delitem__")?;
         l.remove(n)
     };
-    queue_removed(removed);
+    drop(removed);
     Ok(Object::None)
 }
 
@@ -12672,7 +12905,7 @@ fn list_remove(args: &[Object]) -> Result<Object, RuntimeError> {
                 }
             };
             if let Some(removed) = removed {
-                queue_removed(removed);
+                drop(removed);
             }
             return Ok(Object::None);
         }
@@ -12931,7 +13164,7 @@ fn list_clear(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let evicted: Vec<Object> = std::mem::take(&mut *list_self(args)?.borrow_mut());
     for v in evicted {
-        queue_removed(v);
+        drop(v);
     }
     Ok(Object::None)
 }
@@ -13141,7 +13374,7 @@ fn dict_setitem(args: &[Object]) -> Result<Object, RuntimeError> {
     ensure_dict_key(key)?;
     let old = dict_insert(&d, key.clone(), val.clone())?;
     if let Some(old) = old {
-        queue_removed(old);
+        drop(old);
     }
     Ok(Object::None)
 }
@@ -13160,15 +13393,6 @@ fn dict_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
     found.ok_or_else(|| key_error_object(key.clone()))
 }
 
-/// Route a key/value evicted by a container mutator to the prompt-reap
-/// queue (see [`crate::vm_singletons::queue_container_removed`]) before
-/// dropping our reference. The queue holds a clone; the eval loop reaps it
-/// at the next between-bytecodes safe point if the eviction was its last
-/// program-visible reference.
-pub(crate) fn queue_removed(v: Object) {
-    crate::vm_singletons::queue_container_removed(&v);
-}
-
 fn dict_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
     let key = args
@@ -13177,8 +13401,8 @@ fn dict_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
     ensure_dict_key(key)?;
     let removed = dict_remove(&d, key)?;
     if let Some((k, v)) = removed {
-        queue_removed(k);
-        queue_removed(v);
+        drop(k);
+        drop(v);
         Ok(Object::None)
     } else {
         Err(key_error_object(key.clone()))
@@ -13255,7 +13479,7 @@ fn dict_pop(args: &[Object]) -> Result<Object, RuntimeError> {
     if let Some((k, v)) = removed {
         // The *stored* key (equal to, but possibly distinct from, the
         // lookup key) is evicted too; the value is returned to the caller.
-        queue_removed(k);
+        drop(k);
         Ok(v)
     } else if let Some(default) = args.get(2).cloned() {
         Ok(default)
@@ -13294,7 +13518,7 @@ fn dict_update(args: &[Object]) -> Result<Object, RuntimeError> {
                 let src_len = entries.len();
                 for (k, v) in entries {
                     if let Some(old) = dict_insert(&d, k.0, v)? {
-                        queue_removed(old);
+                        drop(old);
                     }
                     // CPython's `PyDict_Merge` re-checks the source size
                     // *after* every insert: a key `__eq__` that mutates the
@@ -13315,7 +13539,7 @@ fn dict_update(args: &[Object]) -> Result<Object, RuntimeError> {
                 let mut dst = d.borrow_mut();
                 for (k, v) in entries {
                     if let Some(old) = dst.insert(k, v) {
-                        queue_removed(old);
+                        drop(old);
                     }
                 }
             }
@@ -13337,8 +13561,8 @@ fn dict_clear(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     }
     for (k, v) in evicted {
-        queue_removed(k.0);
-        queue_removed(v);
+        drop(k.0);
+        drop(v);
     }
     Ok(Object::None)
 }
@@ -13456,7 +13680,7 @@ fn dict_copy(args: &[Object]) -> Result<Object, RuntimeError> {
     // CPython's `PyDict_Copy` preserves GC tracking: the copy is tracked
     // iff the source is (test_dict `test_copy_maintains_tracking`).
     if crate::gc_trace::is_tracked(crate::weakref_registry::id_of(&Object::Dict(d))) {
-        crate::gc_trace::track(out.clone());
+        crate::gc_trace::track(&out);
     }
     Ok(out)
 }
@@ -13548,7 +13772,7 @@ fn dict_or(args: &[Object]) -> Result<Object, RuntimeError> {
         out.insert(k.clone(), v.clone());
     }
     let obj = Object::Dict(Rc::new(RefCell::new(out)));
-    crate::gc_trace::track(obj.clone());
+    crate::gc_trace::track(&obj);
     Ok(obj)
 }
 
@@ -13563,7 +13787,7 @@ fn dict_ror(args: &[Object]) -> Result<Object, RuntimeError> {
         out.insert(k.clone(), v.clone());
     }
     let obj = Object::Dict(Rc::new(RefCell::new(out)));
-    crate::gc_trace::track(obj.clone());
+    crate::gc_trace::track(&obj);
     Ok(obj)
 }
 
@@ -13582,7 +13806,7 @@ fn dict_ior(args: &[Object]) -> Result<Object, RuntimeError> {
             .collect();
         for (k, v) in entries {
             if let Some(old) = dict_insert(&d, k.0, v)? {
-                queue_removed(old);
+                drop(old);
             }
         }
         return Ok(args[0].clone());
@@ -13630,7 +13854,7 @@ fn dict_ior(args: &[Object]) -> Result<Object, RuntimeError> {
         let (k, v) = (kv.next().unwrap(), kv.next().unwrap());
         ensure_dict_key(&k)?;
         if let Some(old) = dict_insert(&d, k, v)? {
-            queue_removed(old);
+            drop(old);
         }
         i += 1;
     }
@@ -13675,12 +13899,12 @@ fn apply_set_inplace_op(s: &mut crate::object::SetData, op: SetInplaceOp) {
         }
         SetInplaceOp::Discard(k) => {
             if let Some(removed) = s.swap_take(&k) {
-                queue_removed(removed.0);
+                drop(removed.0);
             }
         }
         SetInplaceOp::Clear => {
             for k in s.drain(..) {
-                queue_removed(k.0);
+                drop(k.0);
             }
         }
     }
@@ -16299,7 +16523,7 @@ pub(crate) fn file_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
     loop {
         let line = file_readline(&[Object::File(f.clone())])?;
         let len = match &line {
-            Object::Str(s) => str_char_len(s),
+            Object::Str(s) => crate::object::str_char_len(s),
             Object::WStr(cps) => cps.len(),
             Object::Bytes(b) => b.len(),
             _ => 0,

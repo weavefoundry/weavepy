@@ -121,3 +121,14 @@ for i in range(3000):
         assert f_get({Key(1): 2}, Key(1)) == 2
         assert Key.calls == before + 1
 print("ok")
+
+
+# A native leaf that returns a value it owns (a builtin call's fresh
+# result) hands back its own reference, not a pointer into its scratch.
+def f_fresh(s, a):
+    return s.format(a)
+
+
+for i in range(3000):
+    assert f_fresh("{}!", i) == "%d!" % i
+print("fresh ok")

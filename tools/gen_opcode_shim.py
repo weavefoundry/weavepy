@@ -28,7 +28,9 @@ Usage::
 The stack-effect expressions in the header are plain C arithmetic over
 ``oparg`` (``1 + (oparg & 0xFF) + (oparg >> 8)``, ``oparg*2`` ...), which
 is also valid Python with identical results for the non-negative
-``oparg`` values the compiler produces; they are emitted as lambdas.
+``oparg`` values the compiler produces; they are emitted as lambdas, and a
+count that doesn't depend on ``oparg`` as the integer itself (a module
+that defines hundreds of functions is slow to import).
 """
 
 from __future__ import annotations
@@ -172,6 +174,15 @@ def py_expr(expr: str) -> str:
     return expr
 
 
+def effect_value(expr: str) -> str:
+    """A stack-effect table value: the count itself when it doesn't depend
+    on ``oparg`` (most do not), else a lambda over ``oparg``."""
+    expr = py_expr(expr)
+    if expr.isdigit():
+        return expr
+    return "lambda oparg: %s" % expr
+
+
 def render(version: str, size: int, meta, popped, pushed, deopt) -> str:
     lines: list[str] = []
     w = lines.append
@@ -211,46 +222,75 @@ def render(version: str, size: int, meta, popped, pushed, deopt) -> str:
         w("    _names[%r]: %d," % (name, word))
     w("}")
     w("")
-    w("# `_PyOpcode_Deopt`: specialized form -> base instruction.")
-    w("_DEOPT = {")
+    w("# The tables only `stack_effect` reads, built on its first call (most")
+    w("# importers of `opcode` and `dis` never compute a stack effect).")
+    w("_STACK_TABLES = None")
+    w("")
+    w("")
+    w("def _stack_tables():")
+    w("    global _STACK_TABLES")
+    w("    if _STACK_TABLES is not None:")
+    w("        return _STACK_TABLES")
+    w("    # `_PyOpcode_Deopt`: specialized form -> base instruction.")
+    w("    deopt = {")
     for a, b in deopt:
-        w("    _names[%r]: _names[%r]," % (a, b))
-    w("}")
-    w("")
-    w("# `_PyOpcode_num_popped(opcode, oparg)`.")
-    w("_POPPED = {")
+        w("        _names[%r]: _names[%r]," % (a, b))
+    w("    }")
+    w("    # `_PyOpcode_num_popped(opcode, oparg)`: the count, or a function of")
+    w("    # `oparg` for the opcodes whose count depends on it.")
+    w("    popped = {")
     for name, expr in popped:
-        w("    _names[%r]: lambda oparg: %s," % (name, py_expr(expr)))
-    w("}")
-    w("")
-    w("# `_PyOpcode_num_pushed(opcode, oparg)`.")
-    w("_PUSHED = {")
+        w("        _names[%r]: %s," % (name, effect_value(expr)))
+    w("    }")
+    w("    # `_PyOpcode_num_pushed(opcode, oparg)`, likewise.")
+    w("    pushed = {")
     for name, expr in pushed:
-        w("    _names[%r]: lambda oparg: %s," % (name, py_expr(expr)))
-    w("}")
+        w("        _names[%r]: %s," % (name, effect_value(expr)))
+    w("    }")
+    w("    _STACK_TABLES = (deopt, popped, pushed)")
+    w("    return _STACK_TABLES")
+    w("")
     w("")
     w("_BLOCK_PUSH = frozenset(_names[n] for n in %r)" % (BLOCK_PUSH,))
     w("")
-    w("")
-    w("def is_valid(opcode):")
-    w('    """Return True if opcode is valid, False otherwise."""')
-    w("    return 0 <= opcode < _NUM_OPCODES and opcode in _FLAGS")
-    w("")
-    w("")
-    w("def _has(opcode, flag):")
-    w("    return is_valid(opcode) and bool(_FLAGS[opcode] & flag)")
-    w("")
-    w("")
-    for fn, flag, doc in [
+    w("# The valid opcodes, and those with each flag `has_*` reports: `opcode`")
+    w("# (Lib/opcode.py) asks every predicate about every opcode at import, so")
+    w("# a valid opcode is answered by one set lookup.")
+    w("_VALID = frozenset(_FLAGS)")
+    predicates = [
         ("has_arg", "HAS_ARG_FLAG", "Return True if the opcode uses its oparg, False otherwise."),
         ("has_const", "HAS_CONST_FLAG", "Return True if the opcode accesses a constant, False otherwise."),
         ("has_name", "HAS_NAME_FLAG", "Return True if the opcode accesses an attribute by name, False otherwise."),
         ("has_jump", "HAS_JUMP_FLAG", "Return True if the opcode has a jump target, False otherwise."),
         ("has_free", "HAS_FREE_FLAG", "Return True if the opcode accesses a free variable, False otherwise."),
         ("has_local", "HAS_LOCAL_FLAG", "Return True if the opcode accesses a local variable, False otherwise."),
-    ]:
+    ]
+    flag_bits = {name: 1 << i for i, name in enumerate(FLAG_NAMES)}
+    for fn, flag, _doc in predicates:
+        names = [name for name, word in meta if word & flag_bits[flag]]
+        w("_%s = frozenset({" % fn.upper())
+        for name in names:
+            w("    _names[%r]," % name)
+        w("})")
+    w("")
+    w("")
+    w("def is_valid(opcode):")
+    w('    """Return True if opcode is valid, False otherwise."""')
+    w("    return opcode in _VALID or (0 <= opcode < _NUM_OPCODES and opcode in _FLAGS)")
+    w("")
+    w("")
+    w("def _has(opcode, flag):")
+    w("    return is_valid(opcode) and bool(_FLAGS[opcode] & flag)")
+    w("")
+    w("")
+    for fn, flag, doc in predicates:
         w("def %s(opcode):" % fn)
         w('    """%s"""' % doc)
+        w("    if opcode in _%s:" % fn.upper())
+        w("        return True")
+        w("    if opcode in _VALID:")
+        w("        return False")
+        w("    # An invalid opcode, or not an int (which raises as before).")
         w("    return _has(opcode, %s)" % flag)
         w("")
         w("")
@@ -270,16 +310,17 @@ def render(version: str, size: int, meta, popped, pushed, deopt) -> str:
     w("        jump_int = 0")
     w("    else:")
     w('        raise ValueError("stack_effect: jump must be False, True or None")')
+    w("    deopt, popped_table, pushed_table = _stack_tables()")
     w("    # `get_stack_effects` (Python/flowgraph.c): specialized forms and")
     w("    # unknown opcodes have no effect entry.")
-    w("    if opcode < 0 or (opcode <= _MAX_REAL_OPCODE and _DEOPT.get(opcode, opcode) != opcode):")
+    w("    if opcode < 0 or (opcode <= _MAX_REAL_OPCODE and deopt.get(opcode, opcode) != opcode):")
     w('        raise ValueError("invalid opcode or oparg")')
-    w("    popped = _POPPED.get(opcode)")
-    w("    pushed = _PUSHED.get(opcode)")
+    w("    popped = popped_table.get(opcode)")
+    w("    pushed = pushed_table.get(opcode)")
     w("    if popped is None or pushed is None:")
     w('        raise ValueError("invalid opcode or oparg")')
-    w("    npop = popped(oparg_int)")
-    w("    npush = pushed(oparg_int)")
+    w("    npop = popped if popped.__class__ is int else popped(oparg_int)")
+    w("    npush = pushed if pushed.__class__ is int else pushed(oparg_int)")
     w("    if npop < 0 or npush < 0:")
     w('        raise ValueError("invalid opcode or oparg")')
     w("    if opcode in _BLOCK_PUSH and not jump_int:")

@@ -65,13 +65,11 @@ static HOT: AtomicU32 = AtomicU32::new(0);
 /// RFC 0065 (WS1): the dispatch loop's *generation* word. Bumped by
 /// every mutation that can change the loop prologue's decisions —
 /// hot-gate bits ([`set`]/[`clear`] below), observer registration
-/// (`trace::bump_observer_gen`), the GC finalizable/suspect
-/// population transitions (`gc_trace`), and frame materialization
+/// (`trace::bump_observer_gen`), and frame materialization
 /// (`FrameShell::materialize`). The dispatch loop caches a snapshot
 /// of the prologue's inputs keyed by this generation: while the
 /// generation is unchanged *and* the snapshot says "quiet" (no
-/// pending work, no finalizables, no suspects, no observers, no
-/// materialized frame), the loop runs one relaxed load + compare per
+/// pending work, no observers, no materialized frame), the loop runs one relaxed load + compare per
 /// instruction instead of the full ten-plus-probe prologue.
 ///
 /// Same producer/consumer discipline as [`HOT`]: a spurious bump is
@@ -92,6 +90,13 @@ pub fn load() -> u32 {
 #[inline]
 pub fn loop_gen() -> u64 {
     LOOP_GEN.load(Ordering::Relaxed)
+}
+
+/// The loop generation's address, for native code that compares it at
+/// its back edges.
+#[cfg(feature = "jit")]
+pub(crate) fn loop_gen_ptr() -> *const u64 {
+    LOOP_GEN.as_ptr()
 }
 
 /// Invalidate every dispatch loop's cached prologue snapshot
@@ -138,11 +143,6 @@ pub mod env_flags {
             }
         };
     }
-    once_flag!(
-        /// `WEAVEPY_REAP_TRACE`: prompt-reap tracing.
-        reap_trace,
-        "WEAVEPY_REAP_TRACE"
-    );
     once_flag!(
         /// `WEAVEPY_NO_QUIET`: pin the dispatch loop to its full prologue.
         no_quiet,

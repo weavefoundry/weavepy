@@ -148,6 +148,7 @@ impl DequeState<'_> {
 // unguarded (`peek_mut` returns `None` if any guard is live) and neither
 // reference outlives the native call, which runs no Python.
 #[allow(clippy::mut_from_ref)]
+#[inline(always)]
 fn fast_parts(args: &[Object]) -> Option<Fast<'_>> {
     let Object::Instance(inst) = args.first()? else {
         return None;
@@ -156,7 +157,8 @@ fn fast_parts(args: &[Object]) -> Option<Fast<'_>> {
     // checks), and neither reference outlives the native call.
     let slots = unsafe { inst.slots.peek_mut() }?;
     let n = names();
-    let [data, head, maxlen, state] = slots.leading_mut([&n.data, &n.head, &n.maxlen, &n.state])?;
+    let [data, head, maxlen, state] =
+        slots.leading_interned_mut([&n.data, &n.head, &n.maxlen, &n.state])?;
     let Object::List(data) = data else {
         return None;
     };
@@ -216,12 +218,14 @@ impl Fast<'_> {
         }
     }
 
-    /// [`popleft_locked`] over the unguarded parts.
-    fn popleft(&mut self) -> Result<Object, RuntimeError> {
+    /// [`popleft_locked`] over the unguarded parts; `None` (nothing
+    /// touched) on an empty deque.
+    #[inline]
+    fn popleft(&mut self) -> Option<Object> {
         let mut h = self.head();
         let d = &mut *self.d;
         if h >= d.len() {
-            return Err(index_error("pop from an empty deque"));
+            return None;
         }
         let x = std::mem::replace(&mut d[h], Object::None);
         h += 1;
@@ -234,7 +238,101 @@ impl Fast<'_> {
         }
         self.bump_state();
         self.set_head(h);
-        Ok(x)
+        Some(x)
+    }
+}
+
+/// The deque operations a compiled caller may run directly (see
+/// [`fast_op`]); `0` names none. The JIT's method registry carries one
+/// per builtin (`leaf_builtins::register_jit_method`).
+pub(crate) const OP_APPEND: u8 = 1;
+pub(crate) const OP_APPENDLEFT: u8 = 2;
+pub(crate) const OP_POP: u8 = 3;
+pub(crate) const OP_POPLEFT: u8 = 4;
+pub(crate) const OP_LEN: u8 = 5;
+pub(crate) const OP_BOOL: u8 = 6;
+pub(crate) const OP_GETITEM: u8 = 7;
+/// A forward (`_deque_iterator`) or reverse iterator step; the receiver
+/// is the iterator.
+pub(crate) const OP_NEXT: u8 = 8;
+pub(crate) const OP_RNEXT: u8 = 9;
+
+/// One deque operation's common case on `recv` (and its one argument),
+/// over the unguarded views [`fast_parts`] takes: the whole operation,
+/// or `None` with nothing touched when it needs the full body (a guarded
+/// cell, a foreign receiver, an empty deque's `IndexError`, an index out
+/// of range or not an exact `int`). The builtins' fast paths and the
+/// JIT's direct calls share it; it runs no Python code. Inlined, so a
+/// builtin's constant `op` folds the dispatch away.
+#[inline(always)]
+pub(crate) fn fast_op(op: u8, recv: &Object, arg: Option<&Object>) -> Option<Object> {
+    if op >= OP_NEXT {
+        let Object::Instance(iterator) = recv else {
+            return None;
+        };
+        return deque_next_fast(iterator, op == OP_RNEXT);
+    }
+    let mut f = fast_parts(std::slice::from_ref(recv))?;
+    match op {
+        OP_APPEND => {
+            let x = arg?;
+            f.bump_state();
+            f.d.push(x.clone());
+            let trimmed = match f.maxlen() {
+                Some(m) if f.d.len() - f.head() > m => f.popleft(),
+                _ => None,
+            };
+            drop(trimmed);
+            Some(Object::None)
+        }
+        OP_APPENDLEFT => {
+            let x = arg?;
+            f.bump_state();
+            let mut h = f.head().min(f.d.len());
+            if h == 0 {
+                h = std::cmp::max(8, f.d.len() / 2);
+                f.d.splice(0..0, std::iter::repeat_n(Object::None, h));
+            }
+            h -= 1;
+            f.d[h] = x.clone();
+            f.set_head(h);
+            let trimmed = match f.maxlen() {
+                Some(m) if f.d.len() - h > m => f.d.pop(),
+                _ => None,
+            };
+            drop(trimmed);
+            Some(Object::None)
+        }
+        OP_POP => {
+            let h = f.head();
+            if f.d.len() <= h {
+                return None;
+            }
+            f.bump_state();
+            let x = f.d.pop().expect("len checked");
+            // An emptied deque keeps a short free prefix for the next
+            // `appendleft` instead of splicing a new one.
+            if f.d.len() == h && h > 32 {
+                f.d.clear();
+                f.set_head(0);
+            }
+            Some(x)
+        }
+        OP_POPLEFT => f.popleft(),
+        OP_LEN => Some(Object::Int(f.d.len().saturating_sub(f.head()) as i64)),
+        OP_BOOL => Some(Object::Bool(f.d.len() > f.head())),
+        OP_GETITEM => {
+            let Some(&Object::Int(i)) = arg else {
+                return None;
+            };
+            let h = f.head();
+            let n = f.d.len().saturating_sub(h) as i64;
+            let index = if i < 0 { i + n } else { i };
+            (0..n)
+                .contains(&index)
+                .then(|| f.d[h + index as usize].clone())
+        }
+        _ => None,
     }
 }
 
@@ -277,19 +375,9 @@ fn popleft_locked(st: &mut DequeState<'_>, d: &mut Vec<Object>) -> Result<Object
 }
 
 fn deque_append(args: &[Object]) -> Result<Object, RuntimeError> {
-    if let [_, x] = args {
-        if let Some(mut f) = fast_parts(args) {
-            f.bump_state();
-            f.d.push(x.clone());
-            let trimmed = match f.maxlen() {
-                Some(m) if f.d.len() - f.head() > m => Some(f.popleft()?),
-                _ => None,
-            };
-            if trimmed.is_some() {
-                crate::gc_trace::mark_maybe_dead();
-            }
-            drop(trimmed);
-            return Ok(Object::None);
+    if let [recv, x] = args {
+        if let Some(v) = fast_op(OP_APPEND, recv, Some(x)) {
+            return Ok(v);
         }
     }
     let mut st = receiver(args, "append")?;
@@ -319,35 +407,14 @@ fn deque_append(args: &[Object]) -> Result<Object, RuntimeError> {
         };
     }
     drop(st);
-    if trimmed.is_some() {
-        // A bounded deque released its oldest item (leaf contract).
-        crate::gc_trace::mark_maybe_dead();
-    }
     drop(trimmed);
     Ok(Object::None)
 }
 
 fn deque_appendleft(args: &[Object]) -> Result<Object, RuntimeError> {
-    if let [_, x] = args {
-        if let Some(mut f) = fast_parts(args) {
-            f.bump_state();
-            let mut h = f.head().min(f.d.len());
-            if h == 0 {
-                h = std::cmp::max(8, f.d.len() / 2);
-                f.d.splice(0..0, std::iter::repeat_n(Object::None, h));
-            }
-            h -= 1;
-            f.d[h] = x.clone();
-            f.set_head(h);
-            let trimmed = match f.maxlen() {
-                Some(m) if f.d.len() - h > m => f.d.pop(),
-                _ => None,
-            };
-            if trimmed.is_some() {
-                crate::gc_trace::mark_maybe_dead();
-            }
-            drop(trimmed);
-            return Ok(Object::None);
+    if let [recv, x] = args {
+        if let Some(v) = fast_op(OP_APPENDLEFT, recv, Some(x)) {
+            return Ok(v);
         }
     }
     let mut st = receiver(args, "appendleft")?;
@@ -379,28 +446,14 @@ fn deque_appendleft(args: &[Object]) -> Result<Object, RuntimeError> {
         };
     }
     drop(st);
-    if trimmed.is_some() {
-        crate::gc_trace::mark_maybe_dead();
-    }
     drop(trimmed);
     Ok(Object::None)
 }
 
 fn deque_pop(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.len() == 1 {
-        if let Some(mut f) = fast_parts(args) {
-            let h = f.head();
-            if f.d.len() > h {
-                f.bump_state();
-                let x = f.d.pop().expect("len checked");
-                // An emptied deque keeps a short free prefix for the next
-                // `appendleft` instead of splicing a new one.
-                if f.d.len() == h && h > 32 {
-                    f.d.clear();
-                    f.set_head(0);
-                }
-                return Ok(x);
-            }
+    if let [recv] = args {
+        if let Some(v) = fast_op(OP_POP, recv, None) {
+            return Ok(v);
         }
     }
     let mut st = receiver(args, "pop")?;
@@ -426,11 +479,9 @@ fn deque_pop(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn deque_popleft(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.len() == 1 {
-        if let Some(mut f) = fast_parts(args) {
-            if f.head() < f.d.len() {
-                return f.popleft();
-            }
+    if let [recv] = args {
+        if let Some(v) = fast_op(OP_POPLEFT, recv, None) {
+            return Ok(v);
         }
     }
     let mut st = receiver(args, "popleft")?;
@@ -446,9 +497,9 @@ fn deque_popleft(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn deque_len(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.len() == 1 {
-        if let Some(f) = fast_parts(args) {
-            return Ok(Object::Int(f.d.len().saturating_sub(f.head()) as i64));
+    if let [recv] = args {
+        if let Some(v) = fast_op(OP_LEN, recv, None) {
+            return Ok(v);
         }
     }
     let st = receiver(args, "__len__")?;
@@ -460,9 +511,9 @@ fn deque_len(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn deque_bool(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.len() == 1 {
-        if let Some(f) = fast_parts(args) {
-            return Ok(Object::Bool(f.d.len() > f.head()));
+    if let [recv] = args {
+        if let Some(v) = fast_op(OP_BOOL, recv, None) {
+            return Ok(v);
         }
     }
     let st = receiver(args, "__bool__")?;
@@ -474,14 +525,9 @@ fn deque_bool(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn deque_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
-    if let [_, Object::Int(i)] = args {
-        if let Some(f) = fast_parts(args) {
-            let h = f.head();
-            let n = f.d.len().saturating_sub(h) as i64;
-            let index = if *i < 0 { *i + n } else { *i };
-            if (0..n).contains(&index) {
-                return Ok(f.d[h + index as usize].clone());
-            }
+    if let [recv, index] = args {
+        if let Some(v) = fast_op(OP_GETITEM, recv, Some(index)) {
+            return Ok(v);
         }
     }
     let [_, index] = args else {
@@ -555,6 +601,50 @@ fn deque_rotate(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
+/// `iter(d)` / `reversed(d)`: a fresh `_deque_iterator` (or reverse
+/// iterator) over `d` at index 0, snapshotting the mutation counter,
+/// exactly what the iterator classes' `__init__` builds, but with no
+/// Python code running. The classes come from the deque class's
+/// `_iter_types` pair (set by `_collections.py`), so a subclass and each
+/// copy of the module use their own.
+fn deque_make_iter(args: &[Object], reverse: bool) -> Result<Object, RuntimeError> {
+    let method = if reverse { "__reversed__" } else { "__iter__" };
+    let state = {
+        let st = receiver(args, method)?;
+        st.slots
+            .get_hinted(SLOT_STATE, &names().state)
+            .cloned()
+            .unwrap_or(Object::Int(0))
+    };
+    let [recv @ Object::Instance(inst)] = args else {
+        return Err(type_error(format!(
+            "deque.{method}() takes no arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    };
+    let it_cls = match inst.cls().lookup("_iter_types") {
+        Some(Object::Tuple(types)) => match types.get(usize::from(reverse)) {
+            Some(Object::Type(cls)) => cls.clone(),
+            _ => return Err(type_error("deque iterator types are not set")),
+        },
+        _ => return Err(type_error("deque iterator types are not set")),
+    };
+    let it = crate::types::PyInstance::new_deferred(it_cls);
+    // The iterator classes' slot order (see `deque_next_fast`).
+    it.slot_set("_deq", recv.clone());
+    it.slot_set("_index", Object::Int(0));
+    it.slot_set("_deq_state", state);
+    Ok(Object::Instance(it))
+}
+
+fn deque_iter(args: &[Object]) -> Result<Object, RuntimeError> {
+    deque_make_iter(args, false)
+}
+
+fn deque_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
+    deque_make_iter(args, true)
+}
+
 fn deque_iterator_index(args: &[Object]) -> Result<Object, RuntimeError> {
     receiver(args, "__iter__")?;
     let [_, index] = args else {
@@ -586,13 +676,14 @@ const IT_STATE: usize = 2;
 /// [`fast_parts`]): a live iterator over an unmutated deque with an item
 /// left. `None` (nothing touched) leaves every other case to the full
 /// body.
+#[inline(always)]
 fn deque_next_fast(iterator: &crate::types::PyInstance, reverse: bool) -> Option<Object> {
     // SAFETY: no guard is live on the cells (`peek`/`peek_mut` check), no
     // Python runs before the last use, and the iterator and its deque are
     // distinct objects.
     let its = unsafe { iterator.slots.peek_mut() }?;
     let n = names();
-    let [deque, index, it_state] = its.leading_mut([&n.deq, &n.index, &n.deq_state])?;
+    let [deque, index, it_state] = its.leading_interned_mut([&n.deq, &n.index, &n.deq_state])?;
     let Object::Instance(deque) = deque else {
         return None;
     };
@@ -603,12 +694,14 @@ fn deque_next_fast(iterator: &crate::types::PyInstance, reverse: bool) -> Option
     };
     // SAFETY: as above.
     let ds = unsafe { (*deque).slots.peek() }?;
-    let [data, head, _, state] = ds.leading([&n.data, &n.head, &n.maxlen, &n.state])?;
+    let [data, head, _, state] = ds.leading_interned([&n.data, &n.head, &n.maxlen, &n.state])?;
     let Object::List(data) = data else {
         return None;
     };
-    if state.as_i64() != it_state.as_i64() {
-        return None;
+    // The counters are plain ints (any other value takes the full body).
+    match (state, &*it_state) {
+        (Object::Int(a), Object::Int(b)) if a == b => {}
+        _ => return None,
     }
     let h = match *head {
         Object::Int(h) if h >= 0 => h as usize,
@@ -635,7 +728,7 @@ fn deque_next(args: &[Object], reverse: bool) -> Result<Object, RuntimeError> {
     let [Object::Instance(iterator)] = args else {
         return Err(type_error("deque iterator __next__ requires one iterator"));
     };
-    if let Some(v) = deque_next_fast(iterator, reverse) {
+    if let Some(v) = fast_op(if reverse { OP_RNEXT } else { OP_NEXT }, &args[0], None) {
         return Ok(v);
     }
     let (deque, index, it_state) = {
@@ -746,6 +839,8 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         reg("__bool__", "__bool__", deque_bool);
         reg("__getitem__", "__getitem__", deque_getitem);
         reg("rotate", "rotate", deque_rotate);
+        reg("__iter__", "__iter__", deque_iter);
+        reg("__reversed__", "__reversed__", deque_reversed);
         reg("iterator_index", "iterator_index", deque_iterator_index);
         reg("iterator_next", "__next__", deque_iterator_next);
         reg(
@@ -753,9 +848,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             "__next__",
             deque_reverse_iterator_next,
         );
-        // The end operations, length, truth, and iterator steps run no
-        // Python code. Indexing and rotation require an argument guard
-        // because index coercion can invoke Python's __index__ protocol.
+        // The end operations, length, truth, iterator construction, and
+        // iterator steps run no Python code. Indexing and rotation require
+        // an argument guard because index coercion can invoke Python's
+        // __index__ protocol.
         for name in [
             "append",
             "appendleft",
@@ -763,6 +859,8 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             "popleft",
             "__len__",
             "__bool__",
+            "__iter__",
+            "__reversed__",
             "iterator_next",
             "reverse_iterator_next",
         ] {
@@ -779,6 +877,24 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         ] {
             if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
                 crate::leaf_builtins::register_fast(b, fast);
+            }
+        }
+        // The deque's own methods ride the JIT's native method lane (the
+        // receiver checks above reject a foreign receiver exactly).
+        for (name, op) in [
+            ("append", OP_APPEND),
+            ("appendleft", OP_APPENDLEFT),
+            ("pop", OP_POP),
+            ("popleft", OP_POPLEFT),
+            ("__len__", OP_LEN),
+            ("__bool__", OP_BOOL),
+            ("__getitem__", OP_GETITEM),
+            ("rotate", 0),
+            ("iterator_next", OP_NEXT),
+            ("reverse_iterator_next", OP_RNEXT),
+        ] {
+            if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
+                crate::leaf_builtins::register_jit_method(b, op);
             }
         }
     }

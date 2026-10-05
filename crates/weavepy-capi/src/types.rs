@@ -2585,7 +2585,7 @@ fn inherit_inline_base_layout(
     };
 
     let bases = t.bases.borrow();
-    let first_ptr = bases.first().and_then(&resolve);
+    let first_ptr = bases.first().and_then(resolve);
 
     // CPython's `best_base()`: the "solid base" is the base with the widest
     // instance layout (`tp_basicsize`), scanned across *all* bases — not

@@ -445,6 +445,13 @@ pub fn any_observers_active() -> bool {
     any_observers_active_slow()
 }
 
+/// The observer count [`any_observers_active`] tests first, for native
+/// code that tests it in line (a `usize`: nonzero while any observer may
+/// be active).
+pub(crate) fn observer_count_flag() -> *const usize {
+    OBSERVER_COUNT.as_ptr()
+}
+
 #[cold]
 #[inline(never)]
 fn any_observers_active_slow() -> bool {

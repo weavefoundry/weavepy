@@ -51,12 +51,15 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
-/// Process-wide count of parked `__del__` requests across all threads'
-/// [`PENDING_FINALIZERS`] queues (RFC 0058 WS2). The eval loop probes
-/// for pending finalizers *every instruction*; a macOS thread-local
+/// Process-wide count of parked `__del__` requests and weakref callbacks
+/// across all threads' [`PENDING_FINALIZERS`] and
+/// [`PENDING_WEAKREF_CALLBACKS`] queues (RFC 0058 WS2). The eval loop
+/// probes for pending work *every instruction*; a macOS thread-local
 /// access plus a `RefCell` borrow there is measurably expensive, so
-/// this relaxed atomic is the fast gate and the thread-local queue
-/// stays the precise, per-thread source of truth.
+/// this relaxed atomic is the fast gate and the thread-local queues
+/// stay the precise, per-thread source of truth. A drain re-raises the
+/// shared hot gate while it's nonzero, so one thread's drain never
+/// strands work another thread queued.
 static PENDING_FINALIZER_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -68,6 +71,7 @@ pub fn push_pending_finalizer(obj: Object) {
     });
     PENDING_FINALIZER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Release);
     crate::hot_gates::set(crate::hot_gates::PENDING_FINALIZERS);
+    crate::gc_trace::mark_maybe_dead();
 }
 
 /// Like [`push_pending_finalizer`], but callable from `Drop` impls:
@@ -88,6 +92,7 @@ pub fn try_push_pending_finalizer(obj: Object) {
     if pushed {
         PENDING_FINALIZER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Release);
         crate::hot_gates::set(crate::hot_gates::PENDING_FINALIZERS);
+        crate::gc_trace::mark_maybe_dead();
     } else if let Some(obj) = pending {
         // No safe point can run this request during TLS teardown or a
         // reentrant queue borrow. Suppress its Drop fallback before releasing
@@ -99,6 +104,69 @@ pub fn try_push_pending_finalizer(obj: Object) {
             }
             _ => {}
         }
+    }
+}
+
+/// The last reference to `arc`'s object, a `PyInstance` or a `PyGenerator`
+/// (see `rc::Rc`'s `Drop`), is going. One that owes a finalizer (an
+/// instance whose class has `__del__`, a suspended generator, a coroutine
+/// never awaited) is queued, still alive at its own address, for the next
+/// safe point; anything else is released.
+pub(crate) fn finalize_on_last_release<T: ?Sized + 'static>(arc: std::sync::Arc<T>) {
+    use crate::object::{CoroutineKind, GeneratorState, PyGenerator};
+    use crate::types::PyInstance;
+    use std::any::TypeId;
+    use std::sync::Arc;
+    let t = TypeId::of::<T>();
+    if t == TypeId::of::<PyInstance>() {
+        // SAFETY: `T` is `PyInstance` (the cast drops no metadata).
+        let inst = unsafe { Arc::from_raw(Arc::into_raw(arc).cast::<PyInstance>()) };
+        // A natively served `datetime` value: back to its pool (see
+        // `stdlib::datetime_native::recycle`). With no weak reference the
+        // last owner is the only one who can reach the class.
+        let inst = if Arc::weak_count(&inst) == 0
+            // SAFETY: as above.
+            && unsafe { &*inst.class.as_ptr() }.native_kind.get() != 0
+        {
+            match crate::stdlib::datetime_native::recycle(Rc::from_arc(inst)) {
+                Ok(()) => return,
+                Err(inst) => Rc::into_arc(inst),
+            }
+        } else {
+            inst
+        };
+        let owes = !inst.finalize_ran.get()
+            && inst
+                .class
+                .try_borrow()
+                .is_ok_and(|cls| cls.instances_need_finalize());
+        if owes {
+            try_push_pending_finalizer(Object::Instance(Rc::from_arc(inst)));
+        } else {
+            drop(inst);
+        }
+    } else if t == TypeId::of::<PyGenerator>() {
+        // SAFETY: as above, for `PyGenerator`.
+        let g = unsafe { Arc::from_raw(Arc::into_raw(arc).cast::<PyGenerator>()) };
+        let owes = !g.finalize_ran.get()
+            && g.state.try_borrow().is_ok_and(|state| match &*state {
+                GeneratorState::Suspended(_) => true,
+                GeneratorState::Created(_) => g.kind == CoroutineKind::Coroutine,
+                GeneratorState::Finished | GeneratorState::Running => false,
+            });
+        if owes {
+            let kind = g.kind;
+            let g = Rc::from_arc(g);
+            try_push_pending_finalizer(match kind {
+                CoroutineKind::Generator => Object::Generator(g),
+                CoroutineKind::Coroutine => Object::Coroutine(g),
+                CoroutineKind::AsyncGenerator => Object::AsyncGenerator(g),
+            });
+        } else {
+            drop(g);
+        }
+    } else {
+        drop(arc);
     }
 }
 
@@ -136,11 +204,18 @@ pub fn has_pending_finalizers() -> bool {
 /// Queue a weakref callback `(callback, weakref_obj)` for invocation at
 /// the next safe point. Teardown-safe (callable from sweep paths).
 pub fn push_pending_weakref_callback(callback: Object, weakref_obj: Object) {
-    let _ = PENDING_WEAKREF_CALLBACKS.try_with(|cell| {
-        if let Ok(mut queue) = cell.try_borrow_mut() {
-            queue.push((callback, weakref_obj));
-        }
-    });
+    let pushed = PENDING_WEAKREF_CALLBACKS
+        .try_with(|cell| {
+            cell.try_borrow_mut()
+                .map(|mut queue| queue.push((callback, weakref_obj)))
+                .is_ok()
+        })
+        .unwrap_or(false);
+    if pushed {
+        PENDING_FINALIZER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Release);
+        crate::hot_gates::set(crate::hot_gates::PENDING_FINALIZERS);
+        crate::gc_trace::mark_maybe_dead();
+    }
 }
 
 /// Is anything parked in this thread's weakref-callback queue? Cheap
@@ -155,7 +230,11 @@ pub fn has_pending_weakref_callbacks() -> bool {
 
 /// Drain the pending weakref-callback queue.
 pub fn drain_pending_weakref_callbacks() -> Vec<(Object, Object)> {
-    PENDING_WEAKREF_CALLBACKS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+    let taken = PENDING_WEAKREF_CALLBACKS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    if !taken.is_empty() {
+        PENDING_FINALIZER_COUNT.fetch_sub(taken.len(), std::sync::atomic::Ordering::Release);
+    }
+    taken
 }
 
 /// Build a singleton instance of the given built-in registry type.
@@ -399,7 +478,13 @@ pub fn clear_thread_python_tls() {
             PENDING_FINALIZER_COUNT.fetch_sub(n, std::sync::atomic::Ordering::Release);
         }
     }
-    let _ = PENDING_WEAKREF_CALLBACKS.try_with(|cell| cell.borrow_mut().clear());
+    let dropped_callbacks =
+        PENDING_WEAKREF_CALLBACKS.try_with(|cell| std::mem::take(&mut *cell.borrow_mut()).len());
+    if let Ok(n) = dropped_callbacks {
+        if n > 0 {
+            PENDING_FINALIZER_COUNT.fetch_sub(n, std::sync::atomic::Ordering::Release);
+        }
+    }
     let _ = CURRENT_THREAD_HANDLES.try_with(|cell| cell.borrow_mut().clear());
     let dropped_cext =
         PENDING_CEXT_DROPS.try_with(|cell| std::mem::take(&mut *cell.borrow_mut()).len());
@@ -638,6 +723,7 @@ pub fn push_pending_resource_warning(message: String) {
     PENDING_RESOURCE_WARNINGS.with(|cell| cell.borrow_mut().push((message, None)));
     PENDING_RW_FLAG.store(true, std::sync::atomic::Ordering::Release);
     crate::hot_gates::set(crate::hot_gates::RESOURCE_WARNINGS);
+    crate::gc_trace::mark_maybe_dead();
 }
 
 /// As [`push_pending_resource_warning`], carrying the dying object's
@@ -651,6 +737,7 @@ pub fn push_pending_resource_warning_with_source(message: String, source_key: us
     PENDING_RESOURCE_WARNINGS.with(|cell| cell.borrow_mut().push((message, Some(source_key))));
     PENDING_RW_FLAG.store(true, std::sync::atomic::Ordering::Release);
     crate::hot_gates::set(crate::hot_gates::RESOURCE_WARNINGS);
+    crate::gc_trace::mark_maybe_dead();
 }
 
 /// Cheap probe for the eval-loop safe point: are any deferred resource
@@ -805,65 +892,6 @@ thread_local! {
     static PENDING_CEXT_FLAG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-thread_local! {
-    /// Object ids currently being torn down by the prompt reaper's cascade
-    /// on this thread (RFC 0047, wave 5). While an object is mid-cascade,
-    /// the teardown itself crosses it back into C — `traverse_object` runs
-    /// the GC bridge's `tp_traverse`, which mints a transient self box and
-    /// releases it — and that release would *re-queue* the object through
-    /// [`queue_cext_dropped`]. The queued clone then makes the cascade's
-    /// own deadness re-check see the object as externally alive, aborting
-    /// the teardown, and the drained clone starts the cascade over: a
-    /// livelock that pinned `repr(DataFrame)` at 100% CPU indefinitely.
-    /// A queue request for an id in this set is the cascade observing
-    /// itself and is dropped; requests for *other* objects (a child body
-    /// whose last C pin fell during the teardown) still queue normally.
-    static CASCADING_IDS: RefCell<crate::fasthash::FxHashSet<u64>> =
-        RefCell::new(crate::fasthash::FxHashSet::default());
-}
-
-/// RAII marker for one object's trip through the prompt reaper's cascade;
-/// see [`CASCADING_IDS`]. Created by [`enter_cascade`].
-#[derive(Debug)]
-pub struct CascadeGuard {
-    id: u64,
-    owner: bool,
-}
-
-impl Drop for CascadeGuard {
-    fn drop(&mut self) {
-        if self.owner {
-            let _ = CASCADING_IDS.try_with(|c| {
-                if let Ok(mut set) = c.try_borrow_mut() {
-                    set.remove(&self.id);
-                }
-            });
-        }
-    }
-}
-
-/// Mark `id` as mid-cascade for the guard's lifetime. Nesting-safe: a
-/// guard for an id already in the set is a no-op on drop (the outer
-/// guard owns the entry).
-pub fn enter_cascade(id: u64) -> CascadeGuard {
-    let owner = CASCADING_IDS
-        .try_with(|c| {
-            c.try_borrow_mut()
-                .map(|mut set| set.insert(id))
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
-    CascadeGuard { id, owner }
-}
-
-/// Is `id` currently being torn down by the prompt reaper's cascade on
-/// this thread?
-fn in_cascade(id: u64) -> bool {
-    CASCADING_IDS
-        .try_with(|c| c.try_borrow().map(|set| set.contains(&id)).unwrap_or(true))
-        .unwrap_or(false)
-}
-
 /// Park an object dropped by C extension code for a prompt-reap pass at
 /// the next eval-loop safe point. Only object kinds that can carry (or
 /// anchor) finalizers/weakrefs/tracked children are queued; scalars and
@@ -885,23 +913,6 @@ pub fn queue_cext_dropped(obj: &Object) {
         return;
     }
     queue_parked_drop(obj);
-}
-
-/// Park a value evicted from a native container by a *mutating* method or
-/// opcode — `dict.clear`/`__delitem__`/replacing `__setitem__`, `del d[k]`,
-/// `list.remove`/`clear`/slice assignment, `set.discard`, … — for a
-/// prompt-reap pass at the next eval-loop safe point. These mutators run as
-/// plain builtin fns without interpreter access, so the reference they drop
-/// can't go through `prompt_reap_dropped` inline; without the park, an
-/// object whose *last* reference lived in the container stayed pinned by
-/// its weakref registry entry / GC handle until the next cyclic collection.
-/// CPython frees it on the spot (pandas' `_item_cache.clear()` relies on
-/// the evicted Series — and its CoW `Block` — dying immediately: a stale
-/// block kept `refs.has_reference()` true, misfiring the chained-assignment
-/// `FutureWarning` in `Series.__setitem__`). Same kind filter as
-/// [`queue_cext_dropped`]: scalars and other leaves drop inline as before.
-pub fn queue_container_removed(obj: &Object) {
-    queue_cext_dropped(obj);
 }
 
 /// As [`queue_cext_dropped`] but with **no kind filter**. Native side exits
@@ -933,12 +944,6 @@ pub fn queue_parked_drop(obj: &Object) {
     if crate::gc_trace::collector_active() {
         return;
     }
-    // The prompt reaper's own teardown of this object (see
-    // [`CASCADING_IDS`]): the transient C crossings the cascade performs
-    // must not re-queue the object it is in the middle of freeing.
-    if in_cascade(crate::weakref_registry::id_of(obj)) {
-        return;
-    }
     let pushed = PENDING_CEXT_DROPS
         .try_with(|cell| {
             if let Ok(mut queue) = cell.try_borrow_mut() {
@@ -950,33 +955,6 @@ pub fn queue_parked_drop(obj: &Object) {
         })
         .unwrap_or(false);
     if pushed {
-        if crate::hot_gates::env_flags::reap_trace() {
-            eprintln!(
-                "[CEXT-DROP] queued {} id={:#x}",
-                obj.type_name_owned(),
-                crate::weakref_registry::id_of(obj)
-            );
-            if std::env::var_os("WEAVEPY_REAP_BT").is_some() {
-                thread_local! {
-                    static N: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-                }
-                let n = N.with(|c| {
-                    let v = c.get() + 1;
-                    c.set(v);
-                    v
-                });
-                let every: usize = std::env::var("WEAVEPY_REAP_BT_EVERY")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(5000);
-                if n.is_multiple_of(every) {
-                    eprintln!(
-                        "[CEXT-DROP-BT]\n{}",
-                        std::backtrace::Backtrace::force_capture()
-                    );
-                }
-            }
-        }
         let _ = PENDING_CEXT_FLAG.try_with(|c| c.set(true));
         PENDING_CEXT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Release);
         crate::hot_gates::set(crate::hot_gates::PENDING_CEXT);

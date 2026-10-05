@@ -236,7 +236,7 @@ pub enum TOp {
     /// (staged through `ret_bits`) and write it into closure cell
     /// `idx` through the registered `wpjit_cell_set` helper. A
     /// displaced heap value must drop on the interpreter's store path
-    /// (prompt reap, parked finalizers), so the helper deopts before
+    /// (which runs any finalizer it queues), so the helper deopts before
     /// the store in that case and the interpreter re-executes it.
     CellSet { idx: u32, lane: JitType },
     /// RFC 0065 WS5 — `x.append(v)` on a pinned list: pops the value
@@ -284,6 +284,12 @@ pub enum TOp {
     /// `-1` for `None`) and pushes the `bool` result. Purely native —
     /// no helper call, no deopt.
     IsNone { negate: bool },
+    /// `a is b` / `a is not b` on two object lanes: pops both (pin
+    /// indices, or `-1` for `None`) and pushes the `bool` identity
+    /// result. Equal machine values answer in line; otherwise the
+    /// registered helper compares the pinned objects (a pin miss
+    /// deopts).
+    IsObj { negate: bool },
     /// RFC 0070 WS1 — push the `None` singleton in the nullable object
     /// lane (machine value `-1`). Emitted where a `None` constant must
     /// occupy a *native* stack slot: a `StoreFast` into an `Obj` local,
@@ -312,6 +318,27 @@ pub enum TOp {
         argc: u8,
         ret: MethodRet,
     },
+    /// `container[index]` (`BINARY_SUBSCR`) on an object-lane container
+    /// whose class resolved `__getitem__` to a native leaf method at
+    /// compile time (`deque.__getitem__`): pops the `int` index and the
+    /// container pin and calls the registered `wpjit_obj_getitem` helper
+    /// with the method-site `token` (the [`TOp::CallMethod`] protocol,
+    /// index staged as the one argument). A guard miss or a declined
+    /// fast half deopts *at* this pc with both operands spilled (nothing
+    /// ran; the interpreter re-executes the subscript). The result rides
+    /// the object lane, or the `int` lane when `int_result` fuses the
+    /// immediately following integer consumer (any other value parks and
+    /// resumes at that consumer).
+    ObjGetItem { token: u32, int_result: bool },
+    /// The method-form `LOAD_ATTR` of a burned-in native method site
+    /// (see [`TOp::CallMethod`]): peeks the receiver pin and calls the
+    /// registered `wpjit_guard_method` helper with the site's `token`,
+    /// which checks the receiver's class version and that no instance
+    /// attribute shadows the name. A miss (or `None`) deopts *at* this
+    /// pc with the receiver spilled, so the interpreter performs the
+    /// load itself. The `CALL` then needs no guard: the method was bound
+    /// here.
+    GuardMethod { token: u32 },
     /// RFC 0071 WS6 — `==`/`!=` on two pinned `str` values: pops both
     /// pins, calls the registered `wpjit_str_eq` helper (identical-pin
     /// and pointer equality answer before a content compare), and
@@ -349,16 +376,16 @@ pub enum TOp {
     /// interpreted per the trained `val` lane), and calls the
     /// registered `wpjit_dict_set` helper — the interpreter's own
     /// `dict_insert` chokepoint, so PEP 509 / watcher discipline is
-    /// identical. A displaced value that would run the prompt-reap
-    /// cascade deopts *before* the store (the `wpjit_attr_set`
+    /// identical. A displaced value whose release could run a
+    /// finalizer deopts *before* the store (the `wpjit_attr_set`
     /// discipline), as do active C-API dict watchers and any key-lane
     /// surprise.
     DictSet { key: JitType, val: JitType },
     /// `del d[k]` on a pinned exact `dict`: pops the key (`key` lane)
     /// and the dict pin, and calls the registered `wpjit_dict_del`
     /// helper — the interpreter's own `dict_remove` chokepoint. A
-    /// missing key, a displaced value that would run the prompt-reap
-    /// cascade, active C-API dict watchers, or any key-lane surprise
+    /// missing key, a displaced value whose release could run a
+    /// finalizer, active C-API dict watchers, or any key-lane surprise
     /// deopts *before* the delete, and the interpreter re-executes it
     /// (raising the exact `KeyError`).
     DictDel { key: JitType },
@@ -1486,6 +1513,8 @@ impl TOp {
                 | TOp::CallPy { .. }
                 | TOp::CallPyKw { .. }
                 | TOp::CallMethod { .. }
+                | TOp::ObjGetItem { .. }
+                | TOp::GuardMethod { .. }
                 | TOp::MathIntrinsic(_)
                 | TOp::FloatArith(ArithKind::FloorDiv | ArithKind::Mod | ArithKind::Pow)
                 | TOp::ListGet { .. }
@@ -1499,6 +1528,7 @@ impl TOp {
                 | TOp::AttrSet { .. }
                 | TOp::GuardNotNone
                 | TOp::StrEq { .. }
+                | TOp::IsObj { .. }
                 | TOp::StrLen
                 | TOp::BytesLen
                 | TOp::BytesGetItem

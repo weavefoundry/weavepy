@@ -42,50 +42,22 @@ const _: () = {
     assert_sync::<Object>();
 };
 
-/// Number of slots in the per-thread code-point-length cache.
-const STR_LEN_CACHE_CAP: usize = 1024;
-
-thread_local! {
-    /// Direct-mapped cache of `SharedStr` heap identity -> code-point length.
-    ///
-    /// WeavePy stores `str` as UTF-8, so counting code points — needed by
-    /// `len(s)`, index/slice bounds, and `re` span clamping — is O(n).
-    /// Scanners and tokenisers touch the *same* large string repeatedly, so
-    /// without memoisation an otherwise-linear pass degrades to O(n^2) (the
-    /// cause of `test_json`'s deep-recursion cases hanging). Each slot holds
-    /// the source `Rc` so a freed allocation cannot be reused at the same
-    /// address and alias a stale length; collisions simply recompute and
-    /// overwrite, so the cache is always correct and bounded to CAP entries.
-    static STR_LEN_CACHE: std::cell::RefCell<Vec<Option<(usize, SharedStr, usize)>>> =
-        std::cell::RefCell::new(vec![None; STR_LEN_CACHE_CAP]);
-}
-
-/// Code-point length of a UTF-8 `str`, memoised by heap identity. O(1) on a
-/// cache hit; O(n) (and caches the result) on a miss. Strings of 0 or 1
-/// bytes are counted directly — they are necessarily 0 or 1 code points, so
-/// caching them would only evict useful entries.
+/// Code-point length of a `str`: O(1) from the count memoised in the
+/// string itself (see [`SharedStr::char_count`]). WeavePy stores `str` as
+/// UTF-8, so the first count is a scan; scanners and tokenisers that ask
+/// for the length of the same large string repeatedly stay linear.
+#[inline]
 pub(crate) fn str_char_len(s: &SharedStr) -> usize {
-    let bytes = s.len();
-    if bytes <= 1 {
-        return bytes;
-    }
-    let ptr = SharedStr::as_ptr(s).cast::<u8>() as usize;
-    let slot = (ptr / 8) % STR_LEN_CACHE_CAP;
-    STR_LEN_CACHE.with(|c| {
-        let mut cache = c.borrow_mut();
-        if let Some((p, _, n)) = &cache[slot] {
-            if *p == ptr {
-                return *n;
-            }
-        }
-        let n = s.chars().count();
-        cache[slot] = Some((ptr, s.clone(), n));
-        n
-    })
+    SharedStr::char_count(s)
 }
 
 /// A Python value as seen by the interpreter.
+///
+/// `repr(u8)` fixes the layout native code relies on (see `frame_jit`):
+/// the variant's index in a tag byte at offset 0, and each payload at its
+/// natural alignment after it (every payload is one word or smaller).
 #[derive(Clone)]
+#[repr(u8)]
 pub enum Object {
     None,
     /// The "no value" marker for local-variable slots — CPython's NULL
@@ -478,6 +450,35 @@ pub struct PyFrame {
     /// CPython clearing the cell slots out of `f_localsplus` while
     /// the cell objects live on in the closures that captured them.
     pub cleared: Cell<bool>,
+    /// `f_back` while it is still a live activation nobody has looked at:
+    /// a frame object materialized as its activation leaves the spine
+    /// (for a traceback entry that outlives it) links its caller lazily,
+    /// so the caller's own frame object is built only if `f_back` is read
+    /// or the caller leaves the spine while this link lives. Resolved
+    /// into [`Self::back`] by [`Self::back_frame`].
+    pub(crate) lazy_back: RefCell<Option<LazyShellRef>>,
+}
+
+impl PyFrame {
+    /// `f_back`, materializing a lazy link (see [`Self::lazy_back`]).
+    pub fn back_frame(&self) -> Option<Rc<PyFrame>> {
+        let shell = match self.lazy_back.borrow().as_ref() {
+            None => return self.back.borrow().clone(),
+            Some(lazy) => lazy.0.clone(),
+        };
+        let py = materialize_shell(&shell);
+        *self.back.borrow_mut() = Some(py.clone());
+        *self.lazy_back.borrow_mut() = None;
+        Some(py)
+    }
+
+    /// Replace `f_back` (dropping any lazy link).
+    pub fn set_back(&self, back: Option<Rc<PyFrame>>) {
+        *self.back.borrow_mut() = back;
+        if self.lazy_back.borrow().is_some() {
+            *self.lazy_back.borrow_mut() = None;
+        }
+    }
 }
 
 impl fmt::Debug for PyFrame {
@@ -493,6 +494,25 @@ impl fmt::Debug for PyFrame {
 
 impl Drop for PyFrame {
     fn drop(&mut self) {
+        // A dead frame's locals die with its frame object, and CPython's
+        // `frame_dealloc` releases them from the top of the value stack
+        // down, before `f_back`: finalizers observe that order (the
+        // innermost frame of a dropped traceback frees its last local
+        // first).
+        if let Some(locals) = self.locals_mirror.get_mut().take() {
+            if Rc::strong_count(&locals) == 1 {
+                if let Ok(mut values) = locals.try_borrow_mut() {
+                    while let Some(value) = values.pop() {
+                        drop(values);
+                        drop(value);
+                        values = match locals.try_borrow_mut() {
+                            Ok(values) => values,
+                            Err(_) => break,
+                        };
+                    }
+                }
+            }
+        }
         // Iteratively tear down the `back` chain. A plain recursive drop
         // would drop this frame's `back` Arc, whose own drop drops the
         // *next* frame's `back`, and so on — one native stack frame per
@@ -949,6 +969,10 @@ pub struct FrameShell {
     pub has_materialized: std::sync::atomic::AtomicBool,
     /// The real Python frame object, once someone asked for it.
     pub materialized: RefCell<Option<Rc<PyFrame>>>,
+    /// Live traceback entries that recorded this activation without
+    /// materializing it (see `PyTraceback::new_lazy`). The pop
+    /// materializes a shell that still has some. Zero for a parked shell.
+    pub tb_refs: std::sync::atomic::AtomicU32,
 }
 
 /// Metadata in a live frame shell. Recycled shells leave these slots
@@ -1072,6 +1096,7 @@ impl FrameShell {
             lasti: std::sync::atomic::AtomicU32::new(py.lasti.get()),
             has_materialized: std::sync::atomic::AtomicBool::new(true),
             materialized: RefCell::new(Some(py.clone())),
+            tb_refs: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -1092,11 +1117,23 @@ impl FrameShell {
     }
 
     pub fn materialize(&self, back: Option<Rc<PyFrame>>) -> Rc<PyFrame> {
+        let py = self.materialize_departing(back);
+        // RFC 0065 (WS1): a freshly materialized frame must kick its
+        // dispatch loop off the quiet path so the per-instruction
+        // `lasti`-cell sync resumes.
+        crate::hot_gates::bump_loop_gen();
+        py
+    }
+
+    /// [`Self::materialize`] for an activation that is leaving the spine:
+    /// no dispatch loop will run it again, so none needs kicking off its
+    /// quiet path.
+    pub fn materialize_departing(&self, back: Option<Rc<PyFrame>>) -> Rc<PyFrame> {
         if let Some(existing) = self.materialized.borrow().as_ref() {
+            // (`materialize` still bumps: the new holder may keep it, and
+            // a quiet loop running this activation re-derives, finding it
+            // observed if so.)
             self.refresh_materialized(existing);
-            // The new holder may keep it: a quiet loop running this
-            // activation re-derives, and finds it observed if so.
-            crate::hot_gates::bump_loop_gen();
             return existing.clone();
         }
         let py = Rc::new(PyFrame {
@@ -1122,14 +1159,11 @@ impl FrameShell {
             on_stack: Cell::new(1),
             extra_locals: RefCell::new(None),
             cleared: Cell::new(false),
+            lazy_back: RefCell::new(None),
         });
         *self.materialized.borrow_mut() = Some(py.clone());
         self.has_materialized
             .store(true, std::sync::atomic::Ordering::Release);
-        // RFC 0065 (WS1): a freshly materialized frame must kick its
-        // dispatch loop off the quiet path so the per-instruction
-        // `lasti`-cell sync resumes.
-        crate::hot_gates::bump_loop_gen();
         py
     }
 
@@ -1200,7 +1234,7 @@ pub fn materialize_stack_at(stack: &FrameStack, idx: usize) -> Option<Rc<PyFrame
             Some(py) => {
                 shell.refresh_materialized(&py);
                 refreshed = true;
-                *py.back.borrow_mut() = back;
+                py.set_back(back);
                 py
             }
             None => {
@@ -1233,7 +1267,10 @@ pub fn materialize_stack_top(stack: &FrameStack) -> Option<Rc<PyFrame>> {
 /// unwind machinery and chained outward through [`Self::next`].
 #[derive(Debug)]
 pub struct PyTraceback {
-    pub frame: Rc<PyFrame>,
+    /// The frame this entry records: the frame object, or the live
+    /// activation's spine shell until something asks for the object
+    /// (see [`TbFrame`]). Read through [`Self::frame`].
+    frame: RefCell<TbFrame>,
     pub lineno: u32,
     pub lasti: u32,
     /// `types.TracebackType(…)` stores the caller-supplied `tb_lasti`
@@ -1241,6 +1278,143 @@ pub struct PyTraceback {
     /// the instruction index through `cpython_lasti` on read.
     pub raw_lasti: Option<i64>,
     pub next: RefCell<Option<Rc<PyTraceback>>>,
+}
+
+/// A traceback entry's frame.
+///
+/// CPython creates the frame object for every traceback entry, but its
+/// frame objects are cheap; WeavePy's materialization links the whole
+/// `f_back` chain and takes the running activation off its quiet path.
+/// An exception caught and dropped in the frame that raised it (the
+/// `try: d[k] except KeyError:` idiom) never shows anyone that frame,
+/// so an entry recorded while its activation runs keeps the spine
+/// shell instead and materializes from it on first use. While the
+/// activation is live, materializing then is what materializing at the
+/// raise would have produced by now (the object tracks the running
+/// frame either way); when the activation leaves the spine with lazy
+/// entries still alive, `pop_frame_shell` materializes it on the way
+/// out, so the object exists exactly as CPython's would.
+#[derive(Debug)]
+enum TbFrame {
+    Ready(Rc<PyFrame>),
+    Lazy(LazyShellRef),
+}
+
+/// A hold on a live activation's shell standing for its frame object
+/// until someone asks for it: a lazy traceback entry (see [`TbFrame`]) or
+/// a frame's lazy `f_back` (see [`PyFrame::lazy_back`]). Counted in
+/// [`FrameShell::tb_refs`] so the activation's pop knows to materialize.
+#[derive(Debug)]
+pub(crate) struct LazyShellRef(Rc<FrameShell>);
+
+impl LazyShellRef {
+    pub(crate) fn new(shell: Rc<FrameShell>) -> Self {
+        shell
+            .tb_refs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(shell)
+    }
+}
+
+impl Drop for LazyShellRef {
+    fn drop(&mut self) {
+        self.0
+            .tb_refs
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl PyTraceback {
+    /// An entry for an existing frame object.
+    pub fn new(frame: Rc<PyFrame>, lineno: u32, lasti: u32, raw_lasti: Option<i64>) -> Self {
+        Self {
+            frame: RefCell::new(TbFrame::Ready(frame)),
+            lineno,
+            lasti,
+            raw_lasti,
+            next: RefCell::new(None),
+        }
+    }
+
+    /// An entry for the activation `shell` stands for, which must be
+    /// live on this thread's spine and not yet materialized (see
+    /// [`TbFrame`]).
+    pub fn new_lazy(shell: Rc<FrameShell>, lineno: u32, lasti: u32) -> Self {
+        Self {
+            frame: RefCell::new(TbFrame::Lazy(LazyShellRef::new(shell))),
+            lineno,
+            lasti,
+            raw_lasti: None,
+            next: RefCell::new(None),
+        }
+    }
+
+    /// `tb_frame`: the frame object, materialized on first use.
+    pub fn frame(&self) -> Rc<PyFrame> {
+        let shell = match &*self.frame.borrow() {
+            TbFrame::Ready(py) => return py.clone(),
+            TbFrame::Lazy(lazy) => lazy.0.clone(),
+        };
+        let py = materialize_shell(&shell);
+        *self.frame.borrow_mut() = TbFrame::Ready(py.clone());
+        py
+    }
+
+    /// The frame object if one exists already (no materialization).
+    pub fn frame_if_ready(&self) -> Option<Rc<PyFrame>> {
+        match &*self.frame.borrow() {
+            TbFrame::Ready(py) => Some(py.clone()),
+            TbFrame::Lazy(lazy) => lazy.0.materialized.borrow().clone(),
+        }
+    }
+
+    /// The entry's code object, without materializing its frame.
+    pub fn code(&self) -> Rc<CodeObject> {
+        match &*self.frame.borrow() {
+            TbFrame::Ready(py) => py.code.clone(),
+            TbFrame::Lazy(lazy) => (*lazy.0.code).clone(),
+        }
+    }
+}
+
+/// The frame object for `shell`, a lazy traceback entry's activation:
+/// the one it already has, else materialized where it sits on this
+/// thread's spine (linking `f_back` like any other materialization).
+pub(crate) fn materialize_shell(shell: &Rc<FrameShell>) -> Rc<PyFrame> {
+    if let Some(handles) = crate::vm_singletons::current_thread_handles() {
+        let idx = handles
+            .frame_stack
+            .borrow()
+            .iter()
+            .rposition(|s| Rc::ptr_eq(s, shell));
+        if let Some(idx) = idx {
+            if let Some(py) = materialize_stack_at(&handles.frame_stack, idx) {
+                return py;
+            }
+        }
+    }
+    if let Some(py) = shell.materialized.borrow().as_ref() {
+        shell.refresh_materialized(py);
+        return py.clone();
+    }
+    // Live on another thread's spine (an exception from
+    // `sys._current_exceptions()`): materialize it there, as
+    // `sys._current_frames()` does; peer threads are parked under the GIL.
+    for (_, stack, _) in crate::stdlib::faulthandler_mod::thread_snapshots() {
+        let idx = stack
+            .try_borrow()
+            .ok()
+            .and_then(|s| s.iter().rposition(|s| Rc::ptr_eq(s, shell)));
+        if let Some(idx) = idx {
+            if let Some(py) = materialize_stack_at(&stack, idx) {
+                return py;
+            }
+        }
+    }
+    // A greenlet's parked spine: the shell's slots are valid while the
+    // activation lives, but the `f_back` chain belongs to that stack. Its
+    // pop decrements `on_stack` as for any materialization.
+    shell.materialize(None)
 }
 
 impl Drop for PyTraceback {
@@ -2026,6 +2200,7 @@ pub fn c_contiguous_strides(shape: &[usize], itemsize: usize) -> Vec<isize> {
 impl Drop for PyMemoryView {
     fn drop(&mut self) {
         self.release();
+        crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
     }
 }
 
@@ -2880,6 +3055,13 @@ pub struct PyModule {
     pub dict: Rc<RefCell<DictData>>,
 }
 
+/// A dying PyModule clears the weak references watching it.
+impl Drop for PyModule {
+    fn drop(&mut self) {
+        crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
+    }
+}
+
 impl fmt::Debug for PyModule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "<module {:?}>", self.name)
@@ -3064,12 +3246,19 @@ pub struct LeafProbe<'a> {
 }
 
 impl<'a> LeafProbe<'a> {
-    /// `None` unless `key` is a `str` or a machine `int`.
+    /// `None` unless `key` is a `str`, a machine `int`, or a plain
+    /// instance hashed by identity (its `__hash__` is `object`'s).
     #[inline]
     pub fn new(key: &'a Object) -> Option<Self> {
         let hash = match key {
             Object::Str(s) => SharedStr::hash_cached(s),
             Object::Int(_) => py_hash_value(key)?,
+            Object::Instance(i)
+                if i.native.get().is_none()
+                    && i.class_dunder(crate::types::Dunder::Hash).object_owner() =>
+            {
+                identity_hash(key)
+            }
             _ => return None,
         };
         Some(Self {
@@ -3103,6 +3292,9 @@ impl indexmap::Equivalent<DictKey> for LeafProbe<'_> {
         match (self.key, &key.0) {
             (Object::Str(a), Object::Str(b)) => a.as_bytes() == b.as_bytes(),
             (Object::Int(a), Object::Int(b)) => a == b,
+            // Identity settles an instance probe (CPython compares keys
+            // with `is` first); any other pairing may need `__eq__`.
+            (Object::Instance(a), Object::Instance(b)) if Rc::ptr_eq(a, b) => true,
             _ => {
                 self.foreign.set(true);
                 false
@@ -3135,6 +3327,12 @@ pub fn note_class_dict_key(key: &DictKey) {
 #[inline]
 pub fn exotic_str_keys_possible() -> bool {
     EXOTIC_CLASS_KEYS.load(std::sync::atomic::Ordering::Acquire) != 0
+}
+
+/// The counter [`exotic_str_keys_possible`] reads, for native code that
+/// reads it in line (a `usize`: nonzero once exotic keys are possible).
+pub(crate) fn exotic_str_keys_flag() -> *const usize {
+    EXOTIC_CLASS_KEYS.as_ptr()
 }
 
 /// Reach for the running interpreter to compute a user instance's Python
@@ -3198,6 +3396,13 @@ pub(crate) fn instance_has_custom_dunder(obj: &Object, dunder: crate::types::Dun
     // (`class C(int)`, struct sequences) keep their native structural
     // comparison via `native`.
     inst.native.get().is_none() && !info.object_owner()
+}
+
+/// A plain instance compared by identity: no native payload, and its
+/// `__eq__` is `object`'s.
+#[inline]
+pub(crate) fn plain_identity_eq(inst: &crate::types::PyInstance) -> bool {
+    inst.native.get().is_none() && inst.class_dunder(crate::types::Dunder::Eq).object_owner()
 }
 
 /// [`instance_has_custom_dunder`] for `__eq__`: membership tests and
@@ -3281,6 +3486,14 @@ pub(crate) fn key_needs_interp_eq(obj: &Object) -> bool {
 pub(crate) fn member_eq(a: &Object, b: &Object) -> Result<bool, RuntimeError> {
     if a.is_same(b) {
         return Ok(true);
+    }
+    // Two distinct plain instances (`object.__eq__` on both sides) are
+    // unequal: both comparisons return `NotImplemented`. Settled before
+    // the general path, which resolves each side's `__eq__` twice.
+    if let (Object::Instance(x), Object::Instance(y)) = (a, b) {
+        if plain_identity_eq(x) && plain_identity_eq(y) {
+            return Ok(false);
+        }
     }
     // Dispatch the full Python comparison whenever an operand can carry
     // custom `__eq__` semantics: a pure-Python instance with a user dunder,
@@ -4047,6 +4260,11 @@ pub fn global_value_epoch() -> u64 {
     GLOBAL_VALUE_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Where [`GLOBAL_VALUE_EPOCH`] lives (native code reads it in line).
+pub(crate) fn global_value_epoch_ptr() -> *const u64 {
+    GLOBAL_VALUE_EPOCH.as_ptr()
+}
+
 /// Advance [`GLOBAL_VALUE_EPOCH`].
 #[inline]
 pub fn bump_global_value_epoch() {
@@ -4178,6 +4396,9 @@ impl DictData {
         let owner = std::mem::replace(self.deferred_owner.get_mut(), 0);
         crate::gc_trace::track_deferred_owner(owner);
     }
+
+    /// Where the stamp sits in a dict (native code reads it in line).
+    pub(crate) const STAMP_OFFSET: usize = std::mem::offset_of!(DictData, stamp);
 
     /// The stamp of the dict's current state (see the type docs).
     #[inline]
@@ -4364,8 +4585,13 @@ pub struct PyFunction {
     /// data descriptors on the `function` type, so `f.__name__ = x`
     /// must never appear in `f.__dict__` (functools.update_wrapper
     /// copies `__dict__` and asserts the wrapper's annotations are
-    /// untouched by the wrapped function's slots).
-    pub slots: RefCell<DictData>,
+    /// untouched by the wrapped function's slots). Read through
+    /// [`Self::slots`], which first copies in [`Self::slot_seed`].
+    pub slots_raw: RefCell<DictData>,
+    /// The slots a new function starts with, shared by every function
+    /// one `def` makes (see `new_function`), until the first access to
+    /// [`Self::slots`] copies them in: most functions never read theirs.
+    pub slot_seed: RefCell<Option<Rc<DictMap>>>,
     /// The frame `cells` vector for a function whose code has free
     /// variables but no cell variables: exactly `closure`'s cells, built
     /// once (the closure is immutable) for the lean call paths.
@@ -4375,6 +4601,13 @@ pub struct PyFunction {
     /// slot-store probe for the overwhelmingly common function that never
     /// had them overridden.
     pub defaults_override: OverrideFlag,
+}
+
+/// A dying PyFunction clears the weak references watching it.
+impl Drop for PyFunction {
+    fn drop(&mut self) {
+        crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
+    }
 }
 
 /// A clonable set-once flag (see [`PyFunction::defaults_override`]).
@@ -4494,11 +4727,35 @@ impl PyFunction {
             .cloned()
     }
 
+    /// The function's getset slots (see [`Self::slots_raw`]), with the
+    /// seed it was made with copied in.
+    #[inline]
+    pub fn slots(&self) -> &RefCell<DictData> {
+        // SAFETY: a read of the seed's presence with nothing running.
+        if unsafe { (*self.slot_seed.as_ptr()).is_some() } {
+            self.plant_slot_seed();
+        }
+        &self.slots_raw
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn plant_slot_seed(&self) {
+        let Some(seed) = self.slot_seed.borrow_mut().take() else {
+            return;
+        };
+        let mut slots = self.slots_raw.borrow_mut();
+        // Every store goes through `slots()`, which plants the seed
+        // first: nothing is there yet to keep.
+        debug_assert!(slots.is_empty());
+        *slots = DictData::from((*seed).clone());
+    }
+
     /// Read a slot value if one has been stored (explicitly assigned or
     /// stamped at definition time). Computed fallbacks live at the
     /// attribute-access sites.
     pub fn slot(&self, name: &str) -> Option<Object> {
-        self.slots
+        self.slots()
             .borrow()
             .get(&crate::object::StrKey(name))
             .cloned()
@@ -4510,7 +4767,7 @@ impl PyFunction {
                 .0
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        self.slots
+        self.slots()
             .borrow_mut()
             .insert(DictKey(Object::from_str(name)), value);
     }
@@ -4551,6 +4808,13 @@ pub struct BoundMethod {
     /// (`_MAYBE_EXPAND_METHOD` checks `PyMethod_Type`). Irrelevant when
     /// `function` is a Python function (always `method`).
     pub py_method: bool,
+}
+
+/// A dying BoundMethod clears the weak references watching it.
+impl Drop for BoundMethod {
+    fn drop(&mut self) {
+        crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
+    }
 }
 
 impl BoundMethod {
@@ -4802,54 +5066,24 @@ impl fmt::Debug for PyGenerator {
 
 impl Drop for PyGenerator {
     fn drop(&mut self) {
-        // CPython finalizes a generator the moment its refcount dies:
-        // a *suspended* frame gets `GeneratorExit` thrown in so
-        // `finally:`/`with` cleanup runs. We can't run Python from
-        // `Drop`, so resurrect the live frame into the VM's
-        // pending-finalizer queue; `gc.collect()` and the module-exit
-        // path drain it. Created-but-never-started frames have run no
-        // user code, so (like CPython's `gen_close`) they are simply
-        // marked completed.
-        let Ok(mut state) = self.state.try_borrow_mut() else {
-            return;
-        };
-        let prev = std::mem::replace(&mut *state, GeneratorState::Finished);
-        drop(state);
-        match prev {
-            GeneratorState::Suspended(frame) => {
-                // Finalized once already (CPython's `_PyGC_FINALIZED` bit):
-                // drop the frame for real instead of looping forever
-                // through resurrection → finalize → drop.
-                if self.finalize_ran.get() {
-                    defer_generator_state_drop(GeneratorState::Suspended(frame));
-                    return;
-                }
-                let resurrected = Rc::new(PyGenerator {
-                    name: RefCell::new(self.name.borrow().clone()),
-                    qualname: RefCell::new(self.qualname.borrow().clone()),
-                    kind: self.kind,
-                    code: self.code.clone(),
-                    state: RefCell::new(GeneratorState::Suspended(frame)),
-                    origin: RefCell::new(self.origin.borrow().clone()),
-                    hooks_inited: crate::sync::Cell::new(self.hooks_inited.get()),
-                    finalizer: RefCell::new(self.finalizer.borrow().clone()),
-                    finalize_ran: crate::sync::Cell::new(self.finalize_ran.get()),
-                });
-                let obj = match self.kind {
-                    CoroutineKind::Generator => Object::Generator(resurrected),
-                    CoroutineKind::Coroutine => Object::Coroutine(resurrected),
-                    CoroutineKind::AsyncGenerator => Object::AsyncGenerator(resurrected),
-                };
-                crate::vm_singletons::try_push_pending_finalizer(obj);
+        // A suspended generator's `close()` (and a never-awaited
+        // coroutine's warning) already ran: `rc::Rc`'s `Drop` queued the
+        // generator for it at its last release. A created or suspended
+        // frame still owns locals that can hold the *next* generator of a
+        // pipeline (`chain(chain(chain(…)))`); dropping it inline recurses
+        // one native stack frame per link and overflows on long chains, so
+        // route it through the iterative trampoline below.
+        if let Ok(mut state) = self.state.try_borrow_mut() {
+            let prev = std::mem::replace(&mut *state, GeneratorState::Finished);
+            drop(state);
+            if matches!(
+                prev,
+                GeneratorState::Suspended(_) | GeneratorState::Created(_)
+            ) {
+                defer_generator_state_drop(prev);
             }
-            // A never-started frame still owns locals that can hold the
-            // *next* generator of a pipeline (`chain(chain(chain(…)))`).
-            // Dropping it inline recurses one native stack frame per
-            // link and overflows on long chains, so route it through
-            // the iterative trampoline below.
-            state @ GeneratorState::Created(_) => defer_generator_state_drop(state),
-            GeneratorState::Finished | GeneratorState::Running => {}
         }
+        crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
     }
 }
 
@@ -7670,6 +7904,7 @@ impl fmt::Debug for PyFile {
 
 impl Drop for PyFile {
     fn drop(&mut self) {
+        crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
         // CPython's fileio/buffered/textio deallocators emit a
         // `ResourceWarning("unclosed file %R")` when an *open*, fd-backed
         // stream is reclaimed without an explicit `close()`/`with`
@@ -8517,25 +8752,10 @@ impl PyIterator {
         }
     }
 
-    /// Like [`next_value`], but enforces CPython's "container changed
-    /// size during iteration" invariant before yielding. Used on the
-    /// *user-visible* `__next__` boundaries (`FOR_ITER`, the `next()`
-    /// builtin, `iter.__next__()`); the many internal consumers that
-    /// drain a freshly-built iterator without mutating its source can
-    /// keep calling the cheaper [`next_value`].
-    pub fn next_value_checked(&mut self) -> Result<Option<Object>, RuntimeError> {
-        if let PyIterator::Set { set, len, index } = self {
-            // `setiter_iternext`: a size change since creation is fatal,
-            // even on the step that would otherwise raise StopIteration.
-            if set.borrow().len() != *len {
-                // Sticky, like CPython's `si_used = -1`: every further
-                // `next()` keeps raising, and `__length_hint__` reports 0
-                // (test_iterlen.test_immutable_during_iteration).
-                *len = usize::MAX;
-                *index = usize::MAX;
-                return Err(runtime_error("Set changed size during iteration"));
-            }
-        }
+    /// A dict iterator's mutation guards, before each checked step:
+    /// `Ok(true)` when the step must end silently; an error once the dict
+    /// changed under it. Nothing for any other iterator.
+    fn dict_iter_guard(&mut self) -> Result<bool, RuntimeError> {
         if let PyIterator::DictKeys {
             dict: Some(d),
             len,
@@ -8567,13 +8787,80 @@ impl PyIterator {
                         // array leaves `di_pos` past `dk_nentries`, which
                         // is a silent StopIteration, not an error.
                         *index = 0;
-                        return Ok(None);
+                        return Ok(true);
                     }
                     return Err(runtime_error("dictionary keys changed during iteration"));
                 }
                 None => *watch = Some(DictWatch::new(d)),
                 _ => {}
             }
+        }
+        Ok(false)
+    }
+
+    /// The checked step of a forward `dict.items()` iterator without its
+    /// `(key, value)` tuple, for a consumer that unpacks it at once (a
+    /// native tuple-target loop). `None` for any other iterator.
+    pub fn next_item_pair(&mut self) -> Option<Result<Option<(Object, Object)>, RuntimeError>> {
+        if !matches!(
+            self,
+            PyIterator::DictKeys {
+                kind: DictViewKind::Items,
+                reverse: false,
+                ..
+            }
+        ) {
+            return None;
+        }
+        match self.dict_iter_guard() {
+            Err(e) => return Some(Err(e)),
+            Ok(true) => return Some(Ok(None)),
+            Ok(false) => {}
+        }
+        let PyIterator::DictKeys {
+            index, dict, owner, ..
+        } = self
+        else {
+            return None;
+        };
+        let Some(d) = dict.as_ref() else {
+            return Some(Ok(None));
+        };
+        let entry = d
+            .borrow()
+            .get_index(*index)
+            .map(|(k, v)| (k.0.clone(), v.clone()));
+        if entry.is_some() {
+            *index += 1;
+        } else {
+            // Exhausted: detached, as `next_value` leaves it.
+            *dict = None;
+            *owner = None;
+        }
+        Some(Ok(entry))
+    }
+
+    /// Like [`next_value`], but enforces CPython's "container changed
+    /// size during iteration" invariant before yielding. Used on the
+    /// *user-visible* `__next__` boundaries (`FOR_ITER`, the `next()`
+    /// builtin, `iter.__next__()`); the many internal consumers that
+    /// drain a freshly-built iterator without mutating its source can
+    /// keep calling the cheaper [`next_value`].
+    pub fn next_value_checked(&mut self) -> Result<Option<Object>, RuntimeError> {
+        if let PyIterator::Set { set, len, index } = self {
+            // `setiter_iternext`: a size change since creation is fatal,
+            // even on the step that would otherwise raise StopIteration.
+            if set.borrow().len() != *len {
+                // Sticky, like CPython's `si_used = -1`: every further
+                // `next()` keeps raising, and `__length_hint__` reports 0
+                // (test_iterlen.test_immutable_during_iteration).
+                *len = usize::MAX;
+                *index = usize::MAX;
+                return Err(runtime_error("Set changed size during iteration"));
+            }
+        }
+        if self.dict_iter_guard()? {
+            return Ok(None);
         }
         if let PyIterator::File { file } = self {
             // Surface read errors (OSError, decode errors) at the
@@ -11967,6 +12254,13 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             })))
         }
         Object::Instance(inst) => {
+            // The common case first: a plain instance whose `__hash__` is
+            // `object`'s hashes by identity, with no interpreter round trip.
+            if inst.native.get().is_none()
+                && inst.class_dunder(crate::types::Dunder::Hash).object_owner()
+            {
+                return Some(identity_hash(obj));
+            }
             // A `weakref.ref` hashes as its referent (CPython `weakref_hash`),
             // computed natively and memoised so the hot `DictKey` path never
             // pays a reentrant `__hash__` dispatch — see `weakref_native_hash`.
@@ -12689,6 +12983,10 @@ impl Object {
         }
     }
 }
+
+// Every payload is one word or smaller, so a value is a tag and a word.
+const _: () = assert!(std::mem::size_of::<Object>() == 16);
+const _: () = assert!(std::mem::size_of::<Option<Object>>() == 16);
 
 #[cfg(test)]
 mod tests {

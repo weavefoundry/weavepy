@@ -1259,6 +1259,21 @@ fn has_inline_values(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(inline))
 }
 
+/// `_testinternalcapi.instance_layout(obj)` (WeavePy-only): how an
+/// instance stores its attributes, without changing it — `"split"` (the
+/// class's shared names), `"dict"` (a published dictionary), or `"none"`.
+fn instance_layout(args: &[Object]) -> Result<Object, RuntimeError> {
+    let layout = match args.first() {
+        Some(Object::Instance(inst)) if inst.dict.published().is_some() => "dict",
+        Some(Object::Instance(inst)) => match inst.dict.split_cell().try_borrow() {
+            Ok(split) if !split.is_empty() => "split",
+            _ => "none",
+        },
+        _ => "none",
+    };
+    Ok(Object::from_static(layout))
+}
+
 /// `_testinternalcapi.run_in_subinterp_with_config(code, config)` —
 /// CPython's helper spins up a `Py_NewInterpreterFromConfig` interpreter,
 /// runs `code` with `PyRun_SimpleString`, and tears it down, returning
@@ -2136,6 +2151,15 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 name: "incref_decref_delayed",
                 binds_instance: false,
                 call: Box::new(incref_decref_delayed),
+                call_kw: None,
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("instance_layout")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "instance_layout",
+                binds_instance: false,
+                call: Box::new(instance_layout),
                 call_kw: None,
             })),
         );

@@ -231,7 +231,13 @@ jobs:
         # rust-cache still primes dependency compilation, and the
         # merge-base is usually a recent main commit CI has built
         # before, so this step is mostly cache hits.
+        #
+        # The reference binary is only timed, so a lint that a newer
+        # toolchain added (one the merge-base predates) mustn't fail
+        # the build: lints are capped at warnings here.
         shell: bash
+        env:
+          RUSTFLAGS: "--cap-lints=warn"
         run: |
           BASE_SHA=$(git merge-base "${{ github.event.pull_request.base.sha }}" HEAD)
           echo "merge-base: $BASE_SHA"
@@ -263,6 +269,7 @@ jobs:
           python tools/bench_cold_jit.py \
             --base "$BASE_WEAVEPY" --new target/release/weavepy.exe \
             --samples 7 \
+            --fixtures sumvm:2000000,nested_loops:120,jitloop:1000,call_overhead:150000 \
             --out "target/performance/cold-jit-ci/${{ github.run_id }}-${{ github.run_attempt }}/report.json"
       - uses: actions/upload-artifact@v4
         if: always() && steps.cold_jit_diagnostic.outcome != 'skipped' && steps.cold_jit_diagnostic.outcome != ''

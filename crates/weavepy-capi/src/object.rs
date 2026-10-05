@@ -1659,14 +1659,13 @@ pub(crate) unsafe fn free_box(p: *mut PyObject) {
         evict_property_box(weavepy_vm::sync::Rc::as_ptr(rc) as usize, p);
     }
     // RFC 0047 (wave 5): C is dropping what may be the payload's last
-    // program-visible reference, from inside an extension call the VM's
-    // prompt reaper cannot see. Park instance/container payloads for a
-    // refcount-guarded reap at the next eval-loop safe point so anything
-    // that died here gets its weakrefs cleared with CPython's timing
-    // (pandas' `BlockValuesRefs.has_reference` prunes dead block
-    // weakrefs the very next Python-level call after a Cython-internal
-    // `self.blocks = ...` rebind). A payload that is still alive
-    // elsewhere fails the reap's deadness test untouched.
+    // program-visible reference, from inside an extension call that may
+    // still hold borrowed body pointers. Park instance/container payloads
+    // and release them at the next eval-loop safe point outside any C
+    // call, so anything that dies there gets its weakrefs cleared before
+    // the next Python-level read (pandas' `BlockValuesRefs.has_reference`
+    // prunes dead block weakrefs right after a Cython-internal
+    // `self.blocks = ...` rebind).
     weavepy_vm::vm_singletons::queue_cext_dropped(&bx.payload.obj);
     if let Some(d) = bx.payload.destructor {
         let raw = Box::into_raw(bx);

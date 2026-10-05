@@ -158,7 +158,7 @@ impl ModuleCache {
         // is True); a module's globals routinely close cycles (a function
         // defined in the module captures the module's dict). Track on install.
         if matches!(module, Object::Module(_)) {
-            crate::gc_trace::track(module.clone());
+            crate::gc_trace::track(&module);
         }
         self.modules
             .borrow_mut()

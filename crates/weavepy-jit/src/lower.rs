@@ -11,6 +11,7 @@
 //! locals + spilled stack back into the [`JitFrame`] and returns
 //! [`JitStatus::Deopt`] so the interpreter resumes at the exact pc.
 
+use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
     types, AbiParam, Block, BlockArg, FuncRef, Function, InstBuilder, MemFlags, SigRef, Signature,
@@ -45,9 +46,31 @@ pub(crate) struct LeafTarget {
     pub n_locals: u32,
     pub max_stack: u32,
     pub params: Vec<JitType>,
+    /// Per parameter, the default a call that leaves it out binds.
+    pub defaults: Vec<Option<u64>>,
 }
 
-/// Build the Cranelift function body for `tfunc` into `func`.
+/// Where a direct leaf call takes one parameter from: the call's `j`th
+/// value (positionals, then keyword values), or a burned-in default.
+#[derive(Clone, Copy)]
+enum LeafArg {
+    Arg(usize),
+    Default(u64),
+}
+
+/// A `CallPy`/`CallPyKw` site's operands, for its ordinary call.
+#[derive(Clone, Copy)]
+struct SiteCall {
+    token: u32,
+    argc: u8,
+    kwc: u8,
+    perm: u32,
+    gaps: u32,
+}
+
+/// Build the Cranelift function body for `tfunc` into `func`; `false` when
+/// the body assigned a local the write-back plan missed (the build must be
+/// discarded).
 pub(crate) fn build_function(
     func: &mut Function,
     fbctx: &mut FunctionBuilderContext,
@@ -55,14 +78,16 @@ pub(crate) fn build_function(
     ptr_ty: Type,
     self_func: Option<FuncRef>,
     leaves: Vec<LeafTarget>,
-) {
+) -> bool {
     let mut builder = FunctionBuilder::new(func, fbctx);
     let mut lc = Lowerer::new(&mut builder, tfunc, ptr_ty);
     lc.self_func = self_func;
     lc.leaves = leaves;
     lc.build();
+    let sound = !lc.unlisted_assignment;
     builder.seal_all_blocks();
     builder.finalize();
+    sound
 }
 
 struct Lowerer<'a, 'b> {
@@ -131,6 +156,64 @@ struct Lowerer<'a, 'b> {
     self_slow_sig: Option<SigRef>,
     /// Direct scalar-leaf call targets by token.
     leaves: Vec<LeafTarget>,
+    /// Per local slot, whether the body assigns it (see
+    /// [`assigned_slots`]): a local it never assigns still holds the
+    /// frame's own value, so exits and calls don't write it back.
+    assignable: Vec<bool>,
+    /// The slot each local's variable stands for, by variable index.
+    var_slots: Vec<u32>,
+    /// Set when the body assigned a local [`assigned_slots`] missed: the
+    /// build is then unsound and `build_function` reports it.
+    unlisted_assignment: bool,
+}
+
+/// Which local slots `tfunc`'s body assigns after the entry loads them:
+/// every operation and loop step that defines a local's variable (see
+/// [`Lowerer::def_local`], which checks the list).
+fn assigned_slots(tfunc: &TFunc) -> Vec<bool> {
+    let mut out = vec![false; tfunc.n_locals as usize];
+    let mut mark = |slot: u32| {
+        if let Some(a) = out.get_mut(slot as usize) {
+            *a = true;
+        }
+    };
+    for b in &tfunc.blocks {
+        for st in &b.stmts {
+            match st.op {
+                TOp::StoreLocal(slot)
+                | TOp::IterCapture {
+                    iter_slot: slot, ..
+                }
+                | TOp::DictIterNew { iter_slot: slot } => mark(slot),
+                _ => {}
+            }
+        }
+        match b.term {
+            TTerm::ForRange {
+                cur_slot, var_slot, ..
+            } => {
+                mark(cur_slot);
+                mark(var_slot);
+            }
+            TTerm::ForList {
+                idx_slot, var_slot, ..
+            } => {
+                mark(idx_slot);
+                mark(var_slot);
+            }
+            TTerm::ForIter { var_slot, .. } => mark(var_slot),
+            TTerm::ForIterPair {
+                var1_slot,
+                var2_slot,
+                ..
+            } => {
+                mark(var1_slot);
+                mark(var2_slot);
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
@@ -166,7 +249,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             self_sig: None,
             self_slow_sig: None,
             leaves: Vec::new(),
+            assignable: Vec::new(),
+            var_slots: Vec::new(),
+            unlisted_assignment: false,
         }
+    }
+
+    /// Assign the managed local `var` (anything but its entry load).
+    fn def_local(&mut self, var: Variable, v: Value) {
+        let listed = self
+            .var_slots
+            .get(var.index())
+            .and_then(|&slot| self.assignable.get(slot as usize))
+            .copied()
+            .unwrap_or(false);
+        if !listed {
+            debug_assert!(false, "an assignment `assigned_slots` doesn't list");
+            self.unlisted_assignment = true;
+        }
+        self.b.def_var(var, v);
     }
 
     fn cl_ty(ty: JitType) -> Type {
@@ -278,6 +379,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
         // Declare + initialise a variable per managed local.
         self.vars = vec![None; self.tfunc.n_locals as usize];
+        self.assignable = assigned_slots(self.tfunc);
         for slot in 0..self.tfunc.local_types.len() {
             if let Some(ty) = self.tfunc.local_types[slot] {
                 let cl = Self::cl_ty(ty);
@@ -286,6 +388,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let v = self.b.ins().load(cl, trusted, self.locals_base, off);
                 self.b.def_var(var, v);
                 self.vars[slot] = Some(var);
+                if self.var_slots.len() <= var.index() {
+                    self.var_slots.resize(var.index() + 1, u32::MAX);
+                }
+                self.var_slots[var.index()] = slot as u32;
             }
         }
 
@@ -561,9 +667,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let eb = self.cl_blocks[exit];
                 self.b.ins().brif(cond, body_pre, &[], eb, &[]);
                 self.b.switch_to_block(body_pre);
-                self.b.def_var(loop_var, cur);
+                self.def_local(loop_var, cur);
                 let next = self.b.ins().iadd_imm(cur, 1);
-                self.b.def_var(cur_var, next);
+                self.def_local(cur_var, next);
                 let bb = self.cl_blocks[body];
                 self.b.ins().jump(bb, &[]);
             }
@@ -595,6 +701,40 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // args, and a header deopt spills it.
                 let snapshot = self.vstack.clone();
                 let args = self.block_args();
+                // A scalar element of a scalar-lane list, or the end of
+                // the list, in line.
+                let got_b = self.b.create_block();
+                self.b.append_block_param(got_b, Self::cl_ty(elem));
+                let mut native_done = None;
+                if let (Some(l), JitType::Int | JitType::Float | JitType::Bool) =
+                    (runtime::obj_layout(), elem)
+                {
+                    let l = *l;
+                    let miss = self.b.create_block();
+                    let (items, len, _) = self.pinned_list(&l, seq, &[elem], miss, true);
+                    let negative = self.b.ins().icmp_imm(IntCC::SignedLessThan, idx, 0);
+                    self.miss_if(negative, miss);
+                    let at_end = self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, idx, len);
+                    let more = self.b.create_block();
+                    let end = self.b.create_block();
+                    self.b.ins().brif(at_end, end, &[], more, &[]);
+                    self.b.switch_to_block(more);
+                    let off = self.b.ins().ishl_imm(idx, 4);
+                    let e = self.b.ins().iadd(items, off);
+                    let (want, voff, ty) = Self::lane_tag(&l, elem).expect("scalar lane");
+                    let tag = self.b.ins().uload8(types::I32, trusted, e, 0);
+                    let other = self.b.ins().icmp_imm(IntCC::NotEqual, tag, i64::from(want));
+                    self.miss_if(other, miss);
+                    let v = self.b.ins().load(ty, trusted, e, voff);
+                    let v = if ty == types::I8 {
+                        self.b.ins().uextend(types::I64, v)
+                    } else {
+                        v
+                    };
+                    self.b.ins().jump(got_b, &[BlockArg::from(v)]);
+                    self.b.switch_to_block(miss);
+                    native_done = Some(end);
+                }
                 let sig = self.list_helper_sig();
                 let helper = self
                     .b
@@ -605,18 +745,26 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .ins()
                     .call_indirect(sig, helper, &[self.frame_ptr, seq, idx]);
                 let status = self.b.inst_results(call)[0];
-                let got_b = self.b.create_block();
+                let fetched = self.b.create_block();
                 let rest_b = self.b.create_block();
                 let is_got = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
-                self.b.ins().brif(is_got, got_b, &[], rest_b, &[]);
-                self.b.switch_to_block(got_b);
+                self.b.ins().brif(is_got, fetched, &[], rest_b, &[]);
+                self.b.switch_to_block(fetched);
                 let res =
                     self.b
                         .ins()
                         .load(Self::cl_ty(elem), trusted, self.frame_ptr, OFF_RET_BITS);
-                self.b.def_var(loop_var, res);
+                self.b.ins().jump(got_b, &[BlockArg::from(res)]);
+                if let Some(end) = native_done {
+                    self.b.switch_to_block(end);
+                    let eb = self.cl_blocks[exit];
+                    self.b.ins().jump(eb, &args);
+                }
+                self.b.switch_to_block(got_b);
+                let res = self.b.block_params(got_b)[0];
+                self.def_local(loop_var, res);
                 let next = self.b.ins().iadd_imm(idx, 1);
-                self.b.def_var(idx_var, next);
+                self.def_local(idx_var, next);
                 let bb = self.cl_blocks[body];
                 self.b.ins().jump(bb, &args);
                 self.b.switch_to_block(rest_b);
@@ -684,7 +832,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     self.b
                         .ins()
                         .load(Self::cl_ty(elem), trusted, self.frame_ptr, OFF_RET_BITS);
-                self.b.def_var(loop_var, res);
+                self.def_local(loop_var, res);
                 let bb = self.cl_blocks[body];
                 self.b.ins().jump(bb, &args);
                 self.b.switch_to_block(rest_b);
@@ -772,12 +920,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     self.b
                         .ins()
                         .load(Self::cl_ty(elem1), trusted, self.frame_ptr, OFF_RET_BITS);
-                self.b.def_var(var1, e1);
+                self.def_local(var1, e1);
                 let e2 = self
                     .b
                     .ins()
                     .load(Self::cl_ty(elem2), trusted, self.call_args_base, 0);
-                self.b.def_var(var2, e2);
+                self.def_local(var2, e2);
                 let bb = self.cl_blocks[body];
                 self.b.ins().jump(bb, &args);
                 self.b.switch_to_block(rest_b);
@@ -928,7 +1076,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::StoreLocal(slot) => {
                 let (v, _) = self.pop();
                 let var = self.vars[slot as usize].expect("managed local");
-                self.b.def_var(var, v);
+                self.def_local(var, v);
             }
             TOp::IntArith(kind) => self.emit_int_arith(kind, stmt.pc),
             TOp::FloatArith(kind) => self.emit_float_arith(kind, stmt.pc),
@@ -992,8 +1140,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             } => {
                 if is_self && self.self_func.is_some() {
                     self.emit_call_self(token, argc, ret, stmt.pc);
-                } else if let Some(ix) = self.leaf_for(token, argc) {
-                    self.emit_call_leaf(ix, token, argc, ret, stmt.pc);
+                } else if let Some((ix, from)) = self.leaf_for(token, argc, 0, 0) {
+                    let call = SiteCall {
+                        token,
+                        argc,
+                        kwc: 0,
+                        perm: 0,
+                        gaps: 0,
+                    };
+                    self.emit_call_leaf(ix, &from, call, ret, stmt.pc);
                 } else {
                     self.emit_call_py(token, argc, 0, 0, 0, ret, stmt.pc);
                 }
@@ -1005,7 +1160,20 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 perm,
                 gaps,
                 ret,
-            } => self.emit_call_py(token, argc, kwc, perm, gaps, ret, stmt.pc),
+            } => {
+                if let Some((ix, from)) = self.leaf_for(token, argc, kwc, perm) {
+                    let call = SiteCall {
+                        token,
+                        argc,
+                        kwc,
+                        perm,
+                        gaps,
+                    };
+                    self.emit_call_leaf(ix, &from, call, ret, stmt.pc);
+                } else {
+                    self.emit_call_py(token, argc, kwc, perm, gaps, ret, stmt.pc);
+                }
+            }
             TOp::ListGet { elem } => self.emit_list_get(elem, stmt.pc),
             TOp::ListSet => self.emit_list_set(stmt.pc),
             TOp::CellGet { idx, lane } => self.emit_cell_get(idx, lane, stmt.pc),
@@ -1043,10 +1211,44 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::CallMethod { token, argc, ret } => {
                 self.emit_call_method(token, argc, ret, stmt.pc);
             }
+            TOp::GuardMethod { token } => {
+                let snapshot = self.vstack.clone();
+                let &(pin, _) = self.vstack.last().expect("guard on empty stack");
+                let sig = self.list_helper_sig();
+                let helper = self
+                    .b
+                    .ins()
+                    .iconst(self.ptr_ty, runtime::guard_method_helper_addr() as i64);
+                let tokenv = self.b.ins().iconst(types::I64, i64::from(token));
+                let call = self
+                    .b
+                    .ins()
+                    .call_indirect(sig, helper, &[self.frame_ptr, pin, tokenv]);
+                let status = self.b.inst_results(call)[0];
+                let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
+                let cont = self.guard(bad, stmt.pc, &snapshot);
+                self.b.switch_to_block(cont);
+            }
+            TOp::ObjGetItem { token, int_result } => {
+                let ret = MethodRet::Scalar(if int_result {
+                    JitType::Int
+                } else {
+                    JitType::Obj
+                });
+                self.emit_method_helper_call(
+                    runtime::obj_getitem_helper_addr(),
+                    token,
+                    1,
+                    ret,
+                    stmt.pc,
+                    false,
+                );
+            }
             TOp::CallStrMethod { site, argc, ret } => {
                 self.emit_call_str_method(site, argc, ret, stmt.pc);
             }
             TOp::StrEq { negate } => self.emit_str_eq(negate, stmt.pc),
+            TOp::IsObj { negate } => self.emit_is_obj(negate, stmt.pc),
             TOp::StrLen => self.emit_pin_len(runtime::str_len_helper_addr(), stmt.pc),
             TOp::BytesLen => self.emit_pin_len(runtime::bytes_len_helper_addr(), stmt.pc),
             TOp::BytesGetItem => self.emit_bytes_get(stmt.pc),
@@ -1133,7 +1335,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .b
             .ins()
             .iconst(self.ptr_ty, runtime::global_obj_helper_addr() as i64);
-        let tokenv = self.b.ins().iconst(types::I64, i64::from(token));
+        let tokenv = self
+            .b
+            .ins()
+            .iconst(types::I64, runtime::global_obj_list_code(token, lane));
         let call = self
             .b
             .ins()
@@ -1168,7 +1373,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
         let iter_var = self.vars[iter_slot as usize].expect("managed iter slot");
-        self.b.def_var(iter_var, res);
+        self.def_local(iter_var, res);
     }
 
     /// RFC 0074 WS2 — the opaque-call lane via `wpjit_call_dyn`:
@@ -1666,7 +1871,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
         let iter_var = self.vars[iter_slot as usize].expect("managed iter slot");
-        self.b.def_var(iter_var, pin);
+        self.def_local(iter_var, pin);
     }
 
     /// RFC 0073 WS2 — the dict-loop capture behind an erased
@@ -1692,7 +1897,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
         let iter_var = self.vars[iter_slot as usize].expect("managed iter slot");
-        self.b.def_var(iter_var, res);
+        self.def_local(iter_var, res);
     }
 
     /// RFC 0071 WS4 — `BUILD_LIST k`: the elements are staged through
@@ -2131,6 +2336,44 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.vstack.push((res, JitType::Bool));
     }
 
+    /// `a is b` on two object lanes (see [`TOp::IsObj`]): equal machine
+    /// values (the same pin, or both `None`) are the same object; any
+    /// other pair asks the helper, whose status above `1` deopts.
+    fn emit_is_obj(&mut self, negate: bool, pc: u32) {
+        let snapshot = self.vstack.clone();
+        let (b_pin, _) = self.pop();
+        let (a_pin, _) = self.pop();
+        let same = self.b.ins().icmp(IntCC::Equal, a_pin, b_pin);
+        let slow = self.b.create_block();
+        let merge = self.b.create_block();
+        self.b.append_block_param(merge, types::I64);
+        let one = self.b.ins().iconst(types::I64, 1);
+        self.b.ins().brif(same, merge, &[one.into()], slow, &[]);
+        self.b.switch_to_block(slow);
+        let sig = self.list_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::is_obj_helper_addr() as i64);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, a_pin, b_pin]);
+        let status = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, status, 1);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        self.b.ins().jump(merge, &[status.into()]);
+        self.b.switch_to_block(merge);
+        let r = self.b.block_params(merge)[0];
+        let res = if negate {
+            self.b.ins().bxor_imm(r, 1)
+        } else {
+            r
+        };
+        self.vstack.push((res, JitType::Bool));
+    }
+
     /// RFC 0071 WS6 — pinned-`str`/`bytes` length (helper selected by
     /// address; both share the [`Self::pin_helper_sig`] shape and the
     /// negative-status deopt of `emit_list_len`).
@@ -2452,6 +2695,29 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     ///   the bound method + `Unbound` pair), so the interpreter
     ///   re-executes the call generically.
     fn emit_call_method(&mut self, token: u32, argc: u8, ret: MethodRet, pc: u32) {
+        let native = token & runtime::METHOD_NATIVE != 0;
+        let helper = if native {
+            runtime::call_native_method_helper_addr()
+        } else {
+            runtime::call_method_helper_addr()
+        };
+        self.emit_method_helper_call(helper, token, argc, ret, pc, !native);
+    }
+
+    /// [`Self::emit_call_method`]'s body over any helper sharing the
+    /// method helper's shape and status protocol (`wpjit_obj_getitem`
+    /// stages its index as the one argument). `writeback` stores the
+    /// locals first, for a helper that may run Python on this
+    /// activation's behalf.
+    fn emit_method_helper_call(
+        &mut self,
+        helper_addr: usize,
+        token: u32,
+        argc: u8,
+        ret: MethodRet,
+        pc: u32,
+        writeback: bool,
+    ) {
         let trusted = MemFlags::trusted();
         let n = argc as usize;
         // Snapshot *including* receiver + args: the Reject exit re-runs
@@ -2465,11 +2731,42 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             let tagv = self.b.ins().iconst(types::I32, Self::tag(ty));
             self.b.ins().store(trusted, tagv, self.call_tags_base, toff);
         }
+        // What a field update would add: the `int` argument, or (none
+        // passed) the method's literal.
+        let update_arg = match &self.vstack[base..] {
+            [] => Some(None),
+            [(v, JitType::Int)] => Some(Some(*v)),
+            _ => None,
+        };
         self.vstack.truncate(base);
         let (pin, _) = self.pop();
         let snapshot = self.vstack.clone();
 
-        self.writeback_locals();
+        // A method whose body is a field update, run in line once the
+        // helper has armed it (a Python method's helper only); anything
+        // else takes the helper below.
+        let inline = match (runtime::obj_layout(), ret, update_arg) {
+            (Some(l), MethodRet::Scalar(JitType::Int), Some(arg))
+                if helper_addr == runtime::call_method_helper_addr() =>
+            {
+                Some((*l, arg))
+            }
+            _ => None,
+        };
+        let mut join = None;
+        if let Some((l, arg)) = inline {
+            let miss = self.b.create_block();
+            let done = self.b.create_block();
+            self.b.append_block_param(done, types::I64);
+            let v = self.inline_method_update(&l, pin, token, arg, miss);
+            self.b.ins().jump(done, &[BlockArg::from(v)]);
+            self.b.switch_to_block(miss);
+            join = Some(done);
+        }
+
+        if writeback {
+            self.writeback_locals();
+        }
         self.store_call_site_pc(pc);
 
         let expect = match ret {
@@ -2477,10 +2774,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             MethodRet::Scalar(t) => Self::tag(t),
         };
         let sig = self.call_method_helper_sig();
-        let helper = self
-            .b
-            .ins()
-            .iconst(self.ptr_ty, runtime::call_method_helper_addr() as i64);
+        let helper = self.b.ins().iconst(self.ptr_ty, helper_addr as i64);
         let tokenv = self.b.ins().iconst(types::I32, i64::from(token));
         let argcv = self.b.ins().iconst(types::I32, i64::from(argc));
         let expectv = self.b.ins().iconst(types::I32, expect);
@@ -2520,8 +2814,150 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 .b
                 .ins()
                 .load(Self::cl_ty(t), trusted, self.frame_ptr, OFF_RET_BITS);
+            let res = match join {
+                Some(done) => {
+                    self.b.ins().jump(done, &[BlockArg::from(res)]);
+                    self.b.switch_to_block(done);
+                    self.b.block_params(done)[0]
+                }
+                None => res,
+            };
             self.vstack.push((res, t));
         }
+    }
+
+    /// The armed field update of method token `token` on the pinned
+    /// receiver `pin` (see [`runtime::ObjLayout::method_upd_idx`]): the
+    /// updated field's new value, with the current block continuing past
+    /// the store. A receiver of another class version, values not split
+    /// over the class's names or numerous enough to shadow the method, a
+    /// swapped `__code__`, a non-`int` field, an overflow, or an active
+    /// observer, dict watcher or exotic key branches to `miss` (the helper,
+    /// which runs the call exactly) before anything is stored.
+    fn inline_method_update(
+        &mut self,
+        l: &runtime::ObjLayout,
+        pin: Value,
+        token: u32,
+        arg: Option<Value>,
+        miss: Block,
+    ) -> Value {
+        let t = MemFlags::trusted();
+        let ptr = self.ptr_ty;
+        let ctx = self.b.ins().load(ptr, t, self.frame_ptr, OFF_CTX);
+        // The entry: armed, for this call's increment form.
+        let methods = self.b.ins().load(ptr, t, ctx, l.ctx_methods);
+        let n = self.b.ins().load(types::I64, t, methods, l.methods_len);
+        let out = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::UnsignedLessThanOrEqual, n, i64::from(token));
+        self.miss_if(out, miss);
+        let mbuf = self.b.ins().load(ptr, t, methods, l.methods_buf);
+        let e = self
+            .b
+            .ins()
+            .iadd_imm(mbuf, i64::from(token) * i64::from(l.method_size));
+        let idx = self.b.ins().uload32(t, e, l.method_upd_idx);
+        let from_arg = self.b.ins().uload32(t, e, l.method_upd_from_arg);
+        let unarmed = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, idx, i64::from(u32::MAX));
+        let form = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, from_arg, i64::from(arg.is_some()));
+        // The function's code, and the gates.
+        let code_at = self.b.ins().load(ptr, t, e, l.method_upd_code_at);
+        let want = self.b.ins().load(ptr, t, e, l.method_upd_code);
+        let observers = self.b.ins().iconst(ptr, l.observers as i64);
+        let observers = self.b.ins().load(types::I64, t, observers, 0);
+        let watchers = self.b.ins().iconst(ptr, l.dict_watchers as i64);
+        let watchers = self.b.ins().uload8(types::I64, t, watchers, 0);
+        let exotic = self.b.ins().iconst(ptr, l.exotic_keys as i64);
+        let exotic = self.b.ins().load(types::I64, t, exotic, 0);
+        let gates = self.b.ins().bor(observers, watchers);
+        let gates = self.b.ins().bor(gates, exotic);
+        let gated = self.b.ins().icmp_imm(IntCC::NotEqual, gates, 0);
+        let bad = self.b.ins().bor(unarmed, form);
+        let bad = self.b.ins().bor(bad, gated);
+        self.miss_if(bad, miss);
+        let code = self.b.ins().load(ptr, t, code_at, 0);
+        let swapped = self.b.ins().icmp(IntCC::NotEqual, code, want);
+        self.miss_if(swapped, miss);
+        // The pin: an instance.
+        let n = self.b.ins().load(types::I64, t, ctx, l.ctx_pins_len);
+        let out = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, pin, n);
+        self.miss_if(out, miss);
+        let buf = self.b.ins().load(ptr, t, ctx, l.ctx_pins_ptr);
+        let off = self.b.ins().imul_imm(pin, i64::from(l.pin_size));
+        let p = self.b.ins().iadd(buf, off);
+        let ptag = self.b.ins().uload8(types::I32, t, p, l.pin_tag);
+        let otag = self.b.ins().uload8(types::I32, t, p, l.pin_obj);
+        let not_obj = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, ptag, i64::from(l.pin_obj_tag));
+        let not_inst = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, otag, i64::from(l.tag_instance));
+        let bad = self.b.ins().bor(not_obj, not_inst);
+        self.miss_if(bad, miss);
+        let inst = self.b.ins().load(ptr, t, p, l.pin_obj + 8);
+        // Its class and split values, as `split_field_addr` checks them
+        // for a write, against the entry's version.
+        let ver = self.b.ins().load(types::I64, t, e, l.method_ver);
+        let cls = self.b.ins().load(ptr, t, inst, l.inst_class);
+        let cver = self.b.ins().load(types::I64, t, cls, l.type_attr_version);
+        let lazy = self.b.ins().load(ptr, t, inst, l.inst_dict_lazy);
+        let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+        let shared = self.b.ins().uload8(types::I64, t, flag, 0);
+        let borrow = self.b.ins().sload32(t, inst, l.inst_split_borrow);
+        let block = self.b.ins().load(ptr, t, inst, l.inst_split_block);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, cver, ver);
+        let busy = self.b.ins().icmp_imm(IntCC::NotEqual, borrow, 0);
+        let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
+        let other = self.b.ins().bor(lazy, shared);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+        let bad = self.b.ins().bor(stale, busy);
+        let bad = self.b.ins().bor(bad, empty);
+        let bad = self.b.ins().bor(bad, other);
+        self.miss_if(bad, miss);
+        // The class's names, holding the field but not the method's name.
+        let keys = self.b.ins().load(ptr, t, block, l.split_keys);
+        let ckeys = self.b.ins().load(ptr, t, cls, l.type_shared_keys);
+        let len = self.b.ins().uload32(t, block, l.split_len);
+        let shadow = self.b.ins().uload32(t, e, l.method_upd_shadow);
+        let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
+        let absent = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
+        let shadowed = self.b.ins().icmp(IntCC::UnsignedGreaterThan, len, shadow);
+        let bad = self.b.ins().bor(foreign, absent);
+        let bad = self.b.ins().bor(bad, shadowed);
+        self.miss_if(bad, miss);
+        let off = self.b.ins().ishl_imm(idx, 4);
+        let at = self.b.ins().iadd(block, off);
+        let at = self.b.ins().iadd_imm(at, i64::from(l.split_values));
+        // An `int` field, plus the increment without overflow.
+        let tag = self.b.ins().uload8(types::I32, t, at, 0);
+        let not_int = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, tag, i64::from(l.tag_int));
+        self.miss_if(not_int, miss);
+        let old = self.b.ins().load(types::I64, t, at, 8);
+        let inc = match arg {
+            Some(a) => a,
+            None => self.b.ins().load(types::I64, t, e, l.method_upd_inc),
+        };
+        let (new, overflow) = self.checked_add(old, inc);
+        self.miss_if(overflow, miss);
+        self.b.ins().store(t, new, at, 8);
+        new
     }
 
     /// RFC 0073 WS3 — burned-in native `str`-method call via the
@@ -2656,6 +3092,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let snapshot = self.vstack.clone();
         let (val, ty) = self.pop();
         let (pin, _) = self.pop();
+        let appended = self.inline_list_append(pin, val, ty);
         self.b
             .ins()
             .store(trusted, val, self.frame_ptr, OFF_RET_BITS);
@@ -2676,8 +3113,52 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
+        if let Some(done) = appended {
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(done);
+        }
         // `append` returns `None`, which the following `POP_TOP`
         // consumes — neither ever exists on the native stack.
+    }
+
+    /// `append` of a scalar to a pinned list with room for it, in line;
+    /// the block to continue at, with the current block the helper's
+    /// path (`None` when not in line).
+    fn inline_list_append(&mut self, pin: Value, val: Value, ty: JitType) -> Option<Block> {
+        let l = *runtime::obj_layout()?;
+        // The lanes the helper boxes this scalar into.
+        let lanes: &[JitType] = match ty {
+            JitType::Int => &[JitType::Int, JitType::Obj],
+            JitType::Float => &[JitType::Float, JitType::Obj],
+            JitType::Bool => &[JitType::Obj],
+            _ => return None,
+        };
+        let t = MemFlags::trusted();
+        let miss = self.b.create_block();
+        let done = self.b.create_block();
+        let (items, len, list) = self.pinned_list(&l, pin, lanes, miss, false);
+        let cap = self.b.ins().load(types::I64, t, list, l.list_cap);
+        let full = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, len, cap);
+        self.miss_if(full, miss);
+        let off = self.b.ins().ishl_imm(len, 4);
+        let at = self.b.ins().iadd(items, off);
+        let (tag, voff, _) = Self::lane_tag(&l, ty).expect("scalar lane");
+        let v = if ty == JitType::Bool {
+            self.b.ins().ireduce(types::I8, val)
+        } else {
+            val
+        };
+        let tagv = self.b.ins().iconst(types::I8, i64::from(tag));
+        self.b.ins().store(t, tagv, at, 0);
+        self.b.ins().store(t, v, at, voff);
+        let len1 = self.b.ins().iadd_imm(len, 1);
+        self.b.ins().store(t, len1, list, l.list_len);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(miss);
+        Some(done)
     }
 
     /// RFC 0073 WS1 — `LIST_APPEND` inside an inlined comprehension:
@@ -2719,6 +3200,36 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let trusted = MemFlags::trusted();
         let snapshot = self.vstack.clone();
         let (pin, _) = self.pop();
+        // A scalar field of a split-layout instance, read in line; any
+        // other shape takes the helper below.
+        let inline = match (runtime::obj_layout(), out) {
+            (Some(l), JitType::Int | JitType::Float | JitType::Bool) => Some(*l),
+            _ => None,
+        };
+        let mut join = None;
+        if let Some(l) = inline {
+            let miss = self.b.create_block();
+            let done = self.b.create_block();
+            self.b.append_block_param(done, Self::cl_ty(out));
+            let addr = self.split_field_addr(&l, pin, site, miss, true);
+            let (want, off, ty) = match out {
+                JitType::Int => (l.tag_int, 8, types::I64),
+                JitType::Float => (l.tag_float, 8, types::F64),
+                _ => (l.tag_bool, 1, types::I8),
+            };
+            let tag = self.b.ins().uload8(types::I32, trusted, addr, 0);
+            let other = self.b.ins().icmp_imm(IntCC::NotEqual, tag, i64::from(want));
+            self.miss_if(other, miss);
+            let v = self.b.ins().load(ty, trusted, addr, off);
+            let v = if ty == types::I8 {
+                self.b.ins().uextend(types::I64, v)
+            } else {
+                v
+            };
+            self.b.ins().jump(done, &[BlockArg::from(v)]);
+            self.b.switch_to_block(miss);
+            join = Some(done);
+        }
         let sig = self.list_helper_sig();
         let helper = self
             .b
@@ -2737,7 +3248,278 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .b
             .ins()
             .load(Self::cl_ty(out), trusted, self.frame_ptr, OFF_RET_BITS);
+        let res = match join {
+            Some(done) => {
+                self.b.ins().jump(done, &[BlockArg::from(res)]);
+                self.b.switch_to_block(done);
+                self.b.block_params(done)[0]
+            }
+            None => res,
+        };
         self.vstack.push((res, out));
+    }
+
+    /// Branch to `miss` when `cond`; continue in a fresh block otherwise.
+    fn miss_if(&mut self, cond: Value, miss: Block) {
+        let ok = self.b.create_block();
+        self.b.ins().brif(cond, miss, &[], ok, &[]);
+        self.b.switch_to_block(ok);
+    }
+
+    /// The address of the field the attribute guard of `site` names in the
+    /// pinned instance `pin`'s split values (see [`runtime::ObjLayout`]):
+    /// an instance pin whose class still has the guard's version, whose
+    /// values are split over its class's names, unborrowed (`read`) or
+    /// unborrowed and exclusive (a write), and hold the guard's index.
+    /// Anything else branches to `miss`.
+    fn split_field_addr(
+        &mut self,
+        l: &runtime::ObjLayout,
+        pin: Value,
+        site: u32,
+        miss: Block,
+        read: bool,
+    ) -> Value {
+        let t = MemFlags::trusted();
+        let ptr = self.ptr_ty;
+        let ctx = self.b.ins().load(ptr, t, self.frame_ptr, OFF_CTX);
+        // The guard first: a site whose field has no split position (a
+        // `__slots__` member) leaves straight away.
+        let guards = self.b.ins().load(ptr, t, ctx, l.ctx_guards);
+        let gbuf = self.b.ins().load(ptr, t, guards, l.guards_buf);
+        let g = self
+            .b
+            .ins()
+            .iadd_imm(gbuf, i64::from(site) * i64::from(l.guard_size));
+        let idx = self.b.ins().uload32(t, g, l.guard_split_idx);
+        let none = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, idx, i64::from(u32::MAX));
+        // The pin.
+        let n = self.b.ins().load(types::I64, t, ctx, l.ctx_pins_len);
+        let out = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, pin, n);
+        let bad = self.b.ins().bor(none, out);
+        self.miss_if(bad, miss);
+        let buf = self.b.ins().load(ptr, t, ctx, l.ctx_pins_ptr);
+        let off = self.b.ins().imul_imm(pin, i64::from(l.pin_size));
+        let p = self.b.ins().iadd(buf, off);
+        let ptag = self.b.ins().uload8(types::I32, t, p, l.pin_tag);
+        let otag = self.b.ins().uload8(types::I32, t, p, l.pin_obj);
+        let not_obj = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, ptag, i64::from(l.pin_obj_tag));
+        let not_inst = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, otag, i64::from(l.tag_instance));
+        let bad = self.b.ins().bor(not_obj, not_inst);
+        self.miss_if(bad, miss);
+        let inst = self.b.ins().load(ptr, t, p, l.pin_obj + 8);
+        let ver = self.b.ins().load(types::I64, t, g, l.guard_ver);
+        // The class and the split values (grouped by what each group's
+        // loads need proven: fewer blocks compile faster).
+        let cls = self.b.ins().load(ptr, t, inst, l.inst_class);
+        let cver = self.b.ins().load(types::I64, t, cls, l.type_attr_version);
+        let lazy = self.b.ins().load(ptr, t, inst, l.inst_dict_lazy);
+        let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+        let shared = self.b.ins().uload8(types::I64, t, flag, 0);
+        let borrow = self.b.ins().sload32(t, inst, l.inst_split_borrow);
+        let block = self.b.ins().load(ptr, t, inst, l.inst_split_block);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, cver, ver);
+        let busy = if read {
+            self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0)
+        } else {
+            self.b.ins().icmp_imm(IntCC::NotEqual, borrow, 0)
+        };
+        let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
+        let other = self.b.ins().bor(lazy, shared);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+        let bad = self.b.ins().bor(stale, busy);
+        let bad = self.b.ins().bor(bad, empty);
+        let bad = self.b.ins().bor(bad, other);
+        self.miss_if(bad, miss);
+        let keys = self.b.ins().load(ptr, t, block, l.split_keys);
+        let ckeys = self.b.ins().load(ptr, t, cls, l.type_shared_keys);
+        let len = self.b.ins().uload32(t, block, l.split_len);
+        let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
+        let absent = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
+        let bad = self.b.ins().bor(foreign, absent);
+        self.miss_if(bad, miss);
+        let off = self.b.ins().ishl_imm(idx, 4);
+        let at = self.b.ins().iadd(block, off);
+        self.b.ins().iadd_imm(at, i64::from(l.split_values))
+    }
+
+    /// The address the new-key store at `site` appends its field to, in
+    /// the pinned instance `pin`'s split values (see
+    /// [`runtime::ObjLayout`]), having counted it in: an ordinary instance
+    /// pin whose class still has the guard's version, whose values are
+    /// split over its class's names, unborrowed and exclusive, hold exactly
+    /// the names before the guard's index and have room for one more, with
+    /// no dict watcher active. Anything else branches to `miss` before
+    /// anything is written.
+    fn split_append_addr(
+        &mut self,
+        l: &runtime::ObjLayout,
+        pin: Value,
+        site: u32,
+        miss: Block,
+    ) -> Value {
+        let t = MemFlags::trusted();
+        let ptr = self.ptr_ty;
+        let ctx = self.b.ins().load(ptr, t, self.frame_ptr, OFF_CTX);
+        let guards = self.b.ins().load(ptr, t, ctx, l.ctx_guards);
+        let gbuf = self.b.ins().load(ptr, t, guards, l.guards_buf);
+        let g = self
+            .b
+            .ins()
+            .iadd_imm(gbuf, i64::from(site) * i64::from(l.guard_size));
+        let idx = self.b.ins().uload32(t, g, l.guard_split_idx);
+        let none = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, idx, i64::from(u32::MAX));
+        let n = self.b.ins().load(types::I64, t, ctx, l.ctx_pins_len);
+        let out = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, pin, n);
+        let bad = self.b.ins().bor(none, out);
+        self.miss_if(bad, miss);
+        let buf = self.b.ins().load(ptr, t, ctx, l.ctx_pins_ptr);
+        let off = self.b.ins().imul_imm(pin, i64::from(l.pin_size));
+        let p = self.b.ins().iadd(buf, off);
+        let ptag = self.b.ins().uload8(types::I32, t, p, l.pin_tag);
+        let otag = self.b.ins().uload8(types::I32, t, p, l.pin_obj);
+        let not_obj = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, ptag, i64::from(l.pin_obj_tag));
+        let not_inst = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, otag, i64::from(l.tag_instance));
+        let bad = self.b.ins().bor(not_obj, not_inst);
+        self.miss_if(bad, miss);
+        let inst = self.b.ins().load(ptr, t, p, l.pin_obj + 8);
+        let ver = self.b.ins().load(types::I64, t, g, l.guard_ver);
+        let cls = self.b.ins().load(ptr, t, inst, l.inst_class);
+        let cver = self.b.ins().load(types::I64, t, cls, l.type_attr_version);
+        let lazy = self.b.ins().load(ptr, t, inst, l.inst_dict_lazy);
+        let body = self.b.ins().load(ptr, t, inst, l.inst_c_body);
+        let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+        let shared = self.b.ins().uload8(types::I64, t, flag, 0);
+        let watchers = self.b.ins().iconst(ptr, l.dict_watchers as i64);
+        let watchers = self.b.ins().uload8(types::I64, t, watchers, 0);
+        let borrow = self.b.ins().sload32(t, inst, l.inst_split_borrow);
+        let block = self.b.ins().load(ptr, t, inst, l.inst_split_block);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, cver, ver);
+        let busy = self.b.ins().icmp_imm(IntCC::NotEqual, borrow, 0);
+        let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
+        let other = self.b.ins().bor(lazy, body);
+        let other = self.b.ins().bor(other, shared);
+        let other = self.b.ins().bor(other, watchers);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+        let bad = self.b.ins().bor(stale, busy);
+        let bad = self.b.ins().bor(bad, empty);
+        let bad = self.b.ins().bor(bad, other);
+        self.miss_if(bad, miss);
+        let keys = self.b.ins().load(ptr, t, block, l.split_keys);
+        let ckeys = self.b.ins().load(ptr, t, cls, l.type_shared_keys);
+        let len = self.b.ins().uload32(t, block, l.split_len);
+        let cap = self.b.ins().uload32(t, block, l.split_cap);
+        let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
+        let elsewhere = self.b.ins().icmp(IntCC::NotEqual, idx, len);
+        let full = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, len, cap);
+        let bad = self.b.ins().bor(foreign, elsewhere);
+        let bad = self.b.ins().bor(bad, full);
+        self.miss_if(bad, miss);
+        let len1 = self.b.ins().iadd_imm(len, 1);
+        let len1 = self.b.ins().ireduce(types::I32, len1);
+        self.b.ins().store(t, len1, block, l.split_len);
+        let off = self.b.ins().ishl_imm(idx, 4);
+        let at = self.b.ins().iadd(block, off);
+        self.b.ins().iadd_imm(at, i64::from(l.split_values))
+    }
+
+    /// The pinned list `pin`'s items (buffer pointer and length; and its
+    /// capacity, and where the length lives, for an append): a list pin
+    /// whose element lane is one of `lanes`, unborrowed (`read`) or
+    /// unborrowed and exclusive (a write). Anything else branches to
+    /// `miss`.
+    fn pinned_list(
+        &mut self,
+        l: &runtime::ObjLayout,
+        pin: Value,
+        lanes: &[JitType],
+        miss: Block,
+        read: bool,
+    ) -> (Value, Value, Value) {
+        let t = MemFlags::trusted();
+        let ptr = self.ptr_ty;
+        let ctx = self.b.ins().load(ptr, t, self.frame_ptr, OFF_CTX);
+        let n = self.b.ins().load(types::I64, t, ctx, l.ctx_pins_len);
+        let out = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, pin, n);
+        self.miss_if(out, miss);
+        let buf = self.b.ins().load(ptr, t, ctx, l.ctx_pins_ptr);
+        let off = self.b.ins().imul_imm(pin, i64::from(l.pin_size));
+        let p = self.b.ins().iadd(buf, off);
+        let ptag = self.b.ins().uload8(types::I32, t, p, l.pin_tag);
+        let lane = self.b.ins().uload8(types::I32, t, p, l.pin_list_elem);
+        let mut bad = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, ptag, i64::from(l.pin_list_tag));
+        let mut ok_lane = self.b.ins().iconst(types::I8, 0);
+        for &want in lanes {
+            let hit = self.b.ins().icmp_imm(IntCC::Equal, lane, want as i64);
+            ok_lane = self.b.ins().bor(ok_lane, hit);
+        }
+        let wrong_lane = self.b.ins().bxor_imm(ok_lane, 1);
+        bad = self.b.ins().bor(bad, wrong_lane);
+        self.miss_if(bad, miss);
+        let list = self.b.ins().load(ptr, t, p, l.pin_list);
+        let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+        let shared = self.b.ins().uload8(types::I32, t, flag, 0);
+        let borrow = self.b.ins().sload32(t, list, l.list_borrow);
+        let busy = if read {
+            self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0)
+        } else {
+            self.b.ins().icmp_imm(IntCC::NotEqual, borrow, 0)
+        };
+        let shared = self.b.ins().icmp_imm(IntCC::NotEqual, shared, 0);
+        let bad = self.b.ins().bor(busy, shared);
+        self.miss_if(bad, miss);
+        let items = self.b.ins().load(ptr, t, list, l.list_ptr);
+        let len = self.b.ins().load(types::I64, t, list, l.list_len);
+        (items, len, list)
+    }
+
+    /// The element address for a (possibly negative) in-range `idx` of
+    /// `len` items at `items`; out of range branches to `miss`.
+    fn list_elem(&mut self, items: Value, len: Value, idx: Value, miss: Block) -> Value {
+        let neg = self.b.ins().icmp_imm(IntCC::SignedLessThan, idx, 0);
+        let wrapped = self.b.ins().iadd(idx, len);
+        let i = self.b.ins().select(neg, wrapped, idx);
+        let out = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, i, len);
+        self.miss_if(out, miss);
+        let off = self.b.ins().ishl_imm(i, 4);
+        self.b.ins().iadd(items, off)
+    }
+
+    /// The object tag of a scalar lane.
+    fn lane_tag(l: &runtime::ObjLayout, lane: JitType) -> Option<(u8, i32, Type)> {
+        match lane {
+            JitType::Int => Some((l.tag_int, 8, types::I64)),
+            JitType::Float => Some((l.tag_float, 8, types::F64)),
+            JitType::Bool => Some((l.tag_bool, 1, types::I8)),
+            _ => None,
+        }
     }
 
     /// Consecutive callback-free reads can replay from the first read on a
@@ -2892,7 +3674,62 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let trusted = MemFlags::trusted();
         let snapshot = self.vstack.clone();
         let (pin, _) = self.pop();
-        let (val, _) = self.pop();
+        let (val, lane) = self.pop();
+        // A scalar over a scalar field of a split-layout instance, stored
+        // in line (no release, no collector bookkeeping); any other shape
+        // takes the helper below.
+        let inline = match (runtime::obj_layout(), lane) {
+            (Some(l), JitType::Int | JitType::Float | JitType::Bool) => Some(*l),
+            _ => None,
+        };
+        let new_key = self
+            .tfunc
+            .attr_sites
+            .get(site as usize)
+            .is_some_and(|s| s.new_key);
+        let mut done = None;
+        if let (Some(l), true) = (inline, new_key) {
+            // The constructor pattern: a fresh instance's next field.
+            let miss = self.b.create_block();
+            let stored = self.b.create_block();
+            let addr = self.split_append_addr(&l, pin, site, miss);
+            let (tag, off, v) = match lane {
+                JitType::Int => (l.tag_int, 8, val),
+                JitType::Float => (l.tag_float, 8, val),
+                _ => (l.tag_bool, 1, self.b.ins().ireduce(types::I8, val)),
+            };
+            let tagv = self.b.ins().iconst(types::I8, i64::from(tag));
+            self.b.ins().store(trusted, tagv, addr, 0);
+            self.b.ins().store(trusted, v, addr, off);
+            self.b.ins().jump(stored, &[]);
+            self.b.switch_to_block(miss);
+            done = Some(stored);
+        } else if let Some(l) = inline {
+            let miss = self.b.create_block();
+            let stored = self.b.create_block();
+            let addr = self.split_field_addr(&l, pin, site, miss, false);
+            let old = self.b.ins().uload8(types::I64, trusted, addr, 0);
+            let one = self.b.ins().iconst(types::I64, 1);
+            let bit = self.b.ins().ishl(one, old);
+            let scalars = (1i64 << l.tag_int)
+                | (1i64 << l.tag_float)
+                | (1i64 << l.tag_bool)
+                | (1i64 << l.tag_none);
+            let m = self.b.ins().band_imm(bit, scalars);
+            let heap = self.b.ins().icmp_imm(IntCC::Equal, m, 0);
+            self.miss_if(heap, miss);
+            let (tag, off, v) = match lane {
+                JitType::Int => (l.tag_int, 8, val),
+                JitType::Float => (l.tag_float, 8, val),
+                _ => (l.tag_bool, 1, self.b.ins().ireduce(types::I8, val)),
+            };
+            let tagv = self.b.ins().iconst(types::I8, i64::from(tag));
+            self.b.ins().store(trusted, tagv, addr, 0);
+            self.b.ins().store(trusted, v, addr, off);
+            self.b.ins().jump(stored, &[]);
+            self.b.switch_to_block(miss);
+            done = Some(stored);
+        }
         self.b
             .ins()
             .store(trusted, val, self.frame_ptr, OFF_RET_BITS);
@@ -2910,6 +3747,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
+        if let Some(stored) = done {
+            self.b.ins().jump(stored, &[]);
+            self.b.switch_to_block(stored);
+        }
     }
 
     /// RFC 0076 WS6 — closure-cell read via `wpjit_cell_get`. The cell
@@ -3055,6 +3896,24 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let snapshot = self.vstack.clone();
         let (idx, _) = self.pop();
         let (pin, _) = self.pop();
+        // A scalar element of a scalar-lane list, read in line.
+        let mut join = None;
+        if let (Some(l), JitType::Int | JitType::Float) = (runtime::obj_layout(), elem) {
+            let l = *l;
+            let miss = self.b.create_block();
+            let done = self.b.create_block();
+            self.b.append_block_param(done, Self::cl_ty(elem));
+            let (items, len, _) = self.pinned_list(&l, pin, &[elem], miss, true);
+            let e = self.list_elem(items, len, idx, miss);
+            let (want, off, ty) = Self::lane_tag(&l, elem).expect("scalar lane");
+            let tag = self.b.ins().uload8(types::I32, trusted, e, 0);
+            let other = self.b.ins().icmp_imm(IntCC::NotEqual, tag, i64::from(want));
+            self.miss_if(other, miss);
+            let v = self.b.ins().load(ty, trusted, e, off);
+            self.b.ins().jump(done, &[BlockArg::from(v)]);
+            self.b.switch_to_block(miss);
+            join = Some(done);
+        }
         let sig = self.list_helper_sig();
         let helper = self
             .b
@@ -3072,6 +3931,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .b
             .ins()
             .load(Self::cl_ty(elem), trusted, self.frame_ptr, OFF_RET_BITS);
+        let res = match join {
+            Some(done) => {
+                self.b.ins().jump(done, &[BlockArg::from(res)]);
+                self.b.switch_to_block(done);
+                self.b.block_params(done)[0]
+            }
+            None => res,
+        };
         self.vstack.push((res, elem));
     }
 
@@ -3083,7 +3950,21 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let snapshot = self.vstack.clone();
         let (idx, _) = self.pop();
         let (pin, _) = self.pop();
-        let (val, _) = self.pop();
+        let (val, vty) = self.pop();
+        // A scalar over a scalar element of a list of that lane, stored in
+        // line (no release).
+        let mut stored = None;
+        if let (Some(l), JitType::Int | JitType::Float) = (runtime::obj_layout(), vty) {
+            let l = *l;
+            let miss = self.b.create_block();
+            let done = self.b.create_block();
+            let (items, len, _) = self.pinned_list(&l, pin, &[vty], miss, false);
+            let e = self.list_elem(items, len, idx, miss);
+            self.store_scalar_over_scalar(&l, e, val, vty, miss);
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(miss);
+            stored = Some(done);
+        }
         // Typed store: an F64 value lands as its bit pattern.
         self.b
             .ins()
@@ -3101,6 +3982,43 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
+        if let Some(done) = stored {
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(done);
+        }
+    }
+
+    /// Store the scalar `val` (of `lane`) over the value at `at` when that
+    /// one is a scalar too (nothing to release); otherwise branch to
+    /// `miss`, untouched.
+    fn store_scalar_over_scalar(
+        &mut self,
+        l: &runtime::ObjLayout,
+        at: Value,
+        val: Value,
+        lane: JitType,
+        miss: Block,
+    ) {
+        let t = MemFlags::trusted();
+        let old = self.b.ins().uload8(types::I64, t, at, 0);
+        let one = self.b.ins().iconst(types::I64, 1);
+        let bit = self.b.ins().ishl(one, old);
+        let scalars = (1i64 << l.tag_int)
+            | (1i64 << l.tag_float)
+            | (1i64 << l.tag_bool)
+            | (1i64 << l.tag_none);
+        let m = self.b.ins().band_imm(bit, scalars);
+        let heap = self.b.ins().icmp_imm(IntCC::Equal, m, 0);
+        self.miss_if(heap, miss);
+        let (tag, off, _) = Self::lane_tag(l, lane).expect("scalar lane");
+        let v = if lane == JitType::Bool {
+            self.b.ins().ireduce(types::I8, val)
+        } else {
+            val
+        };
+        let tagv = self.b.ins().iconst(types::I8, i64::from(tag));
+        self.b.ins().store(t, tagv, at, 0);
+        self.b.ins().store(t, v, at, off);
     }
 
     /// The shared `(frame, pin, idx) -> status` signature of the
@@ -3304,28 +4222,57 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.vstack.push((v, ret));
     }
 
-    /// The direct leaf target of `token` when this site's argument lanes
-    /// are exactly the leaf's parameter lanes.
-    fn leaf_for(&self, token: u32, argc: u8) -> Option<usize> {
+    /// The direct leaf target of `token`, and where each of its
+    /// parameters comes from, when this site's `argc` positional and `kwc`
+    /// keyword values (keyword `j` binding slot `(perm >> 4j) & 0xF`) have
+    /// the leaf's parameter lanes and every parameter they leave out has a
+    /// default the leaf carries.
+    fn leaf_for(&self, token: u32, argc: u8, kwc: u8, perm: u32) -> Option<(usize, Vec<LeafArg>)> {
         let ix = self.leaves.iter().position(|l| l.token == token)?;
-        let base = self.vstack.len().checked_sub(argc as usize)?;
-        let lanes = self.vstack[base..].iter().map(|&(_, ty)| ty);
-        lanes
-            .eq(self.leaves[ix].params.iter().copied())
-            .then_some(ix)
+        let leaf = &self.leaves[ix];
+        let n = argc as usize + kwc as usize;
+        let base = self.vstack.len().checked_sub(n)?;
+        let mut from: Vec<Option<LeafArg>> = vec![None; leaf.params.len()];
+        for j in 0..n {
+            let slot = if j < argc as usize {
+                j
+            } else {
+                ((perm >> (4 * (j - argc as usize))) & 0xF) as usize
+            };
+            let at = from.get_mut(slot)?;
+            if at.is_some() || self.vstack[base + j].1 != leaf.params[slot] {
+                return None;
+            }
+            *at = Some(LeafArg::Arg(j));
+        }
+        let from = from
+            .iter()
+            .zip(&leaf.defaults)
+            .map(|(&f, &d)| f.or(d.map(LeafArg::Default)))
+            .collect::<Option<Vec<_>>>()?;
+        Some((ix, from))
     }
 
     /// Lower a direct call of a compiled scalar leaf (see [`LeafTarget`]):
     /// charge the activation through the self-call enter helper, fill the
-    /// leaf's `JitFrame` on this function's native stack frame, call it,
-    /// and release the charge. The leaf only computes, so when the enter
-    /// helper declines or the leaf deopts (an overflow, a zero divisor),
-    /// the ordinary call helper runs the call from the start.
-    fn emit_call_leaf(&mut self, ix: usize, token: u32, argc: u8, ret: JitType, pc: u32) {
+    /// leaf's `JitFrame` on this function's native stack frame (the
+    /// parameters from the call's values and the leaf's burned-in
+    /// defaults, per `from`), call it, and release the charge. The leaf
+    /// only computes, so when the enter helper declines or the leaf deopts
+    /// (an overflow, a zero divisor), the ordinary call helper runs the
+    /// call from the start.
+    fn emit_call_leaf(
+        &mut self,
+        ix: usize,
+        from: &[LeafArg],
+        call: SiteCall,
+        ret: JitType,
+        pc: u32,
+    ) {
         let trusted = MemFlags::trusted();
         let (enter_addr, exit_addr, _) =
             runtime::self_call_helper_addrs().expect("checked by the engine");
-        let n = argc as usize;
+        let n = call.argc as usize + call.kwc as usize;
         let base = self.vstack.len() - n;
         let args: Vec<(Value, JitType)> = self.vstack[base..].to_vec();
         self.vstack.truncate(base);
@@ -3334,8 +4281,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
         let sig = self.self_sig();
         let enter = self.b.ins().iconst(self.ptr_ty, enter_addr as i64);
-        let call = self.b.ins().call_indirect(sig, enter, &[self.frame_ptr]);
-        let declined = self.b.inst_results(call)[0];
+        let c = self.b.ins().call_indirect(sig, enter, &[self.frame_ptr]);
+        let declined = self.b.inst_results(c)[0];
 
         let direct_b = self.b.create_block();
         let generic_b = self.b.create_block();
@@ -3386,11 +4333,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.b.ins().store(trusted, null, fp, OFF_CALL_ARGS);
         self.b.ins().store(trusted, null, fp, OFF_CALL_TAGS);
         for slot_ix in 0..n_locals {
-            let v = args.get(slot_ix as usize).map_or(zero64, |&(v, _)| v);
+            let v = match from.get(slot_ix as usize) {
+                Some(&LeafArg::Arg(j)) => args[j].0,
+                Some(&LeafArg::Default(bits)) => self.b.ins().iconst(types::I64, bits as i64),
+                None => zero64,
+            };
             self.b.ins().store(trusted, v, locals, slot_ix * 8);
         }
-        let call = self.b.ins().call(func, &[fp]);
-        let status = self.b.inst_results(call)[0];
+        let c = self.b.ins().call(func, &[fp]);
+        let status = self.b.inst_results(c)[0];
         let exit = self.b.ins().iconst(self.ptr_ty, exit_addr as i64);
         self.b.ins().call_indirect(sig, exit, &[self.frame_ptr]);
         let returned_b = self.b.create_block();
@@ -3409,7 +4360,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // Declined or deopted: the ordinary call, from the start.
         self.b.switch_to_block(generic_b);
         self.vstack.extend(args.iter().copied());
-        self.emit_call_py(token, argc, 0, 0, 0, ret, pc);
+        self.emit_call_py(
+            call.token, call.argc, call.kwc, call.perm, call.gaps, ret, pc,
+        );
         let (v, _) = self.vstack.pop().expect("the call's result");
         self.b.ins().jump(join_b, &[v.into()]);
 
@@ -3897,10 +4850,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     }
 
     /// Write back every managed local into the frame's locals buffer.
+    /// Store the locals the body assigns back to the frame (the others
+    /// still hold the values the entry loaded: reading one here would only
+    /// keep it live to every exit and call).
     fn writeback_locals(&mut self) {
         let trusted = MemFlags::trusted();
         for slot in 0..self.vars.len() {
             if let Some(var) = self.vars[slot] {
+                if !self.assignable.get(slot).copied().unwrap_or(true) {
+                    continue;
+                }
                 let v = self.b.use_var(var);
                 let off = (slot as i32) * 8;
                 self.b.ins().store(trusted, v, self.locals_base, off);

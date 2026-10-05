@@ -208,6 +208,7 @@ fn frame_new(args: &[Object]) -> Result<Object, RuntimeError> {
         on_stack: Cell::new(0),
         extra_locals: RefCell::new(None),
         cleared: Cell::new(false),
+        lazy_back: RefCell::new(None),
     });
     Ok(Object::Frame(frame))
 }

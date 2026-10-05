@@ -1349,7 +1349,7 @@ fn ind_new(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     };
     let inst = Object::Instance(Rc::new(crate::types::PyInstance::new(cls)));
-    crate::gc_trace::track(inst.clone());
+    crate::gc_trace::track(&inst);
     Ok(inst)
 }
 
@@ -4754,7 +4754,7 @@ fn bw_new(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("Buffered.__new__(X): X is not a type object")),
     };
     let inst = Object::Instance(Rc::new(crate::types::PyInstance::new(cls)));
-    crate::gc_trace::track(inst.clone());
+    crate::gc_trace::track(&inst);
     Ok(inst)
 }
 

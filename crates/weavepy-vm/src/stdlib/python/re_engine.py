@@ -2,11 +2,14 @@
 # WeavePy: user-visible Pattern / Match objects for the re package.
 #
 # CPython implements `re.Pattern` and `re.Match` as C types inside the
-# `_sre` extension. WeavePy instead keeps `_sre` as a pure-data
-# backtracking core (compile + exec returning group spans) and builds
-# the user-facing objects here, in Python. Doing so means callable
-# `re.sub` replacements, `finditer`, `Scanner`, etc. all run on the
-# normal interpreter without the engine ever re-entering the VM.
+# `_sre` extension. WeavePy declares them here as Python classes with
+# `__slots__`, and `_sre.install` (at the end of this module) replaces
+# their hot methods with native bodies that work on the slot storage.
+# The natives serve exact `str`/`bytes` subjects with plain arguments;
+# everything else calls the Python methods below, which remain the
+# reference implementation. Patterns, matches and scanners are always
+# built by `_sre` (`make_pattern`, `exec_match`), never by calling the
+# classes.
 #
 # Behaviour (group semantics, greedy/lazy scanning, empty-match
 # handling, split/sub/subn rules) follows CPython 3.13 exactly.
@@ -37,8 +40,9 @@ _template_cache = {}
 
 def compile_pattern(pattern, flags, code, groups, groupindex, indexgroup):
     """Build a Pattern. Called by re._compiler.compile()."""
-    handle = _sre.compile(code, groups)
-    return Pattern(handle, pattern, flags, groups, groupindex, indexgroup)
+    # Issue 14260: a non-modifiable mapping, like CPython's C getter.
+    return _sre.make_pattern(Pattern, pattern, flags, code, groups,
+                             _MappingProxy(groupindex), indexgroup)
 
 
 # Code-point length is O(n) for WeavePy's UTF-8 `str`, and regex-driven
@@ -109,6 +113,12 @@ def _clamp_span(string, pos, endpos):
 class Pattern:
     __module__ = 're'
 
+    # The native methods read these by position (see `_sre.install`).
+    # `_code` is the compiled code's handle; `_indexgroup` maps a group
+    # number to its name or None.
+    __slots__ = ('_code', 'pattern', 'flags', 'groups', 'groupindex',
+                 '_indexgroup', '__weakref__')
+
     # PEP 585: `re.Pattern[str]` / `re.Pattern[bytes]` yield a
     # `types.GenericAlias` (CPython exposes this on the C `Pattern` type).
     __class_getitem__ = classmethod(_GenericAlias)
@@ -118,15 +128,8 @@ class Pattern:
     def __init_subclass__(cls, /, **kwargs):
         raise TypeError("type 're.Pattern' is not an acceptable base type")
 
-    def __init__(self, handle, pattern, flags, groups, groupindex, indexgroup):
-        self._handle = handle
-        self.pattern = pattern
-        self.flags = flags
-        self.groups = groups
-        # Issue 14260: a non-modifiable mapping, like CPython's C getter.
-        self.groupindex = _MappingProxy(groupindex)
-        # tuple: group number (1-based) -> name or None
-        self._indexgroup = indexgroup
+    def __new__(cls, *args, **kwargs):
+        raise TypeError("cannot create 're.Pattern' instances")
 
     # CPython `_sre` pattern rich compare (bpo-35966): equal iff the
     # pattern string/bytes and effective flags agree; hash must follow.
@@ -152,19 +155,22 @@ class Pattern:
 
     # -- internal --------------------------------------------------------
 
-    def _exec(self, string, pos, endpos, mode, must_advance):
+    def _exec(self, string, pos, endpos, mode, must_advance, mpos=None):
         # CPython `_sre` rejects a str/bytes mismatch between the pattern and
         # the subject before matching (test_fnmatch.test_mix_bytes_str, plus
-        # the analogous re tests). `self.pattern` is the original str/bytes.
+        # the analogous re tests). `self.pattern` is the original str/bytes,
+        # or None for a `re.Scanner` pattern, which accepts either.
         if isinstance(self.pattern, str):
             if not isinstance(string, str):
                 raise TypeError(
                     "cannot use a string pattern on a bytes-like object")
-        elif isinstance(string, str):
+        elif self.pattern is not None and isinstance(string, str):
             raise TypeError(
                 "cannot use a bytes pattern on a string-like object")
-        return _sre.exec(self._handle, string, pos, endpos, mode,
-                         1 if must_advance else 0)
+        # A Match reporting `mpos` (default `pos`) and `endpos`, or None.
+        return _sre.exec_match(self, string, pos, endpos, mode,
+                               1 if must_advance else 0,
+                               pos if mpos is None else mpos)
 
     def _iter(self, string, pos, endpos, guard=None):
         # `guard` is a live buffer export pinning a mutable subject
@@ -175,11 +181,12 @@ class Pattern:
             must_advance = False
             opos, oendpos = pos, endpos
             while pos <= endpos:
-                r = self._exec(string, pos, endpos, _MODE_SEARCH, must_advance)
-                if r is None:
+                m = self._exec(string, pos, endpos, _MODE_SEARCH,
+                               must_advance, opos)
+                if m is None:
                     break
-                start, end = r[0], r[1]
-                yield Match(self, string, opos, oendpos, r)
+                start, end = m._marks[0], m._marks[1]
+                yield m
                 must_advance = start == end
                 pos = end
         finally:
@@ -190,24 +197,15 @@ class Pattern:
 
     def match(self, string, pos=0, endpos=None):
         p, e = _clamp_span(string, pos, endpos)
-        r = self._exec(string, p, e, _MODE_MATCH, False)
-        if r is None:
-            return None
-        return Match(self, string, p, e, r)
+        return self._exec(string, p, e, _MODE_MATCH, False)
 
     def fullmatch(self, string, pos=0, endpos=None):
         p, e = _clamp_span(string, pos, endpos)
-        r = self._exec(string, p, e, _MODE_FULLMATCH, False)
-        if r is None:
-            return None
-        return Match(self, string, p, e, r)
+        return self._exec(string, p, e, _MODE_FULLMATCH, False)
 
     def search(self, string, pos=0, endpos=None):
         p, e = _clamp_span(string, pos, endpos)
-        r = self._exec(string, p, e, _MODE_SEARCH, False)
-        if r is None:
-            return None
-        return Match(self, string, p, e, r)
+        return self._exec(string, p, e, _MODE_SEARCH, False)
 
     def findall(self, string, pos=0, endpos=None):
         g = self.groups
@@ -242,11 +240,19 @@ class Pattern:
         return self._subx(repl, string, count)
 
     def _subx(self, repl, string, count):
+        # CPython substitutes nothing for a negative count.
         if count < 0:
             count = 0
+            limit = 0
+        else:
+            limit = None
         empty = _plain_slice(string, 0, 0)
         if callable(repl):
             filt = repl
+        elif _is_literal(repl):
+            # Like CPython, a replacement with no backslash is used as is,
+            # without parsing it as a template.
+            filt = lambda m, _l=repl: _l
         else:
             template = _compile_template(self, repl)
             if len(template) == 1 and not isinstance(template[0], int):
@@ -262,15 +268,17 @@ class Pattern:
         endpos = _subject_len(string)
         must_advance = False
         while pos <= endpos:
-            if count and n >= count:
+            if (count and n >= count) or limit == 0:
                 break
-            r = self._exec(string, pos, endpos, _MODE_SEARCH, must_advance)
-            if r is None:
+            m = self._exec(string, pos, endpos, _MODE_SEARCH, must_advance, 0)
+            if m is None:
                 break
-            start, end = r[0], r[1]
+            start, end = m._marks[0], m._marks[1]
             out.append(_plain_slice(string, last, start))
-            m = Match(self, string, 0, endpos, r)
-            out.append(filt(m))
+            item = filt(m)
+            # CPython skips a None replacement.
+            if item is not None:
+                out.append(item)
             last = end
             n += 1
             must_advance = start == end
@@ -291,11 +299,10 @@ class Pattern:
         while pos <= endpos:
             if maxsplit and n >= maxsplit:
                 break
-            r = self._exec(string, pos, endpos, _MODE_SEARCH, must_advance)
-            if r is None:
+            m = self._exec(string, pos, endpos, _MODE_SEARCH, must_advance, 0)
+            if m is None:
                 break
-            start, end = r[0], r[1]
-            m = Match(self, string, 0, endpos, r)
+            start, end = m._marks[0], m._marks[1]
             out.append(_plain_slice(string, last, start))
             for i in range(1, g + 1):
                 out.append(m.group(i))
@@ -362,6 +369,11 @@ def _flags_repr(flags):
 class Match:
     __module__ = 're'
 
+    # The native methods read these by position (see `_sre.install`).
+    # `_marks` holds the match span, then each group's span, with -1 for a
+    # group that did not take part; `_lastindex` is -1 for none.
+    __slots__ = ('re', 'string', 'pos', 'endpos', '_marks', '_lastindex')
+
     # PEP 585: `re.Match[str]` / `re.Match[bytes]` yield a `types.GenericAlias`.
     __class_getitem__ = classmethod(_GenericAlias)
 
@@ -370,22 +382,13 @@ class Match:
     def __init_subclass__(cls, /, **kwargs):
         raise TypeError("type 're.Match' is not an acceptable base type")
 
-    def __init__(self, pattern, string, pos, endpos, r):
-        self.re = pattern
-        self.string = string
-        self.pos = pos
-        self.endpos = endpos
-        self._start = r[0]
-        self._end = r[1]
-        self._lastindex_raw = r[2]
-        self._marks = r[3]
+    def __new__(cls, *args, **kwargs):
+        raise TypeError("cannot create 're.Match' instances")
 
     # -- group span helpers ---------------------------------------------
 
     def _span_of(self, idx):
-        if idx == 0:
-            return (self._start, self._end)
-        i = (idx - 1) * 2
+        i = idx * 2
         return (self._marks[i], self._marks[i + 1])
 
     def _index(self, group):
@@ -439,14 +442,11 @@ class Match:
 
     @property
     def regs(self):
-        spans = [(self._start, self._end)]
-        for i in range(1, self.re.groups + 1):
-            spans.append(self._span_of(i))
-        return tuple(spans)
+        return tuple(self._span_of(i) for i in range(self.re.groups + 1))
 
     @property
     def lastindex(self):
-        li = self._lastindex_raw
+        li = self._lastindex
         return None if li < 0 else li
 
     @property
@@ -469,9 +469,10 @@ class Match:
         return self
 
     def __repr__(self):
-        text = _plain_slice(self.string, self._start, self._end)
+        start, end = self._marks[0], self._marks[1]
+        text = _plain_slice(self.string, start, end)
         return "<re.Match object; span=(%d, %d), match=%r>" % (
-            self._start, self._end, text)
+            start, end, text)
 
 
 # CPython's Pattern/Match are C static types whose `tp_name` carries the
@@ -479,6 +480,23 @@ class Match:
 # is not callable") prints it, and tests match on that exact string.
 __weavepy_set_tp_name__(Pattern, "re.Pattern")
 __weavepy_set_tp_name__(Match, "re.Match")
+
+
+class SRE_Scanner:
+    """The scanner `finditer` and `Pattern.scanner` return for an exact
+    `str` or `bytes` subject. Built by `_sre` only; `match`, `search` and
+    the iterator protocol are native (see `_sre.install`)."""
+
+    __module__ = '_sre'
+    __slots__ = ('pattern', '_string', '_start', '_pos', '_endpos',
+                 '_must_advance')
+
+    def __new__(cls, *args, **kwargs):
+        raise TypeError("cannot create '_sre.SRE_Scanner' instances")
+
+    def __init_subclass__(cls, /, **kwargs):
+        raise TypeError(
+            "type '_sre.SRE_Scanner' is not an acceptable base type")
 
 
 class _Scanner:
@@ -499,14 +517,14 @@ class _Scanner:
     def _run(self, mode):
         if self._pos > self._endpos:
             return None
-        r = _sre.exec(self.pattern._handle, self._string, self._pos,
-                     self._endpos, mode, 1 if self._must_advance else 0)
-        if r is None:
-            if mode == _MODE_MATCH:
-                return None
+        m = _sre.exec_match(self.pattern, self._string, self._pos,
+                            self._endpos, mode,
+                            1 if self._must_advance else 0, self._opos)
+        if m is None:
+            # Exhausted, like CPython's scanner.
+            self._pos = self._endpos + 1
             return None
-        start, end = r[0], r[1]
-        m = Match(self.pattern, self._string, self._opos, self._oendpos, r)
+        start, end = m._marks[0], m._marks[1]
         self._must_advance = start == end
         self._pos = end
         return m
@@ -516,13 +534,24 @@ class _Scanner:
 # Replacement-template handling
 # ---------------------------------------------------------------------------
 
+def _is_literal(repl):
+    """Whether `repl` is a str or bytes-like object with no backslash
+    (CPython's `pattern_subx` check)."""
+    if isinstance(repl, str):
+        return str.find(repl, '\\') < 0
+    try:
+        return b'\\' not in memoryview(repl).tobytes()
+    except TypeError:
+        return False
+
+
 def _parse_template(pattern, repl):
     return _parser.parse_template(repl, pattern)
 
 
 def _compile_template(pattern, repl):
     try:
-        key = (pattern._handle, repl)
+        key = (pattern._code, repl)
         return _template_cache[key]
     except KeyError:
         pass
@@ -553,3 +582,7 @@ def _expand_template(template, match):
 
 def clear_template_cache():
     _template_cache.clear()
+    _sre.clear_templates(Pattern)
+
+
+_sre.install(Pattern, Match, SRE_Scanner, _compile_template)
