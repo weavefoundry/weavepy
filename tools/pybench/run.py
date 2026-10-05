@@ -1,0 +1,182 @@
+"""Compare interpreters on the realistic workload suite.
+
+    python3 tools/pybench/run.py --weavepy target/release/weavepy [--base OTHER]
+        [--cpython python3.14] [--procs 3] [--reps 5] [--filter SUBSTR]
+        [--json OUT.json] [--instructions]
+
+Each benchmark runs in fresh processes, interleaving the interpreters
+(CPython, WeavePy, base, CPython, ...). Within a process the first call is
+the cold sample and the following calls are warm samples. The report gives
+the median warm time, the median cold time, and the peak RSS of each
+interpreter, with WeavePy/CPython ratios (below 1.00 means WeavePy is
+faster or smaller) and their geometric means. Results are compared with
+CPython's: a mismatch is reported as a failure.
+
+``--instructions`` instead counts instructions retired (macOS
+``/usr/bin/time -l``) for a process doing 1 and 1 + REPS calls, and reports
+the per-call difference, which cancels startup and import work and is
+stable on a loaded machine.
+"""
+
+import argparse
+import json
+import math
+import os
+import re
+import statistics
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BENCH_DIR = os.path.join(HERE, "benchmarks")
+HARNESS = os.path.join(HERE, "harness.py")
+
+
+def discover():
+    names = []
+    for f in sorted(os.listdir(BENCH_DIR)):
+        if f.endswith(".py") and not f.startswith("_"):
+            names.append(f[:-3])
+    return names
+
+
+def work_for(name):
+    with open(os.path.join(BENCH_DIR, name + ".py")) as fh:
+        m = re.search(r"^WORK\s*=\s*(\d+)", fh.read(), re.M)
+    return int(m.group(1)) if m else 1
+
+
+def run_once(interp, name, work, reps, timeout):
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    proc = subprocess.run(
+        [interp, HARNESS, name, str(work), str(reps)],
+        capture_output=True, text=True, timeout=timeout, env=env,
+    )
+    if proc.returncode != 0:
+        return {"error": (proc.stderr or proc.stdout).strip().splitlines()[-1:] or ["exit %d" % proc.returncode]}
+    line = proc.stdout.strip().splitlines()[-1]
+    return json.loads(line)
+
+
+def instructions(interp, name, work, reps, timeout):
+    def count(r):
+        proc = subprocess.run(
+            ["/usr/bin/time", "-l", interp, HARNESS, name, str(work), str(r)],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        m = re.search(r"(\d+)\s+instructions retired", proc.stderr)
+        if proc.returncode != 0 or not m:
+            return None
+        return int(m.group(1))
+
+    a = min(filter(None, [count(0), count(0)]), default=None)
+    b = min(filter(None, [count(reps), count(reps)]), default=None)
+    if a is None or b is None:
+        return None
+    return (b - a) / reps
+
+
+def geomean(xs):
+    xs = [x for x in xs if x and x > 0]
+    return math.exp(sum(math.log(x) for x in xs) / len(xs)) if xs else float("nan")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--weavepy", required=True)
+    ap.add_argument("--base")
+    ap.add_argument("--cpython", default="python3.14")
+    ap.add_argument("--procs", type=int, default=3)
+    ap.add_argument("--reps", type=int, default=5)
+    ap.add_argument("--filter", action="append")
+    ap.add_argument("--json")
+    ap.add_argument("--instructions", action="store_true")
+    ap.add_argument("--timeout", type=int, default=600)
+    args = ap.parse_args()
+
+    interps = [("cpython", args.cpython), ("weavepy", args.weavepy)]
+    if args.base:
+        interps.append(("base", args.base))
+    names = discover()
+    if args.filter:
+        names = [n for n in names if any(f in n for f in args.filter)]
+
+    rows = []
+    for name in names:
+        work = work_for(name)
+        if args.instructions:
+            row = {"name": name}
+            for label, interp in interps:
+                row[label] = instructions(interp, name, work, args.reps, args.timeout)
+            rows.append(row)
+            c, w = row["cpython"], row["weavepy"]
+            ratio = w / c if c and w else float("nan")
+            print("%-22s cpython %14s  weavepy %14s  ratio %6.2f" % (
+                name, "%.0f" % c if c else "-", "%.0f" % w if w else "-", ratio), flush=True)
+            continue
+        samples = {label: [] for label, _ in interps}
+        for p in range(args.procs):
+            order = interps if p % 2 == 0 else list(reversed(interps))
+            for label, interp in order:
+                try:
+                    samples[label].append(run_once(interp, name, work, args.reps, args.timeout))
+                except subprocess.TimeoutExpired:
+                    samples[label].append({"error": ["timeout"]})
+        row = {"name": name, "work": work}
+        for label, _ in interps:
+            ok = [s for s in samples[label] if "error" not in s]
+            if not ok:
+                row[label] = {"error": samples[label][0]["error"]}
+                continue
+            row[label] = {
+                "warm": statistics.median(x for s in ok for x in s["warm_ns"]) / 1e6,
+                "cold": statistics.median(s["cold_ns"] for s in ok) / 1e6,
+                "import": statistics.median(s["import_ns"] for s in ok) / 1e6,
+                "rss": statistics.median(s["rss"] for s in ok) / (1 << 20),
+                "result": ok[0]["result"],
+            }
+        cp, wp = row["cpython"], row["weavepy"]
+        if "error" in wp or "error" in cp:
+            row["status"] = "ERROR " + " ".join(wp.get("error", cp.get("error", [])))
+        elif wp["result"] != cp["result"]:
+            row["status"] = "MISMATCH"
+        else:
+            row["status"] = "ok"
+            row["warm_ratio"] = wp["warm"] / cp["warm"]
+            row["cold_ratio"] = wp["cold"] / cp["cold"]
+            row["rss_ratio"] = wp["rss"] / cp["rss"]
+            if args.base and "error" not in row["base"]:
+                row["vs_base"] = wp["warm"] / row["base"]["warm"]
+        rows.append(row)
+        if row["status"] == "ok":
+            extra = "  vs base %5.2f" % row["vs_base"] if "vs_base" in row else ""
+            print("%-22s cpy %9.2f ms  wp %9.2f ms  warm %5.2f  cold %5.2f  rss %5.2f%s" % (
+                name, cp["warm"], wp["warm"], row["warm_ratio"], row["cold_ratio"], row["rss_ratio"], extra), flush=True)
+        else:
+            print("%-22s %s %s" % (name, row["status"], wp.get("result", "") if row["status"] == "MISMATCH" else ""), flush=True)
+
+    if not args.instructions:
+        ok = [r for r in rows if r.get("status") == "ok"]
+        print()
+        print("geomean over %d benchmarks: warm %.3f  cold %.3f  rss %.3f%s" % (
+            len(ok),
+            geomean(r["warm_ratio"] for r in ok),
+            geomean(r["cold_ratio"] for r in ok),
+            geomean(r["rss_ratio"] for r in ok),
+            "  vs base %.3f" % geomean(r["vs_base"] for r in ok if "vs_base" in r) if args.base else "",
+        ))
+        slower = sorted((r for r in ok if r["warm_ratio"] > 0.8), key=lambda r: -r["warm_ratio"])
+        if slower:
+            print("not yet 1.25x faster than CPython (warm): " + ", ".join(
+                "%s %.2f" % (r["name"], r["warm_ratio"]) for r in slower))
+        bad = [r["name"] + " " + r["status"] for r in rows if r.get("status") != "ok"]
+        if bad:
+            print("failures: " + ", ".join(bad))
+    if args.json:
+        with open(args.json, "w") as fh:
+            json.dump(rows, fh, indent=1)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

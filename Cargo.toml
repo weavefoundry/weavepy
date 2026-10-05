@@ -338,6 +338,17 @@ inherits = "release"
 debug    = true
 strip    = "none"
 
+# A quicker optimized build for performance iteration: thin LTO and
+# parallel, incremental codegen rebuild the VM in minutes rather than the
+# release profile's quarter hour. Its numbers track release's direction but
+# not its exact values, so confirm results on a release build. Cargo puts
+# its output in `target/quick/`.
+[profile.quick]
+inherits      = "release"
+lto           = "thin"
+codegen-units = 16
+incremental   = true
+
 # A profile for shipping a maximally-optimized interpreter binary.
 [profile.dist]
 inherits      = "release"
