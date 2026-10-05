@@ -43,6 +43,13 @@ pub(crate) fn decode_coltable(bytes: &[u8]) -> Option<Vec<ColSpan>> {
     (r.pos == bytes.len()).then_some(spans)
 }
 
+/// Decode a line-number block [`encode`] wrote (see `LineTable`).
+pub(crate) fn decode_linetable(bytes: &[u8]) -> Option<Vec<u32>> {
+    let mut r = Reader { bytes, pos: 0 };
+    let lines = r.deltas()?;
+    (r.pos == bytes.len()).then_some(lines)
+}
+
 /// Decode what [`encode`] wrote, stamping `filename` on every code
 /// object. `None` for input it didn't write (or a different version's).
 pub fn decode(bytes: &[u8], filename: &str) -> Option<CodeObject> {
@@ -340,6 +347,19 @@ impl Reader<'_> {
         Some(v)
     }
 
+    /// The bytes of a [`Self::deltas`] block, checked as that would but
+    /// left encoded (see `LineTable`).
+    fn deltas_raw(&mut self) -> Option<&[u8]> {
+        let start = self.pos;
+        let n = self.len()?;
+        let mut prev = 0i64;
+        for _ in 0..n {
+            prev = prev.checked_add(self.int()?)?;
+            u32::try_from(prev).ok()?;
+        }
+        Some(&self.bytes[start..self.pos])
+    }
+
     fn f64(&mut self) -> Option<f64> {
         let b = self.bytes.get(self.pos..self.pos + 8)?;
         self.pos += 8;
@@ -378,7 +398,7 @@ impl Reader<'_> {
                 push_lasti: self.byte()? != 0,
             });
         }
-        let linetable = self.deltas()?;
+        let linetable = crate::LineTable::encoded(Arc::from(self.deltas_raw()?));
         let coltable = crate::ColTable::encoded(Arc::from(self.raw()?));
         let arg_count = self.u32()?;
         let posonly_count = self.u32()?;
@@ -482,7 +502,7 @@ mod tests {
             ],
             constants: vec![Constant::Int(-5)],
             varnames: vec!["x".to_owned()],
-            linetable: vec![1, 2, 2],
+            linetable: vec![1, 2, 2].into(),
             coltable: vec![ColSpan::default(); 3].into(),
             arg_count: 1,
             is_generator: true,

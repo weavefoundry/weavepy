@@ -1746,7 +1746,7 @@ impl<'a> MarshalReader<'a> {
             freevars: decoded.freevars,
             cellvars: decoded.cellvars,
             exception_table: decoded.exception_table,
-            linetable: decoded.linetable,
+            linetable: decoded.linetable.into(),
             // PEP-657 columns recovered from long-form location entries
             // (RFC 0056 WS4): traceback caret underlines survive the
             // `.pyc` round-trip.

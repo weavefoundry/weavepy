@@ -2795,7 +2795,7 @@ mod tests {
 
     fn code_of(instrs: Vec<Instruction>) -> CodeObject {
         let mut c = CodeObject {
-            linetable: vec![1u32; instrs.len()],
+            linetable: vec![1u32; instrs.len()].into(),
             instructions: instrs,
             ..CodeObject::default()
         };
@@ -3094,7 +3094,7 @@ mod tests {
                 Instruction::new(OpCode::LoadConst, 0),
                 Instruction::new(OpCode::ReturnValue, 0),
             ],
-            linetable: vec![1, 2, 2, 3, 3, 4, 4],
+            linetable: vec![1, 2, 2, 3, 3, 4, 4].into(),
             ..CodeObject::default()
         };
         code.varnames = vec!["a".to_owned(), "b".to_owned()];
@@ -3124,14 +3124,14 @@ mod tests {
         assert_eq!(dc.varnames, code.varnames);
         assert_eq!(dc.cellvars, code.cellvars);
         assert_eq!(dc.freevars, code.freevars);
-        assert_eq!(dc.linetable, code.linetable);
+        assert_eq!(dc.linetable, *code.linetable);
         assert_eq!(dc.exception_table, code.exception_table);
 
         // Re-encoding the decoded form must reproduce the wire bytes
         // exactly — a strong end-to-end inverse invariant.
         let mut code2 = CodeObject {
             instructions: dc.instructions,
-            linetable: dc.linetable,
+            linetable: dc.linetable.into(),
             ..CodeObject::default()
         };
         code2.varnames = dc.varnames;
@@ -3225,7 +3225,7 @@ def body():
             code.exception_table, dc.exception_table,
             "{path}: exception table"
         );
-        assert_eq!(code.linetable, dc.linetable, "{path}: linetable");
+        assert_eq!(*code.linetable, dc.linetable, "{path}: linetable");
         for c in &code.constants {
             if let crate::Constant::Code(inner) = c {
                 walk(inner, format!("{path}/{}", inner.name));
