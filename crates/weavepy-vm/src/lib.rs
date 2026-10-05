@@ -11819,6 +11819,30 @@ impl Interpreter {
                                 pc += 1;
                                 continue;
                             }
+                            // Two exact strings: UTF-8 byte order is code
+                            // point order. Releasing a string runs nothing.
+                            (Object::Str(x), Object::Str(y)) => {
+                                let (x, y) = (x.as_bytes(), y.as_bytes());
+                                let r = match kind {
+                                    CompareKind::Eq => x == y,
+                                    CompareKind::NotEq => x != y,
+                                    CompareKind::Lt => x < y,
+                                    CompareKind::LtE => x <= y,
+                                    CompareKind::Gt => x > y,
+                                    CompareKind::GtE => x >= y,
+                                };
+                                // SAFETY: the operands leave; the result takes
+                                // the lower one's slot.
+                                unsafe {
+                                    drop_hot(base.add(len - 1).read());
+                                    drop_hot(base.add(len - 2).read());
+                                }
+                                len -= 1;
+                                unsafe { base.add(len - 1).write(bool_hot(r)) };
+                                last = pc;
+                                pc += 1;
+                                continue;
+                            }
                             _ => break None,
                         };
                         let r = match kind {
