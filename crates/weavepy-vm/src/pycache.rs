@@ -222,7 +222,10 @@ pub const MAGIC: &[u8; 4] = &weavepy_compiler::cpython_code::MAGIC_NUMBER;
 ///   expression's invocation, a decorator's application) compiles to
 ///   `Call n` rather than `CallSelf n+1`, which the interpreter's fast
 ///   paths don't serve; rev-53 artifacts still run, slowly.
-pub const CACHE_TAG: &str = weavepy_version::vconcat!(weavepy_version::CACHE_TAG_PREFIX, "-54");
+/// - rev `55`: the AST folder leaves a float power that overflows to run
+///   time (it raises `OverflowError`); rev-54 artifacts folded it to
+///   `inf`.
+pub const CACHE_TAG: &str = weavepy_version::vconcat!(weavepy_version::CACHE_TAG_PREFIX, "-55");
 
 const HEADER_LEN: usize = 16;
 

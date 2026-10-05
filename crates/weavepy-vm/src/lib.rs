@@ -11484,6 +11484,12 @@ impl Interpreter {
                                             a % b
                                         })
                                     }
+                                    BinOpKind::Pow if (0..=u32::MAX as i64).contains(&b) => {
+                                        match a.checked_pow(b as u32) {
+                                            Some(r) => Object::Int(r),
+                                            None => break None,
+                                        }
+                                    }
                                     _ => break None,
                                 }
                             }
@@ -11758,6 +11764,21 @@ impl Interpreter {
                                 Some(o) => o,
                                 None => break None,
                             },
+                            // A float against an int the float format holds
+                            // exactly (Python compares the two exactly).
+                            (Object::Float(x), Object::Int(i))
+                            | (Object::Int(i), Object::Float(x))
+                                if i.unsigned_abs() <= 1 << 53 =>
+                            {
+                                let (l, r) = match a {
+                                    Object::Float(_) => (*x, *i as f64),
+                                    _ => (*i as f64, *x),
+                                };
+                                match l.partial_cmp(&r) {
+                                    Some(o) => o,
+                                    None => break None,
+                                }
+                            }
                             // Two natively served instances (see
                             // `stdlib::datetime_native`), out of line.
                             (Object::Instance(i), Object::Instance(_))
@@ -22799,6 +22820,44 @@ impl Interpreter {
             BinOpKind::Sub => a - b,
             BinOpKind::Mult => a * b,
             BinOpKind::Div if b != 0.0 => a / b,
+            // CPython's `float_pow` for the shapes that neither raise nor
+            // go complex: a finite result from finite operands, with a
+            // positive base or an integral exponent.
+            BinOpKind::Pow
+                if a.is_finite()
+                    && b.is_finite()
+                    && (a > 0.0 || (a != 0.0 && b.fract() == 0.0)) =>
+            {
+                let r = a.powf(b);
+                if !r.is_finite() {
+                    return None;
+                }
+                r
+            }
+            // CPython's `float_divmod`, step for step.
+            BinOpKind::FloorDiv | BinOpKind::Mod if b != 0.0 && a.is_finite() && b.is_finite() => {
+                let mut m = a % b;
+                let mut div = (a - m) / b;
+                if m != 0.0 {
+                    if (b < 0.0) != (m < 0.0) {
+                        m += b;
+                        div -= 1.0;
+                    }
+                } else {
+                    m = 0.0f64.copysign(b);
+                }
+                if kind == BinOpKind::Mod {
+                    m
+                } else if div != 0.0 {
+                    let mut fd = div.floor();
+                    if div - fd > 0.5 {
+                        fd += 1.0;
+                    }
+                    fd
+                } else {
+                    0.0f64.copysign(a / b)
+                }
+            }
             _ => return None,
         }))
     }
@@ -68524,13 +68583,32 @@ fn float_pow(x: f64, y: f64) -> Result<Object, RuntimeError> {
     }
     if x < 0.0 && y.fract() != 0.0 && x.is_finite() && y.is_finite() {
         let magnitude = (-x).powf(y);
+        if magnitude.is_infinite() {
+            return Err(overflow_error("complex exponentiation"));
+        }
         let theta = std::f64::consts::PI * y;
         Ok(Object::new_complex(
             magnitude * theta.cos(),
             magnitude * theta.sin(),
         ))
     } else {
-        Ok(crate::object::fresh_float(x.powf(y)))
+        let r = x.powf(y);
+        // Finite operands with an infinite result overflowed (CPython's
+        // `float_pow` raises `OverflowError(ERANGE, ...)`).
+        if r.is_infinite() && x.is_finite() && y.is_finite() {
+            let exc = crate::builtin_types::make_exception("OverflowError", "");
+            if let Object::Instance(inst) = &exc {
+                inst.slot_set(
+                    "args",
+                    Object::new_tuple_array([
+                        Object::Int(34),
+                        Object::from_static("Result too large"),
+                    ]),
+                );
+            }
+            return Err(RuntimeError::PyException(PyException::new(exc)));
+        }
+        Ok(crate::object::fresh_float(r))
     }
 }
 

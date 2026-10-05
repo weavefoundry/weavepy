@@ -1315,7 +1315,12 @@ fn eval_pow(lv: &Constant, rv: &Constant) -> Option<Constant> {
         if a == 0.0 && b < 0.0 {
             return None;
         }
-        return Some(Constant::Float(a.powf(b)));
+        // An overflow raises at run time.
+        let r = a.powf(b);
+        if r.is_infinite() && a.is_finite() && b.is_finite() {
+            return None;
+        }
+        return Some(Constant::Float(r));
     }
     if (is_complex_kind(lv) || is_complex_kind(rv)) && is_numeric(lv) && is_numeric(rv) {
         let (a, b) = (complex_of(lv)?, complex_of(rv)?);
