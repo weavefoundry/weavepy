@@ -6678,3 +6678,18 @@ _PyHASH_NAN = sys.hash_info.nan
 _PyHASH_10INV = pow(10, _PyHASH_MODULUS - 2, _PyHASH_MODULUS)
 del sys
 
+
+# WEAVEPY: native implementations of the hot methods (the role libmpdec
+# plays in CPython's C `_decimal`). They serve finite exact-class operands
+# under an exact Context natively and call the Python methods above for
+# everything else, including every trapped signal.
+try:
+    from _weave_decimal import install as _install_native
+except ImportError:
+    pass
+else:
+    import contextvars as _contextvars
+    _install_native(Decimal, Context, SignalDict, DecimalTuple, _signals,
+                    _current_context_var, _contextvars._STATES,
+                    _rounding_modes)
+    del _install_native, _contextvars

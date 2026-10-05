@@ -12261,6 +12261,13 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             {
                 return Some(identity_hash(obj));
             }
+            // An exact `decimal.Decimal` hashes natively (see
+            // `stdlib::decimal_native`).
+            if crate::stdlib::decimal_native::is_decimal_instance(inst) {
+                if let Some(h) = crate::stdlib::decimal_native::leaf_hash(inst) {
+                    return Some(h);
+                }
+            }
             // A `weakref.ref` hashes as its referent (CPython `weakref_hash`),
             // computed natively and memoised so the hot `DictKey` path never
             // pays a reentrant `__hash__` dispatch — see `weakref_native_hash`.

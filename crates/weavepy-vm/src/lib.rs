@@ -29003,6 +29003,12 @@ impl Interpreter {
             return Ok(text);
         }
         if let Object::Instance(inst) = v {
+            // An exact `decimal.Decimal` (see `stdlib::decimal_native`).
+            if crate::stdlib::decimal_native::is_decimal_instance(inst) {
+                if let Some(r) = crate::stdlib::decimal_native::leaf_str(inst) {
+                    return Ok(r);
+                }
+            }
             // `PyObject_Str` returns the `__str__` result *unchanged*, so a
             // str-subclass result keeps its type
             // (test_str.test_conversion: `str(WithStr(StrSubclass('abc')))`
@@ -29335,6 +29341,12 @@ impl Interpreter {
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<String, RuntimeError> {
         if let Object::Instance(inst) = value {
+            // An exact `decimal.Decimal` (see `stdlib::decimal_native`).
+            if crate::stdlib::decimal_native::is_decimal_instance(inst) {
+                if let Some(r) = crate::stdlib::decimal_native::leaf_format(inst, spec) {
+                    return Ok(r);
+                }
+            }
             if let Some(method) = instance_method(value, "__format__") {
                 let r = self.call(&method, &[Object::from_str(spec)], &[], globals)?;
                 // CPython's `PyObject_Format` rejects a non-str result
@@ -29445,7 +29457,13 @@ impl Interpreter {
         }
         // `PyObject_Repr` hands the `__repr__` result back as-is, so a
         // str-subclass result keeps its type (test_str.test_repr).
-        if let Object::Instance(_) = v {
+        if let Object::Instance(inst) = v {
+            // An exact `decimal.Decimal` (see `stdlib::decimal_native`).
+            if crate::stdlib::decimal_native::is_decimal_instance(inst) {
+                if let Some(r) = crate::stdlib::decimal_native::leaf_repr(inst) {
+                    return Ok(r);
+                }
+            }
             if let Some(method) = instance_method(v, "__repr__") {
                 let r = self.call(&method, &[], &[], globals)?;
                 if str_like_object(&r) {
