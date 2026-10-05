@@ -4695,8 +4695,10 @@ pub struct PyFunction {
     /// must never appear in `f.__dict__` (functools.update_wrapper
     /// copies `__dict__` and asserts the wrapper's annotations are
     /// untouched by the wrapped function's slots). Read through
-    /// [`Self::slots`], which first copies in [`Self::slot_seed`].
-    pub slots_raw: RefCell<DictData>,
+    /// [`Self::slots`], which first copies in [`Self::slot_seed`]. Boxed
+    /// on first use: most functions never have their slots read, and an
+    /// inline table made every function 80 bytes larger.
+    pub slots_raw: crate::sync::OnceBox<RefCell<DictData>>,
     /// The slots a new function starts with, built on first access to
     /// [`Self::slots`] (most functions never read theirs): `__module__`
     /// from the defining globals' `__name__`, kept here, and `__name__`
@@ -4851,7 +4853,17 @@ impl PyFunction {
         if unsafe { (*self.slot_seed.as_ptr()).is_some() } {
             self.plant_slot_seed();
         }
-        &self.slots_raw
+        self.slots_cell()
+    }
+
+    /// [`Self::slots_raw`]'s table, made empty on first use.
+    #[inline]
+    fn slots_cell(&self) -> &RefCell<DictData> {
+        if let Some(slots) = self.slots_raw.get() {
+            return slots;
+        }
+        let _ = self.slots_raw.set(RefCell::new(DictData::default()));
+        self.slots_raw.get().expect("set above")
     }
 
     #[cold]
@@ -4874,7 +4886,7 @@ impl PyFunction {
             DictKey(qualname_key.clone()),
             crate::stdlib::sys::intern_name(&code.qualname),
         );
-        let mut slots = self.slots_raw.borrow_mut();
+        let mut slots = self.slots_cell().borrow_mut();
         // Every store goes through `slots()`, which plants the seed
         // first: nothing is there yet to keep.
         debug_assert!(slots.is_empty());
@@ -4893,7 +4905,10 @@ impl PyFunction {
                 Some(crate::stdlib::sys::intern_name(&code.qualname)),
             );
         }
-        let slots = self.slots_raw.borrow();
+        let Some(slots) = self.slots_raw.get() else {
+            return (None, None);
+        };
+        let slots = slots.borrow();
         let attr_str = |attr: &'static str| match slots.get(&StrKey(attr)) {
             Some(o @ Object::Str(_)) => Some(o.clone()),
             _ => None,

@@ -10545,7 +10545,7 @@ fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
         // Shared, not copied: `func.__dict__` mutations stay visible on
         // both, matching CPython where the function object is the same.
         attrs: RefCell::new(Some(f.attrs())),
-        slots_raw: RefCell::new(f.slots().borrow().clone()),
+        slots_raw: RefCell::new(f.slots().borrow().clone()).into(),
         slot_seed: RefCell::new(None),
         closure_cells: std::sync::OnceLock::new(),
         // The copied slot store carries any override along.
