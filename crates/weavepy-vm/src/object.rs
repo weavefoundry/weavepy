@@ -12048,7 +12048,13 @@ fn fresh_nan_bits(v: f64) -> f64 {
 /// used at every seam where CPython would allocate a new float object.
 #[inline]
 pub fn fresh_float(v: f64) -> Object {
-    Object::Float(tag_nan(v))
+    // Built as two whole words: the enum's constructor writes the tag as
+    // a byte, and the 16-byte move that reads the value back stalls on
+    // store forwarding. `repr(u8)`: `Float` is variant 5, its payload in
+    // the second word.
+    const FLOAT_TAG: u64 = 5;
+    // SAFETY: two initialized words in exactly `Object::Float`'s layout.
+    unsafe { std::mem::transmute::<[u64; 2], Object>([FLOAT_TAG, tag_nan(v).to_bits()]) }
 }
 
 /// Strip a WeavePy identity tag, restoring the canonical quiet NaN (sign

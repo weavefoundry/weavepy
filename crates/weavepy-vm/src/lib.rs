@@ -11200,7 +11200,7 @@ impl Interpreter {
                             break None;
                         }
                         // SAFETY: `len < cap`.
-                        unsafe { base.add(len).write(Object::Int(i64::from(ins.arg))) };
+                        unsafe { base.add(len).write(int_hot(i64::from(ins.arg))) };
                         len += 1;
                         last = pc;
                         pc += 1;
@@ -11319,7 +11319,7 @@ impl Interpreter {
                         unsafe {
                             drop_hot(base.add(len - 1).read());
                             drop_hot(base.add(len - 2).read());
-                            base.add(len - 2).write(Object::Bool(r));
+                            base.add(len - 2).write(bool_hot(r));
                         }
                         len -= 1;
                         last = pc;
@@ -11343,7 +11343,7 @@ impl Interpreter {
                         unsafe {
                             drop_hot(base.add(len - 1).read());
                             drop_hot(base.add(len - 2).read());
-                            base.add(len - 2).write(Object::Bool(r));
+                            base.add(len - 2).write(bool_hot(r));
                         }
                         len -= 1;
                         last = pc;
@@ -11386,7 +11386,7 @@ impl Interpreter {
                             _ => break None,
                         };
                         // SAFETY: the operand (droppable) is replaced in place.
-                        unsafe { drop(std::mem::replace(&mut *top, Object::Bool(b))) };
+                        unsafe { drop(std::mem::replace(&mut *top, bool_hot(b))) };
                         last = pc;
                         pc += 1;
                     }
@@ -11475,27 +11475,25 @@ impl Interpreter {
                                 let (a, b) = (*a, *b);
                                 match kind {
                                     BinOpKind::Add => match a.checked_add(b) {
-                                        Some(r) => Object::Int(r),
+                                        Some(r) => int_hot(r),
                                         None => break None,
                                     },
                                     BinOpKind::Sub => match a.checked_sub(b) {
-                                        Some(r) => Object::Int(r),
+                                        Some(r) => int_hot(r),
                                         None => break None,
                                     },
                                     BinOpKind::Mult => match a.checked_mul(b) {
-                                        Some(r) => Object::Int(r),
+                                        Some(r) => int_hot(r),
                                         None => break None,
                                     },
-                                    BinOpKind::BitAnd => Object::Int(a & b),
-                                    BinOpKind::BitOr => Object::Int(a | b),
-                                    BinOpKind::BitXor => Object::Int(a ^ b),
-                                    BinOpKind::RShift if (0..64).contains(&b) => {
-                                        Object::Int(a >> b)
-                                    }
+                                    BinOpKind::BitAnd => int_hot(a & b),
+                                    BinOpKind::BitOr => int_hot(a | b),
+                                    BinOpKind::BitXor => int_hot(a ^ b),
+                                    BinOpKind::RShift if (0..64).contains(&b) => int_hot(a >> b),
                                     BinOpKind::LShift
                                         if (0..63).contains(&b) && ((a << b) >> b) == a =>
                                     {
-                                        Object::Int(a << b)
+                                        int_hot(a << b)
                                     }
                                     BinOpKind::FloorDiv | BinOpKind::Mod if b > 0 && a >= 0 => {
                                         Object::Int(if kind == BinOpKind::FloorDiv {
@@ -11506,7 +11504,7 @@ impl Interpreter {
                                     }
                                     BinOpKind::Pow if (0..=u32::MAX as i64).contains(&b) => {
                                         match a.checked_pow(b as u32) {
-                                            Some(r) => Object::Int(r),
+                                            Some(r) => int_hot(r),
                                             None => break None,
                                         }
                                     }
@@ -11841,7 +11839,7 @@ impl Interpreter {
                         // SAFETY: both operands are scalars (no drop owed);
                         // the result takes the lower one's slot.
                         len -= 1;
-                        unsafe { base.add(len - 1).write(Object::Bool(r)) };
+                        unsafe { base.add(len - 1).write(bool_hot(r)) };
                         last = pc;
                         pc += 1;
                     }
@@ -12107,7 +12105,7 @@ impl Interpreter {
                                 if live {
                                     let v = *current;
                                     *current = current.wrapping_add(*step);
-                                    Object::Int(v)
+                                    int_hot(v)
                                 } else {
                                     retire = true;
                                     Object::None
@@ -12185,7 +12183,7 @@ impl Interpreter {
                                 match data.get(*index) {
                                     Some(&b) => {
                                         *index += 1;
-                                        Object::Int(i64::from(b))
+                                        int_hot(i64::from(b))
                                     }
                                     // (Immutable: an exhausted iterator stays so.)
                                     None => {
@@ -12202,7 +12200,7 @@ impl Interpreter {
                                 };
                                 let Some(b) = b else { break None };
                                 *index += 1;
-                                Object::Int(i64::from(b))
+                                int_hot(i64::from(b))
                             }
                             crate::object::PyIterator::Str { s, index } => {
                                 match s.get(*index..).and_then(|rest| rest.chars().next()) {
@@ -12324,7 +12322,7 @@ impl Interpreter {
                                         }
                                         let v = *current;
                                         *current = current.wrapping_add(*step);
-                                        Object::Int(v)
+                                        int_hot(v)
                                     }
                                     crate::object::PyIterator::List { items, index, .. } => {
                                         // SAFETY: as above.
@@ -12348,7 +12346,7 @@ impl Interpreter {
                                             break None;
                                         };
                                         *index += 1;
-                                        Object::Int(i64::from(b))
+                                        int_hot(i64::from(b))
                                     }
                                     crate::object::PyIterator::ByteArray { data, index } => {
                                         // SAFETY: as above.
@@ -12358,7 +12356,7 @@ impl Interpreter {
                                         };
                                         let Some(b) = b else { break None };
                                         *index += 1;
-                                        Object::Int(i64::from(b))
+                                        int_hot(i64::from(b))
                                     }
                                     crate::object::PyIterator::Str { s, index } => {
                                         let Some(ch) =
@@ -12381,7 +12379,7 @@ impl Interpreter {
                                     unsafe { base.add(len).write(x) };
                                     len += 1;
                                     pc += 1;
-                                    Object::Int(i)
+                                    int_hot(i)
                                 }
                             }
                             _ => break None,
@@ -13144,7 +13142,7 @@ impl Interpreter {
                                             };
                                             if let Some(n) = n.and_then(|n| i64::try_from(n).ok()) {
                                                 // SAFETY: `len < cap`.
-                                                unsafe { base.add(len).write(Object::Int(n)) };
+                                                unsafe { base.add(len).write(int_hot(n)) };
                                                 len += 1;
                                                 last = pc + 3;
                                                 pc += 4;
@@ -13253,7 +13251,7 @@ impl Interpreter {
                                     None => Object::Type(cls.clone()),
                                 }
                             }
-                            other => other.clone(),
+                            other => clone_hot(other),
                         };
                         // SAFETY: `len < cap`.
                         unsafe { base.add(len).write(v) };
@@ -22724,10 +22722,12 @@ impl Interpreter {
         if meta.c_ext_ptr.get() != 0 || !Self::default_getattribute(meta) {
             return None;
         }
-        let Some(Object::Str(name)) = code_name_obj(code, name_idx) else {
-            return None;
-        };
-        if meta.lookup(name).is_some() {
+        // The metaclass's MRO has no entry for the name (its own leaf
+        // attribute cache remembers the walk per version).
+        if !matches!(
+            Self::leaf_class_attr(code, meta, name_idx),
+            Some(LeafAttr::InstanceOnly)
+        ) {
             return None;
         }
         match Self::leaf_class_attr(code, cls, name_idx)? {
@@ -66481,6 +66481,44 @@ fn scalar_copy(v: &Object) -> Object {
     ));
     // SAFETY: a scalar owns nothing: its bits are a complete copy.
     unsafe { std::ptr::read(v) }
+}
+
+/// `Object::Int(v)` built as two whole words (see [`clone_hot`]): the
+/// enum's own constructor writes the tag as a byte, and the 16-byte move
+/// that reads the value back stalls on store forwarding.
+#[inline(always)]
+fn int_hot(v: i64) -> Object {
+    // `repr(u8)`: the tag (the variant's index) in the low byte of the
+    // first word, the payload in the second.
+    const INT_TAG: u64 = 3;
+    // SAFETY: two initialized words in exactly `Object::Int(v)`'s layout
+    // (checked by `int_hot_matches_the_enum`).
+    unsafe { std::mem::transmute::<[u64; 2], Object>([INT_TAG, v as u64]) }
+}
+
+/// `Object::Bool(b)` as two whole words (see [`int_hot`]).
+#[inline(always)]
+fn bool_hot(b: bool) -> Object {
+    const BOOL_TAG: u64 = 2;
+    // SAFETY: `Object::Bool(b)`'s layout: the tag, then the `bool` byte.
+    unsafe { std::mem::transmute::<[u64; 2], Object>([BOOL_TAG | (u64::from(b) << 8), 0]) }
+}
+
+#[cfg(test)]
+#[test]
+fn scalar_builders_match_the_enum() {
+    for v in [0, 1, -1, i64::MAX, i64::MIN, 1 << 40] {
+        assert!(matches!(int_hot(v), Object::Int(x) if x == v));
+    }
+    for b in [false, true] {
+        assert!(matches!(bool_hot(b), Object::Bool(x) if x == b));
+    }
+    for v in [0.0, -1.5, f64::INFINITY, f64::MIN_POSITIVE] {
+        assert!(
+            matches!(crate::object::fresh_float(v), Object::Float(x) if x.to_bits() == v.to_bits())
+        );
+    }
+    assert!(matches!(crate::object::fresh_float(f64::NAN), Object::Float(x) if x.is_nan()));
 }
 
 /// `drop(v)` with the scalars skipped and the common heap variants'

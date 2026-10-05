@@ -315,13 +315,22 @@ def count_instructions(interp, stmt, n):
     return int(m.group(1))
 
 
-def run_instructions(interp, cases, lo=10000, hi=110000):
-    def per_iter(stmt):
+def run_instructions(interp, cases, lo=10000, hi=110000, cheap=2000, long_hi=1010000):
+    # A cheap statement's span over `hi - lo` iterations is small next to
+    # the process's own variation (JIT compiles, collections), so one under
+    # `cheap` instructions an iteration is measured again over a longer one.
+    def span(stmt, top):
         a = count_instructions(interp, stmt, lo)
-        b = count_instructions(interp, stmt, hi)
+        b = count_instructions(interp, stmt, top)
         if a is None or b is None:
             return None
-        return (b - a) / (hi - lo)
+        return (b - a) / (top - lo)
+
+    def per_iter(stmt):
+        v = span(stmt, hi)
+        if v is not None and v < cheap:
+            v = span(stmt, long_hi)
+        return v
 
     empty = per_iter("pass")
     out = {}
