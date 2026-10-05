@@ -538,7 +538,7 @@ impl Fin {
     }
 
     fn adjusted(&self) -> i128 {
-        self.exp as i128 + self.coef.ndigits() as i128 - 1
+        i128::from(self.exp) + i128::from(self.coef.ndigits()) - 1
     }
 
     fn negated(&self) -> Fin {
@@ -601,7 +601,7 @@ const _: u16 = S_DIVZERO | S_OVERFLOW | S_INVALID;
 /// `Decimal._fix`.
 fn fix(d: Fin, c: &CtxP, sig: &mut u16) -> Option<Fin> {
     let (prec, etiny, etop) = (c.prec, c.etiny(), c.etop());
-    let exp = d.exp as i128;
+    let exp = i128::from(d.exp);
     if d.coef.is_zero() {
         let exp_max = if c.clamp { etop } else { c.emax };
         let new_exp = exp.max(etiny).min(exp_max);
@@ -611,7 +611,7 @@ fn fix(d: Fin, c: &CtxP, sig: &mut u16) -> Option<Fin> {
         }
         return Some(d);
     }
-    let len = d.coef.ndigits() as i128;
+    let len = i128::from(d.coef.ndigits());
     let mut exp_min = len + exp - prec;
     if exp_min > etop {
         return None;
@@ -631,7 +631,7 @@ fn fix(d: Fin, c: &CtxP, sig: &mut u16) -> Option<Fin> {
         let mut coeff = q;
         if changed > 0 {
             coeff = coeff.incr();
-            if coeff.ndigits() as i128 > prec {
+            if i128::from(coeff.ndigits()) > prec {
                 coeff = coeff.divrem_pow10(1).0;
                 exp_min += 1;
             }
@@ -678,12 +678,12 @@ fn rescale_inexact(d: &Fin, exp: i128, mode: Round) -> Option<(Fin, bool)> {
     if d.is_zero() {
         return Some((Fin::new(d.sign, Coef::ZERO, exp)?, false));
     }
-    let dexp = d.exp as i128;
+    let dexp = i128::from(d.exp);
     if dexp >= exp {
         let k = u64::try_from(dexp - exp).ok()?;
         return Some((Fin::new(d.sign, d.coef.mul_pow10(k)?, exp)?, false));
     }
-    let len = d.coef.ndigits() as i128;
+    let len = i128::from(d.coef.ndigits());
     let digits = len + dexp - exp;
     let (q, rem) = if digits < 0 {
         (Coef::ZERO, Rem::Below)
@@ -704,12 +704,12 @@ fn cmp(a: &Fin, b: &Fin) -> Option<Ordering> {
     if let (Coef::S(x), Coef::S(y)) = (&a.coef, &b.coef) {
         if let (Ok(x), Ok(y)) = (u64::try_from(*x), u64::try_from(*y)) {
             if x != 0 && y != 0 && a.sign == b.sign {
-                let aa = a.exp as i128 + digits_u128(u128::from(x)) as i128;
-                let ba = b.exp as i128 + digits_u128(u128::from(y)) as i128;
+                let aa = i128::from(a.exp) + i128::from(digits_u128(u128::from(x)));
+                let ba = i128::from(b.exp) + i128::from(digits_u128(u128::from(y)));
                 let mag = if aa != ba {
                     aa.cmp(&ba)
                 } else {
-                    let d = a.exp as i128 - b.exp as i128;
+                    let d = i128::from(a.exp) - i128::from(b.exp);
                     let (px, py) = if d >= 0 {
                         (POW10[d as usize] as u64, 1)
                     } else {
@@ -750,7 +750,7 @@ fn cmp_general(a: &Fin, b: &Fin) -> Option<Ordering> {
     }
     let (aa, ba) = (a.adjusted(), b.adjusted());
     let mag = if aa == ba {
-        let (ae, be) = (a.exp as i128, b.exp as i128);
+        let (ae, be) = (i128::from(a.exp), i128::from(b.exp));
         let ap = a.coef.mul_pow10(u64::try_from((ae - be).max(0)).ok()?)?;
         let bp = b.coef.mul_pow10(u64::try_from((be - ae).max(0)).ok()?)?;
         ap.cmp(&bp)
@@ -774,8 +774,8 @@ fn normalize(op1: &mut Work, op2: &mut Work, prec: i128) -> Option<()> {
     } else {
         (op1, op2)
     };
-    let tmp_len = tmp.int.ndigits() as i128;
-    let other_len = other.int.ndigits() as i128;
+    let tmp_len = i128::from(tmp.int.ndigits());
+    let other_len = i128::from(other.int.ndigits());
     let exp = tmp.exp + (-1i128).min(tmp_len - prec - 2);
     if other_len + other.exp - 1 < exp {
         other.int = Coef::S(1);
@@ -790,25 +790,25 @@ fn normalize(op1: &mut Work, op2: &mut Work, prec: i128) -> Option<()> {
 
 /// `Decimal.__add__` for finite operands.
 fn add(a: &Fin, b: &Fin, c: &CtxP, sig: &mut u16) -> Option<Fin> {
-    let exp = (a.exp.min(b.exp)) as i128;
+    let exp = i128::from(a.exp.min(b.exp));
     let negativezero = c.round == Round::Floor && a.sign != b.sign;
     if a.is_zero() && b.is_zero() {
         let sign = if negativezero { 1 } else { a.sign.min(b.sign) };
         return fix(Fin::new(sign, Coef::ZERO, exp)?, c, sig);
     }
     if a.is_zero() {
-        let e = exp.max(b.exp as i128 - c.prec - 1);
+        let e = exp.max(i128::from(b.exp) - c.prec - 1);
         return fix(rescale(b, e, c.round)?, c, sig);
     }
     if b.is_zero() {
-        let e = exp.max(a.exp as i128 - c.prec - 1);
+        let e = exp.max(i128::from(a.exp) - c.prec - 1);
         return fix(rescale(a, e, c.round)?, c, sig);
     }
     // Word-sized coefficients a few digits apart: the exact sum, which
     // rounds as `_normalize`'s shortened operand does (that only drops
     // digits below the rounding position).
     if let (Coef::S(x), Coef::S(y)) = (&a.coef, &b.coef) {
-        let (da, db) = (a.exp as i128 - exp, b.exp as i128 - exp);
+        let (da, db) = (i128::from(a.exp) - exp, i128::from(b.exp) - exp);
         if *x <= u128::from(u64::MAX) && *y <= u128::from(u64::MAX) && da < 20 && db < 20 {
             // Both factors are below 2**64: one widening multiply each.
             let (x, y) = (
@@ -845,12 +845,12 @@ fn add_general(
     let mut op1 = Work {
         sign: a.sign,
         int: a.coef.clone(),
-        exp: a.exp as i128,
+        exp: i128::from(a.exp),
     };
     let mut op2 = Work {
         sign: b.sign,
         int: b.coef.clone(),
-        exp: b.exp as i128,
+        exp: i128::from(b.exp),
     };
     normalize(&mut op1, &mut op2, c.prec)?;
     let (sign, int) = if op1.sign != op2.sign {
@@ -871,7 +871,7 @@ fn add_general(
 /// `Decimal.__mul__` for finite operands.
 fn mul(a: &Fin, b: &Fin, c: &CtxP, sig: &mut u16) -> Option<Fin> {
     let sign = a.sign ^ b.sign;
-    let exp = a.exp as i128 + b.exp as i128;
+    let exp = i128::from(a.exp) + i128::from(b.exp);
     if a.is_zero() || b.is_zero() {
         return fix(Fin::new(sign, Coef::ZERO, exp)?, c, sig);
     }
@@ -892,10 +892,10 @@ fn div(a: &Fin, b: &Fin, c: &CtxP, sig: &mut u16) -> Option<Fin> {
     }
     let sign = a.sign ^ b.sign;
     let (coeff, exp) = if a.is_zero() {
-        (Coef::ZERO, a.exp as i128 - b.exp as i128)
+        (Coef::ZERO, i128::from(a.exp) - i128::from(b.exp))
     } else {
-        let shift = b.coef.ndigits() as i128 - a.coef.ndigits() as i128 + c.prec + 1;
-        let mut exp = a.exp as i128 - b.exp as i128 - shift;
+        let shift = i128::from(b.coef.ndigits()) - i128::from(a.coef.ndigits()) + c.prec + 1;
+        let mut exp = i128::from(a.exp) - i128::from(b.exp) - shift;
         let (mut coeff, rem) = if shift >= 0 {
             a.coef
                 .mul_pow10(u64::try_from(shift).ok()?)?
@@ -909,7 +909,7 @@ fn div(a: &Fin, b: &Fin, c: &CtxP, sig: &mut u16) -> Option<Fin> {
                 coeff = coeff.incr();
             }
         } else {
-            let ideal = a.exp as i128 - b.exp as i128;
+            let ideal = i128::from(a.exp) - i128::from(b.exp);
             while exp < ideal && coeff.rem_small(10) == 0 {
                 coeff = coeff.divrem_pow10(1).0;
                 exp += 1;
@@ -928,7 +928,7 @@ fn divide(a: &Fin, b: &Fin, c: &CtxP) -> Option<(Fin, Fin)> {
         return None;
     }
     let sign = a.sign ^ b.sign;
-    let ideal_exp = a.exp.min(b.exp) as i128;
+    let ideal_exp = i128::from(a.exp.min(b.exp));
     let expdiff = a.adjusted() - b.adjusted();
     if a.is_zero() || expdiff <= -2 {
         return Some((
@@ -938,14 +938,14 @@ fn divide(a: &Fin, b: &Fin, c: &CtxP) -> Option<(Fin, Fin)> {
     }
     if expdiff <= c.prec {
         let (mut i1, mut i2) = (a.coef.clone(), b.coef.clone());
-        let (e1, e2) = (a.exp as i128, b.exp as i128);
+        let (e1, e2) = (i128::from(a.exp), i128::from(b.exp));
         if e1 >= e2 {
             i1 = i1.mul_pow10(u64::try_from(e1 - e2).ok()?)?;
         } else {
             i2 = i2.mul_pow10(u64::try_from(e2 - e1).ok()?)?;
         }
         let (q, r) = i1.divrem(&i2);
-        if (q.ndigits() as i128) <= c.prec || q.is_zero() {
+        if i128::from(q.ndigits()) <= c.prec || q.is_zero() {
             return Some((Fin::new(sign, q, 0)?, Fin::new(a.sign, r, ideal_exp)?));
         }
     }
@@ -954,7 +954,7 @@ fn divide(a: &Fin, b: &Fin, c: &CtxP) -> Option<(Fin, Fin)> {
 
 /// `Decimal.quantize` for finite operands with a valid rounding.
 fn quantize(a: &Fin, e: i64, mode: Round, c: &CtxP, sig: &mut u16) -> Option<Fin> {
-    let e = e as i128;
+    let e = i128::from(e);
     if !(c.etiny() <= e && e <= c.emax) {
         return None;
     }
@@ -967,7 +967,7 @@ fn quantize(a: &Fin, e: i64, mode: Round, c: &CtxP, sig: &mut u16) -> Option<Fin
     }
     let (ans, inexact) = rescale_inexact(a, e, mode)?;
     let ans_adj = ans.adjusted();
-    if ans_adj > c.emax || ans.coef.ndigits() as i128 > c.prec {
+    if ans_adj > c.emax || i128::from(ans.coef.ndigits()) > c.prec {
         return None;
     }
     if !ans.is_zero() && ans_adj < c.emin {
@@ -1037,7 +1037,7 @@ fn hash(d: &Fin) -> i64 {
 fn to_sci(d: &Fin, eng: bool, capitals: bool) -> String {
     let digits = d.coef.to_digits();
     let len = digits.len() as i128;
-    let exp = d.exp as i128;
+    let exp = i128::from(d.exp);
     let leftdigits = exp + len;
     let dotplace = if exp <= 0 && leftdigits > -6 {
         leftdigits
@@ -1104,7 +1104,7 @@ fn from_f64(f: f64) -> Option<Fin> {
         let coef = Coef::from_big(BigUint::from(mant) << (e as usize));
         return Some(Fin { sign, coef, exp: 0 });
     }
-    let tz = (mant.trailing_zeros() as i64).min(-e);
+    let tz = i64::from(mant.trailing_zeros()).min(-e);
     mant >>= tz;
     e += tz;
     let k = (-e) as u32;
@@ -1388,7 +1388,7 @@ pub(crate) fn recycle(mut inst: Rc<PyInstance>) -> Result<(), Rc<PyInstance>> {
     let Some(st) = state_of_cls(cls) else {
         return Err(inst);
     };
-    if !std::ptr::eq(&**cls, st.decimal.as_ptr())
+    if !std::ptr::eq(&raw const **cls, st.decimal.as_ptr())
         || m.dict.published().is_some()
         || !m.dict.split_mut().is_empty()
         || m.native.get().is_some()
@@ -1607,7 +1607,9 @@ impl State {
     fn copy_of(&self, i: &PyInstance) -> Option<Object> {
         let packed = with_slots(i, |s| s.as_packed().and_then(PackedSlots::decimal));
         if let Some((sign, coef, exp)) = packed {
-            if exp < MIN_ETINY as i64 || exp as i128 + digits_u128(coef) as i128 - 1 > MAX_EMAX {
+            if exp < MIN_ETINY as i64
+                || i128::from(exp) + i128::from(digits_u128(coef)) - 1 > MAX_EMAX
+            {
                 return None;
             }
             return self.make_packed(sign, coef, exp);
@@ -1616,7 +1618,7 @@ impl State {
         match (&v[0], &v[1], &v[2], &v[3]) {
             (_, _, _, Object::Bool(true)) => {}
             (Object::Int(0..=1), Object::Str(int), Object::Int(exp), Object::Bool(false)) => {
-                let exp = *exp as i128;
+                let exp = i128::from(*exp);
                 if exp + int.len() as i128 - 1 > MAX_EMAX || exp < MIN_ETINY {
                     return None;
                 }
@@ -1713,7 +1715,8 @@ impl State {
                 Some((DictKey(Object::Instance(k)), v)) if Rc::ptr_eq(k, var) => v,
                 _ => {
                     // A borrowed key: no reference count changes hands.
-                    let key = std::mem::ManuallyDrop::new(DictKey(std::ptr::read(&self.var)));
+                    let key =
+                        std::mem::ManuallyDrop::new(DictKey(std::ptr::read(&raw const self.var)));
                     let i = data.get_index_of(&*key)?;
                     self.data_hint.store(i, Relaxed);
                     data.get_index(i)?.1
@@ -1801,7 +1804,7 @@ impl State {
                 None
             };
             let int = |o: &Object| match *o {
-                Object::Int(v) => Some(v as i128),
+                Object::Int(v) => Some(i128::from(v)),
                 _ => None,
             };
             let (
@@ -1914,7 +1917,7 @@ impl State {
     /// `v` lives in `inst`, and nothing runs while the result is in use.
     unsafe fn ctx_from(&self, v: &[Object], inst: Rc<PyInstance>) -> Option<Ctx> {
         let int = |o: &Object| match *o {
-            Object::Int(v) => Some(v as i128),
+            Object::Int(v) => Some(i128::from(v)),
             _ => None,
         };
         let p = CtxP {
@@ -1955,7 +1958,7 @@ impl State {
         let n = &self.names;
         let attr = |name: &SharedStr| inst.attr_get_str(name);
         let int = |o: Object| match o {
-            Object::Int(v) => Some(v as i128),
+            Object::Int(v) => Some(i128::from(v)),
             _ => None,
         };
         let p = CtxP {
@@ -2299,7 +2302,7 @@ fn power(x: &Fin, n: u32, c: &CtxP, sig: &mut u16) -> Option<Fin> {
         return None;
     }
     // Strip the coefficient's trailing zeros.
-    let (mut xc, mut xe) = (x.coef.clone(), x.exp as i128);
+    let (mut xc, mut xe) = (x.coef.clone(), i128::from(x.exp));
     loop {
         let (q, r) = xc.divrem_pow10(1);
         if !r.is_zero() {
@@ -2310,7 +2313,7 @@ fn power(x: &Fin, n: u32, c: &CtxP, sig: &mut u16) -> Option<Fin> {
     }
     let m = i128::from(n);
     let p = c.prec + 1;
-    let ideal = x.exp as i128 * m;
+    let ideal = i128::from(x.exp) * m;
     let exp = xe * m;
     let ans = if xc.is_one() {
         let zeros = (exp - ideal).min(p - 1);
@@ -2321,7 +2324,7 @@ fn power(x: &Fin, n: u32, c: &CtxP, sig: &mut u16) -> Option<Fin> {
         )?
     } else {
         // `xc ** n` stays below `MAX_DIGITS` digits, or the Python code runs.
-        if (xc.ndigits() as u128).saturating_mul(u128::from(n)) > u128::from(MAX_DIGITS) + 1 {
+        if u128::from(xc.ndigits()).saturating_mul(u128::from(n)) > u128::from(MAX_DIGITS) + 1 {
             return None;
         }
         let mut pw = Coef::S(1);
@@ -2336,7 +2339,7 @@ fn power(x: &Fin, n: u32, c: &CtxP, sig: &mut u16) -> Option<Fin> {
                 base = base.mul(&base)?;
             }
         }
-        let len = pw.ndigits() as i128;
+        let len = i128::from(pw.ndigits());
         if len <= p {
             let zeros = (exp - ideal).min(p - len);
             Fin::new(
@@ -2797,7 +2800,7 @@ fn d_normalize(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
             ctx.p.emax
         };
         let mut coef = dup.coef;
-        let mut exp = dup.exp as i128;
+        let mut exp = i128::from(dup.exp);
         while exp < exp_max && coef.rem_small(10) == 0 {
             coef = coef.divrem_pow10(1).0;
             exp += 1;
@@ -2896,7 +2899,7 @@ fn d_from_float(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
         return None;
     };
     let st = state_of_cls(cls)?;
-    if !std::ptr::eq(&**cls, st.decimal.as_ptr()) || a.len() != 2 {
+    if !std::ptr::eq(&raw const **cls, st.decimal.as_ptr()) || a.len() != 2 {
         return None;
     }
     let d = match &a[1] {
@@ -2986,8 +2989,8 @@ fn construct_value(
         Some(o) => int_fin(o)?,
     };
     // The context-free constructor's exact range.
-    let exp = d.exp as i128;
-    if exp + d.coef.ndigits() as i128 - 1 > MAX_EMAX || exp < MIN_ETINY {
+    let exp = i128::from(d.exp);
+    if exp + i128::from(d.coef.ndigits()) - 1 > MAX_EMAX || exp < MIN_ETINY {
         return None;
     }
     ok(st.make(&d)?)
@@ -3339,7 +3342,7 @@ fn insert_thousands_sep(digits: &str, sep: &str, min_width: isize) -> String {
     let mut min_width = min_width;
     let mut groups: Vec<String> = Vec::new();
     loop {
-        let l = (digits.len() as isize).max(min_width).max(1).min(3) as usize;
+        let l = (digits.len() as isize).max(min_width).clamp(1, 3) as usize;
         let take = l.min(digits.len());
         let mut g = "0".repeat(l - take);
         g.push_str(&digits[digits.len() - take..]);
@@ -3371,7 +3374,7 @@ fn format_fin(x: &Fin, spec: &str, ctx: &Ctx) -> Option<String> {
             b'e' | b'E' => d = round_places(&d, p + 1, rounding)?,
             b'f' | b'F' | b'%' => d = rescale(&d, -p, rounding)?,
             _ => {
-                if d.coef.ndigits() as i128 > p {
+                if i128::from(d.coef.ndigits()) > p {
                     d = round_places(&d, p, rounding)?;
                 }
             }
@@ -3387,7 +3390,7 @@ fn format_fin(x: &Fin, spec: &str, ctx: &Ctx) -> Option<String> {
     };
     let digits = d.coef.to_digits();
     let len = digits.len() as i128;
-    let leftdigits = d.exp as i128 + len;
+    let leftdigits = i128::from(d.exp) + len;
     let dotplace = match ty {
         b'e' | b'E' => {
             if d.is_zero() && sp.precision.is_some() {
@@ -3406,7 +3409,7 @@ fn format_fin(x: &Fin, spec: &str, ctx: &Ctx) -> Option<String> {
         }
     };
     // Keep the zero padding a formatter would write bounded.
-    if dotplace.unsigned_abs() > MAX_DIGITS as u128 * 4 {
+    if dotplace.unsigned_abs() > u128::from(MAX_DIGITS) * 4 {
         return None;
     }
     let (intpart, mut fracpart) = if dotplace < 0 {
