@@ -315,6 +315,53 @@ class CallShapesTest(unittest.TestCase):
             with self.assertRaises(ZeroDivisionError):
                 sorted([1, 2], key=lambda v: 1 // 0)
 
+class DisplayAndComprehensionTest(unittest.TestCase):
+    def test_star_displays_and_calls(self):
+        a, b = [1, 2], (3,)
+        for _ in range(3):
+            self.assertEqual([*a, *b], [1, 2, 3])
+            self.assertEqual((*a, *b), (1, 2, 3))
+            self.assertEqual(max(*a, *b), 3)
+            self.assertEqual([*a, *a], [1, 2, 1, 2])
+            self.assertEqual([*"ab", *range(2)], ["a", "b", 0, 1])
+        with self.assertRaises(TypeError):
+            [*a, *5]
+
+    def test_set_and_dict_comprehensions(self):
+        for _ in range(3):
+            self.assertEqual({x % 3 for x in range(9)}, {0, 1, 2})
+            self.assertEqual({str(x): x for x in range(3)}, {"0": 0, "1": 1, "2": 2})
+            d = {k: v for k, v in [(1, "a"), (1.0, "b"), (True, "c")]}
+            self.assertEqual(list(d.items()), [(1, "c")])
+            self.assertIs(type(next(iter(d))), int)
+            s = {x for x in [1, 1.0, True]}
+            self.assertIs(type(next(iter(s))), int)
+
+    def test_comprehension_key_with_python_eq(self):
+        class K:
+            def __init__(self, v):
+                self.v = v
+
+            def __eq__(self, other):
+                return isinstance(other, K) and other.v == self.v
+
+            def __hash__(self):
+                return hash(self.v)
+
+        for _ in range(3):
+            self.assertEqual(len({K(1) for _ in range(3)}), 1)
+            self.assertEqual(len({K(1): 0 for _ in range(3)}), 1)
+
+    def test_starred_unpack(self):
+        for src in ([1, 2, 3, 4], (1, 2, 3, 4)):
+            for _ in range(3):
+                a, *b, c = src
+                self.assertEqual((a, b, c), (1, [2, 3], 4))
+                *d, = src
+                self.assertEqual(d, [1, 2, 3, 4])
+        with self.assertRaises(ValueError):
+            a, b, *c, d, e = [1, 2, 3]
+
 class FormatTest(unittest.TestCase):
     def test_huge_field_index(self):
         for _ in range(3):

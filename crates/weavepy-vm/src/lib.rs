@@ -19006,6 +19006,142 @@ impl Interpreter {
                     last = pc;
                     pc += 1;
                 }
+                // `[*xs]`, `(*a, *b)` and `f(*a, *b)`'s staging list: an
+                // exact list or tuple's items (any other iterable runs
+                // Python, so the full handler's).
+                OpCode::ListExtend => {
+                    let n = stack.len();
+                    let depth = ins.arg as usize;
+                    if n < 2 || depth == 0 || depth >= n {
+                        break;
+                    }
+                    let (Object::List(dst), src) = (&stack[n - 1 - depth], &stack[n - 1]) else {
+                        break;
+                    };
+                    let items: Vec<Object> = match src {
+                        Object::Tuple(t) => t.to_vec(),
+                        Object::List(l) if !Rc::ptr_eq(l, dst) => match l.try_borrow() {
+                            Ok(l) => l.clone(),
+                            Err(_) => break,
+                        },
+                        _ => break,
+                    };
+                    let Ok(mut d) = dst.try_borrow_mut() else {
+                        break;
+                    };
+                    d.extend(items);
+                    drop(d);
+                    drop(stack.pop());
+                    last = pc;
+                    pc += 1;
+                }
+                // The staging list becomes the call's argument tuple.
+                OpCode::ListToTuple => {
+                    if crate::stdlib::tracemalloc_real::is_tracking()
+                        || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+                    {
+                        break;
+                    }
+                    let Some(Object::List(l)) = stack.last() else {
+                        break;
+                    };
+                    let Ok(mut items) = l.try_borrow_mut() else {
+                        break;
+                    };
+                    let t = Object::new_tuple(std::mem::take(&mut *items));
+                    drop(items);
+                    if let Some(top) = stack.last_mut() {
+                        drop(std::mem::replace(top, t));
+                    }
+                    last = pc;
+                    pc += 1;
+                }
+                // A set or dict comprehension's element whose hash and
+                // equality run no Python (see `LeafProbe`): a present key
+                // keeps its stored object, as the table's insert does.
+                OpCode::SetAdd | OpCode::MapAdd => {
+                    let n = stack.len();
+                    let depth = ins.arg as usize;
+                    let operands = if ins.op == OpCode::MapAdd { 2 } else { 1 };
+                    if n < operands + 1 || depth == 0 || depth + operands > n {
+                        break;
+                    }
+                    let key = &stack[n - operands];
+                    let Some(probe) = crate::object::LeafProbe::new(key) else {
+                        break;
+                    };
+                    let target = &stack[n - operands - depth];
+                    let done = match target {
+                        Object::Set(st) => {
+                            let Ok(mut st) = st.try_borrow_mut() else {
+                                break;
+                            };
+                            if st.get_index_of(&probe).is_some() {
+                                true
+                            } else if probe.miss_is_exact() {
+                                st.insert(DictKey(key.clone()));
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        Object::Dict(d) => {
+                            let Ok(mut d) = d.try_borrow_mut() else {
+                                break;
+                            };
+                            let value = stack[n - 1].clone();
+                            if let Some(slot) = d.get_mut(&probe) {
+                                drop(std::mem::replace(slot, value));
+                                true
+                            } else if probe.miss_is_exact() {
+                                d.insert(DictKey(key.clone()), value);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
+                    if !done {
+                        break;
+                    }
+                    stack.truncate(n - operands);
+                    last = pc;
+                    pc += 1;
+                }
+                // `a, *b, c = xs` over an exact list or tuple long enough
+                // (the full handler's stack layout; it raises otherwise).
+                OpCode::UnpackEx => {
+                    let before = ((ins.arg >> 8) & 0xFF) as usize;
+                    let after = (ins.arg & 0xFF) as usize;
+                    if crate::stdlib::tracemalloc_real::is_tracking()
+                        || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+                    {
+                        break;
+                    }
+                    let items: Vec<Object> = match stack.last() {
+                        Some(Object::Tuple(t)) => t.to_vec(),
+                        Some(Object::List(l)) => match l.try_borrow() {
+                            Ok(l) => l.clone(),
+                            Err(_) => break,
+                        },
+                        _ => break,
+                    };
+                    if items.len() < before + after {
+                        break;
+                    }
+                    drop(stack.pop());
+                    let mid_end = items.len() - after;
+                    for x in items[mid_end..].iter().rev() {
+                        stack.push(x.clone());
+                    }
+                    stack.push(Object::new_list(items[before..mid_end].to_vec()));
+                    for x in items[..before].iter().rev() {
+                        stack.push(x.clone());
+                    }
+                    last = pc;
+                    pc += 1;
+                }
                 OpCode::LoadFastAndClear => {
                     // PEP 709: push the slot's value (`Unbound` included)
                     // and clear it. A slot shared with a cell stays on the
@@ -60221,6 +60357,11 @@ static SLOW_LEAF_OPS: [bool; 256] = {
         OpCode::LoadConst,
         OpCode::LoadDeref,
         OpCode::LoadFast,
+        OpCode::ListExtend,
+        OpCode::ListToTuple,
+        OpCode::SetAdd,
+        OpCode::MapAdd,
+        OpCode::UnpackEx,
         OpCode::LoadFastAndClear,
         OpCode::LoadCommonConstant,
         OpCode::LoadGlobal,
