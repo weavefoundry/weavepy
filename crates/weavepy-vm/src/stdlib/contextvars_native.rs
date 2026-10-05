@@ -50,6 +50,9 @@ pub(crate) struct State {
     token_layout: SharedSlice<DictKey>,
 }
 
+/// The most recently installed classes' state (a re-imported
+/// `contextvars` installs fresh classes; instances of the earlier ones
+/// keep working through the state on their own class).
 static STATE: parking_lot::RwLock<Option<Rc<State>>> = parking_lot::RwLock::new(None);
 
 fn state() -> Result<Rc<State>, RuntimeError> {
@@ -57,6 +60,24 @@ fn state() -> Result<Rc<State>, RuntimeError> {
         .read()
         .clone()
         .ok_or_else(|| runtime_error("contextvars is not initialized"))
+}
+
+type Ext = Rc<dyn std::any::Any + Send + Sync>;
+
+/// The state [`install`] hung on `obj`'s class, if any.
+fn ext_of(obj: &Object) -> Option<Ext> {
+    match obj {
+        Object::Instance(i) => i.class.borrow().native_ext.get().cloned(),
+        _ => None,
+    }
+}
+
+/// `obj` is an instance of exactly the class `pick` selects from the
+/// state on its class: that state.
+fn installed_as(obj: &Object, pick: fn(&State) -> &Rc<TypeObject>) -> Option<Ext> {
+    let ext = ext_of(obj)?;
+    let st = ext.downcast_ref::<State>()?;
+    is_exact(obj, pick(st)).then_some(ext)
 }
 
 thread_local! {
@@ -200,27 +221,33 @@ fn new_dict_raw() -> Rc<RefCell<DictData>> {
 
 /// Whether `obj` is a `contextvars.Context`.
 pub(crate) fn is_context(obj: &Object) -> bool {
-    match STATE.read().as_ref() {
-        Some(st) => is_exact(obj, &st.context_cls),
-        None => false,
-    }
+    installed_as(obj, |st| &st.context_cls).is_some()
 }
 
 // ---------------------------------------------------------------------
 // ContextVar.
 
+/// The `ContextVar` receiver, and the state on its class.
 fn var_receiver<'a>(
     args: &'a [Object],
-    st: &State,
     method: &str,
-) -> Result<&'a Rc<PyInstance>, RuntimeError> {
+) -> Result<(&'a Rc<PyInstance>, Ext), RuntimeError> {
     match args.first() {
-        Some(Object::Instance(i)) if Rc::ptr_eq(&i.class.borrow(), &st.var_cls) => Ok(i),
+        Some(obj @ Object::Instance(i)) => match installed_as(obj, |st| &st.var_cls) {
+            Some(ext) => Ok((i, ext)),
+            None => Err(not_applicable(method, "ContextVar", obj)),
+        },
         Some(other) => Err(not_applicable(method, "ContextVar", other)),
         None => Err(type_error(format!(
             "unbound method ContextVar.{method}() needs an argument"
         ))),
     }
+}
+
+/// The state an [`Ext`] from [`installed_as`] holds.
+fn st(ext: &Ext) -> &State {
+    ext.downcast_ref::<State>()
+        .expect("installed_as only returns a State")
 }
 
 fn not_applicable(method: &str, cls: &str, obj: &Object) -> RuntimeError {
@@ -235,8 +262,8 @@ fn not_applicable(method: &str, cls: &str, obj: &Object) -> RuntimeError {
 
 /// `ContextVar.get([default])`.
 fn var_get(args: &[Object]) -> Result<Object, RuntimeError> {
-    let st = state()?;
-    let var = var_receiver(args, &st, "get")?;
+    let (var, ext) = var_receiver(args, "get")?;
+    let st = st(&ext);
     if args.len() > 2 {
         return Err(type_error(format!(
             "get expected at most 1 argument, got {}",
@@ -310,26 +337,26 @@ fn ctx_store(ctx: &PyInstance, var: &Object, value: Option<Object>, missing: &Ob
 
 /// `ContextVar.set(value)`.
 fn var_set(args: &[Object]) -> Result<Object, RuntimeError> {
-    let st = state()?;
-    var_receiver(args, &st, "set")?;
+    let (_, ext) = var_receiver(args, "set")?;
+    let st = st(&ext);
     let [var, value] = args else {
         return Err(type_error(format!(
             "ContextVar.set() takes exactly one argument ({} given)",
             args.len().saturating_sub(1)
         )));
     };
-    let ctx = current(&st);
+    let ctx = current(st);
     let Object::Instance(ci) = &ctx else {
         unreachable!("the current context is an instance")
     };
     let old = ctx_store(ci, var, Some(value.clone()), &st.missing);
-    Ok(new_token(&st, var.clone(), old, ctx.clone()))
+    Ok(new_token(st, var.clone(), old, ctx.clone()))
 }
 
 /// `ContextVar.reset(token)`.
 fn var_reset(args: &[Object]) -> Result<Object, RuntimeError> {
-    let st = state()?;
-    var_receiver(args, &st, "reset")?;
+    let (_, ext) = var_receiver(args, "reset")?;
+    let st = st(&ext);
     let [var, token] = args else {
         return Err(type_error(format!(
             "ContextVar.reset() takes exactly one argument ({} given)",
@@ -373,7 +400,7 @@ fn var_reset(args: &[Object]) -> Result<Object, RuntimeError> {
             repr(token)
         )));
     }
-    let ctx = current(&st);
+    let ctx = current(st);
     if !tctx.is_same(&ctx) {
         return Err(value_error(format!(
             "{} was created in a different Context",
@@ -400,13 +427,16 @@ fn var_reset(args: &[Object]) -> Result<Object, RuntimeError> {
 // ---------------------------------------------------------------------
 // Context.
 
+/// The `Context` receiver, and the state on its class.
 fn ctx_receiver<'a>(
     args: &'a [Object],
-    st: &State,
     method: &str,
-) -> Result<&'a Rc<PyInstance>, RuntimeError> {
+) -> Result<(&'a Rc<PyInstance>, Ext), RuntimeError> {
     match args.first() {
-        Some(Object::Instance(i)) if Rc::ptr_eq(&i.class.borrow(), &st.context_cls) => Ok(i),
+        Some(obj @ Object::Instance(i)) => match installed_as(obj, |st| &st.context_cls) {
+            Some(ext) => Ok((i, ext)),
+            None => Err(not_applicable(method, "Context", obj)),
+        },
         Some(other) => Err(not_applicable(method, "Context", other)),
         None => Err(type_error(format!(
             "unbound method Context.{method}() needs an argument"
@@ -455,8 +485,7 @@ fn exit(ctx: &PyInstance, prev: Object) {
 
 /// `Context.run(callable, *args, **kwargs)`.
 fn ctx_run(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
-    let st = state()?;
-    let ctx = ctx_receiver(args, &st, "run")?;
+    let (ctx, _) = ctx_receiver(args, "run")?;
     let Some(f) = args.get(1) else {
         return Err(type_error("run() missing 1 required positional argument"));
     };
@@ -510,10 +539,9 @@ pub(crate) fn run_in_context(
 
 /// `Context.copy()`.
 fn ctx_copy(args: &[Object]) -> Result<Object, RuntimeError> {
-    let st = state()?;
-    let ctx = ctx_receiver(args, &st, "copy")?;
+    let (ctx, ext) = ctx_receiver(args, "copy")?;
     let data = data_of(ctx).unwrap_or_else(new_dict_raw);
-    Ok(new_context(&st, Object::Dict(data)))
+    Ok(new_context(st(&ext), Object::Dict(data)))
 }
 
 /// `Context()`: the `_data` slot of a context built by `__init__`.
@@ -535,7 +563,6 @@ fn copy_context(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `_enter_context(ctx)` (`PyContext_Enter`): the previous context is
 /// kept in the context's `_prev` slot, as CPython keeps `ctx_prev`.
 fn enter_context(args: &[Object]) -> Result<Object, RuntimeError> {
-    let st = state()?;
     let ctx_obj = args.first().cloned().unwrap_or(Object::None);
     let Object::Instance(ctx) = &ctx_obj else {
         return Err(type_error(format!(
@@ -543,7 +570,7 @@ fn enter_context(args: &[Object]) -> Result<Object, RuntimeError> {
             repr(&ctx_obj)
         )));
     };
-    if !is_exact(&ctx_obj, &st.context_cls) {
+    if !is_context(&ctx_obj) {
         return Err(type_error(format!(
             "a Context was expected, got {}",
             repr(&ctx_obj)
@@ -559,7 +586,6 @@ fn enter_context(args: &[Object]) -> Result<Object, RuntimeError> {
 
 /// `_exit_context(ctx)` (`PyContext_Exit`).
 fn exit_context(args: &[Object]) -> Result<Object, RuntimeError> {
-    let st = state()?;
     let ctx_obj = args.first().cloned().unwrap_or(Object::None);
     let Object::Instance(ctx) = &ctx_obj else {
         return Err(type_error(format!(
@@ -567,7 +593,7 @@ fn exit_context(args: &[Object]) -> Result<Object, RuntimeError> {
             repr(&ctx_obj)
         )));
     };
-    if !is_exact(&ctx_obj, &st.context_cls) {
+    if !is_context(&ctx_obj) {
         return Err(type_error(format!(
             "a Context was expected, got {}",
             repr(&ctx_obj)
@@ -652,7 +678,14 @@ fn install(args: &[Object]) -> Result<Object, RuntimeError> {
         context_layout: layout(&["_data", "_entered", "_prev"]),
         token_layout: layout(&["_var", "_old", "_used", "_ctx"]),
     };
-    let old = STATE.write().replace(Rc::new(st));
+    let st = Rc::new(st);
+    for cls in [context_cls, var_cls, token_cls] {
+        // Fresh classes (each import runs the class statements anew).
+        let _ = cls
+            .native_ext
+            .set(crate::rc_unsize!(st.clone() => dyn std::any::Any + Send + Sync));
+    }
+    let old = STATE.write().replace(st);
     drop(old);
     Ok(Object::None)
 }

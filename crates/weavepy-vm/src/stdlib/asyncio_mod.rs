@@ -15,10 +15,11 @@
 //! - The per-thread running-loop slot (`_get_running_loop` /
 //!   `_set_running_loop` / `get_running_loop` / `get_event_loop`)
 //!   lives in Rust.
-//! - The task registries (`_scheduled_tasks` WeakSet, `_eager_tasks`
-//!   set, `_current_tasks` dict) are module attributes shared with the
-//!   pure-Python `tasks.py` helpers, so `asyncio.all_tasks()` sees
-//!   native and duck-typed tasks alike.
+//! - Native tasks register in the state slab (as 3.14's C tasks join a
+//!   per-thread list); other task-likes go to the module's
+//!   `_scheduled_tasks` WeakSet and `_eager_tasks` set, and
+//!   `asyncio.all_tasks()` reads all three. `_current_tasks` maps each
+//!   loop to its running task.
 //!
 //! ## Storage
 //!
@@ -2996,10 +2997,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             ),
         );
     }
-    // The task registries shared with `tasks.py`: a `weakref.WeakSet` for
-    // scheduled tasks (so leaked tasks don't accumulate) and a plain `set`
-    // for eager ones — created through the interpreter so they are real
-    // Python objects the frozen helpers can iterate.
+    // The registries for task-likes that aren't native tasks: a
+    // `weakref.WeakSet` for scheduled ones (so leaked tasks don't
+    // accumulate) and a plain `set` for eager ones, created through the
+    // interpreter so they are real Python objects.
     if let Ok(interp) = interp() {
         let scheduled = import_attr(interp, "weakref", "WeakSet")
             .and_then(|ws| call(interp, &ws, &[]))

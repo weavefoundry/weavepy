@@ -247,4 +247,31 @@ def check_reports():
 
 
 check_reports()
+
+
+# A re-imported asyncio installs its natives on its fresh classes; a loop
+# from the first import keeps building its own module's handles.
+def check_reimport():
+    old_loop = asyncio.new_event_loop()
+    old_handle_cls = asyncio.Handle
+    for name in [n for n in sys.modules if n == "asyncio" or n.startswith("asyncio.")]:
+        del sys.modules[name]
+    import asyncio as fresh
+
+    async def f(n):
+        await fresh.sleep(0)
+        return n
+
+    assert old_loop.run_until_complete(f(1)) == 1
+    assert fresh.run(f(2)) == 2
+    assert type(old_loop.call_soon(print)) is old_handle_cls
+    new_loop = fresh.new_event_loop()
+    assert type(new_loop.call_soon(print)) is fresh.Handle
+    new_loop.close()
+    old_loop.call_soon(old_loop.stop)
+    old_loop.run_forever()
+    old_loop.close()
+
+
+check_reimport()
 print("ok")

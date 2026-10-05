@@ -51,9 +51,6 @@ struct HandleState {
     run_py: Object,
     /// `events._handle_run_failed(handle, exc)`: `_run`'s `except` body.
     run_failed: Object,
-    /// `asyncio.events`'s namespace (`events.Handle` is looked up there
-    /// at call time).
-    events_dict: Rc<RefCell<DictData>>,
 }
 
 struct LoopState {
@@ -61,7 +58,8 @@ struct LoopState {
     /// The stock methods the fast path requires, and the Python
     /// `call_soon` the native replaced.
     call_soon_py: Object,
-    call_soon_native: Object,
+    /// The native `call_soon` installed on the class.
+    call_soon_native: std::sync::OnceLock<Object>,
     call_soon_inner: Object,
     check_closed: Object,
     get_debug: Object,
@@ -107,13 +105,8 @@ fn is_exc(obj: &Object, name: &str) -> bool {
 // ---------------------------------------------------------------------
 // Handle.
 
-/// `Handle._run(self)`.
-fn handle_run(args: &[Object]) -> Result<Object, RuntimeError> {
-    let Some(hs) = HANDLE.read().clone() else {
-        return Err(crate::error::runtime_error(
-            "asyncio.events is not initialized",
-        ));
-    };
+/// `Handle._run(self)`, for the `Handle` class `hs` describes.
+fn handle_run(hs: &HandleState, args: &[Object]) -> Result<Object, RuntimeError> {
     let Some(Object::Instance(h)) = args.first() else {
         return call(&hs.run_py, args, &[]);
     };
@@ -163,10 +156,10 @@ fn new_handle(hs: &HandleState, cb: Object, args: Object, loop_: Object, ctx: Ob
     obj
 }
 
-/// `install_handle(Handle, run_failed, globals())`.
+/// `install_handle(Handle, run_failed)`.
 fn install_handle(args: &[Object]) -> Result<Object, RuntimeError> {
-    let [Object::Type(cls), run_failed, Object::Dict(events_dict)] = args else {
-        return Err(type_error("install_handle(Handle, run_failed, globals())"));
+    let [Object::Type(cls), run_failed] = args else {
+        return Err(type_error("install_handle(Handle, run_failed)"));
     };
     let run_py = cls
         .dict
@@ -179,24 +172,26 @@ fn install_handle(args: &[Object]) -> Result<Object, RuntimeError> {
         .map(|n| crate::types::slot_key(n))
         .collect::<Vec<_>>()
         .into();
+    let st = Rc::new(HandleState {
+        cls: cls.clone(),
+        layout,
+        run_py,
+        run_failed: run_failed.clone(),
+    });
+    // The native holds its own class's state (a re-imported
+    // `asyncio.events` installs a fresh one on its fresh class).
+    let own = st.clone();
     let native = Object::Builtin(Rc::new(BuiltinFn {
         name: "_run",
         binds_instance: true,
-        call: Box::new(handle_run),
+        call: Box::new(move |args| handle_run(&own, args)),
         call_kw: None,
     }));
     cls.dict
         .borrow_mut()
         .insert(DictKey(Object::from_static("_run")), native);
     cls.bump_attr_version();
-    let st = HandleState {
-        cls: cls.clone(),
-        layout,
-        run_py,
-        run_failed: run_failed.clone(),
-        events_dict: events_dict.clone(),
-    };
-    drop(HANDLE.write().replace(Rc::new(st)));
+    drop(HANDLE.write().replace(st));
     Ok(Object::None)
 }
 
@@ -306,12 +301,11 @@ fn fast_call_soon(
     let Some(hs) = HANDLE.read().clone() else {
         return Ok(None);
     };
-    // `events.Handle` may have been replaced since install.
-    let current = hs
-        .events_dict
-        .borrow()
-        .get(&crate::object::StrKey("Handle"))
-        .is_some_and(|h| matches!(h, Object::Type(t) if Rc::ptr_eq(t, &hs.cls)));
+    // The class the loop's module would build (`events.Handle`, looked up
+    // at call time: it may have been replaced, or come from another
+    // import of `asyncio.events` than the one `hs` describes).
+    let current = global_module_attr(&ls.globals, "events", "Handle")
+        .is_some_and(|h| matches!(h, Object::Type(t) if Rc::ptr_eq(&t, &hs.cls)));
     if !current {
         return Ok(None);
     }
@@ -336,14 +330,10 @@ fn fast_call_soon(
 
 /// `BaseEventLoop.call_soon(self, callback, *args, context=None)`.
 fn loop_call_soon_method(
+    ls: &LoopState,
     args: &[Object],
     kwargs: &[(String, Object)],
 ) -> Result<Object, RuntimeError> {
-    let Some(ls) = LOOP.read().clone() else {
-        return Err(crate::error::runtime_error(
-            "asyncio.base_events is not initialized",
-        ));
-    };
     let mut ctx = Object::None;
     let mut plain = args.len() >= 2;
     for (k, v) in kwargs {
@@ -354,7 +344,7 @@ fn loop_call_soon_method(
         }
     }
     if plain {
-        if let Some(h) = fast_call_soon(&ls, &args[0], &args[1], &args[2..], &ctx)? {
+        if let Some(h) = fast_call_soon(ls, &args[0], &args[1], &args[2..], &ctx)? {
             return Ok(h);
         }
     }
@@ -371,7 +361,9 @@ pub(crate) fn call_soon(
     let ls = LOOP.read().clone();
     if let (Some(ls), Object::Instance(li)) = (&ls, loop_) {
         let native = verified(&NATIVE_CALL_SOON, &li.class.borrow(), || {
-            resolves_to(&li.cls(), "call_soon", &ls.call_soon_native)
+            ls.call_soon_native
+                .get()
+                .is_some_and(|n| resolves_to(&li.cls(), "call_soon", n))
         }) && inst_attr(li, "call_soon", names().call_soon).is_none();
         if native {
             if let Some(h) = fast_call_soon(ls, loop_, &cb, cb_args, &ctx)? {
@@ -449,19 +441,15 @@ fn global_module_attr(globals: &Rc<RefCell<DictData>>, module: &str, attr: &str)
 
 /// `BaseEventLoop.create_task(self, coro, **kwargs)`.
 fn loop_create_task_method(
+    ls: &LoopState,
     args: &[Object],
     kwargs: &[(String, Object)],
 ) -> Result<Object, RuntimeError> {
-    let Some(ls) = LOOP.read().clone() else {
-        return Err(crate::error::runtime_error(
-            "asyncio.base_events is not initialized",
-        ));
-    };
     if let [loop_, coro] = args {
         let plain_kwargs = kwargs
             .iter()
             .all(|(k, _)| matches!(k.as_str(), "name" | "context" | "eager_start"));
-        if plain_kwargs && plain_loop(&ls, loop_) {
+        if plain_kwargs && plain_loop(ls, loop_) {
             let Object::Instance(li) = loop_ else {
                 unreachable!("plain_loop checks for an instance")
             };
@@ -480,18 +468,13 @@ fn loop_create_task_method(
 }
 
 /// `BaseEventLoop.create_future(self)`.
-fn loop_create_future_method(args: &[Object]) -> Result<Object, RuntimeError> {
-    let Some(ls) = LOOP.read().clone() else {
-        return Err(crate::error::runtime_error(
-            "asyncio.base_events is not initialized",
-        ));
-    };
+fn loop_create_future_method(ls: &LoopState, args: &[Object]) -> Result<Object, RuntimeError> {
     if let [loop_] = args {
         let native = global_module_attr(&ls.globals, "futures", "Future")
             .is_some_and(|f| crate::stdlib::asyncio_mod::is_future_class(&f));
         // (Not in debug mode: there the Python method's frame shows in
         // the future's `_source_traceback`.)
-        if native && plain_loop(&ls, loop_) {
+        if native && plain_loop(ls, loop_) {
             return crate::stdlib::asyncio_mod::new_future(loop_);
         }
     }
@@ -516,47 +499,55 @@ fn install_loop(args: &[Object]) -> Result<Object, RuntimeError> {
     let get_debug = get("get_debug")?;
     let create_task_py = get("create_task")?;
     let create_future_py = get("create_future")?;
-    let native = Object::Builtin(Rc::new(BuiltinFn {
-        name: "call_soon",
-        binds_instance: true,
-        call: Box::new(|args| loop_call_soon_method(args, &[])),
-        call_kw: Some(Box::new(loop_call_soon_method)),
-    }));
-    {
-        let mut d = cls.dict.borrow_mut();
-        d.insert(DictKey(Object::from_static("call_soon")), native.clone());
-        d.insert(
-            DictKey(Object::from_static("create_task")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "create_task",
-                binds_instance: true,
-                call: Box::new(|args| loop_create_task_method(args, &[])),
-                call_kw: Some(Box::new(loop_create_task_method)),
-            })),
-        );
-        d.insert(
-            DictKey(Object::from_static("create_future")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "create_future",
-                binds_instance: true,
-                call: Box::new(loop_create_future_method),
-                call_kw: None,
-            })),
-        );
-    }
-    cls.bump_attr_version();
-    let st = LoopState {
+    let st = Rc::new(LoopState {
         cls: cls.clone(),
         call_soon_py,
-        call_soon_native: native,
+        call_soon_native: std::sync::OnceLock::new(),
         call_soon_inner,
         check_closed,
         get_debug,
         create_task_py,
         create_future_py,
         globals: globals.clone(),
-    };
-    drop(LOOP.write().replace(Rc::new(st)));
+    });
+    // The natives hold their own class's state (a re-imported
+    // `asyncio.base_events` installs a fresh one on its fresh class).
+    let (a, b, c, d, e) = (st.clone(), st.clone(), st.clone(), st.clone(), st.clone());
+    let native = Object::Builtin(Rc::new(BuiltinFn {
+        name: "call_soon",
+        binds_instance: true,
+        call: Box::new(move |args| loop_call_soon_method(&a, args, &[])),
+        call_kw: Some(Box::new(move |args, kwargs| {
+            loop_call_soon_method(&b, args, kwargs)
+        })),
+    }));
+    let _ = st.call_soon_native.set(native.clone());
+    {
+        let mut dict = cls.dict.borrow_mut();
+        dict.insert(DictKey(Object::from_static("call_soon")), native);
+        dict.insert(
+            DictKey(Object::from_static("create_task")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "create_task",
+                binds_instance: true,
+                call: Box::new(move |args| loop_create_task_method(&c, args, &[])),
+                call_kw: Some(Box::new(move |args, kwargs| {
+                    loop_create_task_method(&d, args, kwargs)
+                })),
+            })),
+        );
+        dict.insert(
+            DictKey(Object::from_static("create_future")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "create_future",
+                binds_instance: true,
+                call: Box::new(move |args| loop_create_future_method(&e, args)),
+                call_kw: None,
+            })),
+        );
+    }
+    cls.bump_attr_version();
+    drop(LOOP.write().replace(st));
     Ok(Object::None)
 }
 

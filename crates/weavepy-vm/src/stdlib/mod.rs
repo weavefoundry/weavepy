@@ -328,7 +328,7 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("mmap", mmap_mod::build);
     cache.register_builtin("_locale", locale_mod::build);
     cache.register_builtin("_abc", abc_mod::build);
-    // `_contextvars` is the frozen alias of the pure-Python `contextvars`
+    // `_contextvars` is the frozen alias of the frozen `contextvars`
     // (see `python/_contextvars.py`): 3.14's `threading` and
     // `_py_warnings` import the accelerator name directly and must see
     // the same `Context`/`ContextVar` types `contextvars` hands out.

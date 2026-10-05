@@ -905,5 +905,5 @@ try:
 except ImportError:
     pass
 else:
-    _weave_asyncio.install_handle(Handle, _handle_run_failed, globals())
+    _weave_asyncio.install_handle(Handle, _handle_run_failed)
     del _weave_asyncio

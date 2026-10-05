@@ -168,4 +168,27 @@ async def main():
 
 
 asyncio.run(main())
+
+
+# A re-imported `contextvars` defines fresh classes; contexts and
+# variables made from the first import (and `threading`, which runs every
+# thread body through `_contextvars.Context().run`) keep working.
+import sys
+
+old_ctx = contextvars.copy_context()
+del sys.modules["contextvars"]
+import contextvars as fresh  # noqa: E402
+
+assert old_ctx.run(v.get) == 5
+fw = fresh.ContextVar("fw")
+fw.set(1)
+assert fresh.copy_context().run(fw.get) == 1
+assert old_ctx.run(fw.get, None) is None
+with v.set(8):
+    assert v.get() == 8
+seen.clear()
+th = threading.Thread(target=in_thread)
+th.start()
+th.join()
+assert seen == [(0, None)], seen
 print("ok")
