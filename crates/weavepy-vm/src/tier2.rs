@@ -3613,13 +3613,15 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
         let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
         let threshold = st.threshold;
         // Embedders that never report start-up finished still compile,
-        // after sustained work.
+        // after sustained work. Both budgets here must match
+        // [`compile_allowed`]'s: a compile it refused would leave the lean
+        // checkpoint passed and the code interpreted for good.
         let warm = if phase == CompilationPhase::Normal
             && STARTUP_DONE.load(std::sync::atomic::Ordering::Relaxed)
         {
             threshold
         } else {
-            threshold.saturating_mul(16)
+            threshold.saturating_mul(IMPORT_THRESHOLD_FACTOR)
         };
         let entry = st.cache.entry(key).or_insert_with(|| CacheEntry {
             counter: 0,
@@ -3650,7 +3652,7 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
                 // when pure-leaf calls skip frames).
                 let interval = lean_warm_at();
                 entry.counter = entry.counter.saturating_add(interval);
-                if entry.counter < interval.saturating_mul(16) {
+                if entry.counter < interval.saturating_mul(IMPORT_THRESHOLD_FACTOR) {
                     frame.code.jit_hint.defer_lean_compile();
                     return;
                 }
@@ -15033,16 +15035,20 @@ mod native_pair_tests {
 mod startup_compilation_tests {
     use super::{
         budget_import_compilation, compile_allowed, import_compilation_budget,
-        startup_compilation_scope,
+        startup_compilation_scope, IMPORT_THRESHOLD_FACTOR,
     };
+
+    // Inside a start-up or import scope, a code object compiles only once
+    // its counter reaches `IMPORT_THRESHOLD_FACTOR` times the threshold.
+    const BUDGET: u32 = IMPORT_THRESHOLD_FACTOR;
 
     #[test]
     fn import_budget_is_nested_thread_local_and_unwinds() {
         assert!(!import_compilation_budget());
         {
             let _outer = budget_import_compilation();
-            assert!(!compile_allowed(15, 1));
-            assert!(compile_allowed(16, 1));
+            assert!(!compile_allowed(BUDGET - 1, 1));
+            assert!(compile_allowed(BUDGET, 1));
             {
                 let _inner = budget_import_compilation();
                 assert!(import_compilation_budget());
@@ -15063,11 +15069,11 @@ mod startup_compilation_tests {
                 {
                     let _nested_import = budget_import_compilation();
                     assert!(!import_compilation_budget());
-                    assert!(!compile_allowed(15, 1));
-                    assert!(compile_allowed(16, 1));
+                    assert!(!compile_allowed(BUDGET - 1, 1));
+                    assert!(compile_allowed(BUDGET, 1));
                 }
-                assert!(!compile_allowed(15, 1));
-                assert!(compile_allowed(16, 1));
+                assert!(!compile_allowed(BUDGET - 1, 1));
+                assert!(compile_allowed(BUDGET, 1));
             }
             assert!(import_compilation_budget());
         }
@@ -15079,22 +15085,22 @@ mod startup_compilation_tests {
         assert!(compile_allowed(u32::MAX, 1));
         {
             let _outer = startup_compilation_scope();
-            assert!(!compile_allowed(15, 1));
-            assert!(compile_allowed(16, 1));
+            assert!(!compile_allowed(BUDGET - 1, 1));
+            assert!(compile_allowed(BUDGET, 1));
             {
                 let _inner = startup_compilation_scope();
-                assert!(!compile_allowed(15, 1));
-                assert!(compile_allowed(16, 1));
+                assert!(!compile_allowed(BUDGET - 1, 1));
+                assert!(compile_allowed(BUDGET, 1));
             }
-            assert!(!compile_allowed(15, 1));
-            assert!(compile_allowed(16, 1));
+            assert!(!compile_allowed(BUDGET - 1, 1));
+            assert!(compile_allowed(BUDGET, 1));
             let caught = std::panic::catch_unwind(|| {
                 let _inner = startup_compilation_scope();
                 panic!("startup failure");
             });
             assert!(caught.is_err());
-            assert!(!compile_allowed(15, 1));
-            assert!(compile_allowed(16, 1));
+            assert!(!compile_allowed(BUDGET - 1, 1));
+            assert!(compile_allowed(BUDGET, 1));
         }
         assert!(compile_allowed(u32::MAX, 1));
     }

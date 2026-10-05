@@ -11504,7 +11504,7 @@ impl Interpreter {
                                             a % b
                                         })
                                     }
-                                    BinOpKind::Pow if (0..=u32::MAX as i64).contains(&b) => {
+                                    BinOpKind::Pow if (0..=i64::from(u32::MAX)).contains(&b) => {
                                         match a.checked_pow(b as u32) {
                                             Some(r) => Object::Int(r),
                                             None => break None,
@@ -13838,9 +13838,7 @@ impl Interpreter {
                 }
                 // The names below are dispatched by the interpreter, which
                 // knows them on the builtin kinds' receivers.
-                if builtins::method_memo_tag(recv).is_none() {
-                    return None;
-                }
+                builtins::method_memo_tag(recv)?;
                 builtin_method_via_call(b.name).then_some(true)
             }
             None => (!b.binds_instance && builtin_fn_lane_ok(b.name)).then_some(true),
@@ -70652,7 +70650,9 @@ assert loop(2000) == 1999000
                     interp.call_object(leaf.clone(), &[Object::Int(i)], &[]).expect("later call");
                 }
                 assert!(crate::tier2::code_compiled_for_test(&code), "deferred lean code must compile after import");
-                let source = "def leaf(x):\n    return x + 1\nfor i in range(256):\n    assert leaf(i) == i + 1\ndef total(n):\n    s = 0\n    for i in range(n):\n        s += i\n    return s\nassert total(10000) == 49995000\n";
+                // Lean code compiling during an import needs
+                // `IMPORT_THRESHOLD_FACTOR` warm-up intervals of calls.
+                let source = "def leaf(x):\n    return x + 1\nfor i in range(1024):\n    assert leaf(i) == i + 1\ndef total(n):\n    s = 0\n    for i in range(n):\n        s += i\n    return s\nassert total(10000) == 49995000\n";
                 let module = interp
                     .load_from_source("budget_heavy", source, false, "budget_heavy.py")
                     .expect("sustained import work");
@@ -70662,7 +70662,10 @@ assert loop(2000) == 1999000
                     assert!(crate::tier2::code_compiled_for_test(&function.code.borrow()), "{name} must compile during sustained import work");
                 }
                 crate::tier2::force_enable_for_test(50);
-                let source = "def leaf(x):\n    return x + 1\nfor i in range(400):\n    assert leaf(i) == i + 1\n";
+                // The lean budget counts warm-up intervals (24 calls, not the
+                // threshold's 50): 64 of them fall due within 1600 calls, well
+                // short of 64 thresholds.
+                let source = "def leaf(x):\n    return x + 1\nfor i in range(1600):\n    assert leaf(i) == i + 1\n";
                 let module = interp
                     .load_from_source("budget_relative", source, false, "budget_relative.py")
                     .expect("default relative lean budget");
@@ -70831,6 +70834,10 @@ assert loop(2000) == 1999000
             );
             return;
         }
+        // A fresh child process never reports start-up finished, which
+        // would hold its workers' compiles to the start-up budget (see
+        // `tier2::compile_allowed`).
+        crate::tier2::note_startup_finished();
         let (out, parks, resumes, materialized) = run_jit_park(include_str!(
             "../../../tests/regrtest/test_jit_worker_exit.py"
         ));
@@ -77345,9 +77352,13 @@ print("native pickle coverage: ok")
                 interp.run_module(&code).unwrap();
                 let calls = SAVED_NATIVE_LEAF_CALLS.with(std::cell::Cell::get);
                 assert!(calls > 500, "saved native leaf calls: {calls}");
+                // The fixture's argument-less `[].append` is rejected on its
+                // first call; the site's later 99 calls hit the rejection.
+                // (Other saved methods, `list.clear` among them, now run in
+                // the core loop without reaching the rejection.)
                 let rejections = SAVED_NATIVE_REJECTED_CALLS.with(std::cell::Cell::get);
                 assert!(
-                    rejections > 100,
+                    rejections >= 99,
                     "saved native rejection hits: {rejections}"
                 );
                 eprintln!("Saved native leaf calls: {calls}; rejection hits: {rejections}");
