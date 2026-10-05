@@ -158,9 +158,12 @@ pub(crate) struct Native {
     ops: Box<[OpCode]>,
     depths: Box<[i64]>,
     need: usize,
-    /// The `LOAD_GLOBAL` sites' caches, which the code addresses.
+    /// The `LOAD_GLOBAL` and `LOAD_ATTR` sites' caches, which the code
+    /// addresses.
     #[allow(clippy::vec_box)]
     _globals: Vec<Box<GlobalCache>>,
+    #[allow(clippy::vec_box)]
+    _slots: Vec<Box<SlotCache>>,
 }
 
 // SAFETY: the code only touches the state it is handed; it is only
@@ -1573,6 +1576,60 @@ unsafe extern "C" fn h_load_method(
     }
 }
 
+/// A `LOAD_ATTR` site's `__slots__` member shortcut: the class version and
+/// the member's position the site's cache last proved (`ver` 0 empty),
+/// read without decoding the site's cache.
+#[derive(Default)]
+pub(crate) struct SlotCache {
+    ver: std::cell::Cell<u64>,
+    idx: std::cell::Cell<u32>,
+}
+
+/// The `__slots__` member `recv` holds for the `LOAD_ATTR` at `pc`, through
+/// the site's [`SlotCache`] (as `leaf_load_attr_recv`'s slot case reads it).
+///
+/// # Safety
+///
+/// `cache` is the site's cache.
+#[inline(always)]
+unsafe fn slot_hit(
+    code: &CodeObject,
+    recv: &Object,
+    pc: usize,
+    cache: *const SlotCache,
+) -> Option<Object> {
+    // SAFETY: the caller's contract.
+    let cache = unsafe { &*cache };
+    let ver = cache.ver.get();
+    let Object::Instance(inst) = recv else {
+        return None;
+    };
+    if ver == 0 || inst.cls_raw().attr_version.get() != ver {
+        return None;
+    }
+    let slots = inst.slots.try_borrow().ok()?;
+    let (k, v) = slots.get_index(cache.idx.get() as usize)?;
+    crate::slot_name_matches(code, code.instructions[pc].arg, k)
+        .then(|| Interpreter::clone_operand(v))
+}
+
+/// Remember the `LOAD_ATTR` site at `pc`'s `__slots__` member, after a
+/// read through the site's cache.
+#[cold]
+fn slot_note(code: &CodeObject, recv: &Object, pc: usize, cache: *const SlotCache) {
+    use weavepy_compiler::InlineCache as IC;
+    if let (IC::LoadAttrSlot { key_idx, ver }, Object::Instance(inst)) =
+        (code.caches.get(pc as u32), recv)
+    {
+        if inst.cls_raw().attr_version.get() == ver {
+            // SAFETY: the site's cache (see `slot_hit`).
+            let cache = unsafe { &*cache };
+            cache.ver.set(ver);
+            cache.idx.set(key_idx);
+        }
+    }
+}
+
 /// `LOAD_ATTR` (the `pc`th instruction of `code`) on the receiver at
 /// stack slot `at`, as the core loop's arm runs it (and, for an instance
 /// or module, the leaf arm's cached reads): `0` the value in place of the
@@ -1582,16 +1639,22 @@ unsafe extern "C" fn h_stack_attr(
     ext: *const CodeConstObjects,
     pc: u64,
     at: *mut Object,
+    cache: *const SlotCache,
 ) -> u32 {
     use weavepy_compiler::InlineCache as IC;
     // SAFETY: the code passes its own code and extension, one of its
-    // attribute loads, and an initialized stack slot. The reads are the
-    // core loop's: between two instructions, running no code.
+    // attribute loads, an initialized stack slot and the site's slot
+    // cache. The reads are the core loop's: between two instructions,
+    // running no code.
     unsafe {
         let (code, ext, pc) = (&*code, &*ext, pc as usize);
         let recv = &*at;
         if !droppable(recv) {
             return 1;
+        }
+        if let Some(v) = slot_hit(code, recv, pc, cache) {
+            crate::drop_hot(std::mem::replace(&mut *at, v));
+            return 0;
         }
         let arg = code.instructions[pc].arg;
         let v = match recv {
@@ -1635,6 +1698,7 @@ unsafe extern "C" fn h_stack_attr(
         let Some(v) = v else {
             return 1;
         };
+        slot_note(code, recv, pc, cache);
         crate::drop_hot(std::mem::replace(&mut *at, v));
         0
     }
@@ -1650,12 +1714,17 @@ unsafe extern "C" fn h_local_attr(
     ext: *const CodeConstObjects,
     pc: u64,
     recv: *const Object,
+    cache: *const SlotCache,
 ) -> u32 {
     // SAFETY: the code passes a free stack slot, its own code and
-    // extension, one of its attribute loads, and an initialized local.
-    // The reads run no code.
+    // extension, one of its attribute loads, an initialized local and the
+    // site's slot cache. The reads run no code.
     unsafe {
         let (code, ext, pc, recv) = (&*code, &*ext, pc as usize, &*recv);
+        if let Some(v) = slot_hit(code, recv, pc, cache) {
+            dst.write(v);
+            return 0;
+        }
         let arg = code.instructions[pc].arg;
         let v = match recv {
             Object::Instance(inst) if inst.cls_raw().native_kind.get() != 0 => {
@@ -1668,6 +1737,7 @@ unsafe extern "C" fn h_local_attr(
         };
         match v {
             Some(v) => {
+                slot_note(code, recv, pc, cache);
                 dst.write(v);
                 0
             }
@@ -2111,6 +2181,7 @@ fn compile_with(
         .get_or_init(|| (0..ninstrs).map(|_| FieldSlot::empty()).collect());
     let entries: Vec<bool>;
     let globals: Vec<Box<GlobalCache>>;
+    let slots: Vec<Box<SlotCache>>;
     let t0 = stats::enabled().then(std::time::Instant::now);
     let built = {
         let b = FunctionBuilder::new(&mut engine.ctx.func, &mut engine.fbctx);
@@ -2118,6 +2189,7 @@ fn compile_with(
         let done = lower.lower();
         entries = (0..ninstrs).map(|pc| lower.enters_at(pc)).collect();
         globals = std::mem::take(&mut lower.global_caches);
+        slots = std::mem::take(&mut lower.slot_caches);
         if done {
             lower.b.seal_all_blocks();
             lower.b.finalize();
@@ -2168,6 +2240,7 @@ fn compile_with(
         depths: depths.into(),
         need: stack_need(depths),
         _globals: globals,
+        _slots: slots,
     })
 }
 
@@ -2260,9 +2333,12 @@ struct Lower<'a> {
     /// Side exits waiting for their blocks to be filled (after the body:
     /// the builder fills one block at a time).
     side_exits: Vec<SideExit>,
-    /// The `LOAD_GLOBAL` sites' caches, which the code addresses.
+    /// The `LOAD_GLOBAL` and `LOAD_ATTR` sites' caches, which the code
+    /// addresses.
     #[allow(clippy::vec_box)]
     global_caches: Vec<Box<GlobalCache>>,
+    #[allow(clippy::vec_box)]
+    slot_caches: Vec<Box<SlotCache>>,
 }
 
 /// An exit block of [`Lower::exit_with`], filled after the body from the
@@ -2392,6 +2468,7 @@ impl<'a> Lower<'a> {
             sigs: Vec::new(),
             side_exits: Vec::new(),
             global_caches: Vec::new(),
+            slot_caches: Vec::new(),
         }
     }
 
@@ -4486,15 +4563,21 @@ impl<'a> Lower<'a> {
         let code = self.code_ptr();
         let ext = self.ext_ptr();
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
+        let cache: Box<SlotCache> = Box::default();
+        let c = self
+            .b
+            .ins()
+            .iconst(self.ptr, std::ptr::from_ref::<SlotCache>(&cache) as i64);
+        self.slot_caches.push(cache);
         let r = match item {
             Item::Local(_) => self.call(
                 h_local_attr as *const () as usize,
-                &[dst, code, ext, pcv, at],
+                &[dst, code, ext, pcv, at, c],
                 true,
             ),
             _ => self.call(
                 h_stack_attr as *const () as usize,
-                &[code, ext, pcv, at],
+                &[code, ext, pcv, at, c],
                 true,
             ),
         }
