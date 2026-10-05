@@ -257,10 +257,10 @@ fn od_setitem_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     drop((m, o));
     let changed = old.as_ref().is_none_or(|o| !o.is_same(value));
     if in_main.is_none() {
-        crate::object::dict_watch_bump(&main);
+        crate::object::dict_watch_bump(main);
     }
     if changed {
-        crate::object::dict_mutation_event(&main);
+        crate::object::dict_mutation_event(main);
     }
     if !in_order {
         crate::object::dict_watch_bump(&order);
