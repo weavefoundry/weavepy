@@ -2752,7 +2752,7 @@ fn xp_start(st: &State, a: &[Object], kw: Kw) -> Option<Result<Object, RuntimeEr
             return None;
         }
         let mut attrib = DictData::default();
-        for pair in attrs.chunks_exact(2) {
+        for pair in attrs.as_chunks::<2>().0 {
             let Object::Str(k) = &pair[0] else {
                 return None;
             };
@@ -2932,7 +2932,7 @@ impl Session {
             at: f.at,
             memo,
             intern,
-            names: Default::default(),
+            names: crate::fasthash::FxHashMap::default(),
             data: f.data,
             elems: f.elems,
             stack,

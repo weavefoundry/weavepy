@@ -167,7 +167,7 @@ type Registry = parking_lot::Mutex<crate::fasthash::FxHashMap<i64, StateRef>>;
 
 fn parser_reg() -> &'static Registry {
     static REG: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
-    REG.get_or_init(|| parking_lot::Mutex::new(Default::default()))
+    REG.get_or_init(|| parking_lot::Mutex::new(crate::fasthash::FxHashMap::default()))
 }
 
 fn next_id() -> i64 {
@@ -185,7 +185,7 @@ fn state_from_ud(ud: *mut c_void) -> Option<StateRef> {
     // every callback ask for the same one.
     thread_local! {
         static LAST: std::cell::RefCell<(i64, crate::sync::Weak<RefCell<ExpatState>>)> =
-            std::cell::RefCell::new((0, crate::sync::Weak::new()));
+            const { std::cell::RefCell::new((0, crate::sync::Weak::new())) };
     }
     let id = ud as i64;
     let hit = LAST.with(|last| {
