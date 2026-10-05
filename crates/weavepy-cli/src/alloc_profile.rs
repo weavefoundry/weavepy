@@ -4,7 +4,8 @@
 //! records its call stack. A sampled block is charged [`SAMPLE`] bytes to
 //! its stack while it lives, so at exit the table estimates the *live* heap
 //! by allocation site. With `WEAVEPY_ALLOC_PROFILE=<file>` set, the live
-//! samples are written to `<file>`: one line per sample, the charged bytes,
+//! samples are written to `<file>`: one line per sample, the charged bytes
+//! (the interval, or the block size when that is larger),
 //! the block's own size (`s<bytes>`), then the slide-adjusted return
 //! addresses (resolve them with `atos`).
 //! `WEAVEPY_ALLOC_SAMPLE=<bytes>` changes the sampling interval, and the
@@ -315,7 +316,9 @@ fn render(header: String, t: *mut Sample, n: usize) -> String {
         if s.ptr == 0 || s.ptr == usize::MAX {
             continue;
         }
-        out.push_str(&format!("{interval} s{}", s.size));
+        // A block larger than the mean gap is (nearly) always sampled:
+        // charge its own size.
+        out.push_str(&format!("{} s{}", interval.max(s.size), s.size));
         for &a in s.stack.iter().take_while(|a| **a != 0) {
             out.push_str(&format!(" {:x}", a.wrapping_sub(slide)));
         }
