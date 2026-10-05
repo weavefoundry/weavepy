@@ -63,29 +63,17 @@ pub(crate) const RAISED: u32 = 2;
 /// reloads.
 pub(crate) const RELOAD: u32 = 4;
 
-/// Activations and back edges before a code object is compiled
-/// (`WEAVEPY_FRAME_JIT_HOT` overrides it, a tuning aid).
+/// The heat per instruction of a code object at which it compiles (see
+/// `Slot::warm`; `WEAVEPY_FRAME_JIT_HOT` overrides it, a tuning aid).
 fn hot() -> u32 {
     static HOT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *HOT.get_or_init(|| {
         std::env::var("WEAVEPY_FRAME_JIT_HOT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1000)
+            .unwrap_or(2000)
     })
 }
-
-/// How many times [`hot`] a code object's heat must reach: compiling
-/// costs about the same for every instruction of the code, while what it
-/// saves comes from the loop that got hot alone, so a long body (a
-/// driver's setup around a short loop) waits longer to earn its compile.
-#[inline(always)]
-fn size_factor(code: &CodeObject) -> u32 {
-    (code.instructions.len() / SIZE_UNIT).max(1) as u32
-}
-
-/// The code length [`hot`] alone covers.
-const SIZE_UNIT: usize = 16;
 
 /// How many entries at a pc may get nowhere before the core loop stops
 /// entering there.
@@ -268,14 +256,22 @@ impl Slot {
         if self.native.get().is_some() {
             return;
         }
+        // The heat estimates the interpreting so far: a back edge counts its
+        // loop's instructions, an activation or generator step a share of
+        // the code's (most of a call's instructions save less natively
+        // than a loop's). Compiling costs about the same per instruction
+        // of the code, so the code compiles once the heat reaches
+        // [`hot`] times its length: about when interpreting on would have
+        // cost what compiling does.
+        let n = code.instructions.len() as u32;
+        let add = match at {
+            Heat::BackEdge(pc) => code.instructions.get(pc).map_or(1, |i| i.arg.max(1)),
+            Heat::Call | Heat::Step => (n / tuning().call_div).max(1),
+        };
         // (A racing thread losing a count is harmless.)
-        let h = self.heat.load(Ordering::Relaxed) + 1;
+        let h = self.heat.load(Ordering::Relaxed).saturating_add(add);
         self.heat.store(h, Ordering::Relaxed);
-        let mut need = hot().saturating_mul(size_factor(code));
-        if matches!(at, Heat::Call) && code.jit_hint.loop_free(code) {
-            need = need.saturating_mul(tuning().call_factor);
-        }
-        if h >= need {
+        if h >= hot().saturating_mul(n) {
             self.heat.store(0, Ordering::Relaxed);
             self.try_compile(code, ext, nlocals, at);
         }
@@ -468,14 +464,14 @@ struct Tuning {
     exit: usize,
     /// The natively run instructions a body needs beyond its exits' cost.
     body_min: usize,
-    /// How many times [`hot`] a loop-free body's calls must reach.
-    call_factor: u32,
+    /// An activation's heat: the code's length over this.
+    call_div: u32,
 }
 
 fn tuning() -> Tuning {
     static T: std::sync::OnceLock<Tuning> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
-        let mut v = [8usize, 1, 3, 8, 4];
+        let mut v = [8usize, 1, 3, 8, 10];
         if let Ok(s) = std::env::var("WEAVEPY_FRAME_JIT_TUNE") {
             for (slot, x) in v.iter_mut().zip(s.split(',')) {
                 if let Ok(x) = x.trim().parse() {
@@ -488,7 +484,7 @@ fn tuning() -> Tuning {
             call_exit: v[1],
             exit: v[2],
             body_min: v[3],
-            call_factor: v[4] as u32,
+            call_div: (v[4] as u32).max(1),
         }
     })
 }
@@ -2115,6 +2111,7 @@ fn compile_with(
         .get_or_init(|| (0..ninstrs).map(|_| FieldSlot::empty()).collect());
     let entries: Vec<bool>;
     let globals: Vec<Box<GlobalCache>>;
+    let t0 = stats::enabled().then(std::time::Instant::now);
     let built = {
         let b = FunctionBuilder::new(&mut engine.ctx.func, &mut engine.fbctx);
         let mut lower = Lower::new(b, ptr, engine.tags, code, ext, nlocals, depths, field_slots);
@@ -2136,7 +2133,18 @@ fn compile_with(
     if std::env::var("WEAVEPY_FRAME_JIT_DUMP").is_ok_and(|n| code.qualname.contains(&n)) {
         eprintln!("{}", engine.ctx.func.display());
     }
+    let t1 = stats::enabled().then(std::time::Instant::now);
+    let insts = engine.ctx.func.dfg.num_insts();
+    let blocks = engine.ctx.func.dfg.num_blocks();
     let defined = engine.module.define_function(id, &mut engine.ctx);
+    if let (Some(t0), Some(t1)) = (t0, t1) {
+        eprintln!(
+            "frame jit: {} lowered in {:?} ({insts} IR instructions, {blocks} blocks), compiled in {:?}",
+            code.qualname,
+            t1 - t0,
+            t1.elapsed()
+        );
+    }
     if let (Err(e), true) = (&defined, verify()) {
         eprintln!(
             "weavepy: frame {:?} failed to compile: {e:?}",
@@ -2238,8 +2246,6 @@ struct Lower<'a> {
     bound: Vec<bool>,
     /// Each block start's block (instruction index → block).
     blocks: Vec<Option<Block>>,
-    /// The re-entry copies of the blocks' rests (see `lower`).
-    resume: Vec<Option<Block>>,
     /// Dispatches on the state's pc and depth (the entry, and helpers that
     /// move the pc by a run-time amount).
     dispatch: Block,
@@ -2318,34 +2324,6 @@ fn native_op(op: OpCode) -> bool {
     )
 }
 
-/// Whether the native code may hand the instruction at `pc` back to the
-/// core loop for a shape its helpers don't settle (the next instruction is
-/// worth re-entering at).
-fn may_decline(code: &CodeObject, pc: usize) -> bool {
-    native_at(code, pc)
-        && matches!(
-            code.instructions[pc].op,
-            OpCode::LoadGlobal
-                | OpCode::LoadAttr
-                | OpCode::LoadMethodAttr
-                | OpCode::StoreAttr
-                | OpCode::BuildTuple
-                | OpCode::BuildList
-                | OpCode::LoadDeref
-                | OpCode::GetIter
-                | OpCode::BinarySubscr
-                | OpCode::BinarySlice
-                | OpCode::StoreSubscr
-                | OpCode::ListAppend
-                | OpCode::UnpackSequence
-                | OpCode::ContainsOp
-                | OpCode::BinaryOp
-                | OpCode::CompareOp
-                | OpCode::ToBool
-                | OpCode::UnaryOp
-        )
-}
-
 /// Whether the native code runs the instruction at `pc` itself (as
 /// [`native_op`], with the operands some instructions need).
 fn native_at(code: &CodeObject, pc: usize) -> bool {
@@ -2407,7 +2385,6 @@ impl<'a> Lower<'a> {
             },
             bound: vec![false; nlocals],
             blocks: Vec::new(),
-            resume: Vec::new(),
             dispatch: Block::from_u32(0),
             cold: false,
             vs: Vec::new(),
@@ -2866,7 +2843,7 @@ impl<'a> Lower<'a> {
     /// instruction the native code runs (not one it hands straight back).
     fn enters_at(&self, pc: usize) -> bool {
         let instrs = &self.code.instructions;
-        if pc >= instrs.len() || (self.blocks[pc].is_none() && self.resume[pc].is_none()) {
+        if pc >= instrs.len() || self.blocks[pc].is_none() {
             return false;
         }
         native_at(self.code, pc)
@@ -2957,22 +2934,6 @@ impl<'a> Lower<'a> {
             .iter()
             .map(|&s| s.then(|| self.b.create_block()))
             .collect();
-        // Re-entry points after an instruction the helpers may hand back:
-        // the core loop runs that one instruction and enters again at a
-        // copy of the rest of its block (within a code size budget).
-        let mut budget = n;
-        self.resume = vec![None; n];
-        for pc in 0..n.saturating_sub(1) {
-            if starts[pc + 1] || self.depths[pc + 1] < 0 || !may_decline(code, pc) {
-                continue;
-            }
-            let rest = (pc + 1..n).take_while(|&k| !starts[k]).count();
-            if rest < 2 || rest > budget {
-                continue;
-            }
-            budget -= rest;
-            self.resume[pc + 1] = Some(self.b.create_block());
-        }
         // The entry: to the block at the state's pc, when the stack has the
         // block's depth.
         self.dispatch = self.b.create_block();
@@ -2994,7 +2955,7 @@ impl<'a> Lower<'a> {
         let mut tramps = Vec::new();
         let mut calls = Vec::with_capacity(n);
         for pc in 0..n {
-            let target = match self.blocks[pc].or(self.resume[pc]) {
+            let target = match self.blocks[pc] {
                 Some(blk) => {
                     let t = self.b.create_block();
                     tramps.push((t, blk, self.depths[pc]));
@@ -3016,14 +2977,9 @@ impl<'a> Lower<'a> {
             self.b.ins().brif(wrong, out, &[], blk, &[]);
         }
         // The blocks: each from its start until it ends or the next block
-        // starts; then the re-entry copies.
+        // starts.
         for start in 0..n {
             if let Some(blk) = self.blocks[start] {
-                self.lower_block(start, blk);
-            }
-        }
-        for start in 0..n {
-            if let Some(blk) = self.resume[start] {
                 self.lower_block(start, blk);
             }
         }
@@ -3627,8 +3583,14 @@ impl<'a> Lower<'a> {
         {
             return self.binary_borrowed(pc, kind, ai, bi);
         }
-        if matches!(ai, Item::Mem(_)) || matches!(bi, Item::Mem(_)) || native {
+        if native {
             return self.binary_helper(pc, kind, ai, bi);
+        }
+        // A value on the stack (a call's result, an element, a field) is as
+        // likely a heap value as a number: numbers in line, the result
+        // onto the stack, anything else through the helper.
+        if matches!(ai, Item::Mem(_)) || matches!(bi, Item::Mem(_)) {
+            return self.binary_on_stack(pc, kind, ai, bi);
         }
         let (Some(a), Some(b)) = (self.operand(ai), self.operand(bi)) else {
             // A string or other heap constant: the core loop's out-of-line
@@ -3746,6 +3708,101 @@ impl<'a> Lower<'a> {
         let p = self.b.block_params(done);
         let (t, w, byte) = (p[0], p[1], p[2]);
         self.push(Item::Dyn(t, w, byte));
+        self.set_last(pc);
+        true
+    }
+
+    /// `BINARY_OP` with an operand on the stack: two numbers in line, the
+    /// result (a scalar) written to the lower operand's slot; anything
+    /// else through [`h_binop`], whose result takes that slot too.
+    fn binary_on_stack(&mut self, pc: usize, kind: u8, ai: Item, bi: Item) -> bool {
+        let (Some(a), Some(b)) = (self.operand(ai), self.operand(bi)) else {
+            return self.binary_helper(pc, kind, ai, bi);
+        };
+        let is = |k: BinOpKind| kind == k as u8;
+        let int_kind = [
+            BinOpKind::Add,
+            BinOpKind::Sub,
+            BinOpKind::Mult,
+            BinOpKind::BitAnd,
+            BinOpKind::BitOr,
+            BinOpKind::BitXor,
+            BinOpKind::RShift,
+            BinOpKind::LShift,
+            BinOpKind::FloorDiv,
+            BinOpKind::Mod,
+        ]
+        .into_iter()
+        .any(&is);
+        let float_kind =
+            is(BinOpKind::Add) || is(BinOpKind::Sub) || is(BinOpKind::Mult) || is(BinOpKind::Div);
+        let slot = self.depth;
+        let dst = self.slot_addr(slot);
+        let other = self.b.create_block();
+        let done = self.b.create_block();
+        let to_v = |s: &mut Self, o: Opnd, kind: Kind, tag: u8| match s.is_kind(o, kind, tag) {
+            Ok(x) => s.b.ins().iconst(types::I8, i64::from(x)),
+            Err(v) => v,
+        };
+        let (int_t, float_t) = (self.tags.int, self.tags.float);
+        let iav = to_v(self, a, Kind::Int, int_t);
+        let ibv = to_v(self, b, Kind::Int, int_t);
+        let fav = to_v(self, a, Kind::Float, float_t);
+        let fbv = to_v(self, b, Kind::Float, float_t);
+        let both_int = self.b.ins().band(iav, ibv);
+        let int_b = self.b.create_block();
+        let not_int = self.b.create_block();
+        self.b.ins().brif(both_int, int_b, &[], not_int, &[]);
+        self.b.switch_to_block(int_b);
+        match int_kind
+            .then(|| self.int_op(kind, a.word, b.word, other))
+            .flatten()
+        {
+            Some(r) => {
+                self.write_tag(dst, int_t);
+                self.b.ins().store(FLAGS, r, dst, 8);
+                self.b.ins().jump(done, &[]);
+            }
+            None => {
+                self.b.ins().jump(other, &[]);
+            }
+        }
+        self.b.switch_to_block(not_int);
+        if float_kind {
+            let na = self.b.ins().bor(iav, fav);
+            let nb = self.b.ins().bor(ibv, fbv);
+            let nums = self.b.ins().band(na, nb);
+            let bad = self.b.ins().bxor_imm(nums, 1);
+            self.branch_out(bad, other);
+            let x = self.as_f64(a, Err(fav));
+            let y = self.as_f64(b, Err(fbv));
+            let r = self.float_op(kind, x, y, other);
+            let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), r);
+            self.write_tag(dst, float_t);
+            self.b.ins().store(FLAGS, bits, dst, 8);
+            self.b.ins().jump(done, &[]);
+        } else {
+            self.b.ins().jump(other, &[]);
+        }
+        // Any other shape: the operands onto the stack and through the
+        // helper (the operands it releases are the stack's own).
+        self.b.switch_to_block(other);
+        let cold = std::mem::replace(&mut self.cold, true);
+        if !matches!(ai, Item::Mem(_)) {
+            self.materialize(ai, slot);
+        }
+        if !matches!(bi, Item::Mem(_)) {
+            self.materialize(bi, slot + 1);
+        }
+        self.cold = cold;
+        let k = self.b.ins().iconst(types::I32, i64::from(kind));
+        let r = self
+            .call(h_binop as *const () as usize, &[dst, k], true)
+            .expect("returns");
+        let out = self.exit_with(pc, &[Item::Mem(slot), Item::Mem(slot + 1)], INTERP);
+        self.b.ins().brif(r, out, &[], done, &[]);
+        self.b.switch_to_block(done);
+        self.push(Item::Mem(slot));
         self.set_last(pc);
         true
     }
