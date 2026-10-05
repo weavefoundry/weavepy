@@ -147,7 +147,9 @@ pub mod ssl_real;
 pub mod string_mod;
 pub mod warnings_mod;
 
+pub mod asyncio_events;
 pub mod collections_native;
+pub mod contextvars_native;
 pub mod gc_real;
 pub mod multiprocessing_mod;
 pub mod queue_native;
@@ -191,6 +193,9 @@ pub fn register_all(cache: &ModuleCache) {
     // `asyncio/{futures,tasks,events}.py` adoption hooks bind these exactly
     // as CPython's do.
     cache.register_builtin("_asyncio", asyncio_mod::build);
+    // Native `Handle._run` and `BaseEventLoop.call_soon` (see
+    // `asyncio_events.rs`).
+    cache.register_builtin("_weave_asyncio", asyncio_events::build);
     cache.register_builtin("time", time::build);
     cache.register_builtin("_thread", thread_real::build);
     cache.register_builtin("errno", errno_mod::build);
@@ -290,6 +295,8 @@ pub fn register_all(cache: &ModuleCache) {
     // stand-in (CPython documents append/pop from either side as
     // thread-safe; `SimpleQueue` and asyncio's ready queue rely on it).
     cache.register_builtin("_weave_collections", collections_native::build);
+    // Native bodies of the frozen `contextvars` classes (PEP 567).
+    cache.register_builtin("_weave_contextvars", contextvars_native::build);
     cache.register_builtin("_weave_datetime", datetime_accel::build);
     cache.register_builtin("_weave_pickle", pickle_accel::build);
     cache.register_builtin("gc", gc_real::build);

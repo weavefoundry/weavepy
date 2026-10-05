@@ -879,3 +879,31 @@ if hasattr(os, 'fork'):
         signal.set_wakeup_fd(-1)
 
     os.register_at_fork(after_in_child=on_fork)
+
+
+# WeavePy: `Handle._run` is native (`_weave_asyncio`; CPython runs the
+# Python body above). The native body runs the callback and calls this
+# function with any exception the Python `except BaseException` clause
+# would have caught.
+def _handle_run_failed(self, exc):
+    cb = format_helpers._format_callback_source(
+        self._callback, self._args,
+        debug=self._loop.get_debug())
+    msg = f'Exception in callback {cb}'
+    context = {
+        'message': msg,
+        'exception': exc,
+        'handle': self,
+    }
+    if self._source_traceback:
+        context['source_traceback'] = self._source_traceback
+    self._loop.call_exception_handler(context)
+
+
+try:
+    import _weave_asyncio
+except ImportError:
+    pass
+else:
+    _weave_asyncio.install_handle(Handle, _handle_run_failed, globals())
+    del _weave_asyncio
