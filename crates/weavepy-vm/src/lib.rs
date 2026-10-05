@@ -10986,10 +10986,7 @@ impl Interpreter {
                                                 && (scalar(&*dst)
                                                     || matches!(*dst, Object::Unbound))
                                             {
-                                                let c = match src {
-                                                    other => clone_hot(other),
-                                                };
-                                                dst.write(c);
+                                                dst.write(clone_hot(src));
                                                 last = pc + 1;
                                                 pc += 2;
                                                 continue;
