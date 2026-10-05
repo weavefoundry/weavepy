@@ -152,11 +152,16 @@ fn word_time(w: u64) -> (i64, i64, i64, i64, i64) {
     )
 }
 
-/// The packed kinds of a finite `decimal.Decimal` whose coefficient fits
-/// in a word (see `stdlib::decimal_native`): `word` is the coefficient,
-/// `aux` the exponent (as `i64`), and the kind carries the sign.
+/// The packed kinds of a finite `decimal.Decimal` (see
+/// `stdlib::decimal_native`); the kind carries the sign. A coefficient
+/// that fits in a word is `word`, with `aux` the exponent (as `i64`);
+/// the wide kinds hold a coefficient below 2**96 (every one of the
+/// default context's 28 digits) as `word` and the high half of `aux`,
+/// with a 32-bit exponent in its low half.
 pub(crate) const PK_DECIMAL_POS: u8 = 6;
 pub(crate) const PK_DECIMAL_NEG: u8 = 7;
+pub(crate) const PK_DECIMAL_WIDE_POS: u8 = 3;
+pub(crate) const PK_DECIMAL_WIDE_NEG: u8 = 5;
 
 /// The slot layouts packed values describe themselves with, shared by
 /// every interpreter: `[timedelta, date, datetime, Decimal]`, in the
@@ -211,7 +216,7 @@ fn layout_of(kind: u8) -> &'static SharedSlice<DictKey> {
     match kind {
         KIND_TIMEDELTA => &l[0],
         KIND_DATE => &l[1],
-        PK_DECIMAL_POS | PK_DECIMAL_NEG => &l[3],
+        PK_DECIMAL_POS | PK_DECIMAL_NEG | PK_DECIMAL_WIDE_POS | PK_DECIMAL_WIDE_NEG => &l[3],
         _ => &l[2],
     }
 }
@@ -304,11 +309,12 @@ impl PackedSlots {
     fn build_values(&self) -> Vec<Object> {
         let w = self.word;
         match self.kind() {
-            kind @ (PK_DECIMAL_POS | PK_DECIMAL_NEG) => {
+            PK_DECIMAL_POS | PK_DECIMAL_NEG | PK_DECIMAL_WIDE_POS | PK_DECIMAL_WIDE_NEG => {
+                let (sign, coef, exp) = self.decimal().expect("a decimal kind");
                 vec![
-                    Object::Int(i64::from(kind == PK_DECIMAL_NEG)),
-                    super::decimal_native::digits_object(w),
-                    Object::Int(self.aux as i64),
+                    Object::Int(i64::from(sign)),
+                    super::decimal_native::digits_object(coef),
+                    Object::Int(exp),
                     Object::Bool(false),
                 ]
             }
@@ -352,40 +358,64 @@ impl PackedSlots {
         }
     }
 
-    /// A finite `Decimal`: sign `sign`, coefficient `coef`, exponent
-    /// `exp`.
+    /// The packed form of the finite `Decimal` `(sign, coef, exp)`:
+    /// `(kind, word, aux)`, or `None` when it does not pack.
     #[inline]
-    pub(crate) fn new_decimal(sign: u8, coef: u64, exp: i64) -> Self {
+    pub(crate) fn decimal_parts(sign: u8, coef: u128, exp: i64) -> Option<(u8, u64, usize)> {
+        // `aux` holds 64 bits.
+        if usize::BITS != 64 {
+            return None;
+        }
+        if let Ok(w) = u64::try_from(coef) {
+            let kind = if sign == 1 {
+                PK_DECIMAL_NEG
+            } else {
+                PK_DECIMAL_POS
+            };
+            return Some((kind, w, exp as usize));
+        }
+        let hi = u32::try_from(coef >> 64).ok()?;
+        let e = i32::try_from(exp).ok()?;
         let kind = if sign == 1 {
-            PK_DECIMAL_NEG
+            PK_DECIMAL_WIDE_NEG
         } else {
-            PK_DECIMAL_POS
+            PK_DECIMAL_WIDE_POS
         };
-        Self::new(kind, coef, exp as usize)
+        Some((kind, coef as u64, (hi as usize) << 32 | e as u32 as usize))
+    }
+
+    /// A finite `Decimal` packed as [`Self::decimal_parts`] gave.
+    #[inline]
+    pub(crate) fn new_decimal((kind, word, aux): (u8, u64, usize)) -> Self {
+        Self::new(kind, word, aux)
     }
 
     /// `(sign, coefficient, exponent)` of a packed `Decimal`.
     #[inline]
-    pub(crate) fn decimal(&self) -> Option<(u8, u64, i64)> {
+    pub(crate) fn decimal(&self) -> Option<(u8, u128, i64)> {
         match self.kind() {
-            PK_DECIMAL_POS => Some((0, self.word, self.aux as i64)),
-            PK_DECIMAL_NEG => Some((1, self.word, self.aux as i64)),
+            PK_DECIMAL_POS => Some((0, u128::from(self.word), self.aux as i64)),
+            PK_DECIMAL_NEG => Some((1, u128::from(self.word), self.aux as i64)),
+            kind @ (PK_DECIMAL_WIDE_POS | PK_DECIMAL_WIDE_NEG) => {
+                let hi = (self.aux >> 32) as u128;
+                Some((
+                    u8::from(kind == PK_DECIMAL_WIDE_NEG),
+                    hi << 64 | u128::from(self.word),
+                    i64::from(self.aux as u32 as i32),
+                ))
+            }
             _ => None,
         }
     }
 
-    /// Reuse a pooled packed `Decimal`'s storage for a new value (its
-    /// built copy, if any, was released by [`Self::clear`]).
+    /// Reuse a pooled packed `Decimal`'s storage for a new value, as
+    /// [`Self::decimal_parts`] packs it (the old value's built copy, if
+    /// any, was released by [`Self::clear_decimal`]).
     #[inline]
-    pub(crate) fn set_decimal(&mut self, sign: u8, coef: u64, exp: i64) {
-        let kind = if sign == 1 {
-            PK_DECIMAL_NEG
-        } else {
-            PK_DECIMAL_POS
-        };
+    pub(crate) fn set_decimal(&mut self, (kind, word, aux): (u8, u64, usize)) {
         *self.meta.get_mut() = kind as usize;
-        self.word = coef;
-        self.aux = exp as usize;
+        self.word = word;
+        self.aux = aux;
     }
 
     /// Release a dying packed `Decimal`'s built copy (see

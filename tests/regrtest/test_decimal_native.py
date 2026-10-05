@@ -340,3 +340,64 @@ import inspect
 
 assert list(inspect.signature(C.Decimal.quantize).parameters) == \
     ["self", "exp", "rounding", "context"]
+
+# Formatting: every specifier part, both ways, under both capitals.
+C.setcontext(C.Context())
+values = ["0", "-0", "1.5", "-2.675", "123456789.987654321", "1E+30", "1.2E-9",
+          "0.000", "-0.0001", "99999.5", "5E+2", "0E+3"]
+specs = ["", "f", ".0f", ".3f", "e", ".2e", "E", "g", ".4g", "G", "%", ".1%",
+         ",", ",.2f", "_.3f", ".3,f", ".6_f", "+", " .2f", "z.1f", "#.0f",
+         "012.3f", "*^15.2f", "<10", ">10.1e", "=+12.2f", "^9", "08,.1f",
+         "→<12.2f", "z#012.0%"]
+for caps in (1, 0):
+    for v in values:
+        for spec in specs:
+            def fmt(c, a, s=spec, caps=caps):
+                c.capitals = caps
+                return format(a, s)
+            want = run(False, (28, "ROUND_HALF_EVEN"), fmt, v)
+            got = run(True, (28, "ROUND_HALF_EVEN"), fmt, v)
+            assert got == want, (v, spec, caps, got, want)
+for v in ["1.23", "-4.5"]:
+    for spec in ["n", "Q", "=010", ".f", "10.2.f"]:
+        want = run(False, (28, "ROUND_UP"), lambda c, a, s=spec: format(a, s), v)
+        got = run(True, (28, "ROUND_UP"), lambda c, a, s=spec: format(a, s), v)
+        assert got == want, (v, spec, got, want)
+
+# Keyword calls take the same paths as positional ones.
+C.setcontext(C.Context())
+x = C.Decimal("2.675")
+assert str(x.quantize(C.Decimal("0.01"), rounding=C.ROUND_HALF_UP)) == "2.68"
+assert str(x.quantize(exp=C.Decimal("0.01"), rounding=C.ROUND_DOWN)) == "2.67"
+assert str(x.quantize(C.Decimal("0.01"),
+                      context=C.Context(rounding=C.ROUND_UP))) == "2.68"
+assert str(x.to_integral_value(rounding=C.ROUND_CEILING)) == "3"
+for bad in ({"rounding": "nonsense"}, {"bogus": 1}):
+    try:
+        x.quantize(C.Decimal("0.01"), **bad)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("bad keyword call accepted: %r" % bad)
+
+# Hashing in sets and dicts agrees with numeric equality.
+s = {C.Decimal("1.0"), C.Decimal("1.00"), 1, 1.0, C.Decimal("0.5"), 0.5}
+assert len(s) == 2, s
+d = {C.Decimal("2.50"): "x"}
+assert d[C.Decimal("2.5")] == "x" and d[2.5] == "x"
+
+# `getcontext()` hands back the same context until it is replaced.
+c1 = C.getcontext()
+assert C.getcontext() is c1
+c2 = C.Context(prec=3)
+C.setcontext(c2)
+assert C.getcontext() is c2
+with C.localcontext() as lc:
+    assert C.getcontext() is lc
+assert C.getcontext() is c2
+try:
+    C.getcontext(1)
+except TypeError:
+    pass
+else:
+    raise AssertionError("getcontext() took an argument")

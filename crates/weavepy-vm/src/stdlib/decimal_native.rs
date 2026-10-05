@@ -1408,8 +1408,8 @@ pub(crate) fn recycle(mut inst: Rc<PyInstance>) -> Result<(), Rc<PyInstance>> {
 }
 
 /// A `str` of `v`'s decimal digits (a packed `Decimal`'s `_int`).
-pub(crate) fn digits_object(v: u64) -> Object {
-    Object::Str(Coef::S(u128::from(v)).with_digits(SharedStr::from_ascii))
+pub(crate) fn digits_object(v: u128) -> Object {
+    Object::Str(Coef::S(v).with_digits(SharedStr::from_ascii))
 }
 
 const OWNER_CACHE: usize = 16;
@@ -1497,7 +1497,7 @@ impl State {
             if let Some((sign, coef, exp)) = s.as_packed().and_then(PackedSlots::decimal) {
                 return Some(Fin {
                     sign,
-                    coef: Coef::S(u128::from(coef)),
+                    coef: Coef::S(coef),
                     exp,
                 });
             }
@@ -1557,28 +1557,31 @@ impl State {
     #[inline]
     fn make(&self, d: &Fin) -> Option<Object> {
         if let Coef::S(c) = d.coef {
-            if let Ok(c) = u64::try_from(c) {
-                return self.make_packed(d.sign, c, d.exp);
+            if let Some(r) = self.make_packed(d.sign, c, d.exp) {
+                return Some(r);
             }
         }
         self.make_fixed(d)
     }
 
+    /// [`Self::make`] of a value that packs (see `PackedSlots`), else
+    /// `None`.
     #[inline]
-    fn make_packed(&self, sign: u8, coef: u64, exp: i64) -> Option<Object> {
+    fn make_packed(&self, sign: u8, coef: u128, exp: i64) -> Option<Object> {
+        let parts = PackedSlots::decimal_parts(sign, coef, exp)?;
         if let Some(inst) = self.pool.pop() {
             // SAFETY: pooled instances are unique (see `recycle`): nothing
             // else can observe the storage while it changes.
             let m = unsafe { &mut *Rc::as_ptr(&inst).cast_mut() };
             if let Some(p) = m.slots.get_mut().as_packed_mut() {
-                p.set_decimal(sign, coef, exp);
+                p.set_decimal(parts);
                 return Some(Object::Instance(inst));
             }
             drop(Rc::into_arc(inst));
         }
         let cls = self.decimal.upgrade()?;
         let mut i = PyInstance::new(cls);
-        *i.slots.get_mut() = SlotStorage::from_packed(PackedSlots::new_decimal(sign, coef, exp));
+        *i.slots.get_mut() = SlotStorage::from_packed(PackedSlots::new_decimal(parts));
         Some(Object::Instance(Rc::new(i)))
     }
 
@@ -1604,9 +1607,7 @@ impl State {
     fn copy_of(&self, i: &PyInstance) -> Option<Object> {
         let packed = with_slots(i, |s| s.as_packed().and_then(PackedSlots::decimal));
         if let Some((sign, coef, exp)) = packed {
-            if exp < MIN_ETINY as i64
-                || exp as i128 + digits_u128(u128::from(coef)) as i128 - 1 > MAX_EMAX
-            {
+            if exp < MIN_ETINY as i64 || exp as i128 + digits_u128(coef) as i128 - 1 > MAX_EMAX {
                 return None;
             }
             return self.make_packed(sign, coef, exp);
