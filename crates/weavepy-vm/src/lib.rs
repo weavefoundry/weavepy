@@ -10115,12 +10115,13 @@ impl Interpreter {
 
     /// Whether `code` may run as a lean activation: nothing about it needs
     /// the general prologue (an undecodable `co_code` raises there), and
-    /// the tier-2 JIT has no claim on it (the general prologue is where
-    /// compiled code is entered and cold code heats up). A loop-free body
-    /// is the interpreter's until the JIT has compiled it (the lean path
-    /// warms that compile after a few entries): a native entry is then
-    /// worth its framing — a recursive body calls its native self
-    /// directly from there.
+    /// the tier-2 JIT has no compiled form of it (the general prologue is
+    /// where compiled code is entered): a native entry is then worth its
+    /// framing — a recursive body calls its native self directly from
+    /// there. Until then the body is the interpreter's, loops included: a
+    /// short call's loop (a scanner's `while s[i] in chars`) costs far less
+    /// than the general call, and a hot one heats its compile from its
+    /// back edge.
     #[inline(always)]
     fn lean_code_ok(code: &CodeObject) -> bool {
         if code.wire.as_ref().is_some_and(|w| w.exec_error.is_some()) {
@@ -10129,7 +10130,7 @@ impl Interpreter {
         #[cfg(feature = "jit")]
         if !(crate::tier2::jit_off_for_process()
             || code.jit_hint.is_not_jitable()
-            || (code.jit_hint.loop_free(code) && !code.jit_hint.is_compiled()))
+            || !code.jit_hint.is_compiled())
         {
             return false;
         }
