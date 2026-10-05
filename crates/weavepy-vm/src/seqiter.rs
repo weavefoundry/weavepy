@@ -1405,3 +1405,74 @@ pub(crate) fn enumerate_pure_pair(it: &Object) -> Option<(Object, Object)> {
     let i = std::mem::replace(count, next);
     Some((Object::Int(i), v))
 }
+
+/// The truth of a value whose truth is plain data (`None` for anything
+/// whose `__bool__`/`__len__` could run code).
+fn scalar_truth(v: &Object) -> Option<bool> {
+    Some(match v {
+        Object::Bool(b) => *b,
+        Object::Int(i) => *i != 0,
+        Object::None => false,
+        Object::Float(f) => *f != 0.0,
+        Object::Str(s) => !s.is_empty(),
+        _ => return None,
+    })
+}
+
+impl Interpreter {
+    /// [`lazy_pure_next`], and also a `map` or `filter` over a plain
+    /// sequence cursor whose callback is a warm pure-leaf function
+    /// (evaluated in place, as the core loop calls one): the item is
+    /// taken only once the callback has succeeded. `None` (nothing
+    /// consumed) for every other step.
+    pub(crate) fn lazy_core_next(&self, l: &PyLazyIter) -> Option<Option<Object>> {
+        if let Some(r) = lazy_pure_next(l) {
+            return Some(r);
+        }
+        // SAFETY: nothing below runs code that could reach the adapter
+        // (pure leaves call nothing); the view ends with this call.
+        let st = unsafe { l.state.peek() }?;
+        let peek = |c: &Rc<RefCell<PyIterator>>| -> Option<Object> {
+            // SAFETY: as above (a distinct cell).
+            unsafe { c.peek() }?.pure_peek()
+        };
+        let advance = |c: &Rc<RefCell<PyIterator>>| -> Option<()> {
+            // SAFETY: as above; the item was found ready.
+            unsafe { c.peek_mut() }?.next_value().map(drop)
+        };
+        match st {
+            LazyIterKind::Map {
+                func: Object::Function(f),
+                iters,
+                ..
+            } => {
+                let [Object::Iter(c)] = iters.as_slice() else {
+                    return None;
+                };
+                let v = peek(c)?;
+                let r = self.call_pure_leaf(f, std::slice::from_ref(&v))?;
+                advance(c)?;
+                Some(Some(r))
+            }
+            LazyIterKind::Filter {
+                func,
+                source: Object::Iter(c),
+            } => loop {
+                let v = peek(c)?;
+                let keep = match func {
+                    Object::None => scalar_truth(&v)?,
+                    Object::Type(t) if Rc::ptr_eq(t, &builtin_types().bool_) => scalar_truth(&v)?,
+                    Object::Function(f) => {
+                        scalar_truth(&self.call_pure_leaf(f, std::slice::from_ref(&v))?)?
+                    }
+                    _ => return None,
+                };
+                advance(c)?;
+                if keep {
+                    return Some(Some(v));
+                }
+            },
+            _ => None,
+        }
+    }
+}

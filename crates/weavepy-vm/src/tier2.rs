@@ -8522,7 +8522,7 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
         Some(Pin::Obj(Object::Iter(cell))) => builtin_seq_step(cell),
         // A native adapter step that runs no code (`zip` of native
         // iterators, `itertools.repeat`, ...).
-        Some(Pin::Obj(Object::LazyIter(l))) => crate::seqiter::lazy_pure_next(l),
+        Some(Pin::Obj(Object::LazyIter(l))) => interp.lazy_core_next(l),
         _ => None,
     };
     let (step, runs_python) = match fast {

@@ -98,6 +98,28 @@ assert calls == []
 next(m)
 assert calls == [1]
 
+# A callback that fails consumes its item exactly once, however the loop
+# steps it (warm loops evaluate simple callbacks in place).
+for _ in range(200):
+    m = map(lambda x: 10 // x, [1, 2, 0, 5])
+    out = []
+    try:
+        for v in m:
+            out.append(v)
+    except ZeroDivisionError:
+        pass
+    assert out == [10, 5] and next(m) == 2
+    f = filter(lambda x: 1 // x, [1, 0, 1])
+    got = []
+    try:
+        for v in f:
+            got.append(v)
+    except ZeroDivisionError:
+        pass
+    assert got == [1] and list(f) == [1]
+assert [x for x in filter(lambda x: x % 3, range(10))] == [1, 2, 4, 5, 7, 8]
+assert [y for y in map(lambda x: x * x, range(5))] == [0, 1, 4, 9, 16]
+
 # strict=True (map since 3.14).
 assert list(zip([1, 2], [3, 4], strict=True)) == [(1, 3), (2, 4)]
 assert raises(ValueError, list, zip([1, 2], [1], strict=True)) == (

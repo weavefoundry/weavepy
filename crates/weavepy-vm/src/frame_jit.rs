@@ -563,7 +563,10 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
         // iterators, `itertools.repeat`, ...); its exhaustion is the
         // interpreter's.
         Object::LazyIter(l) => {
-            let Some(Some(v)) = crate::seqiter::lazy_pure_next(l) else {
+            // SAFETY: the code passes its live state, whose interpreter
+            // is dormant while the helper runs.
+            let interp = unsafe { &*st.interp };
+            let Some(Some(v)) = interp.lazy_core_next(l) else {
                 return 3;
             };
             // SAFETY: the slot above the iterator is free.

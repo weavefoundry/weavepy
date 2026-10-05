@@ -8847,6 +8847,41 @@ impl PyIterator {
         }
     }
 
+    /// The item [`Self::pure_ready`] promises, without taking it: the
+    /// plain sequence cursors only (`None` for any other iterator).
+    pub fn pure_peek(&self) -> Option<Object> {
+        match self {
+            PyIterator::List {
+                items,
+                index,
+                owner: None,
+            } => {
+                // SAFETY: a read that runs no code.
+                unsafe { items.peek() }?.get(*index).cloned()
+            }
+            PyIterator::Tuple { items, index } => items.get(*index).cloned(),
+            PyIterator::Range {
+                current,
+                stop,
+                step,
+            } => ((*step > 0 && current < stop) || (*step < 0 && current > stop))
+                .then_some(Object::Int(*current)),
+            PyIterator::Str { s, index } => s
+                .get(*index..)
+                .and_then(|rest| rest.chars().next())
+                .map(Object::from_char),
+            PyIterator::Reversed {
+                items,
+                index,
+                owner: None,
+            } if *index >= 0 => {
+                // SAFETY: as above.
+                unsafe { items.peek() }?.get(*index as usize).cloned()
+            }
+            _ => None,
+        }
+    }
+
     /// Whether this iterator can participate in a reference cycle and so
     /// should be enrolled with the cycle GC when created (CPython tracks
     /// these `*_iterator` objects). Scalar iterators (`range`, `str`,

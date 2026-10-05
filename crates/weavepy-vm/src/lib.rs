@@ -11527,7 +11527,7 @@ impl Interpreter {
                                     pc += 1;
                                     continue;
                                 }
-                                let Some(Some(v)) = crate::seqiter::lazy_pure_next(l) else {
+                                let Some(Some(v)) = self.lazy_core_next(l) else {
                                     break None;
                                 };
                                 // SAFETY: `len < cap`.
@@ -17537,7 +17537,7 @@ impl Interpreter {
                     let Some(Object::LazyIter(l)) = stack.last() else {
                         break;
                     };
-                    let Some(next) = crate::seqiter::lazy_pure_next(l) else {
+                    let Some(next) = self.lazy_core_next(l) else {
                         break;
                     };
                     match next {
@@ -31510,7 +31510,7 @@ impl Interpreter {
                 let mut out = Vec::new();
                 if !self.seq_drain(l, &mut out, globals)? {
                     loop {
-                        if let Some(r) = crate::seqiter::itertools_pure_next(l) {
+                        if let Some(r) = crate::seqiter::lazy_pure_next(l) {
                             match r {
                                 Some(x) => out.push(x),
                                 None => break,
@@ -47596,7 +47596,11 @@ impl Interpreter {
                     let items = self.collect_iterable(&args[0], &global_dummy)?;
                     let mut d = DictData::default();
                     for (i, pair) in items.into_iter().enumerate() {
-                        let kv = self.collect_iterable(&pair, &global_dummy)?;
+                        // A 2-tuple (`dict(zip(ks, vs))`) is its own pair.
+                        let kv = match &pair {
+                            Object::Tuple(t) if t.len() == 2 => t.to_vec(),
+                            _ => self.collect_iterable(&pair, &global_dummy)?,
+                        };
                         if kv.len() != 2 {
                             return Err(type_error(format!(
                                 "dictionary update sequence element #{i} has length {}; 2 is required",
