@@ -4085,6 +4085,10 @@ _numbers.Number.register(Decimal)
 
 ##### Context class #######################################################
 
+def _context_changed():
+    """Note that a context attribute changed (replaced by the native
+    fast paths' hook at the end of the module)."""
+
 class _ContextManager(object):
     """Context manager class to support localcontext().
 
@@ -4190,29 +4194,34 @@ class Context(object):
         return object.__setattr__(self, name, d)
 
     def __setattr__(self, /, name, value):
-        if name == 'prec':
-            return self._set_integer_check(name, value, 1, MAX_PREC)
-        elif name == 'Emin':
-            return self._set_integer_check(name, value, MIN_EMIN, 0)
-        elif name == 'Emax':
-            return self._set_integer_check(name, value, 0, MAX_EMAX)
-        elif name == 'capitals':
-            return self._set_integer_check(name, value, 0, 1)
-        elif name == 'clamp':
-            return self._set_integer_check(name, value, 0, 1)
-        elif name == 'rounding':
-            if not value in _rounding_modes:
-                # raise TypeError even for strings to have consistency
-                # among various implementations.
-                raise TypeError("%s: invalid rounding mode" % value)
-            return object.__setattr__(self, name, value)
-        elif name == 'flags' or name == 'traps':
-            return self._set_signal_dict(name, value)
-        elif name == '_ignored_flags':
-            return object.__setattr__(self, name, value)
-        else:
-            raise AttributeError(
-                "'decimal.Context' object has no attribute '%s'" % name)
+        try:
+            if name == 'prec':
+                return self._set_integer_check(name, value, 1, MAX_PREC)
+            elif name == 'Emin':
+                return self._set_integer_check(name, value, MIN_EMIN, 0)
+            elif name == 'Emax':
+                return self._set_integer_check(name, value, 0, MAX_EMAX)
+            elif name == 'capitals':
+                return self._set_integer_check(name, value, 0, 1)
+            elif name == 'clamp':
+                return self._set_integer_check(name, value, 0, 1)
+            elif name == 'rounding':
+                if not value in _rounding_modes:
+                    # raise TypeError even for strings to have consistency
+                    # among various implementations.
+                    raise TypeError("%s: invalid rounding mode" % value)
+                return object.__setattr__(self, name, value)
+            elif name == 'flags' or name == 'traps':
+                return self._set_signal_dict(name, value)
+            elif name == '_ignored_flags':
+                return object.__setattr__(self, name, value)
+            else:
+                raise AttributeError(
+                    "'decimal.Context' object has no attribute '%s'" % name)
+        finally:
+            # WEAVEPY: the native fast paths cache what they read from a
+            # context until an attribute changes.
+            _context_changed()
 
     def __delattr__(self, /, name):
         raise AttributeError("%s cannot be deleted" % name)
@@ -6689,7 +6698,10 @@ except ImportError:
     pass
 else:
     import contextvars as _contextvars
-    _install_native(Decimal, Context, SignalDict, DecimalTuple, _signals,
-                    _current_context_var, _contextvars._STATES,
-                    _rounding_modes)
-    del _install_native, _contextvars
+    _getcontext = _install_native(Decimal, Context, SignalDict, DecimalTuple,
+                                  _signals, _current_context_var,
+                                  _contextvars._STATES, _rounding_modes,
+                                  getcontext)
+    if _getcontext is not None:
+        getcontext, _context_changed = _getcontext
+    del _install_native, _contextvars, _getcontext

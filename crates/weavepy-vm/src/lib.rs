@@ -12013,6 +12013,14 @@ impl Interpreter {
                             Object::Type(ty) if ty.native_kind.get() != 0 => {
                                 Self::core_native_ctor_kw(ops, argc, true)
                             }
+                            // A native method of an exact `decimal.Decimal`
+                            // (see `stdlib::decimal_native::method_kw`).
+                            Object::Builtin(_)
+                                if matches!(&ops[1], Object::Instance(i)
+                                    if crate::stdlib::decimal_native::is_decimal_instance(i)) =>
+                            {
+                                Self::core_native_method_kw(ops, argc)
+                            }
                             _ => self.core_pure_kw_call(code, pc, ops, argc, sw.depth_cell),
                         };
                         let Some(r) = r else {
@@ -16189,6 +16197,21 @@ impl Interpreter {
             return None;
         }
         crate::stdlib::datetime_native::construct_names(cls, args, names, values)?.ok()
+    }
+
+    /// A keyword call of a natively served method (see
+    /// [`crate::stdlib::decimal_native::method_kw`]): `ops` is the core
+    /// loop's `CALL_KW` operands. The result, or `None` (nothing touched)
+    /// for the full handler, which also raises every error.
+    #[inline(never)]
+    fn core_native_method_kw(ops: &[Object], argc: usize) -> Option<Object> {
+        if !ops
+            .iter()
+            .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
+        {
+            return None;
+        }
+        crate::stdlib::decimal_native::method_kw(ops, argc)
     }
 
     /// A call of a bound natively served class method
@@ -32252,6 +32275,12 @@ impl Interpreter {
             return builtins::hash_object(obj);
         }
         if let Object::Instance(inst) = obj {
+            // An exact `decimal.Decimal` (see `stdlib::decimal_native`).
+            if crate::stdlib::decimal_native::is_decimal_instance(inst) {
+                if let Some(h) = crate::stdlib::decimal_native::leaf_hash(inst) {
+                    return Ok(Object::Int(h));
+                }
+            }
             match inst.cls().lookup_with_owner("__hash__") {
                 Some((Object::None, _)) => {
                     return Err(type_error(format!(

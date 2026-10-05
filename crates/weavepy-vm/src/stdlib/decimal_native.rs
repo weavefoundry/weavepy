@@ -30,7 +30,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer;
@@ -113,8 +113,17 @@ fn format_u128(v: u128, buf: &mut [u8; 40]) -> usize {
 
 #[inline]
 fn digits_u128(v: u128) -> u64 {
-    if v == 0 {
-        return 1;
+    if let Ok(w) = u64::try_from(v) {
+        if w == 0 {
+            return 1;
+        }
+        let bits = 64 - w.leading_zeros() as usize;
+        let t = (bits * 1233) >> 12;
+        return if w >= POW10[t] as u64 {
+            t as u64 + 1
+        } else {
+            t as u64
+        };
     }
     let bits = 128 - v.leading_zeros() as usize;
     let t = (bits * 1233) >> 12;
@@ -253,6 +262,9 @@ impl Coef {
 
     fn mul(&self, o: &Coef) -> Option<Coef> {
         if let (Coef::S(a), Coef::S(b)) = (self, o) {
+            if let (Ok(x), Ok(y)) = (u64::try_from(*a), u64::try_from(*b)) {
+                return Some(Coef::S(u128::from(x) * u128::from(y)));
+            }
             if let Some(r) = a.checked_mul(*b) {
                 return Some(Coef::S(r));
             }
@@ -409,7 +421,25 @@ enum Rem {
 }
 
 /// `divmod(c, 10**drop)` (`drop >= 1`), the remainder classified.
+#[inline]
 fn split(c: &Coef, drop: u64) -> (Coef, Rem) {
+    if let Coef::S(v) = *c {
+        if drop >= 39 {
+            // `v < 2**128 < 5 * 10**38`: below half a unit.
+            return (Coef::ZERO, if v == 0 { Rem::Zero } else { Rem::Below });
+        }
+        let (q, r) = divrem_pow10_u128(v, drop);
+        let rem = if r == 0 {
+            Rem::Zero
+        } else {
+            match r.cmp(&(5 * POW10[drop as usize - 1])) {
+                Ordering::Less => Rem::Below,
+                Ordering::Equal => Rem::Half,
+                Ordering::Greater => Rem::Above,
+            }
+        };
+        return (Coef::S(q), rem);
+    }
     let (q, r) = c.divrem_pow10(drop);
     let rem = if r.is_zero() {
         Rem::Zero
@@ -592,12 +622,11 @@ fn fix(d: Fin, c: &CtxP, sig: &mut u16) -> Option<Fin> {
     }
     if exp < exp_min {
         let digits = len + exp - exp_min;
-        let (src, src_len, keep) = if digits < 0 {
-            (Coef::S(1), 1i128, 0i128)
+        let (q, rem) = if digits < 0 {
+            (Coef::ZERO, Rem::Below)
         } else {
-            (d.coef, len, digits)
+            split(&d.coef, (len - digits) as u64)
         };
-        let (q, rem) = split(&src, (src_len - keep) as u64);
         let changed = round_dir(c.round, d.sign, &q, rem);
         let mut coeff = q;
         if changed > 0 {
@@ -638,30 +667,65 @@ fn fix(d: Fin, c: &CtxP, sig: &mut u16) -> Option<Fin> {
 }
 
 /// `Decimal._rescale` (quiet).
+#[inline]
 fn rescale(d: &Fin, exp: i128, mode: Round) -> Option<Fin> {
+    Some(rescale_inexact(d, exp, mode)?.0)
+}
+
+/// [`rescale`], and whether the value changed (digits that were not all
+/// zeros were discarded).
+fn rescale_inexact(d: &Fin, exp: i128, mode: Round) -> Option<(Fin, bool)> {
     if d.is_zero() {
-        return Fin::new(d.sign, Coef::ZERO, exp);
+        return Some((Fin::new(d.sign, Coef::ZERO, exp)?, false));
     }
     let dexp = d.exp as i128;
     if dexp >= exp {
         let k = u64::try_from(dexp - exp).ok()?;
-        return Fin::new(d.sign, d.coef.mul_pow10(k)?, exp);
+        return Some((Fin::new(d.sign, d.coef.mul_pow10(k)?, exp)?, false));
     }
     let len = d.coef.ndigits() as i128;
     let digits = len + dexp - exp;
-    let (src, src_len, keep) = if digits < 0 {
-        (Coef::S(1), 1i128, 0i128)
+    let (q, rem) = if digits < 0 {
+        (Coef::ZERO, Rem::Below)
     } else {
-        (d.coef.clone(), len, digits)
+        split(&d.coef, (len - digits) as u64)
     };
-    let (q, rem) = split(&src, (src_len - keep) as u64);
     let changed = round_dir(mode, d.sign, &q, rem);
     let coeff = if changed == 1 { q.incr() } else { q };
-    Fin::new(d.sign, coeff, exp)
+    Some((Fin::new(d.sign, coeff, exp)?, rem != Rem::Zero))
 }
 
 /// `Decimal._cmp` for finite values.
+#[inline]
 fn cmp(a: &Fin, b: &Fin) -> Option<Ordering> {
+    // Nonzero word-sized coefficients of one sign: the adjusted exponents,
+    // then (equal, so the exponents are within 19 of each other) the
+    // aligned coefficients.
+    if let (Coef::S(x), Coef::S(y)) = (&a.coef, &b.coef) {
+        if let (Ok(x), Ok(y)) = (u64::try_from(*x), u64::try_from(*y)) {
+            if x != 0 && y != 0 && a.sign == b.sign {
+                let aa = a.exp as i128 + digits_u128(u128::from(x)) as i128;
+                let ba = b.exp as i128 + digits_u128(u128::from(y)) as i128;
+                let mag = if aa != ba {
+                    aa.cmp(&ba)
+                } else {
+                    let d = a.exp as i128 - b.exp as i128;
+                    let (px, py) = if d >= 0 {
+                        (POW10[d as usize] as u64, 1)
+                    } else {
+                        (1, POW10[(-d) as usize] as u64)
+                    };
+                    (u128::from(x) * u128::from(px)).cmp(&(u128::from(y) * u128::from(py)))
+                };
+                return Some(if a.sign == 1 { mag.reverse() } else { mag });
+            }
+        }
+    }
+    cmp_general(a, b)
+}
+
+/// [`cmp`] for every finite pair.
+fn cmp_general(a: &Fin, b: &Fin) -> Option<Ordering> {
     let neg = |s: u8| {
         if s == 1 {
             Ordering::Less
@@ -746,7 +810,11 @@ fn add(a: &Fin, b: &Fin, c: &CtxP, sig: &mut u16) -> Option<Fin> {
     if let (Coef::S(x), Coef::S(y)) = (&a.coef, &b.coef) {
         let (da, db) = (a.exp as i128 - exp, b.exp as i128 - exp);
         if *x <= u128::from(u64::MAX) && *y <= u128::from(u64::MAX) && da < 20 && db < 20 {
-            let (x, y) = (x * POW10[da as usize], y * POW10[db as usize]);
+            // Both factors are below 2**64: one widening multiply each.
+            let (x, y) = (
+                u128::from(*x as u64) * u128::from(POW10[da as usize] as u64),
+                u128::from(*y as u64) * u128::from(POW10[db as usize] as u64),
+            );
             let (sign, int) = if a.sign == b.sign {
                 match x.checked_add(y) {
                     Some(s) => (a.sign, s),
@@ -897,15 +965,17 @@ fn quantize(a: &Fin, e: i64, mode: Round, c: &CtxP, sig: &mut u16) -> Option<Fin
     if adj > c.emax || adj - e + 1 > c.prec {
         return None;
     }
-    let ans = rescale(a, e, mode)?;
-    if ans.adjusted() > c.emax || ans.coef.ndigits() as i128 > c.prec {
+    let (ans, inexact) = rescale_inexact(a, e, mode)?;
+    let ans_adj = ans.adjusted();
+    if ans_adj > c.emax || ans.coef.ndigits() as i128 > c.prec {
         return None;
     }
-    if !ans.is_zero() && ans.adjusted() < c.emin {
+    if !ans.is_zero() && ans_adj < c.emin {
         *sig |= S_SUBNORMAL;
     }
     if ans.exp > a.exp {
-        if cmp(&ans, a)? != Ordering::Equal {
+        // `ans != self`: digits that were not all zeros went.
+        if inexact {
             *sig |= S_INEXACT;
         }
         *sig |= S_ROUNDED;
@@ -1246,6 +1316,14 @@ struct State {
     /// The `Context` class's shared attribute names, once proved to start
     /// with `Context.__init__`'s (see [`State::ctx_fields`]).
     ctx_keys: AtomicUsize,
+    /// Advanced after every `Context` attribute store (the native
+    /// `_context_changed`, which `Context.__setattr__` calls).
+    ctx_epoch: AtomicU64,
+    /// The last context read (see [`State::read_ctx`]).
+    ctx_cache: RefCell<Option<CtxCache>>,
+    /// The native `Decimal` methods (by address) → their [`SPECS`] index,
+    /// for keyword calls from the dispatch loop (see [`method_kw`]).
+    methods: HashMap<usize, usize>,
 }
 
 const POOL_CAP: usize = 64;
@@ -1667,13 +1745,51 @@ impl State {
     /// A context's attributes, checked as `Context.__setattr__` leaves
     /// them.
     fn read_ctx(&self, inst: Rc<PyInstance>) -> Option<Ctx> {
+        // SAFETY: a read that runs no code. The cached pointers name
+        // objects the context's attributes hold, unchanged while the
+        // epoch stands (`Context.__setattr__` advances it after every
+        // store), and the context is alive (`inst`).
+        if let Some(c) = unsafe { self.ctx_cache.peek() }.and_then(Option::as_ref) {
+            if std::ptr::eq(c.ctx.as_ptr(), Rc::as_ptr(&inst))
+                && c.epoch == self.ctx_epoch.load(Relaxed)
+            {
+                let ignored = unsafe { &*(c.ignored as *const RefCell<Vec<Object>>) };
+                if !unsafe { ignored.peek() }?.is_empty() {
+                    return None;
+                }
+                return Some(Ctx {
+                    p: c.p,
+                    capitals: c.capitals,
+                    flags: c.flags as *const RefCell<DictData>,
+                    traps: c.traps as *const RefCell<DictData>,
+                    _inst: inst,
+                });
+            }
+        }
+        self.read_ctx_fields(inst)
+    }
+
+    #[inline(never)]
+    fn read_ctx_fields(&self, inst: Rc<PyInstance>) -> Option<Ctx> {
         let n = &self.names;
         // SAFETY: the values are read in place, and nothing runs until the
         // operation that reads the context is done with them; the flag and
         // trap mappings stay owned by the context `Ctx` keeps alive.
         unsafe {
             if let Some(v) = self.ctx_fields(&inst) {
-                return self.ctx_from(&v[..9], inst.clone());
+                let ctx = self.ctx_from(&v[..9], inst.clone())?;
+                if let (Object::List(l), Ok(mut cache)) = (&v[6], self.ctx_cache.try_borrow_mut()) {
+                    *cache = Some(CtxCache {
+                        ctx: Rc::downgrade(&inst),
+                        epoch: self.ctx_epoch.load(Relaxed),
+                        p: ctx.p,
+                        capitals: ctx.capitals,
+                        traps: ctx.traps as usize,
+                        flags: ctx.flags as usize,
+                        ignored: Rc::as_ptr(l) as usize,
+                    });
+                }
+                return Some(ctx);
             }
             let attr = |idx: usize, name: &SharedStr| -> Option<&Object> {
                 if let Some((DictKey(Object::Str(k)), v)) = inst.attr_peek_index(idx) {
@@ -1990,6 +2106,18 @@ impl State {
         self.commit(ctx, sig)?;
         self.make(d)
     }
+}
+
+/// The last context [`State::read_ctx`] read through its fields, with
+/// what it found (the pointers as addresses; see `read_ctx`).
+struct CtxCache {
+    ctx: Weak<PyInstance>,
+    epoch: u64,
+    p: CtxP,
+    capitals: bool,
+    traps: usize,
+    flags: usize,
+    ignored: usize,
 }
 
 /// A context read for one operation. The mappings are borrowed from the
@@ -2394,9 +2522,9 @@ fn d_to_integral_exact(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
             exp: 0,
         })?);
     }
-    let ans = rescale(&x, 0, mode.unwrap_or(ctx.p.round))?;
+    let (ans, inexact) = rescale_inexact(&x, 0, mode.unwrap_or(ctx.p.round))?;
     let mut sig = S_ROUNDED;
-    if cmp(&ans, &x)? != Ordering::Equal {
+    if inexact {
         sig |= S_INEXACT;
     }
     ok(st.finish(&ctx, sig, &ans)?)
@@ -2870,9 +2998,9 @@ fn c_to_integral_exact(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
             exp: 0,
         })?);
     }
-    let ans = rescale(&x, 0, ctx.p.round)?;
+    let (ans, inexact) = rescale_inexact(&x, 0, ctx.p.round)?;
     let mut sig = S_ROUNDED;
-    if cmp(&ans, &x)? != Ordering::Equal {
+    if inexact {
         sig |= S_INEXACT;
     }
     ok(st.finish(&ctx, sig, &ans)?)
@@ -3339,17 +3467,63 @@ pub(crate) fn leaf_binop(
             return None;
         }
     }
-    // SAFETY: a shallow copy the fast halves only read; never dropped.
-    let args = std::mem::ManuallyDrop::new(unsafe { [std::ptr::read(a), std::ptr::read(b)] });
-    match op {
-        B::Add => d_add(&args[..]),
-        B::Sub => d_sub(&args[..]),
-        B::Mult => d_mul(&args[..]),
-        B::Div => d_truediv(&args[..]),
-        B::FloorDiv => d_floordiv(&args[..]),
-        B::Mod => d_mod(&args[..]),
-        _ => None,
+    let f: fn(&Fin, &Fin, &CtxP, &mut u16) -> Option<Fin> = match op {
+        B::Add => add,
+        B::Sub => |x, y, c, s| add(x, &y.negated(), c, s),
+        B::Mult => mul,
+        B::Div => div,
+        B::FloorDiv => floordiv,
+        B::Mod => rem,
+        _ => return None,
+    };
+    let x = st.fin(a)?;
+    let y = st.operand(b)?;
+    let ctx = st.resolve(None)?;
+    let mut sig = 0;
+    let r = f(&x, &y, &ctx.p, &mut sig)?;
+    Some(Ok(st.finish(&ctx, sig, &r)?))
+}
+
+/// A keyword call of a native method of an exact `Decimal`, from the
+/// dispatch loop's `CALL_KW` operands (the method, the receiver in the
+/// self slot, `argc` positional arguments, the keyword values, and the
+/// names tuple): the result, or `None` (nothing touched) for the full
+/// handler.
+pub(crate) fn method_kw(ops: &[Object], argc: usize) -> Option<Object> {
+    let (Object::Builtin(b), recv @ Object::Instance(i)) = (ops.first()?, ops.get(1)?) else {
+        return None;
+    };
+    let st = sealed_state(i)?;
+    let spec = &SPECS[*st.methods.get(&(Rc::as_ptr(b) as usize))?];
+    let Object::Tuple(names) = ops.last()? else {
+        return None;
+    };
+    let n = spec.params.len() + 1;
+    let args = ops.get(2..2 + argc)?;
+    let kwv = ops.get(2 + argc..ops.len() - 1)?;
+    if argc >= n || n > 6 || kwv.len() != names.len() {
+        return None;
     }
+    let mut v: [Object; 6] = std::array::from_fn(|_| Object::Unbound);
+    v[0] = recv.clone();
+    for (k, o) in args.iter().enumerate() {
+        v[k + 1] = o.clone();
+    }
+    for (name, val) in names.iter().zip(kwv) {
+        let Object::Str(name) = name else {
+            return None;
+        };
+        let ix = spec
+            .params
+            .iter()
+            .position(|p| *p == name.as_ref() as &str)?
+            + 1;
+        if !matches!(v[ix], Object::Unbound) {
+            return None;
+        }
+        v[ix] = val.clone();
+    }
+    (spec.fast)(&v[..n])?.ok()
 }
 
 /// `a OP b` comparison for exact `Decimal` operands, or `None`.
@@ -3363,12 +3537,10 @@ pub(crate) fn leaf_compare(
         return None;
     };
     let st = state_of_cls(i.cls_raw())?;
-    if !st.is_decimal(j) || !sealed(st, i.cls_raw()) {
+    if !st.is_decimal(i) || !st.is_decimal(j) || !sealed(st, i.cls_raw()) {
         return None;
     }
-    // SAFETY: a shallow copy the fast halves only read; never dropped.
-    let args = std::mem::ManuallyDrop::new(unsafe { [std::ptr::read(a), std::ptr::read(b)] });
-    let o = compare_with(&args[..])?;
+    let o = cmp(&st.fin_of(i)?, &st.fin_of(j)?)?;
     Some(Ok(Object::Bool(match op {
         C::Eq => o.is_eq(),
         C::NotEq => !o.is_eq(),
@@ -3763,10 +3935,12 @@ fn kw_positional(params: &[&str], a: &[Object], kw: &[(String, Object)]) -> Opti
 }
 
 /// `install(Decimal, Context, SignalDict, DecimalTuple, signals,
-/// context_var, states)`: put the native methods on the exact classes
-/// (see the module docs). Idempotent per class set; returns `None`.
+/// context_var, states, rounding_modes, getcontext)`: put the native
+/// methods on the exact classes (see the module docs), and return the
+/// native `getcontext` (or `None` when the classes were already
+/// installed).
 pub(crate) fn install(args: &[Object]) -> Result<Object, RuntimeError> {
-    let [Object::Type(dec), Object::Type(ctx), Object::Type(sd), Object::Type(dt), Object::List(signals), var, states @ Object::Dict(_), Object::Tuple(roundings)] =
+    let [Object::Type(dec), Object::Type(ctx), Object::Type(sd), Object::Type(dt), Object::List(signals), var, states @ Object::Dict(_), Object::Tuple(roundings), getcontext] =
         args
     else {
         return Err(type_error("install() expects the decimal classes"));
@@ -3836,12 +4010,15 @@ pub(crate) fn install(args: &[Object]) -> Result<Object, RuntimeError> {
         states_hint: AtomicUsize::new(0),
         data_hint: AtomicUsize::new(0),
         ctx_keys: AtomicUsize::new(0),
+        ctx_epoch: AtomicU64::new(1),
+        ctx_cache: RefCell::new(None),
+        methods: HashMap::new(),
     };
     // The natives go in first, then the class version they leave is the
     // sealed one.
     let mut natives: Vec<(u8, &'static str, Object)> = Vec::new();
     let pending: Rc<std::sync::OnceLock<Rc<State>>> = Rc::new(std::sync::OnceLock::new());
-    for spec in SPECS {
+    for (ix, spec) in SPECS.iter().enumerate() {
         let fast = spec.fast;
         let key = (spec.class, spec.name);
         let params = spec.params;
@@ -3876,6 +4053,9 @@ pub(crate) fn install(args: &[Object]) -> Result<Object, RuntimeError> {
             })),
         });
         crate::leaf_builtins::register_fast(&b, fast);
+        if spec.class == C_DECIMAL && !spec.classmethod {
+            state.methods.insert(Rc::as_ptr(&b) as usize, ix);
+        }
         let value = Object::Builtin(b.clone());
         crate::descr_registry::register_text_signature(&value, spec.sig);
         let value = if spec.classmethod {
@@ -3903,7 +4083,49 @@ pub(crate) fn install(args: &[Object]) -> Result<Object, RuntimeError> {
             .set(crate::rc_unsize!(state.clone() => dyn std::any::Any + Send + Sync));
     }
     dec.native_kind.set(KIND_DECIMAL);
-    Ok(Object::None)
+    // `getcontext()`: the current context when it exists, else the Python
+    // function (which creates one).
+    let (st_call, orig_call) = (state.clone(), getcontext.clone());
+    let (st_kw, orig_kw) = (state.clone(), getcontext.clone());
+    let native_getcontext = Object::Builtin(Rc::new(BuiltinFn {
+        name: "getcontext",
+        binds_instance: false,
+        call: Box::new(move |a: &[Object]| {
+            if a.is_empty() {
+                if let Some(c) = st_call.current() {
+                    return Ok(Object::Instance(c));
+                }
+            }
+            with_interp(|i| i.call_object(orig_call.clone(), a, &[]))
+        }),
+        call_kw: Some(Box::new(move |a: &[Object], kw: &[(String, Object)]| {
+            if a.is_empty() && kw.is_empty() {
+                if let Some(c) = st_kw.current() {
+                    return Ok(Object::Instance(c));
+                }
+            }
+            with_interp(|i| i.call_object(orig_kw.clone(), a, kw))
+        })),
+    }));
+    crate::descr_registry::register_module(&native_getcontext, "decimal");
+    crate::descr_registry::register_text_signature(&native_getcontext, "()");
+    // `_context_changed()`: `Context.__setattr__`'s note that a context
+    // attribute changed (see `State::read_ctx`).
+    let st_changed = state.clone();
+    let changed = Rc::new(BuiltinFn {
+        name: "_context_changed",
+        binds_instance: false,
+        call: Box::new(move |_: &[Object]| {
+            st_changed.ctx_epoch.fetch_add(1, Relaxed);
+            Ok(Object::None)
+        }),
+        call_kw: None,
+    });
+    crate::leaf_builtins::register(&changed);
+    Ok(Object::new_tuple_array([
+        native_getcontext,
+        Object::Builtin(changed),
+    ]))
 }
 
 /// `_weave_decimal`: the installer.
