@@ -38,6 +38,8 @@ def main():
     ap.add_argument("--inclusive", action="store_true")
     ap.add_argument("--thread", default="weavepy-main")
     ap.add_argument("--chain", action="store_true", help="show the enclosing inlined frames too")
+    ap.add_argument("--parent-of", help="count samples whose leaf function's name contains this "
+                    "at their caller's address (the call sites of a hot callee)")
     args = ap.parse_args()
 
     prof = load(args.profile)
@@ -82,10 +84,53 @@ def main():
 
     counts = collections.Counter()
     total = 0
+    func_names = thread["funcTable"]["name"]
+    strings = thread["stringArray"]
+
+    # Every library's symbols, for naming leaf frames outside the binary.
+    lib_syms = {}
+    if os.path.exists(syms_path):
+        syms = json.load(open(syms_path))
+        table = syms["string_table"]
+        for lib in syms["data"]:
+            entries = sorted((e["rva"], e["size"], table[e["symbol"]]) for e in lib["symbol_table"])
+            lib_syms[os.path.basename(lib.get("debug_name", ""))] = entries
+    lib_names = [l["name"] for l in prof["libs"]]
+
+    def frame_name(f):
+        func = frames["func"][f]
+        res = func_res[func]
+        if res is None or res < 0:
+            return strings[func_names[func]]
+        entries = lib_syms.get(lib_names[res_lib[res]], [])
+        addr = frames["address"][f]
+        lo, hi = 0, len(entries)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            rva, size, name = entries[mid]
+            if addr < rva:
+                hi = mid
+            elif addr >= rva + size:
+                lo = mid + 1
+            else:
+                return name
+        return strings[func_names[func]]
+
     for stack in thread["samples"]["stack"]:
         if stack is None:
             continue
         total += 1
+        if args.parent_of:
+            if args.parent_of not in frame_name(stacks["frame"][stack]):
+                continue
+            parent = stacks["prefix"][stack]
+            while parent is not None:
+                addr = frame_addr(stacks["frame"][parent])
+                if addr is not None and addr >= 0 and args.func in symbol_at(addr):
+                    counts[addr] += 1
+                    break
+                parent = stacks["prefix"][parent]
+            continue
         seen = set()
         s = stack
         first = True
@@ -116,7 +161,7 @@ def main():
             continue
         def loc(line):
             return line.rsplit("(", 1)[-1].rstrip(")") if "(" in line else line
-        lines[a] = loc(chain[0]) + ("  <- " + " <- ".join(loc(c) for c in chain[1:3]) if args.chain else "")
+        lines[a] = loc(chain[0]) + ("  <- " + " <- ".join(loc(c) for c in chain[1:7]) if args.chain else "")
     by_line = collections.Counter()
     for a, n in top:
         by_line[lines.get(a, hex(a))] += n

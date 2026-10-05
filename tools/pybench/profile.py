@@ -154,6 +154,10 @@ def main():
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(1.0)
     out = args.save or tempfile.mktemp(suffix=".sample.txt")
+    # A first short sample loads the binary's symbols, which can take most
+    # of a window for a large, freshly built binary.
+    subprocess.run(["sample", str(proc.pid), "1", "1", "-file", out],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["sample", str(proc.pid), str(args.secs), "1", "-file", out],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     proc.kill()
