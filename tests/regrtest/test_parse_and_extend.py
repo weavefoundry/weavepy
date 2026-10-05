@@ -77,5 +77,58 @@ class ExtendTest(unittest.TestCase):
         self.assertIn("not iterable", loop(body))
 
 
+
+class BoundBuiltinTest(unittest.TestCase):
+    def test_local_bound_append(self):
+        y = []
+        append = y.append
+        for i in range(300):
+            append(i)
+        self.assertEqual(y, list(range(300)))
+
+    def test_bound_append_of_list_subclass(self):
+        log = []
+
+        class L(list):
+            def append(self, v):
+                log.append(v)
+                super().append(v * 2)
+
+        y = L()
+        append = y.append
+        for i in range(5):
+            append(i)
+        self.assertEqual(y, [0, 2, 4, 6, 8])
+        self.assertEqual(log, [0, 1, 2, 3, 4])
+
+    def test_bound_methods_with_arguments(self):
+        d = {}
+        setdefault = d.setdefault
+        s = set()
+        add = s.add
+        ins = []
+        insert = ins.insert
+        for i in range(50):
+            setdefault(i % 5, i)
+            add(i % 7)
+            insert(0, i)
+        self.assertEqual(d, {0: 0, 1: 1, 2: 2, 3: 3, 4: 4})
+        self.assertEqual(s, set(range(7)))
+        self.assertEqual(ins[:3], [49, 48, 47])
+
+    def test_bound_append_releases(self):
+        import weakref
+
+        class Item:
+            pass
+
+        y = []
+        append = y.append
+        for i in range(10):
+            append(Item())
+        r = weakref.ref(y[0])
+        y.clear()
+        self.assertIsNone(r())
+
 if __name__ == "__main__":
     unittest.main()

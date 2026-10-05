@@ -12693,6 +12693,41 @@ impl Interpreter {
                                 last = pc;
                                 pc += 1;
                             }
+                            // `append(x)` of a local `append = lst.append` on an
+                            // exact list (the site's leaf kind, likewise): the
+                            // operand moves in.
+                            Object::BoundMethod(bm)
+                                if argc == 1
+                                && !bm.redispatch_descriptor
+                                && matches!(&bm.receiver, Object::List(_))
+                                // SAFETY: `len >= argc + 2`: the self slot.
+                                && matches!(unsafe { &*base.add(len - 2) }, Object::Unbound)
+                                && matches!(&bm.function, Object::Builtin(b)
+                                    if site_slot.and_then(|s| s.get_leaf(b))
+                                        == Some(LeafKind::ListAppend)) =>
+                            {
+                                let Object::List(l) = &bm.receiver else {
+                                    break Some(CoreExit::Helper);
+                                };
+                                // SAFETY: nothing below runs code while the
+                                // items are borrowed (see `GilCell::peek_mut`).
+                                let Some(items) = (unsafe { l.peek_mut() }) else {
+                                    break Some(CoreExit::Helper);
+                                };
+                                // SAFETY: the operand moves into the list; the
+                                // empty self slot and the bound method (held
+                                // by the local it was loaded from) leave, and
+                                // the result takes the callee's slot.
+                                unsafe {
+                                    items.push(base.add(len - 1).read());
+                                    drop_hot(base.add(len - 3).read());
+                                    base.add(len - 3).write(Object::None);
+                                }
+                                len -= 2;
+                                last = pc;
+                                pc += 1;
+                                after_release!();
+                            }
                             // A registered leaf builtin (its whole body, or its
                             // fast half, runs no Python code: the site's leaf
                             // kind, filled by the helper's first call) with
@@ -12788,9 +12823,15 @@ impl Interpreter {
                                 }
                                 break None;
                             }
-                            // A leaf builtin or directly constructible type: out
-                            // of line.
+                            // A leaf builtin or directly constructible type, or
+                            // a bound builtin method held in a local (`append =
+                            // y.append`): out of line.
                             Object::Builtin(_) | Object::Type(_) => break Some(CoreExit::Helper),
+                            Object::BoundMethod(bm)
+                                if matches!(&bm.function, Object::Builtin(_)) =>
+                            {
+                                break Some(CoreExit::Helper)
+                            }
                             _ => break None,
                         }
                     }
@@ -13940,18 +13981,25 @@ impl Interpreter {
         let Some(callee_at) = frame.stack.len().checked_sub(ins.arg as usize + 2) else {
             return false;
         };
-        let ok = match (&frame.stack[callee_at], &frame.stack[callee_at + 1]) {
-            (Object::Builtin(b), Object::Unbound) => {
-                !b.binds_instance && self.leaf_call_kind(b).is_some()
+        let (b, recv) = match (&frame.stack[callee_at], &frame.stack[callee_at + 1]) {
+            (Object::Builtin(b), Object::Unbound) => (b, None),
+            (Object::Builtin(b), recv) => (b, Some(recv)),
+            // A bound method held in a local (`append = y.append`).
+            (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
+                match &bm.function {
+                    Object::Builtin(b) => (b, Some(&bm.receiver)),
+                    _ => return false,
+                }
             }
-            (Object::Builtin(b), recv) => {
-                b.binds_instance
-                    && builtins::method_memo_tag(recv).is_some()
-                    && self.leaf_call_kind(b).is_some()
-            }
-            _ => false,
+            _ => return false,
         };
-        ok && self.core_builtin_lane(sw, pc, true)
+        let ok = match recv {
+            None => !b.binds_instance,
+            Some(recv) => b.binds_instance && builtins::method_memo_tag(recv).is_some(),
+        } && self.leaf_call_kind(b).is_some();
+        // A method body safe to call directly runs as such.
+        let via_call = recv.is_none() || !native_call_ic_safe(b.name);
+        ok && self.core_builtin_lane(sw, pc, via_call)
     }
 
     /// [`Self::core_call`] for the `CALL_KW` at `pc`: the quiet loop's
@@ -16973,6 +17021,41 @@ impl Interpreter {
             && matches!(frame.stack[callee_slot], Object::BoundMethod(_))
         {
             let Some(r) = self.leaf_bound_zero_call(code, pc, &frame.stack[callee_slot]) else {
+                return CoreAttr::Decline;
+            };
+            r
+        } else if let (Object::BoundMethod(bm), true) = (
+            &frame.stack[callee_slot],
+            first == self_slot + 1 && (1..=2).contains(&argc),
+        ) {
+            // A bound builtin method held in a local (`append = y.append`):
+            // its leaf half over the receiver and the arguments.
+            let Object::Builtin(b) = &bm.function else {
+                return CoreAttr::Decline;
+            };
+            if bm.redispatch_descriptor || !b.binds_instance {
+                return CoreAttr::Decline;
+            }
+            let slot = code_method_slot(code, pc as u32);
+            let kind = match slot.and_then(|s| s.get_leaf(b)) {
+                Some(k) => k,
+                None => {
+                    let Some(k) = self.leaf_call_kind(b) else {
+                        return CoreAttr::Decline;
+                    };
+                    if let Some(s) = slot {
+                        s.set_leaf(b, k);
+                    }
+                    k
+                }
+            };
+            let recv = bm.receiver.clone();
+            let r = match &frame.stack[first..] {
+                [a] => self.leaf_builtin_call(kind, b, &[recv, a.clone()]),
+                [a, c] => self.leaf_builtin_call(kind, b, &[recv, a.clone(), c.clone()]),
+                _ => None,
+            };
+            let Some(r) = r else {
                 return CoreAttr::Decline;
             };
             r
