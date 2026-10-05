@@ -825,6 +825,16 @@ pub(crate) const LEAVES: [&str; 11] = [
     "odv_items_reversed",
 ];
 
+/// The keyword-taking exports whose leaf halves also serve keyword calls,
+/// with their parameter names.
+pub(crate) fn leaf_kw_names() -> [(&'static str, crate::leaf_builtins::KwNames); 3] {
+    [
+        ("od_move_to_end", &["key", "last"]),
+        ("od_popitem", &["last"]),
+        ("od_pop", &["key", "default"]),
+    ]
+}
+
 /// The exports with leaf halves.
 pub(crate) fn leaf_halves() -> [(&'static str, crate::leaf_builtins::Fast); 4] {
     [

@@ -1133,6 +1133,36 @@ fn chainmap_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
     interp.call_object(missing, std::slice::from_ref(key), &[])
 }
 
+/// [`chainmap_getitem`]'s leaf half (see `leaf_builtins::Fast`): a plain
+/// key found by exact native equality in a list of exact dicts held in
+/// the instance's own `maps` attribute. A key no map holds (the
+/// `__missing__` call), or anything that could run Python, declines.
+fn chainmap_getitem_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(inst), key] = args else {
+        return None;
+    };
+    if crate::object::exotic_str_keys_possible() || inst.cls_raw().lookup("maps").is_some() {
+        return None;
+    }
+    let Object::List(maps) = inst.attr_get_str("maps")? else {
+        return None;
+    };
+    let probe = crate::object::LeafProbe::new(key)?;
+    let maps = maps.try_borrow().ok()?;
+    for mapping in maps.iter() {
+        let Object::Dict(d) = mapping else {
+            return None;
+        };
+        let d = d.try_borrow().ok()?;
+        match d.get(&probe) {
+            Some(v) => return Some(Ok(v.clone())),
+            None if probe.miss_is_exact() => {}
+            None => return None,
+        }
+    }
+    None
+}
+
 /// `mapping[key]`, with a `KeyError` (or subclass) reported as `None`.
 fn chainmap_probe(
     interp: &mut crate::Interpreter,
@@ -1543,6 +1573,12 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         for (name, fast) in super::collections_odict::leaf_halves() {
             if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
                 crate::leaf_builtins::register_fast(b, fast);
+                if let Some((_, names)) = super::collections_odict::leaf_kw_names()
+                    .into_iter()
+                    .find(|(n, _)| *n == name)
+                {
+                    crate::leaf_builtins::register_fast_kw(b, names, fast);
+                }
             }
         }
         // The end operations, length, truth, iterator construction, and
@@ -1572,6 +1608,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 deque_getitem_leaf as crate::leaf_builtins::Fast,
             ),
             ("rotate", deque_rotate_leaf as crate::leaf_builtins::Fast),
+            ("chainmap_getitem", chainmap_getitem_leaf),
         ] {
             if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
                 crate::leaf_builtins::register_fast(b, fast);

@@ -12144,6 +12144,11 @@ impl Interpreter {
                             Object::Type(ty) if ty.native_kind.get() != 0 => {
                                 Self::core_native_ctor_kw(ops, argc, true)
                             }
+                            // A native method's leaf half that also takes
+                            // keywords (`od.popitem(last=False)`).
+                            Object::BoundMethod(_) | Object::Builtin(_) => {
+                                Self::core_native_kw_call(ops, argc)
+                            }
                             _ => self.core_pure_kw_call(code, pc, ops, argc, sw.depth_cell),
                         };
                         let Some(r) = r else {
@@ -16367,6 +16372,63 @@ impl Interpreter {
             return None;
         }
         crate::stdlib::datetime_native::construct_names(cls, args, names, values)?.ok()
+    }
+
+    /// A keyword call of a native method registered with
+    /// [`leaf_builtins::register_fast_kw`]: `ops` is the core loop's
+    /// `CALL_KW` operands (the callee, the self slot, the positionals, the
+    /// keyword values and the names tuple). The keywords bind by name to
+    /// the method's parameters; when the arguments fill a prefix of them,
+    /// the leaf half runs on them. `None` (nothing touched) for the full
+    /// handler.
+    #[inline(never)]
+    fn core_native_kw_call(ops: &[Object], argc: usize) -> Option<Object> {
+        let (b, recv) = match (ops.first()?, ops.get(1)?) {
+            (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
+                let Object::Builtin(b) = &bm.function else {
+                    return None;
+                };
+                (b, &bm.receiver)
+            }
+            (Object::Builtin(b), recv) if !matches!(recv, Object::Unbound) && b.binds_instance => {
+                (b, recv)
+            }
+            _ => return None,
+        };
+        let Object::Tuple(names) = ops.last()? else {
+            return None;
+        };
+        let kwc = names.len();
+        if ops.len() != argc + kwc + 3 || argc + kwc > 4 || crate::trace::any_observers_active() {
+            return None;
+        }
+        let (params, fast) = leaf_builtins::fast_kw(b)?;
+        let mut bound: [Option<&Object>; 4] = [None; 4];
+        for (i, a) in ops[2..2 + argc].iter().enumerate() {
+            bound[i] = Some(a);
+        }
+        for (name, value) in names.iter().zip(&ops[2 + argc..2 + argc + kwc]) {
+            let Object::Str(name) = name else {
+                return None;
+            };
+            let i = params.iter().position(|p| *p == name.as_ref())?;
+            if i >= 4 || bound[i].is_some() {
+                return None;
+            }
+            bound[i] = Some(value);
+        }
+        let n = bound.iter().take_while(|a| a.is_some()).count();
+        if bound[n..].iter().any(Option::is_some)
+            || !ops
+                .iter()
+                .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
+        {
+            return None;
+        }
+        let mut args = Vec::with_capacity(n + 1);
+        args.push(recv.clone());
+        args.extend(bound[..n].iter().map(|a| (*a).expect("prefix").clone()));
+        fast(&args)?.ok()
     }
 
     /// A call of a bound natively served class method
@@ -58400,6 +58462,33 @@ pub(crate) mod leaf_builtins {
 
     pub(crate) fn generation() -> u64 {
         GENERATION.load(Ordering::Acquire)
+    }
+
+    /// A keyword-taking builtin's parameter names (after the receiver),
+    /// for binding a keyword call to its leaf half by position.
+    pub(crate) type KwNames = &'static [&'static str];
+
+    /// Builtins whose leaf half also serves keyword calls (see
+    /// [`register_fast_kw`]).
+    static FAST_KW: parking_lot::Mutex<Vec<(Weak<crate::object::BuiltinFn>, KwNames, Fast)>> =
+        parking_lot::Mutex::new(Vec::new());
+
+    /// Vouch for `fast` as `b`'s leaf half for keyword calls too: the
+    /// keywords bind to `names` (the parameters after the receiver) by
+    /// position, and a call whose arguments fill a prefix of them runs it.
+    pub(crate) fn register_fast_kw(b: &Rc<crate::object::BuiltinFn>, names: KwNames, fast: Fast) {
+        let mut reg = FAST_KW.lock();
+        reg.retain(|(w, _, _)| w.strong_count() > 0);
+        reg.push((Rc::downgrade(b), names, fast));
+    }
+
+    /// `b`'s keyword binding and leaf half, if registered (by identity).
+    pub(crate) fn fast_kw(b: &Rc<crate::object::BuiltinFn>) -> Option<(KwNames, Fast)> {
+        FAST_KW
+            .lock()
+            .iter()
+            .find(|(w, _, _)| std::ptr::eq(w.as_ptr(), Rc::as_ptr(b)) && w.strong_count() > 0)
+            .map(|&(_, names, fast)| (names, fast))
     }
 
     /// Builtins opted into the JIT's native method lane (see
