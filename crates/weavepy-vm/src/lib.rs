@@ -24380,11 +24380,28 @@ impl Interpreter {
                 // frame when one is installed (test_pkg's exec'd
                 // `from t2 import *` reads the names back via `dir()`);
                 // at true module scope locals are the globals dict.
-                let target = frame
-                    .class_namespace
-                    .clone()
-                    .unwrap_or_else(|| frame.globals.clone());
-                self.import_star(&module, &target)?;
+                if let (None, Some(mapping)) =
+                    (&frame.class_namespace, frame.class_namespace_obj.clone())
+                {
+                    // A non-dict locals mapping (an `exec` namespace that
+                    // is an OrderedDict, say): `PyObject_SetItem` per name.
+                    let names = Rc::new(RefCell::new(DictData::default()));
+                    self.import_star(&module, &names)?;
+                    let items: Vec<(Object, Object)> = names
+                        .borrow()
+                        .iter()
+                        .map(|(k, v)| (k.0.clone(), v.clone()))
+                        .collect();
+                    for (k, v) in items {
+                        self.subscr_set_public(&mapping, &k, v)?;
+                    }
+                } else {
+                    let target = frame
+                        .class_namespace
+                        .clone()
+                        .unwrap_or_else(|| frame.globals.clone());
+                    self.import_star(&module, &target)?;
+                }
                 // CALL_INTRINSIC_1(IMPORT_STAR) returns None; the compiler
                 // emits the POP_TOP that consumes it (CPython's shape).
                 frame.push(Object::None);
@@ -46554,27 +46571,20 @@ impl Interpreter {
             // `enum.EnumMeta` forwarding its populated `_EnumDict`).
             Object::Instance(inst) => match inst.native.get() {
                 Some(Object::Dict(d)) => {
-                    // A dict subclass with its own Python `items()`
-                    // (OrderedDict) defines the namespace *order* through
-                    // it, not through the backing dict's insertion order
-                    // (bpo-34320, test_builtin TestType
-                    // test_namespace_order).
-                    let items_override = inst
-                        .cls()
-                        .lookup("items")
-                        .is_some_and(|m| matches!(m, Object::Function(_)));
-                    if items_override {
+                    // CPython's `PyDict_Copy` (`dict_merge`): a dict
+                    // subclass that overrides `__iter__` (OrderedDict)
+                    // copies through `keys()` and `ns[key]`, so its own
+                    // order defines the namespace's (bpo-34320,
+                    // test_builtin TestType test_namespace_order).
+                    let iter = inst.cls_raw().dunder(crate::types::Dunder::Iter);
+                    if iter.present() && !iter.builtin_owner() {
                         let g = fallback_globals();
-                        let items_m = self.load_attr(&args[2], "items")?;
-                        let items = self.call(&items_m, &[], &[], &g)?;
+                        let keys_m = self.load_attr(&args[2], "keys")?;
+                        let keys = self.call(&keys_m, &[], &[], &g)?;
                         let mut nd = DictData::default();
-                        for pair in self.collect_iterable(&items, &g)? {
-                            match &pair {
-                                Object::Tuple(t) if t.len() == 2 => {
-                                    nd.insert(DictKey(t[0].clone()), t[1].clone());
-                                }
-                                _ => return Err(type_error("type() arg 3 must be a dict")),
-                            }
+                        for key in self.collect_iterable(&keys, &g)? {
+                            let value = self.subscr_get_public(&args[2], &key)?;
+                            nd.insert(DictKey(key), value);
                         }
                         nd
                     } else {
@@ -52272,7 +52282,15 @@ impl Interpreter {
             // that function's locals). At module level locals *are*
             // globals, so no distinct mapping is installed.
             Some(Object::None) | None => {
-                if matches!(args.get(1), Some(Object::Dict(_) | Object::Instance(_))) {
+                if let Some(globals @ Object::Instance(inst)) = args.get(1) {
+                    // Explicit dict-subclass globals without locals: locals
+                    // *are* that object, and CPython's `STORE_NAME` binds
+                    // through `PyObject_SetItem` on a non-exact dict, so a
+                    // class with its own `__setitem__` (OrderedDict, which
+                    // records the order) sees every top-level bind.
+                    let setitem = inst.cls_raw().dunder(crate::types::Dunder::SetItem);
+                    (setitem.present() && !setitem.builtin_owner()).then(|| globals.clone())
+                } else if matches!(args.get(1), Some(Object::Dict(_))) {
                     // Explicit globals without locals: locals default to
                     // the same dict (CPython), i.e. no distinct mapping.
                     None
@@ -52485,7 +52503,12 @@ impl Interpreter {
             Some(Object::Dict(d)) if !Rc::ptr_eq(d, &globals_dict) => Some(Object::Dict(d.clone())),
             Some(Object::Dict(_)) => None,
             Some(Object::None) | None => {
-                if matches!(args.get(1), Some(Object::Dict(_) | Object::Instance(_))) {
+                if let Some(globals @ Object::Instance(inst)) = args.get(1) {
+                    // Dict-subclass globals with their own `__setitem__`
+                    // bind through it (see `do_exec_call`).
+                    let setitem = inst.cls_raw().dunder(crate::types::Dunder::SetItem);
+                    (setitem.present() && !setitem.builtin_owner()).then(|| globals.clone())
+                } else if matches!(args.get(1), Some(Object::Dict(_))) {
                     // Explicit globals without locals: locals default to
                     // the globals mapping itself (CPython), never the
                     // caller's frame.

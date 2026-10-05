@@ -227,6 +227,64 @@ class OrderedDictTests(unittest.TestCase):
         self.assertIsNone(OrderedDict(a=1).__getstate__())
 
 
+class OrderedDictNamespaceTests(unittest.TestCase):
+    """Consumers that copy an OrderedDict see its order, and namespace
+    binds into one go through its __setitem__."""
+
+    @staticmethod
+    def user(ns):
+        return [k for k in ns if not k.startswith("__")]
+
+    def test_copies_follow_order(self):
+        od = OrderedDict([("a", 1), ("b", 2), ("c", 3)])
+        od.move_to_end("a")
+        self.assertEqual(self.user(type("C", (), od).__dict__), ["b", "c", "a"])
+        self.assertEqual(list(dict(od)), ["b", "c", "a"])
+        self.assertEqual(list({**od}), ["b", "c", "a"])
+        self.assertEqual((lambda **kw: list(kw))(**od), ["b", "c", "a"])
+        d = {}
+        d.update(od)
+        self.assertEqual(list(d), ["b", "c", "a"])
+
+    def test_exec_and_eval_namespaces(self):
+        ns = OrderedDict()
+        exec("x = 1\ndef f(): pass\nclass K: pass\nfrom os import sep\ny = 2", ns)
+        self.assertEqual(self.user(ns), ["x", "f", "K", "sep", "y"])
+        ns = OrderedDict()
+        exec("from string import *", ns)
+        self.assertIn("ascii_letters", self.user(ns))
+        ns = OrderedDict(a=1)
+        self.assertEqual(eval("(v := 3) + 1", ns), 4)
+        self.assertEqual(self.user(ns), ["a", "v"])
+
+    def test_prepare_namespace(self):
+        class Meta(type):
+            @classmethod
+            def __prepare__(mcls, name, bases):
+                return OrderedDict()
+
+            def __new__(mcls, name, bases, ns):
+                cls = super().__new__(mcls, name, bases, dict(ns))
+                cls.order = [k for k in ns if not k.startswith("__")]
+                return cls
+
+        class C(metaclass=Meta):
+            b = 1
+            a = 2
+
+            def m(self):
+                pass
+
+        self.assertEqual(C.order, ["b", "a", "m"])
+
+    def test_dict_level_insert(self):
+        # As in CPython, a key the payload gained behind the order's back
+        # is present but not iterated.
+        od = OrderedDict(a=1)
+        dict.__setitem__(od, "q", 2)
+        self.assertEqual((list(od), od["q"], len(od)), (["a"], 2, 2))
+
+
 class DefaultDictTests(unittest.TestCase):
     def test_factories(self):
         def run():
