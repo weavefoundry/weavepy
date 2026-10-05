@@ -364,10 +364,20 @@ fn attach_state(inst: &Rc<PyInstance>) -> Rc<RefCell<FutState>> {
     st
 }
 
+/// [`HANDLE_KEY`], interned: the slot key shares its storage, so the
+/// hinted lookup settles on a pointer compare.
+fn handle_key() -> &'static str {
+    static KEY: std::sync::OnceLock<crate::shared_value::SharedStr> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| match crate::stdlib::sys::intern_name(HANDLE_KEY) {
+        Object::Str(s) => s,
+        _ => unreachable!("names intern as strings"),
+    })
+}
+
 /// The registry handle stored on `inst`, if a state is attached.
 #[inline]
 fn handle_of(inst: &PyInstance) -> Option<i64> {
-    match inst.slots.try_borrow().ok()?.get_hinted(0, HANDLE_KEY) {
+    match inst.slots.try_borrow().ok()?.get_hinted(0, handle_key()) {
         Some(Object::Int(h)) => Some(*h),
         _ => None,
     }
@@ -471,7 +481,7 @@ fn release_state(inst: &PyInstance) {
     // Unhook the handle first: a resurrected instance must attach a fresh
     // state rather than find whatever later reuses this slab entry.
     if let Ok(mut slots) = inst.slots.try_borrow_mut() {
-        if let Some(slot) = slots.get_hinted_mut(0, HANDLE_KEY) {
+        if let Some(slot) = slots.get_hinted_mut(0, handle_key()) {
             *slot = Object::None;
         }
     }
@@ -1764,7 +1774,9 @@ fn task_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
         return Err(type_error(format!("a coroutine was expected, got {r}")));
     }
     let name_obj = if matches!(name, Object::None) {
-        Object::from_str(format!("Task-{}", task_name_counter()))
+        // The counter's value; `get_name` formats `Task-N` on first use
+        // (as the C Task does).
+        Object::Int(task_name_counter())
     } else if matches!(name, Object::Str(_)) {
         name
     } else {
@@ -2281,10 +2293,14 @@ fn task_get_context(args: &[Object]) -> Result<Object, RuntimeError> {
 fn task_get_name(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
     let name = st.borrow().name.clone();
-    Ok(if matches!(name, Object::None) {
-        Object::from_static("")
-    } else {
-        name
+    Ok(match name {
+        Object::None => Object::from_static(""),
+        Object::Int(n) => {
+            let formatted = Object::from_str(format!("Task-{n}"));
+            st.borrow_mut().name = formatted.clone();
+            formatted
+        }
+        name => name,
     })
 }
 
