@@ -6,13 +6,22 @@
 //! by allocation site. With `WEAVEPY_ALLOC_PROFILE=<file>` set, the live
 //! samples are written to `<file>`: one line per sample, the charged bytes
 //! then the slide-adjusted return addresses (resolve them with `atos`).
+//! `WEAVEPY_ALLOC_SAMPLE=<bytes>` changes the sampling interval, and the
+//! file's first line (starting `#`) gives the exact live and peak heap
+//! totals, which tell transient allocations apart from retained ones.
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// Bytes between samples.
+/// Default bytes between samples.
 const SAMPLE: usize = 16 * 1024;
+
+/// Bytes between samples (`WEAVEPY_ALLOC_SAMPLE`, else [`SAMPLE`]).
+static INTERVAL: AtomicUsize = AtomicUsize::new(SAMPLE);
+/// Exact bytes currently allocated, and the most ever allocated at once.
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
 /// Return addresses kept per sample.
 const DEPTH: usize = 24;
 /// Sampled blocks tracked at once (open addressing, power of two).
@@ -62,6 +71,13 @@ pub(crate) fn start() {
     if std::env::var_os("WEAVEPY_ALLOC_PROFILE").is_none() {
         return;
     }
+    if let Some(n) = std::env::var("WEAVEPY_ALLOC_SAMPLE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        INTERVAL.store(n, Ordering::Relaxed);
+    }
     let bytes = SLOTS * std::mem::size_of::<Sample>();
     // SAFETY: a fresh zeroed mapping owned for the rest of the process.
     let p = unsafe {
@@ -92,7 +108,9 @@ fn record(ptr: usize) {
     for _ in 0..SLOTS {
         // SAFETY: `i < SLOTS`, inside the mapping.
         let s = unsafe { &mut *t.add(i) };
-        if s.ptr == 0 || s.ptr == ptr {
+        // A fresh block's address was forgotten when it was last freed, so
+        // a tombstone can take it (a long run would fill the table otherwise).
+        if s.ptr == 0 || s.ptr == ptr || s.ptr == usize::MAX {
             s.ptr = ptr;
             s.stack = stack;
             break;
@@ -132,6 +150,7 @@ unsafe impl GlobalAlloc for Profiled {
         // SAFETY: forwarded unchanged.
         let p = unsafe { crate::alloc::Mimalloc.alloc(layout) };
         if ENABLED.load(Ordering::Relaxed) && !p.is_null() {
+            grow(layout.size());
             sample(p as usize, layout.size());
         }
         p
@@ -139,6 +158,7 @@ unsafe impl GlobalAlloc for Profiled {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if ENABLED.load(Ordering::Relaxed) {
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
             forget(ptr as usize);
         }
         // SAFETY: forwarded unchanged.
@@ -147,14 +167,25 @@ unsafe impl GlobalAlloc for Profiled {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if ENABLED.load(Ordering::Relaxed) {
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
             forget(ptr as usize);
         }
         // SAFETY: forwarded unchanged.
         let p = unsafe { crate::alloc::Mimalloc.realloc(ptr, layout, new_size) };
         if ENABLED.load(Ordering::Relaxed) && !p.is_null() {
+            grow(new_size);
             sample(p as usize, new_size);
         }
         p
+    }
+}
+
+/// Count `size` more live bytes (blocks allocated before [`start`] are
+/// never counted, so their frees may briefly wrap the counter below zero).
+fn grow(size: usize) {
+    let live = LIVE.fetch_add(size, Ordering::Relaxed).wrapping_add(size);
+    if live < usize::MAX / 2 && live > PEAK.load(Ordering::Relaxed) {
+        PEAK.fetch_max(live, Ordering::Relaxed);
     }
 }
 
@@ -166,7 +197,7 @@ fn sample(ptr: usize, size: usize) {
         let due = UNTIL_SAMPLE.with(|left| {
             let l = left.get();
             if size >= l {
-                left.set(SAMPLE);
+                left.set(INTERVAL.load(Ordering::Relaxed));
                 true
             } else {
                 left.set(l - size);
@@ -192,7 +223,12 @@ pub(crate) fn finish() {
     let t = table();
     // SAFETY: the main executable is image 0.
     let slide = unsafe { _dyld_get_image_vmaddr_slide(0) } as usize;
-    let mut out = String::new();
+    let interval = INTERVAL.load(Ordering::Relaxed);
+    let mut out = format!(
+        "# live {} peak {}\n",
+        LIVE.load(Ordering::Relaxed) as isize,
+        PEAK.load(Ordering::Relaxed)
+    );
     lock();
     for i in 0..SLOTS {
         // SAFETY: `i < SLOTS`.
@@ -200,7 +236,7 @@ pub(crate) fn finish() {
         if s.ptr == 0 || s.ptr == usize::MAX {
             continue;
         }
-        out.push_str(&SAMPLE.to_string());
+        out.push_str(&interval.to_string());
         for &a in s.stack.iter().take_while(|a| **a != 0) {
             out.push_str(&format!(" {:x}", a.wrapping_sub(slide)));
         }
