@@ -394,6 +394,11 @@ pub struct GcState {
     /// makes one per pass). A flush also hands the collector each live
     /// one's globals dict, which [`track`] would have tracked at birth.
     young_fns: RefCell<Vec<crate::sync::Weak<crate::object::PyFunction>>>,
+    /// Generators and coroutines born since the last collection, held
+    /// weakly as [`Self::young`] holds instances: a generator expression or
+    /// a `for` over a generator call makes one per pass, and most finish
+    /// and die long before a collection could find them in a cycle.
+    young_gens: RefCell<Vec<crate::sync::Weak<crate::object::PyGenerator>>>,
     /// Frozen handles. `gc.freeze()` moves all tracked objects
     /// here; they are skipped by future collections until
     /// `gc.unfreeze()` runs.
@@ -443,6 +448,7 @@ impl GcState {
             deferred_limit: AtomicUsize::new(DEFERRED_FLOOR),
             young: RefCell::new(Vec::new()),
             young_fns: RefCell::new(Vec::new()),
+            young_gens: RefCell::new(Vec::new()),
             frozen: RefCell::new(Vec::new()),
             garbage: RefCell::new(Vec::new()),
             callbacks: RefCell::new(Vec::new()),
@@ -481,6 +487,7 @@ impl GcState {
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).deferred));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).young));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).young_fns));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).young_gens));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).frozen));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).garbage));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).callbacks));
@@ -527,10 +534,12 @@ impl GcState {
         if !container_can_cycle(obj) && self.defer_container(obj) {
             return;
         }
-        if let Object::Instance(inst) = obj {
-            if self.nurse(&self.young, inst) {
-                return;
+        match obj {
+            Object::Instance(inst) if self.nurse(&self.young, inst) => return,
+            Object::Generator(g) | Object::Coroutine(g) if self.nurse(&self.young_gens, g) => {
+                return
             }
+            _ => {}
         }
         self.track_now(obj);
     }
@@ -599,6 +608,23 @@ impl GcState {
                 }
             }
         }
+        if let Ok(mut gens) = self.young_gens.try_borrow_mut() {
+            if !gens.is_empty() {
+                let gens = std::mem::take(&mut *gens);
+                for w in gens {
+                    if let Some(g) = w.upgrade() {
+                        let obj = match g.kind {
+                            crate::object::CoroutineKind::Coroutine => Object::Coroutine(g),
+                            crate::object::CoroutineKind::AsyncGenerator => {
+                                Object::AsyncGenerator(g)
+                            }
+                            crate::object::CoroutineKind::Generator => Object::Generator(g),
+                        };
+                        self.register(&obj, false);
+                    }
+                }
+            }
+        }
         let young = match self.young.try_borrow_mut() {
             Ok(mut young) if !young.is_empty() => std::mem::take(&mut *young),
             _ => return,
@@ -617,11 +643,15 @@ impl GcState {
             fns.retain(|w| w.strong_count() > 0);
             fns.len()
         });
+        let gens = self.young_gens.try_borrow_mut().map_or(0, |mut gens| {
+            gens.retain(|w| w.strong_count() > 0);
+            gens.len()
+        });
         let Ok(mut young) = self.young.try_borrow_mut() else {
-            return fns;
+            return fns + gens;
         };
         young.retain(|w| w.strong_count() > 0);
-        young.len() + fns
+        young.len() + fns + gens
     }
 
     /// Whether the instance or function `id` is in a young set.
@@ -633,7 +663,7 @@ impl GcState {
                     .any(|w| w.as_ptr() as usize as ObjectId == id && w.strong_count() > 0)
             })
         }
-        holds(&self.young, id) || holds(&self.young_fns, id)
+        holds(&self.young, id) || holds(&self.young_fns, id) || holds(&self.young_gens, id)
     }
 
     /// [`Self::track`] for a container its builder knows holds only
@@ -794,32 +824,34 @@ impl GcState {
     /// Stop tracking `obj`. Backs the explicit `gc._untrack(obj)` extension
     /// and the C-API `PyObject_GC_UnTrack`.
     pub fn untrack_id(&self, id: ObjectId) {
-        // (From the newest: an untrack usually follows its birth closely.)
-        if let Ok(mut fns) = self.young_fns.try_borrow_mut() {
-            if let Some(i) = fns
-                .iter()
-                .rposition(|w| w.as_ptr() as usize as ObjectId == id)
-            {
-                fns.swap_remove(i);
-                let mut counts = self.counts.borrow_mut();
-                counts[0] = counts[0].saturating_sub(1);
-                self.sync_gen0_gauge(counts[0], None);
-                return;
-            }
-        }
-        if let Ok(mut young) = self.young.try_borrow_mut() {
-            if let Some(i) = young
-                .iter()
-                .position(|w| w.as_ptr() as usize as ObjectId == id)
-            {
+        // A registered object is in the index and in no young set (a young
+        // object is registered only by the flush that empties its set), so
+        // one hash probe settles the common case; only a miss looks through
+        // the young sets, newest first (an untrack usually follows its
+        // birth closely).
+        let registered = self.index.borrow_mut().remove(&id);
+        let Some(handle) = registered else {
+            fn forget<T: 'static>(set: &RefCell<Vec<crate::sync::Weak<T>>>, id: ObjectId) -> bool {
+                let Ok(mut young) = set.try_borrow_mut() else {
+                    return false;
+                };
+                let Some(i) = young
+                    .iter()
+                    .rposition(|w| w.as_ptr() as usize as ObjectId == id)
+                else {
+                    return false;
+                };
                 young.swap_remove(i);
+                true
+            }
+            if forget(&self.young_gens, id)
+                || forget(&self.young, id)
+                || forget(&self.young_fns, id)
+            {
                 let mut counts = self.counts.borrow_mut();
                 counts[0] = counts[0].saturating_sub(1);
                 self.sync_gen0_gauge(counts[0], None);
-                return;
             }
-        }
-        let Some(handle) = self.index.borrow_mut().remove(&id) else {
             return;
         };
         {
@@ -950,8 +982,28 @@ impl GcState {
         self.index.borrow().contains_key(&id)
     }
 
-    /// [`Self::is_tracked`] for an instance or function, which may be
-    /// young.
+    /// Forget a finished generator that is still young, if it's among the
+    /// newest few: a drained generator usually is, and a longer search
+    /// would cost more than leaving its entry for the next flush.
+    pub fn forget_young_gen(&self, id: ObjectId) {
+        let Ok(mut young) = self.young_gens.try_borrow_mut() else {
+            return;
+        };
+        let n = young.len();
+        if let Some(i) = (n.saturating_sub(8)..n)
+            .rev()
+            .find(|&i| young[i].as_ptr() as usize as ObjectId == id)
+        {
+            young.swap_remove(i);
+            drop(young);
+            let mut counts = self.counts.borrow_mut();
+            counts[0] = counts[0].saturating_sub(1);
+            self.sync_gen0_gauge(counts[0], None);
+        }
+    }
+
+    /// [`Self::is_tracked`] for an instance, function, or generator, which
+    /// may be young.
     pub fn is_tracked_instance(&self, id: ObjectId) -> bool {
         self.is_tracked(id) || self.is_young(id)
     }

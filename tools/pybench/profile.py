@@ -47,9 +47,18 @@ def parse(text):
         if threads:
             threads[-1][1].append((depth, int(m.group("count")), sym))
 
+    waits = ("__ulock_wait", "__psynch_cvwait", "__semwait_signal", "mach_msg2_trap",
+             "mach_msg_trap", "kevent", "__select", "__psynch_mutexwait")
+
     def busy(t):
-        waiting = any(n[2] in ("_pthread_join", "__psynch_cvwait", "__semwait_signal") for n in t[1][:8])
-        return (not waiting, t[0])
+        # Samples whose leaf isn't a wait: the next node is no deeper.
+        nodes = t[1]
+        active = 0
+        for i, (depth, count, sym) in enumerate(nodes):
+            leaf = i + 1 == len(nodes) or nodes[i + 1][0] <= depth
+            if leaf and sym not in waits:
+                active += count
+        return active
 
     return max(threads, key=busy)[1] if threads else []
 
@@ -88,6 +97,42 @@ def report(nodes, top, focus):
         print("%-8d %5.1f%%  %s" % (n, 100.0 * n / max(total, 1), sym[:150]))
 
 
+def demangle(text):
+    """Demangle Rust symbols with the filter named by `RUST_DEMANGLER` (any
+    `rustfilt`-compatible command), when one is set."""
+    tool = os.environ.get("RUST_DEMANGLER")
+    if not tool:
+        return text
+    return subprocess.run([tool], input=text, capture_output=True, text=True).stdout
+
+
+def callers(nodes, target, top):
+    """Self samples of functions matching `target`, by immediate caller."""
+    by_caller = collections.Counter()
+    total = 0
+    stack = []  # [depth, sym, count, children]
+
+    def finish(entry, parent):
+        nonlocal total
+        own = entry[2] - entry[3]
+        if own > 0 and target in entry[1]:
+            by_caller[parent] += own
+            total += own
+
+    for depth, count, sym in nodes + [(-1, 0, "")]:
+        while stack and stack[-1][0] >= depth:
+            entry = stack.pop()
+            finish(entry, stack[-1][1] if stack else "<root>")
+        if depth < 0:
+            break
+        if stack:
+            stack[-1][3] += count
+        stack.append([depth, sym, count, 0])
+    print("self samples in %r: %d" % (target, total))
+    for sym, n in by_caller.most_common(top):
+        print("%-8d %5.1f%%  %s" % (n, 100.0 * n / max(total, 1), sym[:150]))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("bin")
@@ -98,6 +143,7 @@ def main():
     ap.add_argument("--work", type=int)
     ap.add_argument("--focus")
     ap.add_argument("--save")
+    ap.add_argument("--callers", help="attribute this function's self time to its callers")
     args = ap.parse_args()
     bench = os.path.join(HERE, "benchmarks", args.name + ".py")
     work = args.work
@@ -108,10 +154,14 @@ def main():
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(1.0)
     out = args.save or tempfile.mktemp(suffix=".sample.txt")
-    subprocess.run(["sample", str(proc.pid), str(args.secs), "-file", out],
+    subprocess.run(["sample", str(proc.pid), str(args.secs), "1", "-file", out],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     proc.kill()
-    report(parse(open(out).read()), args.top, args.focus)
+    nodes = parse(demangle(open(out).read()))
+    if args.callers:
+        callers(nodes, args.callers, args.top)
+    else:
+        report(nodes, args.top, args.focus)
 
 
 if __name__ == "__main__":

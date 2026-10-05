@@ -36637,10 +36637,14 @@ impl Interpreter {
             return;
         }
         let id = Rc::as_ptr(gen) as usize as u64;
-        if !gc_trace::maybe_tracked(id) || crate::weakref_registry::count_for(id) > 0 {
+        if crate::weakref_registry::count_for(id) > 0 {
             return;
         }
-        gc_trace::untrack_id(id);
+        if gc_trace::maybe_tracked(id) {
+            gc_trace::untrack_id(id);
+        } else {
+            gc_trace::with_state(|s| s.forget_young_gen(id));
+        }
     }
 
     fn park_suspended_boxed(gen: &Rc<PyGenerator>, boxed: Box<Frame>) {
