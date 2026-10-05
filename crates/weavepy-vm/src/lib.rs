@@ -13662,6 +13662,78 @@ impl Interpreter {
                         last = pc;
                         pc += 1;
                     }
+                    // An `except` clause's entry, test, and exit (the slow
+                    // leaf arms' shapes, which the full handlers' match).
+                    OpCode::PushExcInfo => {
+                        // SAFETY: `len > 0` is checked first.
+                        if len == 0
+                            || len == cap
+                            || !matches!(unsafe { &*base.add(len - 1) }, Object::Instance(_))
+                        {
+                            break None;
+                        }
+                        // SAFETY: as above.
+                        let exc = unsafe { &*base.add(len - 1) }.clone();
+                        let prev = self
+                            .exc_info_stack
+                            .borrow()
+                            .last()
+                            .map_or(Object::None, |pe| pe.instance.clone());
+                        // SAFETY: the exception moves up one slot and the
+                        // previous one takes its place (`len < cap`).
+                        unsafe {
+                            let top = base.add(len - 1).read();
+                            base.add(len - 1).write(prev);
+                            base.add(len).write(top);
+                        }
+                        len += 1;
+                        let pe = PyException::new(exc);
+                        frame.exc_handlers.push((ins.arg, pe.clone()));
+                        self.exc_info_stack.borrow_mut().push(pe);
+                        last = pc;
+                        pc += 1;
+                    }
+                    OpCode::CheckExcMatch => {
+                        if len < 2 {
+                            break None;
+                        }
+                        // SAFETY: `len >= 2`.
+                        let matched = match unsafe {
+                            Self::leaf_exc_match(&*base.add(len - 2), &*base.add(len - 1))
+                        } {
+                            Some(m) => m,
+                            None => break None,
+                        };
+                        // SAFETY: the class (or tuple of classes) leaves the
+                        // top slot; releasing it runs nothing.
+                        unsafe {
+                            drop_hot(base.add(len - 1).read());
+                            base.add(len - 1).write(bool_hot(matched));
+                        }
+                        last = pc;
+                        pc += 1;
+                    }
+                    OpCode::PopExcept => {
+                        if len == 0 {
+                            break None;
+                        }
+                        len -= 1;
+                        // SAFETY: the slot at `len` is initialized.
+                        let prev = unsafe { base.add(len).read() };
+                        let popped = frame.exc_handlers.pop();
+                        let top = self.exc_info_stack.borrow_mut().pop();
+                        // See the full handler: the handled exception dies
+                        // here unless something else holds it.
+                        self.recheck_frame_observed = true;
+                        last = pc;
+                        pc += 1;
+                        drop(top);
+                        if let Some((_, pe)) = popped {
+                            self.release(pe.instance);
+                        }
+                        self.release(prev);
+                        after_release!();
+                    }
                     // The finished delegate leaves from under the result.
                     OpCode::EndSend => {
                         // SAFETY: `len >= 2` is checked first.
