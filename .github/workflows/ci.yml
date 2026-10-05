@@ -260,49 +260,6 @@ jobs:
           target/release/weavepy-bench gate $FLAGS \
             --weavepy=target/release/weavepy \
             | tee bench-report.md
-      - name: Time call_overhead the way the gate runs it
-        # The gate has timed the PR binary's `call_overhead` at 1.2-1.5x
-        # the merge-base on every Windows PR run, while direct runs on the
-        # same runner time it at 0.6x. This separates the differences
-        # between the two (environment, caches, binary path).
-        if: failure() && matrix.os == 'windows-latest' && github.event_name == 'pull_request' && steps.bench_gate.outcome == 'failure'
-        timeout-minutes: 30
-        shell: bash
-        run: |
-          F=crates/weavepy-bench/fixtures/call_overhead.py
-          export WEAVEPY_BENCH_WORK=150000
-          unset WEAVEPY_JIT
-          for label in gate-like jit=1 own-caches exe-path base; do
-            for i in 1 2 3; do
-              case $label in
-                gate-like) out=$(target/release/weavepy $F) ;;
-                jit=1) out=$(WEAVEPY_JIT=1 target/release/weavepy $F) ;;
-                own-caches) out=$(WEAVEPY_FROZEN_CACHE="$RUNNER_TEMP/fz" WEAVEPY_STDLIB_CACHE="$RUNNER_TEMP/sc" target/release/weavepy $F) ;;
-                exe-path) out=$(target/release/weavepy.exe $F) ;;
-                base) out=$("$BASE_WEAVEPY" $F) ;;
-              esac
-              echo "$label: $out"
-            done
-          done
-          A="$PWD/$F"
-          echo "absolute-path: $(target/release/weavepy "$A")"
-          # A sampling profile of each run, taken from outside the process
-          # (in-process statistics shift the layout and hide the slowdown).
-          cargo install samply --locked --quiet || echo "samply install failed"
-          OUT="target/performance/cold-jit-ci/${{ github.run_id }}-${{ github.run_attempt }}/profiles"
-          mkdir -p "$OUT"
-          for spec in "slow:$A" "fast:$F"; do
-            name=${spec%%:*}; path=${spec#*:}
-            samply record --save-only --unstable-presymbolicate --rate 4000 \
-              -o "$OUT/$name.json.gz" -- target/release/weavepy.exe "$path" \
-              || echo "samply failed for $name"
-          done
-          # The binaries and their PDBs, to symbolicate the profiles.
-          cp target/release/python314.dll target/release/python314.pdb \
-             target/release/weavepy.exe target/release/weavepy.pdb "$OUT/" || true
-          ls -la "$OUT"
-          echo "--- default cache"
-          ls -la "$LOCALAPPDATA/weavepy" 2>&1 | head -20
       - name: Diagnose cold Windows JIT costs after a failed gate
         id: cold_jit_diagnostic
         if: failure() && matrix.os == 'windows-latest' && github.event_name == 'pull_request' && steps.bench_gate.outcome == 'failure'
