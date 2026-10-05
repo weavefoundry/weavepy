@@ -1242,6 +1242,34 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
             _ => None,
         };
     }
+    // `int(text)` and `float(text)` of a plain ASCII literal (an optional
+    // sign and digits; for a float, also a point and an exponent). Any
+    // other text, including one that would raise, takes the full path.
+    if let [Object::Str(text)] = args {
+        let t = text.as_ref();
+        if Rc::ptr_eq(cls, &bt.int_) {
+            let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+            if !digits.is_empty()
+                && digits.len() <= 18
+                && digits.bytes().all(|c| c.is_ascii_digit())
+            {
+                return t.parse::<i64>().ok().map(Object::Int);
+            }
+            return None;
+        }
+        if Rc::ptr_eq(cls, &bt.float_) {
+            let ok = !t.is_empty()
+                && t.len() <= 64
+                && t.bytes().any(|c| c.is_ascii_digit())
+                && t.bytes()
+                    .all(|c| c.is_ascii_digit() || matches!(c, b'.' | b'e' | b'E' | b'+' | b'-'));
+            return if ok {
+                t.parse::<f64>().ok().map(Object::Float)
+            } else {
+                None
+            };
+        }
+    }
     let native = |o: &Object| {
         matches!(
             o,

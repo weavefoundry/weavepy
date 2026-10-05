@@ -13547,25 +13547,7 @@ impl Interpreter {
                 if builtins::method_memo_tag(recv).is_none() {
                     return None;
                 }
-                matches!(
-                    b.name,
-                    "update"
-                        | "extend"
-                        | "sort"
-                        | "join"
-                        | "union"
-                        | "intersection"
-                        | "difference"
-                        | "symmetric_difference"
-                        | "intersection_update"
-                        | "difference_update"
-                        | "symmetric_difference_update"
-                        | "issubset"
-                        | "issuperset"
-                        | "isdisjoint"
-                        | "fromkeys"
-                )
-                .then_some(true)
+                builtin_method_via_call(b.name).then_some(true)
             }
             None => (!b.binds_instance && builtin_fn_lane_ok(b.name)).then_some(true),
         }
@@ -23304,7 +23286,7 @@ impl Interpreter {
                             if !b.binds_instance
                                 || bm.redispatch_descriptor
                                 || mon_call
-                                || !native_call_ic_safe(b.name)
+                                || !(native_call_ic_safe(b.name) || builtin_method_via_call(b.name))
                             {
                                 return None;
                             }
@@ -64038,6 +64020,31 @@ pub(crate) fn native_call_ic_safe(name: &str) -> bool {
         && name != "__getitem__"
         && name != "super"
         && !builtin_needs_interp(name)
+}
+
+/// Builtin type methods the interpreter dispatches by name (their bodies
+/// iterate or compare through it): the core loop calls one on its exact
+/// builtin receiver through [`Interpreter::call`] (see
+/// `Interpreter::builtin_lane`).
+fn builtin_method_via_call(name: &str) -> bool {
+    matches!(
+        name,
+        "update"
+            | "extend"
+            | "sort"
+            | "join"
+            | "union"
+            | "intersection"
+            | "difference"
+            | "symmetric_difference"
+            | "intersection_update"
+            | "difference_update"
+            | "symmetric_difference_update"
+            | "issubset"
+            | "issuperset"
+            | "isdisjoint"
+            | "fromkeys"
+    )
 }
 
 /// Builtin functions the core loop may call in place (see

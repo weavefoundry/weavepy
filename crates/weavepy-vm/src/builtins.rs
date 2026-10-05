@@ -5548,7 +5548,9 @@ fn parse_int_string(
         };
 
     let cleaned: String = digits.chars().filter(|c| *c != '_').collect();
-    if cleaned.is_empty() {
+    // (The radix parsers below take a sign of their own: `int('--1')` must
+    // not read as `-(-1)`.)
+    if cleaned.is_empty() || cleaned.starts_with(['+', '-']) {
         return Err(invalid());
     }
 
