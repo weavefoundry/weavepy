@@ -701,6 +701,9 @@ pub fn current_thread_holds_gil() -> bool {
 /// Py_END_ALLOW_THREADS`. The C-API macros' expansion
 /// (`PyEval_SaveThread()` / `PyEval_RestoreThread()`) lands here.
 pub fn allow_threads_then<R>(f: impl FnOnce() -> R) -> R {
+    // Other threads may look at this one's frames while it blocks: lean
+    // activations waiting for their shells get them first.
+    crate::builtins::sync_frame_spine();
     // Pop every guard we currently hold (a worker calls
     // `start_new_thread` -> builtin -> `allow_threads_then` with
     // exactly one guard; nested cases pop them all).
@@ -943,6 +946,9 @@ fn maybe_yield_gil() {
     if !switch_interval_elapsed() || !waiter_interval_elapsed() {
         return;
     }
+    // The next holder may look at this thread's frames (see
+    // `allow_threads_then`).
+    crate::builtins::sync_frame_spine();
     let popped: Vec<GilGuard> =
         GIL_GUARD_STACK.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
     if popped.is_empty() {

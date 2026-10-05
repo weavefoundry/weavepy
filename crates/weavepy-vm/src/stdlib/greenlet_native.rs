@@ -826,6 +826,9 @@ fn check_thread_affinity(target: &GreenletBody) -> Result<(), RuntimeError> {
 
 /// `g.switch(*args, **kwargs)`.
 fn green_switch(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    // The switch swaps the thread's frame stack: lean activations waiting
+    // for their shells must have them on this greenlet's stack first.
+    crate::builtins::sync_frame_spine();
     let inst = extract_self(args)?;
     ensure_main();
     let target = body_of(&inst)?;
@@ -899,6 +902,9 @@ fn throw_exception(args: &[Object]) -> Result<RuntimeError, RuntimeError> {
 
 /// `g.throw(typ=GreenletExit, val=None, tb=None)`.
 fn green_throw(args: &[Object]) -> Result<Object, RuntimeError> {
+    // The switch swaps the thread's frame stack: lean activations waiting
+    // for their shells must have them on this greenlet's stack first.
+    crate::builtins::sync_frame_spine();
     let inst = extract_self(args)?;
     ensure_main();
     let target = body_of(&inst)?;

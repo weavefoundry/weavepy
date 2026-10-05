@@ -90,6 +90,7 @@ def main():
     ap.add_argument("--procs", type=int, default=3)
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--filter", action="append")
+    ap.add_argument("--exclude", action="append")
     ap.add_argument("--json")
     ap.add_argument("--instructions", action="store_true")
     ap.add_argument("--timeout", type=int, default=600)
@@ -101,6 +102,8 @@ def main():
     names = discover()
     if args.filter:
         names = [n for n in names if any(f in n for f in args.filter)]
+    if args.exclude:
+        names = [n for n in names if not any(f in n for f in args.exclude)]
 
     rows = []
     for name in names:
@@ -112,8 +115,13 @@ def main():
             rows.append(row)
             c, w = row["cpython"], row["weavepy"]
             ratio = w / c if c and w else float("nan")
-            print("%-22s cpython %14s  weavepy %14s  ratio %6.2f" % (
-                name, "%.0f" % c if c else "-", "%.0f" % w if w else "-", ratio), flush=True)
+            row["ratio"] = ratio
+            extra = ""
+            if args.base and row.get("base") and w:
+                row["vs_base"] = w / row["base"]
+                extra = "  vs base %5.2f" % row["vs_base"]
+            print("%-22s cpython %14s  weavepy %14s  ratio %6.2f%s" % (
+                name, "%.0f" % c if c else "-", "%.0f" % w if w else "-", ratio, extra), flush=True)
             continue
         samples = {label: [] for label, _ in interps}
         for p in range(args.procs):
@@ -156,7 +164,13 @@ def main():
         else:
             print("%-22s %s %s" % (name, row["status"], wp.get("result", "") if row["status"] == "MISMATCH" else ""), flush=True)
 
-    if not args.instructions:
+    if args.instructions:
+        ok = [r for r in rows if r.get("ratio") == r.get("ratio") and r.get("ratio")]
+        print()
+        print("geomean over %d benchmarks: instructions %.3f%s" % (
+            len(ok), geomean(r["ratio"] for r in ok),
+            "  vs base %.3f" % geomean(r["vs_base"] for r in ok if "vs_base" in r) if args.base else ""))
+    else:
         ok = [r for r in rows if r.get("status") == "ok"]
         print()
         print("geomean over %d benchmarks: warm %.3f  cold %.3f  rss %.3f%s" % (

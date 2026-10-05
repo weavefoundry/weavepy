@@ -10275,14 +10275,26 @@ impl Interpreter {
         };
         let cls = inst.cls_raw();
         let ver = cls.attr_version.get();
-        let Some(Object::Function(f)) = cls.lookup(name) else {
-            return CoreAttr::Decline;
+        let ms = code_method_slot(&frame.code, pc as u32);
+        let method = match cls.lookup(name) {
+            Some(Object::Function(f)) => {
+                if let Some(ms) = ms {
+                    ms.set(ver, &f);
+                }
+                Object::Function(f)
+            }
+            // A native class's method (a lock's `__enter__`): bound by the
+            // call, as CPython's method descriptor is.
+            Some(Object::Builtin(b)) if b.binds_instance && native_call_ic_safe(b.name) => {
+                if let Some(ms) = ms {
+                    ms.set_inst_builtin(ver, &b);
+                }
+                Object::Builtin(b)
+            }
+            _ => return CoreAttr::Decline,
         };
-        if let Some(ms) = code_method_slot(&frame.code, pc as u32) {
-            ms.set(ver, &f);
-        }
         let owner = frame.stack.pop().expect("checked above");
-        frame.stack.push(Object::Function(f));
+        frame.stack.push(method);
         frame.stack.push(owner);
         CoreAttr::Done
     }
@@ -12708,17 +12720,19 @@ impl Interpreter {
                             break Some(CoreExit::Helper);
                         };
                         let ver = inst.cls_raw().attr_version.get();
-                        let Some(f) = mslots!(cold_mslots, ext)
-                            .get(pc)
-                            .and_then(|ms| ms.get_held(ver))
-                        else {
+                        let ms = mslots!(cold_mslots, ext).get(pc);
+                        let Some(method) = ms.and_then(|ms| {
+                            ms.get_held(ver)
+                                .map(Object::Function)
+                                .or_else(|| ms.get_inst_builtin(ver).map(Object::Builtin))
+                        }) else {
                             break Some(CoreExit::Helper);
                         };
                         // SAFETY: `len < cap`; the instance moves up into
                         // the self slot.
                         unsafe {
                             let recv = top.read();
-                            top.write(Object::Function(f));
+                            top.write(method);
                             base.add(len).write(recv);
                         }
                         len += 1;
@@ -13115,11 +13129,18 @@ impl Interpreter {
         }
         match recv {
             Some(recv) => {
-                if !b.binds_instance || builtins::method_memo_tag(recv).is_none() {
+                if !b.binds_instance {
                     return None;
                 }
+                // Calling a method body on any receiver is what the full
+                // handler's dispatch does for these names.
                 if native_call_ic_safe(b.name) {
                     return Some(false);
+                }
+                // The names below are dispatched by the interpreter, which
+                // knows them on the builtin kinds' receivers.
+                if builtins::method_memo_tag(recv).is_none() {
+                    return None;
                 }
                 matches!(
                     b.name,
@@ -13182,7 +13203,9 @@ impl Interpreter {
         };
         let ok = argc < MAX_ARGS
             && match receiver {
-                Some(recv) => b.binds_instance && builtins::method_memo_tag(recv).is_some(),
+                Some(recv) => {
+                    b.binds_instance && (!via_call || builtins::method_memo_tag(recv).is_some())
+                }
                 None => !b.binds_instance,
             };
         if !ok {
