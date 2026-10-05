@@ -1171,6 +1171,10 @@ impl JitState {
                     {
                         return None;
                     }
+                    // Hot code keeps its inline-cache tables from here on,
+                    // whatever the verdict (the compiled form's interpreter
+                    // round trips and every later deopt use them).
+                    super::mark_site_tables_warm(code);
                     // RFC 0073 WS1 — a probe-miss rejection is
                     // *environmental* (a receiver local was unbound in
                     // the activation that triggered the compile), so
