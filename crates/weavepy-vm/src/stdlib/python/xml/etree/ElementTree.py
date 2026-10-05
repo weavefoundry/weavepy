@@ -2118,3 +2118,16 @@ except ImportError:
     pass
 else:
     _set_factories(Comment, ProcessingInstruction)
+
+# WeavePy: without the C accelerator, give the hot paths of the Python
+# classes above native bodies (they fall back to this module's code for
+# anything unusual). An import that blocks `_elementtree` asks for the
+# pure-Python implementation, and gets it unchanged.
+if Element is _Element_Py and sys.modules.get("_elementtree", Element) is not None:
+    try:
+        from _weave_elementtree import install as _install_native
+    except ImportError:
+        pass
+    else:
+        _install_native(globals())
+        del _install_native

@@ -209,12 +209,19 @@ unsafe fn cstr(p: *const c_char) -> String {
     String::from_utf8_lossy(std::ffi::CStr::from_ptr(p).to_bytes()).into_owned()
 }
 
+/// A `str` of expat's UTF-8 output, copied once.
+fn utf8_obj(bytes: &[u8]) -> Object {
+    Object::Str(crate::shared_value::SharedStr::from(
+        &*String::from_utf8_lossy(bytes),
+    ))
+}
+
 /// NULL-tolerant conversion: `None` for NULL (CPython `STRING_CONV_FUNC`).
 unsafe fn conv_opt(p: *const c_char) -> Object {
     if p.is_null() {
         Object::None
     } else {
-        Object::from_str(cstr(p))
+        utf8_obj(std::ffi::CStr::from_ptr(p).to_bytes())
     }
 }
 
@@ -222,8 +229,7 @@ unsafe fn conv_len(s: *const c_char, len: c_int) -> Object {
     if s.is_null() {
         return Object::None;
     }
-    let bytes = std::slice::from_raw_parts(s.cast::<u8>(), len as usize);
-    Object::from_str(String::from_utf8_lossy(bytes).into_owned())
+    utf8_obj(std::slice::from_raw_parts(s.cast::<u8>(), len as usize))
 }
 
 /// `string_intern` (pyexpat.c): return the canonical `str` for `p` out of the
@@ -232,18 +238,18 @@ unsafe fn intern_cstr(st: &StateRef, p: *const c_char) -> Object {
     if p.is_null() {
         return Object::None;
     }
-    let s = cstr(p);
+    let bytes = std::ffi::CStr::from_ptr(p).to_bytes();
     let dict = st.borrow().intern.clone();
     if let Object::Dict(dd) = &dict {
-        let key = DictKey(Object::from_str(s));
-        if let Some(existing) = dd.borrow().get(&key).cloned() {
+        let text = String::from_utf8_lossy(bytes);
+        if let Some(existing) = dd.borrow().get(&crate::object::StrKey(&text)).cloned() {
             return existing;
         }
-        let obj = key.0.clone();
-        dd.borrow_mut().insert(key, obj.clone());
+        let obj = Object::Str(crate::shared_value::SharedStr::from(&*text));
+        dd.borrow_mut().insert(DictKey(obj.clone()), obj.clone());
         return obj;
     }
-    key_fallback(s)
+    key_fallback(cstr(p))
 }
 
 fn key_fallback(s: String) -> Object {
@@ -272,7 +278,11 @@ fn dispatch(st: &StateRef, slot: usize, args: Vec<Object>) -> Option<Object> {
         return None;
     };
     st.borrow_mut().in_callback += 1;
-    let result = call(ip, &handler, &args);
+    // `xml.etree`'s native handlers run directly.
+    let result = match crate::stdlib::elementtree_native::expat_dispatch(&handler, &args) {
+        Some(r) => r,
+        None => call(ip, &handler, &args),
+    };
     st.borrow_mut().in_callback -= 1;
     match result {
         Ok(v) => Some(v),
@@ -314,7 +324,7 @@ fn flush_chardata(st: &StateRef) -> bool {
     if matches!(handler, Object::None) {
         return true;
     }
-    let text = Object::from_str(String::from_utf8_lossy(&bytes).into_owned());
+    let text = utf8_obj(&bytes);
     dispatch(st, H_CHARACTER_DATA, vec![text]);
     st.borrow().pending_exc.is_none()
 }
@@ -407,7 +417,7 @@ unsafe extern "C" fn tr_character_data(ud: *mut c_void, s: *const c_char, len: c
         (buffering, fits, oversize)
     };
     if !buffering {
-        let text = Object::from_str(String::from_utf8_lossy(data).into_owned());
+        let text = utf8_obj(data);
         dispatch(&st, H_CHARACTER_DATA, vec![text]);
         return;
     }
@@ -422,7 +432,7 @@ unsafe extern "C" fn tr_character_data(ud: *mut c_void, s: *const c_char, len: c
         }
     }
     if oversize {
-        let text = Object::from_str(String::from_utf8_lossy(data).into_owned());
+        let text = utf8_obj(data);
         dispatch(&st, H_CHARACTER_DATA, vec![text]);
     } else {
         st.borrow_mut().buffer.extend_from_slice(data);
