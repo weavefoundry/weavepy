@@ -7781,6 +7781,9 @@ impl Interpreter {
                 // the spine.
                 if burst_stats::enabled() {
                     burst_stats::note_slow(op_before);
+                    if let Some(op) = op_before {
+                        burst_stats::note_slow_site(frame, cur_pc, op);
+                    }
                     if matches!(op_before, Some(OpCode::LoadAttr | OpCode::LoadMethodAttr)) {
                         let arg = frame.code.instructions[cur_pc].arg;
                         let recv = frame.stack.last().map_or("?", |o| o.type_name());
@@ -11556,6 +11559,35 @@ impl Interpreter {
                                 pc += 1;
                                 continue;
                             }
+                            // `tuple + tuple` and `list + list`, out of line
+                            // (a list's `+=` extends it in place: the full
+                            // handler's).
+                            (Object::Tuple(_), Object::Tuple(_))
+                            | (Object::List(_), Object::List(_))
+                                if kind == BinOpKind::Add
+                                    && (matches!(a, Object::Tuple(_))
+                                        || ins.arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG
+                                            == 0) =>
+                            {
+                                if !Self::core_droppable(a) || !Self::core_droppable(b) {
+                                    break None;
+                                }
+                                let Some(r) = Self::core_seq_concat(a, b) else {
+                                    break None;
+                                };
+                                // SAFETY: both operand slots are initialized and
+                                // leave the stack; the result takes the first.
+                                unsafe {
+                                    drop_hot(base.add(len - 1).read());
+                                    drop_hot(base.add(len - 2).read());
+                                }
+                                len -= 1;
+                                unsafe { base.add(len - 1).write(r) };
+                                last = pc;
+                                pc += 1;
+                                after_release!();
+                                continue;
+                            }
                             _ => break None,
                         };
                         // SAFETY: both operands are scalars (no drop owed).
@@ -12007,11 +12039,21 @@ impl Interpreter {
                                 }
                             }
                             crate::object::PyIterator::Tuple { items, index } => {
-                                let Some(v) = items.get(*index).cloned() else {
-                                    break None;
-                                };
-                                *index += 1;
-                                v
+                                match items.get(*index) {
+                                    Some(v) => {
+                                        let v = v.clone();
+                                        *index += 1;
+                                        v
+                                    }
+                                    // (Its release may free the tuple: a
+                                    // finalizer it queues runs before the
+                                    // next instruction, below.)
+                                    None if unique => {
+                                        retire = true;
+                                        Object::None
+                                    }
+                                    None => break None,
+                                }
                             }
                             crate::object::PyIterator::Bytes { data, index } => {
                                 let Some(&b) = data.get(*index) else {
@@ -12223,6 +12265,7 @@ impl Interpreter {
                                     pc += 1;
                                 }
                             }
+                            after_release!();
                             continue;
                         }
                         // SAFETY: `len < cap`.
@@ -12591,7 +12634,7 @@ impl Interpreter {
                             frame.pc = pc as u32;
                             *last_pc = last;
                             let switched = if python == 1 {
-                                self.core_call(sw, pc)
+                                self.core_call(sw, pc) || self.core_gen_call(sw, pc)
                             } else {
                                 self.core_new(sw, pc, snap_gen)
                             };
@@ -14655,6 +14698,40 @@ impl Interpreter {
         })
     }
 
+    /// `a + b` for two exact tuples or two exact lists (the full handler's
+    /// concatenation), or `None` for it: a list is tracked like
+    /// `BUILD_LIST`'s, so one whose allocation would start a collection is
+    /// left to the full handler.
+    #[inline(never)]
+    fn core_seq_concat(a: &Object, b: &Object) -> Option<Object> {
+        match (a, b) {
+            (Object::Tuple(x), Object::Tuple(y)) => {
+                if y.is_empty() {
+                    return Some(a.clone());
+                }
+                if x.is_empty() {
+                    return Some(b.clone());
+                }
+                Some(Object::new_tuple(
+                    x.iter().chain(y.iter()).cloned().collect(),
+                ))
+            }
+            (Object::List(x), Object::List(y)) => {
+                if crate::stdlib::tracemalloc_real::is_tracking() || gc_trace::auto_collect_due() {
+                    return None;
+                }
+                let (x, y) = (x.try_borrow().ok()?, y.try_borrow().ok()?);
+                let mut items = Vec::with_capacity(x.len() + y.len());
+                items.extend(x.iter().cloned());
+                items.extend(y.iter().cloned());
+                let obj = Object::new_list(items);
+                gc_trace::track(&obj);
+                Some(obj)
+            }
+            _ => None,
+        }
+    }
+
     /// The core loop's container instructions: `seq[i]` and `d[key]` over
     /// exact containers (an in-range index or a present `str`/`int` key),
     /// `seq[i] = v` in range and `d[key] = v`, and a comprehension's
@@ -14716,6 +14793,17 @@ impl Interpreter {
                         let probe = crate::object::LeafProbe::new(k)?;
                         let d = d.try_borrow().ok()?;
                         clone_hot(d.get(&probe)?)
+                    }
+                    // A non-ASCII string's code point (the ASCII case is the
+                    // core loop's own arm).
+                    (Object::Str(s), Object::Int(i)) => {
+                        let i = if *i < 0 {
+                            i.checked_add(i64::try_from(crate::object::str_char_len(s)).ok()?)?
+                        } else {
+                            *i
+                        };
+                        let c = crate::object::str_char_at(s, usize::try_from(i).ok()?)?;
+                        Object::from_char(c)
                     }
                     (Object::Dict(d), Object::Instance(_)) if Self::core_droppable(k) => {
                         let probe = crate::object::LeafProbe::new(k)?;
@@ -43512,18 +43600,15 @@ impl Interpreter {
             (Object::Str(s), Object::Int(i)) => {
                 // A pure-ASCII string (code-point count == byte count, both
                 // cached) is byte-indexable in O(1) — the tokeniser hot path.
-                // Otherwise walk to the indexed code point; only negative
-                // indices need the (cached) length.
-                let blen = s.len();
-                let clen = crate::object::str_char_len(s);
-                let ch = if clen == blen {
-                    let idx = normalize_index_msg(*i, clen, "string index out of range")?;
-                    Some(s.as_bytes()[idx] as char)
-                } else if *i >= 0 {
-                    s.chars().nth(*i as usize)
+                // Otherwise a cursor walks to the indexed code point (see
+                // `str_char_at`); only negative indices need the (cached)
+                // length.
+                let ch = if *i >= 0 {
+                    crate::object::str_char_at(s, *i as usize)
                 } else {
+                    let clen = crate::object::str_char_len(s);
                     let idx = normalize_index_msg(*i, clen, "string index out of range")?;
-                    s.chars().nth(idx)
+                    crate::object::str_char_at(s, idx)
                 };
                 match ch {
                     Some(c) => Ok(Object::from_char(c)),
@@ -50455,8 +50540,7 @@ impl Interpreter {
     /// `iter(obj)` for an instance whose class's `__iter__` is a plain
     /// generator function of `self` alone: the generator, made without
     /// the call machinery (`make_iter`'s instance arm). `None` when
-    /// anything else applies, or a young collection is due (the general
-    /// path runs it).
+    /// anything else applies.
     fn instance_gen_iter(&self, v: &Object) -> Option<Object> {
         let Object::Instance(inst) = v else {
             return None;
@@ -50465,27 +50549,115 @@ impl Interpreter {
             return None;
         };
         let code = f.code();
-        if !code.is_generator
-            || code.arg_count != 1
+        if !code.is_generator {
+            return None;
+        }
+        self.start_generator_fast(&f, &code, vec![v.clone()])
+    }
+
+    /// The generator-family object a call of `f` (its code `code`) with
+    /// the positional arguments `positional` makes, without the call
+    /// machinery (`call_python_owned`'s bootstrap): for positional
+    /// parameters only, missing ones filled from unchanged defaults, and a
+    /// body whose prologue is only cell setup (prebuilt by the frame).
+    /// `None` when anything else applies (an argument error, an observer,
+    /// coroutine origin tracking, or a young collection being due), with
+    /// the general path to run.
+    fn start_generator_fast(
+        &self,
+        f: &PyFunction,
+        code: &Rc<CodeObject>,
+        mut positional: Vec<Object>,
+    ) -> Option<Object> {
+        let nargs = code.arg_count as usize;
+        if !(code.is_generator || code.is_coroutine || code.is_async_generator)
             || code.kwonly_count != 0
             || code.has_varargs
             || code.has_varkeywords
-            || code.instructions.first().map(|i| i.op) != Some(OpCode::ReturnGenerator)
+            || positional.len() > nargs
+            || (code.is_coroutine && crate::stdlib::sys::coroutine_origin_tracking_depth() > 0)
             || crate::trace::eval_frame_record_active()
             || crate::trace::any_observers_active()
             || gc_trace::auto_collect_due()
         {
             return None;
         }
+        let missing = nargs - positional.len();
+        if missing > 0 {
+            if missing > f.defaults.len() || f.defaults_maybe_overridden() {
+                return None;
+            }
+            positional.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
+        }
+        let start = code
+            .instructions
+            .iter()
+            .position(|i| !matches!(i.op, OpCode::MakeCell | OpCode::CopyFreeVars))?;
+        if code.instructions[start].op != OpCode::ReturnGenerator {
+            return None;
+        }
         let mut frame = self.make_frame(
             code.clone(),
-            vec![v.clone()],
+            positional,
             f.closure.clone(),
             f.globals.clone(),
             Some(f.builtins.clone()),
         );
-        frame.pc = 1;
-        Some(Self::wrap_started_generator(&f, &code, frame))
+        frame.pc = start as u32 + 1;
+        Some(Self::wrap_started_generator(f, code, frame))
+    }
+
+    /// The core loop's `CALL` at `pc` of a generator function (a plain
+    /// function, or a method over one), in `sw`'s synced running
+    /// activation: the generator, made in place (see
+    /// [`Self::start_generator_fast`]). `false` touches nothing.
+    #[inline(never)]
+    fn core_gen_call(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let Some(ins) = frame.code.instructions.get(pc) else {
+            return false;
+        };
+        let argc = ins.arg as usize;
+        let Some(callee_at) = frame.stack.len().checked_sub(argc + 2) else {
+            return false;
+        };
+        let (f, receiver) = match (&frame.stack[callee_at], &frame.stack[callee_at + 1]) {
+            (Object::Function(f), Object::Unbound) => (f, None),
+            (Object::Function(f), recv) => (f, Some(recv)),
+            (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
+                match &bm.function {
+                    Object::Function(f) => (f, Some(&bm.receiver)),
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        };
+        let code = f.code();
+        if !(code.is_generator || code.is_coroutine || code.is_async_generator) {
+            return false;
+        }
+        let mut positional = Vec::with_capacity(code.varnames.len().max(argc + 1));
+        positional.extend(receiver.cloned());
+        positional.extend(frame.stack[callee_at + 2..].iter().cloned());
+        let Some(gen) = self.start_generator_fast(f, &code, positional) else {
+            return false;
+        };
+        // The operands leave the stack; one that dies queues its finalizer,
+        // which runs before the next instruction.
+        for o in frame.stack.drain(callee_at..).collect::<Vec<_>>() {
+            self.release(o);
+        }
+        frame.stack.push(gen);
+        frame.pc = pc as u32 + 1;
+        // SAFETY: the running activation's last-pc slot.
+        unsafe { *sw.last = pc };
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        if unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
+        true
     }
 
     /// Bootstrap a generator/coroutine *code object* frame that was not
@@ -57770,26 +57942,6 @@ fn apply_slice_deletion(data: &mut Vec<Object>, s: &PySlice) -> Result<Vec<Objec
     Ok(removed)
 }
 
-/// Byte offsets of code points `start` and `stop` in a UTF-8 `str`, walking
-/// at most to `stop` (or the end). A `start`/`stop` past the end maps to
-/// `s.len()`, so an out-of-range slice naturally yields an empty span.
-fn str_byte_span(s: &str, start: usize, stop: Option<usize>) -> (usize, usize) {
-    let mut bstart = s.len();
-    let mut bstop = s.len();
-    for (cp_idx, (byte_idx, _)) in s.char_indices().enumerate() {
-        if cp_idx == start {
-            bstart = byte_idx;
-        }
-        if let Some(st) = stop {
-            if cp_idx == st {
-                bstop = byte_idx;
-                break;
-            }
-        }
-    }
-    (bstart, bstop)
-}
-
 /// `str` slicing without materialising the whole string as a `Vec<char>`.
 ///
 /// The overwhelmingly common case in scanners (`s[end:end + 1]`,
@@ -57829,7 +57981,18 @@ pub(crate) fn str_subscript_slice(s: &SharedStr, slc: &PySlice) -> Result<Object
             let (bstart, bstop) = if ascii {
                 (start.min(blen), stop.unwrap_or(blen).min(blen))
             } else {
-                str_byte_span(s, start, stop)
+                // Through the per-thread cursor (see `str_byte_offset`).
+                let count = crate::object::str_char_len(s);
+                let (start, stop) = (start.min(count), stop.unwrap_or(count).min(count));
+                let bstart = crate::object::str_byte_offset(s, start).unwrap_or(blen);
+                if stop <= start {
+                    (bstart, bstart)
+                } else {
+                    (
+                        bstart,
+                        crate::object::str_byte_offset(s, stop).unwrap_or(blen),
+                    )
+                }
             };
             if bstart >= bstop {
                 return Ok(Object::from_static(""));
@@ -59540,6 +59703,39 @@ mod burst_stats {
             .or_insert(0) += 1;
     }
 
+    static SLOW_SITES: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+        std::sync::Mutex::new(None);
+
+    /// A slow step's site: the code, pc and opcode, and the operand that
+    /// decides the step's shape (a call's callee, otherwise the top of
+    /// the stack).
+    pub(crate) fn note_slow_site(frame: &crate::Frame, pc: usize, op: weavepy_compiler::OpCode) {
+        use crate::Object;
+        let arg = frame.code.instructions.get(pc).map_or(0, |i| i.arg) as usize;
+        let n = frame.stack.len();
+        let what = match op {
+            weavepy_compiler::OpCode::Call => match n.checked_sub(arg + 2).map(|i| &frame.stack[i])
+            {
+                Some(Object::Function(f)) => format!("function {}", f.code().qualname),
+                Some(Object::Builtin(b)) => format!("builtin {}", b.name),
+                Some(Object::BoundMethod(bm)) => match &bm.function {
+                    Object::Function(f) => format!("method {}", f.code().qualname),
+                    Object::Builtin(b) => format!("builtin method {}", b.name),
+                    other => format!("bound {}", other.type_name()),
+                },
+                Some(Object::Type(t)) => format!("class {}", t.name),
+                Some(o) => o.type_name().to_owned(),
+                None => "-".to_owned(),
+            },
+            _ => frame.stack.last().map_or("-", |o| o.type_name()).to_owned(),
+        };
+        let key = format!("{}@{pc} {} [{what}]", frame.code.qualname, op.name());
+        let mut a = SLOW_SITES.lock().unwrap();
+        *a.get_or_insert_with(Default::default)
+            .entry(key)
+            .or_insert(0) += 1;
+    }
+
     /// An instruction the core loop ran out of line (`leaf_core_helper`).
     pub(crate) fn note_helper(op: weavepy_compiler::OpCode) {
         HELPER[op as u8 as usize].fetch_add(1, Ordering::Relaxed);
@@ -59604,6 +59800,18 @@ mod burst_stats {
         sites.sort_by_key(|a| std::cmp::Reverse(a.1));
         for (k, c) in sites.iter().take(40) {
             let _ = writeln!(out, "  site {k}: {c}");
+        }
+        let mut sites: Vec<(String, u64)> = SLOW_SITES
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|(k, c)| (k.clone(), *c))
+            .collect();
+        sites.sort_by_key(|a| std::cmp::Reverse(a.1));
+        out.push_str("\n## Slow-step sites\n\n");
+        for (k, c) in sites.iter().take(40) {
+            let _ = writeln!(out, "  slow {k}: {c}");
         }
         let mut attrs = ATTRS.lock().unwrap().clone();
         attrs.sort_by_key(|a| std::cmp::Reverse(a.1));
@@ -61516,11 +61724,19 @@ fn resolve_field_name(
             ))
         })?
     } else if let Ok(idx) = base.parse::<usize>() {
+        // An index that overflows Py_ssize_t is a malformed format string
+        // (ValueError), not a lookup miss (test_format_huge_item_number).
+        if idx > isize::MAX as usize {
+            return Err(value_error("Too many decimal digits in format string"));
+        }
         positional.get(idx).cloned().ok_or_else(|| {
             index_error(format!(
                 "Replacement index {idx} out of range for positional args tuple"
             ))
         })?
+    } else if base.as_bytes().iter().all(u8::is_ascii_digit) {
+        // Past even the machine word: still the "too many digits" error.
+        return Err(value_error("Too many decimal digits in format string"));
     } else if let Some(map) = mapping {
         let key = DictKey(Object::from_str(base));
         map.borrow()

@@ -203,6 +203,11 @@ where
     }
 }
 impl<T: ?Sized + ThinPayload> ThinWeak<T> {
+    /// The payload's address, as [`ThinArc::addr`] reports it for a strong
+    /// owner of the same allocation.
+    pub fn addr(&self) -> usize {
+        self.0.as_ptr().cast::<u8>() as usize
+    }
     pub fn upgrade(&self) -> Option<ThinArc<T>> {
         self.0.upgrade().map(ThinArc::from_arc)
     }
@@ -541,6 +546,11 @@ pub struct SharedStr(ThinArc<StrStorage>);
 #[derive(Debug)]
 pub struct WeakStr(ThinWeak<StrStorage>);
 impl SharedStr {
+    /// The allocation's address: equal for every strong and weak owner of
+    /// the same string, and never reused while one exists.
+    pub fn addr(this: &Self) -> usize {
+        this.0.data.as_ptr() as usize
+    }
     pub fn as_ptr(this: &Self) -> *const str {
         ptr::from_ref(&**this)
     }
@@ -860,6 +870,10 @@ impl fmt::Display for SharedStr {
     }
 }
 impl WeakStr {
+    /// The string's allocation address (see [`SharedStr::addr`]).
+    pub fn addr(&self) -> usize {
+        self.0.addr()
+    }
     pub fn upgrade(&self) -> Option<SharedStr> {
         self.0.upgrade().map(SharedStr)
     }

@@ -1228,8 +1228,9 @@ pub(crate) fn itertools_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
 }
 
 /// A builtin adapter type's call (`map`, `filter`, `zip`, `enumerate`,
-/// `reversed`), or `type(x)`, built without running any code (the core
-/// loop's `CALL`): `None` for every shape that might.
+/// `reversed`), `type(x)`, a literal's `int(text)`/`float(text)`, or an
+/// empty container, built without running any code (the core loop's
+/// `CALL`): `None` for every shape that might.
 pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option<Object> {
     if let Some(ty) = SeqType::of_exact(cls) {
         return Interpreter::seq_new_pure(ty, args);
@@ -1241,6 +1242,27 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
             [x] => Some(Object::Type(crate::builtins::class_of(x))),
             _ => None,
         };
+    }
+    // `set()`, `dict()`, `list()`, `tuple()`: an empty one (a container
+    // tracked like the builtins' own, unless that would start a collection).
+    if args.is_empty() {
+        if Rc::ptr_eq(cls, &bt.tuple_) {
+            return Some(Object::new_tuple(Vec::new()));
+        }
+        let obj = if Rc::ptr_eq(cls, &bt.set_) {
+            Object::new_set()
+        } else if Rc::ptr_eq(cls, &bt.dict_) {
+            Object::new_dict()
+        } else if Rc::ptr_eq(cls, &bt.list_) {
+            Object::new_list(Vec::new())
+        } else {
+            return None;
+        };
+        if crate::stdlib::tracemalloc_real::is_tracking() || crate::gc_trace::auto_collect_due() {
+            return None;
+        }
+        crate::gc_trace::track(&obj);
+        return Some(obj);
     }
     // `int(text)` and `float(text)` of a plain ASCII literal (an optional
     // sign and digits; for a float, also a point and an exponent). Any

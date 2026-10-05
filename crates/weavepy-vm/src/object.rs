@@ -51,6 +51,82 @@ pub(crate) fn str_char_len(s: &SharedStr) -> usize {
     SharedStr::char_count(s)
 }
 
+/// `s[index]` (a code-point index) as a `char`, `None` past the end (see
+/// [`str_byte_offset`]).
+pub(crate) fn str_char_at(s: &SharedStr, index: usize) -> Option<char> {
+    let bytes = s.as_bytes();
+    if SharedStr::char_count(s) == bytes.len() {
+        return bytes.get(index).map(|&b| b as char);
+    }
+    s.get(str_byte_offset(s, index)?..)?.chars().next()
+}
+
+/// The byte offset of code point `index` of `s` (`s.len()` for the
+/// index just past the end), `None` beyond that. A pure-ASCII string's
+/// offsets are its indices; any other walks its UTF-8 from a per-thread
+/// cursor, the code point and byte offset of this thread's last lookup
+/// in the same string, so a scanner stepping through non-ASCII text
+/// (`src[pos]`, `src[start:pos]`, `pos += 1`) pays O(1) per step rather
+/// than O(pos). The cursor holds a weak reference to its string, which
+/// keeps the allocation (and so its address) from being reused while the
+/// cursor names it.
+pub(crate) fn str_byte_offset(s: &SharedStr, index: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let count = SharedStr::char_count(s);
+    if count == bytes.len() || index == 0 {
+        return (index <= bytes.len()).then_some(index);
+    }
+    if index >= count {
+        return (index == count).then_some(bytes.len());
+    }
+    thread_local! {
+        static CURSOR: std::cell::RefCell<Option<(crate::shared_value::WeakStr, usize, usize)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    CURSOR.with(|cell| {
+        let mut cursor = cell.borrow_mut();
+        let known = cursor
+            .as_ref()
+            .filter(|(w, ..)| w.addr() == SharedStr::addr(s))
+            .map(|&(_, ci, bo)| (ci, bo));
+        let (mut ci, mut bo) = match known {
+            Some((ci, bo)) if index >= ci || index >= ci / 2 => (ci, bo),
+            _ => (0, 0),
+        };
+        // Walk back from the cursor over continuation bytes, or forward.
+        while ci > index {
+            bo -= 1;
+            while bytes[bo] & 0xC0 == 0x80 {
+                bo -= 1;
+            }
+            ci -= 1;
+        }
+        while ci < index {
+            bo += utf8_width(bytes[bo]);
+            ci += 1;
+        }
+        match cursor.as_mut() {
+            Some((w, c0, b0)) if w.addr() == SharedStr::addr(s) => {
+                *c0 = ci;
+                *b0 = bo;
+            }
+            _ => *cursor = Some((SharedStr::downgrade(s), ci, bo)),
+        }
+        Some(bo)
+    })
+}
+
+/// The byte length of the UTF-8 sequence that `lead` starts.
+#[inline]
+fn utf8_width(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    }
+}
+
 /// A Python value as seen by the interpreter.
 ///
 /// `repr(u8)` fixes the layout native code relies on (see `frame_jit`):
