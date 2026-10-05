@@ -50,6 +50,44 @@ pub(crate) fn refcounts_biased() -> bool {
     }
 }
 
+/// Add a strong owner through the strong-count word `word` (see
+/// [`crate::object::Object`]'s `Clone`).
+///
+/// # Safety
+///
+/// `word` is the strong count of a live `Arc` allocation the caller owns
+/// a reference to.
+#[inline(always)]
+pub(crate) unsafe fn increment_word(word: *const AtomicUsize) {
+    // SAFETY: per the caller.
+    let word = unsafe { &*word };
+    if refcounts_biased() {
+        word.store(word.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    } else {
+        word.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// [`try_release_shared`] through the strong-count word `word`.
+///
+/// # Safety
+///
+/// As [`increment_word`]; on `true` the caller's reference is released.
+#[inline(always)]
+pub(crate) unsafe fn try_release_word(word: *const AtomicUsize) -> bool {
+    if !refcounts_biased() {
+        return false;
+    }
+    // SAFETY: per the caller.
+    let word = unsafe { &*word };
+    let n = word.load(Ordering::Relaxed);
+    if n == 1 {
+        return false;
+    }
+    word.store(n - 1, Ordering::Relaxed);
+    true
+}
+
 /// Revoke the single-thread bias before starting a thread that may touch VM
 /// objects before it acquires the GIL. The caller's later updates observe
 /// the revocation in program order, and the new thread observes it through

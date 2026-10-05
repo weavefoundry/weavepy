@@ -153,7 +153,8 @@ fn utf8_width(lead: u8) -> usize {
 /// `repr(u8)` fixes the layout native code relies on (see `frame_jit`):
 /// the variant's index in a tag byte at offset 0, and each payload at its
 /// natural alignment after it (every payload is one word or smaller).
-#[derive(Clone)]
+/// Every variant but the scalars holds one counted pointer in its second
+/// word, which `Clone` and [`Object::strong_word`] rely on.
 #[repr(u8)]
 pub enum Object {
     None,
@@ -9794,7 +9795,52 @@ impl PyIterator {
 
 // ---------- behavior ----------
 
+/// The variants whose second word is not a counted pointer (`None`,
+/// `Unbound`, `Bool`, `Int`, `Float`), by tag.
+const SCALAR_TAGS: u64 = 1 << 0 | 1 << 1 | 1 << 2 | 1 << 3 | 1 << 5;
+
+/// The variants whose pointer is a [`ThinArc`]'s (`Str`, `WStr`, `Tuple`,
+/// `Bytes`): it addresses the payload, 16 bytes past the strong count
+/// (every payload is aligned to at most 16). Every other counted variant
+/// holds an `Rc`, whose `Arc` addresses its `ArcInner`, strong count first.
+const THIN_TAGS: u64 = 1 << 7 | 1 << 8 | 1 << 9 | 1 << 27;
+
+impl Clone for Object {
+    /// A new owner: the strong count (if any) bumped in place and the two
+    /// words copied, with no per-variant dispatch.
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        if let Some(word) = self.strong_word() {
+            // SAFETY: `self` owns a reference to the live allocation.
+            unsafe { crate::rc::increment_word(word) };
+        }
+        // SAFETY: the count now accounts for the copy.
+        unsafe { std::ptr::read(self) }
+    }
+}
+
 impl Object {
+    /// The variant's tag byte.
+    #[inline(always)]
+    pub(crate) fn tag(&self) -> u8 {
+        // SAFETY: `repr(u8)`: the tag is the first byte.
+        unsafe { *std::ptr::from_ref(self).cast::<u8>() }
+    }
+
+    /// The strong count of the allocation a counted variant holds; `None`
+    /// for a scalar.
+    #[inline(always)]
+    pub(crate) fn strong_word(&self) -> Option<*const std::sync::atomic::AtomicUsize> {
+        let tag = u64::from(self.tag());
+        if (SCALAR_TAGS >> tag) & 1 != 0 {
+            return None;
+        }
+        // SAFETY: a counted variant's second word is its pointer.
+        let p = unsafe { *std::ptr::from_ref(self).cast::<*const u8>().add(1) };
+        let back = ((THIN_TAGS >> tag) & 1) as usize * 16;
+        Some(p.wrapping_sub(back).cast())
+    }
+
     /// Whether the value can never (transitively) reference another
     /// object — so a container holding only such values cannot be part
     /// of a reference cycle. Used by deferred instance tracking.
@@ -13592,6 +13638,51 @@ const _: () = assert!(std::mem::size_of::<Option<Object>>() == 16);
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clone_counts_every_layout() {
+        use crate::object::Object;
+        let tags = [
+            (Object::None, 0),
+            (Object::Unbound, 1),
+            (Object::Bool(true), 2),
+            (Object::Int(7), 3),
+            (Object::Float(1.5), 5),
+            (Object::from_str("a fresh string".to_owned()), 7),
+            (Object::new_tuple(vec![Object::Int(1), Object::None]), 9),
+            (Object::new_bytes(vec![1, 2, 3]), 27),
+            (Object::new_list(vec![Object::Int(1)]), 10),
+            (Object::new_dict(), 11),
+            (
+                Object::int_from_bigint(num_bigint::BigInt::from(1u8) << 100),
+                4,
+            ),
+        ];
+        for (v, tag) in &tags {
+            assert_eq!(v.tag(), *tag);
+        }
+        let count = |v: &Object| -> usize {
+            match v {
+                Object::Str(s) => SharedStr::strong_count(s),
+                Object::Tuple(t) => ThinArc::strong_count(t),
+                Object::Bytes(b) => ThinArc::strong_count(b),
+                Object::List(l) => Rc::strong_count(l),
+                Object::Dict(d) => Rc::strong_count(d),
+                Object::Long(b) => Rc::strong_count(b),
+                _ => 0,
+            }
+        };
+        for (v, _) in &tags {
+            let before = count(v);
+            let c = v.clone();
+            assert!(c.is_same(v) || before == 0);
+            if before != 0 {
+                assert_eq!(count(v), before + 1);
+                drop(c);
+                assert_eq!(count(v), before);
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

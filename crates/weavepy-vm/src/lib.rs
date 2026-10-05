@@ -10943,10 +10943,6 @@ impl Interpreter {
                                             // The scalar shapes copy inline, as
                                             // the single-load arm does.
                                             let ca = match a {
-                                                s @ (Object::Int(_)
-                                                | Object::Float(_)
-                                                | Object::Bool(_)
-                                                | Object::None) => scalar_copy(s),
                                                 Object::Unbound => break None,
                                                 other => clone_hot(other),
                                             };
@@ -10990,10 +10986,6 @@ impl Interpreter {
                                                     || matches!(*dst, Object::Unbound))
                                             {
                                                 let c = match src {
-                                                    s @ (Object::Int(_)
-                                                    | Object::Float(_)
-                                                    | Object::Bool(_)
-                                                    | Object::None) => scalar_copy(s),
                                                     other => clone_hot(other),
                                                 };
                                                 dst.write(c);
@@ -66446,52 +66438,12 @@ pub(crate) fn native_site(ext: &CodeConstObjects, pc: usize) -> bool {
         .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// `v.clone()` with the scalars copied and the common heap variants'
-/// increments in line (the enum's `Clone` is an out-of-line call and a
-/// variant switch per clone).
+/// `v.clone()`, in line (see `Object`'s `Clone`).
 #[inline(always)]
 fn clone_hot(v: &Object) -> Object {
-    // A whole-object copy, not a rebuilt one: rebuilding writes the tag as
-    // a byte and the payload as a word, and the 16-byte move that follows
-    // stalls on store forwarding (it was the core loop's hottest
-    // instruction).
-    match v {
-        Object::None | Object::Unbound | Object::Bool(_) | Object::Int(_) | Object::Float(_) => {
-            scalar_copy(v)
-        }
-        // The single-pointer variants: a new owner of the same pointer.
-        Object::Instance(i) => {
-            std::mem::forget(i.clone());
-            // SAFETY: the reference taken above is the copy's.
-            unsafe { std::ptr::read(v) }
-        }
-        Object::Function(f) => {
-            std::mem::forget(f.clone());
-            // SAFETY: as above.
-            unsafe { std::ptr::read(v) }
-        }
-        Object::List(l) => {
-            std::mem::forget(l.clone());
-            // SAFETY: as above.
-            unsafe { std::ptr::read(v) }
-        }
-        Object::Dict(d) => {
-            std::mem::forget(d.clone());
-            // SAFETY: as above.
-            unsafe { std::ptr::read(v) }
-        }
-        Object::Type(t) => {
-            std::mem::forget(t.clone());
-            // SAFETY: as above.
-            unsafe { std::ptr::read(v) }
-        }
-        Object::Str(s) => {
-            std::mem::forget(s.clone());
-            // SAFETY: as above.
-            unsafe { std::ptr::read(v) }
-        }
-        other => other.clone(),
-    }
+    // `Object`'s `Clone` copies the two words whole (a rebuilt value's tag
+    // byte stalls the 16-byte move that follows on store forwarding).
+    v.clone()
 }
 
 /// A scalar object (`None`, `Unbound`, a `bool`, an `int`, a `float`):
@@ -66544,20 +66496,18 @@ fn scalar_builders_match_the_enum() {
     assert!(matches!(crate::object::fresh_float(f64::NAN), Object::Float(x) if x.is_nan()));
 }
 
-/// `drop(v)` with the scalars skipped and the common heap variants'
-/// decrements in line (the enum's drop glue is an out-of-line call and
-/// a variant switch per drop).
+/// `drop(v)` with the scalars skipped and a shared owner's decrement in
+/// line through [`Object::strong_word`] (the enum's drop glue is an
+/// out-of-line call and a variant switch per drop); only a last owner
+/// takes the glue.
 #[inline(always)]
 fn drop_hot(v: Object) {
-    match v {
-        Object::None | Object::Unbound | Object::Bool(_) | Object::Int(_) | Object::Float(_) => {}
-        Object::Instance(i) => drop(i),
-        Object::Function(f) => drop(f),
-        Object::List(l) => drop(l),
-        Object::Dict(d) => drop(d),
-        Object::Type(t) => drop(t),
-        Object::Str(s) => drop(s),
-        other => drop(other),
+    match v.strong_word() {
+        None => std::mem::forget(v),
+        // SAFETY: `v` owns a reference to the live allocation, released
+        // here unless it's the last one.
+        Some(word) if unsafe { crate::rc::try_release_word(word) } => std::mem::forget(v),
+        Some(_) => drop(v),
     }
 }
 
