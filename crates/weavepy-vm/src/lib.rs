@@ -10240,6 +10240,19 @@ impl Interpreter {
             }
             _ => {}
         }
+        if ins.op == OpCode::GetYieldFromIter {
+            let Some(v) = frame.stack.last() else {
+                return CoreAttr::Decline;
+            };
+            let Some(gen) = self.instance_gen_iter(v) else {
+                return CoreAttr::Decline;
+            };
+            let top = frame.stack.last_mut().expect("checked above");
+            drop(std::mem::replace(top, gen));
+            *last_pc = pc;
+            frame.pc = pc as u32 + 1;
+            return CoreAttr::Done;
+        }
         let done = match ins.op {
             OpCode::Call => self.leaf_core_call(frame, ins, pc),
             OpCode::LoadSpecial => Self::leaf_load_special(frame, ins.arg, pc),
@@ -12982,6 +12995,43 @@ impl Interpreter {
                         len -= 2;
                         last = pc;
                         pc += 1;
+                    }
+                    // `yield from`'s delegate: a generator (or, in a
+                    // coroutine, a coroutine) stays; an instance whose
+                    // `__iter__` is a generator function is the helper's.
+                    OpCode::GetYieldFromIter => {
+                        // SAFETY: `len > 0` is checked first.
+                        let ok = len > 0
+                            && match unsafe { &*base.add(len - 1) } {
+                                Object::Generator(_) => true,
+                                Object::Coroutine(_) => {
+                                    frame.code.is_coroutine || frame.code.is_iterable_coroutine
+                                }
+                                _ => false,
+                            };
+                        if !ok {
+                            break Some(CoreExit::Helper);
+                        }
+                        last = pc;
+                        pc += 1;
+                    }
+                    // The finished delegate leaves from under the result.
+                    OpCode::EndSend => {
+                        // SAFETY: `len >= 2` is checked first.
+                        if len < 2 || !Self::core_droppable(unsafe { &*base.add(len - 2) }) {
+                            break None;
+                        }
+                        len -= 1;
+                        // SAFETY: the top slot moves down over the delegate,
+                        // which leaves by a plain decrement.
+                        unsafe {
+                            let v = base.add(len).read();
+                            drop_hot(std::mem::replace(&mut *base.add(len - 1), v));
+                        }
+                        last = pc;
+                        pc += 1;
+                        after_release!();
+                        continue;
                     }
                     // A list, tuple or range's native iterator (the helper's
                     // arm), when the iterable leaves by a plain decrement.
@@ -15964,8 +16014,14 @@ impl Interpreter {
         let Some(top) = inl.last_mut() else {
             return false;
         };
+        // A shell the full epilogue would act on (a frame object, or
+        // handled-exception entries to stash) parks through `quiet_run`.
         if top.gen.is_none()
-            || top.act.shell.is_some()
+            || top
+                .act
+                .shell
+                .as_deref()
+                .is_some_and(|s| !self.shell_pops_quietly(s, top.exc_depth))
             || self.gil_countdown <= 2
             || crate::hot_gates::loop_gen() != snap_gen
         {
@@ -15983,6 +16039,12 @@ impl Interpreter {
         if depth == sw.entry_depth {
             sw.entry_dead = true;
         }
+        // A shell the generator got while it ran (a `step` flushed the
+        // spine) leaves the spine as the full yield's epilogue does; the
+        // frame keeps it in `shell_cache` for the next resume.
+        if let Some(shell) = done.act.shell.take() {
+            self.retire_quiet_shell(shell, frame, cur_pc);
+        }
         // `inline_gen_finish`'s shell-less yield (the generator parks
         // again) and `inline_gen_deliver`'s yielded value, directly.
         drop(done.guard.take());
@@ -15993,7 +16055,7 @@ impl Interpreter {
         drop(gen);
         let call_pc = done.call_pc;
         self.lean_pending_exit(done.caller_pending);
-        // SAFETY: the shell was `None` (checked above): no drop glue owed.
+        // SAFETY: the shell was taken above: no drop glue owed.
         unsafe { std::ptr::write(&raw mut done.act.shell, None) };
         done.act.frame = std::ptr::from_mut::<Frame>(&mut done.frame);
         done.caller_pending = None;
@@ -49563,56 +49625,12 @@ impl Interpreter {
             };
             match bootstrap {
                 FrameOutcome::StartGenerator => {
-                    let kind = if code.is_coroutine {
-                        crate::object::CoroutineKind::Coroutine
-                    } else if code.is_async_generator {
-                        crate::object::CoroutineKind::AsyncGenerator
-                    } else {
-                        crate::object::CoroutineKind::Generator
-                    };
-                    // CPython snapshots the *function's* current
-                    // `__name__`/`__qualname__` (which user code may have
-                    // reassigned; overrides live in `f.slots`) into
-                    // `gi_name`/`gi_qualname` at call time.
-                    // The pinned slot objects are shared, as CPython's
-                    // `gi_name` shares the function's `__name__`.
-                    let (gen_name, gen_qualname) = {
-                        let slots = f.slots().borrow();
-                        let attr_str =
-                            |attr: &'static str| match slots.get(&crate::object::StrKey(attr)) {
-                                Some(o @ Object::Str(_)) => Some(o.clone()),
-                                _ => None,
-                            };
-                        (
-                            attr_str("__name__")
-                                .unwrap_or_else(|| Object::from_str(f.name.clone())),
-                            attr_str("__qualname__")
-                                .unwrap_or_else(|| Object::from_str(code.qualname.clone())),
-                        )
-                    };
-                    let gen_code = Object::Code(frame.code.clone());
-                    let gen = Rc::new(PyGenerator::with_names(
-                        gen_name,
-                        gen_qualname,
-                        kind,
-                        gen_code,
-                        Box::new(frame),
-                    ));
-                    Self::set_frame_gen_owner(&gen);
+                    let obj = Self::wrap_started_generator(f, &code, frame);
                     if let Some(origin) = cr_origin {
-                        *gen.origin.borrow_mut() = origin;
+                        if let Object::Coroutine(gen) = &obj {
+                            *gen.origin.borrow_mut() = origin;
+                        }
                     }
-                    let obj = if code.is_coroutine {
-                        Object::Coroutine(gen)
-                    } else if code.is_async_generator {
-                        Object::AsyncGenerator(gen)
-                    } else {
-                        Object::Generator(gen)
-                    };
-                    // RFC 0024: generator frames can participate in
-                    // reference cycles (a local that holds the generator
-                    // itself), so track them like instances.
-                    gc_trace::track(&obj);
                     // Threshold-driven young collection at the
                     // allocation site, as in the instance path.
                     if gc_trace::maybe_auto_collect() {
@@ -49639,6 +49657,79 @@ impl Interpreter {
         if let GeneratorState::Created(boxed) = &mut *gen.state.borrow_mut() {
             boxed.gen_owner = Some(Rc::downgrade(gen));
         }
+    }
+
+    /// Wrap `frame`, `f`'s generator-family body just past
+    /// `RETURN_GENERATOR`, in its generator object (tracked).
+    fn wrap_started_generator(f: &PyFunction, code: &CodeObject, frame: Frame) -> Object {
+        let kind = if code.is_coroutine {
+            crate::object::CoroutineKind::Coroutine
+        } else if code.is_async_generator {
+            crate::object::CoroutineKind::AsyncGenerator
+        } else {
+            crate::object::CoroutineKind::Generator
+        };
+        // CPython snapshots the *function's* current `__name__` and
+        // `__qualname__` (which user code may have reassigned) into
+        // `gi_name`/`gi_qualname` at call time, sharing the objects.
+        let (name, qualname) = f.name_objects();
+        let gen_code = Object::Code(frame.code.clone());
+        let gen = Rc::new(PyGenerator::with_names(
+            name.unwrap_or_else(|| Object::from_str(f.name.clone())),
+            qualname.unwrap_or_else(|| Object::from_str(code.qualname.clone())),
+            kind,
+            gen_code,
+            Box::new(frame),
+        ));
+        Self::set_frame_gen_owner(&gen);
+        let obj = if code.is_coroutine {
+            Object::Coroutine(gen)
+        } else if code.is_async_generator {
+            Object::AsyncGenerator(gen)
+        } else {
+            Object::Generator(gen)
+        };
+        // RFC 0024: generator frames can participate in reference cycles
+        // (a local that holds the generator itself), so track them like
+        // instances.
+        gc_trace::track(&obj);
+        obj
+    }
+
+    /// `iter(obj)` for an instance whose class's `__iter__` is a plain
+    /// generator function of `self` alone: the generator, made without
+    /// the call machinery (`make_iter`'s instance arm). `None` when
+    /// anything else applies, or a young collection is due (the general
+    /// path runs it).
+    fn instance_gen_iter(&self, v: &Object) -> Option<Object> {
+        let Object::Instance(inst) = v else {
+            return None;
+        };
+        let Some(Object::Function(f)) = inst.cls_raw().lookup("__iter__") else {
+            return None;
+        };
+        let code = f.code();
+        if !code.is_generator
+            || code.arg_count != 1
+            || code.kwonly_count != 0
+            || code.has_varargs
+            || code.has_varkeywords
+            || code.instructions.first().map(|i| i.op) != Some(OpCode::ReturnGenerator)
+            || crate::trace::eval_frame_record_active()
+            || crate::trace::any_observers_active()
+            || gc_trace::auto_collect_due()
+        {
+            return None;
+        }
+        let mut frame = self.make_frame(
+            code.clone(),
+            vec![v.clone()],
+            f.closure.clone(),
+            f.globals.clone(),
+            Some(f.builtins.clone()),
+        );
+        frame.pc = 1;
+        Some(Self::wrap_started_generator(&f, &code, frame))
     }
 
     /// Bootstrap a generator/coroutine *code object* frame that was not

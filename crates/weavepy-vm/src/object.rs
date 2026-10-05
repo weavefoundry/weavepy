@@ -4772,6 +4772,26 @@ impl PyFunction {
         *slots = DictData::from(map);
     }
 
+    /// The function's current `__name__` and `__qualname__` objects (a
+    /// generator snapshots them at call time); a function whose slots
+    /// were never touched still has its code's interned names.
+    pub fn name_objects(&self) -> (Option<Object>, Option<Object>) {
+        // SAFETY: a read of the seed's presence with nothing running.
+        if unsafe { (*self.slot_seed.as_ptr()).is_some() } {
+            let code = self.code();
+            return (
+                Some(crate::stdlib::sys::intern_name(&code.name)),
+                Some(crate::stdlib::sys::intern_name(&code.qualname)),
+            );
+        }
+        let slots = self.slots_raw.borrow();
+        let attr_str = |attr: &'static str| match slots.get(&StrKey(attr)) {
+            Some(o @ Object::Str(_)) => Some(o.clone()),
+            _ => None,
+        };
+        (attr_str("__name__"), attr_str("__qualname__"))
+    }
+
     /// Read a slot value if one has been stored (explicitly assigned or
     /// stamped at definition time). Computed fallbacks live at the
     /// attribute-access sites.
