@@ -221,7 +221,13 @@ fn with_interp<R>(
 /// that may have released an object with a finalizer.
 #[inline]
 fn release(o: Object) {
-    if !o.is_gc_atomic() {
+    let last = match &o {
+        Object::Instance(i) => Rc::strong_count(i) == 1,
+        Object::List(l) => Rc::strong_count(l) == 1,
+        Object::Dict(d) => Rc::strong_count(d) == 1,
+        o => !o.is_gc_atomic(),
+    };
+    if last {
         crate::gc_trace::mark_maybe_dead();
     }
     drop(o);
@@ -903,8 +909,13 @@ fn iter_type() -> &'static IterType {
 
 fn new_iter(cls: Rc<TypeObject>, root: Object, tag: Object, mode: i64) -> Object {
     let t = iter_type();
-    let first = if mode == MODE_SEQ { 0 } else { F_VISIT_ROOT };
-    let stack = new_list(vec![root, Object::Int(first)]);
+    // A sequence iterator keeps its position in the stack slot and its
+    // element in the tag slot.
+    let (stack, tag) = if mode == MODE_SEQ {
+        (Object::Int(0), root)
+    } else {
+        (new_list(vec![root, Object::Int(F_VISIT_ROOT)]), tag)
+    };
     let mut i = PyInstance::new(t.cls.clone());
     i.slots = RefCell::new(SlotStorage::from_layout(
         t.layout.clone(),
@@ -971,11 +982,11 @@ fn native_truth(o: &Object) -> Option<bool> {
     }
 }
 
-/// An iterator's frame stack, taken out of its list for one step: plain
-/// vector operations instead of a cell borrow each.
-struct Frames(Vec<Object>);
+/// An iterator's frame stack for one step: plain vector operations
+/// instead of a cell borrow each.
+struct Frames<'a>(&'a mut Vec<Object>);
 
-impl Frames {
+impl Frames<'_> {
     #[inline]
     fn top(&self) -> Option<(&Object, i64)> {
         let n = self.0.len();
@@ -986,6 +997,12 @@ impl Frames {
             Object::Int(m) => Some((&self.0[n - 2], *m)),
             _ => None,
         }
+    }
+
+    /// The top frame's object.
+    #[inline]
+    fn top_obj(&self) -> Object {
+        self.0[self.0.len() - 2].clone()
     }
 
     #[inline]
@@ -1016,9 +1033,24 @@ impl Frames {
     }
 }
 
-/// One step of iterator `a[0]`; in leaf mode it runs no Python code and
-/// declines a step that would.
-fn iter_step(a: &[Object], leaf: bool) -> Result<Step, RuntimeError> {
+/// One step of iterator `it` (its stack, search tag and mode, and the
+/// state of its element class).
+fn run_step(
+    st: &State,
+    frames: &mut Frames<'_>,
+    mode: &Object,
+    tag: &Object,
+    it: &PyInstance,
+    leaf: bool,
+) -> Result<Step, RuntimeError> {
+    match mode {
+        Object::Int(MODE_TEXT) => step_text(st, frames, it, leaf),
+        _ => step_iter(st, frames, tag, it, leaf),
+    }
+}
+
+/// One step of iterator `a[0]`, which may run Python code.
+fn iter_step(a: &[Object]) -> Result<Step, RuntimeError> {
     let t = iter_type();
     let Some(Object::Instance(it)) = a.first() else {
         return Err(type_error("descriptor '__next__' needs an argument"));
@@ -1044,55 +1076,130 @@ fn iter_step(a: &[Object], leaf: bool) -> Result<Step, RuntimeError> {
         None => return Err(value_error("generator already executing")),
     };
     if matches!(running, Object::Bool(true)) {
-        if leaf {
-            return Ok(Step::Decline);
-        }
         return Err(value_error("generator already executing"));
     }
-    let (Object::List(stack), Object::Type(cls)) = (stack, cls) else {
+    let Object::Type(cls) = cls else {
         return Ok(Step::Done);
     };
     let Some(st) = state_of_cls(&cls) else {
         return Ok(Step::Done);
     };
+    if matches!(mode, Object::Int(MODE_SEQ)) {
+        return seq_step(st, it, &stack, &tag);
+    }
+    let Object::List(stack) = stack else {
+        return Ok(Step::Done);
+    };
     // The frames stay reachable from this call while Python code runs on
     // the iterator's behalf (a reentrant `next` raises first).
-    let Some(taken) = write(&stack, std::mem::take) else {
+    let Some(mut taken) = write(&stack, std::mem::take) else {
         return Err(value_error("generator already executing"));
     };
-    let mut frames = Frames(taken);
-    let r = match mode {
-        Object::Int(MODE_TEXT) => step_text(st, &mut frames, it, leaf),
-        Object::Int(MODE_SEQ) => step_seq(st, &mut frames, it, leaf),
-        _ => step_iter(st, &mut frames, &tag, it, leaf),
-    };
+    let r = run_step(st, &mut Frames(&mut taken), &mode, &tag, it, false);
     if r.is_ok() {
-        let mut items = frames.0;
-        write(&stack, |v| std::mem::swap(v, &mut items));
-        drop(items);
+        write(&stack, |v| std::mem::swap(v, &mut taken));
+        drop(taken);
     } else {
         // An exception finishes a generator.
-        drop(frames);
+        drop(taken);
         crate::gc_trace::mark_maybe_dead();
     }
     r
 }
 
 fn iter_next(a: &[Object]) -> Result<Object, RuntimeError> {
-    match iter_step(a, false)? {
+    match iter_step(a)? {
         Step::Yield(v) => Ok(v),
         Step::Done | Step::Decline => Err(stop_iteration()),
     }
 }
 
-/// `__next__`'s leaf half (see `leaf_builtins::register_fast`).
+/// `__next__`'s leaf half (see `leaf_builtins::register_fast`): the step
+/// runs in place over the iterator's fields and stack, since it runs no
+/// Python code.
 fn iter_next_fast(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
-    match iter_step(a, true) {
+    let t = iter_type();
+    let Some(Object::Instance(it)) = a.first() else {
+        return None;
+    };
+    let mut exhausted = Object::None;
+    let r = write(&it.slots, |s| {
+        let v = s.values_for_layout_mut(&t.layout)?;
+        if let (Object::Int(MODE_SEQ), Object::Int(i), Object::Type(cls)) =
+            (&v[IT_MODE], &v[IT_STACK], &v[IT_CLASS])
+        {
+            // `elem[i]`, read in place. Past the end, the position goes
+            // negative and the element is dropped (after this borrow);
+            // the full body raises `StopIteration`.
+            let i = *i;
+            if i < 0 || !matches!(v[IT_RUNNING], Object::Bool(false)) {
+                return None;
+            }
+            let st = state_of_cls(cls)?;
+            return match child_native(st, &v[IT_TAG], i)? {
+                Some(c) => {
+                    v[IT_STACK] = Object::Int(i + 1);
+                    Some(Ok(Step::Yield(c)))
+                }
+                None => {
+                    v[IT_STACK] = Object::Int(-1);
+                    exhausted = std::mem::replace(&mut v[IT_TAG], Object::None);
+                    None
+                }
+            };
+        }
+        let (Object::List(stack), Object::Type(cls), Object::Bool(false)) =
+            (&v[IT_STACK], &v[IT_CLASS], &v[IT_RUNNING])
+        else {
+            return None;
+        };
+        let st = state_of_cls(cls)?;
+        write(stack, |frames| {
+            run_step(st, &mut Frames(frames), &v[IT_MODE], &v[IT_TAG], it, true)
+        })
+    })
+    .flatten();
+    release(exhausted);
+    match r? {
         Ok(Step::Yield(v)) => Some(Ok(v)),
-        Ok(Step::Done) => Some(Err(stop_iteration())),
-        Ok(Step::Decline) => None,
+        // The full body raises `StopIteration` (the core loop asks it
+        // again for an exhausted leaf iterator anyway).
+        Ok(Step::Done | Step::Decline) => None,
         Err(e) => Some(Err(e)),
     }
+}
+
+/// One step of a sequence iterator (`iter(elem)`): `elem[i]`.
+fn seq_step(
+    st: &State,
+    it: &PyInstance,
+    pos: &Object,
+    elem: &Object,
+) -> Result<Step, RuntimeError> {
+    let Object::Int(i) = *pos else {
+        return Ok(Step::Done);
+    };
+    if i < 0 {
+        return Ok(Step::Done);
+    }
+    let child = match child_native(st, elem, i) {
+        Some(c) => c,
+        None => child_py(it, elem, i)?,
+    };
+    let t = iter_type();
+    let mut gone = Object::None;
+    write(&it.slots, |s| {
+        if let Some(v) = s.values_for_layout_mut(&t.layout) {
+            if child.is_some() {
+                v[IT_STACK] = Object::Int(i + 1);
+            } else {
+                v[IT_STACK] = Object::Int(-1);
+                gone = std::mem::replace(&mut v[IT_TAG], Object::None);
+            }
+        }
+    });
+    release(gone);
+    Ok(child.map_or(Step::Done, Step::Yield))
 }
 
 #[inline]
@@ -1114,17 +1221,38 @@ fn delegate(
     })
 }
 
-/// An element's `tag` and `_children` (absent: `None`), and whether its
-/// instance dictionary holds only `Element`'s fields.
-fn tag_and_children(st: &State, e: &PyInstance) -> (bool, Object, Option<Object>) {
-    let mut tag = Object::None;
-    let mut children = None;
-    let plain = scan(st, ELEMENT, e, |field, _, v| match field {
-        E_TAG => tag = v.clone(),
-        E_CHILDREN => children = Some(v.clone()),
+/// What `iter` needs of an element it reaches, read in one pass.
+struct Visit {
+    /// Its instance dictionary holds only `Element`'s fields.
+    plain: bool,
+    /// `tag is None or self.tag == tag`, when native code can tell.
+    hit: Option<bool>,
+    /// The element's tag, when `hit` needs Python code.
+    etag: Object,
+    children: Option<Object>,
+}
+
+fn visit(st: &State, e: &PyInstance, tag: &Object) -> Visit {
+    let mut v = Visit {
+        plain: true,
+        hit: match tag {
+            Object::None => Some(true),
+            _ => native_eq(&Object::None, tag),
+        },
+        etag: Object::None,
+        children: None,
+    };
+    v.plain = scan(st, ELEMENT, e, |field, _, val| match field {
+        E_TAG if !matches!(tag, Object::None) => {
+            v.hit = native_eq(val, tag);
+            if v.hit.is_none() {
+                v.etag = val.clone();
+            }
+        }
+        E_CHILDREN => v.children = Some(val.clone()),
         _ => {}
     });
-    (plain, tag, children)
+    v
 }
 
 /// Frame marker for the element an iterator starts from: its method is
@@ -1133,7 +1261,7 @@ const F_VISIT_ROOT: i64 = -5;
 
 fn step_iter(
     st: &State,
-    frames: &mut Frames,
+    frames: &mut Frames<'_>,
     tag: &Object,
     it: &PyInstance,
     leaf: bool,
@@ -1145,42 +1273,42 @@ fn step_iter(
         };
         match marker {
             F_VISIT | F_VISIT_ROOT => {
-                let obj = obj.clone();
-                let Object::Instance(e) = &obj else {
+                // The fields are read in place; only what the step keeps
+                // is cloned.
+                let Object::Instance(e) = obj else {
                     frames.pop();
                     continue;
                 };
-                let (plain, etag, children) = tag_and_children(st, e);
-                if !plain && marker == F_VISIT {
+                let v = visit(st, e, tag);
+                if !v.plain && marker == F_VISIT {
                     if leaf {
                         return Ok(Step::Decline);
                     }
                     // `yield from e.iter(tag)`: the element's own method.
+                    let obj = frames.top_obj();
                     let sub = delegate(it, &obj, "iter", std::slice::from_ref(tag))?;
                     frames.set_top(sub, F_DELEGATE);
                     continue;
                 }
-                let hit = match tag {
-                    Object::None => true,
-                    _ => match native_eq(&etag, tag) {
-                        Some(b) => b,
-                        None if leaf => return Ok(Step::Decline),
-                        None => py(it, |i| {
-                            i.op_compare(&etag, tag, weavepy_compiler::CompareKind::Eq)
-                        })?,
-                    },
+                let hit = match v.hit {
+                    Some(b) => b,
+                    None if leaf => return Ok(Step::Decline),
+                    None => py(it, |i| {
+                        i.op_compare(&v.etag, tag, weavepy_compiler::CompareKind::Eq)
+                    })?,
                 };
                 if hit {
+                    let obj = frames.top_obj();
                     frames.set_marker(F_VISITED);
                     return Ok(Step::Yield(obj));
                 }
-                match children {
+                match v.children {
                     Some(l @ Object::List(_)) => frames.set_top(l, 0),
                     _ => frames.set_marker(F_VISITED),
                 }
             }
             F_VISITED => {
-                let obj = obj.clone();
+                let obj = frames.top_obj();
                 let Object::Instance(e) = &obj else {
                     frames.pop();
                     continue;
@@ -1202,7 +1330,7 @@ fn step_iter(
                 if leaf {
                     return Ok(Step::Decline);
                 }
-                let sub = obj.clone();
+                let sub = frames.top_obj();
                 match py(it, |i| i.iter_next_object(sub))? {
                     Some(v) => return Ok(Step::Yield(v)),
                     None => frames.pop(),
@@ -1213,21 +1341,52 @@ fn step_iter(
                     frames.pop();
                     continue;
                 };
-                match item(l, i as usize) {
-                    None => frames.pop(),
-                    Some(c) => {
-                        if st.exact(ELEMENT, &c).is_some() {
-                            frames.set_marker(i + 1);
-                            frames.push(c, F_VISIT);
-                        } else {
-                            if leaf {
-                                return Ok(Step::Decline);
-                            }
-                            frames.set_marker(i + 1);
-                            let sub = delegate(it, &c, "iter", std::slice::from_ref(tag))?;
-                            frames.push(sub, F_DELEGATE);
+                let Some(c) = item(l, i as usize) else {
+                    frames.pop();
+                    continue;
+                };
+                // The child is visited here, as the generator does when its
+                // loop reaches it: `e.iter(tag)` runs to its first yield.
+                let v = match &c {
+                    Object::Instance(ci) if st.exact(ELEMENT, &c).is_some() => {
+                        let v = visit(st, ci, tag);
+                        v.plain.then_some(v)
+                    }
+                    _ => None,
+                };
+                let Some(v) = v else {
+                    // Not an element the natives serve: `yield from
+                    // e.iter(tag)`, its own method.
+                    if leaf {
+                        return Ok(Step::Decline);
+                    }
+                    frames.set_marker(i + 1);
+                    let sub = delegate(it, &c, "iter", std::slice::from_ref(tag))?;
+                    frames.push(sub, F_DELEGATE);
+                    continue;
+                };
+                let hit = match v.hit {
+                    Some(b) => b,
+                    None if leaf => return Ok(Step::Decline),
+                    None => {
+                        frames.set_marker(i + 1);
+                        frames.push(c.clone(), F_VISIT);
+                        continue;
+                    }
+                };
+                frames.set_marker(i + 1);
+                if hit {
+                    frames.push(c.clone(), F_VISITED);
+                    return Ok(Step::Yield(c));
+                }
+                match v.children {
+                    Some(Object::List(cl)) => {
+                        // An empty children list ends that element's walk.
+                        if read(&cl, Vec::is_empty) != Some(true) {
+                            frames.push(Object::List(cl), 0);
                         }
                     }
+                    _ => frames.push(c, F_VISITED),
                 }
             }
             _ => frames.pop(),
@@ -1272,7 +1431,7 @@ fn is_index_error(o: &Object) -> bool {
 
 fn step_text(
     st: &State,
-    frames: &mut Frames,
+    frames: &mut Frames<'_>,
     it: &PyInstance,
     leaf: bool,
 ) -> Result<Step, RuntimeError> {
@@ -1368,37 +1527,6 @@ fn step_text(
                 }
             }
             _ => frames.pop(),
-        }
-    }
-}
-
-/// `iter(elem)`: the sequence protocol over `elem[0]`, `elem[1]`, ...
-fn step_seq(
-    st: &State,
-    frames: &mut Frames,
-    it: &PyInstance,
-    leaf: bool,
-) -> Result<Step, RuntimeError> {
-    let Some((obj, i)) = frames.top() else {
-        return Ok(Step::Done);
-    };
-    if i < 0 {
-        return Ok(Step::Done);
-    }
-    let obj = obj.clone();
-    let child = match child_native(st, &obj, i) {
-        Some(c) => c,
-        None if leaf => return Ok(Step::Decline),
-        None => child_py(it, &obj, i)?,
-    };
-    match child {
-        None => {
-            frames.pop();
-            Ok(Step::Done)
-        }
-        Some(c) => {
-            frames.set_marker(i + 1);
-            Ok(Step::Yield(c))
         }
     }
 }
