@@ -18911,18 +18911,21 @@ impl Interpreter {
         let ver = cls.attr_version.get();
         let b = match cls.leaf_attrs.get(key, ver) {
             Some(K::BuiltinMethod(b)) => Rc::as_ptr(b),
+            Some(K::Value(_)) => return self.leaf_instance_len_fast(cls, ver, v),
             Some(_) => return None,
             None => {
                 let kind = match cls.lookup("__len__") {
-                    Some(Object::Builtin(b))
-                        if b.binds_instance
-                            && self.leaf_call_kind(&b) == Some(LeafKind::Opaque) =>
-                    {
-                        K::BuiltinMethod(b)
+                    Some(Object::Builtin(b)) if b.binds_instance => {
+                        match self.leaf_call_kind(&b) {
+                            Some(LeafKind::Opaque) => K::BuiltinMethod(b),
+                            // A fast half (see `leaf_instance_len_fast`).
+                            Some(LeafKind::Fast(_)) => K::Value(Object::None),
+                            _ => K::Other,
+                        }
                     }
                     _ => K::Other,
                 };
-                let found = matches!(kind, K::BuiltinMethod(_));
+                let found = matches!(kind, K::BuiltinMethod(_) | K::Value(_));
                 cls.leaf_attrs.set(key, ver, kind);
                 return if found {
                     self.leaf_instance_len(v)
@@ -18939,6 +18942,47 @@ impl Interpreter {
             None => (b.call)(std::slice::from_ref(v)),
         };
         match r.ok()? {
+            Object::Int(n) if n >= 0 => Some(Object::Int(n)),
+            _ => None,
+        }
+    }
+
+    /// [`Self::leaf_instance_len`] for a class whose `__len__` is a builtin
+    /// registered with a leaf fast half (see `leaf_builtins::register_fast`;
+    /// the length cache marks it with a `Value`): the half's answer, or
+    /// `None` when it declines.
+    #[inline(never)]
+    fn leaf_instance_len_fast(
+        &self,
+        cls: &crate::types::TypeObject,
+        ver: u64,
+        v: &Object,
+    ) -> Option<Object> {
+        use crate::types::LeafAttrKind as K;
+        /// The cache key for the fast half's builtin.
+        static LEN_FAST_KEY: u8 = 0;
+        let key = std::ptr::addr_of!(LEN_FAST_KEY) as usize;
+        let fast = match cls.leaf_attrs.get(key, ver) {
+            Some(K::BuiltinMethod(b)) => match self.leaf_call_kind(b)? {
+                LeafKind::Fast(f) => f,
+                _ => return None,
+            },
+            Some(_) => return None,
+            None => {
+                let kind = match cls.lookup("__len__") {
+                    Some(Object::Builtin(b)) if b.binds_instance => K::BuiltinMethod(b),
+                    _ => K::Other,
+                };
+                let found = matches!(kind, K::BuiltinMethod(_));
+                cls.leaf_attrs.set(key, ver, kind);
+                return if found {
+                    self.leaf_instance_len_fast(cls, ver, v)
+                } else {
+                    None
+                };
+            }
+        };
+        match fast(std::slice::from_ref(v))?.ok()? {
             Object::Int(n) if n >= 0 => Some(Object::Int(n)),
             _ => None,
         }
@@ -47932,6 +47976,11 @@ impl Interpreter {
         // A natively served class's common constructor shapes.
         if cls.native_kind.get() != 0 {
             if let Some(r) = crate::stdlib::datetime_native::construct(&cls, args, kwargs) {
+                return r;
+            }
+        }
+        if cls.native_ext.get().is_some() {
+            if let Some(r) = crate::stdlib::elementtree_native::construct(&cls, args, kwargs) {
                 return r;
             }
         }

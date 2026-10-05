@@ -560,10 +560,14 @@ fn merged_attrib(attrib: Option<&Object>, extra: Kw) -> Option<Object> {
         Some(Object::Dict(d)) => DictData::from(read(d, |d| (**d).clone())?),
         Some(_) => return None,
     };
+    // Keyword names are identifiers: interned, their hashes are cached.
+    // Only a copied key that isn't a `str` could need Python code to
+    // compare with them.
+    if !extra.is_empty() && !d.keys().all(|k| matches!(k.0, Object::Str(_))) {
+        return None;
+    }
     for (k, v) in extra {
-        let key = SharedStr::from(k.as_str());
-        str_get(&d, &key)?;
-        d.insert(DictKey(Object::Str(key)), v.clone());
+        d.insert(DictKey(crate::stdlib::sys::intern_name(k)), v.clone());
     }
     Some(new_dict(d))
 }
@@ -597,6 +601,28 @@ fn el_init(st: &State, a: &[Object], kw: Kw) -> Option<Result<Object, RuntimeErr
     set_field(inst, &n.attrib, attrib);
     set_field(inst, &n.children, new_list(Vec::new()));
     Some(Ok(Object::None))
+}
+
+/// `Element(tag, attrib={}, **extra)`: the instance `Element.__init__`
+/// would build, for the exact class (called by the VM's instantiation
+/// before it allocates). `None` for any other class or call shape.
+pub(crate) fn construct(
+    cls: &Rc<TypeObject>,
+    args: &[Object],
+    kw: Kw,
+) -> Option<Result<Object, RuntimeError>> {
+    let st = state_of_cls(cls)?;
+    if Rc::as_ptr(cls) as usize != st.class_ptrs[ELEMENT] || !st.verified(ELEMENT, cls) {
+        return None;
+    }
+    let [tag, rest @ ..] = args else {
+        return None;
+    };
+    if rest.len() > 1 || kw.iter().any(|(k, _)| k == "tag" || k == "attrib") {
+        return None;
+    }
+    let attrib = merged_attrib(rest.first(), kw)?;
+    Some(Ok(new_element(st, cls.clone(), tag.clone(), attrib)))
 }
 
 /// `SubElement(parent, tag, attrib={}, **extra)`.
