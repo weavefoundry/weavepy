@@ -13648,6 +13648,10 @@ impl Interpreter {
                                 // SAFETY: a read between instructions.
                                 Object::Coroutine(g) => unsafe { g.state.peek() }
                                     .is_some_and(|s| matches!(s, GeneratorState::Created(_))),
+                                // A `types.coroutine` generator is its own.
+                                Object::Generator(g) => {
+                                    matches!(&g.code, Object::Code(c) if c.is_iterable_coroutine)
+                                }
                                 _ => false,
                             };
                         if !fresh {
@@ -17672,6 +17676,26 @@ impl Interpreter {
         let recv = recv?;
         let name = code.names.get(name_idx as usize)?.as_str();
         match recv {
+            // `x.__class__` of a builtin value: its exact type (no instance
+            // or class can override it there).
+            Object::Generator(_)
+            | Object::Coroutine(_)
+            | Object::AsyncGenerator(_)
+            | Object::Function(_)
+            | Object::BoundMethod(_)
+            | Object::Builtin(_)
+            | Object::List(_)
+            | Object::Dict(_)
+            | Object::Tuple(_)
+            | Object::Str(_)
+            | Object::Int(_)
+            | Object::Float(_)
+            | Object::Bool(_)
+            | Object::None
+                if name == "__class__" =>
+            {
+                Some(Object::Type(crate::builtins::class_of(recv)))
+            }
             Object::List(_)
             | Object::Dict(_)
             | Object::Set(_)
@@ -20037,7 +20061,7 @@ impl Interpreter {
                         // hit; a miss (including one an exotic stored key
                         // would turn into a Python `__eq__` match) is the
                         // full handler's.
-                        (Object::Dict(d), key @ (Object::Str(_) | Object::Int(_))) => {
+                        (Object::Dict(d), key) => {
                             let Some(probe) = crate::object::LeafProbe::new(key) else {
                                 break;
                             };
@@ -20098,7 +20122,7 @@ impl Interpreter {
                             let v = std::mem::replace(value_slot, Object::Unbound);
                             std::mem::replace(slot, v)
                         }
-                        (Object::Dict(cell), key @ (Object::Str(_) | Object::Int(_))) => {
+                        (Object::Dict(cell), key) => {
                             if crate::capi_watchers::dicts_active() {
                                 break;
                             }
@@ -20781,7 +20805,12 @@ impl Interpreter {
             | Object::Bool(_)
             | Object::None
             | Object::Float(_)
-            | Object::Bytes(_) => true,
+            | Object::Bytes(_)
+            | Object::Function(_)
+            | Object::Generator(_)
+            | Object::Coroutine(_)
+            | Object::AsyncGenerator(_)
+            | Object::Module(_) => true,
             Object::Type(t) => crate::object::type_hash_is_identity(t),
             Object::Instance(inst) => {
                 inst.native.get().is_none()
@@ -22692,6 +22721,22 @@ impl Interpreter {
         }
         if !Self::plain_metaclass(cls) {
             return Self::leaf_load_meta_class_attr(code, cls, name_idx);
+        }
+        // `cls.__doc__` of a Python class (`type_get_doc`): its own dict's
+        // entry, or `None` without one; a descriptor there is the full
+        // path's to run.
+        if !cls.flags.is_builtin
+            && code
+                .names
+                .get(name_idx as usize)
+                .is_some_and(|n| n == "__doc__")
+        {
+            let d = cls.dict.try_borrow().ok()?;
+            return match d.get(&crate::object::StrKey("__doc__")) {
+                None => Some(Object::None),
+                Some(v @ (Object::Str(_) | Object::None)) => Some(v.clone()),
+                Some(_) => None,
+            };
         }
         // A natively served class method (`datetime.fromisoformat`; see
         // `stdlib::datetime_native`), bound as `classmethod.__get__`

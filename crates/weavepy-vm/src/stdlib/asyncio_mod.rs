@@ -2928,10 +2928,6 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             modfn("get_running_loop", mod_get_running_loop),
         );
         d.insert(
-            DictKey(Object::from_static("_get_running_loop")),
-            modfn("_get_running_loop", mod_get_running_loop_raw),
-        );
-        d.insert(
             DictKey(Object::from_static("_set_running_loop")),
             modfn("_set_running_loop", mod_set_running_loop_raw),
         );
@@ -2985,17 +2981,26 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 call_kw: Some(Box::new(mod_all_tasks)),
             })),
         );
-        d.insert(
-            DictKey(Object::from_static("future_add_to_awaited_by")),
-            modfn("future_add_to_awaited_by", mod_future_add_to_awaited_by),
-        );
-        d.insert(
-            DictKey(Object::from_static("future_discard_from_awaited_by")),
-            modfn(
+        // These run no Python code (identity checks on native futures, the
+        // running loop's slot) and release nothing: the core loop calls
+        // them in place.
+        for (name, body) in [
+            (
+                "future_add_to_awaited_by",
+                mod_future_add_to_awaited_by as fn(&[Object]) -> Result<Object, RuntimeError>,
+            ),
+            (
                 "future_discard_from_awaited_by",
                 mod_future_discard_from_awaited_by,
             ),
-        );
+            ("_get_running_loop", mod_get_running_loop_raw),
+        ] {
+            let f = modfn(name, body);
+            if let Object::Builtin(b) = &f {
+                crate::leaf_builtins::register(b);
+            }
+            d.insert(DictKey(Object::from_static(name)), f);
+        }
     }
     // The registries for task-likes that aren't native tasks: a
     // `weakref.WeakSet` for scheduled ones (so leaked tasks don't

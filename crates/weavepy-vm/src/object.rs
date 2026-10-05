@@ -3346,8 +3346,9 @@ pub struct LeafProbe<'a> {
 
 impl<'a> LeafProbe<'a> {
     /// `None` unless `key` is a `str`, a machine `int`, a plain instance
-    /// hashed by identity (its `__hash__` is `object`'s), or a class whose
-    /// metaclass keeps `type`'s `__hash__` and `__eq__`.
+    /// hashed by identity (its `__hash__` is `object`'s), a class whose
+    /// metaclass keeps `type`'s `__hash__` and `__eq__`, or a function,
+    /// generator-family object or module.
     #[inline]
     pub fn new(key: &'a Object) -> Option<Self> {
         let hash = match key {
@@ -3360,6 +3361,12 @@ impl<'a> LeafProbe<'a> {
                 identity_hash(key)
             }
             Object::Type(t) if type_hash_is_identity(t) => identity_hash(key),
+            // Kinds that hash and compare by identity alone.
+            Object::Function(_)
+            | Object::Generator(_)
+            | Object::Coroutine(_)
+            | Object::AsyncGenerator(_)
+            | Object::Module(_) => identity_hash(key),
             _ => return None,
         };
         Some(Self {
@@ -3408,6 +3415,11 @@ impl indexmap::Equivalent<DictKey> for LeafProbe<'_> {
             // with `is` first); any other pairing may need `__eq__`.
             (Object::Instance(a), Object::Instance(b)) if Rc::ptr_eq(a, b) => true,
             (Object::Type(a), Object::Type(b)) if Rc::ptr_eq(a, b) => true,
+            (Object::Function(a), Object::Function(b)) => Rc::ptr_eq(a, b),
+            (Object::Generator(a), Object::Generator(b))
+            | (Object::Coroutine(a), Object::Coroutine(b))
+            | (Object::AsyncGenerator(a), Object::AsyncGenerator(b)) => Rc::ptr_eq(a, b),
+            (Object::Module(a), Object::Module(b)) => Rc::ptr_eq(a, b),
             _ => {
                 self.foreign.set(true);
                 false
