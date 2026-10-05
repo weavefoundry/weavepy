@@ -248,6 +248,73 @@ class IterationTest(unittest.TestCase):
         self.assertEqual(g(), ("decorated", 1))
         self.assertEqual(K.__name__, "K")
 
+class CallShapesTest(unittest.TestCase):
+    def test_lru_cache_and_partial_in_loops(self):
+        import functools
+
+        @functools.lru_cache(maxsize=4)
+        def sq(n):
+            return n * n
+
+        double = functools.partial(lambda a, b: a * b, 2)
+        kw = functools.partial(lambda a, b=0: a - b, b=1)
+        total = 0
+        for i in range(50):
+            for f in (sq, double, kw):
+                total += f(i % 6)
+        self.assertEqual(total, sum((i % 6) ** 2 + 2 * (i % 6) + (i % 6) - 1 for i in range(50)))
+        info = sq.cache_info()
+        self.assertEqual((info.hits + info.misses, info.currsize), (50, 4))
+
+    def test_lru_cache_reentrant_and_raising(self):
+        import functools
+
+        @functools.lru_cache(maxsize=None)
+        def fib(n):
+            return n if n < 2 else fib(n - 1) + fib(n - 2)
+
+        @functools.lru_cache(maxsize=8)
+        def boom(n):
+            raise ValueError(n)
+
+        for _ in range(3):
+            self.assertEqual(fib(60), 1548008755920)
+            with self.assertRaises(ValueError):
+                boom(1)
+
+    def test_function_attributes(self):
+        def f():
+            pass
+
+        f.calls = 0
+        for _ in range(100):
+            f.calls += 1
+        self.assertEqual(f.calls, 100)
+        self.assertEqual(f.__dict__, {"calls": 100})
+        d = {}
+        f.__dict__ = d
+        for i in range(3):
+            f.x = i
+        self.assertEqual(d, {"x": 2})
+        with self.assertRaises(AttributeError):
+            for _ in range(3):
+                f.missing
+        for _ in range(3):
+            self.assertEqual(f.__name__, "f")
+
+    def test_builtin_keyword_calls(self):
+        for _ in range(3):
+            self.assertEqual(sorted((3, 1, 2), key=lambda v: -v), [3, 2, 1])
+            self.assertEqual(sorted([1, 2, 3], reverse=True), [3, 2, 1])
+            self.assertEqual(max([1, 5, 2], key=lambda v: -v), 1)
+            self.assertEqual(min([], default=7), 7)
+            self.assertEqual(round(2.567, ndigits=2), 2.57)
+            self.assertEqual(sum([1, 2], start=10), 13)
+            with self.assertRaises(TypeError):
+                sorted([1], bogus=1)
+            with self.assertRaises(ZeroDivisionError):
+                sorted([1, 2], key=lambda v: 1 // 0)
+
 class FormatTest(unittest.TestCase):
     def test_huge_field_index(self):
         for _ in range(3):

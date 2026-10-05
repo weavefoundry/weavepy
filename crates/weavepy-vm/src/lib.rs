@@ -12553,15 +12553,30 @@ impl Interpreter {
                         };
                         let Some(r) = r else {
                             // A plain Python callee switches in place, as
-                            // `CALL`'s does (see `core_call_kw`).
-                            if !matches!(&ops[0], Object::Function(_)) {
-                                break None;
-                            }
+                            // `CALL`'s does (see `core_call_kw`); a common
+                            // builtin function (`sorted(xs, key=f)`) runs in
+                            // the builtin lane.
+                            let builtin = match &ops[0] {
+                                Object::Function(_) => false,
+                                Object::Builtin(b)
+                                    if !b.binds_instance
+                                        && matches!(&ops[1], Object::Unbound)
+                                        && builtin_fn_lane_ok(b.name) =>
+                                {
+                                    true
+                                }
+                                _ => break None,
+                            };
                             // SAFETY: `len <= cap`, every slot initialized.
                             unsafe { frame.stack.set_len(len) };
                             frame.pc = pc as u32;
                             *last_pc = last;
-                            if !self.core_call_kw(sw, pc) && sw.pending.is_none() {
+                            let ran = if builtin {
+                                self.core_builtin_kw_lane(sw, pc)
+                            } else {
+                                self.core_call_kw(sw, pc)
+                            };
+                            if !ran && sw.pending.is_none() {
                                 sw.pending = Some(CoreExit::Stop(LeafStop::Step));
                             }
                             break Some(CoreExit::Reload);
@@ -13802,6 +13817,76 @@ impl Interpreter {
         }
         // A finalizer queued by a dying operand runs before the next
         // instruction, as after the full handler's call.
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
+        true
+    }
+
+    /// [`Self::core_builtin_lane`] for the `CALL_KW` at `pc` of a builtin
+    /// function the lane admits (`sorted(xs, key=f)`), in `sw`'s synced
+    /// running activation: the operands leave the stack, the call runs
+    /// through [`Self::call`] with the activation on the pending list, and
+    /// its result (or raise) lands as the full handler's would. `false`
+    /// touches nothing.
+    #[inline(never)]
+    fn core_builtin_kw_lane(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let Some(ins) = frame.code.instructions.get(pc) else {
+            return false;
+        };
+        // (The internal arg counts the positionals; the names tuple gives
+        // the keyword values above them.)
+        let argc = ins.arg as usize;
+        let n = frame.stack.len();
+        let Some(Object::Tuple(names)) = frame.stack.last() else {
+            return false;
+        };
+        let kwc = names.len();
+        let Some(callee_at) = n.checked_sub(argc + kwc + 3) else {
+            return false;
+        };
+        let (Object::Builtin(b), Object::Unbound) =
+            (&frame.stack[callee_at], &frame.stack[callee_at + 1])
+        else {
+            return false;
+        };
+        let mut kwargs = Vec::with_capacity(kwc);
+        for name in names.iter() {
+            let Object::Str(name) = name else {
+                return false;
+            };
+            kwargs.push((name.to_string(), Object::None));
+        }
+        // Committed: the operands leave the stack.
+        let b = b.clone();
+        let mut ops: Vec<Object> = frame.stack.drain(callee_at..).collect();
+        drop(ops.pop()); // the names tuple
+        for (slot, v) in kwargs.iter_mut().zip(ops.drain(2 + argc..)) {
+            slot.1 = v;
+        }
+        let args: Vec<Object> = ops.drain(2..).collect();
+        frame.pc = pc as u32 + 1;
+        let globals = frame.globals.clone();
+        let pending = self.core_pending_enter(sw, frame, pc);
+        let result = self.call(&Object::Builtin(b), &args, &kwargs, &globals);
+        self.lean_pending_exit(pending);
+        drop(ops);
+        for v in args.into_iter().chain(kwargs.into_iter().map(|(_, v)| v)) {
+            self.release(v);
+        }
+        match result {
+            Ok(v) => {
+                // SAFETY: as in `core_builtin_lane`.
+                unsafe { (*sw.cur).stack.push(v) };
+                // SAFETY: the running activation's last-pc slot.
+                unsafe { *sw.last = pc };
+            }
+            Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
+        }
         // SAFETY: the running thread's own flag (see `quiet_run`).
         if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
             sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
@@ -16921,6 +17006,13 @@ impl Interpreter {
         use weavepy_compiler::InlineCache as IC;
         let code: &CodeObject = &frame.code;
         let stack = &mut frame.stack;
+        // A function's own attribute (`wrapper.calls += 1`), which the full
+        // handler never specializes: one the function type has no
+        // descriptor for (every name it defines is a dunder) lives in the
+        // function's dict.
+        if let Some(done) = Self::leaf_function_attr(code, stack, ins) {
+            return done;
+        }
         // A first execution belongs to the full handler, which specializes
         // the site (the leaf fallbacks would serve it without ever doing
         // so, leaving every later execution on the class-cache path).
@@ -17117,6 +17209,64 @@ impl Interpreter {
             }
             _ => CoreAttr::Decline,
         }
+    }
+
+    /// `f.name` or `f.name = v` (`ins`, a `LOAD_ATTR` without the method
+    /// flag or a `STORE_ATTR`) on a plain function at the top of `stack`,
+    /// for a non-dunder name: read from or written to its `__dict__`.
+    /// `None` for anything else (a missing name raises on the full path).
+    #[inline]
+    fn leaf_function_attr(
+        code: &CodeObject,
+        stack: &mut Vec<Object>,
+        ins: weavepy_compiler::Instruction,
+    ) -> Option<CoreAttr> {
+        let Some(Object::Function(f)) = stack.last() else {
+            return None;
+        };
+        if !matches!(ins.op, OpCode::LoadAttr | OpCode::StoreAttr)
+            || crate::capi_watchers::dicts_active()
+            || crate::capi_watchers::funcs_active()
+        {
+            return None;
+        }
+        let Some(name @ Object::Str(n)) = code_name_obj(code, ins.arg) else {
+            return None;
+        };
+        if n.starts_with("__") {
+            return None;
+        }
+        if ins.op == OpCode::LoadAttr {
+            let v = {
+                let attrs = f.attrs.try_borrow().ok()?;
+                let d = attrs.as_ref()?.try_borrow().ok()?;
+                d.get(&crate::object::StrKey(n)).cloned()?
+            };
+            let top = stack.last_mut()?;
+            drop(std::mem::replace(top, v));
+            return Some(CoreAttr::Done);
+        }
+        let n_ = stack.len();
+        if n_ < 2 {
+            return None;
+        }
+        let dict = f.attrs();
+        let old = {
+            let mut d = dict.try_borrow_mut().ok()?;
+            let value = stack[n_ - 2].clone();
+            match d.get_mut(&crate::object::StrKey(n)) {
+                Some(slot) => Some(std::mem::replace(slot, value)),
+                None => {
+                    d.insert(DictKey(name.clone()), value);
+                    None
+                }
+            }
+        };
+        // The receiver and the stored value leave the stack; the old value
+        // drops after the dict's borrow ends.
+        stack.truncate(n_ - 2);
+        drop(old);
+        Some(CoreAttr::Done)
     }
 
     /// The core loop's `CALL` of a leaf builtin or a directly
@@ -20026,14 +20176,21 @@ impl Interpreter {
             Some(K::BuiltinMethod(b)) => Some(b.clone()),
             Some(_) => None,
             None => {
+                // A native `__call__` that takes the instance first (one
+                // that binds it, or one of the operator and partial calls):
+                // the call is `type(obj).__call__(obj, ...)` either way (a
+                // body that runs Python, `lru_cache`'s, does so through the
+                // call lanes, which keep the frame stack whole).
                 let kind = match cls.lookup("__call__") {
                     Some(Object::Builtin(b))
-                        if matches!(
-                            b.name,
-                            ".itemgetter.__call__"
-                                | ".attrgetter.__call__"
-                                | ".methodcaller.__call__"
-                        ) || b.name == crate::stdlib::functools_mod::PARTIAL_CALL_NAME =>
+                        if b.binds_instance
+                            || matches!(
+                                b.name,
+                                ".itemgetter.__call__"
+                                    | ".attrgetter.__call__"
+                                    | ".methodcaller.__call__"
+                            )
+                            || b.name == crate::stdlib::functools_mod::PARTIAL_CALL_NAME =>
                     {
                         K::BuiltinMethod(b)
                     }
