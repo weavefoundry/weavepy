@@ -9780,7 +9780,7 @@ impl Interpreter {
         let snap_gen = self.lean_snapshot()?;
         let code = code.clone();
         // Committed.
-        let (inst, tracked) = self.alloc_plain_instance_obj(cls);
+        let (inst, tracked) = self.alloc_lean_instance_obj(cls, &plan.native);
         if tracked && gc_trace::maybe_auto_collect() {
             self.run_pending_finalizers();
         }
@@ -13708,18 +13708,21 @@ impl Interpreter {
             return false;
         };
         // A leaf `__init__` (plain stores of its arguments into `self`)
-        // runs frameless, as a leaf method call does.
-        if self.core_leaf_init(
-            frame,
-            &ty,
-            init,
-            code,
-            argc,
-            missing,
-            self_slot,
-            callee_slot,
-            sw.depth_cell,
-        ) {
+        // runs frameless, as a leaf method call does (a plain instance
+        // only).
+        if matches!(plan.native, crate::types::NativeKind::Plain)
+            && self.core_leaf_init(
+                frame,
+                &ty,
+                init,
+                code,
+                argc,
+                missing,
+                self_slot,
+                callee_slot,
+                sw.depth_cell,
+            )
+        {
             frame.pc = pc as u32 + 1;
             return true;
         }
@@ -13731,9 +13734,9 @@ impl Interpreter {
             return false;
         };
         let (init, code) = (init.clone(), code.clone());
-        drop(plan);
         // Committed.
-        let (inst, tracked) = self.alloc_plain_instance_obj(&ty);
+        let (inst, tracked) = self.alloc_lean_instance_obj(&ty, &plan.native);
+        drop(plan);
         if tracked && gc_trace::maybe_auto_collect() {
             self.run_pending_finalizers();
         }
@@ -44230,7 +44233,10 @@ impl Interpreter {
                     // `dict_init`), including keyword arguments — direct
                     // `d.__init__([...], g=7)` calls must merge, not clear
                     // (test_ordered_dict.CPythonBuiltinDictTests.test_init).
+                    // (A keyword-taking `__init__` is a dict subclass's own
+                    // native one, `defaultdict`'s, not `dict.__init__`.)
                     if (b.name == "update" || b.name == "__init__")
+                        && b.call_kw.is_none()
                         && (matches!(args.first(), Some(Object::Dict(_)))
                             || matches!(
                                 args.first(),
@@ -47462,6 +47468,48 @@ impl Interpreter {
         }
     }
 
+    /// The empty native payload a fresh instance of a `dict`, `list` or
+    /// `set` subclass with its own `__init__` starts with (that `__init__`
+    /// owns the filling, as in [`Self::native_value_payload`]); `None` for
+    /// any other class.
+    fn lean_payload(native: &crate::types::NativeKind) -> Option<Object> {
+        let crate::types::NativeKind::Value {
+            base,
+            mutable: true,
+        } = native
+        else {
+            return None;
+        };
+        let bt = builtin_types();
+        if Rc::ptr_eq(base, &bt.dict_) {
+            Some(Object::Dict(Rc::new(RefCell::new(DictData::default()))))
+        } else if Rc::ptr_eq(base, &bt.list_) {
+            Some(Object::new_list(Vec::new()))
+        } else if Rc::ptr_eq(base, &bt.set_) {
+            Some(Object::new_set_from(Vec::<Object>::new()))
+        } else {
+            None
+        }
+    }
+
+    /// [`Self::alloc_plain_instance_obj`] for a lean construction: a
+    /// container subclass's instance carries its empty payload and is
+    /// tracked at once, as the full constructor does.
+    fn alloc_lean_instance_obj(
+        &self,
+        cls: &Rc<TypeObject>,
+        native: &crate::types::NativeKind,
+    ) -> (Object, bool) {
+        match Self::lean_payload(native) {
+            Some(payload) => {
+                let inst = Object::Instance(Rc::new(PyInstance::with_native(cls.clone(), payload)));
+                gc_trace::track(&inst);
+                (inst, true)
+            }
+            None => self.alloc_plain_instance_obj(cls),
+        }
+    }
+
     /// The memoised [`crate::types::InstancePlan`] for `cls`, rebuilt
     /// when the class's `attr_version` moved since the cached copy.
     /// `pub(crate)` for tier-2's class-constructor probe (RFC 0071 WS2).
@@ -47682,7 +47730,8 @@ impl Interpreter {
                     && is_object_new
                     && !seeds_exception_args
                     && !init_from_object
-                    && matches!(native, NativeKind::Plain)
+                    && (matches!(native, NativeKind::Plain)
+                        || Self::lean_payload(&native).is_some())
                     && !cls.is_type_subclass() =>
             {
                 let code = init.code();

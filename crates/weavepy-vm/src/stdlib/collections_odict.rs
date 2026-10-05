@@ -195,7 +195,7 @@ fn od_setitem(args: &[Object]) -> Result<Object, RuntimeError> {
             args.len().saturating_sub(1)
         )));
     };
-    crate::builtins::ensure_dict_key(key)?;
+    crate::builtins::ensure_hashable(key)?;
     let order = order_of(&inst);
     let old = crate::builtins::dict_insert(&main, key.clone(), value.clone())?;
     // A new key gets a node; an existing one keeps its place (re-storing
@@ -272,7 +272,7 @@ fn od_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
             args.len().saturating_sub(1)
         )));
     };
-    crate::builtins::ensure_dict_key(key)?;
+    crate::builtins::ensure_hashable(key)?;
     if let Some(order) = peek_order(&inst) {
         crate::builtins::dict_remove(&order, key)?;
     }
@@ -428,6 +428,7 @@ fn od_move_to_end(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
     if at_end {
         return Ok(Object::None);
     }
+    crate::builtins::ensure_hashable(&key)?;
     let Some(i) = index_of(&order, &key)? else {
         return Err(key_error_object(key));
     };
@@ -487,7 +488,7 @@ fn od_pop(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runtim
     let bound = bind("pop", &args[1..], kwargs, &["key", "default"], 1)?;
     let key = bound[0].clone().expect("required");
     let default = bound[1].clone();
-    crate::builtins::ensure_dict_key(&key)?;
+    crate::builtins::ensure_hashable(&key)?;
     // Only a key with a node is popped (CPython's `_odict_popkey_hash`):
     // the node first, then the payload's entry.
     let removed = match peek_order(&inst) {

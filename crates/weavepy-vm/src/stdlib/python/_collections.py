@@ -32,6 +32,12 @@ from _weave_collections import (
 # `namedtuple()` registers each generated `__new__` here, so the
 # interpreter builds `NT(a, b, c)` as the tuple directly.
 from _weave_collections import namedtuple_register as _namedtuple_register
+from _weave_collections import (
+    count_elements as _count_elements_native,
+    dd_init as _dd_init,
+    dd_missing as _dd_missing,
+    install_defaultdict as _install_defaultdict,
+)
 # The native `OrderedDict` operations (`stdlib/collections_odict.rs`).
 from _weave_collections import (
     install_odict as _install_odict,
@@ -60,6 +66,10 @@ _dd_repr_running = set()
 
 def _count_elements(mapping, iterable):
     """Tally elements from the iterable (Counter's inner loop)."""
+    # A dict (or a subclass keeping `dict.get` and `dict.__setitem__`,
+    # like `Counter`) is tallied natively, as CPython's C helper does.
+    if _count_elements_native(mapping, iterable):
+        return
     mapping_get = mapping.get
     for elem in iterable:
         mapping[elem] = mapping_get(elem, 0) + 1
@@ -95,48 +105,26 @@ class _tuplegetter:
 _install_tuplegetter(_tuplegetter)
 
 
-class _defaultdict_factory_slot:
-    # The C type's `default_factory` is a `tp_members` slot: a *data*
-    # descriptor (`inspect.isdatadescriptor(defaultdict.default_factory)`
-    # — test_inspect test_excluding_predicates), so it must own both
-    # `__get__` and `__set__`. Instance storage lives under a private
-    # instance-dict key (the C struct field's stand-in). Code like
-    # `dataclasses._asdict_inner` probes `hasattr(type(obj),
-    # 'default_factory')`, which this satisfies too.
-    def __get__(self, obj, objtype=None):
-        if obj is None:
-            return self
-        return obj.__dict__.get('_weavepy_default_factory')
-
-    def __set__(self, obj, value):
-        obj.__dict__['_weavepy_default_factory'] = value
-
-    def __delete__(self, obj):
-        obj.__dict__['_weavepy_default_factory'] = None
-
-
 class defaultdict(dict):
     """dict subclass that calls a factory function to supply missing values."""
 
     # The C type reports `collections`, not `_collections`.
     __module__ = "collections"
 
-    default_factory = _defaultdict_factory_slot()
+    # The C type's `default_factory` is a `tp_members` slot: a member
+    # descriptor that reads `None` when unset (`install_defaultdict`
+    # finishes it), and the instances carry no `__dict__` and no weak
+    # references.
+    __slots__ = ("default_factory",)
 
-    def __init__(self, default_factory=None, /, *args, **kwds):
-        if default_factory is not None and not callable(default_factory):
-            raise TypeError("first argument must be callable or None")
-        dict.__init__(self, *args, **kwds)
-        self.default_factory = default_factory
+    # Native (CPython's `defdict_init`): the factory is checked and set,
+    # then the remaining arguments initialize the dict.
+    __init__ = _dd_init
 
-    def __missing__(self, key):
-        if self.default_factory is None:
-            raise KeyError(key)
-        # The factory runs *before* the insert and may itself populate
-        # the key (re-entering `d[key]`); the first-inserted value wins
-        # (CPython gh-91618 — test_factory_conflict_with_set_value).
-        value = self.default_factory()
-        return self.setdefault(key, value)
+    # Native (CPython's `defdict_missing`): the factory's value, stored with
+    # `dict.setdefault`, so a factory that fills the key itself keeps the
+    # first value (gh-91618 — test_factory_conflict_with_set_value).
+    __missing__ = _dd_missing
 
     def __repr__(self):
         # CPython's `defdict_repr` wraps the *factory* repr in
@@ -181,6 +169,9 @@ class defaultdict(dict):
         return new
 
     __class_getitem__ = classmethod(_GenericAlias)
+
+
+_install_defaultdict(defaultdict)
 
 
 class deque:

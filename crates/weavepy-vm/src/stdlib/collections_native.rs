@@ -973,6 +973,247 @@ pub(crate) fn namedtuple_new_shape(f: &Rc<crate::object::PyFunction>) -> Option<
         .map(|(_, code, n)| (Rc::as_ptr(code) as usize, *n))
 }
 
+// ---------------------------------------------------------------------
+// `defaultdict`.
+
+/// The `default_factory` member's docstring (CPython's `defdict_members`).
+const DD_FACTORY_DOC: &str = "Factory for default value called by __missing__().";
+
+/// `install_defaultdict(cls)`: turn the class's `default_factory` slot
+/// into CPython's member descriptor: unset (never assigned, or deleted)
+/// reads as `None`. The `__slots__` declaration that made the slot is an
+/// implementation detail the C type doesn't have, so it leaves the class
+/// dict (the layout it set up, no instance `__dict__` and no weak
+/// references, stays, as in CPython).
+fn install_defaultdict(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls)] = args else {
+        return Err(type_error("install_defaultdict() expects a class"));
+    };
+    let desc = Object::SlotDescriptor(Rc::new(crate::object::SlotDescriptor {
+        name: "default_factory".to_owned(),
+        class_name: cls.name.clone(),
+        default: Some(Object::None),
+        readonly: false,
+        doc: Some(DD_FACTORY_DOC),
+        objclass: RefCell::new(Some(Rc::downgrade(cls))),
+    }));
+    {
+        let mut d = cls.dict.borrow_mut();
+        d.insert(DictKey(Object::from_static("default_factory")), desc);
+        d.shift_remove(&DictKey(Object::from_static("__slots__")));
+    }
+    cls.bump_attr_version();
+    Ok(Object::None)
+}
+
+/// `defaultdict.__init__(self, default_factory=None, /, *args, **kwds)`,
+/// as CPython's `defdict_init`: the factory (callable or `None`) is set
+/// first, then the rest initializes the dict.
+fn dd_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let Some(Object::Instance(inst)) = args.first() else {
+        return Err(type_error(
+            "descriptor '__init__' of 'collections.defaultdict' object needs an argument",
+        ));
+    };
+    let factory = args.get(1).cloned().unwrap_or(Object::None);
+    if !matches!(factory, Object::None) && !crate::builtins::object_is_callable(&factory) {
+        return Err(type_error("first argument must be callable or None"));
+    }
+    inst.slot_set("default_factory", factory);
+    if args.len() > 2 || !kwargs.is_empty() {
+        let init = crate::builtin_types::builtin_types()
+            .dict_
+            .dict
+            .borrow()
+            .get(&crate::object::StrKey("__init__"))
+            .cloned()
+            .ok_or_else(|| type_error("dict.__init__ is missing"))?;
+        let mut rest = Vec::with_capacity(args.len() - 1);
+        rest.push(args[0].clone());
+        rest.extend_from_slice(&args[2..]);
+        crate::builtins::reentrant_interp()?.call_object(init, &rest, kwargs)?;
+    }
+    Ok(Object::None)
+}
+
+/// A new value from one of the common factories, built natively: the
+/// value `int()`, `list()`, `dict()`, `set()`, `float()`, `str()` or
+/// `tuple()` returns.
+fn builtin_factory_value(factory: &Object) -> Option<Object> {
+    let Object::Type(t) = factory else {
+        return None;
+    };
+    let bt = crate::builtin_types::builtin_types();
+    Some(if Rc::ptr_eq(t, &bt.int_) {
+        Object::Int(0)
+    } else if Rc::ptr_eq(t, &bt.list_) {
+        Object::new_list(Vec::new())
+    } else if Rc::ptr_eq(t, &bt.dict_) {
+        Object::new_dict()
+    } else if Rc::ptr_eq(t, &bt.set_) {
+        Object::new_set()
+    } else if Rc::ptr_eq(t, &bt.float_) {
+        Object::Float(0.0)
+    } else if Rc::ptr_eq(t, &bt.str_) {
+        Object::from_static("")
+    } else if Rc::ptr_eq(t, &bt.tuple_) {
+        Object::new_tuple(Vec::new())
+    } else {
+        return None;
+    })
+}
+
+/// `defaultdict.__missing__(self, key)`, as CPython's `defdict_missing`:
+/// `KeyError(key)` without a factory; otherwise the factory's value,
+/// stored with `dict.setdefault` (the first value stored wins when the
+/// factory itself fills the key — gh-91618).
+fn dd_missing(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [recv, key] = args else {
+        return Err(type_error(format!(
+            "__missing__() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    };
+    let Object::Instance(inst) = recv else {
+        return Err(type_error(format!(
+            "descriptor '__missing__' for 'collections.defaultdict' objects doesn't apply to a '{}' object",
+            crate::builtins::class_of(recv).name
+        )));
+    };
+    let factory = inst.slot_get("default_factory").unwrap_or(Object::None);
+    if matches!(factory, Object::None) {
+        return Err(crate::error::key_error_object(key.clone()));
+    }
+    let value = match builtin_factory_value(&factory) {
+        Some(v) => v,
+        None => crate::builtins::reentrant_interp()?.call_object(factory, &[], &[])?,
+    };
+    if matches!(value, Object::List(_) | Object::Dict(_) | Object::Set(_)) {
+        crate::gc_trace::track(&value);
+    }
+    crate::builtins::dict_setdefault(&[recv.clone(), key.clone(), value])
+}
+
+// ---------------------------------------------------------------------
+// `_count_elements`.
+
+/// The dict a `Counter`-style tally may update directly: an exact dict,
+/// or a dict subclass whose class keeps `dict.get` and `dict.__setitem__`
+/// (CPython's `_count_elements` fast-path test).
+fn tally_dict(mapping: &Object) -> Option<Rc<RefCell<DictData>>> {
+    match mapping {
+        Object::Dict(d) => Some(d.clone()),
+        Object::Instance(inst) => {
+            let Some(Object::Dict(d)) = inst.native.get() else {
+                return None;
+            };
+            let cls = inst.cls_raw();
+            let bt = crate::builtin_types::builtin_types();
+            let same = |name: &str| {
+                let base = bt
+                    .dict_
+                    .dict
+                    .borrow()
+                    .get(&crate::object::StrKey(name))
+                    .cloned();
+                match (cls.lookup(name), base) {
+                    (Some(Object::Builtin(a)), Some(Object::Builtin(b))) => Rc::ptr_eq(&a, &b),
+                    _ => false,
+                }
+            };
+            (same("get") && same("__setitem__")).then(|| d.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Count one element into `d` (`d[key] = d.get(key, 0) + 1`).
+fn tally_one(
+    interp: &mut crate::Interpreter,
+    d: &Rc<RefCell<DictData>>,
+    key: &Object,
+) -> Result<(), RuntimeError> {
+    // A plain key and an `int` count: in place.
+    if let Some(probe) = crate::object::LeafProbe::new(key) {
+        if !crate::capi_watchers::dicts_active() {
+            if let Ok(mut m) = d.try_borrow_mut() {
+                match m.get_mut(&probe) {
+                    Some(Object::Int(n)) if *n < i64::MAX => {
+                        *n += 1;
+                        drop(m);
+                        crate::object::dict_mutation_event(d);
+                        return Ok(());
+                    }
+                    Some(_) => {}
+                    None if probe.miss_is_exact() => {
+                        m.insert(DictKey(key.clone()), Object::Int(1));
+                        drop(m);
+                        crate::object::dict_watch_bump(d);
+                        crate::object::dict_mutation_event(d);
+                        return Ok(());
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    crate::builtins::ensure_hashable(key)?;
+    let new = match crate::builtins::dict_lookup(d, key)? {
+        None => Object::Int(1),
+        Some(old) => {
+            interp.binary_op_public(&old, &Object::Int(1), weavepy_compiler::BinOpKind::Add)?
+        }
+    };
+    crate::builtins::dict_insert(d, key.clone(), new)?;
+    Ok(())
+}
+
+/// `count_elements(mapping, iterable)`: the tally `_count_elements` runs
+/// when `mapping` is a dict it may update directly (see [`tally_dict`]):
+/// `True` when done, `False` (nothing consumed) for the Python loop over
+/// `mapping.get` and `mapping[key] = …`.
+fn count_elements(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [mapping, iterable] = args else {
+        return Err(type_error(
+            "count_elements() expects a mapping and an iterable",
+        ));
+    };
+    let Some(d) = tally_dict(mapping) else {
+        return Ok(Object::Bool(false));
+    };
+    let interp = crate::builtins::reentrant_interp()?;
+    match iterable {
+        Object::Str(s) => {
+            for c in s.chars() {
+                tally_one(interp, &d, &Object::from_char(c))?;
+            }
+        }
+        Object::List(items) => {
+            // Snapshot-free: the list may change under a key's `__eq__`.
+            let mut i = 0;
+            loop {
+                let item = items.borrow().get(i).cloned();
+                let Some(item) = item else { break };
+                tally_one(interp, &d, &item)?;
+                i += 1;
+            }
+        }
+        Object::Tuple(items) => {
+            for item in items.iter() {
+                tally_one(interp, &d, item)?;
+            }
+        }
+        _ => {
+            let globals = interp.builtins_dict();
+            let it = interp.make_iter(iterable, &globals)?;
+            while let Some(item) = interp.iter_next(&it, &globals)? {
+                tally_one(interp, &d, &item)?;
+            }
+        }
+    }
+    Ok(Object::Bool(true))
+}
+
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::default()));
     {
@@ -1018,6 +1259,13 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         reg("tuplegetter_get", "__get__", tuplegetter_get);
         reg(
+            "install_defaultdict",
+            "install_defaultdict",
+            install_defaultdict,
+        );
+        reg("dd_missing", "__missing__", dd_missing);
+        reg("count_elements", "count_elements", count_elements);
+        reg(
             "namedtuple_register",
             "namedtuple_register",
             namedtuple_register,
@@ -1027,6 +1275,15 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             "reverse_iterator_next",
             "__next__",
             deque_reverse_iterator_next,
+        );
+        d.insert(
+            DictKey(Object::from_static("dd_init")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__init__",
+                binds_instance: true,
+                call: Box::new(|a: &[Object]| dd_init(a, &[])),
+                call_kw: Some(Box::new(dd_init)),
+            })),
         );
         // The `OrderedDict` methods (see `collections_odict`).
         for (export, name, body, kw) in super::collections_odict::exports() {

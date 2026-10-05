@@ -13696,7 +13696,7 @@ fn tuple_index(args: &[Object]) -> Result<Object, RuntimeError> {
 
 // ---------- dict extras ----------
 
-fn dict_setdefault(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn dict_setdefault(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
     let key = match args.get(1) {
         Some(k) => DictKey(k.clone()),
