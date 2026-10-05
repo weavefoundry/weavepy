@@ -8746,6 +8746,65 @@ impl Interpreter {
     /// from `f.defaults`. `None` when too many arguments come, too few
     /// for the defaults to fill, or `__defaults__` was rebound.
     #[inline]
+    /// [`Self::missing_defaults`] for a lean `__init__` call with `given`
+    /// positionals (the instance first): an `__init__` with `*args`,
+    /// `**kwargs` or keyword-only parameters binds its surplus positionals
+    /// to `*args`, an empty `**kwargs`, and its compiled keyword-only
+    /// defaults (see [`Self::lean_init_extend`]).
+    fn lean_init_missing(f: &PyFunction, code: &CodeObject, given: usize) -> Option<usize> {
+        if !Self::has_extended_params(code) {
+            return Self::missing_defaults(f, code, given);
+        }
+        if code.kwonly_count != 0
+            && ((f.defaults_maybe_overridden() && f.slot("__kwdefaults__").is_some())
+                || !Self::kwonly_defaults(f, code).all(|d| d.is_some()))
+        {
+            return None;
+        }
+        if given > code.arg_count as usize {
+            return code.has_varargs.then_some(0);
+        }
+        Self::missing_defaults(f, code, given)
+    }
+
+    /// Fill a lean `__init__`'s locals `v` from the instance and its
+    /// positional arguments `args`, given `missing` from
+    /// [`Self::lean_init_missing`]: the declared positionals (the instance
+    /// first), their missing defaults, and for extended parameters the
+    /// keyword-only defaults, the surplus as `*args` (where the instance
+    /// itself lands when `__init__` declares no positionals, as with
+    /// `def __init__(*args)`) and an empty `**kwargs`, in the locals'
+    /// order.
+    fn lean_init_extend(
+        f: &PyFunction,
+        code: &CodeObject,
+        missing: usize,
+        inst: Object,
+        args: impl ExactSizeIterator<Item = Object>,
+        v: &mut Vec<Object>,
+    ) {
+        let mut all = std::iter::once(inst).chain(args);
+        let given = all.size_hint().0;
+        let direct = given.min(code.arg_count as usize);
+        v.extend(all.by_ref().take(direct));
+        if missing > 0 {
+            v.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
+        }
+        if !Self::has_extended_params(code) {
+            return;
+        }
+        for d in Self::kwonly_defaults(f, code) {
+            v.push(d.cloned().unwrap_or(Object::Unbound));
+        }
+        if code.has_varargs {
+            let rest: Vec<Object> = all.collect();
+            v.push(Object::new_tuple(rest));
+        }
+        if code.has_varkeywords {
+            v.push(Object::Dict(Rc::new(RefCell::new(DictData::default()))));
+        }
+    }
+
     fn missing_defaults(f: &PyFunction, code: &CodeObject, given: usize) -> Option<usize> {
         let missing = (code.arg_count as usize).checked_sub(given)?;
         if missing > 0
@@ -9775,7 +9834,7 @@ impl Interpreter {
         {
             return None;
         }
-        let missing = Self::missing_defaults(init, code, args.len() + 1)?;
+        let missing = Self::lean_init_missing(init, code, args.len() + 1)?;
         let cells = init.lean_cells_ref(code)?;
         let snap_gen = self.lean_snapshot()?;
         let code = code.clone();
@@ -9794,13 +9853,7 @@ impl Interpreter {
                 debug_assert_eq!(Rc::strong_count(&rc), 1);
                 // SAFETY: sole owner (see `pooled_locals_from_args`).
                 let v = unsafe { &mut *rc.as_ptr() };
-                v.push(inst.clone());
-                v.extend(args.iter().cloned());
-                v.extend(
-                    init.defaults[init.defaults.len() - missing..]
-                        .iter()
-                        .cloned(),
-                );
+                Self::lean_init_extend(init, &code, missing, inst.clone(), args.iter().cloned(), v);
                 v.resize(nlocals, Object::Unbound);
             }
             rc
@@ -13704,13 +13757,14 @@ impl Interpreter {
         {
             return false;
         }
-        let Some(missing) = Self::missing_defaults(init, code, argc + 1) else {
+        let Some(missing) = Self::lean_init_missing(init, code, argc + 1) else {
             return false;
         };
         // A leaf `__init__` (plain stores of its arguments into `self`)
         // runs frameless, as a leaf method call does (a plain instance
         // only).
         if matches!(plan.native, crate::types::NativeKind::Plain)
+            && !Self::has_extended_params(code)
             && self.core_leaf_init(
                 frame,
                 &ty,
@@ -13747,12 +13801,13 @@ impl Interpreter {
         let locals = unsafe { &mut *act.frame.locals.as_ptr() };
         let nlocals = code.varnames.len();
         locals.reserve(nlocals.max(argc + 1 + missing));
-        locals.push(inst.clone());
-        locals.extend(frame.stack.drain(self_slot + 1..));
-        locals.extend(
-            init.defaults[init.defaults.len() - missing..]
-                .iter()
-                .cloned(),
+        Self::lean_init_extend(
+            &init,
+            &code,
+            missing,
+            inst.clone(),
+            frame.stack.drain(self_slot + 1..),
+            locals,
         );
         fill_unbound(locals, nlocals);
         // The NULL self slot and the class.
@@ -47758,12 +47813,11 @@ impl Interpreter {
                     && !cls.is_type_subclass() =>
             {
                 let code = init.code();
+                // (`*args`, `**kwargs` and keyword-only parameters bind as
+                // `lean_init_extend` fills them.)
                 if code.is_generator
                     || code.is_coroutine
                     || code.is_async_generator
-                    || code.has_varargs
-                    || code.has_varkeywords
-                    || code.kwonly_count != 0
                     || !code.cellvars.is_empty()
                 {
                     None
