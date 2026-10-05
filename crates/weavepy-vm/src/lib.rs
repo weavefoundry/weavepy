@@ -11990,9 +11990,10 @@ impl Interpreter {
                         let Some(it) = (unsafe { it.peek_mut() }) else {
                             break None;
                         };
-                        // An exhausted range or list iterator the loop holds
-                        // alone, whose death frees nothing else (see the leaf
-                        // arm): retired here instead of by the full handler.
+                        // An exhausted range, tuple or list iterator leaves
+                        // the stack here instead of through the full
+                        // handler (a release that frees anything queues its
+                        // finalizers, run before the next instruction).
                         let mut retire = false;
                         let v = match it {
                             crate::object::PyIterator::Range {
@@ -12009,11 +12010,9 @@ impl Interpreter {
                                     let v = *current;
                                     *current = current.wrapping_add(*step);
                                     Object::Int(v)
-                                } else if unique {
+                                } else {
                                     retire = true;
                                     Object::None
-                                } else {
-                                    break None;
                                 }
                             }
                             crate::object::PyIterator::List {
@@ -12031,7 +12030,14 @@ impl Interpreter {
                                         *index += 1;
                                         v
                                     }
-                                    None if unique && owner.is_none() => {
+                                    None if owner.is_none() => {
+                                        // A shared iterator (a generator
+                                        // expression's `.0`) detaches from the
+                                        // list, as `next_value` does, so a later
+                                        // append can't resurrect it.
+                                        if !unique {
+                                            *items = Rc::new(RefCell::new(Vec::new()));
+                                        }
                                         retire = true;
                                         Object::None
                                     }
@@ -12048,6 +12054,28 @@ impl Interpreter {
                                     // (Its release may free the tuple: a
                                     // finalizer it queues runs before the
                                     // next instruction, below.)
+                                    None => {
+                                        retire = true;
+                                        Object::None
+                                    }
+                                }
+                            }
+                            // A set's next element, while the set keeps its
+                            // size (a change raises: the full arm's).
+                            crate::object::PyIterator::Set { set, index, len: n } => {
+                                // SAFETY: as above.
+                                let Some(st) = (unsafe { set.peek() }) else {
+                                    break None;
+                                };
+                                if st.len() != *n {
+                                    break None;
+                                }
+                                match st.get_index(*index) {
+                                    Some(k) => {
+                                        let v = Self::clone_operand(&k.0);
+                                        *index += 1;
+                                        v
+                                    }
                                     None if unique => {
                                         retire = true;
                                         Object::None
@@ -12056,11 +12084,17 @@ impl Interpreter {
                                 }
                             }
                             crate::object::PyIterator::Bytes { data, index } => {
-                                let Some(&b) = data.get(*index) else {
-                                    break None;
-                                };
-                                *index += 1;
-                                Object::Int(i64::from(b))
+                                match data.get(*index) {
+                                    Some(&b) => {
+                                        *index += 1;
+                                        Object::Int(i64::from(b))
+                                    }
+                                    // (Immutable: an exhausted iterator stays so.)
+                                    None => {
+                                        retire = true;
+                                        Object::None
+                                    }
+                                }
                             }
                             crate::object::PyIterator::ByteArray { data, index } => {
                                 // SAFETY: as above.
@@ -12073,12 +12107,19 @@ impl Interpreter {
                                 Object::Int(i64::from(b))
                             }
                             crate::object::PyIterator::Str { s, index } => {
-                                let Some(ch) = s.get(*index..).and_then(|rest| rest.chars().next())
-                                else {
-                                    break None;
-                                };
-                                *index += ch.len_utf8();
-                                Object::from_char(ch)
+                                match s.get(*index..).and_then(|rest| rest.chars().next()) {
+                                    Some(ch) => {
+                                        *index += ch.len_utf8();
+                                        Object::from_char(ch)
+                                    }
+                                    // (Immutable: an exhausted iterator
+                                    // stays so.)
+                                    None if *index >= s.len() => {
+                                        retire = true;
+                                        Object::None
+                                    }
+                                    None => break None,
+                                }
                             }
                             // `reversed(xs)`: the item below the cursor
                             // (exhaustion, which detaches, is the full arm's).
@@ -13486,6 +13527,9 @@ impl Interpreter {
                                 | Object::Range(_)
                                 | Object::Dict(_)
                                 | Object::DictView(_)
+                                | Object::Set(_)
+                                | Object::FrozenSet(_)
+                                | Object::Str(_)
                         ) || !Self::core_droppable(v)
                         {
                             break Some(CoreExit::Helper);
@@ -18817,12 +18861,34 @@ impl Interpreter {
                     // and clear it. A slot shared with a cell stays on the
                     // full path.
                     let slot = ins.arg as usize;
-                    if !code.cellvars.is_empty() {
+                    if !code.cellvars.is_empty() && Self::shared_cell_index(code, slot).is_some() {
                         break;
                     }
                     let v = match locals.get_mut(slot) {
                         Some(v) => std::mem::replace(v, Object::Unbound),
                         None => Object::Unbound,
+                    };
+                    stack.push(v);
+                    last = pc;
+                    pc += 1;
+                }
+                // CPython 3.14's `LOAD_COMMON_CONSTANT` (the full handler's
+                // table).
+                OpCode::LoadCommonConstant => {
+                    use weavepy_compiler::bytecode::{
+                        COMMON_CONSTANT_ALL, COMMON_CONSTANT_ANY, COMMON_CONSTANT_ASSERTION_ERROR,
+                        COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR, COMMON_CONSTANT_TUPLE,
+                    };
+                    let bt = builtin_types();
+                    let v = match ins.arg {
+                        COMMON_CONSTANT_ASSERTION_ERROR => Object::Type(bt.assertion_error.clone()),
+                        COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR => {
+                            Object::Type(bt.not_implemented_error.clone())
+                        }
+                        COMMON_CONSTANT_TUPLE => Object::Type(bt.tuple_.clone()),
+                        COMMON_CONSTANT_ALL => self.common_all_any[0].clone(),
+                        COMMON_CONSTANT_ANY => self.common_all_any[1].clone(),
+                        _ => break,
                     };
                     stack.push(v);
                     last = pc;
@@ -59999,6 +60065,7 @@ static SLOW_LEAF_OPS: [bool; 256] = {
         OpCode::LoadDeref,
         OpCode::LoadFast,
         OpCode::LoadFastAndClear,
+        OpCode::LoadCommonConstant,
         OpCode::LoadGlobal,
         OpCode::LoadMethodAttr,
         OpCode::LoadSmallInt,

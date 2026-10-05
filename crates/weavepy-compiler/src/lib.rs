@@ -3682,7 +3682,7 @@ impl Compiler {
                     self.set_span(stmt_span);
                     // The message rides the wire view's self slot
                     // (CPython compiler_assert: `CALL 0`).
-                    self.emit(OpCode::CallSelf, 1);
+                    self.emit(OpCode::Call, 0);
                 }
                 self.set_span(test.span);
                 self.emit(OpCode::RaiseVarargs, 1);
@@ -5289,7 +5289,7 @@ impl Compiler {
                     // its hoisted arguments (the first rides the wire
                     // `CALL`'s self slot).
                     self.emit(OpCode::Swap, num_args + 1);
-                    self.emit(OpCode::CallSelf, num_args);
+                    self.emit(OpCode::Call, num_args - 1);
                 } else {
                     self.emit(OpCode::PushNull, 0);
                     self.emit(OpCode::Call, 0);
@@ -5356,7 +5356,7 @@ impl Compiler {
             self.set_span(d.span);
             // The decorated value rides the self slot (CPython
             // `codegen_apply_decorators`: `CALL 0`, no PUSH_NULL).
-            self.emit(OpCode::CallSelf, 1);
+            self.emit(OpCode::Call, 0);
             self.current_span = saved;
         }
         self.compile_assign(&Expr {
@@ -5806,7 +5806,7 @@ impl Compiler {
             let saved = self.current_span;
             self.set_span(d.span);
             // Decorated function rides the self slot (wire `CALL 0`).
-            self.emit(OpCode::CallSelf, 1);
+            self.emit(OpCode::Call, 0);
             self.current_span = saved;
         }
         let name_expr = Expr {
@@ -6455,7 +6455,7 @@ impl Compiler {
             let saved = self.current_span;
             self.set_span(d.span);
             // Decorated class rides the self slot (wire `CALL 0`).
-            self.emit(OpCode::CallSelf, 1);
+            self.emit(OpCode::Call, 0);
             self.current_span = saved;
         }
         let name_expr = Expr {
@@ -11642,7 +11642,7 @@ impl Compiler {
         // location, as is the await of an async comprehension).
         self.current_span = whole_span;
         self.set_line_from(whole_span.0);
-        self.emit(OpCode::CallSelf, 1);
+        self.emit(OpCode::Call, 0);
         // For an async list/set/dict comprehension the call returned
         // a coroutine; the enclosing async function awaits it so the
         // final value (list/set/dict) ends up on the stack.

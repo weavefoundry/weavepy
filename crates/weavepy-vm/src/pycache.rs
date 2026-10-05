@@ -218,7 +218,11 @@ pub const MAGIC: &[u8; 4] = &weavepy_compiler::cpython_code::MAGIC_NUMBER;
 ///   `patma` fold shapes, complex `**` by `_Py_c_prod`), the linetable
 ///   decoder, and `co_localsplusnames` for annotation scopes; rev-52
 ///   artifacts written mid-wave carry the old constant values.
-pub const CACHE_TAG: &str = weavepy_version::vconcat!(weavepy_version::CACHE_TAG_PREFIX, "-53");
+/// - rev `54`: a call whose self slot carries a value (a generator
+///   expression's invocation, a decorator's application) compiles to
+///   `Call n` rather than `CallSelf n+1`, which the interpreter's fast
+///   paths don't serve; rev-53 artifacts still run, slowly.
+pub const CACHE_TAG: &str = weavepy_version::vconcat!(weavepy_version::CACHE_TAG_PREFIX, "-54");
 
 const HEADER_LEN: usize = 16;
 

@@ -178,6 +178,76 @@ class GeneratorCallTest(unittest.TestCase):
         c.close()
 
 
+class IterationTest(unittest.TestCase):
+    def test_set_iteration(self):
+        s = {1, 2, 3}
+        for _ in range(3):
+            self.assertEqual(sorted(x for x in s), [1, 2, 3])
+            self.assertEqual(sum(1 for _ in frozenset(s)), 3)
+        with self.assertRaises(RuntimeError):
+            for x in s:
+                s.add(x + 10)
+
+    def test_shared_list_iterator_stays_exhausted(self):
+        data = [1, 2]
+        it = iter(data)
+        out = [x for x in it]
+        data.append(3)
+        self.assertEqual(out, [1, 2])
+        self.assertEqual(list(it), [])
+
+    def test_shared_exhausted_iterators(self):
+        for src in ((1, 2), "ab", b"ab", range(2)):
+            it = iter(src)
+            self.assertEqual(len([x for x in it]), 2)
+            self.assertEqual(list(it), [])
+
+    def test_genexpr_call_shape(self):
+        def frames():
+            return list(sys._getframe(1).f_code.co_name for _ in range(1))
+
+        self.assertEqual(frames(), ["frames"])
+
+        def raising(xs):
+            return list(1 // x for x in xs)
+
+        with self.assertRaises(ZeroDivisionError):
+            raising([1, 0])
+
+    def test_comprehension_save_restore_with_cells(self):
+        def f():
+            x = "outer"
+            fns = [lambda: x for _ in range(2)]
+            vals = [x for x in range(3)]
+            return x, vals, [g() for g in fns]
+
+        for _ in range(3):
+            self.assertEqual(f(), ("outer", [0, 1, 2], ["outer", "outer"]))
+
+    def test_common_constants(self):
+        all = lambda xs: "shadowed"  # noqa: E731
+        for _ in range(3):
+            self.assertIs(any(x > 1 for x in (1, 2)), True)
+            self.assertEqual(all([1]), "shadowed")
+            with self.assertRaises(AssertionError) as cm:
+                assert False, "msg"
+            self.assertEqual(str(cm.exception), "msg")
+
+    def test_decorators(self):
+        def deco(f):
+            return lambda: ("decorated", f())
+
+        @deco
+        def g():
+            return 1
+
+        @(lambda c: c)
+        class K:
+            pass
+
+        self.assertEqual(g(), ("decorated", 1))
+        self.assertEqual(K.__name__, "K")
+
 class FormatTest(unittest.TestCase):
     def test_huge_field_index(self):
         for _ in range(3):
