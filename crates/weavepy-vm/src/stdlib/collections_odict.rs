@@ -55,15 +55,28 @@ pub(crate) fn order_of(inst: &PyInstance) -> Rc<RefCell<DictData>> {
     // The collector must see the order's keys (`A.od[A] = None` is a
     // cycle through it — test_reference_loop).
     crate::gc_trace::track(&order);
-    inst.slot_set(ORDER, order);
+    inst.note_slot_store(&order);
+    inst.slots.borrow_mut().insert_shared(order_name(), order);
     d
+}
+
+/// [`ORDER`], interned: the slot key shares its storage, so finding the
+/// slot settles on a pointer compare (a thread interning its own copy only
+/// misses that compare, never the lookup).
+fn order_name() -> &'static crate::shared_value::SharedStr {
+    static NAME: std::sync::OnceLock<crate::shared_value::SharedStr> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| match crate::stdlib::sys::intern_name(ORDER) {
+        Object::Str(s) => s,
+        _ => unreachable!("names intern as strings"),
+    })
 }
 
 /// The order dict of `inst`, if it has one.
 #[inline]
 fn peek_order(inst: &PyInstance) -> Option<Rc<RefCell<DictData>>> {
     let slots = inst.slots.try_borrow().ok()?;
-    match slots.get_hinted(0, ORDER).or_else(|| slots.get(ORDER)) {
+    let name = order_name().as_ref();
+    match slots.get_hinted(0, name).or_else(|| slots.get(name)) {
         Some(Object::Dict(d)) => Some(d.clone()),
         _ => None,
     }

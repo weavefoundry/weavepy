@@ -652,7 +652,7 @@ unsafe extern "C" fn h_container(
         // the site cached (as the core loop's arm runs it).
         if ins.op == OpCode::StoreSubscr && len >= 3 {
             let ops = std::slice::from_raw_parts(st.stack.add(len - 2), 2);
-            let Some(fast) = (*st.interp).core_native_subscript(&*code, pc as usize, ops) else {
+            let Some(fast) = (*st.interp).core_native_store(&*code, pc as usize, ops) else {
                 return u64::MAX;
             };
             // Bitwise views in the `__setitem__` order, never dropped.

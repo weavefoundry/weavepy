@@ -11405,7 +11405,7 @@ impl Interpreter {
                             // An instance whose class's `__setitem__` is a
                             // native fast store the site cached.
                             None if ins.op == OpCode::StoreSubscr && len >= 3 => {
-                                let Some(fast) = self.core_native_subscript(
+                                let Some(fast) = self.core_native_store(
                                     code,
                                     pc,
                                     // SAFETY: `len >= 3`.
@@ -19082,8 +19082,7 @@ impl Interpreter {
     }
 
     /// [`Self::leaf_instance_subscript`] for `STORE_SUBSCR`: `args` is the
-    /// `[container, key, value]` the class's `__setitem__` takes. The fast
-    /// half is cached in the store site's own method slot.
+    /// `[container, key, value]` the class's `__setitem__` takes.
     #[inline(never)]
     fn leaf_instance_store_subscript(
         &self,
@@ -19094,6 +19093,18 @@ impl Interpreter {
         let [Object::Instance(inst), _, _] = args else {
             return None;
         };
+        self.native_store_fast(inst, code, cache_pc)?(args)
+    }
+
+    /// The leaf half of `inst`'s class's `__setitem__` (a registered native
+    /// builtin's), cached in the store site's own method slot under the
+    /// class's attribute version.
+    fn native_store_fast(
+        &self,
+        inst: &PyInstance,
+        code: &CodeObject,
+        cache_pc: u32,
+    ) -> Option<leaf_builtins::Fast> {
         let cls = inst.cls_raw();
         if !Self::default_getattribute(cls) || crate::object::exotic_str_keys_possible() {
             return None;
@@ -19104,28 +19115,44 @@ impl Interpreter {
             .and_then(|ext| ext.method_slots.get())
             .and_then(|slots| slots.get(cache_pc as usize))
             .and_then(|slot| slot.get_native_subscript(version, generation));
-        let fast = match cached {
-            Some(fast) => fast,
-            None => {
-                let Object::Builtin(builtin) = cls.lookup("__setitem__")? else {
-                    return None;
-                };
-                if !builtin.binds_instance || builtin.call_kw.is_some() {
-                    return None;
-                }
-                match self.leaf_call_kind(&builtin)? {
-                    LeafKind::Fast(fast) => {
-                        if let Some(slot) = code_method_slot(code, cache_pc) {
-                            slot.set_native_subscript(version, generation, fast);
-                        }
-                        fast
-                    }
-                    LeafKind::Opaque => return Some((builtin.call)(args)),
-                    _ => return None,
-                }
-            }
+        if cached.is_some() {
+            return cached;
+        }
+        let Object::Builtin(builtin) = cls.lookup("__setitem__")? else {
+            return None;
         };
-        fast(args)
+        if !builtin.binds_instance || builtin.call_kw.is_some() {
+            return None;
+        }
+        let LeafKind::Fast(fast) = self.leaf_call_kind(&builtin)? else {
+            return None;
+        };
+        if let Some(slot) = code_method_slot(code, cache_pc) {
+            slot.set_native_subscript(version, generation, fast);
+        }
+        Some(fast)
+    }
+
+    /// The native fast `__setitem__` for the `STORE_SUBSCR` at `pc` of
+    /// `code` over `ops` (`[container, key]`), resolved and cached on first
+    /// use, when the operands leave by plain decrements.
+    #[inline(never)]
+    pub(crate) fn core_native_store(
+        &self,
+        code: &CodeObject,
+        pc: usize,
+        ops: &[Object],
+    ) -> Option<leaf_builtins::Fast> {
+        let [Object::Instance(inst), key] = ops else {
+            return None;
+        };
+        if !matches!(key, Object::Int(_) | Object::Str(_))
+            || !Self::core_droppable(&ops[0])
+            || !Self::core_droppable(key)
+        {
+            return None;
+        }
+        self.native_store_fast(inst, code, pc as u32)
     }
 
     /// A registered leaf builtin method `name` on the instance's class
