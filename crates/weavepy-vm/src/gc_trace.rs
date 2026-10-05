@@ -794,34 +794,29 @@ impl GcState {
     /// Stop tracking `obj`. Backs the explicit `gc._untrack(obj)` extension
     /// and the C-API `PyObject_GC_UnTrack`.
     pub fn untrack_id(&self, id: ObjectId) {
-        // (From the newest: an untrack usually follows its birth closely.)
-        if let Ok(mut fns) = self.young_fns.try_borrow_mut() {
-            if let Some(i) = fns
-                .iter()
-                .rposition(|w| w.as_ptr() as usize as ObjectId == id)
-            {
-                fns.swap_remove(i);
-                let mut counts = self.counts.borrow_mut();
-                counts[0] = counts[0].saturating_sub(1);
-                self.sync_gen0_gauge(counts[0], None);
-                return;
+        self.untrack_id_in(id, true);
+    }
+
+    /// [`Self::untrack_id`]; `may_be_young` is `false` for an object no
+    /// young set can hold (anything but an instance or a function).
+    fn untrack_id_in(&self, id: ObjectId, may_be_young: bool) {
+        // A registered object is never in a young set, so the index (a
+        // hash probe) answers first; the young sets are scanned only for
+        // an object it doesn't hold. (Finished coroutines are untracked
+        // here by the thousand, and the young sets hold up to
+        // `YOUNG_CAP` entries.) An index entry left by a dead object
+        // whose address a young one now reuses is dropped, and the young
+        // sets still searched.
+        let indexed = self.index.borrow_mut().remove(&id);
+        let Some(handle) = indexed else {
+            if may_be_young {
+                self.untrack_young(id);
             }
-        }
-        if let Ok(mut young) = self.young.try_borrow_mut() {
-            if let Some(i) = young
-                .iter()
-                .position(|w| w.as_ptr() as usize as ObjectId == id)
-            {
-                young.swap_remove(i);
-                let mut counts = self.counts.borrow_mut();
-                counts[0] = counts[0].saturating_sub(1);
-                self.sync_gen0_gauge(counts[0], None);
-                return;
-            }
-        }
-        let Some(handle) = self.index.borrow_mut().remove(&id) else {
             return;
         };
+        if may_be_young && handle.object.is_dead() {
+            self.untrack_young(id);
+        }
         {
             let mut counts = self.counts.borrow_mut();
             counts[0] = counts[0].saturating_sub(1);
@@ -866,6 +861,31 @@ impl GcState {
         }
         serial_add(&self.tracked_count, usize::MAX);
         serial_add(&self.tracked_version, 1);
+    }
+
+    /// [`Self::untrack_id`] for an object in a young set (searched from
+    /// the newest: an untrack usually follows its birth closely).
+    fn untrack_young(&self, id: ObjectId) {
+        fn remove<T: 'static>(set: &RefCell<Vec<crate::sync::Weak<T>>>, id: ObjectId) -> bool {
+            let Ok(mut young) = set.try_borrow_mut() else {
+                return false;
+            };
+            match young
+                .iter()
+                .rposition(|w| w.as_ptr() as usize as ObjectId == id)
+            {
+                Some(i) => {
+                    young.swap_remove(i);
+                    true
+                }
+                None => false,
+            }
+        }
+        if remove(&self.young_fns, id) || remove(&self.young, id) {
+            let mut counts = self.counts.borrow_mut();
+            counts[0] = counts[0].saturating_sub(1);
+            self.sync_gen0_gauge(counts[0], None);
+        }
     }
 
     /// Drop the entries of objects that have died from `handles`, and from
@@ -2505,6 +2525,12 @@ pub fn untrack(obj: &Object) {
 /// [`untrack`] by identity.
 pub fn untrack_id(id: ObjectId) {
     with_state(|s| s.untrack_id(id));
+}
+
+/// [`untrack_id`] for an object that is neither an instance nor a
+/// function (a generator, say), which is never in a young set.
+pub fn untrack_registered_id(id: ObjectId) {
+    with_state(|s| s.untrack_id_in(id, false));
 }
 
 /// Reinitialise the process-global cycle collector's locks in a `fork(2)`

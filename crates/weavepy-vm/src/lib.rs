@@ -9534,7 +9534,7 @@ impl Interpreter {
         let saved_pc = frame.pc;
         frame.pc = pc as u32 + 1;
         let pending_self = self.lean_pending_enter(frame, shell, pc);
-        let result = self.generator_send_lean(&g, &Object::None, None);
+        let result = self.generator_send_lean(&g, &Object::None, None, false);
         self.lean_pending_exit(pending_self);
         let Some(result) = result else {
             frame.pc = saved_pc;
@@ -36446,6 +36446,7 @@ impl Interpreter {
         gen: &Rc<PyGenerator>,
         sent: &Object,
         fold: Option<FoldSink>,
+        raw_return: bool,
     ) -> Option<Result<Object, RuntimeError>> {
         let snap_gen = self.lean_snapshot()?;
         if self.dbg_sample
@@ -36606,7 +36607,7 @@ impl Interpreter {
                 let frame: &mut Frame = &mut boxed;
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(gen);
-                Err(stop_iteration_with(v))
+                Self::generator_returned(v, raw_return)
             }
             Ok(FrameOutcome::StartGenerator) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
@@ -36640,7 +36641,7 @@ impl Interpreter {
         if !gc_trace::maybe_tracked(id) || crate::weakref_registry::count_for(id) > 0 {
             return;
         }
-        gc_trace::untrack_id(id);
+        gc_trace::untrack_registered_id(id);
     }
 
     fn park_suspended_boxed(gen: &Rc<PyGenerator>, boxed: Box<Frame>) {
@@ -36671,6 +36672,39 @@ impl Interpreter {
         self.generator_send_fold(gen, sent, None)
     }
 
+    /// Resume `gen` with `sent`, as `send` does, but report a return as
+    /// [`GenResume::Returned`] instead of raising `StopIteration` (the C
+    /// API's `PyIter_Send`; asyncio's task step drives coroutines this
+    /// way, sparing an exception per finished task).
+    pub(crate) fn generator_resume(
+        &mut self,
+        gen: &Rc<PyGenerator>,
+        sent: Object,
+    ) -> Result<GenResume, RuntimeError> {
+        GEN_RAW_RETURN.with(|r| r.set(true));
+        let result = self.generator_send_fold(gen, sent, None);
+        GEN_RAW_RETURN.with(|r| r.set(false));
+        match result {
+            Ok(Object::Unbound) => Ok(GenResume::Returned(
+                GEN_RETURN_VALUE
+                    .with(|v| v.borrow_mut().take())
+                    .unwrap_or(Object::None),
+            )),
+            Ok(v) => Ok(GenResume::Yielded(v)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// A resumed generator returned `v`: `StopIteration(v)`, or for
+    /// [`Self::generator_resume`] the `Unbound` marker with `v` parked.
+    fn generator_returned(v: Object, raw_return: bool) -> Result<Object, RuntimeError> {
+        if raw_return {
+            GEN_RETURN_VALUE.with(|slot| *slot.borrow_mut() = Some(v));
+            return Ok(Object::Unbound);
+        }
+        Err(stop_iteration_with(v))
+    }
+
     /// [`Self::generator_send`] for a consumer that drains the generator:
     /// a lean resume folds the yields it can into `fold` (see
     /// [`Self::sum_fold`]) and returns the first it can't. Any other
@@ -36682,7 +36716,10 @@ impl Interpreter {
         sent: Object,
         fold: Option<FoldSink>,
     ) -> Result<Object, RuntimeError> {
-        if let Some(r) = self.generator_send_lean(gen, &sent, fold) {
+        // Consumed here, so a generator this one resumes in turn raises
+        // `StopIteration` as usual.
+        let raw_return = GEN_RAW_RETURN.with(|r| r.replace(false));
+        if let Some(r) = self.generator_send_lean(gen, &sent, fold, raw_return) {
             return r;
         }
         // Take the boxed frame; it is run *in place* (RFC 0069 WS4) so
@@ -36783,7 +36820,7 @@ impl Interpreter {
                 // donate it back to the frame pools.
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(gen);
-                Err(stop_iteration_with(v))
+                Self::generator_returned(v, raw_return)
             }
             Ok(FrameOutcome::StartGenerator) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
@@ -57288,6 +57325,23 @@ enum FrameEv {
 /// [`InlineAct::exhaust_arg`] of a generator resumed by builtin `next`
 /// (no `FOR_ITER` jump is that long).
 const GEN_NEXT_CALL: u32 = u32::MAX;
+
+/// How [`Interpreter::generator_resume`] concluded.
+pub(crate) enum GenResume {
+    /// The generator yielded this value.
+    Yielded(Object),
+    /// The generator returned this value.
+    Returned(Object),
+}
+
+thread_local! {
+    /// Set by [`Interpreter::generator_resume`] for the resume it starts
+    /// (see `generator_send_fold`).
+    static GEN_RAW_RETURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The value a raw resume's generator returned.
+    static GEN_RETURN_VALUE: std::cell::RefCell<Option<Object>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 enum GenStep {
     /// The generator yielded this value.
