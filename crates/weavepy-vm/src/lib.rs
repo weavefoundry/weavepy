@@ -22422,6 +22422,11 @@ impl Interpreter {
                 receiver.clone(),
                 Object::Function(f),
             )))),
+            // A native method on the class (`re.Pattern.match`), bound as
+            // its descriptor binds it.
+            (LeafAttr::BuiltinMethod(b), _) => Some(Object::BoundMethod(Rc::new(
+                BoundMethod::new(receiver.clone(), Object::Builtin(b)),
+            ))),
             // A named tuple field: the tuple item (an index out of range
             // is the descriptor's to raise), remembered for the site.
             (LeafAttr::TupleField(ix), _) => {
@@ -22437,13 +22442,7 @@ impl Interpreter {
                     _ => None,
                 }
             }
-            (
-                LeafAttr::InstanceOnly
-                | LeafAttr::BuiltinMethod(_)
-                | LeafAttr::Property(_)
-                | LeafAttr::ClassMethod(_),
-                _,
-            ) => None,
+            (LeafAttr::InstanceOnly | LeafAttr::Property(_) | LeafAttr::ClassMethod(_), _) => None,
         }
     }
 
@@ -22937,7 +22936,23 @@ impl Interpreter {
         if let Some(f) = slot.and_then(|s| s.get(ver)) {
             return Some(Object::Function(f));
         }
-        let f = Self::load_method_ic_resolve(cls, code, name_idx, mro_idx, key_idx)?;
+        if let Some(b) = slot.and_then(|s| s.get_inst_builtin(ver)) {
+            return Some(Object::Builtin(b));
+        }
+        let Some(f) = Self::load_method_ic_resolve(cls, code, name_idx, mro_idx, key_idx) else {
+            // A native method on the class (`re.Match.end`, installed over
+            // the Python one): the class's own cache resolves it, and the
+            // site remembers it for this version.
+            let LeafAttr::BuiltinMethod(b) =
+                Self::leaf_resolve_instance_attr(code, inst, name_idx)?
+            else {
+                return None;
+            };
+            if let Some(s) = slot {
+                s.set_inst_builtin(ver, &b);
+            }
+            return Some(Object::Builtin(b));
+        };
         if let Some(s) = slot {
             s.set(ver, &f);
         }

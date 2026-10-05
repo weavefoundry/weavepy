@@ -1264,6 +1264,42 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
         crate::gc_trace::track(&obj);
         return Some(obj);
     }
+    // `int(text, base)` of a plain ASCII literal: an optional sign, and
+    // digits of an explicit base, or of the base a `0x`/`0o`/`0b` prefix
+    // names for base 0 (where a decimal literal can't have a leading
+    // zero). Underscores, spaces, and anything that would raise or not fit
+    // a machine word take the full path.
+    if let [Object::Str(text), Object::Int(base)] = args {
+        if !Rc::ptr_eq(cls, &bt.int_) {
+            return None;
+        }
+        let t: &str = text.as_ref();
+        let (neg, body) = match t.as_bytes().first() {
+            Some(b'-') => (true, &t[1..]),
+            Some(b'+') => (false, &t[1..]),
+            _ => (false, t),
+        };
+        let (radix, digits) = match *base {
+            0 => match body.as_bytes() {
+                [b'0', b'x' | b'X', ..] => (16, &body[2..]),
+                [b'0', b'o' | b'O', ..] => (8, &body[2..]),
+                [b'0', b'b' | b'B', ..] => (2, &body[2..]),
+                [b'0', rest @ ..] if rest.iter().all(|&c| c == b'0') => (10, body),
+                [b'0', ..] => return None,
+                _ => (10, body),
+            },
+            b @ 2..=36 => (b as u32, body),
+            _ => return None,
+        };
+        if digits.is_empty()
+            || digits.len() > 15
+            || !digits.bytes().all(|c| char::from(c).is_digit(radix))
+        {
+            return None;
+        }
+        let v = i64::from_str_radix(digits, radix).ok()?;
+        return Some(Object::Int(if neg { -v } else { v }));
+    }
     // `int(text)` and `float(text)` of a plain ASCII literal (an optional
     // sign and digits; for a float, also a point and an exponent). Any
     // other text, including one that would raise, takes the full path.
