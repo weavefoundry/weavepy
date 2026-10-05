@@ -16623,6 +16623,31 @@ impl Interpreter {
         effect: bool,
         depth: usize,
     ) -> Option<Object> {
+        let ext = code_vm_ext(code)?;
+        let tries = ext.leaf_tries.load(std::sync::atomic::Ordering::Relaxed);
+        let (bails, done) = (tries >> 32, tries & 0xFFFF_FFFF);
+        if bails >= LEAF_BAIL_LIMIT && bails > done.saturating_mul(4) {
+            return None;
+        }
+        let r = self.pure_leaf_call_inner(code, f, args, effect, depth);
+        // (Each half stops counting when full: the counts only steer the
+        // decision above.)
+        let bump = if r.is_some() { 1 } else { 1 << 32 };
+        if bails < u64::from(u32::MAX) && done < u64::from(u32::MAX) {
+            ext.leaf_tries
+                .store(tries + bump, std::sync::atomic::Ordering::Relaxed);
+        }
+        r
+    }
+
+    fn pure_leaf_call_inner(
+        &self,
+        code: &CodeObject,
+        f: &crate::object::PyFunction,
+        args: &[*const Object],
+        effect: bool,
+        depth: usize,
+    ) -> Option<Object> {
         // (The tiny shapes `leaf_eval` answers itself skip the probe.)
         #[cfg(feature = "jit")]
         if code_vm_ext(code)
@@ -17912,9 +17937,9 @@ impl Interpreter {
                 }
             }
         }
-        if let (IC::LoadAttrInstance { key_idx, ver }, Object::Instance(inst)) =
-            (code.caches.get(attr_pc as u32), local)
-        {
+        // (Decoded once for the arms below.)
+        let cache = code.caches.get(attr_pc as u32);
+        if let (IC::LoadAttrInstance { key_idx, ver }, Object::Instance(inst)) = (cache, local) {
             let cls = inst.cls_raw();
             if cls.native_kind.get() != 0 || cls.attr_version.get() != ver {
                 return None;
@@ -17930,7 +17955,16 @@ impl Interpreter {
             }
             return Some(Self::clone_operand(v));
         }
-        Self::leaf_fused_local_attr(code, local, attr_pc, name_idx)
+        // `leaf_fused_local_attr`, over the decoded cache.
+        if matches!(cache, IC::Empty) {
+            return None;
+        }
+        match local {
+            Object::Instance(i) if i.cls_raw().native_kind.get() == 0 => {}
+            Object::Module(_) => {}
+            _ => return None,
+        }
+        Self::leaf_load_attr_with(code, local, cache, attr_pc as u32, name_idx)
     }
 
     /// Read a bounded chain of cached instance fields through its root local.
@@ -21969,8 +22003,26 @@ impl Interpreter {
         cache_pc: u32,
         name_idx: u32,
     ) -> Option<Object> {
+        Self::leaf_load_attr_with(
+            code,
+            receiver,
+            code.caches.get(cache_pc),
+            cache_pc,
+            name_idx,
+        )
+    }
+
+    /// [`Self::leaf_load_attr_recv`] with the site's cache already decoded.
+    #[inline]
+    fn leaf_load_attr_with(
+        code: &CodeObject,
+        receiver: &Object,
+        cache: weavepy_compiler::InlineCache,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Option<Object> {
         use weavepy_compiler::InlineCache as IC;
-        match (code.caches.get(cache_pc), receiver) {
+        match (cache, receiver) {
             (IC::LoadAttrInstance { key_idx, ver }, Object::Instance(inst)) => {
                 if inst.cls_raw().attr_version.get() != ver {
                     return None;
@@ -65551,6 +65603,11 @@ struct CodeConstObjects {
     /// `4` constant return, `5` small-int return, `6` attribute return,
     /// `7` comparison of two argument fields.
     pure_leaf: std::sync::atomic::AtomicU8,
+    /// Frameless leaf evaluations of this code that gave up (high half)
+    /// and that finished (low half): one that keeps giving up (a body
+    /// whose leaf shape its calls rarely take, a recursion) stops being
+    /// tried, as each attempt costs about what the call does.
+    leaf_tries: std::sync::atomic::AtomicU64,
     /// Per-instruction fused-pair kinds (see [`code_fast_pairs`]): `1`
     /// at a `LOAD_FAST` whose successor is another `LOAD_FAST`, `2` when
     /// it is a `STORE_FAST`, `0` everywhere else. CPython's compiler
@@ -67141,6 +67198,11 @@ fn pure_leaf_warm(code: &CodeObject) -> bool {
     true
 }
 
+/// Frameless leaf evaluations of a code object that may give up before
+/// the core loop stops trying them when they rarely finish (see
+/// `CodeConstObjects::leaf_tries`).
+const LEAF_BAIL_LIMIT: u64 = 64;
+
 /// Whether `f`'s code is a pure or an effect leaf (the core loop's
 /// frameless call candidates).
 #[inline(always)]
@@ -67252,6 +67314,7 @@ fn code_vm_ext_build(
             attr_poly: std::sync::OnceLock::new(),
             call_slots: std::sync::OnceLock::new(),
             pure_leaf: std::sync::atomic::AtomicU8::new(0),
+            leaf_tries: std::sync::atomic::AtomicU64::new(0),
             fast_pairs: std::sync::OnceLock::new(),
             gen_fast: std::sync::atomic::AtomicU8::new(0),
             field_slots: std::sync::OnceLock::new(),
