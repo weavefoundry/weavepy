@@ -10897,18 +10897,18 @@ impl Interpreter {
                                             // The scalar shapes copy inline, as
                                             // the single-load arm does.
                                             let ca = match a {
-                                                Object::Int(x) => Object::Int(*x),
-                                                Object::Float(x) => Object::Float(*x),
-                                                Object::Bool(x) => Object::Bool(*x),
-                                                Object::None => Object::None,
+                                                s @ (Object::Int(_)
+                                                | Object::Float(_)
+                                                | Object::Bool(_)
+                                                | Object::None) => scalar_copy(s),
                                                 Object::Unbound => break None,
                                                 other => clone_hot(other),
                                             };
                                             let cb = match b {
-                                                Object::Int(x) => Object::Int(*x),
-                                                Object::Float(x) => Object::Float(*x),
-                                                Object::Bool(x) => Object::Bool(*x),
-                                                Object::None => Object::None,
+                                                s @ (Object::Int(_)
+                                                | Object::Float(_)
+                                                | Object::Bool(_)
+                                                | Object::None) => scalar_copy(s),
                                                 Object::Unbound => {
                                                     drop_hot(ca);
                                                     break None;
@@ -10944,10 +10944,10 @@ impl Interpreter {
                                                     || matches!(*dst, Object::Unbound))
                                             {
                                                 let c = match src {
-                                                    Object::Int(x) => Object::Int(*x),
-                                                    Object::Float(x) => Object::Float(*x),
-                                                    Object::Bool(x) => Object::Bool(*x),
-                                                    Object::None => Object::None,
+                                                    s @ (Object::Int(_)
+                                                    | Object::Float(_)
+                                                    | Object::Bool(_)
+                                                    | Object::None) => scalar_copy(s),
                                                     other => clone_hot(other),
                                                 };
                                                 dst.write(c);
@@ -11011,10 +11011,10 @@ impl Interpreter {
                         unsafe {
                             let v = &*lbase.add(i);
                             let c = match v {
-                                Object::Int(x) => Object::Int(*x),
-                                Object::Float(x) => Object::Float(*x),
-                                Object::Bool(x) => Object::Bool(*x),
-                                Object::None => Object::None,
+                                s @ (Object::Int(_)
+                                | Object::Float(_)
+                                | Object::Bool(_)
+                                | Object::None) => scalar_copy(s),
                                 Object::Unbound => break None,
                                 other => {
                                     // `x.attr` on a local receiver: read straight
@@ -11137,10 +11137,10 @@ impl Interpreter {
                         unsafe {
                             let v = &*cbase.add(i);
                             let c = match v {
-                                Object::Int(x) => Object::Int(*x),
-                                Object::Float(x) => Object::Float(*x),
-                                Object::Bool(x) => Object::Bool(*x),
-                                Object::None => Object::None,
+                                s @ (Object::Int(_)
+                                | Object::Float(_)
+                                | Object::Bool(_)
+                                | Object::None) => scalar_copy(s),
                                 other => other.clone(),
                             };
                             base.add(len).write(c);
@@ -13036,10 +13036,10 @@ impl Interpreter {
                             break Some(CoreExit::Helper);
                         };
                         let v = match v {
-                            Object::Int(x) => Object::Int(*x),
-                            Object::Float(x) => Object::Float(*x),
-                            Object::Bool(x) => Object::Bool(*x),
-                            Object::None => Object::None,
+                            s @ (Object::Int(_)
+                            | Object::Float(_)
+                            | Object::Bool(_)
+                            | Object::None) => scalar_copy(s),
                             // `f(...)` of a pure leaf global function with
                             // simple arguments (see `core_pure_global_call`).
                             Object::Function(f)
@@ -65660,20 +65660,59 @@ pub(crate) fn native_site(ext: &CodeConstObjects, pc: usize) -> bool {
 /// variant switch per clone).
 #[inline(always)]
 fn clone_hot(v: &Object) -> Object {
+    // A whole-object copy, not a rebuilt one: rebuilding writes the tag as
+    // a byte and the payload as a word, and the 16-byte move that follows
+    // stalls on store forwarding (it was the core loop's hottest
+    // instruction).
     match v {
-        Object::None => Object::None,
-        Object::Unbound => Object::Unbound,
-        Object::Bool(b) => Object::Bool(*b),
-        Object::Int(i) => Object::Int(*i),
-        Object::Float(f) => Object::Float(*f),
-        Object::Instance(i) => Object::Instance(i.clone()),
-        Object::Function(f) => Object::Function(f.clone()),
-        Object::List(l) => Object::List(l.clone()),
-        Object::Dict(d) => Object::Dict(d.clone()),
-        Object::Type(t) => Object::Type(t.clone()),
-        Object::Str(s) => Object::Str(s.clone()),
+        Object::None | Object::Unbound | Object::Bool(_) | Object::Int(_) | Object::Float(_) => {
+            scalar_copy(v)
+        }
+        // The single-pointer variants: a new owner of the same pointer.
+        Object::Instance(i) => {
+            std::mem::forget(i.clone());
+            // SAFETY: the reference taken above is the copy's.
+            unsafe { std::ptr::read(v) }
+        }
+        Object::Function(f) => {
+            std::mem::forget(f.clone());
+            // SAFETY: as above.
+            unsafe { std::ptr::read(v) }
+        }
+        Object::List(l) => {
+            std::mem::forget(l.clone());
+            // SAFETY: as above.
+            unsafe { std::ptr::read(v) }
+        }
+        Object::Dict(d) => {
+            std::mem::forget(d.clone());
+            // SAFETY: as above.
+            unsafe { std::ptr::read(v) }
+        }
+        Object::Type(t) => {
+            std::mem::forget(t.clone());
+            // SAFETY: as above.
+            unsafe { std::ptr::read(v) }
+        }
+        Object::Str(s) => {
+            std::mem::forget(s.clone());
+            // SAFETY: as above.
+            unsafe { std::ptr::read(v) }
+        }
         other => other.clone(),
     }
+}
+
+/// A scalar object (`None`, `Unbound`, a `bool`, an `int`, a `float`):
+/// copied whole, as two words (see [`clone_hot`]).
+#[inline(always)]
+fn scalar_copy(v: &Object) -> Object {
+    debug_assert!(matches!(
+        v,
+        Object::None | Object::Unbound | Object::Bool(_) | Object::Int(_) | Object::Float(_)
+    ));
+    // SAFETY: a scalar owns nothing: its bits are a complete copy.
+    unsafe { std::ptr::read(v) }
 }
 
 /// `drop(v)` with the scalars skipped and the common heap variants'
