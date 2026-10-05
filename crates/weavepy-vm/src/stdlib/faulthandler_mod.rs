@@ -226,18 +226,13 @@ fn dump_frames(out: &mut String, frame_stack: &crate::object::FrameStack) {
 }
 
 /// Frames of frozen Python stand-ins for machinery CPython implements
-/// in C: `_seqtools` (`map`/`zip`/...), the `_weave_*` internals, and
-/// `contextvars.Context.run` (3.14's `Thread._bootstrap_inner` runs the
-/// target through `self._context.run`, which is a C call in CPython, so
-/// `test_faulthandler.test_dump_traceback_threads` expects exactly
-/// `run` -> `_bootstrap_inner` -> `_bootstrap`). A crash dump must not
-/// show them, just as CPython shows no frame for C code.
+/// in C: `_seqtools` (`map`/`zip`/...) and the `_weave_*` internals. A
+/// crash dump must not show them, just as CPython shows no frame for C
+/// code.
 fn frame_is_native_stand_in(frame: &crate::object::FrameShell) -> bool {
     let filename = frame.code.filename.as_str();
     let base = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
-    base == "_seqtools.py"
-        || base.starts_with("_weave_")
-        || (base == "contextvars.py" && frame.code.name.as_str() == "run")
+    base == "_seqtools.py" || base.starts_with("_weave_")
 }
 
 /// CPython `write_thread_id`: `0x` + the thread id zero-padded to

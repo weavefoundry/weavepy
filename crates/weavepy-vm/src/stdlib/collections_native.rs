@@ -374,7 +374,7 @@ fn popleft_locked(st: &mut DequeState<'_>, d: &mut Vec<Object>) -> Result<Object
     Ok(x)
 }
 
-fn deque_append(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn deque_append(args: &[Object]) -> Result<Object, RuntimeError> {
     if let [recv, x] = args {
         if let Some(v) = fast_op(OP_APPEND, recv, Some(x)) {
             return Ok(v);

@@ -1,27 +1,23 @@
 """WeavePy `contextvars` — PEP 567 context variables.
 
-A pure-Python implementation that matches the CPython API surface
-for asyncio and library code: `ContextVar`, `Context`, `Token`,
-`copy_context`. The runtime keeps a per-thread current context
-pointer; `Context.run(fn, ...)` swaps it on entry and restores it on
-exit.
+The classes are defined here with `__slots__`; their hot methods
+(`ContextVar.get`/`set`/`reset`, `Context.run`/`copy`, and
+`copy_context`) are native (`stdlib/contextvars_native.rs`), which also
+keeps each OS thread's current context. A freshly started thread begins
+with an empty context; it doesn't inherit the spawning thread's values.
 
-PEP 567 semantics: each OS thread has its own independent "current
-context"; a freshly started thread begins with an empty context (it
-does NOT inherit the spawning thread's values). We keep the per-thread
-state in a dict keyed by `_thread.get_ident()` — all mutations happen
-under the GIL, so plain dict operations are safe.
-
-Contexts map ContextVar objects (identity-hashed) to values, so
-iteration/keys/items yield the real variables like CPython's
-HAMT-backed Context. Tokens record the Context they were minted in;
-`reset` enforces CPython's full error taxonomy (RuntimeError for a
-reused token, ValueError for a foreign variable or Context).
+A context's `_data` slot holds its mapping (ContextVar -> value), a
+dict shared between a context and its copies and copied on the first
+write while shared, so `copy_context()` is O(1) like CPython's HAMT-based
+copy. Python code here only reads it. Tokens record the Context they
+were minted in; `reset` enforces CPython's full error taxonomy
+(RuntimeError for a reused token, ValueError for a foreign variable or
+Context).
 """
 
 __all__ = ["ContextVar", "Context", "Token", "copy_context"]
 
-import _thread
+import _weave_contextvars as _native
 
 # `ContextVar[int]` yields a `types.GenericAlias` (CPython exposes this on
 # the C `ContextVar`). Spelled like `_collections_abc` does rather than
@@ -65,6 +61,7 @@ class Token:
 
     MISSING = _MISSING
 
+    # The native `ContextVar.set` builds tokens over this slot order.
     __slots__ = ("_var", "_old", "_used", "_ctx", "__weakref__")
 
     __class_getitem__ = classmethod(_GenericAlias)
@@ -72,11 +69,8 @@ class Token:
     def __init_subclass__(cls, **kwargs):
         _no_subclassing(cls)
 
-    def __init__(self, var, old, ctx):
-        self._var = var
-        self._old = old
-        self._used = False
-        self._ctx = ctx
+    def __new__(cls, *args, **kwargs):
+        raise RuntimeError("Tokens can only be created by ContextVars")
 
     @property
     def var(self):
@@ -128,40 +122,9 @@ class ContextVar:
     def name(self):
         return self._name
 
-    def get(self, *args):
-        if len(args) > 1:
-            raise TypeError(
-                f"get() takes at most 1 argument ({len(args)} given)")
-        data = _current_context()._data
-        if self in data:
-            return data[self]
-        if args:
-            return args[0]
-        if self._default is not _MISSING:
-            return self._default
-        raise LookupError(self)
-
-    def set(self, value):
-        ctx = _current_context()
-        old = ctx._data.get(self, _MISSING)
-        ctx._data[self] = value
-        return Token(self, old, ctx)
-
-    def reset(self, token):
-        if not isinstance(token, Token):
-            raise TypeError("expected an instance of Token")
-        if token._used:
-            raise RuntimeError(f"{token!r} has already been used once")
-        if token._var is not self:
-            raise ValueError(f"{token!r} was created by a different ContextVar")
-        ctx = _current_context()
-        if token._ctx is not ctx:
-            raise ValueError(f"{token!r} was created in a different Context")
-        token._used = True
-        if token._old is _MISSING:
-            ctx._data.pop(self, None)
-        else:
-            ctx._data[self] = token._old
+    get = _native.get
+    set = _native.set
+    reset = _native.reset
 
     def __repr__(self):
         key = id(self)
@@ -180,7 +143,8 @@ class ContextVar:
 class Context:
     """A mapping of `ContextVar` -> value."""
 
-    __slots__ = ("_data", "_entered")
+    # The native `copy_context` builds contexts over this slot order.
+    __slots__ = ("_data", "_entered", "_prev", "__weakref__")
 
     def __init_subclass__(cls, **kwargs):
         _no_subclassing(cls)
@@ -188,34 +152,12 @@ class Context:
     def __init__(self, *args, **kwargs):
         if args or kwargs:
             raise TypeError("Context() does not accept any arguments")
-        self._data = {}
+        self._data = _native._new_mapping()
         self._entered = False
+        self._prev = None
 
-    def run(self, callable_, /, *args, **kwargs):
-        if self._entered:
-            raise RuntimeError(
-                f"cannot enter context: {self!r} is already entered")
-        ident = _thread.get_ident()
-        prev = _STATES.get(ident)
-        self._entered = True
-        _STATES[ident] = self
-        if _switch_hook is not None:
-            _switch_hook(self)
-        try:
-            return callable_(*args, **kwargs)
-        finally:
-            self._entered = False
-            if prev is None:
-                _STATES.pop(ident, None)
-            else:
-                _STATES[ident] = prev
-            if _switch_hook is not None:
-                _switch_hook(prev)
-
-    def copy(self):
-        new = Context()
-        new._data = dict(self._data)
-        return new
+    run = _native.run
+    copy = _native.copy
 
     @staticmethod
     def _check_key(var):
@@ -244,8 +186,8 @@ class Context:
     __hash__ = None
 
     def __iter__(self):
-        # Snapshot: iteration stays valid if a nested `run` mutates
-        # the live mapping (CPython iterates an immutable HAMT).
+        # Snapshot: iteration stays valid if a nested `run` writes a new
+        # mapping (CPython iterates an immutable HAMT).
         return iter(list(self._data))
 
     def __len__(self):
@@ -261,92 +203,28 @@ class Context:
         return list(self._data.items())
 
 
-# Per-thread current context: thread ident -> Context. A thread with
-# no entry yet lazily gets a fresh empty Context on first access.
-_STATES = {}
+copy_context = _native.copy_context
 
-
-def _current_context():
-    ident = _thread.get_ident()
-    ctx = _STATES.get(ident)
-    if ctx is None:
-        ctx = Context()
-        _STATES[ident] = ctx
-    return ctx
-
-
-def copy_context():
-    return _current_context().copy()
+_native.install(Context, ContextVar, Token, _MISSING)
 
 
 # --- C-API bridge (RFC 0072 WS3) -------------------------------------------
 #
 # `PyContext_Enter`/`PyContext_Exit` (uvloop runs every callback under a
 # copied context this way) are `Context.run` split in half: enter makes
-# `ctx` current and remembers the previous context, exit restores it.
-# CPython stashes the previous context inside the C struct; here it
-# lives in a side table keyed by context identity — safe because a
-# context cannot be entered twice (the `_entered` guard).
+# `ctx` current and remembers the previous context in its `_prev` slot,
+# exit restores it.
 
-_C_PREV = {}
-
-
-def _enter_context(ctx):
-    if not isinstance(ctx, Context):
-        raise TypeError(f"a Context was expected, got {ctx!r}")
-    if ctx._entered:
-        raise RuntimeError(
-            f"cannot enter context: {ctx!r} is already entered")
-    ident = _thread.get_ident()
-    _C_PREV[id(ctx)] = _STATES.get(ident)
-    ctx._entered = True
-    _STATES[ident] = ctx
-    if _switch_hook is not None:
-        _switch_hook(ctx)
-
-
-def _exit_context(ctx):
-    if not isinstance(ctx, Context):
-        raise TypeError(f"a Context was expected, got {ctx!r}")
-    if not ctx._entered:
-        raise RuntimeError(
-            f"cannot exit context: {ctx!r} has not been entered")
-    ident = _thread.get_ident()
-    prev = _C_PREV.pop(id(ctx), None)
-    ctx._entered = False
-    if prev is None:
-        _STATES.pop(ident, None)
-    else:
-        _STATES[ident] = prev
-    if _switch_hook is not None:
-        _switch_hook(prev)
-
+_enter_context = _native._enter_context
+_exit_context = _native._exit_context
 
 # --- context watchers (PyContext_AddWatcher, 3.14) -------------------------
 #
 # `Py_CONTEXT_SWITCHED` fires after every enter and exit with the context
-# that just became current (`None` when the stack unwinds to empty). The
-# hook is `None` unless `_testcapi`'s watcher fixture is installed, so the
-# steady-state cost is one global load per switch.
+# that just became current (`None` when the stack unwinds to empty).
 
-_switch_hook = None
-
-
-def _set_switch_hook(hook):
-    global _switch_hook
-    _switch_hook = hook
-
-
-def _clear_context_stack():
-    # `clear_context_stack` in Modules/_testcapi/watchers.c: drop the
-    # thread's base context so the next switch reports `None` on exit.
-    ident = _thread.get_ident()
-    ctx = _STATES.get(ident)
-    if ctx is None:
-        return
-    if ctx._entered:
-        raise RuntimeError("must first exit all non-base contexts")
-    _STATES.pop(ident, None)
+_set_switch_hook = _native._set_switch_hook
+_clear_context_stack = _native._clear_context_stack
 
 
 import _collections_abc  # noqa: E402  (3.14: Context is a virtual Mapping)

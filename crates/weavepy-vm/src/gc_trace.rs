@@ -394,10 +394,10 @@ pub struct GcState {
     /// makes one per pass). A flush also hands the collector each live
     /// one's globals dict, which [`track`] would have tracked at birth.
     young_fns: RefCell<Vec<crate::sync::Weak<crate::object::PyFunction>>>,
-    /// Generators and coroutines born since the last collection, held
-    /// weakly as [`Self::young`] holds instances: a generator expression or
-    /// a `for` over a generator call makes one per pass, and most finish
-    /// and die long before a collection could find them in a cycle.
+    /// Generators, coroutines and async generators born since the last
+    /// collection, held weakly as [`Self::young`] holds instances: an
+    /// `await` of a coroutine function makes one per call, and most
+    /// finish (holding no frame) and die before any collection.
     young_gens: RefCell<Vec<crate::sync::Weak<crate::object::PyGenerator>>>,
     /// Frozen handles. `gc.freeze()` moves all tracked objects
     /// here; they are skipped by future collections until
@@ -535,9 +535,15 @@ impl GcState {
             return;
         }
         match obj {
-            Object::Instance(inst) if self.nurse(&self.young, inst) => return,
-            Object::Generator(g) | Object::Coroutine(g) if self.nurse(&self.young_gens, g) => {
-                return
+            Object::Instance(inst) => {
+                if self.nurse(&self.young, inst) {
+                    return;
+                }
+            }
+            Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
+                if self.nurse(&self.young_gens, g) {
+                    return;
+                }
             }
             _ => {}
         }
@@ -614,11 +620,11 @@ impl GcState {
                 for w in gens {
                     if let Some(g) = w.upgrade() {
                         let obj = match g.kind {
+                            crate::object::CoroutineKind::Generator => Object::Generator(g),
                             crate::object::CoroutineKind::Coroutine => Object::Coroutine(g),
                             crate::object::CoroutineKind::AsyncGenerator => {
                                 Object::AsyncGenerator(g)
                             }
-                            crate::object::CoroutineKind::Generator => Object::Generator(g),
                         };
                         self.register(&obj, false);
                     }
@@ -642,16 +648,15 @@ impl GcState {
         let fns = self.young_fns.try_borrow_mut().map_or(0, |mut fns| {
             fns.retain(|w| w.strong_count() > 0);
             fns.len()
-        });
-        let gens = self.young_gens.try_borrow_mut().map_or(0, |mut gens| {
+        }) + self.young_gens.try_borrow_mut().map_or(0, |mut gens| {
             gens.retain(|w| w.strong_count() > 0);
             gens.len()
         });
         let Ok(mut young) = self.young.try_borrow_mut() else {
-            return fns + gens;
+            return fns;
         };
         young.retain(|w| w.strong_count() > 0);
-        young.len() + fns + gens
+        young.len() + fns
     }
 
     /// Whether the instance or function `id` is in a young set.
@@ -824,36 +829,29 @@ impl GcState {
     /// Stop tracking `obj`. Backs the explicit `gc._untrack(obj)` extension
     /// and the C-API `PyObject_GC_UnTrack`.
     pub fn untrack_id(&self, id: ObjectId) {
-        // A registered object is in the index and in no young set (a young
-        // object is registered only by the flush that empties its set), so
-        // one hash probe settles the common case; only a miss looks through
-        // the young sets, newest first (an untrack usually follows its
-        // birth closely).
-        let registered = self.index.borrow_mut().remove(&id);
-        let Some(handle) = registered else {
-            fn forget<T: 'static>(set: &RefCell<Vec<crate::sync::Weak<T>>>, id: ObjectId) -> bool {
-                let Ok(mut young) = set.try_borrow_mut() else {
-                    return false;
-                };
-                let Some(i) = young
-                    .iter()
-                    .rposition(|w| w.as_ptr() as usize as ObjectId == id)
-                else {
-                    return false;
-                };
-                young.swap_remove(i);
-                true
-            }
-            if forget(&self.young_gens, id)
-                || forget(&self.young, id)
-                || forget(&self.young_fns, id)
-            {
-                let mut counts = self.counts.borrow_mut();
-                counts[0] = counts[0].saturating_sub(1);
-                self.sync_gen0_gauge(counts[0], None);
+        self.untrack_id_in(id, true);
+    }
+
+    /// [`Self::untrack_id`]; with `young` false, an object in a young set
+    /// is left there (see [`untrack_registered_id`]).
+    fn untrack_id_in(&self, id: ObjectId, young: bool) {
+        // A registered object is never in a young set, so the index (a
+        // hash probe) answers first; the young sets are scanned only for
+        // an object it doesn't hold. (Finished coroutines are untracked
+        // here by the thousand, and the young sets hold up to
+        // `YOUNG_CAP` entries.) An index entry left by a dead object
+        // whose address a young one now reuses is dropped, and the young
+        // sets still searched.
+        let indexed = self.index.borrow_mut().remove(&id);
+        let Some(handle) = indexed else {
+            if young {
+                self.untrack_young(id);
             }
             return;
         };
+        if young && handle.object.is_dead() {
+            self.untrack_young(id);
+        }
         {
             let mut counts = self.counts.borrow_mut();
             counts[0] = counts[0].saturating_sub(1);
@@ -898,6 +896,31 @@ impl GcState {
         }
         serial_add(&self.tracked_count, usize::MAX);
         serial_add(&self.tracked_version, 1);
+    }
+
+    /// [`Self::untrack_id`] for an object in a young set (searched from
+    /// the newest: an untrack usually follows its birth closely).
+    fn untrack_young(&self, id: ObjectId) {
+        fn remove<T: 'static>(set: &RefCell<Vec<crate::sync::Weak<T>>>, id: ObjectId) -> bool {
+            let Ok(mut young) = set.try_borrow_mut() else {
+                return false;
+            };
+            match young
+                .iter()
+                .rposition(|w| w.as_ptr() as usize as ObjectId == id)
+            {
+                Some(i) => {
+                    young.swap_remove(i);
+                    true
+                }
+                None => false,
+            }
+        }
+        if remove(&self.young_fns, id) || remove(&self.young, id) || remove(&self.young_gens, id) {
+            let mut counts = self.counts.borrow_mut();
+            counts[0] = counts[0].saturating_sub(1);
+            self.sync_gen0_gauge(counts[0], None);
+        }
     }
 
     /// Drop the entries of objects that have died from `handles`, and from
@@ -982,28 +1005,8 @@ impl GcState {
         self.index.borrow().contains_key(&id)
     }
 
-    /// Forget a finished generator that is still young, if it's among the
-    /// newest few: a drained generator usually is, and a longer search
-    /// would cost more than leaving its entry for the next flush.
-    pub fn forget_young_gen(&self, id: ObjectId) {
-        let Ok(mut young) = self.young_gens.try_borrow_mut() else {
-            return;
-        };
-        let n = young.len();
-        if let Some(i) = (n.saturating_sub(8)..n)
-            .rev()
-            .find(|&i| young[i].as_ptr() as usize as ObjectId == id)
-        {
-            young.swap_remove(i);
-            drop(young);
-            let mut counts = self.counts.borrow_mut();
-            counts[0] = counts[0].saturating_sub(1);
-            self.sync_gen0_gauge(counts[0], None);
-        }
-    }
-
-    /// [`Self::is_tracked`] for an instance, function, or generator, which
-    /// may be young.
+    /// [`Self::is_tracked`] for an instance or function, which may be
+    /// young.
     pub fn is_tracked_instance(&self, id: ObjectId) -> bool {
         self.is_tracked(id) || self.is_young(id)
     }
@@ -2557,6 +2560,15 @@ pub fn untrack(obj: &Object) {
 /// [`untrack`] by identity.
 pub fn untrack_id(id: ObjectId) {
     with_state(|s| s.untrack_id(id));
+}
+
+/// [`untrack_id`] for a registered object only: one still in a young set
+/// stays there. For a finished generator, which holds no frame (and so no
+/// references a cycle could run through): finding it among thousands of
+/// young entries would cost more than leaving it, and a dead entry is
+/// dropped at the next flush.
+pub fn untrack_registered_id(id: ObjectId) {
+    with_state(|s| s.untrack_id_in(id, false));
 }
 
 /// Reinitialise the process-global cycle collector's locks in a `fork(2)`

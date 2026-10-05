@@ -7702,7 +7702,7 @@ impl Interpreter {
                         shell,
                         cur_pc,
                         crate::recursion::depth_cell(),
-                        GenResume::ForIter,
+                        InlineResume::ForIter,
                     ) {
                         return FrameEv::Call(act);
                     }
@@ -7714,7 +7714,7 @@ impl Interpreter {
                         shell,
                         cur_pc,
                         crate::recursion::depth_cell(),
-                        GenResume::Send,
+                        InlineResume::Send,
                     ) {
                         return FrameEv::Call(act);
                     }
@@ -8064,10 +8064,10 @@ impl Interpreter {
     /// `FOR_ITER` over a suspended generator at `pc` of `frame`, as an
     /// inline activation: the generator's boxed frame runs in place (the
     /// `generator_send_lean` shape, without a nested native activation).
-    /// With [`GenResume::NextCall`], the instruction is instead the `CALL`
+    /// With [`InlineResume::NextCall`], the instruction is instead the `CALL`
     /// of builtin `next` on the generator: the call's operands leave the
     /// stack, the yielded value is its result, and exhaustion raises
-    /// `StopIteration`. With [`GenResume::Send`], it's a `SEND` to the
+    /// `StopIteration`. With [`InlineResume::Send`], it's a `SEND` to the
     /// generator or coroutine below the stack's top: the sent value goes
     /// in, the yielded value replaces it, and exhaustion leaves the return
     /// value and takes the jump. `None` leaves everything untouched.
@@ -8077,12 +8077,12 @@ impl Interpreter {
         shell: &mut QuietShell<'_>,
         pc: usize,
         depth_cell: *const std::cell::Cell<usize>,
-        mode: GenResume,
+        mode: InlineResume,
     ) -> Option<Box<InlineAct>> {
         let arg = match mode {
-            GenResume::NextCall => GEN_NEXT_CALL,
-            GenResume::ForIter => frame.code.instructions.get(pc)?.arg,
-            GenResume::Send => {
+            InlineResume::NextCall => GEN_NEXT_CALL,
+            InlineResume::ForIter => frame.code.instructions.get(pc)?.arg,
+            InlineResume::Send => {
                 let jump = frame.code.instructions.get(pc)?.arg;
                 if jump & GEN_SEND != 0 {
                     return None;
@@ -8090,7 +8090,7 @@ impl Interpreter {
                 jump | GEN_SEND
             }
         };
-        let send = mode == GenResume::Send;
+        let send = mode == InlineResume::Send;
         let n = frame.stack.len();
         let (g, sent_none) = if send {
             match (frame.stack.get(n.checked_sub(2)?), frame.stack.last()) {
@@ -8169,7 +8169,7 @@ impl Interpreter {
         }
         let gen_frame: *mut Frame = gf;
         frame.pc = pc as u32 + 1;
-        if mode == GenResume::NextCall {
+        if mode == InlineResume::NextCall {
             // `next`, its empty self slot and the generator (held above).
             let n = frame.stack.len();
             drop(frame.stack.drain(n - 3..));
@@ -9587,7 +9587,7 @@ impl Interpreter {
         let saved_pc = frame.pc;
         frame.pc = pc as u32 + 1;
         let pending_self = self.lean_pending_enter(frame, shell, pc);
-        let result = self.generator_send_lean(&g, &Object::None, None);
+        let result = self.generator_send_lean(&g, &Object::None, None, false);
         self.lean_pending_exit(pending_self);
         let Some(result) = result else {
             frame.pc = saved_pc;
@@ -11549,7 +11549,7 @@ impl Interpreter {
                         unsafe { frame.stack.set_len(len) };
                         frame.pc = pc as u32;
                         *last_pc = last;
-                        if !self.core_gen_resume(sw, pc, GenResume::Send) {
+                        if !self.core_gen_resume(sw, pc, InlineResume::Send) {
                             sw.pending = Some(CoreExit::Stop(LeafStop::Step));
                         }
                         break Some(CoreExit::Reload);
@@ -11613,7 +11613,7 @@ impl Interpreter {
                                 unsafe { frame.stack.set_len(len) };
                                 frame.pc = pc as u32;
                                 *last_pc = last;
-                                if !self.core_gen_resume(sw, pc, GenResume::ForIter) {
+                                if !self.core_gen_resume(sw, pc, InlineResume::ForIter) {
                                     sw.pending = Some(CoreExit::Stop(LeafStop::Step));
                                 }
                                 break Some(CoreExit::Reload);
@@ -12148,7 +12148,7 @@ impl Interpreter {
                             unsafe { frame.stack.set_len(len) };
                             frame.pc = pc as u32;
                             *last_pc = last;
-                            if !self.core_gen_resume(sw, pc, GenResume::NextCall) {
+                            if !self.core_gen_resume(sw, pc, InlineResume::NextCall) {
                                 sw.pending = Some(CoreExit::Stop(LeafStop::Step));
                             }
                             break Some(CoreExit::Reload);
@@ -15913,7 +15913,7 @@ impl Interpreter {
     /// ([`Self::try_inline_gen`]), with the generator's activation pushed
     /// and made the running one here. `false` touches nothing.
     #[inline(never)]
-    fn core_gen_resume(&mut self, sw: &mut CoreSwitch, pc: usize, mode: GenResume) -> bool {
+    fn core_gen_resume(&mut self, sw: &mut CoreSwitch, pc: usize, mode: InlineResume) -> bool {
         if !self.inline_calls_ok() {
             return false;
         }
@@ -24559,6 +24559,21 @@ impl Interpreter {
                     .cloned()
                     .ok_or_else(|| RuntimeError::Internal("SEND empty stack".to_owned()))?;
                 let result = match &iter {
+                    // A delegate's return needs no `StopIteration` unless an
+                    // observer must see it caught (`fire_caught_stop_iteration`).
+                    Object::Generator(g) | Object::Coroutine(g)
+                        if !crate::trace::any_observers_active() =>
+                    {
+                        match self.generator_resume(g, value) {
+                            Ok(GenResume::Yielded(v)) => Ok(v),
+                            Ok(GenResume::Returned(v)) => {
+                                frame.push(v);
+                                frame.pc += ins.arg;
+                                return Ok(StepOutcome::Continue);
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
                     Object::Generator(g) | Object::Coroutine(g) => self.generator_send(g, value),
                     Object::AsyncGenerator(g) => {
                         // Async-generator semantics under SEND:
@@ -32811,9 +32826,25 @@ impl Interpreter {
         if attr_certainly_missing(&args[0], &name) {
             return Ok(Object::Bool(false));
         }
+        let immutable_type = match &args[0] {
+            Object::Type(t) if t.flags.is_builtin && !crate::stdlib::os::is_struct_seq_type(t) => {
+                Some(t)
+            }
+            _ => None,
+        };
+        if let Some(t) = immutable_type {
+            if builtin_type_misses::contains(t, &name) {
+                return Ok(Object::Bool(false));
+            }
+        }
         match self.load_attr(&args[0], &name) {
             Ok(_) => Ok(Object::Bool(true)),
-            Err(e) if self.is_attribute_error(&e) => Ok(Object::Bool(false)),
+            Err(e) if self.is_attribute_error(&e) => {
+                if let Some(t) = immutable_type {
+                    builtin_type_misses::insert(t, &name);
+                }
+                Ok(Object::Bool(false))
+            }
             Err(e) => Err(e),
         }
     }
@@ -36852,6 +36883,7 @@ impl Interpreter {
         gen: &Rc<PyGenerator>,
         sent: &Object,
         fold: Option<FoldSink>,
+        raw_return: bool,
     ) -> Option<Result<Object, RuntimeError>> {
         let snap_gen = self.lean_snapshot()?;
         if self.dbg_sample
@@ -37012,7 +37044,7 @@ impl Interpreter {
                 let frame: &mut Frame = &mut boxed;
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(gen);
-                Err(stop_iteration_with(v))
+                Self::generator_returned(v, raw_return)
             }
             Ok(FrameOutcome::StartGenerator) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
@@ -37046,11 +37078,7 @@ impl Interpreter {
         if crate::weakref_registry::count_for(id) > 0 {
             return;
         }
-        if gc_trace::maybe_tracked(id) {
-            gc_trace::untrack_id(id);
-        } else {
-            gc_trace::with_state(|s| s.forget_young_gen(id));
-        }
+        gc_trace::untrack_registered_id(id);
     }
 
     fn park_suspended_boxed(gen: &Rc<PyGenerator>, boxed: Box<Frame>) {
@@ -37081,6 +37109,39 @@ impl Interpreter {
         self.generator_send_fold(gen, sent, None)
     }
 
+    /// Resume `gen` with `sent`, as `send` does, but report a return as
+    /// [`GenResume::Returned`] instead of raising `StopIteration` (the C
+    /// API's `PyIter_Send`; asyncio's task step drives coroutines this
+    /// way, sparing an exception per finished task).
+    pub(crate) fn generator_resume(
+        &mut self,
+        gen: &Rc<PyGenerator>,
+        sent: Object,
+    ) -> Result<GenResume, RuntimeError> {
+        GEN_RAW_RETURN.with(|r| r.set(true));
+        let result = self.generator_send_fold(gen, sent, None);
+        GEN_RAW_RETURN.with(|r| r.set(false));
+        match result {
+            Ok(Object::Unbound) => Ok(GenResume::Returned(
+                GEN_RETURN_VALUE
+                    .with(|v| v.borrow_mut().take())
+                    .unwrap_or(Object::None),
+            )),
+            Ok(v) => Ok(GenResume::Yielded(v)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// A resumed generator returned `v`: `StopIteration(v)`, or for
+    /// [`Self::generator_resume`] the `Unbound` marker with `v` parked.
+    fn generator_returned(v: Object, raw_return: bool) -> Result<Object, RuntimeError> {
+        if raw_return {
+            GEN_RETURN_VALUE.with(|slot| *slot.borrow_mut() = Some(v));
+            return Ok(Object::Unbound);
+        }
+        Err(stop_iteration_with(v))
+    }
+
     /// [`Self::generator_send`] for a consumer that drains the generator:
     /// a lean resume folds the yields it can into `fold` (see
     /// [`Self::sum_fold`]) and returns the first it can't. Any other
@@ -37092,7 +37153,10 @@ impl Interpreter {
         sent: Object,
         fold: Option<FoldSink>,
     ) -> Result<Object, RuntimeError> {
-        if let Some(r) = self.generator_send_lean(gen, &sent, fold) {
+        // Consumed here, so a generator this one resumes in turn raises
+        // `StopIteration` as usual.
+        let raw_return = GEN_RAW_RETURN.with(|r| r.replace(false));
+        if let Some(r) = self.generator_send_lean(gen, &sent, fold, raw_return) {
             return r;
         }
         // Take the boxed frame; it is run *in place* (RFC 0069 WS4) so
@@ -37193,7 +37257,7 @@ impl Interpreter {
                 // donate it back to the frame pools.
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(gen);
-                Err(stop_iteration_with(v))
+                Self::generator_returned(v, raw_return)
             }
             Ok(FrameOutcome::StartGenerator) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
@@ -57707,7 +57771,7 @@ const GEN_SEND: u32 = 1 << 31;
 /// Which instruction resumes a generator inline (see
 /// [`Interpreter::try_inline_gen`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum GenResume {
+enum InlineResume {
     /// `FOR_ITER` over the generator at the top of the stack.
     ForIter,
     /// A `CALL` of builtin `next` on the generator at the top of the stack.
@@ -57715,6 +57779,23 @@ enum GenResume {
     /// `SEND` of the value at the top of the stack to the generator or
     /// coroutine below it (`yield from`, `await`).
     Send,
+}
+
+/// How [`Interpreter::generator_resume`] concluded.
+pub(crate) enum GenResume {
+    /// The generator yielded this value.
+    Yielded(Object),
+    /// The generator returned this value.
+    Returned(Object),
+}
+
+thread_local! {
+    /// Set by [`Interpreter::generator_resume`] for the resume it starts
+    /// (see `generator_send_fold`).
+    static GEN_RAW_RETURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The value a raw resume's generator returned.
+    static GEN_RETURN_VALUE: std::cell::RefCell<Option<Object>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 enum GenStep {
@@ -59036,6 +59117,57 @@ thread_local! {
     static SLOT_WRAPPER_CACHE: std::cell::RefCell<
         crate::fasthash::FxHashMap<usize, crate::fasthash::FxHashMap<Box<str>, Option<Object>>>,
     > = std::cell::RefCell::new(crate::fasthash::FxHashMap::default());
+}
+
+/// Attribute names a built-in type was found to lack. Built-in types are
+/// immutable, so a miss is permanent, and `hasattr` can answer a repeat
+/// without raising (asyncio's `isfuture` asks
+/// `hasattr(type(coro), '_asyncio_future_blocking')` for every coroutine
+/// it's handed). Their attributes resolve dynamically, so a first miss
+/// must still go through the full lookup. Entries are keyed by address
+/// and hold the type weakly, which keeps the address from being reused.
+mod builtin_type_misses {
+    use std::cell::RefCell;
+
+    use crate::fasthash::{FxHashMap, FxHashSet};
+    use crate::sync::{Rc, Weak};
+    use crate::types::TypeObject;
+
+    /// Past this many names the record starts over (a bound, not a cache
+    /// policy: real programs probe a handful of names).
+    const CAP: usize = 512;
+
+    type Misses = FxHashMap<usize, (Weak<TypeObject>, FxHashSet<Box<str>>)>;
+
+    thread_local! {
+        static MISSES: RefCell<(usize, Misses)> = RefCell::new((0, FxHashMap::default()));
+    }
+
+    pub(super) fn contains(ty: &Rc<TypeObject>, name: &str) -> bool {
+        MISSES.with(|m| {
+            m.borrow()
+                .1
+                .get(&(Rc::as_ptr(ty) as usize))
+                .is_some_and(|(w, names)| w.strong_count() > 0 && names.contains(name))
+        })
+    }
+
+    pub(super) fn insert(ty: &Rc<TypeObject>, name: &str) {
+        MISSES.with(|m| {
+            let mut m = m.borrow_mut();
+            let (count, map) = &mut *m;
+            if *count >= CAP {
+                *count = 0;
+                map.clear();
+            }
+            let entry = map
+                .entry(Rc::as_ptr(ty) as usize)
+                .or_insert_with(|| (Rc::downgrade(ty), FxHashSet::default()));
+            if entry.1.insert(name.into()) {
+                *count += 1;
+            }
+        });
+    }
 }
 
 /// Whether `obj.name` certainly raises `AttributeError` without running

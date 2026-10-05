@@ -43,8 +43,8 @@
 //! meters its own depth); and the contextvars current context follows
 //! greenlet ≥ 1.0 `gr_context` semantics — the departing greenlet stashes
 //! the thread's current `Context`, the arriving one installs its own
-//! (`None` = fresh implicit context), swapped directly in the frozen
-//! `contextvars._STATES` table. The GIL story is untouched: greenlets
+//! (`None` = fresh implicit context), swapped through the native
+//! `contextvars` thread slot. The GIL story is untouched: greenlets
 //! are same-thread by definition, and every thread-local this module
 //! owns enforces that (a greenlet's id is simply absent from another
 //! thread's registry).
@@ -333,45 +333,17 @@ where
     f(interp)
 }
 
-/// The frozen `contextvars._STATES` dict, if the module has been
-/// imported (before that, no context exists to swap).
-fn contextvars_states() -> Option<Object> {
-    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
-    let interp = unsafe { &mut *ptr };
-    let module = interp.module_cache().get("contextvars")?;
-    let Object::Module(m) = module else {
-        return None;
-    };
-    let d = m.dict.borrow();
-    d.get(&DictKey(Object::from_static("_STATES"))).cloned()
-}
-
-fn thread_ident_key() -> Object {
-    Object::Int(crate::vm_singletons::current_worker_thread_id() as i64)
-}
-
 /// Stash the thread's live contextvars Context on the departing body
 /// (greenlet ≥ 1.0: `gr_context` is observable while suspended).
 fn save_context(from: &GreenletBody) {
-    if let Some(Object::Dict(states)) = contextvars_states() {
-        let key = DictKey(thread_ident_key());
-        let cur = states.borrow_mut().shift_remove(&key);
-        *from.context.borrow_mut() = cur.unwrap_or(Object::None);
-    }
+    *from.context.borrow_mut() = crate::stdlib::contextvars_native::take_current();
 }
 
 /// Install the arriving body's stashed Context as the thread's current
 /// one (`None` leaves the slot empty — a fresh implicit context).
 fn install_context(to: &GreenletBody) {
-    if let Some(Object::Dict(states)) = contextvars_states() {
-        let key = DictKey(thread_ident_key());
-        let ctx = std::mem::replace(&mut *to.context.borrow_mut(), Object::None);
-        let mut s = states.borrow_mut();
-        s.shift_remove(&key);
-        if !matches!(ctx, Object::None) {
-            s.insert(key, ctx);
-        }
-    }
+    let ctx = std::mem::replace(&mut *to.context.borrow_mut(), Object::None);
+    crate::stdlib::contextvars_native::set_current(ctx);
 }
 
 /// Departing `from`: snapshot the thread-level pieces of its execution
@@ -1053,13 +1025,7 @@ fn green_context_get(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     if CURRENT.with(|c| c.get()) == b.id {
         // Live: the thread's current context is ours.
-        if let Some(Object::Dict(states)) = contextvars_states() {
-            let key = DictKey(thread_ident_key());
-            if let Some(ctx) = states.borrow().get(&key) {
-                return Ok(ctx.clone());
-            }
-        }
-        return Ok(Object::None);
+        return Ok(crate::stdlib::contextvars_native::peek_current());
     }
     let ctx = b.context.borrow().clone();
     Ok(ctx)
@@ -1073,15 +1039,8 @@ fn green_context_set(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(value_error("cannot set the context of a dead greenlet"));
     }
     if CURRENT.with(|c| c.get()) == b.id {
-        if let Some(Object::Dict(states)) = contextvars_states() {
-            let key = DictKey(thread_ident_key());
-            let mut s = states.borrow_mut();
-            s.shift_remove(&key);
-            if !matches!(value, Object::None) {
-                s.insert(key, value);
-            }
-            return Ok(Object::None);
-        }
+        crate::stdlib::contextvars_native::set_current(value);
+        return Ok(Object::None);
     }
     *b.context.borrow_mut() = value;
     Ok(Object::None)
