@@ -8050,12 +8050,148 @@ impl fmt::Debug for FileBackend {
 #[derive(Debug)]
 pub struct PyLazyIter {
     pub state: RefCell<LazyIterKind>,
+    /// The Python class an exact `itertools` object reports
+    /// (`type(chain(...)) is itertools.chain`). `None` for the builtin
+    /// kinds (`map`, `filter`, `zip`, `enumerate`), whose types are
+    /// native, and for the cores held by subclass instances.
+    pub cls: Option<Rc<crate::types::TypeObject>>,
 }
 
 impl PyLazyIter {
+    /// A classless adapter in `kind`'s initial state.
+    pub fn new(kind: LazyIterKind) -> Self {
+        Self {
+            state: RefCell::new(kind),
+            cls: None,
+        }
+    }
+
+    /// Whether this is one of the builtin adapters (`map`, `filter`,
+    /// `zip`, `enumerate`) rather than an `itertools` object.
+    pub fn is_builtin_kind(&self) -> bool {
+        matches!(
+            self.state.try_borrow().as_deref(),
+            Ok(LazyIterKind::Map { .. }
+                | LazyIterKind::Filter { .. }
+                | LazyIterKind::Zip { .. }
+                | LazyIterKind::Enumerate { .. })
+        )
+    }
+
+    /// Visit every object the adapter keeps alive (the cycle GC's
+    /// `tp_traverse`).
+    pub fn gc_referents(&self, visit: &mut dyn FnMut(&Object)) {
+        let Ok(state) = self.state.try_borrow() else {
+            return;
+        };
+        let opt = |o: &Option<Object>, visit: &mut dyn FnMut(&Object)| {
+            if let Some(o) = o {
+                visit(o);
+            }
+        };
+        match &*state {
+            LazyIterKind::Islice { source, .. } => visit(source),
+            LazyIterKind::Compress { data, selectors } => {
+                visit(data);
+                visit(selectors);
+            }
+            LazyIterKind::Repeat { obj, .. } => visit(obj),
+            LazyIterKind::TeeBranch { data, .. } => visit(data),
+            LazyIterKind::Count { current, step } => {
+                visit(current);
+                visit(step);
+            }
+            LazyIterKind::Cycle { source, saved, .. } => {
+                opt(source, visit);
+                visit(&Object::List(saved.clone()));
+            }
+            LazyIterKind::Chain { source, active } => {
+                opt(source, visit);
+                opt(active, visit);
+            }
+            LazyIterKind::DropWhile { func, source, .. }
+            | LazyIterKind::TakeWhile { func, source, .. }
+            | LazyIterKind::FilterFalse { func, source }
+            | LazyIterKind::StarMap { func, source }
+            | LazyIterKind::Filter { func, source } => {
+                visit(func);
+                visit(source);
+            }
+            LazyIterKind::Pairwise { source, old } => {
+                opt(source, visit);
+                opt(old, visit);
+            }
+            LazyIterKind::ZipLongest {
+                iters, fillvalue, ..
+            } => {
+                for it in iters {
+                    opt(it, visit);
+                }
+                visit(fillvalue);
+            }
+            LazyIterKind::Accumulate {
+                source,
+                func,
+                total,
+                initial,
+            } => {
+                visit(source);
+                opt(func, visit);
+                opt(total, visit);
+                opt(initial, visit);
+            }
+            LazyIterKind::Product { pools, .. } => {
+                for p in pools {
+                    for v in p.iter() {
+                        visit(v);
+                    }
+                }
+            }
+            LazyIterKind::Permutations { pool, .. }
+            | LazyIterKind::Combinations { pool, .. }
+            | LazyIterKind::Cwr { pool, .. } => {
+                for v in pool.iter() {
+                    visit(v);
+                }
+            }
+            LazyIterKind::Batched { source, .. } => opt(source, visit),
+            LazyIterKind::Map { func, iters, .. } => {
+                visit(func);
+                for it in iters {
+                    visit(it);
+                }
+            }
+            LazyIterKind::Zip { iters, result, .. } => {
+                for it in iters {
+                    visit(it);
+                }
+                if let Some(t) = result {
+                    for v in t.iter() {
+                        visit(v);
+                    }
+                }
+            }
+            LazyIterKind::Enumerate {
+                source, count_big, ..
+            } => {
+                visit(source);
+                opt(count_big, visit);
+            }
+        }
+    }
+
     /// Python-visible type name (`type(islice(...)).__name__`).
     pub fn type_name(&self) -> &'static str {
-        match &*self.state.borrow() {
+        // A step in progress holds the state borrowed; the kind of a
+        // builtin adapter never changes, so any name is as good there.
+        let Ok(state) = self.state.try_borrow() else {
+            return "iterator";
+        };
+        match &*state {
+            LazyIterKind::Map { .. } => "map",
+            LazyIterKind::Filter { .. } => "filter",
+            LazyIterKind::Zip { .. } => "zip",
+            LazyIterKind::Enumerate { .. } => "enumerate",
             LazyIterKind::Islice { .. } => "islice",
             LazyIterKind::Repeat { .. } => "repeat",
             LazyIterKind::TeeBranch { .. } => "_tee",
@@ -8216,6 +8352,32 @@ pub enum LazyIterKind {
         source: Option<Object>,
         n: usize,
         strict: bool,
+    },
+    /// The builtin `map(func, *iterables)`: `iters` holds each
+    /// argument's iterator; `strict` is 3.14's `strict=True`.
+    Map {
+        func: Object,
+        iters: Vec<Object>,
+        strict: bool,
+    },
+    /// The builtin `filter(func_or_None, iterable)`.
+    Filter { func: Object, source: Object },
+    /// The builtin `zip(*iterables, strict=...)`. `result` is the last
+    /// tuple produced, refilled in place when nothing else holds it
+    /// (CPython's `zip_next` reuses its result tuple the same way).
+    Zip {
+        iters: Vec<Object>,
+        strict: bool,
+        result: Option<SharedTuple>,
+    },
+    /// The builtin `enumerate(iterable, start)` over a source only the
+    /// interpreter can step (a generator, a user iterator); a native
+    /// source is a `PyIterator::Enumerate`. `count_big` is engaged once
+    /// the counter leaves `i64` (it then holds the next index).
+    Enumerate {
+        source: Object,
+        count: i64,
+        count_big: Option<Object>,
     },
 }
 
@@ -8644,6 +8806,44 @@ impl PyIterator {
                     }
                 }
             }
+        }
+    }
+
+    /// Whether the next step yields an item without running code or
+    /// failing: no mutation guard to trip, no subclass keepalive or
+    /// container to release, no stream to read, and an item left.
+    pub fn pure_ready(&self) -> bool {
+        match self {
+            PyIterator::List {
+                items,
+                index,
+                owner: None,
+            } => items.try_borrow().is_ok_and(|v| *index < v.len()),
+            PyIterator::Tuple { items, index } => *index < items.len(),
+            PyIterator::Str { s, index } => *index < s.len(),
+            PyIterator::Range {
+                current,
+                stop,
+                step,
+            } => (*step > 0 && current < stop) || (*step < 0 && current > stop),
+            PyIterator::Bytes { data, index } => *index < data.len(),
+            PyIterator::ByteArray { data, index } => {
+                data.try_borrow().is_ok_and(|d| *index < d.len())
+            }
+            PyIterator::Reversed {
+                items,
+                index,
+                owner: None,
+            } => {
+                *index >= 0
+                    && items
+                        .try_borrow()
+                        .is_ok_and(|v| (*index as usize) < v.len())
+            }
+            PyIterator::Enumerate { inner, .. } | PyIterator::Shared(inner) => {
+                inner.try_borrow().is_ok_and(|i| i.pure_ready())
+            }
+            _ => false,
         }
     }
 
@@ -10170,7 +10370,8 @@ impl Object {
             Object::Instance(_)
             | Object::Foreign(_)
             | Object::Generator(_)
-            | Object::Coroutine(_) => {
+            | Object::Coroutine(_)
+            | Object::LazyIter(_) => {
                 let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
                     type_error(format!(
                         "'{}' object is not iterable",
@@ -10830,11 +11031,13 @@ impl Object {
                 format!("{}([{}])", v.kind.type_name(), body.join(", "))
             }
             Object::LazyIter(l) => {
-                format!(
-                    "<itertools.{} object at {:#x}>",
-                    l.type_name(),
-                    Rc::as_ptr(l) as usize
-                )
+                let name = l.type_name();
+                let module = if l.is_builtin_kind() {
+                    ""
+                } else {
+                    "itertools."
+                };
+                format!("<{module}{name} object at {:#x}>", Rc::as_ptr(l) as usize)
             }
             Object::Capsule(c) => match &c.name {
                 Some(n) => format!("<capsule object \"{n}\" at 0x{:x}>", c.handle),

@@ -1985,6 +1985,12 @@ class _tee:
         self._core = _tee_core(data, _as_int(index))
 
 
+# The exact classes above build native adapters when called (WeavePy's
+# C-type parity): no `__new__` frame, and the adapter is the instance.
+if _HAVE_NATIVE and hasattr(_n, "_register_types"):
+    _n._register_types(globals())
+
+
 def tee(iterable, n=2):
     """tee(iterable, n=2) --> tuple of n independent iterators."""
     n = _as_int(n)

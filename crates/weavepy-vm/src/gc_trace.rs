@@ -794,6 +794,14 @@ impl GcState {
     /// Stop tracking `obj`. Backs the explicit `gc._untrack(obj)` extension
     /// and the C-API `PyObject_GC_UnTrack`.
     pub fn untrack_id(&self, id: ObjectId) {
+        // A registered object is found by one probe; only then scan the
+        // young sets (an object is in at most one of the three), which
+        // can hold thousands of entries.
+        let handle = self.index.borrow_mut().remove(&id);
+        if let Some(handle) = handle {
+            self.untrack_registered(handle);
+            return;
+        }
         // (From the newest: an untrack usually follows its birth closely.)
         if let Ok(mut fns) = self.young_fns.try_borrow_mut() {
             if let Some(i) = fns
@@ -810,18 +818,18 @@ impl GcState {
         if let Ok(mut young) = self.young.try_borrow_mut() {
             if let Some(i) = young
                 .iter()
-                .position(|w| w.as_ptr() as usize as ObjectId == id)
+                .rposition(|w| w.as_ptr() as usize as ObjectId == id)
             {
                 young.swap_remove(i);
                 let mut counts = self.counts.borrow_mut();
                 counts[0] = counts[0].saturating_sub(1);
                 self.sync_gen0_gauge(counts[0], None);
-                return;
             }
         }
-        let Some(handle) = self.index.borrow_mut().remove(&id) else {
-            return;
-        };
+    }
+
+    /// [`Self::untrack_id`] for an object found in the index.
+    fn untrack_registered(&self, handle: HandleRc<TrackedHandle>) {
         {
             let mut counts = self.counts.borrow_mut();
             counts[0] = counts[0].saturating_sub(1);
@@ -2056,6 +2064,7 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
                 }
             }
         }
+        Object::LazyIter(l) => l.gc_referents(visit),
         Object::Builtin(_)
         | Object::Generator(_)
         | Object::Coroutine(_)

@@ -226,9 +226,6 @@ pub fn default_builtins() -> DictData {
     reg!("sorted", b_sorted);
     reg!("reversed", b_reversed);
     reg_kw!("enumerate", b_enumerate_kw);
-    reg!("zip", b_zip);
-    reg!("map", b_map);
-    reg!("filter", b_filter);
     reg!("all", b_all);
     reg!("any", b_any);
     reg!("isinstance", b_isinstance);
@@ -1242,10 +1239,10 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
                     Err(e) => Err(e),
                 },
                 // An enumerate/reversed *subclass* over a VM-driven source
-                // carries a frozen `_seqtools` iterator instance as its
-                // native payload (`MyEnum(getitem_seq)`) — drive it through
-                // the interpreter's iteration protocol.
-                Some(recv @ Object::Instance(_)) => {
+                // carries a native adapter (or a frozen `_seqtools`
+                // iterator) as its payload (`MyEnum(getitem_seq)`) — drive
+                // it through the interpreter's iteration protocol.
+                Some(recv @ (Object::Instance(_) | Object::LazyIter(_))) => {
                     let interp = reentrant_interp()?;
                     let globals = interp.builtins_dict();
                     match interp.iter_next(recv, &globals)? {
@@ -7422,7 +7419,9 @@ fn bytes_from_source_obj(src: &Object, type_name: &str) -> Result<Vec<u8>, Runti
             // the real collection below would then see zero items
             // (`bytes(x for x in …)` returned `b''`). Generators are
             // always iterable; everything else gets the cheap probe.
-            if !matches!(other, Object::Generator(_)) && other.make_iter().is_err() {
+            if !matches!(other, Object::Generator(_) | Object::LazyIter(_))
+                && other.make_iter().is_err()
+            {
                 return Err(type_error(format!(
                     "cannot convert '{}' object to {}",
                     other.type_name(),
@@ -8280,7 +8279,7 @@ fn b_sorted(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(obj)
 }
 
-fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() > 1 {
         return Err(type_error(format!(
             "reversed expected 1 argument, got {}",
@@ -8307,10 +8306,28 @@ fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
         let len = crate::object::range_len_i128(r);
         let current = r.start + (len - 1).max(0) * r.step;
         let stop = r.start - r.step;
+        let current = if len > 0 { current } else { stop };
+        let step = -r.step;
+        // Machine-int bounds take the `Range` shape the loop fast paths
+        // step (as `iter(range(...))` does); `current += step` must not
+        // overflow past the stop.
+        if let (Ok(c), Ok(s), Ok(st)) = (
+            i64::try_from(current),
+            i64::try_from(stop),
+            i64::try_from(step),
+        ) {
+            if s.checked_add(st).is_some() {
+                return Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Range {
+                    current: c,
+                    stop: s,
+                    step: st,
+                }))));
+            }
+        }
         return Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::RangeHuge {
-            current: if len > 0 { current } else { stop },
+            current,
             stop,
-            step: -r.step,
+            step,
         }))));
     }
     // `dict.__reversed__` / `dict_keys.__reversed__` …: a *live* cursor
@@ -8436,7 +8453,7 @@ fn b_enumerate_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
     b_enumerate(&ctor_args)
 }
 
-fn b_enumerate(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_enumerate(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() > 2 {
         return Err(type_error(format!(
             "enumerate() takes at most 2 arguments ({} given)",
@@ -8473,43 +8490,6 @@ fn b_enumerate(args: &[Object]) -> Result<Object, RuntimeError> {
         count: start,
         count_big: start_big,
     }))))
-}
-
-fn b_zip(args: &[Object]) -> Result<Object, RuntimeError> {
-    // `zip()` with no iterables is an empty iterator — CPython yields
-    // nothing (`list(zip()) == []`). Without this guard the loop below
-    // never reaches an exhausted iterator and spins forever appending
-    // empty tuples.
-    if args.is_empty() {
-        return Ok(Object::new_list(Vec::new()));
-    }
-    let mut iters: Vec<PyIterator> = args
-        .iter()
-        .map(|a| a.make_iter())
-        .collect::<Result<_, _>>()?;
-    let mut out = Vec::new();
-    loop {
-        let mut tup = Vec::with_capacity(iters.len());
-        for it in iters.iter_mut() {
-            match it.next_value() {
-                Some(v) => tup.push(v),
-                None => return Ok(Object::new_list(out)),
-            }
-        }
-        out.push(Object::new_tuple(tup));
-    }
-}
-
-fn b_map(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(type_error(
-        "map() requires call-into-interpreter support; use a list comprehension instead",
-    ))
-}
-
-fn b_filter(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(type_error(
-        "filter() requires call-into-interpreter support; use a list comprehension instead",
-    ))
 }
 
 fn b_all(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -9026,10 +9006,22 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
             Ok(crate::object::PyIterator::Reversed { .. }) => bt.reversed_.clone(),
             _ => bt.iterator_.clone(),
         },
-        // Native itertools adapters share the generic iterator type for
-        // now; `type(x).__name__` is "iterator" rather than CPython's
-        // "islice" until they get dedicated TypeObjects.
-        Object::LazyIter(_) => bt.iterator_.clone(),
+        // A native adapter reports its type: the builtin kinds their
+        // native types, an exact `itertools` object its Python class,
+        // and an internal core the generic iterator type.
+        Object::LazyIter(l) => {
+            if let Some(cls) = &l.cls {
+                return cls.clone();
+            }
+            use crate::object::LazyIterKind as K;
+            match l.state.try_borrow().as_deref() {
+                Ok(K::Map { .. }) => bt.map_.clone(),
+                Ok(K::Filter { .. }) => bt.filter_.clone(),
+                Ok(K::Zip { .. }) => bt.zip_.clone(),
+                Ok(K::Enumerate { .. }) => bt.enumerate_.clone(),
+                _ => bt.iterator_.clone(),
+            }
+        }
         Object::Generator(_) => bt.generator_.clone(),
         Object::Coroutine(_) => bt.coroutine_.clone(),
         Object::AsyncGenerator(_) => bt.async_generator_.clone(),
