@@ -672,7 +672,16 @@ impl SharedStr {
         } else {
             suffix.chars().count()
         };
-        ThinArc::<StrStorage>::try_extend_unique(&mut this.0, suffix.as_bytes(), extra_chars)
+        if ThinArc::<StrStorage>::try_extend_unique(&mut this.0, suffix.as_bytes(), extra_chars) {
+            return true;
+        }
+        // This thread's indexing cursor (see `object::str_byte_offset`) may
+        // hold the only weak reference to a string that's otherwise ours
+        // alone: forget it rather than copy the whole string.
+        Self::strong_count(this) == 1
+            && Self::weak_count(this) == 1
+            && crate::object::release_str_cursor(this)
+            && ThinArc::<StrStorage>::try_extend_unique(&mut this.0, suffix.as_bytes(), extra_chars)
     }
 
     /// The concatenation of `parts`, in one allocation.
@@ -912,8 +921,17 @@ mod tests {
 
     #[test]
     fn strings_preserve_utf8_hash_lookup_and_data_identity() {
-        for text in ["", "a", "x\0y", "mañana", "日本語", "🧶🙂", "e\u{301}"] {
-            let value = SharedStr::from(text);
+        for text in ["", "a", "é", "x\0y", "mañana", "日本語", "🧶🙂", "e\u{301}"] {
+            // The empty and one-character Latin-1 strings are shared (see
+            // `SharedStr::small`); the ownership checks below need an
+            // allocation of their own.
+            let shared = SharedStr::small(text).is_some();
+            assert_eq!(shared, text.chars().count() <= 1);
+            assert_eq!(
+                SharedStr::ptr_eq(&SharedStr::from(text), &SharedStr::from(text)),
+                shared
+            );
+            let value = SharedStr::fresh(text);
             assert_eq!(&*value, text);
             assert_eq!(SharedStr::as_ptr(&value).cast::<u8>(), value.as_ptr());
             assert_eq!(
@@ -934,6 +952,24 @@ mod tests {
             assert!(weak.upgrade().is_none());
             assert_eq!(weak.strong_count(), 0);
         }
+    }
+
+    #[test]
+    fn indexing_cursor_does_not_block_in_place_appends() {
+        let mut text = SharedStr::from("mañana mañana");
+        assert_eq!(crate::object::str_char_at(&text, 9), Some('ñ'));
+        assert_eq!(SharedStr::weak_count(&text), 1);
+        assert!(SharedStr::try_append(&mut text, "ñ"));
+        assert_eq!(&*text, "mañana mañanañ");
+        assert_eq!(crate::object::str_char_at(&text, 13), Some('ñ'));
+        assert_eq!(crate::object::str_char_at(&text, 9), Some('ñ'));
+        // Another strong owner still keeps the text in place.
+        let other = text.clone();
+        assert!(!SharedStr::try_append(&mut text, "x"));
+        assert!(SharedStr::ptr_eq(&text, &other));
+        drop(other);
+        assert!(SharedStr::try_append(&mut text, "x"));
+        assert_eq!(crate::object::str_char_at(&text, 14), Some('x'));
     }
 
     #[test]
@@ -996,7 +1032,10 @@ mod tests {
             "🧶🙂",
             "e\u{301}",
         ] {
-            let value = SharedStr::from(text);
+            // A fresh allocation: a shared small string (see
+            // `SharedStr::small`) has other owners, and its count may
+            // already be known.
+            let value = SharedStr::fresh(text);
             assert_eq!(
                 SharedStr::known_char_count(&value),
                 text.is_empty().then_some(0)
@@ -1021,6 +1060,10 @@ mod tests {
                 crate::object::py_str_hash(&expected)
             );
         }
+        // The shared small strings never grow in place.
+        let mut small = SharedStr::from("a");
+        assert!(!SharedStr::try_append(&mut small, "b"));
+        assert_eq!(&*SharedStr::from("a"), "a");
         let ascii = SharedStr::from_ascii("abc");
         assert_eq!(SharedStr::known_char_count(&ascii), Some(3));
         // SAFETY: ASCII parts and their count.

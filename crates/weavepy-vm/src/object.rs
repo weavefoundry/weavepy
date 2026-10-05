@@ -79,11 +79,7 @@ pub(crate) fn str_byte_offset(s: &SharedStr, index: usize) -> Option<usize> {
     if index >= count {
         return (index == count).then_some(bytes.len());
     }
-    thread_local! {
-        static CURSOR: std::cell::RefCell<Option<(crate::shared_value::WeakStr, usize, usize)>> =
-            const { std::cell::RefCell::new(None) };
-    }
-    CURSOR.with(|cell| {
+    STR_CURSOR.with(|cell| {
         let mut cursor = cell.borrow_mut();
         let known = cursor
             .as_ref()
@@ -114,6 +110,31 @@ pub(crate) fn str_byte_offset(s: &SharedStr, index: usize) -> Option<usize> {
         }
         Some(bo)
     })
+}
+
+thread_local! {
+    /// [`str_byte_offset`]'s cursor: its string, code point, and byte
+    /// offset.
+    static STR_CURSOR: std::cell::RefCell<Option<(crate::shared_value::WeakStr, usize, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Forget this thread's [`str_byte_offset`] cursor if it names `s`, so a
+/// sole owner can grow `s` in place (see `SharedStr::try_append`).
+/// Returns whether it did.
+pub(crate) fn release_str_cursor(s: &SharedStr) -> bool {
+    STR_CURSOR
+        .try_with(|cell| {
+            let Ok(mut cursor) = cell.try_borrow_mut() else {
+                return false;
+            };
+            if !matches!(&*cursor, Some((w, ..)) if w.addr() == SharedStr::addr(s)) {
+                return false;
+            }
+            *cursor = None;
+            true
+        })
+        .unwrap_or(false)
 }
 
 /// The byte length of the UTF-8 sequence that `lead` starts.
