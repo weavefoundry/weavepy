@@ -357,6 +357,12 @@ pub(crate) fn cells_unguarded_flag() -> *const bool {
 /// objects before it registers (see [`crate::rc`]). Never cleared.
 static RC_SHARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The flag [`bias_held`] reads (native code that takes references in
+/// line reads it too).
+pub(crate) fn rc_shared_flag() -> &'static std::sync::atomic::AtomicBool {
+    &RC_SHARED
+}
+
 /// True while one thread owns every reference count (see [`crate::rc`]).
 #[cfg_attr(debug_assertions, allow(dead_code))]
 #[inline(always)]

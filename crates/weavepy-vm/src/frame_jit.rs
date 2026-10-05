@@ -13,20 +13,30 @@
 //! taken) only where something else must see them: at the end of a block,
 //! and before any instruction the native code leaves to the core loop.
 //!
-//! An instruction the native code doesn't take, and any shape an in-line
-//! one doesn't settle (an overflow, a heap operand, a cache miss), returns
-//! to the core loop with the frame exactly as the loop would have it
-//! before that instruction: the loop runs it, and enters the native code
-//! again at the next block start it reaches. The core loop's fused shapes
-//! (a local receiver's method call or attribute store) start at their
-//! `LOAD_FAST`, so the native code hands those over at it.
+//! What doesn't run in line runs through helpers (`h_*`) that do what the
+//! core loop's arm for the instruction does, on the same caches: global
+//! and attribute loads (with in-line caches of their own for a global's
+//! value and a `__slots__` member), method loads, attribute stores,
+//! builds, subscripts, and the calls the core loop runs in place. A call
+//! of a Python function, and an inline activation's return, switch the
+//! running activation as the core loop's arms do and return `RELOAD`.
 //!
-//! Compiling costs far more than interpreting a few iterations, and every
-//! hand-over to the core loop costs a round trip, so a code object
-//! compiles only once a loop of it is hot and that loop runs mostly in
-//! native code (see `worth_compiling`); a loop of calls and global loads
-//! stays with the core loop. Code a tier-2 loop may still take waits for
-//! tier 2 to settle first.
+//! An instruction the native code doesn't take, and any shape neither the
+//! in-line code nor a helper settles (an overflow, a Python dunder, a
+//! cache miss), returns to the core loop with the frame exactly as the
+//! loop would have it before that instruction: the loop runs it, and
+//! enters the native code again at the next block start it reaches. The
+//! core loop's fused shapes (a local receiver's method call or attribute
+//! store) start at their `LOAD_FAST`, so the native code takes those at
+//! it too.
+//!
+//! Compiling costs far more than interpreting a few iterations (some 30 to
+//! 50 microseconds per instruction), and every hand-over to the core loop
+//! costs a round trip, so a code object compiles once its interpreting has
+//! cost about what compiling would (see `Slot::warm`), and only if the
+//! loop that got hot, or for a call of loop-free code its body, runs
+//! mostly in native code (see `worth_compiling`). Code a tier-2 loop may
+//! still take waits for tier 2 to settle first.
 //!
 //! The code reads and writes [`Object`]s in place, through the layout
 //! `repr(u8)` fixes: a tag byte at offset 0, a `bool` payload at offset 1,
@@ -646,6 +656,10 @@ struct Tags {
     /// `Option::<Object>::None`'s first byte, when the option keeps
     /// `Object`'s size (its tag byte's niche).
     opt_none: Option<u8>,
+    /// The heap variants whose payload word is an `Rc`'s allocation, its
+    /// strong count the allocation's first word (a clone is an increment
+    /// there): instances, lists, dicts and classes, as far as measured.
+    rc_counted: i64,
     /// The heap variants whose identity is their payload pointer (and so
     /// `is` compares payload words): instances, strings, lists, dicts,
     /// tuples, classes.
@@ -704,6 +718,20 @@ fn tags() -> Option<Tags> {
             (std::mem::size_of::<Option<Object>>() == 16)
                 .then(|| unsafe { *std::ptr::from_ref(&none).cast::<u8>() })
         },
+        rc_counted: if cfg!(debug_assertions) {
+            // (A debug build's counts are atomic throughout.)
+            0
+        } else {
+            [
+                &inst,
+                &Object::new_list(Vec::new()),
+                &Object::new_dict(),
+                &Object::Type(crate::builtin_types::builtin_types().object_.clone()),
+            ]
+            .into_iter()
+            .filter(|o| tag(o) < 64 && counted_at_payload(o, word(o)))
+            .fold(0, |m, o| m | (1i64 << tag(o)))
+        },
         by_pointer: samples
             .iter()
             .fold(0, |m, &t| if t < 64 { m | (1i64 << t) } else { m }),
@@ -727,6 +755,24 @@ fn tags() -> Option<Tags> {
         && word(&Object::Float(1.5)) == 1.5f64.to_bits()
         && std::mem::size_of::<Object>() == 16)
         .then_some(t)
+}
+
+/// Whether cloning `o` (whose payload word is `w`) adds one to the word at
+/// `w` and nothing else measurable, and dropping the clone takes it away.
+fn counted_at_payload(o: &Object, w: u64) -> bool {
+    if w == 0 || w % 8 != 0 {
+        return false;
+    }
+    let count = || {
+        // SAFETY: probing the first word of the allocation `o` keeps alive
+        // (its count, when the layout is the assumed one).
+        unsafe { std::ptr::with_exposed_provenance::<usize>(w as usize).read() }
+    };
+    let before = count();
+    let copy = o.clone();
+    let during = count();
+    drop(copy);
+    during == before + 1 && count() == before
 }
 
 // ---- helpers (the core loop's arms, for native code) ----------------------
@@ -2656,7 +2702,34 @@ impl<'a> Lower<'a> {
         let by_value = self.b.create_block();
         let by_clone = self.b.create_block();
         let done = self.b.create_block();
-        self.b.ins().brif(scalar, by_value, &[], by_clone, &[]);
+        if self.tags.rc_counted == 0 {
+            self.b.ins().brif(scalar, by_value, &[], by_clone, &[]);
+        } else {
+            // An instance, list, dict or class while one thread owns every
+            // count: a plain increment of its count.
+            let counted = self.b.create_block();
+            let heap = self.b.create_block();
+            self.b.ins().brif(scalar, by_value, &[], heap, &[]);
+            self.b.switch_to_block(heap);
+            let one = self.b.ins().iconst(types::I64, 1);
+            let bit = self.b.ins().ishl(one, tag);
+            let rc = self.b.ins().band_imm(bit, self.tags.rc_counted);
+            let rc = self.b.ins().icmp_imm(IntCC::NotEqual, rc, 0);
+            let flag = self.b.ins().iconst(
+                self.ptr,
+                std::ptr::from_ref(crate::sync::rc_shared_flag()) as i64,
+            );
+            let shared = self.b.ins().load(types::I8, FLAGS, flag, 0);
+            let solo = self.b.ins().icmp_imm(IntCC::Equal, shared, 0);
+            let ok = self.b.ins().band(rc, solo);
+            self.b.ins().brif(ok, counted, &[], by_clone, &[]);
+            self.b.switch_to_block(counted);
+            let w = self.b.ins().load(self.ptr, FLAGS, src, 8);
+            let c = self.b.ins().load(types::I64, FLAGS, w, 0);
+            let c1 = self.b.ins().iadd_imm(c, 1);
+            self.b.ins().store(FLAGS, c1, w, 0);
+            self.b.ins().jump(by_value, &[]);
+        }
         self.b.switch_to_block(by_value);
         self.copy16(dst, src);
         self.b.ins().jump(done, &[]);
