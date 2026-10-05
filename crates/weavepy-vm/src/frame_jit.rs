@@ -760,7 +760,7 @@ fn tags() -> Option<Tags> {
 /// Whether cloning `o` (whose payload word is `w`) adds one to the word at
 /// `w` and nothing else measurable, and dropping the clone takes it away.
 fn counted_at_payload(o: &Object, w: u64) -> bool {
-    if w == 0 || w % 8 != 0 {
+    if w == 0 || !w.is_multiple_of(8) {
         return false;
     }
     let count = || {
@@ -1557,13 +1557,16 @@ unsafe extern "C" fn h_load_global(
             // mutation, so the value stays where it is).
             _ => {
                 let c = &mut *cache;
-                let field = |off: usize| st.frame.cast::<u8>().add(off).cast::<u64>().read();
+                // (A namespace handle's bits: one pointer-sized word.)
                 c.value = 0;
-                c.globals = field(F_GLOBALS);
+                c.globals = std::ptr::addr_of!((*st.frame).globals).cast::<u64>().read();
                 c.gstamp = g_stamp;
                 c.gdata = gdict as u64;
                 (c.builtins, c.bstamp, c.bdata) = if builtin {
-                    (field(F_BUILTINS), b_stamp, bdict as u64)
+                    let b = std::ptr::addr_of!((*st.frame).builtins)
+                        .cast::<u64>()
+                        .read();
+                    (b, b_stamp, bdict as u64)
                 } else {
                     (0, 0, 0)
                 };
@@ -2150,6 +2153,73 @@ unsafe extern "C" fn h_call(
                 RAISED
             }
         }
+    }
+}
+
+/// `CALL_KW` (the `pc`th instruction of `code`) on a stack `len` deep, as
+/// the core loop's arm runs it: a natively served class's constructor, a
+/// native method or builtin that takes keywords, or a pure leaf callee in
+/// place (`0`, the result in the callee's slot); a plain Python function
+/// as an inline activation switched to (`RELOAD`); anything else declined
+/// untouched.
+unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64, len: u64) -> u32 {
+    // SAFETY: the code passes its live state, its own code, one of its
+    // `CALL_KW`s and its stack depth. The in-place shapes run no Python
+    // code; every operand that leaves is checked to leave by a plain
+    // decrement.
+    unsafe {
+        let st = &mut *st;
+        let (code, pc, len) = (&*code, pc as usize, len as usize);
+        let argc = code.instructions[pc].arg as usize;
+        let base = st.stack;
+        let Some(Object::Tuple(names)) = len.checked_sub(1).map(|k| &*base.add(k)) else {
+            return CALL_DECLINED;
+        };
+        let kwc = names.len();
+        if len < kwc + argc + 3 {
+            return CALL_DECLINED;
+        }
+        let start = len - kwc - argc - 3;
+        Interpreter::core_instance_callee(base.add(start));
+        let ops = std::slice::from_raw_parts(base.add(start), len - start);
+        let interp = &*st.interp;
+        let r = match &ops[0] {
+            Object::Type(ty) if ty.native_kind.get() != 0 => {
+                Interpreter::core_native_ctor_kw(ops, argc, true)
+            }
+            Object::Builtin(_)
+                if matches!(&ops[1], Object::Instance(i)
+                    if crate::stdlib::decimal_native::is_decimal_instance(i)) =>
+            {
+                Interpreter::core_native_method_kw(ops, argc)
+            }
+            Object::BoundMethod(_) | Object::Builtin(_) => {
+                Interpreter::core_native_kw_call(ops, argc)
+            }
+            _ if st.depth_cell.is_null() => None,
+            _ => interp.core_pure_kw_call(code, pc, ops, argc, st.depth_cell),
+        };
+        let Some(r) = r else {
+            // A plain Python callee switches in place, as `CALL`'s does.
+            if !matches!(&ops[0], Object::Function(_)) || st.sw.is_null() {
+                return CALL_DECLINED;
+            }
+            let frame = &mut *st.frame;
+            frame.stack.set_len(len);
+            frame.pc = pc as u32;
+            let sw = &mut *st.sw;
+            *sw.last = st.last;
+            let interp = &mut *st.interp.cast_mut();
+            if !interp.core_call_kw(sw, pc) && sw.pending.is_none() {
+                sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+            }
+            return RELOAD;
+        };
+        for k in start..len {
+            crate::drop_hot(base.add(k).read());
+        }
+        base.add(start).write(r);
+        0
     }
 }
 
@@ -3337,7 +3407,7 @@ impl<'a> Lower<'a> {
             }
             OpCode::BinaryOp => return self.binary(pc, ins.arg),
             OpCode::CompareOp => return self.compare(pc, ins.arg),
-            OpCode::ToBool => return self.to_bool(pc),
+            OpCode::ToBool => return self.truth_of(pc),
             OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => {
                 let item = self.pop();
                 let Some(o) = self.operand(item) else {
@@ -3555,6 +3625,7 @@ impl<'a> Lower<'a> {
             // (A generator's fast step never switches or raises from a call
             // helper; a generator body's return isn't a switch.)
             OpCode::Call => return self.call_op(pc, ins.arg as usize),
+            OpCode::CallKw => return self.call_kw(pc),
             OpCode::ReturnValue if !self.is_gen() && self.depth > 0 => {
                 self.flush();
                 self.store_last();
@@ -5051,7 +5122,7 @@ impl<'a> Lower<'a> {
 
     /// `TO_BOOL`: a scalar's truth in line, any other value's through
     /// [`h_truth`].
-    fn to_bool(&mut self, pc: usize) -> bool {
+    fn truth_of(&mut self, pc: usize) -> bool {
         let item = self.pop();
         let o = self.operand(item);
         if o.is_some_and(|o| o.kind == Kind::Bool) {
@@ -5147,6 +5218,46 @@ impl<'a> Lower<'a> {
         self.b.ins().return_(&[r]);
         self.b.switch_to_block(ran);
         self.depth -= argc + 1;
+        self.set_last(pc);
+        self.check_released(pc + 1);
+        true
+    }
+
+    /// `CALL_KW` through [`h_call_kw`] (as [`Self::call_op`]; the depth
+    /// after is the static one).
+    fn call_kw(&mut self, pc: usize) -> bool {
+        let after = self.depths.get(pc + 1).copied().unwrap_or(-1);
+        if after < 0 || self.depth == 0 {
+            self.exit(INTERP, pc);
+            return false;
+        }
+        self.flush();
+        self.store_last();
+        let code = self.code_ptr();
+        let pcv = self.b.ins().iconst(types::I64, pc as i64);
+        let len = self.b.ins().iconst(types::I64, self.depth as i64);
+        let r = self
+            .call(
+                h_call_kw as *const () as usize,
+                &[self.st, code, pcv, len],
+                true,
+            )
+            .expect("returns");
+        let out = self.exit_with(pc, &[], INTERP);
+        let ran = self.b.create_block();
+        let other = self.b.create_block();
+        self.b.ins().brif(r, other, &[], ran, &[]);
+        self.b.switch_to_block(other);
+        let declined = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, r, i64::from(CALL_DECLINED));
+        let leave = self.b.create_block();
+        self.b.ins().brif(declined, out, &[], leave, &[]);
+        self.b.switch_to_block(leave);
+        self.b.ins().return_(&[r]);
+        self.b.switch_to_block(ran);
+        self.depth = after as usize;
         self.set_last(pc);
         self.check_released(pc + 1);
         true
