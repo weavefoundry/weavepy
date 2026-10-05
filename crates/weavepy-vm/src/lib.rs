@@ -10840,6 +10840,13 @@ impl Interpreter {
                 // (The activation is synced at every reload.)
                 return CoreExit::Switch;
             }
+            // The native code writes the stack at fixed offsets: a stack
+            // that started small (a materialized frame's) grows first.
+            #[cfg(feature = "jit")]
+            if let Some(n) = native.filter(|n| cap < n.need()) {
+                stack.reserve(n.need() - len);
+                continue 'reload;
+            }
             #[cfg(feature = "jit")]
             if pc == 0 && !NATIVE {
                 if let Some(ext) = ext {
@@ -10872,6 +10879,8 @@ impl Interpreter {
                             out: 0,
                             depth_cell: sw.depth_cell,
                             err: None,
+                            frame: sw.cur,
+                            sw: std::ptr::from_mut(sw),
                         });
                         nst.len = len;
                         nst.pc = pc;
@@ -10879,6 +10888,11 @@ impl Interpreter {
                         // SAFETY: the running activation's state, as this
                         // loop holds it (its locals count checked above).
                         let status = unsafe { native.run(nst) };
+                        // A call or return the native code switched the
+                        // activation for (synced before the switch).
+                        if status == frame_jit::RELOAD {
+                            break Some(CoreExit::Reload);
+                        }
                         len = nst.len;
                         pc = nst.pc;
                         last = nst.last;
@@ -15107,8 +15121,8 @@ impl Interpreter {
                         let d = d.try_borrow().ok()?;
                         clone_hot(d.get(&probe)?)
                     }
-                    // A non-ASCII string's code point (the ASCII case is the
-                    // core loop's own arm).
+                    // A string's code point (`str_char_at` byte-indexes an
+                    // ASCII string and walks any other from its cursor).
                     (Object::Str(s), Object::Int(i)) => {
                         let i = if *i < 0 {
                             i.checked_add(i64::try_from(crate::object::str_char_len(s)).ok()?)?
