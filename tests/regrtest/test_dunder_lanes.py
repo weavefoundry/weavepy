@@ -236,6 +236,47 @@ class DunderLaneTest(unittest.TestCase):
         h.fn = len
         self.assertEqual(loop(lambda i: h.fn("ab")), 2)
 
+    def test_operator_dunders(self):
+        class V:
+            def __init__(self, x):
+                self.x = x
+
+            def __sub__(self, other):
+                if not isinstance(other, V):
+                    return NotImplemented
+                return V(self.x - other.x)
+
+            def __rsub__(self, other):
+                return V(other - self.x)
+
+            def __lt__(self, other):
+                return self.x < other.x
+
+            def __eq__(self, other):
+                return isinstance(other, V) and self.x == other.x
+
+            __hash__ = None
+
+        class W(V):
+            def __rsub__(self, other):
+                return "W.__rsub__"
+
+        a, b = V(5), V(3)
+        self.assertEqual(loop(lambda i: (a - b).x), 2)
+        self.assertEqual(loop(lambda i: (10 - a).x), 5)
+        self.assertEqual(loop(lambda i: a - W(1)), "W.__rsub__")
+        self.assertIs(loop(lambda i: b < a), True)
+        self.assertIs(loop(lambda i: a == V(5)), True)
+        with self.assertRaises(TypeError):
+            loop(lambda i: a - "s")
+
+        class Boom:
+            def __add__(self, other):
+                raise KeyError("boom")
+
+        with self.assertRaises(KeyError):
+            loop(lambda i: Boom() + 1)
+
     def test_module_function(self):
         self.assertEqual(loop(lambda i: math.floor(i + 0.5)), 299)
         import types

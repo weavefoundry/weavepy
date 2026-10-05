@@ -10407,14 +10407,14 @@ impl Interpreter {
                 CoreExit::Slow => {
                     // SAFETY: as above.
                     let frame = unsafe { &*sw.cur };
-                    if frame
-                        .code
-                        .instructions
-                        .get(frame.pc as usize)
-                        .is_some_and(|i| i.op == OpCode::BinarySubscr)
-                        && self.core_getitem(sw, false)
-                    {
-                        continue;
+                    match frame.code.instructions.get(frame.pc as usize).map(|i| i.op) {
+                        Some(OpCode::BinarySubscr) if self.core_getitem(sw, false) => continue,
+                        Some(OpCode::BinaryOp | OpCode::CompareOp)
+                            if self.core_operator_lane(sw) =>
+                        {
+                            continue
+                        }
+                        _ => {}
                     }
                 }
                 CoreExit::Reload => unreachable!("handled inside the core loop"),
@@ -13819,6 +13819,47 @@ impl Interpreter {
         }
         // A finalizer queued by a dying operand runs before the next
         // instruction, as after the full handler's call.
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
+        true
+    }
+
+    /// A `BINARY_OP` or `COMPARE_OP` at `sw`'s running activation's `pc`
+    /// with an instance operand (a Python dunder, `Vector.__sub__`): the
+    /// full handler's own step, run with the activation on the pending
+    /// list (the dunder runs as a nested call) instead of as a full
+    /// interpreter step. `false` touches nothing.
+    #[inline(never)]
+    fn core_operator_lane(&mut self, sw: &mut CoreSwitch) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let pc = frame.pc as usize;
+        let Some(&ins) = frame.code.instructions.get(pc) else {
+            return false;
+        };
+        let n = frame.stack.len();
+        if n < 2
+            || !(matches!(frame.stack[n - 1], Object::Instance(_))
+                || matches!(frame.stack[n - 2], Object::Instance(_)))
+        {
+            return false;
+        }
+        frame.pc = pc as u32 + 1;
+        let pending = self.core_pending_enter(sw, frame, pc);
+        let result = if ins.op == OpCode::BinaryOp {
+            self.binary_op_step(frame, pc as u32, ins.arg)
+        } else {
+            self.compare_op_step(frame, pc as u32, ins.arg)
+        };
+        self.lean_pending_exit(pending);
+        match result {
+            // SAFETY: the running activation's last-pc slot.
+            Ok(()) => unsafe { *sw.last = pc },
+            Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
+        }
         // SAFETY: the running thread's own flag (see `quiet_run`).
         if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
             sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
