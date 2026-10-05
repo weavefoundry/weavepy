@@ -34422,7 +34422,7 @@ impl Interpreter {
         use crate::object::LazyIterKind;
         // Steps that run no code first (pure state machines, and native
         // sources with an item ready), under one borrow.
-        if let Some(r) = crate::seqiter::itertools_pure_next(l) {
+        if let Some(r) = crate::seqiter::lazy_pure_next(l) {
             return Ok(r);
         }
         // The builtin `map`/`filter`/`zip`/`enumerate` adapters.
@@ -34757,7 +34757,7 @@ impl Interpreter {
                     let Some(item) = self.iter_next(&source, globals)? else {
                         return Ok(None);
                     };
-                    let verdict = self.call(&func, std::slice::from_ref(&item), &[], globals)?;
+                    let verdict = self.seq_call1(&func, item.clone(), globals)?;
                     if !self.obj_truthy(&verdict, globals)? {
                         if let LazyIterKind::DropWhile { started: s, .. } =
                             &mut *l.state.borrow_mut()
@@ -34779,7 +34779,7 @@ impl Interpreter {
                 let Some(item) = self.iter_next(&source, globals)? else {
                     return Ok(None);
                 };
-                let verdict = self.call(&func, std::slice::from_ref(&item), &[], globals)?;
+                let verdict = self.seq_call1(&func, item.clone(), globals)?;
                 if self.obj_truthy(&verdict, globals)? {
                     Ok(Some(item))
                 } else {
@@ -34796,7 +34796,7 @@ impl Interpreter {
                 let truthy = match &func {
                     Object::None => self.obj_truthy(&item, globals)?,
                     f => {
-                        let verdict = self.call(f, std::slice::from_ref(&item), &[], globals)?;
+                        let verdict = self.seq_call1(f, item.clone(), globals)?;
                         self.obj_truthy(&verdict, globals)?
                     }
                 };
@@ -34812,6 +34812,11 @@ impl Interpreter {
                     Object::Tuple(items) => items.to_vec(),
                     other => self.collect_iterable(other, globals)?,
                 };
+                if let Object::Function(f) = &func {
+                    if let Some(r) = self.call_pure_leaf(f, &call_args) {
+                        return Ok(Some(r));
+                    }
+                }
                 Ok(Some(self.call(&func, &call_args, &[], globals)?))
             }
             Snap::Pairwise { source, old } => {

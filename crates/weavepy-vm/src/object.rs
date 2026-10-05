@@ -189,8 +189,9 @@ pub enum Object {
     /// `sys.implementation`, `argparse.Namespace`-shaped fixtures, and
     /// the conformance harness.
     SimpleNamespace(Rc<RefCell<DictData>>),
-    /// Native lazy iterator adapter (RFC 0037) — an `itertools` object
-    /// CPython implements in C. Wraps an arbitrary VM iterable, so it
+    /// Native lazy iterator adapter (RFC 0037) — an `itertools` object or
+    /// a builtin `map`/`filter`/`zip`/`enumerate`, which CPython
+    /// implements in C. Wraps an arbitrary VM iterable, so it
     /// is stepped by the *interpreter* (`Interpreter::iter_next`),
     /// never by `PyIterator::next_value`: advancing the source may
     /// resume a generator or call a user-defined `__next__`. Being

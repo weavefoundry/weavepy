@@ -8387,6 +8387,15 @@ pub(crate) fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
             }))));
         }
     }
+    if let Object::Tuple(items) = iterable {
+        let buf = items.to_vec();
+        let index = buf.len() as i64 - 1;
+        return Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Reversed {
+            items: Rc::new(RefCell::new(buf)),
+            index,
+            owner: None,
+        }))));
+    }
     // Otherwise materialize the source in *forward* order; the Reversed
     // iterator walks it back-to-front. (CPython's `reversed` uses
     // `__reversed__` or `__len__`+`__getitem__`; a forward snapshot

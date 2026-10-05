@@ -283,6 +283,12 @@ fn one_arg<'a>(args: &'a [Object], name: &str) -> Result<&'a Object, RuntimeErro
 
 fn binary(args: &[Object], op: BinOpKind, name: &str) -> Result<Object, RuntimeError> {
     let (a, b) = two_args(args, name)?;
+    // Plain ints and floats have no dunders to dispatch: the native
+    // arithmetic the `BINARY_OP` handler ends in.
+    let plain = |o: &Object| matches!(o, Object::Int(_) | Object::Float(_));
+    if plain(a) && plain(b) && !matches!(op, BinOpKind::MatMult) {
+        return crate::binary_op(a, b, op);
+    }
     with_interp(|interp| interp.op_binary(a, b, op))
 }
 
