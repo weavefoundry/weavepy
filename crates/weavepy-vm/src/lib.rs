@@ -8087,7 +8087,7 @@ impl Interpreter {
         mode: InlineResume,
     ) -> Option<Box<InlineAct>> {
         let arg = match mode {
-            InlineResume::NextCall => GEN_NEXT_CALL,
+            InlineResume::NextCall | InlineResume::SendCall => GEN_NEXT_CALL,
             InlineResume::ForIter => frame.code.instructions.get(pc)?.arg,
             InlineResume::Send => {
                 let jump = frame.code.instructions.get(pc)?.arg;
@@ -8097,9 +8097,27 @@ impl Interpreter {
                 jump | GEN_SEND
             }
         };
-        let send = mode == InlineResume::Send;
+        let send = matches!(mode, InlineResume::Send | InlineResume::SendCall);
         let n = frame.stack.len();
-        let (g, sent_none) = if send {
+        let (g, sent_none) = if mode == InlineResume::SendCall {
+            match (
+                frame.stack.get(n.checked_sub(3)?),
+                frame.stack.get(n - 2),
+                frame.stack.last(),
+            ) {
+                (Some(Object::BoundMethod(bm)), Some(Object::Unbound), Some(v)) => {
+                    match (&bm.receiver, &bm.function) {
+                        (Object::Generator(g) | Object::Coroutine(g), Object::Builtin(b))
+                            if matches!(b.name, ".gen_send" | ".cor_send") =>
+                        {
+                            (g, matches!(v, Object::None))
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            }
+        } else if send {
             match (frame.stack.get(n.checked_sub(2)?), frame.stack.last()) {
                 (Some(Object::Generator(g) | Object::Coroutine(g)), Some(v)) => {
                     (g, matches!(v, Object::None))
@@ -8176,10 +8194,18 @@ impl Interpreter {
         }
         let gen_frame: *mut Frame = gf;
         frame.pc = pc as u32 + 1;
-        if mode == InlineResume::NextCall {
+        match mode {
             // `next`, its empty self slot and the generator (held above).
-            let n = frame.stack.len();
-            drop(frame.stack.drain(n - 3..));
+            InlineResume::NextCall => {
+                let n = frame.stack.len();
+                drop(frame.stack.drain(n - 3..));
+            }
+            // The bound `send` and its empty self slot (the value went in).
+            InlineResume::SendCall => {
+                let n = frame.stack.len();
+                drop(frame.stack.drain(n - 2..));
+            }
+            _ => {}
         }
         let mut act = self.inline_slot();
         // A pooled slot holds none of these (every path back to the pool
@@ -12619,6 +12645,26 @@ impl Interpreter {
                             }
                             break Some(CoreExit::Reload);
                         }
+                        // `gen.send(v)` / `coro.send(v)`: likewise, with the
+                        // value sent in.
+                        // SAFETY: `len >= argc + 2 == 3`.
+                        if argc == 1
+                            && matches!(
+                                unsafe { (&*base.add(len - 3), &*base.add(len - 2)) },
+                                (Object::BoundMethod(bm), Object::Unbound)
+                                    if matches!(&bm.function, Object::Builtin(b)
+                                        if matches!(b.name, ".gen_send" | ".cor_send"))
+                            )
+                        {
+                            // SAFETY: `len <= cap`, every slot initialized.
+                            unsafe { frame.stack.set_len(len) };
+                            frame.pc = pc as u32;
+                            *last_pc = last;
+                            if !self.core_gen_resume(sw, pc, InlineResume::SendCall) {
+                                sw.pending = Some(CoreExit::Stop(LeafStop::Step));
+                            }
+                            break Some(CoreExit::Reload);
+                        }
                         // SAFETY: `len >= argc + 2`: the callee and its self
                         // slot.
                         unsafe { Self::core_instance_callee(base.add(len - argc - 2)) };
@@ -13497,6 +13543,24 @@ impl Interpreter {
                             };
                         if !ok {
                             break Some(CoreExit::Helper);
+                        }
+                        last = pc;
+                        pc += 1;
+                    }
+                    // `await f()`: a coroutine nothing has started is its own
+                    // awaitable (anything else is the full handler's, which
+                    // also refuses a second awaiter).
+                    OpCode::GetAwaitable => {
+                        // SAFETY: `len > 0` is checked first.
+                        let fresh = len > 0
+                            && match unsafe { &*base.add(len - 1) } {
+                                // SAFETY: a read between instructions.
+                                Object::Coroutine(g) => unsafe { g.state.peek() }
+                                    .is_some_and(|s| matches!(s, GeneratorState::Created(_))),
+                                _ => false,
+                            };
+                        if !fresh {
+                            break Some(CoreExit::Stop(LeafStop::Step));
                         }
                         last = pc;
                         pc += 1;
@@ -17056,6 +17120,25 @@ impl Interpreter {
         if let Some(done) = Self::leaf_function_attr(code, stack, ins) {
             return done;
         }
+        // `gen.send(...)` and the other generator and coroutine methods:
+        // the bound method, with an empty self slot (sites the full
+        // handler never specializes either).
+        if ins.op == OpCode::LoadMethodAttr {
+            if let Some(recv @ (Object::Generator(_) | Object::Coroutine(_))) = stack.last() {
+                let Some(name) = code.names.get(ins.arg as usize) else {
+                    return CoreAttr::Decline;
+                };
+                if !matches!(name.as_str(), "send" | "throw" | "close" | "__next__") {
+                    return CoreAttr::Decline;
+                }
+                let bm = make_gen_method(name, recv);
+                if let Some(top) = stack.last_mut() {
+                    drop(std::mem::replace(top, bm));
+                }
+                stack.push(Object::Unbound);
+                return CoreAttr::Done;
+            }
+        }
         // A first execution belongs to the full handler, which specializes
         // the site (the leaf fallbacks would serve it without ever doing
         // so, leaving every later execution on the class-cache path).
@@ -19046,6 +19129,26 @@ impl Interpreter {
                     };
                     l.push(v);
                     drop(l);
+                    last = pc;
+                    pc += 1;
+                }
+                // `del x` of a bound plain local (an `except ... as e:`
+                // clause's cleanup): an unbound one raises, and a slot shared
+                // with a cell is the full handler's. (A frame object nothing
+                // outside holds has no `f_locals` view to refresh: the loop
+                // isn't quiet while one is.)
+                OpCode::DeleteFast => {
+                    let slot = ins.arg as usize;
+                    if !code.cellvars.is_empty() && Self::shared_cell_index(code, slot).is_some() {
+                        break;
+                    }
+                    let Some(v) = locals.get_mut(slot) else {
+                        break;
+                    };
+                    if matches!(v, Object::Unbound) {
+                        break;
+                    }
+                    drop(std::mem::replace(v, Object::Unbound));
                     last = pc;
                     pc += 1;
                 }
@@ -59378,6 +59481,9 @@ enum InlineResume {
     /// `SEND` of the value at the top of the stack to the generator or
     /// coroutine below it (`yield from`, `await`).
     Send,
+    /// A `CALL` of a generator's or coroutine's bound `send` method with
+    /// one argument: as [`Self::NextCall`], with that value sent in.
+    SendCall,
 }
 
 /// How [`Interpreter::generator_resume`] concluded.
@@ -60490,6 +60596,7 @@ static SLOW_LEAF_OPS: [bool; 256] = {
         OpCode::LoadConst,
         OpCode::LoadDeref,
         OpCode::LoadFast,
+        OpCode::DeleteFast,
         OpCode::ListExtend,
         OpCode::ListToTuple,
         OpCode::SetAdd,

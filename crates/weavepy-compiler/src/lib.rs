@@ -432,6 +432,11 @@ impl JitHint {
                 for (pc, i) in ins.iter().enumerate() {
                     if i.op == OpCode::JumpBackward {
                         let target = (pc + 1).saturating_sub(i.arg as usize);
+                        // A `yield from`/`await`'s `CLEANUP_THROW` jumps back
+                        // to its `END_SEND`: an exit, not a loop.
+                        if ins.get(target).is_some_and(|t| t.op == OpCode::EndSend) {
+                            continue;
+                        }
                         let e = extent.entry(target).or_insert(pc);
                         *e = (*e).max(pc);
                     }
